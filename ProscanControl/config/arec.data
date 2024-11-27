@@ -1,8 +1,0 @@
-# Comments start with a #.
-# Blank lines ok.
-
-# Line format:
-#       <index> ; <x pos> ; <y pos> ; <area name> ; <notes, optional>
-# An empty file means no areas.
-
-
