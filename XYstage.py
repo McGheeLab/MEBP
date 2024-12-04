@@ -12,7 +12,10 @@ from scipy.interpolate import interp1d, CubicSpline
 
 class SerialPortManager:
     def __init__(self):
-        self.spo = self.initialize_serial_port()
+        self.spo = serial.Serial(
+      port='COM3', baudrate=9600, bytesize=8,
+      timeout=1, stopbits=serial.STOPBITS_ONE
+      )
 
     def initialize_serial_port(self):
         hostname = socket.gethostname()
@@ -67,8 +70,6 @@ class XYStage:
         try:
             command = f"{command}\r\n".encode('ascii')
             self.spo.write(command)
-            response = self.spo.readline().decode('ascii').strip()
-            print(f"Sent command: {command.strip()} - Response: {response}")
         except serial.SerialException as e:
             print(f"Error sending command: {e}")
 
@@ -260,7 +261,7 @@ class XYStageSimulator:
 
 if __name__ == "__main__":
     # Choose whether to use the real stage or the simulator
-    use_simulator = True
+    use_simulator = False
 
     if use_simulator:
         stage = XYStageSimulator()
