@@ -8,6 +8,9 @@ import serial
 import serial.tools.list_ports
 import numpy as np
 from scipy.interpolate import interp1d, CubicSpline
+import threading
+import re
+import queue
 
 class SerialPortManager:
     #def __init__(self):
@@ -55,20 +58,20 @@ class SerialPortManager:
         print("No ProScan III controller found.")
         return None
 
-
 class XYStage:
-    UPDATE_INTERVAL = 0.1  # Time between updates (300 ms)
+    UPDATE_INTERVAL = 1  # Time between updates in seconds (for waypoint control)
 
     def __init__(self, waypoints, simulate=False, Kp=1.0, Ki=0.0, Kd=0.0):
         self.simulate = simulate
         if self.simulate:
             self.spo = XYStageSimulator()
+            self.spo.start()  # Start the simulator's thread
         else:
             serial_manager = SerialPortManager()
             self.spo = serial_manager.spo
 
         self.waypoints = waypoints
-        
+
         # PID controller parameters
         self.Kp = Kp
         self.Ki = Ki
@@ -79,6 +82,11 @@ class XYStage:
         self.error_sum_y = 0.0
         self.last_error_x = 0.0
         self.last_error_y = 0.0
+
+    def __del__(self):
+            """Ensure the simulator stops when the XYStage instance is destroyed."""
+            if self.simulate and self.spo.running:
+                self.spo.stop()
 
     def send_command(self, command):
         """Send a command to the ProScan III controller or simulator."""
@@ -272,48 +280,95 @@ class XYStage:
         plt.show()
 
 class XYStageSimulator:
-    def __init__(self):
+    def __init__(self, update_rate_hz=100, acceleration_rate=100,communication_delay=0.7):
         self.current_x = 0.0
         self.current_y = 0.0
-        self.velocity_x = 0.0
-        self.velocity_y = 0.0
+        self.current_vx = 0.0
+        self.current_vy = 0.0
+        self.target_vx = 0.0
+        self.target_vy = 0.0
         self.last_update_time = time.time()
 
+        self.acceleration_rate = acceleration_rate  # Max velocity change per second (microns/s^2)
+        self.update_rate_hz = update_rate_hz  # Updates per second
+        self.update_interval = 1.0 / update_rate_hz
+        self.communication_delay = communication_delay  # Simulated delay in seconds
+        
+        self.running = False
+        self.lock = threading.Lock()
+
+        self.thread = threading.Thread(target=self.update_loop)
+        self.thread.daemon = True
+
+    def start(self):
+        """Start the simulator thread."""
+        self.running = True
+        self.thread.start()
+
+    def stop(self):
+        """Stop the simulator thread."""
+        self.running = False
+        self.thread.join()
+
     def send_command(self, command):
-        """Simulate sending a command to the ProScan III controller."""
+        time.sleep(self.communication_delay)  # Simulated delay
+        """Simulate sending a command to the stage controller."""
         print(f"Simulated command: {command.strip()}")
         if command.startswith("VS"):
-            # Extract velocity from command
+            # Parse target velocity from command
             parts = command.split(',')
             if len(parts) == 3:
                 try:
-                    self.velocity_x = float(parts[1])
-                    self.velocity_y = float(parts[2])
-                    response = "R"
+                    vx = float(parts[1])
+                    vy = float(parts[2])
+                    with self.lock:
+                        self.target_vx = vx
+                        self.target_vy = vy
+                    return "R"
                 except ValueError:
-                    response = "Invalid velocity values."
-            else:
-                response = "Invalid command format."
+                    return "Invalid velocity values."
+            return "Invalid command format."
         elif command.strip() == "P":
             # Simulate position query
             x, y, z = self.get_current_position()
-            response = f"{x:.2f},{y:.2f},{z:.2f}"
-        else:
-            response = "Unknown command."
-        return response
+            return f"{x:.2f},{y:.2f},{z:.2f}"
+        return "Unknown command."
 
     def get_current_position(self):
-        """Simulate querying the stage for its current position."""
-        current_time = time.time()
-        elapsed_time = current_time - self.last_update_time
-        self.last_update_time = current_time
+        """Return the current position."""
+        with self.lock:
+            return self.current_x, self.current_y, 0.0
 
-        # Update position based on velocity and elapsed time
-        self.current_x += self.velocity_x * elapsed_time
-        self.current_y += self.velocity_y * elapsed_time
+    def update_velocity(self, current, target, dt):
+        """Gradually adjust velocity towards the target with a linear ramp."""
+        if current < target:
+            return min(current + self.acceleration_rate * dt, target)
+        elif current > target:
+            return max(current - self.acceleration_rate * dt, target)
+        return current
 
-        # For simulation purposes, z is always 0.0
-        return self.current_x, self.current_y, 0.0
+    def update_loop(self):
+        """Update position and velocity in a loop."""
+        while self.running:
+            start_time = time.time()
+            with self.lock:
+                # Compute elapsed time
+                now = time.time()
+                dt = now - self.last_update_time
+                self.last_update_time = now
+
+                # Gradually adjust velocity
+                self.current_vx = self.update_velocity(self.current_vx, self.target_vx, dt)
+                self.current_vy = self.update_velocity(self.current_vy, self.target_vy, dt)
+
+                # Update position
+                self.current_x += self.current_vx * dt
+                self.current_y += self.current_vy * dt
+
+            # Sleep to maintain the update rate
+            elapsed = time.time() - start_time
+            sleep_time = max(0, self.update_interval - elapsed)
+            time.sleep(sleep_time)
 
 class Waypoint:
     def __init__(self, csv_file_path='waypoints.csv'):
@@ -387,9 +442,7 @@ class Waypoint:
         interpolated_values['p3'] += p30  # Corrected line
 
         return interpolated_values
-
-    
-    
+ 
 # Class to send and recieve data with the 3D printer board
 class ZPStage_manager:
     def __init__(self):
@@ -650,15 +703,14 @@ class ZPStage:
         self.current_positions['e'] = interpolated_values['e']
 
 
-
 if __name__ == "__main__":
     # Choose whether to use the real stage or the simulator
-    use_simulator = False
+    use_simulator = True
 
     # PID controller gains
-    Kp = 0.4
-    Ki = 0
-    Kd = 0.01
+    Kp = 0.33
+    Ki = 0.001
+    Kd = 0.02
 
     waypoints = Waypoint('waypoints.csv')
     waypoint_list = waypoints.import_waypoints_from_csv()
@@ -669,3 +721,4 @@ if __name__ == "__main__":
         stage.move( "Waypoint Following with PID Control", interpolation_type="linear", plot=True)
     else:
         print("No waypoints available.")
+        
