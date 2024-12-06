@@ -123,6 +123,11 @@ class XYStageManager:
         command = f"VS,{vx},{vy}"
         self.send_command(command)
 
+    def move_stage_to_position(self, x, y):
+        """Move the stage to the specified position (x, y)."""
+        command = f"PA,{x},{y}"
+        self.send_command(command)
+
 class ZPStageManager:
     # Class to send and receive data with the 3D printer board
     def __init__(self, simulate=False):
@@ -316,7 +321,7 @@ class Stages:
 
     def __init__(self, waypoints, simulate=False, Kp=1.0, Ki=0.0, Kd=0.0):
         self.simulate = simulate
-        self.xy_manager = XYStageManager(simulate=True)
+        self.xy_manager = XYStageManager(simulate=self.simulate)
         self.zp_manager = ZPStageManager(simulate=self.simulate)
 
         self.current_positions_zp = {'x': 0, 'y': 0, 'z': 0, 'e': 0}
@@ -730,6 +735,7 @@ class Waypoint:
 
         return interpolated_values
 
+
 class XYStageSimulator:
     def __init__(self, update_rate_hz=100, acceleration_rate=100, communication_delay=0.0):
         self.current_x = 0.0
@@ -935,14 +941,14 @@ class ZPStageSimulator:
 
 if __name__ == "__main__":
     # Choose whether to use the real stage or the simulator
-    use_simulator = False
+    use_simulator = True
 
     # PID controller gains
     Kp = 0.5#0.33
     Ki = 0#0.001
     Kd = 0#0.02
 
-    waypoints = Waypoint('waypoints.csv')
+    waypoints = Waypoint('multi_layer_toolpath.csv')
     waypoint_list = waypoints.import_waypoints_from_csv()
 
     stage = Stages(waypoints, simulate=use_simulator, Kp=Kp, Ki=Ki, Kd=Kd)
