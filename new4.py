@@ -171,6 +171,7 @@ class ZPStageManager:
             self.serial.close()
 
     def send_data(self, data):
+        print(f"Sending data: {data}")
         data = data.encode("utf-8") + b"\n"
         self.serial.write(data)
         self.serial.flush()
@@ -199,30 +200,40 @@ class ZPStageManager:
     def get_position(self):
         # M114 get all position values
         self.send_data("M114")
-        time.sleep(0.1)
         position_data = self.receive_data()
         self.extract_position_data(position_data)
 
         return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
 
     def extract_position_data(self, response):
-        # Function to extract position data from the response string
+        # Split the response into lines
+        lines = response.split('\n')
 
-        # Use a regular expression to match the position values
-        match = re.search(
-            r"X:(\d+\.\d+)\s+Y:(\d+\.\d+)\s+Z:(\d+\.\d+)\s+E:(\d+\.\d+)\s+Count\s+X:(\d+)\s+Y:(\d+)\s+Z:(\d+)",
-            response,
-        )
+        for line in lines:
+            line = line.strip()
+            # Skip empty lines or lines that contain only "ok"
+            if not line or line == "ok":
+                continue
 
-        if match:
-            # Extract the position values from the match object
-            self.x_pos = float(match.group(1))
-            self.y_pos = float(match.group(2))
-            self.z_pos = float(match.group(3))
-            self.e_pos = float(match.group(4))
-            self.x_cnt = float(match.group(5))
-            self.y_cnt = float(match.group(6))
-            self.z_cnt = float(match.group(7))
+            # Attempt to match the position data in this line
+            match = re.search(r"X:([+-]?\d+\.\d+)\s+"
+                                r"Y:([+-]?\d+\.\d+)\s+"
+                                r"Z:([+-]?\d+\.\d+)\s+"
+                                r"E:([+-]?\d+\.\d+)\s+"
+                                r"Count\s+X:([+-]?\d+)\s+Y:([+-]?\d+)\s+Z:([+-]?\d+)", line
+                            )
+            if match:
+                # Extract the position values from the matched line
+                self.x_pos = float(match.group(1))
+                self.y_pos = float(match.group(2))
+                self.z_pos = float(match.group(3))
+                self.e_pos = float(match.group(4))
+                self.x_cnt = float(match.group(5))
+                self.y_cnt = float(match.group(6))
+                self.z_cnt = float(match.group(7))
+                return  # Successfully extracted position data
+            else:
+                print(f"Failed to match line: {line}")
 
     def get_all_data(self):
         # M503 request all settings from the printer
@@ -305,7 +316,7 @@ class Stages:
 
     def __init__(self, waypoints, simulate=False, Kp=1.0, Ki=0.0, Kd=0.0):
         self.simulate = simulate
-        self.xy_manager = XYStageManager(simulate=simulate)
+        self.xy_manager = XYStageManager(simulate=True)
         self.zp_manager = ZPStageManager(simulate=simulate)
 
         self.current_positions_zp = {'x': 0, 'y': 0, 'z': 0, 'e': 0}
@@ -356,192 +367,6 @@ class Stages:
 
         return vx, vy
 
-    def move(self, plot_title, interpolation_type="linear", plot=False):
-        # Temporary variables for initial position; replace later
-
-        x0, y0, _ = self.xy_manager.get_current_position()
-        if x0 is None or y0 is None:
-            print("Failed to retrieve initial position. Exiting.")
-            return
-
-        z0, p10, p20, p30 = self.zp_manager.get_position()
-
-        start_time = time.time()
-
-        actual_path_x = []
-        actual_path_y = []
-        actual_path_z = []
-
-        ideal_path_x = []
-        ideal_path_y = []
-        ideal_path_z = []
-
-        # For plotting p1, p2, p3
-        actual_p1 = []
-        actual_p2 = []
-        actual_p3 = []
-
-        ideal_p1 = []
-        ideal_p2 = []
-        ideal_p3 = []
-
-        delta_t_xy = self.UPDATE_INTERVAL_XY  # Time interval for XY stage
-        delta_t_zp = self.UPDATE_INTERVAL_ZP  # Time interval for ZP stage
-
-        max_velocity = 1000  # Define maximum allowable velocity
-
-        next_update_time_xy = start_time
-        next_update_time_zp = start_time
-
-        # Initialize the ZP stage command queue
-        zp_command_queue = queue.Queue()
-
-        # Preload two commands into the ZP stage command queue
-        # Get the first two interpolated values for the ZP stage
-        elapsed_time_zp = 0
-        for _ in range(2):
-            interpolated_values_zp = self.waypoints.interpolate_waypoints(
-                elapsed_time_zp, x0, y0, z0, p10, p20, p30, interpolation_type
-            )
-            if interpolated_values_zp is not None:
-                zp_axes = {
-                    'X': interpolated_values_zp['z'] - z0,
-                    'Y': interpolated_values_zp['p1'] - p10,
-                    'Z': interpolated_values_zp['p2'] - p20,
-                    'E': interpolated_values_zp['p3'] - p30
-                }
-                self.zp_manager.movecommand(zp_axes)
-                zp_command_queue.put(zp_axes)
-
-                # Collect ideal positions for plotting
-                ideal_path_z.append(interpolated_values_zp['z'])
-                ideal_p1.append(interpolated_values_zp['p1'])
-                ideal_p2.append(interpolated_values_zp['p2'])
-                ideal_p3.append(interpolated_values_zp['p3'])
-
-                # Update initial positions for next iteration
-                p10 = interpolated_values_zp['p1']
-                p20 = interpolated_values_zp['p2']
-                p30 = interpolated_values_zp['p3']
-                z0 = interpolated_values_zp['z']
-
-                elapsed_time_zp += delta_t_zp
-            else:
-                break
-
-        while True:
-            current_time = time.time()
-            # Update XY Stage
-            if current_time >= next_update_time_xy:
-                elapsed_time_xy = current_time - start_time
-
-                # Desired target position at current time
-                interpolated_values_xy = self.waypoints.interpolate_waypoints(
-                    elapsed_time_xy, x0, y0, 0, 0, 0, 0, interpolation_type
-                )
-
-                if interpolated_values_xy is None:
-                    break
-
-                target_x = interpolated_values_xy['x']
-                target_y = interpolated_values_xy['y']
-
-                # Get current x,y position
-                current_x, current_y, _ = self.xy_manager.get_current_position()
-                print(f"Current XY position: ({current_x}, {current_y})")
-
-                # Calculate error between desired and actual position
-                error_x = target_x - current_x
-                error_y = target_y - current_y
-
-                # Calculate velocity using PID controller
-                vx, vy = self.calculate_velocity_with_pid(error_x, error_y, delta_t_xy)
-
-                # Limit velocities to maximum allowed values
-                velocity_magnitude = np.hypot(vx, vy)
-                if velocity_magnitude > max_velocity:
-                    scaling_factor = max_velocity / velocity_magnitude
-                    vx *= scaling_factor
-                    vy *= scaling_factor
-
-                    # Anti-windup: Reset integral sum if velocity is at maximum limit
-                    self.error_sum_x = 0.0
-                    self.error_sum_y = 0.0
-
-                # Move XY stage
-                self.xy_manager.move_stage_at_velocity(vx, vy)
-
-                # Collect data for plotting
-                ideal_path_x.append(target_x)
-                ideal_path_y.append(target_y)
-
-                actual_path_x.append(current_x)
-                actual_path_y.append(current_y)
-
-                next_update_time_xy += delta_t_xy
-
-            # Update ZP Stage
-            if current_time >= next_update_time_zp:
-                # Ensure there are at least two commands in the ZP stage command queue
-                while zp_command_queue.qsize() < 2:
-                    interpolated_values_zp = self.waypoints.interpolate_waypoints(
-                        elapsed_time_zp, x0, y0, z0, p10, p20, p30, interpolation_type
-                    )
-                    if interpolated_values_zp is not None:
-                        zp_axes = {
-                            'X': interpolated_values_zp['z'] - z0,
-                            'Y': interpolated_values_zp['p1'] - p10,
-                            'Z': interpolated_values_zp['p2'] - p20,
-                            'E': interpolated_values_zp['p3'] - p30
-                        }
-                        self.zp_manager.movecommand(zp_axes)
-                        zp_command_queue.put(zp_axes)
-
-                        # Collect ideal positions for plotting
-                        ideal_path_z.append(interpolated_values_zp['z'])
-                        ideal_p1.append(interpolated_values_zp['p1'])
-                        ideal_p2.append(interpolated_values_zp['p2'])
-                        ideal_p3.append(interpolated_values_zp['p3'])
-
-                        # Update initial positions for next iteration
-                        p10 = interpolated_values_zp['p1']
-                        p20 = interpolated_values_zp['p2']
-                        p30 = interpolated_values_zp['p3']
-                        z0 = interpolated_values_zp['z']
-
-                        elapsed_time_zp += delta_t_zp
-                    else:
-                        break  # No more waypoints
-
-                # Dequeue the command that has been processed
-                if not zp_command_queue.empty():
-                    processed_command = zp_command_queue.get()
-
-                    # For plotting purposes, get current position
-                    zp_current_pos = self.zp_manager.get_position()
-                    actual_path_z.append(zp_current_pos[0])
-                    actual_p1.append(zp_current_pos[1])
-                    actual_p2.append(zp_current_pos[2])
-                    actual_p3.append(zp_current_pos[3])  # e_pos
-
-                next_update_time_zp += delta_t_zp
-
-            # Sleep for a short duration to prevent CPU overutilization
-            time.sleep(0.01)
-
-        # Stop the stages after movement
-        self.xy_manager.move_stage_at_velocity(0, 0)
-        print(f"{plot_title} complete.")
-
-        if plot:
-            self.plot_results_3d(
-                ideal_path_x, ideal_path_y, ideal_path_z,
-                actual_path_x, actual_path_y, actual_path_z,
-                ideal_p1, ideal_p2, ideal_p3,
-                actual_p1, actual_p2, actual_p3,
-                plot_title
-            )
-
     @staticmethod
     def calculate_velocity_to_follow_path(current_x, current_y, future_target_x, future_target_y, delta_t, max_velocity):
         """Calculate the velocity needed to move from current position to future target position over delta_t."""
@@ -560,7 +385,6 @@ class Stages:
             required_vy *= scaling_factor
 
         return required_vx, required_vy
-
 
     def plot_results_3d(
         self, ideal_x, ideal_y, ideal_z,
@@ -672,6 +496,151 @@ class Stages:
         ax.legend()
         plt.show()
 
+    def move(self, plot_title, interpolation_type="linear", plot=False):
+        x0, y0, _ = self.xy_manager.get_current_position()
+        if x0 is None or y0 is None:
+            print("Failed to retrieve initial position. Exiting.")
+            return
+
+        z0, p10, p20, p30 = self.zp_manager.get_position()
+        zp=z0
+        p1p=p10
+        p2p=p20
+        p3p=p30
+
+        start_time = time.time()
+
+        actual_path_x = []
+        actual_path_y = []
+        actual_path_z = []
+
+        ideal_path_x = []
+        ideal_path_y = []
+        ideal_path_z = []
+
+        actual_p1 = []
+        actual_p2 = []
+        actual_p3 = []
+
+        ideal_p1 = []
+        ideal_p2 = []
+        ideal_p3 = []
+
+        delta_t_xy = self.UPDATE_INTERVAL_XY  # Time interval for XY stage updates
+        delta_t_zp = self.UPDATE_INTERVAL_ZP  # Time interval for ZP stage updates
+
+        max_velocity = 1000  # Define maximum allowable velocity
+
+        next_update_time_xy = start_time
+        next_update_time_zp = start_time
+
+        elapsed_time_zp = 0
+        timefactor = -0.3
+
+        while True:
+            current_time = time.time()
+
+            # Update ZP Stage
+            if current_time >= next_update_time_zp:
+                elapsed_time_zp = current_time - start_time
+                # Ensure two commands in the queue
+                interpolated_values_zp = self.waypoints.interpolate_waypoints(
+                    elapsed_time_zp, x0, y0, z0, p10, p20, p30, interpolation_type
+                )
+                if interpolated_values_zp is not None:
+                    dx_z = interpolated_values_zp['z'] - zp
+                    dx_p1 = interpolated_values_zp['p1'] - p1p
+                    dx_p2 = interpolated_values_zp['p2'] - p2p
+                    dx_p3 = interpolated_values_zp['p3'] - p3p
+
+                    zp_axes = {
+                        'X': dx_z,
+                        'Y': dx_p1,
+                        'Z': dx_p2,
+                        'E': dx_p3
+                    }
+
+                    max_distance = max(abs(v) for v in zp_axes.values())
+                    feedrate = (max_distance / (delta_t_zp+timefactor)) * 60 if max_distance > 0 else 100.0
+
+                    self.zp_manager.movecommand(zp_axes, feedrate=feedrate)
+
+                    # Collect ideal positions
+                    ideal_path_z.append(interpolated_values_zp['z'])
+                    ideal_p1.append(interpolated_values_zp['p1'])
+                    ideal_p2.append(interpolated_values_zp['p2'])
+                    ideal_p3.append(interpolated_values_zp['p3'])
+                    
+                    zp += dx_z
+                    p1p += dx_p1
+                    p2p += dx_p2
+                    p3p += dx_p3
+
+                    # get current position
+                    z, p1, p2, p3 = self.zp_manager.get_position()
+                    print(f"Current ZP position: ({z}, {p1}, {p2}, {p3})")
+
+                    actual_path_z.append(z)
+                    actual_p1.append(p1)
+                    actual_p2.append(p2)
+                    actual_p3.append(p3)
+
+                next_update_time_zp += delta_t_zp
+            
+                        # Update XY Stage
+            
+            
+            if current_time >= next_update_time_xy:
+                elapsed_time_xy = current_time - start_time
+                interpolated_values_xy = self.waypoints.interpolate_waypoints(
+                    elapsed_time_xy, x0, y0, 0, 0, 0, 0, interpolation_type
+                )
+
+                if interpolated_values_xy is None:
+                    break
+
+                target_x = interpolated_values_xy['x']
+                target_y = interpolated_values_xy['y']
+
+                current_x, current_y, _ = self.xy_manager.get_current_position()
+                print(f"Current XY position: ({current_x}, {current_y})")
+
+                error_x = target_x - current_x
+                error_y = target_y - current_y
+
+                vx, vy = self.calculate_velocity_with_pid(error_x, error_y, delta_t_xy)
+                velocity_magnitude = np.hypot(vx, vy)
+                if velocity_magnitude > max_velocity:
+                    scaling_factor = max_velocity / velocity_magnitude
+                    vx *= scaling_factor
+                    vy *= scaling_factor
+                    self.error_sum_x = 0.0
+                    self.error_sum_y = 0.0
+
+                self.xy_manager.move_stage_at_velocity(vx, vy)
+
+                ideal_path_x.append(target_x)
+                ideal_path_y.append(target_y)
+                actual_path_x.append(current_x)
+                actual_path_y.append(current_y)
+
+                next_update_time_xy += delta_t_xy
+
+
+            time.sleep(0.01)
+
+        self.xy_manager.move_stage_at_velocity(0, 0)
+        print(f"{plot_title} complete.")
+
+        if plot:
+            self.plot_results_3d(
+                ideal_path_x, ideal_path_y, ideal_path_z,
+                actual_path_x, actual_path_y, actual_path_z,
+                ideal_p1, ideal_p2, ideal_p3,
+                actual_p1, actual_p2, actual_p3,
+                plot_title
+            )
+
 
 class Waypoint:
     def __init__(self, csv_file_path='waypoints.csv'):
@@ -747,7 +716,7 @@ class Waypoint:
         return interpolated_values
 
 class XYStageSimulator:
-    def __init__(self, update_rate_hz=100, acceleration_rate=100, communication_delay=0.7):
+    def __init__(self, update_rate_hz=100, acceleration_rate=100, communication_delay=0.0):
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_vx = 0.0
@@ -951,7 +920,7 @@ class ZPStageSimulator:
 
 if __name__ == "__main__":
     # Choose whether to use the real stage or the simulator
-    use_simulator = True
+    use_simulator = False
 
     # PID controller gains
     Kp = 0.33
