@@ -43,22 +43,47 @@ class XYStageManager:
 
         return spo
 
+   
     def find_proscan_controller(self):
         ports = serial.tools.list_ports.comports()
+    
+      
         for port in ports:
-            try:
-                spo = serial.Serial(
-                    port.device, baudrate=115200, bytesize=8,
-                    timeout=1, stopbits=serial.STOPBITS_ONE
-                )
-                spo.write(b"V\r\n")  # Example command to check if it's the ProScan III controller
-                response = spo.readline().decode('ascii').strip()
-                if "R" in response:  # Adjust this condition based on the expected response
-                    print(f"ProScan III controller found on {port.device}")
-                    return spo
-                spo.close()
-            except (serial.SerialException, UnicodeDecodeError):
-                continue
+            if "USB" in port.device:  # Check if the device is a USB port
+                print(f"Trying port {port.device}")
+                
+                try:
+                    # Open the serial port with the correct settings
+                    spo = serial.Serial(
+                        port=port.device,
+                        baudrate=9600,  # Default baud rate for ProScan III
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=2  # Increased timeout for device response
+                    )
+                    
+                    # Send the "VE" command to verify communication
+                    spo.write(b"VE\r")  # VE<CR> requests version information
+                    
+                    time.sleep(0.2)  # Allow some time for the device to respond
+                    
+                    # Read the response from the device
+                    response = spo.readline().decode('ascii').strip()
+                    
+                    print(f"Received response: {response}")
+                    
+                    # Check if the response contains the expected firmware version string
+                    if response.startswith("R"):
+                        print(f"ProScan III controller found on {port.device}")
+                        return spo  # Return the connected serial port object
+                    
+                    spo.close()  # Close the port if not the desired device
+                except Exception as e:
+                    print(f"Error communicating with port {port.device}: {e}")
+                    if 'spo' in locals() and spo.is_open:
+                        spo.close()  # Ensure the port is closed on error
+
         print("No ProScan III controller found.")
         return None
 
@@ -321,7 +346,7 @@ class Stages:
 
     def __init__(self, waypoints, simulate=False, Kp=1.0, Ki=0.0, Kd=0.0):
         self.simulate = simulate
-        self.xy_manager = XYStageManager(simulate=self.simulate)
+        self.xy_manager = XYStageManager(simulate=False)
         self.zp_manager = ZPStageManager(simulate=self.simulate)
 
         self.current_positions_zp = {'x': 0, 'y': 0, 'z': 0, 'e': 0}
