@@ -124,7 +124,10 @@ class XYStageManager:
         self.send_command(command)
 
 class ZPStageManager:
-    # Class to send and receive data with the 3D printer board
+    """
+    Class to send and receive data with the 3D printer board. Uses the simulator
+    if 'simulate=True' or attempts to find a real 3D printer board otherwise.
+    """
     def __init__(self, simulate=False):
         self.x_pos = 0.0
         self.y_pos = 0.0
@@ -137,64 +140,143 @@ class ZPStageManager:
         self.verbose = False
         self.baudrate = 115200
         self.simulate = simulate
-        self.printer_found = False  # Flag to indicate whether a 3D printer board was found
+        self.printer_found = False
         self.COM = None
+        self.serial = None  # Will hold either a simulator object or a serial.Serial object
 
-        if simulate:
+        if self.simulate:
             # Use the simulator instead of the actual serial port
             self.serial = ZPStageSimulator()
-            self.serial.start()  # Start the simulator's thread
+            self.serial.start()
+            self.printer_found = True
             self.setup()
         else:
+            # Attempt to find and open the 3D printer serial port
             try:
-                available_ports = self.get_available_com_ports()
-                for port in available_ports:
-                    if self.is_3d_printer(port):
-                        self.COM = port
-                        self.printer_found = True
-                        print(f"3D printer board found on port {port}")
-                        break
-                if not self.printer_found:
+                self.serial = self.find_3d_printer_port()
+                if self.serial:
+                    self.printer_found = True
+                    self.COM = self.serial.port  # The device name (e.g., 'COM3', '/dev/ttyUSB0')
+                    print(f"3D printer board found on port {self.COM}")
+                    # Clear buffers, do any initial setup
+                    self.serial.reset_input_buffer()
+                    self.serial.reset_output_buffer()
+                    self.setup()
+                else:
                     print("No 3D printer boards found.")
-                # Open serial connection to the 3D printer
-                self.serial = serial.Serial(self.COM, baudrate=self.baudrate, timeout=1)
-                self.serial.reset_input_buffer()
-                self.serial.reset_output_buffer()
-                self.setup()
             except Exception as e:
                 print("ZPStageManager __init__:", e)
 
     def __del__(self):
-        if self.simulate:
+        """Clean up when the object is deleted."""
+        if self.simulate and getattr(self.serial, "running", False):
             self.serial.stop()
         else:
-            self.serial.close()
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+
+    def find_3d_printer_port(self):
+        """
+        Enumerates all available serial ports and checks if any respond as expected
+        for a 3D printer board (e.g., via M115 command). Returns a serial.Serial 
+        object on success, or None if no 3D printer is found.
+        """
+        ports = serial.tools.list_ports.comports()
+        for port_info in ports:
+            port_name = port_info.device
+            try:
+                # Attempt to open the port
+                ser = serial.Serial(
+                    port_name,
+                    baudrate=self.baudrate,
+                    timeout=1
+                )
+
+                if self.is_3d_printer_port(ser):
+                    return ser
+                else:
+                    # Not the correct device
+                    ser.close()
+            except serial.SerialException as e:
+                # Port might be busy or permission denied, so just skip it
+                if self.verbose:
+                    print(f"Skipping port {port_name} due to error: {e}")
+                continue
+        return None
+
+    def is_3d_printer_port(self, ser):
+        """
+        Sends a quick command to see if the port belongs to a 3D printer board.
+        Here we use the M115 command (common for 3D printers), and look for 
+        something like 'FIRMWARE_NAME' in the response. You may adjust this 
+        check based on your printer firmware.
+        """
+        try:
+            # Clear any pending data
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+
+            # Send M115 and wait for a response
+            ser.write(b"M115\n")
+            time.sleep(0.5)  # Give the printer some time to respond
+
+            # Attempt to read a line of response
+            response = ser.readline().decode("ascii", errors="ignore").strip()
+            if "FIRMWARE_NAME" in response:  # Common substring in M115 response
+                return True
+        except Exception as e:
+            if self.verbose:
+                print("is_3d_printer_port error:", e)
+        return False
+    
+    def setup(self):
+        step_per_mm = 78040
+        max_feedrate = 90 / 10 * 60  # mm/min
+
+        # ignore the cold extrude condition
+        self.send_data("M302 S0")
+
+        # set the extruder to relative motion
+        self.send_data("M83")
+
+        # set the X,Y,Z motion to relative
+        self.send_data("G91")
+
+        # This command sets the maximum feed rate for each of the extruder (E), X, Y, and Z axes.
+        # These values determine the maximum speed at which the printer can move each axis.
+        self.send_data("M203 E10000 X10000 Y10000 Z10000")
+
+        # M92 set steps per unit E is extruder, X, Y, Z are the axes
+        self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")
 
     def send_data(self, data):
         data = data.encode("utf-8") + b"\n"
         self.serial.write(data)
         self.serial.flush()
 
+    def request_data(self):
+        # M114 get all position values
+        self.send_data("M114")
+        position_data = self.receive_data()
+        position_values = self.extract_position_data(position_data)
+
+        if position_values and self.verbose:
+            x_pos, y_pos, z_pos, e_pos = position_values
+            print(f"X Position: {x_pos}")
+            print(f"Y Position: {y_pos}")
+            print(f"Z Position: {z_pos}")
+            print(f"E Position: {e_pos}")
+
     def receive_data(self):
         time.sleep(0.03)
         received_data = self.serial.read_all().decode().strip()
         return received_data
 
-    def movecommand(self, axes, feedrate=None):
-        # filter out any axes with a distance of 0
-        filtered_axes = {
-            axis: distance for axis, distance in axes.items() if distance != 0
-        }
-        # join the non-zero axes and distances into a single string
-        axis_str = " ".join(
-            f"{axis}{distance}" for axis, distance in filtered_axes.items()
-        )
-
-        # send the move command with the feedrate if it is provided
-        if feedrate is not None:
-            self.send_data(f"G0 F{feedrate} {axis_str}")
-        else:
-            self.send_data(f"G0 {axis_str}")
+    def get_all_data(self):
+        # M503 request all settings from the printer
+        self.send_data("M503")
+        all_data = self.receive_data()
+        return all_data
 
     def get_position(self):
         # M114 get all position values
@@ -223,80 +305,38 @@ class ZPStageManager:
             self.y_cnt = float(match.group(6))
             self.z_cnt = float(match.group(7))
 
-    def get_all_data(self):
-        # M503 request all settings from the printer
-        self.send_data("M503")
-        all_data = self.receive_data()
-        return all_data
+    def movecommand(self, axes, feedrate=None):
+        # filter out any axes with a distance of 0
+        filtered_axes = {
+            axis: distance for axis, distance in axes.items() if distance != 0
+        }
+        # join the non-zero axes and distances into a single string
+        axis_str = " ".join(
+            f"{axis}{distance}" for axis, distance in filtered_axes.items()
+        )
 
-    def request_data(self):
-        # M114 get all position values
-        self.send_data("M114")
-        position_data = self.receive_data()
-        position_values = self.extract_position_data(position_data)
-
-        if position_values and self.verbose:
-            x_pos, y_pos, z_pos, e_pos = position_values
-            print(f"X Position: {x_pos}")
-            print(f"Y Position: {y_pos}")
-            print(f"Z Position: {z_pos}")
-            print(f"E Position: {e_pos}")
-
-    def resetprinter(self):
-        self.send_data("M112")
-        print("Printer reset")
-
-    def setup(self):
-        step_per_mm = 78040
-        max_feedrate = 90 / 10 * 60  # mm/min
-
-        # ignore the cold extrude condition
-        self.send_data("M302 S0")
-
-        # set the extruder to relative motion
-        self.send_data("M83")
-
-        # set the X,Y,Z motion to relative
-        self.send_data("G91")
-
-        # This command sets the maximum feed rate for each of the extruder (E), X, Y, and Z axes.
-        # These values determine the maximum speed at which the printer can move each axis.
-        self.send_data("M203 E10000 X10000 Y10000 Z10000")
-
-        # M92 set steps per unit E is extruder, X, Y, Z are the axes
-        self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")
-
-    def change_max_feeds(self, X, Y, Z, E):
-        command = f"M203 E{E} X{X} Y{Y} Z{Z}"
-        self.send_data(command)
+        # send the move command with the feedrate if it is provided
+        if feedrate is not None:
+            self.send_data(f"G0 F{feedrate} {axis_str}")
+        else:
+            self.send_data(f"G0 {axis_str}")
 
     def set_feedrate(self, value):
         # set feedrate
         command = f"F{value} "
         self.send_data(command)
 
-    def get_available_com_ports(self):
-        try:
-            ports = list(serial.tools.list_ports.comports())
-            return [port.device for port in ports]
-        except Exception as e:
-            print("ZPStageManager.get_available_com_ports:", e)
-
-    def is_3d_printer(self, port):
-        try:
-            with serial.Serial(port, 115200, timeout=1) as ser:
-                ser.write(b"\nM115\n")  # Send M115 command to get firmware information
-                response = ser.read_until(b"\n").decode("utf-8")
-
-                if "FIRMWARE_NAME" in response:
-                    return True
-        except serial.SerialException as e:
-            print("ZPStageManager.is_3d_printer:", e)
-
-        return False
+    def change_max_feeds(self, X, Y, Z, E):
+        command = f"M203 E{E} X{X} Y{Y} Z{Z}"
+        self.send_data(command)
 
     def save_settings(self):
         self.send_data("M500")
+
+    def resetprinter(self):
+        self.send_data("M112")
+        print("Printer reset")
+
 
 class Stages:
     UPDATE_INTERVAL_XY = 1  # Time between updates in seconds (for waypoint control)

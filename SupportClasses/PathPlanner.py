@@ -4,7 +4,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
-class ToolpathGenerator:
+class ImageBasedToolpathGenerator:
     def __init__(self,
                  threshold=128,
                  tool_diameter=300.0,
@@ -16,6 +16,8 @@ class ToolpathGenerator:
                  flow_factor=0.01,
                  initial_z=0.0,
                  z_increment=10.0):
+        
+        
         self.threshold = threshold
         self.tool_diameter = tool_diameter
         self.path_overlap = path_overlap
@@ -32,7 +34,8 @@ class ToolpathGenerator:
         self.pump_colors = []
         self.waypoints = []
         self.pump_states_all = []
-        
+    
+    # Load a single layer of images: one main and multiple pump images.    
     def load_layer_images(self, main_image_path, pump_image_paths):
         """Load a single layer of images: one main and multiple pump images."""
         main_img = Image.open(main_image_path).convert('L')
@@ -345,7 +348,7 @@ class ToolpathGenerator:
 
 if __name__ == "__main__":
     # make a toolpath generator
-    generator = ToolpathGenerator()
+    generator = ImageBasedToolpathGenerator()
 
 
     main_image_paths = ["ua_stack_rgb_black_10.png", "BME Logo path.png"]  # multiple layers
