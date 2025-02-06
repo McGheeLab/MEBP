@@ -82,43 +82,57 @@ class XboxControllerInterface(threading.Thread):
             self.processor.add_command("debug", message="No controller connected.")
 
     def run(self):
+        # Set the running flag to True and establish connection with a joystick.
         self.running = True
         self.connect()
 
+        # Check if a joystick has been found. Exit early if not.
         if not self.joystick:
             self.processor.add_command("debug", message="No joystick available. Exiting thread.")
             return
 
-        # Initialize per-axis accumulators.
+        # Initialize accumulators for each axis.
+        # axis_accum stores the sum of values read from each axis.
+        # axis_count counts how many readings have been accumulated per axis.
         num_axes = self.joystick.get_numaxes()
         axis_accum = {axis: 0.0 for axis in range(num_axes)}
         axis_count = {axis: 0 for axis in range(num_axes)}
-        last_axis_time = time.time()
+        last_axis_time = time.time()  # Timestamp marking the start of the interval for averaging.
 
-        # For DPad (hat) state.
+        # Initialize the previous hat (DPad) state for detecting changes.
         last_hat = (0, 0)
 
+        # Dictionary to track the last sent command values for each axis group.
+        last_sent = {}  # Key: group name, Value: last average value sent (could be a scalar or tuple)
+
+        # Main loop that runs while the controller is active.
         while self.running:
+            # Process pending Pygame events (refresh joystick state).
             pygame.event.pump()
 
             # --- Process Button Presses ---
+            # Loop over each button and check if pressed.
             for i in range(self.joystick.get_numbuttons()):
                 if self.joystick.get_button(i):
+                    # Find the mapping for this button.
                     mapped_func = self.mapping.get("buttons", {}).get(str(i), None)
                     if mapped_func is not None and mapped_func != "None":
-                        # Publish the button command with additional details if needed.
+                        # Send a command to the processor with the button pressed.
                         self.processor.add_command(mapped_func, button=i)
-                        time.sleep(0.2)  # debouncing
+                        time.sleep(0.2)  # Short delay for debouncing to avoid multiple triggers.
 
             # --- Accumulate Axis Readings ---
+            # For each axis, gather the current reading.
             for axis in range(num_axes):
                 val = self.joystick.get_axis(axis)
                 axis_accum[axis] += val
                 axis_count[axis] += 1
 
+            # Check if it's time to process the average axis value.
             current_time = time.time()
             if current_time - last_axis_time >= self.avg_interval:
-                # Process axes in groups.
+                # Define groups of axes. Each group might represent 
+                # different controls, e.g., left stick (axes 0-1), right stick (axes 2-3), triggers, etc.
                 groups = [
                     {"name": "0-1", "axes": [0, 1], "type": "axis"},
                     {"name": "2-3", "axes": [2, 3], "type": "axis"},
@@ -127,65 +141,109 @@ class XboxControllerInterface(threading.Thread):
                 ]
                 for group in groups:
                     averages = []
+                    #########################################################################
+                    ########## Compute average value for each axis in the group.#############
+                    #########################################################################
                     for axis in group["axes"]:
+                    
+                        ################## Compute the average value for the axis.###############                        
                         if axis_count[axis]:
                             avg_val = axis_accum[axis] / axis_count[axis]
                         else:
                             avg_val = 0.0
-                        if group["type"] == "trigger":
-                            avg_val = (avg_val + 1) / 2  # remap trigger value from [-1,1] to [0,1]
+    
+                        ################## Remap the value for triggers.#########################
+                        
+                        if group["type"] == "trigger": 
+                            # Remap the value from [-1, 1] to [0, 1].
+                            avg_val = (avg_val + 1) 
+                            # Invert the value for the left trigger (axis 4)
+                            if group["axes"][0] == 4:
+                                avg_val = -avg_val
                         averages.append(avg_val)
                     
-                    # Decide whether to send a command based on deadzone.
-                    send = False
+                    #########################################################################
+                    ### Check if the average value is outside the deadzone.##################
+                    #########################################################################
+                    send = False # Flag to determine if a command should be sent.
                     if len(averages) == 1:
                         if abs(averages[0]) > self.deadzone:
                             send = True
                     else:
                         if any(abs(v) > self.deadzone for v in averages):
                             send = True
+                    # Retrieve the mapped function for this group of axes.
                     mapped_func = self.mapping.get("axes", {}).get(group["name"], None)
                     
-                    if mapped_func is not None and mapped_func != "None" and send:
+                    #########################################################################
+                    ################## Send the command to the processor ####################
+                    #########################################################################
+                    if mapped_func is not None and mapped_func != "None":
+                        
+                        ############# Round the computed averages ####################
                         if len(averages) == 1:
-                            average=averages[0]
+                            current_value = averages[0]
                         else:
-                            average=tuple(round(v, 2) for v in averages)
-                            
-                        self.processor.add_command(mapped_func, axis=group["name"], average=average)
-                    
-                    # Reset accumulators for this group.
+                            current_value = tuple(round(v, 2) for v in averages)
+
+                        ############# create a zero value for the group.############
+                        if len(group["axes"]) == 1:
+                            zero_value = 0
+                        else:
+                            zero_value = tuple(0 for _ in group["axes"])
+
+                        ############# Send the command to the processor.############
+                        if send:
+                            # If outside the deadzone, send the averaged axis value.
+                            self.processor.add_command(mapped_func, axis=group["name"], average=current_value)
+                            last_sent[group["name"]] = current_value
+                        else:
+                            # If within deadzone but a nonzero command was previously sent, 
+                            # send a zero command to stop the motion.
+                            if group["name"] in last_sent and last_sent[group["name"]] != zero_value:
+                                self.processor.add_command(mapped_func, axis=group["name"], average=zero_value)
+                                last_sent[group["name"]] = zero_value
+                                
+                            # Otherwise, initialize the last_sent record in case no command was ever sent.
+                            elif group["name"] not in last_sent:
+                                last_sent[group["name"]] = zero_value
+
+                    # Reset the accumulators for the axes in this group for future readings.
                     for axis in group["axes"]:
                         axis_accum[axis] = 0.0
                         axis_count[axis] = 0
+                # Update the timestamp for the next averaging period.
                 last_axis_time = current_time
 
             # --- Process DPad (Hat) Input ---
+            # If the joystick has a DPad (hat), process its input.
             if self.joystick.get_numhats() > 0:
-                current_hat = self.joystick.get_hat(0)  # (x, y)
+                current_hat = self.joystick.get_hat(0)  # Obtain the current DPad state as a tuple (x, y)
                 if current_hat != last_hat:
+                    # Retrieve mapping for DPad directions.
                     dpad_map = self.mapping.get("dpad", {})
                     if current_hat[1] == 1:
+                        # DPad moved up.
                         func = dpad_map.get("up", None)
                         if func is not None and func != "None":
                             self.processor.add_command(func, direction="up")
                     elif current_hat[1] == -1:
+                        # DPad moved down.
                         func = dpad_map.get("down", None)
                         if func is not None and func != "None":
                             self.processor.add_command(func, direction="down")
                     if current_hat[0] == 1:
+                        # DPad moved right.
                         func = dpad_map.get("right", None)
                         if func is not None and func != "None":
                             self.processor.add_command(func, direction="right")
                     elif current_hat[0] == -1:
+                        # DPad moved left.
                         func = dpad_map.get("left", None)
                         if func is not None and func != "None":
                             self.processor.add_command(func, direction="left")
+                    # Update the last recorded hat state after processing.
                     last_hat = current_hat
-
-            time.sleep(0.05)
-
-        pygame.quit()
-
+                    
     def stop(self):
         self.running = False

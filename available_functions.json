@@ -13,12 +13,17 @@
     "axis": [
       "None",
       "move_stage_at_velocity",
-      "Axis Function 2"
+      "move_x_at_velocity",
+      "move_y_at_velocity",
+      "move_z_at_velocity",
+      "move_e_at_velocity"
     ],
     "trigger": [
       "None",
-      "Trigger Function 1",
-      "Trigger Function 2"
+      "move_x_at_velocity",
+      "move_y_at_velocity",
+      "move_z_at_velocity",
+      "move_e_at_velocity"
     ]
   }
   
