@@ -49,7 +49,7 @@ This class handels all of the planning needed to move the needle to each well, p
 - [ ] identify the amount of bio-ink needed for each part of the print and go pick it up 
   - [ ] limit the amount so nothing goes into the syringe line based on which needle is attached
 - [ ] create a Well plate based on an xml file that describes the well spacing and offsets
-- [ ] using a camera find the xyz location of the needle tip and set it as 0,0,0
+- [x] using a camera find the xyz location of the needle tip and set it as 0,0,0
 - [ ] calculate the print offset needed
 - [ ] handle the ink locations and types
 - [ ] 
@@ -79,3 +79,4 @@ This class stores the 2D or 3D location of cell features of interest then moves 
 ## Description
 This set of functions will setup the print process and display all relavent information such as video feeds, syringe pump positions, xy stage position, cell types, print layout etc. Any class created above can be instanced. 
 
+# Simulator

@@ -1,0 +1,212 @@
+import sys
+import json
+import threading
+import queue
+import time
+import pygame  # pip install pygame
+from PyQt5 import QtWidgets, QtCore
+
+# --- Constants and Defaults ---
+DEFAULT_MAPPING_FILE = 'button_mapping.json'
+FUNCTION_OPTIONS = ['Function 1', 'Function 2', 'Function 3', 'Function 4', 'Function 5']
+DEFAULT_DEADZONE = 0.1  # deadzone threshold for axes
+
+# --- Controller Thread Class ---
+class ControllerThread(threading.Thread):
+    """
+    This thread initializes pygame and polls the Xbox controller.
+    It reads button and axis events (applying a deadzone for axes)
+    and posts event messages into a shared event_queue.
+    """
+    def __init__(self, event_queue, mapping, deadzone=DEFAULT_DEADZONE, *args, **kwargs):
+        super(ControllerThread, self).__init__(*args, **kwargs)
+        self.event_queue = event_queue
+        self.mapping = mapping  # dictionary mapping button indices (as strings) to function names
+        self.deadzone = deadzone
+        self._stop_event = threading.Event()
+        self.connected = False
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        # Initialize pygame and the joystick module
+        pygame.init()
+        pygame.joystick.init()
+
+        # Try to initialize the first connected joystick
+        if pygame.joystick.get_count() == 0:
+            self.event_queue.put("No controller found.")
+            return
+
+        joystick = pygame.joystick.Joystick(0)
+        joystick.init()
+        self.connected = True
+        self.event_queue.put("Controller connected: " + joystick.get_name())
+
+        while not self._stop_event.is_set():
+            # Process internal pygame events so that joystick state updates.
+            pygame.event.pump()
+
+            # --- Check button events ---
+            for i in range(joystick.get_numbuttons()):
+                button_state = joystick.get_button(i)
+                if button_state:
+                    # Use the mapping to get the function name (if mapped)
+                    func = self.mapping.get(str(i), None)
+                    if func:
+                        command = f"Button {i} pressed: {func}"
+                    else:
+                        command = f"Button {i} pressed: No function mapped"
+                    self.event_queue.put(command)
+                    # Simple debounce: wait a bit after a button press.
+                    time.sleep(0.2)
+
+            # --- Check axes (joysticks/triggers) with deadzone handling ---
+            for i in range(joystick.get_numaxes()):
+                axis_val = joystick.get_axis(i)
+                if abs(axis_val) < self.deadzone:
+                    axis_val = 0.0
+                if axis_val != 0.0:
+                    self.event_queue.put(f"Axis {i} moved: {axis_val:.2f}")
+
+            # Small delay to reduce CPU usage.
+            time.sleep(0.05)
+
+        # Cleanup when the thread is asked to stop.
+        joystick.quit()
+        pygame.quit()
+        self.connected = False
+        self.event_queue.put("Controller disconnected.")
+
+
+# --- Main PyQt5 Window ---
+class MainWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super(MainWindow, self).__init__()
+        self.setWindowTitle("Xbox Controller Interface")
+        self.resize(600, 400)
+
+        # Shared event queue between the controller thread and the UI.
+        self.event_queue = queue.Queue()
+        self.controller_thread = None
+        self.mapping = {}  # will hold our button-to-function mapping
+
+        # --- Build the UI ---
+        main_layout = QtWidgets.QVBoxLayout()
+        self.setLayout(main_layout)
+
+        # Connect Button: starts the controller thread.
+        self.connect_button = QtWidgets.QPushButton("Connect to Xbox Controller")
+        self.connect_button.clicked.connect(self.connect_controller)
+        main_layout.addWidget(self.connect_button)
+
+        # Button Mapping UI: for demo purposes, we set up mapping for buttons 0-3.
+        mapping_group = QtWidgets.QGroupBox("Button Mapping")
+        mapping_layout = QtWidgets.QFormLayout()
+        mapping_group.setLayout(mapping_layout)
+        self.combo_boxes = {}
+        for button_id in range(4):  # You can add more if needed.
+            combo = QtWidgets.QComboBox()
+            combo.addItems(FUNCTION_OPTIONS)
+            mapping_layout.addRow(f"Button {button_id}:", combo)
+            self.combo_boxes[str(button_id)] = combo
+        main_layout.addWidget(mapping_group)
+
+        # Save and Load Mapping Buttons.
+        mapping_buttons_layout = QtWidgets.QHBoxLayout()
+        self.save_mapping_button = QtWidgets.QPushButton("Save Mapping")
+        self.save_mapping_button.clicked.connect(self.save_mapping)
+        mapping_buttons_layout.addWidget(self.save_mapping_button)
+        self.load_mapping_button = QtWidgets.QPushButton("Load Mapping")
+        self.load_mapping_button.clicked.connect(self.load_mapping)
+        mapping_buttons_layout.addWidget(self.load_mapping_button)
+        main_layout.addLayout(mapping_buttons_layout)
+
+        # Event List: shows the events/messages from the controller.
+        self.event_list = QtWidgets.QListWidget()
+        main_layout.addWidget(self.event_list)
+
+        # Timer to poll the event queue periodically.
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.poll_queue)
+        self.timer.start(50)
+
+    def connect_controller(self):
+        """Starts the controller thread if not already running."""
+        if self.controller_thread and self.controller_thread.is_alive():
+            self.event_list.addItem("Controller already connected.")
+            return
+
+        # Update the mapping dictionary from the UI combo boxes.
+        self.update_mapping_from_ui()
+
+        # Create and start the controller thread.
+        self.controller_thread = ControllerThread(
+            event_queue=self.event_queue,
+            mapping=self.mapping,
+            deadzone=DEFAULT_DEADZONE
+        )
+        self.controller_thread.start()
+        self.event_list.addItem("Attempting to connect to controller...")
+
+    def update_mapping_from_ui(self):
+        """Read the current selections from the UI into the mapping dictionary."""
+        for button_id, combo in self.combo_boxes.items():
+            self.mapping[button_id] = combo.currentText()
+
+    def save_mapping(self):
+        """Save the current button mapping (and deadzone) to a JSON file."""
+        self.update_mapping_from_ui()
+        data = {
+            "button_mapping": self.mapping,
+            "deadzone": DEFAULT_DEADZONE
+        }
+        try:
+            with open(DEFAULT_MAPPING_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+            self.event_list.addItem("Mapping saved to " + DEFAULT_MAPPING_FILE)
+        except Exception as e:
+            self.event_list.addItem("Error saving mapping: " + str(e))
+
+    def load_mapping(self):
+        """Load the button mapping (and deadzone) from a JSON file and update the UI."""
+        try:
+            with open(DEFAULT_MAPPING_FILE, "r") as f:
+                data = json.load(f)
+            self.mapping = data.get("button_mapping", {})
+            # Update each combo box based on the loaded mapping.
+            for button_id, combo in self.combo_boxes.items():
+                func = self.mapping.get(button_id, FUNCTION_OPTIONS[0])
+                index = combo.findText(func)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            self.event_list.addItem("Mapping loaded from " + DEFAULT_MAPPING_FILE)
+        except Exception as e:
+            self.event_list.addItem("Error loading mapping: " + str(e))
+
+    def poll_queue(self):
+        """Polls the event queue for new messages from the controller thread and displays them."""
+        while not self.event_queue.empty():
+            event_msg = self.event_queue.get()
+            self.event_list.addItem(event_msg)
+            self.event_list.scrollToBottom()
+
+    def closeEvent(self, event):
+        """Cleanly stops the controller thread when the application is closed."""
+        if self.controller_thread:
+            self.controller_thread.stop()
+            self.controller_thread.join(timeout=1.0)
+        event.accept()
+
+
+# --- Main Entry Point ---
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    main_window = MainWindow()
+    main_window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
