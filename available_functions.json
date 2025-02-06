@@ -12,7 +12,7 @@
     ],
     "axis": [
       "None",
-      "Axis Function 1",
+      "move_stage_at_velocity",
       "Axis Function 2"
     ],
     "trigger": [

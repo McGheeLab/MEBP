@@ -4,7 +4,7 @@ import csv
 import numpy as np
 from scipy.interpolate import interp1d, CubicSpline
 import threading
-from DeviceInterface import XYStageManager, ZPStageManager
+from SupportClasses.DeviceInterface import XYStageManager, ZPStageManager
 
 class Stages:
     UPDATE_INTERVAL_XY = 1  # Time between updates in seconds (for XY stage)

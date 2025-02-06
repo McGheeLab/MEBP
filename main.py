@@ -1,16 +1,6 @@
-from SupportClasses.DeviceManager import Stages, Waypoint
+from SupportClasses.Processor import AppController
 
 
 if __name__ == "__main__":
-    # Choose whether to use the real stage or the simulator
-    use_simulator = True
-
-    waypoints = Waypoint('multi_layer_toolpath.csv')
-    waypoint_list = waypoints.import_waypoints_from_csv()
-
-    stage = Stages(waypoints, simulate=use_simulator)
-
-    if waypoint_list:
-        stage.move("Waypoint Following with PID Control", interpolation_type="linear", plot=True)
-    else:
-        print("No waypoints available.")
+    app_controller = AppController()
+    app_controller.start()

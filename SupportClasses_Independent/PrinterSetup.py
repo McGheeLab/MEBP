@@ -5,7 +5,7 @@ import platform
 import socket
 import serial
 import serial.tools.list_ports
-from DeviceInterface import XYStageManager, ZPStageManager
+from SupportClasses.DeviceInterface import XYStageManager, ZPStageManager
 
 class PlateDefinition:
     def __init__(self):

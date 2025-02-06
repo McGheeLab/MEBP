@@ -1,0 +1,73 @@
+@startuml
+'-------------------------
+' Processor Class
+'-------------------------
+class Processor {
+  - _queue: Queue
+  - _subscribers: dict
+  - _running: bool
+  - _thread: Thread
+  + __init__()
+  + register_handler(command_name, handler)
+  + unregister_handler(command_name, handler)
+  + add_command(command_name, *args, **kwargs)
+  - _process_loop()
+  + stop()
+}
+
+'-------------------------
+' ZPStageManager Class
+'-------------------------
+class ZPStageManager {
+  - current_velocity: float
+  + __init__()
+  + move_stage_at_velocity(velocity)
+}
+
+'-------------------------
+' XYStageManager Class
+'-------------------------
+class XYStageManager {
+  - current_velocity: float
+  + __init__()
+  + move_stage_at_velocity(velocity)
+}
+
+'-------------------------
+' XboxControllerInterface Class
+'-------------------------
+' Note: Inherits from PyQt5.QtWidgets.QWidget (omitted for clarity)
+class XboxControllerInterface {
+  - processor: Processor
+  - button: QPushButton
+  + __init__(processor, parent=None)
+  + setup_ui()
+  + setup_connections()
+  + on_move_stage_button_pressed()
+}
+
+'-------------------------
+' AppController Class
+'-------------------------
+class AppController {
+  - processor: Processor
+  - zp_stage: ZPStageManager
+  - xy_stage: XYStageManager
+  - xbox_interface: XboxControllerInterface
+  - app: QApplication
+  + __init__()
+  + handle_move_stage(velocity)
+  + start()
+  + shutdown()
+}
+
+'-------------------------
+' Relationships
+'-------------------------
+AppController --> Processor : instantiates
+AppController --> ZPStageManager : instantiates
+AppController --> XYStageManager : instantiates
+AppController --> XboxControllerInterface : instantiates
+XboxControllerInterface --> Processor : uses
+
+@enduml
