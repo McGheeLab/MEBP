@@ -1,4 +1,4 @@
-from SupportClasses.ProcessCommand import AppController
+from SupportClasses.Processor import AppController
 
 
 if __name__ == "__main__":

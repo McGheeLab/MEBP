@@ -8,8 +8,6 @@ import threading
 import re
 import queue
 
-############################### Communication Classes ########################################
-# These classes manage the serial communication with the XY and ZP stages
 class XYStageManager:
     def __init__(self, simulate=False):
         # Store the simulation flag to decide whether to use real hardware or a simulator
@@ -28,7 +26,6 @@ class XYStageManager:
         if self.simulate and self.spo.running:
             self.spo.stop()
 
-    ####################### Serial Communication Functions ##################################
     def initialize_serial_port(self):
         # Display some system info for debugging
         hostname = socket.gethostname()
@@ -105,8 +102,6 @@ class XYStageManager:
                 # Handle serial port errors
                 print(f"Error sending command: {e}")
 
-    ####################### Stage Query Functions ##################################
-    
     def get_current_position(self):
         """
         Query the stage for its current position.
@@ -147,8 +142,6 @@ class XYStageManager:
                 print(f"Error parsing response: {e}")
                 return None, None, None
 
-    ####################### Stage Movement Functions ##################################
-    
     def move_stage_at_velocity(self, vx, vy):
         """
         Move stage at a specified velocity.
@@ -216,21 +209,7 @@ class ZPStageManager:
             self.serial.stop()
         else:
             self.serial.close()
-            
-    # Setup the printer for operation
-    def setup(self):
-        # Prepare printer for normal operation
-        step_per_mm = 78040
-        max_feedrate = 90 / 10 * 60  # mm/min, example calculation
 
-        self.send_data("M302 S0")  # Allow cold extrusion
-        self.send_data("M83")      # Set extruder to relative mode
-        self.send_data("G91")      # Set XYZ to relative positioning
-        self.send_data("M203 E10000 X10000 Y10000 Z10000")  # Set max feedrates
-        self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")  # Configure steps per unit
-
-    ################################# Communication Functions ########################################
-    
     def send_data(self, data):
         # Send G-code or commands to the printer or simulator
         print(f"Sending data: {data}")
@@ -244,28 +223,6 @@ class ZPStageManager:
         received_data = self.serial.read_all().decode().strip()
         return received_data
 
-    def get_available_com_ports(self):
-        # List available serial ports
-        try:
-            ports = list(serial.tools.list_ports.comports())
-            return [port.device for port in ports]
-        except Exception as e:
-            print("ZPStageManager.get_available_com_ports:", e)
-
-    def is_3d_printer(self, port):
-        # Check if a serial port belongs to a 3D printer by asking for firmware info
-        try:
-            with serial.Serial(port, 115200, timeout=1) as ser:
-                ser.write(b"\nM115\n")  # M115 asks for printer firmware name
-                response = ser.read_until(b"\n").decode("utf-8")
-                if "FIRMWARE_NAME" in response:
-                    return True
-        except serial.SerialException as e:
-            print("ZPStageManager.is_3d_printer:", e)
-        return False
-
-    ################################# Printer Control Functions ########################################
-    
     def movecommand(self, axes, feedrate=None):
         # Build a G0 command string for axes that have a non-zero distance
         filtered_axes = {
@@ -279,22 +236,15 @@ class ZPStageManager:
         else:
             self.send_data(f"G0 {axis_str}")
 
-    def set_feedrate(self, value):
-        # Change feedrate for subsequent moves
-        command = f"F{value} "
-        self.send_data(command)
-        
-    ################################# Printer Request Functions ########################################
-    
     def get_position(self):
         # Send M114 to request current position from the printer or simulator
         self.send_data("M114")
         position_data = self.receive_data()
-        self._extract_position_data(position_data)
+        self.extract_position_data(position_data)
         # Return the four position values as a tuple
         return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
 
-    def _extract_position_data(self, response):
+    def extract_position_data(self, response):
         # Parse the lines in the response to find the position values
         lines = response.split('\n')
         for line in lines:
@@ -324,25 +274,79 @@ class ZPStageManager:
             else:
                 print(f"Failed to match line: {line}")
 
-    ################################# Printer Settings Functions ########################################
-    
+    def get_all_data(self):
+        # M503 requests printer configuration settings
+        self.send_data("M503")
+        all_data = self.receive_data()
+        return all_data
+
+    def request_data(self):
+        # Ask for position again (like get_position) and print if verbose
+        self.send_data("M114")
+        position_data = self.receive_data()
+        position_values = self.extract_position_data(position_data)
+        if position_values and self.verbose:
+            x_pos, y_pos, z_pos, e_pos = position_values
+            print(f"X Position: {x_pos}")
+            print(f"Y Position: {y_pos}")
+            print(f"Z Position: {z_pos}")
+            print(f"E Position: {e_pos}")
+
     def resetprinter(self):
         # Send emergency stop command
         self.send_data("M112")
         print("Printer reset")
+
+    def setup(self):
+        # Prepare printer for normal operation
+        step_per_mm = 78040
+        max_feedrate = 90 / 10 * 60  # mm/min, example calculation
+
+        self.send_data("M302 S0")  # Allow cold extrusion
+        self.send_data("M83")      # Set extruder to relative mode
+        self.send_data("G91")      # Set XYZ to relative positioning
+        self.send_data("M203 E10000 X10000 Y10000 Z10000")  # Set max feedrates
+        self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")  # Configure steps per unit
 
     def change_max_feeds(self, X, Y, Z, E):
         # Adjust maximum speeds on the fly
         command = f"M203 E{E} X{X} Y{Y} Z{Z}"
         self.send_data(command)
 
+    def set_feedrate(self, value):
+        # Change feedrate for subsequent moves
+        command = f"F{value} "
+        self.send_data(command)
+
+    def get_available_com_ports(self):
+        # List available serial ports
+        try:
+            ports = list(serial.tools.list_ports.comports())
+            return [port.device for port in ports]
+        except Exception as e:
+            print("ZPStageManager.get_available_com_ports:", e)
+
+    def is_3d_printer(self, port):
+        # Check if a serial port belongs to a 3D printer by asking for firmware info
+        try:
+            with serial.Serial(port, 115200, timeout=1) as ser:
+                ser.write(b"\nM115\n")  # M115 asks for printer firmware name
+                response = ser.read_until(b"\n").decode("utf-8")
+                if "FIRMWARE_NAME" in response:
+                    return True
+        except serial.SerialException as e:
+            print("ZPStageManager.is_3d_printer:", e)
+        return False
+
     def save_settings(self):
         # Save current configuration to printer memory
         self.send_data("M500")
 
+
 ############################### Communication Simulators ########################################
 # Simulators for the XY and ZP stages just spoof the serial communication with the actual devices.
 # All functions that control the stages are implemented in the the normal classes.
+
 class XYStageSimulator:
     def __init__(self, update_rate_hz=100, acceleration_rate=100, communication_delay=0.0):
         self.current_x = 0.0
@@ -509,7 +513,7 @@ class ZPStageSimulator:
 
         if command.startswith('G0'):
             # Movement command
-            axes = re.findall(r'([XYZE])([-\d\.]+)', command)
+            axes = re.findall(r'([XYZEF])([-\d\.]+)', command)
             for axis, value in axes:
                 value = float(value)
                 self.position[axis] += value
@@ -545,3 +549,4 @@ class ZPStageSimulator:
             response = 'Unknown command'
 
         self.response_queue.put(response)
+
