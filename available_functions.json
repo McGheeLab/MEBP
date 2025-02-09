@@ -1,0 +1,29 @@
+{
+    "button": [
+      "None",
+      "Button Function 1",
+      "Button Function 2",
+      "Button Function 3"
+    ],
+    "dpad": [
+      "None",
+      "DPad Function 1",
+      "DPad Function 2"
+    ],
+    "axis": [
+      "None",
+      "move_stage_at_velocity",
+      "move_x_at_velocity",
+      "move_y_at_velocity",
+      "move_z_at_velocity",
+      "move_e_at_velocity"
+    ],
+    "trigger": [
+      "None",
+      "move_x_at_velocity",
+      "move_y_at_velocity",
+      "move_z_at_velocity",
+      "move_e_at_velocity"
+    ]
+  }
+  

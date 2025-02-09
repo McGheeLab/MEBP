@@ -1,0 +1,3 @@
+{"buttons": {"0": "Button Function 1", "1": "Button Function 2", "2": "Button Function 3", "3": "Button Function 2"}, 
+"axes": {"0-1": "move_stage_at_velocity", "2-3": "move_x_at_velocity", "4": "move_y_at_velocity", "5": "move_y_at_velocity"}, 
+"dpad": {"up": "DPad Function 1", "down": "DPad Function 2", "left": "DPad Function 1", "right": "DPad Function 2"}}
