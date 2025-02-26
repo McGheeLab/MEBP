@@ -1,0 +1,14 @@
+{
+    "Standard1": {
+        "diameter": 1.0,
+        "length": 100.0
+    },
+    "Standard2": {
+        "diameter": 1.5,
+        "length": 150.0
+    },
+    "Standard3": {
+        "diameter": 2.0,
+        "length": 200.0
+    }
+}
