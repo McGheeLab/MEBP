@@ -38,11 +38,11 @@ class PrintManager:
         self.max_velocity = 1000  # Maximum allowable XY velocity
 
         # dict of well properties
-        self.well_properties = {"fastz": None, "floorz": None, "topz": None, "ink_topz":None, "ink_floorz":None , "Well_A1_x": None, "Well_A1_y": None,
-                                "well_dx": None, "well_dy": None, "well_rows": None, "well_cols": None, "well_diameter": None}
+        self.well_properties = {"fastz": 0, "floorz": 0, "topz": 0, "ink_topz":0, "ink_floorz":0 , "Well_A1_x": 0, "Well_A1_y": 0,
+                                "well_dx": 0, "well_dy": 0, "well_rows": 0, "well_cols": 0, "well_diameter": 0}
         
         # Initialize ink wells as a dictionary of InkWell objects.
-        self.ink_wells = {"well_1": InkWell(), "well_2": InkWell(), "well_3": InkWell()}
+        self.ink_wells = {}
         
         # Syringe instances for each pump.
         self.syringes = {"p1": Syringe("p1") , "p2": Syringe("p2") , "p3": Syringe("p3") }

@@ -196,7 +196,7 @@ class SetupMainWindow:
         if self.settings["custom_title_bar"]:
             self.ui.title_bar.set_title(self.settings["app_name"])
         else:
-            self.ui.title_bar.set_title("ME3B")
+            self.ui.title_bar.set_title("Microscope Enabled 3D Bioprinter")
 
         #   LEFT COLUMN SET SIGNALS
         # ///////////////////////////////////////////////////////////////

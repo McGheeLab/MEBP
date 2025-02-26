@@ -24,6 +24,7 @@ import ctypes
 # IMPORT APP CONTROLLER (manages all stage devices)
 # ///////////////////////////////////////////////////////////////
 from SupportClasses.ProcessCommand import AppController
+from SupportClasses.Printer import PrintManager
 
 # IMPORT all of the settings, windows, and widgets
 # ///////////////////////////////////////////////////////////////
@@ -71,7 +72,7 @@ class MainWindow(QMainWindow):
 
         # Instantiate AppController early.
         self.app_controller = AppController()  # if you pass a flag; adjust as needed
-        
+        self.print_mgr = PrintManager(self.app_controller)
         # Now, create an XboxPoller instance. Since MainWindow is a QObject in the main thread,
         # it is safe to create a QTimer here.
         self.xbox_poller = XboxPoller(self.app_controller.xbox_queue, self.app_controller.processor, parent=self)
