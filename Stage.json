@@ -1,0 +1,10 @@
+{
+    "PriorIII_StageSettings": {
+        "maxSpeed": 100,
+        "maxAcceleration": 10,
+        "xRange": [-100, 100],
+        "yRange": [-100, 100],
+        "defaultAcceleration": 5,
+        "defaultVelocity": 50
+    }
+}

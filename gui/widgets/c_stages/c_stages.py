@@ -40,7 +40,7 @@ class StageMonitorWidget(QWidget):
             header_label = QLabel(f"<b>{header}</b>")
             self.zp_layout.addWidget(header_label, 0, col)
         self.zp_axis_widgets = {}
-        for row, axis in enumerate(["X", "Y", "Z", "E"], start=1):
+        for row, axis in enumerate(["Z", "P1", "P2", "P3"], start=1):
             self.zp_layout.addWidget(QLabel(axis), row, 0)
             pos_label = QLabel("0.0")
             self.zp_layout.addWidget(pos_label, row, 1)
@@ -69,7 +69,7 @@ class StageMonitorWidget(QWidget):
             header_label = QLabel(f"<b>{header}</b>")
             self.xy_layout.addWidget(header_label, 0, col)
         self.xy_axis_widgets = {}
-        for row, axis in enumerate(["x", "y", "z"], start=1):
+        for row, axis in enumerate(["x", "y", "f"], start=1):
             self.xy_layout.addWidget(QLabel(axis), row, 0)
             pos_label = QLabel("0.0")
             self.xy_layout.addWidget(pos_label, row, 1)

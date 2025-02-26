@@ -7,14 +7,32 @@ import serial.tools.list_ports
 import threading
 import re
 import queue
+import json
 
 ############################### Communication Classes ########################################
 # These classes manage the serial communication with the XY and ZP stages
+
 class XYStageManager:
+    """currently this class is build to support PriorIII XY stage and 3D printer ZP stage
+        Common commands for the priorIII stage are:
+        V - query firmware version
+        P - query current position
+        PA,x,y - move to absolute position x,y
+        VS,x,y - move at velocity x,y
+        AC,x - set acceleration to x
+        VE,x - set velocity to x
+     """
     def __init__(self, simulate=False):
         # Store the simulation flag to decide whether to use real hardware or a simulator
         self.simulate = simulate
-
+        
+        self.maxSpeed = 100
+        self.maxAcceleration = 10
+        self.xRange = [-100, 100]
+        self.yRange = [-100, 100]
+        self.defaultAcceleration = 5
+        self.defaultVelocity = 50
+       
         # If simulation is enabled, instantiate and start the XYStageSimulator
         if self.simulate:
             self.spo = XYStageSimulator()
@@ -25,9 +43,17 @@ class XYStageManager:
 
     def __del__(self):
         # On object destruction, stop the simulator if it's running
-        if self.simulate and self.spo.running:
+        if self.simulate:
             self.spo.stop()
+        else:
+            self.spo.close()
 
+    def stop(self): 
+        if self.simulate:
+            self.spo.stop()
+        else:
+            self.spo.close()
+    
     ####################### Serial Communication Functions ##################################
     def initialize_serial_port(self):
         # Display some system info for debugging
@@ -56,16 +82,17 @@ class XYStageManager:
         ports = serial.tools.list_ports.comports()
         for port in ports:
             try:
-                # Attempt to open the port at 115200 baud
+                # Attempt to open the port at 9600 baud
                 spo = serial.Serial(
-                    port.device, baudrate=115200, bytesize=8,
+                    port.device, baudrate=9600, bytesize=8,
                     timeout=1, stopbits=serial.STOPBITS_ONE
                 )
                 # Write a command ('V') to check for the correct device
                 spo.write(b"V\r\n")
+                time.sleep(0.1) # Wait for the response to be ready
                 # Read the response and strip extra whitespace
                 response = spo.readline().decode('ascii').strip()
-
+                print(f"Response from {port.device}: {response}")
                 # If response indicates a ProScan III controller, return this serial object
                 if "R" in response:
                     print(f"ProScan III controller found on {port.device}")
@@ -75,11 +102,12 @@ class XYStageManager:
                 spo.close()
             except (serial.SerialException, UnicodeDecodeError):
                 # If there's an issue reading or decoding data, just move on to the next port
+                print(f"Error reading from port {port.device}.")
                 continue
-
+        
         # If no ProScan III controller is found, print a message
         print("No ProScan III controller found.")
-        return None
+        return spo
 
     def send_command(self, command):
         """
@@ -149,20 +177,101 @@ class XYStageManager:
 
     ####################### Stage Movement Functions ##################################
     
-    def move_stage_at_velocity(self, vx, vy):
+    def move_stage_at_velocity(self, vx, vy, timefactor=1):
         """
         Move stage at a specified velocity.
         vx, vy are velocity components in the X and Y axes respectively.
         """
-        command = f"VS,{vx},{vy}"
-        self.send_command(command)
+          
+        if self.check_stage_limits(vx*timefactor, vy*timefactor):
+            command = f"VS,{vx},{vy}"
+            self.send_command(command)
+        else:
+            print("Error: Velocity will move past stage limits.")
 
-    def move_stage_to_position(self, x, y):
+    def move_stage_to_position(self, x, y, fast=False):
         """
         Move stage to a specific position given by (x, y).
         This uses an absolute positioning approach (PA command).
         """
-        command = f"PA,{x},{y}"
+        # change velocity to fast mode if fast is True
+        if fast:
+            self.set_fast_mode()
+        else:
+            self.set_slow_mode()
+
+        # ensure the x and y values are within the valid range if not error
+        if self.check_stage_limits(x, y):
+        
+            command = f"PA,{x},{y}"
+            self.send_command(command)
+            
+        else:
+            print("Error: Position is outside of stage limits.")
+            
+    
+    def check_stage_limits(self, x, y):
+        """
+        Check if the given position (x, y) or the resulting velocity (x,y) times 1 second will be within the valid range.
+        Returns True if the position is valid, False otherwise.
+        """
+        # Check if the resulting position is within the valid range
+        if x < self.xRange[0] or x > self.xRange[1] or y < self.yRange[0] or y > self.yRange[1]:
+            return False
+        return True
+    
+    def set_fast_mode(self):
+        """
+        Set the stage to move at a fast velocity.
+        """
+        self.set_velocity(self.maxSpeed)
+    
+    def set_slow_mode(self):
+        """
+        Set the stage to move at a slow velocity.
+        """
+        self.set_velocity(self.defaultVelocity)
+    
+    ####################### Stage Settings Functions ##################################
+    def load_stage_settings(self):
+        """
+        Load the stage settings from a local .json file.
+        """
+        try:
+            with open('stage_settings.json', 'r') as f:
+                settings = json.load(f)
+                stage_settings = settings.get("PriorIII_StageSettings", {})
+                self.maxSpeed = stage_settings.get("maxSpeed")
+                self.maxAcceleration = stage_settings.get("maxAcceleration")
+                self.xRange = stage_settings.get("xRange")
+                self.yRange = stage_settings.get("yRange")
+                self.defaultAcceleration = stage_settings.get("defaultAcceleration")
+                self.defaultVelocity = stage_settings.get("defaultVelocity")
+                print("Stage settings loaded successfully.")
+        except Exception as e:
+            print(f"Error loading stage settings: {e}")
+    
+    def set_acceleration(self, acceleration):
+        """
+        Set the stage acceleration to the specified value.
+        """
+        # ensure the acceleration value is within the valid range 
+        if acceleration > self.maxAcceleration:
+            print("Error: Acceleration value is too high.")
+            return
+        command = f"AC,{acceleration}"
+        self.send_command(command)
+
+    def set_velocity(self, velocity):
+        """
+        Set the stage velocity to the specified value.
+        """
+        # ensure the velocity value is within the valid range
+        if velocity > self.maxSpeed:
+            print("Error: Velocity value is too high.")
+            return
+        
+        command = f"VE,{velocity}"
         self.send_command(command)
 
 class ZPStageManager:
@@ -212,6 +321,13 @@ class ZPStageManager:
 
     def __del__(self):
         # Stop simulator thread or close hardware connection
+        if self.simulate:
+            self.serial.stop()
+        else:
+            self.serial.close()
+    
+    def stop(self):
+        # Stop the simulator thread or close the hardware connection
         if self.simulate:
             self.serial.stop()
         else:
@@ -266,7 +382,8 @@ class ZPStageManager:
 
     ################################# Printer Control Functions ########################################
     
-    def movecommand(self, axes, feedrate=None):
+    def move_relative(self, axes, feedrate=None):
+        
         # Build a G0 command string for axes that have a non-zero distance
         filtered_axes = {
             axis: distance for axis, distance in axes.items() if distance != 0
@@ -280,12 +397,33 @@ class ZPStageManager:
         else:
             self.send_data(f"G0 {axis_str}")
             print(f"G0 {axis_str}")
-
-    def set_feedrate(self, value):
-        # Change feedrate for subsequent moves
-        command = f"F{value} "
-        self.send_data(command)
+    
+    def move_absolute(self, axes, fast=False):
         
+        # Build a G0 command string for axes to move to a prescribed location
+        filtered_axes = {
+            axis: position for axis, position in axes.items() if position != 0
+        }
+        axis_str = " ".join(f"{axis}{position}" for axis, position in filtered_axes.items())
+        
+        # change to absolute positioning mode
+        self.set_absolute_mode()
+        
+        if fast:
+            self.set_fast_mode()
+        else:
+            self.set_slow_mode()
+                
+        # Move to an absolute position
+        self.send_data(f"G0 {axis_str}")
+        
+        # change back to relative positioning mode by defult
+        self.set_relative_mode()
+        # change back to slow feedrate by default
+        self.set_slow_mode()
+    
+    
+               
     ################################# Printer Request Functions ########################################
         
     def get_current_position(self):
@@ -327,14 +465,33 @@ class ZPStageManager:
                 print(f"Failed to match line: {line}")
 
     ################################# Printer Settings Functions ########################################
+    def set_absolute_mode(self):
+        # Set the printer to absolute positioning mode
+        self.send_data("G90")
+        print("Absolute positioning enabled")
     
+    def set_relative_mode(self):
+        # Set the printer to relative positioning mode
+        self.send_data("G91")
+        print("Relative positioning enabled")
+    
+    def set_fast_mode(self):
+        # Set the feedrate to fast mode
+        self.send_data("M220 S100")
+        print("Fast mode enabled")
+        
+    def set_slow_mode(self):
+        # Set the feedrate to fast mode
+        self.send_data("M220 S10")
+        print("Slow mode enabled")
+     
     def resetprinter(self):
         # Send emergency stop command
         self.send_data("M112")
         print("Printer reset")
 
     def change_max_feeds(self, X, Y, Z, E):
-        # Adjust maximum speeds on the fly
+        # Adjust maximum speeds
         command = f"M203 E{E} X{X} Y{Y} Z{Z}"
         self.send_data(command)
 
@@ -547,3 +704,30 @@ class ZPStageSimulator:
             response = 'Unknown command'
 
         self.response_queue.put(response)
+
+
+
+if __name__ == "__main__":
+    # Test the XYStageManager and ZPStageManager classes
+    xy = XYStageManager(simulate=False)
+    zp = ZPStageManager(simulate=False)
+
+    # Test the XY stage movement functions
+    xy.move_stage_at_velocity(100, 50)
+    time.sleep(1)
+    xy.move_stage_at_velocity(0, 0)
+    time.sleep(1)
+    xy.move_stage_to_position(100, 100)
+    time.sleep(1)
+    print("Current position:", xy.get_current_position())
+
+    # Test the ZP stage movement functions
+    zp.movecommand({'X': 10, 'Y': 20, 'Z': 30, 'E': 40})
+    time.sleep(1)
+    zp.movecommand({'X': 0, 'Y': 0, 'Z': 0, 'E': 0})
+    time.sleep(1)
+    print("Current position:", zp.get_current_position())
+
+    # Clean up
+    xy.stop()
+    zp.stop()

@@ -90,7 +90,12 @@ class MainWindow(QMainWindow):
         # SHOW MAIN WINDOW
         # ///////////////////////////////////////////////////////////////
         self.show()
-
+    
+    def closeEvent(self, event):
+        self.app_controller.stop()
+        self.xbox_poller.stop()
+        event.accept()
+        
     # LEFT MENU BTN IS CLICKED
     # Run function when btn is clicked
     # Check funtion by object name / btn_id
@@ -269,6 +274,9 @@ class XboxPoller(QObject):
     def start(self):
         # Start polling every 50ms.
         self.timer.start(50)
+    
+    def stop(self):
+        self.timer.stop()
     
     def poll(self):
         while not self.queue.empty():

@@ -13,17 +13,17 @@
     "axis": [
       "None",
       "move_stage_at_velocity",
-      "move_x_at_velocity",
-      "move_y_at_velocity",
       "move_z_at_velocity",
-      "move_e_at_velocity"
+      "move_p1_at_velocity",
+      "move_p2_at_velocity",
+      "move_p3_at_velocity"
     ],
     "trigger": [
       "None",
-      "move_x_at_velocity",
-      "move_y_at_velocity",
       "move_z_at_velocity",
-      "move_e_at_velocity"
+      "move_p1_at_velocity",
+      "move_p2_at_velocity",
+      "move_p3_at_velocity"
     ]
   }
   
