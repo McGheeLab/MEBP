@@ -1,13 +1,14 @@
 import sys, json, os, random, csv, math, uuid
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QSplitter, QStyle, QStyleOptionViewItem,
-    QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel, QStyledItemDelegate,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget,QSplitter, QStyle, QStyleOptionViewItem,
+    QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel,QStyledItemDelegate,
     QFileDialog, QMessageBox, QComboBox, QScrollArea, QListWidget, QListWidgetItem, QColorDialog
 )
-from PySide6.QtGui import QPainter, QColor, QRegularExpressionValidator, QValidator, QDrag, QPen
+from PySide6.QtGui import QPainter, QColor,QRegularExpressionValidator, QValidator, QDrag, QPen
 from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Signal, QSignalBlocker, QEvent
 
 from SupportClasses.Printer import InkWell, Syringe
+
 
 def get_contrast_text_color(bg_color: str) -> str:
     """
@@ -20,6 +21,7 @@ def get_contrast_text_color(bg_color: str) -> str:
     luminance = 0.299 * r + 0.587 * g + 0.114 * b
     # If luminance is high, use black text; if low, use white text.
     return "#000000" if luminance > 128 else "#FFFFFF"
+
 
 ############################################################################################################
 #####################################  Main tab window  ####################################################
@@ -71,6 +73,7 @@ class PrintSettingsWidget(QWidget):
     def update_tab_validity(self):
         well_valid, well_msg = self.well_tab.validate()
         ink_valid, ink_msg = self.ink_tab.validate()
+        #self.syringe_tab.update_all_cell_type_options()
         syringe_valid, syringe_msg = self.syringe_tab.validate()
         self.syringe_tab.update_all_cell_type_options()
 
@@ -110,7 +113,6 @@ class PrintSettingsWidget(QWidget):
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", f"Error saving all settings: {e}")
 
-    # **** PROBLEM WITH PUSHING PRINTFILES TO QUEUE ****
     def apply_settings(self):
         valid, msg = self.update_tab_validity()
         if not valid:
@@ -136,13 +138,8 @@ class PrintSettingsWidget(QWidget):
         
         # go through pf and queue the printfiles in the printmanager.queue_a_waypoint(self, well_id, offset, csv_file, **kwargs):
         # the printfile object has the csv file path, color, and offset
-        # there could be multiple printfiles for a single pf.tiem
-        
-        # ****** Does not work *******
-        for well_id, printfiles in pf.items():
-            for printfile in printfiles:
-                self.print_manager.queue_a_waypoint(well_id, printfile.offset, printfile.csv_file)
-        
+        for well_loc, printfile in pf.items():
+            self.print_manager.queue_a_waypoint(well_loc, printfile["offset"], printfile["csv_file"])
             
 ############################################################################################################
 ###################################  All Widgets within the tabs  ##########################################
@@ -161,6 +158,7 @@ class PrintListWidget(QListWidget):
             drag.setMimeData(mimeData)
             drag.exec(supportedActions)
 
+
 # --- PlateLayoutWidget ---
 class PlateLayoutWidget(QWidget):
     # Signal emitted whenever assignments change.
@@ -169,12 +167,12 @@ class PlateLayoutWidget(QWidget):
     def __init__(self, main_widget, parent=None):
         """
         main_widget should contain:
-          - well_tab with well_rows_input, well_cols_input, and plate_mode (from the new Plate Type combobox)
+          - well_tab with well_rows_input and well_cols_input (e.g. QSpinBox)
           - print_setup_tab (used by PlateLayoutTab to get print files)
         """
         super().__init__(parent)
         self.main_widget = main_widget
-        # associations: mapping well location (e.g. "A1" for petridish or "A2" ... "D2" for small wells) -> { printfile_name: {"color": ...} }
+        # associations: mapping well location (e.g. "A1") -> { printfile_name: {"color": ...} }
         self.associations = {}
         # Set of well identifiers for multi-selection (if needed)
         self.selected_wells = set()
@@ -186,184 +184,102 @@ class PlateLayoutWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+
         margin = 20
         width = self.width()
         height = self.height()
+        available_width = width - 2 * margin
+        available_height = height - 2 * margin
 
-        # Determine plate mode from well properties.
-        props = self.main_widget.well_tab.get_properties()
-        plate_mode = props.get("plate_mode", "Well Plate")
+        # Get grid dimensions from main_widget.well_tab widgets.
+        rows = self.main_widget.well_tab.well_rows_input.value()
+        cols = self.main_widget.well_tab.well_cols_input.value()
+        if rows <= 0 or cols <= 0:
+            return
 
-        if plate_mode == "Well Plate":
-            # Use grid layout as before.
-            rows = self.main_widget.well_tab.well_rows_input.value()
-            cols = self.main_widget.well_tab.well_cols_input.value()
-            if rows <= 0 or cols <= 0:
-                return
-            available_width = width - 2 * margin
-            available_height = height - 2 * margin
-            cell_width = available_width / cols
-            cell_height = available_height / rows
-            radius = min(cell_width, cell_height) * 0.4
-            for r in range(rows):
-                for c in range(cols):
-                    center_x = margin + (c + 0.5) * cell_width
-                    center_y = margin + (r + 0.5) * cell_height
-                    well_loc = f"{chr(ord('A') + r)}{c + 1}"
-                    if well_loc in self.associations and self.associations[well_loc]:
-                        assignments = list(self.associations[well_loc].values())
-                        if len(assignments) == 1:
-                            fill_color = assignments[0]["color"]
-                            painter.setPen(Qt.black)
-                            painter.setBrush(QColor(fill_color))
-                            painter.drawEllipse(int(center_x - radius), int(center_y - radius),
-                                                int(2 * radius), int(2 * radius))
-                        else:
-                            start_angle = 0
-                            span_angle = 360 / len(assignments)
-                            for assign in assignments:
-                                painter.setPen(Qt.NoPen)
-                                painter.setBrush(QColor(assign["color"]))
-                                painter.drawPie(int(center_x - radius), int(center_y - radius),
-                                                int(2 * radius), int(2 * radius),
-                                                int(start_angle * 16), int(span_angle * 16))
-                                start_angle += span_angle
-                            painter.setPen(Qt.black)
-                            painter.setBrush(Qt.NoBrush)
-                            painter.drawEllipse(int(center_x - radius), int(center_y - radius),
-                                                int(2 * radius), int(2 * radius))
-                    else:
-                        painter.setPen(Qt.black)
-                        painter.setBrush(QColor("#FFFFFF"))
-                        painter.drawEllipse(int(center_x - radius), int(center_y - radius),
-                                            int(2 * radius), int(2 * radius))
-                    painter.drawText(int(center_x - 10), int(center_y + 5), well_loc)
-                    if well_loc in self.selected_wells:
-                        pen = QPen(Qt.blue, 3, Qt.DashLine)
-                        painter.setPen(pen)
-                        painter.setBrush(Qt.NoBrush)
-                        painter.drawEllipse(int(center_x - radius), int(center_y - radius),
-                                            int(2 * radius), int(2 * radius))
-        elif plate_mode == "Petridish":
-            # Petridish layout: left 75% for the large dish, right 25% divided into 4 wells.
-            total_width = width
-            total_height = height
-            left_area_width = total_width * 0.75 - 2 * margin
-            right_area_width = total_width * 0.25 - 2 * margin
-            available_height = total_height - 2 * margin
-            left_rect = QRectF(margin, margin, total_width * 0.75 - 2 * margin, available_height)
-            right_rect = QRectF(total_width * 0.75 + margin, margin, right_area_width, available_height)
-            # Draw the petridish on the left.
-            petridish_diameter = min(left_rect.width() * 0.75, left_rect.height())
-            petridish_radius = petridish_diameter / 2
-            petridish_center = QPointF(left_rect.center().x(), left_rect.center().y())
-            if "A1" in self.associations and self.associations["A1"]:
-                assignments = list(self.associations["A1"].values())
-                if len(assignments) == 1:
-                    fill_color = assignments[0]["color"]
-                    painter.setPen(Qt.black)
-                    painter.setBrush(QColor(fill_color))
-                    painter.drawEllipse(petridish_center, petridish_radius, petridish_radius)
-                else:
-                    start_angle = 0
-                    span_angle = 360 / len(assignments)
-                    for assign in assignments:
-                        painter.setPen(Qt.NoPen)
-                        painter.setBrush(QColor(assign["color"]))
-                        painter.drawPie(int(petridish_center.x()-petridish_radius), int(petridish_center.y()-petridish_radius),
-                                        int(2 * petridish_radius), int(2 * petridish_radius),
-                                        int(start_angle * 16), int(span_angle * 16))
-                        start_angle += span_angle
-                    painter.setPen(Qt.black)
-                    painter.setBrush(Qt.NoBrush)
-                    painter.drawEllipse(petridish_center, petridish_radius, petridish_radius)
-            else:
-                painter.setPen(Qt.black)
-                painter.setBrush(QColor("#FFFFFF"))
-                painter.drawEllipse(petridish_center, petridish_radius, petridish_radius)
-            painter.drawText(int(petridish_center.x()-10), int(petridish_center.y()+5), "A1")
-            # Draw the 4 wells on the right.
-            num_wells = 4
-            well_diameter = min(right_rect.width(), right_rect.height()/num_wells)
-            for i in range(num_wells):
-                center_x = right_rect.center().x()
-                center_y = right_rect.top() + (i + 0.5) * (right_rect.height()/num_wells)
-                well_label = f"{chr(ord('A') + i)}2"  # Wells in column 2: A2, B2, C2, D2
-                if well_label in self.associations and self.associations[well_label]:
-                    assignments = list(self.associations[well_label].values())
+        cell_width = available_width / cols
+        cell_height = available_height / rows
+        radius = min(cell_width, cell_height) * 0.4
+
+        for r in range(rows):
+            for c in range(cols):
+                center_x = margin + (c + 0.5) * cell_width
+                center_y = margin + (r + 0.5) * cell_height
+                well_loc = f"{chr(ord('A') + r)}{c + 1}"
+
+                # Draw assignments (if any).
+                if well_loc in self.associations and self.associations[well_loc]:
+                    assignments = list(self.associations[well_loc].values())
                     if len(assignments) == 1:
                         fill_color = assignments[0]["color"]
                         painter.setPen(Qt.black)
                         painter.setBrush(QColor(fill_color))
-                        painter.drawEllipse(QPointF(center_x, center_y), well_diameter/2, well_diameter/2)
+                        painter.drawEllipse(int(center_x - radius), int(center_y - radius),
+                                            int(2 * radius), int(2 * radius))
                     else:
                         start_angle = 0
                         span_angle = 360 / len(assignments)
                         for assign in assignments:
                             painter.setPen(Qt.NoPen)
                             painter.setBrush(QColor(assign["color"]))
-                            painter.drawPie(int(center_x - well_diameter/2), int(center_y - well_diameter/2),
-                                            int(well_diameter), int(well_diameter),
+                            painter.drawPie(int(center_x - radius), int(center_y - radius),
+                                            int(2 * radius), int(2 * radius),
                                             int(start_angle * 16), int(span_angle * 16))
                             start_angle += span_angle
                         painter.setPen(Qt.black)
                         painter.setBrush(Qt.NoBrush)
-                        painter.drawEllipse(QPointF(center_x, center_y), well_diameter/2, well_diameter/2)
+                        painter.drawEllipse(int(center_x - radius), int(center_y - radius),
+                                            int(2 * radius), int(2 * radius))
                 else:
+                    # Draw an empty (white) well.
                     painter.setPen(Qt.black)
                     painter.setBrush(QColor("#FFFFFF"))
-                    painter.drawEllipse(QPointF(center_x, center_y), well_diameter/2, well_diameter/2)
-                painter.drawText(int(center_x-10), int(center_y+5), well_label)
-                if well_label in self.selected_wells:
+                    painter.drawEllipse(int(center_x - radius), int(center_y - radius),
+                                        int(2 * radius), int(2 * radius))
+
+                # Draw the well label.
+                painter.drawText(int(center_x - 10), int(center_y + 5), well_loc)
+
+                # If the well is selected, draw a blue dashed border.
+                if well_loc in self.selected_wells:
                     pen = QPen(Qt.blue, 3, Qt.DashLine)
                     painter.setPen(pen)
                     painter.setBrush(Qt.NoBrush)
-                    painter.drawEllipse(QPointF(center_x, center_y), well_diameter/2, well_diameter/2)
+                    painter.drawEllipse(int(center_x - radius), int(center_y - radius),
+                                        int(2 * radius), int(2 * radius))
 
     def mousePressEvent(self, event):
         self.drag_start_pos = event.pos()
         pos = event.pos()
         margin = 20
-        props = self.main_widget.well_tab.get_properties()
-        plate_mode = props.get("plate_mode", "Well Plate")
-        if plate_mode == "Well Plate":
-            rows = self.main_widget.well_tab.well_rows_input.value()
-            cols = self.main_widget.well_tab.well_cols_input.value()
-            available_width = self.width() - 2 * margin
-            available_height = self.height() - 2 * margin
-            cell_width = available_width / cols
-            cell_height = available_height / rows
-            col = int((pos.x() - margin) / cell_width)
-            row = int((pos.y() - margin) / cell_height)
-            if 0 <= row < rows and 0 <= col < cols:
-                well_loc = f"{chr(ord('A') + row)}{col + 1}"
-                self.clicked_well = well_loc
-                if well_loc not in self.associations or not self.associations[well_loc]:
-                    if well_loc in self.selected_wells:
-                        self.selected_wells.remove(well_loc)
-                    else:
-                        self.selected_wells.add(well_loc)
-                    self.update()
-        elif plate_mode == "Petridish":
-            total_width = self.width()
-            total_height = self.height()
-            left_area = QRectF(margin, margin, total_width * 0.75 - 2 * margin, total_height - 2 * margin)
-            right_area = QRectF(total_width * 0.75 + margin, margin, total_width * 0.25 - 2 * margin, total_height - 2 * margin)
-            if left_area.contains(pos):
-                self.clicked_well = "A1"
-            elif right_area.contains(pos):
-                relative_y = pos.y() - right_area.top()
-                index = int(relative_y / (right_area.height()/4))
-                index = max(0, min(3, index))
-                self.clicked_well = f"{chr(ord('A') + index)}2"
-            self.update()
+        rows = self.main_widget.well_tab.well_rows_input.value()
+        cols = self.main_widget.well_tab.well_cols_input.value()
+        available_width = self.width() - 2 * margin
+        available_height = self.height() - 2 * margin
+        cell_width = available_width / cols
+        cell_height = available_height / rows
+
+        col = int((pos.x() - margin) / cell_width)
+        row = int((pos.y() - margin) / cell_height)
+        if 0 <= row < rows and 0 <= col < cols:
+            well_loc = f"{chr(ord('A') + row)}{col + 1}"
+            self.clicked_well = well_loc
+            # If the well is empty, toggle multi-selection.
+            if well_loc not in self.associations or not self.associations[well_loc]:
+                if well_loc in self.selected_wells:
+                    self.selected_wells.remove(well_loc)
+                else:
+                    self.selected_wells.add(well_loc)
+                self.update()
 
     def mouseMoveEvent(self, event):
+        # If dragging from a well that already has an assignment, start a removal drag.
         if self.clicked_well and self.clicked_well in self.associations:
             if (event.pos() - self.drag_start_pos).manhattanLength() > QApplication.startDragDistance():
                 from PySide6.QtCore import QMimeData
                 drag = QDrag(self)
                 mimeData = QMimeData()
+                # Signal removal with MIME text "remove;well"
                 mimeData.setText(f"remove;{self.clicked_well}")
                 drag.setMimeData(mimeData)
                 drag.exec(Qt.MoveAction)
@@ -378,43 +294,30 @@ class PlateLayoutWidget(QWidget):
     def dropEvent(self, event):
         pos = event.position() if hasattr(event, "position") else event.pos()
         margin = 20
-        props = self.main_widget.well_tab.get_properties()
-        plate_mode = props.get("plate_mode", "Well Plate")
-        if plate_mode == "Well Plate":
-            rows = self.main_widget.well_tab.well_rows_input.value()
-            cols = self.main_widget.well_tab.well_cols_input.value()
-            available_width = self.width() - 2 * margin
-            available_height = self.height() - 2 * margin
-            cell_width = available_width / cols
-            cell_height = available_height / rows
-            col = int((pos.x() - margin) / cell_width)
-            row = int((pos.y() - margin) / cell_height)
-            if not (0 <= row < rows and 0 <= col < cols):
-                event.ignore()
-                return
-            well_loc = f"{chr(ord('A') + row)}{col + 1}"
-        elif plate_mode == "Petridish":
-            total_width = self.width()
-            total_height = self.height()
-            left_area = QRectF(margin, margin, total_width * 0.75 - 2 * margin, total_height - 2 * margin)
-            right_area = QRectF(total_width * 0.75 + margin, margin, total_width * 0.25 - 2 * margin, total_height - 2 * margin)
-            if left_area.contains(pos):
-                well_loc = "A1"
-            elif right_area.contains(pos):
-                relative_y = pos.y() - right_area.top()
-                index = int(relative_y / (right_area.height()/4))
-                index = max(0, min(3, index))
-                well_loc = f"{chr(ord('A') + index)}2"
-            else:
-                event.ignore()
-                return
+        rows = self.main_widget.well_tab.well_rows_input.value()
+        cols = self.main_widget.well_tab.well_cols_input.value()
+        available_width = self.width() - 2 * margin
+        available_height = self.height() - 2 * margin
+        cell_width = available_width / cols
+        cell_height = available_height / rows
+
+        col = int((pos.x() - margin) / cell_width)
+        row = int((pos.y() - margin) / cell_height)
+        if not (0 <= row < rows and 0 <= col < cols):
+            event.ignore()
+            return
+
+        well_loc = f"{chr(ord('A') + row)}{col + 1}"
         mime_text = event.mimeData().text()
         parts = mime_text.split(";")
+
+        # Check for removal action.
         if parts[0] == "remove":
             source_well = parts[1] if len(parts) > 1 else well_loc
             if source_well in self.associations:
                 keys = list(self.associations[source_well].keys())
                 removed = False
+                # Remove the first assignment that is not an inkwell.
                 for key in keys:
                     if not key.startswith("InkWell"):
                         del self.associations[source_well][key]
@@ -426,6 +329,8 @@ class PlateLayoutWidget(QWidget):
                 self.update()
             event.acceptProposedAction()
             return
+
+        # Handle inkwell drag-drop.
         if parts[0] == "inkwell":
             if len(parts) < 3:
                 event.ignore()
@@ -440,7 +345,9 @@ class PlateLayoutWidget(QWidget):
                 event.ignore()
                 return
             inkwell = inkwell_widgets[index]
-            if (well_loc in self.associations and any(key.startswith("InkWell") for key in self.associations[well_loc])):
+            # Prevent adding if an inkwell is already assigned in this well.
+            if (well_loc in self.associations and 
+                any(key.startswith("InkWell") for key in self.associations[well_loc])):
                 event.ignore()
                 return
             if well_loc not in self.associations:
@@ -449,11 +356,14 @@ class PlateLayoutWidget(QWidget):
                 "color": inkwell["color"].text().strip(),
                 "name": inkwell["cell_type"].text().strip()
             }
+            # *** New: Update the inkwell widget’s location field ***
             inkwell["location"].setText(well_loc)
             self.associationsChanged.emit()
             self.update()
             event.acceptProposedAction()
             return
+
+        # Otherwise, assume addition for file drag-drop.
         if parts[0] == "file":
             if len(parts) < 5:
                 event.ignore()
@@ -462,7 +372,8 @@ class PlateLayoutWidget(QWidget):
             file_path = parts[2]
             file_color = parts[3]
             file_name = parts[4]
-            if (well_loc in self.associations and any(key.startswith("InkWell") for key in self.associations[well_loc])):
+            if (well_loc in self.associations and 
+                any(key.startswith("InkWell") for key in self.associations[well_loc])):
                 event.ignore()
                 return
             targets = self.selected_wells if self.selected_wells else {well_loc}
@@ -478,8 +389,10 @@ class PlateLayoutWidget(QWidget):
         else:
             event.ignore()
 
+
     def update_layout(self):
         self.update()
+
 
 ############################################################################################################
 ###################################  All Tabs  #############################################################
@@ -564,12 +477,6 @@ class WellPropertiesTab(QWidget):
         self.well_diameter_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well Diameter:", self.well_diameter_input)
 
-        # New: Plate Type selection
-        self.plate_type_combo = QComboBox()
-        self.plate_type_combo.addItems(["Well Plate", "Petridish"])
-        self.plate_type_combo.currentIndexChanged.connect(self.on_change_callback)
-        self.form.addRow("Plate Type:", self.plate_type_combo)
-
         layout.addLayout(self.form)
 
     def get_properties(self):
@@ -585,8 +492,7 @@ class WellPropertiesTab(QWidget):
             "well_dy": self.well_dy_input.value(),
             "well_rows": self.well_rows_input.value(),
             "well_cols": self.well_cols_input.value(),
-            "well_diameter": self.well_diameter_input.value(),
-            "plate_mode": self.plate_type_combo.currentText()
+            "well_diameter": self.well_diameter_input.value()
         }
 
     def load_properties(self):
@@ -607,10 +513,6 @@ class WellPropertiesTab(QWidget):
                 self.well_rows_input.setValue(int(data.get("well_rows", 0)))
                 self.well_cols_input.setValue(int(data.get("well_cols", 0)))
                 self.well_diameter_input.setValue(float(data.get("well_diameter", 0)))
-                plate_mode = data.get("plate_mode", "Well Plate")
-                index = self.plate_type_combo.findText(plate_mode)
-                if index >= 0:
-                    self.plate_type_combo.setCurrentIndex(index)
                 QMessageBox.information(self, "Load", "Well properties loaded successfully.")
                 self.on_change_callback()
             except Exception as e:
@@ -830,6 +732,7 @@ class InkPropertiesTab(QWidget):
         drag.exec(Qt.MoveAction)
    
     def validate(self):
+        # Require at least one ink well.
         if not self.ink_well_widgets:
             return False, "At least one ink well must be defined."
             
@@ -841,17 +744,26 @@ class InkPropertiesTab(QWidget):
             if loc in seen:
                 return False, f"Ink well {i} duplicates assignment from ink well {seen[loc]}."
             seen[loc] = i
+            
+            # Validate the location with the provided validator.
             state, _, _ = widget["location"].validator().validate(widget["location"].text(), 0)
             if state != QValidator.Acceptable:
                 return False, f"Ink well {i} location is invalid."
+            
+            # Check that a name (using cell_type field) is provided.
             if not widget["cell_type"].text().strip():
                 return False, f"Ink well {i} must have a name (cell type) defined."
+            
+            # Check that the volume is greater than zero.
             if widget["volume"].value() <= 0:
                 return False, f"Ink well {i} must have a volume greater than zero."
+            
             if not widget["color"].text().strip():
                 return False, f"Ink well {i} must have a color code."
+                
         return True, ""
 
+    
 # --- Syringe Properties Tab as a Separate Class ---
 class SyringePropertiesTab(QWidget):
     def __init__(self, main_widget, on_change_callback, parent=None):
@@ -910,6 +822,7 @@ class SyringePropertiesTab(QWidget):
         layout.addLayout(self.syringe_form)
 
     def update_syringe_cell_type_options_for(self, pump, combo_box):
+        # Collect valid cell types and map them to colors.
         valid_types = {"None"}
         cell_type_to_color = {"None": ""}
         for ink_widget in self.main_widget.ink_tab.ink_well_widgets:
@@ -928,6 +841,8 @@ class SyringePropertiesTab(QWidget):
             if index < 0:
                 index = 0
         combo_box.setCurrentIndex(index)
+        
+        # Update the combo box background based on the selected ink color.
         selected = combo_box.currentText().strip()
         color = cell_type_to_color.get(selected, "")
         if color:
@@ -936,6 +851,7 @@ class SyringePropertiesTab(QWidget):
             combo_box.setStyleSheet("")
         
     def update_cell_type_color(self, pump, combo_box):
+        # Helper method to update the combo box color when selection changes.
         selected = combo_box.currentText().strip()
         for ink_widget in self.ink_tab.ink_well_widgets:
             if ink_widget["cell_type"].text().strip() == selected:
@@ -945,10 +861,13 @@ class SyringePropertiesTab(QWidget):
 
     def update_all_cell_type_options(self):
         self.current_inks = {"None"}
-        for ink_widget in self.main_widget.ink_tab.ink_well_widgets:
+        # Collect available cell types directly from each ink well widget in the ink tab.
+        for ink_widget in self.ink_tab.ink_well_widgets:
             cell_type = ink_widget["cell_type"].text().strip()
             if cell_type:
                 self.current_inks.add(cell_type)
+        
+        # Update each syringe's cell type combo box while blocking signals
         for pump, inputs in self.syringe_inputs.items():
             current = inputs["cell_type"].currentText().strip()
             with QSignalBlocker(inputs["cell_type"]):
@@ -981,7 +900,7 @@ class SyringePropertiesTab(QWidget):
             }
         return data
 
-    def load_standard_syringe_types_from_file(self, file_path="Syringes.json"):
+    def load_standard_syringe_types_from_file(self,file_path="Syringes.json"):
         try:
             if os.path.exists(file_path):
                 with open(file_path, "r") as f:
@@ -1021,6 +940,7 @@ class SyringePropertiesTab(QWidget):
                 QMessageBox.warning(self, "Save Error", f"Error saving JSON: {e}")
 
     def validate(self):
+        # Example validation: at least one syringe must have a cell type not "None"
         non_none_exists = False
         valid_cell_types = self.current_inks
         print(valid_cell_types)
@@ -1045,6 +965,7 @@ class PrintSetupTab(QWidget):
         super().__init__(parent)
         
         self.main_widget = main_widget
+        # initialize with default values
         self.well_diameter_physical = 1.0  
         self.well_height_physical = 1.0 
         
@@ -1055,6 +976,7 @@ class PrintSetupTab(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter)
 
+        # Left panel: list with "New Print", "Duplicate", "Remove" buttons.
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         self.list_widget = QListWidget()
@@ -1085,6 +1007,7 @@ class PrintSetupTab(QWidget):
         left_layout.addLayout(btn_layout)
         splitter.addWidget(left_panel)
 
+        # Right panel: details panel and preview area.
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         details_panel = QWidget()
@@ -1106,6 +1029,7 @@ class PrintSetupTab(QWidget):
         details_layout.addWidget(load_csv_btn)
         right_layout.addWidget(details_panel)
 
+        # Add an HBox layout below the isometric view with Reset, Top, Side buttons.
         self.view_controls = QWidget()
         vc_layout = QHBoxLayout(self.view_controls)
         reset_btn = QPushButton("Reset View")
@@ -1135,6 +1059,7 @@ class PrintSetupTab(QWidget):
         props = self.main_widget.well_tab.get_properties()
         self.well_diameter_physical = props["well_diameter"]
         self.well_height_physical = props["topz"] - props["floorz"]
+        # Also update the preview widget's values if needed.
         self.well_preview.well_diameter_physical = self.well_diameter_physical
         self.well_preview.well_height_physical = self.well_height_physical
     
@@ -1184,6 +1109,7 @@ class PrintSetupTab(QWidget):
                 item.setForeground(QColor(get_contrast_text_color(pf.color)))
                 self.list_widget.addItem(item)
             self.list_widget.setCurrentRow(0)
+            # Notify that the print files list has changed.
             self.printFilesChanged.emit()
 
     def duplicate_print_file(self):
@@ -1259,10 +1185,12 @@ class PrintSetupTab(QWidget):
             cur_row = self.list_widget.currentRow()
             if cur_row >= 0:
                 self.list_widget.item(cur_row).setText(new_name)
+            # Update the plate layout associations
             plate_layout = self.main_widget.plate_layout_tab.plate_layout_widget
             for well, assignments in plate_layout.associations.items():
                 if self.current_print.uid in assignments:
                     assignments[self.current_print.uid]["name"] = new_name
+            # Emit signal and refresh view
             plate_layout.associationsChanged.emit()
             plate_layout.update()
             self.printFilesChanged.emit()
@@ -1277,6 +1205,7 @@ class PrintSetupTab(QWidget):
                 cur_row = self.list_widget.currentRow()
                 if cur_row >= 0:
                     self.list_widget.item(cur_row).setBackground(QColor(self.current_color))
+                # Update the plate layout associations with the new color.
                 plate_layout = self.main_widget.plate_layout_tab.plate_layout_widget
                 for well, assignments in plate_layout.associations.items():
                     if self.current_print.uid in assignments:
@@ -1334,27 +1263,34 @@ class PlateLayoutTab(QWidget):
     def __init__(self, main_widget, parent=None):
         """
         main_widget should provide:
-          - well_tab with well_rows_input and well_cols_input or petri dish parameters.
+          - well_tab with well_rows_input and well_cols_input.
           - print_setup_tab with a get_print_files() method and a printFilesChanged signal.
         """
         super().__init__(parent)
         self.main_widget = main_widget
         layout = QHBoxLayout(self)
 
+        # Left pane: Print file list.
         self.printfile_list = QListWidget()
         self.printfile_list.setDragEnabled(False)
         self.printfile_list.viewport().installEventFilter(self)
         layout.addWidget(self.printfile_list, 1)
 
+        # Center pane: Plate layout view.
         self.plate_layout_widget = PlateLayoutWidget(main_widget)
         layout.addWidget(self.plate_layout_widget, 3)
 
+        # Right pane: Running list of assignments.
         self.running_list = QListWidget()
         layout.addWidget(self.running_list, 1)
 
+        # Connect the associationsChanged signal to update the running list.
         self.plate_layout_widget.associationsChanged.connect(self.refresh_running_list)
+
+        # Connect the printFilesChanged signal from print_setup_tab to refresh the print file list.
         self.main_widget.print_setup_tab.printFilesChanged.connect(self.refresh_print_file_list)
 
+        # Initial refresh.
         self.refresh_print_file_list()
         self.refresh_running_list()
 
@@ -1374,6 +1310,7 @@ class PlateLayoutTab(QWidget):
                                 from PySide6.QtCore import QMimeData
                                 drag = QDrag(self.printfile_list)
                                 mimeData = QMimeData()
+                                # Format MIME text as "file;{uid};{file_path};{file_color};{file_name}"
                                 mimeData.setText(f"file;{uid};{file_path};{file_color};{file_name}")
                                 drag.setMimeData(mimeData)
                                 drag.exec(Qt.CopyAction)
@@ -1382,10 +1319,12 @@ class PlateLayoutTab(QWidget):
 
     def refresh_print_file_list(self):
         self.printfile_list.clear()
+        # Populate print files dynamically.
         for pf in self.main_widget.print_setup_tab.get_print_files():
             item = QListWidgetItem(pf.name)
             item.setBackground(QColor(pf.color))
             item.setForeground(QColor(get_contrast_text_color(pf.color)))
+            # Store a tuple containing (uid, csv_file, color, name)
             item.setData(Qt.UserRole, (pf.uid, pf.csv_file, pf.color, pf.name))
             self.printfile_list.addItem(item)
 
@@ -1395,6 +1334,7 @@ class PlateLayoutTab(QWidget):
         pf_dict = {pf.uid: pf for pf in print_files}
         for well, assignments in self.plate_layout_widget.associations.items():
             for uid, info in assignments.items():
+                # Use updated print file properties if available.
                 if uid in pf_dict:
                     name = pf_dict[uid].name
                     color = pf_dict[uid].color
@@ -1407,26 +1347,40 @@ class PlateLayoutTab(QWidget):
                 self.running_list.addItem(item)
         
     def get_assigned_printfiles(self):
-        assigned = {}
+        """
+        Returns a list of dictionaries, each containing:
+            - 'well': the well identifier (e.g., "A1")
+            - 'printfile': the corresponding PrintFile object that was assigned.
+        """
+        assigned = []
+        # Get the current list of PrintFile objects from print_setup_tab.
         print_files = self.main_widget.print_setup_tab.get_print_files()
+        # Create a mapping from uid to the PrintFile object.
         pf_dict = {pf.uid: pf for pf in print_files}
+        
+        # Loop over all well assignments in the PlateLayoutWidget.
         for well, assignments in self.plate_layout_widget.associations.items():
             for uid, info in assignments.items():
+                # Look up the full PrintFile object by its unique identifier.
                 pf_obj = pf_dict.get(uid, None)
                 if pf_obj is not None:
-                    assigned[well] = pf_obj
+                    assigned.append({"well": well, "printfile": pf_obj})
         return assigned
+
 
 ############################################################################################################
 ############################### Print Setup Helpers ########################################################
 ############################################################################################################
+# --- Custom delegate for list items ---
 class ColorItemDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         bg = index.data(Qt.BackgroundRole)
         if not bg:
             bg = QColor("white")
         rect = option.rect
+        # Always fill with the stored background color.
         painter.fillRect(rect, bg)
+        # Draw border if hovered or selected.
         if option.state & QStyle.State_Selected:
             pen = QPen(Qt.black, 2)
             painter.setPen(pen)
@@ -1435,23 +1389,27 @@ class ColorItemDelegate(QStyledItemDelegate):
             pen = QPen(Qt.gray, 2)
             painter.setPen(pen)
             painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        # Draw the text.
         painter.setPen(Qt.black)
         text = index.data(Qt.DisplayRole)
         painter.drawText(rect, Qt.AlignCenter, text)
 
+# --- Well Preview Widget (Top/Side View) ---
 class WellPreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.print_file = None  
-        self.dragging = None    
+        self.print_file = None  # Set externally.
+        self.dragging = None    # "bbox" or "floor" or None.
         self.drag_offset = QPointF(0, 0)
-        self.well_diameter_physical = 5.0  
-        self.well_height_physical = 15.0   
+        self.well_diameter_physical = 5.0  # physical well diameter
+        self.well_height_physical = 15.0   # physical well height
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         margin = 10
+
+        # Left half: Top View.
         area_width = (self.width() // 2) - 2 * margin
         area_height = self.height() - 2 * margin
         well_center = QPointF(margin + area_width/2, margin + area_height/2)
@@ -1492,6 +1450,7 @@ class WellPreviewWidget(QWidget):
                 for i in range(len(mapped_points)-1):
                     painter.drawLine(mapped_points[i], mapped_points[i+1])
 
+        # Right half: Side View.
         side_rect = QRectF(self.width()//2 + margin, margin,
                            (self.width()//2) - 2 * margin, self.height() - 2 * margin)
         painter.setPen(QPen(Qt.black, 2))
@@ -1567,12 +1526,13 @@ class WellPreviewWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self.dragging = None
 
+# --- Isometric Preview Widget (click-and-drag rotation with fixed rosette overlay) ---
 class IsometricPreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.print_file = None
-        self.yaw = 0       
-        self.pitch = 1.0   
+        self.yaw = 0       # rotation about Z axis (degrees)
+        self.pitch = 1.0   # pitch factor for z projection
         self.rotating = False
         self.initial_pos = QPointF(0, 0)
         self.initial_yaw = 0
@@ -1591,6 +1551,7 @@ class IsometricPreviewWidget(QWidget):
             dy = pos.y() - self.initial_pos.y()
             self.yaw = self.initial_yaw + dx * 1.0
             self.pitch = self.initial_pitch + dy * 0.02
+            # No clamping now.
             self.update()
 
     def mouseReleaseEvent(self, event):
@@ -1602,6 +1563,7 @@ class IsometricPreviewWidget(QWidget):
         if not self.print_file or not self.print_file.waypoints:
             painter.drawText(self.rect(), Qt.AlignCenter, "No Waypoints")
             return
+        # Draw isometric scene.
         painter.save()
         center = self.rect().center()
         painter.translate(center)
@@ -1616,8 +1578,11 @@ class IsometricPreviewWidget(QWidget):
         for i in range(len(iso_points)-1):
             painter.drawLine(iso_points[i], iso_points[i+1])
         painter.restore()
+        # Draw rosette overlay as a picture-in-picture.
+        # Anchor it in the bottom 1/8th of the widget.
         rosette_center = QPointF(self.width()/8, self.height() - self.height()/8)
-        rosette_length = self.height()/16  
+        rosette_length = self.height()/16  # make it a bit larger
+        # Compute rosette axes based on current yaw and pitch.
         angle_rad = math.radians(self.yaw)
         x_axis = QPointF(math.cos(angle_rad), math.sin(angle_rad))
         y_axis = QPointF(-math.sin(angle_rad), math.cos(angle_rad))
@@ -1635,17 +1600,18 @@ class IsometricPreviewWidget(QWidget):
         painter.drawLine(rosette_center, z_end)
         painter.drawText(z_end + QPointF(2,-2), "Z")
 
+# --- Model class for a print file ---
 class PrintFile:
     def __init__(self, name="", color="#FF0000", csv_file="waypoint.csv"):
-        self.uid = str(uuid.uuid4())  
+        self.uid = str(uuid.uuid4())  # Unique identifier
         self.name = name
         self.color = color
         self.csv_file = csv_file
-        self.bbox_offset = QPointF(0, 0)    
-        self.floor_offset = None            
-        self.waypoints = []                 
-        self.bbox_size = QSizeF(50, 50)     
-        self.offset = (0, 0, 0)             
+        self.bbox_offset = QPointF(0, 0)    # Top-view offset (relative to well center)
+        self.floor_offset = None            # Side-view floor line position (in pixels)
+        self.waypoints = []                 # Loaded from CSV (assumed normalized [0,1])
+        self.bbox_size = QSizeF(50, 50)     # Computed later from CSV x,y range
+        self.offset = (0, 0, 0)             # Offset for this print file
 
     def set_offset_xy(self, offset):
         self.offset = (offset[0], offset[1], self.offset[2])
@@ -1707,6 +1673,7 @@ class InkWellLocationValidator(QValidator):
 ###################################  Testing   #############################################################
 ############################################################################################################
 
+# ----- Dummy Classes for Testing -----
 class DummyPrintManager:
     def __init__(self):
         self.well_properties = {
@@ -1721,6 +1688,13 @@ class DummyPrintManager:
         self.ink_wells = {}
 
     def queue_a_waypoint(self, well_id, offset, csv_file, **kwargs):
+        """
+        Add a new waypoint to the well queue.
+        Parameters:
+            well_id (str): Identifier for the well.
+            target (tuple): (target_x, target_y, target_z)
+            csv_file (str): Path to the CSV file for this waypoint.
+        """
         wp_obj = Waypoint(csv_file)
         wp_obj.well_id = well_id
         wp_obj.offset = offset
@@ -1728,7 +1702,7 @@ class DummyPrintManager:
         self.well_queue.append(entry)
         print(f"Queued waypoint for well '{well_id}' with target {offset}.")
 
-class Waypoint:
+class Waypoint: # this object loads in a waypoint file and interpolates between waypoints in time
     def __init__(self, csv_file_path='waypoints.csv'):
         self.csv_file_path = csv_file_path
         self.waypoints = []
@@ -1740,11 +1714,13 @@ class Waypoint:
         self.offset = offset
     
     def import_waypoints_from_csv(self):
+        """Import waypoints from a CSV file."""
         self.waypoints = []
         try:
             with open(self.csv_file_path, mode='r') as file:
                 csv_reader = csv.reader(file)
                 for row in csv_reader:
+                    # Skip header row
                     if row[0].startswith('x'):
                         continue
                     elif len(row) == 7:
@@ -1767,6 +1743,8 @@ class Waypoint:
             print(f"Error reading CSV file: {e}")
         return self.waypoints
 
+
+# ----- Main Execution -----
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     dummy_pm = DummyPrintManager()

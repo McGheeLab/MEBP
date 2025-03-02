@@ -39,7 +39,7 @@ class PrintManager:
 
         # dict of well properties
         self.well_properties = {"fastz": 0, "floorz": 0, "topz": 0, "ink_topz":0, "ink_floorz":0 , "Well_A1_x": 0, "Well_A1_y": 0,
-                                "well_dx": 0, "well_dy": 0, "well_rows": 0, "well_cols": 0, "well_diameter": 0}
+                                "well_dx": 0, "well_dy": 0, "well_rows": 0, "well_cols": 0, "well_diameter": 0, "plate_mode": "Well Plate"}
         
         # Initialize ink wells as a dictionary of InkWell objects.
         self.ink_wells = {}
