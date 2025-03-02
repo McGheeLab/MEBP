@@ -7,6 +7,38 @@ import pygame
 import time
 import json
 
+class XboxPoller(QObject):
+    def __init__(self, queue, processor, parent=None):
+        super().__init__(parent)
+        self.queue = queue
+        self.processor = processor
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+    
+    def start(self):
+        # Start polling every 50ms.
+        self.timer.start(50)
+    
+    def stop(self):
+        self.timer.stop()
+    
+    def poll(self):
+        while not self.queue.empty():
+            msg = self.queue.get()
+            # Process debug messages.
+            if "debug" in msg:
+                self.processor.add_command("debug", message=msg["debug"])
+            # Process button messages.
+            elif "button" in msg:
+                self.processor.add_command(msg["command"], button=msg["button"])
+            # Process axis messages.
+            elif "axis" in msg:
+                self.processor.add_command(msg["command"], axis=msg["axis"], average=msg["average"])
+            # Process DPad messages.
+            elif "dpad" in msg:
+                self.processor.add_command(msg["command"], direction=msg["dpad"])
+
+
 def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_interval=0.5, deadzone=0.2):
     # Initialize Pygame and its joystick module
     pygame.init()

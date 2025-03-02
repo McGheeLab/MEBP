@@ -60,6 +60,17 @@ class PrintManager:
         self.processor.register_handler("get_waypoints", self.handle_get_waypoints)
         self.processor.register_handler("control_print", self.handle_control_print)
 
+    def set_well_properties(self, well_properties):
+        """Set the well properties for the plate."""
+        print("Well properties updated from:", self.well_properties)
+        self.well_properties.update(well_properties)
+        print("Well properties updated to:", self.well_properties)
+    
+    def set_ink_wells(self, ink_wells):
+        """Set the ink wells for the plate."""
+        self.ink_wells = ink_wells
+        print("Ink wells updated to:", self.ink_wells)
+        
     def calculate_velocity_with_pid(self, error_x, error_y, delta_time):
         """Calculate XY velocity using a PID controller."""
         # Proportional term

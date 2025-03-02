@@ -9,20 +9,6 @@ from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Sign
 
 from SupportClasses.Printer import InkWell, Syringe
 
-
-def get_contrast_text_color(bg_color: str) -> str:
-    """
-    Returns either black (#000000) or white (#FFFFFF) depending on whether the background color
-    is light or dark based on its perceived luminance.
-    """
-    color = QColor(bg_color)
-    # Calculate luminance using standard coefficients.
-    r, g, b = color.red(), color.green(), color.blue()
-    luminance = 0.299 * r + 0.587 * g + 0.114 * b
-    # If luminance is high, use black text; if low, use white text.
-    return "#000000" if luminance > 128 else "#FFFFFF"
-
-
 ############################################################################################################
 #####################################  Main tab window  ####################################################
 ############################################################################################################
@@ -330,40 +316,7 @@ class PlateLayoutWidget(QWidget):
             event.acceptProposedAction()
             return
 
-        # Handle inkwell drag-drop.
-        if parts[0] == "inkwell":
-            if len(parts) < 3:
-                event.ignore()
-                return
-            try:
-                index = int(parts[1])
-            except ValueError:
-                event.ignore()
-                return
-            inkwell_widgets = self.main_widget.ink_tab.ink_well_widgets
-            if index >= len(inkwell_widgets):
-                event.ignore()
-                return
-            inkwell = inkwell_widgets[index]
-            # Prevent adding if an inkwell is already assigned in this well.
-            if (well_loc in self.associations and 
-                any(key.startswith("InkWell") for key in self.associations[well_loc])):
-                event.ignore()
-                return
-            if well_loc not in self.associations:
-                self.associations[well_loc] = {}
-            self.associations[well_loc][f"InkWell_{index}"] = {
-                "color": inkwell["color"].text().strip(),
-                "name": inkwell["cell_type"].text().strip()
-            }
-            # *** New: Update the inkwell widget’s location field ***
-            inkwell["location"].setText(well_loc)
-            self.associationsChanged.emit()
-            self.update()
-            event.acceptProposedAction()
-            return
-
-        # Otherwise, assume addition for file drag-drop.
+        # Otherwise, assume addition. Expected MIME format: "file;{uid};{file_path};{file_color};{file_name}"
         if parts[0] == "file":
             if len(parts) < 5:
                 event.ignore()
@@ -372,14 +325,17 @@ class PlateLayoutWidget(QWidget):
             file_path = parts[2]
             file_color = parts[3]
             file_name = parts[4]
+            # Prevent adding if an inkwell is already assigned in this well.
             if (well_loc in self.associations and 
                 any(key.startswith("InkWell") for key in self.associations[well_loc])):
                 event.ignore()
                 return
+            # Determine target wells: either multi-selected or just this well.
             targets = self.selected_wells if self.selected_wells else {well_loc}
             for target in targets:
                 if target not in self.associations:
                     self.associations[target] = {}
+                # Use the unique id (uid) as key.
                 if uid not in self.associations[target]:
                     self.associations[target][uid] = {"color": file_color, "name": file_name}
             self.selected_wells.clear()
@@ -388,7 +344,6 @@ class PlateLayoutWidget(QWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
-
 
     def update_layout(self):
         self.update()
@@ -543,7 +498,6 @@ class InkPropertiesTab(QWidget):
         on_change_callback: a callback to notify when values change.
         """
         super().__init__(parent)
-        self.main_widget = main_widget
         self.well_properties_tab = main_widget.well_tab
         self.on_change_callback = on_change_callback
         self.ink_well_widgets = []
@@ -568,113 +522,62 @@ class InkPropertiesTab(QWidget):
     def add_ink_well_widget(self):
         group_box = QGroupBox(f"Ink Well {len(self.ink_well_widgets) + 1}")
         layout = QFormLayout(group_box)
-        
-        # Create the location field with a validator.
         location_edit = QLineEdit()
-        validator = InkWellLocationValidator(
-            self.well_properties_tab.well_rows_input.value(),
-            self.well_properties_tab.well_cols_input.value()
-        )
+        # Create a validator using the well_rows and well_cols from the well_properties_tab.
+        validator = InkWellLocationValidator(self.well_properties_tab.well_rows_input.value(),
+                                              self.well_properties_tab.well_cols_input.value())
         location_edit.setValidator(validator)
         location_edit.textChanged.connect(self.on_change_callback)
-        # Use editingFinished so update fires when editing is complete.
-        location_edit.editingFinished.connect(lambda idx=len(self.ink_well_widgets), le=location_edit:
-                                                self.update_plate_layout_for_inkwell(idx, le.text()))
         layout.addRow("Location:", location_edit)
-        
-        # Create the cell type (name) field.
+
         cell_type_edit = QLineEdit("DefaultCell")
         cell_type_edit.textChanged.connect(self.on_change_callback)
-        # *** NEW: When the cell type changes, update the plate layout.
-        cell_type_edit.editingFinished.connect(lambda idx=len(self.ink_well_widgets), ct=cell_type_edit, le=location_edit:
-                                                self.update_plate_layout_for_inkwell(idx, le.text()))
         layout.addRow("Cell Type:", cell_type_edit)
-        
+
+        chilled_check = QGroupBox()  # Or use QCheckBox
+        chilled_checkbox = QGroupBox("Chilled")  # For clarity, you can also use QCheckBox instead.
+        # Here, we use QCheckBox:
         chilled_checkbox = QPushButton("Chilled")
         chilled_checkbox.setCheckable(True)
         chilled_checkbox.setChecked(True)
         layout.addRow("Chilled:", chilled_checkbox)
-        
+
         volume_spin = QDoubleSpinBox()
         volume_spin.setValue(0)
         volume_spin.valueChanged.connect(self.on_change_callback)
         layout.addRow("Volume:", volume_spin)
+
+        #color_edit = QLineEdit("#868eff")
+        #color_edit.textChanged.connect(self.on_change_callback)
+        #layout.addRow("Color:", color_edit)
         
+        # use a QPushButton with a color picker.
         color_btn = QPushButton()
         default_color = "#868eff"
         color_btn.setText(default_color)
         color_btn.setStyleSheet(f"background-color: {default_color}")
-        # Color changes are handled in pick_color below.
         color_btn.clicked.connect(lambda: self.pick_color(color_btn))
         layout.addRow("Color:", color_btn)
-        
+            
         del_btn = QPushButton("Delete")
         del_btn.clicked.connect(lambda: self.remove_ink_well_widget(group_box))
         layout.addRow(del_btn)
         
-        # Enable drag for moving the inkwell.
+        # Enable drag for moving the ink well
         group_box.setMouseTracking(True)
         group_box.mousePressEvent = lambda event, idx=len(self.ink_well_widgets): self.start_drag_inkwell(event, idx)
-        
-        # Store the index in the inkwell widget for later reference.
+    
         ink_widget = {
             "group": group_box,
             "location": location_edit,
             "cell_type": cell_type_edit,
             "chilled": chilled_checkbox,
             "volume": volume_spin,
-            "color": color_btn,
-            "index": len(self.ink_well_widgets)
+            "color": color_btn
         }
         self.ink_well_widgets.append(ink_widget)
         self.ink_well_layout.addWidget(group_box)
         self.on_change_callback()
-
-    def update_plate_layout_for_inkwell(self, index, new_location):
-        try:
-            inkwell = self.ink_well_widgets[index]
-        except IndexError:
-            return
-
-        plate_widget = self.main_widget.plate_layout_tab.plate_layout_widget
-
-        # Validate the new location using the QLineEdit's validator.
-        validator = inkwell["location"].validator()
-        state, _, _ = validator.validate(new_location, 0)
-        if state != QValidator.Acceptable:
-            # Remove any existing assignment if invalid.
-            for well in list(plate_widget.associations.keys()):
-                if f"InkWell_{index}" in plate_widget.associations[well]:
-                    del plate_widget.associations[well][f"InkWell_{index}"]
-                    if not plate_widget.associations[well]:
-                        del plate_widget.associations[well]
-            plate_widget.associationsChanged.emit()
-            plate_widget.update()
-            return
-
-        current_color = inkwell["color"].text().strip()
-        cell_type = inkwell["cell_type"].text().strip()
-
-        # Remove previous assignment if location has changed.
-        old_well = None
-        for well, assignments in plate_widget.associations.items():
-            if f"InkWell_{index}" in assignments:
-                old_well = well
-                break
-        if old_well and old_well != new_location:
-            del plate_widget.associations[old_well][f"InkWell_{index}"]
-            if not plate_widget.associations[old_well]:
-                del plate_widget.associations[old_well]
-
-        # Add or update the assignment at the new location.
-        if new_location not in plate_widget.associations:
-            plate_widget.associations[new_location] = {}
-        plate_widget.associations[new_location][f"InkWell_{index}"] = {
-            "color": current_color,
-            "name": cell_type
-        }
-        plate_widget.associationsChanged.emit()
-        plate_widget.update()
 
     def pick_color(self, button):
         color = QColorDialog.getColor(QColor(button.text()), self, "Pick Ink Well Color")
@@ -683,14 +586,7 @@ class InkPropertiesTab(QWidget):
             button.setText(new_color)
             button.setStyleSheet(f"background-color: {new_color}")
             self.on_change_callback()
-            # Find the inkwell using this button and update its assignment.
-            for idx, widget in enumerate(self.ink_well_widgets):
-                if widget["color"] == button:
-                    loc = widget["location"].text().strip()
-                    if loc:
-                        self.update_plate_layout_for_inkwell(idx, loc)
-                    break
-
+    
     def remove_ink_well_widget(self, widget):
         for ink_widget in self.ink_well_widgets:
             if ink_widget["group"] == widget:
@@ -732,43 +628,28 @@ class InkPropertiesTab(QWidget):
         drag.exec(Qt.MoveAction)
    
     def validate(self):
-        # Require at least one ink well.
-        if not self.ink_well_widgets:
-            return False, "At least one ink well must be defined."
-            
         seen = {}
         for i, widget in enumerate(self.ink_well_widgets, start=1):
             loc = widget["location"].text().strip().upper()
-            if not loc:
-                return False, f"Ink well {i} must have a location."
-            if loc in seen:
-                return False, f"Ink well {i} duplicates assignment from ink well {seen[loc]}."
-            seen[loc] = i
-            
-            # Validate the location with the provided validator.
-            state, _, _ = widget["location"].validator().validate(widget["location"].text(), 0)
+            if loc:
+                if loc in seen:
+                    return False, f"Ink well {i} duplicates assignment from Ink well {seen[loc]}."
+                seen[loc] = i
+            text = widget["location"].text()
+            validator = widget["location"].validator()
+            state, _, _ = validator.validate(text, 0)
             if state != QValidator.Acceptable:
                 return False, f"Ink well {i} location is invalid."
-            
-            # Check that a name (using cell_type field) is provided.
             if not widget["cell_type"].text().strip():
-                return False, f"Ink well {i} must have a name (cell type) defined."
-            
-            # Check that the volume is greater than zero.
-            if widget["volume"].value() <= 0:
-                return False, f"Ink well {i} must have a volume greater than zero."
-            
+                return False, f"Ink well {i} cell type must not be empty."
             if not widget["color"].text().strip():
                 return False, f"Ink well {i} must have a color code."
-                
         return True, ""
 
-    
 # --- Syringe Properties Tab as a Separate Class ---
 class SyringePropertiesTab(QWidget):
     def __init__(self, main_widget, on_change_callback, parent=None):
         super().__init__(parent)
-        self.main_widget = main_widget
         self.print_manager = main_widget.print_manager
         self.standard_syringe_types = {}  # will be loaded from "Syringes.json"
         self.load_standard_syringe_types_from_file(file_path="Syringes.json")
@@ -809,7 +690,6 @@ class SyringePropertiesTab(QWidget):
             group_layout.addRow("Length:", length_spin)
             cell_type_combo = QComboBox()
             self.update_syringe_cell_type_options_for(pump, cell_type_combo)
-            cell_type_combo.currentIndexChanged.connect(lambda idx, p=pump, combo=cell_type_combo: self.update_cell_type_color(p, combo))
             cell_type_combo.currentIndexChanged.connect(self.on_change_callback)
             group_layout.addRow("Cell Type:", cell_type_combo)
             self.syringe_inputs[pump] = {
@@ -822,14 +702,14 @@ class SyringePropertiesTab(QWidget):
         layout.addLayout(self.syringe_form)
 
     def update_syringe_cell_type_options_for(self, pump, combo_box):
-        # Collect valid cell types and map them to colors.
+        # Here you might want to collect valid cell types from ink properties or elsewhere.
         valid_types = {"None"}
-        cell_type_to_color = {"None": ""}
-        for ink_widget in self.main_widget.ink_tab.ink_well_widgets:
-            ct = ink_widget["cell_type"].text().strip()
-            if ct:
-                valid_types.add(ct)
-                cell_type_to_color[ct] = ink_widget["color"].text().strip()
+        # For example, if ink wells exist:
+        for ink in self.print_manager.ink_wells.values():
+            if hasattr(ink, "cell_type"):
+                ct = ink.cell_type
+                if ct and ct.strip():
+                    valid_types.add(ct.strip())
         items = sorted(valid_types)
         current = combo_box.currentText().strip()
         combo_box.clear()
@@ -841,23 +721,6 @@ class SyringePropertiesTab(QWidget):
             if index < 0:
                 index = 0
         combo_box.setCurrentIndex(index)
-        
-        # Update the combo box background based on the selected ink color.
-        selected = combo_box.currentText().strip()
-        color = cell_type_to_color.get(selected, "")
-        if color:
-            combo_box.setStyleSheet(f"background-color: {color}")
-        else:
-            combo_box.setStyleSheet("")
-        
-    def update_cell_type_color(self, pump, combo_box):
-        # Helper method to update the combo box color when selection changes.
-        selected = combo_box.currentText().strip()
-        for ink_widget in self.ink_tab.ink_well_widgets:
-            if ink_widget["cell_type"].text().strip() == selected:
-                combo_box.setStyleSheet(f"background-color: {ink_widget['color'].text().strip()}")
-                return
-        combo_box.setStyleSheet("")
 
     def update_all_cell_type_options(self):
         self.current_inks = {"None"}
@@ -1106,7 +969,6 @@ class PrintSetupTab(QWidget):
                 self.print_files.append(pf)
                 item = QListWidgetItem(pf.name)
                 item.setBackground(QColor(pf.color))
-                item.setForeground(QColor(get_contrast_text_color(pf.color)))
                 self.list_widget.addItem(item)
             self.list_widget.setCurrentRow(0)
             # Notify that the print files list has changed.
@@ -1122,7 +984,6 @@ class PrintSetupTab(QWidget):
             self.print_files.append(pf)
             item = QListWidgetItem(pf.name)
             item.setBackground(QColor(pf.color))
-            item.setForeground(QColor(get_contrast_text_color(pf.color)))
             self.list_widget.addItem(item)
             self.list_widget.setCurrentRow(len(self.print_files)-1)
             self.printFilesChanged.emit()
@@ -1176,7 +1037,6 @@ class PrintSetupTab(QWidget):
         self.well_preview.update()
         self.iso_preview.update()
         self.list_widget.item(index).setBackground(QColor(self.current_print.color))
-        self.list_widget.item(index).setForeground(QColor(get_contrast_text_color(self.current_print.color)))
 
     def update_current_print(self):
         if self.current_print:
@@ -1185,14 +1045,6 @@ class PrintSetupTab(QWidget):
             cur_row = self.list_widget.currentRow()
             if cur_row >= 0:
                 self.list_widget.item(cur_row).setText(new_name)
-            # Update the plate layout associations
-            plate_layout = self.main_widget.plate_layout_tab.plate_layout_widget
-            for well, assignments in plate_layout.associations.items():
-                if self.current_print.uid in assignments:
-                    assignments[self.current_print.uid]["name"] = new_name
-            # Emit signal and refresh view
-            plate_layout.associationsChanged.emit()
-            plate_layout.update()
             self.printFilesChanged.emit()
 
     def pick_color(self):
@@ -1205,14 +1057,7 @@ class PrintSetupTab(QWidget):
                 cur_row = self.list_widget.currentRow()
                 if cur_row >= 0:
                     self.list_widget.item(cur_row).setBackground(QColor(self.current_color))
-                # Update the plate layout associations with the new color.
-                plate_layout = self.main_widget.plate_layout_tab.plate_layout_widget
-                for well, assignments in plate_layout.associations.items():
-                    if self.current_print.uid in assignments:
-                        assignments[self.current_print.uid]["color"] = self.current_print.color
-                plate_layout.associationsChanged.emit()
-                plate_layout.update()
-            self.printFilesChanged.emit()
+                self.printFilesChanged.emit()
 
     def load_csv(self):
         file, _ = QFileDialog.getOpenFileName(self, "Select CSV File", "", "CSV Files (*.csv)")
@@ -1323,29 +1168,19 @@ class PlateLayoutTab(QWidget):
         for pf in self.main_widget.print_setup_tab.get_print_files():
             item = QListWidgetItem(pf.name)
             item.setBackground(QColor(pf.color))
-            item.setForeground(QColor(get_contrast_text_color(pf.color)))
             # Store a tuple containing (uid, csv_file, color, name)
             item.setData(Qt.UserRole, (pf.uid, pf.csv_file, pf.color, pf.name))
             self.printfile_list.addItem(item)
 
     def refresh_running_list(self):
         self.running_list.clear()
-        print_files = self.main_widget.print_setup_tab.get_print_files()
-        pf_dict = {pf.uid: pf for pf in print_files}
         for well, assignments in self.plate_layout_widget.associations.items():
             for uid, info in assignments.items():
-                # Use updated print file properties if available.
-                if uid in pf_dict:
-                    name = pf_dict[uid].name
-                    color = pf_dict[uid].color
-                else:
-                    name = info.get("name", uid)
-                    color = info.get("color", "#FFFFFF")
-                item_text = f"{well}: {name}"
+                item_text = f"{well}: {info.get('name', uid)}"
                 item = QListWidgetItem(item_text)
-                item.setBackground(QColor(color))
+                item.setBackground(QColor(info["color"]))
                 self.running_list.addItem(item)
-        
+
     def get_assigned_printfiles(self):
         """
         Returns a list of dictionaries, each containing:

@@ -25,6 +25,7 @@ import ctypes
 # ///////////////////////////////////////////////////////////////
 from SupportClasses.ProcessCommand import AppController
 from SupportClasses.Printer import PrintManager
+from SupportClasses.XboxControl import XboxPoller
 
 # IMPORT all of the settings, windows, and widgets
 # ///////////////////////////////////////////////////////////////
@@ -32,7 +33,6 @@ from qt_core import *
 from gui.core.json_settings import Settings
 from gui.uis.windows.main_window import *
 from gui.widgets import *
-
 
 # AUTO ADJUST DPI
 # ///////////////////////////////////////////////////////////////
@@ -49,7 +49,7 @@ if sys.platform.startswith("win"):
 else:
     scale = 1.0
 
-os.environ["QT_FONT_DPI"] = "96"
+os.environ["QT_FONT_DPI"] = "75"
 if scale > 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(scale)
 
@@ -262,38 +262,6 @@ class MainWindow(QMainWindow):
     def mousePressEvent(self, event):
         # SET DRAG POS WINDOW
         self.dragPos = event.globalPos()
-
-
-class XboxPoller(QObject):
-    def __init__(self, queue, processor, parent=None):
-        super().__init__(parent)
-        self.queue = queue
-        self.processor = processor
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll)
-    
-    def start(self):
-        # Start polling every 50ms.
-        self.timer.start(50)
-    
-    def stop(self):
-        self.timer.stop()
-    
-    def poll(self):
-        while not self.queue.empty():
-            msg = self.queue.get()
-            # Process debug messages.
-            if "debug" in msg:
-                self.processor.add_command("debug", message=msg["debug"])
-            # Process button messages.
-            elif "button" in msg:
-                self.processor.add_command(msg["command"], button=msg["button"])
-            # Process axis messages.
-            elif "axis" in msg:
-                self.processor.add_command(msg["command"], axis=msg["axis"], average=msg["average"])
-            # Process DPad messages.
-            elif "dpad" in msg:
-                self.processor.add_command(msg["command"], direction=msg["dpad"])
 
 # SETTINGS WHEN TO START
 # Set the initial class and also additional parameters of the "QApplication" class

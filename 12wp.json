@@ -1,0 +1,14 @@
+{
+    "fastz": 10.0,
+    "floorz": 5.0,
+    "topz": 20.0,
+    "ink_topz": 15.0,
+    "ink_floorz": 3.0,
+    "Well_A1_x": 99.99,
+    "Well_A1_y": 99.99,
+    "well_dx": 10.0,
+    "well_dy": 10.0,
+    "well_rows": 4,
+    "well_cols": 6,
+    "well_diameter": 5.0
+}
