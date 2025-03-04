@@ -87,10 +87,16 @@ class StageHandler:
         self.ZUPDATE_INTERVAL = 0.5
         self.POS_UPDATE_INTERVAL = 0.5623  # Polling interval for updating positions
 
+        self.z_fast_mode_velocity = 1000 # mm/min
+        self.z_slow_mode_velocity = 100 # mm/min
+        self.xy_fast_mode_velocity = 1000 # mm/min
+        self.p_load_velocity = 100 # mm/min
+        
         self.processor = processor
         self.zp_stage = zp_stage
         self.xy_stage = xy_stage
         self._running = True
+        
         # Stages are off by default.
         self._zp_running = False
         self._xy_running = False
@@ -172,6 +178,14 @@ class StageHandler:
         # calculate the distance to move from the zero position and the x_value and y_value given
         x_position = x_value - self.zero_position["x"]
         y_position = y_value - self.zero_position["y"]
+        
+        # move the stage to the new position
+        self.xy_stage.move_stage_to_position(x_position, y_position, fast=fastmode)
+    
+    def move_abs_xy_well_reference(self, x_value, y_value, fastmode=False):
+        # calculate the distance to move from the zero position and the x_value and y_value given
+        x_position = x_value
+        y_position = y_value
         
         # move the stage to the new position
         self.xy_stage.move_stage_to_position(x_position, y_position, fast=fastmode)
@@ -318,7 +332,7 @@ class StageHandler:
         feedrate = (distance / dt) * 60
         axes = {'X': dz, 'Y': dp1, 'Z': dp2, 'E': dp3} # Mapping to contoller axes
         print(f"axes {axes} at feedrate {feedrate}")
-        self.zp_stage.movecommand(axes, feedrate)
+        self.zp_stage.move_relative(axes, feedrate)
 
     # ----- Position Polling and State Update -----
     def _update_positions_loop(self):

@@ -43,7 +43,12 @@ class Ui_MainPages(object):
         self.page_3_layout = QVBoxLayout(self.page_3)
         self.page_3_layout.setObjectName(u"page_3_layout")
         self.pages.addWidget(self.page_3)
-
+        self.page_4 = QWidget()
+        self.page_4.setObjectName(u"Print Setup")
+        self.page_4.setStyleSheet(u"font-size: 14pt;")
+        self.page_4_layout = QVBoxLayout(self.page_4)
+        self.page_4_layout.setObjectName(u"page_4_layout")
+        self.pages.addWidget(self.page_4)
         self.main_pages_layout.addWidget(self.pages)
 
 

@@ -1,4 +1,4 @@
-import sys, json, os, random, csv, math, uuid
+import sys, json, os, random, csv, math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QSplitter, QStyle, QStyleOptionViewItem,
     QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel, QStyledItemDelegate,
@@ -7,7 +7,17 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPainter, QColor, QRegularExpressionValidator, QValidator, QDrag, QPen
 from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Signal, QSignalBlocker, QEvent
 
-from SupportClasses.Printer import InkWell, Syringe
+from SupportClasses.Printer import InkWell, Syringe, PrintFile
+
+############################################################################################################
+# improvements to make
+# 1. the views of the waypoint files dont seem to reflect reality still the spiral.csv looks bigger than it is
+# 2. the isoview should resize the view to fit the print
+# 3. if we select multiple printfiles in the printsetup tab we want to see all the bounding boxes in the view colored to the printfile color
+# 4. multiple printfiles should be draggable to the plate layout tab simultaneouly
+# 5. the platelayout representation of the print should be taken directly from the printmanager so that if printfiles are deleted 
+#    somewhere else it is reflected in the view 
+
 
 def get_contrast_text_color(bg_color: str) -> str:
     """
@@ -89,18 +99,78 @@ class PrintSettingsWidget(QWidget):
         return overall_valid, well_msg or ink_msg or syringe_msg or setup_msg
 
     def load_all_settings(self):
-        # Implement loading of all settings by delegating to each tab.
-        self.well_tab.load_properties()
-        # You would also load ink wells and syringe settings here.
-        QMessageBox.information(self, "Load All", "All settings loaded successfully.")
-        self.update_tab_validity()
-
+        filename, _ = QFileDialog.getOpenFileName(self, "Load All Settings", "", "JSON Files (*.json)")
+        if filename:
+            try:
+                with open(filename, "r") as f:
+                    data = json.load(f)
+                # --- Load well plate properties ---
+                wp = data.get("well_properties", {})
+                self.well_tab.fastz_input.setValue(float(wp.get("fastz", 0)))
+                self.well_tab.floorz_input.setValue(float(wp.get("floorz", 0)))
+                self.well_tab.topz_input.setValue(float(wp.get("topz", 0)))
+                self.well_tab.ink_topz_input.setValue(float(wp.get("ink_topz", 0)))
+                self.well_tab.ink_floorz_input.setValue(float(wp.get("ink_floorz", 0)))
+                self.well_tab.well_A1_x_input.setValue(float(wp.get("Well_A1_x", 0)))
+                self.well_tab.well_A1_y_input.setValue(float(wp.get("Well_A1_y", 0)))
+                self.well_tab.well_dx_input.setValue(float(wp.get("well_dx", 0)))
+                self.well_tab.well_dy_input.setValue(float(wp.get("well_dy", 0)))
+                self.well_tab.well_rows_input.setValue(int(wp.get("well_rows", 0)))
+                self.well_tab.well_cols_input.setValue(int(wp.get("well_cols", 0)))
+                self.well_tab.well_diameter_input.setValue(float(wp.get("well_diameter", 0)))
+                plate_mode = wp.get("plate_mode", "Well Plate")
+                index = self.well_tab.plate_type_combo.findText(plate_mode)
+                if index >= 0:
+                    self.well_tab.plate_type_combo.setCurrentIndex(index)
+                
+                # --- Load ink well settings ---
+                inkwells = data.get("ink_wells", {})
+                # Clear existing ink well widgets
+                for widget in self.ink_tab.ink_well_widgets:
+                    widget["group"].setParent(None)
+                    widget["group"].deleteLater()
+                self.ink_tab.ink_well_widgets.clear()
+                # For each saved ink well (assumed keys like "ink_1", "ink_2", etc.)
+                for key in sorted(inkwells.keys()):
+                    inkwell_data = inkwells[key]
+                    self.ink_tab.add_ink_well_widget()
+                    widget = self.ink_tab.ink_well_widgets[-1]
+                    widget["location"].setText(inkwell_data.get("location", ""))
+                    widget["cell_type"].setText(inkwell_data.get("cell_type", ""))
+                    widget["chilled"].setChecked(inkwell_data.get("chilled", True))
+                    widget["volume"].setValue(float(inkwell_data.get("volume", 0)))
+                    color = inkwell_data.get("color", "#868eff")
+                    widget["color"].setText(color)
+                    widget["color"].setStyleSheet(f"background-color: {color}")
+                    # Update the InkWell object accordingly
+                    widget["inkwell"].set_location(inkwell_data.get("location", ""))
+                    widget["inkwell"].set_cell_type(inkwell_data.get("cell_type", ""))
+                    widget["inkwell"].set_chilled(inkwell_data.get("chilled", True))
+                    widget["inkwell"].set_volume(float(inkwell_data.get("volume", 0)))
+                    widget["inkwell"].set_color(color)
+                
+                # --- Load syringe settings ---
+                syringes = data.get("syringes", {})
+                for pump in ["p1", "p2", "p3"]:
+                    if pump in syringes:
+                        pump_data = syringes[pump]
+                        self.syringe_tab.syringe_inputs[pump]["diameter"].setValue(float(pump_data.get("diameter", 0)))
+                        self.syringe_tab.syringe_inputs[pump]["length"].setValue(float(pump_data.get("length", 0)))
+                        self.syringe_tab.syringe_inputs[pump]["cell_type"].setCurrentText(pump_data.get("cell_type", "None"))
+                        self.syringe_tab.syringe_inputs[pump]["std_type"].setCurrentText(pump_data.get("standard_type", "None"))
+                
+                QMessageBox.information(self, "Load All", "All settings loaded successfully.")
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", f"Error loading all settings: {e}")
+            self.update_tab_validity()
+    
     def save_all_settings(self):
-        # Collect data from each tab and save to a file.
-        data = {}
-        data["well_properties"] = self.well_tab.get_properties()
-        data["ink_wells"] = self.ink_tab.get_ink_wells()
-        data["syringes"] = self.syringe_tab.get_syringe_data()
+        # Only collect well plate, ink well, and syringe information.
+        data = {
+            "well_properties": self.well_tab.get_properties(),
+            "ink_wells": self.ink_tab.get_ink_wells_json(),
+            "syringes": self.syringe_tab.get_syringe_data()
+        }
         filename, _ = QFileDialog.getSaveFileName(self, "Save All Settings", "", "JSON Files (*.json)")
         if filename:
             try:
@@ -110,7 +180,6 @@ class PrintSettingsWidget(QWidget):
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", f"Error saving all settings: {e}")
 
-    # **** PROBLEM WITH PUSHING PRINTFILES TO QUEUE ****
     def apply_settings(self):
         valid, msg = self.update_tab_validity()
         if not valid:
@@ -119,7 +188,7 @@ class PrintSettingsWidget(QWidget):
 
         # Update well properties.
         wp = self.well_tab.get_properties()
-        self.print_manager.set_well_properties(wp)
+        self.print_manager.well_properties.update(wp)
 
         # Update syringe properties.
         syr_data = self.syringe_tab.get_syringe_data()
@@ -129,19 +198,17 @@ class PrintSettingsWidget(QWidget):
 
         # Update ink wells.
         ink_data = self.ink_tab.get_ink_wells()
-        self.print_manager.set_ink_wells(ink_data)
+        self.print_manager.ink_wells.update(ink_data)
 
         # get the print setup data which is a dict of well location and printfile object
         pf = self.plate_layout_tab.get_assigned_printfiles()
-        
         # go through pf and queue the printfiles in the printmanager.queue_a_waypoint(self, well_id, offset, csv_file, **kwargs):
         # the printfile object has the csv file path, color, and offset
         # there could be multiple printfiles for a single pf.tiem
-        
-        # ****** Does not work *******
+        self.print_manager.well_queue.clear()
         for well_id, printfiles in pf.items():
             for printfile in printfiles:
-                self.print_manager.queue_a_waypoint(well_id, printfile.offset, printfile.csv_file)
+                self.print_manager.queue_a_printfile(well_id, printfile)
         
             
 ############################################################################################################
@@ -477,6 +544,8 @@ class PlateLayoutWidget(QWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+            
+        self.main_widget.apply_settings()
 
     def update_layout(self):
         self.update()
@@ -632,7 +701,6 @@ class WellPropertiesTab(QWidget):
             return False, "Well Rows and Well Cols must be greater than 0."
         return True, ""
 
-# --- Ink Properties Tab as a Separate Class ---
 class InkPropertiesTab(QWidget):
     def __init__(self, main_widget, on_change_callback, parent=None):
         """
@@ -644,7 +712,7 @@ class InkPropertiesTab(QWidget):
         self.main_widget = main_widget
         self.well_properties_tab = main_widget.well_tab
         self.on_change_callback = on_change_callback
-        self.ink_well_widgets = []
+        self.ink_well_widgets = []  # each entry will be a dict containing UI elements and an InkWell instance
         self.initUI()
 
     def initUI(self):
@@ -683,7 +751,7 @@ class InkPropertiesTab(QWidget):
         # Create the cell type (name) field.
         cell_type_edit = QLineEdit("DefaultCell")
         cell_type_edit.textChanged.connect(self.on_change_callback)
-        # *** NEW: When the cell type changes, update the plate layout.
+        # Update the plate layout when the cell type changes.
         cell_type_edit.editingFinished.connect(lambda idx=len(self.ink_well_widgets), ct=cell_type_edit, le=location_edit:
                                                 self.update_plate_layout_for_inkwell(idx, le.text()))
         layout.addRow("Cell Type:", cell_type_edit)
@@ -714,7 +782,15 @@ class InkPropertiesTab(QWidget):
         group_box.setMouseTracking(True)
         group_box.mousePressEvent = lambda event, idx=len(self.ink_well_widgets): self.start_drag_inkwell(event, idx)
         
-        # Store the index in the inkwell widget for later reference.
+        # Create an InkWell instance to hold the data.
+        inkwell_obj = InkWell()
+        inkwell_obj.set_location("")
+        inkwell_obj.set_cell_type(cell_type_edit.text().strip())
+        inkwell_obj.set_chilled(chilled_checkbox.isChecked())
+        inkwell_obj.set_volume(volume_spin.value())
+        inkwell_obj.set_color(color_btn.text().strip())
+        
+        # Store the UI elements and the InkWell instance.
         ink_widget = {
             "group": group_box,
             "location": location_edit,
@@ -722,7 +798,8 @@ class InkPropertiesTab(QWidget):
             "chilled": chilled_checkbox,
             "volume": volume_spin,
             "color": color_btn,
-            "index": len(self.ink_well_widgets)
+            "index": len(self.ink_well_widgets),
+            "inkwell": inkwell_obj
         }
         self.ink_well_widgets.append(ink_widget)
         self.ink_well_layout.addWidget(group_box)
@@ -730,14 +807,18 @@ class InkPropertiesTab(QWidget):
 
     def update_plate_layout_for_inkwell(self, index, new_location):
         try:
-            inkwell = self.ink_well_widgets[index]
+            ink_widget = self.ink_well_widgets[index]
         except IndexError:
             return
+
+        # Update the InkWell instance with the new location and current cell type.
+        ink_widget["inkwell"].set_location(new_location)
+        ink_widget["inkwell"].set_cell_type(ink_widget["cell_type"].text().strip())
 
         plate_widget = self.main_widget.plate_layout_tab.plate_layout_widget
 
         # Validate the new location using the QLineEdit's validator.
-        validator = inkwell["location"].validator()
+        validator = ink_widget["location"].validator()
         state, _, _ = validator.validate(new_location, 0)
         if state != QValidator.Acceptable:
             # Remove any existing assignment if invalid.
@@ -750,8 +831,8 @@ class InkPropertiesTab(QWidget):
             plate_widget.update()
             return
 
-        current_color = inkwell["color"].text().strip()
-        cell_type = inkwell["cell_type"].text().strip()
+        current_color = ink_widget["color"].text().strip()
+        cell_type = ink_widget["cell_type"].text().strip()
 
         # Remove previous assignment if location has changed.
         old_well = None
@@ -781,10 +862,11 @@ class InkPropertiesTab(QWidget):
             button.setText(new_color)
             button.setStyleSheet(f"background-color: {new_color}")
             self.on_change_callback()
-            # Find the inkwell using this button and update its assignment.
+            # Update the corresponding InkWell instance.
             for idx, widget in enumerate(self.ink_well_widgets):
                 if widget["color"] == button:
                     loc = widget["location"].text().strip()
+                    widget["inkwell"].set_color(new_color)
                     if loc:
                         self.update_plate_layout_for_inkwell(idx, loc)
                     break
@@ -808,8 +890,35 @@ class InkPropertiesTab(QWidget):
                 widget["location"].setValidator(validator)
 
     def get_ink_wells(self):
+        """
+        Update each InkWell instance from its UI fields and return a dictionary of InkWell objects.
+        """
         data = {}
         for i, widget in enumerate(self.ink_well_widgets, start=1):
+            inkwell_obj = widget["inkwell"]
+            inkwell_obj.set_location(widget["location"].text().strip())
+            inkwell_obj.set_cell_type(widget["cell_type"].text().strip())
+            inkwell_obj.set_chilled(widget["chilled"].isChecked())
+            inkwell_obj.set_volume(widget["volume"].value())
+            inkwell_obj.set_color(widget["color"].text().strip())
+            data[f"ink_{i}"] = inkwell_obj
+        return data
+    
+    def get_ink_wells_json(self):
+        """
+        Update each InkWell instance from its UI fields and return a dictionary with
+        only JSON serializable values.
+        """
+        data = {}
+        for i, widget in enumerate(self.ink_well_widgets, start=1):
+            # Update the InkWell instance from UI fields (if needed)
+            widget["inkwell"].set_location(widget["location"].text().strip())
+            widget["inkwell"].set_cell_type(widget["cell_type"].text().strip())
+            widget["inkwell"].set_chilled(widget["chilled"].isChecked())
+            widget["inkwell"].set_volume(widget["volume"].value())
+            widget["inkwell"].set_color(widget["color"].text().strip())
+            
+            # Create a serializable dictionary instead of returning the InkWell object.
             data[f"ink_{i}"] = {
                 "location": widget["location"].text().strip(),
                 "cell_type": widget["cell_type"].text().strip(),
@@ -1414,8 +1523,11 @@ class PlateLayoutTab(QWidget):
             for uid, info in assignments.items():
                 pf_obj = pf_dict.get(uid, None)
                 if pf_obj is not None:
-                    assigned[well] = pf_obj
+                    if well not in assigned:
+                        assigned[well] = []
+                    assigned[well].append(pf_obj)
         return assigned
+
 
 ############################################################################################################
 ############################### Print Setup Helpers ########################################################
@@ -1635,42 +1747,6 @@ class IsometricPreviewWidget(QWidget):
         painter.drawLine(rosette_center, z_end)
         painter.drawText(z_end + QPointF(2,-2), "Z")
 
-class PrintFile:
-    def __init__(self, name="", color="#FF0000", csv_file="waypoint.csv"):
-        self.uid = str(uuid.uuid4())  
-        self.name = name
-        self.color = color
-        self.csv_file = csv_file
-        self.bbox_offset = QPointF(0, 0)    
-        self.floor_offset = None            
-        self.waypoints = []                 
-        self.bbox_size = QSizeF(50, 50)     
-        self.offset = (0, 0, 0)             
-
-    def set_offset_xy(self, offset):
-        self.offset = (offset[0], offset[1], self.offset[2])
-        
-    def set_offset_z(self, offset):
-        self.offset = (self.offset[0], self.offset[1], offset)
-    
-    def load_csv(self):
-        self.waypoints = []
-        try:
-            with open(self.csv_file, newline='') as f:
-                import csv
-                reader = csv.reader(f)
-                for row in reader:
-                    if row and row[0].strip().lower().startswith("x"):
-                        continue
-                    if len(row) >= 3:
-                        try:
-                            pt = {'x': float(row[0]), 'y': float(row[1]), 'z': float(row[2])}
-                            self.waypoints.append(pt)
-                        except Exception as e:
-                            print("Error parsing row", row, e)
-        except Exception as e:
-            print("Error loading CSV:", e)
-
 ############################################################################################################
 #################################  Ink well Helpers  #######################################################
 ############################################################################################################
@@ -1703,74 +1779,3 @@ class InkWellLocationValidator(QValidator):
             return (QValidator.Invalid, input_str, pos)
         return (QValidator.Acceptable, input_str, pos)
 
-############################################################################################################
-###################################  Testing   #############################################################
-############################################################################################################
-
-class DummyPrintManager:
-    def __init__(self):
-        self.well_properties = {
-            "fastz": 10.0, "floorz": 5.0, "topz": 20.0,
-            "ink_topz": 15.0, "ink_floorz": 3.0,
-            "Well_A1_x": 100.0, "Well_A1_y": 200.0,
-            "well_dx": 10.0, "well_dy": 10.0,
-            "well_rows": 8, "well_cols": 12,
-            "well_diameter": 5.0
-        }
-        self.syringes = {"p1": Syringe("p1"), "p2": Syringe("p2"), "p3": Syringe("p3")}
-        self.ink_wells = {}
-
-    def queue_a_waypoint(self, well_id, offset, csv_file, **kwargs):
-        wp_obj = Waypoint(csv_file)
-        wp_obj.well_id = well_id
-        wp_obj.offset = offset
-        entry = {"well_id": well_id, "target": offset, "waypoint": wp_obj}
-        self.well_queue.append(entry)
-        print(f"Queued waypoint for well '{well_id}' with target {offset}.")
-
-class Waypoint:
-    def __init__(self, csv_file_path='waypoints.csv'):
-        self.csv_file_path = csv_file_path
-        self.waypoints = []
-        self.import_waypoints_from_csv()
-        self.well_id = None
-        self.offset = (None,None,None)
-
-    def set_offset(self, offset) :  
-        self.offset = offset
-    
-    def import_waypoints_from_csv(self):
-        self.waypoints = []
-        try:
-            with open(self.csv_file_path, mode='r') as file:
-                csv_reader = csv.reader(file)
-                for row in csv_reader:
-                    if row[0].startswith('x'):
-                        continue
-                    elif len(row) == 7:
-                        x, y, z, p1, p2, p3, t = map(float, row)
-                        waypoint = {
-                            'x': x,
-                            'y': y,
-                            'z': z,
-                            'p1': p1,
-                            'p2': p2,
-                            'p3': p3,
-                            't': t
-                        }
-                        self.waypoints.append(waypoint)
-                    else:
-                        print(f"Invalid row length: {row}")
-        except FileNotFoundError:
-            print(f"Error: File not found at {self.csv_file_path}")
-        except Exception as e:
-            print(f"Error reading CSV file: {e}")
-        return self.waypoints
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    dummy_pm = DummyPrintManager()
-    widget = PrintSettingsWidget(dummy_pm)
-    widget.resize(900, 900)
-    widget.show()
-    sys.exit(app.exec())
