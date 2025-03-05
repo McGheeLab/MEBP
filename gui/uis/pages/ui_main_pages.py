@@ -19,8 +19,12 @@ class Ui_MainPages(object):
         self.main_pages_layout.setSpacing(0)
         self.main_pages_layout.setObjectName(u"main_pages_layout")
         self.main_pages_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Make the window frameless
         self.pages = QStackedWidget(MainPages)
         self.pages.setObjectName(u"pages")
+        
+        # Page 1
         self.page_1 = QWidget()
         self.page_1.setObjectName(u"Overview")
         self.page_1.setStyleSheet(u"font-size: 14pt;")
@@ -28,7 +32,8 @@ class Ui_MainPages(object):
         self.page_1_layout.setSpacing(5)
         self.page_1_layout.setObjectName(u"page_1_layout")
         self.page_1_layout.setContentsMargins(5, 5, 5, 5)
-        self.pages.addWidget(self.page_1)
+        
+        # Page 2
         self.page_2 = QWidget()
         self.page_2.setObjectName(u"Calibration")
         self.page_2.setStyleSheet(u"font-size: 14pt;")
@@ -36,19 +41,35 @@ class Ui_MainPages(object):
         self.page_2_layout.setSpacing(5)
         self.page_2_layout.setObjectName(u"page_2_layout")
         self.page_2_layout.setContentsMargins(5, 5, 5, 5)
-        self.pages.addWidget(self.page_2)
+        
+        # Page 3
         self.page_3 = QWidget()
         self.page_3.setObjectName(u"Print Setup")
         self.page_3.setStyleSheet(u"font-size: 14pt;")
         self.page_3_layout = QVBoxLayout(self.page_3)
         self.page_3_layout.setObjectName(u"page_3_layout")
-        self.pages.addWidget(self.page_3)
+        
+        # Page 4
         self.page_4 = QWidget()
         self.page_4.setObjectName(u"Print Setup")
         self.page_4.setStyleSheet(u"font-size: 14pt;")
         self.page_4_layout = QVBoxLayout(self.page_4)
         self.page_4_layout.setObjectName(u"page_4_layout")
+        
+        # Page 5
+        self.page_5 = QWidget()
+        self.page_5.setObjectName(u"Print Setup")
+        self.page_5.setStyleSheet(u"font-size: 14pt;")
+        self.page_5_layout = QVBoxLayout(self.page_5)
+        self.page_5_layout.setObjectName(u"page_4_layout")
+        
+        # Add pages to the stack
+        self.pages.addWidget(self.page_1)
+        self.pages.addWidget(self.page_2)
+        self.pages.addWidget(self.page_3)
         self.pages.addWidget(self.page_4)
+        self.pages.addWidget(self.page_5)
+        
         self.main_pages_layout.addWidget(self.pages)
 
 

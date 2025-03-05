@@ -71,6 +71,14 @@ class SetupMainWindow:
             "is_active": False,
         },
         {
+            "btn_icon": "icon_widgets.svg",
+            "btn_id": "btn_home5",
+            "btn_text": "pg5",
+            "btn_tooltip": "Open page 5",
+            "show_top": True,
+            "is_active": False,
+        },
+        {
             "btn_icon": "icon_settings.svg",
             "btn_id": "btn_settings",
             "btn_text": "Settings",
@@ -239,16 +247,24 @@ class SetupMainWindow:
     def page3(self):
         # Now, get the StageMonitorWidget from your AppController
         # (Assuming AppController creates the StageMonitorWidget and stores it in an attribute)
+        print_maker_widget = MakePrintWidget()
+        
+        # Add the StageMonitorWidget to page1's layout.
+        self.ui.load_pages.page_3_layout.addWidget(print_maker_widget)
+    
+    def page4(self):
+        # Now, get the StageMonitorWidget from your AppController
+        # (Assuming AppController creates the StageMonitorWidget and stores it in an attribute)
         print_settings_widget = PrintSettingsWidget(self.print_mgr)
         
         # Add the StageMonitorWidget to page1's layout.
-        self.ui.load_pages.page_3_layout.addWidget(print_settings_widget)
+        self.ui.load_pages.page_4_layout.addWidget(print_settings_widget)
     
-    def page4(self):
+    def page5(self):
         # Now, get the StageMonitorWidget from your AppController
         # (Assuming AppController creates the StageMonitorWidget and stores it in an attribute)
         print_monitor_widget = PrintMonitorWidget(self.print_mgr)
         
         # Add the StageMonitorWidget to page1's layout.
-        self.ui.load_pages.page_4_layout.addWidget(print_monitor_widget)
+        self.ui.load_pages.page_5_layout.addWidget(print_monitor_widget)
               

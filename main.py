@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         SetupMainWindow.page2(self)
         SetupMainWindow.page3(self)
         SetupMainWindow.page4(self)
+        SetupMainWindow.page5(self)
         SetupMainWindow.left_column(self)
         SetupMainWindow.right_column(self)
 
@@ -145,6 +146,12 @@ class MainWindow(QMainWindow):
 
             # Load Page 1
             MainFunctions.set_page(self, self.ui.load_pages.page_4)
+        if btn.objectName() == "btn_home5":
+            # Select Menu
+            self.ui.left_menu.select_only_one(btn.objectName())
+
+            # Load Page 1
+            MainFunctions.set_page(self, self.ui.load_pages.page_5)
         
         if btn.objectName() == "btn_settings" or btn.objectName() == "btn_close_left_column":
             #check if left column is visible

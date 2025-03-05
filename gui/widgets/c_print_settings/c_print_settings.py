@@ -2,7 +2,7 @@ import sys, json, os, random, csv, math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QSplitter, QStyle, QStyleOptionViewItem,
     QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel, QStyledItemDelegate,
-    QFileDialog, QMessageBox, QComboBox, QScrollArea, QListWidget, QListWidgetItem, QColorDialog
+    QFileDialog, QMessageBox, QComboBox, QScrollArea, QListWidget, QListWidgetItem, QColorDialog, QMenu
 )
 from PySide6.QtGui import QPainter, QColor, QRegularExpressionValidator, QValidator, QDrag, QPen
 from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Signal, QSignalBlocker, QEvent
@@ -11,12 +11,14 @@ from SupportClasses.Printer import InkWell, Syringe, PrintFile
 
 ############################################################################################################
 # improvements to make
-# 1. the views of the waypoint files dont seem to reflect reality still the spiral.csv looks bigger than it is
-# 2. the isoview should resize the view to fit the print
-# 3. if we select multiple printfiles in the printsetup tab we want to see all the bounding boxes in the view colored to the printfile color
-# 4. multiple printfiles should be draggable to the plate layout tab simultaneouly
-# 5. the platelayout representation of the print should be taken directly from the printmanager so that if printfiles are deleted 
+# [x] [COMPLETE] the views of the waypoint files dont seem to reflect reality still the spiral.csv looks bigger than it is
+# [ ] the isoview should resize the view to fit the print
+# [ ] when the window changes, the drawn diameter of the well should update the scaling of the waypoint file 
+# [ ] if we select multiple printfiles in the printsetup tab we want to see all the bounding boxes in the view colored to the printfile color
+# [ ] multiple printfiles should be draggable to the plate layout tab simultaneouly
+# [ ] the platelayout representation of the print should be taken directly from the printmanager so that if printfiles are deleted 
 #    somewhere else it is reflected in the view 
+
 
 
 def get_contrast_text_color(bg_color: str) -> str:
@@ -1215,19 +1217,6 @@ class PrintSetupTab(QWidget):
         details_layout.addWidget(load_csv_btn)
         right_layout.addWidget(details_panel)
 
-        self.view_controls = QWidget()
-        vc_layout = QHBoxLayout(self.view_controls)
-        reset_btn = QPushButton("Reset View")
-        reset_btn.clicked.connect(self.reset_view)
-        vc_layout.addWidget(reset_btn)
-        top_btn = QPushButton("Top View")
-        top_btn.clicked.connect(self.top_view)
-        vc_layout.addWidget(top_btn)
-        side_btn = QPushButton("Side View")
-        side_btn.clicked.connect(self.side_view)
-        vc_layout.addWidget(side_btn)
-        right_layout.addWidget(self.view_controls)
-
         preview_panel = QWidget()
         preview_layout = QHBoxLayout(preview_panel)
         self.well_preview = WellPreviewWidget()
@@ -1238,7 +1227,7 @@ class PrintSetupTab(QWidget):
         preview_layout.addWidget(self.iso_preview)
         right_layout.addWidget(preview_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([150, 450])
+        splitter.setSizes([150, 800])
 
     def update_from_well_properties(self):
         props = self.main_widget.well_tab.get_properties()
@@ -1246,6 +1235,35 @@ class PrintSetupTab(QWidget):
         self.well_height_physical = props["topz"] - props["floorz"]
         self.well_preview.well_diameter_physical = self.well_diameter_physical
         self.well_preview.well_height_physical = self.well_height_physical
+    
+    def update_print_file_bbox(self, pf):
+        if pf.waypoints:
+            xs = [pt['x'] for pt in pf.waypoints]
+            ys = [pt['y'] for pt in pf.waypoints]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            range_x = max_x - min_x
+            range_y = max_y - min_y
+
+            margin = 10
+            area_width = (self.well_preview.width() // 2) - 2 * margin
+            area_height = self.well_preview.height() - 2 * margin
+            radius = min(area_width, area_height) / 2
+            drawn_diameter = 2 * radius
+
+            # Compute bbox dimensions based on the physical-to-drawn scale.
+            new_width = (range_x / self.well_diameter_physical) * drawn_diameter
+            new_height = (range_y / self.well_diameter_physical) * drawn_diameter
+            if new_width < 10: new_width = 10
+            if new_height < 10: new_height = 10
+            pf.bbox_size = QSizeF(new_width, new_height)
+
+            # Compute the center of the waypoint data and scale it.
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+            scale = drawn_diameter / self.well_diameter_physical
+            pf.bbox_offset = QPointF(center_x * scale, center_y * scale)
+
     
     def validate(self):
         errors = []
@@ -1270,22 +1288,10 @@ class PrintSetupTab(QWidget):
                 pf = PrintFile(name, color, file)
                 pf.load_csv()
                 if pf.waypoints:
-                    xs = [pt['x'] for pt in pf.waypoints]
-                    ys = [pt['y'] for pt in pf.waypoints]
-                    range_x = max(xs) - min(xs)
-                    range_y = max(ys) - min(ys)
-                    margin = 10
-                    area_width = (self.well_preview.width() // 2) - 2 * margin
-                    area_height = self.well_preview.height() - 2 * margin
-                    radius = min(area_width, area_height) / 2
-                    drawn_diameter = 2 * radius
-                    new_width = (range_x / self.well_diameter_physical) * drawn_diameter
-                    new_height = (range_y / self.well_diameter_physical) * drawn_diameter
-                    if new_width < 10: new_width = 10
-                    if new_height < 10: new_height = 10
-                    pf.bbox_size = QSizeF(new_width, new_height)
+                    self.update_print_file_bbox(pf)
                 else:
                     pf.bbox_size = QSizeF(50, 50)
+                    pf.bbox_offset = QPointF(0, 0)
                 pf.floor_offset = None
                 self.print_files.append(pf)
                 item = QListWidgetItem(pf.name)
@@ -1294,6 +1300,7 @@ class PrintSetupTab(QWidget):
                 self.list_widget.addItem(item)
             self.list_widget.setCurrentRow(0)
             self.printFilesChanged.emit()
+
 
     def duplicate_print_file(self):
         if self.current_print:
@@ -1336,20 +1343,7 @@ class PrintSetupTab(QWidget):
         self.color_btn.setStyleSheet(f"background-color: {self.current_color}")
         self.current_print.load_csv()
         if self.current_print.waypoints:
-            xs = [pt['x'] for pt in self.current_print.waypoints]
-            ys = [pt['y'] for pt in self.current_print.waypoints]
-            range_x = max(xs) - min(xs)
-            range_y = max(ys) - min(ys)
-            margin = 10
-            area_width = (self.well_preview.width() // 2) - 2 * margin
-            area_height = self.well_preview.height() - 2 * margin
-            radius = min(area_width, area_height) / 2
-            drawn_diameter = 2 * radius
-            new_width = (range_x / self.well_diameter_physical) * drawn_diameter
-            new_height = (range_y / self.well_diameter_physical) * drawn_diameter
-            if new_width < 10: new_width = 10
-            if new_height < 10: new_height = 10
-            self.current_print.bbox_size = QSizeF(new_width, new_height)
+            self.update_print_file_bbox(self.current_print)
         margin = 10
         side_bottom = self.well_preview.height() - margin
         if self.current_print.floor_offset is None:
@@ -1402,20 +1396,7 @@ class PrintSetupTab(QWidget):
                 self.current_print.csv_file = file
                 self.current_print.load_csv()
                 if self.current_print.waypoints:
-                    xs = [pt['x'] for pt in self.current_print.waypoints]
-                    ys = [pt['y'] for pt in self.current_print.waypoints]
-                    range_x = max(xs) - min(xs)
-                    range_y = max(ys) - min(ys)
-                    margin = 10
-                    area_width = (self.well_preview.width() // 2) - 2 * margin
-                    area_height = self.well_preview.height() - 2 * margin
-                    radius = min(area_width, area_height) / 2
-                    drawn_diameter = 2 * radius
-                    new_width = (range_x / self.well_diameter_physical) * drawn_diameter
-                    new_height = (range_y / self.well_diameter_physical) * drawn_diameter
-                    if new_width < 10: new_width = 10
-                    if new_height < 10: new_height = 10
-                    self.current_print.bbox_size = QSizeF(new_width, new_height)
+                    self.update_print_file_bbox(self.current_print)
                 self.well_preview.update()
                 self.iso_preview.update()
                 self.printFilesChanged.emit()
@@ -1570,25 +1551,16 @@ class WellPreviewWidget(QWidget):
         radius = min(area_width, area_height) / 2
         drawn_diameter = 2 * radius
 
+        # Draw the well circle.
         painter.setPen(QPen(Qt.black, 2))
         painter.drawEllipse(well_center, radius, radius)
 
         if self.print_file:
-            if self.print_file.waypoints:
-                xs = [pt['x'] for pt in self.print_file.waypoints]
-                ys = [pt['y'] for pt in self.print_file.waypoints]
-                range_x = max(xs) - min(xs)
-                range_y = max(ys) - min(ys)
-                new_width = (range_x / self.well_diameter_physical) * drawn_diameter
-                new_height = (range_y / self.well_diameter_physical) * drawn_diameter
-                if new_width < 10: new_width = 10
-                if new_height < 10: new_height = 10
-                self.print_file.bbox_size = QSizeF(new_width, new_height)
             bbox_center = well_center + self.print_file.bbox_offset
             bbox_size = self.print_file.bbox_size
             bbox_rect = QRectF(bbox_center.x() - bbox_size.width()/2,
-                               bbox_center.y() - bbox_size.height()/2,
-                               bbox_size.width(), bbox_size.height())
+                            bbox_center.y() - bbox_size.height()/2,
+                            bbox_size.width(), bbox_size.height())
             half_diag = math.sqrt((bbox_size.width()/2)**2 + (bbox_size.height()/2)**2)
             dist = math.hypot(bbox_center.x()-well_center.x(), bbox_center.y()-well_center.y())
             pen_color = Qt.green if dist + half_diag <= radius else Qt.red
@@ -1596,16 +1568,25 @@ class WellPreviewWidget(QWidget):
             painter.drawRect(bbox_rect)
             if self.print_file.waypoints:
                 painter.setPen(QPen(Qt.blue, 2))
+                xs = [pt['x'] for pt in self.print_file.waypoints]
+                ys = [pt['y'] for pt in self.print_file.waypoints]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                range_x = max_x - min_x if (max_x - min_x) != 0 else 1
+                range_y = max_y - min_y if (max_y - min_y) != 0 else 1
                 mapped_points = []
                 for pt in self.print_file.waypoints:
-                    x = bbox_rect.left() + pt['x'] * bbox_rect.width()
-                    y = bbox_rect.top() + pt['y'] * bbox_rect.height()
+                    norm_x = (pt['x'] - min_x) / range_x
+                    norm_y = (pt['y'] - min_y) / range_y
+                    x = bbox_rect.left() + norm_x * bbox_rect.width()
+                    y = bbox_rect.top() + norm_y * bbox_rect.height()
                     mapped_points.append(QPointF(x, y))
                 for i in range(len(mapped_points)-1):
                     painter.drawLine(mapped_points[i], mapped_points[i+1])
 
+        # Draw the side view.
         side_rect = QRectF(self.width()//2 + margin, margin,
-                           (self.width()//2) - 2 * margin, self.height() - 2 * margin)
+                        (self.width()//2) - 2 * margin, self.height() - 2 * margin)
         painter.setPen(QPen(Qt.black, 2))
         painter.drawRect(side_rect)
         if self.print_file:
@@ -1679,73 +1660,237 @@ class WellPreviewWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self.dragging = None
 
+
 class IsometricPreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.print_file = None
-        self.yaw = 0       
-        self.pitch = 1.0   
-        self.rotating = False
-        self.initial_pos = QPointF(0, 0)
-        self.initial_yaw = 0
-        self.initial_pitch = 1.0
+        self.waypoints = []         # List of (x, y, z, ...)
+        self.pump_states_all = []   # Each state is a list of 3 effective flow values
+        self.pump_colors = []       # Expected base colors [(1,0,0), (0,1,0), (0,0,1)]
+        self.max_flow_rates = [100.0, 100.0, 100.0]
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.zoom = 1.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.last_mouse_pos = None
+        self._right_press_pos = None
+        self._right_dragging = False
+        self.focus_layer_index = 0
 
-    def mousePressEvent(self, event):
-        self.rotating = True
-        self.initial_pos = QPointF(event.position())
-        self.initial_yaw = self.yaw
-        self.initial_pitch = self.pitch
+        self.layer_indices = []  
 
-    def mouseMoveEvent(self, event):
-        if self.rotating:
-            pos = QPointF(event.position())
-            dx = pos.x() - self.initial_pos.x()
-            dy = pos.y() - self.initial_pos.y()
-            self.yaw = self.initial_yaw + dx * 1.0
-            self.pitch = self.initial_pitch + dy * 0.02
-            self.update()
+        self.setContextMenuPolicy(Qt.NoContextMenu)
+        self.setMouseTracking(True)
 
-    def mouseReleaseEvent(self, event):
-        self.rotating = False
+    def set_toolpath(self, waypoints, pump_states_all, pump_colors, max_flow_rates):
+        self.waypoints = waypoints
+        self.pump_states_all = pump_states_all
+        self.pump_colors = pump_colors
+        self.max_flow_rates = max_flow_rates
+        self.layer_indices = sorted(set(round(wp[2], 5) for wp in self.waypoints))
+        self.focus_layer_index = 0
+        self.fit_to_view()
+        self.update()
+
+    def set_focus_layer(self, index):
+        self.focus_layer_index = index
+        self.update()
+
+    def raw_transform_point(self, x, y, z):
+        rx = self.rotation_x
+        ry = self.rotation_y
+        x1 = x
+        y1 = y * math.cos(rx) - z * math.sin(rx)
+        z1 = y * math.sin(rx) + z * math.cos(rx)
+        x2 = x1 * math.cos(ry) + z1 * math.sin(ry)
+        y2 = y1
+        return x2, y2
+
+    def transform_point(self, x, y, z):
+        tx, ty = self.raw_transform_point(x, y, z)
+        proj_x = tx * self.zoom + self.offset_x
+        proj_y = ty * self.zoom + self.offset_y
+        return proj_x, proj_y
+
+    def fit_to_view(self):
+        if not self.waypoints or self.width() <= 0 or self.height() <= 0:
+            return
+        projected = [self.raw_transform_point(wp[0], wp[1], wp[2]) for wp in self.waypoints]
+        xs = [pt[0] for pt in projected]
+        ys = [pt[1] for pt in projected]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        bbox_width = max_x - min_x
+        bbox_height = max_y - min_y
+        if bbox_width == 0 or bbox_height == 0:
+            return
+        margin = 0.9
+        scale_x = (self.width() * margin) / bbox_width
+        scale_y = (self.height() * margin) / bbox_height
+        self.zoom = min(scale_x, scale_y)
+        self.offset_x = (self.width() - bbox_width * self.zoom) / 2 - min_x * self.zoom
+        self.offset_y = (self.height() - bbox_height * self.zoom) / 2 - min_y * self.zoom
+
+    def get_segment_color(self, state):
+        if not self.max_flow_rates or len(self.max_flow_rates) < 3:
+            return QColor(255, 255, 255)
+        try:
+            r = int(state[0] / self.max_flow_rates[0] * 255) if self.max_flow_rates[0] != 0 else 0
+            g = int(state[1] / self.max_flow_rates[1] * 255) if self.max_flow_rates[1] != 0 else 0
+            b = int(state[2] / self.max_flow_rates[2] * 255) if self.max_flow_rates[2] != 0 else 0
+        except Exception:
+            r = g = b = 0
+        r = min(max(r, 0), 255)
+        g = min(max(g, 0), 255)
+        b = min(max(b, 0), 255)
+        return QColor(r, g, b)
 
     def paintEvent(self, event):
+        alpha_factor = 0.2
+        if self.print_file is None:
+            return
+        self.waypoints = self.print_file.waypoints
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        if not self.print_file or not self.print_file.waypoints:
-            painter.drawText(self.rect(), Qt.AlignCenter, "No Waypoints")
-            return
+        focus_z = None
+        if self.layer_indices:
+            focus_z = self.layer_indices[self.focus_layer_index]
+        tol = 1e-3
+        if self.waypoints:
+            # waypoints is a list of dicts with keys 'x', 'y', 'z'
+            transformed_points = [self.transform_point(wp['x'], wp['y'], wp['z']) for wp in self.waypoints]
+            for i in range(len(transformed_points)-1):
+                p1 = transformed_points[i]
+                p2 = transformed_points[i+1]
+                base_color = self.get_segment_color(self.pump_states_all[i]) if i < len(self.pump_states_all) else QColor(0, 0, 0)
+                z_val = self.waypoints[i]['z']
+                alpha = 255 if (focus_z is not None and abs(z_val - focus_z) < tol) else int(255 * alpha_factor)
+                color = QColor(base_color)
+                color.setAlpha(alpha)
+                pen = QPen(color)
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
+            for i, pt in enumerate(transformed_points):
+                base_color = self.get_segment_color(self.pump_states_all[i]) if i < len(self.pump_states_all) else QColor(0, 0, 0)
+                z_val = self.waypoints[i]['z']
+                if focus_z is not None and abs(z_val - focus_z) < tol:
+                    alpha = 255
+                    radius = 4
+                else:
+                    alpha = 0
+                    radius = 2
+                color = QColor(base_color)
+                color.setAlpha(alpha)
+                color_outline = QColor(0, 0, 0, alpha)
+                pen = QPen(color_outline)
+                painter.setPen(pen)
+                painter.setBrush(color)
+                painter.drawEllipse(int(pt[0]-radius), int(pt[1]-radius), radius*2, radius*2)
+        else:
+            painter.drawText(self.rect(), Qt.AlignCenter, "No waypoints to display")
+        self.drawRosette(painter)
+
+    def drawRosette(self, painter):
         painter.save()
-        center = self.rect().center()
-        painter.translate(center)
-        painter.rotate(self.yaw)
-        painter.translate(-center)
-        iso_points = []
-        for pt in self.print_file.waypoints:
-            iso_x = pt['x'] * 100 - pt['y'] * 50
-            iso_y = (pt['x'] * 50 + pt['y'] * 50) - pt['z'] * 10 * self.pitch
-            iso_points.append(QPointF(iso_x + self.width()/2, iso_y + self.height()/2))
-        painter.setPen(QPen(Qt.blue, 2))
-        for i in range(len(iso_points)-1):
-            painter.drawLine(iso_points[i], iso_points[i+1])
+        margin = 10
+        rosette_size = 80
+        center = QPointF(margin + rosette_size/2, self.height()-margin-rosette_size/2)
+        radius = rosette_size/2 - 5
+        pen = QPen(QColor(0, 0, 0))
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(center, radius, radius)
+        def rosette_vector(dx, dy, dz, length):
+            rx = self.rotation_x
+            ry = self.rotation_y
+            x1 = dx
+            y1 = dy * math.cos(rx) - dz * math.sin(rx)
+            z1 = dy * math.sin(rx) + dz * math.cos(rx)
+            x2 = x1 * math.cos(ry) + z1 * math.sin(ry)
+            y2 = y1
+            mag = math.hypot(x2, y2)
+            if mag == 0:
+                return 0, 0
+            return (x2/mag*length, y2/mag*length)
+        arrow_length = radius - 5
+        vx, vy = rosette_vector(1, 0, 0, arrow_length)
+        pen.setColor(QColor(255, 0, 0))
+        painter.setPen(pen)
+        painter.drawLine(center, QPointF(center.x()+vx, center.y()-vy))
+        pen.setColor(QColor(0, 255, 0))
+        painter.setPen(pen)
+        painter.drawLine(center, QPointF(center.x(), center.y()-arrow_length))
+        vx, vy = rosette_vector(0, 0, 1, arrow_length)
+        pen.setColor(QColor(0, 0, 255))
+        painter.setPen(pen)
+        painter.drawLine(center, QPointF(center.x()+vx, center.y()-vy))
         painter.restore()
-        rosette_center = QPointF(self.width()/8, self.height() - self.height()/8)
-        rosette_length = self.height()/16  
-        angle_rad = math.radians(self.yaw)
-        x_axis = QPointF(math.cos(angle_rad), math.sin(angle_rad))
-        y_axis = QPointF(-math.sin(angle_rad), math.cos(angle_rad))
-        z_axis = QPointF(math.cos(angle_rad + math.pi/4), math.sin(angle_rad + math.pi/4))
-        x_end = rosette_center + x_axis * rosette_length
-        y_end = rosette_center + y_axis * rosette_length
-        z_end = rosette_center + z_axis * (rosette_length * self.pitch / 2)
-        painter.setPen(QPen(Qt.red, 2))
-        painter.drawLine(rosette_center, x_end)
-        painter.drawText(x_end + QPointF(2,5), "X")
-        painter.setPen(QPen(Qt.green, 2))
-        painter.drawLine(rosette_center, y_end)
-        painter.drawText(y_end + QPointF(-15,5), "Y")
-        painter.setPen(QPen(Qt.blue, 2))
-        painter.drawLine(rosette_center, z_end)
-        painter.drawText(z_end + QPointF(2,-2), "Z")
+
+    def mousePressEvent(self, event):
+        self.last_mouse_pos = event.position()
+        if event.button() == Qt.RightButton:
+            self._right_press_pos = event.position()
+            self._right_dragging = False
+
+    def mouseMoveEvent(self, event):
+        if self.last_mouse_pos is None:
+            self.last_mouse_pos = event.position()
+            return
+        delta = event.position() - self.last_mouse_pos
+        buttons = event.buttons()
+        if buttons & Qt.LeftButton:
+            self.offset_x += delta.x()
+            self.offset_y += delta.y()
+        if buttons & Qt.RightButton:
+            if self._right_press_pos is not None:
+                if (event.position() - self._right_press_pos).manhattanLength() > 5:
+                    self._right_dragging = True
+            self.rotation_y += delta.x() * 0.01
+            self.rotation_x += delta.y() * 0.01
+        self.last_mouse_pos = event.position()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            if not self._right_dragging:
+                self.showContextMenu(event.globalPos())
+            self._right_press_pos = None
+            self._right_dragging = False
+        self.last_mouse_pos = event.position()
+
+    def wheelEvent(self, event):
+        zoom_factor = 1.0 + event.angleDelta().y() / 1200.0
+        self.zoom *= zoom_factor
+        self.update()
+
+    def showContextMenu(self, global_pos):
+        menu = QMenu(self)
+        front_action = menu.addAction("Front")
+        top_action = menu.addAction("Top")
+        left_action = menu.addAction("Left")
+        right_action = menu.addAction("Right")
+        isometric_action = menu.addAction("Isometric")
+        bottom_action = menu.addAction("Bottom")
+        action = menu.exec_(global_pos)
+        if action == front_action:
+            self.rotation_x = 0.0; self.rotation_y = 0.0
+        elif action == top_action:
+            self.rotation_x = -math.pi/2; self.rotation_y = 0.0
+        elif action == left_action:
+            self.rotation_x = 0.0; self.rotation_y = math.pi/2
+        elif action == right_action:
+            self.rotation_x = 0.0; self.rotation_y = -math.pi/2
+        elif action == isometric_action:
+            self.rotation_x = math.radians(-35); self.rotation_y = math.radians(45)
+        elif action == bottom_action:
+            self.rotation_x = math.pi/2; self.rotation_y = 0.0
+        self.fit_to_view()
+        self.update()
+
 
 ############################################################################################################
 #################################  Ink well Helpers  #######################################################
