@@ -1,19 +1,19 @@
 import sys, json, os, random, csv, math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QTabWidget, QSplitter, QStyle, QStyleOptionViewItem,
-    QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel, QStyledItemDelegate,
-    QFileDialog, QMessageBox, QComboBox, QScrollArea, QListWidget, QListWidgetItem, QColorDialog, QMenu
+    QDoubleSpinBox, QSpinBox, QLineEdit, QGroupBox, QCheckBox, QPushButton, QLabel, QStyledItemDelegate, 
+    QFileDialog, QMessageBox, QComboBox, QScrollArea, QListWidget, QListWidgetItem, QColorDialog, QMenu, QAbstractItemView
 )
 from PySide6.QtGui import QPainter, QColor, QRegularExpressionValidator, QValidator, QDrag, QPen
-from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Signal, QSignalBlocker, QEvent
+from PySide6.QtCore import QRegularExpression, QRectF, QPointF, QSizeF, Qt, Signal, QSignalBlocker, QEvent, QMimeData
 
 from SupportClasses.Printer import InkWell, Syringe, PrintFile
 
 ############################################################################################################
 # improvements to make
 # [x] [COMPLETE] the views of the waypoint files dont seem to reflect reality still the spiral.csv looks bigger than it is
-# [ ] the isoview should resize the view to fit the print
-# [ ] when the window changes, the drawn diameter of the well should update the scaling of the waypoint file 
+# [x] the isoview should resize the view to fit the print
+# [x] when the window changes, the drawn diameter of the well should update the scaling of the waypoint file 
 # [ ] if we select multiple printfiles in the printsetup tab we want to see all the bounding boxes in the view colored to the printfile color
 # [ ] multiple printfiles should be draggable to the plate layout tab simultaneouly
 # [ ] the platelayout representation of the print should be taken directly from the printmanager so that if printfiles are deleted 
@@ -161,7 +161,7 @@ class PrintSettingsWidget(QWidget):
                         self.syringe_tab.syringe_inputs[pump]["cell_type"].setCurrentText(pump_data.get("cell_type", "None"))
                         self.syringe_tab.syringe_inputs[pump]["std_type"].setCurrentText(pump_data.get("standard_type", "None"))
                 
-                QMessageBox.information(self, "Load All", "All settings loaded successfully.")
+                
             except Exception as e:
                 QMessageBox.warning(self, "Load Error", f"Error loading all settings: {e}")
             self.update_tab_validity()
@@ -178,7 +178,7 @@ class PrintSettingsWidget(QWidget):
             try:
                 with open(filename, 'w') as f:
                     json.dump(data, f, indent=4)
-                QMessageBox.information(self, "Save All", "All settings saved successfully.")
+                
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", f"Error saving all settings: {e}")
 
@@ -217,18 +217,55 @@ class PrintSettingsWidget(QWidget):
 ###################################  All Widgets within the tabs  ##########################################
 ############################################################################################################
 # --- CSV List Widget (supports drag) ---
+from PySide6.QtWidgets import QListWidget, QAbstractItemView
+from PySide6.QtCore import Qt, QMimeData
+from PySide6.QtGui import QDrag
+import json
+
 class PrintListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Allow multi-selection.
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # Attribute to store selection when shift is held.
+        self._multi_drag_selection = None
+
+    def mousePressEvent(self, event):
+        # If Shift is held, store the current selection.
+        if event.modifiers() & Qt.ShiftModifier:
+            self._multi_drag_selection = self.selectedItems()
+        else:
+            self._multi_drag_selection = None
+        # Call the base method to handle normal selection behavior.
+        super().mousePressEvent(event)
+
     def startDrag(self, supportedActions):
-        item = self.currentItem()
-        if item:
+        # Use the stored selection if available; otherwise, use the current selection.
+        selected_items = self._multi_drag_selection if self._multi_drag_selection else self.selectedItems()
+        if not selected_items:
+            return
+
+        files_data = []
+        for item in selected_items:
+            # Assuming each item's UserRole data is a tuple: (uid, file_path, file_color, file_name)
             data = item.data(Qt.UserRole)
-            mimeData = self.model().mimeData(self.selectedIndexes())
             if data:
-                file_path, color = data
-                mimeData.setText(f"{file_path};{color}")
-            drag = QDrag(self)
-            drag.setMimeData(mimeData)
-            drag.exec(supportedActions)
+                uid, file_path, file_color, file_name = data
+                files_data.append({
+                    "uid": uid,
+                    "file_path": file_path,
+                    "file_color": file_color,
+                    "file_name": file_name,
+                })
+        mimeData = QMimeData()
+        # Package the data as JSON under our custom MIME type.
+        mimeData.setData("application/json", json.dumps(files_data).encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mimeData)
+        drag.exec(supportedActions)
+        # Clear the stored selection.
+        self._multi_drag_selection = None
+
 
 # --- PlateLayoutWidget ---
 class PlateLayoutWidget(QWidget):
@@ -449,6 +486,8 @@ class PlateLayoutWidget(QWidget):
         margin = 20
         props = self.main_widget.well_tab.get_properties()
         plate_mode = props.get("plate_mode", "Well Plate")
+        
+        # Determine target well location based on plate mode.
         if plate_mode == "Well Plate":
             rows = self.main_widget.well_tab.well_rows_input.value()
             cols = self.main_widget.well_tab.well_cols_input.value()
@@ -471,13 +510,61 @@ class PlateLayoutWidget(QWidget):
                 well_loc = "A1"
             elif right_area.contains(pos):
                 relative_y = pos.y() - right_area.top()
-                index = int(relative_y / (right_area.height()/4))
+                index = int(relative_y / (right_area.height() / 4))
                 index = max(0, min(3, index))
                 well_loc = f"{chr(ord('A') + index)}2"
             else:
                 event.ignore()
                 return
-        mime_text = event.mimeData().text()
+        else:
+            event.ignore()
+            return
+
+        mime = event.mimeData()
+        
+        # Handle multi-file drops if our custom JSON data is available.
+        if mime.hasFormat("application/json"):
+            try:
+                json_bytes = mime.data("application/json")
+                json_str = bytes(json_bytes).decode('utf-8')
+                files_data = json.loads(json_str)
+            except Exception:
+                event.ignore()
+                return
+            
+            if not isinstance(files_data, list):
+                event.ignore()
+                return
+            
+            # Prevent file drops if an inkwell is already assigned.
+            if (well_loc in self.associations and 
+                any(key.startswith("InkWell") for key in self.associations[well_loc])):
+                event.ignore()
+                return
+            
+            # Determine target wells: use selected wells if available, else the calculated well.
+            targets = self.selected_wells if self.selected_wells else {well_loc}
+            for file_data in files_data:
+                uid = file_data.get("uid")
+                file_path = file_data.get("file_path")
+                file_color = file_data.get("file_color")
+                file_name = file_data.get("file_name")
+                if not (uid and file_path and file_color and file_name):
+                    continue
+                for target in targets:
+                    if target not in self.associations:
+                        self.associations[target] = {}
+                    if uid not in self.associations[target]:
+                        self.associations[target][uid] = {"color": file_color, "name": file_name}
+            self.selected_wells.clear()
+            self.associationsChanged.emit()
+            self.update()
+            event.acceptProposedAction()
+            self.main_widget.apply_settings()
+            return
+
+        # Fallback: handle removals, inkwell drops, or single file drops (unchanged)
+        mime_text = mime.text()
         parts = mime_text.split(";")
         if parts[0] == "remove":
             source_well = parts[1] if len(parts) > 1 else well_loc
@@ -494,7 +581,9 @@ class PlateLayoutWidget(QWidget):
                 self.associationsChanged.emit()
                 self.update()
             event.acceptProposedAction()
+            self.main_widget.apply_settings()
             return
+
         if parts[0] == "inkwell":
             if len(parts) < 3:
                 event.ignore()
@@ -509,7 +598,8 @@ class PlateLayoutWidget(QWidget):
                 event.ignore()
                 return
             inkwell = inkwell_widgets[index]
-            if (well_loc in self.associations and any(key.startswith("InkWell") for key in self.associations[well_loc])):
+            if (well_loc in self.associations and 
+                any(key.startswith("InkWell") for key in self.associations[well_loc])):
                 event.ignore()
                 return
             if well_loc not in self.associations:
@@ -522,8 +612,11 @@ class PlateLayoutWidget(QWidget):
             self.associationsChanged.emit()
             self.update()
             event.acceptProposedAction()
+            self.main_widget.apply_settings()
             return
+
         if parts[0] == "file":
+            # Single file drop (text-based)
             if len(parts) < 5:
                 event.ignore()
                 return
@@ -531,7 +624,8 @@ class PlateLayoutWidget(QWidget):
             file_path = parts[2]
             file_color = parts[3]
             file_name = parts[4]
-            if (well_loc in self.associations and any(key.startswith("InkWell") for key in self.associations[well_loc])):
+            if (well_loc in self.associations and 
+                any(key.startswith("InkWell") for key in self.associations[well_loc])):
                 event.ignore()
                 return
             targets = self.selected_wells if self.selected_wells else {well_loc}
@@ -544,9 +638,10 @@ class PlateLayoutWidget(QWidget):
             self.associationsChanged.emit()
             self.update()
             event.acceptProposedAction()
-        else:
-            event.ignore()
-            
+            self.main_widget.apply_settings()
+            return
+
+        event.ignore()
         self.main_widget.apply_settings()
 
     def update_layout(self):
@@ -682,7 +777,6 @@ class WellPropertiesTab(QWidget):
                 index = self.plate_type_combo.findText(plate_mode)
                 if index >= 0:
                     self.plate_type_combo.setCurrentIndex(index)
-                QMessageBox.information(self, "Load", "Well properties loaded successfully.")
                 self.on_change_callback()
             except Exception as e:
                 QMessageBox.warning(self, "Load Error", f"Error loading JSON: {e}")
@@ -694,7 +788,6 @@ class WellPropertiesTab(QWidget):
                 data = self.get_properties()
                 with open(filename, "w") as f:
                     json.dump(data, f, indent=4)
-                QMessageBox.information(self, "Save", "Well properties saved successfully.")
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", f"Error saving JSON: {e}")
 
@@ -1116,7 +1209,7 @@ class SyringePropertiesTab(QWidget):
                         self.syringe_inputs[pump]["length"].setValue(pump_data.get("length", 0))
                         self.syringe_inputs[pump]["cell_type"].setCurrentText(pump_data.get("cell_type", "None"))
                         self.syringe_inputs[pump]["std_type"].setCurrentText(pump_data.get("standard_type", "None"))
-                QMessageBox.information(self, "Load", "Syringe layout loaded successfully.")
+                
             except Exception as e:
                 QMessageBox.warning(self, "Load Error", f"Error loading JSON: {e}")
 
@@ -1127,7 +1220,7 @@ class SyringePropertiesTab(QWidget):
                 data = self.get_syringe_data()
                 with open(filename, 'w') as f:
                     json.dump(data, f, indent=4)
-                QMessageBox.information(self, "Save", "Syringe layout saved successfully.")
+                
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", f"Error saving JSON: {e}")
 
@@ -1434,6 +1527,8 @@ class PlateLayoutTab(QWidget):
         self.printfile_list = QListWidget()
         self.printfile_list.setDragEnabled(False)
         self.printfile_list.viewport().installEventFilter(self)
+        self.printfile_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
         layout.addWidget(self.printfile_list, 1)
 
         self.plate_layout_widget = PlateLayoutWidget(main_widget)
@@ -1532,6 +1627,7 @@ class ColorItemDelegate(QStyledItemDelegate):
         text = index.data(Qt.DisplayRole)
         painter.drawText(rect, Qt.AlignCenter, text)
 
+
 class WellPreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1540,6 +1636,40 @@ class WellPreviewWidget(QWidget):
         self.drag_offset = QPointF(0, 0)
         self.well_diameter_physical = 5.0  
         self.well_height_physical = 15.0   
+
+    def resizeEvent(self, event):
+        # Recalculate the waypoint's bounding box when the widget is resized.
+        if self.print_file and self.print_file.waypoints:
+            xs = [pt['x'] for pt in self.print_file.waypoints]
+            ys = [pt['y'] for pt in self.print_file.waypoints]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            range_x = max_x - min_x
+            range_y = max_y - min_y
+
+            margin = 10
+            # The well is drawn in the left half of the widget.
+            area_width = (self.width() // 2) - 2 * margin
+            area_height = self.height() - 2 * margin
+            radius = min(area_width, area_height) / 2
+            drawn_diameter = 2 * radius
+
+            # Compute new bounding box dimensions based on the current scale.
+            new_width = (range_x / self.well_diameter_physical) * drawn_diameter
+            new_height = (range_y / self.well_diameter_physical) * drawn_diameter
+            new_width = max(new_width, 10)
+            new_height = max(new_height, 10)
+            self.print_file.bbox_size = QSizeF(new_width, new_height)
+
+            # Compute the center of the waypoint data and update its offset.
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+            scale = drawn_diameter / self.well_diameter_physical
+            self.print_file.bbox_offset = QPointF(center_x * scale, center_y * scale)
+        
+        # Call the base class implementation.
+        super().resizeEvent(event)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1556,16 +1686,19 @@ class WellPreviewWidget(QWidget):
         painter.drawEllipse(well_center, radius, radius)
 
         if self.print_file:
+            # Use the updated bbox_offset and bbox_size computed in resizeEvent.
             bbox_center = well_center + self.print_file.bbox_offset
             bbox_size = self.print_file.bbox_size
             bbox_rect = QRectF(bbox_center.x() - bbox_size.width()/2,
-                            bbox_center.y() - bbox_size.height()/2,
-                            bbox_size.width(), bbox_size.height())
+                               bbox_center.y() - bbox_size.height()/2,
+                               bbox_size.width(), bbox_size.height())
             half_diag = math.sqrt((bbox_size.width()/2)**2 + (bbox_size.height()/2)**2)
             dist = math.hypot(bbox_center.x()-well_center.x(), bbox_center.y()-well_center.y())
             pen_color = Qt.green if dist + half_diag <= radius else Qt.red
             painter.setPen(QPen(pen_color, 2))
             painter.drawRect(bbox_rect)
+
+            # Draw waypoint path if available.
             if self.print_file.waypoints:
                 painter.setPen(QPen(Qt.blue, 2))
                 xs = [pt['x'] for pt in self.print_file.waypoints]
@@ -1586,7 +1719,7 @@ class WellPreviewWidget(QWidget):
 
         # Draw the side view.
         side_rect = QRectF(self.width()//2 + margin, margin,
-                        (self.width()//2) - 2 * margin, self.height() - 2 * margin)
+                           (self.width()//2) - 2 * margin, self.height() - 2 * margin)
         painter.setPen(QPen(Qt.black, 2))
         painter.drawRect(side_rect)
         if self.print_file:
@@ -1660,6 +1793,211 @@ class WellPreviewWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self.dragging = None
 
+class WellPreviewWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.print_file = None  
+        self.dragging = None    
+        self.drag_offset = QPointF(0, 0)
+        self.well_diameter_physical = 5.0  
+        self.well_height_physical = 15.0   
+
+    def update_physical_offset(self):
+        """Calculate the physical (x, y, z) offset from the well center,
+        accounting for the current drawn scale in both the well view and side view.
+        The result is stored in self.print_file.physical_offset as a tuple (x, y, z)."""
+        if not self.print_file:
+            return
+        margin = 10
+        # --- Compute for the well (left) view ---
+        area_width = (self.width() // 2) - 2 * margin
+        area_height = self.height() - 2 * margin
+        well_center = QPointF(margin + area_width / 2, margin + area_height / 2)
+        radius = min(area_width, area_height) / 2
+        drawn_diameter = 2 * radius
+        # This scale converts drawn pixels into physical units.
+        scale_well = drawn_diameter / self.well_diameter_physical
+
+        # The bbox_offset is stored in drawn pixels relative to well_center.
+        physical_x = self.print_file.bbox_offset.x() / scale_well
+        physical_y = self.print_file.bbox_offset.y() / scale_well
+
+        # --- Compute for the side view (z) ---
+        side_rect = QRectF(self.width() // 2 + margin, margin,
+                           (self.width() // 2) - 2 * margin, self.height() - 2 * margin)
+        scale_side = side_rect.height() / self.well_height_physical
+        # Use the current floor_offset; if not set, default to the bottom of the side view.
+        floor_offset = self.print_file.floor_offset if self.print_file.floor_offset is not None else side_rect.bottom()
+        # Compute the physical z position (distance from the bottom) by converting drawn pixels.
+        physical_z = (side_rect.bottom() - floor_offset) / scale_side
+        # The well center in z (vertical) is at half the physical well height.
+        physical_z_offset = physical_z - (self.well_height_physical / 2)
+
+        # Store the full (x, y, z) offset in the print file.
+        self.print_file.offset = (physical_x, physical_y, physical_z_offset)
+
+    def resizeEvent(self, event):
+        # When the widget resizes, recalc the drawn waypoint based on the new scale.
+        if self.print_file and self.print_file.waypoints:
+            xs = [pt['x'] for pt in self.print_file.waypoints]
+            ys = [pt['y'] for pt in self.print_file.waypoints]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            range_x = max_x - min_x
+            range_y = max_y - min_y
+
+            margin = 10
+            area_width = (self.width() // 2) - 2 * margin
+            area_height = self.height() - 2 * margin
+            radius = min(area_width, area_height) / 2
+            drawn_diameter = 2 * radius
+
+            # Recalculate bbox size based on the current drawn well diameter.
+            new_width = (range_x / self.well_diameter_physical) * drawn_diameter
+            new_height = (range_y / self.well_diameter_physical) * drawn_diameter
+            new_width = max(new_width, 10)
+            new_height = max(new_height, 10)
+            self.print_file.bbox_size = QSizeF(new_width, new_height)
+
+            # Recalculate bbox offset based on the center of the waypoint data.
+            center_x = (min_x + max_x) / 2
+            center_y = (min_y + max_y) / 2
+            scale = drawn_diameter / self.well_diameter_physical
+            self.print_file.bbox_offset = QPointF(center_x * scale, center_y * scale)
+        
+        # Update the physical offset after recalculating drawn values.
+        super().resizeEvent(event)
+        self.update_physical_offset()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        margin = 10
+        # --- Draw the well (left half) ---
+        area_width = (self.width() // 2) - 2 * margin
+        area_height = self.height() - 2 * margin
+        well_center = QPointF(margin + area_width / 2, margin + area_height / 2)
+        radius = min(area_width, area_height) / 2
+        drawn_diameter = 2 * radius
+
+        painter.setPen(QPen(Qt.black, 2))
+        painter.drawEllipse(well_center, radius, radius)
+
+        if self.print_file:
+            bbox_center = well_center + self.print_file.bbox_offset
+            bbox_size = self.print_file.bbox_size
+            bbox_rect = QRectF(bbox_center.x() - bbox_size.width() / 2,
+                               bbox_center.y() - bbox_size.height() / 2,
+                               bbox_size.width(), bbox_size.height())
+            half_diag = math.sqrt((bbox_size.width() / 2) ** 2 + (bbox_size.height() / 2) ** 2)
+            dist = math.hypot(bbox_center.x() - well_center.x(), bbox_center.y() - well_center.y())
+            pen_color = Qt.green if dist + half_diag <= radius else Qt.red
+            painter.setPen(QPen(pen_color, 2))
+            painter.drawRect(bbox_rect)
+
+            if self.print_file.waypoints:
+                painter.setPen(QPen(Qt.blue, 2))
+                xs = [pt['x'] for pt in self.print_file.waypoints]
+                ys = [pt['y'] for pt in self.print_file.waypoints]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                range_x = max_x - min_x if (max_x - min_x) != 0 else 1
+                range_y = max_y - min_y if (max_y - min_y) != 0 else 1
+                mapped_points = []
+                for pt in self.print_file.waypoints:
+                    norm_x = (pt['x'] - min_x) / range_x
+                    norm_y = (pt['y'] - min_y) / range_y
+                    x = bbox_rect.left() + norm_x * bbox_rect.width()
+                    y = bbox_rect.top() + norm_y * bbox_rect.height()
+                    mapped_points.append(QPointF(x, y))
+                for i in range(len(mapped_points) - 1):
+                    painter.drawLine(mapped_points[i], mapped_points[i + 1])
+
+        # --- Draw the side view ---
+        side_rect = QRectF(self.width() // 2 + margin, margin,
+                           (self.width() // 2) - 2 * margin, self.height() - 2 * margin)
+        painter.setPen(QPen(Qt.black, 2))
+        painter.drawRect(side_rect)
+        if self.print_file:
+            if self.print_file.floor_offset is None:
+                self.print_file.floor_offset = side_rect.bottom()
+            floor_y = self.print_file.floor_offset
+            if self.print_file.waypoints:
+                z_vals = [pt['z'] for pt in self.print_file.waypoints]
+                z_range = max(z_vals) - min(z_vals)
+            else:
+                z_range = self.well_height_physical
+            scale_side = side_rect.height() / self.well_height_physical
+            top_y = floor_y - (z_range * scale_side)
+            painter.setPen(QPen(Qt.black, 2))
+            painter.drawLine(side_rect.left(), floor_y, side_rect.right(), floor_y)
+            painter.drawLine(side_rect.left(), top_y, side_rect.right(), top_y)
+
+    def mousePressEvent(self, event):
+        pos = QPointF(event.position())
+        margin = 10
+        if not self.print_file:
+            return
+        # Check if the click is in the left (well) view.
+        if pos.x() < self.width() // 2:
+            area_width = (self.width() // 2) - 2 * margin
+            area_height = self.height() - 2 * margin
+            well_center = QPointF(margin + area_width / 2, margin + area_height / 2)
+            bbox_center = well_center + self.print_file.bbox_offset
+            bbox_size = self.print_file.bbox_size
+            bbox_rect = QRectF(bbox_center.x() - bbox_size.width() / 2,
+                               bbox_center.y() - bbox_size.height() / 2,
+                               bbox_size.width(), bbox_size.height())
+            if bbox_rect.contains(pos):
+                self.dragging = "bbox"
+                self.drag_offset = pos - bbox_rect.topLeft()
+        else:
+            # Check if the click is near the floor line in the side view.
+            if self.print_file.floor_offset is not None and abs(pos.y() - self.print_file.floor_offset) < 5:
+                self.dragging = "floor"
+                self.drag_offset = pos.y() - self.print_file.floor_offset
+
+    def mouseMoveEvent(self, event):
+        pos = QPointF(event.position())
+        margin = 10
+        if self.dragging == "bbox" and self.print_file:
+            area_width = (self.width() // 2) - 2 * margin
+            area_height = self.height() - 2 * margin
+            well_center = QPointF(margin + area_width / 2, margin + area_height / 2)
+            new_top_left = pos - self.drag_offset
+            new_bbox_center = new_top_left + QPointF(self.print_file.bbox_size.width() / 2,
+                                                      self.print_file.bbox_size.height() / 2)
+            half_diag = math.sqrt((self.print_file.bbox_size.width() / 2) ** 2 +
+                                  (self.print_file.bbox_size.height() / 2) ** 2)
+            max_allowed = (min(area_width, area_height) / 2) - half_diag
+            delta = new_bbox_center - well_center
+            dist = math.hypot(delta.x(), delta.y())
+            if dist > max_allowed:
+                factor = max_allowed / dist if dist != 0 else 1
+                delta = delta * factor
+                new_bbox_center = well_center + delta
+            self.print_file.bbox_offset = new_bbox_center - well_center
+            # Update the physical x,y offset.
+            self.update_physical_offset()
+            self.update()
+        elif self.dragging == "floor" and self.print_file:
+            side_rect = QRectF(self.width() // 2 + margin, margin,
+                               (self.width() // 2) - 2 * margin, self.height() - 2 * margin)
+            new_floor = pos.y() - self.drag_offset
+            if new_floor < side_rect.top():
+                new_floor = side_rect.top()
+            if new_floor > side_rect.bottom():
+                new_floor = side_rect.bottom()
+            self.print_file.floor_offset = new_floor
+            # Update the physical z offset.
+            self.update_physical_offset()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self.dragging = None
+
+
 
 class IsometricPreviewWidget(QWidget):
     def __init__(self, parent=None):
@@ -1717,7 +2055,7 @@ class IsometricPreviewWidget(QWidget):
     def fit_to_view(self):
         if not self.waypoints or self.width() <= 0 or self.height() <= 0:
             return
-        projected = [self.raw_transform_point(wp[0], wp[1], wp[2]) for wp in self.waypoints]
+        projected = [self.raw_transform_point(wp['x'], wp['y'], wp['z']) for wp in self.waypoints]
         xs = [pt[0] for pt in projected]
         ys = [pt[1] for pt in projected]
         min_x, max_x = min(xs), max(xs)
@@ -1789,6 +2127,8 @@ class IsometricPreviewWidget(QWidget):
                 painter.setPen(pen)
                 painter.setBrush(color)
                 painter.drawEllipse(int(pt[0]-radius), int(pt[1]-radius), radius*2, radius*2)
+            self.fit_to_view()
+                
         else:
             painter.drawText(self.rect(), Qt.AlignCenter, "No waypoints to display")
         self.drawRosette(painter)

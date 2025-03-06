@@ -18,6 +18,7 @@ class PrintFile:
         self.offset = (0, 0, 0)        # (x, y, z) offset from well center/floor
         self.floor_offset = None
         self.waypoints = []          # List of dicts with keys: x, y, z, p1, p2, p3, t
+        
         # Other UI properties:
         self.bbox_offset = QPointF(0, 0)
         self.bbox_size = QSizeF(50, 50)
