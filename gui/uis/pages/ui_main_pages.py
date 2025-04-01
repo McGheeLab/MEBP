@@ -63,12 +63,22 @@ class Ui_MainPages(object):
         self.page_5_layout = QVBoxLayout(self.page_5)
         self.page_5_layout.setObjectName(u"page_4_layout")
         
+
+        # Page 6 - Controller Layout
+        self.page_6 = QWidget()
+        self.page_6.setObjectName(u"ControllerLayout")
+        self.page_6.setStyleSheet(u"font-size: 14pt;")
+        self.page_6_layout = QVBoxLayout(self.page_6)
+        self.page_6_layout.setObjectName(u"page_4_layout")
+
+        
         # Add pages to the stack
         self.pages.addWidget(self.page_1)
         self.pages.addWidget(self.page_2)
         self.pages.addWidget(self.page_3)
         self.pages.addWidget(self.page_4)
         self.pages.addWidget(self.page_5)
+        self.pages.addWidget(self.page_6)
         
         self.main_pages_layout.addWidget(self.pages)
 

@@ -38,12 +38,7 @@ class XboxPoller(QObject):
             elif "dpad" in msg:
                 self.processor.add_command(msg["command"], direction=msg["dpad"])
 
-
-def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_interval=0.5, deadzone=0.2):
-    # Initialize Pygame and its joystick module
-    pygame.init()
-    pygame.joystick.init()
-    
+def get_xbox_mapping(mapping_file="current_button_mapping.json"):
     # Attempt to load the button/axis/DPad mapping from a JSON file
     try:
         with open(mapping_file, "r") as f:
@@ -51,7 +46,16 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
     except Exception as e:
         # If the mapping file cannot be loaded, use an empty mapping and notify via the queue
         mapping = {"buttons": {}, "axes": {}, "dpad": {}}
-        queue.put({"debug": f"Mapping file error: {e}"})
+        print(f"Mapping file error: {e}")
+    return mapping
+
+def xbox_polling_worker(queue: Queue, mapping_file="current_button_mapping.json", avg_interval=0.5, deadzone=0.2):
+    # Initialize Pygame and its joystick module
+    pygame.init()
+    pygame.joystick.init()
+    
+    # Attempt to load the button/axis/DPad mapping from a JSON file
+    mapping = get_xbox_mapping(mapping_file)
     
     # Get the number of connected joysticks/controllers
     count = pygame.joystick.get_count()
@@ -79,14 +83,29 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
     axis_accum = {axis: 0.0 for axis in range(num_axes)}  # Sum of axis values
     axis_count = {axis: 0 for axis in range(num_axes)}      # Counts of readings per axis
     last_axis_time = time.time()  # Timestamp for averaging intervals
+    last_mapping_time = time.time()  # Timestamp for last mapping update
     last_hat = (0, 0)             # Last recorded position of the DPad (hat)
     last_sent = {}                # Stores last sent axis values to avoid redundant messages
 
     # Main loop to continually poll and process joystick events
     while True:
+        current_time = time.time()
         # Process internal Pygame events to update joystick state
         pygame.event.pump()
 
+        # update the button mapping every 5 seconds
+        if current_time - last_mapping_time >= 5:
+            # Load the button mapping from the JSON file
+            try:
+                with open(mapping_file, "r") as f:
+                    mapping = json.load(f)
+            except Exception as e:
+                # If the mapping file cannot be loaded, use an empty mapping and notify via the queue
+                mapping = {"buttons": {}, "axes": {}, "dpad": {}}
+                print(f"Mapping file error: {e}")
+            last_mapping_time = current_time  # Update the last mapping time
+            # Update the mapping for buttons and axes
+        
         # --- Process Button Presses ---
         for i in range(joystick.get_numbuttons()):
             if joystick.get_button(i):  # Check if button i is pressed
@@ -103,7 +122,7 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
             axis_accum[axis] += val     # Sum the values for this axis
             axis_count[axis] += 1       # Count the number of readings
 
-        current_time = time.time()
+        
         # Process averaged axis values only after the specified averaging interval has elapsed
         if current_time - last_axis_time >= avg_interval:
             # Define groups of axes for combined processing

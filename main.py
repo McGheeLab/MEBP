@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         SetupMainWindow.page3(self)
         SetupMainWindow.page4(self)
         SetupMainWindow.page5(self)
+        SetupMainWindow.page6(self)
         SetupMainWindow.left_column(self)
         SetupMainWindow.right_column(self)
 
@@ -153,6 +154,11 @@ class MainWindow(QMainWindow):
             # Load Page 1
             MainFunctions.set_page(self, self.ui.load_pages.page_5)
         
+        if btn.objectName() == "btn_controller_layout":
+            self.ui.left_menu.select_only_one(btn.objectName())
+            # Switch to the controller layout page
+            MainFunctions.set_page(self, self.ui.load_pages.page_6)
+
         if btn.objectName() == "btn_settings" or btn.objectName() == "btn_close_left_column":
             #check if left column is visible
             if not MainFunctions.left_column_is_visible(self):
