@@ -88,11 +88,24 @@ class ControllerLayoutWidget(QWidget):
         button_layout = QFormLayout()
         self.button_comboboxes = {}
         btn_options = self.allowed_functions.get("button", ["None", "Function 1", "Function 2", "Function 3", "Function 4", "Function 5"])
-        for i in range(10):
+        xbox_buttons = {
+            0: "A",
+            1: "B",
+            2: "X",
+            3: "Y",
+            4: "LB",
+            5: "RB",
+            6: "⧉",
+            7: "≡",
+            8: "LS ⤓",
+            9: "RS ⤓"
+        }
+
+        for button_id, button_name in xbox_buttons.items():
             combo = QComboBox()
             combo.addItems(btn_options)
-            button_layout.addRow(f"Button {i}", combo)
-            self.button_comboboxes[i] = combo
+            button_layout.addRow(f"{button_name}", combo)
+            self.button_comboboxes[button_id] = combo
         self.button_mapping_group.setLayout(button_layout)
         scroll_layout.addWidget(self.button_mapping_group)
 
@@ -100,11 +113,15 @@ class ControllerLayoutWidget(QWidget):
         self.axis_mapping_group = QGroupBox("Axis Mapping")
         axis_layout = QFormLayout()
         self.axis_comboboxes = {}
-        axis_groups = [("0-1", "axis"), ("2-3", "axis"), ("4", "trigger"), ("5", "trigger")]
+        axis_groups = [
+            ("LS ⭤ ", "axis"), ("LS ⭥", "axis"),  # Left Stick
+            ("RS ⭤ ", "axis"), ("RS ⭥", "axis"),  # Right Stick
+            ("LT", "trigger"), ("RT", "trigger")  # Left Trigger, Right Trigger
+        ]
         for group_name, group_type in axis_groups:
             combo = QComboBox()
             combo.addItems(self.allowed_functions.get(group_type, ["None", "Function 1", "Function 2", "Function 3", "Function 4", "Function 5"]))
-            axis_layout.addRow(f"Axis {group_name}", combo)
+            axis_layout.addRow(f"{group_name}", combo)
             self.axis_comboboxes[group_name] = combo
         self.axis_mapping_group.setLayout(axis_layout)
         scroll_layout.addWidget(self.axis_mapping_group)
@@ -113,11 +130,17 @@ class ControllerLayoutWidget(QWidget):
         self.dpad_mapping_group = QGroupBox("DPad Mapping")
         dpad_layout = QFormLayout()
         self.dpad_comboboxes = {}
-        for direction in ["up", "down", "left", "right"]:
+        dpad_directions = {
+            "U": "Up",
+            "D": "Down",
+            "L": "Left",
+            "R": "Right"
+        }
+        for key, direction in dpad_directions.items():
             combo = QComboBox()
             combo.addItems(self.allowed_functions.get("dpad", ["None", "Function 1", "Function 2", "Function 3", "Function 4", "Function 5"]))
-            dpad_layout.addRow(f"DPad {direction.capitalize()}", combo)
-            self.dpad_comboboxes[direction] = combo
+            dpad_layout.addRow(f"DPad {key}", combo)
+            self.dpad_comboboxes[key] = combo
         self.dpad_mapping_group.setLayout(dpad_layout)
         scroll_layout.addWidget(self.dpad_mapping_group)
 

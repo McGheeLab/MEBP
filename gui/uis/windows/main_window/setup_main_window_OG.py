@@ -39,18 +39,18 @@ class SetupMainWindow:
     # ///////////////////////////////////////////////////////////////
     add_left_menus = [
         {
-            "btn_icon": "icon_home.svg",
+            "btn_icon": "Position.svg",
             "btn_id": "btn_home",
-            "btn_text": "Home",
-            "btn_tooltip": "Home page",
+            "btn_text": "Position",
+            "btn_tooltip": "Monitor position",
             "show_top": True,
             "is_active": True,
         },
         {
-            "btn_icon": "icon_widgets.svg",
+            "btn_icon": "Calibrate.svg",
             "btn_id": "btn_widgets",
-            "btn_text": "Show Custom Widgets",
-            "btn_tooltip": "Show custom widgets",
+            "btn_text": "Calibrate",
+            "btn_tooltip": "Calibrate needle position",
             "show_top": True,
             "is_active": False,
         },

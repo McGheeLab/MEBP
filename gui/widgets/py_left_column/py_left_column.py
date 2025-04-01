@@ -130,13 +130,14 @@ class PyLeftColumn(QWidget):
 
         # ICON
         self.icon_frame = QFrame()
-        self.icon_frame.setFixedSize(30,30)
+        self.icon_frame.setFixedSize(60,60)
         self.icon_frame.setStyleSheet("background: none;")
         self.icon_layout = QVBoxLayout(self.icon_frame)
-        self.icon_layout.setContentsMargins(0,0,0,0)
+        self.icon_layout.setContentsMargins(1,1,1,1)
         self.icon_layout.setSpacing(5)
         self.icon = PyIcon(self._icon_path, self._icon_color)
         self.icon_layout.addWidget(self.icon, Qt.AlignCenter, Qt.AlignCenter)
+        
 
         # LABEL
         self.title_label = QLabel(self._text_title)

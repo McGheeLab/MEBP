@@ -43,15 +43,20 @@ if sys.platform.startswith("win"):
         # Mark the process as DPI aware for correct scaling
         user32.SetProcessDPIAware()
         dpi = user32.GetDpiForSystem()  # Windows returns the system DPI (e.g., 96, 144, etc.)
-        scale = dpi / 96  # 96 DPI is considered 100%
+        scale = dpi / 150  # 96 DPI is considered 100%
+        print(f"System DPI: {dpi}, Scale: {scale}")
     except Exception:
         scale = 1.0
 else:
     scale = 1.0
 
-os.environ["QT_FONT_DPI"] = "75"
+# Set environment variables for DPI scaling
+os.environ["QT_FONT_DPI"] = "150"
 if scale > 1.0:
     os.environ["QT_SCALE_FACTOR"] = str(scale)
+
+# Increase SVG rendering resolution
+QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
 # MAIN WINDOW
 # ///////////////////////////////////////////////////////////////
@@ -71,7 +76,7 @@ class MainWindow(QMainWindow):
         self.settings = settings.items
 
         # Instantiate AppController early.
-        self.app_controller = AppController()  # if you pass a flag; adjust as needed
+        self.app_controller = AppController(True,True)  # simulate the Xbox controller and printer? T
         self.print_mgr = PrintManager(self.app_controller)
         # Now, create an XboxPoller instance. Since MainWindow is a QObject in the main thread,
         # it is safe to create a QTimer here.

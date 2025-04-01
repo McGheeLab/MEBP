@@ -467,10 +467,10 @@ class StageHandler:
         self.pos_thread.join()
 
 class AppController:
-    def __init__(self):
+    def __init__(self,simulatexy=True, simulatezp=True):
         
-        self.simulatexy = False  # Set to True to simulate devices.
-        self.simulatezp = False  # Set to True to simulate devices.
+        self.simulatexy = simulatexy  # Set to True to simulate devices.
+        self.simulatezp = simulatezp  # Set to True to simulate devices.
         
         self.processor = Processor()
         # Initialize device attributes as None.

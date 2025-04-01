@@ -1,10 +1,12 @@
 {
     "buttons": {},
     "axes": {
-        "0-1": "move_stage_at_velocity",
-        "2-3": "move_z_at_velocity",
-        "4": "move_p1_at_velocity",
-        "5": "move_p1_at_velocity"
+        "LS \u2b64 ": "move_stage_at_velocity",
+        "LS \u2b65": "move_stage_at_velocity",
+        "RS \u2b64 ": "move_z_at_velocity",
+        "RS \u2b65": "move_z_at_velocity",
+        "LT": "move_p1_at_velocity",
+        "RT": "move_p1_at_velocity"
     },
     "dpad": {}
 }
