@@ -337,13 +337,16 @@ class ZPStageManager:
     def setup(self):
         # Prepare printer for normal operation
         step_per_mm = 78040
-        max_feedrate = 90 / 10 * 60  # mm/min, example calculation
+        max_feedrate = 200  # mm/min, example calculation
 
         self.send_data("M302 S0")  # Allow cold extrusion
         self.send_data("M83")      # Set extruder to relative mode
         self.send_data("G91")      # Set XYZ to relative positioning
-        self.send_data("M203 E10000 X10000 Y10000 Z10000")  # Set max feedrates
+        self.send_data(f"M203 E{max_feedrate} Y{max_feedrate} X{max_feedrate} Z{max_feedrate}")  # Set max feedrates
         self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")  # Configure steps per unit
+        # set feedrate to max
+        self.send_data(f"G0 F{max_feedrate}")  # Set feedrate to max
+        self.send_data("M220 S100")  # Set feedrate to 100%
 
     ################################# Communication Functions ########################################
     

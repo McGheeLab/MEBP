@@ -38,6 +38,17 @@ class XboxPoller(QObject):
             elif "dpad" in msg:
                 self.processor.add_command(msg["command"], direction=msg["dpad"])
 
+def getmap(queue, mapping_file="button_mapping.json"):
+    try:
+        with open(mapping_file, "r") as f:
+            mapping = json.load(f)
+            return mapping
+    except Exception as e:
+        # If the mapping file cannot be loaded, use an empty mapping and notify via the queue
+        mapping = {"buttons": {}, "axes": {}, "dpad": {}}
+        queue.put({"debug": f"Mapping file error: {e}"})
+        return None
+        
 
 def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_interval=0.5, deadzone=0.2):
     # Initialize Pygame and its joystick module
@@ -45,13 +56,7 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
     pygame.joystick.init()
     
     # Attempt to load the button/axis/DPad mapping from a JSON file
-    try:
-        with open(mapping_file, "r") as f:
-            mapping = json.load(f)
-    except Exception as e:
-        # If the mapping file cannot be loaded, use an empty mapping and notify via the queue
-        mapping = {"buttons": {}, "axes": {}, "dpad": {}}
-        queue.put({"debug": f"Mapping file error: {e}"})
+    mapping = getmap(queue, mapping_file)
     
     # Get the number of connected joysticks/controllers
     count = pygame.joystick.get_count()
@@ -79,6 +84,7 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
     axis_accum = {axis: 0.0 for axis in range(num_axes)}  # Sum of axis values
     axis_count = {axis: 0 for axis in range(num_axes)}      # Counts of readings per axis
     last_axis_time = time.time()  # Timestamp for averaging intervals
+    last_map_time = time.time()   # Timestamp for last mapping update
     last_hat = (0, 0)             # Last recorded position of the DPad (hat)
     last_sent = {}                # Stores last sent axis values to avoid redundant messages
 
@@ -199,3 +205,10 @@ def xbox_polling_worker(queue: Queue, mapping_file="button_mapping.json", avg_in
 
         # Brief sleep to prevent high CPU usage
         time.sleep(0.02)
+        
+        # refresh the mapping every 5 seconds
+        if current_time - last_map_time >= 5:
+            # Attempt to reload the mapping file
+            mapping = getmap(queue, mapping_file)
+            last_map_time = current_time
+        # Cleanup Pygame resources

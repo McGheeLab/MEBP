@@ -84,7 +84,7 @@ class Processor:
 class StageHandler:
     def __init__(self, processor, zp_stage, xy_stage):
         self.XYUPDATE_INTERVAL = 1.0
-        self.ZUPDATE_INTERVAL = 0.5
+        self.ZUPDATE_INTERVAL = 0.25
         self.POS_UPDATE_INTERVAL = 0.5623  # Polling interval for updating positions
 
         self.z_fast_mode_velocity = 1000 # mm/min
@@ -107,7 +107,11 @@ class StageHandler:
         
         self.zspeed_range = (0.01, 10.0)
         self.pspeed_range = (0.01, 10.0)
-        self.xyspeed_range = (1.0, 1000.0)
+        self.xyspeed_range = (1.0, 10000.0)
+        
+        self.maxzspeed = 250
+        self.maxpspeed = 250
+        self.maxxyspeed = 5000
         
         # State dictionaries storing full information for each axis.
         self.zp_state = {
@@ -213,31 +217,37 @@ class StageHandler:
         # if speed is within the speed range multiply the speed by 10
         if self.zspeed < self.zspeed_range[1]:
             self.zspeed *= 10
+        print(f"ZSpeed: {self.zspeed}")
     
     def increment_zspeed_down(self, *args, **kwargs):
         # if speed is within the speed range divide the speed by 10
         if self.zspeed > self.zspeed_range[0]:
             self.zspeed /= 10
-            
+        print(f"ZSpeed: {self.zspeed}")
+        
     def increment_pspeed_up(self, *args, **kwargs):
         # if speed is within the speed range multiply the speed by 10
         if self.pspeed < self.pspeed_range[1]:
             self.pspeed *= 10
+        print(f"PSpeed: {self.pspeed}")
     
     def increment_pspeed_down(self, *args, **kwargs):
         # if speed is within the speed range divide the speed by 10
         if self.pspeed > self.pspeed_range[0]:
             self.pspeed /= 10
+        print(f"PSpeed: {self.pspeed}")
             
     def increment_xyspeed_up(self, *args, **kwargs):
         # if speed is within the speed range multiply the speed by 10
         if self.xyspeed < self.xyspeed_range[1]:
             self.xyspeed *= 10
+        print(f"XY speed: {self.xyspeed}")
     
     def increment_xyspeed_down(self, *args, **kwargs):
         # if speed is within the speed range divide the speed by 10
         if self.xyspeed > self.xyspeed_range[0]:
             self.xyspeed /= 10
+        print(f"XY speed: {self.xyspeed}")
 
     
     # ----- Velocity Update Methods for ZP Stage -----
@@ -246,6 +256,10 @@ class StageHandler:
         # find non-zero velocity
         velocity = next((v for v in [v1, v2] if v != 0), 0.0)
         self.zp_state["Z"]["velocity"] = velocity*self.zspeed
+        # check if the velocity is not faster than the max
+        if self.zp_state["Z"]["velocity"] > self.maxzspeed:
+            self.zp_state["Z"]["velocity"] = self.maxzspeed
+            
         self.zp_state["Z"]["active"] = (velocity != 0)
 
     def update_p1_velocity(self, *args, **kwargs):
@@ -253,6 +267,9 @@ class StageHandler:
         # find non-zero velocity
         velocity = next((v for v in [v1, v2] if v != 0), 0.0)
         self.zp_state["P1"]["velocity"] = velocity*self.pspeed
+        # check if the velocity is not faster than the max
+        if self.zp_state["P1"]["velocity"] > self.maxpspeed:
+            self.zp_state["P1"]["velocity"] = self.maxpspeed
         self.zp_state["P1"]["active"] = (velocity != 0)
 
     def update_p2_velocity(self, *args, **kwargs):
@@ -260,6 +277,9 @@ class StageHandler:
         # find non-zero velocity
         velocity = next((v for v in [v1, v2] if v != 0), 0.0)
         self.zp_state["P2"]["velocity"] = velocity*self.pspeed
+        # check if the velocity is not faster than the max
+        if self.zp_state["P2"]["velocity"] > self.maxpspeed:
+            self.zp_state["P2"]["velocity"] = self.maxpspeed
         self.zp_state["P2"]["active"] = (velocity != 0)
 
     def update_p3_velocity(self, *args, **kwargs):
@@ -267,6 +287,9 @@ class StageHandler:
         # find non-zero velocity
         velocity = next((v for v in [v1, v2] if v != 0), 0.0)
         self.zp_state["P3"]["velocity"] = velocity*self.pspeed
+        # check if the velocity is not faster than the max
+        if self.zp_state["P3"]["velocity"] > self.maxpspeed:
+            self.zp_state["P3"]["velocity"] = self.maxpspeed
         self.zp_state["P3"]["active"] = (velocity != 0)
 
     # ----- Velocity Update for XY Stage -----
@@ -275,6 +298,11 @@ class StageHandler:
         
         self.xy_state["x"]["velocity"] = vx*self.xyspeed
         self.xy_state["y"]["velocity"] = vy*self.xyspeed
+        # check if the velocity is not faster than the max
+        if self.xy_state["x"]["velocity"] > self.maxxyspeed:
+            self.xy_state["x"]["velocity"] = self.maxxyspeed
+        if self.xy_state["y"]["velocity"] > self.maxxyspeed:
+            self.xy_state["y"]["velocity"] = self.maxxyspeed
         self.xy_state["x"]["active"] = (vx != 0)
         self.xy_state["y"]["active"] = (vy != 0)
 
@@ -352,17 +380,15 @@ class StageHandler:
 
     def calibrate_needle_position(self, *args, **kwargs):
         # get current position
-        zp_positions = self.zp_stage.get_current_position()
-        xy_positions = self.xy_stage.get_current_position()
-        if zp_positions and len(zp_positions) >= 4:
-            self.zero_position["Z"] = zp_positions[0]
-            self.zero_position["P1"] = zp_positions[1]
-            self.zero_position["P2"] = zp_positions[2]
-            self.zero_position["P3"] = zp_positions[3]
-        if xy_positions and len(xy_positions) >= 3:
-            self.zero_position["x"] = xy_positions[0]
-            self.zero_position["y"] = xy_positions[1]
-            self.zero_position["f"] = xy_positions[2]
+
+        self.zero_position["Z"] = self.zp_state["Z"]["position"]
+        self.zero_position["P1"] = self.zp_state["P1"]["position"]
+        self.zero_position["P2"] = self.zp_state["P2"]["position"]
+        self.zero_position["P3"] = self.zp_state["P3"]["position"]
+        self.zero_position["x"] = self.xy_state["x"]["position"]
+        self.zero_position["y"] = self.xy_state["y"]["position"]
+        self.zero_position["f"] = self.xy_state["f"]["position"]
+
         # show in command console all of the zero positions
         print("Zero positions:")
         for axis, pos in self.zero_position.items():
@@ -443,8 +469,8 @@ class StageHandler:
 class AppController:
     def __init__(self):
         
-        self.simulatexy = True  # Set to True to simulate devices.
-        self.simulatezp = True  # Set to True to simulate devices.
+        self.simulatexy = False  # Set to True to simulate devices.
+        self.simulatezp = False  # Set to True to simulate devices.
         
         self.processor = Processor()
         # Initialize device attributes as None.
