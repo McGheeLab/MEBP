@@ -671,61 +671,73 @@ class WellPropertiesTab(QWidget):
 
         self.form = QFormLayout()
         self.fastz_input = QDoubleSpinBox()
+        self.fastz_input.setRange(-99999, 99999)  # Allow negative values
         self.fastz_input.setValue(self.print_manager.well_properties.get("fastz", 0))
         self.fastz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Fast Z:", self.fastz_input)
 
         self.floorz_input = QDoubleSpinBox()
+        self.floorz_input.setRange(-99999, 99999)  # Allow negative values
         self.floorz_input.setValue(self.print_manager.well_properties.get("floorz", 0))
         self.floorz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Floor Z:", self.floorz_input)
 
         self.topz_input = QDoubleSpinBox()
+        self.topz_input.setRange(-99999, 99999)  # Allow negative values
         self.topz_input.setValue(self.print_manager.well_properties.get("topz", 0))
         self.topz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Top Z:", self.topz_input)
 
         self.ink_topz_input = QDoubleSpinBox()
+        self.ink_topz_input.setRange(-99999, 99999)  # Allow negative values
         self.ink_topz_input.setValue(self.print_manager.well_properties.get("ink_topz", 0))
         self.ink_topz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Ink Top Z:", self.ink_topz_input)
 
         self.ink_floorz_input = QDoubleSpinBox()
+        self.ink_floorz_input.setRange(-99999, 99999)  # Allow negative values
         self.ink_floorz_input.setValue(self.print_manager.well_properties.get("ink_floorz", 0))
         self.ink_floorz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Ink Floor Z:", self.ink_floorz_input)
 
         self.well_A1_x_input = QDoubleSpinBox()
+        self.well_A1_x_input.setRange(-99999, 99999)  # Allow negative values
         self.well_A1_x_input.setValue(self.print_manager.well_properties.get("Well_A1_x", 0))
         self.well_A1_x_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well A1 X:", self.well_A1_x_input)
 
         self.well_A1_y_input = QDoubleSpinBox()
+        self.well_A1_y_input.setRange(-99999, 99999)  # Allow negative values
         self.well_A1_y_input.setValue(self.print_manager.well_properties.get("Well_A1_y", 0))
         self.well_A1_y_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well A1 Y:", self.well_A1_y_input)
 
         self.well_dx_input = QDoubleSpinBox()
+        self.well_dx_input.setRange(-99999, 99999)  # Allow negative values
         self.well_dx_input.setValue(self.print_manager.well_properties.get("well_dx", 0))
         self.well_dx_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well DX:", self.well_dx_input)
 
         self.well_dy_input = QDoubleSpinBox()
+        self.well_dy_input.setRange(-99999, 99999)  # Allow negative values
         self.well_dy_input.setValue(self.print_manager.well_properties.get("well_dy", 0))
         self.well_dy_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well DY:", self.well_dy_input)
 
         self.well_rows_input = QSpinBox()
+        self.well_rows_input.setRange(-99999, 99999)  # Allow negative values
         self.well_rows_input.setValue(self.print_manager.well_properties.get("well_rows", 0))
         self.well_rows_input.valueChanged.connect(lambda: self.on_change_callback())
         self.form.addRow("Well Rows:", self.well_rows_input)
 
         self.well_cols_input = QSpinBox()
+        self.well_cols_input.setRange(-99999, 99999)  # Allow negative values
         self.well_cols_input.setValue(self.print_manager.well_properties.get("well_cols", 0))
         self.well_cols_input.valueChanged.connect(lambda: self.on_change_callback())
         self.form.addRow("Well Cols:", self.well_cols_input)
 
         self.well_diameter_input = QDoubleSpinBox()
+        self.well_diameter_input.setRange(-99999, 99999)  # Allow negative values
         self.well_diameter_input.setValue(self.print_manager.well_properties.get("well_diameter", 0))
         self.well_diameter_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well Diameter:", self.well_diameter_input)
@@ -1604,7 +1616,6 @@ class PlateLayoutTab(QWidget):
                     assigned[well].append(pf_obj)
         return assigned
 
-
 ############################################################################################################
 ############################### Print Setup Helpers ########################################################
 ############################################################################################################
@@ -1626,172 +1637,6 @@ class ColorItemDelegate(QStyledItemDelegate):
         painter.setPen(Qt.black)
         text = index.data(Qt.DisplayRole)
         painter.drawText(rect, Qt.AlignCenter, text)
-
-
-class WellPreviewWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.print_file = None  
-        self.dragging = None    
-        self.drag_offset = QPointF(0, 0)
-        self.well_diameter_physical = 5.0  
-        self.well_height_physical = 15.0   
-
-    def resizeEvent(self, event):
-        # Recalculate the waypoint's bounding box when the widget is resized.
-        if self.print_file and self.print_file.waypoints:
-            xs = [pt['x'] for pt in self.print_file.waypoints]
-            ys = [pt['y'] for pt in self.print_file.waypoints]
-            min_x, max_x = min(xs), max(xs)
-            min_y, max_y = min(ys), max(ys)
-            range_x = max_x - min_x
-            range_y = max_y - min_y
-
-            margin = 10
-            # The well is drawn in the left half of the widget.
-            area_width = (self.width() // 2) - 2 * margin
-            area_height = self.height() - 2 * margin
-            radius = min(area_width, area_height) / 2
-            drawn_diameter = 2 * radius
-
-            # Compute new bounding box dimensions based on the current scale.
-            new_width = (range_x / self.well_diameter_physical) * drawn_diameter
-            new_height = (range_y / self.well_diameter_physical) * drawn_diameter
-            new_width = max(new_width, 10)
-            new_height = max(new_height, 10)
-            self.print_file.bbox_size = QSizeF(new_width, new_height)
-
-            # Compute the center of the waypoint data and update its offset.
-            center_x = (min_x + max_x) / 2
-            center_y = (min_y + max_y) / 2
-            scale = drawn_diameter / self.well_diameter_physical
-            self.print_file.bbox_offset = QPointF(center_x * scale, center_y * scale)
-        
-        # Call the base class implementation.
-        super().resizeEvent(event)
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        margin = 10
-        area_width = (self.width() // 2) - 2 * margin
-        area_height = self.height() - 2 * margin
-        well_center = QPointF(margin + area_width/2, margin + area_height/2)
-        radius = min(area_width, area_height) / 2
-        drawn_diameter = 2 * radius
-
-        # Draw the well circle.
-        painter.setPen(QPen(Qt.black, 2))
-        painter.drawEllipse(well_center, radius, radius)
-
-        if self.print_file:
-            # Use the updated bbox_offset and bbox_size computed in resizeEvent.
-            bbox_center = well_center + self.print_file.bbox_offset
-            bbox_size = self.print_file.bbox_size
-            bbox_rect = QRectF(bbox_center.x() - bbox_size.width()/2,
-                               bbox_center.y() - bbox_size.height()/2,
-                               bbox_size.width(), bbox_size.height())
-            half_diag = math.sqrt((bbox_size.width()/2)**2 + (bbox_size.height()/2)**2)
-            dist = math.hypot(bbox_center.x()-well_center.x(), bbox_center.y()-well_center.y())
-            pen_color = Qt.green if dist + half_diag <= radius else Qt.red
-            painter.setPen(QPen(pen_color, 2))
-            painter.drawRect(bbox_rect)
-
-            # Draw waypoint path if available.
-            if self.print_file.waypoints:
-                painter.setPen(QPen(Qt.blue, 2))
-                xs = [pt['x'] for pt in self.print_file.waypoints]
-                ys = [pt['y'] for pt in self.print_file.waypoints]
-                min_x, max_x = min(xs), max(xs)
-                min_y, max_y = min(ys), max(ys)
-                range_x = max_x - min_x if (max_x - min_x) != 0 else 1
-                range_y = max_y - min_y if (max_y - min_y) != 0 else 1
-                mapped_points = []
-                for pt in self.print_file.waypoints:
-                    norm_x = (pt['x'] - min_x) / range_x
-                    norm_y = (pt['y'] - min_y) / range_y
-                    x = bbox_rect.left() + norm_x * bbox_rect.width()
-                    y = bbox_rect.top() + norm_y * bbox_rect.height()
-                    mapped_points.append(QPointF(x, y))
-                for i in range(len(mapped_points)-1):
-                    painter.drawLine(mapped_points[i], mapped_points[i+1])
-
-        # Draw the side view.
-        side_rect = QRectF(self.width()//2 + margin, margin,
-                           (self.width()//2) - 2 * margin, self.height() - 2 * margin)
-        painter.setPen(QPen(Qt.black, 2))
-        painter.drawRect(side_rect)
-        if self.print_file:
-            if self.print_file.floor_offset is None:
-                self.print_file.floor_offset = side_rect.bottom()
-            floor_y = self.print_file.floor_offset
-            if self.print_file.waypoints:
-                z_vals = [pt['z'] for pt in self.print_file.waypoints]
-                z_range = max(z_vals) - min(z_vals)
-            else:
-                z_range = self.well_height_physical
-            scale = side_rect.height() / self.well_height_physical
-            top_y = floor_y - (z_range * scale)
-            painter.setPen(QPen(Qt.black, 2))
-            painter.drawLine(side_rect.left(), floor_y, side_rect.right(), floor_y)
-            painter.drawLine(side_rect.left(), top_y, side_rect.right(), top_y)
-
-    def mousePressEvent(self, event):
-        pos = QPointF(event.position())
-        margin = 10
-        if not self.print_file:
-            return
-        if pos.x() < self.width()//2:
-            area_width = (self.width() // 2) - 2 * margin
-            area_height = self.height() - 2 * margin
-            well_center = QPointF(margin + area_width/2, margin + area_height/2)
-            bbox_center = well_center + self.print_file.bbox_offset
-            bbox_size = self.print_file.bbox_size
-            bbox_rect = QRectF(bbox_center.x()-bbox_size.width()/2,
-                               bbox_center.y()-bbox_size.height()/2,
-                               bbox_size.width(), bbox_size.height())
-            if bbox_rect.contains(pos):
-                self.dragging = "bbox"
-                self.drag_offset = pos - bbox_rect.topLeft()
-        else:
-            if self.print_file.floor_offset is not None and abs(pos.y() - self.print_file.floor_offset) < 5:
-                self.dragging = "floor"
-                self.drag_offset = pos.y() - self.print_file.floor_offset
-
-    def mouseMoveEvent(self, event):
-        pos = QPointF(event.position())
-        margin = 10
-        if self.dragging == "bbox" and self.print_file:
-            area_width = (self.width() // 2) - 2 * margin
-            area_height = self.height() - 2 * margin
-            well_center = QPointF(margin + area_width/2, margin + area_height/2)
-            new_top_left = pos - self.drag_offset
-            new_bbox_center = new_top_left + QPointF(self.print_file.bbox_size.width()/2,
-                                                     self.print_file.bbox_size.height()/2)
-            half_diag = math.sqrt((self.print_file.bbox_size.width()/2)**2 + (self.print_file.bbox_size.height()/2)**2)
-            max_allowed = (min(area_width, area_height)/2) - half_diag
-            delta = new_bbox_center - well_center
-            dist = math.hypot(delta.x(), delta.y())
-            if dist > max_allowed:
-                factor = max_allowed / dist if dist != 0 else 1
-                delta = delta * factor
-                new_bbox_center = well_center + delta
-            self.print_file.bbox_offset = new_bbox_center - well_center
-            self.update()
-        elif self.dragging == "floor" and self.print_file:
-            side_rect = QRectF(self.width()//2 + margin, margin,
-                               (self.width()//2) - 2 * margin, self.height() - 2 * margin)
-            new_floor = pos.y() - self.drag_offset
-            if new_floor < side_rect.top():
-                new_floor = side_rect.top()
-            if new_floor > side_rect.bottom():
-                new_floor = side_rect.bottom()
-            self.print_file.floor_offset = new_floor
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        self.dragging = None
 
 class WellPreviewWidget(QWidget):
     def __init__(self, parent=None):
@@ -1996,8 +1841,6 @@ class WellPreviewWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         self.dragging = None
-
-
 
 class IsometricPreviewWidget(QWidget):
     def __init__(self, parent=None):
@@ -2231,9 +2074,8 @@ class IsometricPreviewWidget(QWidget):
         self.fit_to_view()
         self.update()
 
-
 ############################################################################################################
-#################################  Ink well Helpers  #######################################################
+#################################   Ink well Helpers   #####################################################
 ############################################################################################################
 class InkWellLocationValidator(QValidator):
     def __init__(self, max_rows, max_cols, parent=None):
