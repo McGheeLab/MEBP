@@ -352,10 +352,26 @@ class ZPStageManager:
     
     def send_data(self, data):
         # Send G-code or commands to the printer or simulator
-        # print(f"Sending data: {data}")
-        data = data.encode("utf-8") + b"\n"  # Convert to bytes and add newline
-        self.serial.write(data)
-        self.serial.flush()  # Make sure the data is sent immediately
+        # Convert the command to bytes and append a newline
+        data = data.encode("utf-8") + b"\n"
+        # Try to wait briefly until the port is open
+        retry_count = 5
+        wait_time = 0.01  # 100 ms
+        tries = 0
+        while (not self.serial or (hasattr(self.serial, "is_open") and not self.serial.is_open)) and tries < retry_count:
+            print("Warning: Serial port not open. Waiting...")
+            time.sleep(wait_time)
+            tries += 1
+
+        if not self.serial or (hasattr(self.serial, "is_open") and not self.serial.is_open):
+            print("Error: Serial port is still not open. Command not sent.")
+            return
+
+        try:
+            self.serial.write(data)
+            self.serial.flush()  # Ensure the data is sent immediately
+        except serial.SerialException as e:
+            print(f"Error sending data: {e}")
 
     def receive_data(self):
         # Short pause to simulate delay, then read all incoming data

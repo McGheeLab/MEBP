@@ -84,7 +84,7 @@ class Processor:
 class StageHandler:
     def __init__(self, processor, zp_stage, xy_stage):
         self.XYUPDATE_INTERVAL = 1.0
-        self.ZUPDATE_INTERVAL = 0.25
+        self.ZUPDATE_INTERVAL = 0.3333
         self.POS_UPDATE_INTERVAL = 0.5623  # Polling interval for updating positions
 
         self.z_fast_mode_velocity = 1000 # mm/min
