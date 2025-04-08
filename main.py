@@ -76,7 +76,7 @@ class MainWindow(QMainWindow):
         self.settings = settings.items
 
         # Instantiate AppController early.
-        self.app_controller = AppController(True,True)  # simulate the Xbox controller and printer? T
+        self.app_controller = AppController(False,False)  # simulate the Xbox controller and printer? T
         self.print_mgr = PrintManager(self.app_controller)
         # Now, create an XboxPoller instance. Since MainWindow is a QObject in the main thread,
         # it is safe to create a QTimer here.
