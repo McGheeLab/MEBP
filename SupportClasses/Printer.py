@@ -492,13 +492,20 @@ class PrintManager:
                 break
             time.sleep(0.01)
 
-    def wait_for_xy(self, target_x, target_y, tolerance=0.05):
+    def wait_for_xy(self, target_x, target_y,speed, tolerance=0.05):
         while True:
             stage_info = self.app_controller.stage_handler.get_stage_info()["XY"]
             current_x = stage_info["x"]["position"]
             current_y = stage_info["y"]["position"]
-            if np.hypot(current_x - target_x, current_y - target_y) <= tolerance:
+            dx = target_x - current_x
+            dy = target_y - current_y
+            distance = np.hypot(dx, dy)
+            if distance <= tolerance:
                 break
+            # Calculate normalized direction and multiply by a chosen speed factor.
+            vx = dx / distance
+            vy = dy / distance
+            self.processor.add_command("move_stage_at_velocity", average=(vx * speed, vy * speed))
             time.sleep(0.01)
 
     def wait_for_p(self, p_key, target, tolerance=0.05):
@@ -513,8 +520,9 @@ class PrintManager:
         self.wait_for_z(z)
 
     def fastmovexy(self, x, y):
+        speed = 10000
         self.app_controller.stage_handler.move_abs_xy_well_reference(x, y, True)
-        self.wait_for_xy(x, y)
+        self.wait_for_xy(x, y,speed)
 
     def slowmovez(self, z):
         self.app_controller.stage_handler.move_abs_z_zero_reference(z, False)
