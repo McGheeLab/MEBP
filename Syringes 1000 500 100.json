@@ -1,0 +1,20 @@
+{
+    "p1": {
+        "diameter": 7.29,
+        "length": 23.99,
+        "cell_type": "Fibro",
+        "standard_type": "Hamilton 1000\u00ce\u00bcL"
+    },
+    "p2": {
+        "diameter": 4.61,
+        "length": 29.99,
+        "cell_type": "Fibro",
+        "standard_type": "Hamilton 500\u00ce\u00bcL"
+    },
+    "p3": {
+        "diameter": 2.06,
+        "length": 29.76,
+        "cell_type": "Fibro",
+        "standard_type": "Hamilton 100\u00ce\u00bcL"
+    }
+}
