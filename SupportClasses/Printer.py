@@ -651,3 +651,424 @@ class PrintManager:
 
     def __del__(self):
         self.stop()
+
+
+
+class Stages:
+    UPDATE_INTERVAL_XY = 1  # Time between updates in seconds (for XY stage)
+    UPDATE_INTERVAL_ZP = 0.5  # Time between updates for ZP stage
+
+    def __init__(self, waypoints, simulate=False, Kp=1.0, Ki=0.0, Kd=0.0):
+        self.simulate = simulate
+        self.xy_manager = XYStageManager(simulate=self.simulate)
+        self.zp_manager = ZPStageManager(simulate=self.simulate)
+
+        self.current_positions_zp = {'x': 0, 'y': 0, 'z': 0, 'e': 0}
+        self.waypoints = waypoints
+
+        # PID controller parameters
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+
+        # Initialize PID controller variables
+        self.error_sum_x = 0.0
+        self.error_sum_y = 0.0
+        self.last_error_x = 0.0
+        self.last_error_y = 0.0
+
+        self.max_velocity = 1000  # Define a maximum allowable velocity for XY
+
+        # Flags to signal threads to stop
+        self.stop_flag = False
+
+    def __del__(self):
+        """Ensure the simulator stops when the XYStageManager instance is destroyed."""
+        if self.simulate:
+            if self.xy_manager.spo.running:
+                self.xy_manager.spo.stop()
+            if self.zp_manager.serial.running:
+                self.zp_manager.serial.stop()
+
+    def calculate_velocity_with_pid(self, error_x, error_y, delta_time):
+        """Calculate velocity using PID control based on error."""
+        # Proportional term
+        P_x = self.Kp * error_x
+        P_y = self.Kp * error_y
+
+        # Integral term
+        self.error_sum_x += error_x * delta_time
+        self.error_sum_y += error_y * delta_time
+        I_x = self.Ki * self.error_sum_x
+        I_y = self.Ki * self.error_sum_y
+
+        # Derivative term
+        D_x = self.Kd * (error_x - self.last_error_x) / delta_time if delta_time > 0 else 0
+        D_y = self.Kd * (error_y - self.last_error_y) / delta_time if delta_time > 0 else 0
+
+        # PID output
+        vx = P_x + I_x + D_x
+        vy = P_y + I_y + D_y
+
+        # Update last error
+        self.last_error_x = error_x
+        self.last_error_y = error_y
+
+        return vx, vy
+
+    def plot_results_3d(
+        self, ideal_x, ideal_y, ideal_z,
+        actual_x, actual_y, actual_z,
+        ideal_p1, ideal_p2, ideal_p3,
+        actual_p1, actual_p2, actual_p3,
+        plot_title
+    ):
+        """Plot the results of the stage movement in 3D."""
+
+        # Determine the maximum length among all arrays
+        max_length = max(
+            len(ideal_x), len(ideal_y), len(ideal_z),
+            len(actual_x), len(actual_y), len(actual_z),
+            len(ideal_p1), len(ideal_p2), len(ideal_p3),
+            len(actual_p1), len(actual_p2), len(actual_p3)
+        )
+
+        # Create a common time array for interpolation
+        common_time = np.linspace(0, 1, max_length)
+
+        # Function to interpolate data arrays to the common time array
+        def interpolate_array(data_array):
+            original_time = np.linspace(0, 1, len(data_array))
+            interpolation_function = interp1d(
+                original_time, data_array, kind='linear', fill_value="extrapolate"
+            )
+            return interpolation_function(common_time)
+
+        # Interpolate all data arrays
+        ideal_x = interpolate_array(ideal_x)
+        ideal_y = interpolate_array(ideal_y)
+        ideal_z = interpolate_array(ideal_z)
+
+        actual_x = interpolate_array(actual_x)
+        actual_y = interpolate_array(actual_y)
+        actual_z = interpolate_array(actual_z)
+
+        ideal_p1 = interpolate_array(ideal_p1)
+        ideal_p2 = interpolate_array(ideal_p2)
+        ideal_p3 = interpolate_array(ideal_p3)
+
+        actual_p1 = interpolate_array(actual_p1)
+        actual_p2 = interpolate_array(actual_p2)
+        actual_p3 = interpolate_array(actual_p3)
+
+        # Detect changes in p1, p2, p3
+        positions_p1 = []
+        positions_p2 = []
+        positions_p3 = []
+
+        prev_p1 = None
+        prev_p2 = None
+        prev_p3 = None
+
+        # Use a small tolerance for floating-point comparisons
+        tolerance = 1e-2
+
+        for i in range(len(actual_p1)):
+            current_p1 = actual_p1[i]
+            current_p2 = actual_p2[i]
+            current_p3 = actual_p3[i]
+
+            # Use the positions from the actual path
+            x_pos = actual_x[i]
+            y_pos = actual_y[i]
+            z_pos = actual_z[i]
+
+            # Check for significant changes in p1
+            if prev_p1 is not None and abs(current_p1 - prev_p1) > tolerance:
+                positions_p1.append((x_pos, y_pos, z_pos))
+            # Check for significant changes in p2
+            if prev_p2 is not None and abs(current_p2 - prev_p2) > tolerance:
+                positions_p2.append((x_pos*1.02, y_pos*1.02, z_pos))
+            # Check for significant changes in p3
+            if prev_p3 is not None and abs(current_p3 - prev_p3) > tolerance:
+                positions_p3.append((x_pos*0.98, y_pos*0.98, z_pos))
+
+            # Update previous values
+            prev_p1 = current_p1
+            prev_p2 = current_p2
+            prev_p3 = current_p3
+
+        # Proceed with plotting
+        fig = plt.figure(figsize=(12, 10))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Plot ideal XY path
+        ax.plot(ideal_x, ideal_y, ideal_z, label='Ideal XY Path', linestyle='--', color='blue')
+        # Plot actual XY path
+        ax.plot(actual_x, actual_y, actual_z, label='Actual XY Path', linestyle='-', color='red')
+
+        # Plot markers where p1, p2, p3 changed
+        if positions_p1:
+            x_p1, y_p1, z_p1 = zip(*positions_p1)
+            ax.scatter(x_p1, y_p1, z_p1, c='green', marker='^', label='p1 Change')
+        if positions_p2:
+            x_p2, y_p2, z_p2 = zip(*positions_p2)
+            ax.scatter(x_p2, y_p2, z_p2, c='magenta', marker='s', label='p2 Change')
+        if positions_p3:
+            x_p3, y_p3, z_p3 = zip(*positions_p3)
+            ax.scatter(x_p3, y_p3, z_p3, c='cyan', marker='o', label='p3 Change')
+
+        # Customize the plot
+        ax.set_xlabel('X Position (microns)')
+        ax.set_ylabel('Y Position (microns)')
+        ax.set_zlabel('Z Position (microns)')
+        ax.set_title(f'Stage Movement: {plot_title}')
+        ax.legend()
+        plt.show()
+
+    def xy_update_thread(self, start_time, interpolation_type, ideal_path_x, ideal_path_y, actual_path_x, actual_path_y):
+        """Thread function to update XY stage independently."""
+        x0, y0, _ = self.xy_manager.get_current_position()
+        if x0 is None or y0 is None:
+            print("Failed to retrieve initial XY position. Stopping XY updates.")
+            return
+
+        next_update_time_xy = start_time
+        while not self.stop_flag:
+            current_time = time.time()
+            if current_time >= next_update_time_xy:
+                elapsed_time_xy = current_time - start_time
+                interpolated_values_xy = self.waypoints.interpolate_waypoints(
+                    elapsed_time_xy, x0, y0, 0, 0, 0, 0, interpolation_type
+                )
+
+                if interpolated_values_xy is None:
+                    # No more waypoints - stop thread
+                    break
+
+                target_x = interpolated_values_xy['x']
+                target_y = interpolated_values_xy['y']
+
+                current_x, current_y, _ = self.xy_manager.get_current_position()
+                if current_x is None or current_y is None:
+                    print("Failed to retrieve XY position. Stopping XY updates.")
+                    break
+
+                error_x = target_x - current_x
+                error_y = target_y - current_y
+
+                vx, vy = self.calculate_velocity_with_pid(error_x, error_y, self.UPDATE_INTERVAL_XY)
+                velocity_magnitude = np.hypot(vx, vy)
+                if velocity_magnitude > self.max_velocity:
+                    scaling_factor = self.max_velocity / velocity_magnitude
+                    vx *= scaling_factor
+                    vy *= scaling_factor
+                    self.error_sum_x = 0.0
+                    self.error_sum_y = 0.0
+
+                self.xy_manager.move_stage_at_velocity(vx, vy)
+                ideal_path_x.append(target_x)
+                ideal_path_y.append(target_y)
+                actual_path_x.append(current_x)
+                actual_path_y.append(current_y)
+
+                next_update_time_xy += self.UPDATE_INTERVAL_XY
+            time.sleep(0.001)
+
+        # Stop stage movement at end
+        self.xy_manager.move_stage_at_velocity(0, 0)
+        print("XY updates complete.")
+
+    def zp_update_thread(self, start_time, interpolation_type,
+                         ideal_path_z, ideal_p1, ideal_p2, ideal_p3,
+                         actual_path_z, actual_p1_list, actual_p2_list, actual_p3_list):
+        """Thread function to update ZP stage independently."""
+        z0, p10, p20, p30 = self.zp_manager.get_position()
+        if z0 is None:
+            z0, p10, p20, p30 = 0, 0, 0, 0
+            print("Failed to get ZP initial position, defaulting to 0.")
+
+        self.zp_manager.send_data("G90")  # Absolute positioning
+        timefactor = -0.15 * self.UPDATE_INTERVAL_ZP
+
+        next_update_time_zp = start_time
+
+        while not self.stop_flag:
+            current_time = time.time()
+            if current_time >= next_update_time_zp:
+                z, p1, p2, p3 = self.zp_manager.get_position()
+                if z is None:  # If reading fails, attempt defaults or break
+                    z, p1, p2, p3 = 0, 0, 0, 0
+
+                actual_path_z.append(z)
+                actual_p1_list.append(p1)
+                actual_p2_list.append(p2)
+                actual_p3_list.append(p3)
+
+                elapsed_time_zp = current_time - start_time
+
+                interpolated_values_zp = self.waypoints.interpolate_waypoints(
+                    elapsed_time_zp, 0, 0, z0, p10, p20, p30, interpolation_type
+                )
+
+                if interpolated_values_zp is None:
+                    # No more waypoints - stop thread
+                    break
+
+                target_z = interpolated_values_zp['z']
+                target_p1 = interpolated_values_zp['p1']
+                target_p2 = interpolated_values_zp['p2']
+                target_p3 = interpolated_values_zp['p3']
+
+                zp_axes = {
+                    'X': target_z,
+                    'Y': target_p1,
+                    'Z': target_p2,
+                    'E': target_p3
+                }
+
+                # Calculate a feedrate
+                dist_z = abs(target_z - z)
+                dist_p1 = abs(target_p1 - p1)
+                dist_p2 = abs(target_p2 - p2)
+                dist_p3 = abs(target_p3 - p3)
+                max_distance = max(dist_z, dist_p1, dist_p2, dist_p3)
+                feedrate = (max_distance / (self.UPDATE_INTERVAL_ZP + timefactor)) * 60 if max_distance > 0 else 100.0
+
+                self.zp_manager.movecommand(zp_axes, feedrate=feedrate)
+
+                # Collect ideal positions
+                ideal_path_z.append(interpolated_values_zp['z'])
+                ideal_p1.append(interpolated_values_zp['p1'])
+                ideal_p2.append(interpolated_values_zp['p2'])
+                ideal_p3.append(interpolated_values_zp['p3'])
+
+                next_update_time_zp += self.UPDATE_INTERVAL_ZP
+            time.sleep(0.001)
+
+        self.zp_manager.send_data("G91")  # Back to relative
+        print("ZP updates complete.")
+
+    def move(self, plot_title, interpolation_type="linear", plot=False):
+        # Prepare storage lists
+        actual_path_x = []
+        actual_path_y = []
+        actual_path_z = []
+
+        ideal_path_x = []
+        ideal_path_y = []
+        ideal_path_z = []
+
+        actual_p1 = []
+        actual_p2 = []
+        actual_p3 = []
+
+        ideal_p1 = []
+        ideal_p2 = []
+        ideal_p3 = []
+
+        start_time = time.time()
+
+        # Create threads for XY and ZP updates
+        xy_thread = threading.Thread(
+            target=self.xy_update_thread,
+            args=(start_time, interpolation_type, ideal_path_x, ideal_path_y, actual_path_x, actual_path_y)
+        )
+        zp_thread = threading.Thread(
+            target=self.zp_update_thread,
+            args=(start_time, interpolation_type,
+                  ideal_path_z, ideal_p1, ideal_p2, ideal_p3,
+                  actual_path_z, actual_p1, actual_p2, actual_p3)
+        )
+
+        # Start threads
+        xy_thread.start()
+        zp_thread.start()
+
+        # Wait for both threads to finish
+        xy_thread.join()
+        zp_thread.join()
+
+        print(f"{plot_title} complete.")
+
+        if plot:
+            self.plot_results_3d(
+                ideal_path_x, ideal_path_y, ideal_path_z,
+                actual_path_x, actual_path_y, actual_path_z,
+                ideal_p1, ideal_p2, ideal_p3,
+                actual_p1, actual_p2, actual_p3,
+                plot_title
+            )
+
+class Waypoint:
+    def __init__(self, csv_file_path='waypoints.csv'):
+        self.csv_file_path = csv_file_path
+        self.waypoints = []
+        self.import_waypoints_from_csv()
+
+    def import_waypoints_from_csv(self):
+        """Import waypoints from a CSV file."""
+        self.waypoints = []
+        try:
+            with open(self.csv_file_path, mode='r') as file:
+                csv_reader = csv.reader(file)
+                for row in csv_reader:
+                    # Skip header row
+                    if row[0].startswith('x'):
+                        continue
+                    elif len(row) == 7:
+                        x, y, z, p1, p2, p3, t = map(float, row)
+                        waypoint = {
+                            'x': x,
+                            'y': y,
+                            'z': z,
+                            'p1': p1,
+                            'p2': p2,
+                            'p3': p3,
+                            't': t
+                        }
+                        self.waypoints.append(waypoint)
+                    else:
+                        print(f"Invalid row length: {row}")
+        except FileNotFoundError:
+            print(f"Error: File not found at {self.csv_file_path}")
+        except Exception as e:
+            print(f"Error reading CSV file: {e}")
+        return self.waypoints
+
+    def interpolate_waypoints(self, elapsed_time, x0=0, y0=0, z0=0, p10=0, p20=0, p30=0, interpolation_type="linear"):
+        """Interpolate between waypoints to get the target position at the given elapsed time."""
+        waypoints = self.waypoints
+
+        if not waypoints:
+            return None
+
+        if elapsed_time > waypoints[-1]['t']:
+            return None
+
+        times = [wp['t'] for wp in waypoints]
+        data_keys = ['x', 'y', 'z', 'p1', 'p2', 'p3']
+        interpolated_values = {}
+
+        for key in data_keys:
+            values = [wp[key] for wp in waypoints]
+            if interpolation_type == "linear":
+                interp_func = interp1d(times, values, kind='linear', fill_value="extrapolate")
+            elif interpolation_type == "polynomial":
+                degree = min(3, len(waypoints) - 1)
+                interp_func = np.poly1d(np.polyfit(times, values, degree))
+            elif interpolation_type == "spline":
+                interp_func = CubicSpline(times, values)
+            else:
+                raise ValueError(f"Unsupported interpolation type: {interpolation_type}")
+            interpolated_values[key] = interp_func(elapsed_time)
+
+        # Add initial positions if necessary (assuming positions are relative)
+        interpolated_values['x'] += x0
+        interpolated_values['y'] += y0
+        interpolated_values['z'] += z0
+        interpolated_values['p1'] += p10
+        interpolated_values['p2'] += p20  # Corrected line
+        interpolated_values['p3'] += p30  # Corrected line
+
+        return interpolated_values
