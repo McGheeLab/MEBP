@@ -357,10 +357,10 @@ class PrintManager:
             if self.pause_flag:
                 if self.last_pause_time is None:
                     self.last_pause_time = current_time
-                    self.processor.add_command("move_z_at_velocity", average=(0, 0))
-                    self.processor.add_command("move_p1_at_velocity", average=(0, 0))
-                    self.processor.add_command("move_p2_at_velocity", average=(0, 0))
-                    self.processor.add_command("move_p3_at_velocity", average=(0, 0))
+                    self.processor.add_command("move_z_at_velocity", average=(0.0, 0.0))
+                    self.processor.add_command("move_p1_at_velocity", average=(0.0, 0.0))
+                    self.processor.add_command("move_p2_at_velocity", average=(0.0, 0.0))
+                    self.processor.add_command("move_p3_at_velocity", average=(0.0, 0.0))
                 time.sleep(0.05)
                 continue
             else:
@@ -398,15 +398,15 @@ class PrintManager:
                 target_p3 = interpolated['p3']
 
                 dt = self.zp_interval
-                v_z = (target_z - current_z) / dt
-                v_p1 = (target_p1 - current_p1) / dt
-                v_p2 = (target_p2 - current_p2) / dt
-                v_p3 = (target_p3 - current_p3) / dt
+                v_z = float((target_z - current_z) / dt)
+                v_p1 = float((target_p1 - current_p1) / dt)
+                v_p2 = float((target_p2 - current_p2) / dt)
+                v_p3 = float((target_p3 - current_p3) / dt)
 
-                self.processor.add_command("move_z_at_velocity", average=(v_z, 0))
-                self.processor.add_command("move_p1_at_velocity", average=(v_p1, 0))
-                self.processor.add_command("move_p2_at_velocity", average=(v_p2, 0))
-                self.processor.add_command("move_p3_at_velocity", average=(v_p3, 0))
+                self.processor.add_command("move_z_at_velocity", average=(v_z, 0.0))
+                self.processor.add_command("move_p1_at_velocity", average=(v_p1, 0.0))
+                self.processor.add_command("move_p2_at_velocity", average=(v_p2, 0.0))
+                self.processor.add_command("move_p3_at_velocity", average=(v_p3, 0.0))
 
                 ideal_path_z.append(target_z)
                 ideal_p1.append(target_p1)
@@ -415,10 +415,10 @@ class PrintManager:
                 next_update_time += self.zp_interval
             time.sleep(0.001)
 
-        self.processor.add_command("move_z_at_velocity", average=(0, 0))
-        self.processor.add_command("move_p1_at_velocity", average=(0, 0))
-        self.processor.add_command("move_p2_at_velocity", average=(0, 0))
-        self.processor.add_command("move_p3_at_velocity", average=(0, 0))
+        self.processor.add_command("move_z_at_velocity", average=(0.0, 0.0))
+        self.processor.add_command("move_p1_at_velocity", average=(0.0, 0.0))
+        self.processor.add_command("move_p2_at_velocity", average=(0.0, 0.0))
+        self.processor.add_command("move_p3_at_velocity", average=(0.0, 0.0))
         print("ZP print updates complete.")
 
     def start_print(self, print_title, interpolation_type="linear", plot=False, pf=None):
@@ -465,7 +465,7 @@ class PrintManager:
 
             print(f"Starting print for well '{well_id}' with offset {offset}.")
 
-            self.prepare_print(pf)
+            #self.prepare_print(pf)
             self.start_print(print_title=f"Print for well {well_id}", interpolation_type=interpolation_type, plot=plot, pf=pf)
             self.slowmovez(self.well_properties["topz"])
             time.sleep(0.5)
@@ -473,16 +473,24 @@ class PrintManager:
 
     def prepare_print(self, pf):
         # Fast move to z for fast XY moves.
+        print(f"Fast moving to Z: {self.well_properties['fastz']}")
         self.fastmovez(self.well_properties["fastz"])
+        
         # Load inks based on the print file’s waypoints.
         self.load_ink(pf)
+        print(f"Loaded ink for well '{pf.well_id}' with offset {pf.offset}.")
+        # Fast move to z for fast XY moves.
+        self.fastmovez(self.well_properties["fastz"])
+        print(f"Fast moving to Z: {self.well_properties['fastz']}")
         # Move to the well (with XY offset).
         well_xy = self.find_well_xy(pf.well_id)
-        self.fastmovez(self.well_properties["fastz"])
         self.fastmovexy(well_xy[0] + pf.offset[0], well_xy[1] + pf.offset[1])
+        print(f"Fast moving to XY: {well_xy[0] + pf.offset[0]}, {well_xy[1] + pf.offset[1]}")
         # Move to well top and then to floor (with Z offset).
         self.fastmovez(self.well_properties["ink_topz"])
+        print(f"Fast moving to Z: {self.well_properties['ink_topz']}")
         self.slowmovez(self.well_properties["floorz"] - pf.offset[2])
+        print(f"Slow moving to Z: {self.well_properties['floorz'] - pf.offset[2]}")
 
     # Helper functions for polling motion completion
     def wait_for_z(self, target_z, tolerance=0.05):

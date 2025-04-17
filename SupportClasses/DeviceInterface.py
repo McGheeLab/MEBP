@@ -501,7 +501,7 @@ class ZPStageManager:
         
     def set_slow_mode(self):
         # Set the feedrate to fast mode
-        self.send_data("M220 S10")
+        self.send_data("M220 S100")
         print("Slow mode enabled")
      
     def resetprinter(self):
