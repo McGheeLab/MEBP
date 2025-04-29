@@ -10,6 +10,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QPointF, QSizeF
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 ###############################################################################
 #  UI Classes                                                                #
 
@@ -69,9 +72,13 @@ class ControlTab(QWidget):
         self.stop_btn.clicked.connect(lambda: self.printmanager.handle_control_print("stop"))
     
     def start_print(self):
+        
+        flag = self.printmanager.post__init__()
+        
         # The start button now calls process_print_queue and is disabled after being pressed.
-        self.start_btn.setDisabled(True)
-        threading.Thread(target=self.printmanager.process_print_queue, daemon=True).start()
+        if flag: 
+            self.start_btn.setDisabled(True)
+            threading.Thread(target=self.printmanager.process_print_queue, daemon=True).start()
     
     def toggle_pause(self):
         # Toggle between pause and resume.
@@ -214,29 +221,35 @@ class PrintMonitorWidget(QWidget):
         self.printmanager = printmanager
         self.initUI()
         self.setupTimer()
-    
+
     def initUI(self):
         main_layout = QVBoxLayout(self)
-        self.tab_widget = QTabWidget(self)
+        self.tab_widget = QTabWidget()
         main_layout.addWidget(self.tab_widget)
-        self.control_tab = ControlTab(self.printmanager, self)
-        self.waypoints_views_tab = WaypointsViewsTab(self.printmanager, self)
+
+        self.control_tab = ControlTab(self.printmanager)
+        self.waypoints_tab = WaypointsViewsTab(self.printmanager)
+        self.results_tab = ResultsTab(self.printmanager)
+
         self.control_tab.print_selected_callback = self.on_print_selected
-        self.tab_widget.addTab(self.control_tab, "Control")
-        self.tab_widget.addTab(self.waypoints_views_tab, "Waypoints & Views")
-    
+
+        self.tab_widget.addTab(self.control_tab,    "Control")
+        self.tab_widget.addTab(self.waypoints_tab,  "Waypoints & Views")
+        self.tab_widget.addTab(self.results_tab, "Results")
+
     def on_print_selected(self, uid):
-        # This callback can be used to inform other tabs if needed.
+        # if you want to sync selection elsewhere
         pass
-    
+
     def setupTimer(self):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.updateUI)
         self.timer.start(500)
-    
+
     def updateUI(self):
         self.control_tab.updateUI()
-        self.waypoints_views_tab.updateUI()
+        self.waypoints_tab.updateUI()
+        self.results_tab.updateUI()
 
 class TopViewWidget(QWidget):
     def __init__(self, parent=None):
@@ -368,3 +381,95 @@ class IsoViewWidget(QWidget):
                 color = QColor("black")
             painter.setBrush(QBrush(color))
             painter.drawEllipse(pt, radius, radius)
+
+class ResultsTab(QWidget):
+    def __init__(self, printmanager, parent=None):
+        super().__init__(parent)
+        self.printmanager = printmanager
+        self.initUI()
+
+    def initUI(self):
+        # Overall layout: list on left, canvas on right
+        layout = QHBoxLayout(self)
+
+        # — Left: list of completed prints —
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Completed Prints"))
+        self.list = QListWidget()
+        # whenever the selection changes, redraw the plot
+        self.list.currentItemChanged.connect(self.show_plot)
+        left.addWidget(self.list)
+        layout.addLayout(left, 1)
+
+        # — Right: Matplotlib canvas —
+        self.figure = Figure(figsize=(5,4))
+        self.canvas = FigureCanvas(self.figure)
+        layout.addWidget(self.canvas, 3)
+
+    def updateUI(self):
+        # repopulate list but keep the same selection if possible
+        sel_uid = None
+        if self.list.currentItem():
+            sel_uid = self.list.currentItem().data(Qt.UserRole)
+
+        self.list.blockSignals(True)
+        self.list.clear()
+        for uid, res in self.printmanager.results.items():
+            pf = self.printmanager.prints.get(uid)
+            name = pf.name if pf else uid
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, uid)
+            if pf and hasattr(pf, "color"):
+                item.setBackground(QColor(pf.color))
+            self.list.addItem(item)
+            if uid == sel_uid:
+                self.list.setCurrentItem(item)
+        self.list.blockSignals(False)
+
+    def show_plot(self, current, previous=None):
+        # clear existing figure
+        self.figure.clear()
+
+        if not current:
+            self.canvas.draw()
+            return
+
+        uid = current.data(Qt.UserRole)
+        res = self.printmanager.results.get(uid)
+        if not res:
+            self.canvas.draw()
+            return
+
+        ideal, actual = res["ideal"], res["actual"]
+
+        # --- XY subplot (truncate to common length) ---
+        ix, iy = ideal["x"], ideal["y"]
+        ax_, ay_ = actual["x"], actual["y"]
+        n_xy = min(len(ix), len(iy), len(ax_), len(ay_))
+        ix, iy = ix[:n_xy], iy[:n_xy]
+        ax_, ay_ = ax_[:n_xy], ay_[:n_xy]
+
+        ax1 = self.figure.add_subplot(1, 2, 1)
+        ax1.plot(ix, iy,   label="Ideal XY")
+        ax1.plot(ax_, ay_, linestyle="--", label="Actual XY")
+        ax1.set_xlabel("X")
+        ax1.set_ylabel("Y")
+        ax1.set_title("XY Path")
+        ax1.legend()
+
+        # --- Z subplot (truncate to common length) ---
+        iz = ideal["z"]
+        az = actual["z"]
+        n_z = min(len(iz), len(az))
+        iz, az = iz[:n_z], az[:n_z]
+
+        ax2 = self.figure.add_subplot(1, 2, 2)
+        ax2.plot(range(n_z), iz,  label="Ideal Z")
+        ax2.plot(range(n_z), az,  linestyle="--", label="Actual Z")
+        ax2.set_xlabel("Step")
+        ax2.set_ylabel("Z")
+        ax2.set_title("Z Path")
+        ax2.legend()
+
+        self.figure.tight_layout()
+        self.canvas.draw()

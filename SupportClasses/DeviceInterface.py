@@ -194,22 +194,10 @@ class XYStageManager:
         Move stage to a specific position given by (x, y).
         This uses an absolute positioning approach (PA command).
         """
-        # change velocity to fast mode if fast is True
-        if fast:
-            self.set_fast_mode()
-        else:
-            self.set_slow_mode()
-
         # ensure the x and y values are within the valid range if not error
-        if self.check_stage_limits(x, y):
-        
-            command = f"PA,{x},{y}"
-            self.send_command(command)
-            
-        else:
-            print("Error: Position is outside of stage limits.")
-            
-    
+        command = f"PA,{x},{y}"
+        self.send_command(command)
+  
     def check_stage_limits(self, x, y):
         """
         Check if the given position (x, y) or the resulting velocity (x,y) times 1 second will be within the valid range.
@@ -441,8 +429,6 @@ class ZPStageManager:
         # change back to slow feedrate by default
         self.set_slow_mode()
     
-    
-               
     ################################# Printer Request Functions ########################################
         
     def get_current_position(self):
@@ -496,13 +482,11 @@ class ZPStageManager:
     
     def set_fast_mode(self):
         # Set the feedrate to fast mode
-        self.send_data("M220 S100")
-        print("Fast mode enabled")
+        pass
         
     def set_slow_mode(self):
         # Set the feedrate to fast mode
-        self.send_data("M220 S100")
-        print("Slow mode enabled")
+        pass
      
     def resetprinter(self):
         # Send emergency stop command
@@ -618,6 +602,7 @@ class XYStageSimulator:
     def move_stage_at_velocity(self, vx, vy):
         """Wrapper to send a velocity command."""
         command = f"VS,{vx},{vy}"
+        print(f"Sending XY command: {command}")
         self.send_command(command)
 
     def update_velocity(self, current, target, dt):
