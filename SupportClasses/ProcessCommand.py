@@ -255,10 +255,11 @@ class StageHandler:
         v1, v2 = self._extract_velocity(*args, **kwargs)
         # find non-zero velocity
         velocity = next((v for v in [v1, v2] if v != 0), 0.0)
-        self.zp_state["Z"]["velocity"] = velocity*self.zspeed
+        self.zp_state["Z"]["velocity"] = velocity
         # check if the velocity is not faster than the max
         if self.zp_state["Z"]["velocity"] > self.maxzspeed:
             self.zp_state["Z"]["velocity"] = self.maxzspeed
+            print(f"speed limit reached: {self.zp_state['Z']['velocity']}")
             
         self.zp_state["Z"]["active"] = (velocity != 0)
 
@@ -270,6 +271,7 @@ class StageHandler:
         # check if the velocity is not faster than the max
         if self.zp_state["P1"]["velocity"] > self.maxpspeed:
             self.zp_state["P1"]["velocity"] = self.maxpspeed
+            print(f"speed limit reached: {self.zp_state['P1']['velocity']}")
         self.zp_state["P1"]["active"] = (velocity != 0)
 
     def update_p2_velocity(self, *args, **kwargs):
@@ -280,6 +282,7 @@ class StageHandler:
         # check if the velocity is not faster than the max
         if self.zp_state["P2"]["velocity"] > self.maxpspeed:
             self.zp_state["P2"]["velocity"] = self.maxpspeed
+            print(f"speed limit reached: {self.zp_state['P2']['velocity']}")    
         self.zp_state["P2"]["active"] = (velocity != 0)
 
     def update_p3_velocity(self, *args, **kwargs):
@@ -290,19 +293,22 @@ class StageHandler:
         # check if the velocity is not faster than the max
         if self.zp_state["P3"]["velocity"] > self.maxpspeed:
             self.zp_state["P3"]["velocity"] = self.maxpspeed
+            print(f"speed limit reached: {self.zp_state['P3']['velocity']}")
         self.zp_state["P3"]["active"] = (velocity != 0)
 
     # ----- Velocity Update for XY Stage -----
     def update_xy_velocity(self, *args, **kwargs):
         vx, vy = self._extract_velocity(*args, **kwargs)
         
-        self.xy_state["x"]["velocity"] = vx*self.xyspeed
-        self.xy_state["y"]["velocity"] = vy*self.xyspeed
+        self.xy_state["x"]["velocity"] = vx 
+        self.xy_state["y"]["velocity"] = vy
         # check if the velocity is not faster than the max
         if self.xy_state["x"]["velocity"] > self.maxxyspeed:
             self.xy_state["x"]["velocity"] = self.maxxyspeed
+            print(f"speed limit reached: {self.xy_state['x']['velocity']}")
         if self.xy_state["y"]["velocity"] > self.maxxyspeed:
             self.xy_state["y"]["velocity"] = self.maxxyspeed
+            print(f"speed limit reached: {self.xy_state['y']['velocity']}")
         self.xy_state["x"]["active"] = (vx != 0)
         self.xy_state["y"]["active"] = (vy != 0)
 
@@ -339,6 +345,7 @@ class StageHandler:
                 vy = self.xy_state["y"]["velocity"]
                 current_xy_velocity = (vx, vy)
                 if current_xy_velocity != last_xy_velocity:
+                    print(f"XY stage moving at velocity: {current_xy_velocity}")
                     self.xy_stage.move_stage_at_velocity(vx, vy)
                     last_xy_velocity = current_xy_velocity
             time.sleep(self.XYUPDATE_INTERVAL)

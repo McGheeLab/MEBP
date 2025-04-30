@@ -25,22 +25,22 @@
     },
     "syringes": {
         "p1": {
-            "diameter": 1.0,
-            "length": 99.99,
+            "diameter": 7.29,
+            "length": 23.99,
             "cell_type": "DefaultCell",
-            "standard_type": "Standard1"
+            "standard_type": "Hamilton 1000\u00ce\u00bcL"
         },
         "p2": {
-            "diameter": 1.0,
-            "length": 99.99,
+            "diameter": 4.61,
+            "length": 29.99,
             "cell_type": "None",
-            "standard_type": "Standard1"
+            "standard_type": "Hamilton 500\u00ce\u00bcL"
         },
         "p3": {
-            "diameter": 1.5,
-            "length": 99.99,
+            "diameter": 2.06,
+            "length": 29.76,
             "cell_type": "None",
-            "standard_type": "Standard2"
+            "standard_type": "Hamilton 100\u00ce\u00bcL"
         }
     }
 }
