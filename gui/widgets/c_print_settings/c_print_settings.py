@@ -189,8 +189,10 @@ class PrintSettingsWidget(QWidget):
             return
 
         # Update well properties.
+        # Update well-plate properties via the WellPlate API:
         wp = self.well_tab.get_properties()
-        self.print_manager.well_properties.update(wp)
+        for key, val in wp.items():
+            self.print_manager.wellplate.update_property(key, val)
 
         # Update syringe properties.
         syr_data = self.syringe_tab.get_syringe_data()
@@ -200,8 +202,8 @@ class PrintSettingsWidget(QWidget):
 
         # Update ink wells.
         ink_data = self.ink_tab.get_ink_wells()
-        self.print_manager.ink_wells.update(ink_data)
-
+        self.print_manager.wellplate.ink_wells.update(ink_data)
+        
         # get the print setup data which is a dict of well location and printfile object
         pf = self.plate_layout_tab.get_assigned_printfiles()
         # go through pf and queue the printfiles in the printmanager.queue_a_waypoint(self, well_id, offset, csv_file, **kwargs):
@@ -216,11 +218,6 @@ class PrintSettingsWidget(QWidget):
 ############################################################################################################
 ###################################  All Widgets within the tabs  ##########################################
 ############################################################################################################
-# --- CSV List Widget (supports drag) ---
-from PySide6.QtWidgets import QListWidget, QAbstractItemView
-from PySide6.QtCore import Qt, QMimeData
-from PySide6.QtGui import QDrag
-import json
 
 class PrintListWidget(QListWidget):
     def __init__(self, parent=None):
@@ -672,73 +669,73 @@ class WellPropertiesTab(QWidget):
         self.form = QFormLayout()
         self.fastz_input = QDoubleSpinBox()
         self.fastz_input.setRange(-99999, 99999)  # Allow negative values
-        self.fastz_input.setValue(self.print_manager.well_properties.get("fastz", 0))
+        self.fastz_input.setValue(self.print_manager.wellplate.props.get("fastz", 0))
         self.fastz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Fast Z:", self.fastz_input)
 
         self.floorz_input = QDoubleSpinBox()
         self.floorz_input.setRange(-99999, 99999)  # Allow negative values
-        self.floorz_input.setValue(self.print_manager.well_properties.get("floorz", 0))
+        self.floorz_input.setValue(self.print_manager.wellplate.props.get("floorz", 0))
         self.floorz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Floor Z:", self.floorz_input)
 
         self.topz_input = QDoubleSpinBox()
         self.topz_input.setRange(-99999, 99999)  # Allow negative values
-        self.topz_input.setValue(self.print_manager.well_properties.get("topz", 0))
+        self.topz_input.setValue(self.print_manager.wellplate.props.get("topz", 0))
         self.topz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Top Z:", self.topz_input)
 
         self.ink_topz_input = QDoubleSpinBox()
         self.ink_topz_input.setRange(-99999, 99999)  # Allow negative values
-        self.ink_topz_input.setValue(self.print_manager.well_properties.get("ink_topz", 0))
+        self.ink_topz_input.setValue(self.print_manager.wellplate.props.get("ink_topz", 0))
         self.ink_topz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Ink Top Z:", self.ink_topz_input)
 
         self.ink_floorz_input = QDoubleSpinBox()
         self.ink_floorz_input.setRange(-99999, 99999)  # Allow negative values
-        self.ink_floorz_input.setValue(self.print_manager.well_properties.get("ink_floorz", 0))
+        self.ink_floorz_input.setValue(self.print_manager.wellplate.props.get("ink_floorz", 0))
         self.ink_floorz_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Ink Floor Z:", self.ink_floorz_input)
 
         self.well_A1_x_input = QDoubleSpinBox()
         self.well_A1_x_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_A1_x_input.setValue(self.print_manager.well_properties.get("Well_A1_x", 0))
+        self.well_A1_x_input.setValue(self.print_manager.wellplate.props.get("Well_A1_x", 0))
         self.well_A1_x_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well A1 X:", self.well_A1_x_input)
 
         self.well_A1_y_input = QDoubleSpinBox()
         self.well_A1_y_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_A1_y_input.setValue(self.print_manager.well_properties.get("Well_A1_y", 0))
+        self.well_A1_y_input.setValue(self.print_manager.wellplate.props.get("Well_A1_y", 0))
         self.well_A1_y_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well A1 Y:", self.well_A1_y_input)
 
         self.well_dx_input = QDoubleSpinBox()
         self.well_dx_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_dx_input.setValue(self.print_manager.well_properties.get("well_dx", 0))
+        self.well_dx_input.setValue(self.print_manager.wellplate.props.get("well_dx", 0))
         self.well_dx_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well DX:", self.well_dx_input)
 
         self.well_dy_input = QDoubleSpinBox()
         self.well_dy_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_dy_input.setValue(self.print_manager.well_properties.get("well_dy", 0))
+        self.well_dy_input.setValue(self.print_manager.wellplate.props.get("well_dy", 0))
         self.well_dy_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well DY:", self.well_dy_input)
 
         self.well_rows_input = QSpinBox()
         self.well_rows_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_rows_input.setValue(self.print_manager.well_properties.get("well_rows", 0))
+        self.well_rows_input.setValue(self.print_manager.wellplate.props.get("well_rows", 0))
         self.well_rows_input.valueChanged.connect(lambda: self.on_change_callback())
         self.form.addRow("Well Rows:", self.well_rows_input)
 
         self.well_cols_input = QSpinBox()
         self.well_cols_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_cols_input.setValue(self.print_manager.well_properties.get("well_cols", 0))
+        self.well_cols_input.setValue(self.print_manager.wellplate.props.get("well_cols", 0))
         self.well_cols_input.valueChanged.connect(lambda: self.on_change_callback())
         self.form.addRow("Well Cols:", self.well_cols_input)
 
         self.well_diameter_input = QDoubleSpinBox()
         self.well_diameter_input.setRange(-99999, 99999)  # Allow negative values
-        self.well_diameter_input.setValue(self.print_manager.well_properties.get("well_diameter", 0))
+        self.well_diameter_input.setValue(self.print_manager.wellplate.props.get("well_diameter", 0))
         self.well_diameter_input.valueChanged.connect(self.on_change_callback)
         self.form.addRow("Well Diameter:", self.well_diameter_input)
 

@@ -182,22 +182,34 @@ class XYStageManager:
         Move stage at a specified velocity.
         vx, vy are velocity components in the X and Y axes respectively.
         """
-          
-        if self.check_stage_limits(vx*timefactor, vy*timefactor):
-            command = f"VS,{vx},{vy}"
-            self.send_command(command)
-        else:
-            print("Error: Velocity will move past stage limits.")
+
+        command = f"VS,{vx},{vy}"
+        self.send_command(command)
+        print(f"Sending XY command: {command}")
+
 
     def move_stage_to_position(self, x, y, fast=False):
         """
-        Move stage to a specific position given by (x, y).
-        This uses an absolute positioning approach (PA command).
+        Move stage to absolute position (x, y) using ProScan III ASCII RS-232 protocol.
         """
-        # ensure the x and y values are within the valid range if not error
-        command = f"PA,{x},{y}"
-        self.send_command(command)
-  
+
+        # 2. (Optional) if fast=True, you might adjust speed or step size here
+        #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
+        self.send_command("VS,100\r") # set stage speed to 100%
+        #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
+
+        # 3. Build and send the absolute move command:
+        #    'G x,y<CR>' moves to absolute (x,y)  :contentReference[oaicite:2]{index=2}
+        cmd = f"G {int(x)},{int(y)}\r"
+        self.send_command(cmd)
+        print(f"Sent absolute move command: {cmd!r}")
+
+        #wait for completion
+        #read until an 'R' or 'END' is returned.
+        
+        #    e.g.: self.wait_for_response("R")
+        
+    
     def check_stage_limits(self, x, y):
         """
         Check if the given position (x, y) or the resulting velocity (x,y) times 1 second will be within the valid range.

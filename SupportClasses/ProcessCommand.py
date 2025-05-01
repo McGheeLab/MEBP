@@ -160,13 +160,10 @@ class StageHandler:
         self.processor.register_handler("increment_pspeed_down", self.increment_pspeed_down)
         self.processor.register_handler("increment_xyspeed_up", self.increment_xyspeed_up)
         self.processor.register_handler("increment_xyspeed_down", self.increment_xyspeed_down)
-        
-        # Start background threads.
-        self.zp_thread = threading.Thread(target=self._zp_stage_loop, name="ZPStageHandlerThread", daemon=True)
-        self.xy_thread = threading.Thread(target=self._xy_stage_loop, name="XYStageHandlerThread", daemon=True)
-        self.zp_thread.start()
-        self.xy_thread.start()
-    
+            
+        self._update_XY_positions()
+        self._update_ZP_positions()    
+            
     # ----- basic move to location commands for both stages -----
     def move_abs_z_zero_reference(self, z_value, fastmode=False):
         # calculate the distance to move from the zero position and the z_value given
@@ -192,10 +189,13 @@ class StageHandler:
         # move the stage to the new position
         self.xy_stage.move_stage_to_position(x_position, y_position, fast=fastmode)
     
+    def move_abs_xy(self, x_value, y_value):
+        self.xy_stage.move_stage_to_position(x_value, y_value)
+    
     def move_rel_z(self, z_value, feedrate):
         # move the stage to a relative position from the current position
         mappedZ = self.axes_mapping.get("Z")
-        self.zp_stage.move_relative(axes={mappedZ: z_value})
+        self.zp_stage.move_relative(axes={mappedZ: z_value}, feedrate=feedrate)
     
     def move_rel_xy(self, x_value, y_value):
         # calculate the distance to move from the current position and the x_value and y_value given
@@ -324,30 +324,6 @@ class StageHandler:
             v1, v2 = velocity, 0.0
         return v1, v2
 
-    # ----- Stage Move Loops -----
-    def _zp_stage_loop(self):
-        while self._running:
-            if self._zp_running:
-                if (self.zp_state["Z"]["velocity"] != 0 or 
-                    self.zp_state["P1"]["velocity"] != 0 or 
-                    self.zp_state["P2"]["velocity"] != 0 or 
-                    self.zp_state["P3"]["velocity"] != 0):
-                    self.send_zp_move_command()
-            time.sleep(self.ZUPDATE_INTERVAL)
-
-    def _xy_stage_loop(self):
-        last_xy_velocity = (None, None)
-        while self._running:
-            if self._xy_running:
-                vx = self.xy_state["x"]["velocity"]
-                vy = self.xy_state["y"]["velocity"]
-                current_xy_velocity = (vx, vy)
-                if current_xy_velocity != last_xy_velocity:
-                    print(f"XY stage moving at velocity: {current_xy_velocity}")
-                    self.xy_stage.move_stage_at_velocity(vx, vy)
-                    last_xy_velocity = current_xy_velocity
-            time.sleep(self.XYUPDATE_INTERVAL)
-
     def send_zp_move_command(self):
         print("Sending ZP move command")
         dt = self.ZUPDATE_INTERVAL
@@ -370,11 +346,11 @@ class StageHandler:
     # ----- Stage Movement Commands -----
     def jog_xy(self, vx, vy):
         # check if the velocity is not faster than the max and update the state
-        self.update_xy_velocity(vx, vy)
+        #self.update_xy_velocity(vx, vy)
         
         # get stage velocity from the state
-        vx = self.xy_state["x"]["velocity"]
-        vy = self.xy_state["y"]["velocity"]
+        #vx = self.xy_state["x"]["velocity"]
+        #vy = self.xy_state["y"]["velocity"]
         
         self.xy_stage.move_stage_at_velocity(vx, vy)
         
@@ -390,7 +366,8 @@ class StageHandler:
     
     def _update_XY_positions(self):
         xy_positions = self.xy_stage.get_current_position()  # e.g., (x, y, f)
-        if xy_positions and len(xy_positions) >= 3:
+        print(f"XY positions: {xy_positions}")
+        if xy_positions and len(xy_positions) >= 3 and xy_positions[0] is not None and xy_positions[1] is not None and xy_positions[2] is not None:
             self.xy_state["x"]["position"] = xy_positions[0]
             self.xy_state["y"]["position"] = xy_positions[1]
             self.xy_state["f"]["position"] = xy_positions[2]
@@ -487,11 +464,6 @@ class StageHandler:
         elif stage == "XY" and axis in self.xy_state:
             self.xy_state[axis].update(info)
         
-    def stop(self):
-        self._running = False
-        self.zp_thread.join()
-        self.xy_thread.join()
-
     def getAxisMap(self, axis):
         return self.axes_mapping.get(axis, None)
 

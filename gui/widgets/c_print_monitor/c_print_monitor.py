@@ -72,7 +72,6 @@ class ControlTab(QWidget):
         self.stop_btn.clicked.connect(lambda: self.printmanager.handle_control_print("stop"))
     
     def start_print(self):
-        
         self.printmanager.process_print_queue()
     
     def toggle_pause(self):
@@ -110,7 +109,7 @@ class ControlTab(QWidget):
                 label.setStyleSheet(f"background-color: {syringe.color};")
         # Update inkwell list from printmanager.ink_wells.
         self.inkwell_list.clear()
-        for key, inkwell in self.printmanager.ink_wells.items():
+        for key, inkwell in self.printmanager.wellplate.ink_wells.items():
             text = f"{inkwell.well_location} - {inkwell.cell_type} - Volume: {inkwell.volume}"
             item = QListWidgetItem(text)
             item.setBackground(QColor(inkwell.color))
@@ -149,7 +148,9 @@ class WaypointsViewsTab(QWidget):
         self.main_layout.addLayout(views_layout)
     
     def updateUI(self):
-        pf = self.printmanager.activeprint
+        # grab the currently-active PrintFile from the manager
+        uid = self.printmanager.active_uid
+        pf  = self.printmanager.prints.get(uid) if uid is not None else None
         status = self.printmanager.print_status
         self.status_label.setText(f"Status: {status}")
         if pf is None:
