@@ -83,7 +83,7 @@ class Processor:
 
 class StageHandler:
     def __init__(self, processor, zp_stage, xy_stage):
-        self.XYUPDATE_INTERVAL = 1.0
+        self.XYUPDATE_INTERVAL = 1.15
         self.ZUPDATE_INTERVAL = 0.3333
         self.POS_UPDATE_INTERVAL = 0.5623  # Polling interval for updating positions
 
@@ -164,10 +164,8 @@ class StageHandler:
         # Start background threads.
         self.zp_thread = threading.Thread(target=self._zp_stage_loop, name="ZPStageHandlerThread", daemon=True)
         self.xy_thread = threading.Thread(target=self._xy_stage_loop, name="XYStageHandlerThread", daemon=True)
-        self.pos_thread = threading.Thread(target=self._update_positions_loop, name="StagePositionUpdateThread", daemon=True)
         self.zp_thread.start()
         self.xy_thread.start()
-        self.pos_thread.start()
     
     # ----- basic move to location commands for both stages -----
     def move_abs_z_zero_reference(self, z_value, fastmode=False):
@@ -194,7 +192,7 @@ class StageHandler:
         # move the stage to the new position
         self.xy_stage.move_stage_to_position(x_position, y_position, fast=fastmode)
     
-    def move_rel_z(self, z_value):
+    def move_rel_z(self, z_value, feedrate):
         # move the stage to a relative position from the current position
         mappedZ = self.axes_mapping.get("Z")
         self.zp_stage.move_relative(axes={mappedZ: z_value})
@@ -311,7 +309,7 @@ class StageHandler:
             print(f"speed limit reached: {self.xy_state['y']['velocity']}")
         self.xy_state["x"]["active"] = (vx != 0)
         self.xy_state["y"]["active"] = (vy != 0)
-
+    
     def _extract_velocity(self, *args, **kwargs):
         # Check if average is passed as a keyword argument.
         if "average" in kwargs:
@@ -369,22 +367,44 @@ class StageHandler:
         print(f"axes {axes} at feedrate {feedrate}")
         self.zp_stage.move_relative(axes, feedrate)
 
+    # ----- Stage Movement Commands -----
+    def jog_xy(self, vx, vy):
+        # check if the velocity is not faster than the max and update the state
+        self.update_xy_velocity(vx, vy)
+        
+        # get stage velocity from the state
+        vx = self.xy_state["x"]["velocity"]
+        vy = self.xy_state["y"]["velocity"]
+        
+        self.xy_stage.move_stage_at_velocity(vx, vy)
+        
+    
     # ----- Position Polling and State Update -----
-    def _update_positions_loop(self):
-        while self._running:
-            zp_positions = self.zp_stage.get_current_position()  # e.g., (z, p1, p2, p3)
-            if zp_positions and len(zp_positions) >= 4:
-                self.zp_state["Z"]["position"] = zp_positions[0]
-                self.zp_state["P1"]["position"] = zp_positions[1]
-                self.zp_state["P2"]["position"] = zp_positions[2]
-                self.zp_state["P3"]["position"] = zp_positions[3]
-            xy_positions = self.xy_stage.get_current_position()  # e.g., (x, y, f)
-            if xy_positions and len(xy_positions) >= 3:
-                self.xy_state["x"]["position"] = xy_positions[0]
-                self.xy_state["y"]["position"] = xy_positions[1]
-                self.xy_state["f"]["position"] = xy_positions[2]
-            time.sleep(self.POS_UPDATE_INTERVAL)
+    def _update_ZP_positions(self):
+        zp_positions = self.zp_stage.get_current_position()  # e.g., (z, p1, p2, p3)
+        if zp_positions and len(zp_positions) >= 4:
+            self.zp_state["Z"]["position"] = zp_positions[0]
+            self.zp_state["P1"]["position"] = zp_positions[1]
+            self.zp_state["P2"]["position"] = zp_positions[2]
+            self.zp_state["P3"]["position"] = zp_positions[3]
+    
+    def _update_XY_positions(self):
+        xy_positions = self.xy_stage.get_current_position()  # e.g., (x, y, f)
+        if xy_positions and len(xy_positions) >= 3:
+            self.xy_state["x"]["position"] = xy_positions[0]
+            self.xy_state["y"]["position"] = xy_positions[1]
+            self.xy_state["f"]["position"] = xy_positions[2]
 
+    def get_XY_positions(self):
+        self._update_XY_positions()
+        x,y,f = self.xy_state["x"]["position"], self.xy_state["y"]["position"], self.xy_state["f"]["position"]
+        return x,y,f
+    
+    def get_ZP_positions(self):
+        self._update_ZP_positions() 
+        z,p1,p2,p3 = self.zp_state["Z"]["position"], self.zp_state["P1"]["position"], self.zp_state["P2"]["position"], self.zp_state["P3"]["position"]
+        return z,p1,p2,p3
+    
     def calibrate_needle_position(self, *args, **kwargs):
         # get current position
 
@@ -471,7 +491,9 @@ class StageHandler:
         self._running = False
         self.zp_thread.join()
         self.xy_thread.join()
-        self.pos_thread.join()
+
+    def getAxisMap(self, axis):
+        return self.axes_mapping.get(axis, None)
 
 class AppController:
     def __init__(self,simulatexy=True, simulatezp=True):
@@ -604,3 +626,5 @@ class AppController:
         else:
             print("StageHandler is not running.")
             return {"ZP": {}, "XY": {}}
+
+

@@ -73,12 +73,7 @@ class ControlTab(QWidget):
     
     def start_print(self):
         
-        flag = self.printmanager.post__init__()
-        
-        # The start button now calls process_print_queue and is disabled after being pressed.
-        if flag: 
-            self.start_btn.setDisabled(True)
-            threading.Thread(target=self.printmanager.process_print_queue, daemon=True).start()
+        self.printmanager.process_print_queue()
     
     def toggle_pause(self):
         # Toggle between pause and resume.
