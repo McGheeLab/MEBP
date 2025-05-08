@@ -134,7 +134,6 @@ class XYStageManager:
                 print(f"Error sending command: {e}")
 
     ####################### Stage Query Functions ##################################
-    
     def get_current_position(self):
         """
         Query the stage for its current position.
@@ -176,7 +175,6 @@ class XYStageManager:
                 return None, None, None
 
     ####################### Stage Movement Functions ##################################
-    
     def move_stage_at_velocity(self, vx, vy, timefactor=1):
         """
         Move stage at a specified velocity.
@@ -187,17 +185,14 @@ class XYStageManager:
         self.send_command(command)
         print(f"Sending XY command: {command}")
 
-
     def move_stage_to_position(self, x, y, fast=False):
         """
         Move stage to absolute position (x, y) using ProScan III ASCII RS-232 protocol.
         """
-
-        # 2. (Optional) if fast=True, you might adjust speed or step size here
-        #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
-        self.send_command("VS,100\r") # set stage speed to 100%
-        #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
-
+        if fast:
+            self.set_fast_mode()
+        else:
+            self.set_slow_mode()
         # 3. Build and send the absolute move command:
         #    'G x,y<CR>' moves to absolute (x,y)  :contentReference[oaicite:2]{index=2}
         cmd = f"G {int(x)},{int(y)}\r"
@@ -209,7 +204,6 @@ class XYStageManager:
         
         #    e.g.: self.wait_for_response("R")
         
-    
     def check_stage_limits(self, x, y):
         """
         Check if the given position (x, y) or the resulting velocity (x,y) times 1 second will be within the valid range.
@@ -224,13 +218,19 @@ class XYStageManager:
         """
         Set the stage to move at a fast velocity.
         """
-        self.set_velocity(self.maxSpeed)
+        # 2. (Optional) if fast=True, you might adjust speed or step size here
+        #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
+        self.send_command("VS,70\r") # set stage speed to 50%
+        #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
     
     def set_slow_mode(self):
         """
         Set the stage to move at a slow velocity.
         """
-        self.set_velocity(self.defaultVelocity)
+        # 2. (Optional) if fast=True, you might adjust speed or step size here
+        #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
+        self.send_command("VS,30\r") # set stage speed to 50%
+        #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
     
     ####################### Stage Settings Functions ##################################
     def load_stage_settings(self):

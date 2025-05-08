@@ -229,10 +229,6 @@ class Print:
 
     def run(self):
         
-        # move to initial position
-        self.stage.move_abs_xy(0.0, 0.0)
-        time.sleep(5)  # allow time for stage to settle
-        
         self._reset_control_flags()
         start_wall = time.time()
         t0 = 0.0
@@ -281,6 +277,7 @@ class Print:
         self._last_err_y = 0.0
 
     def _xy_loop(self, start_wall, t0):
+        X0, Y0, _ = self.stage.get_XY_positions()
         """Drive XY at velocities, record ideal vs. actual."""
         for i in range(len(self.pf.xy_times)-1):
             if self.stop_flag:
@@ -304,7 +301,7 @@ class Print:
             dt = t_next - t_curr
 
             # desired
-            x_des, y_des = self.pf.xy_x[i], self.pf.xy_y[i]
+            x_des, y_des = self.pf.xy_x[i]+X0, self.pf.xy_y[i]+Y0
             self.ideal_xy.append((t_curr, x_des, y_des))
 
             # actual
@@ -313,6 +310,7 @@ class Print:
 
             # calculate velocity
             vx, vy = self._velocityCalc(x_des - x_act, y_des - y_act, dt)
+            print(f"XY: {x_des=}, {x_act=}, {y_des=}, {y_act=}, {vx=}, {vy=}")
             self.stage.jog_xy(vx, vy)
 
             # wait until real‐time catch up
@@ -380,8 +378,7 @@ class PrintManager:
         # state for the currently active print
         self.active_uid = None
         self.print_status = "idle"
-        
-        
+               
     def queue_a_printfile(self, well_id, pf_tocopy, **kwargs):
         pf = PrintFile(name=well_id, csv_file=None)
         pf.uid = pf_tocopy.uid or str(uuid.uuid4())
@@ -401,20 +398,20 @@ class PrintManager:
             self.print_status = "waiting"
 
     def process_print_queue(self):
-        while self.well_queue:
-            pf = self.well_queue.pop(0)
-            self.active_uid = pf.uid
-            self.print_status = "started"
-            print(f"Starting print for well '{pf.name}'")
+        
+        pf = self.well_queue.pop(0)
+        self.active_uid = pf.uid
+        self.print_status = "started"
+        print(f"Starting print for well '{pf.name}'")
 
-            # delegate all motion & recording to Print
-            printer = Print(self.app, self.app.stage_handler, pf)
-            res = printer.run()
-            self.results[pf.uid] = res
+        # delegate all motion & recording to Print
+        printer = Print(self.app, self.app.stage_handler, pf)
+        res = printer.run()
+        self.results[pf.uid] = res
 
-            print(f"Print '{pf.name}' complete.")
-            self.print_status = "finished"
-            time.sleep(0.5)
+        print(f"Print '{pf.name}' complete.")
+        self.print_status = "finished"
+        time.sleep(0.5)
 
         self.print_status = "idle"
         print("All prints done.")

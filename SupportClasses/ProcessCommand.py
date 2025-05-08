@@ -189,8 +189,8 @@ class StageHandler:
         # move the stage to the new position
         self.xy_stage.move_stage_to_position(x_position, y_position, fast=fastmode)
     
-    def move_abs_xy(self, x_value, y_value):
-        self.xy_stage.move_stage_to_position(x_value, y_value)
+    def move_abs_xy(self, x_value, y_value, fastmode=False):
+        self.xy_stage.move_stage_to_position(x_value, y_value, fastmode)
     
     def move_rel_z(self, z_value, feedrate):
         # move the stage to a relative position from the current position
@@ -298,8 +298,9 @@ class StageHandler:
     def update_xy_velocity(self, *args, **kwargs):
         vx, vy = self._extract_velocity(*args, **kwargs)
         
-        self.xy_state["x"]["velocity"] = vx 
-        self.xy_state["y"]["velocity"] = vy
+        self.xy_state["x"]["velocity"] = vx*self.xyspeed 
+        self.xy_state["y"]["velocity"] = vy*self.xyspeed
+        
         # check if the velocity is not faster than the max
         if self.xy_state["x"]["velocity"] > self.maxxyspeed:
             self.xy_state["x"]["velocity"] = self.maxxyspeed
@@ -309,7 +310,11 @@ class StageHandler:
             print(f"speed limit reached: {self.xy_state['y']['velocity']}")
         self.xy_state["x"]["active"] = (vx != 0)
         self.xy_state["y"]["active"] = (vy != 0)
-    
+        
+        self.jog_xy(self.xy_state["x"]["velocity"], self.xy_state["y"]["velocity"])  # Call the jog method to move the stage at the specified velocity.
+        self._update_XY_positions()  # Update the XY positions after moving.
+        
+        
     def _extract_velocity(self, *args, **kwargs):
         # Check if average is passed as a keyword argument.
         if "average" in kwargs:
