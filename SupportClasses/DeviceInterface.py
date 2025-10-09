@@ -8,6 +8,9 @@ import threading
 import re
 import queue
 import json
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, asdict
 
 ############################### Communication Classes ########################################
 # These classes manage the serial communication with the XY and ZP stages
@@ -274,6 +277,87 @@ class XYStageManager:
         command = f"VE,{velocity}"
         self.send_command(command)
 
+    ######################## Characterize controller ##################################
+    def _finite_diff(self, t, x):
+        dt = np.diff(t)
+        dt[dt == 0] = self.dt_ctrl
+        v = np.diff(x) / dt
+        # pad to match length
+        return np.r_[v[0], v]
+
+    def _estimate_delay_tau(self, t, v, u_level):
+        """
+        Crude FOPDT fit on step from 0 -> u_level (>0).
+        Delay = when v crosses 5% of final.
+        Tau   = time to reach 63.2% of final AFTER delay.
+        """
+        vf = np.median(v[-max(5, len(v)//10):])  # steady approx
+        if abs(vf) < 1e-6:
+            return 0.2, 0.3  # fallback
+        sign = 1 if u_level >= 0 else -1
+        thr5 = 0.05*abs(vf); thr63 = 0.632*abs(vf)
+        idx5 = np.argmax((sign*v) > thr5)
+        t5 = t[idx5] if idx5 > 0 else t[0]
+        # index after delay to 63%
+        post = (t >= t5)
+        if not np.any(post):
+            return 0.2, 0.3
+        v_post = (sign*v[post]) - thr63
+        idx63_rel = np.argmax(v_post > 0)
+        t63 = t[post][idx63_rel] if idx63_rel > 0 else t5 + 0.3
+        delay = max(0.0, t5 - t[0])
+        tau = max(0.05, t63 - t5)
+        return delay, tau
+
+    def calibrate_xy_model(self, step_vel=60.0, dwell_s=4.0):
+        """
+        Sends a +V step on X, measures response, estimates delay & tau_v.
+        (Assumes you're safe to move; use simulate=False and make clearance!)
+        """
+        if self.simulate:
+            print("Calibration requires real hardware (simulate=False).")
+            return
+
+        print("[CAL] Centering and zeroing velocity...")
+        self.xy_mgr.move_stage_at_velocity(0, 0)
+        time.sleep(1.0)
+
+        # Collect
+        t0 = time.time()
+        ts=[]; xs=[]; ys=[]
+        # Pre-step baseline
+        while time.time() - t0 < 0.5:
+            x, y, _ = self.xy_mgr.get_current_position()
+            ts.append(time.time()-t0); xs.append(x); ys.append(y)
+            time.sleep(self.dt_ctrl)
+
+        print(f"[CAL] Step to vx={step_vel} for {dwell_s}s")
+        self.xy_mgr.move_stage_at_velocity(step_vel, 0.0)
+        t_step = time.time()
+        while time.time() - t_step < dwell_s:
+            x, y, _ = self.xy_mgr.get_current_position()
+            ts.append(time.time()-t0); xs.append(x); ys.append(y)
+            time.sleep(self.dt_ctrl)
+
+        print("[CAL] Back to zero")
+        self.xy_mgr.move_stage_at_velocity(0.0, 0.0)
+        time.sleep(0.5)
+
+        t = np.array(ts)
+        vx = self._finite_diff(t, np.array(xs))
+
+        dly, tau = self._estimate_delay_tau(t, vx, step_vel)
+        print(f"[CAL] Estimated delay={dly:.3f}s  tau_v={tau:.3f}s")
+
+        # Save back into plant params and to disk
+        self.xy_params.comm_delay_s = dly
+        self.xy_params.tau_v = tau
+        with open("xy_plant.json", "w") as f:
+            json.dump(asdict(self.xy_params), f, indent=2)
+        print("[CAL] Saved xy_plant.json")
+
+        
+    
 class ZPStageManager:
     # This class manages communication with a 3D printer or a simulator for testing
     def __init__(self, simulate=False):
@@ -407,6 +491,9 @@ class ZPStageManager:
         filtered_axes = {
             axis: distance for axis, distance in axes.items() if distance != 0
         }
+        if not filtered_axes:
+            return  # nothing to send
+        
         axis_str = " ".join(f"{axis}{distance}" for axis, distance in filtered_axes.items())
 
         # If a feed rate is specified, include it. Otherwise just move.

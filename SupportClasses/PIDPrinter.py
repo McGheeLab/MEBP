@@ -58,7 +58,7 @@ class StageController:
         duration    = 120.0       # total time [s]
         dt          = 0.1         # time step [s]
         turns       = 3           # number of spiral revolutions
-        max_radius  = 1000.0        # final spiral radius [um]
+        max_radius  = 100000.0        # final spiral radius [um]
         z_diameter  = 10.0         # circle diameter in Z [mm]
         z_amp       = z_diameter / 2.0
 
