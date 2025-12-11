@@ -1,303 +1,282 @@
-# ///////////////////////////////////////////////////////////////
-#
-# BY: WANDERSON M.PIMENTA
-# PROJECT MADE WITH: Qt Designer and PySide6
-# V: 1.0.0
-#
-# This project can be used freely for all uses, as long as they maintain the
-# respective credits only in the Python scripts, any information in the visual
-# interface (GUI) can be modified without any implication.
-#
-# There are limitations on Qt licenses if you want to use your products
-# commercially, I recommend reading them on the official website:
-# https://doc.qt.io/qtforpython/licenses.html
-#
-# ///////////////////////////////////////////////////////////////
-# IMPORT PACKAGES AND MODULES
-# ///////////////////////////////////////////////////////////////
-from gui.uis.windows.main_window.functions_main_window import *
+"""
+Main controller script for Xbox-controlled XY and ZP stages.
+Ensures smooth motion by processing only the latest commands (no backlog).
+"""
+
+from multiprocessing import Process, Queue
+import threading
+import time
 import sys
-import os
-import ctypes
 
-# IMPORT APP CONTROLLER (manages all stage devices)
-# ///////////////////////////////////////////////////////////////
-from SupportClasses.ProcessCommand import AppController
-from SupportClasses.Printer import PrintManager
-from SupportClasses.XboxControl import XboxPoller
+from SupportClasses.XboxControl import xbox_polling_worker
+from SupportClasses.DeviceInterface import XYStageManager, ZPStageManager
+from SupportClasses.ProcessCommand import Processor, StageHandler
 
-# IMPORT all of the settings, windows, and widgets
-# ///////////////////////////////////////////////////////////////
-from qt_core import *
-from gui.core.json_settings import Settings
-from gui.uis.windows.main_window import *
-from gui.widgets import *
+# Try to import Qt components for the timer-based polling
+try:
+    from qt_core import QApplication, QTimer, QObject
+    HAS_QT = True
+except ImportError:
+    HAS_QT = False
+    print("Qt not available, using threaded polling instead")
 
-# AUTO ADJUST DPI
-# ///////////////////////////////////////////////////////////////
-# Adjust QT DPI based on Windows display settings in a more dynamic way
-if sys.platform.startswith("win"):
-    try:
-        user32 = ctypes.windll.user32
-        # Mark the process as DPI aware for correct scaling
-        user32.SetProcessDPIAware()
-        dpi = user32.GetDpiForSystem()  # Windows returns the system DPI (e.g., 96, 144, etc.)
-        scale = dpi / 150  # 96 DPI is considered 100%
-        print(f"System DPI: {dpi}, Scale: {scale}")
-    except Exception:
-        scale = 1.0
-else:
-    scale = 1.0
 
-# Set environment variables for DPI scaling
-os.environ["QT_FONT_DPI"] = "150"
-if scale > 1.0:
-    os.environ["QT_SCALE_FACTOR"] = str(scale)
+class SmoothXboxPoller:
+    """
+    Polls Xbox command queue and dispatches only the latest commands.
+    Prevents command backlog by draining the queue and keeping only
+    the most recent command per type before dispatching.
+    """
+    def __init__(self, queue, processor, poll_interval_ms=50):
+        self.queue = queue
+        self.processor = processor
+        self.poll_interval = poll_interval_ms / 1000.0
+        self._running = False
+        self._thread = None
+    
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        print("SmoothXboxPoller started")
+    
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        print("SmoothXboxPoller stopped")
+    
+    def _poll_loop(self):
+        while self._running:
+            self._process_queue()
+            time.sleep(self.poll_interval)
+    
+    def _process_queue(self):
+        """
+        Drain the queue and keep only the latest command per command type.
+        This prevents backlog - if the user moved the joystick 10 times since
+        last poll, we only care about the final position.
+        """
+        # Collect all pending messages, keeping only the latest per command type
+        latest_commands = {}
+        
+        while not self.queue.empty():
+            try:
+                msg = self.queue.get_nowait()
+            except:
+                break
+            
+            # Handle debug messages immediately
+            if "debug" in msg:
+                print(f"[Xbox Debug] {msg['debug']}")
+                continue
+            
+            # For other commands, keep only the latest per command type
+            cmd = msg.get("command")
+            if cmd:
+                latest_commands[cmd] = msg
+        
+        # Now dispatch only the latest command for each type
+        for cmd, msg in latest_commands.items():
+            if "button" in msg:
+                self.processor.add_command(cmd, button=msg["button"])
+            elif "axis" in msg:
+                self.processor.add_command(cmd, axis=msg["axis"], average=msg["average"])
+            elif "dpad" in msg:
+                self.processor.add_command(cmd, direction=msg["dpad"])
 
-# Increase SVG rendering resolution
-QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
-# MAIN WINDOW
-# ///////////////////////////////////////////////////////////////
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-
-        # SETUP MAIN WINDOw
-        # Load widgets from "gui\uis\main_window\ui_main.py"
-        # ///////////////////////////////////////////////////////////////
-        self.ui = UI_MainWindow()
-        self.ui.setup_ui(self)
-
-        # LOAD SETTINGS
-        # ///////////////////////////////////////////////////////////////
-        settings = Settings()
-        self.settings = settings.items
-
-        # Instantiate AppController early.
-        self.app_controller = AppController(False,False)  # simulate the Xbox controller and printer? T
-        self.print_mgr = PrintManager(self.app_controller)
-        # Now, create an XboxPoller instance. Since MainWindow is a QObject in the main thread,
-        # it is safe to create a QTimer here.
-        self.xbox_poller = XboxPoller(self.app_controller.xbox_queue, self.app_controller.processor, parent=self)
+class XboxStageController:
+    """
+    Main controller that coordinates Xbox input with stage movement.
+    """
+    def __init__(self, simulate_xy=True, simulate_zp=True):
+        self.simulate_xy = simulate_xy
+        self.simulate_zp = simulate_zp
+        
+        # Core components
+        self.processor = Processor()
+        self.xbox_queue = Queue()
+        self.xbox_process = None
+        self.xbox_poller = None
+        
+        # Stage managers
+        self.xy_stage = None
+        self.zp_stage = None
+        self.stage_handler = None
+        
+        # Register debug handler
+        self.processor.register_handler("debug", self._debug_handler)
+        
+        # ZP velocity update timer for smooth motion
+        self._zp_timer_running = False
+        self._zp_timer_thread = None
+    
+    def _debug_handler(self, *args, **kwargs):
+        msg = kwargs.get("message", "")
+        print(f"[Debug] {msg}")
+    
+    def start(self):
+        """Initialize and start all components."""
+        print("=" * 50)
+        print("Starting Xbox Stage Controller")
+        print("=" * 50)
+        
+        # Initialize stages
+        print("\nInitializing stages...")
+        self.xy_stage = XYStageManager(simulate=self.simulate_xy)
+        print(f"  XY Stage: {'SIMULATED' if self.simulate_xy else 'HARDWARE'}")
+        
+        self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
+        print(f"  ZP Stage: {'SIMULATED' if self.simulate_zp else 'HARDWARE'}")
+        
+        # Initialize stage handler
+        self.stage_handler = StageHandler(self.processor, self.zp_stage, self.xy_stage)
+        print("  StageHandler initialized")
+        
+        # Start ZP velocity update loop for smooth continuous motion
+        self._start_zp_velocity_loop()
+        
+        # Start Xbox polling process
+        print("\nStarting Xbox controller...")
+        self.xbox_process = Process(target=xbox_polling_worker, args=(self.xbox_queue,))
+        self.xbox_process.start()
+        
+        # Start the smooth poller (processes queue without backlog)
+        self.xbox_poller = SmoothXboxPoller(self.xbox_queue, self.processor, poll_interval_ms=50)
         self.xbox_poller.start()
         
-        # SETUP MAIN WINDOW
-        # ///////////////////////////////////////////////////////////////
-        self.hide_grips = True # Show/Hide resize grips
-        SetupMainWindow.setup_gui(self)
-        SetupMainWindow.page1(self)
-        SetupMainWindow.page2(self)
-        SetupMainWindow.page3(self)
-        SetupMainWindow.page4(self)
-        SetupMainWindow.page5(self)
-        SetupMainWindow.page6(self)
-        SetupMainWindow.left_column(self)
-        SetupMainWindow.right_column(self)
-
-        # SHOW MAIN WINDOW
-        # ///////////////////////////////////////////////////////////////
-        self.show()
+        print("\n" + "=" * 50)
+        print("Controller ready! Use Xbox controller to move stages.")
+        print("Press Ctrl+C to exit.")
+        print("=" * 50 + "\n")
     
-    def closeEvent(self, event):
-        self.app_controller.stop()
-        self.xbox_poller.stop()
-        event.accept()
+    def _start_zp_velocity_loop(self):
+        """
+        Start a background thread that periodically sends ZP move commands
+        based on current velocity state. This ensures smooth continuous motion.
+        """
+        self._zp_timer_running = True
+        self._zp_timer_thread = threading.Thread(target=self._zp_velocity_loop, daemon=True)
+        self._zp_timer_thread.start()
+    
+    def _zp_velocity_loop(self):
+        """
+        Periodically send ZP movement commands based on current velocity.
+        This is the 'just-in-time' approach - we send commands at regular
+        intervals rather than queueing them up.
+        """
+        interval = self.stage_handler.ZUPDATE_INTERVAL if self.stage_handler else 0.333
         
-    # LEFT MENU BTN IS CLICKED
-    # Run function when btn is clicked
-    # Check funtion by object name / btn_id
-    # ///////////////////////////////////////////////////////////////
-    def btn_clicked(self):
-        # GET BT CLICKED
-        btn = SetupMainWindow.setup_btns(self)
-
-        # Remove Selection If Clicked By "btn_close_left_column"
-        if btn.objectName() != "btn_settings":
-            self.ui.left_menu.deselect_all_tab()
-
-        # Get Title Bar Btn And Reset Active         
-        top_settings = MainFunctions.get_title_bar_btn(self, "btn_top_settings")
-        top_settings.set_active(False)
-
-        # LEFT MENU
-        # ///////////////////////////////////////////////////////////////
-        
-        # HOME BTN
-        if btn.objectName() == "btn_home":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 1
-            MainFunctions.set_page(self, self.ui.load_pages.page_1)
-            
-        if btn.objectName() == "btn_home2":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 1
-            MainFunctions.set_page(self, self.ui.load_pages.page_2)
-            
-        if btn.objectName() == "btn_home3":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 1
-            MainFunctions.set_page(self, self.ui.load_pages.page_3)
-        
-        if btn.objectName() == "btn_home4":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 1
-            MainFunctions.set_page(self, self.ui.load_pages.page_4)
-        if btn.objectName() == "btn_home5":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 1
-            MainFunctions.set_page(self, self.ui.load_pages.page_5)
-        
-        if btn.objectName() == "btn_controller_layout":
-            self.ui.left_menu.select_only_one(btn.objectName())
-            # Switch to the controller layout page
-            MainFunctions.set_page(self, self.ui.load_pages.page_6)
-
-        if btn.objectName() == "btn_settings" or btn.objectName() == "btn_close_left_column":
-            #check if left column is visible
-            if not MainFunctions.left_column_is_visible(self):
-                
-                # Show / Hide
-                MainFunctions.toggle_left_column(self)
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-            else:
-                if btn.objectName() == "btn_close_left_column":
-                    self.ui.left_menu.deselect_all_tab()
-                    # Show / Hide
-                    MainFunctions.toggle_left_column(self)
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-            
-
-        # WIDGETS BTN
-        if btn.objectName() == "btn_widgets":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 2
-            MainFunctions.set_page(self, self.ui.load_pages.page_2)
-
-        # LOAD USER PAGE
-        if btn.objectName() == "btn_add_user":
-            # Select Menu
-            self.ui.left_menu.select_only_one(btn.objectName())
-
-            # Load Page 3 
-            MainFunctions.set_page(self, self.ui.load_pages.page_3)
-
-        # BOTTOM INFORMATION
-        if btn.objectName() == "btn_info":
-            # CHECK IF LEFT COLUMN IS VISIBLE
-            if not MainFunctions.left_column_is_visible(self):
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-
-                # Show / Hide
-                MainFunctions.toggle_left_column(self)
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-            else:
-                if btn.objectName() == "btn_close_left_column":
-                    self.ui.left_menu.deselect_all_tab()
-                    # Show / Hide
-                    MainFunctions.toggle_left_column(self)
-                
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-
-            # Change Left Column Menu
-            if btn.objectName() != "btn_close_left_column":
-                MainFunctions.set_left_column_menu(
-                    self, 
-                    menu = self.ui.left_column.menus.menu_2,
-                    title = "Info tab",
-                    icon_path = Functions.set_svg_icon("icon_info.svg")
+        while self._zp_timer_running:
+            if self.stage_handler:
+                # Check if any ZP axis is active
+                zp_active = any(
+                    self.stage_handler.zp_state[axis]["active"] 
+                    for axis in ["Z", "P1", "P2", "P3"]
                 )
-        # SETTINGS LEFT
-        if btn.objectName() == "btn_settings" or btn.objectName() == "btn_close_left_column":
-            # CHECK IF LEFT COLUMN IS VISIBLE
-            if not MainFunctions.left_column_is_visible(self):
-                # Show / Hide
-                MainFunctions.toggle_left_column(self)
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-            else:
-                if btn.objectName() == "btn_close_left_column":
-                    self.ui.left_menu.deselect_all_tab()
-                    # Show / Hide
-                    MainFunctions.toggle_left_column(self)
-                self.ui.left_menu.select_only_one_tab(btn.objectName())
-
-            # Change Left Column Menu
-            if btn.objectName() != "btn_close_left_column":
-                MainFunctions.set_left_column_menu(
-                    self, 
-                    menu = self.ui.left_column.menus.menu_1,
-                    title = "Settings Left Column",
-                    icon_path = Functions.set_svg_icon("icon_settings.svg")
-                )
+                if zp_active:
+                    self.stage_handler.send_zp_move_command()
+            
+            time.sleep(interval)
+    
+    def stop(self):
+        """Clean shutdown of all components."""
+        print("\nShutting down...")
         
-        # TITLE BAR MENU
-        # ///////////////////////////////////////////////////////////////
+        # Stop ZP velocity loop
+        self._zp_timer_running = False
+        if self._zp_timer_thread:
+            self._zp_timer_thread.join(timeout=1.0)
         
-        # SETTINGS TITLE BAR
-        if btn.objectName() == "btn_top_settings":
-            # Toogle Active
-            if not MainFunctions.right_column_is_visible(self):
-                btn.set_active(True)
+        # Stop Xbox poller
+        if self.xbox_poller:
+            self.xbox_poller.stop()
+        
+        # Stop Xbox process
+        if self.xbox_process:
+            self.xbox_process.terminate()
+            self.xbox_process.join(timeout=2.0)
+            print("  Xbox process stopped")
+        
+        # Stop stages (send zero velocity first)
+        if self.xy_stage:
+            try:
+                self.xy_stage.move_stage_at_velocity(0, 0)
+                time.sleep(0.1)
+                self.xy_stage.stop()
+                print("  XY stage stopped")
+            except Exception as e:
+                print(f"  Error stopping XY stage: {e}")
+        
+        if self.zp_stage:
+            try:
+                self.zp_stage.stop()
+                print("  ZP stage stopped")
+            except Exception as e:
+                print(f"  Error stopping ZP stage: {e}")
+        
+        # Stop processor
+        self.processor.stop()
+        print("  Processor stopped")
+        
+        print("Shutdown complete.")
+    
+    def run(self):
+        """Main run loop - keeps the program alive and shows status."""
+        try:
+            self.start()
+            
+            # Main loop - print status periodically
+            while True:
+                time.sleep(1.0)
+                self._print_status()
+                
+        except KeyboardInterrupt:
+            print("\n\nInterrupt received...")
+        finally:
+            self.stop()
+    
+    def _print_status(self):
+        """Print current stage positions and velocities."""
+        if not self.stage_handler:
+            return
+        
+        # Get current positions
+        x, y, f = self.stage_handler.get_XY_positions()
+        z, p1, p2, p3 = self.stage_handler.get_ZP_positions()
+        
+        # Get current velocities from state
+        vx = self.stage_handler.xy_state["x"]["velocity"]
+        vy = self.stage_handler.xy_state["y"]["velocity"]
+        vz = self.stage_handler.zp_state["Z"]["velocity"]
+        vp1 = self.stage_handler.zp_state["P1"]["velocity"]
+        
+        # Only print if there's activity or periodically
+        if any([vx, vy, vz, vp1]):
+            print(f"XY: ({x:.1f}, {y:.1f}) vel=({vx:.1f}, {vy:.1f}) | "
+                  f"Z: {z:.2f} vel={vz:.2f} | P1: {p1:.2f} vel={vp1:.2f}")
 
-                # Show / Hide
-                MainFunctions.toggle_right_column(self)
-            else:
-                btn.set_active(False)
 
-                # Show / Hide
-                MainFunctions.toggle_right_column(self)
+def main():
+    """
+    Main entry point. Configure simulation mode here.
+    Set simulate_xy=False and simulate_zp=False for real hardware.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Xbox-controlled stage system")
+    parser.add_argument("--real-xy", action="store_true", help="Use real XY stage hardware")
+    parser.add_argument("--real-zp", action="store_true", help="Use real ZP stage hardware")
+    parser.add_argument("--real", action="store_true", help="Use all real hardware")
+    args = parser.parse_args()
+    
+    simulate_xy = not (args.real_xy or args.real)
+    simulate_zp = not (args.real_zp or args.real)
+    
+    controller = XboxStageController(simulate_xy=simulate_xy, simulate_zp=simulate_zp)
+    controller.run()
 
-            # Get Left Menu Btn            
-            top_settings = MainFunctions.get_left_menu_btn(self, "btn_settings")
-            top_settings.set_active_tab(False)            
 
-        # DEBUG
-        print(f"Button {btn.objectName()}, clicked!")
-
-    # LEFT MENU BTN IS RELEASED
-    # Run function when btn is released
-    # Check funtion by object name / btn_id
-    # ///////////////////////////////////////////////////////////////
-    def btn_released(self):
-        # GET BT CLICKED
-        btn = SetupMainWindow.setup_btns(self)
-
-        # DEBUG
-        print(f"Button {btn.objectName()}, released!")
-
-    # RESIZE EVENT
-    # ///////////////////////////////////////////////////////////////
-    def resizeEvent(self, event):
-        SetupMainWindow.resize_grips(self)
-
-    # MOUSE CLICK EVENTS
-    # ///////////////////////////////////////////////////////////////
-    def mousePressEvent(self, event):
-        # SET DRAG POS WINDOW
-        self.dragPos = event.globalPos()
-
-# SETTINGS WHEN TO START
-# Set the initial class and also additional parameters of the "QApplication" class
-# ///////////////////////////////////////////////////////////////
 if __name__ == "__main__":
-    # APPLICATION
-    # ///////////////////////////////////////////////////////////////
-    app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("icon.ico"))
-    window = MainWindow()
-
-    # EXEC APP
-    # ///////////////////////////////////////////////////////////////
-    sys.exit(app.exec_())
+    main()

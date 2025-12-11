@@ -1,3 +1,0 @@
-{"buttons": {"0": "zero_needle_pos", "1": "Button Function 2", "2": "Button Function 3", "3": "Button Function 2", "4":"increment_pspeed_up", "5":"increment_pspeed_down"}, 
-"axes": {"0-1": "move_stage_at_velocity", "2-3": "move_z_at_velocity", "4": "", "5": ""}, 
-"dpad": {"up": "increment_zspeed_up", "down": "increment_zspeed_down", "left": "increment_xyspeed_up", "right":"increment_xyspeed_down"}}
