@@ -14,11 +14,11 @@ from dataclasses import dataclass, asdict
 
 ############################### Communication Classes ########################################
 # These classes manage the serial communication with the XY and ZP stages
-
 class XYStageManager:
-    """currently this class is build to support PriorIII XY stage and 3D printer ZP stage
-        Common commands for the priorIII stage are:
+    """currently this class is built to support PriorII XY stage
+        Common commands for the priorII stage are:
         V - query firmware version
+        Z - sets the home position as 0,0,0
         P - query current position
         PA,x,y - move to absolute position x,y
         VS,x,y - move at velocity x,y
@@ -30,7 +30,10 @@ class XYStageManager:
         self.simulate = simulate
         
         self.maxSpeed = 100
-        self.maxAcceleration = 1000
+        self.minJerk = 1
+        self.maxJerk = 100
+        self.minAcceleration = 1
+        self.maxAcceleration = 100
         self.xRange = [-100000, 100000]
         self.yRange = [-100000, 100000]
         self.defaultAcceleration = 1000
@@ -83,34 +86,50 @@ class XYStageManager:
     def find_proscan_controller(self):
         # Check all available COM ports for a ProScan III controller
         ports = serial.tools.list_ports.comports()
+        
+        # List of baud rates to try (as recommended by ProScan documentation)
+        baud_rates_to_try = [9600, 19200, 38400, 115200]
+        
         for port in ports:
-            try:
-                # Attempt to open the port at 9600 baud
-                spo = serial.Serial(
-                    port.device, baudrate=9600, bytesize=8,
-                    timeout=1, stopbits=serial.STOPBITS_ONE
-                )
-                # Write a command ('V') to check for the correct device
-                spo.write(b"V\r\n")
-                time.sleep(0.1) # Wait for the response to be ready
-                # Read the response and strip extra whitespace
-                response = spo.readline().decode('ascii').strip()
-                print(f"Response from {port.device}: {response}")
-                # If response indicates a ProScan III controller, return this serial object
-                if "R" in response:
-                    print(f"ProScan III controller found on {port.device}")
-                    return spo
+            for baud_rate in baud_rates_to_try:
+                try:
+                    print(f"Trying {port.device} at {baud_rate} baud...")
+                    # Attempt to open the port at current baud rate
+                    spo = serial.Serial(
+                        port.device, baudrate=baud_rate, bytesize=8,
+                        timeout=1, stopbits=serial.STOPBITS_ONE
+                    )
 
-                # Otherwise, close the port and continue checking
-                spo.close()
-            except (serial.SerialException, UnicodeDecodeError):
-                # If there's an issue reading or decoding data, just move on to the next port
-                print(f"Error reading from port {port.device}.")
-                continue
+                    spo.write(b"STAGE\r\n")  # Wake up the controller
+                    time.sleep(0.1) # Wait for the response to be ready
+                    response = spo.readline().decode('ascii').strip()
+                    print(f"Initial response from {port.device} at {baud_rate}: {response}")
+                    spo.reset_input_buffer()  # Clear any stale data
+                    spo.reset_output_buffer() # Clear any stale data
+
+                    # Write a command ('V') to check for the correct device
+                    spo.write(b"V\r\n")
+                    time.sleep(0.1) # Wait for the response to be ready
+                    # Read the response and strip extra whitespace
+                    response = spo.readline().decode('ascii').strip()
+                    print(f"Response from {port.device} at {baud_rate}: {response}")
+                    
+                    # If response indicates a ProScan III controller, return this serial object
+                    if "E" in response or "R" in response or "ProScan" in response:
+                        print(f"ProScan III controller found on {port.device} at {baud_rate} baud")
+                        return spo
+
+                    # Otherwise, close the port and try next baud rate
+                    spo.close()
+                    
+                except (serial.SerialException, UnicodeDecodeError):
+                    # If there's an issue reading or decoding data, just move on
+                    print(f"Error reading from port {port.device} at {baud_rate} baud.")
+                    continue
         
         # If no ProScan III controller is found, print a message
         print("No ProScan III controller found.")
-        return spo
+        return None
 
     def send_command(self, command):
         """
@@ -177,6 +196,14 @@ class XYStageManager:
                 # On error, print a message and return None for each axis
                 print(f"Error parsing response: {e}")
                 return None, None, None
+            
+    def set_home(self): 
+        """Set the current position as home/reference position for the stage"""
+        response = self.send_command("Z")
+        if response:
+            print(f"HOME command sent, response: {response}")
+        else:
+            print("HOME command sent")
 
     ####################### Stage Movement Functions ##################################
     
@@ -198,7 +225,7 @@ class XYStageManager:
 
         # 2. (Optional) if fast=True, you might adjust speed or step size here
         #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
-        self.send_command("VS,100\r") # set stage speed to 100%
+        # self.send_command("VS,100\r") # set stage speed to 100%
         #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
 
         # 3. Build and send the absolute move command:
@@ -206,6 +233,26 @@ class XYStageManager:
         cmd = f"G {int(x)},{int(y)}\r"
         self.send_command(cmd)
         print(f"Sent absolute move command: {cmd!r}")
+
+        #wait for completion
+        #read until an 'R' or 'END' is returned.
+        
+        #    e.g.: self.wait_for_response("R")
+
+    def move_stage_relative(self, dx, dy, fast=False):
+        """
+        Move stage by a relative offset (dx, dy) using ProScan III ASCII RS-232 protocol.
+        """
+        # 2. (Optional) if fast=True, you might adjust speed or step size here
+        #    e.g. self.send_command("SS 1\r")   # set stage scale to micro-steps
+        # self.send_command("VS,100\r") # set stage speed to 100%
+        #    – see “scale stage” (SS) and virtual joystick speed (VS) in §5.1.
+
+        # 3. Build and send the relative move command:
+        #    'G x,y<CR>' moves to absolute (x,y)  :contentReference[oaicite:2]{index=2}
+        cmd = f"GR {int(dx)},{int(dy)}\r"
+        self.send_command(cmd)
+        print(f"Sent relative move command: {cmd!r}")
 
         #wait for completion
         #read until an 'R' or 'END' is returned.
@@ -245,6 +292,9 @@ class XYStageManager:
                 settings = json.load(f)
                 stage_settings = settings.get("PriorIII_StageSettings", {})
                 self.maxSpeed = stage_settings.get("maxSpeed")
+                self.minJerk = stage_settings.get("minJerk")
+                self.maxJerk = stage_settings.get("maxJerk")
+                self.minAcceleration = stage_settings.get("minAcceleration")
                 self.maxAcceleration = stage_settings.get("maxAcceleration")
                 self.xRange = stage_settings.get("xRange")
                 self.yRange = stage_settings.get("yRange")
@@ -254,15 +304,28 @@ class XYStageManager:
         except Exception as e:
             print(f"Error loading stage settings: {e}")
     
+    def set_jerk(self, jerk):
+        """
+        Set the stage jerk to the specified value.
+        """
+        # ensure the jerk value is within the valid range
+        if jerk > self.maxJerk or jerk < self.minJerk:
+            print("Error: Jerk value is out of bounds.")
+            return
+        jerk = int(jerk)
+        command = f"SCS,{jerk}"
+        self.send_command(command)
+
     def set_acceleration(self, acceleration):
         """
         Set the stage acceleration to the specified value.
         """
-        # ensure the acceleration value is within the valid range 
-        if acceleration > self.maxAcceleration:
-            print("Error: Acceleration value is too high.")
+        # ensure the acceleration value is within the valid range
+        if acceleration > self.maxAcceleration or acceleration < self.minAcceleration:
+            print("Error: Acceleration value is out of bounds.")
             return
-        command = f"AC,{acceleration}"
+        acceleration = int(acceleration)
+        command = f"SAS,{acceleration}"
         self.send_command(command)
 
     def set_velocity(self, velocity):
@@ -270,94 +333,115 @@ class XYStageManager:
         Set the stage velocity to the specified value.
         """
         # ensure the velocity value is within the valid range
-        if velocity > self.maxSpeed:
-            print("Error: Velocity value is too high.")
+        if velocity > self.maxSpeed or velocity < 0:
+            print("Error: Velocity value is out of bounds.")
             return
-        
-        command = f"VE,{velocity}"
+        velocity = int(velocity)
+        command = f"SMS,{velocity}"
         self.send_command(command)
+    
 
-    ######################## Characterize controller ##################################
-    def _finite_diff(self, t, x):
-        dt = np.diff(t)
-        dt[dt == 0] = self.dt_ctrl
-        v = np.diff(x) / dt
-        # pad to match length
-        return np.r_[v[0], v]
 
-    def _estimate_delay_tau(self, t, v, u_level):
+    def set_baudrate(self, baudrate):
         """
-        Crude FOPDT fit on step from 0 -> u_level (>0).
-        Delay = when v crosses 5% of final.
-        Tau   = time to reach 63.2% of final AFTER delay.
+        Set the stage communication baudrate to the specified value.
+        BAUD command: Sets the baud rate of the port issuing the command to the value
+        specified by b. As a protection measure, if no command is sent to
+        the port while the controller is switched on, the baud rate will
+        revert to 9600 after switching off and back on again twice.
+        Allowable values for baud rate are 9600 (argument 96), 19200
+        (argument 19) and 38400 (argument 38)
         """
-        vf = np.median(v[-max(5, len(v)//10):])  # steady approx
-        if abs(vf) < 1e-6:
-            return 0.2, 0.3  # fallback
-        sign = 1 if u_level >= 0 else -1
-        thr5 = 0.05*abs(vf); thr63 = 0.632*abs(vf)
-        idx5 = np.argmax((sign*v) > thr5)
-        t5 = t[idx5] if idx5 > 0 else t[0]
-        # index after delay to 63%
-        post = (t >= t5)
-        if not np.any(post):
-            return 0.2, 0.3
-        v_post = (sign*v[post]) - thr63
-        idx63_rel = np.argmax(v_post > 0)
-        t63 = t[post][idx63_rel] if idx63_rel > 0 else t5 + 0.3
-        delay = max(0.0, t5 - t[0])
-        tau = max(0.05, t63 - t5)
-        return delay, tau
+        # ProScan III baud rate mapping: actual rate -> command argument
+        baudrate_mapping = {9600: 96, 19200: 19, 38400: 38}
 
-    def calibrate_xy_model(self, step_vel=60.0, dwell_s=4.0):
+        if baudrate not in baudrate_mapping:
+            print(f"Error: Invalid baudrate. Choose from {list(baudrate_mapping.keys())}.")
+            return False
+
+        # Send the BAUD command with the mapped argument
+        command = f"BAUD {baudrate_mapping[baudrate]}"
+        
+        if self.simulate:
+            # In simulation, just return success
+            response = self.send_command(command)
+            print(f"Simulated: Baudrate command sent: {command}")
+            return True
+        else:
+            try:
+                # Send the command
+                self.send_command(command)
+                time.sleep(0.1)  # Wait for the command to be processed
+                
+                # Read the response - should be "0" for success
+                response = self.spo.readline().decode('ascii').strip()
+                print(f"BAUD command response: {response}")
+                
+                if response == "0":
+                    # Success - now change the serial port baud rate
+                    print(f"Baudrate successfully changed to {baudrate}")
+                    self.spo.baudrate = baudrate
+                    
+                    # Clear buffers after baud rate change
+                    self.spo.reset_input_buffer()
+                    self.spo.reset_output_buffer()
+                    
+                    # Test communication at new baud rate
+                    self.spo.write(b"V\r\n")
+                    time.sleep(0.1)
+                    test_response = self.spo.readline().decode('ascii').strip()
+                    if test_response:
+                        print(f"Communication test successful at {baudrate} baud: {test_response}")
+                        return True
+                    else:
+                        print("Warning: No response received after baud rate change")
+                        return False
+                else:
+                    print(f"Error: BAUD command failed with response: {response}")
+                    return False
+                    
+            except Exception as e:
+                print(f"Error executing BAUD command: {e}")
+                return False
+
+    def test_baud_rates(self):
         """
-        Sends a +V step on X, measures response, estimates delay & tau_v.
-        (Assumes you're safe to move; use simulate=False and make clearance!)
+        Test communication at different baud rates to verify BAUD command functionality.
+        This is useful for troubleshooting communication issues.
         """
         if self.simulate:
-            print("Calibration requires real hardware (simulate=False).")
-            return
-
-        print("[CAL] Centering and zeroing velocity...")
-        self.xy_mgr.move_stage_at_velocity(0, 0)
-        time.sleep(1.0)
-
-        # Collect
-        t0 = time.time()
-        ts=[]; xs=[]; ys=[]
-        # Pre-step baseline
-        while time.time() - t0 < 0.5:
-            x, y, _ = self.xy_mgr.get_current_position()
-            ts.append(time.time()-t0); xs.append(x); ys.append(y)
-            time.sleep(self.dt_ctrl)
-
-        print(f"[CAL] Step to vx={step_vel} for {dwell_s}s")
-        self.xy_mgr.move_stage_at_velocity(step_vel, 0.0)
-        t_step = time.time()
-        while time.time() - t_step < dwell_s:
-            x, y, _ = self.xy_mgr.get_current_position()
-            ts.append(time.time()-t0); xs.append(x); ys.append(y)
-            time.sleep(self.dt_ctrl)
-
-        print("[CAL] Back to zero")
-        self.xy_mgr.move_stage_at_velocity(0.0, 0.0)
-        time.sleep(0.5)
-
-        t = np.array(ts)
-        vx = self._finite_diff(t, np.array(xs))
-
-        dly, tau = self._estimate_delay_tau(t, vx, step_vel)
-        print(f"[CAL] Estimated delay={dly:.3f}s  tau_v={tau:.3f}s")
-
-        # Save back into plant params and to disk
-        self.xy_params.comm_delay_s = dly
-        self.xy_params.tau_v = tau
-        with open("xy_plant.json", "w") as f:
-            json.dump(asdict(self.xy_params), f, indent=2)
-        print("[CAL] Saved xy_plant.json")
-
+            print("Testing BAUD command in simulation mode...")
+            # Test all supported baud rates in simulation
+            for baud_rate in [9600, 19200, 38400]:
+                result = self.set_baudrate(baud_rate)
+                print(f"BAUD {baud_rate}: {'Success' if result else 'Failed'}")
+            return True
         
-    
+        print("Testing BAUD command with real hardware...")
+        print("Current baud rate:", self.spo.baudrate if self.spo else "Unknown")
+        
+        # Test setting to different baud rates and back
+        original_baud = self.spo.baudrate if self.spo else 9600
+        test_rates = [9600, 19200, 38400]
+        
+        for baud_rate in test_rates:
+            if baud_rate != original_baud:
+                print(f"\nTesting baud rate change to {baud_rate}...")
+                if self.set_baudrate(baud_rate):
+                    # Test communication at new baud rate
+                    pos = self.get_current_position()
+                    if pos[0] is not None:
+                        print(f"Communication successful at {baud_rate} baud")
+                        print(f"Current position: X={pos[0]}, Y={pos[1]}, Z={pos[2]}")
+                    else:
+                        print(f"Communication failed at {baud_rate} baud")
+                else:
+                    print(f"Failed to change to {baud_rate} baud")
+        
+        # Return to original baud rate
+        print(f"\nReturning to original baud rate {original_baud}...")
+        return self.set_baudrate(original_baud)
+            
 class ZPStageManager:
     # This class manages communication with a 3D printer or a simulator for testing
     def __init__(self, simulate=False):
@@ -369,16 +453,17 @@ class ZPStageManager:
         self.x_cnt = 0.0
         self.y_cnt = 0.0
         self.z_cnt = 0.0
+        self.feedrate = 200  # Default feedrate in mm/min
 
         # General settings for communication and state
         self.verbose = False
-        self.baudrate = 115200
+        self.baudrate = 38400
         self.simulate = simulate
         self.printer_found = False
         self.COM = None
 
         # If in simulate mode, use the ZPStageSimulator instead of real hardware
-        if simulate:
+        if self.simulate:
             self.serial = ZPStageSimulator()
             self.serial.start()
             self.setup()
@@ -416,21 +501,27 @@ class ZPStageManager:
             self.serial.stop()
         else:
             self.serial.close()
-            
+     
+    def set_max_feedrate(self, feedrate):
+        self.feedrate = feedrate
+        self.send_data(f"M203 E{feedrate} Y{feedrate} X{feedrate} Z{feedrate}")
+        print(f"Set max feedrate to {feedrate} mm/min for all axes")
+
     # Setup the printer for operation
     def setup(self):
         # Prepare printer for normal operation
         step_per_mm = 78040
-        max_feedrate = 200  # mm/min, example calculation
-
+        # The original feedrate is 200 mm/min, but we use self.feedrate
         self.send_data("M302 S0")  # Allow cold extrusion
         self.send_data("M83")      # Set extruder to relative mode
         self.send_data("G91")      # Set XYZ to relative positioning
-        self.send_data(f"M203 E{max_feedrate} Y{max_feedrate} X{max_feedrate} Z{max_feedrate}")  # Set max feedrates
+        self.send_data(f"M203 E{self.feedrate} Y{self.feedrate} X{self.feedrate} Z{self.feedrate}")  # Set max feedrates
         self.send_data("M92 X5069.00 Y5069.00 Z-5069.00 E5069.00")  # Configure steps per unit
         # set feedrate to max
-        self.send_data(f"G0 F{max_feedrate}")  # Set feedrate to max
+        self.send_data(f"G0 F{self.feedrate}")  # Set feedrate to max
         self.send_data("M220 S100")  # Set feedrate to 100%
+
+    # (Removed duplicate set_max_feedrate)
 
     ################################# Communication Functions ########################################
     
@@ -452,6 +543,7 @@ class ZPStageManager:
             return
 
         try:
+            print(f"Sending data: {data.decode().strip()}")
             self.serial.write(data)
             self.serial.flush()  # Ensure the data is sent immediately
         except serial.SerialException as e:
@@ -491,18 +583,14 @@ class ZPStageManager:
         filtered_axes = {
             axis: distance for axis, distance in axes.items() if distance != 0
         }
-        if not filtered_axes:
-            return  # nothing to send
-        
         axis_str = " ".join(f"{axis}{distance}" for axis, distance in filtered_axes.items())
 
         # If a feed rate is specified, include it. Otherwise just move.
-        if feedrate is not None:
-            self.send_data(f"G0 F{feedrate} {axis_str}")
-            print(f"G0 F{feedrate} {axis_str}")
-        else:
-            self.send_data(f"G0 {axis_str}")
-            print(f"G0 {axis_str}")
+        if feedrate is None:
+            feedrate = self.feedrate
+        # ...existing code...
+        self.send_data(f"G0 F{feedrate} {axis_str}")
+        print(f"G0 F{feedrate} {axis_str}")
     
     def move_absolute(self, axes, fast=False):
         
@@ -600,6 +688,7 @@ class ZPStageManager:
     def save_settings(self):
         # Save current configuration to printer memory
         self.send_data("M500")
+
 
 
 ###############################
