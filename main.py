@@ -1,403 +1,308 @@
 """
-Just-in-time Xbox Stage Controller.
-Single-threaded pygame access to avoid threading issues.
+Main controller using existing project architecture:
+- XboxControl.py: Xbox polling in separate process
+- ProcessCommand.py: Command routing via Processor
+- DeviceInterface.py: Stage communication
 """
 
-import pygame
+from multiprocessing import Process, Queue
 import threading
 import time
-import json
 import math
 
+from SupportClasses.XboxControl import xbox_polling_worker
+from SupportClasses.ProcessCommand import Processor
 from SupportClasses.DeviceInterface import XYStageManager, ZPStageManager
 
 
-class JsonMapping:
-    """Loads and caches button mapping from JSON file."""
-    def __init__(self, path="current_button_mapping.json"):
-        self.path = path
-        self.data = {"buttons": {}, "axes": {}, "dpad": {}}
-        self.last_load = 0
-        self.load()
+class XboxQueuePoller:
+    """
+    Polls the Xbox queue in a thread and dispatches to Processor.
+    (Replaces Qt-based XboxPoller since we're not running Qt event loop)
+    """
+    def __init__(self, queue, processor):
+        self.queue = queue
+        self.processor = processor
+        self._running = False
+        self._thread = None
     
-    def load(self):
-        try:
-            with open(self.path, "r") as f:
-                self.data = json.load(f)
-            print(f"Loaded mapping: {self.path}")
-        except Exception as e:
-            print(f"Could not load mapping: {e}")
-        self.last_load = time.time()
-    
-    def maybe_reload(self):
-        if time.time() - self.last_load > 5:
-            self.load()
-    
-    def get_button_cmd(self, idx):
-        cmd = self.data.get("buttons", {}).get(str(idx))
-        return cmd if cmd and cmd != "None" else None
-    
-    def get_dpad_cmd(self, direction):
-        cmd = self.data.get("dpad", {}).get(direction)
-        return cmd if cmd and cmd != "None" else None
-
-
-class StageController:
-    """Handles stage movement commands."""
-    def __init__(self, simulate_xy=True, simulate_zp=True):
-        self.xy_stage = XYStageManager(simulate=simulate_xy)
-        self.zp_stage = ZPStageManager(simulate=simulate_zp)
-        
-        # Set higher max feedrate on ZP stage to allow smooth motion
-        # Default is often too low which causes moves to complete too fast
-        self.zp_stage.set_max_feedrate(500)  # mm/min for all axes
-        
-        # Speed multipliers (user input * speed = velocity in mm/s)
-        self.xy_speed = 100.0
-        self.z_speed = 5.0    # mm/s at full stick deflection
-        self.p_speed = 5.0    # mm/s at full trigger
-        
-        self.max_xy_speed = 5000
-        self.max_z_speed = 50   # mm/s max
-        self.max_p_speed = 50   # mm/s max
-        
-        self.xy_speed_range = (1.0, 10000.0)
-        self.z_speed_range = (0.1, 100.0)
-        self.p_speed_range = (0.1, 100.0)
-        
-        self.xy_pos = (0.0, 0.0, 0.0)
-        self.zp_pos = (0.0, 0.0, 0.0, 0.0)
-    
-    def update_xy(self, vx, vy):
-        vx *= self.xy_speed
-        vy *= self.xy_speed
-        vx = max(-self.max_xy_speed, min(self.max_xy_speed, vx))
-        vy = max(-self.max_xy_speed, min(self.max_xy_speed, vy))
-        self.xy_stage.move_stage_at_velocity(vx, vy)
-        self.xy_pos = self.xy_stage.get_current_position()
-    
-    def update_zp(self, vz, vp1, vp2, dt):
-        """
-        Update ZP stage with smooth motion by keeping printer buffer full.
-        
-        Strategy: Send small moves at high frequency. The printer board
-        buffers commands, so by sending faster than execution, we keep
-        2+ moves in the queue for seamless transitions.
-        """
-        # Calculate desired velocities in mm/s
-        vel_z = vz * self.z_speed
-        vel_p1 = vp1 * self.p_speed
-        vel_p2 = vp2 * self.p_speed
-        
-        # Clamp velocities
-        vel_z = max(-self.max_z_speed, min(self.max_z_speed, vel_z))
-        vel_p1 = max(-self.max_p_speed, min(self.max_p_speed, vel_p1))
-        vel_p2 = max(-self.max_p_speed, min(self.max_p_speed, vel_p2))
-        
-        # Calculate small distances for this short interval
-        dz = vel_z * dt
-        dp1 = vel_p1 * dt
-        dp2 = vel_p2 * dt
-        
-        # Always send command (even zero) to keep buffer fed
-        # Calculate feedrate from velocity
-        combined_vel = math.sqrt(vel_z**2 + vel_p1**2 + vel_p2**2)
-        
-        if combined_vel > 0.001:
-            feedrate = combined_vel * 60  # mm/s to mm/min
-            feedrate = max(feedrate, 1)   # minimum feedrate
-        else:
-            feedrate = 60  # default feedrate for zero moves
-        
-        axes = {'X': dz, 'Y': dp1, 'Z': dp2, 'E': 0}
-        self.zp_stage.move_relative(axes, feedrate)
-        
-        # Don't update position every cycle - too slow
-        # self.zp_pos = self.zp_stage.get_current_position()
-    
-    def run_command(self, cmd):
-        if cmd == "increment_zspeed_up":
-            if self.z_speed < self.z_speed_range[1]:
-                self.z_speed *= 2
-            print(f"Z Speed = {self.z_speed}")
-        elif cmd == "increment_zspeed_down":
-            if self.z_speed > self.z_speed_range[0]:
-                self.z_speed /= 2
-            print(f"Z Speed = {self.z_speed}")
-        elif cmd == "increment_pspeed_up":
-            if self.p_speed < self.p_speed_range[1]:
-                self.p_speed *= 2
-            print(f"P Speed = {self.p_speed}")
-        elif cmd == "increment_pspeed_down":
-            if self.p_speed > self.p_speed_range[0]:
-                self.p_speed /= 2
-            print(f"P Speed = {self.p_speed}")
-        elif cmd == "increment_xyspeed_up":
-            if self.xy_speed < self.xy_speed_range[1]:
-                self.xy_speed *= 2
-            print(f"XY Speed = {self.xy_speed}")
-        elif cmd == "increment_xyspeed_down":
-            if self.xy_speed > self.xy_speed_range[0]:
-                self.xy_speed /= 2
-            print(f"XY Speed = {self.xy_speed}")
-        elif cmd == "zero_needle_pos":
-            print(f"Zeroed at XY={self.xy_pos} ZP={self.zp_pos}")
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
     
     def stop(self):
-        self.xy_stage.move_stage_at_velocity(0, 0)
-        self.xy_stage.stop()
-        self.zp_stage.stop()
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+    
+    def _poll_loop(self):
+        while self._running:
+            while not self.queue.empty():
+                try:
+                    msg = self.queue.get_nowait()
+                except:
+                    break
+                
+                if "debug" in msg:
+                    # Only print connection messages, not polling spam
+                    debug_msg = msg["debug"]
+                    if "connect" in debug_msg.lower() or "found" in debug_msg.lower():
+                        print(f"[Xbox] {debug_msg}")
+                elif "button" in msg:
+                    self.processor.add_command(msg["command"], button=msg["button"])
+                elif "axis" in msg:
+                    self.processor.add_command(msg["command"], axis=msg["axis"], average=msg["average"])
+                elif "dpad" in msg:
+                    self.processor.add_command(msg["command"], direction=msg["dpad"])
+            
+            time.sleep(0.02)
 
 
-def main_loop(simulate_xy=True, simulate_zp=True):
+class ZPJogHandler:
     """
-    Single-threaded main loop.
-    All pygame calls happen in the main thread.
-    Stage updates happen at defined intervals.
+    Handles ZP stage jogging in its own thread.
     """
-    # Initialize pygame
-    pygame.init()
-    pygame.joystick.init()
+    def __init__(self, processor, zp_stage):
+        self.processor = processor
+        self.stage = zp_stage
+        
+        self.vel_z = 0.0
+        self.vel_p1 = 0.0
+        self.vel_p2 = 0.0
+        self.vel_p3 = 0.0
+        self.lock = threading.Lock()
+        
+        self.segment_time = 0.12
+        self.z_speed = 0.5
+        self.p_speed = 0.5
+        self.max_speed = 1.0
+        
+        self._was_moving = False
+        self._running = False
+        self._thread = None
+        
+        # Register handlers
+        self.processor.register_handler("move_z_at_velocity", self._handle_z_velocity)
+        self.processor.register_handler("move_p1_at_velocity", self._handle_p1_velocity)
+        self.processor.register_handler("move_p2_at_velocity", self._handle_p2_velocity)
+        self.processor.register_handler("move_p3_at_velocity", self._handle_p3_velocity)
+        self.processor.register_handler("increment_zspeed_up", self._increment_z_up)
+        self.processor.register_handler("increment_zspeed_down", self._increment_z_down)
+        self.processor.register_handler("increment_pspeed_up", self._increment_p_up)
+        self.processor.register_handler("increment_pspeed_down", self._increment_p_down)
     
-    count = pygame.joystick.get_count()
-    print(f"Found {count} joystick(s)")
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._jog_loop, daemon=True)
+        self._thread.start()
     
-    if count == 0:
-        print("No controller found! Exiting.")
-        return
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
     
-    js = pygame.joystick.Joystick(0)
-    js.init()
-    print(f"Controller: {js.get_name()}")
-    print(f"  Axes: {js.get_numaxes()}, Buttons: {js.get_numbuttons()}, Hats: {js.get_numhats()}")
+    def _extract_velocity(self, *args, **kwargs):
+        if "average" in kwargs:
+            val = kwargs["average"]
+            if isinstance(val, (list, tuple)):
+                return val[1] if len(val) > 1 else val[0]
+            return val
+        return 0.0
     
-    # Initialize components
-    mapping = JsonMapping()
-    stages = StageController(simulate_xy=simulate_xy, simulate_zp=simulate_zp)
+    def _handle_z_velocity(self, *args, **kwargs):
+        raw = self._extract_velocity(*args, **kwargs)
+        with self.lock:
+            self.vel_z = max(-self.max_speed, min(self.max_speed, raw * self.z_speed))
     
-    # Timing intervals
-    xy_interval = 0.333
-    zp_interval = 0.05  # 20Hz - fast updates to keep printer buffer full
-    last_xy_update = 0
-    last_zp_update = 0
-    last_status = 0
+    def _handle_p1_velocity(self, *args, **kwargs):
+        raw = self._extract_velocity(*args, **kwargs)
+        with self.lock:
+            self.vel_p1 = max(-self.max_speed, min(self.max_speed, raw * self.p_speed))
     
-    # Prime the ZP buffer with initial commands
-    zp_buffer_primed = False
+    def _handle_p2_velocity(self, *args, **kwargs):
+        raw = self._extract_velocity(*args, **kwargs)
+        with self.lock:
+            self.vel_p2 = max(-self.max_speed, min(self.max_speed, raw * self.p_speed))
     
-    # State tracking for edge detection
-    prev_buttons = [False] * js.get_numbuttons()
-    prev_dpad = (0, 0)
+    def _handle_p3_velocity(self, *args, **kwargs):
+        raw = self._extract_velocity(*args, **kwargs)
+        with self.lock:
+            self.vel_p3 = max(-self.max_speed, min(self.max_speed, raw * self.p_speed))
     
-    deadzone = 0.15
+    def _increment_z_up(self, *args, **kwargs):
+        self.z_speed = min(self.z_speed * 2, 100)
+        print(f"Z speed: {self.z_speed}")
     
-    print("\nControls:")
-    print("  Left Stick    -> XY movement")
-    print("  Right Stick Y -> Z movement")
-    print("  Left Trigger  -> P1 (withdraw)")
-    print("  Right Trigger -> P2 (dispense)")
-    print("\nPress Ctrl+C to exit.\n")
+    def _increment_z_down(self, *args, **kwargs):
+        self.z_speed = max(self.z_speed / 2, 0.1)
+        print(f"Z speed: {self.z_speed}")
     
-    try:
-        while True:
-            now = time.time()
-            
-            # Pump pygame events (MUST be in main thread)
-            pygame.event.pump()
-            
-            # Reload mapping periodically
-            mapping.maybe_reload()
-            
-            # --- Read controller state ---
-            
-            # Axes with deadzone
-            axes = []
-            for i in range(js.get_numaxes()):
-                val = js.get_axis(i)
-                if abs(val) < deadzone:
-                    val = 0.0
-                axes.append(val)
-            
-            # Buttons with edge detection
-            for i in range(js.get_numbuttons()):
-                pressed = js.get_button(i)
-                if pressed and not prev_buttons[i]:
-                    # Button just pressed
-                    cmd = mapping.get_button_cmd(i)
-                    if cmd:
-                        print(f"[BUTTON {i}] -> {cmd}")
-                        stages.run_command(cmd)
-                    else:
-                        print(f"[BUTTON {i}] (unmapped)")
-                prev_buttons[i] = pressed
-            
-            # Dpad with edge detection
-            if js.get_numhats() > 0:
-                dpad = js.get_hat(0)
-                
-                # Up
-                if dpad[1] == 1 and prev_dpad[1] != 1:
-                    cmd = mapping.get_dpad_cmd("up")
-                    if cmd:
-                        print(f"[DPAD UP] -> {cmd}")
-                        stages.run_command(cmd)
-                # Down
-                if dpad[1] == -1 and prev_dpad[1] != -1:
-                    cmd = mapping.get_dpad_cmd("down")
-                    if cmd:
-                        print(f"[DPAD DOWN] -> {cmd}")
-                        stages.run_command(cmd)
-                # Right
-                if dpad[0] == 1 and prev_dpad[0] != 1:
-                    cmd = mapping.get_dpad_cmd("right")
-                    if cmd:
-                        print(f"[DPAD RIGHT] -> {cmd}")
-                        stages.run_command(cmd)
-                # Left
-                if dpad[0] == -1 and prev_dpad[0] != -1:
-                    cmd = mapping.get_dpad_cmd("left")
-                    if cmd:
-                        print(f"[DPAD LEFT] -> {cmd}")
-                        stages.run_command(cmd)
-                
-                prev_dpad = dpad
-            
-            # --- Update stages at their intervals ---
-            
-            # XY stage update
-            if now - last_xy_update >= xy_interval:
-                vx = axes[0] if len(axes) > 0 else 0
-                vy = axes[1] if len(axes) > 1 else 0
-                stages.update_xy(vx, vy)
-                last_xy_update = now
-            
-            # ZP stage update - high frequency to keep buffer full
-            if now - last_zp_update >= zp_interval:
-                # Right stick Y for Z (axis 3)
-                vz = axes[3] if len(axes) > 3 else 0
-                
-                # Triggers for pumps (axes 4,5 go from -1 to 1)
-                lt = axes[4] if len(axes) > 4 else -1
-                rt = axes[5] if len(axes) > 5 else -1
-                
-                # Normalize triggers from [-1,1] to [0,1]
-                lt = (lt + 1) / 2
-                rt = (rt + 1) / 2
-                
-                vp1 = -lt  # Left trigger withdraws
-                vp2 = rt   # Right trigger dispenses
-                
-                # Only send if there's actual input (don't spam zero commands)
-                if any(abs(v) > 0.01 for v in [vz, vp1, vp2]):
-                    stages.update_zp(vz, vp1, vp2, zp_interval)
-                
-                last_zp_update = now
-            
-            # Update ZP position less frequently
-            if now - last_status >= 1.0:
-                stages.zp_pos = stages.zp_stage.get_current_position()
-            
-            # Status print
-            if now - last_status >= 3.0:
-                x, y, _ = stages.xy_pos or (0, 0, 0)
-                z, p1, p2, _ = stages.zp_pos or (0, 0, 0, 0)
-                print(f"[STATUS] XY=({x:.1f}, {y:.1f}) Z={z:.2f} P1={p1:.2f} P2={p2:.2f} | "
-                      f"Speed: xy={stages.xy_speed} z={stages.z_speed} p={stages.p_speed}")
-                last_status = now
-            
-            # Small sleep to prevent CPU spin
-            time.sleep(0.01)
+    def _increment_p_up(self, *args, **kwargs):
+        self.p_speed = min(self.p_speed * 2, 100)
+        print(f"P speed: {self.p_speed}")
     
-    except KeyboardInterrupt:
-        print("\n\nShutting down...")
-    finally:
-        stages.stop()
-        pygame.quit()
-        print("Done.")
+    def _increment_p_down(self, *args, **kwargs):
+        self.p_speed = max(self.p_speed / 2, 0.1)
+        print(f"P speed: {self.p_speed}")
+    
+    def _jog_loop(self):
+        while self._running:
+            with self.lock:
+                vz, vp1, vp2, vp3 = self.vel_z, self.vel_p1, self.vel_p2, self.vel_p3
+            
+            is_moving = any(abs(v) > 0.001 for v in [vz, vp1, vp2, vp3])
+            
+            if is_moving and not self._was_moving:
+                print(f"[ZP] Start: z={vz:.2f} p1={vp1:.2f} p2={vp2:.2f} p3={vp3:.2f}")
+            elif not is_moving and self._was_moving:
+                print("[ZP] Stop")
+            self._was_moving = is_moving
+            
+            if not is_moving:
+                time.sleep(0.01)
+                continue
+            
+            dz = -vz * self.segment_time
+            dp1 = vp1 * self.segment_time
+            dp2 = vp2 * self.segment_time
+            dp3 = vp3 * self.segment_time
+            
+            combined = math.sqrt(vz**2 + vp1**2 + vp2**2 + vp3**2)
+            feedrate = max(combined * 60, 1)
+            
+            axes = {'X': dz, 'Y': dp1, 'Z': dp2, 'E': dp3}
+            self.stage.move_relative(axes, feedrate)
+            
+            time.sleep(self.segment_time)
 
 
-def test_controller():
-    """Raw controller test mode."""
-    pygame.init()
-    pygame.joystick.init()
+class XYJogHandler:
+    """
+    Handles XY stage jogging in its own thread.
+    """
+    def __init__(self, processor, xy_stage):
+        self.processor = processor
+        self.stage = xy_stage
+        
+        self.vel_x = 0.0
+        self.vel_y = 0.0
+        self.lock = threading.Lock()
+        
+        self.xy_speed = 100.0
+        self.max_speed = 5000.0
+        self.update_interval = 0.1
+        
+        self._was_moving = False
+        self._running = False
+        self._thread = None
+        
+        self.processor.register_handler("move_stage_at_velocity", self._handle_xy_velocity)
+        self.processor.register_handler("increment_xyspeed_up", self._increment_up)
+        self.processor.register_handler("increment_xyspeed_down", self._increment_down)
     
-    if pygame.joystick.get_count() == 0:
-        print("No controller found!")
-        return
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._jog_loop, daemon=True)
+        self._thread.start()
     
-    js = pygame.joystick.Joystick(0)
-    js.init()
-    print(f"Controller: {js.get_name()}")
-    print(f"Axes: {js.get_numaxes()}, Buttons: {js.get_numbuttons()}, Hats: {js.get_numhats()}")
-    print("\nPress Ctrl+C to exit.\n")
+    def stop(self):
+        self._running = False
+        self.stage.move_stage_at_velocity(0, 0)
+        if self._thread:
+            self._thread.join(timeout=1.0)
     
-    prev_buttons = [False] * js.get_numbuttons()
-    prev_dpad = (0, 0)
+    def _handle_xy_velocity(self, *args, **kwargs):
+        if "average" in kwargs:
+            val = kwargs["average"]
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                vx, vy = val[0], val[1]
+            else:
+                vx, vy = 0, 0
+        else:
+            vx, vy = 0, 0
+        
+        with self.lock:
+            self.vel_x = max(-self.max_speed, min(self.max_speed, vx * self.xy_speed))
+            self.vel_y = max(-self.max_speed, min(self.max_speed, vy * self.xy_speed))
     
-    try:
-        while True:
-            pygame.event.pump()
+    def _increment_up(self, *args, **kwargs):
+        self.xy_speed = min(self.xy_speed * 2, 10000)
+        print(f"XY speed: {self.xy_speed}")
+    
+    def _increment_down(self, *args, **kwargs):
+        self.xy_speed = max(self.xy_speed / 2, 1)
+        print(f"XY speed: {self.xy_speed}")
+    
+    def _jog_loop(self):
+        while self._running:
+            with self.lock:
+                vx, vy = self.vel_x, self.vel_y
             
-            # Buttons
-            for i in range(js.get_numbuttons()):
-                pressed = js.get_button(i)
-                if pressed and not prev_buttons[i]:
-                    print(f"BUTTON {i} PRESSED")
-                prev_buttons[i] = pressed
+            is_moving = abs(vx) > 0.001 or abs(vy) > 0.001
             
-            # Axes
-            active = []
-            for i in range(js.get_numaxes()):
-                val = js.get_axis(i)
-                if abs(val) > 0.2:
-                    active.append(f"Axis{i}={val:.2f}")
-            if active:
-                print(f"AXES: {' '.join(active)}")
+            if is_moving and not self._was_moving:
+                print(f"[XY] Start: x={vx:.1f} y={vy:.1f}")
+            elif not is_moving and self._was_moving:
+                print("[XY] Stop")
+            self._was_moving = is_moving
             
-            # Dpad
-            if js.get_numhats() > 0:
-                dpad = js.get_hat(0)
-                if dpad != prev_dpad and dpad != (0, 0):
-                    dirs = []
-                    if dpad[1] == 1: dirs.append("UP")
-                    if dpad[1] == -1: dirs.append("DOWN")
-                    if dpad[0] == 1: dirs.append("RIGHT")
-                    if dpad[0] == -1: dirs.append("LEFT")
-                    print(f"DPAD: {'+'.join(dirs)}")
-                prev_dpad = dpad
-            
-            time.sleep(0.05)
-    except KeyboardInterrupt:
-        print("\nDone.")
-    finally:
-        pygame.quit()
+            self.stage.move_stage_at_velocity(vx, vy)
+            time.sleep(self.update_interval)
 
 
 def main():
-    import argparse
+    # ========== CONFIGURATION ==========
+    SIMULATE_XY = False
+    SIMULATE_ZP = False
+    # ===================================
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--test-controller", action="store_true")
-    parser.add_argument("--real-xy", action="store_true")
-    parser.add_argument("--real-zp", action="store_true")
-    parser.add_argument("--real", action="store_true")
-    args = parser.parse_args()
+    print("=" * 50)
+    print("Xbox Stage Controller")
+    print("=" * 50)
+    print(f"XY: {'SIM' if SIMULATE_XY else 'REAL'}")
+    print(f"ZP: {'SIM' if SIMULATE_ZP else 'REAL'}")
+    print("=" * 50)
     
-    if args.test_controller:
-        test_controller()
-        return
+    # Create processor
+    processor = Processor()
     
-    simulate_xy =  (args.real_xy or args.real)
-    simulate_zp =  (args.real_zp or args.real)
+    # Create stages
+    xy_stage = XYStageManager(simulate=SIMULATE_XY)
+    zp_stage = ZPStageManager(simulate=SIMULATE_ZP)
     
-    print("=" * 60)
-    print("Xbox Stage Controller (Single-Threaded)")
-    print("=" * 60)
-    print(f"XY Stage: {'SIMULATED' if simulate_xy else 'HARDWARE'}")
-    print(f"ZP Stage: {'SIMULATED' if simulate_zp else 'HARDWARE'}")
-    print("=" * 60)
+    # Create and start jog handlers
+    zp_jog = ZPJogHandler(processor, zp_stage)
+    xy_jog = XYJogHandler(processor, xy_stage)
+    zp_jog.start()
+    xy_jog.start()
     
-    main_loop(simulate_xy=simulate_xy, simulate_zp=simulate_zp)
+    # Create Xbox queue and process
+    xbox_queue = Queue()
+    xbox_process = Process(target=xbox_polling_worker, args=(xbox_queue,))
+    xbox_process.start()
+    
+    # Create and start queue poller
+    xbox_poller = XboxQueuePoller(xbox_queue, processor)
+    xbox_poller.start()
+    
+    print("Ready. Press Ctrl+C to exit.\n")
+    
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        xbox_poller.stop()
+        xbox_process.terminate()
+        xbox_process.join(timeout=1.0)
+        zp_jog.stop()
+        xy_jog.stop()
+        xy_stage.stop()
+        zp_stage.stop()
+        processor.stop()
+        print("Done.")
 
 
 if __name__ == "__main__":

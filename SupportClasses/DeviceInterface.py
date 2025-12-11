@@ -88,7 +88,7 @@ class XYStageManager:
         ports = serial.tools.list_ports.comports()
         
         # List of baud rates to try (as recommended by ProScan documentation)
-        baud_rates_to_try = [9600, 19200, 38400, 115200]
+        baud_rates_to_try = [38400]
         
         for port in ports:
             for baud_rate in baud_rates_to_try:
@@ -215,7 +215,6 @@ class XYStageManager:
 
         command = f"VS,{vx},{vy}"
         self.send_command(command)
-        print(f"Sending XY command: {command}")
 
 
     def move_stage_to_position(self, x, y, fast=False):
@@ -790,7 +789,8 @@ class XYStageSimulator:
     def move_stage_at_velocity(self, vx, vy):
         """Wrapper to send a velocity command."""
         command = f"VS,{vx},{vy}"
-        print(f"Sending XY command: {command}")
+        if vx is not 0.0 or vy is not 0.0:
+            print(f"Sending XY command: {command}")
         self.send_command(command)
 
     def update_velocity(self, current, target, dt):

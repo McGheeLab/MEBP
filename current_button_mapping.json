@@ -16,8 +16,8 @@
     "axes": {
         "0-1": "move_stage_at_velocity",
         "2-3": "move_z_at_velocity",
-        "4": "move_p1_at_velocity",
-        "5": "move_p2_at_velocity"
+        "4": "move_p3_at_velocity",
+        "5": "move_p3_at_velocity"
     },
     "dpad": {
         "up": "increment_zspeed_up",
