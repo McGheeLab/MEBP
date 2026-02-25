@@ -337,6 +337,9 @@ class PrintSetupPage(QWidget):
         main_layout = QHBoxLayout(self)
         main_layout.setSpacing(8)
 
+        # Initialize preview canvas early since tab builders may trigger preview updates.
+        self.canvas = PathPreviewCanvas()
+
         # ── Left: Source Tabs + Canvas ─────────────────────────────
         left_panel = QVBoxLayout()
 
@@ -362,7 +365,6 @@ class PrintSetupPage(QWidget):
         # Preview canvas
         canvas_group = QGroupBox("Path Preview")
         canvas_layout = QVBoxLayout(canvas_group)
-        self.canvas = PathPreviewCanvas()
         canvas_layout.addWidget(self.canvas)
         left_panel.addWidget(canvas_group, stretch=1)
 
