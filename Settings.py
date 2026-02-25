@@ -9,6 +9,7 @@ Saves and loads app state from a JSON file:
   - Last-used print settings
   - Active tab
   - Xbox mapping file path
+  - Safety limits (Session 4)
 """
 
 import json
@@ -57,6 +58,30 @@ DEFAULTS = {
     },
     "logging": {
         "verbose": False,
+    },
+    # Session 4: Safety Limits
+    "safety_limits": {
+        "xy_min_x": -100000.0,
+        "xy_min_y": -100000.0,
+        "xy_max_x": 100000.0,
+        "xy_max_y": 100000.0,
+        "z_min": -10.0,
+        "z_max": 50.0,
+        "p1_min": -50.0,
+        "p1_max": 50.0,
+        "p2_min": -50.0,
+        "p2_max": 50.0,
+        "p3_min": -50.0,
+        "p3_max": 50.0,
+        "max_xy_speed": 10000.0,
+        "max_z_feedrate": 500.0,
+        "max_pump_feedrate": 200.0,
+        "enabled": True,
+    },
+    # Session 4: Polling settings
+    "polling": {
+        "position_interval_ms": 300,
+        "watchdog_interval_s": 3.0,
     },
 }
 

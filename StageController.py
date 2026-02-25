@@ -5,9 +5,14 @@ This module contains:
 - XboxQueuePoller: Reads Xbox events from multiprocessing queue
 - XYJogHandler: Continuous velocity jogging for XY stage (own thread)
 - ZPJogHandler: Segmented relative moves for ZP stage (own thread)
+- PositionPoller: Background thread for cached position reads
 - StageController: Top-level orchestrator that ties everything together
 
 The jog handlers are taken directly from the proven XBOXCONTROLLED code.
+
+Session 4 additions:
+- SafetyLimits integration (software endstops for all axes)
+- PositionLogger integration (timestamped position recording)
 """
 
 import math
@@ -21,6 +26,8 @@ from SupportClasses.XYStage import XYStageManager
 from SupportClasses.ZPStage import ZPStageManager, AXIS_MAP
 from SupportClasses.XboxController import xbox_polling_worker
 from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
+from SupportClasses.SafetyLimits import SafetyLimits
+from SupportClasses.PositionLogger import PositionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +82,16 @@ class ZPJogHandler:
     Converts velocity commands into segmented relative moves.
     
     Proven working from XBOXCONTROLLED code.
+    
+    Session 4: Now accepts optional safety_limits for boundary checking.
     """
 
-    def __init__(self, processor: Processor, zp_stage: ZPStageManager):
+    def __init__(self, processor: Processor, zp_stage: ZPStageManager,
+                 safety_limits: SafetyLimits = None, get_zp_position=None):
         self.processor = processor
         self.stage = zp_stage
+        self.safety_limits = safety_limits
+        self._get_zp_position = get_zp_position  # callable → (z, p1, p2, p3)
 
         self.vel_z = 0.0
         self.vel_p1 = 0.0
@@ -188,8 +200,29 @@ class ZPJogHandler:
             dp2 = vp2 * self.segment_time
             dp3 = vp3 * self.segment_time
 
+            # Safety limits check for jog moves
+            if self.safety_limits and self.safety_limits.enabled and self._get_zp_position:
+                try:
+                    pos = self._get_zp_position()
+                    if pos[0] is not None:
+                        cur_z, cur_p1, cur_p2, cur_p3 = pos
+                        new_z = self.safety_limits.clamp_z(cur_z + dz)
+                        new_p1 = self.safety_limits.clamp_pump(cur_p1 + dp1, "P1")
+                        new_p2 = self.safety_limits.clamp_pump(cur_p2 + dp2, "P2")
+                        new_p3 = self.safety_limits.clamp_pump(cur_p3 + dp3, "P3")
+                        dz = new_z - cur_z
+                        dp1 = new_p1 - cur_p1
+                        dp2 = new_p2 - cur_p2
+                        dp3 = new_p3 - cur_p3
+                except Exception:
+                    pass  # Don't block jogging if position query fails
+
             combined = math.sqrt(vz**2 + vp1**2 + vp2**2 + vp3**2)
             feedrate = max(combined * 60, 1)
+
+            # Clamp feedrate
+            if self.safety_limits and self.safety_limits.enabled:
+                feedrate = min(feedrate, self.safety_limits.max_z_feedrate)
 
             axes = {'X': dz, 'Y': dp1, 'Z': dp2, 'E': dp3}
             self.stage.move_relative(axes, feedrate)
@@ -203,11 +236,16 @@ class XYJogHandler:
     Sends continuous velocity commands.
     
     Proven working from XBOXCONTROLLED code.
+    
+    Session 4: Now accepts optional safety_limits for boundary checking.
     """
 
-    def __init__(self, processor: Processor, xy_stage: XYStageManager):
+    def __init__(self, processor: Processor, xy_stage: XYStageManager,
+                 safety_limits: SafetyLimits = None, get_xy_position=None):
         self.processor = processor
         self.stage = xy_stage
+        self.safety_limits = safety_limits
+        self._get_xy_position = get_xy_position  # callable → (x, y, f)
 
         self.vel_x = 0.0
         self.vel_y = 0.0
@@ -276,6 +314,23 @@ class XYJogHandler:
             elif not is_moving and self._was_moving:
                 logger.debug("[XY] Stop")
             self._was_moving = is_moving
+
+            # Safety limits: dampen velocity near boundaries
+            if is_moving and self.safety_limits and self.safety_limits.enabled and self._get_xy_position:
+                try:
+                    pos = self._get_xy_position()
+                    if pos[0] is not None:
+                        near = self.safety_limits.check_xy_near_limit(pos[0], pos[1], margin=500)
+                        if near["x_near_min"] and vx < 0:
+                            vx *= 0.3
+                        if near["x_near_max"] and vx > 0:
+                            vx *= 0.3
+                        if near["y_near_min"] and vy < 0:
+                            vy *= 0.3
+                        if near["y_near_max"] and vy > 0:
+                            vy *= 0.3
+                except Exception:
+                    pass
 
             self.stage.move_stage_at_velocity(vx, vy)
             time.sleep(self.update_interval)
@@ -362,6 +417,10 @@ class StageController:
     
     This is the main object that the GUI (or headless mode) interacts with.
     It owns the Processor, stages, jog handlers, and Xbox controller.
+    
+    Session 4 additions:
+    - SafetyLimits: Software endstops for all axes (Task 3)
+    - PositionLogger: Timestamped position recording (Task 2)
     """
 
     def __init__(self, simulate_xy=True, simulate_zp=True):
@@ -390,6 +449,12 @@ class StageController:
             "Z": 0.0, "P1": 0.0, "P2": 0.0, "P3": 0.0,
         }
 
+        # Session 4: Safety Limits
+        self.safety_limits = SafetyLimits()
+
+        # Session 4: Position Logger
+        self.position_logger = PositionLogger()
+
         # Connection watchdog for real hardware
         self._watchdog = ConnectionWatchdog(check_interval=3.0)
         self._watchdog.start()
@@ -410,7 +475,11 @@ class StageController:
         """Initialize and connect both stages."""
         if self.xy_stage is None:
             self.xy_stage = XYStageManager(simulate=self.simulate_xy)
-            self.xy_jog = XYJogHandler(self.processor, self.xy_stage)
+            self.xy_jog = XYJogHandler(
+                self.processor, self.xy_stage,
+                safety_limits=self.safety_limits,
+                get_xy_position=lambda: self._pos_poller.xy_position,
+            )
             self.xy_jog.start()
             # Watch for disconnects (real hardware only)
             if not self.simulate_xy:
@@ -423,7 +492,11 @@ class StageController:
 
         if self.zp_stage is None:
             self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
-            self.zp_jog = ZPJogHandler(self.processor, self.zp_stage)
+            self.zp_jog = ZPJogHandler(
+                self.processor, self.zp_stage,
+                safety_limits=self.safety_limits,
+                get_zp_position=lambda: self._pos_poller.zp_position,
+            )
             self.zp_jog.start()
             if not self.simulate_zp:
                 self._watchdog.watch(
@@ -438,66 +511,87 @@ class StageController:
 
     def _handle_disconnect(self, stage_name: str):
         """Called by watchdog when a serial disconnect is detected."""
-        logger.warning(f"{stage_name} stage disconnected unexpectedly!")
+        logger.error(f"{stage_name} stage disconnected!")
+        if stage_name == "XY":
+            self.disconnect_xy()
+        elif stage_name == "ZP":
+            self.disconnect_zp()
         if self.on_disconnect:
-            try:
-                self.on_disconnect(stage_name)
-            except Exception as e:
-                logger.error(f"Disconnect callback error: {e}")
+            self.on_disconnect(stage_name)
 
-    def disconnect_stages(self):
-        """Disconnect and clean up both stages."""
-        self._watchdog.unwatch("XY")
-        self._watchdog.unwatch("ZP")
-        self._pos_poller.set_stages(None, None)
+    def disconnect_xy(self):
+        """Disconnect and clean up XY stage."""
         if self.xy_jog:
             self.xy_jog.stop()
             self.xy_jog = None
+        if self.xy_stage:
+            try:
+                self.xy_stage.stop()
+            except Exception:
+                pass
+            self.xy_stage = None
+        self._pos_poller.set_stages(None, self.zp_stage)
+        self._watchdog.unwatch("XY")
+        logger.info("XY stage disconnected")
+
+    def disconnect_zp(self):
+        """Disconnect and clean up ZP stage."""
         if self.zp_jog:
             self.zp_jog.stop()
             self.zp_jog = None
-        if self.xy_stage:
-            self.xy_stage.stop()
-            self.xy_stage = None
         if self.zp_stage:
-            self.zp_stage.stop()
+            try:
+                self.zp_stage.stop()
+            except Exception:
+                pass
             self.zp_stage = None
-        logger.info("Stages disconnected")
+        self._pos_poller.set_stages(self.xy_stage, None)
+        self._watchdog.unwatch("ZP")
+        logger.info("ZP stage disconnected")
 
-    def connect_xbox(self, mapping_file="current_button_mapping.json"):
-        """Start the Xbox controller process."""
-        if self.xbox_process is not None:
-            logger.info("Xbox already running")
+    def disconnect_stages(self):
+        """Disconnect both stages."""
+        self.disconnect_xy()
+        self.disconnect_zp()
+
+    # ── Xbox Controller ────────────────────────────────────────────
+
+    def connect_xbox(self, mapping_file: str = "current_button_mapping.json"):
+        """Start Xbox controller in separate process."""
+        if self.xbox_process and self.xbox_process.is_alive():
+            logger.warning("Xbox already connected")
             return
 
         self.xbox_queue = Queue()
         self.xbox_process = Process(
             target=xbox_polling_worker,
-            args=(self.xbox_queue, mapping_file)
+            args=(self.xbox_queue,),
+            kwargs={"mapping_file": mapping_file},
+            daemon=True,
         )
         self.xbox_process.start()
-
         self.xbox_poller = XboxQueuePoller(self.xbox_queue, self.processor)
         self.xbox_poller.start()
-        logger.info("Xbox controller started")
+        logger.info("Xbox controller connected")
 
     def disconnect_xbox(self):
-        """Stop the Xbox controller process."""
+        """Stop Xbox controller."""
         if self.xbox_poller:
             self.xbox_poller.stop()
             self.xbox_poller = None
-        if self.xbox_process:
+        if self.xbox_process and self.xbox_process.is_alive():
             self.xbox_process.terminate()
-            self.xbox_process.join(timeout=1.0)
+            self.xbox_process.join(timeout=2.0)
             self.xbox_process = None
         self.xbox_queue = None
-        logger.info("Xbox controller stopped")
+        logger.info("Xbox controller disconnected")
 
-    # ── State Queries ──────────────────────────────────────────────
+    # ── Position Queries ───────────────────────────────────────────
 
-    def get_xy_position(self, cached: bool = True) -> tuple:
+    def get_xy_position(self, cached=True) -> tuple:
         """
-        Get current XY position. Returns (x, y, f) or (None, None, None).
+        Get current XY position.
+        Returns (x, y, f) or (None, None, None).
         
         Args:
             cached: If True, returns the most recent polled value (non-blocking).
@@ -513,9 +607,10 @@ class StageController:
                 logger.debug(f"XY position query error: {e}")
         return (None, None, None)
 
-    def get_zp_position(self, cached: bool = True) -> tuple:
+    def get_zp_position(self, cached=True) -> tuple:
         """
-        Get current ZP position. Returns (z, p1, p2, p3) or (None,)*4.
+        Get current ZP position.
+        Returns (z, p1, p2, p3) or (None,)*4.
         
         Args:
             cached: If True, returns the most recent polled value (non-blocking).
@@ -572,21 +667,47 @@ class StageController:
 
         logger.info(f"Zero position calibrated: {self.zero_position}")
 
+        # Session 4: Log calibration event
+        self.position_logger.record(
+            "calibrate_zero",
+            xy_pos=self.get_xy_position(cached=False),
+            zp_pos=self.get_zp_position(cached=False),
+            metadata={"zero_position": dict(self.zero_position)},
+        )
+
     # ── Movement (for GUI / print commands) ────────────────────────
 
     def move_xy_absolute(self, x, y, from_zero_ref=True, fast=False):
-        """Move XY stage to absolute position."""
+        """
+        Move XY stage to absolute position.
+        
+        Session 4: Now applies safety limit clamping before sending command.
+        """
         if not self.xy_stage:
             return
+
+        # Apply safety limits (clamp in zero-ref space before converting)
+        if self.safety_limits.enabled and from_zero_ref:
+            x, y = self.safety_limits.clamp_xy(x, y)
+
         if from_zero_ref:
             x = x + self.zero_position["x"]
             y = y + self.zero_position["y"]
         self.xy_stage.move_stage_to_position(x, y, fast)
 
     def move_z_absolute(self, z_value, from_zero_ref=True, fast=False):
-        """Move Z axis to absolute position."""
+        """
+        Move Z axis to absolute position.
+        
+        Session 4: Now applies safety limit clamping.
+        """
         if not self.zp_stage:
             return
+
+        # Apply safety limits (clamp in zero-ref space)
+        if self.safety_limits.enabled and from_zero_ref:
+            z_value = self.safety_limits.clamp_z(z_value)
+
         position = z_value
         if from_zero_ref:
             position = z_value + self.zero_position["Z"]
@@ -594,16 +715,64 @@ class StageController:
         self.zp_stage.move_absolute({mapped: position}, fast)
 
     def move_z_relative(self, distance, feedrate=None):
-        """Move Z axis by relative distance."""
+        """
+        Move Z axis by relative distance.
+        
+        Session 4: Clamps feedrate and checks resulting position.
+        """
         if not self.zp_stage:
             return
+
+        # Clamp feedrate
+        if feedrate and self.safety_limits.enabled:
+            feedrate = self.safety_limits.clamp_z_feedrate(feedrate)
+
+        # Check resulting position against limits
+        if self.safety_limits.enabled:
+            try:
+                pos = self.get_zp_position(cached=True)
+                if pos[0] is not None:
+                    new_z = pos[0] + distance
+                    clamped_z = self.safety_limits.clamp_z(
+                        new_z - self.zero_position["Z"]
+                    )
+                    distance = (clamped_z + self.zero_position["Z"]) - pos[0]
+            except Exception:
+                pass
+
         mapped = AXIS_MAP["Z"]
         self.zp_stage.move_relative({mapped: distance}, feedrate)
 
     def move_pump_relative(self, pump: str, distance: float, feedrate=None):
-        """Move a pump (P1/P2/P3) by relative distance."""
+        """
+        Move a pump (P1/P2/P3) by relative distance.
+        
+        Session 4: Clamps feedrate and checks resulting position.
+        """
         if not self.zp_stage:
             return
+
+        # Clamp feedrate
+        if feedrate and self.safety_limits.enabled:
+            feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
+
+        # Check resulting position against limits
+        if self.safety_limits.enabled:
+            try:
+                pos = self.get_zp_position(cached=True)
+                if pos[0] is not None:
+                    # Map pump to position index: P1→1, P2→2, P3→3
+                    pump_idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
+                    cur_pos = pos[pump_idx]
+                    new_pos = cur_pos + distance
+                    zero_ref = self.zero_position.get(pump, 0)
+                    clamped = self.safety_limits.clamp_pump(
+                        new_pos - zero_ref, pump
+                    )
+                    distance = (clamped + zero_ref) - cur_pos
+            except Exception:
+                pass
+
         mapped = AXIS_MAP.get(pump)
         if mapped:
             self.zp_stage.move_relative({mapped: distance}, feedrate)

@@ -3,9 +3,14 @@ Main Application Window
 
 Clean tab-based layout:
   - Connection panel at top (always visible)
-  - Tab pages: Dashboard, Jog Control, Calibration, Print Setup
+  - Tab pages: Dashboard, Jog Control, Calibration, Print Setup, Settings
   - Console log at bottom (collapsible)
   - Status bar for quick info
+
+Session 4 additions:
+  - Settings tab (Task 5)
+  - Safety limits restoration from settings (Task 3)
+  - Position log count in status bar (Task 2)
 """
 
 from PySide6.QtWidgets import (
@@ -17,12 +22,14 @@ from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
 
 from SupportClasses.StageController import StageController
+from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.Settings import Settings
 from gui.styles import DARK_THEME
 from gui.pages.dashboard import DashboardPage
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
 from gui.pages.print_setup import PrintSetupPage
+from gui.pages.settings_page import SettingsPage
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
 
@@ -39,6 +46,11 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.controller = controller
         self.settings = settings or Settings()
+
+        # Session 4: Restore safety limits from settings
+        saved_limits = self.settings.get_section("safety_limits")
+        if saved_limits:
+            self.controller.safety_limits = SafetyLimits.from_dict(saved_limits)
 
         # Disconnect bridge for thread-safe notifications
         self._disconnect_bridge = _DisconnectBridge()
@@ -59,66 +71,40 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(8)
+        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(8, 8, 8, 4)
 
-        # ── Top: Connection Panel ──────────────────────────────────
-        conn_group = QGroupBox("Connections")
-        conn_layout = QHBoxLayout(conn_group)
+        # Connection panel at top
+        conn_frame = QGroupBox("Connections")
+        conn_layout = QHBoxLayout(conn_frame)
+        conn_layout.setSpacing(12)
 
-        # XY Stage
-        xy_frame = self._make_connection_row(
-            "XY Stage (Prior)", "xy",
-            self._on_connect_xy, self._on_disconnect_xy
-        )
-        conn_layout.addWidget(xy_frame)
+        # XY stage connection
+        conn_layout.addWidget(self._make_connection_row(
+            "XY Stage", "xy",
+            self._connect_xy, self._disconnect_xy,
+        ))
 
-        # Separator
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.VLine)
-        conn_layout.addWidget(sep1)
+        # ZP stage connection
+        conn_layout.addWidget(self._make_connection_row(
+            "ZP Stage", "zp",
+            self._connect_zp, self._disconnect_zp,
+        ))
 
-        # ZP Stage
-        zp_frame = self._make_connection_row(
-            "ZP Stage (Marlin)", "zp",
-            self._on_connect_zp, self._on_disconnect_zp
-        )
-        conn_layout.addWidget(zp_frame)
+        # Xbox connection
+        conn_layout.addWidget(self._make_connection_row(
+            "Xbox", "xbox",
+            self._connect_xbox, self._disconnect_xbox,
+        ))
 
-        # Separator
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.VLine)
-        conn_layout.addWidget(sep2)
-
-        # Xbox
-        xbox_frame = self._make_connection_row(
-            "Xbox Controller", "xbox",
-            self._on_connect_xbox, self._on_disconnect_xbox
-        )
-        conn_layout.addWidget(xbox_frame)
-
-        # Xbox mapping editor button
-        btn_mapping = QPushButton("⚙")
-        btn_mapping.setToolTip("Edit Xbox button mapping")
-        btn_mapping.setFixedSize(36, 36)
-        btn_mapping.clicked.connect(self._open_mapping_editor)
+        # Xbox mapping button
+        btn_mapping = QPushButton("🎮 Edit Mapping")
+        btn_mapping.clicked.connect(self._open_xbox_editor)
         conn_layout.addWidget(btn_mapping)
 
-        # Separator
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.VLine)
-        conn_layout.addWidget(sep3)
+        main_layout.addWidget(conn_frame)
 
-        # Emergency Stop
-        self.btn_estop = QPushButton("EMERGENCY\nSTOP")
-        self.btn_estop.setObjectName("emergencyStop")
-        self.btn_estop.setFixedWidth(140)
-        self.btn_estop.clicked.connect(self._on_emergency_stop)
-        conn_layout.addWidget(self.btn_estop)
-
-        main_layout.addWidget(conn_group)
-
-        # ── Middle: Splitter with tabs and console ─────────────────
+        # Splitter: Tabs + Console
         self._splitter = QSplitter(Qt.Orientation.Vertical)
 
         # Tab widget
@@ -132,6 +118,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.calibration_page, "📐 Calibration")
         self.print_setup_page = PrintSetupPage(self.controller)
         self.tabs.addTab(self.print_setup_page, "🖨️ Print Setup")
+
+        # Session 4: Settings tab (Task 5)
+        self.settings_page = SettingsPage(self.controller, self.settings)
+        self.tabs.addTab(self.settings_page, "⚙ Settings")
 
         self._splitter.addWidget(self.tabs)
 
@@ -151,20 +141,17 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
 
-        # Label
         label = QLabel(label_text)
         label.setObjectName("headerLabel")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label)
 
-        # Status
         status = QLabel("Disconnected")
         status.setObjectName("statusDisconnected")
         status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         setattr(self, f"status_{prefix}", status)
         layout.addWidget(status)
 
-        # Buttons
         btn_row = QHBoxLayout()
         btn_connect = QPushButton("Connect")
         btn_connect.setObjectName("connectBtn")
@@ -202,185 +189,162 @@ class MainWindow(QMainWindow):
         self.sb_speed.setFont(mono)
         self.status_bar.addPermanentWidget(self.sb_speed)
 
+        # Session 4: Safety limits indicator
+        self.sb_safety = QLabel("🛡️ ON")
+        self.sb_safety.setFont(mono)
+        self.sb_safety.setToolTip("Safety limits status")
+        self.status_bar.addPermanentWidget(self.sb_safety)
+
+        # Session 4: Position log count
+        self.sb_log_count = QLabel("📝 0")
+        self.sb_log_count.setFont(mono)
+        self.sb_log_count.setToolTip("Position log entries")
+        self.status_bar.addPermanentWidget(self.sb_log_count)
+
     def _setup_timers(self):
         """Setup periodic UI update timers."""
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_ui)
-        self.update_timer.start(500)  # 500ms update cycle
-
-    # ── Connection Handlers ────────────────────────────────────────
-
-    def _set_connected(self, prefix, connected):
-        """Update UI state for a connection."""
-        status = getattr(self, f"status_{prefix}")
-        btn_c = getattr(self, f"btn_connect_{prefix}")
-        btn_d = getattr(self, f"btn_disconnect_{prefix}")
-
-        if connected:
-            status.setText("Connected")
-            status.setObjectName("statusConnected")
-            btn_c.setEnabled(False)
-            btn_d.setEnabled(True)
-        else:
-            status.setText("Disconnected")
-            status.setObjectName("statusDisconnected")
-            btn_c.setEnabled(True)
-            btn_d.setEnabled(False)
-
-        # Force style refresh
-        status.style().unpolish(status)
-        status.style().polish(status)
-
-    def _on_connect_xy(self):
-        try:
-            if self.controller.xy_stage is None:
-                from SupportClasses.XYStage import XYStageManager
-                from SupportClasses.StageController import XYJogHandler
-                self.controller.xy_stage = XYStageManager(simulate=self.controller.simulate_xy)
-                self.controller.xy_jog = XYJogHandler(self.controller.processor, self.controller.xy_stage)
-                # Apply saved speed
-                saved_xy = self.settings.get("speeds.xy")
-                if saved_xy and self.controller.xy_jog:
-                    self.controller.xy_jog.xy_speed = saved_xy
-                self.controller.xy_jog.start()
-                # Register with position poller
-                self.controller._pos_poller.set_stages(
-                    self.controller.xy_stage, self.controller.zp_stage
-                )
-            self._set_connected("xy", True)
-            self.console.log("XY stage connected")
-        except Exception as e:
-            self.console.log(f"XY connection failed: {e}", "error")
-
-    def _on_disconnect_xy(self):
-        if self.controller.xy_jog:
-            self.controller.xy_jog.stop()
-            self.controller.xy_jog = None
-        if self.controller.xy_stage:
-            self.controller.xy_stage.stop()
-            self.controller.xy_stage = None
-        self.controller._pos_poller.set_stages(None, self.controller.zp_stage)
-        self._set_connected("xy", False)
-        self.console.log("XY stage disconnected")
-
-    def _on_connect_zp(self):
-        try:
-            if self.controller.zp_stage is None:
-                from SupportClasses.ZPStage import ZPStageManager
-                from SupportClasses.StageController import ZPJogHandler
-                self.controller.zp_stage = ZPStageManager(simulate=self.controller.simulate_zp)
-                self.controller.zp_jog = ZPJogHandler(self.controller.processor, self.controller.zp_stage)
-                # Apply saved speeds
-                saved_z = self.settings.get("speeds.z")
-                saved_p = self.settings.get("speeds.p")
-                if self.controller.zp_jog:
-                    if saved_z:
-                        self.controller.zp_jog.speeds["z"] = saved_z
-                    if saved_p:
-                        self.controller.zp_jog.speeds["p"] = saved_p
-                self.controller.zp_jog.start()
-                # Register with position poller
-                self.controller._pos_poller.set_stages(
-                    self.controller.xy_stage, self.controller.zp_stage
-                )
-            self._set_connected("zp", True)
-            self.console.log("ZP stage connected")
-        except Exception as e:
-            self.console.log(f"ZP connection failed: {e}", "error")
-
-    def _on_disconnect_zp(self):
-        if self.controller.zp_jog:
-            self.controller.zp_jog.stop()
-            self.controller.zp_jog = None
-        if self.controller.zp_stage:
-            self.controller.zp_stage.stop()
-            self.controller.zp_stage = None
-        self.controller._pos_poller.set_stages(self.controller.xy_stage, None)
-        self._set_connected("zp", False)
-        self.console.log("ZP stage disconnected")
-
-    def _on_connect_xbox(self):
-        try:
-            self.controller.connect_xbox()
-            self._set_connected("xbox", True)
-            self.console.log("Xbox controller connected")
-        except Exception as e:
-            self.console.log(f"Xbox connection failed: {e}", "error")
-
-    def _on_disconnect_xbox(self):
-        self.controller.disconnect_xbox()
-        self._set_connected("xbox", False)
-        self.console.log("Xbox controller disconnected")
-
-    def _open_mapping_editor(self):
-        """Open the Xbox button mapping editor dialog."""
-        mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
-        dialog = XboxMappingEditor(mapping_file, parent=self)
-        dialog.setStyleSheet(self.styleSheet())
-        if dialog.exec():
-            self.console.log("Xbox mapping updated (hot-reloaded in ~5s)", "success")
-
-    def _on_emergency_stop(self):
-        """Emergency stop all axes."""
-        self.console.log("EMERGENCY STOP", "error")
-        if self.controller.zp_stage:
-            self.controller.zp_stage.emergency_stop()
-        if self.controller.xy_stage:
-            self.controller.xy_stage.move_stage_at_velocity(0, 0)
-
-    def _on_hardware_disconnect(self, stage_name: str):
-        """Handle unexpected hardware disconnect (called from watchdog via signal)."""
-        self.console.log(f"{stage_name} stage disconnected unexpectedly!", "error")
-        # Update connection status in the UI
-        if stage_name == "XY":
-            self._set_connected("xy", False)
-        elif stage_name == "ZP":
-            self._set_connected("zp", False)
-
-    # ── Periodic UI Update ─────────────────────────────────────────
+        self.update_timer.start(500)
 
     def _update_ui(self):
-        """Update status bar and page data."""
-        # XY position
-        if self.controller.is_xy_connected:
-            try:
-                x, y, f = self.controller.get_xy_position()
-                if x is not None:
-                    self.sb_xy.setText(f"XY: {x:.1f} , {y:.1f}")
-            except Exception:
-                pass
+        """Periodic UI refresh."""
+        # Position display
+        xy = self.controller.get_xy_position(cached=True)
+        if xy[0] is not None:
+            zero_x = xy[0] - self.controller.zero_position["x"]
+            zero_y = xy[1] - self.controller.zero_position["y"]
+            self.sb_xy.setText(f"XY: {zero_x:.0f}, {zero_y:.0f}")
         else:
-            self.sb_xy.setText("XY: --")
+            self.sb_xy.setText("XY: --, --")
 
-        # ZP position
-        if self.controller.is_zp_connected:
-            try:
-                z, p1, p2, p3 = self.controller.get_zp_position()
-                if z is not None:
-                    self.sb_zp.setText(f"Z:{z:.3f} | P1:{p1:.3f} P2:{p2:.3f} P3:{p3:.3f}")
-            except Exception:
-                pass
+        zp = self.controller.get_zp_position(cached=True)
+        if zp[0] is not None:
+            zero_z = zp[0] - self.controller.zero_position["Z"]
+            zero_p1 = zp[1] - self.controller.zero_position["P1"]
+            zero_p2 = zp[2] - self.controller.zero_position["P2"]
+            zero_p3 = zp[3] - self.controller.zero_position["P3"]
+            self.sb_zp.setText(
+                f"Z: {zero_z:.2f} | P1: {zero_p1:.2f} P2: {zero_p2:.2f} P3: {zero_p3:.2f}"
+            )
         else:
             self.sb_zp.setText("Z: -- | P1: -- P2: -- P3: --")
 
-        # Speed info
+        # Speed display
         speeds = self.controller.get_speed_info()
         self.sb_speed.setText(
-            f"Speed XY:{speeds['xy']:.0f} Z:{speeds['z']:.2f} P:{speeds['p']:.2f}"
+            f"Speed XY:{speeds['xy']:.0f} Z:{speeds['z']:.1f} P:{speeds['p']:.1f}"
         )
 
-        # Update connection status indicators
-        self._set_connected("xy", self.controller.is_xy_connected)
-        self._set_connected("zp", self.controller.is_zp_connected)
-        self._set_connected("xbox", self.controller.is_xbox_connected)
+        # Safety limits indicator
+        sl = self.controller.safety_limits
+        self.sb_safety.setText(f"🛡️ {'ON' if sl.enabled else 'OFF'}")
+        self.sb_safety.setStyleSheet(
+            f"color: {'#a6e3a1' if sl.enabled else '#f38ba8'};"
+        )
 
-        # Update active tab
-        current = self.tabs.currentWidget()
-        if hasattr(current, 'update_data'):
-            current.update_data()
+        # Position log count
+        self.sb_log_count.setText(f"📝 {self.controller.position_logger.count}")
+
+        # Update active pages
+        active_page = self.tabs.currentWidget()
+        if hasattr(active_page, 'update_data'):
+            active_page.update_data()
+
+    # ── Connection Actions ─────────────────────────────────────────
+
+    def _connect_xy(self):
+        try:
+            self.controller.connect_stages()
+            self.status_xy.setText("Connected" if self.controller.simulate_xy else "Connected (HW)")
+            self.status_xy.setObjectName("statusConnected")
+            self.status_xy.setStyleSheet("color: #a6e3a1;")
+            self.btn_connect_xy.setEnabled(False)
+            self.btn_disconnect_xy.setEnabled(True)
+            # ZP also connected via connect_stages
+            self._update_zp_status()
+            self.console.log("Stages connected", "success")
+        except Exception as e:
+            self.console.log(f"Connection failed: {e}", "error")
+
+    def _disconnect_xy(self):
+        self.controller.disconnect_xy()
+        self.status_xy.setText("Disconnected")
+        self.status_xy.setStyleSheet("color: #f38ba8;")
+        self.btn_connect_xy.setEnabled(True)
+        self.btn_disconnect_xy.setEnabled(False)
+
+    def _connect_zp(self):
+        try:
+            self.controller.connect_stages()
+            self._update_zp_status()
+            self._update_xy_status()
+            self.console.log("Stages connected", "success")
+        except Exception as e:
+            self.console.log(f"Connection failed: {e}", "error")
+
+    def _disconnect_zp(self):
+        self.controller.disconnect_zp()
+        self.status_zp.setText("Disconnected")
+        self.status_zp.setStyleSheet("color: #f38ba8;")
+        self.btn_connect_zp.setEnabled(True)
+        self.btn_disconnect_zp.setEnabled(False)
+
+    def _update_xy_status(self):
+        if self.controller.is_xy_connected:
+            self.status_xy.setText("Connected" if self.controller.simulate_xy else "Connected (HW)")
+            self.status_xy.setStyleSheet("color: #a6e3a1;")
+            self.btn_connect_xy.setEnabled(False)
+            self.btn_disconnect_xy.setEnabled(True)
+
+    def _update_zp_status(self):
+        if self.controller.is_zp_connected:
+            self.status_zp.setText("Connected" if self.controller.simulate_zp else "Connected (HW)")
+            self.status_zp.setStyleSheet("color: #a6e3a1;")
+            self.btn_connect_zp.setEnabled(False)
+            self.btn_disconnect_zp.setEnabled(True)
+
+    def _connect_xbox(self):
+        try:
+            mapping = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
+            self.controller.connect_xbox(mapping)
+            self.status_xbox.setText("Connected")
+            self.status_xbox.setStyleSheet("color: #a6e3a1;")
+            self.btn_connect_xbox.setEnabled(False)
+            self.btn_disconnect_xbox.setEnabled(True)
+            self.console.log("Xbox controller connected", "success")
+        except Exception as e:
+            self.console.log(f"Xbox connection failed: {e}", "error")
+
+    def _disconnect_xbox(self):
+        self.controller.disconnect_xbox()
+        self.status_xbox.setText("Disconnected")
+        self.status_xbox.setStyleSheet("color: #f38ba8;")
+        self.btn_connect_xbox.setEnabled(True)
+        self.btn_disconnect_xbox.setEnabled(False)
+
+    def _open_xbox_editor(self):
+        mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
+        editor = XboxMappingEditor(mapping_file, parent=self)
+        editor.exec()
+
+    def _on_hardware_disconnect(self, stage_name):
+        """Handle unexpected hardware disconnect."""
+        self.console.log(f"⚠ {stage_name} stage disconnected!", "error")
+        if stage_name == "XY":
+            self.status_xy.setText("Disconnected")
+            self.status_xy.setStyleSheet("color: #f38ba8;")
+            self.btn_connect_xy.setEnabled(True)
+            self.btn_disconnect_xy.setEnabled(False)
+        elif stage_name == "ZP":
+            self.status_zp.setText("Disconnected")
+            self.status_zp.setStyleSheet("color: #f38ba8;")
+            self.btn_connect_zp.setEnabled(True)
+            self.btn_disconnect_zp.setEnabled(False)
+
+    # ── Window Events ──────────────────────────────────────────────
 
     def closeEvent(self, event):
-        """Clean shutdown on window close."""
         self.update_timer.stop()
         self.save_settings()
         self.controller.shutdown()
@@ -392,24 +356,20 @@ class MainWindow(QMainWindow):
         """Apply saved settings to the window."""
         s = self.settings
 
-        # Window geometry
         x = s.get("window.x", 100)
         y = s.get("window.y", 100)
         w = s.get("window.width", 1200)
         h = s.get("window.height", 800)
         self.setGeometry(x, y, w, h)
 
-        # Active tab
         tab_idx = s.get("window.active_tab", 0)
         if 0 <= tab_idx < self.tabs.count():
             self.tabs.setCurrentIndex(tab_idx)
 
-        # Splitter sizes
         splitter_sizes = s.get("window.splitter_sizes", None)
         if splitter_sizes and hasattr(self, '_splitter'):
             self._splitter.setSizes(splitter_sizes)
 
-        # Apply saved speeds to jog handlers (if stages are connected later)
         saved_speeds = s.get_section("speeds")
         if saved_speeds:
             self._pending_speeds = saved_speeds
@@ -418,7 +378,6 @@ class MainWindow(QMainWindow):
         """Save current window state to settings."""
         s = self.settings
 
-        # Window geometry
         geo = self.geometry()
         s.set("window.x", geo.x())
         s.set("window.y", geo.y())
@@ -429,17 +388,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_splitter'):
             s.set("window.splitter_sizes", self._splitter.sizes())
 
-        # Simulation mode
         s.set("simulation.simulate_xy", self.controller.simulate_xy)
         s.set("simulation.simulate_zp", self.controller.simulate_zp)
 
-        # Speeds
         speeds = self.controller.get_speed_info()
         s.set("speeds.xy", speeds["xy"])
         s.set("speeds.z", speeds["z"])
         s.set("speeds.p", speeds["p"])
 
-        # Zero position
         s.set_section("zero_position", self.controller.zero_position)
+
+        # Session 4: Save safety limits
+        s.set_section("safety_limits", self.controller.safety_limits.to_dict())
 
         s.save()

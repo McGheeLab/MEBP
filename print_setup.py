@@ -1,17 +1,23 @@
 """
 Print Setup Page - Load, preview, configure, and execute print jobs.
 
+Session 4 additions:
+- Task 1: Multi-material pump selector (per-well or per-layer)
+- Task 4: Live print visualization (current position, completed/remaining coloring, layers)
+- Task 6: Print queue UI (job list, add/remove/reorder, start queue)
+
 Layout:
-┌─────────────────────────────────────────────────┐
-│  [File / Well Plate / Pattern tabs]             │
-│  ┌─────────────────────┬───────────────────────┐ │
-│  │                     │  Settings Panel       │ │
-│  │   2D Path Preview   │  ─────────────────    │ │
-│  │   Canvas            │  Print Settings       │ │
-│  │                     │  Execution Controls   │ │
-│  │                     │  Progress             │ │
-│  └─────────────────────┴───────────────────────┘ │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  [File / Well Plate / Pattern tabs]                                 │
+│  ┌──────────────────────┬──────────────────────────────────────────┐│
+│  │                      │  Settings Panel                         ││
+│  │   2D Path Preview    │  ──────────────────                     ││
+│  │   Canvas             │  Print Settings + Multi-material        ││
+│  │                      │  Execution Controls                     ││
+│  │                      │  Queue Panel                            ││
+│  │                      │  Progress                               ││
+│  └──────────────────────┴──────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
 """
 
 from PySide6.QtWidgets import (
@@ -26,7 +32,7 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QPainterPath
 
 from SupportClasses.StageController import StageController
 from SupportClasses.PrintManager import (
-    PrintManager, PrintJob, PrintSettings, PrintState,
+    PrintManager, PrintJob, PrintSettings, PrintState, PrintQueue,
     load_print_file, build_well_plate_job, save_print_job,
 )
 from SupportClasses.WellPlate import (
@@ -40,7 +46,19 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2D Path Preview Canvas
+# Thread → GUI Signal Bridge
+# ═══════════════════════════════════════════════════════════════════
+
+class PrintSignalBridge(QObject):
+    """Thread-safe bridge for PrintManager → GUI signals."""
+    progress_signal = Signal(int, int, str)     # step, total, message
+    state_signal = Signal(object)               # PrintState enum
+    queue_progress_signal = Signal(int, int, str)  # job_idx, total, name
+    queue_completed_signal = Signal()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 2D Path Preview Canvas (Task 4: Enhanced)
 # ═══════════════════════════════════════════════════════════════════
 
 class PathPreviewCanvas(QWidget):
@@ -48,17 +66,40 @@ class PathPreviewCanvas(QWidget):
     2D canvas that renders the print toolpath.
     Shows travel moves (dashed gray) and print moves (solid colored).
     Optionally shows well plate outlines.
+    
+    Session 4 enhancements:
+    - Current position marker during printing
+    - Completed vs remaining path coloring
+    - Layer filtering
     """
+
+    # Pump color mapping for multi-material
+    PUMP_COLORS = {
+        "P1": QColor("#a6e3a1"),  # green
+        "P2": QColor("#89b4fa"),  # blue
+        "P3": QColor("#f9e2af"),  # yellow
+    }
+    COMPLETED_COLOR = QColor("#a6e3a1")    # bright green
+    REMAINING_COLOR = QColor(166, 227, 161, 80)  # dim green
+    TRAVEL_DONE_COLOR = QColor(100, 100, 100, 100)
+    TRAVEL_TODO_COLOR = QColor(100, 100, 100, 40)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(400, 400)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self._segments: list[dict] = []    # {"type": "travel"|"print", "points": [...]}
-        self._wells: list[dict] = []       # {"name": str, "x": float, "y": float, "diameter": float}
+        self._segments: list[dict] = []
+        self._wells: list[dict] = []
         self._margin = 40
         self._show_grid = True
+
+        # Task 4: Live visualization state
+        self._current_pos: tuple | None = None   # (x, y) in zero-ref coords
+        self._completed_step: int = 0             # command index completed so far
+        self._total_steps: int = 0
+        self._active_layer: int = -1              # -1 = show all layers
+        self._layer_boundaries: list[tuple[int, str]] = []
 
     def set_path_segments(self, segments: list[dict]):
         """Set path segments for rendering."""
@@ -70,9 +111,37 @@ class PathPreviewCanvas(QWidget):
         self._wells = wells
         self.update()
 
+    def set_current_position(self, x: float, y: float):
+        """Task 4: Set current position marker during active print."""
+        self._current_pos = (x, y)
+        self.update()
+
+    def clear_current_position(self):
+        """Remove the current position marker."""
+        self._current_pos = None
+        self.update()
+
+    def set_progress(self, completed_step: int, total_steps: int):
+        """Task 4: Set completed progress for dual-color rendering."""
+        self._completed_step = completed_step
+        self._total_steps = total_steps
+        self.update()
+
+    def set_layer_boundaries(self, boundaries: list[tuple[int, str]]):
+        """Task 4: Set layer boundaries for layer filtering."""
+        self._layer_boundaries = boundaries
+
+    def set_active_layer(self, layer: int):
+        """Task 4: Set which layer to show (-1 = all)."""
+        self._active_layer = layer
+        self.update()
+
     def clear(self):
         self._segments = []
         self._wells = []
+        self._current_pos = None
+        self._completed_step = 0
+        self._total_steps = 0
         self.update()
 
     def _get_bounds(self):
@@ -85,189 +154,147 @@ class PathPreviewCanvas(QWidget):
                 all_y.append(pt[1])
 
         for well in self._wells:
-            r = well.get("diameter", 0) / 2
+            r = well.get("diameter", 10) / 2
             all_x.extend([well["x"] - r, well["x"] + r])
             all_y.extend([well["y"] - r, well["y"] + r])
 
         if not all_x or not all_y:
-            return -10, -10, 10, 10
+            return QRectF(-10, -10, 20, 20)
 
-        padding = 5
-        return (min(all_x) - padding, min(all_y) - padding,
-                max(all_x) + padding, max(all_y) + padding)
+        margin = 2
+        return QRectF(
+            min(all_x) - margin, min(all_y) - margin,
+            max(all_x) - min(all_x) + 2 * margin,
+            max(all_y) - min(all_y) + 2 * margin,
+        )
+
+    def _transform(self, x, y, bounds, w, h):
+        """Transform data coordinates to canvas coordinates."""
+        if bounds.width() == 0 or bounds.height() == 0:
+            return self._margin + w / 2, self._margin + h / 2
+
+        scale_x = (w - 2 * self._margin) / bounds.width()
+        scale_y = (h - 2 * self._margin) / bounds.height()
+        scale = min(scale_x, scale_y)
+
+        cx = (x - bounds.x()) * scale + self._margin
+        cy = (y - bounds.y()) * scale + self._margin
+
+        # Offset to center
+        used_w = bounds.width() * scale
+        used_h = bounds.height() * scale
+        cx += (w - 2 * self._margin - used_w) / 2
+        cy += (h - 2 * self._margin - used_h) / 2
+
+        return cx, cy
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        w, h = self.width(), self.height()
+        bounds = self._get_bounds()
+
         # Background
-        painter.fillRect(self.rect(), QColor("#11111b"))
-
-        w = self.width()
-        h = self.height()
-        margin = self._margin
-
-        # Calculate transform
-        min_x, min_y, max_x, max_y = self._get_bounds()
-        data_w = max(max_x - min_x, 1)
-        data_h = max(max_y - min_y, 1)
-
-        draw_w = w - 2 * margin
-        draw_h = h - 2 * margin
-
-        scale = min(draw_w / data_w, draw_h / data_h)
-        offset_x = margin + (draw_w - data_w * scale) / 2
-        offset_y = margin + (draw_h - data_h * scale) / 2
-
-        def to_screen(x, y):
-            sx = offset_x + (x - min_x) * scale
-            sy = offset_y + (data_h - (y - min_y)) * scale  # Flip Y
-            return QPointF(sx, sy)
+        painter.fillRect(0, 0, w, h, QColor("#181825"))
 
         # Grid
         if self._show_grid:
-            self._draw_grid(painter, min_x, min_y, max_x, max_y, to_screen, scale)
+            self._draw_grid(painter, bounds, w, h)
 
-        # Well outlines
+        # Origin marker
+        ox, oy = self._transform(0, 0, bounds, w, h)
+        painter.setPen(QPen(QColor("#f38ba8"), 2))
+        painter.drawLine(int(ox - 8), int(oy), int(ox + 8), int(oy))
+        painter.drawLine(int(ox), int(oy - 8), int(ox), int(oy + 8))
+
+        # Wells
         for well in self._wells:
-            cx, cy = to_screen(well["x"], well["y"]).x(), to_screen(well["x"], well["y"]).y()
-            r = well.get("diameter", 0) / 2 * scale
+            wx, wy = self._transform(well["x"], well["y"], bounds, w, h)
+            r = well.get("diameter", 6) / 2
+            # Scale radius
+            scale = min(
+                (w - 2 * self._margin) / max(bounds.width(), 0.001),
+                (h - 2 * self._margin) / max(bounds.height(), 0.001),
+            )
+            pr = r * scale
 
-            painter.setPen(QPen(QColor("#585b70"), 1.5))
+            painter.setPen(QPen(QColor("#585b70"), 1))
             painter.setBrush(QBrush(QColor(88, 91, 112, 30)))
-            painter.drawEllipse(QPointF(cx, cy), r, r)
+            painter.drawEllipse(QPointF(wx, wy), pr, pr)
 
             # Well label
             painter.setPen(QColor("#6c7086"))
-            painter.setFont(QFont("Consolas", max(7, int(r / 3))))
-            text_rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, well.get("name", ""))
+            font = QFont("Consolas", 7)
+            painter.setFont(font)
+            painter.drawText(int(wx - 10), int(wy - pr - 3), well.get("name", ""))
 
-        # Path segments
+        # Path segments with progress coloring
+        cmd_index = 0
         for seg in self._segments:
             points = seg.get("points", [])
             if len(points) < 2:
+                cmd_index += 1
                 continue
 
-            if seg["type"] == "print":
-                pen = QPen(QColor("#a6e3a1"), 2.0)
+            is_print = seg.get("type") == "print"
+            pump = seg.get("pump", "P1")
+
+            if is_print:
+                if cmd_index < self._completed_step and self._total_steps > 0:
+                    color = self.COMPLETED_COLOR
+                elif self._total_steps > 0:
+                    color = self.REMAINING_COLOR
+                else:
+                    color = self.PUMP_COLORS.get(pump, self.COMPLETED_COLOR)
+                pen = QPen(color, 2)
             else:
-                pen = QPen(QColor("#6c7086"), 1.0, Qt.PenStyle.DashLine)
+                if cmd_index < self._completed_step and self._total_steps > 0:
+                    color = self.TRAVEL_DONE_COLOR
+                else:
+                    color = self.TRAVEL_TODO_COLOR
+                pen = QPen(color, 1, Qt.PenStyle.DashLine)
 
             painter.setPen(pen)
+            for i in range(len(points) - 1):
+                x1, y1 = self._transform(points[i][0], points[i][1], bounds, w, h)
+                x2, y2 = self._transform(points[i + 1][0], points[i + 1][1], bounds, w, h)
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
 
-            path = QPainterPath()
-            start = to_screen(points[0][0], points[0][1])
-            path.moveTo(start)
+            cmd_index += 1
 
-            for pt in points[1:]:
-                p = to_screen(pt[0], pt[1])
-                path.lineTo(p)
+        # Task 4: Current position marker
+        if self._current_pos:
+            cx, cy = self._transform(self._current_pos[0], self._current_pos[1], bounds, w, h)
 
-            painter.drawPath(path)
-
-        # Start point marker
-        all_pts = []
-        for seg in self._segments:
-            all_pts.extend(seg.get("points", []))
-        if all_pts:
-            start_pt = to_screen(all_pts[0][0], all_pts[0][1])
-            painter.setPen(QPen(QColor("#89b4fa"), 2))
-            painter.setBrush(QBrush(QColor("#89b4fa")))
-            painter.drawEllipse(start_pt, 5, 5)
-
-            # End point
-            end_pt = to_screen(all_pts[-1][0], all_pts[-1][1])
+            # Pulsing circle effect (using step count for animation)
+            pulse = 6 + (self._completed_step % 4)
             painter.setPen(QPen(QColor("#f38ba8"), 2))
-            painter.setBrush(QBrush(QColor("#f38ba8")))
-            painter.drawEllipse(end_pt, 5, 5)
+            painter.setBrush(QBrush(QColor(243, 139, 168, 120)))
+            painter.drawEllipse(QPointF(cx, cy), pulse, pulse)
 
-        # Origin marker
-        origin = to_screen(0, 0)
-        painter.setPen(QPen(QColor("#f9e2af"), 1.5))
-        size = 8
-        painter.drawLine(
-            QPointF(origin.x() - size, origin.y()),
-            QPointF(origin.x() + size, origin.y()),
-        )
-        painter.drawLine(
-            QPointF(origin.x(), origin.y() - size),
-            QPointF(origin.x(), origin.y() + size),
-        )
-
-        # Legend
-        self._draw_legend(painter, w, h)
+            # Crosshair
+            painter.setPen(QPen(QColor("#f38ba8"), 1))
+            painter.drawLine(int(cx - 12), int(cy), int(cx + 12), int(cy))
+            painter.drawLine(int(cx), int(cy - 12), int(cx), int(cy + 12))
 
         painter.end()
 
-    def _draw_grid(self, painter, min_x, min_y, max_x, max_y, to_screen, scale):
-        """Draw background grid."""
-        painter.setPen(QPen(QColor("#1e1e2e"), 0.5))
+    def _draw_grid(self, painter, bounds, w, h):
+        """Draw a light grid background."""
+        painter.setPen(QPen(QColor("#313244"), 1, Qt.PenStyle.DotLine))
+        grid_step = max(1, int(bounds.width() / 10))
+        if grid_step < 1:
+            return
 
-        # Choose grid spacing based on scale
-        data_range = max(max_x - min_x, max_y - min_y)
-        if data_range > 200:
-            spacing = 50
-        elif data_range > 50:
-            spacing = 10
-        elif data_range > 10:
-            spacing = 5
-        else:
-            spacing = 1
+        for gx in range(int(bounds.x()), int(bounds.x() + bounds.width()), grid_step):
+            x, _ = self._transform(gx, 0, bounds, w, h)
+            painter.drawLine(int(x), 0, int(x), h)
 
-        import math
-        x_start = math.floor(min_x / spacing) * spacing
-        y_start = math.floor(min_y / spacing) * spacing
-
-        x = x_start
-        while x <= max_x:
-            p1 = to_screen(x, min_y)
-            p2 = to_screen(x, max_y)
-            painter.drawLine(p1, p2)
-            x += spacing
-
-        y = y_start
-        while y <= max_y:
-            p1 = to_screen(min_x, y)
-            p2 = to_screen(max_x, y)
-            painter.drawLine(p1, p2)
-            y += spacing
-
-    def _draw_legend(self, painter, w, h):
-        """Draw a small legend in the corner."""
-        painter.setPen(QColor("#6c7086"))
-        painter.setFont(QFont("Segoe UI", 8))
-
-        x, y = 8, h - 60
-
-        # Print path
-        painter.setPen(QPen(QColor("#a6e3a1"), 2))
-        painter.drawLine(QPointF(x, y), QPointF(x + 20, y))
-        painter.setPen(QColor("#a6adc8"))
-        painter.drawText(QPointF(x + 25, y + 4), "Print")
-
-        y += 16
-
-        # Travel
-        painter.setPen(QPen(QColor("#6c7086"), 1, Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(x, y), QPointF(x + 20, y))
-        painter.setPen(QColor("#a6adc8"))
-        painter.drawText(QPointF(x + 25, y + 4), "Travel")
-
-        y += 16
-
-        # Origin
-        painter.setPen(QPen(QColor("#f9e2af"), 1.5))
-        painter.drawText(QPointF(x, y + 4), "✚ Origin")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Signal bridge for thread-safe state updates
-# ═══════════════════════════════════════════════════════════════════
-
-class PrintSignalBridge(QObject):
-    progress_signal = Signal(int, int, str)   # step, total, message
-    state_signal = Signal(object)              # PrintState
+        grid_step_y = max(1, int(bounds.height() / 10))
+        for gy in range(int(bounds.y()), int(bounds.y() + bounds.height()), grid_step_y):
+            _, y = self._transform(0, gy, bounds, w, h)
+            painter.drawLine(0, int(y), w, int(y))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -275,20 +302,32 @@ class PrintSignalBridge(QObject):
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintSetupPage(QWidget):
-    """Print setup, preview, and execution page."""
+    """
+    Complete print setup page with file loading, well plate generation,
+    pattern generation, settings, execution, and live preview.
+    """
 
     def __init__(self, controller: StageController, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.print_manager = PrintManager(controller)
+        self.print_queue = PrintQueue(controller)
 
         # Signal bridge for thread → GUI communication
         self._bridge = PrintSignalBridge()
         self._bridge.progress_signal.connect(self._on_progress)
         self._bridge.state_signal.connect(self._on_state_changed)
+        self._bridge.queue_progress_signal.connect(self._on_queue_progress)
+        self._bridge.queue_completed_signal.connect(self._on_queue_completed)
 
         self.print_manager.on_progress = lambda s, t, m: self._bridge.progress_signal.emit(s, t, m)
         self.print_manager.on_state_changed = lambda st: self._bridge.state_signal.emit(st)
+
+        # Wire queue callbacks
+        self.print_queue.on_progress = lambda s, t, m: self._bridge.progress_signal.emit(s, t, m)
+        self.print_queue.on_state_changed = lambda st: self._bridge.state_signal.emit(st)
+        self.print_queue.on_queue_progress = lambda i, t, n: self._bridge.queue_progress_signal.emit(i, t, n)
+        self.print_queue.on_queue_completed = lambda: self._bridge.queue_completed_signal.emit()
 
         self._current_well_plate = None
 
@@ -311,6 +350,15 @@ class PrintSetupPage(QWidget):
 
         left_panel.addWidget(self.source_tabs)
 
+        # Task 4: Layer selector
+        layer_row = QHBoxLayout()
+        layer_row.addWidget(QLabel("Layer:"))
+        self.layer_combo = QComboBox()
+        self.layer_combo.addItem("All Layers", -1)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_changed)
+        layer_row.addWidget(self.layer_combo, stretch=1)
+        left_panel.addLayout(layer_row)
+
         # Preview canvas
         canvas_group = QGroupBox("Path Preview")
         canvas_layout = QVBoxLayout(canvas_group)
@@ -321,13 +369,21 @@ class PrintSetupPage(QWidget):
         main_layout.addLayout(left_panel, stretch=3)
 
         # ── Right: Settings + Controls ─────────────────────────────
-        right_panel = QVBoxLayout()
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setMinimumWidth(280)
+
+        right_content = QWidget()
+        right_panel = QVBoxLayout(right_content)
 
         self._build_settings_panel(right_panel)
         self._build_execution_panel(right_panel)
+        self._build_queue_panel(right_panel)
 
         right_panel.addStretch()
-        main_layout.addLayout(right_panel, stretch=1)
+        right_scroll.setWidget(right_content)
+        main_layout.addWidget(right_scroll, stretch=1)
 
     # ── Source Tab: File Loading ────────────────────────────────────
 
@@ -335,7 +391,6 @@ class PrintSetupPage(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # File browse row
         browse_row = QHBoxLayout()
         self.file_label = QLabel("No file loaded")
         self.file_label.setStyleSheet("color: #a6adc8;")
@@ -347,7 +402,6 @@ class PrintSetupPage(QWidget):
 
         layout.addLayout(browse_row)
 
-        # Job info
         self.job_info_label = QLabel("")
         self.job_info_label.setWordWrap(True)
         self.job_info_label.setStyleSheet("color: #6c7086;")
@@ -362,7 +416,6 @@ class PrintSetupPage(QWidget):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # Plate format
         format_row = QHBoxLayout()
         format_row.addWidget(QLabel("Plate:"))
         self.plate_combo = QComboBox()
@@ -373,15 +426,12 @@ class PrintSetupPage(QWidget):
         format_row.addWidget(self.plate_combo)
         layout.addLayout(format_row)
 
-        # Well selection
         well_row = QHBoxLayout()
-
         self.well_list = QListWidget()
         self.well_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.well_list.setMaximumHeight(120)
         well_row.addWidget(self.well_list)
 
-        # Quick select buttons
         btn_col = QVBoxLayout()
         btn_all = QPushButton("All")
         btn_all.clicked.connect(self._select_all_wells)
@@ -391,71 +441,49 @@ class PrintSetupPage(QWidget):
         btn_col.addWidget(btn_none)
         btn_col.addStretch()
         well_row.addLayout(btn_col)
-
         layout.addLayout(well_row)
 
-        # Generate button
         btn_generate = QPushButton("Generate Well Plate Job")
         btn_generate.setObjectName("connectBtn")
         btn_generate.clicked.connect(self._generate_well_plate_job)
         layout.addWidget(btn_generate)
 
         self.source_tabs.addTab(tab, "🧫 Well Plate")
-
-        # Initialize with first plate
         self._on_plate_changed()
 
-    # ── Source Tab: Pattern ─────────────────────────────────────────
+    # ── Source Tab: Pattern ────────────────────────────────────────
 
     def _build_pattern_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        # Pattern type
-        pat_row = QHBoxLayout()
-        pat_row.addWidget(QLabel("Pattern:"))
+        grid = QGridLayout()
+        row = 0
+
+        grid.addWidget(QLabel("Pattern:"), row, 0)
         self.pattern_combo = QComboBox()
         self.pattern_combo.addItems(["Line", "Meander", "Spiral", "Grid"])
         self.pattern_combo.currentIndexChanged.connect(self._update_pattern_preview)
-        pat_row.addWidget(self.pattern_combo)
-        layout.addLayout(pat_row)
+        grid.addWidget(self.pattern_combo, row, 1)
+        row += 1
 
-        # Pattern parameters (2-column grid)
-        params = QGridLayout()
+        for label, attr, default, suffix in [
+            ("Width:", "pat_width", 5.0, "mm"),
+            ("Height:", "pat_height", 5.0, "mm"),
+            ("Spacing:", "pat_spacing", 0.5, "mm"),
+            ("Angle:", "pat_angle", 0.0, "°"),
+        ]:
+            grid.addWidget(QLabel(label), row, 0)
+            spin = QDoubleSpinBox()
+            spin.setRange(0.1, 100)
+            spin.setValue(default)
+            spin.setSuffix(f" {suffix}")
+            spin.valueChanged.connect(self._update_pattern_preview)
+            grid.addWidget(spin, row, 1)
+            setattr(self, f"{attr}", spin)
+            row += 1
 
-        params.addWidget(QLabel("Width:"), 0, 0)
-        self.pat_width = QDoubleSpinBox()
-        self.pat_width.setRange(0.1, 100)
-        self.pat_width.setValue(10.0)
-        self.pat_width.setSuffix(" mm")
-        self.pat_width.valueChanged.connect(self._update_pattern_preview)
-        params.addWidget(self.pat_width, 0, 1)
-
-        params.addWidget(QLabel("Height:"), 0, 2)
-        self.pat_height = QDoubleSpinBox()
-        self.pat_height.setRange(0.1, 100)
-        self.pat_height.setValue(10.0)
-        self.pat_height.setSuffix(" mm")
-        self.pat_height.valueChanged.connect(self._update_pattern_preview)
-        params.addWidget(self.pat_height, 0, 3)
-
-        params.addWidget(QLabel("Spacing:"), 1, 0)
-        self.pat_spacing = QDoubleSpinBox()
-        self.pat_spacing.setRange(0.05, 50)
-        self.pat_spacing.setValue(1.0)
-        self.pat_spacing.setSuffix(" mm")
-        self.pat_spacing.valueChanged.connect(self._update_pattern_preview)
-        params.addWidget(self.pat_spacing, 1, 1)
-
-        params.addWidget(QLabel("Angle:"), 1, 2)
-        self.pat_angle = QDoubleSpinBox()
-        self.pat_angle.setRange(0, 360)
-        self.pat_angle.setValue(0)
-        self.pat_angle.setSuffix(" °")
-        self.pat_angle.valueChanged.connect(self._update_pattern_preview)
-        params.addWidget(self.pat_angle, 1, 3)
-
-        layout.addLayout(params)
+        layout.addLayout(grid)
 
         btn_preview = QPushButton("Preview Pattern")
         btn_preview.clicked.connect(self._update_pattern_preview)
@@ -500,11 +528,43 @@ class PrintSetupPage(QWidget):
         add_spin("Pump Feedrate:", "pump_feed", 1, 500, 30, 0, "mm/min")
         add_spin("Flow Rate:", "flow_rate", 0.001, 10, 0.01, 3, "mm/mm")
 
-        # Pump selector
+        # Task 1: Pump selector with multi-material option
         grid.addWidget(QLabel("Pump:"), row, 0)
         self.pump_combo = QComboBox()
         self.pump_combo.addItems(["P1", "P2", "P3"])
         grid.addWidget(self.pump_combo, row, 1)
+        row += 1
+
+        # Multi-material checkbox
+        self.chk_multi_material = QCheckBox("Multi-material")
+        self.chk_multi_material.toggled.connect(self._on_multi_material_toggled)
+        grid.addWidget(self.chk_multi_material, row, 0, 1, 2)
+        row += 1
+
+        # Multi-material mode (hidden by default)
+        self.multi_material_widget = QWidget()
+        mm_layout = QVBoxLayout(self.multi_material_widget)
+        mm_layout.setContentsMargins(0, 0, 0, 0)
+
+        mm_layout.addWidget(QLabel("Assignment Mode:"))
+        self.mm_mode_combo = QComboBox()
+        self.mm_mode_combo.addItems(["Per-layer (P1→P2→P3)", "Alternate wells (P1, P2)"])
+        mm_layout.addWidget(self.mm_mode_combo)
+
+        mm_layout.addWidget(QLabel("Pumps to use:"))
+        self.chk_mm_p1 = QCheckBox("P1")
+        self.chk_mm_p1.setChecked(True)
+        self.chk_mm_p2 = QCheckBox("P2")
+        self.chk_mm_p2.setChecked(True)
+        self.chk_mm_p3 = QCheckBox("P3")
+        pump_row = QHBoxLayout()
+        pump_row.addWidget(self.chk_mm_p1)
+        pump_row.addWidget(self.chk_mm_p2)
+        pump_row.addWidget(self.chk_mm_p3)
+        mm_layout.addLayout(pump_row)
+
+        self.multi_material_widget.setVisible(False)
+        grid.addWidget(self.multi_material_widget, row, 0, 1, 2)
         row += 1
 
         add_spin("Retraction:", "retract", 0, 10, 0.0, 2, "mm")
@@ -513,87 +573,120 @@ class PrintSetupPage(QWidget):
 
         parent_layout.addWidget(group)
 
+    def _on_multi_material_toggled(self, checked):
+        self.multi_material_widget.setVisible(checked)
+        self.pump_combo.setEnabled(not checked)
+
     def _get_settings(self) -> PrintSettings:
         """Read current settings from UI into a PrintSettings object."""
+        retract = self.setting_retract.value()
+        prime = self.setting_prime.value()
         return PrintSettings(
+            xy_feedrate=1000.0,
+            z_feedrate=self.setting_z_feed.value(),
+            print_feedrate=self.setting_print_speed.value(),
+            pump_feedrate=self.setting_pump_feed.value(),
             travel_z_height=self.setting_travel_z.value(),
             print_z_height=self.setting_print_z.value(),
             layer_height=self.setting_layer_h.value(),
             num_layers=self.setting_layers.value(),
-            print_feedrate=self.setting_print_speed.value(),
-            z_feedrate=self.setting_z_feed.value(),
-            pump_feedrate=self.setting_pump_feed.value(),
-            retract_amount=self.setting_retract.value(),
-            prime_amount=self.setting_prime.value(),
+            retract_amount=retract,
+            prime_amount=prime,
             dwell_after_move=self.setting_settle.value(),
+            # Per-pump amounts (use global as default for all)
+            retract_amounts={"P1": retract, "P2": retract, "P3": retract},
+            prime_amounts={"P1": prime, "P2": prime, "P3": prime},
         )
+
+    def _get_multi_material_params(self) -> dict:
+        """Get multi-material parameters from UI."""
+        if not self.chk_multi_material.isChecked():
+            return {}
+
+        pumps = []
+        if self.chk_mm_p1.isChecked():
+            pumps.append("P1")
+        if self.chk_mm_p2.isChecked():
+            pumps.append("P2")
+        if self.chk_mm_p3.isChecked():
+            pumps.append("P3")
+
+        mode = self.mm_mode_combo.currentIndex()
+        if mode == 0:  # Per-layer
+            pump_per_layer = {}
+            for i in range(self.setting_layers.value()):
+                pump_per_layer[str(i + 1)] = pumps[i % len(pumps)] if pumps else "P1"
+            return {"pump_per_layer": pump_per_layer}
+        else:  # Alternate wells
+            return {"pump_sequence": pumps if pumps else ["P1"]}
 
     # ── Execution Panel ────────────────────────────────────────────
 
     def _build_execution_panel(self, parent_layout):
-        group = QGroupBox("Print Execution")
+        group = QGroupBox("Execution")
         layout = QVBoxLayout(group)
 
-        # Status label
-        self.status_label = QLabel("Status: Idle")
-        self.status_label.setObjectName("headerLabel")
-        layout.addWidget(self.status_label)
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #45475a;
-                border-radius: 4px;
-                background-color: #313244;
-                text-align: center;
-                color: #cdd6f4;
-                min-height: 24px;
-            }
-            QProgressBar::chunk {
-                background-color: #89b4fa;
-                border-radius: 3px;
-            }
-        """)
-        layout.addWidget(self.progress_bar)
-
-        # Progress message
-        self.progress_label = QLabel("")
-        self.progress_label.setStyleSheet("color: #a6adc8; font-size: 9pt;")
-        self.progress_label.setWordWrap(True)
-        layout.addWidget(self.progress_label)
-
-        # Control buttons
-        btn_row = QGridLayout()
-
+        # Buttons
+        btn_row = QHBoxLayout()
         self.btn_start = QPushButton("▶ Start Print")
         self.btn_start.setObjectName("connectBtn")
-        self.btn_start.setMinimumHeight(40)
         self.btn_start.clicked.connect(self._on_start)
-        btn_row.addWidget(self.btn_start, 0, 0)
+        btn_row.addWidget(self.btn_start)
 
         self.btn_pause = QPushButton("⏸ Pause")
-        self.btn_pause.setMinimumHeight(40)
-        self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self._on_pause)
-        btn_row.addWidget(self.btn_pause, 0, 1)
+        btn_row.addWidget(self.btn_pause)
 
         self.btn_abort = QPushButton("⏹ Abort")
         self.btn_abort.setObjectName("disconnectBtn")
-        self.btn_abort.setMinimumHeight(40)
-        self.btn_abort.setEnabled(False)
         self.btn_abort.clicked.connect(self._on_abort)
-        btn_row.addWidget(self.btn_abort, 1, 0, 1, 2)
-
+        btn_row.addWidget(self.btn_abort)
         layout.addLayout(btn_row)
 
-        # Save job button
-        btn_save = QPushButton("💾 Save Job as JSON...")
-        btn_save.clicked.connect(self._save_job)
-        layout.addWidget(btn_save)
+        # Progress
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFormat("%p%")
+        layout.addWidget(self.progress_bar)
+
+        self.progress_label = QLabel("Status: Idle")
+        self.progress_label.setWordWrap(True)
+        layout.addWidget(self.progress_label)
+
+        parent_layout.addWidget(group)
+
+    # ── Queue Panel (Task 6) ───────────────────────────────────────
+
+    def _build_queue_panel(self, parent_layout):
+        group = QGroupBox("Print Queue")
+        layout = QVBoxLayout(group)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(100)
+        self.queue_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        layout.addWidget(self.queue_list)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("+ Add to Queue")
+        btn_add.clicked.connect(self._add_to_queue)
+        btn_row.addWidget(btn_add)
+
+        btn_remove = QPushButton("- Remove")
+        btn_remove.clicked.connect(self._remove_from_queue)
+        btn_row.addWidget(btn_remove)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self._clear_queue)
+        btn_row.addWidget(btn_clear)
+        layout.addLayout(btn_row)
+
+        btn_start_queue = QPushButton("▶ Start Queue")
+        btn_start_queue.setObjectName("connectBtn")
+        btn_start_queue.clicked.connect(self._start_queue)
+        layout.addWidget(btn_start_queue)
+
+        self.queue_progress_label = QLabel("")
+        self.queue_progress_label.setStyleSheet("color: #6c7086;")
+        layout.addWidget(self.queue_progress_label)
 
         parent_layout.addWidget(group)
 
@@ -615,6 +708,7 @@ class PrintSetupPage(QWidget):
                     f"Commands: {job.total_steps}"
                 )
                 self._refresh_preview()
+                self._update_layer_combo()
             except Exception as e:
                 self.file_label.setText(f"Error: {e}")
                 logger.error(f"Failed to load file: {e}")
@@ -640,26 +734,20 @@ class PrintSetupPage(QWidget):
         self.well_list.clearSelection()
 
     def _get_selected_wells(self) -> list:
-        """Get selected well names."""
         return [item.text() for item in self.well_list.selectedItems()]
 
     def _update_well_preview(self):
-        """Update the canvas to show well plate layout."""
         if not self._current_well_plate:
             return
-
         wells = []
         for well in self._current_well_plate.get_all_wells():
             wells.append({
-                "name": well.name,
-                "x": well.x,
-                "y": well.y,
+                "name": well.name, "x": well.x, "y": well.y,
                 "diameter": well.diameter,
             })
         self.canvas.set_wells(wells)
 
     def _generate_well_plate_job(self):
-        """Generate a print job from well plate selection + current pattern."""
         if not self._current_well_plate:
             return
 
@@ -668,13 +756,11 @@ class PrintSetupPage(QWidget):
             self.progress_label.setText("No wells selected!")
             return
 
-        # Get pattern
         pattern_points = self._generate_current_pattern()
         if not pattern_points:
             self.progress_label.setText("No pattern generated!")
             return
 
-        # Get well positions
         well_positions = []
         for name in selected:
             try:
@@ -683,10 +769,12 @@ class PrintSetupPage(QWidget):
             except KeyError:
                 pass
 
-        # Build the job
         settings = self._get_settings()
         pump = self.pump_combo.currentText()
         flow_rate = self.setting_flow_rate.value()
+
+        # Task 1: Get multi-material params
+        mm_params = self._get_multi_material_params()
 
         job = build_well_plate_job(
             well_positions=well_positions,
@@ -695,6 +783,7 @@ class PrintSetupPage(QWidget):
             pump=pump,
             flow_rate=flow_rate,
             job_name=f"Well Plate {self._current_well_plate.format}-well",
+            **mm_params,
         )
 
         self.print_manager.load_job(job)
@@ -702,12 +791,12 @@ class PrintSetupPage(QWidget):
             f"Job: {job.name}\n{job.description}\nCommands: {job.total_steps}"
         )
         self._refresh_preview()
+        self._update_layer_combo()
         self.progress_label.setText(f"Job generated: {len(selected)} wells, {settings.num_layers} layers")
 
     # ── Pattern Generation ─────────────────────────────────────────
 
     def _generate_current_pattern(self) -> list[tuple[float, float]]:
-        """Generate pattern points based on current UI settings."""
         pattern = self.pattern_combo.currentText()
         w = self.pat_width.value()
         h = self.pat_height.value()
@@ -725,31 +814,39 @@ class PrintSetupPage(QWidget):
         return []
 
     def _update_pattern_preview(self):
-        """Preview the pattern on the canvas."""
         points = self._generate_current_pattern()
         if not points:
             return
-
-        # Show as a single print segment
         segments = [{"type": "print", "points": points}]
         self.canvas.set_path_segments(segments)
-
-        # Also show well plate if applicable
         self._update_well_preview()
 
     # ── Preview Refresh ────────────────────────────────────────────
 
     def _refresh_preview(self):
-        """Refresh the canvas from the current print job."""
         if not self.print_manager.job:
             self.canvas.clear()
             return
-
         segments = self.print_manager.job.get_path_segments()
         self.canvas.set_path_segments(segments)
-
-        # If well plate tab, show wells too
         self._update_well_preview()
+
+    # ── Layer Selector (Task 4) ────────────────────────────────────
+
+    def _update_layer_combo(self):
+        """Update layer selector from current job."""
+        self.layer_combo.clear()
+        self.layer_combo.addItem("All Layers", -1)
+        if self.print_manager.job:
+            boundaries = self.print_manager.job.get_layer_boundaries()
+            self.canvas.set_layer_boundaries(boundaries)
+            for i, (_, label) in enumerate(boundaries):
+                self.layer_combo.addItem(f"Layer {i + 1}", i)
+
+    def _on_layer_changed(self):
+        layer = self.layer_combo.currentData()
+        if layer is not None:
+            self.canvas.set_active_layer(layer)
 
     # ── Execution Control ──────────────────────────────────────────
 
@@ -762,9 +859,7 @@ class PrintSetupPage(QWidget):
             self.progress_label.setText("Connect both stages first!")
             return
 
-        # Apply settings from UI to job
         self.print_manager.job.settings = self._get_settings()
-
         self.print_manager.start()
 
     def _on_pause(self):
@@ -777,17 +872,21 @@ class PrintSetupPage(QWidget):
 
     def _on_abort(self):
         self.print_manager.abort()
+        if self.print_queue.is_running:
+            self.print_queue.abort()
 
     def _on_progress(self, step, total, message):
-        """Handle progress update (runs in GUI thread via signal)."""
         if total > 0:
             percent = int(step / total * 100)
             self.progress_bar.setValue(percent)
             self.progress_bar.setFormat(f"{step}/{total} ({percent}%)")
+
+            # Task 4: Update canvas progress
+            self.canvas.set_progress(step, total)
+
         self.progress_label.setText(message)
 
     def _on_state_changed(self, state):
-        """Handle state change (runs in GUI thread via signal)."""
         state_labels = {
             PrintState.IDLE: ("Status: Idle", "#cdd6f4"),
             PrintState.RUNNING: ("Status: Printing...", "#a6e3a1"),
@@ -796,47 +895,62 @@ class PrintSetupPage(QWidget):
             PrintState.ABORTED: ("Status: Aborted", "#f38ba8"),
             PrintState.ERROR: ("Status: Error!", "#f38ba8"),
         }
+        text, color = state_labels.get(state, ("Unknown", "#cdd6f4"))
+        self.progress_label.setText(text)
+        self.progress_label.setStyleSheet(f"color: {color};")
 
-        text, color = state_labels.get(state, ("Status: Unknown", "#cdd6f4"))
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-
-        is_running = state == PrintState.RUNNING
-        is_paused = state == PrintState.PAUSED
-        is_active = is_running or is_paused
-
-        self.btn_start.setEnabled(not is_active)
-        self.btn_pause.setEnabled(is_active)
-        self.btn_abort.setEnabled(is_active)
-
-        if state == PrintState.PAUSED:
-            self.btn_pause.setText("▶ Resume")
-        else:
+        if state in (PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
+            self.canvas.clear_current_position()
+            self.canvas.set_progress(0, 0)
             self.btn_pause.setText("⏸ Pause")
 
-        if state == PrintState.COMPLETED:
-            self.progress_bar.setValue(100)
+    # ── Queue Controls (Task 6) ────────────────────────────────────
 
-    # ── Save Job ───────────────────────────────────────────────────
+    def _add_to_queue(self):
+        if self.print_manager.job:
+            job = self.print_manager.job
+            self.print_queue.add_job(job)
+            self.queue_list.addItem(f"{job.name} ({job.total_steps} cmds)")
+            self.queue_progress_label.setText(f"Queue: {self.print_queue.total_jobs} jobs")
 
-    def _save_job(self):
-        if not self.print_manager.job:
-            self.progress_label.setText("No job to save!")
+    def _remove_from_queue(self):
+        row = self.queue_list.currentRow()
+        if row >= 0:
+            self.print_queue.remove_job(row)
+            self.queue_list.takeItem(row)
+            self.queue_progress_label.setText(f"Queue: {self.print_queue.total_jobs} jobs")
+
+    def _clear_queue(self):
+        self.print_queue.clear()
+        self.queue_list.clear()
+        self.queue_progress_label.setText("Queue cleared")
+
+    def _start_queue(self):
+        if self.print_queue.total_jobs == 0:
+            self.queue_progress_label.setText("Queue is empty!")
             return
+        if not self.controller.is_xy_connected or not self.controller.is_zp_connected:
+            self.queue_progress_label.setText("Connect both stages first!")
+            return
+        self.print_queue.start_all()
 
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Print Job", "",
-            "JSON (*.json);;All (*)"
-        )
-        if filepath:
-            try:
-                save_print_job(self.print_manager.job, filepath)
-                self.progress_label.setText(f"Saved to {filepath}")
-            except Exception as e:
-                self.progress_label.setText(f"Save error: {e}")
+    def _on_queue_progress(self, job_idx, total_jobs, job_name):
+        self.queue_progress_label.setText(f"Job {job_idx}/{total_jobs}: {job_name}")
 
-    # ── Periodic Update ────────────────────────────────────────────
+    def _on_queue_completed(self):
+        self.queue_progress_label.setText("Queue completed!")
+
+    # ── Live Update (Task 4) ───────────────────────────────────────
 
     def update_data(self):
-        """Called by main window timer."""
-        pass  # Progress is handled via signals
+        """
+        Called by the main window's update timer.
+        During active printing, updates the canvas with current position.
+        """
+        if self.print_manager.state == PrintState.RUNNING:
+            pos = self.controller.get_xy_position(cached=True)
+            if pos[0] is not None:
+                # Convert from machine coords to zero-ref coords
+                zero_x = pos[0] - self.controller.zero_position["x"]
+                zero_y = pos[1] - self.controller.zero_position["y"]
+                self.canvas.set_current_position(zero_x, zero_y)

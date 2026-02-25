@@ -1,0 +1,32 @@
+{
+  "name": "Multi-Material Test - 2 Pumps",
+  "description": "Test job using P1 for layer 1 and P2 for layer 2",
+  "settings": {
+    "xy_feedrate": 1000.0,
+    "z_feedrate": 60.0,
+    "print_feedrate": 200.0,
+    "pump_feedrate": 30.0,
+    "travel_z_height": 5.0,
+    "print_z_height": 0.1,
+    "layer_height": 0.1,
+    "num_layers": 2,
+    "retract_amounts": {"P1": 0.1, "P2": 0.1, "P3": 0.0},
+    "prime_amounts": {"P1": 0.05, "P2": 0.05, "P3": 0.0}
+  },
+  "commands": [
+    {"type": "comment", "label": "=== Layer 1 ==="},
+    {"type": "move_xy", "x": 0.0, "y": 0.0},
+    {"type": "travel_down"},
+    {"type": "print_path", "points": [[0,0],[10,0],[10,10],[0,10],[0,0]], "pump": "P1", "flow_rate": 0.01},
+    {"type": "travel_up"},
+
+    {"type": "comment", "label": "=== Layer 2 ==="},
+    {"type": "switch_pump", "pump": "P2"},
+    {"type": "move_xy", "x": 0.0, "y": 0.0},
+    {"type": "travel_down"},
+    {"type": "print_path", "points": [[0,0],[10,0],[10,10],[0,10],[0,0]], "pump": "P2", "flow_rate": 0.01},
+    {"type": "travel_up"},
+
+    {"type": "home_xy"}
+  ]
+}
