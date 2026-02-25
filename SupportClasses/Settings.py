@@ -86,6 +86,17 @@ DEFAULTS: dict[str, Any] = {
         "position_interval_ms": 300,
         "watchdog_interval_s": 3.0,
     },
+    "calibration": {
+        "plate_format": 96,
+        "taught_a1": None,
+        "taught_corner": None,
+        "corner_well": "H12",
+        "offset_x": 0.0,
+        "offset_y": 0.0,
+        "rotation": 0.0,
+        "scale": 1.0,
+        "alignment_valid": False,
+    },
 }
 
 

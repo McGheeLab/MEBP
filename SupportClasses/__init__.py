@@ -18,9 +18,9 @@ Module Overview:
 """
 
 from SupportClasses.Processor import Processor
-from SupportClasses.XYStage import XYStage
+from SupportClasses.XYStage import XYStageManager as XYStage
 from SupportClasses.XYStageSimulator import XYStageSimulator
-from SupportClasses.ZPStage import ZPStage, AXIS_MAP, AXIS_MAP_REVERSE
+from SupportClasses.ZPStage import ZPStageManager as ZPStage, AXIS_MAP, AXIS_MAP_REVERSE
 from SupportClasses.ZPStageSimulator import ZPStageSimulator
 from SupportClasses.XboxController import xbox_polling_worker
 from SupportClasses.StageController import StageController

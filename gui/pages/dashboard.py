@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 class DashboardPage(QWidget):
     """Overview dashboard showing device status and positions."""
 
-    def __init__(self, controller: StageController, parent=None):
+    def __init__(self, controller: StageController, print_history=None, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self.print_history = print_history  # Enhancement 6
         self._setup_ui()
 
     def _setup_ui(self):
@@ -143,6 +144,42 @@ class DashboardPage(QWidget):
 
         layout.addWidget(log_group)
 
+        # Enhancement 6: Print History Stats
+        history_group = QGroupBox("Print History (Enhancement 6)")
+        history_layout = QVBoxLayout(history_group)
+
+        history_stats = QGridLayout()
+        stats_labels = [
+            ("Total Prints:", "lbl_hist_total"),
+            ("Completed:", "lbl_hist_completed"),
+            ("Aborted:", "lbl_hist_aborted"),
+            ("Errors:", "lbl_hist_errors"),
+            ("Total Print Time:", "lbl_hist_time"),
+            ("Success Rate:", "lbl_hist_rate"),
+        ]
+        for i, (name, attr) in enumerate(stats_labels):
+            row, col = divmod(i, 3)
+            history_stats.addWidget(QLabel(name), row, col * 2)
+            lbl = QLabel("—")
+            lbl.setFont(mono)
+            history_stats.addWidget(lbl, row, col * 2 + 1)
+            setattr(self, attr, lbl)
+        history_layout.addLayout(history_stats)
+
+        hist_btn_row = QHBoxLayout()
+        btn_export_hist = QPushButton("📋 Export History CSV")
+        btn_export_hist.clicked.connect(self._export_history_csv)
+        hist_btn_row.addWidget(btn_export_hist)
+
+        btn_clear_hist = QPushButton("Clear History")
+        btn_clear_hist.setObjectName("disconnectBtn")
+        btn_clear_hist.clicked.connect(self._clear_history)
+        hist_btn_row.addWidget(btn_clear_hist)
+        hist_btn_row.addStretch()
+        history_layout.addLayout(hist_btn_row)
+
+        layout.addWidget(history_group)
+
         layout.addStretch()
 
     # ── Update ─────────────────────────────────────────────────
@@ -212,6 +249,20 @@ class DashboardPage(QWidget):
         # Position log count
         self.lbl_log_count.setText(f"Entries: {ctrl.position_logger.count}")
 
+        # Enhancement 6: Print history stats
+        if self.print_history:
+            stats = self.print_history.get_stats()
+            self.lbl_hist_total.setText(str(stats["total_prints"]))
+            self.lbl_hist_completed.setText(str(stats["completed"]))
+            self.lbl_hist_aborted.setText(str(stats["aborted"]))
+            self.lbl_hist_errors.setText(str(stats["errors"]))
+            hours = stats["total_print_time_hours"]
+            if hours >= 1:
+                self.lbl_hist_time.setText(f"{hours:.1f} hrs")
+            else:
+                self.lbl_hist_time.setText(f"{hours * 60:.1f} min")
+            self.lbl_hist_rate.setText(f"{stats['success_rate']:.0f}%")
+
     # ── Position Log Export (Task 2) ───────────────────────────
 
     def _export_log_csv(self):
@@ -244,3 +295,22 @@ class DashboardPage(QWidget):
 
     def _clear_log(self):
         self.controller.position_logger.clear()
+
+    # ── Enhancement 6: Print History Export ────────────────────
+
+    def _export_history_csv(self):
+        if not self.print_history or self.print_history.count == 0:
+            return
+        from datetime import datetime
+        default_name = f"print_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Print History", default_name,
+            "CSV Files (*.csv);;All (*)"
+        )
+        if filepath:
+            self.print_history.export_csv(filepath)
+            logger.info(f"Print history exported to {filepath}")
+
+    def _clear_history(self):
+        if self.print_history:
+            self.print_history.clear()

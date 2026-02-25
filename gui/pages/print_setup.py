@@ -33,7 +33,7 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QPainterPath
 from SupportClasses.StageController import StageController
 from SupportClasses.PrintManager import (
     PrintManager, PrintJob, PrintSettings, PrintState, PrintQueue,
-    load_print_file, build_well_plate_job, save_print_job,
+    load_print_file, build_well_plate_job, save_print_job, export_gcode,
 )
 from SupportClasses.WellPlate import (
     WellPlate, PLATE_DEFINITIONS,
@@ -643,6 +643,19 @@ class PrintSetupPage(QWidget):
         btn_row.addWidget(self.btn_abort)
         layout.addLayout(btn_row)
 
+        # Enhancement 1 + 3: Export/Resume buttons
+        btn_row2 = QHBoxLayout()
+        btn_export_gcode = QPushButton("📄 Export G-code")
+        btn_export_gcode.setToolTip("Export current job to G-code format")
+        btn_export_gcode.clicked.connect(self._export_gcode)
+        btn_row2.addWidget(btn_export_gcode)
+
+        btn_save_job = QPushButton("💾 Save Job JSON")
+        btn_save_job.setToolTip("Save current job to JSON format")
+        btn_save_job.clicked.connect(self._save_job_json)
+        btn_row2.addWidget(btn_save_job)
+        layout.addLayout(btn_row2)
+
         # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setFormat("%p%")
@@ -903,6 +916,57 @@ class PrintSetupPage(QWidget):
             self.canvas.clear_current_position()
             self.canvas.set_progress(0, 0)
             self.btn_pause.setText("⏸ Pause")
+
+    # ── Enhancement 1: G-code Export ──────────────────────────────
+
+    def _export_gcode(self):
+        """Export current job to G-code format."""
+        if not self.print_manager.job:
+            self.progress_label.setText("No job loaded to export!")
+            return
+        default_name = f"{self.print_manager.job.name.replace(' ', '_')}.gcode"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export G-code", default_name,
+            "G-code Files (*.gcode *.gco);;All (*)"
+        )
+        if filepath:
+            export_gcode(self.print_manager.job, filepath)
+            self.progress_label.setText(f"Exported G-code to {filepath}")
+            logger.info(f"G-code exported: {filepath}")
+
+    def _save_job_json(self):
+        """Save current job to JSON format."""
+        if not self.print_manager.job:
+            self.progress_label.setText("No job loaded to save!")
+            return
+        default_name = f"{self.print_manager.job.name.replace(' ', '_')}.json"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Print Job", default_name,
+            "JSON Files (*.json);;All (*)"
+        )
+        if filepath:
+            self.print_manager.job.settings = self._get_settings()
+            save_print_job(self.print_manager.job, filepath)
+            self.progress_label.setText(f"Job saved to {filepath}")
+
+    # ── Enhancement 3: Print Resume ───────────────────────────────
+
+    def resume_print(self, resume_data: dict):
+        """Resume a print from saved progress data."""
+        job = resume_data["job"]
+        self.print_manager.load_job(job)
+        self._update_preview()
+
+        if not self.controller.is_xy_connected or not self.controller.is_zp_connected:
+            self.progress_label.setText("Connect both stages first, then start resume")
+            return
+
+        self.print_manager.resume_from_saved(resume_data)
+        step = resume_data["current_step"]
+        total = job.total_steps
+        self.progress_label.setText(
+            f"Resuming '{job.name}' from step {step}/{total}"
+        )
 
     # ── Queue Controls (Task 6) ────────────────────────────────────
 

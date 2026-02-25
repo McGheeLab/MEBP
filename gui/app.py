@@ -11,19 +11,27 @@ Session 4 additions:
   - Settings tab (Task 5)
   - Safety limits restoration from settings (Task 3)
   - Position log count in status bar (Task 2)
+
+Enhancements:
+  - Enhancement 3: Print resume check on startup
+  - Enhancement 4: Global keyboard shortcuts for jogging in any tab
+  - Enhancement 5: Calibration persistence (settings passed to CalibrationPage)
+  - Enhancement 6: Print history integration
 """
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QPushButton, QLabel, QStatusBar, QSplitter, QGroupBox, QCheckBox,
-    QFrame
+    QFrame, QMessageBox
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeyEvent, QShortcut, QKeySequence
 
 from SupportClasses.StageController import StageController
 from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.Settings import Settings
+from SupportClasses.PrintHistory import PrintHistory
+from SupportClasses.PrintManager import load_print_progress, clear_print_progress
 from gui.styles import DARK_THEME
 from gui.pages.dashboard import DashboardPage
 from gui.pages.jog_control import JogControlPage
@@ -52,6 +60,10 @@ class MainWindow(QMainWindow):
         if saved_limits:
             self.controller.safety_limits = SafetyLimits.from_dict(saved_limits)
 
+        # Enhancement 6: Print history
+        self.print_history = PrintHistory()
+        self.print_history.load()
+
         # Disconnect bridge for thread-safe notifications
         self._disconnect_bridge = _DisconnectBridge()
         self._disconnect_bridge.disconnected.connect(self._on_hardware_disconnect)
@@ -64,7 +76,11 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_status_bar()
         self._setup_timers()
+        self._setup_global_shortcuts()  # Enhancement 4
         self._apply_settings()
+
+        # Enhancement 3: Check for resume data on startup
+        QTimer.singleShot(1000, self._check_print_resume)
 
     def _setup_ui(self):
         """Build the main UI layout."""
@@ -109,9 +125,9 @@ class MainWindow(QMainWindow):
 
         # Tab widget
         self.tabs = QTabWidget()
-        self.dashboard_page = DashboardPage(self.controller)
+        self.dashboard_page = DashboardPage(self.controller, print_history=self.print_history)
         self.jog_page = JogControlPage(self.controller)
-        self.calibration_page = CalibrationPage(self.controller)
+        self.calibration_page = CalibrationPage(self.controller, settings=self.settings)
 
         self.tabs.addTab(self.dashboard_page, "📊 Dashboard")
         self.tabs.addTab(self.jog_page, "🕹️ Jog Control")
@@ -201,6 +217,12 @@ class MainWindow(QMainWindow):
         self.sb_log_count.setToolTip("Position log entries")
         self.status_bar.addPermanentWidget(self.sb_log_count)
 
+        # Enhancement 6: Print history count
+        self.sb_history = QLabel("📋 0")
+        self.sb_history.setFont(mono)
+        self.sb_history.setToolTip("Total prints recorded")
+        self.status_bar.addPermanentWidget(self.sb_history)
+
     def _setup_timers(self):
         """Setup periodic UI update timers."""
         self.update_timer = QTimer(self)
@@ -245,6 +267,9 @@ class MainWindow(QMainWindow):
 
         # Position log count
         self.sb_log_count.setText(f"📝 {self.controller.position_logger.count}")
+
+        # Enhancement 6: Print history count
+        self.sb_history.setText(f"📋 {self.print_history.count}")
 
         # Update active pages
         active_page = self.tabs.currentWidget()
@@ -342,6 +367,130 @@ class MainWindow(QMainWindow):
             self.btn_connect_zp.setEnabled(True)
             self.btn_disconnect_zp.setEnabled(False)
 
+    # ── Enhancement 4: Global Keyboard Jogging ──────────────────────
+
+    def _setup_global_shortcuts(self):
+        """
+        Set up global keyboard shortcuts that work regardless of active tab.
+
+        Arrow keys: XY jog
+        PageUp/PageDown: Z jog
+        Home: Go to zero reference
+        Escape: Emergency stop
+        """
+        from functools import partial
+
+        # Store shortcut step sizes (matching jog control defaults)
+        self._global_xy_step = 500
+        self._global_z_step = 0.1
+
+        # We use keyPressEvent on the main window level
+        # (shortcuts are handled in keyPressEvent override below)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """
+        Enhancement 4: Global keyboard shortcuts for jogging in any tab.
+
+        Only fires jog commands when the active widget isn't a text input.
+        """
+        # Don't intercept if a text input has focus
+        from PySide6.QtWidgets import QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox
+        focus = self.focusWidget()
+        if isinstance(focus, (QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox)):
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        handled = False
+
+        # Arrow keys → XY jog
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+            if self.controller.is_xy_connected and not event.isAutoRepeat():
+                dx, dy = 0, 0
+                if key == Qt.Key.Key_Left:
+                    dx = -1
+                elif key == Qt.Key.Key_Right:
+                    dx = 1
+                elif key == Qt.Key.Key_Up:
+                    dy = -1
+                elif key == Qt.Key.Key_Down:
+                    dy = 1
+                self._global_jog_xy(dx, dy)
+                handled = True
+
+        # PageUp/Down → Z jog
+        elif key == Qt.Key.Key_PageUp and not event.isAutoRepeat():
+            if self.controller.is_zp_connected:
+                self.controller.move_z_relative(-self._global_z_step)
+                handled = True
+        elif key == Qt.Key.Key_PageDown and not event.isAutoRepeat():
+            if self.controller.is_zp_connected:
+                self.controller.move_z_relative(self._global_z_step)
+                handled = True
+
+        # Home → go to zero
+        elif key == Qt.Key.Key_Home and not event.isAutoRepeat():
+            self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+            self.controller.move_z_absolute(0, from_zero_ref=True)
+            handled = True
+
+        # Escape → emergency stop
+        elif key == Qt.Key.Key_Escape:
+            if self.controller.zp_stage:
+                try:
+                    self.controller.zp_stage.emergency_stop()
+                    self.console.log("EMERGENCY STOP sent!", "error")
+                except Exception:
+                    pass
+            handled = True
+
+        if not handled:
+            super().keyPressEvent(event)
+
+    def _global_jog_xy(self, dx: int, dy: int):
+        """Execute a global XY jog step."""
+        pos = self.controller.get_xy_position(cached=True)
+        if pos[0] is None:
+            return
+        zx = self.controller.zero_position["x"]
+        zy = self.controller.zero_position["y"]
+        target_x = (pos[0] - zx) + dx * self._global_xy_step
+        target_y = (pos[1] - zy) + dy * self._global_xy_step
+        self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
+
+    # ── Enhancement 3: Print Resume Check ────────────────────────
+
+    def _check_print_resume(self):
+        """Check if there's a saved print progress file and offer to resume."""
+        resume_data = load_print_progress()
+        if resume_data is None:
+            return
+
+        job = resume_data["job"]
+        step = resume_data["current_step"]
+        saved_at = resume_data.get("saved_at", "unknown time")
+
+        reply = QMessageBox.question(
+            self,
+            "Resume Print?",
+            f"Found saved print progress:\n\n"
+            f"  Job: {job.name}\n"
+            f"  Progress: {step}/{job.total_steps} commands\n"
+            f"  Saved at: {saved_at}\n\n"
+            f"Would you like to resume this print?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.console.log(f"Resuming print: {job.name} from step {step}", "success")
+            # Switch to print setup tab and trigger resume
+            self.tabs.setCurrentWidget(self.print_setup_page)
+            if hasattr(self.print_setup_page, 'resume_print'):
+                self.print_setup_page.resume_print(resume_data)
+        else:
+            clear_print_progress()
+            self.console.log("Discarded saved print progress", "info")
+
     # ── Window Events ──────────────────────────────────────────────
 
     def closeEvent(self, event):
@@ -400,5 +549,7 @@ class MainWindow(QMainWindow):
 
         # Session 4: Save safety limits
         s.set_section("safety_limits", self.controller.safety_limits.to_dict())
+
+        # Enhancement 5: Calibration is saved by CalibrationPage directly
 
         s.save()

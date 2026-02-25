@@ -13,6 +13,11 @@ Session 4 additions:
 - Position logging during print execution (Task 2)
 - PrintQueue for sequential multi-job execution (Task 6)
 
+Enhancement additions:
+- G-code export: export_gcode() for compatibility with external slicers
+- Print resume: save/load print progress for crash recovery
+- Print history: integration with PrintHistory for persistent logging
+
 Print File Format (JSON):
 {
     "name": "My Print Job",
@@ -589,6 +594,13 @@ class PrintManager:
         # Current step tracking
         self._current_step = 0
 
+        # Enhancement 3: Print resume support
+        self._resume_interval = 20  # Save progress every N commands
+        self._start_time: Optional[float] = None
+
+        # Enhancement 6: Print history (set externally by GUI/main)
+        self.print_history = None
+
     # ── Job Management ─────────────────────────────────────────────
 
     def load_file(self, filepath: str):
@@ -625,10 +637,48 @@ class PrintManager:
         self._pause_event.set()
         self._current_step = 0
         self._active_pump = "P1"
+        self._start_time = time.time()
 
         self._thread = threading.Thread(target=self._execute_loop, daemon=True)
         self._thread.start()
         self._set_state(PrintState.RUNNING)
+
+    def resume_from_saved(self, resume_data: dict) -> bool:
+        """
+        Enhancement 3: Resume a print from saved progress.
+
+        Args:
+            resume_data: Dict from load_print_progress() with
+                         'job', 'current_step', 'active_pump'.
+        Returns:
+            True if resume started successfully.
+        """
+        if self.state == PrintState.RUNNING:
+            logger.warning("Cannot resume: print already running")
+            return False
+
+        self.job = resume_data["job"]
+        start_step = resume_data["current_step"]
+        self._active_pump = resume_data.get("active_pump", "P1")
+        self._start_time = time.time()
+
+        logger.info(
+            f"Resuming print '{self.job.name}' from step "
+            f"{start_step}/{self.job.total_steps}"
+        )
+
+        self._abort_flag.clear()
+        self._pause_event.set()
+        self._current_step = start_step
+
+        self._thread = threading.Thread(
+            target=self._execute_loop,
+            kwargs={"start_from": start_step},
+            daemon=True,
+        )
+        self._thread.start()
+        self._set_state(PrintState.RUNNING)
+        return True
 
     def pause(self):
         """Pause the current print. Completes the current command first."""
@@ -637,6 +687,12 @@ class PrintManager:
         self._pause_event.clear()
         self._set_state(PrintState.PAUSED)
         logger.info("Print paused")
+
+        # Enhancement 3: Save progress on pause
+        if self.job:
+            save_print_progress(
+                self.job, self._current_step, self._active_pump
+            )
 
     def resume(self):
         """Resume a paused print."""
@@ -654,6 +710,15 @@ class PrintManager:
         self._pause_event.set()  # Unblock if paused
         self._set_state(PrintState.ABORTED)
         logger.info("Print aborted")
+
+        # Enhancement 3: Save progress on abort for potential resume
+        if self.job:
+            save_print_progress(
+                self.job, self._current_step, self._active_pump
+            )
+
+        # Enhancement 6: Record abort to history
+        self._record_history("aborted")
 
         # Safety: raise Z to travel height
         if self.controller.is_zp_connected and self.job:
@@ -675,22 +740,28 @@ class PrintManager:
         if self.on_progress:
             self.on_progress(self._current_step, self.job.total_steps, message)
 
-    def _execute_loop(self):
+    def _execute_loop(self, start_from: int = 0):
         """Main execution loop running in a dedicated thread."""
-        logger.info(f"Starting print: {self.job.name}")
+        logger.info(f"Starting print: {self.job.name}" +
+                     (f" (resuming from step {start_from})" if start_from else ""))
 
         # Session 4: Log print start
         pos_logger = getattr(self.controller, 'position_logger', None)
         if pos_logger:
             pos_logger.record(
-                "print_start",
+                "print_start" if start_from == 0 else "print_resume",
                 xy_pos=self.controller.get_xy_position(cached=False),
                 zp_pos=self.controller.get_zp_position(cached=False),
-                metadata={"job_name": self.job.name, "total_steps": self.job.total_steps},
+                metadata={"job_name": self.job.name, "total_steps": self.job.total_steps,
+                          "start_from": start_from},
             )
 
         try:
             for i, cmd in enumerate(self.job.commands):
+                # Skip already-completed commands when resuming
+                if i < start_from:
+                    continue
+
                 # Check abort
                 if self._abort_flag.is_set():
                     logger.info("Abort flag detected, stopping")
@@ -717,9 +788,18 @@ class PrintManager:
                         metadata={"step": i + 1, "command": cmd.type.value},
                     )
 
+                # Enhancement 3: Save progress periodically for resume
+                if i % self._resume_interval == 0:
+                    save_print_progress(
+                        self.job, i + 1, self._active_pump
+                    )
+
             self._set_state(PrintState.COMPLETED)
             self._report_progress("Print complete!")
             logger.info("Print job completed successfully")
+
+            # Enhancement 3: Clear resume file on successful completion
+            clear_print_progress()
 
             # Session 4: Log print end
             if pos_logger:
@@ -730,10 +810,18 @@ class PrintManager:
                     metadata={"job_name": self.job.name, "result": "completed"},
                 )
 
+            # Enhancement 6: Record to print history
+            self._record_history("completed")
+
         except Exception as e:
             logger.error(f"Print execution error: {e}", exc_info=True)
             self._set_state(PrintState.ERROR)
             self._report_progress(f"Error: {e}")
+
+            # Enhancement 3: Save progress on error for potential resume
+            save_print_progress(
+                self.job, self._current_step, self._active_pump
+            )
 
             if pos_logger:
                 pos_logger.record(
@@ -742,6 +830,40 @@ class PrintManager:
                     zp_pos=self.controller.get_zp_position(cached=True),
                     metadata={"job_name": self.job.name, "error": str(e)},
                 )
+
+            # Enhancement 6: Record error to history
+            self._record_history("error", error_message=str(e))
+
+    def _record_history(self, state: str, error_message: str = ""):
+        """Enhancement 6: Record completed/aborted/error print to history."""
+        if self.print_history is None or self.job is None:
+            return
+        duration = time.time() - self._start_time if self._start_time else 0.0
+        settings_dict = {
+            fname: getattr(self.job.settings, fname)
+            for fname in self.job.settings.__dataclass_fields__
+            if not isinstance(getattr(self.job.settings, fname), dict)
+        }
+        # Count unique pumps used
+        pumps = set()
+        for cmd in self.job.commands:
+            if cmd.params.get("pump"):
+                pumps.add(cmd.params["pump"])
+        try:
+            self.print_history.add_entry(
+                job_name=self.job.name,
+                state=state,
+                source_file=self.job.source_file,
+                total_commands=self.job.total_steps,
+                completed_commands=self._current_step,
+                duration_seconds=duration,
+                settings=settings_dict,
+                layers=self.job.settings.num_layers,
+                pumps_used=sorted(pumps),
+                error_message=error_message,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record print history: {e}")
 
     def _execute_command(self, cmd: PrintCommand):
         """Execute a single print command."""
@@ -1092,3 +1214,255 @@ def save_print_job(job: PrintJob, filepath: str):
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
     logger.info(f"Saved print job to {filepath}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Enhancement 1: G-code Export
+# ═══════════════════════════════════════════════════════════════════
+
+def export_gcode(job: PrintJob, filepath: str) -> None:
+    """
+    Export a PrintJob to G-code format for compatibility with external slicers.
+
+    Maps internal command types to standard G-code:
+        MOVE_XY    → G0 Xn Yn
+        MOVE_Z     → G0 Zn
+        MOVE_Z_REL → G91; G0 Zn; G90
+        EXTRUDE    → G1 En Fn
+        PRINT_PATH → G1 Xn Yn En Fn (coordinated moves)
+        DWELL      → G4 Sn
+        TRAVEL_UP  → G0 Z{travel_height}
+        TRAVEL_DOWN→ G0 Z{print_height}
+        HOME_XY    → G28 X Y
+        COMMENT    → ; comment text
+        SWITCH_PUMP→ ; SWITCH_PUMP comment (no G-code equivalent)
+
+    Args:
+        job: PrintJob to export.
+        filepath: Output .gcode file path.
+    """
+    path = Path(filepath)
+    settings = job.settings
+    lines: list[str] = []
+
+    # Header
+    lines.append(f"; G-code exported from MEBP v7.0")
+    lines.append(f"; Job: {job.name}")
+    lines.append(f"; Description: {job.description}")
+    lines.append(f"; Generated: {__import__('datetime').datetime.now().isoformat()}")
+    lines.append(f"; Commands: {job.total_steps}")
+    lines.append(f";")
+    lines.append(f"; Print Settings:")
+    lines.append(f";   XY feedrate: {settings.xy_feedrate}")
+    lines.append(f";   Z feedrate: {settings.z_feedrate}")
+    lines.append(f";   Print feedrate: {settings.print_feedrate}")
+    lines.append(f";   Travel Z: {settings.travel_z_height} mm")
+    lines.append(f";   Print Z: {settings.print_z_height} mm")
+    lines.append(f";   Layers: {settings.num_layers}")
+    lines.append(f";   Layer height: {settings.layer_height} mm")
+    lines.append("")
+
+    # Initialization
+    lines.append("; Initialization")
+    lines.append("G90 ; Absolute positioning")
+    lines.append("G21 ; Millimeters")
+    lines.append("M302 S0 ; Allow cold extrusion")
+    lines.append("M83 ; Relative extrusion")
+    lines.append(f"G0 F{settings.xy_feedrate} ; Set travel feedrate")
+    lines.append("")
+
+    active_pump_idx = 0  # Track pump for E-axis mapping
+
+    for i, cmd in enumerate(job.commands):
+        p = cmd.params
+
+        if cmd.type == CommandType.COMMENT:
+            lines.append(f"; {cmd.label}")
+
+        elif cmd.type == CommandType.MOVE_XY:
+            x, y = p.get("x", 0), p.get("y", 0)
+            lines.append(f"G0 X{x:.4f} Y{y:.4f} F{settings.xy_feedrate} ; {cmd.label}")
+
+        elif cmd.type == CommandType.MOVE_Z:
+            z = p.get("z", 0)
+            lines.append(f"G0 Z{z:.4f} F{settings.z_feedrate} ; {cmd.label}")
+
+        elif cmd.type == CommandType.MOVE_Z_REL:
+            dist = p.get("distance", 0)
+            feedrate = p.get("feedrate", settings.z_feedrate)
+            lines.append("G91 ; Relative")
+            lines.append(f"G0 Z{dist:.4f} F{feedrate}")
+            lines.append("G90 ; Absolute")
+
+        elif cmd.type == CommandType.EXTRUDE:
+            amount = p.get("amount", 0)
+            feedrate = p.get("feedrate", settings.pump_feedrate)
+            pump = p.get("pump", "P1")
+            lines.append(f"G1 E{amount:.5f} F{feedrate} ; {pump} {cmd.label}")
+
+        elif cmd.type == CommandType.PRINT_PATH:
+            points = p.get("points", [])
+            flow_rate = p.get("flow_rate", 0.01)
+            pump = p.get("pump", "P1")
+            lines.append(f"; Print path ({len(points)} points, {pump}, flow={flow_rate})")
+            if len(points) >= 2:
+                # Move to first point
+                lines.append(f"G0 X{points[0][0]:.4f} Y{points[0][1]:.4f} F{settings.xy_feedrate}")
+                # Print segments with extrusion
+                for j in range(1, len(points)):
+                    x1, y1 = points[j - 1][0], points[j - 1][1]
+                    x2, y2 = points[j][0], points[j][1]
+                    seg_len = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                    extrude = seg_len * flow_rate
+                    lines.append(
+                        f"G1 X{x2:.4f} Y{y2:.4f} E{extrude:.5f} F{settings.print_feedrate}"
+                    )
+
+        elif cmd.type == CommandType.DWELL:
+            seconds = p.get("seconds", 0)
+            lines.append(f"G4 S{seconds:.1f} ; Dwell")
+
+        elif cmd.type == CommandType.TRAVEL_UP:
+            lines.append(f"G0 Z{settings.travel_z_height:.4f} F{settings.z_feedrate} ; Travel up")
+
+        elif cmd.type == CommandType.TRAVEL_DOWN:
+            lines.append(f"G0 Z{settings.print_z_height:.4f} F{settings.z_feedrate} ; Travel down")
+
+        elif cmd.type == CommandType.HOME_XY:
+            lines.append("G0 X0 Y0 ; Home XY")
+
+        elif cmd.type == CommandType.SET_PUMP_RATE:
+            lines.append(f"; Set pump rate (no G-code equivalent)")
+
+        elif cmd.type == CommandType.SWITCH_PUMP:
+            new_pump = p.get("pump", "P1")
+            old_pump = p.get("old_pump", "P1")
+            retract_amt = settings.get_retract_amount(old_pump)
+            prime_amt = settings.get_prime_amount(new_pump)
+            lines.append(f"; SWITCH_PUMP: {old_pump} → {new_pump}")
+            if retract_amt > 0:
+                lines.append(f"G1 E{-retract_amt:.5f} F{settings.pump_feedrate} ; Retract {old_pump}")
+            if prime_amt > 0:
+                lines.append(f"G1 E{prime_amt:.5f} F{settings.pump_feedrate} ; Prime {new_pump}")
+
+    # Footer
+    lines.append("")
+    lines.append("; End of print")
+    lines.append(f"G0 Z{settings.travel_z_height:.4f} ; Final travel up")
+    lines.append("G0 X0 Y0 ; Return home")
+    lines.append("M84 ; Motors off")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    logger.info(f"Exported G-code to {path} ({len(lines)} lines)")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Enhancement 3: Print Resume — Save/Load Progress
+# ═══════════════════════════════════════════════════════════════════
+
+_RESUME_FILE = "print_resume.json"
+
+
+def save_print_progress(
+    job: PrintJob,
+    current_step: int,
+    active_pump: str = "P1",
+    filepath: str = _RESUME_FILE,
+) -> None:
+    """
+    Save print progress to allow resuming after crash/disconnect.
+
+    Saves the full job definition plus current execution state.
+    Called periodically during printing and on pause.
+    """
+    data = {
+        "version": 1,
+        "saved_at": __import__("datetime").datetime.now().isoformat(),
+        "current_step": current_step,
+        "active_pump": active_pump,
+        "job": {
+            "name": job.name,
+            "description": job.description,
+            "source_file": job.source_file,
+            "settings": {
+                fname: getattr(job.settings, fname)
+                for fname in job.settings.__dataclass_fields__
+            },
+            "commands": [
+                {"type": cmd.type.value, "label": cmd.label, **cmd.params}
+                for cmd in job.commands
+            ],
+        },
+    }
+    try:
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.debug(f"Print progress saved at step {current_step}/{job.total_steps}")
+    except Exception as e:
+        logger.error(f"Failed to save print progress: {e}")
+
+
+def load_print_progress(filepath: str = _RESUME_FILE) -> dict | None:
+    """
+    Load saved print progress for resume.
+
+    Returns:
+        Dict with 'job' (PrintJob), 'current_step', 'active_pump'
+        or None if no resume file exists.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+
+        # Reconstruct the job
+        job_data = data["job"]
+        settings = PrintSettings.from_dict(job_data.get("settings", {}))
+        commands = []
+        for cmd_data in job_data.get("commands", []):
+            cmd_type_str = cmd_data.get("type", "")
+            try:
+                cmd_type = CommandType(cmd_type_str)
+            except ValueError:
+                continue
+            params = {k: v for k, v in cmd_data.items() if k != "type"}
+            label = params.pop("label", "")
+            commands.append(PrintCommand(type=cmd_type, params=params, label=label))
+
+        job = PrintJob(
+            name=job_data.get("name", "Resumed Job"),
+            description=job_data.get("description", ""),
+            settings=settings,
+            commands=commands,
+            source_file=job_data.get("source_file", ""),
+        )
+
+        result = {
+            "job": job,
+            "current_step": data.get("current_step", 0),
+            "active_pump": data.get("active_pump", "P1"),
+            "saved_at": data.get("saved_at", ""),
+        }
+        logger.info(
+            f"Resume data loaded: {job.name} at step "
+            f"{result['current_step']}/{job.total_steps}"
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to load print progress: {e}")
+        return None
+
+
+def clear_print_progress(filepath: str = _RESUME_FILE) -> None:
+    """Remove the resume file after successful completion."""
+    path = Path(filepath)
+    if path.exists():
+        try:
+            path.unlink()
+            logger.debug("Print resume file cleared")
+        except Exception as e:
+            logger.warning(f"Failed to clear resume file: {e}")
