@@ -1,17 +1,8 @@
 """
-Jog Control Page — Manual movement with direction buttons and speed sliders.
+Jog Control Page — Manual movement with compact layout.
 
-Provides:
-    - XY direction pad (arrow buttons + diagonal)
-    - Z needle up / down buttons
-    - Pump forward / reverse buttons (P1, P2, P3)
-    - Step size selector (discrete steps per click)
-    - Speed multiplier sliders for XY, Z, and Pump
-    - Live position readouts (zero-relative)
-    - Keyboard shortcuts for all jog directions
-
-The GUI jog uses fixed-step relative moves (not velocity commands like the
-Xbox controller).  Each button click sends one move command.
+Main content: XY pad, Z/pump buttons, position readouts, quick actions
+Context panel: step sizes, speed multipliers
 """
 
 from __future__ import annotations
@@ -20,46 +11,172 @@ import logging
 from functools import partial
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QComboBox, QSlider, QFrame, QSizePolicy,
+    QScrollArea,
 )
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QKeyEvent, QShortcut, QKeySequence
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QKeyEvent
 
 from SupportClasses.StageController import StageController
+from gui.styles import COLORS
 
 logger = logging.getLogger(__name__)
 
-
-# Step-size presets
 XY_STEPS = [10, 50, 100, 500, 1000, 5000, 10000]
 Z_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
 P_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
 
 
 class JogControlPage(QWidget):
-    """Manual jog controls with fixed-step moves and speed adjustment."""
+    """Manual jog controls with fixed-step moves."""
+
+    _page_title_text = "Jog Control"
 
     def __init__(self, controller: StageController, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._context_widget = None
         self._setup_ui()
         self._setup_shortcuts()
 
-    # ── UI Construction ───────────────────────────────────────────
+    def get_page_title(self) -> str:
+        return "Jog Control"
+
+    def get_context_widget(self) -> QWidget:
+        """Context panel: step sizes + speed multipliers."""
+        if self._context_widget is not None:
+            return self._context_widget
+
+        ctx = QWidget()
+        layout = QVBoxLayout(ctx)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(6)
+
+        # ── Step Sizes ───────────────────────────────────────────
+        step_label = QLabel("Step Sizes")
+        step_label.setObjectName("contextSectionLabel")
+        layout.addWidget(step_label)
+
+        # XY step
+        xy_row = QHBoxLayout()
+        xy_row.addWidget(QLabel("XY:"))
+        self.xy_step_combo = QComboBox()
+        for s in XY_STEPS:
+            self.xy_step_combo.addItem(f"{s:,} steps", s)
+        self.xy_step_combo.setCurrentIndex(3)
+        xy_row.addWidget(self.xy_step_combo, stretch=1)
+        layout.addLayout(xy_row)
+
+        # Z step
+        z_row = QHBoxLayout()
+        z_row.addWidget(QLabel("Z:"))
+        self.z_step_combo = QComboBox()
+        for s in Z_STEPS:
+            self.z_step_combo.addItem(f"{s} mm", s)
+        self.z_step_combo.setCurrentIndex(2)
+        z_row.addWidget(self.z_step_combo, stretch=1)
+        layout.addLayout(z_row)
+
+        # Pump step
+        p_row = QHBoxLayout()
+        p_row.addWidget(QLabel("Pump:"))
+        self.p_step_combo = QComboBox()
+        for s in P_STEPS:
+            self.p_step_combo.addItem(f"{s} mm", s)
+        self.p_step_combo.setCurrentIndex(2)
+        p_row.addWidget(self.p_step_combo, stretch=1)
+        layout.addLayout(p_row)
+
+        # ── Speed Multipliers ────────────────────────────────────
+        speed_label = QLabel("Speed (Xbox Jog)")
+        speed_label.setObjectName("contextSectionLabel")
+        layout.addWidget(speed_label)
+
+        # XY speed
+        self.lbl_xy_speed = QLabel("100")
+        layout.addWidget(self._make_ctx_slider(
+            "XY:", self.lbl_xy_speed, 1, 10000, 100, self._on_xy_speed))
+
+        # Z speed
+        self.lbl_z_speed = QLabel("0.50")
+        layout.addWidget(self._make_ctx_slider(
+            "Z:", self.lbl_z_speed, 1, 500, 50, self._on_z_speed))
+
+        # Pump speed
+        self.lbl_p_speed = QLabel("0.50")
+        layout.addWidget(self._make_ctx_slider(
+            "Pump:", self.lbl_p_speed, 1, 500, 50, self._on_p_speed))
+
+        # ── Quick Actions ────────────────────────────────────────
+        actions_label = QLabel("Quick Actions")
+        actions_label.setObjectName("contextSectionLabel")
+        layout.addWidget(actions_label)
+
+        btn_zero = QPushButton("Set Zero Here")
+        btn_zero.setObjectName("successBtn")
+        btn_zero.clicked.connect(self._set_zero)
+        layout.addWidget(btn_zero)
+
+        btn_goto = QPushButton("Go to Zero")
+        btn_goto.clicked.connect(self._goto_zero)
+        layout.addWidget(btn_goto)
+
+        btn_estop = QPushButton("⚠ EMERGENCY STOP")
+        btn_estop.setObjectName("dangerBtn")
+        btn_estop.clicked.connect(self._emergency_stop)
+        layout.addWidget(btn_estop)
+
+        layout.addStretch()
+
+        self._context_widget = ctx
+        return ctx
+
+    def _make_ctx_slider(self, label, value_label, min_v, max_v, default, callback):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
+        top = QHBoxLayout()
+        top.addWidget(QLabel(label))
+        top.addStretch()
+        value_label.setObjectName("dimLabel")
+        top.addWidget(value_label)
+        lay.addLayout(top)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_v, max_v)
+        slider.setValue(default)
+        slider.valueChanged.connect(callback)
+        lay.addWidget(slider)
+        return w
+
+    # ── Main Content UI ──────────────────────────────────────────
 
     def _setup_ui(self):
-        main = QHBoxLayout(self)
-        main.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll)
+
+        container = QWidget()
+        main = QHBoxLayout(container)
+        main.setSpacing(8)
+        main.setContentsMargins(16, 12, 16, 12)
+        scroll.setWidget(container)
 
         left = QVBoxLayout()
         right = QVBoxLayout()
-
-        # ── Position readout ──────────────────────────────────────
-        pos_group = QGroupBox("Current Position (zero-relative)")
-        pos_grid = QGridLayout(pos_group)
         mono = QFont("Consolas", 14)
+
+        # ── Position readout ─────────────────────────────────────
+        pos_card = QFrame()
+        pos_card.setObjectName("cardFrame")
+        pos_grid = QGridLayout(pos_card)
+        pos_grid.setSpacing(4)
 
         labels = [("X:", "lbl_x"), ("Y:", "lbl_y"), ("Z:", "lbl_z"),
                   ("P1:", "lbl_p1"), ("P2:", "lbl_p2"), ("P3:", "lbl_p3")]
@@ -72,27 +189,20 @@ class JogControlPage(QWidget):
             pos_grid.addWidget(lbl, row, col * 2 + 1)
             setattr(self, attr, lbl)
 
-        left.addWidget(pos_group)
+        left.addWidget(pos_card)
 
-        # ── XY Jog Pad ───────────────────────────────────────────
-        xy_group = QGroupBox("XY Stage")
-        xy_layout = QVBoxLayout(xy_group)
+        # ── XY Jog Pad ──────────────────────────────────────────
+        xy_card = QFrame()
+        xy_card.setObjectName("cardFrame")
+        xy_layout = QVBoxLayout(xy_card)
+        xy_layout.setSpacing(4)
 
-        # Step selector
-        step_row = QHBoxLayout()
-        step_row.addWidget(QLabel("Step:"))
-        self.xy_step_combo = QComboBox()
-        for s in XY_STEPS:
-            self.xy_step_combo.addItem(f"{s:,} steps", s)
-        self.xy_step_combo.setCurrentIndex(3)  # default 500
-        step_row.addWidget(self.xy_step_combo)
-        step_row.addStretch()
-        xy_layout.addLayout(step_row)
+        xy_title = QLabel("XY Stage")
+        xy_title.setObjectName("sectionLabel")
+        xy_layout.addWidget(xy_title)
 
-        # Arrow pad (3x3 grid)
         pad = QGridLayout()
         pad.setSpacing(4)
-
         dirs = {
             (0, 0): ("↖", -1, -1), (0, 1): ("↑",  0, -1), (0, 2): ("↗",  1, -1),
             (1, 0): ("←", -1,  0), (1, 1): ("⌂",  0,  0), (1, 2): ("→",  1,  0),
@@ -101,13 +211,11 @@ class JogControlPage(QWidget):
         for (r, c), (sym, dx, dy) in dirs.items():
             btn = QPushButton(sym)
             btn.setObjectName("jogBtn")
-            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             if dx == 0 and dy == 0:
-                btn.setText("⌂")
-                btn.setToolTip("Home XY to zero reference")
+                btn.setToolTip("Home XY to zero")
                 btn.clicked.connect(self._jog_xy_home)
             else:
-                btn.setToolTip(f"Move XY ({dx:+d}, {dy:+d})")
                 btn.clicked.connect(partial(self._jog_xy, dx, dy))
                 btn.setAutoRepeat(True)
                 btn.setAutoRepeatDelay(400)
@@ -115,21 +223,17 @@ class JogControlPage(QWidget):
             pad.addWidget(btn, r, c)
 
         xy_layout.addLayout(pad)
-        left.addWidget(xy_group)
+        left.addWidget(xy_card)
 
         # ── Z Jog ────────────────────────────────────────────────
-        z_group = QGroupBox("Z Needle")
-        z_layout = QVBoxLayout(z_group)
+        z_card = QFrame()
+        z_card.setObjectName("cardFrame")
+        z_layout = QVBoxLayout(z_card)
+        z_layout.setSpacing(4)
 
-        z_step_row = QHBoxLayout()
-        z_step_row.addWidget(QLabel("Step:"))
-        self.z_step_combo = QComboBox()
-        for s in Z_STEPS:
-            self.z_step_combo.addItem(f"{s} mm", s)
-        self.z_step_combo.setCurrentIndex(2)  # default 0.1
-        z_step_row.addWidget(self.z_step_combo)
-        z_step_row.addStretch()
-        z_layout.addLayout(z_step_row)
+        z_title = QLabel("Z Needle")
+        z_title.setObjectName("sectionLabel")
+        z_layout.addWidget(z_title)
 
         z_btns = QHBoxLayout()
         btn_z_up = QPushButton("▲ Z Up")
@@ -147,23 +251,18 @@ class JogControlPage(QWidget):
         btn_z_down.setAutoRepeatDelay(400)
         btn_z_down.setAutoRepeatInterval(200)
         z_btns.addWidget(btn_z_down)
-
         z_layout.addLayout(z_btns)
-        right.addWidget(z_group)
+        right.addWidget(z_card)
 
         # ── Pump Jog ─────────────────────────────────────────────
-        pump_group = QGroupBox("Syringe Pumps")
-        pump_layout = QVBoxLayout(pump_group)
+        pump_card = QFrame()
+        pump_card.setObjectName("cardFrame")
+        pump_layout = QVBoxLayout(pump_card)
+        pump_layout.setSpacing(4)
 
-        p_step_row = QHBoxLayout()
-        p_step_row.addWidget(QLabel("Step:"))
-        self.p_step_combo = QComboBox()
-        for s in P_STEPS:
-            self.p_step_combo.addItem(f"{s} mm", s)
-        self.p_step_combo.setCurrentIndex(2)  # default 0.1
-        p_step_row.addWidget(self.p_step_combo)
-        p_step_row.addStretch()
-        pump_layout.addLayout(p_step_row)
+        pump_title = QLabel("Syringe Pumps")
+        pump_title.setObjectName("sectionLabel")
+        pump_layout.addWidget(pump_title)
 
         for pump in ("P1", "P2", "P3"):
             row = QHBoxLayout()
@@ -181,89 +280,33 @@ class JogControlPage(QWidget):
             btn_rev.setAutoRepeatInterval(200)
             row.addWidget(btn_rev)
             pump_layout.addLayout(row)
-
-        right.addWidget(pump_group)
-
-        # ── Speed Sliders ────────────────────────────────────────
-        speed_group = QGroupBox("Speed Multipliers (affects Xbox jogging)")
-        speed_layout = QGridLayout(speed_group)
-
-        self.lbl_xy_speed = QLabel("100")
-        self._add_speed_slider(speed_layout, 0, "XY", self.lbl_xy_speed,
-                               1, 10000, 100, self._on_xy_speed)
-
-        self.lbl_z_speed = QLabel("0.50")
-        self._add_speed_slider(speed_layout, 1, "Z", self.lbl_z_speed,
-                               1, 500, 50, self._on_z_speed)
-
-        self.lbl_p_speed = QLabel("0.50")
-        self._add_speed_slider(speed_layout, 2, "Pump", self.lbl_p_speed,
-                               1, 500, 50, self._on_p_speed)
-
-        right.addWidget(speed_group)
-
-        # ── Calibration quick actions ────────────────────────────
-        cal_group = QGroupBox("Quick Actions")
-        cal_layout = QHBoxLayout(cal_group)
-
-        btn_zero = QPushButton("Set Zero Here")
-        btn_zero.setObjectName("connectBtn")
-        btn_zero.setToolTip("Set current position as the zero reference for all axes")
-        btn_zero.clicked.connect(self._set_zero)
-        cal_layout.addWidget(btn_zero)
-
-        btn_goto_zero = QPushButton("Go to Zero")
-        btn_goto_zero.setToolTip("Move all axes to the zero reference position")
-        btn_goto_zero.clicked.connect(self._goto_zero)
-        cal_layout.addWidget(btn_goto_zero)
-
-        btn_estop = QPushButton("EMERGENCY STOP")
-        btn_estop.setObjectName("disconnectBtn")
-        btn_estop.setToolTip("Send emergency stop to ZP stage (M112)")
-        btn_estop.clicked.connect(self._emergency_stop)
-        cal_layout.addWidget(btn_estop)
-
-        right.addWidget(cal_group)
+        right.addWidget(pump_card)
 
         right.addStretch()
         left.addStretch()
         main.addLayout(left, stretch=1)
         main.addLayout(right, stretch=1)
 
-    def _add_speed_slider(self, grid, row, label, value_label, min_v, max_v, default, callback):
-        grid.addWidget(QLabel(f"{label}:"), row, 0)
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(min_v, max_v)
-        slider.setValue(default)
-        slider.valueChanged.connect(callback)
-        grid.addWidget(slider, row, 1)
-        value_label.setMinimumWidth(60)
-        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        grid.addWidget(value_label, row, 2)
-
-    # ── Keyboard shortcuts ────────────────────────────────────────
+    # ── Keyboard Shortcuts ───────────────────────────────────────
 
     def _setup_shortcuts(self):
-        shortcuts = {
-            Qt.Key.Key_Left:  partial(self._jog_xy, -1,  0),
-            Qt.Key.Key_Right: partial(self._jog_xy,  1,  0),
-            Qt.Key.Key_Up:    partial(self._jog_xy,  0, -1),
-            Qt.Key.Key_Down:  partial(self._jog_xy,  0,  1),
+        self._key_actions = {
+            Qt.Key.Key_Left:     partial(self._jog_xy, -1,  0),
+            Qt.Key.Key_Right:    partial(self._jog_xy,  1,  0),
+            Qt.Key.Key_Up:       partial(self._jog_xy,  0, -1),
+            Qt.Key.Key_Down:     partial(self._jog_xy,  0,  1),
             Qt.Key.Key_PageUp:   partial(self._jog_z, -1),
             Qt.Key.Key_PageDown: partial(self._jog_z,  1),
         }
-        # Store for keyPressEvent
-        self._key_actions = shortcuts
 
     def keyPressEvent(self, event: QKeyEvent):
-        key = event.key()
-        action = self._key_actions.get(key)
+        action = self._key_actions.get(event.key())
         if action and not event.isAutoRepeat():
             action()
         else:
             super().keyPressEvent(event)
 
-    # ── Jog Actions ───────────────────────────────────────────────
+    # ── Jog Actions ──────────────────────────────────────────────
 
     def _jog_xy(self, dx: int, dy: int):
         if not self.controller.is_xy_connected:
@@ -274,26 +317,22 @@ class JogControlPage(QWidget):
             return
         zx = self.controller.zero_position["x"]
         zy = self.controller.zero_position["y"]
-        target_x = (pos[0] - zx) + dx * step
-        target_y = (pos[1] - zy) + dy * step
-        self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
+        self.controller.move_xy_absolute(
+            (pos[0] - zx) + dx * step,
+            (pos[1] - zy) + dy * step,
+            from_zero_ref=True)
 
     def _jog_xy_home(self):
-        if not self.controller.is_xy_connected:
-            return
-        self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+        if self.controller.is_xy_connected:
+            self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
 
     def _jog_z(self, direction: int):
-        if not self.controller.is_zp_connected:
-            return
-        step = self.z_step_combo.currentData()
-        self.controller.move_z_relative(direction * step)
+        if self.controller.is_zp_connected:
+            self.controller.move_z_relative(direction * self.z_step_combo.currentData())
 
     def _jog_pump(self, pump: str, direction: int):
-        if not self.controller.is_zp_connected:
-            return
-        step = self.p_step_combo.currentData()
-        self.controller.move_pump_relative(pump, direction * step)
+        if self.controller.is_zp_connected:
+            self.controller.move_pump_relative(pump, direction * self.p_step_combo.currentData())
 
     def _set_zero(self):
         self.controller._calibrate_zero()
@@ -311,7 +350,7 @@ class JogControlPage(QWidget):
             except Exception as e:
                 logger.error("E-stop failed: %s", e)
 
-    # ── Speed callbacks ───────────────────────────────────────────
+    # ── Speed Callbacks ──────────────────────────────────────────
 
     def _on_xy_speed(self, value: int):
         self.lbl_xy_speed.setText(f"{value}")
@@ -330,10 +369,12 @@ class JogControlPage(QWidget):
         if self.controller.zp_jog:
             self.controller.zp_jog.p_speed = real
 
-    # ── Timer update ──────────────────────────────────────────────
+    # ── Status Update ────────────────────────────────────────────
+
+    def on_status_update(self):
+        self.update_data()
 
     def update_data(self):
-        """Called by MainWindow timer to refresh position readouts."""
         ctrl = self.controller
         xy = ctrl.get_xy_position(cached=True)
         if xy[0] is not None:
@@ -353,10 +394,8 @@ class JogControlPage(QWidget):
             for lbl in (self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3):
                 lbl.setText("—")
 
-        # Sync sliders with actual jog handler speeds (e.g. changed via Xbox)
         if ctrl.xy_jog:
-            speed = int(ctrl.xy_jog.speed)
-            self.lbl_xy_speed.setText(f"{speed}")
+            self.lbl_xy_speed.setText(f"{int(ctrl.xy_jog.speed)}")
         if ctrl.zp_jog:
             zs = ctrl.zp_jog.speeds
             self.lbl_z_speed.setText(f"{zs['z']:.2f}")

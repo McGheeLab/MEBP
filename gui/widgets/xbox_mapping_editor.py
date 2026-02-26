@@ -175,7 +175,7 @@ class XboxMappingEditor(QDialog):
         btn_row.addWidget(btn_import)
 
         btn_save = QPushButton("Save")
-        btn_save.setObjectName("connectBtn")
+        btn_save.setObjectName("successBtn")
         btn_save.clicked.connect(self._save_mapping)
         btn_row.addWidget(btn_save)
 

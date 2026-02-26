@@ -1,9 +1,9 @@
 """
-Stage Controller Application - Entry Point
+MEBP Bioprinter Application — Entry Point
 
 Supports two modes:
-  --headless : Xbox controller only (no GUI), same as proven XBOXCONTROLLED code
-  (default)  : Full GUI application
+  --headless : Xbox controller only (no GUI)
+  (default)  : Full PyDracula-style GUI application
 
 Usage:
   python main.py                         # GUI mode, simulation
@@ -14,9 +14,13 @@ Usage:
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
+
+# PyDracula HiDPI fix — must be set before QApplication
+os.environ["QT_FONT_DPI"] = "96"
 
 from SupportClasses.StageController import StageController
 from SupportClasses.Settings import Settings
@@ -33,24 +37,19 @@ def setup_logging(verbose=False):
 
 
 def run_headless(controller: StageController):
-    """
-    Run in headless mode (Xbox controller only, no GUI).
-    This is equivalent to the proven main_XBOXCONTROLLED.py behavior.
-    """
+    """Run in headless mode (Xbox controller only, no GUI)."""
     print("=" * 50)
-    print("Stage Controller - Headless Mode")
+    print("MEBP Bioprinter - Headless Mode")
     print("=" * 50)
     print(f"XY: {'SIM' if controller.simulate_xy else 'REAL'}")
     print(f"ZP: {'SIM' if controller.simulate_zp else 'REAL'}")
     print("=" * 50)
 
-    # Connect everything
     controller.connect_stages()
     controller.connect_xbox()
 
     print("Ready. Press Ctrl+C to exit.\n")
 
-    # Handle graceful shutdown
     def signal_handler(sig, frame):
         print("\nShutting down...")
         controller.shutdown()
@@ -69,7 +68,6 @@ def run_headless(controller: StageController):
 
 def run_gui(controller: StageController, settings: Settings):
     """Run the full GUI application."""
-    # Import PySide6 only when needed
     try:
         from PySide6.QtWidgets import QApplication
         from gui.app import MainWindow
@@ -81,7 +79,7 @@ def run_gui(controller: StageController, settings: Settings):
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Stage Controller")
+    app.setApplicationName("MEBP Bioprinter")
     app.setOrganizationName("Lab")
 
     window = MainWindow(controller, settings)
@@ -94,7 +92,6 @@ def run_gui(controller: StageController, settings: Settings):
     window.show()
     window.console.log("Application started", "success")
 
-    # Clean shutdown on exit
     def on_quit():
         window.save_settings()
         controller.shutdown()
@@ -105,7 +102,7 @@ def run_gui(controller: StageController, settings: Settings):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage Controller Application")
+    parser = argparse.ArgumentParser(description="MEBP Bioprinter Application")
     parser.add_argument("--headless", action="store_true",
                         help="Run without GUI (Xbox controller only)")
     parser.add_argument("--real-xy", action="store_true",
@@ -118,11 +115,9 @@ def main():
                         help="Path to settings file (default: settings.json)")
     args = parser.parse_args()
 
-    # Load persistent settings
     settings = Settings(args.settings)
     settings.load()
 
-    # CLI flags override saved settings
     verbose = args.verbose or settings.get("logging.verbose", False)
     setup_logging(verbose)
 
@@ -134,13 +129,11 @@ def main():
     if args.real_zp:
         simulate_zp = False
 
-    # Create the controller
     controller = StageController(
         simulate_xy=simulate_xy,
         simulate_zp=simulate_zp,
     )
 
-    # Restore zero position from settings
     saved_zero = settings.get_section("zero_position")
     if saved_zero:
         controller.zero_position.update(saved_zero)

@@ -51,24 +51,28 @@ MEBP-Version-7.0/
 │   ├── SafetyLimits.py                  # Software endstops with clamping
 │   ├── PositionLogger.py                # Timestamped position recording + CSV/JSON export
 │   ├── Settings.py                      # JSON config with dot-path access
-│   └── PrintHistory.py                  # Enhancement 6: Persistent print history log
+│   └── PrintHistory.py                  # Persistent print history log
 │
-├── gui/                                 # Frontend — PySide6 only
+├── gui/                                 # Frontend — PySide6, PyDracula-style layout
 │   ├── __init__.py
-│   ├── app.py                           # MainWindow: tabs, connection panel, status bar, timers
-│   ├── styles.py                        # QSS dark theme stylesheet (Catppuccin Mocha)
+│   ├── app.py                           # MainWindow: sidebar nav, context panel, top/bottom bars
+│   ├── styles.py                        # QSS dark theme (Catppuccin Mocha) + COLORS dict
+│   ├── ui_functions.py                  # Animation helpers: toggleMenu, toggleLeftBox, selectMenu
 │   ├── pages/
 │   │   ├── __init__.py
-│   │   ├── dashboard.py                 # Device status, positions, speeds, safety, position log export
-│   │   ├── jog_control.py               # Manual jog: direction pad, speed sliders, keyboard shortcuts
-│   │   ├── calibration.py               # Guided calibration: zero needle, teach plate, validate
-│   │   ├── print_setup.py               # Job loading, 2D preview, well plate, execution, queue
-│   │   └── settings_page.py             # Connection, safety, polling, Xbox, logging controls
-│   └── widgets/
+│   │   ├── dashboard.py                 # Device status, positions, speeds, safety, history
+│   │   ├── jog_control.py               # Manual jog: dpad, step sizes, speed sliders
+│   │   ├── calibration.py               # Guided 3-step calibration with camera feed
+│   │   ├── print_setup.py               # Job loading, 2D preview, execution, queue
+│   │   └── settings_page.py             # Connection, safety, polling, Xbox, logging
+│   ├── widgets/
+│   │   ├── __init__.py
+│   │   ├── console_log.py               # Log viewer + QtLogHandler (thread-safe)
+│   │   ├── xbox_mapping_editor.py       # Button/axis/dpad mapping editor dialog
+│   │   └── camera_widget.py             # Live microscope camera feed (OpenCV)
+│   └── tests/
 │       ├── __init__.py
-│       ├── console_log.py               # Log viewer widget + QtLogHandler (thread-safe)
-│       ├── xbox_mapping_editor.py       # Button/axis/dpad mapping editor dialog
-│       └── camera_widget.py             # Enhancement 2: Live microscope camera feed
+│       └── test_integration.py          # Headless integration test (all pages + shell)
 │
 └── sample_jobs/
     └── multi_material_test.json         # Example multi-material print job
@@ -80,8 +84,8 @@ MEBP-Version-7.0/
 | Layer | Status | Files |
 |-------|--------|-------|
 | **SupportClasses** (13 files, 3,385 lines) | ✅ Complete | All 13 files delivered |
-| **gui/** (12 files, 3,683 lines) | ✅ Complete | All pages, widgets, and styles delivered |
-| **main.py** | ✅ Written | Supports `--headless`, `--real-xy`, `--real-zp`, `--verbose` |
+| **gui/** (17 files, 6,453 lines) | ✅ Complete | PyDracula layout, all pages, widgets, tests |
+| **main.py** (148 lines) | ✅ Written | Supports `--headless`, `--real-xy`, `--real-zp`, `--verbose` |
 | **Config files** | ✅ Written | `current_button_mapping.json`, `sample_jobs/multi_material_test.json` |
 
 ---
@@ -106,15 +110,19 @@ main.py
   ├── SupportClasses.Settings          ← persistent config
   │
   └── gui.app.MainWindow               (GUI mode only)
-        ├── gui.pages.dashboard        → StageController (read-only)
+        ├── gui.styles                 → DARK_THEME QSS, COLORS dict
+        ├── gui.ui_functions           → Animation helpers (toggleMenu, toggleLeftBox)
+        ├── gui.pages.dashboard        → StageController (read-only), PrintHistory
         ├── gui.pages.jog_control      → StageController (jog commands)
-        ├── gui.pages.calibration      → StageController (calibration)
+        ├── gui.pages.calibration      → StageController (calibration), CameraWidget
         ├── gui.pages.print_setup      → PrintManager, PrintQueue, WellPlate
         ├── gui.pages.settings_page    → StageController, SafetyLimits, Settings
-        └── gui.widgets.*              → Console log, Xbox mapping editor
+        └── gui.widgets.*              → Console log, Xbox mapping editor, Camera
 ```
 
 **Key rule: GUI pages never talk to serial ports directly. Everything goes through StageController or PrintManager.**
+
+**Key rule: Pages communicate with MainWindow via `self.window()` — never by storing a direct reference.**
 
 ---
 
@@ -319,82 +327,210 @@ Default sections: `window`, `simulation`, `speeds`, `zero_position`, `safety_lim
 
 ## 6. GUI Layer
 
-### 6.1 Architecture
+### 6.1 PyDracula Layout Architecture
+
+The GUI uses a PyDracula-inspired layout (adapted from Wanderson M. Pimenta's framework) with a Catppuccin Mocha color palette. Instead of tabs, pages are selected via an icon sidebar with animated transitions.
 
 ```
-MainWindow (app.py)
-├── Connection Panel (always visible at top)
-│   ├── XY Stage: [Connect] [Disconnect] + status label
-│   ├── ZP Stage: [Connect] [Disconnect] + status label
-│   ├── Xbox:     [Connect] [Disconnect] + status label
-│   └── [Edit Mapping] button
-│
-├── QTabWidget
-│   ├── 📊 Dashboard       → DashboardPage
-│   ├── 🕹️ Jog Control     → JogControlPage (NOT YET WRITTEN)
-│   ├── 📐 Calibration     → CalibrationPage (NOT YET WRITTEN)
-│   ├── 🖨️ Print Setup     → PrintSetupPage
-│   └── ⚙️ Settings        → SettingsPage
-│
-├── Console Log (collapsible, bottom splitter)
-│   └── ConsoleLogWidget + QtLogHandler (NOT YET WRITTEN)
-│
-└── Status Bar
-    ├── XY position readout
-    ├── ZP position readout (Z + P1 + P2 + P3)
-    ├── Speed multipliers
-    ├── Safety limits indicator (🛡️ ON/OFF)
-    └── Position log entry count
+┌────────────────────────────────────────────────────────────────────┐
+│  MainWindow                                                        │
+│ ┌────┬──────────┬────────────────────────────────────────────────┐ │
+│ │ L  │ Context  │  Top Bar (page title + connection dots + ☰)    │ │
+│ │ E  │ Panel    ├────────────────────────────────────────────────┤ │
+│ │ F  │ (extra   │                                                │ │
+│ │ T  │  left    │   Content Pages (QStackedWidget)               │ │
+│ │    │  box)    │     📊 Dashboard / 🕹️ Jog / 📐 Calibration     │ │
+│ │ M  │          │     🖨️ Print Setup / ⚙️ Settings                │ │
+│ │ E  │ Scrollable│                                               │ │
+│ │ N  │ per-page │ ┌────────────────────────────────────────────┐ │ │
+│ │ U  │ settings │ │ Console Log (collapsible via QSplitter)    │ │ │
+│ │    │          │ └────────────────────────────────────────────┘ │ │
+│ │ ⚙  │          ├────────────────────────────────────────────────┤ │
+│ └────┴──────────┘  Bottom Bar (XY pos, ZP pos, speed, safety)    │ │
+│                   ──────────────────────────────────────────────── │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 GUI ↔ Backend Communication
+**Left Menu** (60px collapsed / 200px expanded):
+- Icon buttons for each page (emoji + tooltip)
+- Toggle button (≡) for expand/collapse with slide animation
+- Active page indicator: 3px mauve left border + subtle background tint
+- Settings button pinned to bottom
 
-**Timer-based polling** (500ms): Main window timer calls `update_data()` on the active tab page. Pages read cached positions via `controller.get_xy_position(cached=True)` — never blocking on serial I/O.
+**Context Panel** (0px hidden / 260px open):
+- Each page provides its own context widget via `get_context_widget()`
+- Context widgets are stacked in a `QStackedWidget`, switched on page navigation
+- Wrapped in a `QScrollArea` for overflow on small screens
+- Mauve header bar with close button (✕)
+- Auto-opens when navigating to a page that has context content
+
+**Content Area**:
+- Top bar: page title + 3 connection dots (XY/ZP/Xbox) + context toggle (☰)
+- Main area: `QStackedWidget` with 5 page widgets
+- Console: `ConsoleLogWidget` in collapsible `QSplitter`
+- Bottom status bar: position readouts, speed, safety indicator, log count
+
+### 6.2 Page Interface Contract
+
+Every page widget must implement these methods:
+
+```python
+def get_page_title(self) -> str:
+    """Return display title for the top bar."""
+
+def get_context_widget(self) -> QWidget | None:
+    """Return a QWidget for the context panel. Must cache the widget —
+    this is called once during page creation, and the same object is
+    returned on subsequent calls."""
+
+def on_status_update(self):
+    """Called by MainWindow's periodic timer (~300ms) when this page
+    is the active page. Use for updating position readouts, connection
+    statuses, and live data."""
+```
+
+Optional:
+```python
+def update_data(self):
+    """Alias for on_status_update(), used internally by some pages."""
+
+def resume_print(self, resume_data: dict):
+    """PrintSetupPage only — restore an interrupted print."""
+```
+
+### 6.3 GUI ↔ Backend Communication
+
+**Timer-based polling** (300ms): Main window timer calls `on_status_update()` on the active page. Pages read cached positions via `controller.get_xy_position(cached=True)` — never blocking on serial I/O.
 
 **Thread → GUI signals**: Print execution runs in background threads. A `PrintSignalBridge(QObject)` with Qt Signals bridges thread callbacks to GUI-safe slots. Similarly, `_DisconnectBridge` bridges watchdog disconnect events.
 
-**Settings persistence**: `MainWindow.save_settings()` stores window geometry, active tab, splitter sizes, simulation flags, speed multipliers, zero reference, and safety limits. Called on window close and app quit.
+**Page → MainWindow delegation**: Pages access MainWindow methods via `self.window()` (Qt's parent traversal). Dashboard connection buttons call `self.window().connect_xy()` etc. Pages never store a direct reference to MainWindow.
 
-### 6.3 Page Descriptions
+**Settings persistence**: `MainWindow.save_settings()` stores window geometry, active tab, splitter sizes, simulation flags, speed multipliers, zero reference, and safety limits. Called on window close.
 
-**DashboardPage** (`dashboard.py`, 247 lines): Read-only overview showing XY position, ZP position, speed multipliers, zero reference, safety limits status, and position log count. Includes CSV/JSON export buttons for position log.
+### 6.4 Page Descriptions
 
-**PrintSetupPage** (`print_setup.py`, 957 lines): The most complex page.
-- **Source tabs**: Load from file / Configure well plate + pattern
-- **2D canvas** (`PathPreviewCanvas`): QPainter widget with auto-scaling, grid, origin marker, well outlines, dual-color paths (completed=bright green, remaining=dim), pulsing crosshair for current position during printing, layer filtering.
-- **Settings panel**: Print feedrates, Z heights, layer count, pump selection, flow rate, retract/prime amounts.
-- **Multi-material controls**: Pump sequence (per-well cycling) or pump-per-layer assignment.
-- **Execution controls**: Start/Pause/Resume/Abort with progress bar.
-- **Queue panel**: Job list with add/remove/reorder, start queue, abort queue.
+**DashboardPage** (`dashboard.py`, 533 lines): Read-only overview.
+- **Main content**: XY position card, ZP position card (Z + P1–P3), speed readouts, zero reference, safety limits display, print history stats.
+- **Context panel**: Connection controls (Connect/Disconnect for XY, ZP, Xbox), Xbox mapping editor launcher, position log count.
+- Position log CSV/JSON export and history export/clear buttons.
+
+**JogControlPage** (`jog_control.py`, 402 lines): Manual movement control.
+- **Main content**: XY direction pad (arrow buttons), Z up/down buttons, pump extrude/retract, step size selectors (XY: 10–10000 steps, Z/P: 0.01–5.0 mm).
+- **Context panel**: Speed multiplier sliders (XY, Z, Pump), quick actions (Home All, Zero All, E-Stop).
+- Keyboard shortcuts: arrow keys (XY), PgUp/PgDn (Z), Home (go to zero), Escape (E-stop).
+
+**CalibrationPage** (`calibration.py`, 693 lines): Guided 3-step calibration wizard.
+- **Main content**: Step 1 (Zero Needle), Step 2 (Teach Plate — A1 + diagonal corner), Step 3 (Validate — camera feed + computed positions). Progress indicator.
+- **Context panel**: Camera source selector, brightness/gamma sliders, FPS control, crosshair toggle, start/stop camera, snapshot. Plate format selector, calibration save/load buttons, computed scale/rotation readouts.
+- Camera widget is lazily created; falls back gracefully if OpenCV not installed.
+
+**PrintSetupPage** (`print_setup.py`, 1,059 lines): The most complex page.
+- **Main content**: Source tabs (File browse / Well Plate config / Pattern generator), layer selector, `PathPreviewCanvas` (auto-scaling 2D preview with dual-color paths, well overlays, current position marker, grid).
+- **Context panel**: Print settings (travel/print Z, layers, speed, feedrates, pump selector, multi-material mode, retraction/prime, settle delay), execution controls (Start/Pause/Abort, G-code export, JSON save, progress bar), print queue (job list with drag-reorder, add/remove/clear, start queue).
+- **Multi-material**: Per-layer or per-well pump assignment via configurable pump sequence.
 - **Live update**: During printing, reads cached position and updates canvas crosshair.
+- **Print resume**: `resume_print(resume_data)` restores an interrupted print from saved progress.
 
-**SettingsPage** (`settings_page.py`, 422 lines): Scrollable settings editor.
-- **Connection**: Simulation mode checkboxes, serial port list with refresh.
-- **Safety limits**: Per-axis min/max spinboxes, "Set from Current" buttons, feedrate limits.
-- **Polling**: Position poll interval (ms), watchdog interval (s).
-- **Xbox**: Mapping file path with browse.
-- **Logging**: Verbose checkbox (applies immediately).
-- **Apply / Reset to Defaults** buttons.
+**SettingsPage** (`settings_page.py`, 667 lines): System configuration.
+- **Main content**: Simulation mode checkboxes (XY/ZP with restart warning), serial port list, safety limits (per-axis min/max spinboxes with "Set from Current" buttons, feedrate limits), polling intervals, Xbox mapping file path, verbose logging toggle.
+- **Context panel**: Quick safety enable/disable (synced bidirectionally with main content), simulation status indicators (color-coded), serial port list + refresh, Apply/Reset buttons with status feedback.
+- Apply writes to controller and settings.json; simulation flag changes require restart.
 
-**XboxMappingEditor** (`xbox_mapping_editor.py`, 352 lines): Modal dialog.
+### 6.5 Widgets
+
+**ConsoleLogWidget** (`console_log.py`, 171 lines): Read-only log viewer.
+- Auto-scroll toggle, clear button, color-coded by severity.
+- `log(message, tag)` for direct messages; `log_record(record, formatted)` for Python logging integration.
+- Thread-safe via `_LogSignalBridge(QObject)` with Qt Signal.
+- `QtLogHandler(logging.Handler)` routes Python `logging` to the widget.
+- Max 5,000 lines with automatic trimming.
+
+**XboxMappingEditor** (`xbox_mapping_editor.py`, 351 lines): Modal dialog.
 - Tabbed: Buttons (12), Axes (4 groups), D-Pad (4 directions).
-- Dropdown command selectors for all available commands.
-- Human-readable input labels.
+- Dropdown command selectors for all available Processor commands.
 - Import/Export/Reset to Defaults/Save.
 
-### 6.4 GUI File Summary
+**CameraWidget** (`camera_widget.py`, 264 lines): Live microscope feed.
+- OpenCV-based capture with configurable camera index and FPS.
+- Crosshair overlay for needle alignment.
+- Snapshot capture to timestamped files.
+- Graceful fallback if `cv2` not installed (`CV2_AVAILABLE` flag).
+
+**UIFunctions** (`ui_functions.py`, 161 lines): PyDracula animation helpers.
+- `toggleMenu(window)`: Animate sidebar expand (60px → 200px) / collapse.
+- `toggleLeftBox(window)`: Animate context panel open (0 → 260px) / close.
+- `setLeftBoxWidth(window, width)`: Set context panel to specific width.
+- All animations use `QParallelAnimationGroup` on both `minimumWidth` and `maximumWidth`.
+- `selectMenu(style)` / `deselectMenu(style)`: Append/remove active indicator stylesheet.
+
+### 6.6 Styling & Theming
+
+**COLORS dict** (`styles.py`): Python-accessible color constants for dynamic styling.
+Used when QSS alone isn't sufficient (e.g., `QPainter` drawing, conditional `setStyleSheet()`).
+
+| Key | Hex | Usage |
+|-----|-----|-------|
+| `base` | `#1e1e2e` | Main content background |
+| `mantle` | `#181825` | Sidebar, top/bottom bars |
+| `crust` | `#11111b` | Console background |
+| `surface0` | `#313244` | Card/panel backgrounds, input fields |
+| `surface1` | `#45475a` | Hover states, borders |
+| `surface2` | `#585b70` | Active borders |
+| `overlay0` | `#6c7086` | Disabled/dim text |
+| `subtext0` | `#a6adc8` | Secondary text |
+| `text` | `#cdd6f4` | Primary text |
+| `green` | `#a6e3a1` | Success, connected |
+| `red` | `#f38ba8` | Error, danger, disconnected |
+| `yellow` | `#f9e2af` | Warning, paused |
+| `blue` | `#89b4fa` | Accent, links |
+| `mauve` | `#cba6f7` | Selected accent (brand purple) |
+| `peach` | `#fab387` | Highlights |
+| `pink` | `#f5c2e7` | Secondary accent |
+
+**objectName conventions** — widgets use `setObjectName()` to pick up QSS rules:
+
+| objectName | Widget Type | Purpose |
+|------------|-------------|---------|
+| `cardFrame` | QFrame | Card container with rounded border + hover |
+| `sectionLabel` | QLabel | Bold mauve section header in main content |
+| `contextSectionLabel` | QLabel | Bold mauve section header in context panel |
+| `contextLabel` | QLabel | Form label in context panel |
+| `valueLabel` | QLabel | Monospace data readout |
+| `dimLabel` | QLabel | De-emphasized helper text |
+| `successBtn` | QPushButton | Green-tinted action (Connect, Apply, Start) |
+| `dangerBtn` | QPushButton | Red-tinted action (Disconnect, Abort, Delete) |
+| `warningBtn` | QPushButton | Yellow-tinted action (Pause) |
+| `accentBtn` | QPushButton | Mauve-tinted action (accent) |
+| `flatBtn` | QPushButton | Borderless transparent button |
+| `jogBtn` | QPushButton | Square jog direction pad button |
+
+### 6.7 Responsive Behavior
+
+- **Context panel width**: Adapts to window width via `resizeEvent()`:
+  - < 1000px → 200px, < 1300px → 230px, ≥ 1300px → 260px
+- **Context panel inputs**: QSS `#extraLeftBox` scoping applies smaller `min-height`, `padding`, and `font-size` to spinboxes, combos, buttons, checkboxes, progress bars, and list widgets.
+- **Sidebar**: Fixed 60px collapsed. Expand/collapse animated with `QParallelAnimationGroup`.
+- **Console**: Collapsible via `QSplitter` handle — user can drag to hide.
+- **Tested targets**: 1080p (minimum comfortable), 1440p (primary), 4K (scales naturally).
+
+### 6.8 GUI File Summary
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `gui/styles.py` | 385 | QSS dark theme (Catppuccin Mocha palette) |
-| `gui/app.py` | 404 | MainWindow with tabs, connection panel, status bar |
-| `gui/pages/dashboard.py` | 246 | Device status, position readouts, position log export |
-| `gui/pages/jog_control.py` | 363 | Direction pad, step sizes, speed sliders, keyboard shortcuts, E-stop |
-| `gui/pages/calibration.py` | 383 | 3-step wizard: zero needle, teach plate (A1 + corner), validate alignment |
-| `gui/pages/print_setup.py` | 956 | Job loading, 2D canvas, well plate config, print execution, queue |
-| `gui/pages/settings_page.py` | 421 | Safety limits, polling, Xbox mapping, simulation mode, logging |
+| `gui/app.py` | 857 | MainWindow: PyDracula shell, navigation, timers, keyboard shortcuts |
+| `gui/styles.py` | 861 | QSS dark theme (Catppuccin Mocha) + COLORS dict + objectName rules |
+| `gui/ui_functions.py` | 161 | Animation helpers: sidebar toggle, context panel toggle, menu selection |
+| `gui/pages/dashboard.py` | 533 | Device status, positions, speeds, safety, print history |
+| `gui/pages/jog_control.py` | 402 | Direction pad, step sizes, speed sliders, keyboard E-stop |
+| `gui/pages/calibration.py` | 693 | 3-step wizard with camera feed, plate teaching, save/load |
+| `gui/pages/print_setup.py` | 1,059 | Job loading, 2D canvas, well plate, execution, queue |
+| `gui/pages/settings_page.py` | 667 | Safety limits, polling, simulation mode, Xbox, logging |
 | `gui/widgets/console_log.py` | 171 | ConsoleLogWidget + QtLogHandler with thread-safe signal bridge |
 | `gui/widgets/xbox_mapping_editor.py` | 351 | Modal editor for button/axis/dpad → command mappings |
+| `gui/widgets/camera_widget.py` | 264 | Live microscope camera feed (OpenCV, optional) |
+| `gui/tests/test_integration.py` | 278 | Headless integration test (all pages + shell + contracts) |
+| **Total GUI** | **6,453** | **17 files** |
 
 ---
 
@@ -402,7 +538,7 @@ MainWindow (app.py)
 
 ```
 ┌─ Main Thread (GUI event loop) ─────────────────────────────────────────────┐
-│  QTimer (500ms) → update_data() → read cached positions                    │
+│  QTimer (300ms) → on_status_update() → read cached positions               │
 │  Button clicks → controller.connect_stages() / print_manager.start() etc.  │
 └────────────────────────────────────────────────────────────────────────────┘
 
@@ -510,7 +646,7 @@ PositionPoller (300ms loop)
   │  ZPStage.get_position() → (Z, P1, P2, P3)   [serial I/O]
   │  lock.acquire() → cache.update() → lock.release()
   ▼
-GUI Timer (500ms)
+GUI Timer (300ms)
   │  controller.get_xy_position(cached=True)
   │  lock.acquire() → read cache → lock.release()
   │  update status bar labels
@@ -623,7 +759,33 @@ GUI routes all Python logging to a `ConsoleLogWidget` via `QtLogHandler` with co
 
 ---
 
-## 13. Remaining Work — Task List for Next Sessions
+## 13. Migration & Integration Status
+
+### GUI Migration: Complete
+
+All 5 pages have been migrated from the original tab-based layout to the PyDracula sidebar + context panel architecture. The migration was completed across multiple sessions with systematic integration testing.
+
+**Bugs found and fixed during integration:**
+1. `app.py` `_update_status()` treated `get_zp_position()` tuple as dict (would crash on timer tick)
+2. `ui_functions.py` only animated `minimumWidth` — collapsing animations broke (fixed with `QParallelAnimationGroup`)
+3. `ui_functions.py` never toggled logo text visibility on sidebar expand/collapse
+4. `settings_page.py` context panel labels started blank (context created after `_load_from_controller()`)
+5. `xbox_mapping_editor.py` used `connectBtn` objectName with no QSS rule (changed to `successBtn`)
+6. `settings_page.py` had redundant local `SafetyLimits` import
+
+### Integration Testing
+
+Integration test script: `gui/tests/test_integration.py` (run headless with `QT_QPA_PLATFORM=offscreen`).
+
+Tests cover:
+- All module imports succeed
+- All 5 pages instantiate in simulation mode
+- Interface contract: `get_page_title()`, `get_context_widget()`, `on_status_update()` all present and callable
+- Context widgets are properly cached (idempotent)
+- `PathPreviewCanvas` methods work
+- Settings page safety toggle syncs bidirectionally
+- Console log and `QtLogHandler` thread-safe operation
+- Full `MainWindow` lifecycle: creation, page switching, status updates, keyboard events, settings save
 
 ### API Compatibility Verification
 
@@ -637,27 +799,28 @@ Key API surface verified:
 - `PositionLogger`: `count`, `clear()`, `save_csv()`, `save_json()`, `generate_filename()`
 - `ZPStage`: `emergency_stop()` (alias for `reset_printer()`)
 
-### Integration Testing
+### Smoke Testing Checklist
 
-- Smoke test: run `python main.py` in simulation mode — verify all tabs load
-- Xbox: connect simulated stages, verify jog commands flow through Processor
-- Print execution: load a sample job, start/pause/abort cycle
-- Calibration: run through 3-step wizard with simulated positions
-- Settings: modify safety limits, save, restart, verify persistence
+- [ ] Run `python main.py` in simulation mode — verify all tabs load
+- [ ] Xbox: connect simulated stages, verify jog commands flow through Processor
+- [ ] Print execution: load a sample job, start/pause/abort cycle
+- [ ] Calibration: run through 3-step wizard with simulated positions
+- [ ] Settings: modify safety limits, save, restart, verify persistence
+- [ ] Camera: test on machine with USB microscope connected
+- [ ] Print queue: add multiple jobs, test drag-reorder, start queue
 
-### Potential Enhancements
+### Enhancement Summary
 
-1. **G-code export** ✅: `export_gcode()` function in `PrintManager.py` — converts `PrintJob` commands to standard G-code (G0/G1/G4/G28) with proper header, initialization, per-segment extrusion, and `SWITCH_PUMP` translation. Export button added to `PrintSetupPage` execution panel.
-
-2. **Camera integration** ✅: `gui/widgets/camera_widget.py` — Live microscope camera feed widget using OpenCV (`cv2`). Features: auto-detect cameras, live feed with configurable FPS, crosshair overlay for needle alignment, snapshot capture. Embedded in `CalibrationPage` step 3 area. Falls back gracefully if OpenCV not installed.
-
-3. **Print resume** ✅: `save_print_progress()` / `load_print_progress()` / `clear_print_progress()` in `PrintManager.py`. Progress saved to `print_resume.json` every 20 commands and on pause/abort/error. On app startup, `MainWindow._check_print_resume()` offers to resume. `PrintManager.resume_from_saved()` and `PrintSetupPage.resume_print()` handle the resume flow.
-
-4. **Keyboard jogging in any tab** ✅: `MainWindow.keyPressEvent()` in `app.py` provides global keyboard shortcuts: Arrow keys (XY jog), PageUp/PageDown (Z jog), Home (go to zero), Escape (emergency stop). Text input widgets are excluded from interception.
-
-5. **Calibration persistence** ✅: Calibration data (taught A1/corner positions, scale, rotation, offset) saved to `settings.json` under the `"calibration"` section. Save/Load buttons added to `CalibrationPage`. Auto-loaded on page initialization. `Settings.py` updated with default calibration section.
-
-6. **Print history log** ✅: `SupportClasses/PrintHistory.py` — persistent log (`print_history.json`) with `PrintHistoryEntry` dataclass. Records job name, state, duration, commands, pumps used, errors. `PrintManager` auto-records on completion/abort/error. `DashboardPage` shows live stats (total, completed, success rate, print time). Export to CSV supported. Rolling 500-entry limit.
+| # | Feature | Status | Key Files |
+|---|---------|--------|-----------|
+| 1 | G-code export | ✅ | `PrintManager.export_gcode()`, Print Setup export button |
+| 2 | Camera integration | ✅ | `gui/widgets/camera_widget.py`, Calibration page step 3 |
+| 3 | Print resume | ✅ | `PrintManager.save/load/clear_print_progress()`, MainWindow popup |
+| 4 | Keyboard jogging | ✅ | `MainWindow.keyPressEvent()`, arrows/PgUp/PgDn/Home/Escape |
+| 5 | Calibration persistence | ✅ | `settings.json` calibration section, CalibrationPage save/load |
+| 6 | Print history | ✅ | `PrintHistory.py`, Dashboard stats and export |
+| 7 | PyDracula layout | ✅ | Sidebar nav, animated context panel, responsive sizing |
+| 8 | Visual polish | ✅ | Hover effects, state-based conn dots, card hover, responsive context |
 
 ---
 

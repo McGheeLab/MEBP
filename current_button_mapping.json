@@ -1,0 +1,28 @@
+{
+    "buttons": {
+        "0": "zero_needle_pos",
+        "1": "None",
+        "2": "None",
+        "3": "None",
+        "4": "increment_zspeed_down",
+        "5": "increment_zspeed_up",
+        "6": "increment_pspeed_down",
+        "7": "increment_pspeed_up",
+        "8": "increment_xyspeed_down",
+        "9": "increment_xyspeed_up",
+        "10": "None",
+        "11": "None"
+    },
+    "axes": {
+        "0-1": "move_stage_at_velocity",
+        "2-3": "move_z_at_velocity",
+        "4": "move_p3_at_velocity",
+        "5": "move_p3_at_velocity"
+    },
+    "dpad": {
+        "up": "increment_zspeed_up",
+        "down": "increment_zspeed_down",
+        "left": "increment_pspeed_down",
+        "right": "increment_pspeed_up"
+    }
+}
