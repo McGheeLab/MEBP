@@ -654,9 +654,23 @@ class MainWindow(QMainWindow):
         try:
             mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
             self.controller.connect_xbox(mapping_file)
-            self.console.log("Xbox controller connected", "success")
+            # Verify connection after a brief delay — the worker process exits
+            # immediately if no controller is found, so we check is_alive().
+            QTimer.singleShot(800, self._verify_xbox_connection)
+            self.console.log("Xbox controller starting…", "info")
         except Exception as e:
             self.console.log(f"Xbox connection failed: {e}", "error")
+
+    def _verify_xbox_connection(self):
+        """Check if the Xbox process is still alive after startup."""
+        if self.controller.is_xbox_connected:
+            self.console.log("Xbox controller connected", "success")
+        else:
+            self.console.log(
+                "Xbox controller not found — is a controller plugged in?", "warning"
+            )
+            # Clean up the dead process
+            self.controller.disconnect_xbox()
 
     def disconnect_xbox(self):
         self.controller.disconnect_xbox()

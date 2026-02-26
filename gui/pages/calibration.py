@@ -1,12 +1,12 @@
 """
-Calibration Page — Guided workflow with camera settings in context panel.
+Calibration Page — Multi-camera layout with calibration steps in context panel.
 
-Main content: 3-step calibration wizard (zero needle, teach plate, validate)
-Context panel: camera source/settings, plate format, calibration save/load
+Main content: Position readout + up to 3 simultaneous camera feeds
+Context panel (left box): Camera settings, plate config, 3-step calibration
+    wizard (zero needle, teach plate, validate), calibration save/load
 
-The context panel provides camera gamma, brightness, FPS, crosshair toggle,
-and webcam source selection — accessible whenever the Calibration workflow
-is active.
+Camera feeds support software brightness and gamma adjustment which works
+regardless of webcam hardware capabilities.
 """
 
 from __future__ import annotations
@@ -31,14 +31,20 @@ logger = logging.getLogger(__name__)
 
 # Optional camera support
 try:
-    from gui.widgets.camera_widget import CameraWidget, CV2_AVAILABLE
+    from gui.widgets.camera_widget import CameraWidget, CV2_AVAILABLE, detect_cameras
 except ImportError:
     CameraWidget = None
     CV2_AVAILABLE = False
 
+    def detect_cameras(max_index=8):
+        return []
+
+# Maximum simultaneous cameras
+MAX_CAMERAS = 3
+
 
 class CalibrationPage(QWidget):
-    """Three-step guided calibration wizard with camera context panel."""
+    """Multi-camera calibration page with steps in the context panel."""
 
     _page_title_text = "Calibration"
 
@@ -57,58 +63,45 @@ class CalibrationPage(QWidget):
         self._rotation = 0.0
         self._scale = 1.0
 
-        # Camera widget (created in context panel)
-        self._camera_widget: CameraWidget | None = None
+        # Camera widgets (up to MAX_CAMERAS)
+        self._cameras: list[CameraWidget] = []
         self._context_widget = None
 
         self._setup_ui()
-        self._load_calibration()
 
     def get_page_title(self) -> str:
         return "Calibration"
 
+    # ════════════════════════════════════════════════════════════════
+    #  CONTEXT PANEL  (Steps 1-2-3 + Camera Settings + Plate Config)
+    # ════════════════════════════════════════════════════════════════
+
     def get_context_widget(self) -> QWidget:
-        """Build camera settings + calibration config context panel."""
+        """Build the context panel with calibration steps and settings."""
         if self._context_widget is not None:
             return self._context_widget
 
         ctx = QWidget()
         layout = QVBoxLayout(ctx)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(5)
 
-        # ── Camera Settings ──────────────────────────────────────
-        cam_label = QLabel("Camera Settings")
+        # ── Camera Controls (global) ─────────────────────────────
+        cam_label = QLabel("Camera Controls")
         cam_label.setObjectName("contextSectionLabel")
         layout.addWidget(cam_label)
 
         if CV2_AVAILABLE:
-            # Camera source selection
-            src_row = QHBoxLayout()
-            src_row.addWidget(QLabel("Source:"))
-            self._cam_source_combo = QComboBox()
-            self._cam_source_combo.setToolTip("Select webcam device")
-            self._populate_cameras()
-            self._cam_source_combo.currentIndexChanged.connect(self._on_camera_source_changed)
-            src_row.addWidget(self._cam_source_combo, stretch=1)
-            layout.addLayout(src_row)
-
-            # Refresh cameras button
-            btn_refresh_cam = QPushButton("🔄 Detect Cameras")
-            btn_refresh_cam.setObjectName("flatBtn")
-            btn_refresh_cam.clicked.connect(self._populate_cameras)
-            layout.addWidget(btn_refresh_cam)
-
-            # Brightness
+            # Brightness slider
             layout.addWidget(self._make_slider_row(
                 "Brightness:", -100, 100, 0,
-                "cam_brightness", self._on_brightness_changed
+                "cam_brightness", self._on_brightness_changed,
             ))
 
-            # Contrast / Gamma
+            # Gamma slider
             layout.addWidget(self._make_slider_row(
                 "Gamma:", 10, 300, 100,
-                "cam_gamma", self._on_gamma_changed
+                "cam_gamma", self._on_gamma_changed,
             ))
 
             # FPS
@@ -122,34 +115,22 @@ class CalibrationPage(QWidget):
             layout.addLayout(fps_row)
 
             # Crosshair toggle
-            self._chk_crosshair = QCheckBox("Show Crosshair")
+            self._chk_crosshair = QCheckBox("Show Crosshair (all cameras)")
             self._chk_crosshair.setChecked(True)
             self._chk_crosshair.toggled.connect(self._on_crosshair_toggled)
             layout.addWidget(self._chk_crosshair)
 
-            # Camera controls
-            cam_btn_row = QHBoxLayout()
-            self._btn_cam_start = QPushButton("▶ Start")
-            self._btn_cam_start.setObjectName("successBtn")
-            self._btn_cam_start.clicked.connect(self._start_camera)
-            cam_btn_row.addWidget(self._btn_cam_start)
-
-            self._btn_cam_stop = QPushButton("⏹ Stop")
-            self._btn_cam_stop.setObjectName("dangerBtn")
-            self._btn_cam_stop.setEnabled(False)
-            self._btn_cam_stop.clicked.connect(self._stop_camera)
-            cam_btn_row.addWidget(self._btn_cam_stop)
-            layout.addLayout(cam_btn_row)
-
-            btn_snapshot = QPushButton("📷 Snapshot")
-            btn_snapshot.clicked.connect(self._take_snapshot)
-            layout.addWidget(btn_snapshot)
+            # Detect cameras button
+            btn_detect = QPushButton("🔄 Detect Cameras")
+            btn_detect.setObjectName("flatBtn")
+            btn_detect.clicked.connect(self._refresh_all_cameras)
+            layout.addWidget(btn_detect)
         else:
             layout.addWidget(QLabel(
-                "Camera unavailable.\nInstall OpenCV:\npip install opencv-python"
+                "Camera unavailable.\nInstall: pip install opencv-python"
             ))
 
-        # ── Plate Settings ───────────────────────────────────────
+        # ── Plate Configuration ──────────────────────────────────
         plate_label = QLabel("Plate Configuration")
         plate_label.setObjectName("contextSectionLabel")
         layout.addWidget(plate_label)
@@ -164,6 +145,104 @@ class CalibrationPage(QWidget):
         plate_row.addWidget(self.ctx_plate_combo, stretch=1)
         layout.addLayout(plate_row)
 
+        # ── Step 1: Zero Needle ──────────────────────────────────
+        s1_label = QLabel("Step 1 — Zero Needle")
+        s1_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s1_label)
+
+        layout.addWidget(QLabel("Jog to contact, then Set Zero."))
+
+        s1_row = QHBoxLayout()
+        btn_set_zero = QPushButton("Set Zero")
+        btn_set_zero.setObjectName("successBtn")
+        btn_set_zero.setMaximumHeight(26)
+        btn_set_zero.clicked.connect(self._set_zero)
+        s1_row.addWidget(btn_set_zero)
+
+        btn_goto_zero = QPushButton("Go to Zero")
+        btn_goto_zero.setMaximumHeight(26)
+        btn_goto_zero.clicked.connect(self._goto_zero)
+        s1_row.addWidget(btn_goto_zero)
+        layout.addLayout(s1_row)
+
+        self.lbl_zero_status = QLabel("Not set")
+        self.lbl_zero_status.setStyleSheet(f"color: {COLORS['yellow']};")
+        layout.addWidget(self.lbl_zero_status)
+
+        # ── Step 2: Teach Plate Position ─────────────────────────
+        s2_label = QLabel("Step 2 — Teach Plate")
+        s2_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s2_label)
+
+        layout.addWidget(QLabel("Jog to A1 → Record, corner → Record."))
+
+        # A1 row
+        a1_row = QHBoxLayout()
+        a1_row.addWidget(QLabel("A1:"))
+        self.lbl_a1 = QLabel("—")
+        self.lbl_a1.setStyleSheet(f"color: {COLORS['overlay0']};")
+        a1_row.addWidget(self.lbl_a1, stretch=1)
+        btn_rec_a1 = QPushButton("Rec")
+        btn_rec_a1.setMaximumHeight(24)
+        btn_rec_a1.setMaximumWidth(40)
+        btn_rec_a1.clicked.connect(self._record_a1)
+        a1_row.addWidget(btn_rec_a1)
+        btn_go_a1 = QPushButton("Go")
+        btn_go_a1.setMaximumHeight(24)
+        btn_go_a1.setMaximumWidth(30)
+        btn_go_a1.clicked.connect(self._goto_a1)
+        a1_row.addWidget(btn_go_a1)
+        layout.addLayout(a1_row)
+
+        # Corner row
+        cr_row = QHBoxLayout()
+        cr_row.addWidget(QLabel("Corner:"))
+        self.lbl_corner = QLabel("—")
+        self.lbl_corner.setStyleSheet(f"color: {COLORS['overlay0']};")
+        cr_row.addWidget(self.lbl_corner, stretch=1)
+        btn_rec_corner = QPushButton("Rec")
+        btn_rec_corner.setMaximumHeight(24)
+        btn_rec_corner.setMaximumWidth(40)
+        btn_rec_corner.clicked.connect(self._record_corner)
+        cr_row.addWidget(btn_rec_corner)
+        btn_go_corner = QPushButton("Go")
+        btn_go_corner.setMaximumHeight(24)
+        btn_go_corner.setMaximumWidth(30)
+        btn_go_corner.clicked.connect(self._goto_corner)
+        cr_row.addWidget(btn_go_corner)
+        layout.addLayout(cr_row)
+
+        btn_calc = QPushButton("Calculate Alignment")
+        btn_calc.setObjectName("accentBtn")
+        btn_calc.setMaximumHeight(28)
+        btn_calc.clicked.connect(self._calculate_alignment)
+        layout.addWidget(btn_calc)
+
+        self.lbl_alignment = QLabel("")
+        self.lbl_alignment.setWordWrap(True)
+        self.lbl_alignment.setStyleSheet(f"color: {COLORS['subtext0']};")
+        layout.addWidget(self.lbl_alignment)
+
+        # ── Step 3: Validate ─────────────────────────────────────
+        s3_label = QLabel("Step 3 — Validate")
+        s3_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s3_label)
+
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel("Well:"))
+        self.val_well_combo = QComboBox()
+        val_row.addWidget(self.val_well_combo, stretch=1)
+        btn_goto_well = QPushButton("Go")
+        btn_goto_well.setMaximumHeight(24)
+        btn_goto_well.clicked.connect(self._goto_well)
+        val_row.addWidget(btn_goto_well)
+        layout.addLayout(val_row)
+
+        self.lbl_val_result = QLabel("")
+        self.lbl_val_result.setWordWrap(True)
+        self.lbl_val_result.setStyleSheet(f"color: {COLORS['subtext0']};")
+        layout.addWidget(self.lbl_val_result)
+
         # ── Calibration Persistence ──────────────────────────────
         persist_label = QLabel("Calibration Data")
         persist_label.setObjectName("contextSectionLabel")
@@ -174,28 +253,36 @@ class CalibrationPage(QWidget):
         self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
         layout.addWidget(self.ctx_lbl_cal_status)
 
-        btn_save_cal = QPushButton("💾 Save Calibration")
+        cal_btn_row = QHBoxLayout()
+        btn_save_cal = QPushButton("💾 Save")
+        btn_save_cal.setMaximumHeight(26)
         btn_save_cal.clicked.connect(self._save_calibration)
-        layout.addWidget(btn_save_cal)
+        cal_btn_row.addWidget(btn_save_cal)
 
-        btn_load_cal = QPushButton("📂 Load Calibration")
+        btn_load_cal = QPushButton("📂 Load")
+        btn_load_cal.setMaximumHeight(26)
         btn_load_cal.clicked.connect(self._load_calibration)
-        layout.addWidget(btn_load_cal)
+        cal_btn_row.addWidget(btn_load_cal)
+        layout.addLayout(cal_btn_row)
 
         layout.addStretch()
 
         self._context_widget = ctx
+
+        # Now that all widgets exist, load any saved calibration
+        self._load_calibration()
+
         return ctx
 
-    # ── Camera Context Helpers ───────────────────────────────────
+    # ── Context panel helpers ─────────────────────────────────────
 
     def _make_slider_row(self, label: str, min_val: int, max_val: int,
                          default: int, attr_name: str, slot) -> QWidget:
-        """Create a labeled slider row for the context panel."""
+        """Create a compact labeled slider row."""
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(2)
+        lay = QVBoxLayout(widget)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(2)
 
         top = QHBoxLayout()
         top.addWidget(QLabel(label))
@@ -204,7 +291,7 @@ class CalibrationPage(QWidget):
         value_lbl.setMinimumWidth(30)
         top.addStretch()
         top.addWidget(value_lbl)
-        layout.addLayout(top)
+        lay.addLayout(top)
 
         slider = QSlider(Qt.Horizontal)
         slider.setRange(min_val, max_val)
@@ -212,74 +299,41 @@ class CalibrationPage(QWidget):
         slider.valueChanged.connect(lambda v: value_lbl.setText(str(v)))
         slider.valueChanged.connect(slot)
         setattr(self, f"_slider_{attr_name}", slider)
-        layout.addWidget(slider)
+        lay.addWidget(slider)
 
         return widget
 
-    def _populate_cameras(self):
-        """Detect available cameras and populate the source combo."""
-        if not CV2_AVAILABLE:
-            return
-        self._cam_source_combo.clear()
-        # Probe up to 8 camera indices
-        import cv2
-        for i in range(8):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                self._cam_source_combo.addItem(f"Camera {i}", i)
-                cap.release()
-
-        if self._cam_source_combo.count() == 0:
-            self._cam_source_combo.addItem("No cameras found", -1)
-
-    def _on_camera_source_changed(self, index: int):
-        if self._camera_widget and self._camera_widget._running:
-            self._stop_camera()
-            cam_idx = self._cam_source_combo.currentData()
-            if cam_idx is not None and cam_idx >= 0:
-                self._camera_widget._camera_index = cam_idx
-                self._start_camera()
+    # ── Camera settings callbacks (apply to ALL cameras) ──────────
 
     def _on_brightness_changed(self, value: int):
-        if self._camera_widget and self._camera_widget._capture:
-            import cv2
-            self._camera_widget._capture.set(cv2.CAP_PROP_BRIGHTNESS, value)
+        for cam in self._cameras:
+            cam.set_brightness(value)
 
     def _on_gamma_changed(self, value: int):
-        if self._camera_widget and self._camera_widget._capture:
-            import cv2
-            self._camera_widget._capture.set(cv2.CAP_PROP_GAMMA, value / 100.0)
+        for cam in self._cameras:
+            cam.set_gamma(value / 100.0)
 
     def _on_fps_changed(self, value: int):
-        if self._camera_widget:
-            self._camera_widget._fps = value
-            if self._camera_widget._running:
-                self._camera_widget._timer.setInterval(int(1000 / value))
+        for cam in self._cameras:
+            cam._fps = value
+            if cam._running:
+                cam._timer.setInterval(int(1000 / value))
 
     def _on_crosshair_toggled(self, checked: bool):
-        if self._camera_widget:
-            self._camera_widget._show_crosshair = checked
+        for cam in self._cameras:
+            cam._show_crosshair = checked
+            if hasattr(cam, 'chk_crosshair'):
+                cam.chk_crosshair.blockSignals(True)
+                cam.chk_crosshair.setChecked(checked)
+                cam.chk_crosshair.blockSignals(False)
 
-    def _start_camera(self):
-        if self._camera_widget:
-            cam_idx = self._cam_source_combo.currentData() if hasattr(self, '_cam_source_combo') else 0
-            if cam_idx is not None and cam_idx >= 0:
-                self._camera_widget._camera_index = cam_idx
-            self._camera_widget.start()
-            self._btn_cam_start.setEnabled(False)
-            self._btn_cam_stop.setEnabled(True)
+    def _refresh_all_cameras(self):
+        for cam in self._cameras:
+            cam.refresh_cameras()
 
-    def _stop_camera(self):
-        if self._camera_widget:
-            self._camera_widget.stop()
-            self._btn_cam_start.setEnabled(True)
-            self._btn_cam_stop.setEnabled(False)
-
-    def _take_snapshot(self):
-        if self._camera_widget and hasattr(self._camera_widget, 'take_snapshot'):
-            self._camera_widget.take_snapshot()
-
-    # ── Main Content UI ──────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  MAIN CONTENT UI  (position readout + multi-camera grid)
+    # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
         outer = QVBoxLayout(self)
@@ -293,7 +347,7 @@ class CalibrationPage(QWidget):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setSpacing(8)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(12, 8, 12, 8)
         scroll.setWidget(container)
 
         mono = QFont("Consolas", 12)
@@ -313,154 +367,45 @@ class CalibrationPage(QWidget):
         pos_layout.addStretch()
         layout.addWidget(pos_card)
 
-        # ── Main content: Camera + Steps side by side ─────────────
-        content_row = QHBoxLayout()
-        content_row.setSpacing(8)
-
-        # Steps column
-        steps_widget = QWidget()
-        steps_layout = QVBoxLayout(steps_widget)
-        steps_layout.setSpacing(8)
-        steps_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Step 1: Zero Needle
-        step1 = QFrame()
-        step1.setObjectName("cardFrame")
-        s1 = QVBoxLayout(step1)
-        s1.setSpacing(4)
-        s1_title = QLabel("Step 1 — Zero Needle")
-        s1_title.setObjectName("sectionLabel")
-        s1.addWidget(s1_title)
-
-        s1.addWidget(QLabel(
-            "Jog needle to contact point, then press 'Set Zero'."
-        ))
-
-        s1_row = QHBoxLayout()
-        btn_set_zero = QPushButton("Set Zero Here")
-        btn_set_zero.setObjectName("successBtn")
-        btn_set_zero.clicked.connect(self._set_zero)
-        s1_row.addWidget(btn_set_zero)
-
-        btn_goto_zero = QPushButton("Go to Zero")
-        btn_goto_zero.clicked.connect(self._goto_zero)
-        s1_row.addWidget(btn_goto_zero)
-
-        self.lbl_zero_status = QLabel("Not set")
-        self.lbl_zero_status.setStyleSheet(f"color: {COLORS['yellow']};")
-        s1_row.addWidget(self.lbl_zero_status)
-        s1_row.addStretch()
-        s1.addLayout(s1_row)
-        steps_layout.addWidget(step1)
-
-        # Step 2: Teach Well Plate
-        step2 = QFrame()
-        step2.setObjectName("cardFrame")
-        s2 = QVBoxLayout(step2)
-        s2.setSpacing(4)
-        s2_title = QLabel("Step 2 — Teach Plate Position")
-        s2_title.setObjectName("sectionLabel")
-        s2.addWidget(s2_title)
-
-        s2.addWidget(QLabel(
-            "Jog to A1 center → Record.  Jog to corner well → Record."
-        ))
-
-        teach_grid = QGridLayout()
-        teach_grid.setSpacing(4)
-
-        teach_grid.addWidget(QLabel("A1:"), 0, 0)
-        self.lbl_a1 = QLabel("Not recorded")
-        self.lbl_a1.setStyleSheet(f"color: {COLORS['overlay0']};")
-        teach_grid.addWidget(self.lbl_a1, 0, 1)
-        btn_rec_a1 = QPushButton("Record")
-        btn_rec_a1.setMaximumHeight(26)
-        btn_rec_a1.clicked.connect(self._record_a1)
-        teach_grid.addWidget(btn_rec_a1, 0, 2)
-        btn_go_a1 = QPushButton("Go to")
-        btn_go_a1.setMaximumHeight(26)
-        btn_go_a1.clicked.connect(self._goto_a1)
-        teach_grid.addWidget(btn_go_a1, 0, 3)
-
-        teach_grid.addWidget(QLabel("Corner:"), 1, 0)
-        self.lbl_corner = QLabel("Not recorded")
-        self.lbl_corner.setStyleSheet(f"color: {COLORS['overlay0']};")
-        teach_grid.addWidget(self.lbl_corner, 1, 1)
-        btn_rec_corner = QPushButton("Record")
-        btn_rec_corner.setMaximumHeight(26)
-        btn_rec_corner.clicked.connect(self._record_corner)
-        teach_grid.addWidget(btn_rec_corner, 1, 2)
-        btn_go_corner = QPushButton("Go to")
-        btn_go_corner.setMaximumHeight(26)
-        btn_go_corner.clicked.connect(self._goto_corner)
-        teach_grid.addWidget(btn_go_corner, 1, 3)
-
-        s2.addLayout(teach_grid)
-
-        calc_row = QHBoxLayout()
-        btn_calc = QPushButton("Calculate Alignment")
-        btn_calc.setObjectName("accentBtn")
-        btn_calc.clicked.connect(self._calculate_alignment)
-        calc_row.addWidget(btn_calc)
-        self.lbl_alignment = QLabel("")
-        self.lbl_alignment.setWordWrap(True)
-        self.lbl_alignment.setStyleSheet(f"color: {COLORS['subtext0']};")
-        calc_row.addWidget(self.lbl_alignment, stretch=1)
-        s2.addLayout(calc_row)
-        steps_layout.addWidget(step2)
-
-        # Step 3: Validate
-        step3 = QFrame()
-        step3.setObjectName("cardFrame")
-        s3 = QVBoxLayout(step3)
-        s3.setSpacing(4)
-        s3_title = QLabel("Step 3 — Validate Alignment")
-        s3_title.setObjectName("sectionLabel")
-        s3.addWidget(s3_title)
-
-        val_row = QHBoxLayout()
-        val_row.addWidget(QLabel("Well:"))
-        self.val_well_combo = QComboBox()
-        val_row.addWidget(self.val_well_combo)
-        btn_goto_well = QPushButton("Go to Well")
-        btn_goto_well.clicked.connect(self._goto_well)
-        val_row.addWidget(btn_goto_well)
-        val_row.addStretch()
-        s3.addLayout(val_row)
-
-        self.lbl_val_result = QLabel("")
-        self.lbl_val_result.setWordWrap(True)
-        self.lbl_val_result.setStyleSheet(f"color: {COLORS['subtext0']};")
-        s3.addWidget(self.lbl_val_result)
-        steps_layout.addWidget(step3)
-
-        steps_layout.addStretch()
-        content_row.addWidget(steps_widget, stretch=2)
-
-        # Camera feed column
-        cam_widget = QFrame()
-        cam_widget.setObjectName("cardFrame")
-        cam_layout = QVBoxLayout(cam_widget)
+        # ── Camera Feeds Grid ─────────────────────────────────────
+        cam_card = QFrame()
+        cam_card.setObjectName("cardFrame")
+        cam_layout = QVBoxLayout(cam_card)
         cam_layout.setSpacing(4)
 
-        cam_title = QLabel("Camera Feed")
+        cam_title = QLabel("Camera Feeds")
         cam_title.setObjectName("sectionLabel")
         cam_layout.addWidget(cam_title)
 
         if CV2_AVAILABLE and CameraWidget is not None:
-            self._camera_widget = CameraWidget()
-            cam_layout.addWidget(self._camera_widget, stretch=1)
+            self._cam_grid = QHBoxLayout()
+            self._cam_grid.setSpacing(6)
+
+            for i in range(MAX_CAMERAS):
+                cam = CameraWidget(
+                    camera_label=f"Camera {i + 1}",
+                    compact=(MAX_CAMERAS > 1),
+                    show_controls=True,
+                    parent=self,
+                )
+                self._cameras.append(cam)
+                self._cam_grid.addWidget(cam, stretch=1)
+
+            cam_layout.addLayout(self._cam_grid, stretch=1)
         else:
-            no_cam = QLabel("Camera unavailable\nInstall: pip install opencv-python")
+            no_cam = QLabel(
+                "Camera unavailable\n"
+                "Install: pip install opencv-python"
+            )
             no_cam.setAlignment(Qt.AlignCenter)
             no_cam.setStyleSheet(f"color: {COLORS['overlay0']};")
             cam_layout.addWidget(no_cam, stretch=1)
 
-        content_row.addWidget(cam_widget, stretch=1)
+        layout.addWidget(cam_card, stretch=1)
 
-        layout.addLayout(content_row)
-
-    # ── Status Update ────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  STATUS UPDATE
+    # ════════════════════════════════════════════════════════════════
 
     def on_status_update(self):
         """Called periodically by the main window."""
@@ -478,10 +423,14 @@ class CalibrationPage(QWidget):
             self.lbl_y.setText("—")
 
         zp = ctrl.get_zp_position(cached=True)
-        if zp.get("Z") is not None:
-            self.lbl_z.setText(f"{zp['Z'] - ctrl.zero_position.get('Z', 0):.2f}")
+        if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
+            self.lbl_z.setText(f"{zp[0] - ctrl.zero_position.get('Z', 0):.2f}")
         else:
             self.lbl_z.setText("—")
+
+    # ════════════════════════════════════════════════════════════════
+    #  CALIBRATION STEPS
+    # ════════════════════════════════════════════════════════════════
 
     # ── Step 1: Zero Needle ──────────────────────────────────────
 
@@ -500,7 +449,7 @@ class CalibrationPage(QWidget):
     # ── Step 2: Teach Well Plate ─────────────────────────────────
 
     def _on_plate_changed(self, idx):
-        """Handle plate format change (from either main or context combo)."""
+        """Handle plate format change."""
         sender = self.sender()
         if sender is None:
             return
@@ -513,26 +462,18 @@ class CalibrationPage(QWidget):
         defn = PLATE_DEFINITIONS[fmt]
         rows, cols = defn["rows"], defn["cols"]
 
-        # Determine corner well
         row_letter = chr(ord('A') + rows - 1)
         self._corner_well = f"{row_letter}{cols}"
 
-        # Update validation well combo
         wells = self._plate.well_names
         self.val_well_combo.clear()
         self.val_well_combo.addItems(wells)
 
-        # Sync the other combo if present
-        if hasattr(self, 'ctx_plate_combo') and sender != self.ctx_plate_combo:
-            self.ctx_plate_combo.blockSignals(True)
-            self.ctx_plate_combo.setCurrentIndex(idx)
-            self.ctx_plate_combo.blockSignals(False)
-
         # Reset taught positions
         self._taught_a1 = None
         self._taught_corner = None
-        self.lbl_a1.setText("Not recorded")
-        self.lbl_corner.setText("Not recorded")
+        self.lbl_a1.setText("—")
+        self.lbl_corner.setText("—")
         self.lbl_alignment.setText("")
 
     def _record_a1(self):
@@ -569,18 +510,20 @@ class CalibrationPage(QWidget):
 
     def _calculate_alignment(self):
         if not self._taught_a1 or not self._taught_corner or not self._plate:
-            self.lbl_alignment.setText("⚠ Record A1 and corner first, and select plate format.")
+            self.lbl_alignment.setText(
+                "⚠ Record A1 and corner first, and select plate format."
+            )
             return
 
-        # Get expected positions from plate geometry
         a1_expected = self._plate.get_well_position("A1")
         corner_expected = self._plate.get_well_position(self._corner_well)
 
         if a1_expected is None or corner_expected is None:
-            self.lbl_alignment.setText("⚠ Cannot compute alignment for this plate format.")
+            self.lbl_alignment.setText(
+                "⚠ Cannot compute alignment for this plate format."
+            )
             return
 
-        # Vectors
         ex = corner_expected[0] - a1_expected[0]
         ey = corner_expected[1] - a1_expected[1]
         mx = self._taught_corner[0] - self._taught_a1[0]
@@ -601,9 +544,9 @@ class CalibrationPage(QWidget):
         self._offset_y = self._taught_a1[1] - self.controller.zero_position["y"]
 
         self.lbl_alignment.setText(
-            f"✅ Aligned | Scale: {self._scale:.4f} | "
-            f"Rotation: {self._rotation:.2f}° | "
-            f"Offset: ({self._offset_x:.0f}, {self._offset_y:.0f})"
+            f"✅ Scale: {self._scale:.4f} | "
+            f"Rot: {self._rotation:.2f}° | "
+            f"Off: ({self._offset_x:.0f}, {self._offset_y:.0f})"
         )
         self.lbl_alignment.setStyleSheet(f"color: {COLORS['green']};")
 
@@ -637,9 +580,13 @@ class CalibrationPage(QWidget):
         target_y = self._offset_y + ry * self._scale
 
         self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
-        self.lbl_val_result.setText(f"Moving to {well} → ({target_x:.0f}, {target_y:.0f})")
+        self.lbl_val_result.setText(
+            f"Moving to {well} → ({target_x:.0f}, {target_y:.0f})"
+        )
 
-    # ── Calibration Persistence ──────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  CALIBRATION PERSISTENCE
+    # ════════════════════════════════════════════════════════════════
 
     def _save_calibration(self):
         if self.settings is None:
@@ -672,12 +619,16 @@ class CalibrationPage(QWidget):
 
         if cal.get("taught_a1"):
             self._taught_a1 = tuple(cal["taught_a1"])
-            self.lbl_a1.setText(f"({self._taught_a1[0]:.0f}, {self._taught_a1[1]:.0f})")
+            self.lbl_a1.setText(
+                f"({self._taught_a1[0]:.0f}, {self._taught_a1[1]:.0f})"
+            )
             self.lbl_a1.setStyleSheet(f"color: {COLORS['green']};")
 
         if cal.get("taught_corner"):
             self._taught_corner = tuple(cal["taught_corner"])
-            self.lbl_corner.setText(f"({self._taught_corner[0]:.0f}, {self._taught_corner[1]:.0f})")
+            self.lbl_corner.setText(
+                f"({self._taught_corner[0]:.0f}, {self._taught_corner[1]:.0f})"
+            )
             self.lbl_corner.setStyleSheet(f"color: {COLORS['green']};")
 
         self._offset_x = cal.get("offset_x", 0)
@@ -687,7 +638,9 @@ class CalibrationPage(QWidget):
 
         if self._scale != 1.0 or self._rotation != 0:
             self.lbl_alignment.setText(
-                f"Loaded | Scale: {self._scale:.4f} | Rotation: {self._rotation:.2f}°")
+                f"Loaded | Scale: {self._scale:.4f} | "
+                f"Rotation: {self._rotation:.2f}°"
+            )
             if hasattr(self, 'ctx_lbl_cal_status'):
                 self.ctx_lbl_cal_status.setText("✅ Loaded from settings")
                 self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['green']};")

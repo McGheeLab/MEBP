@@ -502,9 +502,14 @@ class StageController:
 
     # ── Connection Management ─────────────────────────────────────
 
-    def connect_stages(self) -> None:
-        """Initialise and connect both stages."""
-        if self.xy_stage is None:
+    def connect_stages(self, xy: bool = True, zp: bool = True) -> None:
+        """Initialise and connect stages.
+
+        Args:
+            xy: If True, connect the XY stage (default True).
+            zp: If True, connect the ZP stage (default True).
+        """
+        if xy and self.xy_stage is None:
             self.xy_stage = XYStageManager(simulate=self.simulate_xy)
             self.xy_jog = XYJogHandler(
                 self.processor, self.xy_stage,
@@ -520,7 +525,7 @@ class StageController:
                 )
             logger.info("XY stage connected")
 
-        if self.zp_stage is None:
+        if zp and self.zp_stage is None:
             self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
             self.zp_jog = ZPJogHandler(
                 self.processor, self.zp_stage,
