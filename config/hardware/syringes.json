@@ -1,0 +1,16 @@
+{
+    "description": "Hamilton 1700-series Half-Height Gastight syringes",
+    "manufacturer": "Hamilton",
+    "series": "1700",
+    "plunger_type": "UHMWPE X-style BFP",
+    "stroke_length_mm": 30.0,
+    "notes": "Compatible with Hamilton PSD/4 Syringe Pumps. Barrel ID computed from: ID = sqrt(4 × V / (π × L)) where V = volume, L = 30mm",
+    "syringes": {
+        "25":   {"part_number": "1702", "barrel_id_mm": 1.030},
+        "50":   {"part_number": "1705", "barrel_id_mm": 1.457},
+        "100":  {"part_number": "1710", "barrel_id_mm": 2.060},
+        "250":  {"part_number": "1725", "barrel_id_mm": 3.256},
+        "500":  {"part_number": "1750", "barrel_id_mm": 4.606},
+        "1000": {"part_number": "1001", "barrel_id_mm": 6.513}
+    }
+}

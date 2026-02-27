@@ -1,0 +1,20 @@
+{
+    "description": "Needle gauge specifications (ASTM standard values)",
+    "notes": "OD/ID/Wall in micrometers (µm). Standard hypodermic needle gauges.",
+    "needles": {
+        "16": {"od_um": 1651, "id_um": 1194, "wall_um": 229},
+        "17": {"od_um": 1473, "id_um": 1067, "wall_um": 203},
+        "18": {"od_um": 1270, "id_um":  838, "wall_um": 216},
+        "19": {"od_um": 1067, "id_um":  686, "wall_um": 191},
+        "20": {"od_um":  908, "id_um":  603, "wall_um": 152},
+        "21": {"od_um":  819, "id_um":  514, "wall_um": 152},
+        "22": {"od_um":  718, "id_um":  413, "wall_um": 152},
+        "23": {"od_um":  641, "id_um":  337, "wall_um": 152},
+        "25": {"od_um":  515, "id_um":  260, "wall_um": 127},
+        "26": {"od_um":  464, "id_um":  260, "wall_um": 102},
+        "27": {"od_um":  413, "id_um":  210, "wall_um": 102},
+        "28": {"od_um":  362, "id_um":  184, "wall_um":  89},
+        "30": {"od_um":  312, "id_um":  159, "wall_um":  76},
+        "32": {"od_um":  235, "id_um":  108, "wall_um":  64}
+    }
+}
