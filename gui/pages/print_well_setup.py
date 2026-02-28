@@ -26,6 +26,10 @@ Layout matches the coding plan Tab 3 wireframe:
 └────────────────────────────────────────────────────────┘
 
 Session G — Tasks P5.19, P5.23, P5.26, P5.27, P5.32, P5.33, P5.34, P5.35.
+
+v7.1 minor gap fix: MiniProjectionView now imported from
+gui.widgets.projection_canvas (unified L-shaped projection widget)
+instead of being defined inline.
 """
 
 from __future__ import annotations
@@ -40,16 +44,14 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox,
     QFileDialog, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QScrollArea, QSizePolicy,
-    QMenu, QSplitter, QGraphicsView, QGraphicsScene,
-    QGraphicsEllipseItem, QGraphicsLineItem,
+    QMenu, QSplitter,
 )
-from PySide6.QtCore import Qt, Signal, QPointF, QRectF, QTimer
-from PySide6.QtGui import (
-    QColor, QPen, QBrush, QPainter, QFont, QAction,
-)
+from PySide6.QtCore import Qt, Signal, QPointF, QTimer
+from PySide6.QtGui import QColor, QCursor
 
 from gui.styles import COLORS
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
+from gui.widgets.projection_canvas import MiniProjectionView
 
 from SupportClasses.PhysicalModels import (
     WellRole, ROLE_COLORS, InkSpec, RosetteInsert, WorkspaceConfig,
@@ -63,127 +65,6 @@ from SupportClasses.WellSetup import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Projection canvas constants
-PROJ_SCALE = 4.0   # mm → pixels
-PROJ_BG = "#181825"
-PROJ_WELL_COLOR = "#45475a"
-PROJ_NEEDLE_COLOR = "#f5c2e7"
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Mini Projection Views (ZY / XZ)
-# ═══════════════════════════════════════════════════════════════════
-
-class MiniProjectionView(QGraphicsView):
-    """
-    Compact side/bottom projection showing well bottoms and needle.
-
-    Modes:
-    - "ZY": tall view (right of plate) — X axis = Z, Y axis = Y
-    - "XZ": wide view (below plate) — X axis = X, Y axis = Z
-    """
-
-    def __init__(self, mode: str = "ZY", parent: QWidget | None = None):
-        super().__init__(parent)
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-        self._mode = mode
-        self._plate: WellPlate | None = None
-        self._z_offsets: dict[str, float] = {}
-        self._needle_pos: tuple[float, float, float] | None = None
-
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setStyleSheet(f"background-color: {PROJ_BG}; border: 1px solid #45475a;")
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        if mode == "ZY":
-            self.setFixedWidth(160)
-            self.setMinimumHeight(150)
-        else:  # XZ
-            self.setFixedHeight(120)
-            self.setMinimumWidth(200)
-
-    def set_plate_data(
-        self,
-        plate: WellPlate,
-        z_offsets: dict[str, float] | None = None,
-    ) -> None:
-        """Update plate geometry for projection."""
-        self._plate = plate
-        self._z_offsets = z_offsets or {}
-        self._redraw()
-
-    def set_needle_position(
-        self,
-        x_mm: float | None,
-        y_mm: float | None,
-        z_mm: float | None,
-    ) -> None:
-        """Update needle position for overlay."""
-        if x_mm is not None and y_mm is not None and z_mm is not None:
-            self._needle_pos = (x_mm, y_mm, z_mm)
-        else:
-            self._needle_pos = None
-        self._redraw()
-
-    def _redraw(self) -> None:
-        self._scene.clear()
-        if self._plate is None:
-            return
-
-        wells = self._plate.get_all_wells()
-        pen = QPen(QColor(PROJ_WELL_COLOR), 1)
-
-        z_range = 2.0  # Default Z display range (mm)
-
-        if self._mode == "ZY":
-            # Y axis vertical, Z axis horizontal
-            for w in wells:
-                z = self._z_offsets.get(w.name, 0.0)
-                sx = z * PROJ_SCALE * 10  # Amplify Z for visibility
-                sy = w.y * PROJ_SCALE
-                well_w = 4
-                well_h = self._plate.well_diameter * PROJ_SCALE * 0.3
-                self._scene.addRect(
-                    QRectF(sx - well_w / 2, sy - well_h / 2, well_w, well_h),
-                    pen, QBrush(QColor(PROJ_WELL_COLOR)),
-                )
-
-            # Needle
-            if self._needle_pos:
-                nx = self._needle_pos[2] * PROJ_SCALE * 10
-                ny = self._needle_pos[1] * PROJ_SCALE
-                n_pen = QPen(QColor(PROJ_NEEDLE_COLOR), 2)
-                self._scene.addLine(nx, ny - 6, nx, ny + 6, n_pen)
-                self._scene.addLine(nx - 4, ny, nx + 4, ny, n_pen)
-
-        else:  # XZ
-            # X axis horizontal, Z axis vertical
-            for w in wells:
-                z = self._z_offsets.get(w.name, 0.0)
-                sx = w.x * PROJ_SCALE
-                sy = z * PROJ_SCALE * 10
-                well_w = self._plate.well_diameter * PROJ_SCALE * 0.3
-                well_h = 4
-                self._scene.addRect(
-                    QRectF(sx - well_w / 2, sy - well_h / 2, well_w, well_h),
-                    pen, QBrush(QColor(PROJ_WELL_COLOR)),
-                )
-
-            # Needle
-            if self._needle_pos:
-                nx = self._needle_pos[0] * PROJ_SCALE
-                ny = self._needle_pos[2] * PROJ_SCALE * 10
-                n_pen = QPen(QColor(PROJ_NEEDLE_COLOR), 2)
-                self._scene.addLine(nx, ny - 6, nx, ny + 6, n_pen)
-                self._scene.addLine(nx - 4, ny, nx + 4, ny, n_pen)
-
-        # Fit view
-        rect = self._scene.itemsBoundingRect().adjusted(-10, -10, 10, 10)
-        if not rect.isEmpty():
-            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -272,13 +153,14 @@ class WellSetupTab(QWidget):
         self.legend = WellRoleLegend()
         info_row.addWidget(self.legend)
         self.selection_label = QLabel("[0 wells selected]")
-        self.selection_label.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 11px;")
+        self.selection_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 11px;")
         info_row.addWidget(self.selection_label)
         plate_layout.addLayout(info_row)
 
         top_splitter.addWidget(plate_container)
 
-        # ZY side projection
+        # ZY side projection (uses unified projection_canvas widget)
         self.zy_view = MiniProjectionView("ZY")
         top_splitter.addWidget(self.zy_view)
         top_splitter.setStretchFactor(0, 5)
@@ -419,7 +301,8 @@ class WellSetupTab(QWidget):
         layout = QVBoxLayout(self.rosette_group)
         self.subwell_table = QTableWidget()
         self.subwell_table.setColumnCount(3)
-        self.subwell_table.setHorizontalHeaderLabels(["Sub-well", "Role", "Ink"])
+        self.subwell_table.setHorizontalHeaderLabels(
+            ["Sub-well", "Role", "Ink"])
         self.subwell_table.horizontalHeader().setStretchLastSection(True)
         self.subwell_table.verticalHeader().setVisible(False)
         self.subwell_table.setMaximumHeight(200)
@@ -439,7 +322,8 @@ class WellSetupTab(QWidget):
 
         self.plane_info_label = QLabel(
             "Jog needle to glass surface in 3+ wells → Calculate plane")
-        self.plane_info_label.setStyleSheet(f"color: {COLORS['subtext0']};")
+        self.plane_info_label.setStyleSheet(
+            f"color: {COLORS['subtext0']};")
         self.plane_info_label.setWordWrap(True)
         layout.addWidget(self.plane_info_label)
 
@@ -487,11 +371,13 @@ class WellSetupTab(QWidget):
         seq = ServiceSequence()
         for name in seq.PRESETS:
             self.service_preset_combo.addItem(name)
-        self.service_preset_combo.currentTextChanged.connect(self._apply_service_preset)
+        self.service_preset_combo.currentTextChanged.connect(
+            self._apply_service_preset)
         layout.addWidget(self.service_preset_combo)
 
         self.service_steps_label = QLabel("waste → wash → buffer → ink")
-        self.service_steps_label.setStyleSheet(f"color: {COLORS['subtext0']};")
+        self.service_steps_label.setStyleSheet(
+            f"color: {COLORS['subtext0']};")
         layout.addWidget(self.service_steps_label)
         layout.addStretch()
 
@@ -547,7 +433,8 @@ class WellSetupTab(QWidget):
         # Auto-assign dropdown button
         btn_auto = QPushButton("Auto-assign Pattern...")
         menu = QMenu(self)
-        menu.addAction("Block → Print", lambda: self._auto_assign("block_print"))
+        menu.addAction("Block → Print",
+                       lambda: self._auto_assign("block_print"))
         menu.addAction("Checkerboard (Print/Empty)",
                        lambda: self._auto_assign("checker"))
         menu.addAction("Border = Service, Inner = Print",
@@ -568,9 +455,12 @@ class WellSetupTab(QWidget):
     # ── Signal Connections ────────────────────────────────────────
 
     def _connect_signals(self) -> None:
-        self.plate_view.selection_changed.connect(self._on_selection_changed)
-        self.plate_view.well_double_clicked.connect(self._on_well_double_clicked)
-        self.plate_view.context_menu_requested.connect(self._on_context_menu)
+        self.plate_view.selection_changed.connect(
+            self._on_selection_changed)
+        self.plate_view.well_double_clicked.connect(
+            self._on_well_double_clicked)
+        self.plate_view.context_menu_requested.connect(
+            self._on_context_menu)
 
     # ── Refresh Helpers ───────────────────────────────────────────
 
@@ -603,11 +493,16 @@ class WellSetupTab(QWidget):
         data = self._model.get_assignment_summary()
         self.summary_table.setRowCount(len(data))
         for i, row in enumerate(data):
-            self.summary_table.setItem(i, 0, QTableWidgetItem(row["well"]))
-            self.summary_table.setItem(i, 1, QTableWidgetItem(row["role"]))
-            self.summary_table.setItem(i, 2, QTableWidgetItem(row["insert"]))
-            self.summary_table.setItem(i, 3, QTableWidgetItem(row["prints"]))
-            self.summary_table.setItem(i, 4, QTableWidgetItem(row["z_offset"]))
+            self.summary_table.setItem(
+                i, 0, QTableWidgetItem(row["well"]))
+            self.summary_table.setItem(
+                i, 1, QTableWidgetItem(row["role"]))
+            self.summary_table.setItem(
+                i, 2, QTableWidgetItem(row["insert"]))
+            self.summary_table.setItem(
+                i, 3, QTableWidgetItem(row["prints"]))
+            self.summary_table.setItem(
+                i, 4, QTableWidgetItem(row["z_offset"]))
 
             # Color the role cell
             color = QColor(row["color"])
@@ -647,16 +542,21 @@ class WellSetupTab(QWidget):
             pts = []
             for p in detector.points:
                 pts.append(f"[{p.well_name}: z={p.z_mm:+.3f}]")
-            self.teach_points_label.setText(f"Teach points: {' '.join(pts)}")
+            self.teach_points_label.setText(
+                f"Teach points: {' '.join(pts)}")
 
         result = detector.result
         if result:
-            self.plane_result_label.setText(f"Plane: {result.describe()}")
-            self.plane_result_label.setStyleSheet(f"color: {COLORS['green']};")
+            self.plane_result_label.setText(
+                f"Plane: {result.describe()}")
+            self.plane_result_label.setStyleSheet(
+                f"color: {COLORS['green']};")
         else:
             self.plane_result_label.setText("")
 
-    def _refresh_rosette_editor(self, well_name: str | None = None) -> None:
+    def _refresh_rosette_editor(
+        self, well_name: str | None = None,
+    ) -> None:
         """Show/hide and populate rosette sub-well editor."""
         if well_name is None:
             self.rosette_group.setVisible(False)
@@ -678,7 +578,8 @@ class WellSetupTab(QWidget):
 
         for i in range(n):
             # Sub-well label
-            label = wa.subwell_labels[i] if i < len(wa.subwell_labels) else f"SW{i}"
+            label = (wa.subwell_labels[i]
+                     if i < len(wa.subwell_labels) else f"SW{i}")
             self.subwell_table.setItem(i, 0, QTableWidgetItem(label))
 
             # Role combo
@@ -711,7 +612,8 @@ class WellSetupTab(QWidget):
     def _on_selection_changed(self, well_names: list[str]) -> None:
         """Handle plate view selection change."""
         n = len(well_names)
-        self.selection_label.setText(f"[{n} well{'s' if n != 1 else ''} selected]")
+        self.selection_label.setText(
+            f"[{n} well{'s' if n != 1 else ''} selected]")
 
         # Show rosette editor for single selection
         if n == 1:
@@ -723,7 +625,9 @@ class WellSetupTab(QWidget):
         """Double-click: could open detail editor (future)."""
         logger.info(f"Double-clicked well {well_name}")
 
-    def _on_context_menu(self, well_names: list[str], pos: QPointF) -> None:
+    def _on_context_menu(
+        self, well_names: list[str], pos: QPointF,
+    ) -> None:
         """Right-click context menu on selected wells."""
         menu = QMenu(self)
 
@@ -813,7 +717,8 @@ class WellSetupTab(QWidget):
         if not selected:
             return
         rosette_name = self.rosette_combo.currentData()
-        self._model.attach_rosette(selected, rosette_name, self._workspace)
+        self._model.attach_rosette(
+            selected, rosette_name, self._workspace)
         self._refresh_well_colors()
         self._refresh_summary()
         if len(selected) == 1:
@@ -833,7 +738,7 @@ class WellSetupTab(QWidget):
         self.setup_changed.emit()
 
     def _select_same_role(self) -> None:
-        """Select all wells with the same role as first selected well."""
+        """Select all wells with same role as first selected well."""
         selected = self.plate_view.get_selected_wells()
         if not selected:
             return
@@ -849,14 +754,18 @@ class WellSetupTab(QWidget):
         same = self._model.get_wells_by_role(wa.role)
         self.plate_view.set_selection(same)
 
-    def _context_set_role(self, well_names: list[str], role: WellRole) -> None:
+    def _context_set_role(
+        self, well_names: list[str], role: WellRole,
+    ) -> None:
         """Context menu: set role."""
         self._model.set_role(well_names, role)
         self._refresh_well_colors()
         self._refresh_summary()
         self.setup_changed.emit()
 
-    def _context_assign_print(self, well_names: list[str], name: str) -> None:
+    def _context_assign_print(
+        self, well_names: list[str], name: str,
+    ) -> None:
         """Context menu: assign print."""
         self._model.assign_print(well_names, name)
         self._refresh_well_colors()
@@ -895,7 +804,8 @@ class WellSetupTab(QWidget):
         """Record current Z position at selected well."""
         selected = self.plate_view.get_selected_wells()
         if len(selected) != 1:
-            self.plane_info_label.setText("Select exactly 1 well to teach")
+            self.plane_info_label.setText(
+                "Select exactly 1 well to teach")
             return
 
         well_name = selected[0]
@@ -926,7 +836,8 @@ class WellSetupTab(QWidget):
                 f"Plane fitted with R²={result.r_squared:.4f}")
             self._refresh_projections()
         else:
-            self.plane_info_label.setText("Need ≥3 teach points to fit plane")
+            self.plane_info_label.setText(
+                "Need ≥3 teach points to fit plane")
         self._refresh_teach_display()
         self._refresh_summary()
 
@@ -942,9 +853,11 @@ class WellSetupTab(QWidget):
 
     def _apply_service_preset(self, preset_name: str) -> None:
         """Apply a service sequence preset."""
-        self._model.service_sequence = ServiceSequence.from_preset(preset_name)
+        self._model.service_sequence = ServiceSequence.from_preset(
+            preset_name)
         steps = self._model.service_sequence.steps
-        self.service_steps_label.setText(" → ".join(steps) if steps else "(none)")
+        self.service_steps_label.setText(
+            " → ".join(steps) if steps else "(none)")
         self.setup_changed.emit()
 
     # ── Auto-assign Patterns ──────────────────────────────────────
@@ -955,7 +868,9 @@ class WellSetupTab(QWidget):
 
         if pattern == "block_print":
             # All wells = PRINT
-            result = {w.name: WellRole.PRINT for w in plate.get_all_wells()}
+            result = {
+                w.name: WellRole.PRINT for w in plate.get_all_wells()
+            }
         elif pattern == "checker":
             result = auto_assign_checkerboard(
                 plate, WellRole.PRINT, WellRole.EMPTY)
@@ -987,12 +902,16 @@ class WellSetupTab(QWidget):
         """Run validation and display results."""
         issues = self._model.validate(self._workspace)
         if not issues:
-            self.plane_info_label.setText("✅ Setup is valid and ready to print")
-            self.plane_info_label.setStyleSheet(f"color: {COLORS['green']};")
+            self.plane_info_label.setText(
+                "✅ Setup is valid and ready to print")
+            self.plane_info_label.setStyleSheet(
+                f"color: {COLORS['green']};")
         else:
-            text = "⚠ Issues found:\n" + "\n".join(f"  • {i}" for i in issues)
+            text = "⚠ Issues found:\n" + "\n".join(
+                f"  • {i}" for i in issues)
             self.plane_info_label.setText(text)
-            self.plane_info_label.setStyleSheet(f"color: {COLORS['yellow']};")
+            self.plane_info_label.setStyleSheet(
+                f"color: {COLORS['yellow']};")
 
     # ── Save/Load ─────────────────────────────────────────────────
 
