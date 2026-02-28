@@ -454,9 +454,18 @@ class StageController:
     safety limits, and position logger.
     """
 
-    def __init__(self, simulate_xy: bool = True, simulate_zp: bool = True):
+    def __init__(
+        self,
+        simulate_xy: bool = True,
+        simulate_zp: bool = True,
+        controller_json: str | None = None,
+    ):
         self.simulate_xy = simulate_xy
         self.simulate_zp = simulate_zp
+
+        # v7.1 P8.27: Controller JSON path (passed through to XYStageManager)
+        # "auto" = auto-detect, None = default ProScan III, or explicit path
+        self.controller_json = controller_json
 
         # Core command processor
         self.processor = Processor()
@@ -510,7 +519,10 @@ class StageController:
             zp: If True, connect the ZP stage (default True).
         """
         if xy and self.xy_stage is None:
-            self.xy_stage = XYStageManager(simulate=self.simulate_xy)
+            self.xy_stage = XYStageManager(
+                simulate=self.simulate_xy,
+                controller_json=self.controller_json,
+            )
             self.xy_jog = XYJogHandler(
                 self.processor, self.xy_stage,
                 safety_limits=self.safety_limits,
@@ -751,6 +763,110 @@ class StageController:
         mapped = AXIS_MAP.get(pump)
         if mapped:
             self.zp_stage.move_relative({mapped: distance}, feedrate)
+
+    # ── v7.1: Velocity & Timestamped Position API ──────────────────
+
+    def send_velocity_xy(self, vx: float, vy: float) -> None:
+        """
+        P8.24: Send continuous velocity command to XY stage.
+
+        Used by the MotionController for trajectory tracking. Velocity
+        units match the stage's native format (typically µsteps/s for Prior).
+
+        Args:
+            vx: X velocity
+            vy: Y velocity
+        """
+        if not self.xy_stage:
+            return
+        self.xy_stage.move_stage_at_velocity(vx, vy)
+
+    def get_position_with_timestamp(self) -> dict:
+        """
+        P8.25: Get position with monotonic timestamp for Kalman filter.
+
+        Returns a dict with timestamped XY and ZP positions. Uses
+        direct (non-cached) reads for accuracy.
+
+        Returns:
+            {
+                "t": float (time.monotonic()),
+                "xy": (x, y, z) or (None, None, None),
+                "zp": (z, p1, p2, p3) or (None, None, None, None),
+            }
+        """
+        t_before = time.monotonic()
+        xy = self.get_xy_position(cached=False)
+        zp = self.get_zp_position(cached=False)
+        t_after = time.monotonic()
+
+        return {
+            "t": (t_before + t_after) / 2.0,  # Midpoint estimate
+            "latency_s": t_after - t_before,
+            "xy": xy,
+            "zp": zp,
+        }
+
+    def test_command_rate(self, num_tests: int = 20) -> dict:
+        """
+        P8.26: Test the XY stage command/response rate.
+
+        Sends a series of position queries to measure communication latency.
+        Safe to call at any time — only reads position, no movement.
+
+        ⚠ SAFETY: This method does NOT move the stage. It only queries position.
+
+        Args:
+            num_tests: Number of position queries to time (default 20)
+
+        Returns:
+            {
+                "avg_round_trip_ms": float,
+                "min_round_trip_ms": float,
+                "max_round_trip_ms": float,
+                "max_command_hz": float,
+                "num_tests": int,
+                "controller": str,
+            }
+        """
+        if not self.xy_stage:
+            return {
+                "error": "XY stage not connected",
+                "avg_round_trip_ms": 0,
+                "max_command_hz": 0,
+            }
+
+        latencies = []
+        for _ in range(num_tests):
+            t0 = time.monotonic()
+            self.xy_stage.get_current_position()
+            t1 = time.monotonic()
+            latencies.append((t1 - t0) * 1000)  # ms
+            time.sleep(0.01)  # Small gap to avoid flooding
+
+        avg_ms = sum(latencies) / len(latencies)
+        min_ms = min(latencies)
+        max_ms = max(latencies)
+
+        controller_name = "unknown"
+        if hasattr(self.xy_stage, '_protocol') and self.xy_stage._protocol:
+            controller_name = self.xy_stage._protocol.controller_name
+
+        result = {
+            "avg_round_trip_ms": round(avg_ms, 2),
+            "min_round_trip_ms": round(min_ms, 2),
+            "max_round_trip_ms": round(max_ms, 2),
+            "max_command_hz": round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0,
+            "num_tests": num_tests,
+            "controller": controller_name,
+        }
+
+        logger.info(
+            f"Command rate test: avg={avg_ms:.1f}ms, "
+            f"max_hz={result['max_command_hz']}, "
+            f"controller={controller_name}"
+        )
+        return result
 
     # ── Shutdown ──────────────────────────────────────────────────
 

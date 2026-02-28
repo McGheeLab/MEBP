@@ -4,10 +4,10 @@
     "y": 46,
     "width": 1281,
     "height": 777,
-    "active_tab": 3,
+    "active_tab": 5,
     "splitter_sizes": [
-      606,
-      100
+      706,
+      0
     ]
   },
   "simulation": {
@@ -21,10 +21,10 @@
   },
   "zero_position": {
     "x": 0.0,
-    "y": -7.87,
+    "y": 0.0,
     "f": 0.0,
-    "Z": -0.7474,
-    "P1": 0.1,
+    "Z": 0.0,
+    "P1": 0.0,
     "P2": 0.0,
     "P3": 0.0
   },
@@ -63,6 +63,9 @@
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
+    "max_flow_rate_p1_uL_s": 0.0,
+    "max_flow_rate_p2_uL_s": 0.0,
+    "max_flow_rate_p3_uL_s": 0.0,
     "enabled": true
   },
   "polling": {
@@ -79,6 +82,57 @@
     "rotation": 0.0,
     "scale": 1.0,
     "alignment_valid": false
+  },
+  "controller": {
+    "controller_json": null,
+    "auto_detect_result": null,
+    "controllers_dir": "config/controllers"
+  },
+  "workspace": {
+    "needle_gauge": null,
+    "plate_format": 24,
+    "pump_loadouts": {
+      "P1": {
+        "syringe_volume_uL": null,
+        "ink_name": null,
+        "printing_mode": "incremental"
+      },
+      "P2": {
+        "syringe_volume_uL": null,
+        "ink_name": null,
+        "printing_mode": "incremental"
+      },
+      "P3": {
+        "syringe_volume_uL": null,
+        "ink_name": null,
+        "printing_mode": "incremental"
+      }
+    },
+    "buffer_ink_name": null
+  },
+  "ink_library": {
+    "inks": {}
+  },
+  "rosette_library": {
+    "rosettes": {}
+  },
+  "well_setup": {
+    "last_saved_file": null,
+    "auto_save": true
+  },
+  "motion_controller": {
+    "controller_type": "pid",
+    "pid_kp": 1.0,
+    "pid_ki": 0.0,
+    "pid_kd": 0.1,
+    "kalman_process_noise": 0.01,
+    "kalman_measurement_noise": 0.1,
+    "rate_test_results": null
+  },
+  "fluid_columns": {
+    "P1": null,
+    "P2": null,
+    "P3": null
   },
   "ui": {
     "scale": 2.0

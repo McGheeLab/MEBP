@@ -19,12 +19,19 @@ Workflow tabs (left menu icons):
     🕹️  Jog Control     — manual movement, dpad, speed control
     📐  Calibration     — needle zero, plate teach, validate
     🖨️  Print Setup     — job loading, preview, execution, queue
+    📈  Print Monitor   — live trajectory, plate progress, recordings (v7.1)
     ⚙️  Settings        — connections, safety, polling, logging
 
 Each page provides:
     - get_context_widget() → QWidget for the extra-left panel
     - get_page_title() → str for the top bar
     - get_page_subtitle() → str
+
+v7.1 Session I additions:
+    - Print Monitor page (6th nav button) — P8.34
+    - WorkspaceConfig shared state passing — P8.35
+    - PrintRecorder wiring (auto-start/stop) — P7.4, P7.5
+    - Recording browser + replay overlay — P7.6, P7.7
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.Settings import Settings
 from SupportClasses.PrintHistory import PrintHistory
 from SupportClasses.PrintManager import load_print_progress, clear_print_progress
+from SupportClasses.PrintRecorder import PrintRecorder
 from gui.styles import DARK_THEME, COLORS
 from gui.ui_functions import UIFunctions, AppSettings
 from gui.pages.dashboard import DashboardPage
@@ -52,6 +60,7 @@ from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
 from gui.pages.print_setup import PrintSetupPage
 from gui.pages.settings_page import SettingsPage
+from gui.pages.print_monitor import PrintMonitorPage
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
 
@@ -87,6 +96,7 @@ class MainWindow(QMainWindow):
     PAGE_CALIBRATION = 2
     PAGE_PRINT = 3
     PAGE_SETTINGS = 4
+    PAGE_MONITOR = 5  # v7.1 P8.34: Print Monitor
 
     def __init__(self, controller: StageController, settings: Settings = None, parent=None):
         super().__init__(parent)
@@ -101,6 +111,9 @@ class MainWindow(QMainWindow):
         # Print history
         self.print_history = PrintHistory()
         self.print_history.load()
+
+        # v7.1 P7.4: PrintRecorder for recording print data
+        self.print_recorder = PrintRecorder()
 
         # Disconnect bridge
         self._disconnect_bridge = _DisconnectBridge()
@@ -201,6 +214,7 @@ class MainWindow(QMainWindow):
             ("btn_jog",       "🕹️", "Jog Control"),
             ("btn_calibrate", "📐", "Calibration"),
             ("btn_print",     "🖨️", "Print Setup"),
+            ("btn_monitor",   "📈", "Print Monitor"),  # v7.1 P8.34
         ]
         for obj_name, icon_text, tooltip in menu_items:
             btn = self._make_menu_button(obj_name, icon_text, tooltip)
@@ -420,12 +434,33 @@ class MainWindow(QMainWindow):
         self.print_setup_page = PrintSetupPage(self.controller)
         self.settings_page = SettingsPage(self.controller, self.settings)
 
+        # v7.1 P8.34, P8.36: Print Monitor page
+        self.print_monitor_page = PrintMonitorPage(
+            controller=self.controller,
+            settings=self.settings,
+        )
+
+        # v7.1 P7.4: Wire PrintRecorder to monitor page
+        self.print_monitor_page.set_recorder(self.print_recorder)
+
+        # v7.1 P7.4, P7.5: Wire PrintRecorder to PrintManager (via print_setup_page)
+        if hasattr(self.print_setup_page, 'print_manager'):
+            pm = self.print_setup_page.print_manager
+            if pm:
+                pm.recorder = self.print_recorder
+
+        # v7.1 P8.34: Wire monitor signals to print_setup_page's PrintManager
+        self.print_monitor_page.pause_requested.connect(self._monitor_pause)
+        self.print_monitor_page.resume_requested.connect(self._monitor_resume)
+        self.print_monitor_page.abort_requested.connect(self._monitor_abort)
+
         pages = [
             self.dashboard_page,
             self.jog_page,
             self.calibration_page,
             self.print_setup_page,
             self.settings_page,
+            self.print_monitor_page,  # v7.1 P8.34: 6th page
         ]
 
         for page in pages:
@@ -482,6 +517,7 @@ class MainWindow(QMainWindow):
             "btn_calibrate": self.PAGE_CALIBRATION,
             "btn_print": self.PAGE_PRINT,
             "btn_settings": self.PAGE_SETTINGS,
+            "btn_monitor": self.PAGE_MONITOR,  # v7.1
         }
 
         idx = page_map.get(name)
@@ -504,16 +540,16 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            titles = ["Dashboard", "Jog Control", "Calibration", "Print Setup", "Settings"]
+            titles = ["Dashboard", "Jog Control", "Calibration", "Print Setup", "Settings", "Print Monitor"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
         # Update context panel title
-        context_titles = ["Dashboard", "Jog Settings", "Calibration", "Print Settings", "Settings"]
+        context_titles = ["Dashboard", "Jog Settings", "Calibration", "Print Settings", "Settings", "Recordings"]
         self._context_title.setText(context_titles[index] if index < len(context_titles) else "Settings")
 
         # Update menu button styling
-        btn_names = ["btn_dashboard", "btn_jog", "btn_calibrate", "btn_print", "btn_settings"]
+        btn_names = ["btn_dashboard", "btn_jog", "btn_calibrate", "btn_print", "btn_monitor", "btn_settings"]
         for i, btn in enumerate(self._menu_buttons):
             if i == index:
                 btn.setStyleSheet(UIFunctions.selectMenu(btn.styleSheet()))
@@ -680,6 +716,45 @@ class MainWindow(QMainWindow):
         mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
         editor = XboxMappingEditor(mapping_file, parent=self)
         editor.exec()
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.1: PRINT MONITOR WIRING (P8.34, P8.35, P7.4, P7.5)
+    # ════════════════════════════════════════════════════════════════
+
+    def _monitor_pause(self):
+        """Handle pause request from Print Monitor."""
+        if hasattr(self.print_setup_page, 'print_manager'):
+            pm = self.print_setup_page.print_manager
+            if pm and pm.state.name == "RUNNING":
+                pm.pause()
+                self.console.log("Print paused (from monitor)", "info")
+
+    def _monitor_resume(self):
+        """Handle resume request from Print Monitor."""
+        if hasattr(self.print_setup_page, 'print_manager'):
+            pm = self.print_setup_page.print_manager
+            if pm and pm.state.name == "PAUSED":
+                pm.resume()
+                self.console.log("Print resumed (from monitor)", "info")
+
+    def _monitor_abort(self):
+        """Handle abort request from Print Monitor."""
+        if hasattr(self.print_setup_page, 'print_manager'):
+            pm = self.print_setup_page.print_manager
+            if pm and pm.state.name in ("RUNNING", "PAUSED"):
+                pm.abort()
+                self.console.log("Print aborted (from monitor)", "warning")
+
+    def pass_workspace_to_monitor(self, workspace) -> None:
+        """
+        P8.35: Pass WorkspaceConfig to Print Monitor page.
+
+        Called from PrintSetupPage when workspace is configured and
+        print is about to start.
+        """
+        if hasattr(self, 'print_monitor_page'):
+            self.print_monitor_page.set_workspace(workspace)
+            logger.debug("WorkspaceConfig passed to Print Monitor")
 
     # ════════════════════════════════════════════════════════════════
     #  HARDWARE DISCONNECT HANDLER

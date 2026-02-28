@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-02-28T03:11:41.869809+00:00",
+  "timestamp_str": "20260228_031141",
+  "job_name": "Well Plate 6-well",
+  "status": "aborted",
+  "workspace": {},
+  "well_setup": {},
+  "duration_s": 15.625,
+  "num_samples": 0,
+  "end_time": "2026-02-28T03:11:57.495534+00:00",
+  "summary": {
+    "empty": true
+  }
+}

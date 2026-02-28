@@ -5,6 +5,15 @@ Supports dot-path access (e.g. ``settings.get("window.width")``),
 deep-merge on load (new defaults are preserved), and section-level
 get/set for bulk operations.
 
+v7.1 additions (P8.30–P8.33):
+- controller: JSON protocol path + auto-detect result
+- workspace: needle, pump, plate config persistence
+- ink_library: user-defined inks
+- rosette_library: user-defined rosette inserts
+- well_setup: well assignment persistence
+- motion_controller: PID/Kalman tuning + rate test results
+- fluid_columns: per-pump fluid column state persistence
+
 Usage::
 
     settings = Settings()
@@ -96,6 +105,55 @@ DEFAULTS: dict[str, Any] = {
         "rotation": 0.0,
         "scale": 1.0,
         "alignment_valid": False,
+    },
+    # ── v7.1 additions (P8.30–P8.33) ─────────────────────────────
+    "controller": {
+        # P8.33: Controller protocol JSON path
+        # "auto" = auto-detect, null = default ProScan III, or explicit path
+        "controller_json": None,
+        "auto_detect_result": None,         # Name of last auto-detected controller
+        "controllers_dir": "config/controllers",
+    },
+    "workspace": {
+        # P8.30: Workspace configuration persistence
+        "needle_gauge": None,               # Last selected needle gauge (int)
+        "plate_format": 24,                 # Last selected plate format
+        "pump_loadouts": {                  # Per-pump syringe and ink assignments
+            "P1": {"syringe_volume_uL": None, "ink_name": None, "printing_mode": "incremental"},
+            "P2": {"syringe_volume_uL": None, "ink_name": None, "printing_mode": "incremental"},
+            "P3": {"syringe_volume_uL": None, "ink_name": None, "printing_mode": "incremental"},
+        },
+        "buffer_ink_name": None,
+    },
+    "ink_library": {
+        # P8.30: User-defined inks (name → InkSpec dict)
+        "inks": {},
+    },
+    "rosette_library": {
+        # P8.30: User-defined rosette inserts (name → RosetteInsert dict)
+        "rosettes": {},
+    },
+    "well_setup": {
+        # P8.30: Well setup persistence
+        "last_saved_file": None,            # Path to last saved well setup JSON
+        "auto_save": True,                  # Auto-save well setup on changes
+    },
+    "motion_controller": {
+        # P8.30/P8.31: Motion controller tuning and rate test results
+        "controller_type": "pid",           # "pid" or "kalman"
+        "pid_kp": 1.0,
+        "pid_ki": 0.0,
+        "pid_kd": 0.1,
+        "kalman_process_noise": 0.01,
+        "kalman_measurement_noise": 0.1,
+        "rate_test_results": None,          # P8.31: Last test_command_rate() results
+    },
+    "fluid_columns": {
+        # P8.32: Fluid column state persistence (save/restore between sessions)
+        # Per-pump fluid column state (oil_uL, buffer_uL, ink_uL, ink_name)
+        "P1": None,
+        "P2": None,
+        "P3": None,
     },
 }
 

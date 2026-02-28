@@ -1,20 +1,20 @@
 """
-XY Stage Manager — Interface to Prior ProScan III XY stage.
+XY Stage Manager — JSON-protocol-driven interface to Prior ProScan controllers.
 
-Handles serial discovery, command formatting, and position parsing.
+v7.1 refactor: Commands are no longer hardcoded. Instead, a ControllerProtocol
+JSON file defines the command syntax, terminators, and detection sequence.
+Adding support for a new XY controller = adding a new JSON file.
+
+Supports:
+- Prior ProScan III (config/controllers/proscan_iii.json)
+- Prior ProScan II  (config/controllers/proscan_ii.json)
+- Auto-detection across all JSON files in the controllers directory
+- Graceful fallback when a command is unsupported by the loaded protocol
+
 When ``simulate=True``, delegates to :class:`XYStageSimulator` instead
-of real serial hardware.
+of real serial hardware (unchanged from v7.0).
 
-Common ProScan III commands:
-    V           Query firmware version
-    Z           Set current position as home (0,0,0)
-    P           Query current position → "x,y,z"
-    G x,y       Absolute move to (x, y)
-    GR dx,dy    Relative move by (dx, dy)
-    VS,vx,vy    Set velocity
-    SMS,speed   Set max speed
-    SAS,accel   Set acceleration
-    SCS,jerk    Set jerk
+Session I — Tasks P8.17, P8.18, P8.19, P8.20, P8.21.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import json
 import logging
 import platform
 import socket
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -38,40 +37,58 @@ except ImportError:
     logger.warning("pyserial not installed — hardware mode unavailable")
 
 from SupportClasses.XYStageSimulator import XYStageSimulator
+from SupportClasses.ControllerProtocol import (
+    ControllerProtocol,
+    discover_controller_files,
+    DEFAULT_CONTROLLERS_DIR,
+)
 
 
 class XYStageManager:
     """
-    Manager for the Prior ProScan III XY stage (or simulator).
+    Manager for Prior ProScan XY stages (or simulator).
+
+    v7.1: Uses ControllerProtocol JSON files for command formatting.
 
     Parameters:
-        simulate:  If True, use the software simulator.
-        settings:  Optional dict of stage parameters to override defaults.
+        simulate:        If True, use the software simulator.
+        settings:        Optional dict of stage parameters to override defaults.
+        controller_json: Path to controller JSON file, "auto" for auto-detect,
+                         or None to use the default ProScan III config.
     """
 
-    # Default stage parameters
+    # Default stage parameters (used when protocol doesn't specify)
     DEFAULT_MAX_SPEED = 100
     DEFAULT_ACCELERATION = 50
     DEFAULT_VELOCITY = 50
-    DEFAULT_BAUD_RATES = [38400]
-    POSITION_RANGE_X = (-100000, 100000)
-    POSITION_RANGE_Y = (-100000, 100000)
 
-    def __init__(self, simulate: bool = False, settings: Optional[dict] = None):
+    def __init__(
+        self,
+        simulate: bool = False,
+        settings: Optional[dict] = None,
+        controller_json: Optional[str] = None,
+    ):
         self.simulate = simulate
+        self._protocol: Optional[ControllerProtocol] = None
+        self._detected_controller: Optional[str] = None
 
-        # Stage parameters (may be overridden by settings file)
+        # Stage parameters (may be overridden by protocol or settings)
         self.max_speed: int = self.DEFAULT_MAX_SPEED
         self.min_jerk: int = 1
         self.max_jerk: int = 100
         self.min_acceleration: int = 1
         self.max_acceleration: int = 100
-        self.x_range = list(self.POSITION_RANGE_X)
-        self.y_range = list(self.POSITION_RANGE_Y)
+        self.x_range: list[int] = [-100_000, 100_000]
+        self.y_range: list[int] = [-100_000, 100_000]
         self.default_acceleration: int = self.DEFAULT_ACCELERATION
         self.default_velocity: int = self.DEFAULT_VELOCITY
 
-        # Apply any provided settings
+        # P8.17: Load controller protocol JSON
+        if not simulate:
+            self._load_protocol(controller_json)
+            self._apply_protocol_parameters()
+
+        # Apply any user-provided settings (override protocol defaults)
         if settings:
             self._apply_settings(settings)
 
@@ -82,6 +99,76 @@ class XYStageManager:
             logger.info("XY stage simulator started")
         else:
             self.spo = self._initialise_serial()
+
+    # ── Protocol Loading (P8.17) ──────────────────────────────────
+
+    def _load_protocol(self, controller_json: Optional[str]) -> None:
+        """Load controller protocol from JSON file or auto-detect."""
+        if controller_json is None:
+            # Default: ProScan III
+            default_path = Path(DEFAULT_CONTROLLERS_DIR) / "proscan_iii.json"
+            if default_path.exists():
+                try:
+                    self._protocol = ControllerProtocol.load(default_path)
+                    logger.info(f"Loaded default protocol: {self._protocol.controller_name}")
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to load default protocol: {e}")
+            # Fallback: no protocol loaded (will use hardcoded commands)
+            logger.warning("No controller protocol loaded — using hardcoded defaults")
+
+        elif controller_json.lower() == "auto":
+            # Auto-detect will happen during serial initialisation
+            logger.info("Controller protocol set to auto-detect")
+
+        else:
+            # Explicit JSON path
+            path = Path(controller_json)
+            if path.exists():
+                try:
+                    self._protocol = ControllerProtocol.load(path)
+                    logger.info(f"Loaded protocol: {self._protocol.controller_name}")
+                except Exception as e:
+                    logger.error(f"Failed to load controller protocol {path}: {e}")
+            else:
+                logger.warning(f"Controller protocol file not found: {path}")
+
+    def _apply_protocol_parameters(self) -> None:
+        """Apply parameter ranges from the loaded protocol."""
+        if self._protocol is None:
+            return
+
+        speed_range = self._protocol.get_speed_range()
+        if speed_range:
+            self.max_speed = speed_range[1]
+
+        accel_range = self._protocol.get_acceleration_range()
+        if accel_range:
+            self.min_acceleration = accel_range[0]
+            self.max_acceleration = accel_range[1]
+
+        jerk_range = self._protocol.get_jerk_range()
+        if jerk_range:
+            self.min_jerk = jerk_range[0]
+            self.max_jerk = jerk_range[1]
+
+        pos_range_x = self._protocol.get_parameter("position_range_x")
+        if pos_range_x:
+            self.x_range = list(pos_range_x)
+
+        pos_range_y = self._protocol.get_parameter("position_range_y")
+        if pos_range_y:
+            self.y_range = list(pos_range_y)
+
+    @property
+    def protocol(self) -> Optional[ControllerProtocol]:
+        """The loaded controller protocol (or None if not loaded)."""
+        return self._protocol
+
+    @property
+    def detected_controller(self) -> Optional[str]:
+        """Name of the auto-detected controller (or None)."""
+        return self._detected_controller
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -107,69 +194,136 @@ class XYStageManager:
     # ── Serial Initialisation ─────────────────────────────────────
 
     def _initialise_serial(self) -> serial.Serial:
-        """Find and open the ProScan III controller."""
+        """Find and open the controller."""
+        controller_name = "XY controller"
+        if self._protocol:
+            controller_name = self._protocol.controller_name
+
         logger.info(
-            f"Searching for ProScan III controller "
+            f"Searching for {controller_name} "
             f"(platform={platform.system()}, host={socket.gethostname()})"
         )
-        spo = self._find_proscan_controller()
+        spo = self._find_controller()
         if spo is None:
             raise ConnectionError(
-                "ProScan III controller not found. "
+                f"{controller_name} not found. "
                 "Check USB connection and ensure no other program is using the port."
             )
         return spo
 
-    def _find_proscan_controller(self) -> Optional[serial.Serial]:
-        """Scan COM ports for a ProScan III controller."""
+    def _find_controller(self) -> Optional[serial.Serial]:
+        """
+        Scan COM ports for the controller.
+
+        If a protocol is loaded, uses its detection sequence.
+        If protocol is None (auto-detect mode), tries all JSON files.
+        """
         if serial is None:
             raise ImportError("pyserial is required for hardware mode")
 
+        if self._protocol is not None:
+            # Use the loaded protocol's detection sequence
+            return self._find_with_protocol(self._protocol)
+
+        # P8.21: Auto-detect — try each JSON file
+        return self._auto_detect_controller()
+
+    def _find_with_protocol(self, protocol: ControllerProtocol) -> Optional[serial.Serial]:
+        """Try to find a controller matching the given protocol."""
+        detection = protocol.get_detection_info()
+        wake_cmd = detection.get("wake_command")
+        wake_delay = detection.get("wake_delay_ms", 100) / 1000.0
+        fw_query = detection.get("firmware_query", "V")
+        tokens = detection.get("identify_tokens", [])
+        baud = protocol.baud_rate
+
         ports = serial.tools.list_ports.comports()
         for port_info in ports:
-            for baud in self.DEFAULT_BAUD_RATES:
-                try:
-                    logger.debug(f"Trying {port_info.device} @ {baud} baud")
-                    spo = serial.Serial(
-                        port_info.device,
-                        baudrate=baud,
-                        bytesize=8,
-                        timeout=1,
-                        stopbits=serial.STOPBITS_ONE,
-                    )
+            try:
+                logger.debug(f"Trying {port_info.device} @ {baud} baud ({protocol.controller_name})")
+                spo = serial.Serial(
+                    port_info.device,
+                    baudrate=baud,
+                    bytesize=protocol.byte_size,
+                    timeout=protocol.timeout,
+                    stopbits=serial.STOPBITS_ONE,
+                )
 
-                    # Wake up the controller
-                    spo.write(b"STAGE\r\n")
-                    time.sleep(0.1)
+                # P8.18: Use protocol terminators
+                tx_term = protocol.tx_terminator
+
+                # Wake command (if defined)
+                if wake_cmd:
+                    spo.write(wake_cmd.encode(protocol.encoding) + tx_term)
+                    time.sleep(wake_delay)
                     spo.readline()  # discard wake-up response
                     spo.reset_input_buffer()
                     spo.reset_output_buffer()
 
-                    # Check firmware version
-                    spo.write(b"V\r\n")
-                    time.sleep(0.1)
-                    response = spo.readline().decode("ascii", errors="replace").strip()
-                    logger.debug(f"Response from {port_info.device}: {response}")
+                # Firmware query
+                spo.write(fw_query.encode(protocol.encoding) + tx_term)
+                time.sleep(0.1)
+                response = spo.readline().decode(protocol.encoding, errors="replace").strip()
+                logger.debug(f"Response from {port_info.device}: {response}")
 
-                    if any(tok in response for tok in ("E", "R", "ProScan")):
-                        logger.info(
-                            f"ProScan III found on {port_info.device} @ {baud} baud"
-                        )
-                        return spo
+                # Check identification tokens
+                if tokens and any(tok in response for tok in tokens):
+                    logger.info(
+                        f"{protocol.controller_name} found on "
+                        f"{port_info.device} @ {baud} baud"
+                    )
+                    self._detected_controller = protocol.controller_name
+                    return spo
 
-                    spo.close()
-                except (serial.SerialException, UnicodeDecodeError, OSError) as e:
-                    logger.debug(f"Error on {port_info.device} @ {baud}: {e}")
-                    continue
+                spo.close()
+            except (serial.SerialException, UnicodeDecodeError, OSError) as e:
+                logger.debug(f"Error on {port_info.device} @ {baud}: {e}")
+                continue
 
-        logger.warning("No ProScan III controller found on any port")
+        logger.debug(f"{protocol.controller_name} not found on any port")
         return None
 
-    # ── Command Interface ─────────────────────────────────────────
+    # ── P8.21: Auto-Detection ────────────────────────────────────
+
+    def _auto_detect_controller(self) -> Optional[serial.Serial]:
+        """
+        Auto-detect controller by iterating all JSON protocol files.
+
+        Tries each protocol's detection sequence on every COM port.
+        Selects the first one that matches.
+        """
+        json_files = discover_controller_files()
+        if not json_files:
+            logger.warning("No controller JSON files found for auto-detect")
+            return None
+
+        logger.info(f"Auto-detecting controller from {len(json_files)} protocol files")
+
+        for json_path in json_files:
+            try:
+                protocol = ControllerProtocol.load(json_path)
+            except Exception as e:
+                logger.debug(f"Skipping {json_path}: {e}")
+                continue
+
+            spo = self._find_with_protocol(protocol)
+            if spo is not None:
+                self._protocol = protocol
+                self._apply_protocol_parameters()
+                logger.info(f"Auto-detected: {protocol.controller_name}")
+                return spo
+
+        logger.warning("Auto-detect failed — no controller matched any protocol")
+        return None
+
+    # ── Command Interface (P8.18, P8.19, P8.20) ──────────────────
 
     def send_command(self, command: str) -> Optional[str]:
         """
         Send a raw command string to the stage.
+
+        P8.18: In hardware mode, uses protocol.tx_terminator instead
+        of hardcoded \\r\\n.
 
         In simulation mode, returns the simulator's response directly.
         In hardware mode, writes to serial (response must be read separately).
@@ -182,14 +336,51 @@ class XYStageManager:
             return self.spo.send_command(command)
 
         try:
-            encoded = f"{command}\r\n".encode("ascii")
+            # P8.18: Use protocol terminator
+            if self._protocol:
+                encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
+            else:
+                # Fallback: default terminator
+                encoded = f"{command}\r\n".encode("ascii")
+
             self.spo.write(encoded)
             return None  # caller reads response via get_current_position etc.
         except (serial.SerialException, OSError) as e:
             logger.error(f"XY send_command error: {e}")
             return None
 
-    # ── Position Queries ──────────────────────────────────────────
+    def _send_protocol_command(
+        self, command_name: str, fallback_cmd: Optional[str] = None, **kwargs
+    ) -> Optional[str]:
+        """
+        Format and send a command using the protocol.
+
+        P8.19: All methods use this instead of hardcoded command strings.
+        P8.20: Returns None gracefully if the command is unsupported.
+
+        Args:
+            command_name: Abstract command name from the protocol
+            fallback_cmd: Hardcoded command to use if protocol is unavailable
+            **kwargs: Parameters for the command template
+
+        Returns:
+            Simulator response (sim mode) or None (hardware mode)
+        """
+        if self._protocol:
+            cmd = self._protocol.format_command(command_name, **kwargs)
+            if cmd is None:
+                # P8.20: Command not supported by this controller
+                logger.debug(f"Command '{command_name}' not supported by {self._protocol.controller_name}")
+                return None
+        elif fallback_cmd:
+            cmd = fallback_cmd
+        else:
+            logger.warning(f"No protocol loaded and no fallback for '{command_name}'")
+            return None
+
+        return self.send_command(cmd)
+
+    # ── Position Queries (P8.19) ──────────────────────────────────
 
     def get_current_position(self) -> tuple[float | None, float | None, float | None]:
         """
@@ -203,8 +394,11 @@ class XYStageManager:
             return self._parse_position_response(response)
 
         try:
-            self.send_command("P")
-            response = self.spo.readline().decode("ascii", errors="replace").strip()
+            self._send_protocol_command("position_query", fallback_cmd="P")
+            response = self.spo.readline().decode(
+                self._protocol.encoding if self._protocol else "ascii",
+                errors="replace"
+            ).strip()
             return self._parse_position_response(response)
         except Exception as e:
             logger.debug(f"XY position query error: {e}")
@@ -225,45 +419,77 @@ class XYStageManager:
             logger.debug(f"Failed to parse XY position: {e}")
             return (None, None, None)
 
-    # ── Movement Commands ─────────────────────────────────────────
+    # ── Movement Commands (P8.19) ─────────────────────────────────
 
     def move_stage_at_velocity(self, vx: float, vy: float) -> None:
         """Set XY velocity (continuous jog mode)."""
-        self.send_command(f"VS,{vx},{vy}")
+        self._send_protocol_command(
+            "set_velocity",
+            fallback_cmd=f"VS,{vx},{vy}",
+            vx=vx, vy=vy,
+        )
 
     def move_stage_to_position(self, x: float, y: float, fast: bool = False) -> None:
         """Move to absolute position (x, y) in stage coordinates."""
-        cmd = f"G {int(x)},{int(y)}"
-        self.send_command(cmd)
+        self._send_protocol_command(
+            "move_absolute",
+            fallback_cmd=f"G {int(x)},{int(y)}",
+            x=int(x), y=int(y),
+        )
         logger.debug(f"XY absolute move: ({x:.0f}, {y:.0f}) fast={fast}")
 
     def move_stage_relative(self, dx: float, dy: float) -> None:
         """Move by relative offset (dx, dy)."""
-        cmd = f"GR {int(dx)},{int(dy)}"
-        self.send_command(cmd)
+        self._send_protocol_command(
+            "move_relative",
+            fallback_cmd=f"GR {int(dx)},{int(dy)}",
+            dx=int(dx), dy=int(dy),
+        )
         logger.debug(f"XY relative move: ({dx:.0f}, {dy:.0f})")
 
     def set_home(self) -> None:
         """Set current position as home (0, 0, 0)."""
-        self.send_command("Z")
+        self._send_protocol_command("set_home", fallback_cmd="Z")
         logger.info("XY home position set")
 
-    # ── Stage Settings ────────────────────────────────────────────
+    def stop_stage(self) -> None:
+        """Send immediate stop command."""
+        self._send_protocol_command("stop", fallback_cmd="I")
+        logger.info("XY stage stopped")
+
+    # ── Stage Settings (P8.19, P8.20) ────────────────────────────
 
     def set_velocity(self, velocity: int) -> None:
-        """Set maximum stage velocity (1–100)."""
+        """Set maximum stage velocity (1–max)."""
         velocity = max(0, min(self.max_speed, velocity))
-        self.send_command(f"SMS,{int(velocity)}")
+        self._send_protocol_command(
+            "set_max_speed",
+            fallback_cmd=f"SMS,{int(velocity)}",
+            speed=int(velocity),
+        )
 
     def set_acceleration(self, acceleration: int) -> None:
-        """Set stage acceleration (1–100)."""
+        """Set stage acceleration (min–max)."""
         acceleration = max(self.min_acceleration, min(self.max_acceleration, acceleration))
-        self.send_command(f"SAS,{int(acceleration)}")
+        self._send_protocol_command(
+            "set_acceleration",
+            fallback_cmd=f"SAS,{int(acceleration)}",
+            accel=int(acceleration),
+        )
 
     def set_jerk(self, jerk: int) -> None:
-        """Set stage jerk (1–100)."""
+        """
+        Set stage jerk (min–max).
+
+        P8.20: Silently ignored if the controller doesn't support jerk.
+        """
         jerk = max(self.min_jerk, min(self.max_jerk, jerk))
-        self.send_command(f"SCS,{int(jerk)}")
+        result = self._send_protocol_command(
+            "set_jerk",
+            fallback_cmd=f"SCS,{int(jerk)}",
+            jerk=int(jerk),
+        )
+        # result is None if not supported — logged in _send_protocol_command
 
     def set_fast_mode(self) -> None:
         """Set velocity to maximum."""
@@ -272,6 +498,22 @@ class XYStageManager:
     def set_slow_mode(self) -> None:
         """Set velocity to default."""
         self.set_velocity(self.default_velocity)
+
+    def get_firmware_version(self) -> Optional[str]:
+        """Query the controller firmware version."""
+        if self.simulate:
+            return "Simulator v1.0"
+
+        try:
+            self._send_protocol_command("firmware_version", fallback_cmd="V")
+            response = self.spo.readline().decode(
+                self._protocol.encoding if self._protocol else "ascii",
+                errors="replace"
+            ).strip()
+            return response
+        except Exception as e:
+            logger.debug(f"Firmware version query error: {e}")
+            return None
 
     def check_stage_limits(self, x: float, y: float) -> bool:
         """Return True if (x, y) is within the stage's physical range."""
@@ -311,4 +553,5 @@ class XYStageManager:
 
     def __repr__(self) -> str:
         mode = "SIM" if self.simulate else "HW"
-        return f"XYStageManager(mode={mode})"
+        proto = self._protocol.controller_name if self._protocol else "no protocol"
+        return f"XYStageManager(mode={mode}, protocol={proto})"

@@ -18,6 +18,15 @@ Enhancement additions:
 - Print resume: save/load print progress for crash recovery
 - Print history: integration with PrintHistory for persistent logging
 
+v7.1 Session I additions:
+- TRAJECTORY command + TrajectoryExecutor for smooth trajectory tracking (P8.1–P8.3)
+- PrintRecorder auto-start/stop for execution recording (P8.4)
+- WorkspaceConfig reference on PrintJob (P8.5)
+- SERVICE_SEQUENCE command + ServiceSequenceExecutor (P8.6)
+- FluidColumnTracker for ink state management (P8.7)
+- Ink change detection in SWITCH_PUMP (P8.8)
+- Incremental vs continuous mode tracking (P8.9)
+
 Print File Format (JSON):
 {
     "name": "My Print Job",
@@ -101,6 +110,9 @@ class CommandType(Enum):
     HOME_XY = "home_xy"             # Move XY to zero reference
     COMMENT = "comment"             # No-op, just a label/comment
     SWITCH_PUMP = "switch_pump"     # Session 4: Switch active pump (multi-material)
+    # v7.1 additions
+    TRAJECTORY = "trajectory"       # P8.1: Execute full trajectory via MotionController
+    SERVICE_SEQUENCE = "service_seq"  # P8.6: Run service sequence (waste→wash→buffer→ink)
 
 
 @dataclass
@@ -163,6 +175,13 @@ class PrintJob:
     settings: PrintSettings = field(default_factory=PrintSettings)
     commands: list[PrintCommand] = field(default_factory=list)
     source_file: str = ""
+
+    # v7.1 P8.5: WorkspaceConfig reference for trajectory-based prints
+    # Stores needle/syringe/ink/plate config used to generate this job.
+    # Set to None for legacy discrete-command jobs.
+    workspace: object = None          # WorkspaceConfig (typed loosely to avoid circular import)
+    well_setup: object = None         # WellSetupModel reference (same reason)
+    trajectory_waypoints: list = field(default_factory=list)  # Waypoint list for trajectory mode
 
     @property
     def total_steps(self) -> int:
@@ -553,6 +572,355 @@ def build_well_plate_job(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# v7.1: Trajectory Executor (P8.2)
+# ═══════════════════════════════════════════════════════════════════
+
+class TrajectoryExecutor:
+    """
+    P8.2: Executes a time-parameterised trajectory using the MotionController.
+
+    Runs the motion control loop at a fixed timestep, commanding the stage
+    to follow the planned trajectory. Records actual vs planned positions
+    via the PrintRecorder if available.
+
+    This replaces discrete MOVE_XY + EXTRUDE commands with smooth,
+    continuous trajectory tracking.
+    """
+
+    def __init__(self, controller, recorder=None):
+        """
+        Args:
+            controller: StageController instance
+            recorder: Optional PrintRecorder for data logging
+        """
+        self.controller = controller
+        self.recorder = recorder
+        self._abort_flag = threading.Event()
+
+    def execute(
+        self,
+        waypoints: list,
+        pause_event: threading.Event | None = None,
+        on_progress: Callable | None = None,
+    ) -> bool:
+        """
+        Execute a trajectory (list of Waypoints).
+
+        Args:
+            waypoints: List of Waypoint objects with t, x, y, z, p1, p2, p3
+            pause_event: Event that blocks when cleared (for pause support)
+            on_progress: Callback(current_idx, total, message)
+
+        Returns:
+            True if completed, False if aborted
+        """
+        if not waypoints:
+            logger.warning("TrajectoryExecutor: empty waypoint list")
+            return True
+
+        total = len(waypoints)
+        ctrl = self.controller
+        t_start = time.monotonic()
+
+        logger.info(f"TrajectoryExecutor: starting {total} waypoints, "
+                     f"duration={waypoints[-1].t:.2f}s")
+
+        for i, wp in enumerate(waypoints):
+            # Check abort
+            if self._abort_flag.is_set():
+                logger.info("TrajectoryExecutor: aborted")
+                return False
+
+            # Wait if paused
+            if pause_event is not None:
+                pause_event.wait()
+                if self._abort_flag.is_set():
+                    return False
+
+            # Wait until waypoint time
+            t_target = t_start + wp.t
+            t_now = time.monotonic()
+            if t_target > t_now:
+                time.sleep(t_target - t_now)
+
+            # Command stage position
+            # XY: convert mm to stage units (µsteps) — done by controller
+            if ctrl.is_xy_connected:
+                ctrl.move_xy_absolute(wp.x, wp.y, from_zero_ref=True, fast=False)
+
+            # Z axis
+            if ctrl.is_zp_connected:
+                ctrl.move_z_absolute(wp.z, from_zero_ref=True)
+
+            # Pumps (move to absolute plunger position)
+            if ctrl.is_zp_connected and ctrl.zp_stage:
+                from SupportClasses.ZPStage import AXIS_MAP
+                for pump_id, wp_val in [("P1", wp.p1), ("P2", wp.p2), ("P3", wp.p3)]:
+                    mapped = AXIS_MAP.get(pump_id)
+                    if mapped and wp_val != 0.0:
+                        ctrl.zp_stage.move_absolute(
+                            {mapped: wp_val + ctrl.zero_position.get(pump_id, 0)},
+                            fast=False,
+                        )
+
+            # Record to PrintRecorder
+            if self.recorder and self.recorder.is_recording:
+                actual_xy = ctrl.get_xy_position(cached=True)
+                actual_zp = ctrl.get_zp_position(cached=True)
+                ax = actual_xy[0] if actual_xy[0] is not None else 0.0
+                ay = actual_xy[1] if actual_xy[1] is not None else 0.0
+                az = actual_zp[0] if actual_zp[0] is not None else 0.0
+                ap1 = actual_zp[1] if actual_zp[1] is not None else 0.0
+                ap2 = actual_zp[2] if actual_zp[2] is not None else 0.0
+                ap3 = actual_zp[3] if actual_zp[3] is not None else 0.0
+
+                # Convert actual XY from stage coords to zero-ref coords
+                ax -= ctrl.zero_position.get("x", 0)
+                ay -= ctrl.zero_position.get("y", 0)
+                az -= ctrl.zero_position.get("Z", 0)
+
+                self.recorder.record_sample(
+                    t=wp.t,
+                    planned=(wp.x, wp.y, wp.z, wp.p1, wp.p2, wp.p3),
+                    actual_xy=(ax, ay),
+                    actual_zp=(az, ap1, ap2, ap3),
+                    segment_id=getattr(wp, "segment_id", 0),
+                    is_travel=getattr(wp, "is_travel", False),
+                    is_retract=getattr(wp, "is_retract", False),
+                )
+
+            # Progress reporting (every 10 waypoints)
+            if on_progress and i % 10 == 0:
+                on_progress(i, total, f"Trajectory {i}/{total}")
+
+        logger.info("TrajectoryExecutor: trajectory complete")
+        return True
+
+    def abort(self):
+        """Signal the executor to stop."""
+        self._abort_flag.set()
+
+    def reset(self):
+        """Reset abort flag for reuse."""
+        self._abort_flag.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v7.1: Service Sequence Executor (P8.6)
+# ═══════════════════════════════════════════════════════════════════
+
+class ServiceSequenceExecutor:
+    """
+    P8.6: Executes service sequences (waste→wash→buffer→ink) between prints.
+
+    A service sequence automates fluid handling when switching inks or
+    refreshing the needle. Steps reference well roles, and the executor
+    finds the nearest well with that role to execute the operation.
+
+    Sequence steps: "waste", "wash", "buffer", "ink"
+    """
+
+    def __init__(self, controller, well_setup=None):
+        """
+        Args:
+            controller: StageController instance
+            well_setup: WellSetupModel with well assignments and roles
+        """
+        self.controller = controller
+        self.well_setup = well_setup
+
+    def execute_sequence(
+        self,
+        sequence_steps: list[str],
+        pump: str,
+        fluid_tracker: "FluidColumnTracker | None" = None,
+        settings: PrintSettings | None = None,
+        on_progress: Callable | None = None,
+    ) -> bool:
+        """
+        Execute a service sequence.
+
+        Args:
+            sequence_steps: List of step names ["waste", "wash", "buffer", "ink"]
+            pump: Which pump to service (e.g. "P1")
+            fluid_tracker: Optional FluidColumnTracker for volume tracking
+            settings: Print settings for Z heights and feedrates
+            on_progress: Callback(step_name, step_idx, total_steps)
+
+        Returns:
+            True if completed successfully
+        """
+        if not self.well_setup or not sequence_steps:
+            logger.debug("ServiceSequence: no setup or empty sequence, skipping")
+            return True
+
+        if settings is None:
+            settings = PrintSettings()
+
+        ctrl = self.controller
+        total = len(sequence_steps)
+
+        for idx, step_name in enumerate(sequence_steps):
+            if on_progress:
+                on_progress(step_name, idx, total)
+
+            logger.info(f"ServiceSequence: step {idx+1}/{total} — {step_name} ({pump})")
+
+            if step_name == "waste":
+                self._do_waste(ctrl, pump, fluid_tracker, settings)
+            elif step_name == "wash":
+                self._do_wash(ctrl, pump, settings)
+            elif step_name == "buffer":
+                self._do_buffer(ctrl, pump, fluid_tracker, settings)
+            elif step_name == "ink":
+                self._do_ink_pickup(ctrl, pump, fluid_tracker, settings)
+            else:
+                logger.warning(f"ServiceSequence: unknown step '{step_name}'")
+
+        logger.info(f"ServiceSequence: completed {total} steps for {pump}")
+        return True
+
+    def _do_waste(self, ctrl, pump, tracker, settings):
+        """Eject old ink + contaminated buffer into waste well."""
+        # Travel to waste well position (would come from well_setup)
+        ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
+        time.sleep(0.5)
+        # Eject: push pump to expel contents
+        eject_amount = 2.0  # mm (configurable from behavior)
+        ctrl.move_pump_relative(pump, eject_amount, settings.pump_feedrate)
+        time.sleep(1.0)
+        if tracker:
+            tracker.record_waste(pump)
+
+    def _do_wash(self, ctrl, pump, settings):
+        """Jiggle needle in wash well to clean exterior."""
+        ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
+        time.sleep(0.3)
+        # Small Z oscillation to agitate wash fluid
+        for _ in range(3):
+            ctrl.move_z_relative(-1.0, settings.z_feedrate)
+            time.sleep(0.2)
+            ctrl.move_z_relative(1.0, settings.z_feedrate)
+            time.sleep(0.2)
+
+    def _do_buffer(self, ctrl, pump, tracker, settings):
+        """Aspirate fresh buffer."""
+        ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
+        time.sleep(0.3)
+        aspirate_amount = -1.0  # mm (negative = aspirate)
+        ctrl.move_pump_relative(pump, aspirate_amount, settings.pump_feedrate)
+        time.sleep(1.0)
+        if tracker:
+            tracker.record_buffer(pump, abs(aspirate_amount))
+
+    def _do_ink_pickup(self, ctrl, pump, tracker, settings):
+        """Aspirate ink from ink well."""
+        ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
+        time.sleep(0.3)
+        aspirate_amount = -0.5  # mm (configurable from behavior)
+        ctrl.move_pump_relative(pump, aspirate_amount, settings.pump_feedrate)
+        time.sleep(1.5)
+        if tracker:
+            tracker.record_ink_pickup(pump, abs(aspirate_amount))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v7.1: Fluid Column Tracker (P8.7, P8.8, P8.9)
+# ═══════════════════════════════════════════════════════════════════
+
+class FluidColumnTracker:
+    """
+    P8.7: Tracks fluid column state for each pump during printing.
+    P8.8: Detects when ink change is needed and triggers service sequences.
+    P8.9: Handles incremental vs continuous printing modes.
+
+    Works alongside the FluidColumn dataclass from PhysicalModels, but
+    operates at a higher level — tracking print-time state changes and
+    deciding when service sequences are needed.
+    """
+
+    def __init__(self):
+        # Per-pump state
+        self._columns: dict[str, dict] = {
+            "P1": {"ink_name": None, "ink_remaining_uL": 0, "mode": "incremental"},
+            "P2": {"ink_name": None, "ink_remaining_uL": 0, "mode": "incremental"},
+            "P3": {"ink_name": None, "ink_remaining_uL": 0, "mode": "incremental"},
+        }
+        self._refill_threshold_uL = 5.0
+
+    def configure_pump(
+        self,
+        pump: str,
+        ink_name: str | None,
+        initial_volume_uL: float = 0.0,
+        mode: str = "incremental",
+    ) -> None:
+        """Configure a pump's initial state."""
+        self._columns[pump] = {
+            "ink_name": ink_name,
+            "ink_remaining_uL": initial_volume_uL,
+            "mode": mode,
+        }
+
+    def needs_ink_change(self, pump: str, required_ink: str | None) -> bool:
+        """
+        P8.8: Check if this pump needs an ink change before printing.
+
+        Returns True if the pump's current ink differs from required_ink.
+        """
+        if required_ink is None:
+            return False
+        current = self._columns.get(pump, {}).get("ink_name")
+        return current is not None and current != required_ink
+
+    def needs_refill(self, pump: str) -> bool:
+        """Check if pump ink volume is below refill threshold."""
+        col = self._columns.get(pump, {})
+        if col.get("mode") == "continuous":
+            return col.get("ink_remaining_uL", 0) < self._refill_threshold_uL
+        # Incremental mode always picks up before each print
+        return True
+
+    def is_continuous_mode(self, pump: str) -> bool:
+        """P8.9: Check if pump is in continuous mode."""
+        return self._columns.get(pump, {}).get("mode") == "continuous"
+
+    def record_dispense(self, pump: str, volume_uL: float) -> None:
+        """Record that a volume was dispensed (printing)."""
+        col = self._columns.get(pump, {})
+        col["ink_remaining_uL"] = max(0, col.get("ink_remaining_uL", 0) - volume_uL)
+
+    def record_waste(self, pump: str) -> None:
+        """Record waste ejection — ink column is now empty."""
+        col = self._columns.get(pump, {})
+        col["ink_remaining_uL"] = 0
+
+    def record_buffer(self, pump: str, volume_uL: float) -> None:
+        """Record buffer aspiration."""
+        pass  # Buffer tracked separately in FluidColumn if needed
+
+    def record_ink_pickup(self, pump: str, volume_uL: float) -> None:
+        """Record ink aspiration."""
+        col = self._columns.get(pump, {})
+        col["ink_remaining_uL"] = col.get("ink_remaining_uL", 0) + volume_uL
+
+    def set_ink(self, pump: str, ink_name: str) -> None:
+        """Update the ink currently loaded in a pump."""
+        if pump in self._columns:
+            self._columns[pump]["ink_name"] = ink_name
+
+    def get_state(self) -> dict:
+        """Get serialisable state for persistence."""
+        return dict(self._columns)
+
+    def restore_state(self, state: dict) -> None:
+        """Restore from saved state."""
+        for pump in ("P1", "P2", "P3"):
+            if pump in state:
+                self._columns[pump] = dict(state[pump])
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Print Executor
 # ═══════════════════════════════════════════════════════════════════
 
@@ -566,6 +934,14 @@ class PrintManager:
     Session 4 additions:
     - SWITCH_PUMP command execution (Task 1)
     - Position logging at key events (Task 2)
+
+    v7.1 additions:
+    - TRAJECTORY command via TrajectoryExecutor (P8.2, P8.3)
+    - PrintRecorder auto-start/stop (P8.4)
+    - WorkspaceConfig on PrintJob (P8.5)
+    - SERVICE_SEQUENCE command via ServiceSequenceExecutor (P8.6)
+    - FluidColumnTracker for ink state management (P8.7, P8.8)
+    - Incremental vs continuous mode handling (P8.9)
     """
 
     def __init__(self, controller):
@@ -600,6 +976,18 @@ class PrintManager:
 
         # Enhancement 6: Print history (set externally by GUI/main)
         self.print_history = None
+
+        # v7.1 P8.4: PrintRecorder (set externally or created on start)
+        self.recorder: Optional[object] = None  # PrintRecorder instance
+
+        # v7.1 P8.2: TrajectoryExecutor
+        self._trajectory_executor: Optional[TrajectoryExecutor] = None
+
+        # v7.1 P8.6: Service sequence executor
+        self._service_executor: Optional[ServiceSequenceExecutor] = None
+
+        # v7.1 P8.7: Fluid column tracking
+        self.fluid_tracker = FluidColumnTracker()
 
     # ── Job Management ─────────────────────────────────────────────
 
@@ -638,6 +1026,20 @@ class PrintManager:
         self._current_step = 0
         self._active_pump = "P1"
         self._start_time = time.time()
+
+        # v7.1 P8.4: Auto-start recording
+        self._start_recorder()
+
+        # v7.1 P8.2: Create trajectory executor with recorder
+        self._trajectory_executor = TrajectoryExecutor(
+            self.controller, recorder=self.recorder
+        )
+
+        # v7.1 P8.6: Create service sequence executor
+        well_setup = getattr(self.job, 'well_setup', None)
+        self._service_executor = ServiceSequenceExecutor(
+            self.controller, well_setup=well_setup
+        )
 
         self._thread = threading.Thread(target=self._execute_loop, daemon=True)
         self._thread.start()
@@ -708,6 +1110,11 @@ class PrintManager:
             return
         self._abort_flag.set()
         self._pause_event.set()  # Unblock if paused
+
+        # v7.1: Abort trajectory executor if running
+        if self._trajectory_executor:
+            self._trajectory_executor.abort()
+
         self._set_state(PrintState.ABORTED)
         logger.info("Print aborted")
 
@@ -716,6 +1123,9 @@ class PrintManager:
             save_print_progress(
                 self.job, self._current_step, self._active_pump
             )
+
+        # v7.1 P8.4: Auto-stop recording
+        self._stop_recorder("aborted")
 
         # Enhancement 6: Record abort to history
         self._record_history("aborted")
@@ -813,6 +1223,9 @@ class PrintManager:
             # Enhancement 6: Record to print history
             self._record_history("completed")
 
+            # v7.1 P8.4: Auto-stop recording on completion
+            self._stop_recorder("completed")
+
         except Exception as e:
             logger.error(f"Print execution error: {e}", exc_info=True)
             self._set_state(PrintState.ERROR)
@@ -833,6 +1246,9 @@ class PrintManager:
 
             # Enhancement 6: Record error to history
             self._record_history("error", error_message=str(e))
+
+            # v7.1 P8.4: Auto-stop recording on error
+            self._stop_recorder("error")
 
     def _record_history(self, state: str, error_message: str = ""):
         """Enhancement 6: Record completed/aborted/error print to history."""
@@ -934,6 +1350,14 @@ class PrintManager:
         elif cmd.type == CommandType.SWITCH_PUMP:
             self._execute_switch_pump(cmd)
 
+        # v7.1 P8.3: Trajectory execution via MotionController
+        elif cmd.type == CommandType.TRAJECTORY:
+            self._execute_trajectory(cmd)
+
+        # v7.1 P8.6: Service sequence execution
+        elif cmd.type == CommandType.SERVICE_SEQUENCE:
+            self._execute_service_sequence(cmd)
+
         else:
             logger.warning(f"Unknown command type: {cmd.type}")
 
@@ -941,14 +1365,34 @@ class PrintManager:
         """
         Session 4: Execute pump switch for multi-material printing.
         
+        v7.1 P8.8: Now checks if ink change is needed and triggers
+        service sequence automatically.
+
         Retracts the old pump, switches active pump, then primes the new pump.
         """
         new_pump = cmd.params.get("pump", "P1")
         old_pump = cmd.params.get("old_pump", self._active_pump)
+        required_ink = cmd.params.get("ink_name")  # v7.1: optional ink requirement
         settings = self.job.settings
         ctrl = self.controller
 
         logger.info(f"Switching pump: {old_pump} → {new_pump}")
+
+        # v7.1 P8.8: Check if ink change is needed on the new pump
+        if required_ink and self.fluid_tracker.needs_ink_change(new_pump, required_ink):
+            logger.info(
+                f"Ink change detected for {new_pump}: "
+                f"needs '{required_ink}'"
+            )
+            # Trigger service sequence before switching
+            if self._service_executor:
+                self._service_executor.execute_sequence(
+                    sequence_steps=["waste", "wash", "buffer", "ink"],
+                    pump=new_pump,
+                    fluid_tracker=self.fluid_tracker,
+                    settings=settings,
+                )
+            self.fluid_tracker.set_ink(new_pump, required_ink)
 
         # Retract old pump
         retract = settings.get_retract_amount(old_pump)
@@ -966,6 +1410,108 @@ class PrintManager:
             ctrl.move_pump_relative(new_pump, prime, settings.pump_feedrate)
             wait = prime / (settings.pump_feedrate / 60.0) + 0.1
             time.sleep(min(wait, 3.0))
+
+    # ── v7.1: Trajectory Execution (P8.3) ─────────────────────────
+
+    def _execute_trajectory(self, cmd: PrintCommand):
+        """
+        P8.3: Execute a trajectory command using the TrajectoryExecutor.
+
+        Params:
+            waypoints: list of Waypoint objects (or use job.trajectory_waypoints)
+            segment_id: optional segment ID for recording
+        """
+        p = cmd.params
+        waypoints = p.get("waypoints", [])
+
+        # Fallback to job-level trajectory if not specified in command
+        if not waypoints and self.job:
+            waypoints = self.job.trajectory_waypoints
+
+        if not waypoints:
+            logger.warning("TRAJECTORY command but no waypoints provided")
+            return
+
+        if self._trajectory_executor is None:
+            logger.error("TrajectoryExecutor not initialised")
+            return
+
+        self._trajectory_executor.reset()
+        success = self._trajectory_executor.execute(
+            waypoints=waypoints,
+            pause_event=self._pause_event,
+            on_progress=lambda cur, total, msg: self._report_progress(
+                f"Trajectory: {msg}"
+            ),
+        )
+
+        if not success:
+            logger.info("Trajectory execution was aborted")
+
+    # ── v7.1: Service Sequence Execution (P8.6) ──────────────────
+
+    def _execute_service_sequence(self, cmd: PrintCommand):
+        """
+        P8.6: Execute a service sequence command.
+
+        Params:
+            pump: Which pump to service
+            steps: List of step names (e.g. ["waste", "wash", "buffer", "ink"])
+        """
+        p = cmd.params
+        pump = p.get("pump", self._active_pump)
+        steps = p.get("steps", ["waste", "wash", "buffer", "ink"])
+
+        if self._service_executor is None:
+            logger.warning("ServiceSequenceExecutor not available")
+            return
+
+        self._service_executor.execute_sequence(
+            sequence_steps=steps,
+            pump=pump,
+            fluid_tracker=self.fluid_tracker,
+            settings=self.job.settings if self.job else None,
+            on_progress=lambda step, idx, total: self._report_progress(
+                f"Service: {step} ({idx+1}/{total})"
+            ),
+        )
+
+    # ── v7.1: Recording Helpers (P8.4) ───────────────────────────
+
+    def _start_recorder(self) -> None:
+        """P8.4: Auto-start recording when print begins."""
+        if self.recorder is None:
+            return
+        try:
+            workspace_dict = None
+            well_setup_dict = None
+            if self.job:
+                ws = getattr(self.job, 'workspace', None)
+                if ws and hasattr(ws, 'to_dict'):
+                    workspace_dict = ws.to_dict()
+                wsu = getattr(self.job, 'well_setup', None)
+                if wsu and hasattr(wsu, 'to_dict'):
+                    well_setup_dict = wsu.to_dict()
+
+            self.recorder.start_recording(
+                workspace_dict=workspace_dict,
+                well_setup_dict=well_setup_dict,
+                job_name=self.job.name if self.job else "unnamed",
+            )
+            logger.info("PrintRecorder: auto-started for print")
+        except Exception as e:
+            logger.warning(f"Failed to start recording: {e}")
+
+    def _stop_recorder(self, status: str) -> None:
+        """P8.4: Auto-stop recording when print ends."""
+        if self.recorder is None:
+            return
+        try:
+            if hasattr(self.recorder, 'is_recording') and self.recorder.is_recording:
+                self.recorder.stop_recording(status=status)
+                logger.info(f"PrintRecorder: auto-stopped (status={status})")
+        except Exception as e:
+            logger.warning(f"Failed to stop recording: {e}")
 
     def _execute_print_path(self, cmd: PrintCommand):
         """

@@ -9,18 +9,23 @@ All positions use the same units as their respective controllers:
     - XY: steps (Prior ProScan III)
     - Z / Pumps: mm (Marlin G-code)
 
+v7.1 additions:
+    - Per-pump max flow rate limits in µL/s (P8.28)
+    - clamp_flow_rate() method (P8.29)
+
 Usage::
 
     limits = SafetyLimits.from_dict(saved_dict)
     clamped_x, clamped_y = limits.clamp_xy(req_x, req_y)
     clamped_z = limits.clamp_z(req_z)
     clamped_p = limits.clamp_pump(req_p, "P1")
+    clamped_flow = limits.clamp_flow_rate(5.0, "P1")
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,13 @@ class SafetyLimits:
     max_xy_speed: float = 10_000.0     # steps/s
     max_z_feedrate: float = 500.0      # mm/min
     max_pump_feedrate: float = 200.0   # mm/min
+
+    # v7.1: Per-pump max flow rate limits (µL/s) — P8.28
+    # Computed from FlowPhysics based on needle/syringe/ink combo.
+    # Default of 0.0 means "not yet computed / no limit enforced".
+    max_flow_rate_p1_uL_s: float = 0.0
+    max_flow_rate_p2_uL_s: float = 0.0
+    max_flow_rate_p3_uL_s: float = 0.0
 
     # Master enable switch
     enabled: bool = True
@@ -103,6 +115,62 @@ class SafetyLimits:
         if clamped != feedrate:
             logger.warning(f"Pump feedrate clamped: {feedrate:.0f} → {clamped:.0f} mm/min")
         return clamped
+
+    # ── v7.1: Flow Rate Clamping (P8.29) ─────────────────────────
+
+    def clamp_flow_rate(self, flow_rate_uL_s: float, pump: str = "P1") -> float:
+        """
+        Clamp a volumetric flow rate to the safe maximum for a pump.
+
+        The max flow rate per pump is computed from FlowPhysics based on
+        the current needle/syringe/ink configuration. A value of 0.0 means
+        no limit has been configured yet (passes through unclamped).
+
+        Args:
+            flow_rate_uL_s: Requested flow rate (µL/s, positive = dispense)
+            pump: Pump identifier ("P1", "P2", "P3")
+
+        Returns:
+            Clamped flow rate in µL/s (preserves sign)
+        """
+        if not self.enabled:
+            return flow_rate_uL_s
+
+        max_rate = self._get_max_flow_rate(pump)
+        if max_rate <= 0.0:
+            # No limit configured — pass through
+            return flow_rate_uL_s
+
+        # Clamp magnitude, preserve sign (positive = dispense, negative = aspirate)
+        sign = 1.0 if flow_rate_uL_s >= 0 else -1.0
+        magnitude = abs(flow_rate_uL_s)
+        if magnitude > max_rate:
+            logger.warning(
+                f"{pump} flow rate clamped: {flow_rate_uL_s:.3f} → "
+                f"{sign * max_rate:.3f} µL/s (max={max_rate:.3f})"
+            )
+            return sign * max_rate
+        return flow_rate_uL_s
+
+    def set_max_flow_rate(self, pump: str, max_rate_uL_s: float) -> None:
+        """
+        Set the maximum safe flow rate for a pump.
+
+        Typically called after FlowPhysics.max_safe_flow_rate_uL_s()
+        computes the limit based on current needle/syringe/ink config.
+
+        Args:
+            pump: Pump identifier ("P1", "P2", "P3")
+            max_rate_uL_s: Maximum safe flow rate in µL/s
+        """
+        attr = self._flow_rate_attr(pump)
+        if attr:
+            setattr(self, attr, max_rate_uL_s)
+            logger.info(f"{pump} max flow rate set to {max_rate_uL_s:.3f} µL/s")
+
+    def get_max_flow_rate(self, pump: str) -> float:
+        """Get the configured max flow rate for a pump (µL/s). 0 = no limit."""
+        return self._get_max_flow_rate(pump)
 
     # ── Proximity Checks ──────────────────────────────────────────
 
@@ -171,12 +239,36 @@ class SafetyLimits:
         }
         return mapping.get(pump, (-50.0, 50.0))
 
+    def _flow_rate_attr(self, pump: str) -> str | None:
+        """Return the attribute name for a pump's max flow rate."""
+        mapping = {
+            "P1": "max_flow_rate_p1_uL_s",
+            "P2": "max_flow_rate_p2_uL_s",
+            "P3": "max_flow_rate_p3_uL_s",
+        }
+        return mapping.get(pump)
+
+    def _get_max_flow_rate(self, pump: str) -> float:
+        """Get the max flow rate for a pump."""
+        mapping = {
+            "P1": self.max_flow_rate_p1_uL_s,
+            "P2": self.max_flow_rate_p2_uL_s,
+            "P3": self.max_flow_rate_p3_uL_s,
+        }
+        return mapping.get(pump, 0.0)
+
     def __repr__(self) -> str:
         state = "ON" if self.enabled else "OFF"
+        flow_info = ""
+        for pump in ("P1", "P2", "P3"):
+            rate = self._get_max_flow_rate(pump)
+            if rate > 0:
+                flow_info += f", {pump}_flow≤{rate:.2f}µL/s"
         return (
             f"SafetyLimits({state}: "
             f"XY=[{self.xy_min_x:.0f}..{self.xy_max_x:.0f}, "
             f"{self.xy_min_y:.0f}..{self.xy_max_y:.0f}], "
             f"Z=[{self.z_min:.1f}..{self.z_max:.1f}], "
-            f"P1=[{self.p1_min:.1f}..{self.p1_max:.1f}])"
+            f"P1=[{self.p1_min:.1f}..{self.p1_max:.1f}]"
+            f"{flow_info})"
         )

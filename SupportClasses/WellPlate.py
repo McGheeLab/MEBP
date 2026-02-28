@@ -1,12 +1,18 @@
 """
 Well Plate Geometry — Standard ANSI/SLAS well plate definitions and path generators.
 
-Provides coordinate geometry for 6, 12, 24, 48, and 96-well plates.
+Provides coordinate geometry for 6, 12, 24, 48, 96, and 384-well plates.
 All coordinates are relative to the A1 well centre, which aligns
 with the zero reference position set during calibration.
 
 Path generators produce lists of (x, y) waypoints for common fill
 patterns: line, meander, spiral, grid, and concentric rings.
+
+v7.1 additions:
+- well_depth_mm per plate format (P8.10)
+- per-well bottom_z_offset storage from plane fitting (P8.11)
+- rosette_insert field on WellInfo for attached geometry (P8.12)
+- 384-well plate definition (P8.13)
 
 Usage::
 
@@ -21,6 +27,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +41,7 @@ PLATE_DEFINITIONS: dict[int, dict] = {
         "rows": 2, "cols": 3,
         "well_spacing_x": 39.12, "well_spacing_y": 39.12,
         "well_diameter": 34.8,
+        "well_depth_mm": 17.4,
         "a1_offset_x": 24.76, "a1_offset_y": 23.16,
         "description": "6-well plate",
     },
@@ -41,6 +49,7 @@ PLATE_DEFINITIONS: dict[int, dict] = {
         "rows": 3, "cols": 4,
         "well_spacing_x": 26.01, "well_spacing_y": 26.01,
         "well_diameter": 22.1,
+        "well_depth_mm": 17.4,
         "a1_offset_x": 24.94, "a1_offset_y": 16.79,
         "description": "12-well plate",
     },
@@ -48,6 +57,7 @@ PLATE_DEFINITIONS: dict[int, dict] = {
         "rows": 4, "cols": 6,
         "well_spacing_x": 19.30, "well_spacing_y": 19.30,
         "well_diameter": 15.6,
+        "well_depth_mm": 17.4,
         "a1_offset_x": 17.05, "a1_offset_y": 13.67,
         "description": "24-well plate",
     },
@@ -55,6 +65,7 @@ PLATE_DEFINITIONS: dict[int, dict] = {
         "rows": 6, "cols": 8,
         "well_spacing_x": 13.00, "well_spacing_y": 13.00,
         "well_diameter": 11.0,
+        "well_depth_mm": 17.4,
         "a1_offset_x": 18.16, "a1_offset_y": 10.08,
         "description": "48-well plate",
     },
@@ -62,12 +73,22 @@ PLATE_DEFINITIONS: dict[int, dict] = {
         "rows": 8, "cols": 12,
         "well_spacing_x": 9.00, "well_spacing_y": 9.00,
         "well_diameter": 6.35,
+        "well_depth_mm": 10.67,
         "a1_offset_x": 14.38, "a1_offset_y": 11.24,
         "description": "96-well plate",
     },
+    384: {
+        "rows": 16, "cols": 24,
+        "well_spacing_x": 4.50, "well_spacing_y": 4.50,
+        "well_diameter": 3.63,
+        "well_depth_mm": 11.56,
+        "a1_offset_x": 12.13, "a1_offset_y": 8.99,
+        "description": "384-well plate",
+    },
 }
 
-ROW_LABELS = "ABCDEFGH"
+# Extended row labels for 384-well plates (rows A–P)
+ROW_LABELS = "ABCDEFGHIJKLMNOP"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -84,6 +105,10 @@ class WellInfo:
     y: float            # Y centre (mm, relative to A1)
     diameter: float     # Well diameter (mm)
 
+    # v7.1 additions (P8.11, P8.12)
+    bottom_z_offset: float = 0.0    # Z offset from plane fit (mm), 0 = on reference plane
+    rosette_insert: Any = None      # Attached RosetteInsert geometry (or None)
+
 
 @dataclass
 class WellPlate:
@@ -99,6 +124,7 @@ class WellPlate:
     well_spacing_x: float
     well_spacing_y: float
     well_diameter: float
+    well_depth_mm: float            # v7.1 (P8.10): Typical well depth for this format
     a1_offset_x: float
     a1_offset_y: float
     description: str
@@ -124,7 +150,7 @@ class WellPlate:
     @classmethod
     def from_format(cls, well_count: int) -> WellPlate:
         """
-        Create a plate from a standard format (6, 12, 24, 48, 96).
+        Create a plate from a standard format (6, 12, 24, 48, 96, 384).
 
         Raises ValueError for unsupported formats.
         """
@@ -180,6 +206,72 @@ class WellPlate:
             (w for w in self._wells.values() if w.col == col_number - 1),
             key=lambda w: w.row,
         )
+
+    # ── v7.1 Well Z Offset Methods (P8.11) ───────────────────────
+
+    def set_well_z_offset(self, well_name: str, z_offset: float) -> None:
+        """Set the bottom Z offset for a well (from plane fitting)."""
+        well = self._wells.get(well_name.upper())
+        if well is None:
+            raise KeyError(f"Well '{well_name}' not found")
+        well.bottom_z_offset = z_offset
+
+    def get_well_z_offset(self, well_name: str) -> float:
+        """Get the bottom Z offset for a well."""
+        well = self._wells.get(well_name.upper())
+        if well is None:
+            raise KeyError(f"Well '{well_name}' not found")
+        return well.bottom_z_offset
+
+    def set_z_offsets_from_plane(self, z_offsets: dict[str, float]) -> None:
+        """
+        Bulk-set Z offsets from a plane fit result.
+
+        Args:
+            z_offsets: Dict mapping well names to Z offsets (mm)
+        """
+        for name, offset in z_offsets.items():
+            well = self._wells.get(name.upper())
+            if well is not None:
+                well.bottom_z_offset = offset
+
+    def get_all_z_offsets(self) -> dict[str, float]:
+        """Get Z offsets for all wells as a dict."""
+        return {
+            name: well.bottom_z_offset
+            for name, well in self._wells.items()
+        }
+
+    def clear_z_offsets(self) -> None:
+        """Reset all well Z offsets to zero."""
+        for well in self._wells.values():
+            well.bottom_z_offset = 0.0
+
+    # ── v7.1 Rosette Methods (P8.12) ─────────────────────────────
+
+    def attach_rosette(self, well_name: str, rosette_insert: Any) -> None:
+        """
+        Attach a RosetteInsert to a well.
+
+        Args:
+            well_name: Target well (e.g. "A1")
+            rosette_insert: RosetteInsert instance (from PhysicalModels)
+        """
+        well = self._wells.get(well_name.upper())
+        if well is None:
+            raise KeyError(f"Well '{well_name}' not found")
+        well.rosette_insert = rosette_insert
+        logger.debug(f"Rosette attached to well {well_name}")
+
+    def detach_rosette(self, well_name: str) -> None:
+        """Remove rosette insert from a well."""
+        well = self._wells.get(well_name.upper())
+        if well is not None:
+            well.rosette_insert = None
+
+    def get_wells_with_rosettes(self) -> list[WellInfo]:
+        """Return all wells that have rosette inserts attached."""
+        return [w for w in self._wells.values() if w.rosette_insert is not None]
 
     # ── Properties ────────────────────────────────────────────────
 

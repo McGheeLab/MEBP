@@ -30,6 +30,9 @@ from PySide6.QtCore import Qt
 from SupportClasses.StageController import StageController
 from SupportClasses.Settings import Settings
 from SupportClasses.SerialUtils import list_serial_ports
+from SupportClasses.ControllerProtocol import (
+    ControllerProtocol, discover_controller_files, DEFAULT_CONTROLLERS_DIR,
+)
 from gui.styles import COLORS
 
 logger = logging.getLogger(__name__)
@@ -205,6 +208,7 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(12, 8, 12, 8)
 
         self._build_connection_card(layout)
+        self._build_controller_card(layout)
         self._build_safety_card(layout)
         self._build_polling_card(layout)
         self._build_xbox_card(layout)
@@ -285,6 +289,128 @@ class SettingsPage(QWidget):
 
         layout.addLayout(grid)
         parent_layout.addWidget(card)
+
+    # ── Controller Protocol Card (P8.22) ────────────────────────────
+
+    def _build_controller_card(self, parent_layout):
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        layout = QVBoxLayout(card)
+        layout.setSpacing(6)
+
+        title = QLabel("XY Controller Protocol")
+        title.setObjectName("sectionLabel")
+        title.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; "
+            f"color: {COLORS['text']};")
+        layout.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        row = 0
+
+        # Controller selector dropdown
+        grid.addWidget(QLabel("Controller:"), row, 0)
+        self.combo_controller = QComboBox()
+        self._populate_controller_combo()
+        grid.addWidget(self.combo_controller, row, 1)
+        row += 1
+
+        # Auto-detect button
+        btn_row = QHBoxLayout()
+        btn_auto = QPushButton("🔍 Auto-Detect")
+        btn_auto.setToolTip("Scan all ports for a matching controller")
+        btn_auto.clicked.connect(self._auto_detect_controller)
+        btn_row.addWidget(btn_auto)
+
+        # Test rate button
+        btn_test = QPushButton("⏱ Test Rate")
+        btn_test.setToolTip("Measure command/response latency")
+        btn_test.clicked.connect(self._test_command_rate)
+        btn_row.addWidget(btn_test)
+        grid.addLayout(btn_row, row, 0, 1, 2)
+        row += 1
+
+        # Status label
+        self.lbl_controller_status = QLabel("—")
+        self.lbl_controller_status.setWordWrap(True)
+        self.lbl_controller_status.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 10pt;")
+        grid.addWidget(self.lbl_controller_status, row, 0, 1, 2)
+        row += 1
+
+        # Rate test results label
+        self.lbl_rate_results = QLabel("")
+        self.lbl_rate_results.setWordWrap(True)
+        self.lbl_rate_results.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 10pt;")
+        grid.addWidget(self.lbl_rate_results, row, 0, 1, 2)
+        row += 1
+
+        layout.addLayout(grid)
+        parent_layout.addWidget(card)
+
+    def _populate_controller_combo(self):
+        """Populate the controller dropdown with JSON files + Auto option."""
+        self.combo_controller.clear()
+        self.combo_controller.addItem("Auto-Detect", "auto")
+        self.combo_controller.addItem("Default (ProScan III)", None)
+
+        json_files = discover_controller_files()
+        for fp in json_files:
+            try:
+                proto = ControllerProtocol.load(fp)
+                self.combo_controller.addItem(
+                    f"{proto.controller_name}", str(fp))
+            except Exception:
+                self.combo_controller.addItem(
+                    f"⚠ {fp.stem}", str(fp))
+
+    def _auto_detect_controller(self):
+        """Run auto-detection and update the UI."""
+        self.lbl_controller_status.setText("Scanning ports...")
+        self.lbl_controller_status.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: 10pt;")
+
+        # This would ideally run in a thread, but for now it's synchronous
+        if self.controller.xy_stage and hasattr(self.controller.xy_stage, '_detected_controller'):
+            detected = self.controller.xy_stage._detected_controller
+            if detected:
+                self.lbl_controller_status.setText(f"✓ Detected: {detected}")
+                self.lbl_controller_status.setStyleSheet(
+                    f"color: {COLORS['green']}; font-size: 10pt;")
+                # P8.23: Store auto-detect result
+                self.settings.set("controller.auto_detect_result", detected)
+                return
+
+        self.lbl_controller_status.setText("No controller detected (XY not connected?)")
+        self.lbl_controller_status.setStyleSheet(
+            f"color: {COLORS['red']}; font-size: 10pt;")
+
+    def _test_command_rate(self):
+        """Run command rate test and display results."""
+        self.lbl_rate_results.setText("Testing...")
+
+        result = self.controller.test_command_rate()
+
+        if "error" in result:
+            self.lbl_rate_results.setText(f"⚠ {result['error']}")
+            self.lbl_rate_results.setStyleSheet(
+                f"color: {COLORS['red']}; font-size: 10pt;")
+            return
+
+        self.lbl_rate_results.setText(
+            f"Avg: {result['avg_round_trip_ms']:.1f}ms | "
+            f"Max Hz: {result['max_command_hz']:.0f} | "
+            f"Min: {result['min_round_trip_ms']:.1f}ms | "
+            f"Max: {result['max_round_trip_ms']:.1f}ms"
+        )
+        self.lbl_rate_results.setStyleSheet(
+            f"color: {COLORS['green']}; font-size: 10pt;")
+
+        # P8.31: Store results
+        self.settings.set("motion_controller.rate_test_results", result)
+        self.settings.save()
 
     # ── Safety Limits Card ────────────────────────────────────────
 
@@ -547,6 +673,32 @@ class SettingsPage(QWidget):
         self._refresh_ports()
         self._update_context_sim_labels()
 
+        # Controller protocol (P8.22)
+        ctrl_json = self.settings.get("controller.controller_json")
+        if ctrl_json == "auto":
+            self.combo_controller.setCurrentIndex(0)  # Auto-Detect
+        elif ctrl_json is None:
+            self.combo_controller.setCurrentIndex(1)  # Default
+        else:
+            # Find matching item by data
+            for i in range(self.combo_controller.count()):
+                if self.combo_controller.itemData(i) == ctrl_json:
+                    self.combo_controller.setCurrentIndex(i)
+                    break
+
+        # Show last auto-detect result
+        last_detect = self.settings.get("controller.auto_detect_result")
+        if last_detect:
+            self.lbl_controller_status.setText(f"Last detected: {last_detect}")
+
+        # Show last rate test
+        rate_results = self.settings.get("motion_controller.rate_test_results")
+        if rate_results and isinstance(rate_results, dict):
+            self.lbl_rate_results.setText(
+                f"Last test: {rate_results.get('avg_round_trip_ms', 0):.1f}ms avg | "
+                f"{rate_results.get('max_command_hz', 0):.0f} Hz"
+            )
+
     def _apply_settings(self):
         """Apply UI values to controller and persist."""
         sl = self.controller.safety_limits
@@ -588,6 +740,10 @@ class SettingsPage(QWidget):
         self.settings.set("logging.verbose", verbose)
         log_level = logging.DEBUG if verbose else logging.INFO
         logging.getLogger().setLevel(log_level)
+
+        # P8.23: Controller protocol selection
+        ctrl_data = self.combo_controller.currentData()
+        self.settings.set("controller.controller_json", ctrl_data)
 
         self.settings.save()
         logger.info("Settings applied and saved")
