@@ -36,6 +36,7 @@
         "acceleration_range": [1, 100],
         "jerk_range": null,
         "position_units": "microsteps",
+        "microsteps_per_micron": 10.0,
         "position_range_x": [-100000, 100000],
         "position_range_y": [-100000, 100000]
     }

@@ -1,5 +1,5 @@
 """
-Main Application Window — PyDracula-style layout.
+Main Application Window — PyDracula-inspired layout for MEBP bioprinter.
 
 Layout:
     ┌────┬──────────┬──────────────────────────────┐
@@ -32,6 +32,11 @@ v7.1 Session I additions:
     - WorkspaceConfig shared state passing — P8.35
     - PrintRecorder wiring (auto-start/stop) — P7.4, P7.5
     - Recording browser + replay overlay — P7.6, P7.7
+
+v7.1.1 Improvements:
+    - Menu icons visible when sidebar collapsed (centered icon, left-aligned icon+label when expanded)
+    - XY positions displayed in microns (µm) throughout, configurable via microsteps_per_micron
+    - Centralized color scheme via styles.py COLORS dict
 """
 
 from __future__ import annotations
@@ -55,6 +60,11 @@ from SupportClasses.PrintManager import load_print_progress, clear_print_progres
 from SupportClasses.PrintRecorder import PrintRecorder
 from gui.styles import DARK_THEME, COLORS
 from gui.ui_functions import UIFunctions, AppSettings
+from gui.unit_helpers import (
+    steps_to_um, um_to_steps, format_um,
+    get_microsteps_per_micron_from_protocol,
+    DEFAULT_MICROSTEPS_PER_MICRON,
+)
 from gui.pages.dashboard import DashboardPage
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
@@ -70,84 +80,115 @@ logger = logging.getLogger(__name__)
 # ── Emoji → colored pixmap icon helper ───────────────────────────
 def _make_text_icon(text: str, size: int = 24, color: str = "#a6adc8") -> QIcon:
     """Create a QIcon from a text character (emoji or symbol)."""
-    pix = QPixmap(size, size)
-    pix.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pix)
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(QColor(color))
-    font = QFont("Segoe UI Emoji", int(size * 0.55))
-    painter.setFont(font)
-    painter.drawText(pix.rect(), Qt.AlignCenter, text)
+    painter.setFont(QFont("Segoe UI Emoji", int(size * 0.6)))
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, text)
     painter.end()
-    return QIcon(pix)
-
-
-class _DisconnectBridge(QObject):
-    """Thread-safe bridge for disconnect notifications from watchdog."""
-    disconnected = Signal(str)  # stage_name
+    return QIcon(pixmap)
 
 
 class MainWindow(QMainWindow):
-    """Main application window with PyDracula-style navigation."""
+    """MEBP main application window with PyDracula-style sidebar navigation."""
 
-    # Page indices
-    PAGE_DASHBOARD = 0
-    PAGE_JOG = 1
-    PAGE_CALIBRATION = 2
-    PAGE_PRINT = 3
-    PAGE_SETTINGS = 4
-    PAGE_MONITOR = 5  # v7.1 P8.34: Print Monitor
-
-    def __init__(self, controller: StageController, settings: Settings = None, parent=None):
-        super().__init__(parent)
+    def __init__(self, controller: StageController, settings: Settings,
+                 print_history: PrintHistory | None = None,
+                 recorder: PrintRecorder | None = None):
+        super().__init__()
         self.controller = controller
-        self.settings = settings or Settings()
+        self.settings = settings
+        self.print_history = print_history
+        self.recorder = recorder
 
-        # Restore safety limits from settings
-        saved_limits = self.settings.get_section("safety_limits")
-        if saved_limits:
-            self.controller.safety_limits = SafetyLimits.from_dict(saved_limits)
-
-        # Print history
-        self.print_history = PrintHistory()
-        self.print_history.load()
-
-        # v7.1 P7.4: PrintRecorder for recording print data
-        self.print_recorder = PrintRecorder()
-
-        # Disconnect bridge
-        self._disconnect_bridge = _DisconnectBridge()
-        self._disconnect_bridge.disconnected.connect(self._on_hardware_disconnect)
-        self.controller.on_disconnect = lambda name: self._disconnect_bridge.disconnected.emit(name)
-
-        self.setWindowTitle("MEBP Bioprinter")
-        self.setMinimumSize(1100, 700)
-        self.setStyleSheet(DARK_THEME)
-
-        self._current_page_index = 0
+        # Menu button references
         self._menu_buttons: list[QPushButton] = []
         self._page_widgets: list[QWidget] = []
-        self._context_widgets: list[QWidget | None] = []
+        self._current_page_index = 0
 
-        self._build_shell()
-        self._create_pages()
+        # Microsteps-per-micron conversion factor
+        # Priority: 1) controller protocol  2) settings.json  3) default (10.0)
+        self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
+        self._protocol_checked = False  # Set True after first XY connect
+
+        self.setWindowTitle("MEBP Bioprinter — v7.1")
+        self.setMinimumSize(1100, 700)
+        self.resize(1400, 850)
+
+        # Apply dark theme
+        self.setStyleSheet(DARK_THEME)
+
+        # Build the UI shell
+        self._build_ui()
         self._build_bottom_bar()
+        self._create_pages()
         self._setup_timers()
-        self._setup_global_shortcuts()
-        self._apply_settings()
 
-        # Start on dashboard
-        self._switch_page(self.PAGE_DASHBOARD)
+        # Select the dashboard by default
+        self._navigate_to(0)
 
-        # Check for print resume data
-        QTimer.singleShot(1000, self._check_print_resume)
+        logger.info("MainWindow initialized")
+
+    @property
+    def microsteps_per_micron(self) -> float:
+        """Get the microsteps-per-micron conversion factor."""
+        return self._microsteps_per_micron
+
+    @microsteps_per_micron.setter
+    def microsteps_per_micron(self, value: float):
+        """Set the conversion factor and propagate to pages."""
+        self._microsteps_per_micron = max(0.001, value)
+        self.settings.set("stage.microsteps_per_micron", self._microsteps_per_micron)
+        # Notify pages that need to update their displays
+        for page in self._page_widgets:
+            if hasattr(page, 'set_microsteps_per_micron'):
+                page.set_microsteps_per_micron(self._microsteps_per_micron)
+        logger.info(f"microsteps_per_micron set to {self._microsteps_per_micron}")
+
+    def _resolve_microsteps_per_micron(self) -> float:
+        """
+        Resolve microsteps_per_micron from best available source.
+
+        Priority:
+            1. Controller protocol JSON (if XY stage already connected)
+            2. settings.json  →  stage.microsteps_per_micron
+            3. DEFAULT_MICROSTEPS_PER_MICRON (10.0)
+        """
+        # Try connected protocol first
+        proto_val = self._try_load_from_protocol()
+        if proto_val is not None:
+            logger.info(f"microsteps_per_micron from protocol: {proto_val}")
+            self.settings.set("stage.microsteps_per_micron", proto_val)
+            return proto_val
+
+        # Try settings
+        saved = self.settings.get("stage.microsteps_per_micron")
+        if saved is not None:
+            try:
+                val = float(saved)
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+
+        return DEFAULT_MICROSTEPS_PER_MICRON
+
+    def _try_load_from_protocol(self) -> float | None:
+        """Attempt to read microsteps_per_micron from XY stage protocol."""
+        xy = getattr(self.controller, 'xy_stage', None)
+        if xy is None:
+            return None
+        protocol = getattr(xy, '_protocol', None)
+        return get_microsteps_per_micron_from_protocol(protocol)
 
     # ════════════════════════════════════════════════════════════════
-    #  SHELL CONSTRUCTION
+    #  UI CONSTRUCTION
     # ════════════════════════════════════════════════════════════════
 
-    def _build_shell(self):
-        """Build the PyDracula-style shell layout."""
+    def _build_ui(self):
+        """Build the main UI shell: left menu, context panel, content area."""
         # Central widget
         central = QWidget()
         self.setCentralWidget(central)
@@ -208,16 +249,16 @@ class MainWindow(QMainWindow):
         top_menu_layout.setSpacing(0)
         top_menu_layout.setContentsMargins(0, 4, 0, 4)
 
-        # Create workflow buttons
+        # Create workflow buttons (icon, label stored separately for toggle)
         menu_items = [
             ("btn_dashboard", "📊", "Dashboard"),
             ("btn_jog",       "🕹️", "Jog Control"),
             ("btn_calibrate", "📐", "Calibration"),
             ("btn_print",     "🖨️", "Print Setup"),
-            ("btn_monitor",   "📈", "Print Monitor"),  # v7.1 P8.34
+            ("btn_monitor",   "📈", "Print Monitor"),
         ]
-        for obj_name, icon_text, tooltip in menu_items:
-            btn = self._make_menu_button(obj_name, icon_text, tooltip)
+        for obj_name, icon_text, label_text in menu_items:
+            btn = self._make_menu_button(obj_name, icon_text, label_text)
             top_menu_layout.addWidget(btn)
             self._menu_buttons.append(btn)
 
@@ -357,16 +398,28 @@ class MainWindow(QMainWindow):
 
         app_layout.addWidget(content_frame)
 
-    def _make_menu_button(self, obj_name: str, icon_text: str, tooltip: str) -> QPushButton:
-        """Create a left-menu navigation button."""
-        btn = QPushButton(f"  {icon_text}")
+    def _make_menu_button(self, obj_name: str, icon_text: str, label_text: str) -> QPushButton:
+        """
+        Create a left-menu navigation button.
+
+        Stores icon and label text separately so the toggle can switch between:
+        - Collapsed (60px): centered icon only
+        - Expanded (200px): left-aligned icon + label
+        """
+        # Start in collapsed state: icon only, centered
+        btn = QPushButton(icon_text)
         btn.setObjectName(obj_name)
         btn.setMinimumHeight(45)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setToolTip(tooltip)
-        btn.setFont(QFont("Segoe UI Emoji", 12))
+        btn.setToolTip(label_text)
+        btn.setFont(QFont("Segoe UI Emoji", 14))
         btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn.clicked.connect(self._on_menu_click)
+
+        # Store icon/label for toggle switching
+        btn._icon_text = icon_text
+        btn._label_text = label_text
+
         return btn
 
     def _make_conn_dot(self, label: str) -> QWidget:
@@ -399,7 +452,7 @@ class MainWindow(QMainWindow):
 
         mono = QFont("Consolas", 9)
 
-        self.sb_xy = QLabel("XY: — , —")
+        self.sb_xy = QLabel("XY: — , — µm")
         self.sb_xy.setFont(mono)
         self.status_bar.addPermanentWidget(self.sb_xy)
 
@@ -427,105 +480,74 @@ class MainWindow(QMainWindow):
 
     def _create_pages(self):
         """Instantiate all page widgets and their context panels."""
-        # Create pages
-        self.dashboard_page = DashboardPage(self.controller, print_history=self.print_history)
-        self.jog_page = JogControlPage(self.controller)
-        self.calibration_page = CalibrationPage(self.controller, settings=self.settings)
-        self.print_setup_page = PrintSetupPage(self.controller)
-        self.settings_page = SettingsPage(self.controller, self.settings)
-
-        # v7.1 P8.34, P8.36: Print Monitor page
-        self.print_monitor_page = PrintMonitorPage(
-            controller=self.controller,
-            settings=self.settings,
-        )
-
-        # v7.1 P7.4: Wire PrintRecorder to monitor page
-        self.print_monitor_page.set_recorder(self.print_recorder)
-
-        # v7.1 P7.4, P7.5: Wire PrintRecorder to PrintManager (via print_setup_page)
-        if hasattr(self.print_setup_page, 'print_manager'):
-            pm = self.print_setup_page.print_manager
-            if pm:
-                pm.recorder = self.print_recorder
-
-        # v7.1 P8.34: Wire monitor signals to print_setup_page's PrintManager
-        self.print_monitor_page.pause_requested.connect(self._monitor_pause)
-        self.print_monitor_page.resume_requested.connect(self._monitor_resume)
-        self.print_monitor_page.abort_requested.connect(self._monitor_abort)
-
         pages = [
-            self.dashboard_page,
-            self.jog_page,
-            self.calibration_page,
-            self.print_setup_page,
-            self.settings_page,
-            self.print_monitor_page,  # v7.1 P8.34: 6th page
+            DashboardPage(self.controller, self.print_history),
+            JogControlPage(self.controller),
+            CalibrationPage(self.controller, settings=self.settings),
+            PrintSetupPage(self.controller),
+            SettingsPage(self.controller, self.settings),
+            PrintMonitorPage(self.controller, self.settings),
         ]
 
-        for page in pages:
-            self._page_stack.addWidget(page)
-            self._page_widgets.append(page)
+        # Wire recorder to print manager and monitor if available
+        if self.recorder:
+            monitor = pages[5]
+            if hasattr(monitor, 'set_recorder'):
+                monitor.set_recorder(self.recorder)
+            setup = pages[3]
+            if hasattr(setup, 'print_manager') and setup.print_manager:
+                setup.print_manager.recorder = self.recorder
 
-            # Get context widget if the page provides one
+        for page in pages:
+            self._page_widgets.append(page)
+            self._page_stack.addWidget(page)
+
+            # Create context panel (wrapped in scroll area)
             ctx = None
             if hasattr(page, 'get_context_widget'):
                 ctx = page.get_context_widget()
-            if ctx is None:
-                # Provide a default empty context widget
-                ctx = self._make_default_context(page)
+            if ctx is not None:
+                scroll = QScrollArea()
+                scroll.setObjectName("contextScrollArea")
+                scroll.setWidgetResizable(True)
+                scroll.setWidget(ctx)
+                self._context_stack.addWidget(scroll)
+            else:
+                # Placeholder
+                placeholder = QWidget()
+                self._context_stack.addWidget(placeholder)
 
-            # Wrap in scroll area
-            scroll = QScrollArea()
-            scroll.setObjectName("contextScrollArea")
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            scroll.setWidget(ctx)
-            self._context_stack.addWidget(scroll)
-            self._context_widgets.append(ctx)
-
-    def _make_default_context(self, page) -> QWidget:
-        """Create a default context panel for pages that don't have one yet."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        title = getattr(page, '_page_title_text', page.__class__.__name__)
-        lbl = QLabel(f"No settings panel\nfor {title}")
-        lbl.setObjectName("dimLabel")
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setWordWrap(True)
-        layout.addWidget(lbl)
-        layout.addStretch()
-        return widget
+            # Propagate microsteps_per_micron to pages that support it
+            if hasattr(page, 'set_microsteps_per_micron'):
+                page.set_microsteps_per_micron(self._microsteps_per_micron)
 
     # ════════════════════════════════════════════════════════════════
     #  NAVIGATION
     # ════════════════════════════════════════════════════════════════
 
     def _on_menu_click(self):
-        """Handle left menu button clicks."""
+        """Handle menu button click: navigate to the corresponding page."""
         btn = self.sender()
         if not btn:
             return
 
-        name = btn.objectName()
-        page_map = {
-            "btn_dashboard": self.PAGE_DASHBOARD,
-            "btn_jog": self.PAGE_JOG,
-            "btn_calibrate": self.PAGE_CALIBRATION,
-            "btn_print": self.PAGE_PRINT,
-            "btn_settings": self.PAGE_SETTINGS,
-            "btn_monitor": self.PAGE_MONITOR,  # v7.1
+        # Map button names to page indices
+        btn_map = {
+            "btn_dashboard": 0,
+            "btn_jog": 1,
+            "btn_calibrate": 2,
+            "btn_print": 3,
+            "btn_monitor": 5,
+            "btn_settings": 4,
         }
+        index = btn_map.get(btn.objectName(), 0)
+        self._navigate_to(index)
 
-        idx = page_map.get(name)
-        if idx is not None:
-            self._switch_page(idx)
+    def _navigate_to(self, index: int):
+        """Switch to a page by index."""
+        if index < 0 or index >= len(self._page_widgets):
+            return
 
-    def _switch_page(self, index: int):
-        """Switch to the specified page and update context panel."""
         self._current_page_index = index
 
         # Update page stack
@@ -540,16 +562,21 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            titles = ["Dashboard", "Jog Control", "Calibration", "Print Setup", "Settings", "Print Monitor"]
+            titles = ["Dashboard", "Jog Control", "Calibration", "Print Setup",
+                       "Settings", "Print Monitor"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
         # Update context panel title
-        context_titles = ["Dashboard", "Jog Settings", "Calibration", "Print Settings", "Settings", "Recordings"]
-        self._context_title.setText(context_titles[index] if index < len(context_titles) else "Settings")
+        context_titles = ["Dashboard", "Jog Settings", "Calibration",
+                          "Print Settings", "Settings", "Recordings"]
+        self._context_title.setText(
+            context_titles[index] if index < len(context_titles) else "Settings"
+        )
 
         # Update menu button styling
-        btn_names = ["btn_dashboard", "btn_jog", "btn_calibrate", "btn_print", "btn_monitor", "btn_settings"]
+        btn_names = ["btn_dashboard", "btn_jog", "btn_calibrate",
+                     "btn_print", "btn_monitor", "btn_settings"]
         for i, btn in enumerate(self._menu_buttons):
             if i == index:
                 btn.setStyleSheet(UIFunctions.selectMenu(btn.styleSheet()))
@@ -586,18 +613,30 @@ class MainWindow(QMainWindow):
         self._update_conn_dot("zp", zp_ok)
         self._update_conn_dot("xbox", xbox_ok)
 
-        # Position readouts
+        # Re-check protocol on first XY connect to pick up microsteps_per_micron
+        if xy_ok and not self._protocol_checked:
+            self._protocol_checked = True
+            proto_val = self._try_load_from_protocol()
+            if proto_val is not None and proto_val != self._microsteps_per_micron:
+                self.microsteps_per_micron = proto_val
+                logger.info(
+                    f"Updated µsteps/µm from protocol on connect: {proto_val}")
+
+        # Position readouts (XY in µm, ZP in mm)
         try:
             xy = self.controller.get_xy_position(cached=True)
             zp = self.controller.get_zp_position(cached=True)
             speeds = self.controller.get_speed_info()
 
             if xy[0] is not None:
-                zx = self.controller.zero_position["x"]
-                zy = self.controller.zero_position["y"]
-                self.sb_xy.setText(f"XY: {xy[0] - zx:,.0f} , {xy[1] - zy:,.0f}")
+                zx = xy[0] - self.controller.zero_position["x"]
+                zy = xy[1] - self.controller.zero_position["y"]
+                # Convert steps → microns for display
+                ux = steps_to_um(zx, self._microsteps_per_micron)
+                uy = steps_to_um(zy, self._microsteps_per_micron)
+                self.sb_xy.setText(f"XY: {ux:,.1f} , {uy:,.1f} µm")
             else:
-                self.sb_xy.setText("XY: — , —")
+                self.sb_xy.setText("XY: — , — µm")
 
             if zp[0] is not None:
                 zz = self.controller.zero_position.get("Z", 0)
@@ -642,305 +681,51 @@ class MainWindow(QMainWindow):
         """Update a connection dot indicator with state-based styling."""
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
-        if dot:
-            if connected:
-                dot.setObjectName("connDotOn")
-                dot.setText("●")
-            else:
-                dot.setObjectName("connDotOff")
-                dot.setText("●")
-            dot.style().unpolish(dot)
-            dot.style().polish(dot)
-        if lbl:
-            if connected:
+        if dot is None:
+            return
+        if connected:
+            dot.setObjectName("connDotOn")
+            if lbl:
                 lbl.setObjectName("connLabelOn")
-            else:
-                lbl.setObjectName("connLabelOff")
-            lbl.style().unpolish(lbl)
-            lbl.style().polish(lbl)
-
-    # ════════════════════════════════════════════════════════════════
-    #  CONNECTION MANAGEMENT (delegated to Settings page context)
-    # ════════════════════════════════════════════════════════════════
-
-    def connect_xy(self):
-        """Connect XY stage — called from context panels."""
-        try:
-            self.controller.connect_stages(xy=True, zp=False)
-            self.console.log("XY stage connected", "success")
-        except Exception as e:
-            self.console.log(f"XY connection failed: {e}", "error")
-
-    def disconnect_xy(self):
-        self.controller.disconnect_xy()
-        self.console.log("XY stage disconnected", "info")
-
-    def connect_zp(self):
-        try:
-            self.controller.connect_stages(xy=False, zp=True)
-            self.console.log("ZP stage connected", "success")
-        except Exception as e:
-            self.console.log(f"ZP connection failed: {e}", "error")
-
-    def disconnect_zp(self):
-        self.controller.disconnect_zp()
-        self.console.log("ZP stage disconnected", "info")
-
-    def connect_xbox(self):
-        try:
-            mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
-            self.controller.connect_xbox(mapping_file)
-            # Verify connection after a brief delay — the worker process exits
-            # immediately if no controller is found, so we check is_alive().
-            QTimer.singleShot(800, self._verify_xbox_connection)
-            self.console.log("Xbox controller starting…", "info")
-        except Exception as e:
-            self.console.log(f"Xbox connection failed: {e}", "error")
-
-    def _verify_xbox_connection(self):
-        """Check if the Xbox process is still alive after startup."""
-        if self.controller.is_xbox_connected:
-            self.console.log("Xbox controller connected", "success")
         else:
-            self.console.log(
-                "Xbox controller not found — is a controller plugged in?", "warning"
-            )
-            # Clean up the dead process
-            self.controller.disconnect_xbox()
-
-    def disconnect_xbox(self):
-        self.controller.disconnect_xbox()
-        self.console.log("Xbox controller disconnected", "info")
-
-    def open_xbox_editor(self):
-        mapping_file = self.settings.get("xbox.mapping_file", "current_button_mapping.json")
-        editor = XboxMappingEditor(mapping_file, parent=self)
-        editor.exec()
+            dot.setObjectName("connDotOff")
+            if lbl:
+                lbl.setObjectName("connLabelOff")
+        # Force style refresh
+        dot.setStyleSheet(dot.styleSheet())
+        if lbl:
+            lbl.setStyleSheet(lbl.styleSheet())
 
     # ════════════════════════════════════════════════════════════════
-    #  v7.1: PRINT MONITOR WIRING (P8.34, P8.35, P7.4, P7.5)
+    #  KEYBOARD SHORTCUTS
     # ════════════════════════════════════════════════════════════════
-
-    def _monitor_pause(self):
-        """Handle pause request from Print Monitor."""
-        if hasattr(self.print_setup_page, 'print_manager'):
-            pm = self.print_setup_page.print_manager
-            if pm and pm.state.name == "RUNNING":
-                pm.pause()
-                self.console.log("Print paused (from monitor)", "info")
-
-    def _monitor_resume(self):
-        """Handle resume request from Print Monitor."""
-        if hasattr(self.print_setup_page, 'print_manager'):
-            pm = self.print_setup_page.print_manager
-            if pm and pm.state.name == "PAUSED":
-                pm.resume()
-                self.console.log("Print resumed (from monitor)", "info")
-
-    def _monitor_abort(self):
-        """Handle abort request from Print Monitor."""
-        if hasattr(self.print_setup_page, 'print_manager'):
-            pm = self.print_setup_page.print_manager
-            if pm and pm.state.name in ("RUNNING", "PAUSED"):
-                pm.abort()
-                self.console.log("Print aborted (from monitor)", "warning")
-
-    def pass_workspace_to_monitor(self, workspace) -> None:
-        """
-        P8.35: Pass WorkspaceConfig to Print Monitor page.
-
-        Called from PrintSetupPage when workspace is configured and
-        print is about to start.
-        """
-        if hasattr(self, 'print_monitor_page'):
-            self.print_monitor_page.set_workspace(workspace)
-            logger.debug("WorkspaceConfig passed to Print Monitor")
-
-    # ════════════════════════════════════════════════════════════════
-    #  HARDWARE DISCONNECT HANDLER
-    # ════════════════════════════════════════════════════════════════
-
-    def _on_hardware_disconnect(self, stage_name: str):
-        """Handle unexpected hardware disconnect."""
-        self.console.log(f"⚠ {stage_name} stage disconnected unexpectedly!", "error")
-
-    # ════════════════════════════════════════════════════════════════
-    #  GLOBAL KEYBOARD SHORTCUTS
-    # ════════════════════════════════════════════════════════════════
-
-    def _setup_global_shortcuts(self):
-        """Set up global keyboard jog shortcuts."""
-        self._global_xy_step = 500
-        self._global_z_step = 0.1
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Global keyboard shortcuts for jogging in any tab."""
-        from PySide6.QtWidgets import QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox
-        focus = self.focusWidget()
-        if isinstance(focus, (QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox)):
-            super().keyPressEvent(event)
-            return
-
-        key = event.key()
-        handled = False
-
-        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
-            if self.controller.is_xy_connected and not event.isAutoRepeat():
-                dx, dy = 0, 0
-                if key == Qt.Key.Key_Left:
-                    dx = -1
-                elif key == Qt.Key.Key_Right:
-                    dx = 1
-                elif key == Qt.Key.Key_Up:
-                    dy = -1
-                elif key == Qt.Key.Key_Down:
-                    dy = 1
-                self._global_jog_xy(dx, dy)
-                handled = True
-
-        elif key == Qt.Key.Key_PageUp and not event.isAutoRepeat():
-            if self.controller.is_zp_connected:
-                self.controller.move_z_relative(-self._global_z_step)
-                handled = True
-        elif key == Qt.Key.Key_PageDown and not event.isAutoRepeat():
-            if self.controller.is_zp_connected:
-                self.controller.move_z_relative(self._global_z_step)
-                handled = True
-
-        elif key == Qt.Key.Key_Home and not event.isAutoRepeat():
-            self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
-            self.controller.move_z_absolute(0, from_zero_ref=True)
-            handled = True
-
-        elif key == Qt.Key.Key_Escape:
+        """Global keyboard shortcuts."""
+        if event.key() == Qt.Key.Key_Escape:
+            # Emergency stop
             if self.controller.zp_stage:
                 try:
                     self.controller.zp_stage.emergency_stop()
-                    self.console.log("EMERGENCY STOP sent!", "error")
-                except Exception:
-                    pass
-            handled = True
-
-        if not handled:
-            super().keyPressEvent(event)
-
-    def _global_jog_xy(self, dx: int, dy: int):
-        pos = self.controller.get_xy_position(cached=True)
-        if pos[0] is None:
-            return
-        zx = self.controller.zero_position["x"]
-        zy = self.controller.zero_position["y"]
-        target_x = (pos[0] - zx) + dx * self._global_xy_step
-        target_y = (pos[1] - zy) + dy * self._global_xy_step
-        self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
-
-    # ════════════════════════════════════════════════════════════════
-    #  PRINT RESUME CHECK
-    # ════════════════════════════════════════════════════════════════
-
-    def _check_print_resume(self):
-        resume_data = load_print_progress()
-        if resume_data is None:
-            return
-
-        job = resume_data["job"]
-        step = resume_data["current_step"]
-        saved_at = resume_data.get("saved_at", "unknown time")
-
-        reply = QMessageBox.question(
-            self,
-            "Resume Print?",
-            f"Found saved print progress:\n\n"
-            f"  Job: {job.name}\n"
-            f"  Progress: {step}/{job.total_steps} commands\n"
-            f"  Saved at: {saved_at}\n\n"
-            f"Would you like to resume this print?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            self.console.log(f"Resuming print: {job.name} from step {step}", "success")
-            self._switch_page(self.PAGE_PRINT)
-            if hasattr(self.print_setup_page, 'resume_print'):
-                self.print_setup_page.resume_print(resume_data)
+                    logger.warning("EMERGENCY STOP via Escape key")
+                except Exception as e:
+                    logger.error(f"E-stop failed: {e}")
         else:
-            clear_print_progress()
-            self.console.log("Discarded saved print progress", "info")
+            # Propagate to active page
+            page = self._page_widgets[self._current_page_index]
+            if hasattr(page, 'keyPressEvent'):
+                page.keyPressEvent(event)
+            else:
+                super().keyPressEvent(event)
 
     # ════════════════════════════════════════════════════════════════
-    #  SETTINGS PERSISTENCE & WINDOW EVENTS
+    #  CLEANUP
     # ════════════════════════════════════════════════════════════════
-
-    def _apply_settings(self):
-        s = self.settings
-        x = s.get("window.x", 100)
-        y = s.get("window.y", 100)
-        w = s.get("window.width", 1200)
-        h = s.get("window.height", 800)
-        self.setGeometry(x, y, w, h)
-
-        tab_idx = s.get("window.active_tab", 0)
-        if 0 <= tab_idx < len(self._page_widgets):
-            self._switch_page(tab_idx)
-
-        splitter_sizes = s.get("window.splitter_sizes", None)
-        if splitter_sizes and hasattr(self, '_splitter'):
-            self._splitter.setSizes(splitter_sizes)
-
-        saved_speeds = s.get_section("speeds")
-        if saved_speeds:
-            try:
-                if "xy" in saved_speeds and hasattr(self.controller, 'xy_jog'):
-                    self.controller.xy_jog.xy_speed = float(saved_speeds["xy"])
-                if "z" in saved_speeds and hasattr(self.controller, 'zp_jog'):
-                    self.controller.zp_jog.z_speed = float(saved_speeds["z"])
-                if "p" in saved_speeds and hasattr(self.controller, 'zp_jog'):
-                    self.controller.zp_jog.p_speed = float(saved_speeds["p"])
-            except (AttributeError, TypeError, ValueError):
-                pass  # Jog controllers may not be initialized yet
-
-    def save_settings(self):
-        s = self.settings
-        geo = self.geometry()
-        s.set("window.x", geo.x())
-        s.set("window.y", geo.y())
-        s.set("window.width", geo.width())
-        s.set("window.height", geo.height())
-        s.set("window.active_tab", self._current_page_index)
-
-        if hasattr(self, '_splitter'):
-            s.set("window.splitter_sizes", self._splitter.sizes())
-
-        s.set("simulation.simulate_xy", self.controller.simulate_xy)
-        s.set("simulation.simulate_zp", self.controller.simulate_zp)
-
-        speeds = self.controller.get_speed_info()
-        s.set("speeds.xy", speeds["xy"])
-        s.set("speeds.z", speeds["z"])
-        s.set("speeds.p", speeds["p"])
-
-        s.set_section("zero_position", self.controller.zero_position)
-        s.set_section("safety_limits", self.controller.safety_limits.to_dict())
-        s.save()
 
     def closeEvent(self, event):
+        """Clean shutdown."""
         self.update_timer.stop()
-        self.save_settings()
+        if self.recorder and self.recorder.is_recording:
+            self.recorder.stop_recording()
         self.controller.shutdown()
         event.accept()
-
-    def resizeEvent(self, event):
-        """Adapt context panel width for smaller screens."""
-        super().resizeEvent(event)
-        w = event.size().width()
-        # On narrow windows, shrink context panel
-        if w < 1000:
-            AppSettings.LEFT_BOX_WIDTH = 200
-        elif w < 1300:
-            AppSettings.LEFT_BOX_WIDTH = 230
-        else:
-            AppSettings.LEFT_BOX_WIDTH = 260
-        # If context panel is currently open, resize it live
-        if self.ui_extraLeftBox.width() > 0:
-            self.ui_extraLeftBox.setMinimumWidth(AppSettings.LEFT_BOX_WIDTH)
-            self.ui_extraLeftBox.setMaximumWidth(AppSettings.LEFT_BOX_WIDTH)

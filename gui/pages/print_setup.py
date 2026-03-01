@@ -107,6 +107,7 @@ class PrintSetupPage(QWidget):
         self._workspace = WorkspaceConfig()
 
         self._context_widget = None
+        self._microsteps_per_micron = 10.0  # Default, updated by MainWindow
         self._setup_ui()
 
     # ════════════════════════════════════════════════════════════════
@@ -115,6 +116,10 @@ class PrintSetupPage(QWidget):
 
     def get_page_title(self) -> str:
         return "Print Setup"
+
+    def set_microsteps_per_micron(self, value: float):
+        """Update the microsteps-per-micron conversion factor."""
+        self._microsteps_per_micron = value
 
     def get_page_subtitle(self) -> str:
         return "Configure workspace, design objects, assign wells"

@@ -43,6 +43,7 @@ from PySide6.QtCore import Qt, Signal, QTimer, QRectF
 from PySide6.QtGui import QColor, QPen, QBrush, QPainter, QFont
 
 from gui.styles import COLORS
+from gui.unit_helpers import steps_to_um, DEFAULT_MICROSTEPS_PER_MICRON
 from gui.widgets.syringe_display import SyringeStatusPanel
 from gui.widgets.trajectory_view import TrajectoryView
 
@@ -239,6 +240,7 @@ class PrintMonitorPage(QWidget):
 
         # v7.1 P7.4: PrintRecorder reference (set by app.py wiring)
         self._recorder = None
+        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
 
     # ── Page Interface (P8.34) ───────────────────────────────────
 
@@ -323,6 +325,10 @@ class PrintMonitorPage(QWidget):
     def set_recorder(self, recorder) -> None:
         """P7.4: Set PrintRecorder reference for live recording access."""
         self._recorder = recorder
+
+    def set_microsteps_per_micron(self, value: float):
+        """Update the microsteps-per-micron conversion factor."""
+        self._microsteps_per_micron = value
 
     @property
     def recorder(self):

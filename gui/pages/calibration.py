@@ -26,6 +26,7 @@ from PySide6.QtGui import QFont
 from SupportClasses.StageController import StageController
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
 from gui.styles import COLORS
+from gui.unit_helpers import steps_to_um, format_um, DEFAULT_MICROSTEPS_PER_MICRON
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,17 @@ class CalibrationPage(QWidget):
         self._cameras: list[CameraWidget] = []
         self._context_widget = None
 
+        # v7.1.1: Microsteps-to-microns conversion factor
+        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
+
         self._setup_ui()
 
     def get_page_title(self) -> str:
         return "Calibration"
+
+    def set_microsteps_per_micron(self, value: float):
+        """Update the microsteps-per-micron conversion factor."""
+        self._microsteps_per_micron = value
 
     # ════════════════════════════════════════════════════════════════
     #  CONTEXT PANEL  (Steps 1-2-3 + Camera Settings + Plate Config)
@@ -357,7 +365,7 @@ class CalibrationPage(QWidget):
         pos_card.setObjectName("cardFrame")
         pos_layout = QHBoxLayout(pos_card)
         pos_layout.setSpacing(16)
-        for name, attr in [("X:", "lbl_x"), ("Y:", "lbl_y"), ("Z:", "lbl_z")]:
+        for name, attr in [("X (µm):", "lbl_x"), ("Y (µm):", "lbl_y"), ("Z (mm):", "lbl_z")]:
             pos_layout.addWidget(QLabel(name))
             lbl = QLabel("—")
             lbl.setFont(mono)
@@ -416,8 +424,10 @@ class CalibrationPage(QWidget):
         if xy[0] is not None:
             zx = xy[0] - ctrl.zero_position["x"]
             zy = xy[1] - ctrl.zero_position["y"]
-            self.lbl_x.setText(f"{zx:.0f}")
-            self.lbl_y.setText(f"{zy:.0f}")
+            ux = steps_to_um(zx, self._microsteps_per_micron)
+            uy = steps_to_um(zy, self._microsteps_per_micron)
+            self.lbl_x.setText(f"{ux:,.1f}")
+            self.lbl_y.setText(f"{uy:,.1f}")
         else:
             self.lbl_x.setText("—")
             self.lbl_y.setText("—")
@@ -437,8 +447,10 @@ class CalibrationPage(QWidget):
     def _set_zero(self):
         self.controller._calibrate_zero()
         z = self.controller.zero_position
+        zx_um = steps_to_um(z['x'], self._microsteps_per_micron)
+        zy_um = steps_to_um(z['y'], self._microsteps_per_micron)
         self.lbl_zero_status.setText(
-            f"Set: X={z['x']:.0f} Y={z['y']:.0f} Z={z['Z']:.2f}")
+            f"Set: X={zx_um:,.1f} µm  Y={zy_um:,.1f} µm  Z={z['Z']:.2f} mm")
         self.lbl_zero_status.setStyleSheet(f"color: {COLORS['green']};")
         logger.info(f"Zero set: {z}")
 
@@ -481,7 +493,9 @@ class CalibrationPage(QWidget):
         if xy[0] is None:
             return
         self._taught_a1 = (xy[0], xy[1])
-        self.lbl_a1.setText(f"({xy[0]:.0f}, {xy[1]:.0f})")
+        ax = steps_to_um(xy[0], self._microsteps_per_micron)
+        ay = steps_to_um(xy[1], self._microsteps_per_micron)
+        self.lbl_a1.setText(f"({ax:,.1f}, {ay:,.1f}) µm")
         self.lbl_a1.setStyleSheet(f"color: {COLORS['green']};")
 
     def _goto_a1(self):
@@ -497,7 +511,9 @@ class CalibrationPage(QWidget):
         if xy[0] is None:
             return
         self._taught_corner = (xy[0], xy[1])
-        self.lbl_corner.setText(f"({xy[0]:.0f}, {xy[1]:.0f})")
+        cx = steps_to_um(xy[0], self._microsteps_per_micron)
+        cy = steps_to_um(xy[1], self._microsteps_per_micron)
+        self.lbl_corner.setText(f"({cx:,.1f}, {cy:,.1f}) µm")
         self.lbl_corner.setStyleSheet(f"color: {COLORS['green']};")
 
     def _goto_corner(self):
@@ -543,10 +559,12 @@ class CalibrationPage(QWidget):
         self._offset_x = self._taught_a1[0] - self.controller.zero_position["x"]
         self._offset_y = self._taught_a1[1] - self.controller.zero_position["y"]
 
+        off_x_um = steps_to_um(self._offset_x, self._microsteps_per_micron)
+        off_y_um = steps_to_um(self._offset_y, self._microsteps_per_micron)
         self.lbl_alignment.setText(
             f"✅ Scale: {self._scale:.4f} | "
             f"Rot: {self._rotation:.2f}° | "
-            f"Off: ({self._offset_x:.0f}, {self._offset_y:.0f})"
+            f"Off: ({off_x_um:,.1f}, {off_y_um:,.1f}) µm"
         )
         self.lbl_alignment.setStyleSheet(f"color: {COLORS['green']};")
 
@@ -580,8 +598,10 @@ class CalibrationPage(QWidget):
         target_y = self._offset_y + ry * self._scale
 
         self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
+        tx_um = steps_to_um(target_x, self._microsteps_per_micron)
+        ty_um = steps_to_um(target_y, self._microsteps_per_micron)
         self.lbl_val_result.setText(
-            f"Moving to {well} → ({target_x:.0f}, {target_y:.0f})"
+            f"Moving to {well} → ({tx_um:,.1f}, {ty_um:,.1f}) µm"
         )
 
     # ════════════════════════════════════════════════════════════════
@@ -619,16 +639,16 @@ class CalibrationPage(QWidget):
 
         if cal.get("taught_a1"):
             self._taught_a1 = tuple(cal["taught_a1"])
-            self.lbl_a1.setText(
-                f"({self._taught_a1[0]:.0f}, {self._taught_a1[1]:.0f})"
-            )
+            a1x = steps_to_um(self._taught_a1[0], self._microsteps_per_micron)
+            a1y = steps_to_um(self._taught_a1[1], self._microsteps_per_micron)
+            self.lbl_a1.setText(f"({a1x:,.1f}, {a1y:,.1f}) µm")
             self.lbl_a1.setStyleSheet(f"color: {COLORS['green']};")
 
         if cal.get("taught_corner"):
             self._taught_corner = tuple(cal["taught_corner"])
-            self.lbl_corner.setText(
-                f"({self._taught_corner[0]:.0f}, {self._taught_corner[1]:.0f})"
-            )
+            cx = steps_to_um(self._taught_corner[0], self._microsteps_per_micron)
+            cy = steps_to_um(self._taught_corner[1], self._microsteps_per_micron)
+            self.lbl_corner.setText(f"({cx:,.1f}, {cy:,.1f}) µm")
             self.lbl_corner.setStyleSheet(f"color: {COLORS['green']};")
 
         self._offset_x = cal.get("offset_x", 0)

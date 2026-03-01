@@ -34,6 +34,10 @@ from SupportClasses.ControllerProtocol import (
     ControllerProtocol, discover_controller_files, DEFAULT_CONTROLLERS_DIR,
 )
 from gui.styles import COLORS
+from gui.unit_helpers import (
+    steps_to_um, um_to_steps, convert_safety_xy_text,
+    DEFAULT_MICROSTEPS_PER_MICRON,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,7 @@ class SettingsPage(QWidget):
         self.controller = controller
         self.settings = settings
         self._context_widget = None
+        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
         self._setup_ui()
         self._load_from_controller()
 
@@ -66,6 +71,16 @@ class SettingsPage(QWidget):
 
     def on_status_update(self):
         """Called by MainWindow timer. No periodic refresh needed."""
+
+    def set_microsteps_per_micron(self, value: float):
+        """Update the conversion factor and refresh related UI."""
+        self._microsteps_per_micron = value
+        if hasattr(self, 'spin_um_factor'):
+            self.spin_um_factor.blockSignals(True)
+            self.spin_um_factor.setValue(value)
+            self.spin_um_factor.blockSignals(False)
+        if hasattr(self, 'lbl_safety_um'):
+            self._update_safety_um_label()
         pass
 
     # legacy alias
@@ -414,6 +429,43 @@ class SettingsPage(QWidget):
 
     # ── Safety Limits Card ────────────────────────────────────────
 
+    def _build_unit_conversion_card(self, parent_layout):
+        """Build the XY unit conversion settings card."""
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        layout = QVBoxLayout(card)
+        layout.setSpacing(6)
+
+        title = QLabel("XY Unit Conversion")
+        title.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; "
+            f"color: {COLORS['text']};")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "The XY stage reports positions in microsteps.\n"
+            "Set the conversion factor to display in microns (µm).\n"
+            "ProScan III default: 10.0 microsteps/µm (0.1 µm resolution)")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(desc)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Microsteps per µm:"))
+        self.spin_um_factor = QDoubleSpinBox()
+        self.spin_um_factor.setRange(0.001, 10000.0)
+        self.spin_um_factor.setDecimals(3)
+        self.spin_um_factor.setSingleStep(0.1)
+        self.spin_um_factor.setValue(self._microsteps_per_micron)
+        self.spin_um_factor.setToolTip(
+            "Conversion factor: microsteps_per_micron\n"
+            "ProScan III: 10.0 (0.1 µm/step)\n"
+            "ProScan II: 10.0 (0.1 µm/step)")
+        row.addWidget(self.spin_um_factor)
+        layout.addLayout(row)
+
+        parent_layout.addWidget(card)
+
     def _build_safety_card(self, parent_layout):
         card = QFrame()
         card.setObjectName("cardFrame")
@@ -430,6 +482,13 @@ class SettingsPage(QWidget):
         self.chk_safety_enabled.setChecked(True)
         self.chk_safety_enabled.toggled.connect(self._safety_main_toggled)
         layout.addWidget(self.chk_safety_enabled)
+
+        # XY limits summary in µm
+        self.lbl_safety_um = QLabel("")
+        self.lbl_safety_um.setWordWrap(True)
+        self.lbl_safety_um.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt; padding: 2px;")
+        layout.addWidget(self.lbl_safety_um)
 
         grid = QGridLayout()
         grid.setSpacing(4)
@@ -670,6 +729,13 @@ class SettingsPage(QWidget):
         self.chk_verbose.setChecked(
             self.settings.get("logging.verbose", False))
 
+        # Unit conversion factor
+        um_val = self.settings.get("stage.microsteps_per_micron",
+                                   DEFAULT_MICROSTEPS_PER_MICRON)
+        self._microsteps_per_micron = float(um_val)
+        if hasattr(self, 'spin_um_factor'):
+            self.spin_um_factor.setValue(self._microsteps_per_micron)
+
         self._refresh_ports()
         self._update_context_sim_labels()
 
@@ -745,8 +811,17 @@ class SettingsPage(QWidget):
         ctrl_data = self.combo_controller.currentData()
         self.settings.set("controller.controller_json", ctrl_data)
 
+        # Unit conversion factor
+        if hasattr(self, 'spin_um_factor'):
+            um_val = self.spin_um_factor.value()
+            self.settings.set("stage.microsteps_per_micron", um_val)
+            self._microsteps_per_micron = um_val
+
         self.settings.save()
         logger.info("Settings applied and saved")
+
+        # Update µm summary
+        self._update_safety_um_label()
 
         # Update context panel status
         if self._context_widget:
@@ -773,6 +848,17 @@ class SettingsPage(QWidget):
     # ════════════════════════════════════════════════════════════════
     #  HELPERS
     # ════════════════════════════════════════════════════════════════
+
+    def _update_safety_um_label(self):
+        """Update the safety limits µm summary label."""
+        if not hasattr(self, 'lbl_safety_um'):
+            return
+        try:
+            sl = self.controller.safety_limits
+            self.lbl_safety_um.setText(
+                convert_safety_xy_text(sl, self._microsteps_per_micron))
+        except Exception:
+            self.lbl_safety_um.setText("")
 
     def _refresh_ports(self):
         """Refresh serial port list."""
@@ -806,9 +892,11 @@ class SettingsPage(QWidget):
             else:
                 self.spin_xy_min_x.setValue(zero_x)
                 self.spin_xy_min_y.setValue(zero_y)
+            ux = steps_to_um(zero_x, self._microsteps_per_micron)
+            uy = steps_to_um(zero_y, self._microsteps_per_micron)
             logger.info(
                 f"XY {'max' if as_max else 'min'} set to "
-                f"({zero_x:.0f}, {zero_y:.0f})")
+                f"({ux:,.1f}, {uy:,.1f}) µm")
 
     def _set_z_from_current(self, as_max=True):
         """Set Z limit from the current position."""

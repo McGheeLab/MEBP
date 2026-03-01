@@ -78,6 +78,18 @@ MENU_SELECTED_STYLESHEET = (
     "background-color: rgba(203, 166, 247, 0.08);"
 )
 
+# ── Menu Button State Styles (collapsed vs expanded) ─────────────
+# Applied programmatically when menu toggles.
+MENU_BTN_COLLAPSED_STYLE = (
+    "text-align: center;"
+    "padding-left: 0px;"
+)
+
+MENU_BTN_EXPANDED_STYLE = (
+    "text-align: left;"
+    "padding-left: 44px;"
+)
+
 # ── Main QSS Theme ───────────────────────────────────────────────
 DARK_THEME = """
 
@@ -131,20 +143,21 @@ QToolTip {
     color: #cba6f7;
 }
 
-/* Main menu buttons */
+/* Main menu buttons — default state is COLLAPSED (centered icons) */
 #topMenu QPushButton {
-    background-position: left center;
+    background-position: center;
     background-repeat: no-repeat;
     border: none;
     border-left: 3px solid transparent;
     background-color: transparent;
-    text-align: left;
-    padding-left: 44px;
+    text-align: center;
+    padding-left: 0px;
     padding-top: 5px;
     padding-bottom: 5px;
     color: #a6adc8;
     margin: 1px 4px;
     border-radius: 0px 4px 4px 0px;
+    font: 14pt "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
 }
 
 #topMenu QPushButton:hover {
@@ -159,20 +172,21 @@ QToolTip {
     color: #cdd6f4;
 }
 
-/* Bottom menu buttons */
+/* Bottom menu buttons — same collapsed-by-default pattern */
 #bottomMenu QPushButton {
-    background-position: left center;
+    background-position: center;
     background-repeat: no-repeat;
     border: none;
     border-left: 3px solid transparent;
     background-color: transparent;
-    text-align: left;
-    padding-left: 44px;
+    text-align: center;
+    padding-left: 0px;
     padding-top: 5px;
     padding-bottom: 5px;
     color: #a6adc8;
     margin: 1px 4px;
     border-radius: 0px 4px 4px 0px;
+    font: 14pt "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif;
 }
 
 #bottomMenu QPushButton:hover {
@@ -198,11 +212,12 @@ QToolTip {
     border: none;
     border-left: 3px solid transparent;
     background-color: #181825;
-    text-align: left;
-    padding-left: 44px;
+    text-align: center;
+    padding-left: 0px;
     color: #6c7086;
     margin: 1px 4px;
     border-radius: 0px 4px 4px 0px;
+    font: 12pt "Segoe UI";
 }
 
 #toggleButton:hover {
@@ -524,7 +539,7 @@ QComboBox::drop-down {
 
 QComboBox QAbstractItemView {
     background-color: #313244;
-    border: 1px solid #585b70;
+    border: 1px solid #45475a;
     color: #cdd6f4;
     selection-background-color: #45475a;
 }
@@ -534,58 +549,48 @@ QComboBox QAbstractItemView {
 ///////////////////////////////////////////////////////////////////////////////////////////////// */
 
 QSlider::groove:horizontal {
-    background: #45475a;
+    border: none;
     height: 6px;
+    background-color: #313244;
     border-radius: 3px;
 }
 
 QSlider::handle:horizontal {
-    background: #cba6f7;
-    width: 16px;
+    background-color: #cba6f7;
+    border: 2px solid #cba6f7;
+    width: 14px;
     margin: -5px 0;
-    border-radius: 8px;
+    border-radius: 7px;
 }
 
 QSlider::handle:horizontal:hover {
-    background: #dbb8f8;
+    background-color: #f5c2e7;
+    border-color: #f5c2e7;
 }
 
-QSlider::groove:vertical {
-    background: #45475a;
-    width: 6px;
+QSlider::sub-page:horizontal {
+    background-color: #cba6f7;
     border-radius: 3px;
 }
 
-QSlider::handle:vertical {
-    background: #cba6f7;
-    height: 16px;
-    margin: 0 -5px;
-    border-radius: 8px;
-}
-
 /* /////////////////////////////////////////////////////////////////////////////////////////////////
-   SCROLL BARS
+   SCROLLBAR
 ///////////////////////////////////////////////////////////////////////////////////////////////// */
 
-QScrollArea {
+QScrollBar:vertical {
+    background-color: #1e1e2e;
+    width: 10px;
     border: none;
 }
 
-QScrollBar:vertical {
-    background: #181825;
-    width: 8px;
-    margin: 0;
-    border-radius: 4px;
-}
-
 QScrollBar::handle:vertical {
-    background: #45475a;
-    min-height: 30px;
-    border-radius: 4px;
+    background-color: #45475a;
+    border-radius: 5px;
+    min-height: 20px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background: #585b70;
+    background-color: #585b70;
 }
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -593,15 +598,19 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 }
 
 QScrollBar:horizontal {
-    background: #181825;
-    height: 8px;
-    border-radius: 4px;
+    background-color: #1e1e2e;
+    height: 10px;
+    border: none;
 }
 
 QScrollBar::handle:horizontal {
-    background: #45475a;
-    min-width: 30px;
-    border-radius: 4px;
+    background-color: #45475a;
+    border-radius: 5px;
+    min-width: 20px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #585b70;
 }
 
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
@@ -627,18 +636,19 @@ QProgressBar::chunk {
 }
 
 /* /////////////////////////////////////////////////////////////////////////////////////////////////
-   CHECK BOXES
+   CHECKBOXES
 ///////////////////////////////////////////////////////////////////////////////////////////////// */
 
 QCheckBox {
     spacing: 8px;
+    color: #cdd6f4;
 }
 
 QCheckBox::indicator {
     width: 16px;
     height: 16px;
-    border: 2px solid #585b70;
-    border-radius: 4px;
+    border: 2px solid #45475a;
+    border-radius: 3px;
     background-color: #313244;
 }
 
@@ -707,6 +717,16 @@ QLabel#pageTitle {
 QLabel#pageSubtitle {
     color: #6c7086;
     font: 9pt "Segoe UI";
+}
+
+/* /////////////////////////////////////////////////////////////////////////////////////////////////
+   UNIT LABELS (microns, mm, etc.)
+///////////////////////////////////////////////////////////////////////////////////////////////// */
+
+QLabel#unitLabel {
+    color: #6c7086;
+    font: 8pt "Segoe UI";
+    padding: 0px 2px;
 }
 
 /* /////////////////////////////////////////////////////////////////////////////////////////////////

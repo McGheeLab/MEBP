@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 # Try importing backend modules (graceful if not yet available)
 try:
     from SupportClasses.GeometryEngine import (
-        PrintObject, PrintCollection, GeometryEngine,
-        AVAILABLE_TYPES, generate_object,
+        PrintObject, PrintCollection, ObjectType,
+        OBJECT_TYPE_INFO, get_default_params, get_available_object_types,
+        generate_object_trajectory,
     )
     HAS_GEOMETRY = True
 except ImportError:
@@ -71,38 +72,46 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Default object type parameters
+# Object type parameters (from GeometryEngine catalog or fallback)
 # ═══════════════════════════════════════════════════════════════════
 
-DEFAULT_PARAMS = {
-    "point": {},
-    "line": {"length_mm": 5.0, "angle_deg": 0.0},
-    "circle": {"radius_mm": 2.0},
-    "spiral": {"radius_mm": 2.0, "spacing_mm": 0.3, "turns": 5},
-    "meander": {"width_mm": 5.0, "height_mm": 5.0, "spacing_mm": 0.3},
-    "grid": {"width_mm": 5.0, "height_mm": 5.0, "spacing_mm": 1.0},
-    "cylinder_solid": {
-        "radius_mm": 2.0, "height_mm": 3.0,
-        "fill_spacing_mm": 0.3, "fill_pattern": "spiral",
-    },
-    "cylinder_shell": {
-        "radius_mm": 2.0, "height_mm": 3.0,
-    },
-    "csv_trajectory": {},
-}
+def _build_type_catalog() -> tuple[dict, dict]:
+    """Build (type_names, default_params) from GeometryEngine or fallback."""
+    if HAS_GEOMETRY:
+        info = get_available_object_types()
+        names = {k: v.get("label", k) for k, v in info.items()}
+        params = {k: dict(v.get("params", {})) for k, v in info.items()}
+        # Always include CSV import option
+        names["csv_import"] = "CSV Trajectory Import"
+        params["csv_import"] = {}
+        return names, params
 
-# Display names
-OBJECT_TYPE_NAMES = {
-    "point": "Point (single drop)",
-    "line": "Line",
-    "circle": "Circle",
-    "spiral": "Spiral (2D)",
-    "meander": "Meander (2D fill)",
-    "grid": "Grid",
-    "cylinder_solid": "Cylinder (solid fill)",
-    "cylinder_shell": "Cylinder (shell only)",
-    "csv_trajectory": "CSV Trajectory Import",
-}
+    # Fallback when GeometryEngine is not importable
+    names = {
+        "point": "Point (single drop)",
+        "line": "Line",
+        "circle": "Circle",
+        "spiral": "Spiral (2D)",
+        "cylinder_solid": "Cylinder (solid fill)",
+        "cylinder_shell": "Cylinder (shell only)",
+        "csv_import": "CSV Trajectory Import",
+    }
+    params = {
+        "point": {"cx": 0.0, "cy": 0.0, "dwell_time_s": 1.0,
+                  "dispense_volume_uL": 0.1},
+        "line": {"x1": -1.0, "y1": 0.0, "x2": 1.0, "y2": 0.0,
+                 "num_points": 50},
+        "circle": {"radius": 1.0, "num_points": 64},
+        "spiral": {"max_radius": 2.0, "num_points_per_turn": 64},
+        "cylinder_solid": {"radius": 1.0, "height": 2.0,
+                           "layer_height": 0.2},
+        "cylinder_shell": {"radius": 1.0, "height": 2.0,
+                           "layer_height": 0.2, "num_points": 64},
+        "csv_import": {},
+    }
+    return names, params
+
+OBJECT_TYPE_NAMES, DEFAULT_PARAMS = _build_type_catalog()
 
 # Default ink colors for preview
 DEFAULT_COLORS = [
@@ -189,6 +198,7 @@ class PrintObjectsTab(QWidget):
         self._sim_playing = False
 
         self._build_ui()
+        self._update_well_diameter()
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -196,6 +206,7 @@ class PrintObjectsTab(QWidget):
         """Update workspace config (called when Tab 1 changes)."""
         self._workspace = workspace
         self._refresh_ink_combos()
+        self._update_well_diameter()
 
     def get_collections(self) -> dict:
         """Return all named PrintCollections for job building."""
@@ -204,6 +215,24 @@ class PrintObjectsTab(QWidget):
     def on_status_update(self):
         """Called by parent tab timer."""
         pass
+
+    def _update_well_diameter(self) -> None:
+        """Read plate format from workspace and set well boundary on preview."""
+        if not (HAS_PROJECTION_CANVAS
+                and isinstance(self._preview, ProjectionCanvas)):
+            return
+        diameter = 10.0  # sensible default for 6-well plate
+        if self._workspace and hasattr(self._workspace, 'plate_format'):
+            try:
+                from SupportClasses.WellPlate import PLATE_DEFINITIONS
+                fmt = self._workspace.plate_format
+                if fmt in PLATE_DEFINITIONS:
+                    diameter = PLATE_DEFINITIONS[fmt].get(
+                        "well_diameter_mm", 10.0)
+            except ImportError:
+                pass
+        self._preview.set_well_diameter(diameter)
+        self._preview.refresh()
 
     # ── UI Construction ───────────────────────────────────────────
 
@@ -618,22 +647,13 @@ class PrintObjectsTab(QWidget):
         points = []
         if HAS_GEOMETRY:
             try:
-                obj_type = entry["object_type"]
-                params = dict(entry.get("params", {}))
-
-                if "cylinder" in obj_type:
-                    params["num_layers"] = entry.get("num_layers", 1)
-                    params["layer_height_mm"] = entry.get("layer_height", 0.2)
-
-                obj = generate_object(
+                obj = self._build_print_object(
                     name=library_key,
-                    object_type=obj_type,
-                    params=params,
+                    obj_type=entry["object_type"],
+                    params=entry.get("params", {}),
                     position=(0, 0, 0),  # centered, offset applied by item
-                    ink_assignments={
-                        entry.get("ink_pump", "P1"): "ink"},
                     color=color,
-                    workspace=self._workspace,
+                    pump_id=entry.get("ink_pump", "P1"),
                 )
                 if obj and obj.has_trajectory and HAS_NUMPY:
                     traj = obj.trajectory
@@ -841,7 +861,7 @@ class PrintObjectsTab(QWidget):
         self._param_spins.clear()
 
         # CSV type has no parameters (imported from file)
-        if obj_type == "csv_trajectory":
+        if obj_type == "csv_import":
             lbl = QLabel("Use 'Import CSV' below to load trajectory data")
             lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-style: italic;")
             self._param_layout.addRow(lbl)
@@ -903,6 +923,76 @@ class PrintObjectsTab(QWidget):
     #  OBJECT GENERATION + PREVIEW
     # ════════════════════════════════════════════════════════════════
 
+    def _extract_needle_syringe(self) -> tuple:
+        """Extract (needle, syringe_map, settings) from workspace."""
+        needle = None
+        syringe_map = {}
+        speed = 5.0
+        layer_h = 0.2
+
+        if self._workspace:
+            needle = getattr(self._workspace, 'needle', None)
+            for pid, pump in getattr(self._workspace, 'pumps', {}).items():
+                if hasattr(pump, 'syringe') and pump.syringe is not None:
+                    syringe_map[pid] = pump.syringe
+            ps = getattr(self._workspace, 'print_settings', {})
+            speed = ps.get('print_speed_mm_s', 5.0)
+            layer_h = ps.get('layer_height_mm', 0.2)
+
+        # Fallback: create minimal needle if workspace has none
+        if needle is None:
+            try:
+                from SupportClasses.PhysicalModels import NeedleSpec
+                needle = NeedleSpec(gauge=22, od_um=718, id_um=413, wall_um=152)
+            except ImportError:
+                pass
+
+        return needle, syringe_map, speed, layer_h
+
+    def _build_print_object(
+        self,
+        name: str,
+        obj_type: str,
+        params: dict,
+        position: tuple = (0, 0, 0),
+        color: str = "#a6e3a1",
+        pump_id: str = "P1",
+    ) -> PrintObject | None:
+        """
+        Create a PrintObject and generate its trajectory.
+
+        Returns the PrintObject with .trajectory populated, or None on failure.
+        """
+        if not HAS_GEOMETRY:
+            return None
+
+        obj = PrintObject(
+            name=name,
+            object_type=obj_type,
+            params=dict(params),
+            position=position,
+            ink_assignments={pump_id: "ink"},
+            color=color,
+        )
+
+        needle, syringe_map, speed, layer_h = self._extract_needle_syringe()
+        if needle is None:
+            logger.warning("No needle configured — cannot generate trajectory")
+            return obj  # Return object without trajectory
+
+        try:
+            generate_object_trajectory(
+                obj, needle, syringe_map,
+                print_speed_mm_s=speed,
+                layer_height_mm=layer_h,
+                pump_id=pump_id,
+            )
+        except Exception as e:
+            logger.error(f"Trajectory generation failed for '{name}': {e}",
+                         exc_info=True)
+
+        return obj
+
     def _generate_preview(self):
         """Generate a print object and show in projection view."""
         obj_type = self.type_combo.currentData()
@@ -911,28 +1001,14 @@ class PrintObjectsTab(QWidget):
         position = (self.pos_x.value(), self.pos_y.value(), self.pos_z.value())
         color = self._color
         pump = self.ink_combo.currentData() or "P1"
-        num_layers = self.obj_layers.value()
-        layer_h = self.obj_layer_h.value()
 
         if not HAS_GEOMETRY:
             self.obj_info.setText("GeometryEngine not available")
             return
 
         try:
-            # Add layer info to params for 3D objects
-            if "cylinder" in obj_type:
-                params["num_layers"] = num_layers
-                params["layer_height_mm"] = layer_h
-
-            obj = generate_object(
-                name=name,
-                object_type=obj_type,
-                params=params,
-                position=position,
-                ink_assignments={pump: pump},
-                color=color,
-                workspace=self._workspace,
-            )
+            obj = self._build_print_object(
+                name, obj_type, params, position, color, pump)
 
             if obj and obj.has_trajectory:
                 self._show_trajectory_preview(obj)
@@ -966,18 +1042,8 @@ class PrintObjectsTab(QWidget):
         obj_path = ObjectPath(name=obj.name, color=color, points=pts)
         self._preview.set_object_paths([obj_path])
 
-        # Set well diameter for context
-        if self._workspace and hasattr(self._workspace, 'plate_format'):
-            try:
-                from SupportClasses.WellPlate import PLATE_DEFINITIONS
-                fmt = self._workspace.plate_format
-                if fmt in PLATE_DEFINITIONS:
-                    d = PLATE_DEFINITIONS[fmt].get("well_diameter_mm", 10.0)
-                    self._preview.set_well_diameter(d)
-            except ImportError:
-                pass
-
-        self._preview.refresh()
+        # Ensure well boundary is current
+        self._update_well_diameter()
 
     # ════════════════════════════════════════════════════════════════
     #  OBJECT LIBRARY
@@ -1075,25 +1141,19 @@ class PrintObjectsTab(QWidget):
         entry = self._object_library.get(name)
         if not entry or not HAS_GEOMETRY:
             return
-        # Quick generate + preview
         try:
-            obj_type = entry["object_type"]
-            params = dict(entry.get("params", {}))
-            if "cylinder" in obj_type:
-                params["num_layers"] = entry.get("num_layers", 1)
-                params["layer_height_mm"] = entry.get("layer_height", 0.2)
-            obj = generate_object(
+            obj = self._build_print_object(
                 name=name,
-                object_type=obj_type,
-                params=params,
+                obj_type=entry["object_type"],
+                params=entry.get("params", {}),
                 position=entry.get("position", (0, 0, 0)),
                 color=entry.get("color", DEFAULT_COLORS[0]),
-                workspace=self._workspace,
+                pump_id=entry.get("ink_pump", "P1"),
             )
             if obj and obj.has_trajectory:
                 self._show_trajectory_preview(obj)
         except Exception:
-            pass  # Non-critical — just skip preview
+            pass  # Non-critical
 
     def _refresh_library_list(self):
         self.library_list.clear()
@@ -1279,7 +1339,7 @@ class PrintObjectsTab(QWidget):
             if HAS_GEOMETRY:
                 obj = PrintObject(
                     name=name,
-                    object_type="csv_trajectory",
+                    object_type="csv_import",
                     params={"source_file": str(path)},
                     color=DEFAULT_COLORS[len(self._object_library) % len(DEFAULT_COLORS)],
                 )
@@ -1293,7 +1353,7 @@ class PrintObjectsTab(QWidget):
                 # Add to library
                 self._object_library[name] = {
                     "name": name,
-                    "object_type": "csv_trajectory",
+                    "object_type": "csv_import",
                     "params": {"source_file": str(path)},
                     "position": (0, 0, 0),
                     "color": obj.color,

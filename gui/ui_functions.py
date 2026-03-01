@@ -6,6 +6,7 @@ Provides:
     - toggleLeftBox: Animate extra-left context panel open/close
     - selectMenu / deselectMenu / resetStyle: Menu button highlighting
     - uiDefinitions: Standard window setup (custom title bar, grips)
+    - updateMenuButtonStates: Switch between icon-only (collapsed) and icon+label (expanded)
 
 Adapted from PyDracula by Wanderson M. Pimenta, restyled for MEBP bioprinter.
 """
@@ -15,7 +16,10 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import QPushButton, QSizeGrip, QGraphicsDropShadowEffect
 from PySide6.QtGui import QColor
-from gui.styles import COLORS, MENU_SELECTED_STYLESHEET
+from gui.styles import (
+    COLORS, MENU_SELECTED_STYLESHEET,
+    MENU_BTN_COLLAPSED_STYLE, MENU_BTN_EXPANDED_STYLE,
+)
 
 
 class AppSettings:
@@ -48,6 +52,9 @@ class UIFunctions:
         if hasattr(window, '_logo_text'):
             window._logo_text.setVisible(expanding)
 
+        # Update all menu buttons: icon-only when collapsed, icon+label when expanded
+        UIFunctions.updateMenuButtonStates(window, expanding)
+
         if animate:
             group = QParallelAnimationGroup()
             for prop in (b"minimumWidth", b"maximumWidth"):
@@ -63,6 +70,50 @@ class UIFunctions:
         else:
             menu.setMinimumWidth(target)
             menu.setMaximumWidth(target)
+
+    # ── Menu Button State Management ─────────────────────────────
+
+    @staticmethod
+    def updateMenuButtonStates(window, expanded: bool):
+        """
+        Switch all menu buttons between collapsed (icon-only, centered)
+        and expanded (icon + label, left-aligned) states.
+
+        Requires menu buttons to have `_icon_text` and `_label_text`
+        attributes set during creation (see MainWindow._make_menu_button).
+        """
+        for btn in window._menu_buttons:
+            icon_text = getattr(btn, '_icon_text', '')
+            label_text = getattr(btn, '_label_text', '')
+
+            if expanded:
+                # Show icon + label, left-aligned
+                btn.setText(f"  {icon_text}   {label_text}")
+                # Apply expanded alignment while preserving existing selection styles
+                UIFunctions._apply_menu_alignment(btn, expanded=True)
+            else:
+                # Show icon only, centered
+                btn.setText(icon_text)
+                # Apply collapsed alignment while preserving existing selection styles
+                UIFunctions._apply_menu_alignment(btn, expanded=False)
+
+    @staticmethod
+    def _apply_menu_alignment(btn: QPushButton, expanded: bool):
+        """
+        Apply text alignment to a menu button without disrupting selection styles.
+
+        We inject alignment properties into the button's inline stylesheet,
+        replacing any previous alignment block.
+        """
+        current = btn.styleSheet()
+        # Remove any previous alignment block we inserted
+        current = current.replace(MENU_BTN_COLLAPSED_STYLE, "")
+        current = current.replace(MENU_BTN_EXPANDED_STYLE, "")
+        # Add the new alignment block
+        if expanded:
+            btn.setStyleSheet(current + MENU_BTN_EXPANDED_STYLE)
+        else:
+            btn.setStyleSheet(current + MENU_BTN_COLLAPSED_STYLE)
 
     # ── Extra Left Box (Context Panel) Toggle ────────────────────
 
@@ -148,14 +199,3 @@ class UIFunctions:
         shadow.setYOffset(offset[1])
         shadow.setColor(QColor(color))
         widget.setGraphicsEffect(shadow)
-
-    # ── UI Definitions (window setup) ────────────────────────────
-
-    @staticmethod
-    def uiDefinitions(window):
-        """Standard window setup — size grips, etc."""
-        # Add size grips for resizing
-        window._sizegrip = QSizeGrip(window)
-        window._sizegrip.setStyleSheet(
-            "width: 16px; height: 16px; margin: 0; padding: 0;"
-        )
