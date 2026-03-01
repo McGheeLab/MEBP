@@ -567,6 +567,38 @@ class StageController:
 
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
 
+    # ── Convenience connection methods (used by Dashboard) ────────
+
+    def connect_xy(self) -> None:
+        """Connect only the XY stage."""
+        self.connect_stages(xy=True, zp=False)
+
+    def connect_zp(self) -> None:
+        """Connect only the ZP stage."""
+        self.connect_stages(xy=False, zp=True)
+
+    def disconnect_xy(self) -> None:
+        """Disconnect only the XY stage."""
+        if self.xy_jog:
+            self.xy_jog.stop()
+            self.xy_jog = None
+        if self.xy_stage:
+            self.xy_stage.stop()
+            self.xy_stage = None
+        self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
+        logger.info("XY stage disconnected")
+
+    def disconnect_zp(self) -> None:
+        """Disconnect only the ZP stage."""
+        if self.zp_jog:
+            self.zp_jog.stop()
+            self.zp_jog = None
+        if self.zp_stage:
+            self.zp_stage.stop()
+            self.zp_stage = None
+        self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
+        logger.info("ZP stage disconnected")
+
     def _handle_disconnect(self, stage_name: str) -> None:
         logger.error(f"{stage_name} stage disconnected!")
         if stage_name == "XY":

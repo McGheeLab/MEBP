@@ -303,7 +303,7 @@ class SafetyLimits:
 
             # Set pump travel limits from syringe stroke length
             if pump_cfg.syringe:
-                stroke_mm = pump_cfg.syringe.stroke_mm
+                stroke_mm = pump_cfg.syringe.stroke_length_mm
                 # Allow ±stroke from zero reference (generous)
                 attr_min = f"{pid.lower()}_min"
                 attr_max = f"{pid.lower()}_max"

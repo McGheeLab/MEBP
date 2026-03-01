@@ -160,6 +160,9 @@ class QtLogHandler(logging.Handler):
         try:
             msg = self.format(record)
             self.console.log_record(record, msg)
+        except RuntimeError:
+            # Qt signal/widget already destroyed during shutdown — ignore
+            pass
         except Exception:
             self.handleError(record)
 

@@ -183,6 +183,9 @@ class PrintObjectsTab(QWidget):
         # Workspace (set by Tab 1)
         self._workspace = WorkspaceConfig() if HAS_MODELS else None
 
+        # v7.2: Hardware config for syringe/needle info
+        self._hw_config = None
+
         # Object library: name → PrintObject template
         self._object_library: dict[str, dict] = {}
 
@@ -207,6 +210,10 @@ class PrintObjectsTab(QWidget):
         self._workspace = workspace
         self._refresh_ink_combos()
         self._update_well_diameter()
+
+    def set_hardware_config(self, config) -> None:
+        """v7.2: Receive hardware config for syringe/needle info."""
+        self._hw_config = config
 
     def get_collections(self) -> dict:
         """Return all named PrintCollections for job building."""
@@ -924,12 +931,13 @@ class PrintObjectsTab(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _extract_needle_syringe(self) -> tuple:
-        """Extract (needle, syringe_map, settings) from workspace."""
+        """Extract (needle, syringe_map, settings) from workspace + hardware config."""
         needle = None
         syringe_map = {}
         speed = 5.0
         layer_h = 0.2
 
+        # Try workspace first
         if self._workspace:
             needle = getattr(self._workspace, 'needle', None)
             for pid, pump in getattr(self._workspace, 'pumps', {}).items():
@@ -938,6 +946,15 @@ class PrintObjectsTab(QWidget):
             ps = getattr(self._workspace, 'print_settings', {})
             speed = ps.get('print_speed_mm_s', 5.0)
             layer_h = ps.get('layer_height_mm', 0.2)
+
+        # v7.2: Fall back to HardwareConfig for needle and syringes
+        if self._hw_config is not None:
+            if needle is None and hasattr(self._hw_config, 'needle'):
+                needle = self._hw_config.needle
+            if not syringe_map and hasattr(self._hw_config, 'pumps'):
+                for pid, pump_cfg in self._hw_config.pumps.items():
+                    if hasattr(pump_cfg, 'syringe') and pump_cfg.syringe is not None:
+                        syringe_map[pid] = pump_cfg.syringe
 
         # Fallback: create minimal needle if workspace has none
         if needle is None:

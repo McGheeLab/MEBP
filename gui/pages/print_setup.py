@@ -130,6 +130,9 @@ class PrintSetupPage(QWidget):
     def set_hardware_config(self, config):
         """v7.2: Set hardware config for µL-based pump control."""
         self._hardware_config = config
+        # v7.2: Forward to Print Objects tab
+        if hasattr(self, 'tab_objects') and hasattr(self.tab_objects, 'set_hardware_config'):
+            self.tab_objects.set_hardware_config(config)
         # Forward to workspace tab if it exists
         if hasattr(self, 'tab_workspace') and hasattr(self.tab_workspace, 'set_hardware_config'):
             self.tab_workspace.set_hardware_config(config)

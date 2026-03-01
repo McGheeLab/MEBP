@@ -362,7 +362,7 @@ class PrintMonitorPage(QWidget):
 
             for rec in recordings:
                 # rec is a RecordingInfo namedtuple
-                label = f"{rec.job_name}  ({rec.date_str})"
+                label = f"{rec.job_name}  ({rec.timestamp})"
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, rec.meta_path)
                 item.setToolTip(

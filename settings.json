@@ -139,10 +139,10 @@
     "config_name": "Default",
     "notes": "",
     "needle": {
-      "gauge": 25,
-      "od_um": 515,
+      "gauge": 26,
+      "od_um": 464,
       "id_um": 260,
-      "wall_um": 127,
+      "wall_um": 102,
       "length_inches": 1.0,
       "num_channels": 1,
       "channel_pump_map": {
