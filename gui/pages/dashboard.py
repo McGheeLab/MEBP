@@ -22,6 +22,11 @@ from SupportClasses.StageController import StageController
 from SupportClasses.PrintHistory import PrintHistory
 from gui.styles import COLORS
 
+try:
+    from SupportClasses.HardwareConfig import HardwareConfig
+except ImportError:
+    HardwareConfig = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +42,7 @@ class DashboardPage(QWidget):
 
         # Microsteps per micron — set by MainWindow
         self._microsteps_per_micron: float = 10.0
+        self._hardware_config = None  # v7.2: HardwareConfig for µL display
 
         self._setup_ui()
 
@@ -46,6 +52,11 @@ class DashboardPage(QWidget):
     def set_microsteps_per_micron(self, value: float):
         """Called by MainWindow when the conversion factor changes."""
         self._microsteps_per_micron = max(0.001, value)
+
+    def set_hardware_config(self, config):
+        """v7.2: Set hardware config for µL pump display."""
+        self._hardware_config = config
+
 
     def get_context_widget(self) -> QWidget:
         """Context panel: connection controls + log management."""
@@ -362,13 +373,28 @@ class DashboardPage(QWidget):
             self.lbl_xy_status.setText(conn)
             self.lbl_xy_status.setStyleSheet(f"color: {color};")
 
-        # ZP position (already in mm)
+        # ZP position — Z in mm, pumps in µL (v7.2) or mm (fallback)
         zp = ctrl.get_zp_position(cached=True)
         if zp[0] is not None:
             self.lbl_z.setText(f"{zp[0] - ctrl.zero_position['Z']:.2f}")
-            self.lbl_p1.setText(f"{zp[1] - ctrl.zero_position['P1']:.2f}")
-            self.lbl_p2.setText(f"{zp[2] - ctrl.zero_position['P2']:.2f}")
-            self.lbl_p3.setText(f"{zp[3] - ctrl.zero_position['P3']:.2f}")
+            for pid, lbl in [("P1", self.lbl_p1), ("P2", self.lbl_p2), ("P3", self.lbl_p3)]:
+                idx = {"P1": 1, "P2": 2, "P3": 3}[pid]
+                pos_mm = zp[idx] if idx < len(zp) else None
+                zero_ref = ctrl.zero_position.get(pid, 0)
+                if pos_mm is not None:
+                    rel_mm = pos_mm - zero_ref
+                    if self._hardware_config:
+                        pump_cfg = self._hardware_config.pumps.get(pid)
+                        if pump_cfg and pump_cfg.is_configured:
+                            try:
+                                pos_uL = pump_cfg.mm_to_uL(rel_mm)
+                                lbl.setText(f"{pos_uL:.2f} µL")
+                                continue
+                            except (ValueError, AttributeError):
+                                pass
+                    lbl.setText(f"{rel_mm:.2f}")
+                else:
+                    lbl.setText("—")
             self.lbl_zp_status.setText("Connected")
             self.lbl_zp_status.setStyleSheet(f"color: {COLORS['green']};")
         else:

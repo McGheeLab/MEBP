@@ -28,6 +28,11 @@ from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
 from gui.styles import COLORS
 from gui.unit_helpers import steps_to_um, format_um, DEFAULT_MICROSTEPS_PER_MICRON
 
+try:
+    from SupportClasses.HardwareConfig import HardwareConfig
+except ImportError:
+    HardwareConfig = None
+
 logger = logging.getLogger(__name__)
 
 # Optional camera support
@@ -70,6 +75,7 @@ class CalibrationPage(QWidget):
 
         # v7.1.1: Microsteps-to-microns conversion factor
         self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
+        self._hardware_config = None  # v7.2: HardwareConfig
 
         self._setup_ui()
 
@@ -79,6 +85,29 @@ class CalibrationPage(QWidget):
     def set_microsteps_per_micron(self, value: float):
         """Update the microsteps-per-micron conversion factor."""
         self._microsteps_per_micron = value
+
+    def set_hardware_config(self, config):
+        """v7.2: Set hardware config — auto-select plate format and show needle info."""
+        self._hardware_config = config
+        if config is None:
+            return
+
+        # Auto-select plate format from hardware config
+        if hasattr(config, 'plate_format') and config.plate_format:
+            if hasattr(self, 'plate_combo'):
+                for i in range(self.plate_combo.count()):
+                    if self.plate_combo.itemData(i) == config.plate_format:
+                        self.plate_combo.setCurrentIndex(i)
+                        break
+
+        # Show needle info in calibration context panel
+        if hasattr(config, 'needle') and config.needle and hasattr(self, 'ctx_lbl_needle_info'):
+            n = config.needle
+            self.ctx_lbl_needle_info.setText(
+                f"Needle: {n.gauge}G | ID: {n.inner_diameter_um:.0f} µm | "
+                f"Length: {n.length_inches:.1f}\""
+            )
+
 
     # ════════════════════════════════════════════════════════════════
     #  CONTEXT PANEL  (Steps 1-2-3 + Camera Settings + Plate Config)

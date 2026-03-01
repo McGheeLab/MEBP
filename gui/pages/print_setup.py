@@ -43,6 +43,11 @@ from SupportClasses.PrintManager import (
 from SupportClasses.PhysicalModels import WorkspaceConfig
 from gui.styles import COLORS
 
+try:
+    from SupportClasses.HardwareConfig import HardwareConfig
+except ImportError:
+    HardwareConfig = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,6 +113,7 @@ class PrintSetupPage(QWidget):
 
         self._context_widget = None
         self._microsteps_per_micron = 10.0  # Default, updated by MainWindow
+        self._hardware_config = None  # v7.2: HardwareConfig (set by MainWindow)
         self._setup_ui()
 
     # ════════════════════════════════════════════════════════════════
@@ -120,6 +126,19 @@ class PrintSetupPage(QWidget):
     def set_microsteps_per_micron(self, value: float):
         """Update the microsteps-per-micron conversion factor."""
         self._microsteps_per_micron = value
+
+    def set_hardware_config(self, config):
+        """v7.2: Set hardware config for µL-based pump control."""
+        self._hardware_config = config
+        # Forward to workspace tab if it exists
+        if hasattr(self, 'tab_workspace') and hasattr(self.tab_workspace, 'set_hardware_config'):
+            self.tab_workspace.set_hardware_config(config)
+        # Forward to print manager
+        if hasattr(self.print_manager, 'hardware_config'):
+            self.print_manager.hardware_config = config
+        elif hasattr(self.controller, 'set_hardware_config'):
+            pass  # Already set via controller
+
 
     def get_page_subtitle(self) -> str:
         return "Configure workspace, design objects, assign wells"
@@ -260,12 +279,13 @@ class PrintSetupPage(QWidget):
         layout.addLayout(zf_row)
 
         pf_row = QHBoxLayout()
-        pf_row.addWidget(QLabel("Pump Feed:"))
+        pf_row.addWidget(QLabel("Pump Rate:"))
         self.pump_feed_spin = QDoubleSpinBox()
-        self.pump_feed_spin.setRange(0.001, 5.0)
-        self.pump_feed_spin.setValue(0.1)
-        self.pump_feed_spin.setSuffix(" mm/s")
+        self.pump_feed_spin.setRange(0.001, 50.0)
+        self.pump_feed_spin.setValue(0.25)
+        self.pump_feed_spin.setSuffix(" µL/s")
         self.pump_feed_spin.setDecimals(3)
+        self.pump_feed_spin.setToolTip("Default pump flow rate in µL/s")
         pf_row.addWidget(self.pump_feed_spin)
         layout.addLayout(pf_row)
 
@@ -473,17 +493,40 @@ class PrintSetupPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _get_settings(self) -> PrintSettings:
-        """Read current settings from context panel into PrintSettings."""
+        """Read current settings from context panel into PrintSettings.
+
+        v7.2: Uses µL-based fields for pump control. Legacy mm fields
+        are populated for backward compatibility.
+        """
+        active_pump = self.pump_combo.currentText()
+        pump_rate = self.pump_feed_spin.value()  # µL/s
+        retract_uL = self.retract_spin.value()    # µL
+        prime_uL = self.prime_spin.value()         # µL
+
         return PrintSettings(
-            feedrate_xy=self.xy_feed_spin.value(),
-            feedrate_z=self.z_feed_spin.value(),
-            feedrate_pump=self.pump_feed_spin.value(),
+            xy_feedrate=self.xy_feed_spin.value(),
+            z_feedrate=self.z_feed_spin.value() * 60.0,  # mm/s → mm/min for legacy
+            print_feedrate=self.xy_feed_spin.value() * 60.0,  # mm/s → mm/min
             num_layers=self.layers_spin.value(),
             layer_height=self.layer_height_spin.value(),
-            active_pump=self.pump_combo.currentText(),
-            flow_rate=self.flow_spin.value(),
-            retract_volume=self.retract_spin.value(),
-            prime_volume=self.prime_spin.value(),
+            dwell_after_move=0.0,
+            # v7.2 µL fields
+            pump_rate_uL_s=pump_rate,
+            retract_amounts_uL={
+                "P1": retract_uL if active_pump == "P1" else 0.0,
+                "P2": retract_uL if active_pump == "P2" else 0.0,
+                "P3": retract_uL if active_pump == "P3" else 0.0,
+            },
+            prime_amounts_uL={
+                "P1": prime_uL if active_pump == "P1" else 0.0,
+                "P2": prime_uL if active_pump == "P2" else 0.0,
+                "P3": prime_uL if active_pump == "P3" else 0.0,
+            },
+            pump_rates_uL_s={
+                "P1": pump_rate, "P2": pump_rate, "P3": pump_rate,
+            },
+            # Legacy fields for backward compat
+            pump_feedrate=30.0,
         )
 
     # ════════════════════════════════════════════════════════════════

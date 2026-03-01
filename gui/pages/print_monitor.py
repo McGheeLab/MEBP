@@ -43,6 +43,11 @@ from PySide6.QtCore import Qt, Signal, QTimer, QRectF
 from PySide6.QtGui import QColor, QPen, QBrush, QPainter, QFont
 
 from gui.styles import COLORS
+
+try:
+    from SupportClasses.HardwareConfig import HardwareConfig
+except ImportError:
+    HardwareConfig = None
 from gui.unit_helpers import steps_to_um, DEFAULT_MICROSTEPS_PER_MICRON
 from gui.widgets.syringe_display import SyringeStatusPanel
 from gui.widgets.trajectory_view import TrajectoryView
@@ -241,11 +246,18 @@ class PrintMonitorPage(QWidget):
         # v7.1 P7.4: PrintRecorder reference (set by app.py wiring)
         self._recorder = None
         self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
+        self._hardware_config = None  # v7.2: HardwareConfig for µL display
+
 
     # ── Page Interface (P8.34) ───────────────────────────────────
 
     def get_page_title(self) -> str:
         return "Print Monitor"
+
+    def set_hardware_config(self, config):
+        """v7.2: Set hardware config for µL pump display in monitor."""
+        self._hardware_config = config
+
 
     def get_context_widget(self) -> QWidget:
         """P7.6: Context panel with recording browser + replay controls."""

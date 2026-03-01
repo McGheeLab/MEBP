@@ -257,6 +257,84 @@ class SafetyLimits:
         }
         return mapping.get(pump, 0.0)
 
+    # ── v7.2: Auto-configure from HardwareConfig ─────────────────
+
+    def update_from_hardware_config(self, hardware_config) -> None:
+        """
+        v7.2: Auto-configure safety limits from hardware config.
+
+        Sets per-pump max flow rate limits based on needle gauge.
+        Uses conservative lookup table: smaller gauge = lower max flow.
+
+        Also updates pump travel limits based on syringe stroke length.
+        """
+        if hardware_config is None:
+            return
+
+        # Max flow rate by needle gauge (µL/s) — conservative defaults
+        # Based on typical bioprinting literature recommendations
+        GAUGE_MAX_FLOW = {
+            16: 50.0,   # 16G: very wide, high flow ok
+            18: 30.0,
+            20: 15.0,
+            22: 8.0,
+            23: 5.0,
+            25: 3.0,
+            27: 1.5,
+            28: 1.0,
+            30: 0.5,
+            32: 0.2,
+        }
+
+        gauge = None
+        if hasattr(hardware_config, 'needle') and hardware_config.needle:
+            gauge = hardware_config.needle.gauge
+
+        for pid in ["P1", "P2", "P3"]:
+            pump_cfg = hardware_config.pumps.get(pid)
+            if pump_cfg is None or not pump_cfg.is_configured:
+                continue
+
+            # Set flow rate limit from needle gauge
+            if gauge and gauge in GAUGE_MAX_FLOW:
+                max_rate = GAUGE_MAX_FLOW[gauge]
+                self.set_max_flow_rate(pid, max_rate)
+                logger.info(f"{pid}: max flow rate = {max_rate:.1f} µL/s ({gauge}G needle)")
+
+            # Set pump travel limits from syringe stroke length
+            if pump_cfg.syringe:
+                stroke_mm = pump_cfg.syringe.stroke_mm
+                # Allow ±stroke from zero reference (generous)
+                attr_min = f"{pid.lower()}_min"
+                attr_max = f"{pid.lower()}_max"
+                if hasattr(self, attr_min):
+                    setattr(self, attr_min, -stroke_mm * 0.1)  # Small negative for retract
+                if hasattr(self, attr_max):
+                    setattr(self, attr_max, stroke_mm * 1.05)  # Slight extra for safety
+                logger.info(f"{pid}: pump limits = [{-stroke_mm*0.1:.1f}, {stroke_mm*1.05:.1f}] mm "
+                           f"(syringe stroke = {stroke_mm:.1f} mm)")
+
+    def get_pump_limits_uL(self, pump: str, hardware_config=None) -> tuple[float, float] | None:
+        """
+        v7.2: Get pump limits in µL instead of mm.
+
+        Returns (min_uL, max_uL) or None if no syringe configured.
+        """
+        if hardware_config is None:
+            return None
+
+        pump_cfg = hardware_config.pumps.get(pump)
+        if not pump_cfg or not pump_cfg.is_configured:
+            return None
+
+        p_min, p_max = self._pump_limits(pump)
+        try:
+            min_uL = pump_cfg.mm_to_uL(p_min)
+            max_uL = pump_cfg.mm_to_uL(p_max)
+            return (min_uL, max_uL)
+        except (ValueError, AttributeError):
+            return None
+
     def __repr__(self) -> str:
         state = "ON" if self.enabled else "OFF"
         flow_info = ""

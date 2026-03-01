@@ -1,10 +1,10 @@
 {
   "window": {
     "x": 0,
-    "y": 46,
-    "width": 1291,
-    "height": 777,
-    "active_tab": 3,
+    "y": 25,
+    "width": 1296,
+    "height": 792,
+    "active_tab": 4,
     "splitter_sizes": [
       706,
       0
@@ -63,10 +63,10 @@
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
+    "enabled": true,
     "max_flow_rate_p1_uL_s": 0.0,
     "max_flow_rate_p2_uL_s": 0.0,
-    "max_flow_rate_p3_uL_s": 0.0,
-    "enabled": true
+    "max_flow_rate_p3_uL_s": 0.0
   },
   "polling": {
     "position_interval_ms": 300,
@@ -133,6 +133,93 @@
     "P1": null,
     "P2": null,
     "P3": null
+  },
+  "hardware_config": {
+    "version": "7.2",
+    "config_name": "Default",
+    "notes": "",
+    "needle": {
+      "gauge": 25,
+      "od_um": 515,
+      "id_um": 260,
+      "wall_um": 127,
+      "length_inches": 1.0,
+      "num_channels": 1,
+      "channel_pump_map": {
+        "1": "P1"
+      }
+    },
+    "pumps": {
+      "P1": {
+        "pump_id": "P1",
+        "syringe_volume_uL": 100,
+        "syringe": {
+          "volume_uL": 100,
+          "stroke_length_mm": 30.0,
+          "barrel_id_mm": 2.06,
+          "part_number": "1710"
+        },
+        "ink": {
+          "name": "Large M7",
+          "ink_type": "granular",
+          "viscosity_cP": 1.0,
+          "granule_diameter_um": 0.0,
+          "cell_diameter_um": 0.0,
+          "density_g_mL": 1.0,
+          "color": "#a6e3a1"
+        },
+        "printing_mode": "incremental",
+        "fluid_column": {
+          "oil_volume_uL": 0.0,
+          "buffer_volume_uL": 0.0,
+          "ink_volume_uL": 0.0,
+          "dead_volume_uL": 2.0
+        },
+        "enabled": true
+      },
+      "P2": {
+        "pump_id": "P2",
+        "syringe_volume_uL": null,
+        "syringe": null,
+        "ink": null,
+        "printing_mode": "incremental",
+        "fluid_column": {
+          "oil_volume_uL": 0.0,
+          "buffer_volume_uL": 0.0,
+          "ink_volume_uL": 0.0,
+          "dead_volume_uL": 2.0
+        },
+        "enabled": false
+      },
+      "P3": {
+        "pump_id": "P3",
+        "syringe_volume_uL": null,
+        "syringe": null,
+        "ink": null,
+        "printing_mode": "incremental",
+        "fluid_column": {
+          "oil_volume_uL": 0.0,
+          "buffer_volume_uL": 0.0,
+          "ink_volume_uL": 0.0,
+          "dead_volume_uL": 2.0
+        },
+        "enabled": false
+      }
+    },
+    "plate_format": 24,
+    "ink_library": {
+      "Large M7": {
+        "name": "Large M7",
+        "ink_type": "granular",
+        "viscosity_cP": 1.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#a6e3a1"
+      }
+    },
+    "rosette_library": {},
+    "buffer_ink_name": null
   },
   "ui": {
     "scale": 2.0

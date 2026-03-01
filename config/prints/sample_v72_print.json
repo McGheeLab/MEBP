@@ -1,0 +1,40 @@
+{
+  "version": "7.2",
+  "name": "Multi-Material µL Test — 2 Pumps",
+  "description": "v7.2 format: all pump commands use µL/µL/s units",
+  "settings": {
+    "xy_feedrate": 1000.0,
+    "z_feedrate": 60.0,
+    "print_feedrate": 200.0,
+    "pump_rate_uL_s": 0.25,
+    "travel_z_height": 5.0,
+    "print_z_height": 0.1,
+    "layer_height": 0.1,
+    "num_layers": 2,
+    "retract_amounts_uL": {"P1": 0.5, "P2": 0.5, "P3": 0.0},
+    "prime_amounts_uL": {"P1": 0.3, "P2": 0.3, "P3": 0.0},
+    "pump_rates_uL_s": {"P1": 0.25, "P2": 0.5, "P3": 0.25},
+    "retract_amounts": {"P1": 0.0, "P2": 0.0, "P3": 0.0},
+    "prime_amounts": {"P1": 0.0, "P2": 0.0, "P3": 0.0}
+  },
+  "commands": [
+    {"type": "comment", "label": "=== Layer 1 (P1: Hydrogel A) ==="},
+    {"type": "move_xy", "x": 0.0, "y": 0.0},
+    {"type": "travel_down"},
+    {"type": "extrude", "pump": "P1", "amount_uL": 0.3, "rate_uL_s": 0.25, "label": "Prime P1"},
+    {"type": "print_path", "points": [[0,0],[10,0],[10,10],[0,10],[0,0]], "pump": "P1", "flow_rate_uL_s": 0.1},
+    {"type": "extrude", "pump": "P1", "amount_uL": -0.5, "rate_uL_s": 0.5, "label": "Retract P1"},
+    {"type": "travel_up"},
+
+    {"type": "comment", "label": "=== Layer 2 (P2: MSC Cells) ==="},
+    {"type": "switch_pump", "pump": "P2"},
+    {"type": "move_xy", "x": 0.0, "y": 0.0},
+    {"type": "travel_down"},
+    {"type": "extrude", "pump": "P2", "amount_uL": 0.3, "rate_uL_s": 0.5, "label": "Prime P2"},
+    {"type": "print_path", "points": [[0,0],[10,0],[10,10],[0,10],[0,0]], "pump": "P2", "flow_rate_uL_s": 0.2},
+    {"type": "extrude", "pump": "P2", "amount_uL": -0.5, "rate_uL_s": 1.0, "label": "Retract P2"},
+    {"type": "travel_up"},
+
+    {"type": "home_xy"}
+  ]
+}

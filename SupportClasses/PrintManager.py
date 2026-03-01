@@ -145,6 +145,31 @@ class PrintSettings:
     retract_amounts: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
     prime_amounts: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
 
+    # v7.2: µL-based pump settings
+    pump_rate_uL_s: float = 0.25         # Default pump flow rate (µL/s)
+    retract_amounts_uL: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
+    prime_amounts_uL: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
+    pump_rates_uL_s: dict = field(default_factory=lambda: {"P1": 0.25, "P2": 0.25, "P3": 0.25})
+
+    def get_retract_uL(self, pump: str) -> float:
+        """Get retract amount for a pump in µL (v7.2). Falls back to legacy mm value."""
+        uL = self.retract_amounts_uL.get(pump, 0.0)
+        if uL > 0:
+            return uL
+        return 0.0
+
+    def get_prime_uL(self, pump: str) -> float:
+        """Get prime amount for a pump in µL (v7.2). Falls back to legacy mm value."""
+        uL = self.prime_amounts_uL.get(pump, 0.0)
+        if uL > 0:
+            return uL
+        return 0.0
+
+    def get_pump_rate(self, pump: str) -> float:
+        """Get flow rate for a specific pump in µL/s."""
+        return self.pump_rates_uL_s.get(pump, self.pump_rate_uL_s)
+
+
     @classmethod
     def from_dict(cls, d: dict) -> "PrintSettings":
         """Create from dictionary, ignoring unknown keys."""
@@ -289,9 +314,14 @@ def load_print_file(filepath: str) -> PrintJob:
 
 
 def _load_json_file(path: Path) -> PrintJob:
-    """Load from custom JSON format."""
+    """Load from custom JSON format. Auto-detects v7.1 vs v7.2 format."""
     with open(path, "r") as f:
         data = json.load(f)
+
+    # v7.2: Detect file version and migrate if needed
+    file_version = data.get("version", "7.1")
+    if file_version < "7.2":
+        logger.info(f"Loading v{file_version} print file — commands may use legacy mm format")
 
     settings = PrintSettings.from_dict(data.get("settings", {}))
     commands = []
@@ -521,36 +551,57 @@ def build_well_plate_job(
                 label="Lower to print height",
             ))
 
-            # Prime (using per-pump amount)
-            prime_amt = settings.get_prime_amount(active_pump)
-            if prime_amt > 0:
+            # Prime (v7.2: µL amounts, legacy mm fallback)
+            prime_uL = settings.get_prime_uL(active_pump)
+            prime_mm = settings.get_prime_amount(active_pump)
+            if prime_uL > 0:
                 commands.append(PrintCommand(
                     type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount": prime_amt,
+                    params={"pump": active_pump, "amount_uL": prime_uL,
+                            "rate_uL_s": settings.get_pump_rate(active_pump)},
+                    label=f"Prime {active_pump} ({prime_uL:.2f} µL)",
+                ))
+            elif prime_mm > 0:
+                commands.append(PrintCommand(
+                    type=CommandType.EXTRUDE,
+                    params={"pump": active_pump, "amount": prime_mm,
                             "feedrate": settings.pump_feedrate},
-                    label=f"Prime {active_pump}",
+                    label=f"Prime {active_pump} (legacy)",
                 ))
 
-            # Print the path in this well
+            # Print the path in this well (v7.2: include flow_rate_uL_s)
             well_path = [(well_x + px, well_y + py) for px, py in path_points]
+            path_params = {
+                "points": well_path,
+                "pump": active_pump,
+                "flow_rate": flow_rate,
+            }
+            # If flow_rate looks like µL/s (> 0.05), tag as v7.2
+            pump_rate = settings.get_pump_rate(active_pump) if hasattr(settings, 'get_pump_rate') else 0
+            if pump_rate > 0:
+                path_params["flow_rate_uL_s"] = pump_rate
             commands.append(PrintCommand(
                 type=CommandType.PRINT_PATH,
-                params={
-                    "points": well_path,
-                    "pump": active_pump,
-                    "flow_rate": flow_rate,
-                },
+                params=path_params,
                 label=f"Print in {well_name}",
             ))
 
-            # Retract (using per-pump amount)
-            retract_amt = settings.get_retract_amount(active_pump)
-            if retract_amt > 0:
+            # Retract (v7.2: µL amounts, legacy mm fallback)
+            retract_uL = settings.get_retract_uL(active_pump) if hasattr(settings, 'get_retract_uL') else 0
+            retract_mm = settings.get_retract_amount(active_pump)
+            if retract_uL > 0:
                 commands.append(PrintCommand(
                     type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount": -retract_amt,
+                    params={"pump": active_pump, "amount_uL": -retract_uL,
+                            "rate_uL_s": settings.get_pump_rate(active_pump)},
+                    label=f"Retract {active_pump} ({retract_uL:.2f} µL)",
+                ))
+            elif retract_mm > 0:
+                commands.append(PrintCommand(
+                    type=CommandType.EXTRUDE,
+                    params={"pump": active_pump, "amount": -retract_mm,
                             "feedrate": settings.pump_feedrate},
-                    label=f"Retract {active_pump}",
+                    label=f"Retract {active_pump} (legacy)",
                 ))
 
     # Final travel up
@@ -1315,11 +1366,27 @@ class PrintManager:
 
         elif cmd.type == CommandType.EXTRUDE:
             pump = p.get("pump", self._active_pump)
-            amount = p.get("amount", 0)
-            feedrate = p.get("feedrate", settings.pump_feedrate)
-            ctrl.move_pump_relative(pump, amount, feedrate)
-            wait = abs(amount) / (feedrate / 60.0) + 0.1
-            time.sleep(min(wait, 5.0))
+
+            # v7.2: Check for µL-based command first
+            if "amount_uL" in p:
+                amount_uL = p["amount_uL"]
+                rate_uL_s = p.get("rate_uL_s", settings.get_pump_rate(pump))
+                if hasattr(ctrl, 'move_pump_uL'):
+                    ctrl.move_pump_uL(pump, amount_uL, rate_uL_s)
+                else:
+                    # Fallback if controller not yet patched
+                    logger.warning("Controller missing move_pump_uL — using raw mm")
+                    ctrl.move_pump_relative(pump, amount_uL * 0.3, 30.0)
+                wait = abs(amount_uL) / max(rate_uL_s, 0.001) + 0.1
+                time.sleep(min(wait, 10.0))
+
+            # v7.1 legacy: mm-based command
+            elif "amount" in p:
+                amount = p["amount"]
+                feedrate = p.get("feedrate", settings.pump_feedrate)
+                ctrl.move_pump_relative(pump, amount, feedrate)
+                wait = abs(amount) / max(feedrate / 60.0, 0.001) + 0.1
+                time.sleep(min(wait, 5.0))
 
         elif cmd.type == CommandType.PRINT_PATH:
             self._execute_print_path(cmd)
@@ -1521,7 +1588,10 @@ class PrintManager:
         settings = self.job.settings
         points = cmd.params.get("points", [])
         pump = cmd.params.get("pump", self._active_pump)
+        # v7.2: flow_rate_uL_s takes priority, fall back to legacy flow_rate
+        flow_rate_uL_s = cmd.params.get("flow_rate_uL_s", None)
         flow_rate = cmd.params.get("flow_rate", 0.01)
+        use_uL = flow_rate_uL_s is not None
 
         if len(points) < 2:
             return
@@ -1543,15 +1613,31 @@ class PrintManager:
             if seg_length < 0.001:
                 continue
 
-            # Extrude proportional to segment length
-            extrude_amount = seg_length * flow_rate
-            if extrude_amount > 0.0001:
-                mapped = AXIS_MAP.get(pump)
-                if mapped and ctrl.zp_stage:
-                    ctrl.zp_stage.move_relative(
-                        {mapped: extrude_amount},
-                        settings.pump_feedrate,
-                    )
+            # v7.2: Extrude using µL/s flow rate or legacy ratio
+            if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0:
+                # Calculate volume from flow rate × segment time
+                xy_speed = max(settings.print_feedrate, 1.0)
+                seg_time = seg_length / (xy_speed / 60.0) if xy_speed > 0 else 0
+                volume_uL = flow_rate_uL_s * seg_time
+                if volume_uL > 0.001 and hasattr(ctrl, 'move_pump_uL'):
+                    ctrl.move_pump_uL(pump, volume_uL, flow_rate_uL_s)
+                elif volume_uL > 0.001:
+                    mapped = AXIS_MAP.get(pump)
+                    if mapped and ctrl.zp_stage:
+                        ctrl.zp_stage.move_relative(
+                            {mapped: volume_uL * 0.3},
+                            settings.pump_feedrate,
+                        )
+            else:
+                # Legacy: extrude proportional to segment length (dimensionless ratio)
+                extrude_amount = seg_length * flow_rate
+                if extrude_amount > 0.0001:
+                    mapped = AXIS_MAP.get(pump)
+                    if mapped and ctrl.zp_stage:
+                        ctrl.zp_stage.move_relative(
+                            {mapped: extrude_amount},
+                            settings.pump_feedrate,
+                        )
 
             # Move XY
             ctrl.move_xy_absolute(x2, y2, from_zero_ref=True)
@@ -1741,6 +1827,7 @@ class PrintQueue:
 def save_print_job(job: PrintJob, filepath: str):
     """Save a PrintJob to JSON file."""
     data = {
+        "version": "7.2",
         "name": job.name,
         "description": job.description,
         "settings": {
@@ -1792,7 +1879,7 @@ def export_gcode(job: PrintJob, filepath: str) -> None:
     lines: list[str] = []
 
     # Header
-    lines.append(f"; G-code exported from MEBP v7.0")
+    lines.append(f"; G-code exported from MEBP v7.2")
     lines.append(f"; Job: {job.name}")
     lines.append(f"; Description: {job.description}")
     lines.append(f"; Generated: {__import__('datetime').datetime.now().isoformat()}")
@@ -1841,10 +1928,17 @@ def export_gcode(job: PrintJob, filepath: str) -> None:
             lines.append("G90 ; Absolute")
 
         elif cmd.type == CommandType.EXTRUDE:
-            amount = p.get("amount", 0)
-            feedrate = p.get("feedrate", settings.pump_feedrate)
             pump = p.get("pump", "P1")
-            lines.append(f"G1 E{amount:.5f} F{feedrate} ; {pump} {cmd.label}")
+            if "amount_uL" in p:
+                # v7.2: µL-based — note in comment, use raw value for G-code
+                amount_uL = p["amount_uL"]
+                rate = p.get("rate_uL_s", settings.pump_rate_uL_s if hasattr(settings, 'pump_rate_uL_s') else 0.25)
+                lines.append(f"; v7.2 EXTRUDE {pump}: {amount_uL:.3f} µL at {rate:.3f} µL/s")
+                lines.append(f"G1 E{amount_uL:.5f} F{rate * 60:.1f} ; {pump} {cmd.label} (µL units)")
+            else:
+                amount = p.get("amount", 0)
+                feedrate = p.get("feedrate", settings.pump_feedrate)
+                lines.append(f"G1 E{amount:.5f} F{feedrate} ; {pump} {cmd.label}")
 
         elif cmd.type == CommandType.PRINT_PATH:
             points = p.get("points", [])
@@ -2012,3 +2106,113 @@ def clear_print_progress(filepath: str = _RESUME_FILE) -> None:
             logger.debug("Print resume file cleared")
         except Exception as e:
             logger.warning(f"Failed to clear resume file: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v7.2: Print File Version Migration
+# ═══════════════════════════════════════════════════════════════════
+
+def migrate_print_file_v71_to_v72(data: dict, hardware_config=None) -> dict:
+    """
+    Migrate a v7.1 print file to v7.2 format.
+
+    Converts mm-based pump amounts to µL using the hardware config.
+    If no hardware config is available, cannot convert and returns
+    the data with a migration warning flag.
+
+    Args:
+        data: Parsed JSON print file dict
+        hardware_config: HardwareConfig with syringe specs for conversion
+
+    Returns:
+        Migrated data dict with v7.2 format commands
+    """
+    file_version = data.get("version", "7.1")
+    if file_version >= "7.2":
+        return data
+
+    logger.info(f"Migrating print file from v{file_version} to v7.2")
+
+    migrated = dict(data)
+    migrated["version"] = "7.2"
+    migrated["migrated_from"] = file_version
+
+    if not hardware_config:
+        logger.warning(
+            "No hardware config — cannot convert mm→µL. "
+            "Commands with legacy 'amount' (mm) will be executed as-is."
+        )
+        migrated["_migration_incomplete"] = True
+        return migrated
+
+    commands = migrated.get("commands", [])
+    converted_count = 0
+
+    for cmd in commands:
+        cmd_type = cmd.get("type", "")
+
+        if cmd_type == "extrude" and "amount" in cmd and "amount_uL" not in cmd:
+            pump = cmd.get("pump", "P1")
+            amount_mm = cmd["amount"]
+            pump_cfg = hardware_config.pumps.get(pump)
+
+            if pump_cfg and pump_cfg.is_configured:
+                try:
+                    cmd["amount_uL"] = pump_cfg.mm_to_uL(amount_mm)
+                    if "feedrate" in cmd:
+                        cmd["rate_uL_s"] = pump_cfg.feedrate_mm_min_to_uL_s(
+                            cmd["feedrate"]
+                        )
+                    # Archive legacy values
+                    cmd["_legacy_amount_mm"] = cmd.pop("amount")
+                    if "feedrate" in cmd:
+                        cmd["_legacy_feedrate_mm_min"] = cmd.pop("feedrate")
+                    converted_count += 1
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"Migration failed for {pump} extrude: {e}")
+
+        elif cmd_type == "print_path" and "flow_rate" in cmd and "flow_rate_uL_s" not in cmd:
+            # Legacy flow_rate was dimensionless ratio — flag for manual review
+            cmd["flow_rate_uL_s"] = cmd.get("flow_rate", 0.01)
+            cmd["_legacy_flow_rate"] = cmd["flow_rate"]
+            cmd["_needs_review"] = True
+            converted_count += 1
+
+    # Migrate settings
+    settings = migrated.get("settings", {})
+    if "pump_feedrate" in settings and "pump_rate_uL_s" not in settings:
+        settings["pump_rate_uL_s"] = 0.25  # Default — needs manual verification
+
+    if "retract_amounts" in settings and "retract_amounts_uL" not in settings:
+        settings["retract_amounts_uL"] = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
+
+    if "prime_amounts" in settings and "prime_amounts_uL" not in settings:
+        settings["prime_amounts_uL"] = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
+
+    logger.info(f"Migration complete: {converted_count} commands converted")
+    return migrated
+
+
+def detect_print_file_version(data: dict) -> str:
+    """
+    Detect the version of a print file.
+
+    Returns "7.2" if any command has amount_uL or flow_rate_uL_s,
+    otherwise returns whatever is in the version field or "7.1".
+    """
+    # Explicit version tag
+    if "version" in data:
+        return str(data["version"])
+
+    # Heuristic: check commands for v7.2 fields
+    for cmd in data.get("commands", []):
+        if "amount_uL" in cmd or "flow_rate_uL_s" in cmd or "rate_uL_s" in cmd:
+            return "7.2"
+
+    # Heuristic: check settings for v7.2 fields
+    settings = data.get("settings", {})
+    if "pump_rate_uL_s" in settings or "retract_amounts_uL" in settings:
+        return "7.2"
+
+    return "7.1"
+

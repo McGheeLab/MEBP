@@ -28,10 +28,12 @@ from SupportClasses.PrintManager import (
     PrintManager, PrintQueue, PrintJob, PrintCommand,
     PrintSettings, PrintState, CommandType,
     load_print_file, save_print_job, build_well_plate_job,
+    migrate_print_file_v71_to_v72, detect_print_file_version,
 )
 from SupportClasses.WellPlate import WellPlate, WellInfo, PLATE_DEFINITIONS
 from SupportClasses.Settings import Settings
 from SupportClasses.SafetyLimits import SafetyLimits
+from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
 from SupportClasses.PositionLogger import PositionLogger, PositionRecord
 from SupportClasses.SerialUtils import (
     SerialError, SerialDisconnectedError, SerialTimeoutError, SerialAccessError,
@@ -54,10 +56,12 @@ __all__ = [
     "PrintManager", "PrintQueue",
     "PrintJob", "PrintCommand", "PrintSettings", "PrintState", "CommandType",
     "load_print_file", "save_print_job", "build_well_plate_job",
+    "migrate_print_file_v71_to_v72", "detect_print_file_version",
     # Utilities
     "WellPlate", "WellInfo", "PLATE_DEFINITIONS",
     "Settings",
     "SafetyLimits",
+    "HardwareConfig", "PumpChannelConfig",
     "PositionLogger", "PositionRecord",
     # Serial
     "SerialError", "SerialDisconnectedError", "SerialTimeoutError", "SerialAccessError",

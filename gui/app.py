@@ -1,63 +1,34 @@
 """
-Main Application Window — PyDracula-inspired layout for MEBP bioprinter.
+app.py — MEBP Main Window with PyDracula-style sidebar navigation.
 
-Layout:
-    ┌────┬──────────┬──────────────────────────────┐
-    │ L  │ Context  │  Top Bar (title + conn dots)  │
-    │ E  │ Panel    ├──────────────────────────────┤
-    │ F  │ (extra   │                              │
-    │ T  │  left    │   Content Pages (stacked)    │
-    │    │  box)    │                              │
-    │ M  │          ├──────────────────────────────┤
-    │ E  │          │   Console Log (collapsible)  │
-    │ N  │          ├──────────────────────────────┤
-    │ U  │          │   Bottom Bar (status)        │
-    └────┴──────────┴──────────────────────────────┘
-
-Workflow tabs (left menu icons):
-    📊  Dashboard       — device status, positions, print history
-    🕹️  Jog Control     — manual movement, dpad, speed control
-    📐  Calibration     — needle zero, plate teach, validate
-    🖨️  Print Setup     — job loading, preview, execution, queue
-    📈  Print Monitor   — live trajectory, plate progress, recordings (v7.1)
-    ⚙️  Settings        — connections, safety, polling, logging
-
-Each page provides:
-    - get_context_widget() → QWidget for the extra-left panel
-    - get_page_title() → str for the top bar
-    - get_page_subtitle() → str
-
-v7.1 Session I additions:
-    - Print Monitor page (6th nav button) — P8.34
-    - WorkspaceConfig shared state passing — P8.35
-    - PrintRecorder wiring (auto-start/stop) — P7.4, P7.5
-    - Recording browser + replay overlay — P7.6, P7.7
-
-v7.1.1 Improvements:
-    - Menu icons visible when sidebar collapsed (centered icon, left-aligned icon+label when expanded)
-    - XY positions displayed in microns (µm) throughout, configurable via microsteps_per_micron
-    - Centralized color scheme via styles.py COLORS dict
+v7.2 changes:
+    - Hardware Setup page added as page 0 (🔧)
+    - Pages 1-5 gated until hardware config is valid
+    - Settings page (⚙️) always accessible
+    - HardwareConfig propagated to all pages
+    - Bottom bar pump readouts in µL when syringe is configured
+    - Hardware config persisted in settings.json
 """
 
 from __future__ import annotations
 
 import logging
-from functools import partial
+import os
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
-    QPushButton, QLabel, QSizePolicy, QStackedWidget, QSplitter,
-    QScrollArea, QMessageBox, QApplication,
+    QPushButton, QLabel, QStackedWidget, QScrollArea, QSizePolicy,
+    QSplitter,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
-from PySide6.QtGui import QFont, QKeyEvent, QIcon, QPixmap, QPainter, QColor
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QKeyEvent
 
 from SupportClasses.StageController import StageController
-from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.Settings import Settings
 from SupportClasses.PrintHistory import PrintHistory
 from SupportClasses.PrintManager import load_print_progress, clear_print_progress
 from SupportClasses.PrintRecorder import PrintRecorder
+from SupportClasses.HardwareConfig import HardwareConfig
 from gui.styles import DARK_THEME, COLORS
 from gui.ui_functions import UIFunctions, AppSettings
 from gui.unit_helpers import (
@@ -65,6 +36,7 @@ from gui.unit_helpers import (
     get_microsteps_per_micron_from_protocol,
     DEFAULT_MICROSTEPS_PER_MICRON,
 )
+from gui.pages.hardware_setup import HardwareSetupPage
 from gui.pages.dashboard import DashboardPage
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
@@ -108,12 +80,14 @@ class MainWindow(QMainWindow):
         self._page_widgets: list[QWidget] = []
         self._current_page_index = 0
 
-        # Microsteps-per-micron conversion factor
-        # Priority: 1) controller protocol  2) settings.json  3) default (10.0)
-        self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
-        self._protocol_checked = False  # Set True after first XY connect
+        # v7.2: Hardware configuration
+        self._hardware_config: HardwareConfig | None = None
 
-        self.setWindowTitle("MEBP Bioprinter — v7.1")
+        # Microsteps-per-micron conversion factor
+        self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
+        self._protocol_checked = False
+
+        self.setWindowTitle("MEBP Bioprinter — v7.2")
         self.setMinimumSize(1100, 700)
         self.resize(1400, 850)
 
@@ -126,44 +100,29 @@ class MainWindow(QMainWindow):
         self._create_pages()
         self._setup_timers()
 
-        # Select the dashboard by default
+        # v7.2: Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized")
+        logger.info("MainWindow initialized (v7.2)")
 
     @property
     def microsteps_per_micron(self) -> float:
-        """Get the microsteps-per-micron conversion factor."""
         return self._microsteps_per_micron
 
     @microsteps_per_micron.setter
     def microsteps_per_micron(self, value: float):
-        """Set the conversion factor and propagate to pages."""
         self._microsteps_per_micron = max(0.001, value)
         self.settings.set("stage.microsteps_per_micron", self._microsteps_per_micron)
-        # Notify pages that need to update their displays
         for page in self._page_widgets:
             if hasattr(page, 'set_microsteps_per_micron'):
                 page.set_microsteps_per_micron(self._microsteps_per_micron)
         logger.info(f"microsteps_per_micron set to {self._microsteps_per_micron}")
 
     def _resolve_microsteps_per_micron(self) -> float:
-        """
-        Resolve microsteps_per_micron from best available source.
-
-        Priority:
-            1. Controller protocol JSON (if XY stage already connected)
-            2. settings.json  →  stage.microsteps_per_micron
-            3. DEFAULT_MICROSTEPS_PER_MICRON (10.0)
-        """
-        # Try connected protocol first
         proto_val = self._try_load_from_protocol()
         if proto_val is not None:
-            logger.info(f"microsteps_per_micron from protocol: {proto_val}")
             self.settings.set("stage.microsteps_per_micron", proto_val)
             return proto_val
-
-        # Try settings
         saved = self.settings.get("stage.microsteps_per_micron")
         if saved is not None:
             try:
@@ -172,11 +131,9 @@ class MainWindow(QMainWindow):
                     return val
             except (TypeError, ValueError):
                 pass
-
         return DEFAULT_MICROSTEPS_PER_MICRON
 
     def _try_load_from_protocol(self) -> float | None:
-        """Attempt to read microsteps_per_micron from XY stage protocol."""
         xy = getattr(self.controller, 'xy_stage', None)
         if xy is None:
             return None
@@ -189,7 +146,6 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         """Build the main UI shell: left menu, context panel, content area."""
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
         app_layout = QHBoxLayout(central)
@@ -207,7 +163,7 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(0)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Logo / Title area
+        # Logo
         logo_frame = QFrame()
         logo_frame.setObjectName("topLogo")
         logo_frame.setMinimumHeight(50)
@@ -220,7 +176,7 @@ class MainWindow(QMainWindow):
         logo_layout.addWidget(logo_label)
         self._logo_text = QLabel("MEBP")
         self._logo_text.setObjectName("titleLeftApp")
-        self._logo_text.setVisible(False)  # Hidden when collapsed
+        self._logo_text.setVisible(False)
         logo_layout.addWidget(self._logo_text)
         logo_layout.addStretch()
         left_layout.addWidget(logo_frame)
@@ -249,8 +205,9 @@ class MainWindow(QMainWindow):
         top_menu_layout.setSpacing(0)
         top_menu_layout.setContentsMargins(0, 4, 0, 4)
 
-        # Create workflow buttons (icon, label stored separately for toggle)
+        # v7.2: Hardware Setup is first
         menu_items = [
+            ("btn_hardware",  "🔧", "Hardware Setup"),
             ("btn_dashboard", "📊", "Dashboard"),
             ("btn_jog",       "🕹️", "Jog Control"),
             ("btn_calibrate", "📐", "Calibration"),
@@ -263,11 +220,9 @@ class MainWindow(QMainWindow):
             self._menu_buttons.append(btn)
 
         left_layout.addWidget(self.ui_topMenu, 0, Qt.AlignTop)
-
-        # Spacer
         left_layout.addStretch()
 
-        # Bottom menu (settings, etc.)
+        # Bottom menu (settings)
         bottom_menu = QFrame()
         bottom_menu.setObjectName("bottomMenu")
         bottom_menu.setFrameShape(QFrame.NoFrame)
@@ -280,7 +235,6 @@ class MainWindow(QMainWindow):
         self._menu_buttons.append(btn_settings)
 
         left_layout.addWidget(bottom_menu, 0, Qt.AlignBottom)
-
         app_layout.addWidget(self.ui_leftMenuBg)
 
         # ── Extra Left Box (context panel) ───────────────────────
@@ -294,7 +248,6 @@ class MainWindow(QMainWindow):
         extra_layout.setSpacing(0)
         extra_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Top bar of context panel
         extra_top = QFrame()
         extra_top.setObjectName("extraTopBg")
         extra_top.setMinimumHeight(40)
@@ -316,7 +269,6 @@ class MainWindow(QMainWindow):
 
         extra_layout.addWidget(extra_top)
 
-        # Context content area (stacked)
         self._context_stack = QStackedWidget()
         self._context_stack.setObjectName("extraContent")
         extra_layout.addWidget(self._context_stack)
@@ -338,13 +290,12 @@ class MainWindow(QMainWindow):
         top_bar_layout = QHBoxLayout(top_bar)
         top_bar_layout.setContentsMargins(12, 0, 12, 0)
 
-        # Page title area
         title_frame = QWidget()
         title_layout = QVBoxLayout(title_frame)
         title_layout.setSpacing(0)
         title_layout.setContentsMargins(0, 4, 0, 4)
 
-        self._page_title = QLabel("Dashboard")
+        self._page_title = QLabel("Hardware Setup")
         self._page_title.setObjectName("pageTitle")
         self._page_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
         title_layout.addWidget(self._page_title)
@@ -352,30 +303,25 @@ class MainWindow(QMainWindow):
         top_bar_layout.addWidget(title_frame)
         top_bar_layout.addStretch()
 
-        # Connection dots (compact status indicators)
+        # Connection dots
         conn_frame = QFrame()
         conn_frame.setObjectName("connStatusFrame")
         conn_layout = QHBoxLayout(conn_frame)
         conn_layout.setSpacing(12)
         conn_layout.setContentsMargins(0, 0, 0, 0)
-
-        self._conn_xy = self._make_conn_dot("XY")
-        self._conn_zp = self._make_conn_dot("ZP")
-        self._conn_xbox = self._make_conn_dot("Xbox")
-        conn_layout.addWidget(self._conn_xy)
-        conn_layout.addWidget(self._conn_zp)
-        conn_layout.addWidget(self._conn_xbox)
-
-        # Context panel toggle button
-        self._btn_context_toggle = QPushButton("☰")
-        self._btn_context_toggle.setObjectName("flatBtn")
-        self._btn_context_toggle.setFixedSize(32, 32)
-        self._btn_context_toggle.setCursor(Qt.PointingHandCursor)
-        self._btn_context_toggle.setToolTip("Toggle settings panel")
-        self._btn_context_toggle.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
-        conn_layout.addWidget(self._btn_context_toggle)
-
+        conn_layout.addWidget(self._make_conn_dot("XY"))
+        conn_layout.addWidget(self._make_conn_dot("ZP"))
+        conn_layout.addWidget(self._make_conn_dot("Xbox"))
         top_bar_layout.addWidget(conn_frame)
+
+        # Context panel toggle
+        btn_context = QPushButton("☰")
+        btn_context.setObjectName("extraBtn")
+        btn_context.setFixedSize(32, 32)
+        btn_context.setCursor(Qt.PointingHandCursor)
+        btn_context.setToolTip("Toggle context panel")
+        btn_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
+        top_bar_layout.addWidget(btn_context)
 
         content_layout.addWidget(top_bar)
 
@@ -383,8 +329,9 @@ class MainWindow(QMainWindow):
         self._splitter = QSplitter(Qt.Vertical)
         self._splitter.setObjectName("contentBottom")
 
-        # Stacked pages
+        # Page stack
         self._page_stack = QStackedWidget()
+        self._page_stack.setObjectName("pagesContainer")
         self._splitter.addWidget(self._page_stack)
 
         # Console log
@@ -398,32 +345,16 @@ class MainWindow(QMainWindow):
 
         app_layout.addWidget(content_frame)
 
-    def _make_menu_button(self, obj_name: str, icon_text: str, label_text: str) -> QPushButton:
-        """
-        Create a left-menu navigation button.
-
-        Stores icon and label text separately so the toggle can switch between:
-        - Collapsed (60px): centered icon only
-        - Expanded (200px): left-aligned icon + label
-        """
-        # Start in collapsed state: icon only, centered
+    def _make_menu_button(self, obj_name: str, icon_text: str, label: str) -> QPushButton:
         btn = QPushButton(icon_text)
         btn.setObjectName(obj_name)
-        btn.setMinimumHeight(45)
+        btn.setMinimumHeight(44)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setToolTip(label_text)
-        btn.setFont(QFont("Segoe UI Emoji", 14))
-        btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn.setToolTip(label)
         btn.clicked.connect(self._on_menu_click)
-
-        # Store icon/label for toggle switching
-        btn._icon_text = icon_text
-        btn._label_text = label_text
-
         return btn
 
     def _make_conn_dot(self, label: str) -> QWidget:
-        """Create a compact connection status indicator (dot + label)."""
         frame = QWidget()
         layout = QHBoxLayout(frame)
         layout.setSpacing(4)
@@ -439,14 +370,12 @@ class MainWindow(QMainWindow):
         lbl.setObjectName("connLabelOff")
         layout.addWidget(lbl)
 
-        # Store dot reference for status updates
         setattr(self, f"_dot_{label.lower()}", dot)
         setattr(self, f"_lbl_{label.lower()}", lbl)
-
         return frame
 
     def _build_bottom_bar(self):
-        """Build the bottom status bar."""
+        """Build the bottom status bar with µL pump readouts."""
         self.status_bar = self.statusBar()
         self.status_bar.setObjectName("bottomBar")
 
@@ -456,9 +385,22 @@ class MainWindow(QMainWindow):
         self.sb_xy.setFont(mono)
         self.status_bar.addPermanentWidget(self.sb_xy)
 
-        self.sb_zp = QLabel("Z: — | P1: — P2: — P3: —")
-        self.sb_zp.setFont(mono)
-        self.status_bar.addPermanentWidget(self.sb_zp)
+        # v7.2: Separate pump labels for µL display
+        self.sb_z = QLabel("Z: —")
+        self.sb_z.setFont(mono)
+        self.status_bar.addPermanentWidget(self.sb_z)
+
+        self.sb_p1 = QLabel("P1: —")
+        self.sb_p1.setFont(mono)
+        self.status_bar.addPermanentWidget(self.sb_p1)
+
+        self.sb_p2 = QLabel("P2: —")
+        self.sb_p2.setFont(mono)
+        self.status_bar.addPermanentWidget(self.sb_p2)
+
+        self.sb_p3 = QLabel("P3: —")
+        self.sb_p3.setFont(mono)
+        self.status_bar.addPermanentWidget(self.sb_p3)
 
         self.sb_speed = QLabel("Speed XY:— Z:— P:—")
         self.sb_speed.setFont(mono)
@@ -466,35 +408,51 @@ class MainWindow(QMainWindow):
 
         self.sb_safety = QLabel("🛡️ ON")
         self.sb_safety.setFont(mono)
-        self.sb_safety.setToolTip("Safety limits status")
         self.status_bar.addPermanentWidget(self.sb_safety)
 
         self.sb_log_count = QLabel("📝 0")
         self.sb_log_count.setFont(mono)
-        self.sb_log_count.setToolTip("Position log entries")
         self.status_bar.addPermanentWidget(self.sb_log_count)
 
     # ════════════════════════════════════════════════════════════════
-    #  PAGE CREATION
+    #  PAGE CREATION (v7.2: Hardware Setup as page 0)
     # ════════════════════════════════════════════════════════════════
 
     def _create_pages(self):
-        """Instantiate all page widgets and their context panels."""
+        """
+        Instantiate all page widgets.
+        Page 0: Hardware Setup (always enabled)
+        Pages 1-5: Gated until hardware config is valid
+        Page 6: Settings (always enabled)
+        """
+        # Restore hardware config from settings
+        self._hardware_config = self._restore_hardware_config()
+
         pages = [
-            DashboardPage(self.controller, self.print_history),
-            JogControlPage(self.controller),
-            CalibrationPage(self.controller, settings=self.settings),
-            PrintSetupPage(self.controller),
-            SettingsPage(self.controller, self.settings),
-            PrintMonitorPage(self.controller, self.settings),
+            HardwareSetupPage(),                                          # 0
+            DashboardPage(self.controller, self.print_history),           # 1
+            JogControlPage(self.controller),                              # 2
+            CalibrationPage(self.controller, settings=self.settings),     # 3
+            PrintSetupPage(self.controller),                              # 4
+            PrintMonitorPage(self.controller, self.settings),             # 5
+            SettingsPage(self.controller, self.settings),                 # 6
         ]
 
-        # Wire recorder to print manager and monitor if available
+        # Wire Hardware Setup signals
+        hw_page = pages[0]
+        hw_page.config_changed.connect(self._on_hardware_config_changed)
+        hw_page.config_validated.connect(self._on_hardware_validated)
+
+        # Restore saved config to Hardware Setup page
+        if self._hardware_config:
+            hw_page.set_config(self._hardware_config)
+
+        # Wire recorder
         if self.recorder:
             monitor = pages[5]
             if hasattr(monitor, 'set_recorder'):
                 monitor.set_recorder(self.recorder)
-            setup = pages[3]
+            setup = pages[4]
             if hasattr(setup, 'print_manager') and setup.print_manager:
                 setup.print_manager.recorder = self.recorder
 
@@ -502,7 +460,7 @@ class MainWindow(QMainWindow):
             self._page_widgets.append(page)
             self._page_stack.addWidget(page)
 
-            # Create context panel (wrapped in scroll area)
+            # Create context panel
             ctx = None
             if hasattr(page, 'get_context_widget'):
                 ctx = page.get_context_widget()
@@ -513,77 +471,142 @@ class MainWindow(QMainWindow):
                 scroll.setWidget(ctx)
                 self._context_stack.addWidget(scroll)
             else:
-                # Placeholder
                 placeholder = QWidget()
                 self._context_stack.addWidget(placeholder)
 
-            # Propagate microsteps_per_micron to pages that support it
+            # Propagate microsteps_per_micron
             if hasattr(page, 'set_microsteps_per_micron'):
                 page.set_microsteps_per_micron(self._microsteps_per_micron)
 
+        # Propagate existing hardware config to pages
+        if self._hardware_config:
+            self._propagate_hardware_config(self._hardware_config)
+
+        # Initial page gating
+        is_valid = self._hardware_config is not None and self._hardware_config.is_valid
+        self._update_page_gating(is_valid)
+
     # ════════════════════════════════════════════════════════════════
-    #  NAVIGATION
+    #  v7.2: HARDWARE CONFIG MANAGEMENT
+    # ════════════════════════════════════════════════════════════════
+
+    def _on_hardware_config_changed(self, config: HardwareConfig):
+        """Called when hardware setup changes. Propagates to all pages."""
+        self._hardware_config = config
+        self._propagate_hardware_config(config)
+        self._save_hardware_config(config)
+        logger.info(f"Hardware config updated: {config}")
+
+    def _on_hardware_validated(self, is_valid: bool):
+        """Called when hardware setup validity changes. Gates other pages."""
+        self._update_page_gating(is_valid)
+        if is_valid:
+            logger.info("Hardware setup valid — all pages unlocked")
+        else:
+            logger.info("Hardware setup incomplete — pages locked")
+
+    def _propagate_hardware_config(self, config: HardwareConfig):
+        """Push hardware config to all pages and the controller."""
+        # Push to controller
+        if hasattr(self.controller, 'set_hardware_config'):
+            self.controller.set_hardware_config(config)
+
+        # Push to each page that supports it
+        for page in self._page_widgets:
+            if hasattr(page, 'set_hardware_config'):
+                page.set_hardware_config(config)
+
+    def _update_page_gating(self, hardware_valid: bool):
+        """Enable/disable navigation buttons for pages requiring hardware setup."""
+        # Page indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibrate,
+        #               4=Print, 5=Monitor, 6=Settings
+        for i, btn in enumerate(self._menu_buttons):
+            if i == 0:
+                # Hardware Setup — always enabled
+                btn.setEnabled(True)
+                btn.setToolTip("Hardware Setup")
+            elif i == 6 or btn.objectName() == "btn_settings":
+                # Settings — always enabled
+                btn.setEnabled(True)
+                btn.setToolTip("Settings")
+            else:
+                btn.setEnabled(hardware_valid)
+                if not hardware_valid:
+                    btn.setToolTip("Complete Hardware Setup first")
+                else:
+                    btn.setToolTip("")
+
+    def _restore_hardware_config(self) -> HardwareConfig | None:
+        """Try to restore hardware config from settings."""
+        try:
+            hw_data = self.settings.get("hardware_config")
+            if hw_data and isinstance(hw_data, dict):
+                config = HardwareConfig.from_dict(hw_data)
+                logger.info(f"Restored hardware config: {config}")
+                return config
+        except Exception as e:
+            logger.warning(f"Failed to restore hardware config: {e}")
+        return None
+
+    def _save_hardware_config(self, config: HardwareConfig):
+        """Persist hardware config to settings.json."""
+        try:
+            self.settings.set("hardware_config", config.to_dict())
+            self.settings.save()
+        except Exception as e:
+            logger.warning(f"Failed to save hardware config: {e}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  NAVIGATION (v7.2: updated indices)
     # ════════════════════════════════════════════════════════════════
 
     def _on_menu_click(self):
-        """Handle menu button click: navigate to the corresponding page."""
         btn = self.sender()
         if not btn:
             return
 
-        # Map button names to page indices
         btn_map = {
-            "btn_dashboard": 0,
-            "btn_jog": 1,
-            "btn_calibrate": 2,
-            "btn_print": 3,
-            "btn_monitor": 5,
-            "btn_settings": 4,
+            "btn_hardware":  0,
+            "btn_dashboard": 1,
+            "btn_jog":       2,
+            "btn_calibrate": 3,
+            "btn_print":     4,
+            "btn_monitor":   5,
+            "btn_settings":  6,
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
 
     def _navigate_to(self, index: int):
-        """Switch to a page by index."""
         if index < 0 or index >= len(self._page_widgets):
             return
 
         self._current_page_index = index
-
-        # Update page stack
         self._page_stack.setCurrentIndex(index)
-
-        # Update context stack
         self._context_stack.setCurrentIndex(index)
 
-        # Update page title
         page = self._page_widgets[index]
         title = "MEBP Bioprinter"
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            titles = ["Dashboard", "Jog Control", "Calibration", "Print Setup",
-                       "Settings", "Print Monitor"]
+            titles = ["Hardware Setup", "Dashboard", "Jog Control", "Calibration",
+                       "Print Setup", "Print Monitor", "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
-        # Update context panel title
-        context_titles = ["Dashboard", "Jog Settings", "Calibration",
-                          "Print Settings", "Settings", "Recordings"]
+        context_titles = ["Hardware", "Dashboard", "Jog Settings", "Calibration",
+                          "Print Settings", "Recordings", "Settings"]
         self._context_title.setText(
             context_titles[index] if index < len(context_titles) else "Settings"
         )
 
-        # Update menu button styling
-        btn_names = ["btn_dashboard", "btn_jog", "btn_calibrate",
-                     "btn_print", "btn_monitor", "btn_settings"]
         for i, btn in enumerate(self._menu_buttons):
             if i == index:
                 btn.setStyleSheet(UIFunctions.selectMenu(btn.styleSheet()))
             else:
                 btn.setStyleSheet(UIFunctions.deselectMenu(btn.styleSheet()))
 
-        # Auto-open context panel if page has context content
         if hasattr(page, 'get_context_widget') and page.get_context_widget() is not None:
             if self.ui_extraLeftBox.width() == 0:
                 UIFunctions.setLeftBoxWidth(self, AppSettings.LEFT_BOX_WIDTH)
@@ -596,14 +619,13 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def _setup_timers(self):
-        """Set up periodic update timers."""
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._update_status)
         interval = self.settings.get("polling.position_interval_ms", 300)
         self.update_timer.start(interval)
 
     def _update_status(self):
-        """Update connection dots and status bar readouts."""
+        """Update connection dots, position readouts, and page callbacks."""
         # Connection indicators
         xy_ok = self.controller.is_xy_connected
         zp_ok = self.controller.is_zp_connected
@@ -613,44 +635,61 @@ class MainWindow(QMainWindow):
         self._update_conn_dot("zp", zp_ok)
         self._update_conn_dot("xbox", xbox_ok)
 
-        # Re-check protocol on first XY connect to pick up microsteps_per_micron
+        # Protocol check on first XY connect
         if xy_ok and not self._protocol_checked:
             self._protocol_checked = True
             proto_val = self._try_load_from_protocol()
             if proto_val is not None and proto_val != self._microsteps_per_micron:
                 self.microsteps_per_micron = proto_val
-                logger.info(
-                    f"Updated µsteps/µm from protocol on connect: {proto_val}")
 
-        # Position readouts (XY in µm, ZP in mm)
+        # Position readouts
         try:
             xy = self.controller.get_xy_position(cached=True)
             zp = self.controller.get_zp_position(cached=True)
             speeds = self.controller.get_speed_info()
 
+            # XY in µm
             if xy[0] is not None:
                 zx = xy[0] - self.controller.zero_position["x"]
                 zy = xy[1] - self.controller.zero_position["y"]
-                # Convert steps → microns for display
                 ux = steps_to_um(zx, self._microsteps_per_micron)
                 uy = steps_to_um(zy, self._microsteps_per_micron)
                 self.sb_xy.setText(f"XY: {ux:,.1f} , {uy:,.1f} µm")
             else:
                 self.sb_xy.setText("XY: — , — µm")
 
+            # Z in mm
             if zp[0] is not None:
                 zz = self.controller.zero_position.get("Z", 0)
-                zp1 = self.controller.zero_position.get("P1", 0)
-                zp2 = self.controller.zero_position.get("P2", 0)
-                zp3 = self.controller.zero_position.get("P3", 0)
-                self.sb_zp.setText(
-                    f"Z: {zp[0] - zz:.2f} | "
-                    f"P1: {zp[1] - zp1:.2f} "
-                    f"P2: {zp[2] - zp2:.2f} "
-                    f"P3: {zp[3] - zp3:.2f}"
-                )
+                self.sb_z.setText(f"Z: {zp[0] - zz:.2f}")
+
+                # v7.2: Pumps in µL when syringe configured, else mm
+                for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
+                    pos_mm = zp[idx] if idx < len(zp) else None
+                    lbl = getattr(self, f"sb_p{idx}", None)
+                    if lbl is None:
+                        continue
+
+                    zero_ref = self.controller.zero_position.get(pid, 0)
+                    if pos_mm is not None and self._hardware_config:
+                        pump_cfg = self._hardware_config.pumps.get(pid)
+                        if pump_cfg and pump_cfg.is_configured:
+                            try:
+                                pos_uL = pump_cfg.mm_to_uL(pos_mm - zero_ref)
+                                lbl.setText(f"{pid}: {pos_uL:.2f} µL")
+                                continue
+                            except ValueError:
+                                pass
+                    if pos_mm is not None:
+                        lbl.setText(f"{pid}: {pos_mm - zero_ref:.2f} mm")
+                    else:
+                        lbl.setText(f"{pid}: —")
             else:
-                self.sb_zp.setText("Z: — | P1: — P2: — P3: —")
+                self.sb_z.setText("Z: —")
+                for idx in [1, 2, 3]:
+                    lbl = getattr(self, f"sb_p{idx}", None)
+                    if lbl:
+                        lbl.setText(f"P{idx}: —")
 
             self.sb_speed.setText(
                 f"Speed XY:{speeds['xy']:,.0f} Z:{speeds['z']:.1f} P:{speeds['p']:.1f}"
@@ -669,16 +708,14 @@ class MainWindow(QMainWindow):
 
         # Position log count
         if hasattr(self.controller, 'position_logger'):
-            count = self.controller.position_logger.count
-            self.sb_log_count.setText(f"📝 {count}")
+            self.sb_log_count.setText(f"📝 {self.controller.position_logger.count}")
 
-        # Propagate updates to active page
+        # Propagate to active page
         page = self._page_widgets[self._current_page_index]
         if hasattr(page, 'on_status_update'):
             page.on_status_update()
 
     def _update_conn_dot(self, name: str, connected: bool):
-        """Update a connection dot indicator with state-based styling."""
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
         if dot is None:
@@ -691,7 +728,6 @@ class MainWindow(QMainWindow):
             dot.setObjectName("connDotOff")
             if lbl:
                 lbl.setObjectName("connLabelOff")
-        # Force style refresh
         dot.setStyleSheet(dot.styleSheet())
         if lbl:
             lbl.setStyleSheet(lbl.styleSheet())
@@ -701,9 +737,7 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Global keyboard shortcuts."""
         if event.key() == Qt.Key.Key_Escape:
-            # Emergency stop
             if self.controller.zp_stage:
                 try:
                     self.controller.zp_stage.emergency_stop()
@@ -711,7 +745,6 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     logger.error(f"E-stop failed: {e}")
         else:
-            # Propagate to active page
             page = self._page_widgets[self._current_page_index]
             if hasattr(page, 'keyPressEvent'):
                 page.keyPressEvent(event)
@@ -719,12 +752,27 @@ class MainWindow(QMainWindow):
                 super().keyPressEvent(event)
 
     # ════════════════════════════════════════════════════════════════
+    #  SETTINGS SAVE / RESTORE
+    # ════════════════════════════════════════════════════════════════
+
+    def save_settings(self):
+        """Save all settings including window geometry and hardware config."""
+        self.settings.set("window.x", self.x())
+        self.settings.set("window.y", self.y())
+        self.settings.set("window.width", self.width())
+        self.settings.set("window.height", self.height())
+        self.settings.set("window.active_tab", self._current_page_index)
+        if self._hardware_config:
+            self._save_hardware_config(self._hardware_config)
+        self.settings.save()
+
+    # ════════════════════════════════════════════════════════════════
     #  CLEANUP
     # ════════════════════════════════════════════════════════════════
 
     def closeEvent(self, event):
-        """Clean shutdown."""
         self.update_timer.stop()
+        self.save_settings()
         if self.recorder and self.recorder.is_recording:
             self.recorder.stop_recording()
         self.controller.shutdown()

@@ -155,6 +155,11 @@ DEFAULTS: dict[str, Any] = {
         "P2": None,
         "P3": None,
     },
+    # v7.2: Hardware configuration persistence
+    "hardware_config": {
+        "last_config_file": None,           # Path to last loaded hardware config JSON
+        "auto_load": True,                  # Auto-load last config on startup
+    },
 }
 
 

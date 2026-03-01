@@ -75,6 +75,12 @@ class SettingsPage(QWidget):
     def set_microsteps_per_micron(self, value: float):
         """Update the conversion factor and refresh related UI."""
         self._microsteps_per_micron = value
+
+    _hardware_config = None
+
+    def set_hardware_config(self, config):
+        """v7.2: Receive hardware config for dual mm/µL display."""
+        self._hardware_config = config
         if hasattr(self, 'spin_um_factor'):
             self.spin_um_factor.blockSignals(True)
             self.spin_um_factor.setValue(value)

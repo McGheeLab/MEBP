@@ -1,0 +1,116 @@
+{
+  "version": "7.2",
+  "config_name": "Standard Bioprinting Setup",
+  "notes": "22G needle, 100µL syringe on P1, 250µL on P2",
+  "needle": {
+    "gauge": 22,
+    "od_um": 718,
+    "id_um": 413,
+    "wall_um": 152,
+    "length_inches": 1.0,
+    "num_channels": 1,
+    "channel_pump_map": null
+  },
+  "pumps": {
+    "P1": {
+      "pump_id": "P1",
+      "syringe_volume_uL": 100,
+      "syringe": {
+        "volume_uL": 100,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 2.06,
+        "part_number": "1710"
+      },
+      "ink": {
+        "name": "Hydrogel A",
+        "ink_type": "hydrogel",
+        "viscosity_cP": 50.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#a6e3a1"
+      },
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 60.0,
+        "buffer_volume_uL": 5.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": true
+    },
+    "P2": {
+      "pump_id": "P2",
+      "syringe_volume_uL": 250,
+      "syringe": {
+        "volume_uL": 250,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 3.256,
+        "part_number": "1725"
+      },
+      "ink": {
+        "name": "MSC Cells",
+        "ink_type": "cells",
+        "viscosity_cP": 1.2,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 20.0,
+        "density_g_mL": 1.0,
+        "color": "#89b4fa"
+      },
+      "printing_mode": "continuous",
+      "fluid_column": {
+        "oil_volume_uL": 150.0,
+        "buffer_volume_uL": 10.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": true
+    },
+    "P3": {
+      "pump_id": "P3",
+      "syringe_volume_uL": null,
+      "syringe": null,
+      "ink": null,
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": false
+    }
+  },
+  "plate_format": 24,
+  "ink_library": {
+    "Hydrogel A": {
+      "name": "Hydrogel A",
+      "ink_type": "hydrogel",
+      "viscosity_cP": 50.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#a6e3a1"
+    },
+    "MSC Cells": {
+      "name": "MSC Cells",
+      "ink_type": "cells",
+      "viscosity_cP": 1.2,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 20.0,
+      "density_g_mL": 1.0,
+      "color": "#89b4fa"
+    },
+    "DPBS": {
+      "name": "DPBS",
+      "ink_type": "buffer",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#74c7ec"
+    }
+  },
+  "rosette_library": {},
+  "buffer_ink_name": "DPBS"
+}

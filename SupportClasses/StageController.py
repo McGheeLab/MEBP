@@ -26,6 +26,7 @@ from SupportClasses.ZPStage import ZPStageManager, AXIS_MAP
 from SupportClasses.XboxController import xbox_polling_worker
 from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
 from SupportClasses.SafetyLimits import SafetyLimits
+from SupportClasses.HardwareConfig import HardwareConfig
 from SupportClasses.PositionLogger import PositionLogger
 
 logger = logging.getLogger(__name__)
@@ -291,6 +292,14 @@ class XYJogHandler:
         self.processor.register_handler("increment_xyspeed_up", self._incr_up)
         self.processor.register_handler("increment_xyspeed_down", self._incr_down)
 
+
+    # v7.2: Hardware config for µL conversion
+    _hardware_config = None
+
+    def set_hardware_config(self, config):
+        """v7.2: Enable µL-based pump jog when hardware config available."""
+        self._hardware_config = config
+
     def start(self) -> None:
         self._running = True
         self._thread = threading.Thread(
@@ -505,6 +514,9 @@ class StageController:
 
         # Disconnect callback (GUI can set this)
         self.on_disconnect: Callable | None = None
+
+        # v7.2: Hardware configuration (set by GUI when hardware setup completes)
+        self._hardware_config: HardwareConfig | None = None
 
         # Register calibration handler
         self.processor.register_handler("zero_needle_pos", self._calibrate_zero)
@@ -879,3 +891,150 @@ class StageController:
         self.disconnect_stages()
         self.processor.stop()
         logger.info("Shutdown complete")
+
+
+    # ══════════════════════════════════════════════════════════════
+    #  v7.2: µL-Based Pump Control
+    # ══════════════════════════════════════════════════════════════
+
+    def set_hardware_config(self, config: HardwareConfig) -> None:
+        """
+        Set the hardware configuration. Called by MainWindow when
+        hardware setup is completed or modified.
+
+        Enables µL-based pump methods and updates safety limits.
+        """
+        self._hardware_config = config
+        if config:
+            for pid in ["P1", "P2", "P3"]:
+                pump_cfg = config.pumps.get(pid)
+                if pump_cfg and pump_cfg.is_configured:
+                    logger.debug(f"{pid}: syringe={pump_cfg.syringe.volume_uL}µL")
+        logger.info("StageController: hardware config updated")
+
+        # Propagate to ZP jog handler for µL pump jog
+        if self.zp_jog and hasattr(self.zp_jog, 'set_hardware_config'):
+            self.zp_jog.set_hardware_config(config)
+
+        # Update safety limits from hardware config
+        if self.safety_limits:
+            self.safety_limits.update_from_hardware_config(config)
+
+    @property
+    def hardware_config(self) -> HardwareConfig | None:
+        """Get the current hardware configuration."""
+        return self._hardware_config
+
+    def move_pump_uL(
+        self, pump: str, volume_uL: float, rate_uL_s: float | None = None
+    ) -> None:
+        """
+        Move a pump by a specified volume in µL.
+
+        This is the primary pump movement method for v7.2+.
+        Converts µL → mm using the syringe spec, and µL/s → mm/min
+        for the feedrate.
+
+        Args:
+            pump: Pump identifier ("P1", "P2", "P3")
+            volume_uL: Volume to dispense (+) or aspirate (-) in µL
+            rate_uL_s: Flow rate in µL/s. If None, uses default feedrate.
+
+        Raises:
+            ValueError: If pump has no syringe configured
+        """
+        if not self._hardware_config:
+            raise ValueError("No hardware config — complete Hardware Setup first")
+
+        pump_cfg = self._hardware_config.pumps.get(pump)
+        if not pump_cfg or not pump_cfg.is_configured:
+            raise ValueError(f"{pump}: No syringe configured")
+
+        # Convert µL → mm
+        distance_mm = pump_cfg.uL_to_mm(volume_uL)
+
+        # Convert rate µL/s → mm/min
+        feedrate_mm_min = None
+        if rate_uL_s is not None:
+            feedrate_mm_min = pump_cfg.feedrate_uL_s_to_mm_min(abs(rate_uL_s))
+            # Clamp flow rate via safety limits
+            if self.safety_limits.enabled:
+                clamped = self.safety_limits.clamp_flow_rate(rate_uL_s, pump)
+                if abs(clamped) != abs(rate_uL_s):
+                    feedrate_mm_min = pump_cfg.feedrate_uL_s_to_mm_min(abs(clamped))
+
+        logger.debug(
+            f"move_pump_uL({pump}, {volume_uL:+.3f} µL"
+            + (f", {rate_uL_s:.3f} µL/s" if rate_uL_s else "")
+            + f") → {distance_mm:+.5f} mm"
+            + (f", {feedrate_mm_min:.1f} mm/min" if feedrate_mm_min else "")
+        )
+        self.move_pump_relative(pump, distance_mm, feedrate_mm_min)
+
+    def get_pump_position_uL(self, pump: str) -> float | None:
+        """
+        Get the current pump position in µL (relative to zero reference).
+
+        Returns None if unavailable or no syringe configured.
+        """
+        if not self._hardware_config:
+            return None
+
+        pump_cfg = self._hardware_config.pumps.get(pump)
+        if not pump_cfg or not pump_cfg.is_configured:
+            return None
+
+        pos = self.get_zp_position(cached=True)
+        if pos is None or pos[0] is None:
+            return None
+
+        idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
+        if idx >= len(pos):
+            return None
+
+        pos_mm = pos[idx]
+        zero_ref = self.zero_position.get(pump, 0)
+        relative_mm = pos_mm - zero_ref
+
+        try:
+            return pump_cfg.mm_to_uL(relative_mm)
+        except ValueError:
+            return None
+
+    def get_all_pump_positions_uL(self) -> dict[str, float | None]:
+        """Get all pump positions in µL as a dict."""
+        return {pid: self.get_pump_position_uL(pid) for pid in ["P1", "P2", "P3"]}
+
+    def extrude_uL(
+        self, pump: str, volume_uL: float, rate_uL_s: float | None = None
+    ) -> bool:
+        """
+        Extrude (dispense) a specific volume with fluid column tracking.
+
+        Positive volume_uL = dispense, negative = aspirate.
+        Updates FluidColumn in HardwareConfig if available.
+
+        Returns True if executed successfully.
+        """
+        if not self._hardware_config:
+            logger.error("No hardware config — cannot extrude")
+            return False
+
+        pump_cfg = self._hardware_config.pumps.get(pump)
+        if not pump_cfg or not pump_cfg.is_configured:
+            logger.error(f"{pump}: not configured — cannot extrude")
+            return False
+
+        # Track fluid column
+        if volume_uL > 0:
+            if not pump_cfg.fluid_column.can_dispense(volume_uL):
+                logger.warning(
+                    f"{pump}: Requested {volume_uL:.2f} µL but only "
+                    f"{pump_cfg.fluid_column.ink_volume_uL:.2f} µL available"
+                )
+            pump_cfg.fluid_column.dispense(volume_uL)
+        elif volume_uL < 0 and pump_cfg.ink:
+            pump_cfg.fluid_column.aspirate_ink(abs(volume_uL), pump_cfg.ink)
+
+        self.move_pump_uL(pump, volume_uL, rate_uL_s)
+        return True
