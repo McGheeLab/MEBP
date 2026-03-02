@@ -1,13 +1,16 @@
 """
 app.py — MEBP Main Window with PyDracula-style sidebar navigation.
 
-v7.2 changes:
+v7.2.3 changes:
     - Hardware Setup page added as page 0 (🔧)
     - Pages 1-5 gated until hardware config is valid
     - Settings page (⚙️) always accessible
     - HardwareConfig propagated to all pages
     - Bottom bar pump readouts in µL when syringe is configured
     - Hardware config persisted in settings.json
+    - v7.2.3: Job pipeline: PrintSetup → app → PrintMonitor
+    - v7.2.3: Execution controls wired from Monitor to PrintManager
+    - v7.2.3: PrintManager callbacks forwarded to Monitor for live updates
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── Emoji → colored pixmap icon helper ───────────────────────────
+
 def _make_text_icon(text: str, size: int = 24, color: str = "#a6adc8") -> QIcon:
     """Create a QIcon from a text character (emoji or symbol)."""
     pixmap = QPixmap(size, size)
@@ -87,7 +91,7 @@ class MainWindow(QMainWindow):
         self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.2")
+        self.setWindowTitle("MEBP Bioprinter — v7.2.3")
         self.setMinimumSize(1100, 700)
         self.resize(1400, 850)
 
@@ -100,10 +104,14 @@ class MainWindow(QMainWindow):
         self._create_pages()
         self._setup_timers()
 
-        # v7.2: Start on Hardware Setup page
+        # Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized (v7.2)")
+        logger.info("MainWindow initialized (v7.2.3)")
+
+    # ════════════════════════════════════════════════════════════════
+    #  MICROSTEPS-PER-MICRON PROPERTY
+    # ════════════════════════════════════════════════════════════════
 
     @property
     def microsteps_per_micron(self) -> float:
@@ -205,7 +213,7 @@ class MainWindow(QMainWindow):
         top_menu_layout.setSpacing(0)
         top_menu_layout.setContentsMargins(0, 4, 0, 4)
 
-        # v7.2: Hardware Setup is first
+        # Page buttons — Hardware Setup is first
         menu_items = [
             ("btn_hardware",  "🔧", "Hardware Setup"),
             ("btn_dashboard", "📊", "Dashboard"),
@@ -345,16 +353,22 @@ class MainWindow(QMainWindow):
 
         app_layout.addWidget(content_frame)
 
-    def _make_menu_button(self, obj_name: str, icon_text: str, label: str) -> QPushButton:
+    def _make_menu_button(self, obj_name: str, icon_text: str,
+                          label: str) -> QPushButton:
+        """Create a sidebar navigation button."""
         btn = QPushButton(icon_text)
         btn.setObjectName(obj_name)
         btn.setMinimumHeight(44)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip(label)
         btn.clicked.connect(self._on_menu_click)
+        # Store icon/label for UIFunctions.updateMenuButtonStates
+        btn._icon_text = icon_text
+        btn._label_text = label
         return btn
 
     def _make_conn_dot(self, label: str) -> QWidget:
+        """Create a connection status indicator dot + label."""
         frame = QWidget()
         layout = QHBoxLayout(frame)
         layout.setSpacing(4)
@@ -385,7 +399,6 @@ class MainWindow(QMainWindow):
         self.sb_xy.setFont(mono)
         self.status_bar.addPermanentWidget(self.sb_xy)
 
-        # v7.2: Separate pump labels for µL display
         self.sb_z = QLabel("Z: —")
         self.sb_z.setFont(mono)
         self.status_bar.addPermanentWidget(self.sb_z)
@@ -415,15 +428,19 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.sb_log_count)
 
     # ════════════════════════════════════════════════════════════════
-    #  PAGE CREATION (v7.2: Hardware Setup as page 0)
+    #  PAGE CREATION
     # ════════════════════════════════════════════════════════════════
 
     def _create_pages(self):
         """
         Instantiate all page widgets.
+
         Page 0: Hardware Setup (always enabled)
         Pages 1-5: Gated until hardware config is valid
         Page 6: Settings (always enabled)
+
+        v7.2.3: Also wires the job pipeline (Setup → Monitor)
+        and execution control signals (Monitor → PrintManager).
         """
         # Restore hardware config from settings
         self._hardware_config = self._restore_hardware_config()
@@ -456,6 +473,7 @@ class MainWindow(QMainWindow):
             if hasattr(setup, 'print_manager') and setup.print_manager:
                 setup.print_manager.recorder = self.recorder
 
+        # Register all pages with the stacked widgets
         for page in pages:
             self._page_widgets.append(page)
             self._page_stack.addWidget(page)
@@ -483,11 +501,136 @@ class MainWindow(QMainWindow):
             self._propagate_hardware_config(self._hardware_config)
 
         # Initial page gating
-        is_valid = self._hardware_config is not None and self._hardware_config.is_valid
+        is_valid = (self._hardware_config is not None
+                    and self._hardware_config.is_valid)
         self._update_page_gating(is_valid)
 
+        # ── v7.2.3: Wire job pipeline and execution controls ─────
+        self._wire_job_pipeline()
+        self._wire_print_manager_to_monitor()
+
     # ════════════════════════════════════════════════════════════════
-    #  v7.2: HARDWARE CONFIG MANAGEMENT
+    #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
+    # ════════════════════════════════════════════════════════════════
+
+    def _wire_job_pipeline(self):
+        """
+        Wire the print job flow from PrintSetupPage through to
+        PrintMonitorPage, and connect execution control signals.
+
+        Signal flow:
+            PrintSetup.job_ready(PrintJob)
+                → app._send_job_to_monitor(job)
+                → Monitor.receive_job(job)
+                → auto-switch to page 5
+
+            PrintSetup.navigate_to_page(int)
+                → app._switch_page(index)
+
+            Monitor.start_requested(PrintJob)
+                → app._on_monitor_start(job)
+                → PrintManager.start(job)
+
+            Monitor.pause_requested()  → PrintManager.pause()
+            Monitor.resume_requested() → PrintManager.resume()
+            Monitor.abort_requested()  → PrintManager.abort()
+        """
+        setup_page = self._page_widgets[4]   # PrintSetupPage
+        monitor_page = self._page_widgets[5]  # PrintMonitorPage
+
+        # Job pipeline: PrintSetup → app → PrintMonitor
+        if hasattr(setup_page, 'job_ready'):
+            setup_page.job_ready.connect(self._send_job_to_monitor)
+
+        # Navigation: "Edit Hardware Setup" button → switch to page 0
+        if hasattr(setup_page, 'navigate_to_page'):
+            setup_page.navigate_to_page.connect(self._switch_page)
+
+        # Execution control signals from Monitor
+        if hasattr(monitor_page, 'start_requested'):
+            monitor_page.start_requested.connect(self._on_monitor_start)
+        if hasattr(monitor_page, 'pause_requested'):
+            monitor_page.pause_requested.connect(self._on_monitor_pause)
+        if hasattr(monitor_page, 'resume_requested'):
+            monitor_page.resume_requested.connect(self._on_monitor_resume)
+        if hasattr(monitor_page, 'abort_requested'):
+            monitor_page.abort_requested.connect(self._on_monitor_abort)
+
+    def _wire_print_manager_to_monitor(self):
+        """
+        Wire PrintManager's progress and state callbacks to update
+        the PrintMonitorPage in real-time, while preserving any
+        existing callback wiring (e.g., PrintSetup's signal bridge).
+        """
+        setup_page = self._page_widgets[4]
+        monitor_page = self._page_widgets[5]
+
+        if not hasattr(setup_page, 'print_manager'):
+            return
+
+        pm = setup_page.print_manager
+
+        # Chain onto existing progress callback
+        original_progress = pm.on_progress
+
+        def combined_progress(step, total, msg):
+            if original_progress:
+                original_progress(step, total, msg)
+            if hasattr(monitor_page, 'on_print_progress'):
+                monitor_page.on_print_progress(step, total, msg)
+
+        pm.on_progress = combined_progress
+
+        # Chain onto existing state-changed callback
+        original_state = pm.on_state_changed
+
+        def combined_state(state):
+            if original_state:
+                original_state(state)
+            if hasattr(monitor_page, 'on_print_state_changed'):
+                monitor_page.on_print_state_changed(state)
+
+        pm.on_state_changed = combined_state
+
+    def _send_job_to_monitor(self, job):
+        """
+        Receive a PrintJob from PrintSetupPage, forward it to
+        PrintMonitorPage's job queue, and switch to the monitor page.
+        """
+        monitor_page = self._page_widgets[5]
+
+        if hasattr(monitor_page, 'receive_job'):
+            monitor_page.receive_job(job)
+
+        # Auto-switch to Print Monitor page
+        self._switch_page(5)
+
+    def _on_monitor_start(self, job):
+        """Monitor requested start — forward to PrintManager."""
+        setup_page = self._page_widgets[4]
+        if hasattr(setup_page, 'print_manager'):
+            setup_page.print_manager.start(job)
+
+    def _on_monitor_pause(self):
+        """Monitor requested pause — forward to PrintManager."""
+        setup_page = self._page_widgets[4]
+        if hasattr(setup_page, 'print_manager'):
+            setup_page.print_manager.pause()
+
+    def _on_monitor_resume(self):
+        """Monitor requested resume — forward to PrintManager."""
+        setup_page = self._page_widgets[4]
+        if hasattr(setup_page, 'print_manager'):
+            setup_page.print_manager.resume()
+
+    def _on_monitor_abort(self):
+        """Monitor requested abort — forward to PrintManager."""
+        setup_page = self._page_widgets[4]
+        if hasattr(setup_page, 'print_manager'):
+            setup_page.print_manager.abort()
+
+    # ════════════════════════════════════════════════════════════════
+    #  HARDWARE CONFIG MANAGEMENT
     # ════════════════════════════════════════════════════════════════
 
     def _on_hardware_config_changed(self, config: HardwareConfig):
@@ -507,11 +650,9 @@ class MainWindow(QMainWindow):
 
     def _propagate_hardware_config(self, config: HardwareConfig):
         """Push hardware config to all pages and the controller."""
-        # Push to controller
         if hasattr(self.controller, 'set_hardware_config'):
             self.controller.set_hardware_config(config)
 
-        # Push to each page that supports it
         for page in self._page_widgets:
             if hasattr(page, 'set_hardware_config'):
                 page.set_hardware_config(config)
@@ -557,10 +698,11 @@ class MainWindow(QMainWindow):
             logger.warning(f"Failed to save hardware config: {e}")
 
     # ════════════════════════════════════════════════════════════════
-    #  NAVIGATION (v7.2: updated indices)
+    #  NAVIGATION
     # ════════════════════════════════════════════════════════════════
 
     def _on_menu_click(self):
+        """Handle sidebar menu button click."""
         btn = self.sender()
         if not btn:
             return
@@ -578,6 +720,7 @@ class MainWindow(QMainWindow):
         self._navigate_to(index)
 
     def _navigate_to(self, index: int):
+        """Switch to the page at the given index."""
         if index < 0 or index >= len(self._page_widgets):
             return
 
@@ -590,35 +733,48 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            titles = ["Hardware Setup", "Dashboard", "Jog Control", "Calibration",
-                       "Print Setup", "Print Monitor", "Settings"]
+            titles = ["Hardware Setup", "Dashboard", "Jog Control",
+                      "Calibration", "Print Setup", "Print Monitor",
+                      "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
-        context_titles = ["Hardware", "Dashboard", "Jog Settings", "Calibration",
-                          "Print Settings", "Recordings", "Settings"]
+        context_titles = ["Hardware", "Dashboard", "Jog Settings",
+                          "Calibration", "Print Settings", "Recordings",
+                          "Settings"]
         self._context_title.setText(
             context_titles[index] if index < len(context_titles) else "Settings"
         )
 
+        # Highlight the active menu button
         for i, btn in enumerate(self._menu_buttons):
             if i == index:
                 btn.setStyleSheet(UIFunctions.selectMenu(btn.styleSheet()))
             else:
                 btn.setStyleSheet(UIFunctions.deselectMenu(btn.styleSheet()))
 
-        if hasattr(page, 'get_context_widget') and page.get_context_widget() is not None:
+        # Auto-show/hide context panel based on page
+        if (hasattr(page, 'get_context_widget')
+                and page.get_context_widget() is not None):
             if self.ui_extraLeftBox.width() == 0:
                 UIFunctions.setLeftBoxWidth(self, AppSettings.LEFT_BOX_WIDTH)
         else:
             if self.ui_extraLeftBox.width() > 0:
                 UIFunctions.setLeftBoxWidth(self, 0)
 
+    def _switch_page(self, index: int):
+        """
+        Public alias for _navigate_to, used by page signals
+        (e.g., PrintSetupPage.navigate_to_page).
+        """
+        self._navigate_to(index)
+
     # ════════════════════════════════════════════════════════════════
     #  TIMERS & STATUS UPDATES
     # ════════════════════════════════════════════════════════════════
 
     def _setup_timers(self):
+        """Start the position/status polling timer."""
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self._update_status)
         interval = self.settings.get("polling.position_interval_ms", 300)
@@ -658,12 +814,11 @@ class MainWindow(QMainWindow):
             else:
                 self.sb_xy.setText("XY: — , — µm")
 
-            # Z in mm
+            # Z in mm, Pumps in µL when syringe configured else mm
             if zp[0] is not None:
                 zz = self.controller.zero_position.get("Z", 0)
                 self.sb_z.setText(f"Z: {zp[0] - zz:.2f}")
 
-                # v7.2: Pumps in µL when syringe configured, else mm
                 for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
                     pos_mm = zp[idx] if idx < len(zp) else None
                     lbl = getattr(self, f"sb_p{idx}", None)
@@ -692,7 +847,8 @@ class MainWindow(QMainWindow):
                         lbl.setText(f"P{idx}: —")
 
             self.sb_speed.setText(
-                f"Speed XY:{speeds['xy']:,.0f} Z:{speeds['z']:.1f} P:{speeds['p']:.1f}"
+                f"Speed XY:{speeds['xy']:,.0f} Z:{speeds['z']:.1f} "
+                f"P:{speeds['p']:.1f}"
             )
         except Exception:
             pass
@@ -708,7 +864,8 @@ class MainWindow(QMainWindow):
 
         # Position log count
         if hasattr(self.controller, 'position_logger'):
-            self.sb_log_count.setText(f"📝 {self.controller.position_logger.count}")
+            self.sb_log_count.setText(
+                f"📝 {self.controller.position_logger.count}")
 
         # Propagate to active page
         page = self._page_widgets[self._current_page_index]
@@ -716,6 +873,7 @@ class MainWindow(QMainWindow):
             page.on_status_update()
 
     def _update_conn_dot(self, name: str, connected: bool):
+        """Update a connection status dot (green/red)."""
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
         if dot is None:
@@ -737,6 +895,7 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def keyPressEvent(self, event: QKeyEvent):
+        """Global keyboard handling — Escape triggers E-stop."""
         if event.key() == Qt.Key.Key_Escape:
             if self.controller.zp_stage:
                 try:
@@ -771,6 +930,7 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def closeEvent(self, event):
+        """Clean shutdown — stop timers, save settings, stop recording."""
         self.update_timer.stop()
         self.save_settings()
         if self.recorder and self.recorder.is_recording:
