@@ -218,7 +218,68 @@
         "color": "#a6e3a1"
       }
     },
-    "rosette_library": {},
+    "rosette_library": {
+      "6wp_5": {
+        "name": "6wp_5",
+        "well_format": 6,
+        "num_subwells": 6,
+        "has_center_well": true,
+        "ring_radius_mm": 11.654999999999998,
+        "subwell_diameter_mm": 1.5,
+        "subwell_depth_mm": 6.0,
+        "insert_z_offset_mm": 0.0,
+        "subwells": [
+          {
+            "index": 0,
+            "angle_deg": 0.0,
+            "radial_offset_mm": 0.0,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          },
+          {
+            "index": 1,
+            "angle_deg": 0.0,
+            "radial_offset_mm": 11.654999999999998,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          },
+          {
+            "index": 2,
+            "angle_deg": 72.0,
+            "radial_offset_mm": 11.654999999999998,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          },
+          {
+            "index": 3,
+            "angle_deg": 144.0,
+            "radial_offset_mm": 11.654999999999998,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          },
+          {
+            "index": 4,
+            "angle_deg": 216.0,
+            "radial_offset_mm": 11.654999999999998,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          },
+          {
+            "index": 5,
+            "angle_deg": 288.0,
+            "radial_offset_mm": 11.654999999999998,
+            "diameter_mm": 1.5,
+            "depth_mm": 6.0,
+            "z_offset_mm": 0.0
+          }
+        ]
+      }
+    },
     "buffer_ink_name": null
   },
   "ui": {

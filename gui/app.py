@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
                  print_history: PrintHistory | None = None,
                  recorder: PrintRecorder | None = None):
         super().__init__()
+
+        self._propagating_config = False
         self.controller = controller
         self.settings = settings
         self.print_history = print_history
@@ -635,10 +637,16 @@ class MainWindow(QMainWindow):
 
     def _on_hardware_config_changed(self, config: HardwareConfig):
         """Called when hardware setup changes. Propagates to all pages."""
-        self._hardware_config = config
-        self._propagate_hardware_config(config)
-        self._save_hardware_config(config)
-        logger.info(f"Hardware config updated: {config}")
+        if self._propagating_config:
+            return  # Guard against re-entrant calls
+        self._propagating_config = True
+        try:
+            self._hardware_config = config
+            self._propagate_hardware_config(config)
+            self._save_hardware_config(config)
+            logger.info(f"Hardware config updated: {config}")
+        finally:
+            self._propagating_config = False
 
     def _on_hardware_validated(self, is_valid: bool):
         """Called when hardware setup validity changes. Gates other pages."""
@@ -654,6 +662,9 @@ class MainWindow(QMainWindow):
             self.controller.set_hardware_config(config)
 
         for page in self._page_widgets:
+            # Skip the hardware setup page — it's the SOURCE, not the target
+            if isinstance(page, HardwareSetupPage):
+                continue
             if hasattr(page, 'set_hardware_config'):
                 page.set_hardware_config(config)
 
