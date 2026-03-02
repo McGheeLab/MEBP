@@ -1,24 +1,23 @@
 """
-Print Setup Page — v7.1 Tabbed Workspace with Execution Controls.
+Print Setup Page — v7.2.3 Tabbed Workspace with Settings Context Panel.
+
+v7.2.3 Changes:
+    - Tab 1 (Workspace) is now read-only hardware summary
+    - Context panel: execution controls REMOVED (move to Print Monitor in S3)
+    - Context panel: enhanced grouped print settings per pump
+    - HardwareConfig forwarded to WorkspaceTab for bridge to WorkspaceConfig
+    - WorkspaceTab.navigate_to_page signal wired to page navigation
+    - PrintManager/PrintQueue still owned here (moved in Session 3)
 
 PyDracula layout:
     Main content  = 3-tab workflow (Workspace / Print Objects / Well Setup)
-    Context panel = Print Settings, Execution Controls, Print Queue
-
-v7.1 restructure: The original File/WellPlate/Pattern tabs are replaced by
-a 3-tab workspace-oriented workflow:
-    Tab 1 — Workspace:     Syringe/needle/ink/rosette configuration
-    Tab 2 — Print Objects:  Parametric object design, CSV import, collections
-    Tab 3 — Well Setup:    Well assignment, roles, plane calibration
-
-The execution engine, print queue, progress tracking, and context panel
-are preserved from v7.0 but updated to work with the new WorkspaceConfig-
-driven pipeline.
+    Context panel = Print Settings only (grouped per-pump)
 
 Interface contract:
     get_page_title()     → str
-    get_context_widget() → QWidget  (execution controls + queue)
+    get_context_widget() → QWidget
     on_status_update()   → called by MainWindow timer
+    set_hardware_config  → v7.2: receives HardwareConfig from app.py
     resume_print(data)   → called from MainWindow resume dialog
 """
 
@@ -30,8 +29,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
     QTabWidget, QFileDialog, QProgressBar, QFrame,
-    QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
-    QSizePolicy, QMessageBox,
+    QCheckBox, QGroupBox, QSizePolicy, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, QObject
 
@@ -52,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Thread → GUI Signal Bridge
+# Thread → GUI Signal Bridge  (kept for S3 transition)
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintSignalBridge(QObject):
@@ -64,56 +62,56 @@ class PrintSignalBridge(QObject):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Print Setup Page — v7.1 3-Tab Wrapper
+# Print Setup Page — v7.2.3
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintSetupPage(QWidget):
     """
-    Print setup: 3-tab workspace workflow + execution controls.
+    Print setup: 3-tab workflow + print settings context panel.
 
-    Tab 1 — Workspace:     Physical hardware config (needle, syringes, inks)
-    Tab 2 — Print Objects:  Design objects, import CSV, build collections
-    Tab 3 — Well Setup:    Assign prints to wells, calibrate plane, set roles
+    v7.2.3:
+        Tab 1 — Workspace:    READ-ONLY hardware summary + WorkspaceConfig bridge
+        Tab 2 — Print Objects: Design objects, import CSV, build collections
+        Tab 3 — Well Setup:   Assign prints to wells, calibrate plane, set roles
 
-    Context panel provides execution controls, print queue, and settings.
+    Context panel provides print settings ONLY.
+    Execution controls move to Print Monitor in Session 3.
     """
 
     # Emitted when workspace config changes (for app.py to forward to monitor)
     workspace_updated = Signal(object)  # WorkspaceConfig
 
+    # v7.2.3: Request navigation to a specific page (e.g. Hardware Setup)
+    navigate_to_page = Signal(int)  # page index
+
+    # v7.2.3: Signal that a print job is ready to send to monitor
+    job_ready = Signal(object)  # PrintJob
+
     def __init__(self, controller: StageController, settings=None, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.settings = settings
+
+        # v7.2.3: PrintManager/PrintQueue still owned here until S3
         self.print_manager = PrintManager(controller)
         self.print_queue = PrintQueue(controller)
 
-        # Signal bridge for thread → GUI communication
+        # Signal bridge for thread → GUI
         self._bridge = PrintSignalBridge()
         self._bridge.progress_signal.connect(self._on_progress)
         self._bridge.state_signal.connect(self._on_state_changed)
-        self._bridge.queue_progress_signal.connect(self._on_queue_progress)
-        self._bridge.queue_completed_signal.connect(self._on_queue_completed)
 
         self.print_manager.on_progress = (
             lambda s, t, m: self._bridge.progress_signal.emit(s, t, m))
         self.print_manager.on_state_changed = (
             lambda st: self._bridge.state_signal.emit(st))
-        self.print_queue.on_progress = (
-            lambda s, t, m: self._bridge.progress_signal.emit(s, t, m))
-        self.print_queue.on_state_changed = (
-            lambda st: self._bridge.state_signal.emit(st))
-        self.print_queue.on_queue_progress = (
-            lambda i, t, n: self._bridge.queue_progress_signal.emit(i, t, n))
-        self.print_queue.on_queue_completed = (
-            lambda: self._bridge.queue_completed_signal.emit())
 
         # Workspace config (shared between tabs)
         self._workspace = WorkspaceConfig()
 
         self._context_widget = None
-        self._microsteps_per_micron = 10.0  # Default, updated by MainWindow
-        self._hardware_config = None  # v7.2: HardwareConfig (set by MainWindow)
+        self._microsteps_per_micron = 10.0
+        self._hardware_config = None
         self._setup_ui()
 
     # ════════════════════════════════════════════════════════════════
@@ -123,45 +121,48 @@ class PrintSetupPage(QWidget):
     def get_page_title(self) -> str:
         return "Print Setup"
 
-    def set_microsteps_per_micron(self, value: float):
-        """Update the microsteps-per-micron conversion factor."""
-        self._microsteps_per_micron = value
-
-    def set_hardware_config(self, config):
-        """v7.2: Set hardware config for µL-based pump control."""
-        self._hardware_config = config
-        # v7.2: Forward to Print Objects tab
-        if hasattr(self, 'tab_objects') and hasattr(self.tab_objects, 'set_hardware_config'):
-            self.tab_objects.set_hardware_config(config)
-        # Forward to workspace tab if it exists
-        if hasattr(self, 'tab_workspace') and hasattr(self.tab_workspace, 'set_hardware_config'):
-            self.tab_workspace.set_hardware_config(config)
-        # Forward to print manager
-        if hasattr(self.print_manager, 'hardware_config'):
-            self.print_manager.hardware_config = config
-        elif hasattr(self.controller, 'set_hardware_config'):
-            pass  # Already set via controller
-
-
     def get_page_subtitle(self) -> str:
         return "Configure workspace, design objects, assign wells"
 
+    def set_microsteps_per_micron(self, value: float):
+        self._microsteps_per_micron = value
+
+    def set_hardware_config(self, config):
+        """
+        v7.2.3: Set hardware config — forward to all tabs.
+
+        The workspace tab receives the config and builds a WorkspaceConfig
+        from it via the bridge method, then emits workspace_changed.
+        """
+        self._hardware_config = config
+
+        # v7.2.3: Forward to workspace tab (builds WorkspaceConfig)
+        if hasattr(self, 'tab_workspace') and hasattr(self.tab_workspace, 'set_hardware_config'):
+            self.tab_workspace.set_hardware_config(config)
+
+        # Forward to Print Objects tab
+        if hasattr(self, 'tab_objects') and hasattr(self.tab_objects, 'set_hardware_config'):
+            self.tab_objects.set_hardware_config(config)
+
+        # Forward to print manager
+        if hasattr(self.print_manager, 'hardware_config'):
+            self.print_manager.hardware_config = config
+
     def on_status_update(self):
         """Called by MainWindow timer (~300 ms)."""
-        # Forward to active tab if it has an update method
         idx = self.tabs.currentIndex()
         current = self.tabs.currentWidget()
         if hasattr(current, 'on_status_update'):
             current.on_status_update()
 
     def get_context_widget(self) -> QWidget:
-        """Build execution controls + queue context panel."""
+        """Build print settings context panel (v7.2.3: no execution controls)."""
         if self._context_widget:
             return self._context_widget
         return self._build_context_panel()
 
     def resume_print(self, resume_data: dict):
-        """Resume a previously interrupted print."""
+        """Resume a previously interrupted print (kept for S3 transition)."""
         job = resume_data["job"]
         step = resume_data["current_step"]
         self.print_manager.start(job, resume_from_step=step)
@@ -202,7 +203,7 @@ class PrintSetupPage(QWidget):
             }}
         """)
 
-        # Import tab widgets (lazy to avoid circular imports at module level)
+        # Import tab widgets (lazy to avoid circular imports)
         from gui.pages.print_workspace import WorkspaceTab
         from gui.pages.print_objects import PrintObjectsTab
         from gui.pages.print_well_setup import WellSetupTab
@@ -231,6 +232,11 @@ class PrintSetupPage(QWidget):
         # Workspace → Objects + Wells + Monitor
         self.tab_workspace.workspace_changed.connect(self._on_workspace_changed)
 
+        # v7.2.3: Workspace "Edit Hardware Setup" → navigate to Page 0
+        if hasattr(self.tab_workspace, 'navigate_to_page'):
+            self.tab_workspace.navigate_to_page.connect(
+                self.navigate_to_page.emit)
+
         # Objects → Wells (available print collections)
         if hasattr(self.tab_objects, 'collections_changed'):
             self.tab_objects.collections_changed.connect(
@@ -243,10 +249,17 @@ class PrintSetupPage(QWidget):
         outer.addWidget(self.tabs)
 
     # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL — Execution Controls + Queue
+    #  CONTEXT PANEL — Print Settings Only (v7.2.3)
     # ════════════════════════════════════════════════════════════════
 
     def _build_context_panel(self) -> QWidget:
+        """
+        Build the context panel with print settings only.
+
+        v7.2.3: Execution controls (Start/Pause/Abort, progress bar,
+        print queue) have been removed. They will move to Print Monitor
+        in Session 3.
+        """
         ctx = QWidget()
         ctx.setObjectName("contextPanel")
         layout = QVBoxLayout(ctx)
@@ -260,7 +273,7 @@ class PrintSetupPage(QWidget):
             f"font-weight: bold; color: {COLORS['text']}; font-size: 13px;")
         layout.addWidget(settings_label)
 
-        # Feedrate
+        # XY Feed
         fr_row = QHBoxLayout()
         fr_row.addWidget(QLabel("XY Feed:"))
         self.xy_feed_spin = QDoubleSpinBox()
@@ -271,6 +284,7 @@ class PrintSetupPage(QWidget):
         fr_row.addWidget(self.xy_feed_spin)
         layout.addLayout(fr_row)
 
+        # Z Feed
         zf_row = QHBoxLayout()
         zf_row.addWidget(QLabel("Z Feed:"))
         self.z_feed_spin = QDoubleSpinBox()
@@ -281,6 +295,7 @@ class PrintSetupPage(QWidget):
         zf_row.addWidget(self.z_feed_spin)
         layout.addLayout(zf_row)
 
+        # Pump Rate (default)
         pf_row = QHBoxLayout()
         pf_row.addWidget(QLabel("Pump Rate:"))
         self.pump_feed_spin = QDoubleSpinBox()
@@ -301,6 +316,7 @@ class PrintSetupPage(QWidget):
         ly_row.addWidget(self.layers_spin)
         layout.addLayout(ly_row)
 
+        # Layer Height
         lh_row = QHBoxLayout()
         lh_row.addWidget(QLabel("Layer H:"))
         self.layer_height_spin = QDoubleSpinBox()
@@ -323,143 +339,243 @@ class PrintSetupPage(QWidget):
         flow_row = QHBoxLayout()
         flow_row.addWidget(QLabel("Flow:"))
         self.flow_spin = QDoubleSpinBox()
-        self.flow_spin.setRange(0.0, 100.0)
-        self.flow_spin.setValue(1.0)
-        self.flow_spin.setSuffix(" µL/s")
-        self.flow_spin.setDecimals(2)
+        self.flow_spin.setRange(0.0, 10.0)
+        self.flow_spin.setValue(0.01)
+        self.flow_spin.setDecimals(4)
+        self.flow_spin.setToolTip("Flow rate per mm of travel (µL/mm)")
         flow_row.addWidget(self.flow_spin)
         layout.addLayout(flow_row)
 
-        # Retract / Prime
-        ret_row = QHBoxLayout()
-        ret_row.addWidget(QLabel("Retract:"))
-        self.retract_spin = QDoubleSpinBox()
-        self.retract_spin.setRange(0.0, 50.0)
-        self.retract_spin.setValue(2.0)
-        self.retract_spin.setSuffix(" µL")
-        ret_row.addWidget(self.retract_spin)
-        layout.addLayout(ret_row)
+        # Travel Z height
+        tz_row = QHBoxLayout()
+        tz_row.addWidget(QLabel("Travel Z:"))
+        self.travel_z_spin = QDoubleSpinBox()
+        self.travel_z_spin.setRange(0.1, 50.0)
+        self.travel_z_spin.setValue(5.0)
+        self.travel_z_spin.setSuffix(" mm")
+        self.travel_z_spin.setDecimals(1)
+        tz_row.addWidget(self.travel_z_spin)
+        layout.addLayout(tz_row)
 
-        prime_row = QHBoxLayout()
-        prime_row.addWidget(QLabel("Prime:"))
-        self.prime_spin = QDoubleSpinBox()
-        self.prime_spin.setRange(0.0, 50.0)
-        self.prime_spin.setValue(2.0)
-        self.prime_spin.setSuffix(" µL")
-        prime_row.addWidget(self.prime_spin)
-        layout.addLayout(prime_row)
+        # ── Per-Pump Settings Group (v7.2.3: NEW) ────────────────
+        pump_grp = QGroupBox("Per-Pump Retract / Prime")
+        pump_grp.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; color: {COLORS['text']};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 6px; padding-top: 14px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; left: 8px; padding: 0 3px;
+            }}
+        """)
+        pump_grp_lay = QVBoxLayout(pump_grp)
+        pump_grp_lay.setSpacing(3)
 
-        # ── Separator ─────────────────────────────────────────────
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet(f"background: {COLORS['surface1']};")
-        layout.addWidget(sep1)
+        self._retract_spins: dict[str, QDoubleSpinBox] = {}
+        self._prime_spins: dict[str, QDoubleSpinBox] = {}
 
-        # ── Execution Controls ────────────────────────────────────
-        exec_label = QLabel("Execution")
-        exec_label.setObjectName("contextSectionLabel")
-        exec_label.setStyleSheet(
-            f"font-weight: bold; color: {COLORS['text']}; font-size: 13px;")
-        layout.addWidget(exec_label)
+        for pid in ["P1", "P2", "P3"]:
+            row = QHBoxLayout()
+            lbl = QLabel(f"{pid}:")
+            lbl.setFixedWidth(24)
+            lbl.setStyleSheet(
+                f"font-weight: bold; color: {COLORS.get('blue', '#89b4fa')};")
+            row.addWidget(lbl)
 
-        self.btn_start = QPushButton("▶ Start Print")
-        self.btn_start.setObjectName("accentBtn")
-        self.btn_start.setMaximumHeight(32)
-        self.btn_start.clicked.connect(self._start_print)
-        layout.addWidget(self.btn_start)
+            row.addWidget(QLabel("Ret:"))
+            ret_spin = QDoubleSpinBox()
+            ret_spin.setRange(0.0, 20.0)
+            ret_spin.setValue(0.5)
+            ret_spin.setSuffix(" µL")
+            ret_spin.setDecimals(2)
+            ret_spin.setToolTip(f"{pid} retract volume after path segment")
+            ret_spin.setMaximumWidth(80)
+            row.addWidget(ret_spin)
+            self._retract_spins[pid] = ret_spin
 
-        btn_row = QHBoxLayout()
-        self.btn_pause = QPushButton("⏸ Pause")
-        self.btn_pause.setMaximumHeight(28)
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.clicked.connect(self._pause_print)
-        btn_row.addWidget(self.btn_pause)
+            row.addWidget(QLabel("Prime:"))
+            prime_spin = QDoubleSpinBox()
+            prime_spin.setRange(0.0, 20.0)
+            prime_spin.setValue(0.5)
+            prime_spin.setSuffix(" µL")
+            prime_spin.setDecimals(2)
+            prime_spin.setToolTip(f"{pid} prime volume before path segment")
+            prime_spin.setMaximumWidth(80)
+            row.addWidget(prime_spin)
+            self._prime_spins[pid] = prime_spin
 
-        self.btn_abort = QPushButton("⏹ Abort")
-        self.btn_abort.setMaximumHeight(28)
-        self.btn_abort.setEnabled(False)
-        self.btn_abort.clicked.connect(self._abort_print)
-        btn_row.addWidget(self.btn_abort)
-        layout.addLayout(btn_row)
+            pump_grp_lay.addLayout(row)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(16)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        layout.addWidget(pump_grp)
 
-        self.status_label = QLabel("Idle")
+        # ── Settle Delay ──────────────────────────────────────────
+        sd_row = QHBoxLayout()
+        sd_row.addWidget(QLabel("Settle:"))
+        self.settle_spin = QDoubleSpinBox()
+        self.settle_spin.setRange(0.0, 10.0)
+        self.settle_spin.setValue(0.0)
+        self.settle_spin.setSuffix(" s")
+        self.settle_spin.setDecimals(1)
+        self.settle_spin.setToolTip("Wait time after travel moves (seconds)")
+        sd_row.addWidget(self.settle_spin)
+        layout.addLayout(sd_row)
+
+        # ── Send to Monitor (v7.2.3: replaces Start Print) ───────
+        layout.addSpacing(10)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {COLORS.get('surface1', '#45475a')};")
+        layout.addWidget(sep)
+
+        self.btn_send_to_monitor = QPushButton("📤 Send to Monitor ▶")
+        self.btn_send_to_monitor.setObjectName("accentBtn")
+        self.btn_send_to_monitor.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS.get('green', '#a6e3a1')};
+                color: {COLORS.get('base', '#1e1e2e')};
+                font-weight: bold; padding: 8px 16px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS.get('teal', '#94e2d5')};
+            }}
+        """)
+        self.btn_send_to_monitor.setToolTip(
+            "Build print job and send to Print Monitor for execution")
+        self.btn_send_to_monitor.clicked.connect(self._send_to_monitor)
+        layout.addWidget(self.btn_send_to_monitor)
+
+        self.status_label = QLabel("Configure wells → Send to Monitor")
         self.status_label.setObjectName("dimLabel")
-        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
         layout.addWidget(self.status_label)
 
-        # ── Export ────────────────────────────────────────────────
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"background: {COLORS['surface1']};")
-        layout.addWidget(sep2)
-
+        # ── Export Actions ────────────────────────────────────────
         export_row = QHBoxLayout()
-        btn_save_json = QPushButton("💾 Save Job")
-        btn_save_json.setMaximumHeight(24)
-        btn_save_json.clicked.connect(self._save_job)
-        export_row.addWidget(btn_save_json)
-
-        btn_export_gc = QPushButton("📄 Export G-code")
-        btn_export_gc.setMaximumHeight(24)
-        btn_export_gc.clicked.connect(self._export_gcode)
-        export_row.addWidget(btn_export_gc)
+        btn_export = QPushButton("Export G-code")
+        btn_export.setMaximumHeight(24)
+        btn_export.clicked.connect(self._export_gcode)
+        export_row.addWidget(btn_export)
+        btn_save = QPushButton("Save JSON")
+        btn_save.setMaximumHeight(24)
+        btn_save.clicked.connect(self._save_job)
+        export_row.addWidget(btn_save)
         layout.addLayout(export_row)
-
-        # ── Print Queue ───────────────────────────────────────────
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.HLine)
-        sep3.setStyleSheet(f"background: {COLORS['surface1']};")
-        layout.addWidget(sep3)
-
-        q_lbl = QLabel("Print Queue")
-        q_lbl.setObjectName("contextSectionLabel")
-        q_lbl.setStyleSheet(
-            f"font-weight: bold; color: {COLORS['text']}; font-size: 13px;")
-        layout.addWidget(q_lbl)
-
-        self.queue_list = QListWidget()
-        self.queue_list.setMaximumHeight(80)
-        self.queue_list.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove)
-        layout.addWidget(self.queue_list)
-
-        q_btn_row = QHBoxLayout()
-        q_btn_row.setSpacing(3)
-        btn_add = QPushButton("+")
-        btn_add.setToolTip("Add current job to queue")
-        btn_add.setMaximumHeight(24)
-        btn_add.clicked.connect(self._add_to_queue)
-        q_btn_row.addWidget(btn_add)
-        btn_rm = QPushButton("−")
-        btn_rm.setToolTip("Remove selected")
-        btn_rm.setMaximumHeight(24)
-        btn_rm.clicked.connect(self._remove_from_queue)
-        q_btn_row.addWidget(btn_rm)
-        btn_clr = QPushButton("Clear")
-        btn_clr.setMaximumHeight(24)
-        btn_clr.clicked.connect(self._clear_queue)
-        q_btn_row.addWidget(btn_clr)
-        layout.addLayout(q_btn_row)
-
-        btn_start_q = QPushButton("▶ Start Queue")
-        btn_start_q.setObjectName("accentBtn")
-        btn_start_q.setMaximumHeight(28)
-        btn_start_q.clicked.connect(self._start_queue)
-        layout.addWidget(btn_start_q)
-
-        self.queue_progress_label = QLabel("")
-        self.queue_progress_label.setObjectName("dimLabel")
-        layout.addWidget(self.queue_progress_label)
 
         layout.addStretch()
         self._context_widget = ctx
         return ctx
+
+    # ════════════════════════════════════════════════════════════════
+    #  SETTINGS EXTRACTION
+    # ════════════════════════════════════════════════════════════════
+
+    def _get_settings(self) -> PrintSettings:
+        """Build PrintSettings from context panel controls."""
+        s = PrintSettings()
+        s.xy_feedrate = self.xy_feed_spin.value()
+        s.z_feedrate = self.z_feed_spin.value()
+        s.pump_rate_uL_s = self.pump_feed_spin.value()
+        s.num_layers = self.layers_spin.value()
+        s.layer_height = self.layer_height_spin.value()
+        s.active_pump = self.pump_combo.currentText()
+        s.flow_rate = self.flow_spin.value()
+        s.travel_z_height = self.travel_z_spin.value()
+        s.settle_delay = self.settle_spin.value()
+
+        # Per-pump retract/prime
+        s.retract_amounts = {
+            pid: spin.value() for pid, spin in self._retract_spins.items()
+        }
+        s.prime_amounts = {
+            pid: spin.value() for pid, spin in self._prime_spins.items()
+        }
+
+        return s
+
+    # ════════════════════════════════════════════════════════════════
+    #  SEND TO MONITOR (v7.2.3: replaces direct execution)
+    # ════════════════════════════════════════════════════════════════
+
+    def _send_to_monitor(self):
+        """Build a print job and emit job_ready for Print Monitor."""
+        job = self._build_current_job()
+        if job is None:
+            self.status_label.setText("⚠ No job — configure wells first")
+            self.status_label.setStyleSheet(
+                f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
+            return
+
+        self.job_ready.emit(job)
+        self.status_label.setText(f"✓ Job sent to Monitor: {job.name}")
+        self.status_label.setStyleSheet(
+            f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
+        logger.info(f"Print job sent to Monitor: {job.name}")
+
+    def _build_current_job(self):
+        """Build a print job from current well setup and settings."""
+        # Check if Tab 3 has a well plate configured
+        if hasattr(self.tab_wells, '_model') and self.tab_wells._model:
+            model = self.tab_wells._model
+            plate = model.plate
+            settings = self._get_settings()
+
+            # Get print wells
+            print_wells = [
+                name for name, a in model.assignments.items()
+                if a.role.value == "print"
+            ]
+
+            if print_wells and plate:
+                return build_well_plate_job(
+                    plate=plate,
+                    selected_wells=print_wells,
+                    settings=settings,
+                )
+
+        logger.warning("No printable job could be built from current setup")
+        return None
+
+    # ════════════════════════════════════════════════════════════════
+    #  EXPORT
+    # ════════════════════════════════════════════════════════════════
+
+    def _export_gcode(self):
+        """Export the current job as G-code."""
+        job = self._build_current_job()
+        if job is None:
+            QMessageBox.warning(self, "No Job",
+                                "Configure wells before exporting.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export G-code", f"{job.name}.gcode",
+            "G-code files (*.gcode)")
+        if path:
+            try:
+                export_gcode(job, path)
+                self.status_label.setText(f"✓ Exported to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    def _save_job(self):
+        """Save the current job as JSON."""
+        job = self._build_current_job()
+        if job is None:
+            QMessageBox.warning(self, "No Job",
+                                "Configure wells before saving.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Job", f"{job.name}.json",
+            "JSON files (*.json)")
+        if path:
+            try:
+                save_print_job(job, path)
+                self.status_label.setText(f"✓ Saved to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", str(e))
 
     # ════════════════════════════════════════════════════════════════
     #  CROSS-TAB SIGNAL HANDLERS
@@ -489,255 +605,22 @@ class PrintSetupPage(QWidget):
 
     def _on_setup_changed(self):
         """Well Setup tab changed → may affect execution readiness."""
-        logger.debug("Well setup changed — checking execution readiness")
+        pass
 
     # ════════════════════════════════════════════════════════════════
-    #  SETTINGS HELPERS
-    # ════════════════════════════════════════════════════════════════
-
-    def _get_settings(self) -> PrintSettings:
-        """Read current settings from context panel into PrintSettings.
-
-        v7.2: Uses µL-based fields for pump control. Legacy mm fields
-        are populated for backward compatibility.
-        """
-        active_pump = self.pump_combo.currentText()
-        pump_rate = self.pump_feed_spin.value()  # µL/s
-        retract_uL = self.retract_spin.value()    # µL
-        prime_uL = self.prime_spin.value()         # µL
-
-        return PrintSettings(
-            xy_feedrate=self.xy_feed_spin.value(),
-            z_feedrate=self.z_feed_spin.value() * 60.0,  # mm/s → mm/min for legacy
-            print_feedrate=self.xy_feed_spin.value() * 60.0,  # mm/s → mm/min
-            num_layers=self.layers_spin.value(),
-            layer_height=self.layer_height_spin.value(),
-            dwell_after_move=0.0,
-            # v7.2 µL fields
-            pump_rate_uL_s=pump_rate,
-            retract_amounts_uL={
-                "P1": retract_uL if active_pump == "P1" else 0.0,
-                "P2": retract_uL if active_pump == "P2" else 0.0,
-                "P3": retract_uL if active_pump == "P3" else 0.0,
-            },
-            prime_amounts_uL={
-                "P1": prime_uL if active_pump == "P1" else 0.0,
-                "P2": prime_uL if active_pump == "P2" else 0.0,
-                "P3": prime_uL if active_pump == "P3" else 0.0,
-            },
-            pump_rates_uL_s={
-                "P1": pump_rate, "P2": pump_rate, "P3": pump_rate,
-            },
-            # Legacy fields for backward compat
-            pump_feedrate=30.0,
-        )
-
-    # ════════════════════════════════════════════════════════════════
-    #  EXECUTION CONTROLS
-    # ════════════════════════════════════════════════════════════════
-
-    def _build_current_job(self):
-        """
-        Build a PrintJob from current workspace + well setup state.
-
-        Uses TrajectoryPlanner if available, falls back to legacy
-        well plate job builder otherwise.
-        """
-        try:
-            from SupportClasses.TrajectoryPlanner import TrajectoryPlanner
-            from SupportClasses.GeometryEngine import PrintCollection
-
-            # Get collections from Tab 2
-            collections = {}
-            if hasattr(self.tab_objects, 'get_collections'):
-                collections = self.tab_objects.get_collections()
-
-            # Get well assignments from Tab 3
-            well_setup = None
-            if hasattr(self.tab_wells, 'model'):
-                well_setup = self.tab_wells.model
-
-            if well_setup and collections:
-                # v7.1 trajectory-based job
-                planner = TrajectoryPlanner(self._workspace)
-                settings = self._get_settings()
-
-                # Build job using trajectory planner + well assignments
-                from SupportClasses.PrintManager import PrintJob, CommandType
-                job = PrintJob(
-                    name=f"Workspace Print",
-                    workspace=self._workspace,
-                    well_setup=well_setup.to_dict() if hasattr(well_setup, 'to_dict') else {},
-                    settings=settings,
-                )
-
-                # Plan trajectories for each assigned well
-                for name, assignment in well_setup.assignments.items():
-                    if assignment.role.value == "print" and assignment.print_collections:
-                        for coll_name in assignment.print_collections:
-                            if coll_name in collections:
-                                coll = collections[coll_name]
-                                well_pos = well_setup.plate.get_well_center_mm(name)
-                                z_off = assignment.get_effective_z()
-                                wps = planner.plan_well_print(
-                                    coll, well_pos, z_off)
-                                if wps:
-                                    job.trajectory_waypoints.extend(wps)
-
-                if job.trajectory_waypoints:
-                    job.total_steps = len(job.trajectory_waypoints)
-                    return job
-
-        except (ImportError, AttributeError, Exception) as e:
-            logger.debug(f"Trajectory-based job build failed: {e}")
-
-        # Fallback: legacy well plate job (backward compat)
-        return self._build_legacy_job()
-
-    def _build_legacy_job(self):
-        """Build a legacy job from well plate settings (v7.0 compat)."""
-        # Check if Tab 3 has a well plate configured
-        if hasattr(self.tab_wells, '_model') and self.tab_wells._model:
-            model = self.tab_wells._model
-            plate = model.plate
-            settings = self._get_settings()
-
-            # Get print wells
-            print_wells = [
-                name for name, a in model.assignments.items()
-                if a.role.value == "print"
-            ]
-
-            if print_wells and plate:
-                return build_well_plate_job(
-                    plate=plate,
-                    selected_wells=print_wells,
-                    settings=settings,
-                )
-
-        logger.warning("No printable job could be built from current setup")
-        return None
-
-    def _start_print(self):
-        """Start print execution."""
-        job = self._build_current_job()
-        if job is None:
-            self.status_label.setText("No job to print — configure wells first")
-            return
-
-        self.print_manager.start(job)
-        self.btn_start.setEnabled(False)
-        self.btn_pause.setEnabled(True)
-        self.btn_abort.setEnabled(True)
-
-    def _pause_print(self):
-        state = self.print_manager.state
-        if state == PrintState.RUNNING:
-            self.print_manager.pause()
-            self.btn_pause.setText("▶ Resume")
-        elif state == PrintState.PAUSED:
-            self.print_manager.resume()
-            self.btn_pause.setText("⏸ Pause")
-
-    def _abort_print(self):
-        reply = QMessageBox.question(
-            self, "Abort Print",
-            "Are you sure you want to abort the current print?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.print_manager.abort()
-
-    # ════════════════════════════════════════════════════════════════
-    #  PROGRESS / STATE CALLBACKS
+    #  PROGRESS / STATE CALLBACKS (kept for S3 transition)
     # ════════════════════════════════════════════════════════════════
 
     def _on_progress(self, step: int, total: int, message: str):
-        if total > 0:
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(step)
-        self.status_label.setText(message)
+        """Handle progress updates (minimal — will move to Monitor in S3)."""
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(message)
 
     def _on_state_changed(self, state):
-        if state == PrintState.IDLE:
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_abort.setEnabled(False)
-            self.btn_pause.setText("⏸ Pause")
-            self.status_label.setText("Idle")
-        elif state == PrintState.COMPLETED:
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_abort.setEnabled(False)
-            self.status_label.setText("Print completed!")
-            self.progress_bar.setValue(self.progress_bar.maximum())
+        """Handle state changes (minimal — will move to Monitor in S3)."""
+        if state == PrintState.COMPLETED:
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("✓ Print completed!")
         elif state == PrintState.ERROR:
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_abort.setEnabled(False)
-            self.status_label.setText("Print error — check log")
-        elif state == PrintState.ABORTED:
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_abort.setEnabled(False)
-            self.status_label.setText("Print aborted")
-
-    # ════════════════════════════════════════════════════════════════
-    #  EXPORT
-    # ════════════════════════════════════════════════════════════════
-
-    def _save_job(self):
-        job = self._build_current_job()
-        if job is None:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Print Job", "", "JSON Files (*.json)")
-        if path:
-            save_print_job(job, path)
-            self.status_label.setText(f"Job saved: {path}")
-
-    def _export_gcode(self):
-        job = self._build_current_job()
-        if job is None:
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export G-code", "", "G-code Files (*.gcode)")
-        if path:
-            export_gcode(job, path)
-            self.status_label.setText(f"G-code exported: {path}")
-
-    # ════════════════════════════════════════════════════════════════
-    #  PRINT QUEUE
-    # ════════════════════════════════════════════════════════════════
-
-    def _add_to_queue(self):
-        job = self._build_current_job()
-        if job is None:
-            return
-        self.print_queue.add(job)
-        item = QListWidgetItem(f"{job.name} ({job.total_steps} steps)")
-        self.queue_list.addItem(item)
-
-    def _remove_from_queue(self):
-        row = self.queue_list.currentRow()
-        if row >= 0:
-            self.queue_list.takeItem(row)
-            self.print_queue.remove(row)
-
-    def _clear_queue(self):
-        self.queue_list.clear()
-        self.print_queue.clear()
-
-    def _start_queue(self):
-        if self.print_queue.size == 0:
-            return
-        self.print_queue.start()
-        self.btn_start.setEnabled(False)
-
-    def _on_queue_progress(self, job_idx: int, total: int, name: str):
-        self.queue_progress_label.setText(
-            f"Queue: {job_idx + 1}/{total} — {name}")
-
-    def _on_queue_completed(self):
-        self.queue_progress_label.setText("Queue completed!")
-        self.btn_start.setEnabled(True)
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("⚠ Print error")
