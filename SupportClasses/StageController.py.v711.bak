@@ -356,8 +356,6 @@ class XYJogHandler:
                 try:
                     pos = self._get_xy_position()
                     if pos[0] is not None:
-                        # BUG-5: margin=500 microsteps ≈ 50µm at 10 steps/µm
-                        # This slows jog speed when within 50µm of a limit
                         near = self.safety_limits.check_xy_near_limit(pos[0], pos[1], margin=500)
                         if near["x_near_min"] and vx < 0:
                             vx *= 0.3
@@ -756,35 +754,6 @@ class StageController:
             x += self.zero_position["x"]
             y += self.zero_position["y"]
         self.xy_stage.move_stage_to_position(x, y, fast)
-    def move_xy_relative(self, dx: float, dy: float) -> None:
-        """
-        Move XY stage by a relative offset (microsteps).
-
-        BUG-1 FIX: Sends relative moves directly to hardware, eliminating
-        dependency on stale cached position data.
-
-        Safety limits are projected from cached position (minor boundary
-        imprecision is acceptable vs. the gross errors from the old approach).
-        """
-        if not self.xy_stage:
-            return
-
-        # Safety: project cached position + delta, clamp if needed
-        if self.safety_limits.enabled:
-            pos = self.get_xy_position(cached=True)
-            if pos[0] is not None:
-                zero_x = self.zero_position["x"]
-                zero_y = self.zero_position["y"]
-                cur_zr_x = pos[0] - zero_x
-                cur_zr_y = pos[1] - zero_y
-                new_zr_x = cur_zr_x + dx
-                new_zr_y = cur_zr_y + dy
-                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_zr_x, new_zr_y)
-                dx = clamped_x - cur_zr_x
-                dy = clamped_y - cur_zr_y
-
-        self.xy_stage.move_stage_relative(dx, dy)
-
 
     def move_z_absolute(
         self, z_value: float, from_zero_ref: bool = True, fast: bool = False

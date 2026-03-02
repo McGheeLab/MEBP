@@ -5,9 +5,12 @@ Main content: XY pad, Z/pump buttons, position readouts, quick actions
 Context panel: step sizes, speed multipliers
 
 v7.1.1: XY step sizes and positions displayed in microns (µm).
-v7.2:   Pump step sizes and positions displayed in µL (microliters).
-         Conversion to/from mm handled via HardwareConfig.
-         Pump jog buttons disabled until hardware setup is complete.
+         Conversion to/from microsteps handled internally via microsteps_per_micron.
+
+v7.1.2: BUG-1 FIX — XY jog now uses relative moves (move_xy_relative) instead
+         of computing absolute targets from cached (stale) position data.
+         This eliminates the "position update not consistent with jog command"
+         bug where stale cached positions caused incorrect move targets.
 """
 
 from __future__ import annotations
@@ -18,13 +21,12 @@ from functools import partial
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QComboBox, QSlider, QFrame, QSizePolicy,
-    QScrollArea, QGroupBox,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QKeyEvent
 
 from SupportClasses.StageController import StageController
-from SupportClasses.HardwareConfig import HardwareConfig
 from gui.styles import COLORS
 
 logger = logging.getLogger(__name__)
@@ -32,18 +34,13 @@ logger = logging.getLogger(__name__)
 # Step sizes in microns (µm) for the XY stage
 XY_STEPS_UM = [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
-# Z step sizes remain in mm
-Z_STEPS = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
-
-# Pump step sizes in µL (microliters) — the core change in v7.2
-P_STEPS_UL = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
-
-# Pump flow rate presets in µL/s for speed slider
-P_RATES_UL_S = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+# Z and pump step sizes remain in mm
+Z_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+P_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
 
 
 class JogControlPage(QWidget):
-    """Manual jog controls with fixed-step moves. Pumps operate in µL."""
+    """Manual jog controls with fixed-step moves."""
 
     _page_title_text = "Jog Control"
 
@@ -52,9 +49,6 @@ class JogControlPage(QWidget):
         self.controller = controller
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._context_widget = None
-
-        # Hardware config — set by MainWindow when hardware setup completes
-        self._hw_config: HardwareConfig | None = None
 
         # Microsteps per micron — set by MainWindow, default 10 (ProScan III typical)
         self._microsteps_per_micron: float = 10.0
@@ -69,429 +63,357 @@ class JogControlPage(QWidget):
         """Called by MainWindow when the conversion factor changes."""
         self._microsteps_per_micron = max(0.001, value)
 
-    def set_hardware_config(self, config: HardwareConfig):
-        """
-        Called by MainWindow when hardware setup changes.
-        Enables/disables pump jog buttons based on which pumps are configured.
-        """
-        self._hw_config = config
-        self._update_pump_buttons_state()
-        self._update_pump_readouts()
-        logger.info(f"JogControl: hardware config updated, {config.active_pump_count} pumps active")
-
-    # ════════════════════════════════════════════════════════════════
-    #  UI CONSTRUCTION
-    # ════════════════════════════════════════════════════════════════
-
-    def _setup_ui(self):
-        main = QVBoxLayout(self)
-        main.setContentsMargins(12, 12, 12, 12)
-        main.setSpacing(12)
-
-        # Top row: Position readouts
-        readout_frame = QFrame()
-        readout_frame.setObjectName("readoutFrame")
-        readout_lay = QGridLayout(readout_frame)
-        readout_lay.setContentsMargins(8, 8, 8, 8)
-
-        # XY readout (µm)
-        readout_lay.addWidget(self._make_label("X:", bold=True), 0, 0)
-        self.x_readout = self._make_label("0.0 µm")
-        readout_lay.addWidget(self.x_readout, 0, 1)
-
-        readout_lay.addWidget(self._make_label("Y:", bold=True), 0, 2)
-        self.y_readout = self._make_label("0.0 µm")
-        readout_lay.addWidget(self.y_readout, 0, 3)
-
-        # Z readout (mm)
-        readout_lay.addWidget(self._make_label("Z:", bold=True), 1, 0)
-        self.z_readout = self._make_label("0.000 mm")
-        readout_lay.addWidget(self.z_readout, 1, 1)
-
-        # Pump readouts (µL) — one for each pump
-        self.pump_readouts: dict[str, QLabel] = {}
-        for col, pid in enumerate(["P1", "P2", "P3"]):
-            readout_lay.addWidget(self._make_label(f"{pid}:", bold=True), 1, 2 + col * 2)
-            lbl = self._make_label("— µL")
-            self.pump_readouts[pid] = lbl
-            readout_lay.addWidget(lbl, 1, 3 + col * 2)
-
-        main.addWidget(readout_frame)
-
-        # ── Jog Grid ──────────────────────────────────────────────
-        jog_grid = QGridLayout()
-        jog_grid.setSpacing(8)
-
-        # XY Pad (left side)
-        xy_group = QGroupBox("XY Stage (µm)")
-        xy_lay = QGridLayout(xy_group)
-        xy_lay.setSpacing(4)
-
-        self.xy_step_combo = QComboBox()
-        for s in XY_STEPS_UM:
-            self.xy_step_combo.addItem(f"{s:.1f} µm" if s < 1000 else f"{s/1000:.1f} mm", s)
-        self.xy_step_combo.setCurrentIndex(3)  # Default 50 µm
-        xy_lay.addWidget(QLabel("Step:"), 0, 0)
-        xy_lay.addWidget(self.xy_step_combo, 0, 1, 1, 2)
-
-        # Direction buttons
-        self.btn_y_plus = QPushButton("▲ Y+")
-        self.btn_y_plus.clicked.connect(lambda: self._jog_xy(0, 1))
-        xy_lay.addWidget(self.btn_y_plus, 1, 1)
-
-        self.btn_x_minus = QPushButton("◄ X-")
-        self.btn_x_minus.clicked.connect(lambda: self._jog_xy(-1, 0))
-        xy_lay.addWidget(self.btn_x_minus, 2, 0)
-
-        self.btn_xy_home = QPushButton("⌂")
-        self.btn_xy_home.setToolTip("Move to zero reference")
-        self.btn_xy_home.clicked.connect(self._go_home_xy)
-        xy_lay.addWidget(self.btn_xy_home, 2, 1)
-
-        self.btn_x_plus = QPushButton("X+ ►")
-        self.btn_x_plus.clicked.connect(lambda: self._jog_xy(1, 0))
-        xy_lay.addWidget(self.btn_x_plus, 2, 2)
-
-        self.btn_y_minus = QPushButton("▼ Y-")
-        self.btn_y_minus.clicked.connect(lambda: self._jog_xy(0, -1))
-        xy_lay.addWidget(self.btn_y_minus, 3, 1)
-
-        jog_grid.addWidget(xy_group, 0, 0)
-
-        # Z Pad (middle)
-        z_group = QGroupBox("Z Needle (mm)")
-        z_lay = QGridLayout(z_group)
-        z_lay.setSpacing(4)
-
-        self.z_step_combo = QComboBox()
-        for s in Z_STEPS:
-            self.z_step_combo.addItem(f"{s:.2f} mm", s)
-        self.z_step_combo.setCurrentIndex(2)  # Default 0.1 mm
-        z_lay.addWidget(QLabel("Step:"), 0, 0)
-        z_lay.addWidget(self.z_step_combo, 0, 1)
-
-        self.btn_z_up = QPushButton("▲ Z Up")
-        self.btn_z_up.clicked.connect(lambda: self._jog_z(1))
-        z_lay.addWidget(self.btn_z_up, 1, 0, 1, 2)
-
-        self.btn_z_down = QPushButton("▼ Z Down")
-        self.btn_z_down.clicked.connect(lambda: self._jog_z(-1))
-        z_lay.addWidget(self.btn_z_down, 2, 0, 1, 2)
-
-        jog_grid.addWidget(z_group, 0, 1)
-
-        # Pump Pads (right) — one per pump, all in µL
-        pump_container = QGroupBox("Pumps (µL)")
-        pump_lay = QGridLayout(pump_container)
-        pump_lay.setSpacing(4)
-
-        # Shared step size for all pumps
-        pump_lay.addWidget(QLabel("Step:"), 0, 0)
-        self.p_step_combo = QComboBox()
-        for s in P_STEPS_UL:
-            if s >= 1.0:
-                self.p_step_combo.addItem(f"{s:.1f} µL", s)
-            else:
-                self.p_step_combo.addItem(f"{s:.2f} µL", s)
-        self.p_step_combo.setCurrentIndex(3)  # Default 0.25 µL
-        pump_lay.addWidget(self.p_step_combo, 0, 1, 1, 2)
-
-        # Pump rate selector
-        pump_lay.addWidget(QLabel("Rate:"), 0, 3)
-        self.p_rate_combo = QComboBox()
-        for r in P_RATES_UL_S:
-            self.p_rate_combo.addItem(f"{r:.2f} µL/s", r)
-        self.p_rate_combo.setCurrentIndex(3)  # Default 0.25 µL/s
-        pump_lay.addWidget(self.p_rate_combo, 0, 4)
-
-        # Individual pump buttons
-        self._pump_jog_buttons: dict[str, tuple[QPushButton, QPushButton]] = {}
-        for col, pid in enumerate(["P1", "P2", "P3"]):
-            lbl = QLabel(pid)
-            lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
-            lbl.setAlignment(Qt.AlignCenter)
-            pump_lay.addWidget(lbl, 1, col * 2, 1, 2)
-
-            btn_up = QPushButton(f"▲ Dispense")
-            btn_up.setToolTip(f"{pid}: Push plunger (dispense)")
-            btn_up.clicked.connect(partial(self._jog_pump, pid, 1))
-            pump_lay.addWidget(btn_up, 2, col * 2, 1, 2)
-
-            btn_down = QPushButton(f"▼ Aspirate")
-            btn_down.setToolTip(f"{pid}: Pull plunger (aspirate)")
-            btn_down.clicked.connect(partial(self._jog_pump, pid, -1))
-            pump_lay.addWidget(btn_down, 3, col * 2, 1, 2)
-
-            self._pump_jog_buttons[pid] = (btn_up, btn_down)
-
-        jog_grid.addWidget(pump_container, 0, 2)
-
-        main.addLayout(jog_grid)
-        main.addStretch()
-
-        # Initial pump state
-        self._update_pump_buttons_state()
-
-    def _make_label(self, text: str, bold: bool = False) -> QLabel:
-        lbl = QLabel(text)
-        if bold:
-            lbl.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        return lbl
-
-    # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL
-    # ════════════════════════════════════════════════════════════════
-
     def get_context_widget(self) -> QWidget:
-        """Context panel with step sizes and speed controls."""
-        if self._context_widget:
+        """Context panel: step sizes + speed multipliers."""
+        if self._context_widget is not None:
             return self._context_widget
 
         ctx = QWidget()
-        lay = QVBoxLayout(ctx)
-        lay.setContentsMargins(8, 8, 8, 8)
+        layout = QVBoxLayout(ctx)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(6)
 
-        # Pump capacity info
-        self._ctx_pump_info = QGroupBox("Pump Syringe Info")
-        self._ctx_pump_lay = QVBoxLayout(self._ctx_pump_info)
-        self._ctx_pump_labels: dict[str, QLabel] = {}
-        for pid in ["P1", "P2", "P3"]:
-            lbl = QLabel(f"{pid}: No syringe")
-            lbl.setStyleSheet(f"color: {COLORS.get('subtext0', '#6c7086')}; font-size: 11px;")
-            self._ctx_pump_lay.addWidget(lbl)
-            self._ctx_pump_labels[pid] = lbl
-        lay.addWidget(self._ctx_pump_info)
+        # ── Step Sizes ───────────────────────────────────────────
+        step_label = QLabel("Step Sizes")
+        step_label.setObjectName("contextSectionLabel")
+        layout.addWidget(step_label)
 
-        # Quick actions
-        actions_group = QGroupBox("Quick Actions")
-        actions_lay = QVBoxLayout(actions_group)
+        # XY step (in µm)
+        xy_row = QHBoxLayout()
+        xy_row.addWidget(QLabel("XY:"))
+        self.xy_step_combo = QComboBox()
+        for s in XY_STEPS_UM:
+            if s >= 1.0:
+                self.xy_step_combo.addItem(f"{s:g} µm", s)
+            else:
+                self.xy_step_combo.addItem(f"{s:.2f} µm", s)
+        self.xy_step_combo.setCurrentIndex(3)  # Default: 50 µm
+        xy_row.addWidget(self.xy_step_combo, stretch=1)
+        layout.addLayout(xy_row)
 
-        btn_zero_xy = QPushButton("Set XY Zero Here")
-        btn_zero_xy.clicked.connect(self._set_zero_xy)
-        actions_lay.addWidget(btn_zero_xy)
+        # Z step (in mm)
+        z_row = QHBoxLayout()
+        z_row.addWidget(QLabel("Z:"))
+        self.z_step_combo = QComboBox()
+        for s in Z_STEPS:
+            self.z_step_combo.addItem(f"{s} mm", s)
+        self.z_step_combo.setCurrentIndex(2)
+        z_row.addWidget(self.z_step_combo, stretch=1)
+        layout.addLayout(z_row)
 
-        btn_zero_z = QPushButton("Set Z Zero Here")
-        btn_zero_z.clicked.connect(self._set_zero_z)
-        actions_lay.addWidget(btn_zero_z)
+        # Pump step (in mm)
+        p_row = QHBoxLayout()
+        p_row.addWidget(QLabel("Pump:"))
+        self.p_step_combo = QComboBox()
+        for s in P_STEPS:
+            self.p_step_combo.addItem(f"{s} mm", s)
+        self.p_step_combo.setCurrentIndex(2)
+        p_row.addWidget(self.p_step_combo, stretch=1)
+        layout.addLayout(p_row)
 
-        for pid in ["P1", "P2", "P3"]:
-            btn = QPushButton(f"Set {pid} Zero Here")
-            btn.clicked.connect(partial(self._set_zero_pump, pid))
-            actions_lay.addWidget(btn)
+        # ── Speed Multipliers ────────────────────────────────────
+        speed_label = QLabel("Speed (Xbox Jog)")
+        speed_label.setObjectName("contextSectionLabel")
+        layout.addWidget(speed_label)
 
-        lay.addWidget(actions_group)
-        lay.addStretch()
+        # XY speed
+        self.lbl_xy_speed = QLabel("100")
+        layout.addWidget(self._make_ctx_slider(
+            "XY:", self.lbl_xy_speed, 1, 10000, 100, self._on_xy_speed))
 
+        # Z speed
+        self.lbl_z_speed = QLabel("0.50")
+        layout.addWidget(self._make_ctx_slider(
+            "Z:", self.lbl_z_speed, 1, 500, 50, self._on_z_speed))
+
+        # Pump speed
+        self.lbl_p_speed = QLabel("0.50")
+        layout.addWidget(self._make_ctx_slider(
+            "P:", self.lbl_p_speed, 1, 500, 50, self._on_p_speed))
+
+        layout.addStretch()
         self._context_widget = ctx
         return ctx
 
     # ════════════════════════════════════════════════════════════════
-    #  JOG COMMANDS
+    #  UI SETUP
     # ════════════════════════════════════════════════════════════════
 
-    def _jog_xy(self, dx_sign: int, dy_sign: int):
-        """Jog XY by selected step size (µm → microsteps)."""
-        step_um = self.xy_step_combo.currentData() or 50.0
-        dx_um = dx_sign * step_um
-        dy_um = dy_sign * step_um
-        # Convert µm → microsteps
-        dx_steps = dx_um * self._microsteps_per_micron
-        dy_steps = dy_um * self._microsteps_per_micron
-        # XY relative move: get current pos, compute absolute target
-        xy = self.controller.get_xy_position(cached=True)
-        if xy[0] is None:
-            logger.warning("Cannot jog XY: no position available")
-            return
-        target_x = xy[0] + dx_steps - self.controller.zero_position["x"]
-        target_y = xy[1] + dy_steps - self.controller.zero_position["y"]
-        self.controller.move_xy_absolute(target_x, target_y, from_zero_ref=True)
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 8, 12, 8)
+        main_layout.setSpacing(8)
 
-    def _jog_z(self, direction: int):
-        """Jog Z by selected step (mm)."""
-        step = self.z_step_combo.currentData() or 0.1
-        self.controller.move_z_relative(direction * step)
+        # ── Position Readout ─────────────────────────────────────
+        pos_frame = QFrame()
+        pos_frame.setObjectName("cardFrame")
+        pos_layout = QGridLayout(pos_frame)
+        pos_layout.setSpacing(4)
 
-    def _jog_pump(self, pump: str, direction: int):
-        """
-        Jog a pump by selected step in µL.
+        for col, (name, attr) in enumerate([
+            ("X (µm):", "lbl_x"), ("Y (µm):", "lbl_y"),
+            ("Z (mm):", "lbl_z"),
+            ("P1:", "lbl_p1"), ("P2:", "lbl_p2"), ("P3:", "lbl_p3"),
+        ]):
+            lbl = QLabel(name)
+            lbl.setStyleSheet(f"color: {COLORS['overlay0']};")
+            pos_layout.addWidget(lbl, 0, col)
+            val = QLabel("—")
+            val.setObjectName("positionValue")
+            val.setFont(QFont("Consolas", 11))
+            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            setattr(self, attr, val)
+            pos_layout.addWidget(val, 1, col)
 
-        The step size is in µL. We convert to mm using the syringe spec
-        from the hardware config, then send to the controller.
-        Positive direction = dispense (plunger pushes), negative = aspirate.
-        """
-        if not self._hw_config:
-            logger.warning(f"Cannot jog {pump}: no hardware config")
-            return
+        main_layout.addWidget(pos_frame)
 
-        pump_cfg = self._hw_config.pumps.get(pump)
-        if not pump_cfg or not pump_cfg.is_configured:
-            logger.warning(f"Cannot jog {pump}: not configured")
-            return
+        # ── XY Direction Pad ─────────────────────────────────────
+        xy_frame = QFrame()
+        xy_frame.setObjectName("cardFrame")
+        xy_grid = QGridLayout(xy_frame)
+        xy_grid.setSpacing(4)
 
-        step_uL = self.p_step_combo.currentData() or 0.25
-        volume_uL = direction * step_uL
+        btn_up = QPushButton("▲")
+        btn_up.setMinimumSize(50, 40)
+        btn_up.clicked.connect(partial(self._jog_xy, 0, -1))
+        xy_grid.addWidget(btn_up, 0, 1)
 
-        # Convert µL to mm
-        try:
-            distance_mm = pump_cfg.uL_to_mm(volume_uL)
-        except ValueError as e:
-            logger.error(f"Pump jog conversion error: {e}")
-            return
+        btn_left = QPushButton("◀")
+        btn_left.setMinimumSize(50, 40)
+        btn_left.clicked.connect(partial(self._jog_xy, -1, 0))
+        xy_grid.addWidget(btn_left, 1, 0)
 
-        # Convert rate from µL/s to mm/min
-        rate_uL_s = self.p_rate_combo.currentData() or 0.25
-        try:
-            feedrate_mm_min = pump_cfg.feedrate_uL_s_to_mm_min(rate_uL_s)
-        except ValueError:
-            feedrate_mm_min = None
+        btn_home = QPushButton("⌂")
+        btn_home.setMinimumSize(50, 40)
+        btn_home.setToolTip("Move to zero reference")
+        btn_home.clicked.connect(self._jog_xy_home)
+        xy_grid.addWidget(btn_home, 1, 1)
 
-        logger.debug(
-            f"Jog {pump}: {volume_uL:+.3f} µL → {distance_mm:+.5f} mm, "
-            f"rate: {rate_uL_s:.2f} µL/s → {feedrate_mm_min:.1f} mm/min"
-        )
-        self.controller.move_pump_relative(pump, distance_mm, feedrate_mm_min)
+        btn_right = QPushButton("▶")
+        btn_right.setMinimumSize(50, 40)
+        btn_right.clicked.connect(partial(self._jog_xy, 1, 0))
+        xy_grid.addWidget(btn_right, 1, 2)
+
+        btn_down = QPushButton("▼")
+        btn_down.setMinimumSize(50, 40)
+        btn_down.clicked.connect(partial(self._jog_xy, 0, 1))
+        xy_grid.addWidget(btn_down, 2, 1)
+
+        main_layout.addWidget(xy_frame)
+
+        # ── Z and Pump Controls ──────────────────────────────────
+        zp_frame = QFrame()
+        zp_frame.setObjectName("cardFrame")
+        zp_layout = QHBoxLayout(zp_frame)
+
+        # Z buttons
+        z_group = QVBoxLayout()
+        z_group.addWidget(QLabel("Z Needle"))
+        btn_z_up = QPushButton("Z ▲")
+        btn_z_up.clicked.connect(partial(self._jog_z, -1))
+        z_group.addWidget(btn_z_up)
+        btn_z_down = QPushButton("Z ▼")
+        btn_z_down.clicked.connect(partial(self._jog_z, 1))
+        z_group.addWidget(btn_z_down)
+        zp_layout.addLayout(z_group)
+
+        # Pump buttons
+        for pump_name in ["P1", "P2", "P3"]:
+            p_group = QVBoxLayout()
+            p_group.addWidget(QLabel(pump_name))
+            btn_ext = QPushButton(f"{pump_name} ▲")
+            btn_ext.clicked.connect(partial(self._jog_pump, pump_name, 1))
+            p_group.addWidget(btn_ext)
+            btn_ret = QPushButton(f"{pump_name} ▼")
+            btn_ret.clicked.connect(partial(self._jog_pump, pump_name, -1))
+            p_group.addWidget(btn_ret)
+            zp_layout.addLayout(p_group)
+
+        main_layout.addWidget(zp_frame)
+
+        # ── Quick Actions ────────────────────────────────────────
+        actions_frame = QFrame()
+        actions_frame.setObjectName("cardFrame")
+        actions_layout = QHBoxLayout(actions_frame)
+
+        btn_set_zero = QPushButton("Set Zero Here")
+        btn_set_zero.clicked.connect(self._set_zero)
+        actions_layout.addWidget(btn_set_zero)
+
+        btn_goto_zero = QPushButton("Go to Zero")
+        btn_goto_zero.clicked.connect(self._goto_zero)
+        actions_layout.addWidget(btn_goto_zero)
+
+        btn_estop = QPushButton("⚠ STOP")
+        btn_estop.setStyleSheet(
+            f"background-color: {COLORS['red']}; color: {COLORS['crust']}; "
+            f"font-weight: bold; padding: 6px 16px;")
+        btn_estop.clicked.connect(self._emergency_stop)
+        actions_layout.addWidget(btn_estop)
+
+        main_layout.addWidget(actions_frame)
+        main_layout.addStretch()
 
     # ════════════════════════════════════════════════════════════════
-    #  PUMP STATE MANAGEMENT
-    # ════════════════════════════════════════════════════════════════
-
-    def _update_pump_buttons_state(self):
-        """Enable/disable pump jog buttons based on hardware config."""
-        for pid, (btn_up, btn_down) in self._pump_jog_buttons.items():
-            if self._hw_config:
-                pump_cfg = self._hw_config.pumps.get(pid)
-                enabled = pump_cfg is not None and pump_cfg.is_configured
-            else:
-                enabled = False
-            btn_up.setEnabled(enabled)
-            btn_down.setEnabled(enabled)
-
-            if not enabled:
-                btn_up.setToolTip(f"{pid}: No syringe configured — set up in Hardware Setup")
-                btn_down.setToolTip(f"{pid}: No syringe configured — set up in Hardware Setup")
-
-    def _update_pump_readouts(self):
-        """Update context panel with syringe info."""
-        if not hasattr(self, '_ctx_pump_labels'):
-            return
-
-        for pid in ["P1", "P2", "P3"]:
-            lbl = self._ctx_pump_labels.get(pid)
-            if not lbl:
-                continue
-
-            if self._hw_config:
-                pump_cfg = self._hw_config.pumps.get(pid)
-                if pump_cfg and pump_cfg.is_configured:
-                    syr = pump_cfg.syringe
-                    lbl.setText(
-                        f"{pid}: {syr.volume_uL} µL syringe | "
-                        f"{syr.uL_per_mm:.2f} µL/mm"
-                    )
-                    continue
-            lbl.setText(f"{pid}: No syringe")
-
-    # ════════════════════════════════════════════════════════════════
-    #  STATUS UPDATE (called by MainWindow timer)
+    #  STATUS UPDATE
     # ════════════════════════════════════════════════════════════════
 
     def on_status_update(self):
-        """
-        Update position readouts. Fetches positions from controller.
-        Called by MainWindow timer with no arguments.
-        """
+        """Called by MainWindow timer (~300 ms)."""
         ctrl = self.controller
 
-        # XY in µm (relative to zero)
-        xy_pos = ctrl.get_xy_position(cached=True)
-        if xy_pos[0] is not None:
-            x_rel = xy_pos[0] - ctrl.zero_position["x"]
-            y_rel = xy_pos[1] - ctrl.zero_position["y"]
-            x_um = x_rel / self._microsteps_per_micron
-            y_um = y_rel / self._microsteps_per_micron
-            self.x_readout.setText(f"{x_um:.1f} µm")
-            self.y_readout.setText(f"{y_um:.1f} µm")
-
-        # Z in mm (relative to zero)
-        zp_pos = ctrl.get_zp_position(cached=True)
-        if isinstance(zp_pos, (list, tuple)) and len(zp_pos) >= 1 and zp_pos[0] is not None:
-            z_rel = zp_pos[0] - ctrl.zero_position.get("Z", 0)
-            self.z_readout.setText(f"{z_rel:.3f} mm")
-
-        # Pumps in µL (relative to zero)
-        if isinstance(zp_pos, (list, tuple)) and len(zp_pos) >= 4:
-            for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
-                pos_mm = zp_pos[idx] if idx < len(zp_pos) else None
-                lbl = self.pump_readouts.get(pid)
-                if lbl is None:
-                    continue
-
-                if pos_mm is not None:
-                    pos_rel = pos_mm - ctrl.zero_position.get(pid, 0)
-                    if self._hw_config:
-                        pump_cfg = self._hw_config.pumps.get(pid)
-                        if pump_cfg and pump_cfg.is_configured:
-                            try:
-                                pos_uL = pump_cfg.mm_to_uL(pos_rel)
-                                lbl.setText(f"{pos_uL:.2f} µL")
-                                continue
-                            except (ValueError, AttributeError):
-                                pass
-                    lbl.setText(f"{pos_rel:.3f} mm")
-                else:
-                    lbl.setText("— µL")
-
-    # ════════════════════════════════════════════════════════════════
-    #  QUICK ACTIONS
-    # ════════════════════════════════════════════════════════════════
-
-    def _set_zero_xy(self):
-        """Set current XY position as zero reference."""
-        xy = self.controller.get_xy_position(cached=False)
+        # XY position (convert steps → µm)
+        xy = ctrl.get_xy_position(cached=True)
         if xy[0] is not None:
-            self.controller.zero_position["x"] = xy[0]
-            self.controller.zero_position["y"] = xy[1]
-            logger.info(f"XY zero set: ({xy[0]:.1f}, {xy[1]:.1f})")
+            zx = xy[0] - ctrl.zero_position["x"]
+            zy = xy[1] - ctrl.zero_position["y"]
+            ux = zx / self._microsteps_per_micron
+            uy = zy / self._microsteps_per_micron
+            self.lbl_x.setText(f"{ux:,.1f}")
+            self.lbl_y.setText(f"{uy:,.1f}")
+        else:
+            self.lbl_x.setText("—")
+            self.lbl_y.setText("—")
 
-    def _set_zero_z(self):
-        """Set current Z position as zero reference."""
-        zp = self.controller.get_zp_position(cached=False)
-        if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
-            self.controller.zero_position["Z"] = zp[0]
-            logger.info(f"Z zero set: {zp[0]:.3f} mm")
-
-    def _set_zero_pump(self, pump: str):
-        """Set current pump position as zero reference."""
-        zp = self.controller.get_zp_position(cached=False)
-        idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
-        if isinstance(zp, (list, tuple)) and len(zp) > idx and zp[idx] is not None:
-            self.controller.zero_position[pump] = zp[idx]
-            logger.info(f"{pump} zero set: {zp[idx]:.3f} mm")
-
-    def _go_home_xy(self):
-        self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+        # ZP position (already in mm)
+        zp = ctrl.get_zp_position(cached=True)
+        if zp[0] is not None:
+            self.lbl_z.setText(f"{zp[0] - ctrl.zero_position['Z']:.2f}")
+            self.lbl_p1.setText(f"{zp[1] - ctrl.zero_position['P1']:.2f}")
+            self.lbl_p2.setText(f"{zp[2] - ctrl.zero_position['P2']:.2f}")
+            self.lbl_p3.setText(f"{zp[3] - ctrl.zero_position['P3']:.2f}")
+        else:
+            for lbl in [self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3]:
+                lbl.setText("—")
 
     # ════════════════════════════════════════════════════════════════
     #  KEYBOARD SHORTCUTS
     # ════════════════════════════════════════════════════════════════
 
     def _setup_shortcuts(self):
-        pass  # Handled in keyPressEvent
+        self._key_actions = {
+            Qt.Key.Key_Left:     partial(self._jog_xy, -1,  0),
+            Qt.Key.Key_Right:    partial(self._jog_xy,  1,  0),
+            Qt.Key.Key_Up:       partial(self._jog_xy,  0, -1),
+            Qt.Key.Key_Down:     partial(self._jog_xy,  0,  1),
+            Qt.Key.Key_PageUp:   partial(self._jog_z, -1),
+            Qt.Key.Key_PageDown: partial(self._jog_z,  1),
+        }
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Arrow keys for XY, PgUp/PgDown for Z."""
-        key = event.key()
-        if key == Qt.Key.Key_Left:
-            self._jog_xy(-1, 0)
-        elif key == Qt.Key.Key_Right:
-            self._jog_xy(1, 0)
-        elif key == Qt.Key.Key_Up:
-            self._jog_xy(0, 1)
-        elif key == Qt.Key.Key_Down:
-            self._jog_xy(0, -1)
-        elif key == Qt.Key.Key_PageUp:
-            self._jog_z(1)
-        elif key == Qt.Key.Key_PageDown:
-            self._jog_z(-1)
+        action = self._key_actions.get(event.key())
+        if action and not event.isAutoRepeat():
+            action()
         else:
             super().keyPressEvent(event)
+
+    # ════════════════════════════════════════════════════════════════
+    #  JOG ACTIONS — BUG-1 FIX: Use relative moves
+    # ════════════════════════════════════════════════════════════════
+
+    def _jog_xy(self, dx: int, dy: int):
+        """
+        Move XY stage by the selected step size.
+
+        BUG-1 FIX (v7.1.2): Now uses move_xy_relative() instead of
+        computing absolute targets from cached (potentially stale) positions.
+
+        The old approach:
+            pos = controller.get_xy_position(cached=True)  ← stale!
+            target = (pos - zero) + dx * steps
+            controller.move_xy_absolute(target, from_zero_ref=True)
+
+        The new approach:
+            controller.move_xy_relative(dx * steps, dy * steps)  ← always correct
+
+        This eliminates the dependency on cached position data, which could
+        be up to 300ms stale (the position poller interval), causing the
+        displayed position to not match the requested jog amount.
+        """
+        if not self.controller.is_xy_connected:
+            return
+
+        # Get step size in microns from combo box
+        step_um = self.xy_step_combo.currentData()
+        # Convert µm → microsteps
+        step_steps = step_um * self._microsteps_per_micron
+
+        # BUG-1 FIX: Use relative move — no dependency on cached position
+        self.controller.move_xy_relative(dx * step_steps, dy * step_steps)
+
+    def _jog_xy_home(self):
+        """Move to the zero reference position (absolute move, this is fine)."""
+        if self.controller.is_xy_connected:
+            self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+
+    def _jog_z(self, direction: int):
+        if self.controller.is_zp_connected:
+            self.controller.move_z_relative(direction * self.z_step_combo.currentData())
+
+    def _jog_pump(self, pump: str, direction: int):
+        if self.controller.is_zp_connected:
+            self.controller.move_pump_relative(pump, direction * self.p_step_combo.currentData())
+
+    def _set_zero(self):
+        self.controller._calibrate_zero()
+        logger.info("Zero reference set from jog page")
+
+    def _goto_zero(self):
+        self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+        self.controller.move_z_absolute(0, from_zero_ref=True)
+
+    def _emergency_stop(self):
+        if self.controller.zp_stage:
+            try:
+                self.controller.zp_stage.emergency_stop()
+                logger.warning("EMERGENCY STOP sent!")
+            except Exception as e:
+                logger.error(f"E-stop failed: {e}")
+        if self.controller.xy_stage:
+            try:
+                self.controller.xy_stage.stop_stage()
+                logger.warning("XY STOP sent!")
+            except Exception as e:
+                logger.error(f"XY stop failed: {e}")
+
+    # ── Context Panel Callbacks ──────────────────────────────────
+
+    def _on_xy_speed(self, value):
+        self.lbl_xy_speed.setText(f"{value}")
+        if hasattr(self.controller, 'xy_jog') and self.controller.xy_jog:
+            self.controller.xy_jog.xy_speed = float(value)
+
+    def _on_z_speed(self, value):
+        speed = value / 100.0
+        self.lbl_z_speed.setText(f"{speed:.2f}")
+        if hasattr(self.controller, 'zp_jog') and self.controller.zp_jog:
+            self.controller.zp_jog.z_speed = speed
+
+    def _on_p_speed(self, value):
+        speed = value / 100.0
+        self.lbl_p_speed.setText(f"{speed:.2f}")
+        if hasattr(self.controller, 'zp_jog') and self.controller.zp_jog:
+            self.controller.zp_jog.pump_speed = speed
+
+    # ── Widget Helpers ───────────────────────────────────────────
+
+    def _make_ctx_slider(self, label_text, value_label, min_val, max_val,
+                         default, callback):
+        """Create a labeled slider row for the context panel."""
+        frame = QFrame()
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        lbl = QLabel(label_text)
+        lbl.setMinimumWidth(24)
+        layout.addWidget(lbl)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
+        slider.valueChanged.connect(callback)
+        layout.addWidget(slider, stretch=1)
+
+        layout.addWidget(value_label)
+        return frame

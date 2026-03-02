@@ -84,13 +84,7 @@ class XYStageManager:
         self.default_velocity: int = self.DEFAULT_VELOCITY
 
         # P8.17: Load controller protocol JSON
-        # BUG-3 FIX (v7.1.2): Always load protocol, even in sim mode,
-        # so parameters like microsteps_per_micron are accessible.
-        if controller_json is not None:
-            self._load_protocol(controller_json)
-            self._apply_protocol_parameters()
-        elif not simulate:
-            # Real hardware without explicit protocol → try default/auto-detect
+        if not simulate:
             self._load_protocol(controller_json)
             self._apply_protocol_parameters()
 
@@ -101,16 +95,6 @@ class XYStageManager:
         # Initialise the communication backend
         if self.simulate:
             self.spo = XYStageSimulator()
-            # BUG-3 FIX: Configure simulator with protocol-derived parameters
-            if self._protocol:
-                params = self._protocol._config.get("parameters", {})
-                sim_max_speed = params.get("max_speed", 100000)
-                sim_accel = params.get("acceleration", 200000)
-                if hasattr(self.spo, 'configure_from_protocol'):
-                    self.spo.configure_from_protocol(
-                        max_speed=float(sim_max_speed),
-                        acceleration=float(sim_accel),
-                    )
             self.spo.start()
             logger.info("XY stage simulator started")
         else:
@@ -449,8 +433,8 @@ class XYStageManager:
         """Move to absolute position (x, y) in stage coordinates."""
         self._send_protocol_command(
             "move_absolute",
-            fallback_cmd=f"G {round(x)},{round(y)}",
-            x=round(x), y=round(y),
+            fallback_cmd=f"G {int(x)},{int(y)}",
+            x=int(x), y=int(y),
         )
         logger.debug(f"XY absolute move: ({x:.0f}, {y:.0f}) fast={fast}")
 
@@ -458,8 +442,8 @@ class XYStageManager:
         """Move by relative offset (dx, dy)."""
         self._send_protocol_command(
             "move_relative",
-            fallback_cmd=f"GR {round(dx)},{round(dy)}",
-            dx=round(dx), dy=round(dy),
+            fallback_cmd=f"GR {int(dx)},{int(dy)}",
+            dx=int(dx), dy=int(dy),
         )
         logger.debug(f"XY relative move: ({dx:.0f}, {dy:.0f})")
 
