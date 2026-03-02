@@ -1,19 +1,25 @@
 """
-Hardware Setup Page — Required configuration before any other page works.
+Hardware Setup Page — v7.2.3 — Required configuration before any other page works.
 
 This is Page 0 in the sidebar. All other pages (Jog, Calibration, Print, etc.)
 are disabled until the hardware setup is valid (at least one pump with a syringe
 and a needle gauge selected).
 
+v7.2.3 Changes:
+    - Reordered sections: Name → Needle → Plate → Ink Library → Pumps → Rosettes
+    - Added Rosette Library UI section with add/edit/delete
+    - Fixed _apply_config_to_ui() to restore ink library BEFORE pump combos
+    - Fixed PumpChannelWidget.set_config() to resolve ink names properly
+    - Auto-load from settings now fully restores all fields
+
 Sections:
     1. Setup Name & Notes
     2. Needle configuration (gauge selector)
     3. Well plate format selector
-    4. Pump channels (P1/P2/P3) — syringe selection, ink assignment, mode
-    5. Ink library (add/edit/delete)
-    6. Save/Load buttons
-
-All pump-related values are displayed in µL throughout.
+    4. Ink library (add/edit/delete)         ← MOVED UP from Section 5
+    5. Pump channels (P1/P2/P3)              ← MOVED DOWN from Section 4
+    6. Rosette library (add/edit/delete)     ← NEW
+    7. Save/Load buttons + validity
 
 Signals:
     config_changed: Emitted whenever the hardware config changes
@@ -23,6 +29,7 @@ Signals:
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -38,7 +45,7 @@ from PySide6.QtGui import QFont, QColor
 
 from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
 from SupportClasses.PhysicalModels import (
-    NeedleSpec, SyringeSpec, InkSpec, PrintingMode,
+    NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert,
     load_needle_catalog, load_syringe_catalog,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
@@ -130,37 +137,122 @@ class InkEditorDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Rosette Editor Dialog  (v7.2.3: added to hardware setup)
+# ═══════════════════════════════════════════════════════════════════
+
+class RosetteEditorDialog(QDialog):
+    """Dialog for adding/editing a rosette insert."""
+
+    def __init__(self, rosette: RosetteInsert | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Rosette" if rosette else "New Rosette")
+        self.setMinimumWidth(320)
+
+        layout = QFormLayout(self)
+
+        self.name_edit = QLineEdit(rosette.name if rosette else "")
+        layout.addRow("Name:", self.name_edit)
+
+        self.format_combo = QComboBox()
+        for fmt in sorted(PLATE_DEFINITIONS.keys()):
+            self.format_combo.addItem(f"{fmt}-well", fmt)
+        if rosette:
+            idx = self.format_combo.findData(rosette.well_format)
+            if idx >= 0:
+                self.format_combo.setCurrentIndex(idx)
+        layout.addRow("Fits plate:", self.format_combo)
+
+        self.ring_spin = QSpinBox()
+        self.ring_spin.setRange(2, 12)
+        ring_count = 6
+        if rosette:
+            ring_count = rosette.num_subwells - (1 if rosette.has_center_well else 0)
+        self.ring_spin.setValue(ring_count)
+        layout.addRow("Ring sub-wells:", self.ring_spin)
+
+        self.center_check = QComboBox()
+        self.center_check.addItems(["Yes", "No"])
+        if rosette and not rosette.has_center_well:
+            self.center_check.setCurrentIndex(1)
+        layout.addRow("Center well:", self.center_check)
+
+        self.diameter_spin = QDoubleSpinBox()
+        self.diameter_spin.setRange(0.5, 20.0)
+        self.diameter_spin.setDecimals(1)
+        self.diameter_spin.setSuffix(" mm")
+        self.diameter_spin.setValue(rosette.subwell_diameter_mm if rosette else 1.5)
+        layout.addRow("Sub-well Ø:", self.diameter_spin)
+
+        self.depth_spin = QDoubleSpinBox()
+        self.depth_spin.setRange(1.0, 30.0)
+        self.depth_spin.setDecimals(1)
+        self.depth_spin.setSuffix(" mm")
+        self.depth_spin.setValue(rosette.subwell_depth_mm if rosette else 6.0)
+        layout.addRow("Sub-well depth:", self.depth_spin)
+
+        self.z_offset_spin = QDoubleSpinBox()
+        self.z_offset_spin.setRange(0.0, 20.0)
+        self.z_offset_spin.setDecimals(1)
+        self.z_offset_spin.setSuffix(" mm")
+        self.z_offset_spin.setValue(rosette.insert_z_offset_mm if rosette else 0.0)
+        layout.addRow("Insert Z offset:", self.z_offset_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def get_rosette(self) -> RosetteInsert:
+        return RosetteInsert.create_standard(
+            name=self.name_edit.text().strip() or "Unnamed",
+            well_format=self.format_combo.currentData(),
+            num_ring=self.ring_spin.value(),
+            has_center=self.center_check.currentIndex() == 0,
+            subwell_diameter_mm=self.diameter_spin.value(),
+            subwell_depth_mm=self.depth_spin.value(),
+            insert_z_offset_mm=self.z_offset_spin.value(),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Pump Channel Widget
 # ═══════════════════════════════════════════════════════════════════
 
 class PumpChannelWidget(QGroupBox):
     """
     Compact widget for configuring a single pump channel.
-    Shows syringe selection, ink assignment, printing mode, and capacity info.
-    All values displayed in µL.
+
+    Shows: Enable checkbox, syringe selector, ink selector, mode selector,
+    and computed syringe info line.
     """
 
-    changed = Signal()
+    changed = Signal()  # Emitted on any config change
 
-    def __init__(
-        self,
-        pump_id: str,
-        syringe_catalog: dict[int, SyringeSpec],
-        parent=None,
-    ):
-        super().__init__(f"Pump {pump_id}", parent)
+    def __init__(self, pump_id: str, syringe_catalog: dict, parent=None):
+        super().__init__(pump_id, parent)
         self.pump_id = pump_id
         self.syringe_catalog = syringe_catalog
         self._ink_names: list[str] = []
         self._build_ui()
 
     def _build_ui(self):
+        self.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; color: {COLORS.get('blue', '#89b4fa')};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 6px; padding-top: 14px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; left: 8px; padding: 0 4px;
+            }}
+        """)
         layout = QGridLayout(self)
-        layout.setContentsMargins(8, 12, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(4)
 
-        # Row 0: Enable checkbox + Syringe selector
-        self.enable_check = QCheckBox("Enabled")
+        # Row 0: Enable + Syringe
+        self.enable_check = QCheckBox("Enable")
+        self.enable_check.setChecked(False)
         self.enable_check.toggled.connect(self._on_enable_changed)
         layout.addWidget(self.enable_check, 0, 0)
 
@@ -169,48 +261,49 @@ class PumpChannelWidget(QGroupBox):
         self.syringe_combo.addItem("— None —", None)
         for vol in sorted(self.syringe_catalog.keys()):
             spec = self.syringe_catalog[vol]
-            self.syringe_combo.addItem(f"{vol} µL ({spec.part_number})", vol)
+            self.syringe_combo.addItem(f"{vol} µL  (Hamilton)", vol)
         self.syringe_combo.currentIndexChanged.connect(self._on_syringe_changed)
         layout.addWidget(self.syringe_combo, 0, 2, 1, 2)
 
-        # Row 1: Ink selector + Mode
+        # Row 1: Ink + Mode
         layout.addWidget(QLabel("Ink:"), 1, 0)
         self.ink_combo = QComboBox()
         self.ink_combo.addItem("— None —", None)
-        self.ink_combo.currentIndexChanged.connect(self._on_changed)
-        layout.addWidget(self.ink_combo, 1, 1, 1, 2)
+        self.ink_combo.currentIndexChanged.connect(lambda: self.changed.emit())
+        layout.addWidget(self.ink_combo, 1, 1, 1, 1)
 
-        layout.addWidget(QLabel("Mode:"), 1, 3)
+        layout.addWidget(QLabel("Mode:"), 1, 2)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Incremental", PrintingMode.INCREMENTAL.value)
         self.mode_combo.addItem("Continuous", PrintingMode.CONTINUOUS.value)
-        self.mode_combo.currentIndexChanged.connect(self._on_changed)
-        layout.addWidget(self.mode_combo, 1, 4)
+        self.mode_combo.currentIndexChanged.connect(lambda: self.changed.emit())
+        layout.addWidget(self.mode_combo, 1, 3)
 
-        # Row 2: Info labels
-        self.info_label = QLabel("No syringe selected")
-        self.info_label.setStyleSheet(f"color: {COLORS.get('subtext0', '#6c7086')};")
-        layout.addWidget(self.info_label, 2, 0, 1, 5)
+        # Row 2: Info line
+        self.info_label = QLabel("Pump disabled")
+        self.info_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label, 2, 0, 1, 4)
 
         # Initial state
         self._on_enable_changed(False)
 
-    def _on_enable_changed(self, enabled):
+    def _on_enable_changed(self, enabled: bool):
         self.syringe_combo.setEnabled(enabled)
         self.ink_combo.setEnabled(enabled)
         self.mode_combo.setEnabled(enabled)
-        self._update_info()
-        self._on_changed()
+        if not enabled:
+            self.info_label.setText("Pump disabled")
+        else:
+            self._update_info()
+        self.changed.emit()
 
     def _on_syringe_changed(self):
         self._update_info()
-        self._on_changed()
-
-    def _on_changed(self):
         self.changed.emit()
 
     def _update_info(self):
-        """Update the info label with syringe capacity details."""
         if not self.enable_check.isChecked():
             self.info_label.setText("Pump disabled")
             return
@@ -233,14 +326,14 @@ class PumpChannelWidget(QGroupBox):
             self.info_label.setText("Unknown syringe")
 
     def update_ink_list(self, ink_names: list[str]):
-        """Refresh the ink dropdown with current library."""
+        """Refresh the ink dropdown with current library names."""
         current = self.ink_combo.currentData()
         self.ink_combo.blockSignals(True)
         self.ink_combo.clear()
         self.ink_combo.addItem("— None —", None)
         for name in ink_names:
             self.ink_combo.addItem(name, name)
-        # Restore selection
+        # Restore selection if still available
         if current:
             idx = self.ink_combo.findData(current)
             if idx >= 0:
@@ -259,43 +352,61 @@ class PumpChannelWidget(QGroupBox):
 
         ink_name = self.ink_combo.currentData()
         if ink_name:
-            # Ink object will be resolved by the parent from the library
-            config.ink = InkSpec(name=ink_name)  # Placeholder — parent resolves full spec
+            # Placeholder — parent resolves full InkSpec from library
+            config.ink = InkSpec(name=ink_name)
 
         mode_val = self.mode_combo.currentData()
         config.printing_mode = PrintingMode(mode_val) if mode_val else PrintingMode.INCREMENTAL
 
         return config
 
-    def set_config(self, config: PumpChannelConfig):
-        """Apply a config to this widget."""
+    def set_config(self, config: PumpChannelConfig, ink_names: list[str] | None = None):
+        """
+        Apply a config to this widget.
+
+        v7.2.3 FIX: Accepts optional ink_names to ensure the ink combo
+        is populated BEFORE attempting to set the ink selection.
+        """
         self.enable_check.blockSignals(True)
         self.syringe_combo.blockSignals(True)
         self.ink_combo.blockSignals(True)
         self.mode_combo.blockSignals(True)
 
+        # v7.2.3: If ink_names provided, refresh ink combo first
+        if ink_names is not None:
+            self.update_ink_list(ink_names)
+
         self.enable_check.setChecked(config.enabled)
 
-        # Set syringe
+        # Set syringe by matching volume_uL
         if config.syringe:
             idx = self.syringe_combo.findData(config.syringe.volume_uL)
             if idx >= 0:
                 self.syringe_combo.setCurrentIndex(idx)
+            else:
+                logger.warning(f"{self.pump_id}: syringe {config.syringe.volume_uL}µL "
+                               f"not found in catalog")
+                self.syringe_combo.setCurrentIndex(0)
         else:
             self.syringe_combo.setCurrentIndex(0)
 
-        # Set ink
-        if config.ink:
+        # v7.2.3 FIX: Set ink by matching ink name in the combo
+        if config.ink and config.ink.name:
             idx = self.ink_combo.findData(config.ink.name)
             if idx >= 0:
                 self.ink_combo.setCurrentIndex(idx)
+            else:
+                logger.warning(f"{self.pump_id}: ink '{config.ink.name}' "
+                               f"not found in ink combo (available: {self._ink_names})")
+                self.ink_combo.setCurrentIndex(0)
         else:
             self.ink_combo.setCurrentIndex(0)
 
-        # Set mode
-        idx = self.mode_combo.findData(config.printing_mode.value)
-        if idx >= 0:
-            self.mode_combo.setCurrentIndex(idx)
+        # Set printing mode
+        if config.printing_mode:
+            idx = self.mode_combo.findData(config.printing_mode.value)
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
 
         self.enable_check.blockSignals(False)
         self.syringe_combo.blockSignals(False)
@@ -313,8 +424,7 @@ class HardwareSetupPage(QWidget):
     """
     Page 0: Hardware Setup — must be completed before other pages unlock.
 
-    Configures needle, syringes, inks, well plate, and printing modes.
-    All pump values are in µL.
+    v7.2.3: Reordered sections, added rosette library, fixed config restore.
     """
 
     _page_title_text = "Hardware Setup"
@@ -342,102 +452,103 @@ class HardwareSetupPage(QWidget):
 
     @property
     def hardware_config(self) -> HardwareConfig:
-        """Get the current hardware configuration."""
         return self._config
 
     # ════════════════════════════════════════════════════════════════
-    #  UI CONSTRUCTION
+    #  UI CONSTRUCTION — v7.2.3 reordered
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
-        """Build the main page layout."""
+        """Build the main page layout with v7.2.3 section ordering."""
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
 
-        # Title + validity indicator
-        title_row = QHBoxLayout()
-        title = QLabel("Hardware Setup")
-        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        title.setStyleSheet(f"color: {COLORS.get('text', '#cdd6f4')};")
-        title_row.addWidget(title)
-        title_row.addStretch()
-
-        self.validity_label = QLabel("⚠ Setup incomplete")
-        self.validity_label.setStyleSheet(f"color: {COLORS.get('yellow', '#f9e2af')};")
-        self.validity_label.setFont(QFont("Segoe UI", 11))
-        title_row.addWidget(self.validity_label)
-        outer.addLayout(title_row)
-
-        # Scrollable content
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
-        content = QWidget()
-        self._content_layout = QVBoxLayout(content)
-        self._content_layout.setSpacing(12)
 
-        # ── Section 1: Setup Name ─────────────────────────────────
+        scroll_content = QWidget()
+        self._content_layout = QVBoxLayout(scroll_content)
+        self._content_layout.setContentsMargins(12, 8, 12, 8)
+        self._content_layout.setSpacing(8)
+
+        # ── Section 1: Name & Notes ───────────────────────────────
         name_group = QGroupBox("Setup Identity")
-        name_lay = QFormLayout(name_group)
+        name_group.setStyleSheet(self._group_style())
+        name_lay = QVBoxLayout(name_group)
+
+        nr = QHBoxLayout()
+        nr.addWidget(QLabel("Name:"))
         self.name_edit = QLineEdit("Untitled Setup")
         self.name_edit.textChanged.connect(self._on_config_changed)
-        name_lay.addRow("Name:", self.name_edit)
+        nr.addWidget(self.name_edit)
+        name_lay.addLayout(nr)
+
+        notes_row = QHBoxLayout()
+        notes_row.addWidget(QLabel("Notes:"))
         self.notes_edit = QLineEdit()
-        self.notes_edit.setPlaceholderText("Optional experiment notes...")
-        self.notes_edit.textChanged.connect(self._on_config_changed)
-        name_lay.addRow("Notes:", self.notes_edit)
+        self.notes_edit.setPlaceholderText("Optional description...")
+        notes_row.addWidget(self.notes_edit)
+        name_lay.addLayout(notes_row)
+
         self._content_layout.addWidget(name_group)
 
-        # ── Section 2: Needle ─────────────────────────────────────
+        # ── Section 2: Needle Configuration ───────────────────────
         needle_group = QGroupBox("Needle Configuration")
-        needle_lay = QGridLayout(needle_group)
+        needle_group.setStyleSheet(self._group_style())
+        needle_lay = QVBoxLayout(needle_group)
 
-        needle_lay.addWidget(QLabel("Gauge:"), 0, 0)
+        gauge_row = QHBoxLayout()
+        gauge_row.addWidget(QLabel("Gauge:"))
         self.gauge_combo = QComboBox()
         self.gauge_combo.addItem("— Select —", None)
         for gauge in sorted(self._needle_catalog.keys()):
             spec = self._needle_catalog[gauge]
             self.gauge_combo.addItem(
-                f"{gauge}G  (ID: {spec.id_um:.0f} µm, OD: {spec.od_um:.0f} µm)",
-                gauge,
-            )
+                f"{gauge}G  (ID: {spec.id_um} µm, OD: {spec.od_um} µm)", gauge)
         self.gauge_combo.currentIndexChanged.connect(self._on_needle_changed)
-        needle_lay.addWidget(self.gauge_combo, 0, 1, 1, 2)
+        gauge_row.addWidget(self.gauge_combo)
+        needle_lay.addLayout(gauge_row)
 
-        needle_lay.addWidget(QLabel("Length:"), 1, 0)
+        len_row = QHBoxLayout()
+        len_row.addWidget(QLabel("Length:"))
         self.length_combo = QComboBox()
-        self.length_combo.addItem("1.0 inch (25.4 mm)", 1.0)
-        self.length_combo.addItem("1.5 inch (38.1 mm)", 1.5)
-        self.length_combo.addItem("2.0 inch (50.8 mm)", 2.0)
-        self.length_combo.currentIndexChanged.connect(self._on_needle_changed)
-        needle_lay.addWidget(self.length_combo, 1, 1)
+        for length in [0.5, 1.0, 1.5, 2.0, 3.0]:
+            self.length_combo.addItem(f'{length}"', length)
+        idx = self.length_combo.findData(1.0)
+        if idx >= 0:
+            self.length_combo.setCurrentIndex(idx)
+        self.length_combo.currentIndexChanged.connect(self._on_config_changed)
+        len_row.addWidget(self.length_combo)
 
-        needle_lay.addWidget(QLabel("Channels:"), 1, 2)
+        len_row.addWidget(QLabel("Channels:"))
         self.channels_spin = QSpinBox()
-        self.channels_spin.setRange(1, 3)
+        self.channels_spin.setRange(1, 7)
         self.channels_spin.setValue(1)
-        self.channels_spin.valueChanged.connect(self._on_needle_changed)
-        needle_lay.addWidget(self.channels_spin, 1, 3)
+        self.channels_spin.valueChanged.connect(self._on_config_changed)
+        len_row.addWidget(self.channels_spin)
+        len_row.addStretch()
+        needle_lay.addLayout(len_row)
 
-        self.needle_info = QLabel("Select a needle gauge")
-        self.needle_info.setStyleSheet(f"color: {COLORS.get('subtext0', '#6c7086')};")
-        needle_lay.addWidget(self.needle_info, 2, 0, 1, 4)
+        self.needle_info_label = QLabel("Select a needle gauge above")
+        self.needle_info_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+        needle_lay.addWidget(self.needle_info_label)
 
         self._content_layout.addWidget(needle_group)
 
         # ── Section 3: Well Plate ─────────────────────────────────
-        plate_group = QGroupBox("Well Plate")
+        plate_group = QGroupBox("Well Plate Format")
+        plate_group.setStyleSheet(self._group_style())
         plate_lay = QHBoxLayout(plate_group)
+
         plate_lay.addWidget(QLabel("Format:"))
         self.plate_combo = QComboBox()
         for fmt in sorted(PLATE_DEFINITIONS.keys()):
             pdef = PLATE_DEFINITIONS[fmt]
             self.plate_combo.addItem(
-                f"{fmt}-well  ({pdef['rows']}×{pdef['cols']})",
-                fmt,
-            )
-        # Default to 24-well
+                f"{fmt}-well  ({pdef['rows']}×{pdef['cols']})", fmt)
         idx = self.plate_combo.findData(24)
         if idx >= 0:
             self.plate_combo.setCurrentIndex(idx)
@@ -446,8 +557,46 @@ class HardwareSetupPage(QWidget):
         plate_lay.addStretch()
         self._content_layout.addWidget(plate_group)
 
-        # ── Section 4: Pump Channels ──────────────────────────────
+        # ── Section 4: Ink Library  (v7.2.3: MOVED UP) ───────────
+        ink_group = QGroupBox("Ink Library")
+        ink_group.setStyleSheet(self._group_style())
+        ink_lay = QVBoxLayout(ink_group)
+
+        ink_btn_row = QHBoxLayout()
+        self.add_ink_btn = QPushButton("+ Add Ink")
+        self.add_ink_btn.clicked.connect(self._add_ink)
+        ink_btn_row.addWidget(self.add_ink_btn)
+        self.edit_ink_btn = QPushButton("Edit")
+        self.edit_ink_btn.clicked.connect(self._edit_ink)
+        ink_btn_row.addWidget(self.edit_ink_btn)
+        self.remove_ink_btn = QPushButton("Remove")
+        self.remove_ink_btn.clicked.connect(self._remove_ink)
+        ink_btn_row.addWidget(self.remove_ink_btn)
+        ink_btn_row.addStretch()
+        ink_lay.addLayout(ink_btn_row)
+
+        self.ink_table = QTableWidget()
+        self.ink_table.setColumnCount(5)
+        self.ink_table.setHorizontalHeaderLabels(
+            ["Name", "Type", "Viscosity", "Granule Ø", "Cell Ø"])
+        self.ink_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.ink_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.ink_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.ink_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.ink_table.setMaximumHeight(120)
+        self.ink_table.verticalHeader().setDefaultSectionSize(22)
+        self.ink_table.verticalHeader().setVisible(False)
+        ink_lay.addWidget(self.ink_table)
+
+        self._content_layout.addWidget(ink_group)
+
+        # ── Section 5: Pump Channels (v7.2.3: MOVED DOWN) ────────
         pumps_group = QGroupBox("Pump Channels  (all values in µL)")
+        pumps_group.setStyleSheet(self._group_style())
         pumps_lay = QVBoxLayout(pumps_group)
 
         self._pump_widgets: dict[str, PumpChannelWidget] = {}
@@ -459,123 +608,108 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(pumps_group)
 
-        # ── Section 5: Ink Library ────────────────────────────────
-        ink_group = QGroupBox("Ink Library")
-        ink_lay = QVBoxLayout(ink_group)
+        # ── Section 6: Rosette Library (v7.2.3: NEW) ─────────────
+        rosette_group = QGroupBox("Rosette Library")
+        rosette_group.setStyleSheet(self._group_style())
+        rosette_lay = QVBoxLayout(rosette_group)
 
-        # Buttons
-        ink_btn_row = QHBoxLayout()
-        self.add_ink_btn = QPushButton("+ Add Ink")
-        self.add_ink_btn.clicked.connect(self._add_ink)
-        ink_btn_row.addWidget(self.add_ink_btn)
+        ros_btn_row = QHBoxLayout()
+        self.add_rosette_btn = QPushButton("+ New Rosette")
+        self.add_rosette_btn.clicked.connect(self._add_rosette)
+        ros_btn_row.addWidget(self.add_rosette_btn)
+        self.edit_rosette_btn = QPushButton("Edit")
+        self.edit_rosette_btn.clicked.connect(self._edit_rosette)
+        ros_btn_row.addWidget(self.edit_rosette_btn)
+        self.remove_rosette_btn = QPushButton("Remove")
+        self.remove_rosette_btn.clicked.connect(self._remove_rosette)
+        ros_btn_row.addWidget(self.remove_rosette_btn)
+        ros_btn_row.addStretch()
+        rosette_lay.addLayout(ros_btn_row)
 
-        self.edit_ink_btn = QPushButton("Edit")
-        self.edit_ink_btn.clicked.connect(self._edit_ink)
-        ink_btn_row.addWidget(self.edit_ink_btn)
+        self.rosette_table = QTableWidget()
+        self.rosette_table.setColumnCount(5)
+        self.rosette_table.setHorizontalHeaderLabels(
+            ["Name", "Sub-wells", "Fits", "Depth", "Z-offset"])
+        self.rosette_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.rosette_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rosette_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.rosette_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rosette_table.setMaximumHeight(110)
+        self.rosette_table.verticalHeader().setDefaultSectionSize(22)
+        self.rosette_table.verticalHeader().setVisible(False)
+        rosette_lay.addWidget(self.rosette_table)
 
-        self.remove_ink_btn = QPushButton("Remove")
-        self.remove_ink_btn.clicked.connect(self._remove_ink)
-        ink_btn_row.addWidget(self.remove_ink_btn)
-        ink_btn_row.addStretch()
-        ink_lay.addLayout(ink_btn_row)
+        self._content_layout.addWidget(rosette_group)
 
-        # Table
-        self.ink_table = QTableWidget(0, 5)
-        self.ink_table.setHorizontalHeaderLabels(["Name", "Type", "Viscosity", "Granule Ø", "Cell Ø"])
-        self.ink_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.ink_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.ink_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.ink_table.setMaximumHeight(180)
-        ink_lay.addWidget(self.ink_table)
+        # ── Section 7: Save/Load + Validity ───────────────────────
+        action_group = QGroupBox("Actions")
+        action_group.setStyleSheet(self._group_style())
+        action_lay = QVBoxLayout(action_group)
 
-        self._content_layout.addWidget(ink_group)
-
-        # ── Spacer ────────────────────────────────────────────────
-        self._content_layout.addStretch()
-
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
-
-        # ── Bottom bar: Save / Load / Apply ───────────────────────
         btn_row = QHBoxLayout()
-
-        self.save_btn = QPushButton("💾 Save Setup")
+        self.save_btn = QPushButton("💾 Save to File")
         self.save_btn.clicked.connect(self._save_config)
         btn_row.addWidget(self.save_btn)
-
-        self.load_btn = QPushButton("📂 Load Setup")
+        self.load_btn = QPushButton("📂 Load from File")
         self.load_btn.clicked.connect(self._load_config)
         btn_row.addWidget(self.load_btn)
-
         btn_row.addStretch()
+        action_lay.addLayout(btn_row)
 
-        self.apply_btn = QPushButton("✓ Apply & Continue")
-        self.apply_btn.setMinimumWidth(160)
-        self.apply_btn.clicked.connect(self._apply_config)
-        btn_row.addWidget(self.apply_btn)
+        self.validity_label = QLabel("⚠ Setup incomplete")
+        self.validity_label.setStyleSheet(
+            f"color: {COLORS.get('yellow', '#f9e2af')}; font-weight: bold;")
+        action_lay.addWidget(self.validity_label)
 
-        outer.addLayout(btn_row)
+        self._content_layout.addWidget(action_group)
 
-    # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL
-    # ════════════════════════════════════════════════════════════════
+        self._content_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        outer.addWidget(scroll)
 
-    def get_context_widget(self) -> QWidget:
-        """Context panel: quick syringe reference + recent configs."""
-        if self._context_widget:
-            return self._context_widget
-
-        ctx = QWidget()
-        lay = QVBoxLayout(ctx)
-        lay.setContentsMargins(8, 8, 8, 8)
-
-        # Quick reference: Syringe catalog
-        ref_group = QGroupBox("Syringe Reference")
-        ref_lay = QVBoxLayout(ref_group)
-        for vol in sorted(self._syringe_catalog.keys()):
-            spec = self._syringe_catalog[vol]
-            lbl = QLabel(f"{vol} µL — {spec.uL_per_mm:.2f} µL/mm — Ø{spec.barrel_id_mm:.3f} mm")
-            lbl.setStyleSheet(f"color: {COLORS.get('subtext1', '#a6adc8')}; font-size: 11px;")
-            ref_lay.addWidget(lbl)
-        lay.addWidget(ref_group)
-
-        # Quick reference: Needle catalog
-        needle_group = QGroupBox("Needle Reference")
-        needle_lay = QVBoxLayout(needle_group)
-        for gauge in sorted(self._needle_catalog.keys()):
-            spec = self._needle_catalog[gauge]
-            lbl = QLabel(f"{gauge}G — ID: {spec.id_um:.0f} µm, OD: {spec.od_um:.0f} µm")
-            lbl.setStyleSheet(f"color: {COLORS.get('subtext1', '#a6adc8')}; font-size: 11px;")
-            needle_lay.addWidget(lbl)
-        lay.addWidget(needle_group)
-
-        lay.addStretch()
-        self._context_widget = ctx
-        return ctx
+    def _group_style(self) -> str:
+        """Shared GroupBox stylesheet."""
+        return f"""
+            QGroupBox {{
+                font-weight: bold;
+                color: {COLORS.get('text', '#cdd6f4')};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 14px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }}
+        """
 
     # ════════════════════════════════════════════════════════════════
-    #  EVENT HANDLERS
+    #  NEEDLE CHANGE HANDLER
     # ════════════════════════════════════════════════════════════════
 
     def _on_needle_changed(self):
-        """Update needle info and config when gauge/length/channels change."""
         gauge = self.gauge_combo.currentData()
         if gauge and gauge in self._needle_catalog:
             spec = self._needle_catalog[gauge]
-            length = self.length_combo.currentData() or 1.0
-            channels = self.channels_spin.value()
-            self.needle_info.setText(
-                f"ID: {spec.id_um:.0f} µm ({spec.id_mm:.3f} mm) | "
-                f"OD: {spec.od_um:.0f} µm ({spec.od_mm:.3f} mm) | "
-                f"Length: {length}\" ({length * 25.4:.1f} mm) | "
-                f"Channels: {channels}"
-            )
+            self.needle_info_label.setText(
+                f"ID: {spec.id_um} µm | OD: {spec.od_um} µm | "
+                f"Wall: {spec.wall_um} µm")
         else:
-            self.needle_info.setText("Select a needle gauge")
+            self.needle_info_label.setText("Select a needle gauge above")
         self._on_config_changed()
 
+    # ════════════════════════════════════════════════════════════════
+    #  CONFIG CHANGE / REBUILD
+    # ════════════════════════════════════════════════════════════════
+
     def _on_config_changed(self):
-        """Rebuild the config from current widget state and emit signals."""
+        """Called whenever any config widget changes."""
         self._rebuild_config()
         valid = self._config.is_valid
         if valid != self._last_valid:
@@ -584,11 +718,14 @@ class HardwareSetupPage(QWidget):
 
         if valid:
             self.validity_label.setText("✓ Setup complete")
-            self.validity_label.setStyleSheet(f"color: {COLORS.get('green', '#a6e3a1')};")
+            self.validity_label.setStyleSheet(
+                f"color: {COLORS.get('green', '#a6e3a1')};")
         else:
             _, issues = self._config.validate()
-            self.validity_label.setText(f"⚠ {issues[0]}" if issues else "⚠ Setup incomplete")
-            self.validity_label.setStyleSheet(f"color: {COLORS.get('yellow', '#f9e2af')};")
+            self.validity_label.setText(
+                f"⚠ {issues[0]}" if issues else "⚠ Setup incomplete")
+            self.validity_label.setStyleSheet(
+                f"color: {COLORS.get('yellow', '#f9e2af')};")
 
         self.config_changed.emit(self._config)
 
@@ -602,7 +739,6 @@ class HardwareSetupPage(QWidget):
         gauge = self.gauge_combo.currentData()
         if gauge and gauge in self._needle_catalog:
             needle = self._needle_catalog[gauge]
-            # Create a new NeedleSpec with user-selected length and channels
             self._config.needle = NeedleSpec(
                 gauge=needle.gauge,
                 od_um=needle.od_um,
@@ -617,17 +753,18 @@ class HardwareSetupPage(QWidget):
         # Well plate
         self._config.plate_format = self.plate_combo.currentData() or 24
 
-        # Pumps
+        # Pumps — resolve ink from library
         for pid, pw in self._pump_widgets.items():
             pcfg = pw.get_config()
-            # Resolve ink from library
             if pcfg.ink and pcfg.ink.name in self._config.ink_library:
                 pcfg.ink = self._config.ink_library[pcfg.ink.name]
             elif pcfg.ink:
-                pcfg.ink = None  # Ink not in library anymore
+                pcfg.ink = None  # Ink no longer in library
             self._config.pumps[pid] = pcfg
 
-    # ── Ink Library ───────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  INK LIBRARY CRUD
+    # ════════════════════════════════════════════════════════════════
 
     def _add_ink(self):
         dlg = InkEditorDialog(parent=self)
@@ -651,7 +788,6 @@ class HardwareSetupPage(QWidget):
         if dlg.exec() == QDialog.Accepted:
             new_ink = dlg.get_ink()
             if new_ink:
-                # Remove old, add new (handles name change)
                 if new_ink.name != name:
                     self._config.remove_ink(name)
                 self._config.add_ink(new_ink)
@@ -677,21 +813,80 @@ class HardwareSetupPage(QWidget):
             self.ink_table.insertRow(row)
             self.ink_table.setItem(row, 0, QTableWidgetItem(ink.name))
             self.ink_table.setItem(row, 1, QTableWidgetItem(ink.ink_type))
-            self.ink_table.setItem(row, 2, QTableWidgetItem(f"{ink.viscosity_cP:.1f} cP"))
+            self.ink_table.setItem(row, 2, QTableWidgetItem(
+                f"{ink.viscosity_cP:.1f} cP"))
             self.ink_table.setItem(row, 3, QTableWidgetItem(
-                f"{ink.granule_diameter_um:.0f} µm" if ink.granule_diameter_um > 0 else "—"
-            ))
+                f"{ink.granule_diameter_um:.0f} µm"
+                if ink.granule_diameter_um > 0 else "—"))
             self.ink_table.setItem(row, 4, QTableWidgetItem(
-                f"{ink.cell_diameter_um:.0f} µm" if ink.cell_diameter_um > 0 else "—"
-            ))
+                f"{ink.cell_diameter_um:.0f} µm"
+                if ink.cell_diameter_um > 0 else "—"))
 
     def _refresh_pump_ink_combos(self):
-        """Update all pump channel ink dropdowns."""
+        """Update all pump channel ink dropdowns from current library."""
         ink_names = list(self._config.ink_library.keys())
         for pw in self._pump_widgets.values():
             pw.update_ink_list(ink_names)
 
-    # ── Save / Load ───────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════
+    #  ROSETTE LIBRARY CRUD  (v7.2.3: NEW)
+    # ════════════════════════════════════════════════════════════════
+
+    def _add_rosette(self):
+        dlg = RosetteEditorDialog(parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            ros = dlg.get_rosette()
+            self._config.rosette_library[ros.name] = ros
+            self._refresh_rosette_table()
+            self._on_config_changed()
+
+    def _edit_rosette(self):
+        row = self.rosette_table.currentRow()
+        if row < 0:
+            return
+        old_name = self.rosette_table.item(row, 0).text()
+        ros = self._config.rosette_library.get(old_name)
+        if ros is None:
+            return
+        dlg = RosetteEditorDialog(rosette=ros, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            new_ros = dlg.get_rosette()
+            if new_ros.name != old_name:
+                del self._config.rosette_library[old_name]
+            self._config.rosette_library[new_ros.name] = new_ros
+            self._refresh_rosette_table()
+            self._on_config_changed()
+
+    def _remove_rosette(self):
+        row = self.rosette_table.currentRow()
+        if row < 0:
+            return
+        name = self.rosette_table.item(row, 0).text()
+        self._config.rosette_library.pop(name, None)
+        self._refresh_rosette_table()
+        self._on_config_changed()
+
+    def _refresh_rosette_table(self):
+        """Rebuild the rosette table from the config."""
+        self.rosette_table.setRowCount(0)
+        for name, ros in self._config.rosette_library.items():
+            row = self.rosette_table.rowCount()
+            self.rosette_table.insertRow(row)
+            center_str = "+center" if ros.has_center_well else ""
+            ring_n = ros.num_subwells - (1 if ros.has_center_well else 0)
+            self.rosette_table.setItem(row, 0, QTableWidgetItem(ros.name))
+            self.rosette_table.setItem(row, 1, QTableWidgetItem(
+                f"{ring_n}{center_str}"))
+            self.rosette_table.setItem(row, 2, QTableWidgetItem(
+                f"{ros.well_format}w"))
+            self.rosette_table.setItem(row, 3, QTableWidgetItem(
+                f"{ros.subwell_depth_mm:.1f} mm"))
+            self.rosette_table.setItem(row, 4, QTableWidgetItem(
+                f"{ros.insert_z_offset_mm:.1f} mm"))
+
+    # ════════════════════════════════════════════════════════════════
+    #  SAVE / LOAD
+    # ════════════════════════════════════════════════════════════════
 
     def _save_config(self):
         """Save the current config to a JSON file."""
@@ -704,9 +899,11 @@ class HardwareSetupPage(QWidget):
         if path:
             try:
                 self._config.save(path)
-                QMessageBox.information(self, "Saved", f"Configuration saved to:\n{path}")
+                QMessageBox.information(
+                    self, "Saved", f"Configuration saved to:\n{path}")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to save:\n{e}")
 
     def _load_config(self):
         """Load a config from a JSON file."""
@@ -718,65 +915,112 @@ class HardwareSetupPage(QWidget):
             try:
                 self._config = HardwareConfig.load(path)
                 self._apply_config_to_ui()
-                QMessageBox.information(self, "Loaded", f"Configuration loaded from:\n{path}")
+                QMessageBox.information(
+                    self, "Loaded", f"Configuration loaded from:\n{path}")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load:\n{e}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to load:\n{e}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  APPLY CONFIG TO UI  (v7.2.3: COMPLETE REWRITE)
+    # ════════════════════════════════════════════════════════════════
 
     def _apply_config_to_ui(self):
-        """Push the current config state into all UI widgets."""
-        # Block signals during bulk update
+        """
+        Push the current config state into all UI widgets.
+
+        v7.2.3 FIX: Restores in dependency order so that ink library
+        is populated before pump channel combos try to resolve ink names.
+
+        Restore order:
+        1. Name & Notes
+        2. Ink library → table + pump combo refresh
+        3. Rosette library → table
+        4. Needle gauge + length + channels
+        5. Plate format
+        6. Pump channels (with ink_names available)
+        7. Emit config_changed + config_validated
+        """
+        logger.info("Applying config to UI (v7.2.3 dependency-ordered restore)")
+
+        # ── 1. Name & Notes ───────────────────────────────────────
+        self.name_edit.blockSignals(True)
         self.name_edit.setText(self._config.config_name)
+        self.name_edit.blockSignals(False)
         self.notes_edit.setText(self._config.notes)
 
-        # Needle
+        # ── 2. Ink Library FIRST (pumps depend on this) ───────────
+        self._refresh_ink_table()
+        # This populates pump ink combos with all ink names
+        self._refresh_pump_ink_combos()
+        ink_names = list(self._config.ink_library.keys())
+        logger.debug(f"  Ink library restored: {ink_names}")
+
+        # ── 3. Rosette Library ────────────────────────────────────
+        self._refresh_rosette_table()
+        logger.debug(f"  Rosette library restored: "
+                     f"{list(self._config.rosette_library.keys())}")
+
+        # ── 4. Needle ─────────────────────────────────────────────
+        self.gauge_combo.blockSignals(True)
         if self._config.needle:
             idx = self.gauge_combo.findData(self._config.needle.gauge)
             if idx >= 0:
                 self.gauge_combo.setCurrentIndex(idx)
+            else:
+                logger.warning(f"  Needle gauge {self._config.needle.gauge} "
+                               f"not in catalog")
+                self.gauge_combo.setCurrentIndex(0)
             # Length
             lidx = self.length_combo.findData(self._config.needle.length_inches)
             if lidx >= 0:
                 self.length_combo.setCurrentIndex(lidx)
+            # Channels
             self.channels_spin.setValue(self._config.needle.num_channels)
+            logger.debug(f"  Needle restored: {self._config.needle.gauge}G, "
+                         f"{self._config.needle.length_inches}\", "
+                         f"{self._config.needle.num_channels}ch")
         else:
             self.gauge_combo.setCurrentIndex(0)
+        self.gauge_combo.blockSignals(False)
+        # Update needle info label directly (avoid triggering _on_config_changed)
+        gauge = self.gauge_combo.currentData()
+        if gauge and gauge in self._needle_catalog:
+            spec = self._needle_catalog[gauge]
+            self.needle_info_label.setText(
+                f"ID: {spec.id_um} µm | OD: {spec.od_um} µm | "
+                f"Wall: {spec.wall_um} µm")
 
-        # Plate
+        # ── 5. Plate Format ───────────────────────────────────────
+        self.plate_combo.blockSignals(True)
         pidx = self.plate_combo.findData(self._config.plate_format)
         if pidx >= 0:
             self.plate_combo.setCurrentIndex(pidx)
+        self.plate_combo.blockSignals(False)
+        logger.debug(f"  Plate format restored: {self._config.plate_format}")
 
-        # Ink library
-        self._refresh_ink_table()
-        self._refresh_pump_ink_combos()
-
-        # Pumps
+        # ── 6. Pump Channels (ink combos are now populated) ───────
         for pid, pw in self._pump_widgets.items():
             if pid in self._config.pumps:
-                pw.set_config(self._config.pumps[pid])
+                pcfg = self._config.pumps[pid]
+                # v7.2.3: Pass ink_names so the combo is guaranteed populated
+                pw.set_config(pcfg, ink_names=ink_names)
+                logger.debug(
+                    f"  {pid}: enabled={pcfg.enabled}, "
+                    f"syringe={pcfg.syringe.volume_uL if pcfg.syringe else None}µL, "
+                    f"ink={pcfg.ink.name if pcfg.ink else None}, "
+                    f"mode={pcfg.printing_mode.value}")
 
+        # ── 7. Emit signals ──────────────────────────────────────
         self._on_config_changed()
-
-    def _apply_config(self):
-        """Apply config and signal the app to unlock other pages."""
-        self._rebuild_config()
-        valid, issues = self._config.validate()
-        if not valid:
-            QMessageBox.warning(
-                self, "Incomplete Setup",
-                "Please resolve the following:\n\n" + "\n".join(f"• {i}" for i in issues),
-            )
-            return
-        self.config_changed.emit(self._config)
-        self.config_validated.emit(True)
-        logger.info(f"Hardware config applied: {self._config}")
+        logger.info("Config restore complete")
 
     # ════════════════════════════════════════════════════════════════
     #  EXTERNAL API
     # ════════════════════════════════════════════════════════════════
 
     def set_config(self, config: HardwareConfig):
-        """Set config programmatically (e.g. from settings restore)."""
+        """Set config programmatically (e.g. from settings restore on launch)."""
         self._config = config
         self._apply_config_to_ui()
 
@@ -784,3 +1028,16 @@ class HardwareSetupPage(QWidget):
         """Get the current config after rebuilding from UI."""
         self._rebuild_config()
         return self._config
+
+    def set_hardware_config(self, config):
+        """v7.2 interface: same as set_config (this IS the hardware page)."""
+        if isinstance(config, HardwareConfig):
+            self.set_config(config)
+
+    def on_status_update(self):
+        """Called by MainWindow timer. No periodic refresh needed for this page."""
+        pass
+
+    def get_context_widget(self) -> QWidget | None:
+        """Hardware Setup has no context panel."""
+        return self._context_widget
