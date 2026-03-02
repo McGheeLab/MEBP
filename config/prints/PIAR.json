@@ -1,0 +1,114 @@
+{
+  "schema_version": "7.2.3",
+  "metadata": {
+    "name": "PIAR",
+    "description": "",
+    "modified": "2026-03-02T22:34:05.633593+00:00"
+  },
+  "objects": {
+    "Spiral_1": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        2.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Spiral_2": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        1.0000000000000002,
+        1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Spiral_3": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        -0.9999999999999997,
+        1.7320508075688774,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Spiral_4": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        -2.0,
+        2.4492935982947064e-16,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Spiral_5": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        -1.0000000000000009,
+        -1.7320508075688767,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Spiral_6": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 2.0,
+        "num_points_per_turn": 64.0
+      },
+      "position": [
+        1.0000000000000002,
+        -1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

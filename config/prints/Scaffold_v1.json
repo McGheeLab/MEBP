@@ -1,0 +1,62 @@
+{
+  "schema_version": "7.2.3",
+  "metadata": {
+    "name": "Scaffold_v1",
+    "description": "Example scaffold with base layer + cell ring",
+    "created": "2026-03-02T10:30:00+00:00",
+    "modified": "2026-03-02T11:15:00+00:00",
+    "author": "MEBP Sample"
+  },
+  "objects": {
+    "Base_Scaffold": {
+      "object_type": "cylinder_solid",
+      "params": {
+        "radius": 2.0,
+        "height": 0.6,
+        "layer_height": 0.2
+      },
+      "position": [0.0, 0.0, 0.0],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 3,
+      "layer_height": 0.2
+    },
+    "Cell_Ring": {
+      "object_type": "circle",
+      "params": {
+        "radius": 1.5,
+        "fill": "none",
+        "spacing": 0.3
+      },
+      "position": [0.0, 0.0, 0.65],
+      "color": "#89b4fa",
+      "ink_pump": "P2",
+      "num_layers": 1,
+      "layer_height": 0.2
+    },
+    "Top_Dot": {
+      "object_type": "dot",
+      "params": {
+        "radius": 0.5
+      },
+      "position": [0.0, 0.0, 0.85],
+      "color": "#f5c2e7",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2
+    }
+  },
+  "collections": {
+    "Full_Scaffold": [
+      {"object_name": "Base_Scaffold", "position": [0, 0, 0], "copies": 1},
+      {"object_name": "Cell_Ring", "position": [0, 0, 0.65], "copies": 1},
+      {"object_name": "Top_Dot", "position": [0, 0, 0.85], "copies": 1}
+    ]
+  },
+  "layout_presets": {
+    "Ring_6": {
+      "pattern": "ring",
+      "params": {"n": 6, "radius": 2.0, "start_angle": 0}
+    }
+  }
+}

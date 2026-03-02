@@ -511,25 +511,21 @@ class HardwareSetupPage(QWidget):
         gauge_row.addWidget(self.gauge_combo)
         needle_lay.addLayout(gauge_row)
 
-        len_row = QHBoxLayout()
-        len_row.addWidget(QLabel("Length:"))
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("Length:"))
         self.length_combo = QComboBox()
-        for length in [0.5, 1.0, 1.5, 2.0, 3.0]:
-            self.length_combo.addItem(f'{length}"', length)
-        idx = self.length_combo.findData(1.0)
-        if idx >= 0:
-            self.length_combo.setCurrentIndex(idx)
+        self.length_combo.addItem("1.0\"", 1.0)
+        self.length_combo.addItem("2.0\"", 2.0)
         self.length_combo.currentIndexChanged.connect(self._on_config_changed)
-        len_row.addWidget(self.length_combo)
+        opt_row.addWidget(self.length_combo)
 
-        len_row.addWidget(QLabel("Channels:"))
+        opt_row.addWidget(QLabel("Channels:"))
         self.channels_spin = QSpinBox()
-        self.channels_spin.setRange(1, 7)
+        self.channels_spin.setRange(1, 3)
         self.channels_spin.setValue(1)
         self.channels_spin.valueChanged.connect(self._on_config_changed)
-        len_row.addWidget(self.channels_spin)
-        len_row.addStretch()
-        needle_lay.addLayout(len_row)
+        opt_row.addWidget(self.channels_spin)
+        needle_lay.addLayout(opt_row)
 
         self.needle_info_label = QLabel("Select a needle gauge above")
         self.needle_info_label.setStyleSheet(
@@ -538,7 +534,7 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(needle_group)
 
-        # ── Section 3: Well Plate ─────────────────────────────────
+        # ── Section 3: Well Plate Format ──────────────────────────
         plate_group = QGroupBox("Well Plate Format")
         plate_group.setStyleSheet(self._group_style())
         plate_lay = QHBoxLayout(plate_group)
@@ -548,13 +544,15 @@ class HardwareSetupPage(QWidget):
         for fmt in sorted(PLATE_DEFINITIONS.keys()):
             pdef = PLATE_DEFINITIONS[fmt]
             self.plate_combo.addItem(
-                f"{fmt}-well  ({pdef['rows']}×{pdef['cols']})", fmt)
-        idx = self.plate_combo.findData(24)
-        if idx >= 0:
-            self.plate_combo.setCurrentIndex(idx)
+                f"{fmt}-well  ({pdef['rows']}×{pdef['cols']}, "
+                f"Ø{pdef['well_diameter']:.1f} mm)", fmt)
+        # Default to 24-well
+        idx_24 = self.plate_combo.findData(24)
+        if idx_24 >= 0:
+            self.plate_combo.setCurrentIndex(idx_24)
         self.plate_combo.currentIndexChanged.connect(self._on_config_changed)
         plate_lay.addWidget(self.plate_combo)
-        plate_lay.addStretch()
+
         self._content_layout.addWidget(plate_group)
 
         # ── Section 4: Ink Library  (v7.2.3: MOVED UP) ───────────
@@ -562,117 +560,117 @@ class HardwareSetupPage(QWidget):
         ink_group.setStyleSheet(self._group_style())
         ink_lay = QVBoxLayout(ink_group)
 
-        ink_btn_row = QHBoxLayout()
-        self.add_ink_btn = QPushButton("+ Add Ink")
-        self.add_ink_btn.clicked.connect(self._add_ink)
-        ink_btn_row.addWidget(self.add_ink_btn)
-        self.edit_ink_btn = QPushButton("Edit")
-        self.edit_ink_btn.clicked.connect(self._edit_ink)
-        ink_btn_row.addWidget(self.edit_ink_btn)
-        self.remove_ink_btn = QPushButton("Remove")
-        self.remove_ink_btn.clicked.connect(self._remove_ink)
-        ink_btn_row.addWidget(self.remove_ink_btn)
-        ink_btn_row.addStretch()
-        ink_lay.addLayout(ink_btn_row)
-
-        self.ink_table = QTableWidget()
-        self.ink_table.setColumnCount(5)
+        self.ink_table = QTableWidget(0, 5)
         self.ink_table.setHorizontalHeaderLabels(
             ["Name", "Type", "Viscosity", "Granule Ø", "Cell Ø"])
         self.ink_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
+            QHeaderView.Stretch)
         self.ink_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
+            QAbstractItemView.SelectRows)
         self.ink_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
+            QAbstractItemView.SingleSelection)
         self.ink_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.ink_table.setMaximumHeight(120)
-        self.ink_table.verticalHeader().setDefaultSectionSize(22)
-        self.ink_table.verticalHeader().setVisible(False)
+            QAbstractItemView.NoEditTriggers)
+        self.ink_table.setMaximumHeight(160)
         ink_lay.addWidget(self.ink_table)
+
+        ink_btns = QHBoxLayout()
+        btn_add_ink = QPushButton("+ Add Ink")
+        btn_add_ink.clicked.connect(self._add_ink)
+        ink_btns.addWidget(btn_add_ink)
+        btn_edit_ink = QPushButton("Edit")
+        btn_edit_ink.clicked.connect(self._edit_ink)
+        ink_btns.addWidget(btn_edit_ink)
+        btn_del_ink = QPushButton("Remove")
+        btn_del_ink.clicked.connect(self._remove_ink)
+        ink_btns.addWidget(btn_del_ink)
+        ink_btns.addStretch()
+        ink_lay.addLayout(ink_btns)
 
         self._content_layout.addWidget(ink_group)
 
-        # ── Section 5: Pump Channels (v7.2.3: MOVED DOWN) ────────
-        pumps_group = QGroupBox("Pump Channels  (all values in µL)")
-        pumps_group.setStyleSheet(self._group_style())
-        pumps_lay = QVBoxLayout(pumps_group)
+        # ── Section 5: Pump Channels  (v7.2.3: MOVED DOWN) ───────
+        pump_group = QGroupBox("Pump Channels")
+        pump_group.setStyleSheet(self._group_style())
+        pump_lay = QVBoxLayout(pump_group)
 
         self._pump_widgets: dict[str, PumpChannelWidget] = {}
         for pid in ["P1", "P2", "P3"]:
             pw = PumpChannelWidget(pid, self._syringe_catalog)
             pw.changed.connect(self._on_config_changed)
-            pumps_lay.addWidget(pw)
+            pump_lay.addWidget(pw)
             self._pump_widgets[pid] = pw
 
-        self._content_layout.addWidget(pumps_group)
+        self._content_layout.addWidget(pump_group)
 
-        # ── Section 6: Rosette Library (v7.2.3: NEW) ─────────────
-        rosette_group = QGroupBox("Rosette Library")
-        rosette_group.setStyleSheet(self._group_style())
-        rosette_lay = QVBoxLayout(rosette_group)
+        # ── Section 6: Rosette Library  (v7.2.3: NEW) ────────────
+        ros_group = QGroupBox("Rosette Library")
+        ros_group.setStyleSheet(self._group_style())
+        ros_lay = QVBoxLayout(ros_group)
 
-        ros_btn_row = QHBoxLayout()
-        self.add_rosette_btn = QPushButton("+ New Rosette")
-        self.add_rosette_btn.clicked.connect(self._add_rosette)
-        ros_btn_row.addWidget(self.add_rosette_btn)
-        self.edit_rosette_btn = QPushButton("Edit")
-        self.edit_rosette_btn.clicked.connect(self._edit_rosette)
-        ros_btn_row.addWidget(self.edit_rosette_btn)
-        self.remove_rosette_btn = QPushButton("Remove")
-        self.remove_rosette_btn.clicked.connect(self._remove_rosette)
-        ros_btn_row.addWidget(self.remove_rosette_btn)
-        ros_btn_row.addStretch()
-        rosette_lay.addLayout(ros_btn_row)
-
-        self.rosette_table = QTableWidget()
-        self.rosette_table.setColumnCount(5)
+        self.rosette_table = QTableWidget(0, 5)
         self.rosette_table.setHorizontalHeaderLabels(
             ["Name", "Sub-wells", "Fits", "Depth", "Z-offset"])
         self.rosette_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
+            QHeaderView.Stretch)
         self.rosette_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows)
+            QAbstractItemView.SelectRows)
         self.rosette_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
+            QAbstractItemView.SingleSelection)
         self.rosette_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.rosette_table.setMaximumHeight(110)
-        self.rosette_table.verticalHeader().setDefaultSectionSize(22)
-        self.rosette_table.verticalHeader().setVisible(False)
-        rosette_lay.addWidget(self.rosette_table)
+            QAbstractItemView.NoEditTriggers)
+        self.rosette_table.setMaximumHeight(140)
+        ros_lay.addWidget(self.rosette_table)
 
-        self._content_layout.addWidget(rosette_group)
+        ros_btns = QHBoxLayout()
+        btn_add_ros = QPushButton("+ New Rosette")
+        btn_add_ros.clicked.connect(self._add_rosette)
+        ros_btns.addWidget(btn_add_ros)
+        btn_edit_ros = QPushButton("Edit")
+        btn_edit_ros.clicked.connect(self._edit_rosette)
+        ros_btns.addWidget(btn_edit_ros)
+        btn_del_ros = QPushButton("Remove")
+        btn_del_ros.clicked.connect(self._remove_rosette)
+        ros_btns.addWidget(btn_del_ros)
+        ros_btns.addStretch()
+        ros_lay.addLayout(ros_btns)
 
-        # ── Section 7: Save/Load + Validity ───────────────────────
-        action_group = QGroupBox("Actions")
-        action_group.setStyleSheet(self._group_style())
-        action_lay = QVBoxLayout(action_group)
+        self._content_layout.addWidget(ros_group)
+
+        # ── Section 7: Actions + Validity ─────────────────────────
+        actions_group = QGroupBox("Actions")
+        actions_group.setStyleSheet(self._group_style())
+        actions_lay = QVBoxLayout(actions_group)
 
         btn_row = QHBoxLayout()
-        self.save_btn = QPushButton("💾 Save to File")
-        self.save_btn.clicked.connect(self._save_config)
-        btn_row.addWidget(self.save_btn)
-        self.load_btn = QPushButton("📂 Load from File")
-        self.load_btn.clicked.connect(self._load_config)
-        btn_row.addWidget(self.load_btn)
+        btn_save = QPushButton("💾 Save Config")
+        btn_save.clicked.connect(self._save_config)
+        btn_row.addWidget(btn_save)
+        btn_load = QPushButton("📂 Load Config")
+        btn_load.clicked.connect(self._load_config)
+        btn_row.addWidget(btn_load)
         btn_row.addStretch()
-        action_lay.addLayout(btn_row)
+        actions_lay.addLayout(btn_row)
 
         self.validity_label = QLabel("⚠ Setup incomplete")
         self.validity_label.setStyleSheet(
-            f"color: {COLORS.get('yellow', '#f9e2af')}; font-weight: bold;")
-        action_lay.addWidget(self.validity_label)
+            f"color: {COLORS.get('yellow', '#f9e2af')};")
+        self.validity_label.setFont(QFont("", 10, QFont.Bold))
+        actions_lay.addWidget(self.validity_label)
 
-        self._content_layout.addWidget(action_group)
+        self._content_layout.addWidget(actions_group)
 
+        # ── Finalize scroll area ──────────────────────────────────
         self._content_layout.addStretch()
         scroll.setWidget(scroll_content)
         outer.addWidget(scroll)
 
-    def _group_style(self) -> str:
-        """Shared GroupBox stylesheet."""
+    # ════════════════════════════════════════════════════════════════
+    #  SHARED STYLES
+    # ════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _group_style() -> str:
         return f"""
             QGroupBox {{
                 font-weight: bold;

@@ -25,254 +25,216 @@ class LayoutPattern(Enum):
     CONCENTRIC_RINGS = "concentric_rings"
 
 
-# Pattern display info for UI
-LAYOUT_INFO = {
-    LayoutPattern.RING: {
+# ═══════════════════════════════════════════════════════════════════
+# Layout Parameter Definitions (for dynamic UI generation)
+# ═══════════════════════════════════════════════════════════════════
+
+LAYOUT_INFO: dict[str, dict[str, Any]] = {
+    "ring": {
         "label": "Ring",
-        "icon": "◯",
-        "description": "Objects evenly spaced on a circle",
+        "icon": "◎",
+        "description": "Objects equally spaced around a circle",
         "params": {
-            "count": {"label": "Count", "type": "int", "min": 1, "max": 100, "default": 6},
-            "radius_mm": {"label": "Radius", "type": "float", "min": 0.1, "max": 20.0,
-                          "default": 2.0, "suffix": " mm"},
-            "start_angle_deg": {"label": "Start Angle", "type": "float", "min": 0.0,
-                                "max": 359.0, "default": 0.0, "suffix": "°"},
+            "n": {"label": "Count", "type": "int", "min": 1, "max": 100, "default": 6},
+            "radius": {"label": "Radius (mm)", "type": "float", "min": 0.1, "max": 20.0, "default": 2.0, "step": 0.1},
+            "start_angle": {"label": "Start Angle (°)", "type": "float", "min": 0, "max": 360, "default": 0.0, "step": 15},
         },
     },
-    LayoutPattern.SQUARE_GRID: {
+    "square_grid": {
         "label": "Square Grid",
         "icon": "▦",
-        "description": "Rectangular grid of objects",
+        "description": "Objects in a rectangular rows × columns grid",
         "params": {
             "rows": {"label": "Rows", "type": "int", "min": 1, "max": 20, "default": 3},
             "cols": {"label": "Columns", "type": "int", "min": 1, "max": 20, "default": 3},
-            "spacing_mm": {"label": "Spacing", "type": "float", "min": 0.1, "max": 10.0,
-                           "default": 1.0, "suffix": " mm"},
+            "spacing": {"label": "Spacing (mm)", "type": "float", "min": 0.05, "max": 10.0, "default": 1.0, "step": 0.05},
         },
     },
-    LayoutPattern.HEX_GRID: {
+    "hex_grid": {
         "label": "Hex Grid",
         "icon": "⬡",
-        "description": "Hexagonal close-packed grid",
+        "description": "Hexagonal (honeycomb) packing — efficient space use",
         "params": {
             "rows": {"label": "Rows", "type": "int", "min": 1, "max": 20, "default": 3},
             "cols": {"label": "Columns", "type": "int", "min": 1, "max": 20, "default": 3},
-            "spacing_mm": {"label": "Spacing", "type": "float", "min": 0.1, "max": 10.0,
-                           "default": 1.0, "suffix": " mm"},
+            "spacing": {"label": "Spacing (mm)", "type": "float", "min": 0.05, "max": 10.0, "default": 1.0, "step": 0.05},
         },
     },
-    LayoutPattern.LINE: {
+    "line": {
         "label": "Line",
         "icon": "╱",
-        "description": "Objects in a straight line",
+        "description": "Objects spaced along a straight line",
         "params": {
-            "count": {"label": "Count", "type": "int", "min": 2, "max": 50, "default": 5},
-            "length_mm": {"label": "Length", "type": "float", "min": 0.5, "max": 20.0,
-                          "default": 4.0, "suffix": " mm"},
-            "angle_deg": {"label": "Angle", "type": "float", "min": 0.0, "max": 359.0,
-                          "default": 0.0, "suffix": "°"},
+            "n": {"label": "Count", "type": "int", "min": 2, "max": 100, "default": 5},
+            "start_x": {"label": "Start X (mm)", "type": "float", "min": -20, "max": 20, "default": -2.0, "step": 0.1},
+            "start_y": {"label": "Start Y (mm)", "type": "float", "min": -20, "max": 20, "default": 0.0, "step": 0.1},
+            "end_x": {"label": "End X (mm)", "type": "float", "min": -20, "max": 20, "default": 2.0, "step": 0.1},
+            "end_y": {"label": "End Y (mm)", "type": "float", "min": -20, "max": 20, "default": 0.0, "step": 0.1},
         },
     },
-    LayoutPattern.CONCENTRIC_RINGS: {
+    "concentric_rings": {
         "label": "Concentric Rings",
-        "icon": "◎",
-        "description": "Multiple rings at different radii",
+        "icon": "◉",
+        "description": "Multiple rings with increasing radii",
         "params": {
-            "num_rings": {"label": "Rings", "type": "int", "min": 1, "max": 10, "default": 3},
-            "objects_per_ring": {"label": "Per Ring", "type": "int", "min": 2, "max": 30,
-                                 "default": 6},
-            "inner_radius_mm": {"label": "Inner R", "type": "float", "min": 0.3, "max": 10.0,
-                                "default": 1.0, "suffix": " mm"},
-            "outer_radius_mm": {"label": "Outer R", "type": "float", "min": 0.5, "max": 15.0,
-                                "default": 3.0, "suffix": " mm"},
+            "ring_count": {"label": "Ring Count", "type": "int", "min": 1, "max": 10, "default": 3},
+            "objects_per_ring": {"label": "Objects per Ring", "type": "int", "min": 2, "max": 50, "default": 6},
+            "inner_radius": {"label": "Inner Radius (mm)", "type": "float", "min": 0.1, "max": 10.0, "default": 0.5, "step": 0.1},
+            "outer_radius": {"label": "Outer Radius (mm)", "type": "float", "min": 0.2, "max": 20.0, "default": 3.0, "step": 0.1},
         },
     },
 }
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Layout Generators
+# Layout Generators
 # ═══════════════════════════════════════════════════════════════════
 
-def auto_layout_ring(
-    count: int,
-    radius_mm: float,
-    start_angle_deg: float = 0.0,
+def generate_ring(
+    n: int,
+    radius: float = 2.0,
+    start_angle: float = 0.0,
     center: tuple[float, float] = (0.0, 0.0),
 ) -> list[tuple[float, float]]:
     """
-    Generate (x, y) positions for objects evenly spaced on a circle.
+    Generate positions equally spaced around a circle.
 
     Args:
-        count: Number of objects
-        radius_mm: Circle radius in mm
-        start_angle_deg: Angle of first object (0 = right, 90 = top)
-        center: (x, y) center of the ring in mm
+        n: Number of objects
+        radius: Circle radius in mm
+        start_angle: Starting angle in degrees (0 = right / +X)
+        center: Center point (x, y) in mm
 
     Returns:
-        List of (x, y) tuples in mm
+        List of (x, y) positions
     """
-    if count <= 0:
+    if n < 1:
         return []
-    if count == 1:
-        angle = math.radians(start_angle_deg)
-        return [(center[0] + radius_mm * math.cos(angle),
-                 center[1] + radius_mm * math.sin(angle))]
-
-    positions = []
-    for i in range(count):
-        angle = math.radians(start_angle_deg + i * 360.0 / count)
-        x = center[0] + radius_mm * math.cos(angle)
-        y = center[1] + radius_mm * math.sin(angle)
-        positions.append((round(x, 4), round(y, 4)))
-    return positions
-
-
-def auto_layout_grid(
-    rows: int,
-    cols: int,
-    spacing_mm: float,
-    center: tuple[float, float] = (0.0, 0.0),
-) -> list[tuple[float, float]]:
-    """
-    Generate (x, y) positions for a rectangular grid, centered on center.
-
-    Args:
-        rows: Number of rows
-        cols: Number of columns
-        spacing_mm: Distance between adjacent objects in mm
-        center: (x, y) center of the grid
-
-    Returns:
-        List of (x, y) tuples in mm, row-major order
-    """
-    positions = []
-    x_start = center[0] - (cols - 1) * spacing_mm / 2
-    y_start = center[1] - (rows - 1) * spacing_mm / 2
-    for r in range(rows):
-        for c in range(cols):
-            x = x_start + c * spacing_mm
-            y = y_start + r * spacing_mm
-            positions.append((round(x, 4), round(y, 4)))
-    return positions
-
-
-def auto_layout_hex(
-    rows: int,
-    cols: int,
-    spacing_mm: float,
-    center: tuple[float, float] = (0.0, 0.0),
-) -> list[tuple[float, float]]:
-    """
-    Generate (x, y) positions for a hexagonal close-packed grid.
-
-    Odd rows are offset by half a spacing to create hex packing.
-
-    Args:
-        rows: Number of rows
-        cols: Number of columns
-        spacing_mm: Center-to-center distance between adjacent objects
-        center: (x, y) center of the grid
-
-    Returns:
-        List of (x, y) tuples in mm
-    """
-    positions = []
-    row_height = spacing_mm * math.sqrt(3) / 2
-    x_start = center[0] - (cols - 1) * spacing_mm / 2
-    y_start = center[1] - (rows - 1) * row_height / 2
-
-    for r in range(rows):
-        x_offset = spacing_mm / 2 if r % 2 == 1 else 0
-        for c in range(cols):
-            x = x_start + c * spacing_mm + x_offset
-            y = y_start + r * row_height
-            positions.append((round(x, 4), round(y, 4)))
-    return positions
-
-
-def auto_layout_line(
-    count: int,
-    length_mm: float,
-    angle_deg: float = 0.0,
-    center: tuple[float, float] = (0.0, 0.0),
-) -> list[tuple[float, float]]:
-    """
-    Generate (x, y) positions along a straight line, centered on center.
-
-    Args:
-        count: Number of objects (minimum 2)
-        length_mm: Total length of the line
-        angle_deg: Angle of the line (0 = horizontal right)
-        center: (x, y) center of the line
-
-    Returns:
-        List of (x, y) tuples in mm
-    """
-    if count <= 0:
-        return []
-    if count == 1:
+    if n == 1:
         return [center]
 
-    angle = math.radians(angle_deg)
-    dx = math.cos(angle) * length_mm / 2
-    dy = math.sin(angle) * length_mm / 2
-
-    x_start = center[0] - dx
-    y_start = center[1] - dy
-
     positions = []
-    for i in range(count):
-        t = i / (count - 1)  # 0.0 to 1.0
-        x = x_start + t * 2 * dx
-        y = y_start + t * 2 * dy
+    for i in range(n):
+        angle_rad = math.radians(start_angle + i * 360.0 / n)
+        x = center[0] + radius * math.cos(angle_rad)
+        y = center[1] + radius * math.sin(angle_rad)
         positions.append((round(x, 4), round(y, 4)))
     return positions
 
 
-def auto_layout_concentric_rings(
-    num_rings: int,
-    objects_per_ring: int,
-    inner_radius_mm: float,
-    outer_radius_mm: float,
+def generate_square_grid(
+    rows: int = 3,
+    cols: int = 3,
+    spacing: float = 1.0,
     center: tuple[float, float] = (0.0, 0.0),
 ) -> list[tuple[float, float]]:
     """
-    Generate (x, y) positions on multiple concentric rings.
-
-    Each ring has the same number of objects, evenly spaced.
-    Rings are evenly spaced between inner and outer radius.
-    Adjacent rings are offset by half a step for hex-like packing.
+    Generate positions in a rectangular grid centered on (0, 0).
 
     Args:
-        num_rings: Number of concentric rings
-        objects_per_ring: Number of objects per ring
-        inner_radius_mm: Radius of innermost ring
-        outer_radius_mm: Radius of outermost ring
-        center: (x, y) center
-
-    Returns:
-        List of (x, y) tuples in mm, from inner to outer ring
+        rows: Number of rows
+        cols: Number of columns
+        spacing: Distance between adjacent objects in mm
+        center: Center point (x, y) in mm
     """
-    if num_rings <= 0 or objects_per_ring <= 0:
+    x0 = center[0] - (cols - 1) * spacing / 2
+    y0 = center[1] - (rows - 1) * spacing / 2
+    positions = []
+    for r in range(rows):
+        for c in range(cols):
+            x = x0 + c * spacing
+            y = y0 + r * spacing
+            positions.append((round(x, 4), round(y, 4)))
+    return positions
+
+
+def generate_hex_grid(
+    rows: int = 3,
+    cols: int = 3,
+    spacing: float = 1.0,
+    center: tuple[float, float] = (0.0, 0.0),
+) -> list[tuple[float, float]]:
+    """
+    Generate positions in a hexagonal (honeycomb) grid.
+
+    Odd rows are shifted right by half the spacing.
+    """
+    row_height = spacing * math.sqrt(3) / 2
+    x0 = center[0] - (cols - 1) * spacing / 2
+    y0 = center[1] - (rows - 1) * row_height / 2
+    positions = []
+    for r in range(rows):
+        offset = spacing / 2 if r % 2 else 0
+        for c in range(cols):
+            x = x0 + c * spacing + offset
+            y = y0 + r * row_height
+            positions.append((round(x, 4), round(y, 4)))
+    return positions
+
+
+def generate_line(
+    n: int = 5,
+    start_x: float = -2.0,
+    start_y: float = 0.0,
+    end_x: float = 2.0,
+    end_y: float = 0.0,
+) -> list[tuple[float, float]]:
+    """
+    Generate positions equally spaced along a straight line.
+
+    Args:
+        n: Number of objects (minimum 2)
+        start_x, start_y: Line start point
+        end_x, end_y: Line end point
+    """
+    if n < 1:
+        return []
+    if n == 1:
+        mx = (start_x + end_x) / 2
+        my = (start_y + end_y) / 2
+        return [(round(mx, 4), round(my, 4))]
+
+    positions = []
+    for i in range(n):
+        t = i / (n - 1)
+        x = start_x + t * (end_x - start_x)
+        y = start_y + t * (end_y - start_y)
+        positions.append((round(x, 4), round(y, 4)))
+    return positions
+
+
+def generate_concentric_rings(
+    ring_count: int = 3,
+    objects_per_ring: int = 6,
+    inner_radius: float = 0.5,
+    outer_radius: float = 3.0,
+    center: tuple[float, float] = (0.0, 0.0),
+) -> list[tuple[float, float]]:
+    """
+    Generate positions on concentric rings.
+
+    Objects per ring is uniform. Rings are equally spaced between
+    inner_radius and outer_radius.
+    """
+    if ring_count < 1 or objects_per_ring < 1:
         return []
 
     positions = []
-    if num_rings == 1:
-        radii = [inner_radius_mm]
+    if ring_count == 1:
+        radii = [inner_radius]
     else:
         radii = [
-            inner_radius_mm + i * (outer_radius_mm - inner_radius_mm) / (num_rings - 1)
-            for i in range(num_rings)
+            inner_radius + i * (outer_radius - inner_radius) / (ring_count - 1)
+            for i in range(ring_count)
         ]
 
     for ring_idx, radius in enumerate(radii):
-        # Offset alternate rings for better packing
-        angle_offset = (180.0 / objects_per_ring) if ring_idx % 2 == 1 else 0.0
-        ring_positions = auto_layout_ring(
-            count=objects_per_ring,
-            radius_mm=radius,
-            start_angle_deg=angle_offset,
+        # Offset each ring slightly for visual distinction
+        start_angle = ring_idx * 15.0  # 15° offset per ring
+        ring_positions = generate_ring(
+            n=objects_per_ring,
+            radius=radius,
+            start_angle=start_angle,
             center=center,
         )
         positions.extend(ring_positions)
@@ -281,92 +243,69 @@ def auto_layout_concentric_rings(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Dispatch
+# Dispatch + Count
 # ═══════════════════════════════════════════════════════════════════
 
-def generate_layout(
-    pattern: LayoutPattern | str,
-    params: dict[str, Any],
-    center: tuple[float, float] = (0.0, 0.0),
-) -> list[tuple[float, float]]:
+GENERATORS = {
+    "ring": generate_ring,
+    "square_grid": generate_square_grid,
+    "hex_grid": generate_hex_grid,
+    "line": generate_line,
+    "concentric_rings": generate_concentric_rings,
+}
+
+
+def generate_layout(pattern: str, **kwargs) -> list[tuple[float, float]]:
     """
-    Generate object positions for a given layout pattern.
+    Dispatch to the appropriate layout generator.
 
     Args:
-        pattern: LayoutPattern enum or string value
-        params: Pattern-specific parameters (from LAYOUT_INFO)
-        center: (x, y) center of the layout
+        pattern: One of 'ring', 'square_grid', 'hex_grid', 'line', 'concentric_rings'
+        **kwargs: Parameters specific to the chosen pattern
 
     Returns:
         List of (x, y) positions in mm
     """
-    if isinstance(pattern, str):
-        pattern = LayoutPattern(pattern)
+    gen = GENERATORS.get(pattern)
+    if gen is None:
+        raise ValueError(f"Unknown layout pattern: {pattern}. "
+                         f"Available: {list(GENERATORS.keys())}")
+    return gen(**kwargs)
 
-    if pattern == LayoutPattern.RING:
-        return auto_layout_ring(
-            count=params.get("count", 6),
-            radius_mm=params.get("radius_mm", 2.0),
-            start_angle_deg=params.get("start_angle_deg", 0.0),
-            center=center,
-        )
-    elif pattern == LayoutPattern.SQUARE_GRID:
-        return auto_layout_grid(
-            rows=params.get("rows", 3),
-            cols=params.get("cols", 3),
-            spacing_mm=params.get("spacing_mm", 1.0),
-            center=center,
-        )
-    elif pattern == LayoutPattern.HEX_GRID:
-        return auto_layout_hex(
-            rows=params.get("rows", 3),
-            cols=params.get("cols", 3),
-            spacing_mm=params.get("spacing_mm", 1.0),
-            center=center,
-        )
-    elif pattern == LayoutPattern.LINE:
-        return auto_layout_line(
-            count=params.get("count", 5),
-            length_mm=params.get("length_mm", 4.0),
-            angle_deg=params.get("angle_deg", 0.0),
-            center=center,
-        )
-    elif pattern == LayoutPattern.CONCENTRIC_RINGS:
-        return auto_layout_concentric_rings(
-            num_rings=params.get("num_rings", 3),
-            objects_per_ring=params.get("objects_per_ring", 6),
-            inner_radius_mm=params.get("inner_radius_mm", 1.0),
-            outer_radius_mm=params.get("outer_radius_mm", 3.0),
-            center=center,
-        )
+
+def count_layout_objects(pattern: str, **kwargs) -> int:
+    """
+    Compute how many objects a layout will produce without generating positions.
+    """
+    if pattern == "ring":
+        return kwargs.get("n", 6)
+    elif pattern in ("square_grid", "hex_grid"):
+        return kwargs.get("rows", 3) * kwargs.get("cols", 3)
+    elif pattern == "line":
+        return kwargs.get("n", 5)
+    elif pattern == "concentric_rings":
+        return kwargs.get("ring_count", 3) * kwargs.get("objects_per_ring", 6)
     else:
-        raise ValueError(f"Unknown layout pattern: {pattern}")
+        raise ValueError(f"Unknown pattern: {pattern}")
 
 
-def get_layout_count(pattern: LayoutPattern | str, params: dict) -> int:
-    """Get the total number of objects a layout will generate."""
-    if isinstance(pattern, str):
-        pattern = LayoutPattern(pattern)
-
-    if pattern == LayoutPattern.RING:
-        return params.get("count", 6)
-    elif pattern in (LayoutPattern.SQUARE_GRID, LayoutPattern.HEX_GRID):
-        return params.get("rows", 3) * params.get("cols", 3)
-    elif pattern == LayoutPattern.LINE:
-        return params.get("count", 5)
-    elif pattern == LayoutPattern.CONCENTRIC_RINGS:
-        return params.get("num_rings", 3) * params.get("objects_per_ring", 6)
-    return 0
-
+# ═══════════════════════════════════════════════════════════════════
+# Validation Against Well Boundary
+# ═══════════════════════════════════════════════════════════════════
 
 def validate_layout_in_well(
     positions: list[tuple[float, float]],
     well_diameter_mm: float,
 ) -> tuple[bool, list[str]]:
     """
-    Check if all layout positions fit within a circular well.
+    Check whether all positions fit within a circular well.
 
-    Returns (all_fit, list_of_warnings).
+    Args:
+        positions: List of (x, y) from a layout generator
+        well_diameter_mm: Well diameter in mm
+
+    Returns:
+        (all_fit, list_of_warnings)
     """
     warnings = []
     well_radius = well_diameter_mm / 2

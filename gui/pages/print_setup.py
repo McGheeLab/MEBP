@@ -327,46 +327,43 @@ class PrintSetupPage(QWidget):
         lh_row.addWidget(self.layer_height_spin)
         layout.addLayout(lh_row)
 
-        # Active pump
-        pump_row = QHBoxLayout()
-        pump_row.addWidget(QLabel("Pump:"))
+        # Active Pump
+        ap_row = QHBoxLayout()
+        ap_row.addWidget(QLabel("Active Pump:"))
         self.pump_combo = QComboBox()
         self.pump_combo.addItems(["P1", "P2", "P3"])
-        pump_row.addWidget(self.pump_combo)
-        layout.addLayout(pump_row)
+        ap_row.addWidget(self.pump_combo)
+        layout.addLayout(ap_row)
 
-        # Flow rate
-        flow_row = QHBoxLayout()
-        flow_row.addWidget(QLabel("Flow:"))
+        # Flow Rate
+        fl_row = QHBoxLayout()
+        fl_row.addWidget(QLabel("Flow Rate:"))
         self.flow_spin = QDoubleSpinBox()
-        self.flow_spin.setRange(0.0, 10.0)
-        self.flow_spin.setValue(0.01)
-        self.flow_spin.setDecimals(4)
-        self.flow_spin.setToolTip("Flow rate per mm of travel (µL/mm)")
-        flow_row.addWidget(self.flow_spin)
-        layout.addLayout(flow_row)
+        self.flow_spin.setRange(0.001, 100.0)
+        self.flow_spin.setValue(1.0)
+        self.flow_spin.setSuffix(" µL/s")
+        self.flow_spin.setDecimals(3)
+        fl_row.addWidget(self.flow_spin)
+        layout.addLayout(fl_row)
 
-        # Travel Z height
+        # Travel Z
         tz_row = QHBoxLayout()
         tz_row.addWidget(QLabel("Travel Z:"))
         self.travel_z_spin = QDoubleSpinBox()
-        self.travel_z_spin.setRange(0.1, 50.0)
+        self.travel_z_spin.setRange(0.1, 30.0)
         self.travel_z_spin.setValue(5.0)
         self.travel_z_spin.setSuffix(" mm")
         self.travel_z_spin.setDecimals(1)
         tz_row.addWidget(self.travel_z_spin)
         layout.addLayout(tz_row)
 
-        # ── Per-Pump Settings Group (v7.2.3: NEW) ────────────────
+        # ── Per-Pump Retract / Prime (v7.2.3: NEW) ───────────────
         pump_grp = QGroupBox("Per-Pump Retract / Prime")
         pump_grp.setStyleSheet(f"""
             QGroupBox {{
                 font-weight: bold; color: {COLORS['text']};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
                 border-radius: 4px; margin-top: 6px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 8px; padding: 0 3px;
             }}
         """)
         pump_grp_lay = QVBoxLayout(pump_grp)

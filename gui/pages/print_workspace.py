@@ -151,15 +151,12 @@ class HardwareSummaryWidget(QWidget):
         self._ink_table = QTableWidget()
         self._ink_table.setColumnCount(4)
         self._ink_table.setHorizontalHeaderLabels(
-            ["Name", "Type", "Viscosity", "Granule/Cell Ø"])
+            ["Name", "Type", "Viscosity", "Particles"])
         self._ink_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self._ink_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._ink_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.NoSelection)
-        self._ink_table.setMaximumHeight(100)
-        self._ink_table.verticalHeader().setDefaultSectionSize(20)
+            QHeaderView.Stretch)
+        self._ink_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._ink_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._ink_table.setMaximumHeight(140)
         self._ink_table.verticalHeader().setVisible(False)
         ink_lay.addWidget(self._ink_table)
         self._ink_empty_label = QLabel("No inks defined")
@@ -174,13 +171,10 @@ class HardwareSummaryWidget(QWidget):
         self._ros_table.setHorizontalHeaderLabels(
             ["Name", "Sub-wells", "Fits", "Depth"])
         self._ros_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch)
-        self._ros_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._ros_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.NoSelection)
-        self._ros_table.setMaximumHeight(90)
-        self._ros_table.verticalHeader().setDefaultSectionSize(20)
+            QHeaderView.Stretch)
+        self._ros_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._ros_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._ros_table.setMaximumHeight(120)
         self._ros_table.verticalHeader().setVisible(False)
         ros_lay.addWidget(self._ros_table)
         self._ros_empty_label = QLabel("No rosettes defined")
@@ -242,8 +236,10 @@ class HardwareSummaryWidget(QWidget):
         # Needle
         if config.needle:
             n = config.needle
-            ch_str = f" | {n.num_channels} channel(s)" if hasattr(n, 'num_channels') and n.num_channels > 1 else ""
-            len_str = f" | {n.length_inches}\"" if hasattr(n, 'length_inches') else ""
+            ch_str = (f" | {n.num_channels} channel(s)"
+                      if hasattr(n, 'num_channels') and n.num_channels > 1 else "")
+            len_str = (f" | {n.length_inches}\""
+                       if hasattr(n, 'length_inches') else "")
             self._needle_label.setText(
                 f"{n.gauge}G — ID: {n.id_um} µm, OD: {n.od_um} µm, "
                 f"Wall: {n.wall_um} µm{len_str}{ch_str}")
@@ -254,10 +250,15 @@ class HardwareSummaryWidget(QWidget):
         fmt = config.plate_format
         pdef = PLATE_DEFINITIONS.get(fmt)
         if pdef:
+            rows = pdef.rows if hasattr(pdef, 'rows') else pdef.get('rows', '?')
+            cols = pdef.cols if hasattr(pdef, 'cols') else pdef.get('cols', '?')
+            well_d = (pdef.well_diameter if hasattr(pdef, 'well_diameter')
+                      else pdef.get('well_diameter', '?'))
+            spacing = (pdef.well_spacing_x if hasattr(pdef, 'well_spacing_x')
+                       else pdef.get('well_spacing_x', '?'))
             self._plate_label.setText(
-                f"{fmt}-well  ({pdef['rows']} × {pdef['cols']})  —  "
-                f"Ø {pdef.get('well_diameter', '?')} mm, "
-                f"Spacing: {pdef.get('well_spacing_x', '?')} mm")
+                f"{fmt}-well  ({rows} × {cols})  —  "
+                f"Ø {well_d} mm, Spacing: {spacing} mm")
         else:
             self._plate_label.setText(f"{fmt}-well")
 
@@ -272,7 +273,8 @@ class HardwareSummaryWidget(QWidget):
                     parts.append(f"Ink: {pcfg.ink.name}")
                 if pcfg.printing_mode:
                     parts.append(pcfg.printing_mode.value.capitalize())
-                self._pump_labels[pid].setText(" | ".join(parts) if parts else "Enabled (no syringe)")
+                self._pump_labels[pid].setText(
+                    " | ".join(parts) if parts else "Enabled (no syringe)")
             else:
                 self._pump_labels[pid].setText("Disabled")
 
@@ -510,71 +512,69 @@ class WorkspaceTab(QWidget):
         """Build workspace context panel with save/load buttons."""
         ctx = QWidget()
         layout = QVBoxLayout(ctx)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        title = QLabel("Workspace")
-        title.setObjectName("contextSectionLabel")
-        title.setStyleSheet(
-            f"font-weight: bold; color: {COLORS['text']}; font-size: 13px;")
-        layout.addWidget(title)
+        # Save/Load workspace
+        save_group = QGroupBox("Workspace Files")
+        save_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; color: {COLORS['text']};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 6px; padding-top: 14px;
+            }}
+        """)
+        save_lay = QVBoxLayout(save_group)
 
-        btn_save = QPushButton("💾 Save Workspace")
-        btn_save.clicked.connect(self._save_workspace_file)
-        layout.addWidget(btn_save)
+        btn_save = QPushButton("💾 Export Workspace")
+        btn_save.clicked.connect(self._export_workspace)
+        save_lay.addWidget(btn_save)
 
-        btn_load = QPushButton("📂 Load Workspace")
-        btn_load.clicked.connect(self._load_workspace_file)
-        layout.addWidget(btn_load)
+        btn_load = QPushButton("📂 Import Workspace")
+        btn_load.clicked.connect(self._import_workspace)
+        save_lay.addWidget(btn_load)
 
-        # Quick reference
-        layout.addSpacing(10)
-        ref_lbl = QLabel("Hamilton 1700 Series")
-        ref_lbl.setStyleSheet(
-            f"font-weight: bold; color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 11px;")
-        layout.addWidget(ref_lbl)
-
-        for vol, spec in sorted(self._syringe_catalog.items()):
-            txt = f"  {vol} µL — ID {spec.barrel_id_mm:.3f} mm — {spec.uL_per_mm:.2f} µL/mm"
-            lbl = QLabel(txt)
-            lbl.setStyleSheet(
-                f"color: {COLORS.get('overlay0', '#6c7086')}; font-size: 10px;")
-            layout.addWidget(lbl)
-
+        layout.addWidget(save_group)
         layout.addStretch()
         return ctx
 
-    def _save_workspace_file(self):
+    # ────────────────────────────────────────────────────────────────
+    #  Workspace Export / Import
+    # ────────────────────────────────────────────────────────────────
+
+    def _export_workspace(self):
+        """Export current workspace config to JSON file."""
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Workspace", "", "JSON Files (*.json)")
+            self, "Export Workspace", "workspace.json",
+            "Workspace Config (*.json)")
         if path:
             try:
                 self.workspace.save_json(path)
+                QMessageBox.information(
+                    self, "Exported", f"Workspace saved to:\n{path}")
             except Exception as e:
-                QMessageBox.warning(self, "Save Error", f"Failed to save:\n{e}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to export:\n{e}")
 
-    def _load_workspace_file(self):
+    def _import_workspace(self):
+        """Import workspace config from JSON file."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Workspace", "", "JSON Files (*.json)")
+            self, "Import Workspace", "",
+            "Workspace Config (*.json)")
         if path:
             try:
-                self.workspace = WorkspaceConfig.load_json(path)
+                self.workspace = WorkspaceConfig.from_json(path)
                 self._emit_workspace()
+                QMessageBox.information(
+                    self, "Imported", f"Workspace loaded from:\n{path}")
             except Exception as e:
-                QMessageBox.warning(self, "Load Error", f"Failed to load:\n{e}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to import:\n{e}")
 
     # ────────────────────────────────────────────────────────────────
-    #  Compatibility API (v7.1 interface preserved)
+    #  Page Interface
     # ────────────────────────────────────────────────────────────────
 
     def on_status_update(self):
-        """Called by parent tab timer. No periodic work needed."""
+        """Called by MainWindow timer. No periodic refresh needed."""
         pass
-
-    def save_workspace_file(self):
-        """Public API for save (called from context panel)."""
-        self._save_workspace_file()
-
-    def load_workspace_file(self):
-        """Public API for load (called from context panel)."""
-        self._load_workspace_file()

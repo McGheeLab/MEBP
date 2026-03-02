@@ -1,17 +1,32 @@
 """
-print_objects.py — Tab 2: Print Objects for MEBP v7.1.
+print_objects.py — Tab 2: Print Objects Designer for MEBP v7.2.3.
 
-Design parametric print objects and build print collections:
-- Object designer form (type, parameters, ink assignment)
-- Parametric preview generation via GeometryEngine
-- Object library (add/edit/delete/duplicate)
-- Print collection builder (ordered list with positions)
-- L-shaped projection preview (XY large, ZY right, XZ bottom)
-- CSV trajectory import
-- Print simulation playback
-- Color coding by ink assignment
+File-centric workflow redesign (Section 3.4):
+- Print File Bar: New / Load / Save / Duplicate / Delete with auto-save
+- Object type icon buttons (not dropdown)
+- Dynamic parameter panel per type (QStackedWidget)
+- Live preview with 100ms debounce
+- Single objects list (replaces library + collection)
+- Edit-in-place mode (select → edit → Update Object)
+- Auto-layout: Ring, Grid, Hex, Line, Concentric patterns
+- CSV Import as first-class action
+- Print summary widget
+- prints_changed signal for Tab 3 integration
+- Auto-save on every change (500ms debounce)
 
-Session D — Tasks P5.10–P5.18.
+Layout:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ [+ New Print]  Name: [Scaffold_v1]  │ Saved: [▾] [Load][Dup]  │
+    ├──────────────────────┬──────────────────────────────────────────┤
+    │ Object Designer      │ Well Preview (L-shaped projection)       │
+    │ [●][╱][◯][◎][▦][📄]│                                           │
+    │ Parameters (dynamic) │                                          │
+    │ [Add Object]         ├──────────────────────────────────────────┤
+    │                      │ Objects in This Print:                    │
+    │ Auto-Layout:         │ 1. ● Base Scaffold P1 @ (0,0,0)         │
+    │ Pattern: [Ring ▾]    │ [▲][▼][Edit][Dup][✕]                    │
+    │ [Apply] [Clear]      │ Summary: 3 obj | P1,P2 | ~45s | 2.3µL  │
+    └──────────────────────┴──────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -21,24 +36,25 @@ from pathlib import Path
 from functools import partial
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox,
-    QTabWidget, QFileDialog, QFrame, QTableWidget, QTableWidgetItem,
+    QFileDialog, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem,
     QSplitter, QScrollArea, QSizePolicy, QLineEdit, QFormLayout,
-    QColorDialog, QSlider, QMessageBox,
+    QColorDialog, QSlider, QMessageBox, QStackedWidget,
+    QInputDialog, QToolBar,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QMimeData
-from PySide6.QtGui import QColor, QDrag
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtGui import QColor, QFont, QIcon
 
 from gui.styles import COLORS
 
 logger = logging.getLogger(__name__)
 
-# Try importing backend modules (graceful if not yet available)
+# ── Optional imports (graceful fallback) ──────────────────────────
 try:
     from SupportClasses.GeometryEngine import (
-        PrintObject, PrintCollection, ObjectType,
+        PrintObject, PrintCollection,
         OBJECT_TYPE_INFO, get_default_params, get_available_object_types,
         generate_object_trajectory,
     )
@@ -48,16 +64,34 @@ except ImportError:
     logger.warning("GeometryEngine not available — preview disabled")
 
 try:
-    from SupportClasses.PhysicalModels import WorkspaceConfig, InkSpec
+    from SupportClasses.PhysicalModels import WorkspaceConfig, InkSpec, NeedleSpec
     HAS_MODELS = True
 except ImportError:
     HAS_MODELS = False
 
 try:
+    from SupportClasses.PrintFileManager import (
+        PrintFileManager, PrintFileData, PrintFileMetadata,
+        validate_print_file, migrate_print_file,
+    )
+    HAS_FILE_MANAGER = True
+except ImportError:
+    HAS_FILE_MANAGER = False
+    logger.warning("PrintFileManager not available — using in-memory only")
+
+try:
+    from SupportClasses.auto_layout import (
+        generate_layout, validate_layout, LAYOUT_INFO,
+    )
+    HAS_AUTO_LAYOUT = True
+except ImportError:
+    HAS_AUTO_LAYOUT = False
+    logger.warning("auto_layout not available")
+
+try:
     from gui.widgets.projection_canvas import (
-        ProjectionCanvas, ObjectPath, create_well_preview,
-        InteractiveProjectionCanvas, PlacedObject,
-        OBJECT_MIME_TYPE, create_interactive_well_preview,
+        ProjectionCanvas, ObjectPath, InteractiveProjectionCanvas,
+        PlacedObject, create_interactive_well_preview,
     )
     HAS_PROJECTION_CANVAS = True
 except ImportError:
@@ -72,108 +106,129 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Object type parameters (from GeometryEngine catalog or fallback)
+# Constants
 # ═══════════════════════════════════════════════════════════════════
 
-def _build_type_catalog() -> tuple[dict, dict]:
-    """Build (type_names, default_params) from GeometryEngine or fallback."""
+# Object type definitions: key → (label, icon_text)
+# Built dynamically from GeometryEngine when available, with fallback
+_ICON_MAP = {
+    "point": "●", "line": "╱", "circle": "◯", "square": "□",
+    "triangle": "△", "spiral": "◎", "ellipse": "⬭",
+    "sphere_shell": "○", "sphere_solid": "●",
+    "cube_shell": "◻", "cube_solid": "◼",
+    "cylinder_shell": "◯", "cylinder_solid": "⬤",
+    "ellipsoid_shell": "⬭", "ellipsoid_solid": "⬬",
+    "csv_import": "📄",
+}
+
+_CATEGORY_ICONS = {"2D": "╱", "3D": "▦"}
+
+
+def _build_object_types() -> dict[str, tuple[str, str]]:
+    """Build OBJECT_TYPES dict from GeometryEngine or fallback."""
+    types = {}
     if HAS_GEOMETRY:
-        info = get_available_object_types()
-        names = {k: v.get("label", k) for k, v in info.items()}
-        params = {k: dict(v.get("params", {})) for k, v in info.items()}
-        # Always include CSV import option
-        names["csv_import"] = "CSV Trajectory Import"
-        params["csv_import"] = {}
-        return names, params
+        for key, info in OBJECT_TYPE_INFO.items():
+            label = info.get("label", key.replace("_", " ").title())
+            icon = _ICON_MAP.get(key, _CATEGORY_ICONS.get(info.get("category", ""), "?"))
+            types[key] = (label, icon)
+    else:
+        # Fallback — basic set
+        types = {
+            "point":           ("Dot",             "●"),
+            "line":            ("Line",            "╱"),
+            "circle":          ("Circle",          "◯"),
+            "spiral":          ("Spiral",          "◎"),
+            "cylinder_solid":  ("Cylinder (solid)", "⬤"),
+            "cylinder_shell":  ("Cylinder (shell)", "◯"),
+            "sphere_solid":    ("Sphere (solid)",   "●"),
+            "sphere_shell":    ("Sphere (shell)",   "○"),
+            "cube_solid":      ("Cube (solid)",     "◼"),
+            "cube_shell":      ("Cube (shell)",     "◻"),
+        }
+    # Always include CSV import
+    types["csv_import"] = ("CSV Import", "📄")
+    return types
 
-    # Fallback when GeometryEngine is not importable
-    names = {
-        "point": "Point (single drop)",
-        "line": "Line",
-        "circle": "Circle",
-        "spiral": "Spiral (2D)",
-        "cylinder_solid": "Cylinder (solid fill)",
-        "cylinder_shell": "Cylinder (shell only)",
-        "csv_import": "CSV Trajectory Import",
-    }
-    params = {
-        "point": {"cx": 0.0, "cy": 0.0, "dwell_time_s": 1.0,
-                  "dispense_volume_uL": 0.1},
-        "line": {"x1": -1.0, "y1": 0.0, "x2": 1.0, "y2": 0.0,
-                 "num_points": 50},
-        "circle": {"radius": 1.0, "num_points": 64},
-        "spiral": {"max_radius": 2.0, "num_points_per_turn": 64},
-        "cylinder_solid": {"radius": 1.0, "height": 2.0,
-                           "layer_height": 0.2},
-        "cylinder_shell": {"radius": 1.0, "height": 2.0,
-                           "layer_height": 0.2, "num_points": 64},
-        "csv_import": {},
-    }
-    return names, params
 
-OBJECT_TYPE_NAMES, DEFAULT_PARAMS = _build_type_catalog()
+OBJECT_TYPES = _build_object_types()
 
-# Default ink colors for preview
+# Parameter names that must be integers (count/index values)
+INT_PARAMS = {
+    "num_points", "num_points_per_turn", "points_per_side",
+    "count", "rows", "cols", "n", "num_layers",
+}
+
 DEFAULT_COLORS = [
-    "#a6e3a1",  # green
-    "#89b4fa",  # blue
-    "#f5c2e7",  # pink
-    "#f9e2af",  # yellow
-    "#cba6f7",  # mauve
-    "#94e2d5",  # teal
+    "#a6e3a1", "#89b4fa", "#f5c2e7", "#f9e2af", "#cba6f7", "#94e2d5",
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Drag-enabled Library List
-# ═══════════════════════════════════════════════════════════════════
+def _normalize_file_list(raw_list) -> list[str]:
+    """Normalize PrintFileManager.list_files() output to list of name strings.
 
-class DragLibraryList(QListWidget):
+    list_files() may return list[str] or list[dict] depending on version.
+    This helper handles both gracefully.
     """
-    QListWidget that starts a drag with OBJECT_MIME_TYPE payload
-    containing the library object name.  Drop targets (the
-    InteractiveProjectionPane) accept this MIME type.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setDragEnabled(True)
-        self.setDefaultDropAction(Qt.DropAction.CopyAction)
-
-    def startDrag(self, supportedActions):
-        item = self.currentItem()
-        if not item:
-            return
-        # Extract library key (name before " (type)")
-        name = item.text().split(" (")[0]
-        mime = QMimeData()
-        if HAS_PROJECTION_CANVAS:
-            mime.setData(OBJECT_MIME_TYPE, name.encode("utf-8"))
+    names = []
+    for item in (raw_list or []):
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            # Try common key names for the print file name
+            name = item.get("name") or item.get("print_name") or item.get("filename", "")
+            if name:
+                names.append(str(name))
         else:
-            mime.setText(name)
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.CopyAction)
+            names.append(str(item))
+    return names
+
+# Auto-incrementing name counters
+_type_counters: dict[str, int] = {}
+
+
+def _auto_name(obj_type: str) -> str:
+    """Generate auto-incrementing name like 'Dot_1', 'Line_2'."""
+    label = OBJECT_TYPES.get(obj_type, ("Obj", "?"))[0]
+    _type_counters[obj_type] = _type_counters.get(obj_type, 0) + 1
+    return f"{label}_{_type_counters[obj_type]}"
+
+
+def _get_type_params(obj_type: str) -> dict:
+    """Get default parameters for an object type from GeometryEngine."""
+    if HAS_GEOMETRY:
+        return get_default_params(obj_type)
+    # Fallback defaults
+    fallbacks = {
+        "point": {"cx": 0.0, "cy": 0.0, "dwell_time_s": 1.0},
+        "line": {"x1": -1.0, "y1": 0.0, "x2": 1.0, "y2": 0.0, "num_points": 50},
+        "circle": {"radius": 1.0, "num_points": 64},
+        "spiral": {"max_radius": 2.0, "num_points_per_turn": 64},
+        "cylinder_solid": {"radius": 1.0, "height": 2.0, "layer_height": 0.2},
+        "csv_import": {},
+    }
+    return dict(fallbacks.get(obj_type, {}))
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Print Objects Tab
+# PrintObjectsTab — Complete Rewrite for v7.2.3
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintObjectsTab(QWidget):
     """
-    Tab 2: Design parametric print objects and build collections.
+    Tab 2: File-centric print object designer.
 
-    Layout:
-    ┌───────────────────────┬─────────────────────────────┐
-    │  Object Designer      │  Projection Preview         │
-    │  + Object Library     │  (XY large, ZY right,       │
-    │  + Collection Builder │   XZ bottom)                │
-    └───────────────────────┴─────────────────────────────┘
+    Manages persistent print files in config/prints/ with auto-save,
+    streamlined object creation via icon buttons and dynamic parameters,
+    auto-layout patterns, and integration with Tab 3 via prints_changed.
     """
 
-    # Emitted when print collections change (names list for Well Setup tab)
-    collections_changed = Signal(list)  # list[str]
+    # Replaces collections_changed — emits list of print file names
+    prints_changed = Signal(list)
+    # Emitted on file load/save/new
+    file_changed = Signal(str)
+    # Legacy compatibility — forwards to prints_changed
+    collections_changed = Signal(list)
 
     def __init__(self, controller=None, settings=None, parent=None):
         super().__init__(parent)
@@ -182,152 +237,118 @@ class PrintObjectsTab(QWidget):
 
         # Workspace (set by Tab 1)
         self._workspace = WorkspaceConfig() if HAS_MODELS else None
-
-        # v7.2: Hardware config for syringe/needle info
         self._hw_config = None
 
-        # Object library: name → PrintObject template
-        self._object_library: dict[str, dict] = {}
+        # Print file manager
+        self._file_manager = None
+        if HAS_FILE_MANAGER:
+            prints_dir = Path("config/prints")
+            prints_dir.mkdir(parents=True, exist_ok=True)
+            self._file_manager = PrintFileManager(prints_dir)
 
-        # Named collections: name → PrintCollection
-        self._collections: dict[str, object] = {}
-        self._active_collection_name: str = "Default"
+        # Current print file data (in-memory)
+        self._current_file: PrintFileData | None = None
+        self._active_file_name: str | None = None
 
-        # Simulation state
+        # Objects list: ordered list of dicts
+        # Each: {name, object_type, params, position, color, ink_pump, num_layers, layer_height, auto_layout}
+        self._objects: list[dict] = []
+
+        # Edit mode tracking
+        self._editing_index: int | None = None  # None = add mode, int = edit mode
+
+        # Auto-save timer
+        self._auto_save_timer = QTimer(self)
+        self._auto_save_timer.setSingleShot(True)
+        self._auto_save_timer.setInterval(500)
+        self._auto_save_timer.timeout.connect(self._do_auto_save)
+
+        # Preview update timer (100ms debounce)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(100)
+        self._preview_timer.timeout.connect(self._update_live_preview)
+
+        # Simulation
         self._sim_timer = QTimer(self)
-        self._sim_timer.setInterval(50)  # 20 FPS
+        self._sim_timer.setInterval(50)
         self._sim_timer.timeout.connect(self._sim_step)
         self._sim_index = 0
         self._sim_playing = False
 
         self._build_ui()
-        self._update_well_diameter()
+        self._restore_last_print()
 
-    # ── Public API ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  PUBLIC API
+    # ══════════════════════════════════════════════════════════════
 
     def set_workspace(self, workspace) -> None:
         """Update workspace config (called when Tab 1 changes)."""
         self._workspace = workspace
-        self._refresh_ink_combos()
+        self._refresh_ink_pump_combos()
         self._update_well_diameter()
 
     def set_hardware_config(self, config) -> None:
         """v7.2: Receive hardware config for syringe/needle info."""
         self._hw_config = config
+        self._refresh_ink_pump_combos()
 
     def get_collections(self) -> dict:
-        """Return all named PrintCollections for job building."""
-        return dict(self._collections)
+        """Legacy: return collections for job building."""
+        return self._build_legacy_collections()
+
+    def get_print_file_names(self) -> list[str]:
+        """Return list of available print file names."""
+        if self._file_manager:
+            return _normalize_file_list(self._file_manager.list_files())
+        return []
 
     def on_status_update(self):
         """Called by parent tab timer."""
         pass
 
-    def _update_well_diameter(self) -> None:
-        """Read plate format from workspace and set well boundary on preview."""
-        if not (HAS_PROJECTION_CANVAS
-                and isinstance(self._preview, ProjectionCanvas)):
-            return
-        diameter = 10.0  # sensible default for 6-well plate
-        if self._workspace and hasattr(self._workspace, 'plate_format'):
-            try:
-                from SupportClasses.WellPlate import PLATE_DEFINITIONS
-                fmt = self._workspace.plate_format
-                if fmt in PLATE_DEFINITIONS:
-                    diameter = PLATE_DEFINITIONS[fmt].get(
-                        "well_diameter_mm", 10.0)
-            except ImportError:
-                pass
-        self._preview.set_well_diameter(diameter)
-        self._preview.refresh()
-
-    # ── UI Construction ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  UI CONSTRUCTION
+    # ══════════════════════════════════════════════════════════════
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
 
+        # ── Print File Bar ────────────────────────────────────────
+        self._build_file_bar(outer)
+
+        # ── Main splitter ─────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # ── Left panel: Designer + Library + Collection ───────────
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(4, 2, 4, 2)
-        left_layout.setSpacing(4)
+        # Left panel: Designer + Auto-Layout
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_content = QWidget()
-        self._left_content = QVBoxLayout(scroll_content)
-        self._left_content.setContentsMargins(0, 0, 0, 0)
-        self._left_content.setSpacing(6)
+        self._build_designer_section(left_layout)
+        self._build_auto_layout_section(left_layout)
+        self._build_csv_import_section(left_layout)
+        left_layout.addStretch()
 
-        self._build_designer_section()
-        self._build_library_section()
-        self._build_collection_section()
-        self._build_arrangement_section()
-        self._build_csv_section()
+        left_scroll.setWidget(left_widget)
+        splitter.addWidget(left_scroll)
 
-        self._left_content.addStretch()
-        scroll.setWidget(scroll_content)
-        left_layout.addWidget(scroll)
-        splitter.addWidget(left)
-
-        # ── Right panel: Projection Preview ───────────────────────
+        # Right panel: Preview + Objects List + Summary
         right = QWidget()
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(2, 2, 2, 2)
+        right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.setSpacing(4)
 
-        preview_label = QLabel("Preview")
-        preview_label.setStyleSheet(
-            f"font-weight: bold; color: {COLORS['text']}; font-size: 12px;")
-        right_layout.addWidget(preview_label)
-
-        if HAS_PROJECTION_CANVAS:
-            self._preview = create_interactive_well_preview()
-            self._preview.set_library_resolver(self._resolve_library_object)
-            self._preview.object_placed.connect(self._on_object_placed)
-            self._preview.object_moved.connect(self._on_object_moved)
-            self._preview.object_removed.connect(self._on_object_removed)
-        else:
-            self._preview = QLabel("Preview unavailable\n(projection_canvas.py missing)")
-            self._preview.setAlignment(Qt.AlignCenter)
-            self._preview.setStyleSheet(
-                f"color: {COLORS['subtext0']}; "
-                f"background: {COLORS['mantle']}; "
-                f"border-radius: 6px; min-height: 200px;")
-        right_layout.addWidget(self._preview, stretch=1)
-
-        # Tip label
-        tip = QLabel("Drag objects from Library → drop into XY preview to arrange")
-        tip.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 10px; font-style: italic;")
-        tip.setWordWrap(True)
-        right_layout.addWidget(tip)
-
-        # Simulation controls
-        sim_row = QHBoxLayout()
-        self.btn_sim = QPushButton("▶ Simulate")
-        self.btn_sim.setMaximumHeight(28)
-        self.btn_sim.clicked.connect(self._toggle_simulation)
-        sim_row.addWidget(self.btn_sim)
-
-        sim_row.addWidget(QLabel("Speed:"))
-        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(1, 20)
-        self.speed_slider.setValue(5)
-        self.speed_slider.setMaximumWidth(100)
-        sim_row.addWidget(self.speed_slider)
-
-        self.btn_clear_preview = QPushButton("Clear")
-        self.btn_clear_preview.setMaximumHeight(28)
-        self.btn_clear_preview.clicked.connect(self._clear_preview)
-        sim_row.addWidget(self.btn_clear_preview)
-        sim_row.addStretch()
-        right_layout.addLayout(sim_row)
+        self._build_preview_section(right_layout)
+        self._build_objects_list_section(right_layout)
+        self._build_summary_section(right_layout)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
@@ -335,9 +356,80 @@ class PrintObjectsTab(QWidget):
 
         outer.addWidget(splitter)
 
-    # ── Object Designer Section ───────────────────────────────────
+    # ── File Bar ──────────────────────────────────────────────────
 
-    def _build_designer_section(self):
+    def _build_file_bar(self, parent_layout):
+        """Print File Bar: New / Name / Load dropdown / Save / Dup / Delete / Status."""
+        bar = QFrame()
+        bar.setStyleSheet(
+            f"background: {COLORS['surface0']}; border-radius: 4px; padding: 4px;")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(8, 4, 8, 4)
+        bar_layout.setSpacing(8)
+
+        # + New Print
+        btn_new = QPushButton("+ New Print")
+        btn_new.setStyleSheet(
+            f"background: {COLORS['green']}; color: {COLORS['base']}; "
+            f"font-weight: bold; padding: 4px 12px; border-radius: 4px;")
+        btn_new.clicked.connect(self._on_new_print)
+        bar_layout.addWidget(btn_new)
+
+        # Print name
+        bar_layout.addWidget(QLabel("Name:"))
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("Enter print name...")
+        self._name_edit.setMaximumWidth(200)
+        self._name_edit.editingFinished.connect(self._on_name_changed)
+        bar_layout.addWidget(self._name_edit)
+
+        bar_layout.addWidget(self._separator_v())
+
+        # Load dropdown
+        bar_layout.addWidget(QLabel("Saved:"))
+        self._file_combo = QComboBox()
+        self._file_combo.setMinimumWidth(150)
+        self._file_combo.currentTextChanged.connect(self._on_file_selected)
+        bar_layout.addWidget(self._file_combo)
+
+        btn_load = QPushButton("Load")
+        btn_load.clicked.connect(self._on_load_print)
+        bar_layout.addWidget(btn_load)
+
+        btn_dup = QPushButton("Dup")
+        btn_dup.setToolTip("Duplicate current print")
+        btn_dup.clicked.connect(self._on_duplicate_print)
+        bar_layout.addWidget(btn_dup)
+
+        btn_del = QPushButton("Delete")
+        btn_del.setStyleSheet(f"color: {COLORS['red']};")
+        btn_del.clicked.connect(self._on_delete_print)
+        bar_layout.addWidget(btn_del)
+
+        btn_export = QPushButton("Export")
+        btn_export.setToolTip("Export print file as JSON")
+        btn_export.clicked.connect(self._on_export_print)
+        bar_layout.addWidget(btn_export)
+
+        bar_layout.addStretch()
+
+        # Auto-save status
+        self._save_status = QLabel("● No print loaded")
+        self._save_status.setStyleSheet(f"color: {COLORS['overlay0']};")
+        bar_layout.addWidget(self._save_status)
+
+        parent_layout.addWidget(bar)
+
+    @staticmethod
+    def _separator_v():
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet(f"color: {COLORS['surface1']};")
+        return sep
+
+    # ── Object Designer ───────────────────────────────────────────
+
+    def _build_designer_section(self, parent_layout):
         group = QGroupBox("Object Designer")
         group.setStyleSheet(f"""
             QGroupBox {{
@@ -349,114 +441,234 @@ class PrintObjectsTab(QWidget):
                 subcontrol-origin: margin; left: 10px; padding: 0 6px;
             }}
         """)
-        layout = QFormLayout(group)
-        layout.setSpacing(4)
+        layout = QVBoxLayout(group)
 
-        # Object name
-        self.name_edit = QLineEdit("Object_1")
-        layout.addRow("Name:", self.name_edit)
+        # S4B.1: Object type categorised list (replaces icon button row)
+        type_label = QLabel("Object Type:")
+        type_label.setStyleSheet(f"font-weight: bold; color: {COLORS['subtext0']};")
+        layout.addWidget(type_label)
 
-        # Type selector
-        self.type_combo = QComboBox()
-        for key, label in OBJECT_TYPE_NAMES.items():
-            self.type_combo.addItem(label, key)
-        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
-        layout.addRow("Type:", self.type_combo)
+        self._type_list = QListWidget()
+        self._type_list.setMaximumHeight(140)
+        self._type_list.setStyleSheet(f"""
+            QListWidget {{
+                background: {COLORS['surface0']}; color: {COLORS['text']};
+                border: 1px solid {COLORS['surface1']}; border-radius: 4px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                padding: 2px 6px; border-radius: 3px;
+            }}
+            QListWidget::item:selected {{
+                background: {COLORS['surface2']}; color: {COLORS['blue']};
+            }}
+            QListWidget::item:hover {{
+                background: {COLORS['surface1']};
+            }}
+        """)
 
-        # Dynamic parameter area
-        self._param_container = QWidget()
-        self._param_layout = QFormLayout(self._param_container)
-        self._param_layout.setSpacing(3)
-        self._param_layout.setContentsMargins(0, 0, 0, 0)
-        layout.addRow(self._param_container)
+        # Build categorised entries
+        self._type_buttons: dict[str, QPushButton] = {}  # kept for compat (unused)
+        self._type_list_map: dict[int, str] = {}  # row → obj_type key
 
-        # Ink assignment
-        self.ink_combo = QComboBox()
-        self.ink_combo.addItem("P1 (default)", "P1")
-        self.ink_combo.addItem("P2", "P2")
-        self.ink_combo.addItem("P3", "P3")
-        layout.addRow("Ink/Pump:", self.ink_combo)
+        categories = self._categorize_object_types()
+        row_idx = 0
+        for cat_name, types_in_cat in categories:
+            # Section header
+            header = QListWidgetItem(f"── {cat_name} ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)  # not selectable
+            header.setForeground(QColor(COLORS['overlay0']))
+            font = header.font()
+            font.setBold(True)
+            font.setPointSize(font.pointSize() - 1)
+            header.setFont(font)
+            self._type_list.addItem(header)
+            row_idx += 1
 
-        # Color
+            for obj_type, (label, icon_text) in types_in_cat:
+                item = QListWidgetItem(f"  {icon_text}  {label}")
+                item.setData(Qt.ItemDataRole.UserRole, obj_type)
+                self._type_list.addItem(item)
+                self._type_list_map[row_idx] = obj_type
+                row_idx += 1
+
+        # Select first selectable item
+        first_type = list(OBJECT_TYPES.keys())[0]
+        self._current_type = first_type
+        for i in range(self._type_list.count()):
+            item = self._type_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == first_type:
+                self._type_list.setCurrentItem(item)
+                break
+
+        self._type_list.currentItemChanged.connect(self._on_type_list_changed)
+        layout.addWidget(self._type_list)
+
+        # S4B.2: Dynamic parameters panel (QStackedWidget)
+        self._param_stack = QStackedWidget()
+        self._param_widgets: dict[str, dict] = {}  # type → {param_name: widget}
+        self._param_stack_indices: dict[str, int] = {}
+
+        for obj_type in OBJECT_TYPES:
+            page, widgets = self._build_param_page(obj_type)
+            idx = self._param_stack.addWidget(page)
+            self._param_widgets[obj_type] = widgets
+            self._param_stack_indices[obj_type] = idx
+
+        layout.addWidget(self._param_stack)
+
+        # Common fields: ink/pump, color, position, layers
+        common = QFormLayout()
+        common.setSpacing(4)
+
+        # Ink/Pump selector
+        self._ink_combo = QComboBox()
+        self._ink_combo.addItem("P1 (default)", "P1")
+        common.addRow("Pump / Ink:", self._ink_combo)
+
+        # Color picker
         color_row = QHBoxLayout()
-        self._color = DEFAULT_COLORS[0]
-        self.color_btn = QPushButton("  ")
-        self.color_btn.setFixedSize(24, 24)
-        self.color_btn.setStyleSheet(
-            f"background: {self._color}; border-radius: 4px;")
-        self.color_btn.clicked.connect(self._pick_color)
-        color_row.addWidget(self.color_btn)
-        color_row.addWidget(QLabel("Preview color"))
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(24, 24)
+        self._current_color = DEFAULT_COLORS[0]
+        self._color_btn.setStyleSheet(
+            f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: 4px;")
+        self._color_btn.clicked.connect(self._pick_color)
+        color_row.addWidget(self._color_btn)
+        color_row.addWidget(QLabel("Object color"))
         color_row.addStretch()
-        layout.addRow("Color:", color_row)
+        common.addRow("Color:", color_row)
 
-        # Position offsets
+        # Position
         pos_row = QHBoxLayout()
-        self.pos_x = QDoubleSpinBox()
-        self.pos_x.setRange(-50, 50)
-        self.pos_x.setDecimals(2)
-        self.pos_x.setSuffix(" mm")
-        pos_row.addWidget(QLabel("X:"))
-        pos_row.addWidget(self.pos_x)
+        self._pos_x = QDoubleSpinBox()
+        self._pos_y = QDoubleSpinBox()
+        self._pos_z = QDoubleSpinBox()
+        for spin, label in [(self._pos_x, "X"), (self._pos_y, "Y"), (self._pos_z, "Z")]:
+            spin.setRange(-50.0, 50.0)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(2)
+            spin.setSuffix(" mm")
+            spin.setMaximumWidth(90)
+            spin.valueChanged.connect(self._schedule_preview)
+            pos_row.addWidget(QLabel(label))
+            pos_row.addWidget(spin)
+        pos_row.addStretch()
+        common.addRow("Position:", pos_row)
 
-        self.pos_y = QDoubleSpinBox()
-        self.pos_y.setRange(-50, 50)
-        self.pos_y.setDecimals(2)
-        self.pos_y.setSuffix(" mm")
-        pos_row.addWidget(QLabel("Y:"))
-        pos_row.addWidget(self.pos_y)
-
-        self.pos_z = QDoubleSpinBox()
-        self.pos_z.setRange(-20, 20)
-        self.pos_z.setDecimals(2)
-        self.pos_z.setSuffix(" mm")
-        pos_row.addWidget(QLabel("Z:"))
-        pos_row.addWidget(self.pos_z)
-        layout.addRow("Position:", pos_row)
-
-        # Layers (for 3D objects)
+        # Layers
         layer_row = QHBoxLayout()
-        self.obj_layers = QSpinBox()
-        self.obj_layers.setRange(1, 100)
-        self.obj_layers.setValue(1)
-        layer_row.addWidget(self.obj_layers)
+        self._num_layers = QSpinBox()
+        self._num_layers.setRange(1, 100)
+        self._num_layers.setValue(1)
+        self._num_layers.valueChanged.connect(self._schedule_preview)
+        layer_row.addWidget(QLabel("Layers:"))
+        layer_row.addWidget(self._num_layers)
 
-        self.obj_layer_h = QDoubleSpinBox()
-        self.obj_layer_h.setRange(0.01, 5.0)
-        self.obj_layer_h.setValue(0.2)
-        self.obj_layer_h.setSuffix(" mm")
-        layer_row.addWidget(QLabel("H:"))
-        layer_row.addWidget(self.obj_layer_h)
-        layout.addRow("Layers:", layer_row)
+        self._layer_height = QDoubleSpinBox()
+        self._layer_height.setRange(0.01, 5.0)
+        self._layer_height.setValue(0.2)
+        self._layer_height.setSingleStep(0.05)
+        self._layer_height.setSuffix(" mm")
+        self._layer_height.valueChanged.connect(self._schedule_preview)
+        layer_row.addWidget(QLabel("Height:"))
+        layer_row.addWidget(self._layer_height)
+        layer_row.addStretch()
+        common.addRow("", layer_row)
 
-        # Generate button
+        layout.addLayout(common)
+
+        # Add/Update Object button
         btn_row = QHBoxLayout()
-        self.btn_generate = QPushButton("🔄 Generate Preview")
-        self.btn_generate.setObjectName("accentBtn")
-        self.btn_generate.clicked.connect(self._generate_preview)
-        btn_row.addWidget(self.btn_generate)
+        self._add_btn = QPushButton("+ Add Object")
+        self._add_btn.setStyleSheet(
+            f"background: {COLORS['green']}; color: {COLORS['base']}; "
+            f"font-weight: bold; padding: 6px 16px; border-radius: 4px;")
+        self._add_btn.clicked.connect(self._on_add_or_update)
+        btn_row.addWidget(self._add_btn)
 
-        self.btn_add_lib = QPushButton("📚 Add to Library")
-        self.btn_add_lib.clicked.connect(self._add_to_library)
-        btn_row.addWidget(self.btn_add_lib)
-        layout.addRow(btn_row)
+        self._cancel_edit_btn = QPushButton("Cancel Edit")
+        self._cancel_edit_btn.setVisible(False)
+        self._cancel_edit_btn.clicked.connect(self._cancel_edit_mode)
+        btn_row.addWidget(self._cancel_edit_btn)
+
+        btn_row.addStretch()
 
         # Info label
-        self.obj_info = QLabel("")
-        self.obj_info.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self.obj_info.setWordWrap(True)
-        layout.addRow(self.obj_info)
+        self._obj_info = QLabel("")
+        self._obj_info.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 10px;")
+        self._obj_info.setWordWrap(True)
+        btn_row.addWidget(self._obj_info)
 
-        self._left_content.addWidget(group)
+        layout.addLayout(btn_row)
 
-        # Initialize parameters for first type
-        self._param_spins = {}
-        self._on_type_changed()
+        # Edit mode indicator
+        self._edit_indicator = QLabel("")
+        self._edit_indicator.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-weight: bold; font-size: 11px;")
+        self._edit_indicator.setVisible(False)
+        layout.addWidget(self._edit_indicator)
 
-    # ── Object Library Section ────────────────────────────────────
+        parent_layout.addWidget(group)
 
-    def _build_library_section(self):
-        group = QGroupBox("Object Library")
+    def _build_param_page(self, obj_type: str) -> tuple[QWidget, dict]:
+        """Build a parameter form for one object type. Returns (widget, {name: spinbox})."""
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setSpacing(4)
+        widgets = {}
+
+        if obj_type == "csv_import":
+            lbl = QLabel("No parameters — use CSV Import section below")
+            lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-style: italic;")
+            form.addRow(lbl)
+            return page, widgets
+
+        defaults = _get_type_params(obj_type)
+        for param_name, default_val in defaults.items():
+            # Use QSpinBox for integer params, QDoubleSpinBox for floats
+            is_int_param = param_name in INT_PARAMS or isinstance(default_val, int)
+
+            if is_int_param:
+                spin = QSpinBox()
+                spin.setRange(1, 10000)
+                spin.setSingleStep(1)
+                spin.setValue(int(default_val))
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(3)
+                spin.setSingleStep(0.1)
+
+                # Set sensible ranges based on param name
+                if "angle" in param_name:
+                    spin.setRange(-360, 360)
+                    spin.setSuffix("°")
+                elif "time" in param_name:
+                    spin.setRange(0, 300)
+                    spin.setSuffix(" s")
+                elif "volume" in param_name:
+                    spin.setRange(0, 1000)
+                    spin.setSuffix(" µL")
+                else:
+                    spin.setRange(-100, 100)
+                    spin.setSuffix(" mm")
+
+                spin.setValue(float(default_val))
+
+            spin.valueChanged.connect(self._schedule_preview)
+
+            # Pretty label
+            label = param_name.replace("_", " ").title()
+            form.addRow(f"{label}:", spin)
+            widgets[param_name] = spin
+
+        return page, widgets
+
+    # ── Auto-Layout Section ───────────────────────────────────────
+
+    def _build_auto_layout_section(self, parent_layout):
+        group = QGroupBox("Auto-Layout")
         group.setStyleSheet(f"""
             QGroupBox {{
                 font-weight: bold; color: {COLORS['text']};
@@ -469,356 +681,113 @@ class PrintObjectsTab(QWidget):
         """)
         layout = QVBoxLayout(group)
 
-        self.library_list = DragLibraryList()
-        self.library_list.setMaximumHeight(100)
-        self.library_list.currentRowChanged.connect(self._on_library_select)
-        layout.addWidget(self.library_list)
+        # Pattern selector
+        pat_row = QHBoxLayout()
+        pat_row.addWidget(QLabel("Pattern:"))
+        self._layout_pattern = QComboBox()
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(3)
-
-        btn_load = QPushButton("Load")
-        btn_load.setMaximumHeight(24)
-        btn_load.setToolTip("Load selected into designer")
-        btn_load.clicked.connect(self._load_from_library)
-        btn_row.addWidget(btn_load)
-
-        btn_dup = QPushButton("Dup")
-        btn_dup.setMaximumHeight(24)
-        btn_dup.setToolTip("Duplicate selected")
-        btn_dup.clicked.connect(self._duplicate_library_item)
-        btn_row.addWidget(btn_dup)
-
-        btn_del = QPushButton("Del")
-        btn_del.setMaximumHeight(24)
-        btn_del.clicked.connect(self._delete_library_item)
-        btn_row.addWidget(btn_del)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self._left_content.addWidget(group)
-
-    # ── Print Collection Section ──────────────────────────────────
-
-    def _build_collection_section(self):
-        group = QGroupBox("Print Collection")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
-
-        # Collection name + selector
-        name_row = QHBoxLayout()
-        name_row.addWidget(QLabel("Name:"))
-        self.coll_name_edit = QLineEdit("Default")
-        name_row.addWidget(self.coll_name_edit)
-
-        btn_new_coll = QPushButton("New")
-        btn_new_coll.setMaximumHeight(24)
-        btn_new_coll.clicked.connect(self._new_collection)
-        name_row.addWidget(btn_new_coll)
-        layout.addLayout(name_row)
-
-        # Collection selector
-        coll_sel_row = QHBoxLayout()
-        coll_sel_row.addWidget(QLabel("Active:"))
-        self.coll_selector = QComboBox()
-        self.coll_selector.addItem("Default")
-        self.coll_selector.currentTextChanged.connect(self._on_collection_selected)
-        coll_sel_row.addWidget(self.coll_selector, 1)
-        layout.addLayout(coll_sel_row)
-
-        # Objects in collection
-        self.coll_list = QListWidget()
-        self.coll_list.setMaximumHeight(100)
-        self.coll_list.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove)
-        layout.addWidget(self.coll_list)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(3)
-
-        btn_add = QPushButton("+Add")
-        btn_add.setMaximumHeight(24)
-        btn_add.setToolTip("Add selected library object to collection")
-        btn_add.clicked.connect(self._add_to_collection)
-        btn_row.addWidget(btn_add)
-
-        btn_up = QPushButton("↑")
-        btn_up.setMaximumHeight(24)
-        btn_up.clicked.connect(self._move_up)
-        btn_row.addWidget(btn_up)
-
-        btn_down = QPushButton("↓")
-        btn_down.setMaximumHeight(24)
-        btn_down.clicked.connect(self._move_down)
-        btn_row.addWidget(btn_down)
-
-        btn_rm = QPushButton("Del")
-        btn_rm.setMaximumHeight(24)
-        btn_rm.clicked.connect(self._remove_from_collection)
-        btn_row.addWidget(btn_rm)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        # Collection stats
-        self.coll_info = QLabel("")
-        self.coll_info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self.coll_info.setWordWrap(True)
-        layout.addWidget(self.coll_info)
-
-        self._left_content.addWidget(group)
-
-    # ── Well Arrangement Section ──────────────────────────────────
-
-    def _build_arrangement_section(self):
-        group = QGroupBox("Well Arrangement")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
-
-        info = QLabel(
-            "Drag objects from the Library into the XY preview to "
-            "arrange them within the well. Reposition by dragging. "
-            "Right-click to remove.")
-        info.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 10px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Placed objects summary
-        self.arrangement_list = QListWidget()
-        self.arrangement_list.setMaximumHeight(80)
-        layout.addWidget(self.arrangement_list)
-
-        btn_row = QHBoxLayout()
-
-        btn_create = QPushButton("Create Print from Arrangement")
-        btn_create.setObjectName("accentBtn")
-        btn_create.setToolTip(
-            "Bundle all placed objects into a named print collection")
-        btn_create.clicked.connect(self._create_from_arrangement)
-        btn_row.addWidget(btn_create)
-
-        btn_clear_arr = QPushButton("Clear All")
-        btn_clear_arr.setMaximumWidth(70)
-        btn_clear_arr.clicked.connect(self._clear_arrangement)
-        btn_row.addWidget(btn_clear_arr)
-
-        layout.addLayout(btn_row)
-
-        self.arrangement_info = QLabel("")
-        self.arrangement_info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self.arrangement_info.setWordWrap(True)
-        layout.addWidget(self.arrangement_info)
-
-        self._left_content.addWidget(group)
-
-    # ── Drag-drop callbacks ───────────────────────────────────────
-
-    def _resolve_library_object(
-        self, library_key: str, x_mm: float, y_mm: float,
-    ):
-        """
-        Resolve a library key into a PlacedObject with trajectory points.
-
-        Called by InteractiveProjectionPane when an object is dropped.
-        Returns a PlacedObject or None.
-        """
-        entry = self._object_library.get(library_key)
-        if entry is None:
-            return None
-
-        color = entry.get("color", DEFAULT_COLORS[0])
-
-        # Try to generate trajectory points
-        points = []
-        if HAS_GEOMETRY:
-            try:
-                obj = self._build_print_object(
-                    name=library_key,
-                    obj_type=entry["object_type"],
-                    params=entry.get("params", {}),
-                    position=(0, 0, 0),  # centered, offset applied by item
-                    color=color,
-                    pump_id=entry.get("ink_pump", "P1"),
-                )
-                if obj and obj.has_trajectory and HAS_NUMPY:
-                    traj = obj.trajectory
-                    points = [
-                        (float(traj[i, 0]),
-                         float(traj[i, 1]),
-                         float(traj[i, 2]))
-                        for i in range(len(traj))
-                    ]
-            except Exception as e:
-                logger.warning(
-                    f"Failed to generate trajectory for drop: {e}")
-
-        # Fall back: check for stored _print_object
-        if not points:
-            po = entry.get("_print_object")
-            if po and hasattr(po, "trajectory") and po.trajectory is not None:
-                traj = po.trajectory
-                points = [
-                    (float(traj[i, 0]),
-                     float(traj[i, 1]),
-                     float(traj[i, 2]))
-                    for i in range(len(traj))
-                ]
-
-        # Still no points? Create a small marker
-        if not points:
-            points = [(0.0, 0.0, 0.0)]
-
-        placed = PlacedObject(
-            name=library_key,
-            color=color,
-            points=points,
-            x_offset=x_mm,
-            y_offset=y_mm,
-            z_offset=0.0,
-            library_key=library_key,
-        )
-        return placed
-
-    def _on_object_placed(self, name: str, x_mm: float, y_mm: float):
-        """Handle object dropped into preview."""
-        self._refresh_arrangement_list()
-        self.arrangement_info.setText(
-            f"Placed '{name}' at ({x_mm:.1f}, {y_mm:.1f})")
-
-    def _on_object_moved(self, name: str, x_mm: float, y_mm: float):
-        """Handle object repositioned by drag."""
-        self._refresh_arrangement_list()
-        self.arrangement_info.setText(
-            f"Moved '{name}' → ({x_mm:.1f}, {y_mm:.1f})")
-
-    def _on_object_removed(self, name: str):
-        """Handle object removed via right-click."""
-        self._refresh_arrangement_list()
-        self.arrangement_info.setText(f"Removed '{name}'")
-
-    def _refresh_arrangement_list(self):
-        """Update the arrangement summary list."""
-        self.arrangement_list.clear()
-        if not (HAS_PROJECTION_CANVAS
-                and isinstance(self._preview, InteractiveProjectionCanvas)):
-            return
-        placed = self._preview.get_placed_objects()
-        for p in placed:
-            self.arrangement_list.addItem(
-                f"{p.name} @ ({p.x_offset:.1f}, {p.y_offset:.1f})")
-
-    def _clear_arrangement(self):
-        """Remove all placed objects from the preview."""
-        if (HAS_PROJECTION_CANVAS
-                and isinstance(self._preview, InteractiveProjectionCanvas)):
-            self._preview.clear_placed_objects()
-        self._refresh_arrangement_list()
-        self.arrangement_info.setText("Cleared arrangement")
-
-    def _create_from_arrangement(self):
-        """
-        Bundle all placed objects into a named print collection.
-
-        Each placed object keeps its user-set XY offset as the position
-        within the collection, so when assigned to a well the whole
-        arrangement is reproduced.
-        """
-        if not (HAS_PROJECTION_CANVAS
-                and isinstance(self._preview, InteractiveProjectionCanvas)):
-            self.arrangement_info.setText("Preview not available")
-            return
-
-        placed = self._preview.get_placed_objects()
-        if not placed:
-            self.arrangement_info.setText("No objects in arrangement")
-            return
-
-        # Use active collection name (or generate one)
-        coll_name = self.coll_name_edit.text().strip()
-        if not coll_name:
-            coll_name = f"Arrangement_{len(self._collections) + 1}"
-            self.coll_name_edit.setText(coll_name)
-
-        # Build collection
-        if HAS_GEOMETRY:
-            coll = PrintCollection(name=coll_name)
-            for p in placed:
-                entry = self._object_library.get(p.library_key, {})
-                obj = PrintObject(
-                    name=p.name,
-                    object_type=entry.get("object_type", "point"),
-                    params=entry.get("params", {}),
-                    position=(p.x_offset, p.y_offset, p.z_offset),
-                    color=p.color,
-                    ink_assignments={
-                        entry.get("ink_pump", "P1"): "ink"},
-                    num_layers=entry.get("num_layers", 1),
-                )
-                # Copy trajectory with offset applied
-                if p.points:
-                    import numpy as np
-                    pts = p.offset_points
-                    traj = np.array([
-                        [pt[0], pt[1], pt[2], 0.0, 0.0, 0.0, 0.0]
-                        for pt in pts
-                    ])
-                    # Add time column (evenly spaced)
-                    if len(traj) > 1:
-                        traj[:, 6] = np.linspace(
-                            0, len(traj) * 0.01, len(traj))
-                    obj.trajectory = traj
-                coll.add_object(obj)
-            self._collections[coll_name] = coll
+        patterns = ["ring", "grid", "hex", "line", "concentric"]
+        if HAS_AUTO_LAYOUT:
+            for p in patterns:
+                info = LAYOUT_INFO.get(p, {})
+                self._layout_pattern.addItem(info.get("label", p.title()), p)
         else:
-            # Fallback dict-based collection
-            objs = []
-            for p in placed:
-                entry = dict(self._object_library.get(
-                    p.library_key, {}))
-                entry["position"] = (
-                    p.x_offset, p.y_offset, p.z_offset)
-                entry["name"] = p.name
-                objs.append(entry)
-            self._collections[coll_name] = {
-                "name": coll_name, "objects": objs}
+            for p in patterns:
+                self._layout_pattern.addItem(p.title(), p)
 
-        # Update UI
-        if self.coll_selector.findText(coll_name) < 0:
-            self.coll_selector.addItem(coll_name)
-        self.coll_selector.setCurrentText(coll_name)
-        self._refresh_collection_list()
-        self._emit_collections()
+        self._layout_pattern.currentIndexChanged.connect(self._on_layout_pattern_changed)
+        pat_row.addWidget(self._layout_pattern)
+        pat_row.addStretch()
+        layout.addLayout(pat_row)
 
-        n = len(placed)
-        self.arrangement_info.setText(
-            f"✅ Created '{coll_name}' with {n} object(s)")
+        # Dynamic layout parameters
+        self._layout_param_stack = QStackedWidget()
+        self._layout_param_widgets: dict[str, dict] = {}
+
+        for pattern in patterns:
+            page, widgets = self._build_layout_param_page(pattern)
+            self._layout_param_stack.addWidget(page)
+            self._layout_param_widgets[pattern] = widgets
+
+        layout.addWidget(self._layout_param_stack)
+
+        # Object source label
+        self._layout_source_label = QLabel("Uses current designer object type + params")
+        self._layout_source_label.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 10px; font-style: italic;")
+        layout.addWidget(self._layout_source_label)
+
+        # Apply / Clear buttons
+        btn_row = QHBoxLayout()
+        self._btn_apply_layout = QPushButton("Apply Layout")
+        self._btn_apply_layout.setStyleSheet(
+            f"background: {COLORS['blue']}; color: {COLORS['base']}; "
+            f"padding: 4px 12px; border-radius: 4px;")
+        self._btn_apply_layout.clicked.connect(self._apply_auto_layout)
+        btn_row.addWidget(self._btn_apply_layout)
+
+        self._btn_clear_layout = QPushButton("Clear Layout Objects")
+        self._btn_clear_layout.clicked.connect(self._clear_auto_layout)
+        btn_row.addWidget(self._btn_clear_layout)
+
+        self._layout_count_label = QLabel("")
+        self._layout_count_label.setStyleSheet(f"color: {COLORS['overlay0']};")
+        btn_row.addWidget(self._layout_count_label)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        parent_layout.addWidget(group)
+
+    def _build_layout_param_page(self, pattern: str) -> tuple[QWidget, dict]:
+        """Build parameter controls for one auto-layout pattern."""
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setSpacing(4)
+        widgets = {}
+
+        if HAS_AUTO_LAYOUT:
+            info = LAYOUT_INFO.get(pattern, {})
+            param_defs = info.get("params", {})
+        else:
+            # Fallback definitions
+            param_defs = {
+                "ring": {"count": 6, "radius": 2.0, "start_angle_deg": 0.0},
+                "grid": {"rows": 3, "cols": 3, "spacing": 1.0},
+                "hex": {"rows": 3, "cols": 3, "spacing": 1.0},
+                "line": {"count": 5, "spacing": 1.0},
+                "concentric": {"ring_counts": "6,12", "inner_radius": 1.0, "outer_radius": 3.0},
+            }.get(pattern, {})
+
+        for pname, default in param_defs.items():
+            if isinstance(default, str):
+                # Text field (e.g., ring_counts as comma-separated)
+                edit = QLineEdit(default)
+                edit.setMaximumWidth(120)
+                form.addRow(f"{pname.replace('_', ' ').title()}:", edit)
+                widgets[pname] = edit
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(2)
+                if "count" in pname or "rows" in pname or "cols" in pname:
+                    spin.setRange(1, 100)
+                    spin.setDecimals(0)
+                    spin.setSingleStep(1)
+                elif "angle" in pname:
+                    spin.setRange(-360, 360)
+                    spin.setSuffix("°")
+                else:
+                    spin.setRange(0.1, 50.0)
+                    spin.setSuffix(" mm")
+                spin.setValue(float(default))
+                form.addRow(f"{pname.replace('_', ' ').title()}:", spin)
+                widgets[pname] = spin
+
+        return page, widgets
 
     # ── CSV Import Section ────────────────────────────────────────
 
-    def _build_csv_section(self):
-        group = QGroupBox("CSV Trajectory Import")
+    def _build_csv_import_section(self, parent_layout):
+        group = QGroupBox("📂 CSV Import")
         group.setStyleSheet(f"""
             QGroupBox {{
                 font-weight: bold; color: {COLORS['text']};
@@ -831,123 +800,767 @@ class PrintObjectsTab(QWidget):
         """)
         layout = QVBoxLayout(group)
 
-        info = QLabel(
-            "Import CSV with columns: x, y, z, p1, p2, p3, t\n"
-            "Units: mm for positions, seconds for time.")
-        info.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 10px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        btn = QPushButton("Import CSV Trajectory")
+        btn.setStyleSheet(
+            f"background: {COLORS['surface1']}; padding: 6px 12px; border-radius: 4px;")
+        btn.clicked.connect(self._import_csv)
+        layout.addWidget(btn)
 
-        btn_import = QPushButton("📂 Import CSV Trajectory")
-        btn_import.clicked.connect(self._import_csv)
-        layout.addWidget(btn_import)
+        self._csv_info = QLabel("Import XYZ(T/P) trajectory from CSV file")
+        self._csv_info.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 10px; font-style: italic;")
+        layout.addWidget(self._csv_info)
 
-        self.csv_info = QLabel("")
-        self.csv_info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self.csv_info.setWordWrap(True)
-        layout.addWidget(self.csv_info)
+        parent_layout.addWidget(group)
 
-        self._left_content.addWidget(group)
+    # ── Preview Section ───────────────────────────────────────────
 
-    # ════════════════════════════════════════════════════════════════
-    #  PARAMETER MANAGEMENT
-    # ════════════════════════════════════════════════════════════════
+    def _build_preview_section(self, parent_layout):
+        if HAS_PROJECTION_CANVAS:
+            self._preview = create_interactive_well_preview()
+            self._preview.set_library_resolver(self._resolve_library_object)
+            if hasattr(self._preview, 'object_placed'):
+                self._preview.object_placed.connect(self._on_object_repositioned)
+            if hasattr(self._preview, 'object_moved'):
+                self._preview.object_moved.connect(self._on_object_repositioned)
+        else:
+            self._preview = QLabel(
+                "Preview unavailable\n(projection_canvas.py not found)")
+            self._preview.setAlignment(Qt.AlignCenter)
+            self._preview.setStyleSheet(
+                f"color: {COLORS['subtext0']}; background: {COLORS['mantle']}; "
+                f"border-radius: 6px; min-height: 200px;")
 
-    def _on_type_changed(self, _index=0):
-        """Rebuild parameter form for selected object type."""
-        obj_type = self.type_combo.currentData()
+        parent_layout.addWidget(self._preview, stretch=1)
+
+    # ── Objects List Section (S4B.5) ──────────────────────────────
+
+    def _build_objects_list_section(self, parent_layout):
+        group = QGroupBox("Objects in This Print")
+        group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; color: {COLORS['text']};
+                border: 1px solid {COLORS['surface1']};
+                border-radius: 6px; margin-top: 4px; padding-top: 14px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; left: 10px; padding: 0 6px;
+            }}
+        """)
+        layout = QVBoxLayout(group)
+
+        self._objects_list = QListWidget()
+        self._objects_list.setMaximumHeight(160)
+        self._objects_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._objects_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._objects_list.currentRowChanged.connect(self._on_object_selected)
+        self._objects_list.model().rowsMoved.connect(self._on_objects_reordered)
+        layout.addWidget(self._objects_list)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        for label, slot, tip in [
+            ("Edit", self._edit_selected, "Load into designer for editing"),
+            ("Dup", self._duplicate_selected, "Duplicate with offset"),
+            ("▲", self._move_up, "Move up in order"),
+            ("▼", self._move_down, "Move down in order"),
+            ("✕", self._remove_selected, "Remove from print"),
+        ]:
+            btn = QPushButton(label)
+            btn.setToolTip(tip)
+            btn.setFixedHeight(24)
+            btn.setMaximumWidth(50)
+            btn.clicked.connect(slot)
+            btn_row.addWidget(btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        parent_layout.addWidget(group)
+
+    # ── Summary Section (S4B.11) ──────────────────────────────────
+
+    def _build_summary_section(self, parent_layout):
+        self._summary_label = QLabel("No objects")
+        self._summary_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; background: {COLORS['surface0']}; "
+            f"padding: 4px 8px; border-radius: 4px; font-size: 11px;")
+        parent_layout.addWidget(self._summary_label)
+
+    # ══════════════════════════════════════════════════════════════
+    #  FILE BAR OPERATIONS
+    # ══════════════════════════════════════════════════════════════
+
+    def _on_new_print(self):
+        """Create a new empty print file."""
+        name, ok = QInputDialog.getText(
+            self, "New Print", "Print name:",
+            text=self._next_print_name())
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        self._objects.clear()
+        self._editing_index = None
+        _type_counters.clear()
+
+        if self._file_manager:
+            self._file_manager.new_file(name)
+            self._active_file_name = name
+
+        self._name_edit.setText(name)
+        self._refresh_objects_list()
+        self._refresh_preview_all()
+        self._update_summary()
+        self._refresh_file_combo()
+        self._save_status.setText("✅ New print created")
+        self._save_status.setStyleSheet(f"color: {COLORS['green']};")
+        self._emit_prints_changed()
+        self.file_changed.emit(name)
+
+    def _on_load_print(self):
+        """Load selected print from combo."""
+        name = self._file_combo.currentText()
+        if not name or not self._file_manager:
+            return
+        self._load_print_file(name)
+
+    def _on_file_selected(self, name: str):
+        """Handle file combo selection change (preview only, not auto-load)."""
+        pass  # Load is explicit via button
+
+    def _on_name_changed(self):
+        """Handle print name edit."""
+        new_name = self._name_edit.text().strip()
+        if new_name and new_name != self._active_file_name:
+            if self._file_manager and self._active_file_name:
+                # Rename = save-as + delete old
+                try:
+                    self._file_manager.save_as(new_name)
+                    old = self._active_file_name
+                    self._active_file_name = new_name
+                    self._file_manager.delete(old)
+                    self._refresh_file_combo()
+                    self._emit_prints_changed()
+                except Exception as e:
+                    logger.warning(f"Rename failed: {e}")
+            self._active_file_name = new_name
+
+    def _on_duplicate_print(self):
+        """Duplicate current print file."""
+        if not self._active_file_name or not self._file_manager:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Duplicate Print", "New name:",
+            text=f"{self._active_file_name}_copy")
+        if ok and new_name.strip():
+            try:
+                self._file_manager.duplicate(new_name.strip())
+                self._refresh_file_combo()
+                self._emit_prints_changed()
+                self._save_status.setText(f"✅ Duplicated as '{new_name.strip()}'")
+            except Exception as e:
+                QMessageBox.warning(self, "Duplicate Failed", str(e))
+
+    def _on_delete_print(self):
+        """Delete current print file."""
+        if not self._active_file_name or not self._file_manager:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Print",
+            f"Delete '{self._active_file_name}'? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._file_manager.delete(self._active_file_name)
+            self._active_file_name = None
+            self._objects.clear()
+            self._name_edit.clear()
+            self._refresh_objects_list()
+            self._refresh_preview_all()
+            self._update_summary()
+            self._refresh_file_combo()
+            self._emit_prints_changed()
+            self._save_status.setText("● Deleted")
+
+    def _on_export_print(self):
+        """Export current print as standalone JSON."""
+        if not self._objects:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Print", f"{self._active_file_name or 'print'}.json",
+            "JSON Files (*.json)")
+        if path:
+            import json
+            data = self._serialize_current_state()
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            self._save_status.setText(f"✅ Exported to {Path(path).name}")
+
+    def _load_print_file(self, name: str):
+        """Load a print file by name."""
+        if not self._file_manager:
+            return
+        try:
+            self._file_manager.load(name)
+            self._active_file_name = name
+            self._current_file = self._file_manager._current_file
+
+            # Rebuild objects list from file data
+            self._objects.clear()
+            if self._current_file and hasattr(self._current_file, 'objects'):
+                for obj_name, obj_data in self._current_file.objects.items():
+                    entry = {
+                        "name": obj_name,
+                        "object_type": obj_data.get("object_type", "point"),
+                        "params": obj_data.get("params", {}),
+                        "position": tuple(obj_data.get("position", [0, 0, 0])),
+                        "color": obj_data.get("color", DEFAULT_COLORS[0]),
+                        "ink_pump": obj_data.get("ink_pump", "P1"),
+                        "num_layers": obj_data.get("num_layers", 1),
+                        "layer_height": obj_data.get("layer_height", 0.2),
+                        "auto_layout": obj_data.get("auto_layout", False),
+                    }
+                    self._objects.append(entry)
+
+            self._name_edit.setText(name)
+            self._editing_index = None
+            self._cancel_edit_mode()
+            self._refresh_objects_list()
+            self._refresh_preview_all()
+            self._update_summary()
+            self._save_status.setText(f"✅ Loaded '{name}'")
+            self._save_status.setStyleSheet(f"color: {COLORS['green']};")
+            self.file_changed.emit(name)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Load Failed", str(e))
+            logger.error(f"Failed to load print '{name}': {e}", exc_info=True)
+
+    def _refresh_file_combo(self):
+        """Update file combo with available prints."""
+        self._file_combo.blockSignals(True)
+        self._file_combo.clear()
+        if self._file_manager:
+            for name in _normalize_file_list(self._file_manager.list_files()):
+                self._file_combo.addItem(name)
+            if self._active_file_name:
+                idx = self._file_combo.findText(self._active_file_name)
+                if idx >= 0:
+                    self._file_combo.setCurrentIndex(idx)
+        self._file_combo.blockSignals(False)
+
+    def _next_print_name(self) -> str:
+        """Generate next available print name."""
+        if self._file_manager and hasattr(self._file_manager, 'get_next_name'):
+            try:
+                result = self._file_manager.get_next_name()
+                return str(result) if result else "Print_001"
+            except Exception:
+                pass
+        # Fallback: count existing files
+        existing = self.get_print_file_names()
+        n = len(existing) + 1
+        return f"Print_{n:03d}"
+
+    def _restore_last_print(self):
+        """Restore last active print from settings."""
+        self._refresh_file_combo()
+        if self.settings:
+            last = self.settings.get("print_objects.last_active_print", None)
+            if last and self._file_manager:
+                try:
+                    self._load_print_file(last)
+                    return
+                except Exception:
+                    pass
+
+    # ══════════════════════════════════════════════════════════════
+    #  OBJECT DESIGNER OPERATIONS (S4B.3, S4B.4, S4B.6)
+    # ══════════════════════════════════════════════════════════════
+
+    def _on_type_list_changed(self, current, previous):
+        """Handle type list selection changed."""
+        if current is None:
+            return
+        obj_type = current.data(Qt.ItemDataRole.UserRole)
         if obj_type is None:
+            # Header item clicked — re-select previous or skip
+            if previous is not None:
+                self._type_list.blockSignals(True)
+                self._type_list.setCurrentItem(previous)
+                self._type_list.blockSignals(False)
             return
+        self._current_type = obj_type
+        idx = self._param_stack_indices.get(obj_type, 0)
+        self._param_stack.setCurrentIndex(idx)
+        self._schedule_preview()
 
-        # Clear existing params
-        while self._param_layout.count():
-            item = self._param_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._param_spins.clear()
+    @staticmethod
+    def _categorize_object_types() -> list[tuple[str, list]]:
+        """Group OBJECT_TYPES into (category_name, [(key, (label, icon))]) sections."""
+        cats_2d = []
+        cats_3d_shell = []
+        cats_3d_solid = []
+        cats_other = []
 
-        # CSV type has no parameters (imported from file)
-        if obj_type == "csv_import":
-            lbl = QLabel("Use 'Import CSV' below to load trajectory data")
-            lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-style: italic;")
-            self._param_layout.addRow(lbl)
-            return
-
-        params = DEFAULT_PARAMS.get(obj_type, {})
-        for key, default in params.items():
-            label = key.replace("_", " ").title()
-            if isinstance(default, float):
-                spin = QDoubleSpinBox()
-                spin.setRange(0.01, 100.0)
-                spin.setDecimals(2)
-                spin.setValue(default)
-                if "mm" in key:
-                    spin.setSuffix(" mm")
-                elif "deg" in key:
-                    spin.setSuffix("°")
-                    spin.setRange(-360, 360)
-                elif "percent" in key or "overlap" in key:
-                    spin.setSuffix("%")
-                    spin.setRange(0, 100)
-            elif isinstance(default, int):
-                spin = QSpinBox()
-                spin.setRange(1, 1000)
-                spin.setValue(default)
-            elif isinstance(default, str):
-                spin = QComboBox()
-                # Fill patterns
-                if "pattern" in key:
-                    spin.addItems(["spiral", "meander", "concentric"])
+        for obj_type, (label, icon_text) in OBJECT_TYPES.items():
+            entry = (obj_type, (label, icon_text))
+            if obj_type == "csv_import":
+                cats_other.append(entry)
+            elif HAS_GEOMETRY and obj_type in OBJECT_TYPE_INFO:
+                cat = OBJECT_TYPE_INFO[obj_type].get("category", "")
+                if cat == "3D" and "shell" in obj_type:
+                    cats_3d_shell.append(entry)
+                elif cat == "3D":
+                    cats_3d_solid.append(entry)
                 else:
-                    spin = QLineEdit(default)
+                    cats_2d.append(entry)
+            elif "shell" in obj_type:
+                cats_3d_shell.append(entry)
+            elif "solid" in obj_type or "sphere" in obj_type or "cube" in obj_type or "cylinder" in obj_type or "ellipsoid" in obj_type:
+                cats_3d_solid.append(entry)
             else:
-                continue
+                cats_2d.append(entry)
 
-            self._param_spins[key] = spin
-            self._param_layout.addRow(f"{label}:", spin)
+        result = []
+        if cats_2d:
+            result.append(("2D Objects", cats_2d))
+        if cats_3d_solid:
+            result.append(("3D Solid", cats_3d_solid))
+        if cats_3d_shell:
+            result.append(("3D Shell", cats_3d_shell))
+        if cats_other:
+            result.append(("Import", cats_other))
+        return result
 
-        # Show/hide layers based on 3D type
-        is_3d = "cylinder" in obj_type
-        self.obj_layers.setEnabled(is_3d)
-        self.obj_layer_h.setEnabled(is_3d)
-        if is_3d and self.obj_layers.value() == 1:
-            self.obj_layers.setValue(10)
+    def _get_current_params(self) -> dict:
+        """Collect parameters from current type's widgets.
 
-    def _get_params(self) -> dict:
-        """Read current parameter values from form."""
+        QSpinBox values are returned as int, QDoubleSpinBox as float.
+        Additional safety: any param in INT_PARAMS is cast to int.
+        """
+        widgets = self._param_widgets.get(self._current_type, {})
         params = {}
-        for key, widget in self._param_spins.items():
-            if isinstance(widget, (QDoubleSpinBox, QSpinBox)):
-                params[key] = widget.value()
-            elif isinstance(widget, QComboBox):
-                params[key] = widget.currentText()
+        for pname, widget in widgets.items():
+            if isinstance(widget, QSpinBox):
+                params[pname] = widget.value()  # already int
+            elif isinstance(widget, QDoubleSpinBox):
+                val = widget.value()
+                # Cast to int if this is a count/index parameter
+                if pname in INT_PARAMS:
+                    params[pname] = int(val)
+                else:
+                    params[pname] = val
             elif isinstance(widget, QLineEdit):
-                params[key] = widget.text()
+                params[pname] = widget.text()
         return params
 
-    # ════════════════════════════════════════════════════════════════
-    #  OBJECT GENERATION + PREVIEW
-    # ════════════════════════════════════════════════════════════════
+    def _set_params_from_dict(self, obj_type: str, params: dict):
+        """Set parameter widgets from a dict."""
+        widgets = self._param_widgets.get(obj_type, {})
+        for pname, val in params.items():
+            w = widgets.get(pname)
+            if w is None:
+                continue
+            if isinstance(w, QSpinBox):
+                w.blockSignals(True)
+                w.setValue(int(val))
+                w.blockSignals(False)
+            elif isinstance(w, QDoubleSpinBox):
+                w.blockSignals(True)
+                w.setValue(float(val))
+                w.blockSignals(False)
+            elif isinstance(w, QLineEdit):
+                w.setText(str(val))
 
-    def _extract_needle_syringe(self) -> tuple:
-        """Extract (needle, syringe_map, settings) from workspace + hardware config."""
+    def _schedule_preview(self, *_args):
+        """Schedule a debounced preview update."""
+        self._preview_timer.start()
+
+    def _update_live_preview(self):
+        """Generate trajectory for current designer state and show in preview (S4B.3)."""
+        if self._current_type == "csv_import":
+            return
+
+        params = self._get_current_params()
+        position = (self._pos_x.value(), self._pos_y.value(), self._pos_z.value())
+        pump_id = self._ink_combo.currentData() or "P1"
+
+        obj = self._build_print_object(
+            name="__preview__",
+            obj_type=self._current_type,
+            params=params,
+            position=position,
+            color=self._current_color,
+            pump_id=pump_id,
+        )
+
+        if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+            self._show_single_preview(obj, ghost=True)
+            info_parts = []
+            if hasattr(obj, 'num_waypoints') and obj.num_waypoints:
+                info_parts.append(f"{obj.num_waypoints} pts")
+            if hasattr(obj, 'total_length_mm') and obj.total_length_mm:
+                info_parts.append(f"{obj.total_length_mm:.1f} mm")
+            if hasattr(obj, 'total_time_s') and obj.total_time_s:
+                info_parts.append(f"{obj.total_time_s:.1f} s")
+            self._obj_info.setText(" | ".join(info_parts) if info_parts else "Preview ready")
+        else:
+            self._obj_info.setText("⚠ No trajectory generated")
+
+    def _on_add_or_update(self):
+        """Add new object or update existing (S4B.4, S4B.6)."""
+        if self._current_type == "csv_import":
+            self._import_csv()
+            return
+
+        params = self._get_current_params()
+        position = (self._pos_x.value(), self._pos_y.value(), self._pos_z.value())
+        pump_id = self._ink_combo.currentData() or "P1"
+
+        entry = {
+            "object_type": self._current_type,
+            "params": dict(params),
+            "position": position,
+            "color": self._current_color,
+            "ink_pump": pump_id,
+            "num_layers": self._num_layers.value(),
+            "layer_height": self._layer_height.value(),
+            "auto_layout": False,
+        }
+
+        if self._editing_index is not None:
+            # Update existing
+            entry["name"] = self._objects[self._editing_index]["name"]
+            self._objects[self._editing_index] = entry
+            self._cancel_edit_mode()
+        else:
+            # Add new
+            entry["name"] = _auto_name(self._current_type)
+            self._objects.append(entry)
+
+        self._refresh_objects_list()
+        self._refresh_preview_all()
+        self._update_summary()
+        self._trigger_auto_save()
+        self._emit_prints_changed()
+
+    def _cancel_edit_mode(self):
+        """Exit edit mode, return to add mode."""
+        self._editing_index = None
+        self._add_btn.setText("+ Add Object")
+        self._add_btn.setStyleSheet(
+            f"background: {COLORS['green']}; color: {COLORS['base']}; "
+            f"font-weight: bold; padding: 6px 16px; border-radius: 4px;")
+        self._cancel_edit_btn.setVisible(False)
+        self._edit_indicator.setVisible(False)
+
+    def _enter_edit_mode(self, index: int):
+        """Enter edit mode for an object (S4B.6)."""
+        if index < 0 or index >= len(self._objects):
+            return
+        self._editing_index = index
+        entry = self._objects[index]
+
+        # Set type via list selection
+        obj_type = entry["object_type"]
+        self._current_type = obj_type
+        for i in range(self._type_list.count()):
+            item = self._type_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == obj_type:
+                self._type_list.blockSignals(True)
+                self._type_list.setCurrentItem(item)
+                self._type_list.blockSignals(False)
+                break
+        self._param_stack.setCurrentIndex(self._param_stack_indices.get(obj_type, 0))
+
+        # Set params
+        self._set_params_from_dict(obj_type, entry.get("params", {}))
+
+        # Set common fields
+        pos = entry.get("position", (0, 0, 0))
+        self._pos_x.setValue(pos[0])
+        self._pos_y.setValue(pos[1])
+        self._pos_z.setValue(pos[2] if len(pos) > 2 else 0.0)
+        self._num_layers.setValue(entry.get("num_layers", 1))
+        self._layer_height.setValue(entry.get("layer_height", 0.2))
+
+        # Color
+        self._current_color = entry.get("color", DEFAULT_COLORS[0])
+        self._color_btn.setStyleSheet(
+            f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: 4px;")
+
+        # Ink/pump
+        pump_id = entry.get("ink_pump", "P1")
+        idx = self._ink_combo.findData(pump_id)
+        if idx >= 0:
+            self._ink_combo.setCurrentIndex(idx)
+
+        # UI indicators
+        self._add_btn.setText("✓ Update Object")
+        self._add_btn.setStyleSheet(
+            f"background: {COLORS['yellow']}; color: {COLORS['base']}; "
+            f"font-weight: bold; padding: 6px 16px; border-radius: 4px;")
+        self._cancel_edit_btn.setVisible(True)
+        self._edit_indicator.setText(f"Editing: {entry['name']}")
+        self._edit_indicator.setVisible(True)
+
+        self._schedule_preview()
+
+    # ══════════════════════════════════════════════════════════════
+    #  OBJECTS LIST OPERATIONS (S4B.5)
+    # ══════════════════════════════════════════════════════════════
+
+    def _refresh_objects_list(self):
+        """Rebuild the objects list widget from self._objects."""
+        self._objects_list.clear()
+        for i, obj in enumerate(self._objects):
+            type_info = OBJECT_TYPES.get(obj["object_type"], ("?", "?"))
+            icon_text = type_info[1]
+            pos = obj.get("position", (0, 0, 0))
+            pump = obj.get("ink_pump", "P1")
+            auto = " [auto]" if obj.get("auto_layout") else ""
+            text = (f"{i+1}. {icon_text} {obj['name']} "
+                    f"{pump} @ ({pos[0]:.1f}, {pos[1]:.1f}){auto}")
+            item = QListWidgetItem(text)
+            color = QColor(obj.get("color", DEFAULT_COLORS[0]))
+            item.setForeground(color)
+            self._objects_list.addItem(item)
+
+    def _on_object_selected(self, row: int):
+        """Highlight selected object in preview."""
+        if 0 <= row < len(self._objects):
+            self._refresh_preview_all(highlight_index=row)
+
+    def _on_objects_reordered(self, *_args):
+        """Handle drag reorder in objects list."""
+        # Rebuild _objects from current list order
+        new_order = []
+        for i in range(self._objects_list.count()):
+            text = self._objects_list.item(i).text()
+            # Extract original index from "N. icon Name..."
+            try:
+                idx_str = text.split(".")[0].strip()
+                orig_idx = int(idx_str) - 1
+                if 0 <= orig_idx < len(self._objects):
+                    new_order.append(self._objects[orig_idx])
+            except (ValueError, IndexError):
+                pass
+
+        if len(new_order) == len(self._objects):
+            self._objects = new_order
+            self._refresh_objects_list()
+            self._trigger_auto_save()
+
+    def _edit_selected(self):
+        """Load selected object into designer for editing."""
+        row = self._objects_list.currentRow()
+        if 0 <= row < len(self._objects):
+            self._enter_edit_mode(row)
+
+    def _duplicate_selected(self):
+        """Duplicate selected object with small position offset."""
+        row = self._objects_list.currentRow()
+        if row < 0 or row >= len(self._objects):
+            return
+        import copy
+        entry = copy.deepcopy(self._objects[row])
+        entry["name"] = _auto_name(entry["object_type"])
+        pos = list(entry.get("position", (0, 0, 0)))
+        pos[0] += 0.5  # Offset so it's visible
+        entry["position"] = tuple(pos)
+        entry["auto_layout"] = False
+        self._objects.insert(row + 1, entry)
+        self._refresh_objects_list()
+        self._refresh_preview_all()
+        self._update_summary()
+        self._trigger_auto_save()
+
+    def _move_up(self):
+        row = self._objects_list.currentRow()
+        if row > 0:
+            self._objects[row], self._objects[row - 1] = (
+                self._objects[row - 1], self._objects[row])
+            self._refresh_objects_list()
+            self._objects_list.setCurrentRow(row - 1)
+            self._trigger_auto_save()
+
+    def _move_down(self):
+        row = self._objects_list.currentRow()
+        if 0 <= row < len(self._objects) - 1:
+            self._objects[row], self._objects[row + 1] = (
+                self._objects[row + 1], self._objects[row])
+            self._refresh_objects_list()
+            self._objects_list.setCurrentRow(row + 1)
+            self._trigger_auto_save()
+
+    def _remove_selected(self):
+        row = self._objects_list.currentRow()
+        if 0 <= row < len(self._objects):
+            self._objects.pop(row)
+            self._refresh_objects_list()
+            self._refresh_preview_all()
+            self._update_summary()
+            self._trigger_auto_save()
+            self._emit_prints_changed()
+
+    # ══════════════════════════════════════════════════════════════
+    #  AUTO-LAYOUT (S4B.7, S4B.8)
+    # ══════════════════════════════════════════════════════════════
+
+    def _on_layout_pattern_changed(self, index: int):
+        self._layout_param_stack.setCurrentIndex(index)
+
+    def _get_layout_params(self) -> dict:
+        """Collect auto-layout parameters from current pattern."""
+        pattern = self._layout_pattern.currentData()
+        widgets = self._layout_param_widgets.get(pattern, {})
+        params = {}
+        for pname, w in widgets.items():
+            if isinstance(w, QDoubleSpinBox):
+                params[pname] = w.value()
+            elif isinstance(w, QLineEdit):
+                params[pname] = w.text()
+        return params
+
+    def _apply_auto_layout(self):
+        """Generate N objects using auto-layout pattern (S4B.7)."""
+        pattern = self._layout_pattern.currentData()
+        params = self._get_layout_params()
+
+        # Generate positions
+        if HAS_AUTO_LAYOUT:
+            try:
+                positions = generate_layout(pattern, **params)
+            except Exception as e:
+                QMessageBox.warning(self, "Layout Error", str(e))
+                return
+        else:
+            # Fallback: simple ring
+            import math
+            count = int(params.get("count", 6))
+            radius = float(params.get("radius", 2.0))
+            positions = [
+                (radius * math.cos(2 * math.pi * i / count),
+                 radius * math.sin(2 * math.pi * i / count))
+                for i in range(count)
+            ]
+
+        if not positions:
+            self._layout_count_label.setText("No positions generated")
+            return
+
+        # Use current designer params as template
+        obj_type = self._current_type
+        obj_params = self._get_current_params()
+        pump_id = self._ink_combo.currentData() or "P1"
+
+        for x, y in positions:
+            entry = {
+                "name": _auto_name(obj_type),
+                "object_type": obj_type,
+                "params": dict(obj_params),
+                "position": (x, y, self._pos_z.value()),
+                "color": self._current_color,
+                "ink_pump": pump_id,
+                "num_layers": self._num_layers.value(),
+                "layer_height": self._layer_height.value(),
+                "auto_layout": True,
+            }
+            self._objects.append(entry)
+
+        self._layout_count_label.setText(f"{len(positions)} objects added")
+        self._refresh_objects_list()
+        self._refresh_preview_all()
+        self._update_summary()
+        self._trigger_auto_save()
+        self._emit_prints_changed()
+
+    def _clear_auto_layout(self):
+        """Remove all objects tagged as auto_layout (S4B.7)."""
+        before = len(self._objects)
+        self._objects = [o for o in self._objects if not o.get("auto_layout")]
+        removed = before - len(self._objects)
+        self._layout_count_label.setText(f"Removed {removed} auto-layout objects")
+        self._refresh_objects_list()
+        self._refresh_preview_all()
+        self._update_summary()
+        self._trigger_auto_save()
+        self._emit_prints_changed()
+
+    # ══════════════════════════════════════════════════════════════
+    #  CSV IMPORT (S4B.10)
+    # ══════════════════════════════════════════════════════════════
+
+    def _import_csv(self):
+        """Import trajectory from CSV file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import CSV Trajectory", "",
+            "CSV Files (*.csv *.txt);;All Files (*)")
+        if not path:
+            return
+
+        try:
+            if HAS_NUMPY:
+                data = np.genfromtxt(path, delimiter=",", skip_header=1)
+            else:
+                import csv
+                with open(path) as f:
+                    reader = csv.reader(f)
+                    next(reader, None)  # skip header
+                    data = [list(map(float, row)) for row in reader if row]
+                data = data  # keep as list
+
+            name, ok = QInputDialog.getText(
+                self, "Name CSV Import", "Object name:",
+                text=f"CSV_{Path(path).stem}")
+            if not ok or not name.strip():
+                return
+
+            entry = {
+                "name": name.strip(),
+                "object_type": "csv_import",
+                "params": {"source_file": str(path)},
+                "position": (0.0, 0.0, 0.0),
+                "color": DEFAULT_COLORS[len(self._objects) % len(DEFAULT_COLORS)],
+                "ink_pump": self._ink_combo.currentData() or "P1",
+                "num_layers": 1,
+                "layer_height": 0.2,
+                "auto_layout": False,
+                "_csv_data": data if HAS_NUMPY else None,
+            }
+            self._objects.append(entry)
+            self._refresh_objects_list()
+            self._refresh_preview_all()
+            self._update_summary()
+            self._trigger_auto_save()
+            self._csv_info.setText(f"✅ Imported {Path(path).name}")
+
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Import Failed", str(e))
+            self._csv_info.setText(f"⚠ Import failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  PREVIEW AND TRAJECTORY
+    # ══════════════════════════════════════════════════════════════
+
+    def _extract_needle_syringe(self):
+        """Get needle and syringe info from workspace or hardware config."""
         needle = None
         syringe_map = {}
         speed = 5.0
         layer_h = 0.2
 
-        # Try workspace first
         if self._workspace:
             needle = getattr(self._workspace, 'needle', None)
             for pid, pump in getattr(self._workspace, 'pumps', {}).items():
                 if hasattr(pump, 'syringe') and pump.syringe is not None:
                     syringe_map[pid] = pump.syringe
             ps = getattr(self._workspace, 'print_settings', {})
-            speed = ps.get('print_speed_mm_s', 5.0)
-            layer_h = ps.get('layer_height_mm', 0.2)
+            speed = ps.get('print_speed_mm_s', 5.0) if isinstance(ps, dict) else 5.0
+            layer_h = ps.get('layer_height_mm', 0.2) if isinstance(ps, dict) else 0.2
 
-        # v7.2: Fall back to HardwareConfig for needle and syringes
+        # Fall back to HardwareConfig
         if self._hw_config is not None:
             if needle is None and hasattr(self._hw_config, 'needle'):
                 needle = self._hw_config.needle
@@ -956,30 +1569,18 @@ class PrintObjectsTab(QWidget):
                     if hasattr(pump_cfg, 'syringe') and pump_cfg.syringe is not None:
                         syringe_map[pid] = pump_cfg.syringe
 
-        # Fallback: create minimal needle if workspace has none
+        # Last resort fallback
         if needle is None:
             try:
-                from SupportClasses.PhysicalModels import NeedleSpec
                 needle = NeedleSpec(gauge=22, od_um=718, id_um=413, wall_um=152)
-            except ImportError:
+            except Exception:
                 pass
 
         return needle, syringe_map, speed, layer_h
 
-    def _build_print_object(
-        self,
-        name: str,
-        obj_type: str,
-        params: dict,
-        position: tuple = (0, 0, 0),
-        color: str = "#a6e3a1",
-        pump_id: str = "P1",
-    ) -> PrintObject | None:
-        """
-        Create a PrintObject and generate its trajectory.
-
-        Returns the PrintObject with .trajectory populated, or None on failure.
-        """
+    def _build_print_object(self, name, obj_type, params, position=(0, 0, 0),
+                            color="#a6e3a1", pump_id="P1"):
+        """Create a PrintObject and generate its trajectory."""
         if not HAS_GEOMETRY:
             return None
 
@@ -994,8 +1595,7 @@ class PrintObjectsTab(QWidget):
 
         needle, syringe_map, speed, layer_h = self._extract_needle_syringe()
         if needle is None:
-            logger.warning("No needle configured — cannot generate trajectory")
-            return obj  # Return object without trajectory
+            return obj
 
         try:
             generate_object_trajectory(
@@ -1005,513 +1605,359 @@ class PrintObjectsTab(QWidget):
                 pump_id=pump_id,
             )
         except Exception as e:
-            logger.error(f"Trajectory generation failed for '{name}': {e}",
-                         exc_info=True)
+            logger.error(f"Trajectory generation failed for '{name}': {e}")
 
         return obj
 
-    def _generate_preview(self):
-        """Generate a print object and show in projection view."""
-        obj_type = self.type_combo.currentData()
-        name = self.name_edit.text().strip() or "Unnamed"
-        params = self._get_params()
-        position = (self.pos_x.value(), self.pos_y.value(), self.pos_z.value())
-        color = self._color
-        pump = self.ink_combo.currentData() or "P1"
-
-        if not HAS_GEOMETRY:
-            self.obj_info.setText("GeometryEngine not available")
-            return
-
-        try:
-            obj = self._build_print_object(
-                name, obj_type, params, position, color, pump)
-
-            if obj and obj.has_trajectory:
-                self._show_trajectory_preview(obj)
-                self.obj_info.setText(
-                    f"✅ {obj.num_waypoints} waypoints | "
-                    f"{obj.total_length_mm:.1f} mm path | "
-                    f"{obj.total_time_s:.1f} s | "
-                    f"{obj.num_layers} layer(s)")
-            else:
-                self.obj_info.setText("⚠ No trajectory generated")
-
-        except Exception as e:
-            self.obj_info.setText(f"Error: {e}")
-            logger.error(f"Object generation failed: {e}", exc_info=True)
-
-    def _show_trajectory_preview(self, obj):
-        """Render object trajectory in the projection canvas."""
+    def _show_single_preview(self, obj, ghost=False):
+        """Show a single object trajectory in the preview."""
         if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
             return
-
-        self._preview.clear_path()
-
-        if not HAS_NUMPY or not obj.has_trajectory:
+        if not HAS_NUMPY or not hasattr(obj, 'trajectory') or obj.trajectory is None:
             return
 
         traj = obj.trajectory
-        # Build an ObjectPath with the object's color
         pts = [(float(traj[i, 0]), float(traj[i, 1]), float(traj[i, 2]))
                for i in range(len(traj))]
         color = getattr(obj, 'color', "#a6e3a1")
         obj_path = ObjectPath(name=obj.name, color=color, points=pts)
         self._preview.set_object_paths([obj_path])
-
-        # Ensure well boundary is current
         self._update_well_diameter()
+        self._preview.refresh()
 
-    # ════════════════════════════════════════════════════════════════
-    #  OBJECT LIBRARY
-    # ════════════════════════════════════════════════════════════════
-
-    def _add_to_library(self):
-        """Add current designer config to library."""
-        name = self.name_edit.text().strip()
-        if not name:
+    def _refresh_preview_all(self, highlight_index=None):
+        """Regenerate preview showing all objects in current print."""
+        if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
             return
 
-        # Store as dict for recreation
-        entry = {
-            "name": name,
-            "object_type": self.type_combo.currentData(),
-            "params": self._get_params(),
-            "position": (self.pos_x.value(), self.pos_y.value(), self.pos_z.value()),
-            "color": self._color,
-            "ink_pump": self.ink_combo.currentData() or "P1",
-            "num_layers": self.obj_layers.value(),
-            "layer_height": self.obj_layer_h.value(),
-        }
-
-        self._object_library[name] = entry
-        self._refresh_library_list()
-        self.obj_info.setText(f"Added '{name}' to library")
-
-    def _load_from_library(self):
-        """Load selected library item into designer."""
-        item = self.library_list.currentItem()
-        if not item:
-            return
-        name = item.text().split(" (")[0]
-        entry = self._object_library.get(name)
-        if not entry:
-            return
-
-        self.name_edit.setText(entry["name"])
-        idx = self.type_combo.findData(entry["object_type"])
-        if idx >= 0:
-            self.type_combo.setCurrentIndex(idx)
-        # Params will be set after type change rebuilds form
-        QTimer.singleShot(50, lambda: self._apply_params(entry))
-
-    def _apply_params(self, entry: dict):
-        """Apply stored parameters to form."""
-        for key, val in entry.get("params", {}).items():
-            spin = self._param_spins.get(key)
-            if spin and isinstance(spin, (QDoubleSpinBox, QSpinBox)):
-                spin.setValue(val)
-            elif spin and isinstance(spin, QComboBox):
-                idx = spin.findText(str(val))
-                if idx >= 0:
-                    spin.setCurrentIndex(idx)
-
-        pos = entry.get("position", (0, 0, 0))
-        self.pos_x.setValue(pos[0])
-        self.pos_y.setValue(pos[1])
-        self.pos_z.setValue(pos[2])
-        self._color = entry.get("color", DEFAULT_COLORS[0])
-        self.color_btn.setStyleSheet(
-            f"background: {self._color}; border-radius: 4px;")
-        self.obj_layers.setValue(entry.get("num_layers", 1))
-        self.obj_layer_h.setValue(entry.get("layer_height", 0.2))
-
-    def _duplicate_library_item(self):
-        item = self.library_list.currentItem()
-        if not item:
-            return
-        name = item.text().split(" (")[0]
-        entry = self._object_library.get(name)
-        if entry:
-            new_name = f"{name}_copy"
-            new_entry = dict(entry)
-            new_entry["name"] = new_name
-            self._object_library[new_name] = new_entry
-            self._refresh_library_list()
-
-    def _delete_library_item(self):
-        item = self.library_list.currentItem()
-        if not item:
-            return
-        name = item.text().split(" (")[0]
-        self._object_library.pop(name, None)
-        self._refresh_library_list()
-
-    def _on_library_select(self, row: int):
-        """Show preview of selected library item (helps before dragging)."""
-        if row < 0:
-            return
-        item = self.library_list.item(row)
-        if not item:
-            return
-        name = item.text().split(" (")[0]
-        entry = self._object_library.get(name)
-        if not entry or not HAS_GEOMETRY:
-            return
-        try:
+        all_paths = []
+        for i, entry in enumerate(self._objects):
             obj = self._build_print_object(
-                name=name,
+                name=entry["name"],
                 obj_type=entry["object_type"],
                 params=entry.get("params", {}),
                 position=entry.get("position", (0, 0, 0)),
                 color=entry.get("color", DEFAULT_COLORS[0]),
                 pump_id=entry.get("ink_pump", "P1"),
             )
-            if obj and obj.has_trajectory:
-                self._show_trajectory_preview(obj)
+            if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+                traj = obj.trajectory
+                pts = [(float(traj[j, 0]), float(traj[j, 1]), float(traj[j, 2]))
+                       for j in range(len(traj))]
+                color = entry.get("color", DEFAULT_COLORS[0])
+                if highlight_index is not None and i == highlight_index:
+                    color = "#ffffff"  # Highlight
+                all_paths.append(ObjectPath(name=entry["name"], color=color, points=pts))
+
+        if all_paths:
+            self._preview.set_object_paths(all_paths)
+        else:
+            if hasattr(self._preview, 'clear_object_paths'):
+                self._preview.clear_object_paths()
+            elif hasattr(self._preview, 'clear_path'):
+                self._preview.clear_path()
+
+        self._update_well_diameter()
+        self._preview.refresh()
+
+    def _update_well_diameter(self):
+        """Set well boundary circle on preview from workspace plate format."""
+        if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
+            return
+        try:
+            from SupportClasses.WellPlate import PLATE_DEFINITIONS
+            plate_fmt = "96-well"
+            if self._workspace and hasattr(self._workspace, 'plate_format'):
+                plate_fmt = self._workspace.plate_format
+            elif self._hw_config and hasattr(self._hw_config, 'plate_format'):
+                plate_fmt = self._hw_config.plate_format
+            defn = PLATE_DEFINITIONS.get(plate_fmt, {})
+            diameter = defn.get("well_diameter_mm", 6.86)
+            if hasattr(self._preview, 'set_well_diameter'):
+                self._preview.set_well_diameter(diameter)
         except Exception:
-            pass  # Non-critical
+            pass
 
-    def _refresh_library_list(self):
-        self.library_list.clear()
-        for name, entry in self._object_library.items():
-            type_name = OBJECT_TYPE_NAMES.get(
-                entry["object_type"], entry["object_type"])
-            self.library_list.addItem(f"{name} ({type_name})")
+    def _resolve_library_object(self, library_key, x_mm, y_mm):
+        """Resolve a library key to a PlacedObject (for drag-drop compat)."""
+        for entry in self._objects:
+            if entry["name"] == library_key:
+                obj = self._build_print_object(
+                    name=library_key,
+                    obj_type=entry["object_type"],
+                    params=entry.get("params", {}),
+                    color=entry.get("color", DEFAULT_COLORS[0]),
+                    pump_id=entry.get("ink_pump", "P1"),
+                )
+                pts = []
+                if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+                    traj = obj.trajectory
+                    pts = [(float(traj[i, 0]), float(traj[i, 1]), float(traj[i, 2]))
+                           for i in range(len(traj))]
+                if not pts:
+                    pts = [(0.0, 0.0, 0.0)]
+                if HAS_PROJECTION_CANVAS:
+                    return PlacedObject(
+                        name=library_key, color=entry.get("color", DEFAULT_COLORS[0]),
+                        points=pts, x_offset=x_mm, y_offset=y_mm, z_offset=0.0,
+                        library_key=library_key,
+                    )
+        return None
 
-    # ════════════════════════════════════════════════════════════════
-    #  PRINT COLLECTION
-    # ════════════════════════════════════════════════════════════════
+    def _on_object_repositioned(self, name: str, x_mm: float, y_mm: float):
+        """Handle object repositioned in preview (S4B.9)."""
+        for entry in self._objects:
+            if entry["name"] == name:
+                pos = list(entry.get("position", (0, 0, 0)))
+                pos[0] = x_mm
+                pos[1] = y_mm
+                entry["position"] = tuple(pos)
+                self._refresh_objects_list()
+                self._trigger_auto_save()
+                break
 
-    def _new_collection(self):
-        """Create a new named collection."""
-        name = self.coll_name_edit.text().strip()
-        if not name:
+    # ══════════════════════════════════════════════════════════════
+    #  SIMULATION
+    # ══════════════════════════════════════════════════════════════
+
+    def _toggle_simulation(self):
+        if self._sim_playing:
+            self._sim_timer.stop()
+            self._sim_playing = False
+        else:
+            self._sim_index = 0
+            self._sim_playing = True
+            self._sim_timer.start()
+
+    def _sim_step(self):
+        self._sim_index += 1
+        # Simulation step — advance visual marker in preview
+        # (simplified; full implementation depends on ProjectionCanvas API)
+
+    # ══════════════════════════════════════════════════════════════
+    #  AUTO-SAVE (S4A.7, 3.4.9)
+    # ══════════════════════════════════════════════════════════════
+
+    def _trigger_auto_save(self):
+        """Schedule auto-save after 500ms debounce."""
+        self._save_status.setText("⏳ Saving...")
+        self._save_status.setStyleSheet(f"color: {COLORS['yellow']};")
+        self._auto_save_timer.start()
+
+    def _do_auto_save(self):
+        """Persist current state to print file."""
+        if not self._file_manager or not self._active_file_name:
+            self._save_status.setText("● Not saved (no active file)")
+            self._save_status.setStyleSheet(f"color: {COLORS['overlay0']};")
             return
-        if name not in self._collections:
-            if HAS_GEOMETRY:
-                self._collections[name] = PrintCollection(name=name)
+
+        try:
+            data = self._serialize_current_state()
+            # Update file manager's current file
+            if self._current_file:
+                self._current_file.objects = data.get("objects", {})
+                self._current_file.collections = data.get("collections", {})
+                self._current_file.layout_presets = data.get("layout_presets", {})
+                self._file_manager.save()
             else:
-                self._collections[name] = {"name": name, "objects": []}
-            self.coll_selector.addItem(name)
-            self.coll_selector.setCurrentText(name)
-            self._emit_collections()
+                # Save raw
+                import json
+                path = Path("config/prints") / f"{self._active_file_name}.json"
+                with open(path, "w") as f:
+                    json.dump(data, f, indent=2)
 
-    def _on_collection_selected(self, name: str):
-        self._active_collection_name = name
-        self._refresh_collection_list()
+            self._save_status.setText("✅ Saved")
+            self._save_status.setStyleSheet(f"color: {COLORS['green']};")
 
-    def _add_to_collection(self):
-        """Add selected library item to active collection."""
-        item = self.library_list.currentItem()
-        if not item:
-            self.coll_info.setText("Select a library object first")
+            # Remember last active
+            if self.settings:
+                self.settings.set("print_objects.last_active_print",
+                                  self._active_file_name)
+
+        except Exception as e:
+            self._save_status.setText(f"⚠ Save failed: {e}")
+            self._save_status.setStyleSheet(f"color: {COLORS['red']};")
+            logger.error(f"Auto-save failed: {e}", exc_info=True)
+
+    def _serialize_current_state(self) -> dict:
+        """Serialize current print state to JSON-compatible dict."""
+        from datetime import datetime, timezone
+        objects = {}
+        for obj in self._objects:
+            obj_data = {
+                "object_type": obj["object_type"],
+                "params": obj.get("params", {}),
+                "position": list(obj.get("position", (0, 0, 0))),
+                "color": obj.get("color", DEFAULT_COLORS[0]),
+                "ink_pump": obj.get("ink_pump", "P1"),
+                "num_layers": obj.get("num_layers", 1),
+                "layer_height": obj.get("layer_height", 0.2),
+                "auto_layout": obj.get("auto_layout", False),
+            }
+            objects[obj["name"]] = obj_data
+
+        return {
+            "schema_version": "7.2.3",
+            "metadata": {
+                "name": self._active_file_name or "Untitled",
+                "description": "",
+                "modified": datetime.now(timezone.utc).isoformat(),
+            },
+            "objects": objects,
+            "collections": {},
+            "layout_presets": {},
+        }
+
+    # ══════════════════════════════════════════════════════════════
+    #  SUMMARY (S4B.11)
+    # ══════════════════════════════════════════════════════════════
+
+    def _update_summary(self):
+        """Update summary label with current print statistics."""
+        n = len(self._objects)
+        if n == 0:
+            self._summary_label.setText("No objects")
             return
 
-        name = item.text().split(" (")[0]
-        entry = self._object_library.get(name)
-        if not entry:
-            return
+        pumps = set(o.get("ink_pump", "P1") for o in self._objects)
+        auto_count = sum(1 for o in self._objects if o.get("auto_layout"))
 
-        coll_name = self._active_collection_name
-        if coll_name not in self._collections:
-            self._new_collection()
+        parts = [f"{n} objects"]
+        parts.append(f"Pumps: {', '.join(sorted(pumps))}")
+        if auto_count:
+            parts.append(f"{auto_count} auto-layout")
 
-        coll = self._collections.get(coll_name)
-        if coll is None:
-            return
+        self._summary_label.setText(" | ".join(parts))
 
-        if HAS_GEOMETRY and isinstance(coll, PrintCollection):
+    # ══════════════════════════════════════════════════════════════
+    #  SIGNALS & INTEGRATION (S4B.12, S4A.9)
+    # ══════════════════════════════════════════════════════════════
+
+    def _emit_prints_changed(self):
+        """Emit prints_changed with list of print file names."""
+        names = self.get_print_file_names()
+        self.prints_changed.emit(names)
+        # Legacy compatibility
+        self.collections_changed.emit(names)
+
+    def _build_legacy_collections(self) -> dict:
+        """Build legacy PrintCollection dict for backward compatibility."""
+        if not HAS_GEOMETRY or not self._objects:
+            return {}
+
+        coll = PrintCollection(name=self._active_file_name or "Default")
+        for entry in self._objects:
             obj = PrintObject(
                 name=entry["name"],
                 object_type=entry["object_type"],
                 params=entry.get("params", {}),
                 position=entry.get("position", (0, 0, 0)),
-                color=entry.get("color", DEFAULT_COLORS[0]),
                 ink_assignments={entry.get("ink_pump", "P1"): "ink"},
-                num_layers=entry.get("num_layers", 1),
+                color=entry.get("color", DEFAULT_COLORS[0]),
             )
             coll.add_object(obj)
-        elif isinstance(coll, dict):
-            coll["objects"].append(dict(entry))
 
-        self._refresh_collection_list()
-        self._emit_collections()
+        return {coll.name: coll}
 
-    def _remove_from_collection(self):
-        row = self.coll_list.currentRow()
-        if row < 0:
-            return
-        coll = self._collections.get(self._active_collection_name)
-        if coll is None:
-            return
+    # ══════════════════════════════════════════════════════════════
+    #  INK / PUMP COMBO MANAGEMENT
+    # ══════════════════════════════════════════════════════════════
 
-        if HAS_GEOMETRY and isinstance(coll, PrintCollection):
-            coll.remove_object(row)
-        elif isinstance(coll, dict):
-            objects = coll.get("objects", [])
-            if 0 <= row < len(objects):
-                objects.pop(row)
+    def _refresh_ink_pump_combos(self):
+        """Update ink/pump combo from hardware config."""
+        self._ink_combo.clear()
 
-        self._refresh_collection_list()
-        self._emit_collections()
+        # Default entries
+        self._ink_combo.addItem("P1 (default)", "P1")
 
-    def _move_up(self):
-        row = self.coll_list.currentRow()
-        if row <= 0:
-            return
-        coll = self._collections.get(self._active_collection_name)
-        if HAS_GEOMETRY and isinstance(coll, PrintCollection):
-            coll.move_object(row, row - 1)
-        self._refresh_collection_list()
-        self.coll_list.setCurrentRow(row - 1)
+        if self._hw_config and hasattr(self._hw_config, 'pumps'):
+            self._ink_combo.clear()
+            for pid, pump_cfg in self._hw_config.pumps.items():
+                if hasattr(pump_cfg, 'enabled') and not pump_cfg.enabled:
+                    continue
+                ink_name = ""
+                if hasattr(pump_cfg, 'ink_name') and pump_cfg.ink_name:
+                    ink_name = f": {pump_cfg.ink_name}"
+                self._ink_combo.addItem(f"{pid}{ink_name}", pid)
+        elif self._workspace:
+            self._ink_combo.clear()
+            pumps = getattr(self._workspace, 'pumps', {})
+            for pid in sorted(pumps.keys()):
+                self._ink_combo.addItem(pid, pid)
+            if not pumps:
+                self._ink_combo.addItem("P1", "P1")
 
-    def _move_down(self):
-        row = self.coll_list.currentRow()
-        coll = self._collections.get(self._active_collection_name)
-        max_idx = self.coll_list.count() - 1
-        if row < 0 or row >= max_idx:
-            return
-        if HAS_GEOMETRY and isinstance(coll, PrintCollection):
-            coll.move_object(row, row + 1)
-        self._refresh_collection_list()
-        self.coll_list.setCurrentRow(row + 1)
-
-    def _refresh_collection_list(self):
-        self.coll_list.clear()
-        coll = self._collections.get(self._active_collection_name)
-        if coll is None:
-            return
-
-        objects = []
-        if HAS_GEOMETRY and isinstance(coll, PrintCollection):
-            objects = coll.objects
-        elif isinstance(coll, dict):
-            objects = coll.get("objects", [])
-
-        for i, obj in enumerate(objects):
-            if HAS_GEOMETRY and isinstance(obj, PrintObject):
-                pos = obj.position
-                label = f"{i+1}. {obj.name} @ ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
-            elif isinstance(obj, dict):
-                pos = obj.get("position", (0, 0, 0))
-                label = f"{i+1}. {obj['name']} @ ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f})"
-            else:
-                label = f"{i+1}. {obj}"
-            self.coll_list.addItem(label)
-
-        num = len(objects)
-        self.coll_info.setText(
-            f"{num} object(s) in '{self._active_collection_name}'")
-
-    def _emit_collections(self):
-        """Emit collection names for Well Setup tab."""
-        names = list(self._collections.keys())
-        self.collections_changed.emit(names)
-
-    # ════════════════════════════════════════════════════════════════
-    #  CSV IMPORT
-    # ════════════════════════════════════════════════════════════════
-
-    def _import_csv(self):
-        """Import a CSV trajectory file as a custom object."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import CSV Trajectory", "",
-            "CSV Files (*.csv);;TSV Files (*.tsv);;All Files (*)")
-        if not path:
-            return
-
-        try:
-            if HAS_NUMPY:
-                import pandas as pd
-            else:
-                self.csv_info.setText("numpy/pandas required for CSV import")
-                return
-
-            df = pd.read_csv(path)
-
-            # Validate columns
-            required = {"x", "y", "z", "t"}
-            optional = {"p1", "p2", "p3"}
-            found = set(c.lower().strip() for c in df.columns)
-
-            if not required.issubset(found):
-                missing = required - found
-                self.csv_info.setText(f"Missing columns: {missing}")
-                return
-
-            # Build trajectory array [x, y, z, p1, p2, p3, t]
-            col_map = {c.lower().strip(): c for c in df.columns}
-            traj = np.zeros((len(df), 7), dtype=np.float64)
-            traj[:, 0] = df[col_map["x"]].values
-            traj[:, 1] = df[col_map["y"]].values
-            traj[:, 2] = df[col_map["z"]].values
-            traj[:, 6] = df[col_map["t"]].values
-            for i, p in enumerate(["p1", "p2", "p3"]):
-                if p in col_map:
-                    traj[:, 3 + i] = df[col_map[p]].values
-
-            # Create a PrintObject with this trajectory
-            name = Path(path).stem
-            if HAS_GEOMETRY:
-                obj = PrintObject(
-                    name=name,
-                    object_type="csv_import",
-                    params={"source_file": str(path)},
-                    color=DEFAULT_COLORS[len(self._object_library) % len(DEFAULT_COLORS)],
-                )
-                obj.trajectory = traj
-                obj.total_length_mm = float(np.sum(np.sqrt(
-                    np.diff(traj[:, 0])**2 + np.diff(traj[:, 1])**2
-                )))
-                obj.total_time_s = float(traj[-1, 6] - traj[0, 6])
-                obj.num_layers = 1
-
-                # Add to library
-                self._object_library[name] = {
-                    "name": name,
-                    "object_type": "csv_import",
-                    "params": {"source_file": str(path)},
-                    "position": (0, 0, 0),
-                    "color": obj.color,
-                    "ink_pump": "P1",
-                    "num_layers": 1,
-                    "layer_height": 0.2,
-                    "_print_object": obj,  # Store generated object
-                }
-                self._refresh_library_list()
-
-                # Show preview
-                self._show_trajectory_preview(obj)
-                self.csv_info.setText(
-                    f"✅ Imported: {len(traj)} waypoints, "
-                    f"{obj.total_length_mm:.1f} mm, "
-                    f"{obj.total_time_s:.1f} s")
-            else:
-                self.csv_info.setText(
-                    f"Loaded {len(traj)} rows (GeometryEngine unavailable)")
-
-        except Exception as e:
-            self.csv_info.setText(f"Import error: {e}")
-            logger.error(f"CSV import failed: {e}", exc_info=True)
-
-    # ════════════════════════════════════════════════════════════════
-    #  SIMULATION PLAYBACK
-    # ════════════════════════════════════════════════════════════════
-
-    def _toggle_simulation(self):
-        if self._sim_playing:
-            self._stop_simulation()
-        else:
-            self._start_simulation()
-
-    def _start_simulation(self):
-        """Start animated playback of active collection."""
-        if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
-            return
-
-        # Collect all trajectories from active collection
-        self._sim_trajectories = []
-        coll = self._collections.get(self._active_collection_name)
-        if coll and HAS_GEOMETRY and isinstance(coll, PrintCollection):
-            for obj in coll.objects:
-                if obj.has_trajectory:
-                    self._sim_trajectories.append(obj.trajectory)
-        elif coll and isinstance(coll, dict):
-            for entry in coll.get("objects", []):
-                po = entry.get("_print_object")
-                if po and hasattr(po, "trajectory") and po.trajectory is not None:
-                    self._sim_trajectories.append(po.trajectory)
-
-        if not self._sim_trajectories:
-            self.obj_info.setText("No trajectory data to simulate")
-            return
-
-        # Merge all trajectories
-        if HAS_NUMPY:
-            self._sim_merged = np.vstack(self._sim_trajectories)
-        else:
-            return
-
-        self._sim_index = 0
-        self._sim_playing = True
-        self._preview.clear_path()
-        self.btn_sim.setText("⏹ Stop")
-        self._sim_timer.start()
-
-    def _stop_simulation(self):
-        self._sim_playing = False
-        self._sim_timer.stop()
-        self.btn_sim.setText("▶ Simulate")
-
-    def _sim_step(self):
-        """Advance simulation by speed_slider steps."""
-        if not self._sim_playing or not HAS_NUMPY:
-            return
-
-        steps_per_frame = self.speed_slider.value()
-        data = self._sim_merged
-
-        for _ in range(steps_per_frame):
-            if self._sim_index >= len(data):
-                self._stop_simulation()
-                return
-
-            row = data[self._sim_index]
-            x, y, z = float(row[0]), float(row[1]), float(row[2])
-            self._preview.add_completed_point(x, y, z)
-            self._preview.set_needle_position(x, y, z)
-
-            # Show upcoming waypoints
-            future = min(self._sim_index + 20, len(data))
-            upcoming = [
-                (float(data[j, 0]), float(data[j, 1]), float(data[j, 2]))
-                for j in range(self._sim_index + 1, future)
-            ]
-            self._preview.set_upcoming_waypoints(upcoming)
-
-            self._sim_index += 1
-
-        self._preview.refresh()
-
-    # ════════════════════════════════════════════════════════════════
-    #  HELPERS
-    # ════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+    #  COLOR PICKER
+    # ══════════════════════════════════════════════════════════════
 
     def _pick_color(self):
         color = QColorDialog.getColor(
-            QColor(self._color), self, "Object Color")
+            QColor(self._current_color), self, "Object Color")
         if color.isValid():
-            self._color = color.name()
-            self.color_btn.setStyleSheet(
-                f"background: {self._color}; border-radius: 4px;")
+            self._current_color = color.name()
+            self._color_btn.setStyleSheet(
+                f"background: {self._current_color}; "
+                f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+            self._schedule_preview()
 
-    def _clear_preview(self):
-        if HAS_PROJECTION_CANVAS and isinstance(self._preview, ProjectionCanvas):
-            self._preview.clear_path()
-            if isinstance(self._preview, InteractiveProjectionCanvas):
-                self._preview.clear_placed_objects()
-                self._refresh_arrangement_list()
-            self._preview.refresh()
+    # ══════════════════════════════════════════════════════════════
+    #  CONTEXT WIDGET (for sidebar panel)
+    # ══════════════════════════════════════════════════════════════
 
-    def _refresh_ink_combos(self):
-        """Update ink combo from workspace ink library."""
-        current = self.ink_combo.currentData()
-        self.ink_combo.clear()
+    def get_context_widget(self) -> QWidget:
+        """Build context panel: file browser + presets + color legend."""
+        ctx = QWidget()
+        layout = QVBoxLayout(ctx)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        if self._workspace and hasattr(self._workspace, 'pumps'):
-            for pid, pump in self._workspace.pumps.items():
-                ink_name = ""
-                if hasattr(pump, 'fluid_column') and pump.fluid_column:
-                    ink_name = getattr(pump.fluid_column, 'ink_name', '') or ''
-                label = f"{pid}: {ink_name}" if ink_name else pid
-                self.ink_combo.addItem(label, pid)
-        else:
-            self.ink_combo.addItem("P1 (default)", "P1")
-            self.ink_combo.addItem("P2", "P2")
-            self.ink_combo.addItem("P3", "P3")
+        # File browser
+        file_group = QGroupBox("Print Files")
+        file_layout = QVBoxLayout(file_group)
+        self._ctx_file_list = QListWidget()
+        self._ctx_file_list.setMaximumHeight(150)
+        self._ctx_file_list.itemDoubleClicked.connect(
+            lambda item: self._load_print_file(item.text()))
+        file_layout.addWidget(self._ctx_file_list)
+        self._refresh_ctx_file_list()
+        layout.addWidget(file_group)
 
-        # Restore selection
-        idx = self.ink_combo.findData(current)
-        if idx >= 0:
-            self.ink_combo.setCurrentIndex(idx)
+        # Color legend
+        legend_group = QGroupBox("Ink → Pump Legend")
+        legend_layout = QVBoxLayout(legend_group)
+        self._legend_label = QLabel("No inks configured")
+        self._legend_label.setStyleSheet(f"color: {COLORS['subtext0']};")
+        self._legend_label.setWordWrap(True)
+        legend_layout.addWidget(self._legend_label)
+        layout.addWidget(legend_group)
+        self._refresh_legend()
+
+        layout.addStretch()
+        return ctx
+
+    def _refresh_ctx_file_list(self):
+        """Update context file browser."""
+        if not hasattr(self, '_ctx_file_list'):
+            return
+        self._ctx_file_list.clear()
+        if self._file_manager:
+            for name in _normalize_file_list(self._file_manager.list_files()):
+                self._ctx_file_list.addItem(name)
+
+    def _refresh_legend(self):
+        """Update ink-pump color legend."""
+        if not hasattr(self, '_legend_label'):
+            return
+        if not self._objects:
+            self._legend_label.setText("No objects")
+            return
+        legend_parts = []
+        seen = set()
+        for obj in self._objects:
+            pump = obj.get("ink_pump", "P1")
+            color = obj.get("color", "#a6e3a1")
+            key = (pump, color)
+            if key not in seen:
+                seen.add(key)
+                legend_parts.append(f"■ {pump} = {color}")
+        self._legend_label.setText("\n".join(legend_parts) if legend_parts else "No inks")
