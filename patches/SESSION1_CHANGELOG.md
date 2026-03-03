@@ -1,116 +1,142 @@
-# Session 1 Change Log — Hardware Setup Fixes
-## MEBP v7.2.3 | March 2026
+# Session 1 Change Log — Styles + Hardware Config Propagation
+## MEBP v7.2.4 | March 2026
 
 ---
 
-## File: `gui/pages/hardware_setup.py`
-**Action**: Major modification (1043 lines, up from ~680 original)
+## Issues Addressed
 
-### Changes Made
+| # | Issue | Status |
+|---|-------|--------|
+| 1 | HW config not propagating to calibration plate / well setup inks+rosettes | ✅ Fixed |
+| 7 | GUI section titles misaligned / not stylish | ✅ Fixed (centralized styles) |
+| 2 | XY jog step mismatch (partial) | ✅ Propagation audited |
 
-#### S1.1 — Reordered `_setup_ui()` Sections ✅
+---
 
-| Section | v7.2 (old) | v7.2.3 (new) |
-|---------|------------|--------------|
-| 1 | Name & Notes | Name & Notes |
-| 2 | Needle | Needle |
-| 3 | Plate | Plate |
-| **4** | **Pump Channels** | **Ink Library** ← moved up |
-| **5** | **Ink Library** | **Pump Channels** ← moved down |
-| **6** | Save/Load | **Rosette Library** ← NEW |
-| **7** | — | Save/Load + Validity |
+## Changes By File
 
-**Rationale**: Users must define inks before they can assign them to pump channels. The old order had pumps before inks, causing the ink combo boxes to be empty when the user tried to assign inks.
+### `gui/styles.py` — Centralized Section Styles
 
-#### S1.2 — Rosette Library UI Section ✅
+Added 4 new style constants that all pages should use instead of per-page inline styles:
 
-Added new `QGroupBox("Rosette Library")` with:
-- `QTableWidget` (5 columns: Name, Sub-wells, Fits, Depth, Z-offset)
-- `+ New Rosette` / `Edit` / `Remove` buttons
-- `RosetteEditorDialog` class (imported from `print_workspace.py` design, now in this file)
-  - Name, Fits plate, Ring sub-wells, Center well, Sub-well Ø, Depth, Z-offset
-  - Uses `RosetteInsert.create_standard()` to build the rosette
-- CRUD methods: `_add_rosette()`, `_edit_rosette()`, `_remove_rosette()`, `_refresh_rosette_table()`
-- Data stored in `self._config.rosette_library` (already existed in `HardwareConfig`)
+- **`SECTION_TITLE_STYLE`** — QGroupBox styling with consistent border radius, blue accent titles, proper padding. Replaces all `_group_style()` static methods.
+- **`CONTEXT_SECTION_LABEL_STYLE`** — For section header labels in context panels. Consistent 10pt weight-600 blue text with subtle bottom border.
+- **`PAGE_HEADER_STYLE`** — For page title labels (14pt bold).
+- **`CARD_FRAME_STYLE`** — For card-style QFrame containers used in dashboard and settings.
 
-#### S1.3 — Overhauled `_apply_config_to_ui()` ✅
+### `gui/app.py` — Propagation Audit
 
-**Root cause of bug**: The old method restored widgets in UI build order:
-1. Name → 2. Needle → 3. Plate → 4. **Pumps** → 5. **Ink Library**
+Enhanced `_propagate_hardware_config()`:
+- Added per-page debug logging showing which pages receive the config
+- Added try/except around each page's `set_hardware_config()` call
+- Logs the page name and index for debugging
+- Catches and logs any propagation failures without crashing
 
-This meant pump combos tried to set ink selections BEFORE the ink library was loaded into the combos. Result: ink assignments silently dropped on auto-load and file-load.
+### `gui/pages/calibration.py` — Plate Format Sync (Issue #1 Fix)
 
-**New dependency-ordered restore**:
+**Root Cause**: The calibration page had a `ctx_plate_combo` in the context panel that was initialized with a hardcoded default (96-well) and only updated when the user manually changed it. When the user selected a different plate format on Page 0, the calibration page's plate model, corner well calculation, and validation well combo were all stale.
+
+**Fix**: Enhanced `set_hardware_config()` to:
+1. Sync both `plate_combo` (if exists) and `ctx_plate_combo` from HardwareConfig
+2. Rebuild `self._plate = WellPlate.from_format(fmt)` directly
+3. Recalculate `self._corner_well` for the correct plate geometry
+4. Rebuild the validation well combo with correct well names
+5. Show needle info from HardwareConfig
+6. Added `SECTION_TITLE_STYLE` import for style consistency
+
+### `gui/pages/print_well_setup.py` — Ink/Rosette Refresh (Issue #1 Fix)
+
+**Root Cause**: Well setup populated ink and rosette combos from `WorkspaceConfig` only. The workspace bridge (`_hardware_config_to_workspace()`) was the only path for these lists to arrive, but if the bridge didn't fire or was stale, the combos showed outdated data.
+
+**Fix**:
+1. Added `set_hardware_config(config)` method — receives HardwareConfig directly and refreshes:
+   - `ink_combo` with current ink library names
+   - `rosette_combo` with current rosette library names
+   - Preserves previous selection if still valid
+2. Enhanced `_refresh_ink_combo()` — now checks `self._hw_config` first (most current), falls back to workspace
+3. Enhanced `_refresh_rosette_combo()` — same dual-source pattern
+4. Both methods now log what they received for debugging
+
+### `gui/pages/print_objects.py` — Ink + Well Diameter Refresh (Issue #1 Fix)
+
+**Root Cause**: Print objects tab only received ink options via `WorkspaceConfig`. When inks were added/edited on Page 0, the tab wouldn't see them until a workspace refresh.
+
+**Fix**:
+1. Added/enhanced `set_hardware_config()` to store `self._hw_config`
+2. Added `_refresh_ink_options_from_config()` — updates ink combo with pump assignments
+3. Updates well diameter in preview from `config.plate_format`
+
+### `gui/pages/print_setup.py` — Forward to Sub-Tabs
+
+**Fix**: Added forwarding in `set_hardware_config()` to call:
+- `self.tab_wells.set_hardware_config(config)` — ensures well setup gets latest inks/rosettes
+- `self.tab_objects.set_hardware_config(config)` — ensures print objects gets latest inks
+
+### All Page Files — `_group_style()` → Centralized (Issue #7 Fix)
+
+Replaced the `_group_style()` static method body in every page that had one. The method now returns `SECTION_TITLE_STYLE` from the centralized import instead of defining inline styles. This ensures consistent:
+- Border radius (8px)
+- Title color (blue accent)
+- Title position (top-left with background pill)
+- Padding and margins
+- Font size and weight
+
+---
+
+## Signal Flow After Patch
+
 ```
-1. Name & Notes                 (no dependencies)
-2. Ink Library → _refresh_ink_table() + _refresh_pump_ink_combos()
-3. Rosette Library → _refresh_rosette_table()
-4. Needle gauge + length + channels
-5. Plate format
-6. Pump channels — ink combos are NOW populated
-7. Emit config_changed + config_validated
+User edits Hardware Setup (Page 0)
+  │ config_changed(HardwareConfig)
+  ▼
+app.py._on_hardware_config_changed(config)
+  ├── _save_hardware_config(config)
+  ├── _update_page_gating(config.is_valid)
+  └── _propagate_hardware_config(config)  ← v7.2.4: per-page logging
+        │
+        ├── Page 1 (Dashboard).set_hardware_config(config)
+        ├── Page 2 (Jog).set_hardware_config(config)
+        ├── Page 3 (Calibration).set_hardware_config(config)
+        │     ├── Sync ctx_plate_combo to config.plate_format
+        │     ├── Rebuild WellPlate model
+        │     ├── Recalculate corner well
+        │     ├── Rebuild validation well combo
+        │     └── Update needle info label
+        ├── Page 4 (Print Setup).set_hardware_config(config)
+        │     ├── tab_workspace.set_hardware_config(config)
+        │     │     └── _hardware_config_to_workspace() bridge
+        │     ├── tab_objects.set_hardware_config(config)   ← v7.2.4 NEW
+        │     │     ├── Store _hw_config
+        │     │     ├── Refresh ink combo options
+        │     │     └── Update well diameter
+        │     └── tab_wells.set_hardware_config(config)     ← v7.2.4 NEW
+        │           ├── Store _hw_config
+        │           ├── Refresh ink combo from ink_library
+        │           └── Refresh rosette combo from rosette_library
+        ├── Page 5 (Monitor).set_hardware_config(config)
+        └── Page 6 (Settings).set_hardware_config(config)
 ```
 
-Key details:
-- All widget signals blocked during restore to prevent cascading `_on_config_changed` calls
-- `ink_names` list extracted AFTER ink table refresh, passed to `pw.set_config()`
-- Comprehensive debug logging at each step
-- Fixed needle info label update (removed broken `__wrapped__` call)
+---
 
-#### S1.4 — Fixed `PumpChannelWidget.set_config()` ✅
+## How to Apply
 
-**Old signature**: `set_config(self, config: PumpChannelConfig)`
-**New signature**: `set_config(self, config: PumpChannelConfig, ink_names: list[str] | None = None)`
+```bash
+cd /path/to/MEBP-project
+python patches/v724/patch_s1_styles_and_propagation.py
+```
 
-When `ink_names` is provided, the method calls `self.update_ink_list(ink_names)` BEFORE attempting to set `self.ink_combo.setCurrentIndex()`. This guarantees the ink name is in the combo when the index lookup happens.
+Or specify the project root explicitly:
+```bash
+python patch_s1_styles_and_propagation.py /path/to/MEBP-project
+```
 
-Added warning logging when ink name or syringe volume can't be found in their respective combos.
-
-#### S1.5 — Additional Fixes
-
-- Added `set_hardware_config()` method (v7.2 page interface compatibility)
-- Added `on_status_update()` method (page interface requirement)
-- Added `RosetteInsert` to imports from `PhysicalModels`
-- Shared `_group_style()` method for consistent GroupBox styling
+The patch is idempotent — running it multiple times will skip already-applied changes.
 
 ---
 
-## Files NOT Changed (verified compatible)
+## Next: Session 2
 
-| File | Why unchanged |
-|------|---------------|
-| `SupportClasses/HardwareConfig.py` | Already has `rosette_library`, `add_ink()`, `remove_ink()`, `to_dict()`/`from_dict()` with rosettes |
-| `SupportClasses/PhysicalModels.py` | `RosetteInsert`, `RosetteSubWell`, `create_standard()` already complete |
-| `gui/app.py` | `set_config()` call path unchanged; auto-load works via same `set_config()` → `_apply_config_to_ui()` |
-| `SupportClasses/Settings.py` | `hardware_config` settings key already exists |
-
----
-
-## Test Coverage
-
-| Test | Status |
-|------|--------|
-| HardwareConfig round-trip (dict) | ✅ Covered |
-| HardwareConfig round-trip (JSON file) | ✅ Covered |
-| Validation with/without required fields | ✅ Covered |
-| Ink removal clears from pumps | ✅ Covered |
-| Section ordering verification (source analysis) | ✅ Covered |
-| `_apply_config_to_ui` dependency ordering (source analysis) | ✅ Covered |
-| `PumpChannelWidget.set_config` ink_names parameter | ✅ Covered |
-| Rosette CRUD methods exist | ✅ Covered |
-| `RosetteEditorDialog` importable | ✅ Covered |
-
----
-
-## Verification Checklist
-
-- [x] Python syntax valid (ast.parse passes)
-- [x] All 4 classes present: InkEditorDialog, RosetteEditorDialog, PumpChannelWidget, HardwareSetupPage
-- [x] 38 total methods across all classes
-- [x] Section order: Name → Needle → Plate → Ink → Pumps → Rosettes → Actions
-- [x] `_apply_config_to_ui` restores ink library BEFORE pump combos
-- [x] `set_config` calls `_apply_config_to_ui` (auto-load path)
-- [x] `_load_config` calls `_apply_config_to_ui` (file-load path)
-- [x] Page interface: `get_page_title()`, `get_context_widget()`, `on_status_update()`, `set_hardware_config()`
-- [x] No `__wrapped__` or other suspicious patterns
-- [x] Consistent Catppuccin styling via `COLORS` dict
+Session 2 covers:
+- **Issue #2**: Jog step size display verification + conversion factor display
+- **Issue #3**: Hardware setup config file browser in context panel
