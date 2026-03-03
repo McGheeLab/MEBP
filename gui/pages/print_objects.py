@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon
 
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 logger = logging.getLogger(__name__)
 
@@ -1659,6 +1659,32 @@ class PrintObjectsTab(QWidget):
 
         self._update_well_diameter()
         self._preview.refresh()
+
+
+    def _refresh_ink_options_from_config(self):
+        """v7.2.4: Update ink selection options from HardwareConfig."""
+        if not hasattr(self, '_hw_config') or not self._hw_config:
+            return
+        ink_names = list(self._hw_config.ink_library.keys())
+        # Update ink combo in the designer if it exists
+        if hasattr(self, '_ink_combo'):
+            current = self._ink_combo.currentData()
+            self._ink_combo.clear()
+            for name in ink_names:
+                pump_id = None
+                for pid, pcfg in self._hw_config.pumps.items():
+                    if pcfg.ink and pcfg.ink.name == name:
+                        pump_id = pid
+                        break
+                label = f"{pump_id}: {name}" if pump_id else name
+                self._ink_combo.addItem(label, name)
+            if current:
+                idx = self._ink_combo.findData(current)
+                if idx >= 0:
+                    self._ink_combo.setCurrentIndex(idx)
+        # Update well diameter from plate format
+        self._update_well_diameter()
+        logger.debug(f"PrintObjects: refreshed ink options: {ink_names}")
 
     def _update_well_diameter(self):
         """Set well boundary circle on preview from workspace plate format."""

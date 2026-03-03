@@ -33,7 +33,7 @@ from SupportClasses.SerialUtils import list_serial_ports
 from SupportClasses.ControllerProtocol import (
     ControllerProtocol, discover_controller_files, DEFAULT_CONTROLLERS_DIR,
 )
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.unit_helpers import (
     steps_to_um, um_to_steps, convert_safety_xy_text,
     DEFAULT_MICROSTEPS_PER_MICRON,

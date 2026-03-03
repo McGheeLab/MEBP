@@ -1,5 +1,4 @@
 The calibration left box does not auto update the plate configuration: format 
-the print objects tab of the print setup page does not look like the plan 
 the well setup does not recognize the list of current inks
 the well setup does not recognize the list of current rosettes
 the X and Y movements on the jog page do not show the correct motion amount for the step size requested on the jog settings

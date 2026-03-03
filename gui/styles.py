@@ -71,6 +71,59 @@ COLORS = {
     "bottom_bar_bg": "#181825",
 }
 
+
+
+# ── Centralized Section Styles (v7.2.4) ─────────────────────────
+# Use these instead of per-page _group_style() methods for consistency.
+
+SECTION_TITLE_STYLE = f"""
+    QGroupBox {{
+        font-size: 11pt;
+        font-weight: 600;
+        color: {COLORS['text']};
+        border: 1px solid {COLORS['surface1']};
+        border-radius: 8px;
+        margin-top: 12px;
+        padding: 16px 12px 10px 12px;
+    }}
+    QGroupBox::title {{
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        left: 12px;
+        padding: 2px 8px;
+        background-color: {COLORS['base']};
+        border-radius: 4px;
+        color: {COLORS['blue']};
+        font-size: 10pt;
+        font-weight: 600;
+    }}
+"""
+
+CONTEXT_SECTION_LABEL_STYLE = f"""
+    font-size: 10pt;
+    font-weight: 600;
+    color: {COLORS['blue']};
+    padding: 6px 0px 2px 0px;
+    border-bottom: 1px solid {COLORS['surface1']};
+    margin-bottom: 4px;
+"""
+
+PAGE_HEADER_STYLE = f"""
+    font-size: 14pt;
+    font-weight: 700;
+    color: {COLORS['text']};
+    padding: 4px 0px;
+"""
+
+CARD_FRAME_STYLE = f"""
+    QFrame#cardFrame {{
+        background-color: {COLORS['surface0']};
+        border: 1px solid {COLORS['surface1']};
+        border-radius: 8px;
+        padding: 12px;
+    }}
+"""
+
 # ── Menu Selection Stylesheet (appended dynamically) ─────────────
 MENU_SELECTED_STYLESHEET = (
     "border-left: 3px solid #cba6f7;"

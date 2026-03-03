@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QKeyEvent
 
 from SupportClasses.StageController import StageController
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 logger = logging.getLogger(__name__)
 

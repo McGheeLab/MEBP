@@ -25,7 +25,7 @@ from PySide6.QtGui import QFont
 
 from SupportClasses.StageController import StageController
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import steps_to_um, format_um, DEFAULT_MICROSTEPS_PER_MICRON
 
 try:
@@ -87,26 +87,51 @@ class CalibrationPage(QWidget):
         self._microsteps_per_micron = value
 
     def set_hardware_config(self, config):
-        """v7.2: Set hardware config — auto-select plate format and show needle info."""
+        """v7.2.4: Set hardware config — sync plate format, needle info, and plate model.
+
+        Syncs BOTH the main plate_combo (if it exists) and the context panel
+        ctx_plate_combo. Also rebuilds the WellPlate model and validation
+        well combo so calibration uses the correct plate geometry.
+        """
         self._hardware_config = config
         if config is None:
             return
 
-        # Auto-select plate format from hardware config
+        # Auto-select plate format in context panel combo
         if hasattr(config, 'plate_format') and config.plate_format:
+            fmt = config.plate_format
+            # Sync main plate_combo (if page has one)
             if hasattr(self, 'plate_combo'):
                 for i in range(self.plate_combo.count()):
-                    if self.plate_combo.itemData(i) == config.plate_format:
+                    if self.plate_combo.itemData(i) == fmt:
                         self.plate_combo.setCurrentIndex(i)
                         break
+            # Sync context panel plate combo
+            if hasattr(self, 'ctx_plate_combo'):
+                for i in range(self.ctx_plate_combo.count()):
+                    if self.ctx_plate_combo.itemData(i) == fmt:
+                        if self.ctx_plate_combo.currentIndex() != i:
+                            self.ctx_plate_combo.setCurrentIndex(i)
+                        break
+            # Rebuild the plate model directly so calibration always matches HW config
+            self._plate = WellPlate.from_format(fmt)
+            defn = PLATE_DEFINITIONS[fmt]
+            rows, cols = defn["rows"], defn["cols"]
+            self._corner_well = f"{chr(ord('A') + rows - 1)}{cols}"
+            if hasattr(self, 'val_well_combo'):
+                wells = self._plate.well_names
+                self.val_well_combo.clear()
+                self.val_well_combo.addItems(wells)
+            logger.info(f"Calibration: plate format synced to {fmt}-well from HardwareConfig")
 
         # Show needle info in calibration context panel
-        if hasattr(config, 'needle') and config.needle and hasattr(self, 'ctx_lbl_needle_info'):
+        if hasattr(config, 'needle') and config.needle:
             n = config.needle
-            self.ctx_lbl_needle_info.setText(
-                f"Needle: {n.gauge}G | ID: {n.inner_diameter_um:.0f} µm | "
-                f"Length: {n.length_inches:.1f}\""
-            )
+            needle_text = (f"Needle: {n.gauge}G | ID: {n.id_um:.0f} \u00b5m | "
+                           f"Length: {n.length_inches:.1f}\"")
+            if hasattr(self, 'ctx_lbl_needle_info'):
+                self.ctx_lbl_needle_info.setText(needle_text)
+
 
 
     # ════════════════════════════════════════════════════════════════

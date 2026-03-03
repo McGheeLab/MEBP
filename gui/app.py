@@ -657,16 +657,28 @@ class MainWindow(QMainWindow):
             logger.info("Hardware setup incomplete — pages locked")
 
     def _propagate_hardware_config(self, config: HardwareConfig):
-        """Push hardware config to all pages and the controller."""
+        """Push hardware config to all pages and the controller.
+
+        v7.2.4: Added per-page logging to audit propagation completeness.
+        """
         if hasattr(self.controller, 'set_hardware_config'):
             self.controller.set_hardware_config(config)
+            logger.debug("HW config → StageController")
 
-        for page in self._page_widgets:
+        for i, page in enumerate(self._page_widgets):
             # Skip the hardware setup page — it's the SOURCE, not the target
             if isinstance(page, HardwareSetupPage):
                 continue
+            page_name = getattr(page, '_page_title_text', page.__class__.__name__)
             if hasattr(page, 'set_hardware_config'):
-                page.set_hardware_config(config)
+                try:
+                    page.set_hardware_config(config)
+                    logger.debug(f"HW config → Page {i}: {page_name}")
+                except Exception as e:
+                    logger.error(f"HW config propagation FAILED for Page {i} "
+                                 f"({page_name}): {e}")
+            else:
+                logger.debug(f"HW config → Page {i}: {page_name} (no set_hardware_config)")
 
     def _update_page_gating(self, hardware_valid: bool):
         """Enable/disable navigation buttons for pages requiring hardware setup."""

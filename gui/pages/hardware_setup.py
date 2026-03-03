@@ -49,7 +49,7 @@ from SupportClasses.PhysicalModels import (
     load_needle_catalog, load_syringe_catalog,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 logger = logging.getLogger(__name__)
 
@@ -671,21 +671,8 @@ class HardwareSetupPage(QWidget):
 
     @staticmethod
     def _group_style() -> str:
-        return f"""
-            QGroupBox {{
-                font-weight: bold;
-                color: {COLORS.get('text', '#cdd6f4')};
-                border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 6px;
-                margin-top: 8px;
-                padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 6px;
-            }}
-        """
+        """v7.2.4: Delegates to centralized SECTION_TITLE_STYLE."""
+        return SECTION_TITLE_STYLE
 
     # ════════════════════════════════════════════════════════════════
     #  NEEDLE CHANGE HANDLER

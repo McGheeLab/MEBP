@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPointF, QTimer
 from PySide6.QtGui import QColor, QCursor
 
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
 from gui.widgets.projection_canvas import MiniProjectionView
 
@@ -117,7 +117,53 @@ class WellSetupTab(QWidget):
     def model(self) -> WellSetupModel:
         return self._model
 
-    def set_workspace(self, workspace: WorkspaceConfig) -> None:
+    def set_hardware_config(self, config):
+        """v7.2.4: Receive HardwareConfig directly for ink/rosette/plate sync.
+
+        This ensures the well setup tab always has the latest ink library
+        and rosette library from Page 0, even if the WorkspaceConfig bridge
+        hasn't fired yet.
+        """
+        if config is None:
+            return
+        self._hw_config = config
+        logger.info(f"WellSetup: received HardwareConfig "
+                    f"(plate={config.plate_format}, "
+                    f"inks={list(config.ink_library.keys())}, "
+                    f"rosettes={list(config.rosette_library.keys())})")
+
+        # Refresh ink combo from HardwareConfig ink library
+        if hasattr(self, 'ink_combo'):
+            current_ink = self.ink_combo.currentData()
+            self.ink_combo.clear()
+            self.ink_combo.addItem("(none)", None)
+            for name in config.ink_library:
+                self.ink_combo.addItem(name, name)
+            # Restore previous selection if still valid
+            if current_ink:
+                idx = self.ink_combo.findData(current_ink)
+                if idx >= 0:
+                    self.ink_combo.setCurrentIndex(idx)
+
+        # Refresh rosette combo from HardwareConfig rosette library
+        if hasattr(self, 'rosette_combo'):
+            current_ros = self.rosette_combo.currentData()
+            self.rosette_combo.clear()
+            self.rosette_combo.addItem("None", None)
+            for name in config.rosette_library:
+                self.rosette_combo.addItem(name, name)
+            if current_ros:
+                idx = self.rosette_combo.findData(current_ros)
+                if idx >= 0:
+                    self.rosette_combo.setCurrentIndex(idx)
+
+        # Sync plate format if the model supports it
+        if hasattr(self, '_model') and self._model:
+            if config.plate_format != getattr(self._model, '_plate_format', None):
+                # The plate view will be rebuilt when workspace is also updated
+                pass
+
+        def set_workspace(self, workspace: WorkspaceConfig) -> None:
         """Update workspace config (called when Tab 1 changes)."""
         self._workspace = workspace
         if workspace.plate_format != self._model.plate_format:
@@ -511,18 +557,50 @@ class WellSetupTab(QWidget):
                 role_item.setForeground(color)
 
     def _refresh_ink_combo(self) -> None:
-        """Populate ink combo from workspace ink library."""
+        """Populate ink combo from workspace ink library or HardwareConfig.
+
+        v7.2.4: Prefers HardwareConfig._hw_config if available (most up-to-date),
+        falls back to workspace ink library.
+        """
+        source = {}
+        if hasattr(self, '_hw_config') and self._hw_config:
+            source = self._hw_config.ink_library
+        elif self._workspace:
+            source = self._workspace.ink_library
+
+        current = self.ink_combo.currentData() if self.ink_combo.count() > 0 else None
         self.ink_combo.clear()
         self.ink_combo.addItem("(none)", None)
-        for name in self._workspace.ink_library:
+        for name in source:
             self.ink_combo.addItem(name, name)
+        if current:
+            idx = self.ink_combo.findData(current)
+            if idx >= 0:
+                self.ink_combo.setCurrentIndex(idx)
+        logger.debug(f"WellSetup: ink combo refreshed with {list(source.keys())}")
 
     def _refresh_rosette_combo(self) -> None:
-        """Populate rosette combo from workspace rosette library."""
+        """Populate rosette combo from workspace rosette library or HardwareConfig.
+
+        v7.2.4: Prefers HardwareConfig._hw_config if available (most up-to-date),
+        falls back to workspace rosette library.
+        """
+        source = {}
+        if hasattr(self, '_hw_config') and self._hw_config:
+            source = self._hw_config.rosette_library
+        elif self._workspace:
+            source = self._workspace.rosette_library
+
+        current = self.rosette_combo.currentData() if self.rosette_combo.count() > 0 else None
         self.rosette_combo.clear()
         self.rosette_combo.addItem("None", None)
-        for name in self._workspace.rosette_library:
+        for name in source:
             self.rosette_combo.addItem(name, name)
+        if current:
+            idx = self.rosette_combo.findData(current)
+            if idx >= 0:
+                self.rosette_combo.setCurrentIndex(idx)
+        logger.debug(f"WellSetup: rosette combo refreshed with {list(source.keys())}")
 
     def _refresh_print_combo(self) -> None:
         """Populate print collection combo."""

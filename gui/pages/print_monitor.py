@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer, QRectF
 from PySide6.QtGui import QColor, QPen, QBrush, QPainter, QFont
 
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig

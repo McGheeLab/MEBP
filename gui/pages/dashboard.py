@@ -20,7 +20,7 @@ from PySide6.QtGui import QFont
 
 from SupportClasses.StageController import StageController
 from SupportClasses.PrintHistory import PrintHistory
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig

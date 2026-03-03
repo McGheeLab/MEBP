@@ -39,7 +39,7 @@ from SupportClasses.PrintManager import (
     build_well_plate_job, save_print_job, export_gcode,
 )
 from SupportClasses.PhysicalModels import WorkspaceConfig
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig
@@ -130,6 +130,13 @@ class PrintSetupPage(QWidget):
     def set_hardware_config(self, config):
         """
         v7.2.3: Set hardware config — forward to all tabs.
+
+        # v7.2.4: Forward to Well Setup tab for ink/rosette refresh
+        if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, 'set_hardware_config'):
+            self.tab_wells.set_hardware_config(config)
+        # v7.2.4: Forward to Print Objects tab for ink refresh
+        if hasattr(self, 'tab_objects') and hasattr(self.tab_objects, 'set_hardware_config'):
+            self.tab_objects.set_hardware_config(config)
 
         The workspace tab receives the config and builds a WorkspaceConfig
         from it via the bridge method, then emits workspace_changed.

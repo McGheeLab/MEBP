@@ -46,7 +46,7 @@ from SupportClasses.PhysicalModels import (
     load_needle_catalog, load_syringe_catalog,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
-from gui.styles import COLORS
+from gui.styles import COLORS, SECTION_TITLE_STYLE
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
