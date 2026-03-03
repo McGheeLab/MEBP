@@ -126,18 +126,18 @@ from SupportClasses.PhysicalModels import (
     WellRole, ROLE_COLORS, InkSpec, RosetteInsert, WorkspaceConfig,
 )
 from SupportClasses.WellPlate import WellPlate, ROW_LABELS
+
 from SupportClasses.WellSetup import (
+    WellAssignment, WellSetupModel, ServiceSequence,
+    WashBehavior, WasteBehavior, BufferBehavior,
+    InkPickupBehavior, SortedCellBehavior, PlaneResult,
+    auto_assign_block, auto_assign_checkerboard, auto_assign_border,
+)
 
 from SupportClasses.PrintPlanOfAction import (
     PrintPlanOfAction, PlanPreferences, PlanStepType,
     PLAN_STEP_COLORS, PLAN_STEP_ICONS,
     validate_well_setup,
-)
-
-    WellAssignment, WellSetupModel, ServiceSequence,
-    WashBehavior, WasteBehavior, BufferBehavior,
-    InkPickupBehavior, SortedCellBehavior, PlaneResult,
-    auto_assign_block, auto_assign_checkerboard, auto_assign_border,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,7 +245,7 @@ class WellSetupTab(QWidget):
                 # The plate view will be rebuilt when workspace is also updated
                 pass
 
-        def set_workspace(self, workspace: WorkspaceConfig) -> None:
+    def set_workspace(self, workspace: WorkspaceConfig) -> None:
         """Update workspace config (called when Tab 1 changes)."""
         self._workspace = workspace
         if workspace.plate_format != self._model.plate_format:
@@ -958,7 +958,7 @@ class WellSetupTab(QWidget):
             try:
                 pos = self._controller.get_zp_position()
                 if pos:
-                    z_mm = pos.get("Z", 0.0)
+                    z_mm = pos[0] if pos and pos[0] is not None else 0.0
                     # Convert steps to mm if needed
                     if abs(z_mm) > 100:
                         z_mm = z_mm / 1000.0  # Rough conversion

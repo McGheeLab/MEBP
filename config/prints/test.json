@@ -1,7 +1,7 @@
 {
   "schema_version": "7.2.3",
   "metadata": {
-    "name": "Dot_Array_4x4",
+    "name": "test",
     "description": "4x4 grid of hydrogel dots for cell adhesion testing",
     "created": "2026-03-02T12:00:00+00:00",
     "modified": "2026-03-02T12:00:00+00:00",
@@ -13,7 +13,11 @@
       "params": {
         "radius": 0.25
       },
-      "position": [0.0, 0.0, 0.0],
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "color": "#a6e3a1",
       "ink_pump": "P1",
       "num_layers": 1,
@@ -24,11 +28,19 @@
   "layout_presets": {
     "Grid_4x4": {
       "pattern": "square_grid",
-      "params": {"rows": 4, "cols": 4, "spacing": 0.8}
+      "params": {
+        "rows": 4,
+        "cols": 4,
+        "spacing": 0.8
+      }
     },
     "Hex_Pack": {
       "pattern": "hex_grid",
-      "params": {"rows": 4, "cols": 4, "spacing": 0.8}
+      "params": {
+        "rows": 4,
+        "cols": 4,
+        "spacing": 0.8
+      }
     }
   }
 }

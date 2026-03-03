@@ -55,7 +55,7 @@ try:
     HAS_WELL_PREVIEW = True
 except ImportError:
     HAS_WELL_PREVIEW = False
-, SECTION_TITLE_STYLE
+
 
 logger = logging.getLogger(__name__)
 
@@ -1018,7 +1018,7 @@ class PrintObjectsTab(QWidget):
         try:
             self._file_manager.load(name)
             self._active_file_name = name
-            self._current_file = self._file_manager._current_file
+            self._current_file = str(self._file_manager.current_path) if self._file_manager.current_path else None
 
             # Rebuild objects list from file data
             self._objects.clear()
