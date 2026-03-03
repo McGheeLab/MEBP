@@ -22,75 +22,7 @@ Layout matches the coding plan Tab 3 wireframe:
 ├────────────────────────────────────────────────────────┤
 │  Well Bottom Detection                                 │
 ├────────────────────────────────────────────────────────┤
-│  
-        # -- Print Plan of Action (v7.2.4 S5) ---------------------
-        plan_group = QGroupBox("Print Plan of Action")
-        plan_group.setCheckable(True)
-        plan_group.setChecked(True)
-        plan_layout = QVBoxLayout(plan_group)
-
-        # Plan preferences row
-        pref_row = QHBoxLayout()
-
-        pref_row.addWidget(QLabel("Max Ink/Run:"))
-        self._max_ink_spin = QDoubleSpinBox()
-        self._max_ink_spin.setRange(0.1, 1000.0)
-        self._max_ink_spin.setValue(100.0)
-        self._max_ink_spin.setSuffix(" uL")
-        self._max_ink_spin.setDecimals(1)
-        pref_row.addWidget(self._max_ink_spin)
-
-        self._wash_check = QCheckBox("Wash")
-        self._wash_check.setChecked(True)
-        pref_row.addWidget(self._wash_check)
-
-        self._waste_check = QCheckBox("Waste")
-        self._waste_check.setChecked(True)
-        pref_row.addWidget(self._waste_check)
-
-        self._buffer_check = QCheckBox("Buffer")
-        self._buffer_check.setChecked(True)
-        pref_row.addWidget(self._buffer_check)
-
-        plan_layout.addLayout(pref_row)
-
-        # Generate + Validate buttons
-        btn_row = QHBoxLayout()
-        self._generate_plan_btn = QPushButton("Generate Plan")
-        self._generate_plan_btn.clicked.connect(self._generate_plan)
-        btn_row.addWidget(self._generate_plan_btn)
-
-        self._validate_btn = QPushButton("Validate Setup")
-        self._validate_btn.clicked.connect(self._run_validation)
-        btn_row.addWidget(self._validate_btn)
-        plan_layout.addLayout(btn_row)
-
-        # Plan step display (scrollable list)
-        self._plan_display = QLabel("No plan generated yet")
-        self._plan_display.setWordWrap(True)
-        self._plan_display.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px; padding: 4px;")
-        plan_scroll = QScrollArea()
-        plan_scroll.setWidget(self._plan_display)
-        plan_scroll.setWidgetResizable(True)
-        plan_scroll.setMaximumHeight(180)
-        plan_layout.addWidget(plan_scroll)
-
-        # Plan summary
-        self._plan_summary = QLabel("")
-        self._plan_summary.setStyleSheet(
-            f"color: {COLORS['text']}; font-weight: bold; font-size: 10px;")
-        plan_layout.addWidget(self._plan_summary)
-
-        # Validation status
-        self._validation_label = QLabel("")
-        self._validation_label.setWordWrap(True)
-        self._validation_label.setStyleSheet(f"font-size: 10px;")
-        plan_layout.addWidget(self._validation_label)
-
-        main_layout.addWidget(plan_group)
-
-Assignment Summary Table                              │
+│  Assignment Summary Table                              │
 └────────────────────────────────────────────────────────┘
 
 Session G — Tasks P5.19, P5.23, P5.26, P5.27, P5.32, P5.33, P5.34, P5.35.
@@ -108,7 +40,6 @@ from pathlib import Path
 from functools import partial
 
 from PySide6.QtWidgets import (
-    QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox,
     QFileDialog, QFrame, QTableWidget, QTableWidgetItem,
@@ -127,13 +58,6 @@ from SupportClasses.PhysicalModels import (
 )
 from SupportClasses.WellPlate import WellPlate, ROW_LABELS
 from SupportClasses.WellSetup import (
-
-from SupportClasses.PrintPlanOfAction import (
-    PrintPlanOfAction, PlanPreferences, PlanStepType,
-    PLAN_STEP_COLORS, PLAN_STEP_ICONS,
-    validate_well_setup,
-)
-
     WellAssignment, WellSetupModel, ServiceSequence,
     WashBehavior, WasteBehavior, BufferBehavior,
     InkPickupBehavior, SortedCellBehavior, PlaneResult,
@@ -182,12 +106,6 @@ class WellSetupTab(QWidget):
 
         # Available print collections (populated from Tab 2)
         self._available_prints: list[str] = []
-
-        # v7.2.4: Print Plan of Action (S5)
-        self._plan: PrintPlanOfAction | None = None
-        self._plan_preferences = PlanPreferences()
-        self._hw_config = None
-
 
         self._build_ui()
         self._connect_signals()
@@ -1056,106 +974,6 @@ class WellSetupTab(QWidget):
                 f"color: {COLORS['yellow']};")
 
     # ── Save/Load ─────────────────────────────────────────────────
-
-
-    # == Print Plan of Action (v7.2.4 S5) ========================
-
-    def _get_plan_preferences(self) -> PlanPreferences:
-        """Build PlanPreferences from UI controls."""
-        prefs = PlanPreferences(
-            wash_after_refill=self._wash_check.isChecked(),
-            waste_before_refill=self._waste_check.isChecked(),
-            refill_buffer_after_waste=self._buffer_check.isChecked(),
-        )
-        # Set max ink per run for all pumps
-        max_vol = self._max_ink_spin.value()
-        if self._hw_config:
-            for pid in self._hw_config.enabled_pump_ids:
-                prefs.max_ink_volume_uL[pid] = max_vol
-        return prefs
-
-    def _generate_plan(self) -> None:
-        """Generate execution plan from current setup."""
-        if self._hw_config is None:
-            self._plan_display.setText(
-                "Cannot generate plan: no hardware configuration")
-            return
-
-        prefs = self._get_plan_preferences()
-        try:
-            self._plan = PrintPlanOfAction.generate_plan(
-                hw_config=self._hw_config,
-                well_model=self._model,
-                preferences=prefs,
-            )
-        except Exception as e:
-            self._plan_display.setText(f"Plan generation failed: {e}")
-            logger.error(f"Plan generation error: {e}", exc_info=True)
-            return
-
-        # Display steps
-        if self._plan and self._plan.steps:
-            lines = self._plan.step_summary_lines()
-            self._plan_display.setText("\n".join(lines))
-            self._plan_summary.setText(self._plan.summary())
-            self._plan_summary.setStyleSheet(
-                f"color: {COLORS['green']}; font-weight: bold; font-size: 10px;")
-        else:
-            self._plan_display.setText("Plan is empty (no print wells?)")
-            self._plan_summary.setText("")
-
-        # Auto-validate after generation
-        self._run_validation()
-
-    def _run_validation(self) -> None:
-        """Run comprehensive validation and display results."""
-        if self._hw_config is None:
-            self._validation_label.setText(
-                "Cannot validate: no hardware configuration")
-            self._validation_label.setStyleSheet(
-                f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
-            return
-
-        is_valid, issues = validate_well_setup(
-            hw_config=self._hw_config,
-            well_model=self._model,
-            plan=self._plan,
-        )
-
-        if is_valid:
-            self._validation_label.setText("Ready to print")
-            self._validation_label.setStyleSheet(
-                f"color: {COLORS['green']}; font-size: 10px;")
-        else:
-            text = "Issues found:\n" + "\n".join(f"  {i}" for i in issues)
-            self._validation_label.setText(text)
-            self._validation_label.setStyleSheet(
-                f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-
-    def _on_plan_auto_regen(self) -> None:
-        """Auto-regenerate plan when assignments change (debounced)."""
-        if self._plan is not None and self._hw_config is not None:
-            self._generate_plan()
-
-
-
-    def validate(self) -> tuple[bool, list[str]]:
-        """
-        v7.2.4 S5.11: Comprehensive validation before send-to-monitor.
-
-        Called by print_setup.py before emitting job_ready signal.
-        Returns (is_valid, list_of_issues).
-        """
-        return validate_well_setup(
-            hw_config=self._hw_config,
-            well_model=self._model,
-            plan=self._plan,
-        )
-
-    def get_plan(self) -> PrintPlanOfAction | None:
-        """Get the current plan of action (for inclusion in PrintJob)."""
-        return self._plan
-
 
     def _save_layout(self) -> None:
         """Save well setup to JSON."""

@@ -505,77 +505,19 @@ class PrintSetupPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _send_to_monitor(self):
-        """
-        v7.2.4 S5.12: Build a print job with validation gate.
-
-        Validates well setup before sending. Shows issues dialog on failure.
-        Includes PrintPlanOfAction in the job when valid.
-        """
-        # Run validation first
-        if hasattr(self.tab_wells, 'validate'):
-            is_valid, issues = self.tab_wells.validate()
-            if not is_valid:
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Setup Validation Failed")
-                msg.setIcon(QMessageBox.Icon.Warning)
-                msg.setText(
-                    f"Cannot send to monitor: {len(issues)} issue(s) found."
-                )
-                msg.setDetailedText("\n".join(f"\u2022 {i}" for i in issues))
-                msg.exec()
-                self.status_label.setText(
-                    f"\u26a0 {len(issues)} validation issue(s)")
-                self.status_label.setStyleSheet(
-                    f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-                logger.warning(f"Send-to-monitor blocked: {issues}")
-                return
-
-        # Build job
+        """Build a print job and emit job_ready for Print Monitor."""
         job = self._build_current_job()
         if job is None:
-            self.status_label.setText("\u26a0 No job -- configure wells first")
+            self.status_label.setText("⚠ No job — configure wells first")
             self.status_label.setStyleSheet(
                 f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
             return
 
-        # Attach plan of action to job
-        if hasattr(self.tab_wells, 'get_plan'):
-            plan = self.tab_wells.get_plan()
-            if plan is not None:
-                job.plan_of_action = plan
-
-        # Show confirmation
-        summary_parts = []
-        if hasattr(self.tab_wells, '_model'):
-            model = self.tab_wells._model
-            print_wells = [
-                n for n, a in model.assignments.items()
-                if a.role.value == "print"
-            ]
-            summary_parts.append(f"{len(print_wells)} print wells")
-        if hasattr(self.tab_wells, 'get_plan'):
-            plan = self.tab_wells.get_plan()
-            if plan:
-                summary_parts.append(f"{plan.total_runs} run(s)")
-                summary_parts.append(
-                    f"~{plan.estimated_total_seconds / 60:.1f} min")
-
-        confirm = QMessageBox.question(
-            self,
-            "Send to Monitor",
-            f"Send job to Print Monitor?\n\n"
-            + "\n".join(summary_parts),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-
         self.job_ready.emit(job)
-        self.status_label.setText(f"\u2713 Job sent: {job.name}")
+        self.status_label.setText(f"✓ Job sent to Monitor: {job.name}")
         self.status_label.setStyleSheet(
             f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
         logger.info(f"Print job sent to Monitor: {job.name}")
-
 
     def _build_current_job(self):
         """Build a print job from current well setup and settings."""
