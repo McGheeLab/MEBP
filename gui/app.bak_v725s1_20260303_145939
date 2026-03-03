@@ -127,9 +127,6 @@ class MainWindow(QMainWindow):
             # v7.2.5 NOTE: Jog page now sends microns directly to the
             # Prior controller via move_xy_relative_um(). The microsteps_per_micron
             # factor is kept for backward compat with other pages that may need it.
-            # v7.2.5 NOTE: Jog page now sends microns directly to the
-            # Prior controller via move_xy_relative_um(). The microsteps_per_micron
-            # factor is kept for backward compat with other pages that may need it.
             if hasattr(page, 'set_microsteps_per_micron'):
                 page.set_microsteps_per_micron(self._microsteps_per_micron)
         logger.info(f"microsteps_per_micron set to {self._microsteps_per_micron}")

@@ -36,10 +36,7 @@ XY_STEPS_UM = [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
 # Z and pump step sizes remain in mm
 Z_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
-# v7.2.5: Pump steps in µL (converted to mm via HardwareConfig)
-# Fallback: used as mm if no HW config available
-P_STEPS_UL = [0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
-P_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]  # legacy mm fallback
+P_STEPS  = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
 
 
 class JogControlPage(QWidget):
@@ -52,9 +49,6 @@ class JogControlPage(QWidget):
         self.controller = controller
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._context_widget = None
-
-        # v7.2.5: Hardware config for pump enable/disable and µL display
-        self._hardware_config = None
 
         # Microsteps per micron — set by MainWindow, default 10 (ProScan III typical)
         self._microsteps_per_micron: float = 10.0
@@ -176,7 +170,7 @@ class JogControlPage(QWidget):
         for col, (name, attr) in enumerate([
             ("X (µm):", "lbl_x"), ("Y (µm):", "lbl_y"),
             ("Z (mm):", "lbl_z"),
-            ("P1 (µL):", "lbl_p1"), ("P2 (µL):", "lbl_p2"), ("P3 (µL):", "lbl_p3"),
+            ("P1:", "lbl_p1"), ("P2:", "lbl_p2"), ("P3:", "lbl_p3"),
         ]):
             lbl = QLabel(name)
             lbl.setStyleSheet(f"color: {COLORS['overlay0']};")
@@ -240,13 +234,10 @@ class JogControlPage(QWidget):
         z_group.addWidget(btn_z_down)
         zp_layout.addLayout(z_group)
 
-        # Pump buttons — v7.2.5: store refs for enable/disable
-        self._pump_buttons = {}  # {pump_name: (label, btn_ext, btn_ret)}
-        self._pump_labels = {}   # {pump_name: QLabel for position}
+        # Pump buttons
         for pump_name in ["P1", "P2", "P3"]:
             p_group = QVBoxLayout()
-            p_label = QLabel(pump_name)
-            p_group.addWidget(p_label)
+            p_group.addWidget(QLabel(pump_name))
             btn_ext = QPushButton(f"{pump_name} ▲")
             btn_ext.clicked.connect(partial(self._jog_pump, pump_name, 1))
             p_group.addWidget(btn_ext)
@@ -254,7 +245,6 @@ class JogControlPage(QWidget):
             btn_ret.clicked.connect(partial(self._jog_pump, pump_name, -1))
             p_group.addWidget(btn_ret)
             zp_layout.addLayout(p_group)
-            self._pump_buttons[pump_name] = (p_label, btn_ext, btn_ret)
 
         main_layout.addWidget(zp_frame)
 
@@ -286,43 +276,8 @@ class JogControlPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def set_hardware_config(self, config):
-        """v7.2.5: Receive hardware config — enable/disable pump buttons, µL display."""
+        """v7.2.4: Receive hardware config (for future pump µL display)."""
         self._hardware_config = config
-        self._update_pump_states()
-        self._refresh_pump_step_combo()
-    def _update_pump_states(self):
-        """v7.2.5: Enable/disable pump buttons based on HardwareConfig."""
-        if not hasattr(self, '_pump_buttons'):
-            return
-
-        configured_pumps = set()
-        if self._hardware_config:
-            configured_pumps = set(self._hardware_config.configured_pump_ids)
-
-        for pump_name, (label, btn_ext, btn_ret) in self._pump_buttons.items():
-            is_configured = pump_name in configured_pumps
-            btn_ext.setEnabled(is_configured)
-            btn_ret.setEnabled(is_configured)
-            if is_configured:
-                label.setStyleSheet(f"color: {COLORS['text']};")
-                btn_ext.setToolTip(f"Extend {pump_name}")
-                btn_ret.setToolTip(f"Retract {pump_name}")
-            else:
-                label.setStyleSheet(f"color: {COLORS.get('overlay0', '#6c7086')};")
-                btn_ext.setToolTip(f"{pump_name} not configured")
-                btn_ret.setToolTip(f"{pump_name} not configured")
-
-        # Update pump position labels in readout
-        for col, pump_name in enumerate(["P1", "P2", "P3"], start=3):
-            lbl_attr = f"lbl_p{pump_name[-1]}"
-            if hasattr(self, lbl_attr):
-                lbl = getattr(self, lbl_attr)
-                if pump_name not in configured_pumps:
-                    lbl.setText("—")
-                    lbl.setStyleSheet(
-                        f"color: {COLORS.get('overlay0', '#6c7086')}; font-size: 11px;")
-
-
 
     def on_status_update(self):
         """Called by MainWindow timer (~300 ms)."""
@@ -339,25 +294,13 @@ class JogControlPage(QWidget):
             self.lbl_x.setText("—")
             self.lbl_y.setText("—")
 
-        # ZP position
+        # ZP position (already in mm)
         zp = ctrl.get_zp_position(cached=True)
         if zp[0] is not None:
             self.lbl_z.setText(f"{zp[0] - ctrl.zero_position['Z']:.2f}")
-            # v7.2.5: Display pump positions in µL if HW config available
-            for pidx, pid in enumerate(["P1", "P2", "P3"], start=1):
-                lbl = getattr(self, f"lbl_p{pidx}", None)
-                if lbl is None:
-                    continue
-                pos_mm = zp[pidx] - ctrl.zero_position[pid]
-                if (self._hardware_config and
-                        pid in self._hardware_config.configured_pump_ids):
-                    try:
-                        pos_uL = self._hardware_config.mm_to_uL(pid, pos_mm)
-                        lbl.setText(f"{pos_uL:.2f}")
-                        continue
-                    except (ValueError, AttributeError):
-                        pass
-                lbl.setText(f"{pos_mm:.2f}")
+            self.lbl_p1.setText(f"{zp[1] - ctrl.zero_position['P1']:.2f}")
+            self.lbl_p2.setText(f"{zp[2] - ctrl.zero_position['P2']:.2f}")
+            self.lbl_p3.setText(f"{zp[3] - ctrl.zero_position['P3']:.2f}")
         else:
             for lbl in [self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3]:
                 lbl.setText("—")
@@ -379,35 +322,6 @@ class JogControlPage(QWidget):
     # ════════════════════════════════════════════════════════════════
     #  KEYBOARD SHORTCUTS
     # ════════════════════════════════════════════════════════════════
-
-
-    def _refresh_pump_step_combo(self):
-        """v7.2.5: Update pump step combo with µL values if HW config available."""
-        if not hasattr(self, 'p_step_combo'):
-            return
-        self.p_step_combo.blockSignals(True)
-        current_data = self.p_step_combo.currentData()
-        self.p_step_combo.clear()
-        if self._hardware_config and self._hardware_config.configured_pump_ids:
-            # Use µL step sizes
-            for s in P_STEPS_UL:
-                self.p_step_combo.addItem(f"{s:g} µL", s)
-            # Try to restore selection
-            idx = self.p_step_combo.findData(current_data)
-            if idx >= 0:
-                self.p_step_combo.setCurrentIndex(idx)
-            else:
-                self.p_step_combo.setCurrentIndex(2)  # Default 1.0 µL
-        else:
-            # Fallback: mm step sizes
-            for s in P_STEPS:
-                self.p_step_combo.addItem(f"{s:g} mm", s)
-            idx = self.p_step_combo.findData(current_data)
-            if idx >= 0:
-                self.p_step_combo.setCurrentIndex(idx)
-            else:
-                self.p_step_combo.setCurrentIndex(2)  # Default 0.1 mm
-        self.p_step_combo.blockSignals(False)
 
     def _setup_shortcuts(self):
         self._key_actions = {
@@ -486,23 +400,8 @@ class JogControlPage(QWidget):
             self.controller.move_z_relative(direction * self.z_step_combo.currentData())
 
     def _jog_pump(self, pump: str, direction: int):
-        """v7.2.5: Jog pump — convert µL step to mm if HW config available."""
-        if not self.controller.is_zp_connected:
-            return
-        step_val = self.p_step_combo.currentData()
-        # v7.2.5: If HW config available, step_val is in µL — convert to mm
-        if self._hardware_config:
-            pump_cfg = self._hardware_config.pumps.get(pump)
-            if pump_cfg and pump_cfg.is_configured:
-                try:
-                    step_mm = self._hardware_config.uL_to_mm(pump, step_val)
-                    self.controller.move_pump_relative(pump, direction * step_mm)
-                    logger.debug(f"Pump {pump}: {step_val} µL = {step_mm:.4f} mm")
-                    return
-                except (ValueError, AttributeError) as e:
-                    logger.warning(f"µL→mm conversion failed for {pump}: {e}")
-        # Fallback: use raw value as mm
-        self.controller.move_pump_relative(pump, direction * step_val)
+        if self.controller.is_zp_connected:
+            self.controller.move_pump_relative(pump, direction * self.p_step_combo.currentData())
 
     def _set_zero(self):
         self.controller._calibrate_zero()

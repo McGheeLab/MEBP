@@ -897,28 +897,10 @@ class PrintObjectsTab(QWidget):
 
     def _build_summary_section(self, parent_layout):
         self._summary_label = QLabel("No objects")
-
-        # v7.2.5: "Send to Available Prints" button
-        self._btn_send_to_prints = QPushButton("📋 Send to Available Prints")
-        self._btn_send_to_prints.setToolTip(
-            "Refresh the list of available prints for well setup assignment")
-        self._btn_send_to_prints.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS.get('mauve', '#cba6f7')};
-                color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 6px 12px;
-                border-radius: 4px; font-size: 11px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS.get('pink', '#f5c2e7')};
-            }}
-        """)
-        self._btn_send_to_prints.clicked.connect(self._send_to_available_prints)
         self._summary_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; background: {COLORS['surface0']}; "
             f"padding: 4px 8px; border-radius: 4px; font-size: 11px;")
         parent_layout.addWidget(self._summary_label)
-        parent_layout.addWidget(self._btn_send_to_prints)
 
     # ══════════════════════════════════════════════════════════════
     #  FILE BAR OPERATIONS
@@ -2025,40 +2007,6 @@ class PrintObjectsTab(QWidget):
     # ══════════════════════════════════════════════════════════════
     #  SIGNALS & INTEGRATION (S4B.12, S4A.9)
     # ══════════════════════════════════════════════════════════════
-
-
-    def _send_to_available_prints(self):
-        """v7.2.5: Explicitly send current prints list to well setup."""
-        self._emit_prints_changed()
-        # Provide visual feedback
-        if hasattr(self, '_btn_send_to_prints'):
-            original_text = self._btn_send_to_prints.text()
-            self._btn_send_to_prints.setText("✓ Prints list sent!")
-            self._btn_send_to_prints.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS.get('green', '#a6e3a1')};
-                    color: {COLORS.get('base', '#1e1e2e')};
-                    font-weight: bold; padding: 6px 12px;
-                    border-radius: 4px; font-size: 11px;
-                }}
-            """)
-            QTimer.singleShot(1500, lambda: self._restore_send_button(original_text))
-
-    def _restore_send_button(self, text: str):
-        """Restore send button to default style after feedback."""
-        if hasattr(self, '_btn_send_to_prints'):
-            self._btn_send_to_prints.setText(text)
-            self._btn_send_to_prints.setStyleSheet(f"""
-                QPushButton {{
-                    background: {COLORS.get('mauve', '#cba6f7')};
-                    color: {COLORS.get('base', '#1e1e2e')};
-                    font-weight: bold; padding: 6px 12px;
-                    border-radius: 4px; font-size: 11px;
-                }}
-                QPushButton:hover {{
-                    background: {COLORS.get('pink', '#f5c2e7')};
-                }}
-            """)
 
     def _emit_prints_changed(self):
         """Emit prints_changed with list of print file names."""

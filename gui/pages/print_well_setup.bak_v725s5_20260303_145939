@@ -441,7 +441,6 @@ class WellSetupTab(QWidget):
         self._plate_view.update_well_roles(self._model.get_role_map())
         self._refresh_summary_table()
         self._refresh_summary_table()
-        self._refresh_well_status_colors()
         self.setup_changed.emit()
         # Auto-regenerate plan if available
         if hasattr(self, '_on_plan_auto_regen'):
@@ -1227,8 +1226,6 @@ class WellSetupTab(QWidget):
         self._model.set_ink(selected, ink_name)
         self._refresh_well_colors()
         self._refresh_summary()
-        self._refresh_well_status_colors()
-        self._refresh_summary_table()
         self.setup_changed.emit()
 
     def _assign_print(self, replace: bool = False) -> None:
@@ -1562,24 +1559,6 @@ class WellSetupTab(QWidget):
         """Get the current plan of action (for inclusion in PrintJob)."""
         return self._plan
 
-
-
-    def _refresh_well_status_colors(self):
-        """v7.2.5: Update well border colors based on assignment status."""
-        if not hasattr(self, '_plate_view') or not self._plate_view:
-            return
-
-        status_map = {}
-        for name, wa in self._model.assignments.items():
-            if wa.role == WellRole.EMPTY:
-                status_map[name] = "empty"
-            elif self._check_well_ready(wa):
-                status_map[name] = "ready"
-            else:
-                status_map[name] = "incomplete"
-
-        if hasattr(self._plate_view, 'update_well_status'):
-            self._plate_view.update_well_status(status_map)
 
     def _save_layout(self) -> None:
         """Save well setup to JSON."""

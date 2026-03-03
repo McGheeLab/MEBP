@@ -249,11 +249,6 @@ class PrintSetupPage(QWidget):
             self.tab_objects.collections_changed.connect(
                 self._on_collections_changed)
 
-        # v7.2.5: Also connect prints_changed (primary signal)
-        if hasattr(self.tab_objects, 'prints_changed'):
-            self.tab_objects.prints_changed.connect(
-                self._on_collections_changed)
-
         # Wells → execution readiness
         if hasattr(self.tab_wells, 'setup_changed'):
             self.tab_wells.setup_changed.connect(self._on_setup_changed)
@@ -742,10 +737,9 @@ class PrintSetupPage(QWidget):
         logger.debug("Workspace config propagated to all tabs")
 
     def _on_collections_changed(self, collection_names: list[str]):
-        """v7.2.5: Print Objects tab changed collections → update Well Setup tab."""
+        """Print Objects tab changed collections → update Well Setup tab."""
         if hasattr(self.tab_wells, 'set_available_prints'):
             self.tab_wells.set_available_prints(collection_names)
-            logger.info(f"Forwarded {len(collection_names)} prints to well setup")
 
     def _on_setup_changed(self):
         """Well Setup tab changed → may affect execution readiness."""

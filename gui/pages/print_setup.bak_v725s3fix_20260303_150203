@@ -249,11 +249,6 @@ class PrintSetupPage(QWidget):
             self.tab_objects.collections_changed.connect(
                 self._on_collections_changed)
 
-        # v7.2.5: Also connect prints_changed (primary signal)
-        if hasattr(self.tab_objects, 'prints_changed'):
-            self.tab_objects.prints_changed.connect(
-                self._on_collections_changed)
-
         # Wells → execution readiness
         if hasattr(self.tab_wells, 'setup_changed'):
             self.tab_wells.setup_changed.connect(self._on_setup_changed)

@@ -788,38 +788,6 @@ class StageController:
                      f"microsteps (raw: dx={dx:.2f} dy={dy:.2f})")
         self.xy_stage.move_stage_relative(dx, dy)
 
-    def move_xy_relative_um(self, dx_um: float, dy_um: float) -> None:
-        """
-        Move XY stage by a relative offset in MICRONS.
-
-        v7.2.5: The Prior ProScan controller accepts movement commands
-        in microns directly. This method sends micron values without
-        any microstep conversion.
-
-        Safety limits are projected from cached position.
-        """
-        if not self.xy_stage:
-            return
-
-        # Safety: project cached position + delta, clamp if needed
-        # Note: safety limits and positions are all in the same units (microns)
-        if self.safety_limits.enabled:
-            pos = self.get_xy_position(cached=True)
-            if pos[0] is not None:
-                zero_x = self.zero_position["x"]
-                zero_y = self.zero_position["y"]
-                cur_zr_x = pos[0] - zero_x
-                cur_zr_y = pos[1] - zero_y
-                new_zr_x = cur_zr_x + dx_um
-                new_zr_y = cur_zr_y + dy_um
-                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_zr_x, new_zr_y)
-                dx_um = clamped_x - cur_zr_x
-                dy_um = clamped_y - cur_zr_y
-
-        logger.debug(f"move_xy_relative_um: sending dx={dx_um:.1f} dy={dy_um:.1f} µm")
-        self.xy_stage.move_stage_relative(dx_um, dy_um)
-
-
 
     def move_z_absolute(
         self, z_value: float, from_zero_ref: bool = True, fast: bool = False

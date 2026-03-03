@@ -1177,10 +1177,8 @@ class HardwareSetupPage(QWidget):
 
         # ── 3. Ink Library (MUST come before pumps) ──────────────
         self._refresh_ink_table()
-        # v7.2.5: Force pump ink combo refresh BEFORE pump restore
-        self._refresh_pump_ink_combos()
         ink_names = list(self._config.ink_library.keys())
-        logger.debug(f"  Ink library: {len(ink_names)} inks — pump combos refreshed")
+        logger.debug(f"  Ink library: {len(ink_names)} inks")
 
         # ── 4. Rosette Library ───────────────────────────────────
         self._refresh_rosette_table()
@@ -1222,42 +1220,6 @@ class HardwareSetupPage(QWidget):
                     f"ink={pcfg.ink.name if pcfg.ink else None}, "
                     f"mode={pcfg.printing_mode.value}")
 
-        # v7.2.5: Verify pump ink assignments after restore
-        for pid, pw in self._pump_widgets.items():
-            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
-            expected_ink = self._config.pumps[pid].ink.name if (
-                pid in self._config.pumps and self._config.pumps[pid].ink) else None
-            if expected_ink and actual_ink != expected_ink:
-                logger.warning(
-                    f"  {pid} ink mismatch: expected={expected_ink}, "
-                    f"actual={actual_ink}. Re-applying...")
-                # Force re-apply: set the combo directly
-                idx = pw.ink_combo.findText(expected_ink)
-                if idx >= 0:
-                    pw.ink_combo.blockSignals(True)
-                    pw.ink_combo.setCurrentIndex(idx)
-                    pw.ink_combo.blockSignals(False)
-                else:
-                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
-
-        # v7.2.5: Verify pump ink assignments after restore
-        for pid, pw in self._pump_widgets.items():
-            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
-            expected_ink = self._config.pumps[pid].ink.name if (
-                pid in self._config.pumps and self._config.pumps[pid].ink) else None
-            if expected_ink and actual_ink != expected_ink:
-                logger.warning(
-                    f"  {pid} ink mismatch: expected={expected_ink}, "
-                    f"actual={actual_ink}. Re-applying...")
-                # Force re-apply: set the combo directly
-                idx = pw.ink_combo.findText(expected_ink)
-                if idx >= 0:
-                    pw.ink_combo.blockSignals(True)
-                    pw.ink_combo.setCurrentIndex(idx)
-                    pw.ink_combo.blockSignals(False)
-                else:
-                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
-
         # Refresh exclusions after all pumps loaded
         self._refresh_pump_ink_exclusions()
         self._update_pump_ink_summary()
@@ -1272,11 +1234,6 @@ class HardwareSetupPage(QWidget):
                     combo.blockSignals(True)
                     combo.setCurrentIndex(idx)
                     combo.blockSignals(False)
-                else:
-                    logger.warning(
-                        f"  Channel {ch_idx}: pump {mapped_pump!r} "
-                        f"not found in combo. Available: "
-                        f"{[combo.itemData(i) for i in range(combo.count())]}")
         self._update_channel_map_status()
         logger.debug(
             f"  Channel map: {self._config.needle_channel_pump_map}")

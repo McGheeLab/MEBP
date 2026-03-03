@@ -1,0 +1,147 @@
+{
+  "schema_version": "7.2.3",
+  "metadata": {
+    "name": "Print_006",
+    "description": "",
+    "created": "2026-03-03T16:05:00.407885+00:00",
+    "modified": "2026-03-03T16:05:00.407885+00:00",
+    "author": ""
+  },
+  "objects": {
+    "Point_1": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": false
+    },
+    "Point_2": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        2.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Point_3": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        1.0000000000000002,
+        1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Point_4": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        -0.9999999999999997,
+        1.7320508075688774,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Point_5": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        -2.0,
+        2.4492935982947064e-16,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Point_6": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        -1.0000000000000009,
+        -1.7320508075688767,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    },
+    "Point_7": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1
+      },
+      "position": [
+        1.0000000000000002,
+        -1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

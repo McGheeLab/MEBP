@@ -568,7 +568,6 @@ class WellPlateView(QGraphicsView):
                     self._select_row(idx)
                 elif kind == "col":
                     self._select_column(idx)
-                self._restore_well_borders()  # v7.2.5: restore status colors
                 self.selection_changed.emit(list(self._selected_wells))
                 return
 
@@ -678,62 +677,6 @@ class WellPlateView(QGraphicsView):
         """Reset to fit-in-view."""
         self.resetTransform()
         self.fit_view()
-
-
-    def update_well_status(self, status_map: dict[str, str]):
-        """
-        v7.2.5: Update well border colors based on assignment status.
-
-        Args:
-            status_map: {well_name: "ready" | "incomplete" | "empty"}
-
-        Border colors:
-            ready      → green (#a6e3a1) — fully configured
-            incomplete → red (#f38ba8) — has role but missing details
-            empty      → gray (#585b70) — no assignment
-        """
-        STATUS_COLORS = {
-            "ready":      "#a6e3a1",  # Green
-            "incomplete": "#f38ba8",  # Red
-            "empty":      "#585b70",  # Gray
-        }
-
-        for well_name, status in status_map.items():
-            item = self._well_items.get(well_name)
-            if item is None:
-                continue
-
-            color = STATUS_COLORS.get(status, STATUS_COLORS["empty"])
-
-            # Only update border if well is not currently selected
-            # (selected wells keep their selection highlight)
-            if well_name not in self._selected_wells:
-                pen = QPen(QColor(color), WELL_BORDER_WIDTH)
-                item.setPen(pen)
-
-            # Store status for re-application after selection changes
-            if not hasattr(self, '_well_status'):
-                self._well_status = {}
-            self._well_status[well_name] = status
-
-    def _restore_well_borders(self):
-        """v7.2.5: Restore status-based borders after selection changes."""
-        if not hasattr(self, '_well_status'):
-            return
-
-        STATUS_COLORS = {
-            "ready":      "#a6e3a1",
-            "incomplete": "#f38ba8",
-            "empty":      "#585b70",
-        }
-
-        for well_name, item in self._well_items.items():
-            if well_name in self._selected_wells:
-                continue  # Keep selection highlight
-            status = self._well_status.get(well_name, "empty")
-            color = STATUS_COLORS.get(status, STATUS_COLORS["empty"])
-            pen = QPen(QColor(color), WELL_BORDER_WIDTH)
-            item.setPen(pen)
 
 
 class WellRoleLegend(QWidget):

@@ -249,11 +249,6 @@ class PrintSetupPage(QWidget):
             self.tab_objects.collections_changed.connect(
                 self._on_collections_changed)
 
-        # v7.2.5: Also connect prints_changed (primary signal)
-        if hasattr(self.tab_objects, 'prints_changed'):
-            self.tab_objects.prints_changed.connect(
-                self._on_collections_changed)
-
         # Wells → execution readiness
         if hasattr(self.tab_wells, 'setup_changed'):
             self.tab_wells.setup_changed.connect(self._on_setup_changed)
@@ -438,31 +433,6 @@ class PrintSetupPage(QWidget):
         sep.setStyleSheet(f"color: {COLORS.get('surface1', '#45475a')};")
         layout.addWidget(sep)
 
-        # v7.2.5: Generate Print button — validate + build execution plan
-        self.btn_generate_print = QPushButton("⚙ Generate Print")
-        self.btn_generate_print.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS.get('blue', '#89b4fa')};
-                color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 8px 16px;
-                border-radius: 4px;
-            }}
-            QPushButton:hover {{
-                background: {COLORS.get('sapphire', '#74c7ec')};
-            }}
-        """)
-        self.btn_generate_print.setToolTip(
-            "Validate well setup and generate execution plan")
-        self.btn_generate_print.clicked.connect(self._generate_print)
-        layout.addWidget(self.btn_generate_print)
-
-        # Generation status label
-        self._gen_status_label = QLabel("")
-        self._gen_status_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
-        self._gen_status_label.setWordWrap(True)
-        layout.addWidget(self._gen_status_label)
-
         self.btn_send_to_monitor = QPushButton("📤 Send to Monitor ▶")
         self.btn_send_to_monitor.setObjectName("accentBtn")
         self.btn_send_to_monitor.setStyleSheet(f"""
@@ -635,57 +605,6 @@ class PrintSetupPage(QWidget):
     #  EXPORT
     # ════════════════════════════════════════════════════════════════
 
-
-    def _generate_print(self):
-        """
-        v7.2.5: Validate well setup and generate execution plan.
-
-        This is the primary "prepare for print" action. It:
-        1. Validates the well setup (roles, inks, service wells)
-        2. Generates the execution plan (runs, service steps)
-        3. Shows results in the status label
-        4. Enables/disables Send to Monitor based on validity
-        """
-        # Step 1: Validate
-        if hasattr(self.tab_wells, 'validate'):
-            is_valid, issues = self.tab_wells.validate()
-        else:
-            is_valid, issues = False, ["Well setup tab missing validate() method"]
-
-        if not is_valid:
-            self._gen_status_label.setText(
-                f"⚠ {len(issues)} issue(s):\n" +
-                "\n".join(f"  • {i}" for i in issues[:5]))
-            self._gen_status_label.setStyleSheet(
-                f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-            self.btn_send_to_monitor.setEnabled(False)
-            logger.warning(f"Generate Print: {len(issues)} validation issues")
-            return
-
-        # Step 2: Generate plan
-        if hasattr(self.tab_wells, '_generate_plan'):
-            try:
-                self.tab_wells._generate_plan()
-            except Exception as e:
-                self._gen_status_label.setText(f"⚠ Plan generation failed: {e}")
-                self._gen_status_label.setStyleSheet(
-                    f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-                self.btn_send_to_monitor.setEnabled(False)
-                return
-
-        # Step 3: Show success
-        plan = self.tab_wells.get_plan() if hasattr(self.tab_wells, 'get_plan') else None
-        summary_parts = ["✓ Print plan generated"]
-        if plan:
-            summary_parts.append(f"{plan.total_runs} run(s)")
-            if hasattr(plan, 'estimated_total_seconds') and plan.estimated_total_seconds > 0:
-                summary_parts.append(f"~{plan.estimated_total_seconds / 60:.1f} min")
-        self._gen_status_label.setText(" | ".join(summary_parts))
-        self._gen_status_label.setStyleSheet(
-            f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
-        self.btn_send_to_monitor.setEnabled(True)
-        logger.info("Generate Print: plan ready")
-
     def _export_gcode(self):
         """Export the current job as G-code."""
         job = self._build_current_job()
@@ -742,10 +661,9 @@ class PrintSetupPage(QWidget):
         logger.debug("Workspace config propagated to all tabs")
 
     def _on_collections_changed(self, collection_names: list[str]):
-        """v7.2.5: Print Objects tab changed collections → update Well Setup tab."""
+        """Print Objects tab changed collections → update Well Setup tab."""
         if hasattr(self.tab_wells, 'set_available_prints'):
             self.tab_wells.set_available_prints(collection_names)
-            logger.info(f"Forwarded {len(collection_names)} prints to well setup")
 
     def _on_setup_changed(self):
         """Well Setup tab changed → may affect execution readiness."""
