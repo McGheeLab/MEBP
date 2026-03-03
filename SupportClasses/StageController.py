@@ -783,6 +783,9 @@ class StageController:
                 dx = clamped_x - cur_zr_x
                 dy = clamped_y - cur_zr_y
 
+        # v7.2.4: Verification logging — exact microstep values
+        logger.debug(f"move_xy_relative: sending dx={round(dx)} dy={round(dy)} "
+                     f"microsteps (raw: dx={dx:.2f} dy={dy:.2f})")
         self.xy_stage.move_stage_relative(dx, dy)
 
 

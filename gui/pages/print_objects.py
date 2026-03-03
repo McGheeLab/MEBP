@@ -47,7 +47,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon
 
-from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.styles import COLORS
+
+# v7.2.4: XY-only well preview with zoom/pan/bounds (S4.2)
+try:
+    from gui.widgets.well_preview import WellPreviewWidget, ObjectPath as WPObjectPath
+    HAS_WELL_PREVIEW = True
+except ImportError:
+    HAS_WELL_PREVIEW = False
+, SECTION_TITLE_STYLE
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +285,14 @@ class PrintObjectsTab(QWidget):
         self._sim_playing = False
 
         self._build_ui()
+
+        # v7.2.4: Out-of-bounds detection (S4.9-S4.10)
+        self._oob_indices: set[int] = set()
+        self._oob_flash_state: bool = False
+        self._oob_flash_timer = QTimer(self)
+        self._oob_flash_timer.setInterval(500)
+        self._oob_flash_timer.timeout.connect(self._toggle_oob_flash)
+
         self._restore_last_print()
 
     # ══════════════════════════════════════════════════════════════
@@ -320,41 +336,61 @@ class PrintObjectsTab(QWidget):
         # ── Print File Bar ────────────────────────────────────────
         self._build_file_bar(outer)
 
-        # ── Main splitter ─────────────────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # ── v7.2.4: Restructured layout (S4.3 + S4.12) ─────────
+        # Vertical splitter: top (preview + objects) | bottom (designer)
+        v_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Left panel: Designer + Auto-Layout
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(4, 4, 4, 4)
-        left_layout.setSpacing(6)
+        # ── Top: Preview (LEFT) + Objects List (RIGHT) ────────────
+        top_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self._build_designer_section(left_layout)
-        self._build_auto_layout_section(left_layout)
-        self._build_csv_import_section(left_layout)
-        left_layout.addStretch()
+        # Left: Well Preview (XY only, zoomable)
+        preview_container = QWidget()
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(4, 4, 4, 4)
+        preview_layout.setSpacing(4)
+        self._build_preview_section(preview_layout)
+        top_splitter.addWidget(preview_container)
 
-        left_scroll.setWidget(left_widget)
-        splitter.addWidget(left_scroll)
-
-        # Right panel: Preview + Objects List + Summary
+        # Right: Objects List + Summary
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.setSpacing(4)
-
-        self._build_preview_section(right_layout)
         self._build_objects_list_section(right_layout)
         self._build_summary_section(right_layout)
+        top_splitter.addWidget(right)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        top_splitter.setStretchFactor(0, 3)  # Preview gets more space
+        top_splitter.setStretchFactor(1, 2)
 
-        outer.addWidget(splitter)
+        v_splitter.addWidget(top_splitter)
+
+        # ── Bottom: Collapsible Designer + Auto-Layout ────────────
+        designer_container = QWidget()
+        designer_scroll = QScrollArea()
+        designer_scroll.setWidgetResizable(True)
+        designer_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        designer_widget = QWidget()
+        designer_layout = QVBoxLayout(designer_widget)
+        designer_layout.setContentsMargins(4, 4, 4, 4)
+        designer_layout.setSpacing(6)
+
+        self._build_designer_section(designer_layout)
+        self._build_auto_layout_section(designer_layout)
+        self._build_csv_import_section(designer_layout)
+        designer_layout.addStretch()
+
+        designer_scroll.setWidget(designer_widget)
+        designer_outer = QVBoxLayout(designer_container)
+        designer_outer.setContentsMargins(0, 0, 0, 0)
+        designer_outer.addWidget(designer_scroll)
+
+        v_splitter.addWidget(designer_container)
+        v_splitter.setStretchFactor(0, 3)  # Preview area dominant
+        v_splitter.setStretchFactor(1, 2)  # Designer collapsible
+
+        outer.addWidget(v_splitter)
 
     # ── File Bar ──────────────────────────────────────────────────
 
@@ -816,7 +852,13 @@ class PrintObjectsTab(QWidget):
     # ── Preview Section ───────────────────────────────────────────
 
     def _build_preview_section(self, parent_layout):
-        if HAS_PROJECTION_CANVAS:
+        """XY-only well preview with zoom/pan (v7.2.4 S4.4-S4.8)."""
+        if HAS_WELL_PREVIEW:
+            self._preview = WellPreviewWidget()
+            self._preview.oob_detected.connect(self._on_oob_detected)
+            self._update_well_diameter()
+        elif HAS_PROJECTION_CANVAS:
+            # Fallback to legacy ProjectionCanvas
             self._preview = create_interactive_well_preview()
             self._preview.set_library_resolver(self._resolve_library_object)
             if hasattr(self._preview, 'object_placed'):
@@ -825,7 +867,8 @@ class PrintObjectsTab(QWidget):
                 self._preview.object_moved.connect(self._on_object_repositioned)
         else:
             self._preview = QLabel(
-                "Preview unavailable\n(projection_canvas.py not found)")
+                "Preview unavailable
+(well_preview.py not found)")
             self._preview.setAlignment(Qt.AlignCenter)
             self._preview.setStyleSheet(
                 f"color: {COLORS['subtext0']}; background: {COLORS['mantle']}; "
@@ -1327,6 +1370,10 @@ class PrintObjectsTab(QWidget):
             item.setForeground(color)
             self._objects_list.addItem(item)
 
+        # v7.2.4: Apply OOB flash colors (S4.10)
+        if hasattr(self, '_oob_indices'):
+            self._refresh_objects_list_colors()
+
     def _on_object_selected(self, row: int):
         """Highlight selected object in preview."""
         if 0 <= row < len(self._objects):
@@ -1627,8 +1674,6 @@ class PrintObjectsTab(QWidget):
 
     def _refresh_preview_all(self, highlight_index=None):
         """Regenerate preview showing all objects in current print."""
-        if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
-            return
 
         all_paths = []
         for i, entry in enumerate(self._objects):
@@ -1646,11 +1691,20 @@ class PrintObjectsTab(QWidget):
                        for j in range(len(traj))]
                 color = entry.get("color", DEFAULT_COLORS[0])
                 if highlight_index is not None and i == highlight_index:
-                    color = "#ffffff"  # Highlight
-                all_paths.append(ObjectPath(name=entry["name"], color=color, points=pts))
+                    color = "#ffffff"
+
+                # v7.2.4: Use WPObjectPath for WellPreviewWidget
+                if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
+                    all_paths.append(WPObjectPath(
+                        name=entry["name"], color=color, points=pts))
+                else:
+                    all_paths.append(ObjectPath(
+                        name=entry["name"], color=color, points=pts))
 
         if all_paths:
             self._preview.set_object_paths(all_paths)
+            if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
+                self._preview.set_highlight(highlight_index)
         else:
             if hasattr(self._preview, 'clear_object_paths'):
                 self._preview.clear_object_paths()
@@ -1658,7 +1712,11 @@ class PrintObjectsTab(QWidget):
                 self._preview.clear_path()
 
         self._update_well_diameter()
-        self._preview.refresh()
+        if hasattr(self._preview, 'refresh'):
+            self._preview.refresh()
+
+        # v7.2.4: Refresh OOB state after preview update
+        self._refresh_oob_state()
 
 
     def _refresh_ink_options_from_config(self):
@@ -1687,7 +1745,122 @@ class PrintObjectsTab(QWidget):
         logger.debug(f"PrintObjects: refreshed ink options: {ink_names}")
 
     def _update_well_diameter(self):
-        """Set well boundary circle on preview from workspace plate format."""
+        """Set well boundary circle on preview from workspace/HW config."""
+        diam = self._get_well_diameter_mm()
+        if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
+            self._preview.set_well_diameter(diam)
+            return
+
+    # ── Out-of-Bounds Detection (v7.2.4 S4.9-S4.11) ─────────────
+
+    def _check_bounds(self, entry: dict) -> bool:
+        """Check if a print object is within the well boundary.
+
+        Returns True if in-bounds, False if out-of-bounds.
+        """
+        well_diam = self._get_well_diameter_mm()
+        well_radius = well_diam / 2.0
+        import math
+
+        # Get trajectory points
+        obj = self._build_print_object(
+            name=entry.get("name", "check"),
+            obj_type=entry.get("object_type", "point"),
+            params=entry.get("params", {}),
+            position=entry.get("position", (0, 0, 0)),
+            color=entry.get("color", "#ffffff"),
+            pump_id=entry.get("ink_pump", "P1"),
+        )
+        if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+            traj = obj.trajectory
+            for i in range(len(traj)):
+                px, py = float(traj[i, 0]), float(traj[i, 1])
+                if math.sqrt(px * px + py * py) > well_radius:
+                    return False
+        return True
+
+    def _refresh_oob_state(self):
+        """Recheck all objects for OOB and start/stop flash timer."""
+        old_oob = set(self._oob_indices)
+        new_oob = set()
+        for i, entry in enumerate(self._objects):
+            if not self._check_bounds(entry):
+                new_oob.add(i)
+        self._oob_indices = new_oob
+
+        if new_oob:
+            if not self._oob_flash_timer.isActive():
+                self._oob_flash_timer.start()
+        else:
+            self._oob_flash_timer.stop()
+            self._oob_flash_state = False
+
+        # Update list colors if changed
+        if old_oob != new_oob:
+            self._refresh_objects_list_colors()
+
+    def _on_oob_detected(self, indices: list):
+        """Handle OOB signal from WellPreviewWidget."""
+        self._oob_indices = set(indices)
+        if indices:
+            if not self._oob_flash_timer.isActive():
+                self._oob_flash_timer.start()
+        self._refresh_objects_list_colors()
+
+    def _toggle_oob_flash(self):
+        """Toggle flash state for OOB items (called by QTimer every 500ms)."""
+        self._oob_flash_state = not self._oob_flash_state
+        self._refresh_objects_list_colors()
+
+    def _refresh_objects_list_colors(self):
+        """Update list item colors — flash red for OOB items."""
+        for i in range(self._objects_list.count()):
+            item = self._objects_list.item(i)
+            if item is None:
+                continue
+            if i in self._oob_indices:
+                if self._oob_flash_state:
+                    item.setBackground(QColor("#f38ba8"))  # Red flash
+                    item.setForeground(QColor("#1e1e2e"))  # Dark text
+                else:
+                    item.setBackground(QColor("#45475a"))  # Surface2
+                    if i < len(self._objects):
+                        color = QColor(self._objects[i].get("color", "#cdd6f4"))
+                        item.setForeground(color)
+                # Prepend warning icon to text if not already there
+                text = item.text()
+                if not text.startswith("⚠"):
+                    item.setText(f"⚠ {text}")
+            else:
+                item.setBackground(QColor("transparent"))
+                if i < len(self._objects):
+                    color = QColor(self._objects[i].get("color", "#cdd6f4"))
+                    item.setForeground(color)
+                # Remove warning icon if present
+                text = item.text()
+                if text.startswith("⚠ "):
+                    item.setText(text[2:])
+
+    def _get_well_diameter_mm(self) -> float:
+        """Get well diameter from hardware config or workspace."""
+        if hasattr(self, '_hw_config') and self._hw_config:
+            try:
+                fmt = self._hw_config.plate_format
+                from SupportClasses.WellPlate import PLATE_DEFINITIONS
+                plate_def = PLATE_DEFINITIONS.get(fmt, {})
+                return plate_def.get("well_diameter", 6.0)
+            except (ImportError, AttributeError):
+                pass
+        if hasattr(self, '_workspace') and self._workspace:
+            try:
+                fmt = self._workspace.plate_format
+                from SupportClasses.WellPlate import PLATE_DEFINITIONS
+                plate_def = PLATE_DEFINITIONS.get(fmt, {})
+                return plate_def.get("well_diameter", 6.0)
+            except (ImportError, AttributeError):
+                pass
+        return 6.0  # Default 96-well plate
+
         if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
             return
         try:

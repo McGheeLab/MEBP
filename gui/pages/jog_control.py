@@ -53,6 +53,11 @@ class JogControlPage(QWidget):
         # Microsteps per micron — set by MainWindow, default 10 (ProScan III typical)
         self._microsteps_per_micron: float = 10.0
 
+        # v7.2.4: Step verification tracking
+        self._last_jog_step_um: float = 0.0
+        self._last_xy_before: tuple = (None, None)
+        self._conversion_factor_set: bool = False  # True once protocol loads
+
         self._setup_ui()
         self._setup_shortcuts()
 
@@ -60,8 +65,20 @@ class JogControlPage(QWidget):
         return "Jog Control"
 
     def set_microsteps_per_micron(self, value: float):
-        """Called by MainWindow when the conversion factor changes."""
+        """Called by MainWindow when the conversion factor changes.
+
+        v7.2.4: Also updates the conversion factor display and hides
+        the warning banner once a real value is set.
+        """
         self._microsteps_per_micron = max(0.001, value)
+        self._conversion_factor_set = True
+        # Update context panel labels if they exist
+        if hasattr(self, '_lbl_conversion_factor'):
+            self._lbl_conversion_factor.setText(
+                f"Scale: {self._microsteps_per_micron:.1f} steps/µm")
+        if hasattr(self, '_lbl_factor_warning'):
+            self._lbl_factor_warning.setVisible(False)
+        logger.info(f"Jog: microsteps_per_micron set to {value}")
 
     def get_context_widget(self) -> QWidget:
         """Context panel: step sizes + speed multipliers."""
@@ -258,6 +275,10 @@ class JogControlPage(QWidget):
     #  STATUS UPDATE
     # ════════════════════════════════════════════════════════════════
 
+    def set_hardware_config(self, config):
+        """v7.2.4: Receive hardware config (for future pump µL display)."""
+        self._hardware_config = config
+
     def on_status_update(self):
         """Called by MainWindow timer (~300 ms)."""
         ctrl = self.controller
@@ -285,6 +306,20 @@ class JogControlPage(QWidget):
         else:
             for lbl in [self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3]:
                 lbl.setText("—")
+
+        # v7.2.4: Step verification — show measured delta after jog
+        if (self._last_jog_step_um > 0 and
+                self._last_xy_before[0] is not None and
+                xy[0] is not None):
+            dx_steps = abs(xy[0] - self._last_xy_before[0]) + \
+                       abs(xy[1] - self._last_xy_before[1])
+            dx_um = dx_steps / self._microsteps_per_micron
+            # Only show verification if stage has settled (delta > 0)
+            if dx_um > 0.01 and hasattr(self, '_lbl_last_jog'):
+                current_text = self._lbl_last_jog.text()
+                if "→" not in current_text:  # Don't keep appending
+                    self._lbl_last_jog.setText(
+                        f"{current_text}\n→ Moved: {dx_um:.1f} µm")
 
     # ════════════════════════════════════════════════════════════════
     #  KEYBOARD SHORTCUTS
@@ -338,8 +373,27 @@ class JogControlPage(QWidget):
         # Convert µm → microsteps
         step_steps = step_um * self._microsteps_per_micron
 
+        # v7.2.4: Record pre-jog position for verification display
+        self._last_xy_before = self.controller.get_xy_position(cached=True)
+        self._last_jog_step_um = step_um
+
         # BUG-1 FIX: Use relative move — no dependency on cached position
         self.controller.move_xy_relative(dx * step_steps, dy * step_steps)
+
+        # v7.2.4: Update step verification display
+        direction = ""
+        if dx > 0: direction = "X+"
+        elif dx < 0: direction = "X−"
+        if dy > 0: direction += "Y+"
+        elif dy < 0: direction += "Y−"
+        cmd_steps = round(step_steps)
+        if hasattr(self, '_lbl_last_jog'):
+            self._lbl_last_jog.setText(
+                f"Last: {direction} {step_um:g} µm "
+                f"({cmd_steps} steps)")
+        logger.debug(f"Jog {direction}: {step_um:g} µm = "
+                     f"{cmd_steps} microsteps "
+                     f"(factor={self._microsteps_per_micron})")
 
     def _jog_xy_home(self):
         """Move to the zero reference position (absolute move, this is fine)."""

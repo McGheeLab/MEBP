@@ -51,7 +51,7 @@ from PySide6.QtGui import QColor, QCursor
 
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
-from gui.widgets.projection_canvas import MiniProjectionView
+# MiniProjectionView removed in v7.2.4 (XY-only layout)
 
 from SupportClasses.PhysicalModels import (
     WellRole, ROLE_COLORS, InkSpec, RosetteInsert, WorkspaceConfig,
@@ -182,10 +182,8 @@ class WellSetupTab(QWidget):
         main_layout.setContentsMargins(4, 4, 4, 4)
         main_layout.setSpacing(4)
 
-        # ── Top area: Plate view + ZY projection ──────────────────
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # Plate view
+        # ── Interactive Plate View (XY) — full width ─────────────
+        # v7.2.4: Removed ZY and XZ projections (Issue #4)
         plate_container = QWidget()
         plate_layout = QVBoxLayout(plate_container)
         plate_layout.setContentsMargins(0, 0, 0, 0)
@@ -204,19 +202,7 @@ class WellSetupTab(QWidget):
         info_row.addWidget(self.selection_label)
         plate_layout.addLayout(info_row)
 
-        top_splitter.addWidget(plate_container)
-
-        # ZY side projection (uses unified projection_canvas widget)
-        self.zy_view = MiniProjectionView("ZY")
-        top_splitter.addWidget(self.zy_view)
-        top_splitter.setStretchFactor(0, 5)
-        top_splitter.setStretchFactor(1, 1)
-
-        main_layout.addWidget(top_splitter, stretch=3)
-
-        # ── XZ bottom projection ──────────────────────────────────
-        self.xz_view = MiniProjectionView("XZ")
-        main_layout.addWidget(self.xz_view)
+        main_layout.addWidget(plate_container, stretch=3)
 
         # ── Scroll area for panels below ──────────────────────────
         scroll = QScrollArea()
@@ -527,12 +513,8 @@ class WellSetupTab(QWidget):
         self.plate_view.update_all_wells(appearances)
 
     def _refresh_projections(self) -> None:
-        """Update ZY and XZ projection views."""
-        z_offsets = {}
-        for name, wa in self._model.assignments.items():
-            z_offsets[name] = wa.get_effective_z()
-        self.zy_view.set_plate_data(self._model.plate, z_offsets)
-        self.xz_view.set_plate_data(self._model.plate, z_offsets)
+        """No-op: ZY/XZ projections removed in v7.2.4 (Issue #4)."""
+        pass
 
     def _refresh_summary(self) -> None:
         """Rebuild the assignment summary table."""

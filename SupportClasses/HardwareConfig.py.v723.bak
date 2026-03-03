@@ -320,46 +320,6 @@ class HardwareConfig:
                             f"Pump {pump_id} assigned to multiple channels: "
                             f"{', '.join(ch_strs)}")
 
-        # v7.2.4: Ink uniqueness — each ink assigned to at most one pump
-        ink_assignments: dict[str, list[str]] = {}
-        for pid, pcfg in self.pumps.items():
-            if pcfg.enabled and pcfg.ink:
-                ink_name = pcfg.ink.name
-                ink_assignments.setdefault(ink_name, []).append(pid)
-        for ink_name, pump_ids in ink_assignments.items():
-            if len(pump_ids) > 1:
-                issues.append(
-                    f"Ink '{ink_name}' assigned to multiple pumps: "
-                    f"{', '.join(pump_ids)}")
-
-        # v7.2.4: Needle channel-pump mapping
-        if self.needle is not None:
-            num_channels = self.needle.num_channels
-            enabled_ids = self.enabled_pump_ids
-
-            if num_channels > 0 and enabled_ids:
-                if len(self.needle_channel_pump_map) != num_channels:
-                    issues.append(
-                        f"Needle has {num_channels} channel(s) but "
-                        f"{len(self.needle_channel_pump_map)} mapped — "
-                        f"all channels must be assigned to pumps")
-
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    if pump_id not in enabled_ids:
-                        issues.append(
-                            f"Channel {ch_idx + 1} mapped to {pump_id} "
-                            f"but {pump_id} is not enabled/configured")
-
-                mapped_pumps: dict[str, list[int]] = {}
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    mapped_pumps.setdefault(pump_id, []).append(ch_idx)
-                for pump_id, channels in mapped_pumps.items():
-                    if len(channels) > 1:
-                        ch_strs = [str(c + 1) for c in channels]
-                        issues.append(
-                            f"Pump {pump_id} assigned to multiple channels: "
-                            f"{', '.join(ch_strs)}")
-
         return (len(issues) == 0, issues)
 
     @property
@@ -403,8 +363,6 @@ class HardwareConfig:
             raise ValueError(f"Unknown pump: {pump}")
         self.pumps[pump].syringe = syringe
         self.pumps[pump].enabled = syringe is not None
-        # v7.2.4: Clear channel mappings if pump changes
-        self._clear_invalid_channel_mappings()
         # Clear channel mapping if pump changes configuration
         self._clear_invalid_channel_mappings()
 
