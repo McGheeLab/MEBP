@@ -1018,7 +1018,7 @@ class PrintObjectsTab(QWidget):
         try:
             self._file_manager.load(name)
             self._active_file_name = name
-            self._current_file = str(self._file_manager.current_path) if self._file_manager.current_path else None
+            self._current_file = self._file_manager.current
 
             # Rebuild objects list from file data
             self._objects.clear()
@@ -1926,10 +1926,13 @@ class PrintObjectsTab(QWidget):
         try:
             data = self._serialize_current_state()
             # Update file manager's current file
-            if self._current_file:
-                self._current_file.objects = data.get("objects", {})
-                self._current_file.collections = data.get("collections", {})
-                self._current_file.layout_presets = data.get("layout_presets", {})
+            pf = (self._file_manager.current
+                  if self._file_manager
+                  else self._current_file)
+            if pf and hasattr(pf, 'objects'):
+                pf.objects = data.get("objects", {})
+                pf.collections = data.get("collections", {})
+                pf.layout_presets = data.get("layout_presets", {})
                 self._file_manager.save()
             else:
                 # Save raw

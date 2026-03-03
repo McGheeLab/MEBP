@@ -1134,7 +1134,7 @@ class WellSetupTab(QWidget):
 
     def _on_plan_auto_regen(self) -> None:
         """Auto-regenerate plan when assignments change (debounced)."""
-        if self._plan is not None and self._hw_config is not None:
+        if self._hw_config is not None:
             self._generate_plan()
 
 
@@ -1144,8 +1144,13 @@ class WellSetupTab(QWidget):
         v7.2.4 S5.11: Comprehensive validation before send-to-monitor.
 
         Called by print_setup.py before emitting job_ready signal.
+        Auto-generates a plan if none exists and hardware config is available.
         Returns (is_valid, list_of_issues).
         """
+        # Auto-generate plan if missing (user may not have clicked Generate)
+        if self._plan is None and self._hw_config is not None:
+            self._generate_plan()
+
         return validate_well_setup(
             hw_config=self._hw_config,
             well_model=self._model,
