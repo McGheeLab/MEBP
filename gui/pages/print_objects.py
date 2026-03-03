@@ -336,61 +336,41 @@ class PrintObjectsTab(QWidget):
         # ── Print File Bar ────────────────────────────────────────
         self._build_file_bar(outer)
 
-        # ── v7.2.4: Restructured layout (S4.3 + S4.12) ─────────
-        # Vertical splitter: top (preview + objects) | bottom (designer)
-        v_splitter = QSplitter(Qt.Orientation.Vertical)
+        # ── Main splitter ─────────────────────────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # ── Top: Preview (LEFT) + Objects List (RIGHT) ────────────
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Left panel: Designer + Auto-Layout
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
 
-        # Left: Well Preview (XY only, zoomable)
-        preview_container = QWidget()
-        preview_layout = QVBoxLayout(preview_container)
-        preview_layout.setContentsMargins(4, 4, 4, 4)
-        preview_layout.setSpacing(4)
-        self._build_preview_section(preview_layout)
-        top_splitter.addWidget(preview_container)
+        self._build_designer_section(left_layout)
+        self._build_auto_layout_section(left_layout)
+        self._build_csv_import_section(left_layout)
+        left_layout.addStretch()
 
-        # Right: Objects List + Summary
+        left_scroll.setWidget(left_widget)
+        splitter.addWidget(left_scroll)
+
+        # Right panel: Preview + Objects List + Summary
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.setSpacing(4)
+
+        self._build_preview_section(right_layout)
         self._build_objects_list_section(right_layout)
         self._build_summary_section(right_layout)
-        top_splitter.addWidget(right)
 
-        top_splitter.setStretchFactor(0, 3)  # Preview gets more space
-        top_splitter.setStretchFactor(1, 2)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
 
-        v_splitter.addWidget(top_splitter)
-
-        # ── Bottom: Collapsible Designer + Auto-Layout ────────────
-        designer_container = QWidget()
-        designer_scroll = QScrollArea()
-        designer_scroll.setWidgetResizable(True)
-        designer_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        designer_widget = QWidget()
-        designer_layout = QVBoxLayout(designer_widget)
-        designer_layout.setContentsMargins(4, 4, 4, 4)
-        designer_layout.setSpacing(6)
-
-        self._build_designer_section(designer_layout)
-        self._build_auto_layout_section(designer_layout)
-        self._build_csv_import_section(designer_layout)
-        designer_layout.addStretch()
-
-        designer_scroll.setWidget(designer_widget)
-        designer_outer = QVBoxLayout(designer_container)
-        designer_outer.setContentsMargins(0, 0, 0, 0)
-        designer_outer.addWidget(designer_scroll)
-
-        v_splitter.addWidget(designer_container)
-        v_splitter.setStretchFactor(0, 3)  # Preview area dominant
-        v_splitter.setStretchFactor(1, 2)  # Designer collapsible
-
-        outer.addWidget(v_splitter)
+        outer.addWidget(splitter)
 
     # ── File Bar ──────────────────────────────────────────────────
 
@@ -852,13 +832,7 @@ class PrintObjectsTab(QWidget):
     # ── Preview Section ───────────────────────────────────────────
 
     def _build_preview_section(self, parent_layout):
-        """XY-only well preview with zoom/pan (v7.2.4 S4.4-S4.8)."""
-        if HAS_WELL_PREVIEW:
-            self._preview = WellPreviewWidget()
-            self._preview.oob_detected.connect(self._on_oob_detected)
-            self._update_well_diameter()
-        elif HAS_PROJECTION_CANVAS:
-            # Fallback to legacy ProjectionCanvas
+        if HAS_PROJECTION_CANVAS:
             self._preview = create_interactive_well_preview()
             self._preview.set_library_resolver(self._resolve_library_object)
             if hasattr(self._preview, 'object_placed'):
@@ -867,8 +841,7 @@ class PrintObjectsTab(QWidget):
                 self._preview.object_moved.connect(self._on_object_repositioned)
         else:
             self._preview = QLabel(
-                "Preview unavailable
-(well_preview.py not found)")
+                "Preview unavailable\n(projection_canvas.py not found)")
             self._preview.setAlignment(Qt.AlignCenter)
             self._preview.setStyleSheet(
                 f"color: {COLORS['subtext0']}; background: {COLORS['mantle']}; "
