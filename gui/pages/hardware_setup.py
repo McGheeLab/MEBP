@@ -1258,6 +1258,24 @@ class HardwareSetupPage(QWidget):
                 else:
                     logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
 
+        # v7.2.5: Verify pump ink assignments after restore
+        for pid, pw in self._pump_widgets.items():
+            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
+            expected_ink = self._config.pumps[pid].ink.name if (
+                pid in self._config.pumps and self._config.pumps[pid].ink) else None
+            if expected_ink and actual_ink != expected_ink:
+                logger.warning(
+                    f"  {pid} ink mismatch: expected={expected_ink}, "
+                    f"actual={actual_ink}. Re-applying...")
+                # Force re-apply: set the combo directly
+                idx = pw.ink_combo.findText(expected_ink)
+                if idx >= 0:
+                    pw.ink_combo.blockSignals(True)
+                    pw.ink_combo.setCurrentIndex(idx)
+                    pw.ink_combo.blockSignals(False)
+                else:
+                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
+
         # Refresh exclusions after all pumps loaded
         self._refresh_pump_ink_exclusions()
         self._update_pump_ink_summary()

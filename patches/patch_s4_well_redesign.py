@@ -35,6 +35,16 @@ ARCHITECTURE NOTE:
 import os
 import re
 import sys
+
+# === Windows console encoding fix ===
+import sys as _sys
+if _sys.platform == 'win32':
+    for _stream_name in ('stdout', 'stderr'):
+        _stream = getattr(_sys, _stream_name, None)
+        if _stream and hasattr(_stream, 'reconfigure'):
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+# === End encoding fix ===
+
 import shutil
 from pathlib import Path
 from datetime import datetime

@@ -1,12 +1,14 @@
-The calibration left box does not auto update the plate configuration: format 
-the well setup does not recognize the list of current inks
-the well setup does not recognize the list of current rosettes
-the X and Y movements on the jog page do not show the correct motion amount for the step size requested on the jog settings
-on the hardware setup page I want the left box to have a list of the available harware setup files we currently have 
-in well setup I dont need to see the projections XZ and ZY
-the well view in the print object pannel needs work, the projections should match the XY view. axis should alllign. hard to see since its so small. objects in print pannel should be to the right of the well preview. we should be able to expand the well preivew window and zoom in and everything. 
-If a print is outside the print area of a well preview, it should be flashing red in the objects in this print section
-All over the titles of each section are not in the correct allignment 
-Inks should be assigned to pumps
-If the needle is multichannel then each channel must be assigned to a pump a single needle bore must also be assigned to a pump therefor the needle selection should go after the pump assignments. 
-validate the well setup before sending the print to the monitor. To be valid it must have correct ink assignments (if pump is incremental then the ink assigned to the pump should be in a well).
+1) on the jog page, active pumps should have a white text for their locaitons
+2) the well setup does not recognize the list of current inks from the hardware setup
+3) the well setup does not recognize the list of current rosettes from the hardware setup
+4) the print setup in the print object pannel needs work make all of the pannels slide adjustable.
+5) the print setup in the print objects pannel: we dont want to send all print files to the well preview, only the ones we have loaded or generated new when we hit the "send to available prints button" we should have a list of the prints we will add to the list next to the button, add the ability to remove prints if needed.  
+6)If a print is outside the print area of a well preview, it should be flashing red in the objects in this print section.
+7)All throughout the code, the titles of each section are not in the correct allignment with the pannel, they are above them
+8) When loading a hardware setup, the pump do not get activated and needle bore assignments do not get loaded in properly
+9) It is not possible to sent a print setup to the monitor because there is no option to generate a path exectution plan
+10) we do not need to detect cameras on startup, we should do this on the calibration page if needed
+11) trying to resize the output terminal at the bottom crashes that pannel and I no longer have access 
+12) trying to detect cameras takes a very long time and stops the software from working
+13)  The well setup page needs to be redesigned. The selection actions needs to change so that nothing is shown until the well is assigned a role. 
+a) user selects the wells to be assigned a role, b) After the designation of the role, the options for that type of designation appear. (e.g. we assign well A1 : B2 to be print, then the Print list populates and we can choose the selected wells to be PIAR or some other print file. We can also choose the wells individually to change their assignement) After assignment, the well boarder will be recolored green to show its ready (red if not assigned) Selected wells are still outlined in purple

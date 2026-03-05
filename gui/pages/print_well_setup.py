@@ -339,7 +339,8 @@ class WellSetupTab(QWidget):
         self._build_service_sequence(scroll_layout)
 
         # ── Assignment Summary Table ──────────────────────────────
-        self._build_summary_table(scroll_layout)
+        # v7.2.5 G2: Summary table now inside top splitter (right pane)
+        # self._build_summary_table(scroll_layout)  # moved to _build_top_splitter
 
         # ── Save/Load + Auto-assign ───────────────────────────────
         self._build_bottom_buttons(scroll_layout)
@@ -440,6 +441,8 @@ class WellSetupTab(QWidget):
         self._model.set_role(selected, role)
         self._plate_view.update_well_roles(self._model.get_role_map())
         self._refresh_summary_table()
+        self._refresh_summary_table()
+        self._refresh_well_status_colors()
         self._refresh_summary_table()
         self._refresh_well_status_colors()
         self.setup_changed.emit()
@@ -717,6 +720,73 @@ class WellSetupTab(QWidget):
         overlay.raise_()
         overlay.setGeometry(0, 0, 200, 30)
         self._zoom_overlay = overlay
+
+
+    def _build_top_splitter(self, parent_layout: QVBoxLayout) -> None:
+        """v7.2.5 G2: Build side-by-side layout with plate view (left) + summary (right)."""
+        from PySide6.QtCore import Qt as QtCore_Qt
+
+        splitter = QSplitter(QtCore_Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(3)
+
+        # ── Left pane: Plate view ──
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+
+        # Move the plate view into the left pane
+        if hasattr(self, '_plate_view') and self._plate_view is not None:
+            # Remove from any existing parent layout
+            old_parent = self._plate_view.parent()
+            if old_parent and old_parent.layout():
+                old_parent.layout().removeWidget(self._plate_view)
+            left_layout.addWidget(self._plate_view, stretch=1)
+
+        left_widget.setLayout(left_layout)
+        splitter.addWidget(left_widget)
+
+        # ── Right pane: Assignment summary ──
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(4)
+
+        summary_label = QLabel("Assignment Summary")
+        summary_label.setStyleSheet(
+            f"color: {COLORS['blue']}; font-weight: bold; font-size: 12px;")
+        right_layout.addWidget(summary_label)
+
+        # Summary table
+        if not hasattr(self, '_summary_table'):
+            self._summary_table = QTableWidget()
+            self._summary_table.setColumnCount(4)
+            self._summary_table.setHorizontalHeaderLabels(
+                ["Well", "Role", "Assignment", "Status"])
+            self._summary_table.horizontalHeader().setStretchLastSection(True)
+            self._summary_table.setSelectionBehavior(
+                QTableWidget.SelectionBehavior.SelectRows)
+            self._summary_table.setEditTriggers(
+                QTableWidget.EditTrigger.NoEditTriggers)
+            self._summary_table.setAlternatingRowColors(True)
+            self._summary_table.cellClicked.connect(self._on_summary_row_clicked)
+        right_layout.addWidget(self._summary_table, stretch=1)
+
+        # Summary counts footer
+        if not hasattr(self, '_summary_counts_label'):
+            self._summary_counts_label = QLabel("")
+            self._summary_counts_label.setStyleSheet(
+                f"color: {COLORS.get('overlay0', '#6c7086')}; font-size: 10px;")
+        right_layout.addWidget(self._summary_counts_label)
+
+        right_widget.setLayout(right_layout)
+        splitter.addWidget(right_widget)
+
+        # Set initial sizes: ~70% plate, ~30% summary
+        splitter.setSizes([700, 300])
+
+        self._top_splitter = splitter
+        parent_layout.addWidget(splitter, stretch=2)
 
     def _build_selection_actions(self, parent_layout: QVBoxLayout) -> None:
         group = QGroupBox("Selection Actions")
@@ -999,6 +1069,9 @@ class WellSetupTab(QWidget):
 
     def _refresh_summary(self) -> None:
         """Rebuild the assignment summary table."""
+        # v7.2.5 S7: Guard -- summary_table may not exist yet during __init__
+        if not hasattr(self, "summary_table") or self.summary_table is None:
+            return
         data = self._model.get_assignment_summary()
         self.summary_table.setRowCount(len(data))
         for i, row in enumerate(data):
@@ -1025,6 +1098,9 @@ class WellSetupTab(QWidget):
         v7.2.4: Prefers HardwareConfig._hw_config if available (most up-to-date),
         falls back to workspace ink library.
         """
+        # v7.2.5 S7: Guard -- ink_combo may not exist during __init__
+        if not hasattr(self, "ink_combo"):
+            return
         source = {}
         if hasattr(self, '_hw_config') and self._hw_config:
             source = self._hw_config.ink_library
@@ -1048,6 +1124,9 @@ class WellSetupTab(QWidget):
         v7.2.4: Prefers HardwareConfig._hw_config if available (most up-to-date),
         falls back to workspace rosette library.
         """
+        # v7.2.5 S7: Guard -- rosette_combo may not exist during __init__
+        if not hasattr(self, "rosette_combo"):
+            return
         source = {}
         if hasattr(self, '_hw_config') and self._hw_config:
             source = self._hw_config.rosette_library

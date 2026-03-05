@@ -569,6 +569,7 @@ class WellPlateView(QGraphicsView):
                 elif kind == "col":
                     self._select_column(idx)
                 self._restore_well_borders()  # v7.2.5: restore status colors
+                self._restore_well_borders()  # v7.2.5: restore status colors
                 self.selection_changed.emit(list(self._selected_wells))
                 return
 

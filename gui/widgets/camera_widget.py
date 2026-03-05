@@ -51,16 +51,50 @@ except ImportError:
     logger.info("OpenCV (cv2) not installed — camera widget disabled")
 
 
-def detect_cameras(max_index: int = 8) -> list[int]:
-    """Probe camera indices and return those that are available."""
+def detect_cameras(max_index: int = 4) -> list[int]:
+    """Probe camera indices and return those that are available.
+
+    v7.2.5 S7: Reduced max_index 8->4, suppresses OpenCV errors,
+    stops after 2 consecutive failures for speed.
+    """
     if not CV2_AVAILABLE:
         return []
+
+    # Suppress OpenCV error spam during probing
+    old_log_level = None
+    try:
+        old_log_level = cv2.getLogLevel()
+        cv2.setLogLevel(0)  # SILENT
+    except (AttributeError, cv2.error):
+        pass
+
     available = []
-    for idx in range(max_index):
-        cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            available.append(idx)
-            cap.release()
+    consecutive_fails = 0
+    try:
+        for idx in range(max_index):
+            try:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    available.append(idx)
+                    cap.release()
+                    consecutive_fails = 0
+                else:
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        break
+            except Exception:
+                consecutive_fails += 1
+                if consecutive_fails >= 2:
+                    break
+    finally:
+        if old_log_level is not None:
+            try:
+                cv2.setLogLevel(old_log_level)
+            except (AttributeError, cv2.error):
+                pass
+
+    logger.info(f"Camera detection: found {len(available)} camera(s) "
+               f"at indices {available}")
     return available
 
 
@@ -177,7 +211,24 @@ class CameraWidget(QWidget):
         layout.addWidget(self.video_label, stretch=1)
 
     def _populate_cameras(self):
-        """Detect available cameras and populate the source combo."""
+        """Show placeholder in camera combo -- no hardware probe.
+
+        v7.2.5 S7: Camera detection is now lazy. This method just
+        sets a placeholder. Call refresh_cameras() or start() to
+        actually probe hardware.
+        """
+        self.camera_combo.clear()
+        if not CV2_AVAILABLE:
+            return
+        self._cameras_detected = False
+        self.camera_combo.addItem("Click Detect or Start", -1)
+
+    def refresh_cameras(self):
+        """Detect cameras and populate the combo.
+
+        v7.2.5 S7: This is now the only path that probes hardware.
+        Called by user clicking Detect, or automatically on first start().
+        """
         self.camera_combo.clear()
         if not CV2_AVAILABLE:
             return
@@ -185,17 +236,21 @@ class CameraWidget(QWidget):
             self.camera_combo.addItem(f"Camera {idx}", idx)
         if self.camera_combo.count() == 0:
             self.camera_combo.addItem("No cameras found", -1)
-
-    def refresh_cameras(self):
-        """Re-scan for cameras (can be called externally)."""
-        self._populate_cameras()
+        self._cameras_detected = True
 
     # ── Start / Stop ──────────────────────────────────────────────
 
     def start(self):
-        """Start the camera feed using the currently selected combo index."""
+        """Start the camera feed using the currently selected combo index.
+
+        v7.2.5 S7: Triggers lazy camera detection on first start.
+        """
         if not CV2_AVAILABLE or self._running:
             return
+
+        # Lazy detection: probe hardware on first start
+        if not getattr(self, "_cameras_detected", False):
+            self.refresh_cameras()
 
         idx = self.camera_combo.currentData()
         if idx is None or idx < 0:
