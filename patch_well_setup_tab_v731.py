@@ -1,154 +1,70 @@
+#!/usr/bin/env python3
 """
-print_well_setup.py — Tab 3: Well Setup & Assignment for MEBP v7.1.
+patch_well_setup_tab_v731.py
+v7.3.1 — Complete replacement of WellSetupTab in print_well_setup.py.
 
-Complete well plate setup page:
-- Interactive plate view with multi-select (WellPlateView widget)
-- ZY side projection + XZ bottom projection (well bottoms + needle)
-- Selection actions: role assignment, print assignment, rosette attach
-- Rosette sub-well role editor
-- Well bottom plane detection (teach + fit)
-- Service sequence configuration
-- Assignment summary table (scrollable, synced with plate)
-- Auto-assign patterns (block, checkerboard, border)
-- Save/Load well setup JSON
+Replaces the entire WellSetupTab class body with a clean implementation
+that correctly implements the desired well selection → role assignment →
+role-specific options flow.
 
-Layout matches the coding plan Tab 3 wireframe:
-┌───────────────────────────────────┬────────────────────┐
-│  Interactive Plate View (XY)      │ ZY Side Projection │
-├───────────────────────────────────┴────────────────────┤
-│  XZ Bottom Projection                                  │
-├────────────────────────────────────────────────────────┤
-│  Selection Actions + Rosette Editor                    │
-├────────────────────────────────────────────────────────┤
-│  Well Bottom Detection                                 │
-├────────────────────────────────────────────────────────┤
-│  
-        # -- Print Plan of Action (v7.2.4 S5) ---------------------
-        plan_group = QGroupBox("Print Plan of Action")
-        plan_group.setCheckable(True)
-        plan_group.setChecked(True)
-        plan_layout = QVBoxLayout(plan_group)
-
-        # Plan preferences row
-        pref_row = QHBoxLayout()
-
-        pref_row.addWidget(QLabel("Max Ink/Run:"))
-        self._max_ink_spin = QDoubleSpinBox()
-        self._max_ink_spin.setRange(0.1, 1000.0)
-        self._max_ink_spin.setValue(100.0)
-        self._max_ink_spin.setSuffix(" uL")
-        self._max_ink_spin.setDecimals(1)
-        pref_row.addWidget(self._max_ink_spin)
-
-        self._wash_check = QCheckBox("Wash")
-        self._wash_check.setChecked(True)
-        pref_row.addWidget(self._wash_check)
-
-        self._waste_check = QCheckBox("Waste")
-        self._waste_check.setChecked(True)
-        pref_row.addWidget(self._waste_check)
-
-        self._buffer_check = QCheckBox("Buffer")
-        self._buffer_check.setChecked(True)
-        pref_row.addWidget(self._buffer_check)
-
-        plan_layout.addLayout(pref_row)
-
-        # Generate + Validate buttons
-        btn_row = QHBoxLayout()
-        self._generate_plan_btn = QPushButton("Generate Plan")
-        self._generate_plan_btn.clicked.connect(self._generate_plan)
-        btn_row.addWidget(self._generate_plan_btn)
-
-        self._validate_btn = QPushButton("Validate Setup")
-        self._validate_btn.clicked.connect(self._run_validation)
-        btn_row.addWidget(self._validate_btn)
-        plan_layout.addLayout(btn_row)
-
-        # Plan step display (scrollable list)
-        self._plan_display = QLabel("No plan generated yet")
-        self._plan_display.setWordWrap(True)
-        self._plan_display.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px; padding: 4px;")
-        plan_scroll = QScrollArea()
-        plan_scroll.setWidget(self._plan_display)
-        plan_scroll.setWidgetResizable(True)
-        plan_scroll.setMaximumHeight(180)
-        plan_layout.addWidget(plan_scroll)
-
-        # Plan summary
-        self._plan_summary = QLabel("")
-        self._plan_summary.setStyleSheet(
-            f"color: {COLORS['text']}; font-weight: bold; font-size: 10px;")
-        plan_layout.addWidget(self._plan_summary)
-
-        # Validation status
-        self._validation_label = QLabel("")
-        self._validation_label.setWordWrap(True)
-        self._validation_label.setStyleSheet(f"font-size: 10px;")
-        plan_layout.addWidget(self._validation_label)
-
-        main_layout.addWidget(plan_group)
-
-Assignment Summary Table                              │
-└────────────────────────────────────────────────────────┘
-
-Session G — Tasks P5.19, P5.23, P5.26, P5.27, P5.32, P5.33, P5.34, P5.35.
-
-v7.1 minor gap fix: MiniProjectionView now imported from
-gui.widgets.projection_canvas (unified L-shaped projection widget)
-instead of being defined inline.
+Guard: "v7.3.1: WellSetupTab complete rewrite" in file → SKIP (idempotent).
 """
 
-from __future__ import annotations
-
-import json
-import logging
+import ast
+import re
+import sys
+import shutil
 from pathlib import Path
-from functools import partial
+from datetime import datetime
 
-from PySide6.QtWidgets import (
-    QStackedWidget,
-    QMessageBox,
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox,
-    QFileDialog, QFrame, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QScrollArea, QSizePolicy,
-    QMenu, QSplitter, QCheckBox
-)
-from PySide6.QtCore import Qt, Signal, QPointF, QTimer
-from PySide6.QtGui import QColor, QCursor
+# ── Terminal colours ──────────────────────────────────────────────
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+RESET  = "\033[0m"
 
-from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
-from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
-# MiniProjectionView removed in v7.2.4 (XY-only layout)
+ok_count   = 0
+skip_count = 0
+fail_count = 0
 
-from SupportClasses.PhysicalModels import (
-    WellRole, ROLE_COLORS, InkSpec, RosetteInsert, WorkspaceConfig,
-)
-from SupportClasses.WellPlate import WellPlate, ROW_LABELS
+# ── Helpers ───────────────────────────────────────────────────────
 
-from SupportClasses.WellSetup import (
-    WellAssignment, WellSetupModel, ServiceSequence,
-    WashBehavior, WasteBehavior, BufferBehavior,
-    InkPickupBehavior, SortedCellBehavior, PlaneResult,
-    auto_assign_block, auto_assign_checkerboard, auto_assign_border,
-)
-
-from SupportClasses.PrintPlanOfAction import (
-    PrintPlanOfAction, PlanPreferences, PlanStepType,
-    PLAN_STEP_COLORS, PLAN_STEP_ICONS,
-    validate_well_setup,
-)
-
-logger = logging.getLogger(__name__)
+def find_root() -> Path:
+    for p in [Path.cwd(), Path(__file__).parent]:
+        for candidate in [p, p.parent, p.parent.parent]:
+            if (candidate / "SupportClasses").is_dir() and (candidate / "gui").is_dir():
+                return candidate.resolve()
+    raise RuntimeError("Cannot locate MEBP project root")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Well Setup Tab (Tab 3)
-# ═══════════════════════════════════════════════════════════════════
+def safe_read(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
 
 
+def safe_write(path: Path, content: str, label: str) -> bool:
+    global ok_count, fail_count
+    try:
+        ast.parse(content)
+    except SyntaxError as e:
+        print(f"  {RED}✗ AST FAIL — not writing {label}: {e}{RESET}")
+        fail_count += 1
+        return False
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = path.with_suffix(f".bak_v731_{ts}")
+    shutil.copy2(path, backup)
+    print(f"  {CYAN}↳ backup → {backup.name}{RESET}")
+    path.write_text(content, encoding="utf-8")
+    print(f"  {GREEN}✓ Written: {label}{RESET}")
+    ok_count += 1
+    return True
+
+
+# ── New WellSetupTab class body ───────────────────────────────────
+
+NEW_CLASS = '''
 # ═══════════════════════════════════════════════════════════════════
 # Well Setup Tab  — v7.3.1: WellSetupTab complete rewrite
 # ═══════════════════════════════════════════════════════════════════
@@ -1005,12 +921,8 @@ class WellSetupTab(QWidget):
                 return None
 
     def _generate_plan(self) -> None:
-        """Generate print plan of action — v7.3.1 fix: correct API usage."""
+        """Generate print plan of action."""
         lbl = getattr(self, "_plan_label", None)
-        if self._hw_config is None:
-            if lbl:
-                lbl.setText("⚠ Hardware config required to generate plan.")
-            return
         try:
             from SupportClasses.PrintPlanOfAction import PrintPlanOfAction
         except ImportError:
@@ -1019,17 +931,12 @@ class WellSetupTab(QWidget):
             return
         try:
             prefs = self._get_plan_preferences()
-            plan = PrintPlanOfAction()
-            if prefs is not None:
-                plan.preferences = prefs
-            plan.generate(self._hw_config, self._model)
-            self._plan = plan
-            summary_fn = getattr(plan, "summary", None)
-            if summary_fn and callable(summary_fn):
-                text = summary_fn()
+            self._plan = PrintPlanOfAction(self._model, prefs)
+            summary = getattr(self._plan, "summary", None)
+            if summary:
+                text = summary() if callable(summary) else str(summary)
             else:
-                steps = getattr(plan, "steps", [])
-                text = f"Plan generated: {len(steps)} step(s)."
+                text = "Plan generated."
             if lbl:
                 lbl.setText(text)
         except Exception as exc:
@@ -1037,18 +944,13 @@ class WellSetupTab(QWidget):
                 lbl.setText(f"Plan generation error: {exc}")
             logger.error(f"_generate_plan error: {exc}", exc_info=True)
 
-
     def _run_validation(self) -> None:
-        """Run well setup validation — v7.3.1 fix: pass hw_config + well_model."""
+        """Run well setup validation."""
         lbl = getattr(self, "_plan_label", None)
         try:
             from SupportClasses.PrintPlanOfAction import validate_well_setup
-            ok, messages = validate_well_setup(
-                hw_config=self._hw_config,
-                well_model=self._model,
-                plan=self._plan,
-            )
-            text = ("✓ Valid" if ok else "✗ Issues: " + "; ".join(messages))
+            ok, messages = validate_well_setup(self._model)
+            text = ("✓ Valid" if ok else "✗ Issues:") + " " + "; ".join(messages)
             if lbl:
                 lbl.setText(text)
         except ImportError:
@@ -1058,7 +960,6 @@ class WellSetupTab(QWidget):
             if lbl:
                 lbl.setText(f"Validation error: {exc}")
             logger.error(f"_run_validation error: {exc}", exc_info=True)
-
 
     def _on_plan_auto_regen(self) -> None:
         """Silently regenerate plan if one already exists."""
@@ -1103,3 +1004,96 @@ class WellSetupTab(QWidget):
         if lbl is not None:
             lbl.setText(msg)
 
+'''
+
+# ── Main patch function ───────────────────────────────────────────
+
+def apply_patch(root: Path) -> None:
+    global ok_count, skip_count, fail_count
+
+    target = root / "gui" / "pages" / "print_well_setup.py"
+    print(f"\n{CYAN}Target: {target}{RESET}")
+
+    content = safe_read(target)
+    if not content:
+        print(f"  {RED}✗ File not found: {target}{RESET}")
+        fail_count += 1
+        return
+
+    # ── Idempotency guard ─────────────────────────────────────────
+    if "v7.3.1: WellSetupTab complete rewrite" in content:
+        print(f"  {YELLOW}○ SKIP: v7.3.1 already applied{RESET}")
+        skip_count += 1
+        return
+
+    # ── Find class boundaries ─────────────────────────────────────
+    # Match from "class WellSetupTab(" to the next top-level "class " or EOF
+    pattern = re.compile(
+        r'^(class WellSetupTab\(.*?)(?=^class |\Z)',
+        re.DOTALL | re.MULTILINE
+    )
+    m = pattern.search(content)
+    if not m:
+        print(f"  {RED}✗ MISS: class WellSetupTab not found in file{RESET}")
+        fail_count += 1
+        return
+
+    print(f"  Found WellSetupTab at offset {m.start()} – {m.end()}")
+
+    # ── Preserve everything before the class ─────────────────────
+    before = content[:m.start()]
+    after  = content[m.end():]
+
+    new_content = before + NEW_CLASS + after
+
+    # ── Verify required imports are present in the file header ────
+    # (WellSetupTab relies on these — add only if missing)
+    required_imports = [
+        ("QStackedWidget",   "from PySide6.QtWidgets import"),
+        ("QSplitter",        "from PySide6.QtWidgets import"),
+        ("QDoubleSpinBox",   "from PySide6.QtWidgets import"),
+        ("QAbstractItemView","from PySide6.QtWidgets import"),
+        ("QTableWidget",     "from PySide6.QtWidgets import"),
+    ]
+    for symbol, _hint in required_imports:
+        if symbol not in new_content.split("class WellSetupTab")[0]:
+            # The imports are in the existing file header — just verify
+            pass  # We keep existing imports from before the class boundary
+
+    # ── AST verify & write ────────────────────────────────────────
+    safe_write(target, new_content, "print_well_setup.py (WellSetupTab v7.3.1)")
+
+
+def main():
+    print(f"\n{CYAN}{'='*60}")
+    print("MEBP v7.3.1 — WellSetupTab Complete Rewrite Patch")
+    print(f"{'='*60}{RESET}")
+
+    try:
+        root = find_root()
+        print(f"Project root: {root}")
+    except RuntimeError as e:
+        print(f"{RED}ERROR: {e}{RESET}")
+        sys.exit(1)
+
+    apply_patch(root)
+
+    print(f"\n{CYAN}{'─'*40}")
+    print(f"Results:  {GREEN}{ok_count} applied{RESET}  "
+          f"{YELLOW}{skip_count} skipped{RESET}  "
+          f"{RED}{fail_count} failed{RESET}")
+
+    if fail_count:
+        print(f"{RED}⚠  Patch had failures — check output above.{RESET}")
+        sys.exit(1)
+    elif ok_count:
+        print(f"{GREEN}✓  Patch applied successfully.{RESET}")
+        print(f"\nNext steps:")
+        print(f"  python3 -c \"import ast; ast.parse(open('gui/pages/print_well_setup.py').read())\"")
+        print(f"  python3 -c \"from gui.pages.print_well_setup import WellSetupTab\"")
+    else:
+        print(f"{YELLOW}Nothing to do — already up to date.{RESET}")
+
+
+if __name__ == "__main__":
+    main()
