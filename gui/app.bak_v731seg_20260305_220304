@@ -574,80 +574,39 @@ class MainWindow(QMainWindow):
 
     def _wire_print_manager_to_monitor(self):
         """
-        v7.3.1: Wire PrintManager progress/state to monitor via Qt signals.
-
-        CRITICAL: PrintManager callbacks fire from a daemon thread.
-        Direct widget calls from threads cause SIGSEGV on macOS/PySide6.
-        We bounce through a QObject signal bridge so all GUI updates
-        execute on the main thread.
+        Wire PrintManager's progress and state callbacks to update
+        the PrintMonitorPage in real-time, while preserving any
+        existing callback wiring (e.g., PrintSetup's signal bridge).
         """
-        setup_page  = self._page_widgets[4]
+        setup_page = self._page_widgets[4]
         monitor_page = self._page_widgets[5]
 
-        if not hasattr(setup_page, "print_manager"):
-            logger.warning("_wire_print_manager_to_monitor: no print_manager on setup page")
+        if not hasattr(setup_page, 'print_manager'):
             return
 
         pm = setup_page.print_manager
 
-        # ── Create a signal bridge owned by app.py ────────────────
-        try:
-            from gui.pages.print_setup import PrintSignalBridge
-        except ImportError:
-            # Fallback: define minimal bridge inline
-            from PySide6.QtCore import QObject, Signal as _Signal
-            class PrintSignalBridge(QObject):
-                progress_signal = _Signal(int, int, str)
-                state_signal    = _Signal(object)
+        # Chain onto existing progress callback
+        original_progress = pm.on_progress
 
-        self._print_signal_bridge = PrintSignalBridge(self)
+        def combined_progress(step, total, msg):
+            if original_progress:
+                original_progress(step, total, msg)
+            if hasattr(monitor_page, 'on_print_progress'):
+                monitor_page.on_print_progress(step, total, msg)
 
-        # Connect bridge signals → monitor (runs on main thread) ──
-        if hasattr(monitor_page, "on_print_progress"):
-            self._print_signal_bridge.progress_signal.connect(
-                monitor_page.on_print_progress,
-                type=__import__("PySide6.QtCore", fromlist=["Qt"]).Qt.QueuedConnection,
-            )
-        if hasattr(monitor_page, "on_print_state_changed"):
-            self._print_signal_bridge.state_signal.connect(
-                monitor_page.on_print_state_changed,
-                type=__import__("PySide6.QtCore", fromlist=["Qt"]).Qt.QueuedConnection,
-            )
+        pm.on_progress = combined_progress
 
-        # Wire PrintManager callbacks → emit bridge signals ────────
-        # These lambdas may be called from the print thread — they only
-        # call .emit() which is thread-safe in Qt.
-        bridge = self._print_signal_bridge
+        # Chain onto existing state-changed callback
+        original_state = pm.on_state_changed
 
-        original_progress  = pm.on_progress
-        original_state     = pm.on_state_changed
+        def combined_state(state):
+            if original_state:
+                original_state(state)
+            if hasattr(monitor_page, 'on_print_state_changed'):
+                monitor_page.on_print_state_changed(state)
 
-        def safe_progress(step, total, msg):
-            try:
-                if original_progress:
-                    original_progress(step, total, msg)
-            except Exception:
-                pass
-            try:
-                bridge.progress_signal.emit(step, total, msg)
-            except Exception:
-                pass
-
-        def safe_state(state):
-            try:
-                if original_state:
-                    original_state(state)
-            except Exception:
-                pass
-            try:
-                bridge.state_signal.emit(state)
-            except Exception:
-                pass
-
-        pm.on_progress       = safe_progress
-        pm.on_state_changed  = safe_state
-        logger.info("Print manager → monitor wired via thread-safe signal bridge")
-
+        pm.on_state_changed = combined_state
 
     def _send_job_to_monitor(self, job):
         """

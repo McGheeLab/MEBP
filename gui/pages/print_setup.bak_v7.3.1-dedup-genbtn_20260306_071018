@@ -462,6 +462,30 @@ class PrintSetupPage(QWidget):
         self._gen_status_label.setWordWrap(True)
         layout.addWidget(self._gen_status_label)
 
+        # v7.2.5: Generate Print button — validate + build execution plan
+        self.btn_generate_print = QPushButton("⚙ Generate Print")
+        self.btn_generate_print.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS.get('blue', '#89b4fa')};
+                color: {COLORS.get('base', '#1e1e2e')};
+                font-weight: bold; padding: 8px 16px;
+                border-radius: 4px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS.get('sapphire', '#74c7ec')};
+            }}
+        """)
+        self.btn_generate_print.setToolTip(
+            "Validate well setup and generate execution plan")
+        self.btn_generate_print.clicked.connect(self._generate_print)
+        layout.addWidget(self.btn_generate_print)
+
+        # Generation status label
+        self._gen_status_label = QLabel("")
+        self._gen_status_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+        self._gen_status_label.setWordWrap(True)
+        layout.addWidget(self._gen_status_label)
 
         self.btn_send_to_monitor = QPushButton("📤 Send to Monitor ▶")
         self.btn_send_to_monitor.setObjectName("accentBtn")

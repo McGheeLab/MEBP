@@ -965,10 +965,8 @@ class PrintMonitorPage(QWidget):
         # Track start time
         if state == PrintState.RUNNING and self._print_start_time is None:
             self._print_start_time = time.time()
-            self._start_position_poll()  # v7.3.1-timerwire
         elif state in (PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
             self._print_start_time = None
-            self._stop_position_poll()   # v7.3.1-timerwire
 
         if state == PrintState.COMPLETED:
             self._advance_queue()

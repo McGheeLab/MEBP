@@ -82,10 +82,12 @@
       -22797.06,
       -22365.15
     ],
+    "corner_well": "H12",
     "offset_x": -10054.98,
     "offset_y": -7703.829999999999,
     "rotation": -158.4802704427954,
-    "scale": 151.74057486979584
+    "scale": 151.74057486979584,
+    "alignment_valid": false
   },
   "controller": {
     "controller_json": null,
@@ -139,8 +141,6 @@
     "P3": null
   },
   "hardware_config": {
-    "last_config_file": null,
-    "auto_load": true,
     "version": "7.2.4",
     "config_name": "Standard Bioprinting Setup",
     "notes": "22G needle, 100\u00b5L syringe on P1, 250\u00b5L on P2",

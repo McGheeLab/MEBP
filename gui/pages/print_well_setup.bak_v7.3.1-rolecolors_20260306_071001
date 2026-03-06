@@ -781,65 +781,62 @@ class WellSetupTab(QWidget):
         self._refresh_summary_table()
         self._refresh_ink_combo()
 
-    def _refresh_well_colors(self) -> None:
-        """Update all well fill colors from role (v7.3.1-rolecolors)."""
+    def _refresh_well_status_colors(self) -> None:
+        """
+        Update well border colors:
+          PURPLE  = currently selected (overrides everything)
+          GREEN   = assigned + complete (ready to print)
+          RED     = assigned + incomplete
+          GRAY    = empty
+        Uses set_well_border_color if available, falls back to set_well_color.
+        """
         pv = getattr(self, "plate_view", None)
         if pv is None:
             return
-        appearances: dict = {}
-        for name, wa in self._model.assignments.items():
-            appearances[name] = (wa.role, wa.get_display_label()
-                                 if hasattr(wa, "get_display_label")
-                                 else wa.role.value)
-        if hasattr(pv, "update_all_wells"):
-            try:
-                pv.update_all_wells(appearances)
-            except Exception:
-                pass
-        # Apply selection border on top
-        self._apply_selection_borders()
 
-    def _apply_selection_borders(self) -> None:
-        """Purple border for selected wells; bright white for taught points."""
-        pv = getattr(self, "plate_view", None)
-        if pv is None or not hasattr(pv, "set_well_border_color"):
-            return
+        # Get currently selected wells
         selected = set()
         if hasattr(pv, "get_selected_wells"):
             try:
                 selected = set(pv.get_selected_wells())
             except Exception:
                 pass
-        COLOR_PURPLE = COLORS.get("mauve", "#cba6f7")
-        COLOR_DEFAULT = "#585b70"
-        for name in self._model.assignments:
-            color = COLOR_PURPLE if name in selected else COLOR_DEFAULT
+        else:
+            selected = set(getattr(pv, "selected_wells", set()))
+
+        COLOR_GRAY   = COLORS.get("surface1", "#45475a")
+        COLOR_GREEN  = COLORS.get("green",    "#a6e3a1")
+        COLOR_RED    = COLORS.get("red",      "#f38ba8")
+        COLOR_PURPLE = COLORS.get("mauve",    "#cba6f7")
+
+        # Prefer set_well_border_color; fall back to set_well_color
+        set_color = (
+            pv.set_well_border_color if hasattr(pv, "set_well_border_color")
+            else pv.set_well_color   if hasattr(pv, "set_well_color")
+            else None
+        )
+        if set_color is None:
+            # Try update_well_roles as last resort
+            if hasattr(pv, "update_well_roles") and hasattr(self._model, "get_role_map"):
+                try:
+                    pv.update_well_roles(self._model.get_role_map())
+                except Exception:
+                    pass
+            return
+
+        for name, wa in self._model.assignments.items():
+            if name in selected:
+                color = COLOR_PURPLE
+            elif wa.role == WellRole.EMPTY:
+                color = COLOR_GRAY
+            elif self._check_well_ready(wa):
+                color = COLOR_GREEN
+            else:
+                color = COLOR_RED
             try:
-                pv.set_well_border_color(name, color)
+                set_color(name, color)
             except Exception:
                 pass
-
-    def _refresh_well_status_colors(self) -> None:
-        """Alias kept for compatibility — delegates to _refresh_well_colors."""
-        self._refresh_well_colors()
-
-    def _refresh_well_rosettes(self) -> None:
-        """Push rosette data to plate view for subwell rendering."""
-        pv = getattr(self, "plate_view", None)
-        if pv is None or not hasattr(pv, "update_well_rosettes"):
-            return
-        rosette_map: dict = {}
-        for name, wa in self._model.assignments.items():
-            rn = getattr(wa, "rosette_name", None)
-            if rn and self._workspace:
-                rosette = self._workspace.get_rosette(rn) if hasattr(self._workspace, "get_rosette") else None
-                if rosette:
-                    rosette_map[name] = rosette
-        try:
-            pv.update_well_rosettes(rosette_map, self._model.plate)
-        except Exception:
-            pass
-
 
     def _check_well_ready(self, wa) -> bool:
         """True if the well assignment is fully configured (ready to print)."""
