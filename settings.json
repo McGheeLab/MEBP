@@ -250,5 +250,8 @@
   },
   "ui": {
     "scale": 2.0
+  },
+  "execution": {
+    "mode": "discrete"
   }
 }

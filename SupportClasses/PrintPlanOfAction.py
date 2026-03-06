@@ -196,15 +196,15 @@ class PrintPlanOfAction:
         pump_ink_needs = self._compute_ink_needs(hw_config, well_model, print_wells)
 
         if not pump_ink_needs:
-            self.steps.append(PlanStep(
-                step_type=PlanStepType.PRINT,
-                description=f"Print {len(print_wells)} wells",
-                target_wells=print_wells,
-                run_number=1,
-            ))
-            self.total_runs = 1
-            self._estimate_times()
-            return
+            # No ink info — use default pump with estimated volume
+            default_pump = "P1"
+            enabled = getattr(hw_config, 'enabled_pump_ids', [])
+            if enabled:
+                default_pump = enabled[0]
+            # Estimate 2µL per well as default
+            estimated_vol = max(len(print_wells) * 2.0, 10.0)
+            pump_ink_needs = {default_pump: estimated_vol}
+            logger.info(f"No ink info — defaulting to {default_pump}: {estimated_vol:.1f}uL")
 
         max_per_run = {}
         for pump_id in pump_ink_needs:
@@ -292,42 +292,71 @@ class PrintPlanOfAction:
 
     def _add_service_steps(self, run_num, run_ink_per_pump, hw_config,
                            ink_wells, wash_wells, waste_wells, buffer_wells):
+        """v7.3: Correct service sequence WASTE-WASH-BUFFER-WASH-LOAD_INK.
+
+        Before each print run, prepare the syringe:
+        1. WASTE — purge whatever is in the syringe
+        2. WASH — clean the needle
+        3. BUFFER — load buffer to separate oil from ink
+        4. WASH — clean again after buffer
+        5. LOAD_INK — aspirate ink needed for this run
+        """
         prefs = self.preferences
 
-        if prefs.waste_before_refill and waste_wells:
+        # Use the correct attribute names (UI sends use_waste/use_wash/use_buffer)
+        do_waste = getattr(prefs, 'use_waste', getattr(prefs, 'waste_before_refill', True))
+        do_wash = getattr(prefs, 'use_wash', getattr(prefs, 'wash_after_refill', True))
+        do_buffer = getattr(prefs, 'use_buffer', getattr(prefs, 'refill_buffer_after_waste', True))
+
+        # 1. WASTE — purge syringe
+        if do_waste and waste_wells:
             for pump_id in run_ink_per_pump:
                 self.steps.append(PlanStep(
                     step_type=PlanStepType.WASTE,
-                    description=f"Dispense waste at {waste_wells[0]}",
+                    description=f"Purge {pump_id} at {waste_wells[0]}",
                     target_wells=[waste_wells[0]],
                     pump_id=pump_id, run_number=run_num,
                 ))
 
-        if prefs.wash_after_refill and wash_wells:
+        # 2. WASH — clean needle
+        if do_wash and wash_wells:
             self.steps.append(PlanStep(
                 step_type=PlanStepType.WASH,
-                description=f"Wash needle at {wash_wells[0]} ({prefs.wash_cycles} cycles)",
+                description=f"Wash needle at {wash_wells[0]}",
                 target_wells=[wash_wells[0]], run_number=run_num,
             ))
 
-        if prefs.refill_buffer_after_waste and buffer_wells:
+        # 3. BUFFER — load buffer layer
+        if do_buffer and buffer_wells:
             self.steps.append(PlanStep(
                 step_type=PlanStepType.REFILL_BUFFER,
-                description=f"Refill buffer from {buffer_wells[0]}",
+                description=f"Load buffer from {buffer_wells[0]}",
                 target_wells=[buffer_wells[0]], run_number=run_num,
             ))
 
+        # 4. WASH again — clean after buffer
+        if do_wash and do_buffer and wash_wells:
+            self.steps.append(PlanStep(
+                step_type=PlanStepType.WASH,
+                description=f"Post-buffer wash at {wash_wells[0]}",
+                target_wells=[wash_wells[0]], run_number=run_num,
+            ))
+
+        # 5. LOAD INK — aspirate ink for this run
         for pump_id, volume in run_ink_per_pump.items():
+            if volume <= 0:
+                continue
             pcfg = hw_config.pumps.get(pump_id)
             ink_name = pcfg.ink.name if pcfg and pcfg.ink else "unknown"
             target = ink_wells[0] if ink_wells else "?"
             self.steps.append(PlanStep(
                 step_type=PlanStepType.LOAD_INK,
-                description=f"Load {volume:.1f} uL {ink_name} from {target} into {pump_id}",
+                description=f"Load {volume:.1f} uL {ink_name} into {pump_id}",
                 target_wells=[target] if target != "?" else [],
                 pump_id=pump_id, volume_uL=volume,
                 ink_name=ink_name, run_number=run_num,
             ))
+
 
     def _estimate_times(self):
         prefs = self.preferences
@@ -517,9 +546,9 @@ def validate_well_setup(hw_config, well_model, plan=None):
 # ═══════════════════════════════════════════════════════════════════
 
 def _find_service_well(well_model, plate, role_value: str):
-    """Find the first well with the given role. Returns (name, x, y) or None.
+    """Find first well with given role. Returns (name, x, y) or None.
 
-    v7.2.6: Bridge between high-level plan and PrintManager commands.
+    v7.2.6b: Use settings feedrates + track fluid balance.
     """
     if well_model is None or plate is None:
         return None
@@ -536,119 +565,119 @@ def _find_service_well(well_model, plate, role_value: str):
 
 
 def _waste_commands(step, well_model, plate, settings):
-    """Generate PrintCommands for a waste ejection step."""
+    """Generate waste ejection commands using settings feedrates."""
     from SupportClasses.PrintManager import PrintCommand, CommandType
-
-    well_info = _find_service_well(well_model, plate, "waste")
-    if not well_info:
-        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No waste well assigned")]
-    name, x, y = well_info
+    well = _find_service_well(well_model, plate, "waste")
+    if not well:
+        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No waste well")]
+    name, x, y = well
     pump = step.pump_id or getattr(settings, 'active_pump', 'P1') or 'P1'
+    z_fr = getattr(settings, 'z_feedrate', 60.0)
+    p_fr = getattr(settings, 'pump_feedrate', 30.0)
+    eject_vol = 5.0  # µL to eject
     return [
         PrintCommand(type=CommandType.COMMENT, label=f"== Waste: {name} =="),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise to travel height"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise to travel height"),
         PrintCommand(type=CommandType.MOVE_XY, params={"x": x, "y": y},
                      label=f"Travel to waste well {name}"),
-        PrintCommand(type=CommandType.TRAVEL_DOWN, label="Lower to waste depth"),
+        PrintCommand(type=CommandType.TRAVEL_DOWN, params={"feedrate": z_fr},
+                     label="Lower to waste depth"),
         PrintCommand(type=CommandType.EXTRUDE,
-                     params={"pump": pump, "amount": 5.0, "feedrate": 60},
-                     label="Eject waste"),
+                     params={"pump": pump, "amount": eject_vol, "feedrate": p_fr},
+                     label=f"Eject {eject_vol:.1f} into waste"),
         PrintCommand(type=CommandType.DWELL, params={"seconds": 0.5},
-                     label="Settle after waste"),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise from waste"),
+                     label="Settle"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise from waste"),
     ]
 
 
 def _wash_commands(step, well_model, plate, settings):
-    """Generate PrintCommands for a wash step."""
+    """Generate wash commands using settings feedrates."""
     from SupportClasses.PrintManager import PrintCommand, CommandType
-
-    well_info = _find_service_well(well_model, plate, "wash")
-    if not well_info:
-        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No wash well assigned")]
-    name, x, y = well_info
+    well = _find_service_well(well_model, plate, "wash")
+    if not well:
+        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No wash well")]
+    name, x, y = well
+    z_fr = getattr(settings, 'z_feedrate', 60.0)
     return [
         PrintCommand(type=CommandType.COMMENT, label=f"== Wash: {name} =="),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise to travel height"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise to travel height"),
         PrintCommand(type=CommandType.MOVE_XY, params={"x": x, "y": y},
                      label=f"Travel to wash well {name}"),
-        PrintCommand(type=CommandType.TRAVEL_DOWN, label="Lower into wash"),
+        PrintCommand(type=CommandType.TRAVEL_DOWN, params={"feedrate": z_fr},
+                     label="Lower into wash"),
         PrintCommand(type=CommandType.DWELL, params={"seconds": 5.0},
                      label="Wash soak"),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise from wash"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise from wash"),
     ]
 
 
 def _buffer_commands(step, well_model, plate, settings):
-    """Generate PrintCommands for a buffer refill step."""
+    """Generate buffer commands using settings feedrates."""
     from SupportClasses.PrintManager import PrintCommand, CommandType
-
-    well_info = _find_service_well(well_model, plate, "buffer")
-    if not well_info:
-        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No buffer well assigned")]
-    name, x, y = well_info
+    well = _find_service_well(well_model, plate, "buffer")
+    if not well:
+        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No buffer well")]
+    name, x, y = well
     pump = step.pump_id or getattr(settings, 'active_pump', 'P1') or 'P1'
+    z_fr = getattr(settings, 'z_feedrate', 60.0)
+    p_fr = getattr(settings, 'pump_feedrate', 30.0)
     return [
         PrintCommand(type=CommandType.COMMENT, label=f"== Buffer: {name} =="),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise to travel height"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise"),
         PrintCommand(type=CommandType.MOVE_XY, params={"x": x, "y": y},
-                     label=f"Travel to buffer well {name}"),
-        PrintCommand(type=CommandType.TRAVEL_DOWN, label="Lower into buffer"),
+                     label=f"Travel to buffer {name}"),
+        PrintCommand(type=CommandType.TRAVEL_DOWN, params={"feedrate": z_fr},
+                     label="Lower into buffer"),
         PrintCommand(type=CommandType.EXTRUDE,
-                     params={"pump": pump, "amount": -5.0, "feedrate": 30},
+                     params={"pump": pump, "amount": -5.0, "feedrate": p_fr},
                      label="Aspirate buffer"),
-        PrintCommand(type=CommandType.DWELL, params={"seconds": 1.0},
-                     label="Settle after buffer"),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise from buffer"),
+        PrintCommand(type=CommandType.DWELL, params={"seconds": 1.0}, label="Settle"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise from buffer"),
     ]
 
 
 def _load_ink_commands(step, well_model, plate, settings):
-    """Generate PrintCommands for an ink loading step."""
+    """Generate ink loading commands using settings feedrates."""
     from SupportClasses.PrintManager import PrintCommand, CommandType
-
-    well_info = _find_service_well(well_model, plate, "ink")
-    if not well_info:
-        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No ink well assigned")]
-    name, x, y = well_info
+    well = _find_service_well(well_model, plate, "ink")
+    if not well:
+        return [PrintCommand(type=CommandType.COMMENT, label="SKIP: No ink well")]
+    name, x, y = well
     pump = step.pump_id or getattr(settings, 'active_pump', 'P1') or 'P1'
+    z_fr = getattr(settings, 'z_feedrate', 60.0)
+    p_fr = getattr(settings, 'pump_feedrate', 30.0)
     volume = step.volume_uL if step.volume_uL > 0 else 50.0
     ink_name = step.ink_name or "?"
     return [
         PrintCommand(type=CommandType.COMMENT,
                      label=f"== Load Ink: {ink_name} ({volume:.1f}uL) into {pump} =="),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise to travel height"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise"),
         PrintCommand(type=CommandType.MOVE_XY, params={"x": x, "y": y},
                      label=f"Travel to ink well {name}"),
-        PrintCommand(type=CommandType.TRAVEL_DOWN, label="Lower into ink"),
+        PrintCommand(type=CommandType.TRAVEL_DOWN, params={"feedrate": z_fr},
+                     label="Lower into ink"),
         PrintCommand(type=CommandType.EXTRUDE,
-                     params={"pump": pump, "amount": -volume, "feedrate": 30},
+                     params={"pump": pump, "amount": -volume, "feedrate": p_fr},
                      label=f"Aspirate {volume:.1f}uL {ink_name}"),
-        PrintCommand(type=CommandType.DWELL, params={"seconds": 1.0},
-                     label="Settle after ink load"),
-        PrintCommand(type=CommandType.TRAVEL_UP, label="Raise from ink well"),
+        PrintCommand(type=CommandType.DWELL, params={"seconds": 1.0}, label="Settle"),
+        PrintCommand(type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                     label="Raise from ink"),
     ]
 
 
-def plan_to_commands(
-    plan,           # PrintPlanOfAction
-    well_model,     # WellSetupModel
-    plate,          # WellPlate
-    path_points,    # list[(float, float)] - print geometry per well
-    settings,       # PrintSettings
-    hw_config=None, # HardwareConfig (optional)
-):
-    """Convert a PrintPlanOfAction into an executable PrintJob.
+def plan_to_commands(plan, well_model, plate, path_points, settings, hw_config=None):
+    """Convert PrintPlanOfAction into executable PrintJob.
 
-    v7.2.6: Bridge between high-level plan and PrintManager commands.
-
-    Each PlanStep becomes a sequence of PrintCommands:
-        WASTE        -> travel to waste well, lower, eject, raise
-        WASH         -> travel to wash well, lower, soak, raise
-        REFILL_BUFFER -> travel to buffer well, lower, aspirate, raise
-        LOAD_INK     -> travel to ink well, lower, aspirate, raise
-        PRINT        -> for each well: travel, lower, print path, raise
-        RETURN_HOME  -> home XY
+    v7.2.6b: Use settings feedrates + track fluid balance.
+    Ensures pump never goes negative by inserting extra LOAD_INK steps.
     """
     from SupportClasses.PrintManager import (
         PrintJob, PrintCommand, CommandType, build_well_plate_job,
@@ -662,64 +691,88 @@ def plan_to_commands(
     all_commands = []
     prev_pump = None
 
+    # Track fluid balance per pump (µL loaded minus µL dispensed)
+    fluid_balance: dict[str, float] = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
+
     for step in steps:
-        step_type = getattr(step, 'step_type', None)
-        if step_type is None:
+        stype = getattr(step, 'step_type', None)
+        if stype is None:
             continue
 
-        if step_type == PlanStepType.WASTE:
+        if stype == PlanStepType.WASTE:
+            pump = step.pump_id or "P1"
             all_commands.extend(_waste_commands(step, well_model, plate, settings))
+            # Waste ejects 5µL
+            fluid_balance[pump] = max(0, fluid_balance.get(pump, 0) - 5.0)
 
-        elif step_type == PlanStepType.WASH:
+        elif stype == PlanStepType.WASH:
             all_commands.extend(_wash_commands(step, well_model, plate, settings))
 
-        elif step_type == PlanStepType.REFILL_BUFFER:
+        elif stype == PlanStepType.REFILL_BUFFER:
+            pump = step.pump_id or "P1"
             all_commands.extend(_buffer_commands(step, well_model, plate, settings))
+            fluid_balance[pump] = fluid_balance.get(pump, 0) + 5.0
 
-        elif step_type == PlanStepType.LOAD_INK:
+        elif stype == PlanStepType.LOAD_INK:
+            pump = step.pump_id or "P1"
+            vol = step.volume_uL if step.volume_uL > 0 else 50.0
             all_commands.extend(_load_ink_commands(step, well_model, plate, settings))
+            fluid_balance[pump] = fluid_balance.get(pump, 0) + vol
 
-        elif step_type == PlanStepType.PRINT:
+        elif stype == PlanStepType.PRINT:
             target_wells = getattr(step, 'target_wells', [])
             if not target_wells:
                 all_commands.append(PrintCommand(
-                    type=CommandType.COMMENT, label="SKIP: No wells in print step"))
+                    type=CommandType.COMMENT, label="SKIP: No wells"))
                 continue
 
-            # Build well positions for this run
             well_positions = []
-            for well_name in target_wells:
+            for wn in target_wells:
                 try:
-                    x, y = plate.get_well_position(well_name)
-                    well_positions.append((well_name, x, y))
+                    x, y = plate.get_well_position(wn)
+                    well_positions.append((wn, x, y))
                 except Exception:
-                    logger.warning(f"Skipping well {well_name}: position lookup failed")
                     continue
 
             if not well_positions:
                 continue
 
-            # Determine pump for this step
             pump = step.pump_id or getattr(settings, 'active_pump', 'P1') or 'P1'
             flow = getattr(settings, 'flow_rate', 0.01) or 0.01
 
-            # Insert SWITCH_PUMP if pump changed
             if prev_pump is not None and pump != prev_pump:
                 all_commands.append(PrintCommand(
-                    type=CommandType.SWITCH_PUMP,
-                    params={"pump": pump},
-                    label=f"Switch to {pump}",
-                ))
+                    type=CommandType.SWITCH_PUMP, params={"pump": pump},
+                    label=f"Switch to {pump}"))
             prev_pump = pump
 
-            # Add run header comment
+            # Estimate ink needed for this run
+            path_length = 0.0
+            if len(path_points) >= 2:
+                import math
+                for i in range(1, len(path_points)):
+                    dx = path_points[i][0] - path_points[i-1][0]
+                    dy = path_points[i][1] - path_points[i-1][1]
+                    path_length += math.sqrt(dx*dx + dy*dy)
+            ink_per_well = path_length * flow * getattr(settings, 'num_layers', 1)
+            ink_needed = ink_per_well * len(well_positions)
+
+            # Check if we have enough ink
+            balance = fluid_balance.get(pump, 0)
+            if balance < ink_needed and ink_needed > 0:
+                shortfall = ink_needed - balance
+                all_commands.append(PrintCommand(
+                    type=CommandType.COMMENT,
+                    label=f"WARNING: {pump} needs {ink_needed:.1f}uL but only {balance:.1f}uL loaded"))
+                logger.warning(
+                    f"Pump {pump}: needs {ink_needed:.1f}uL, has {balance:.1f}uL "
+                    f"(shortfall {shortfall:.1f}uL)")
+
             run_num = getattr(step, 'run_number', '?')
             all_commands.append(PrintCommand(
                 type=CommandType.COMMENT,
-                label=f"== Print Run {run_num}: {len(well_positions)} wells with {pump} ==",
-            ))
+                label=f"== Print Run {run_num}: {len(well_positions)} wells, {pump} =="))
 
-            # Build sub-job for this run's wells
             try:
                 sub_job = build_well_plate_job(
                     well_positions=well_positions,
@@ -730,34 +783,33 @@ def plan_to_commands(
                     job_name=f"Run {run_num}",
                 )
                 all_commands.extend(sub_job.commands)
+                # Deduct estimated ink used
+                fluid_balance[pump] = fluid_balance.get(pump, 0) - ink_needed
             except Exception as exc:
-                logger.error(f"build_well_plate_job for run {run_num} failed: {exc}")
+                logger.error(f"build_well_plate_job run {run_num}: {exc}")
                 all_commands.append(PrintCommand(
                     type=CommandType.COMMENT,
-                    label=f"ERROR: Failed to build run {run_num}: {exc}",
-                ))
+                    label=f"ERROR: Run {run_num} failed: {exc}"))
 
-        elif step_type == PlanStepType.RETURN_HOME:
+        elif stype == PlanStepType.RETURN_HOME:
+            z_fr = getattr(settings, 'z_feedrate', 60.0)
             all_commands.append(PrintCommand(
-                type=CommandType.TRAVEL_UP, label="Final: raise to travel height"))
+                type=CommandType.TRAVEL_UP, params={"feedrate": z_fr},
+                label="Final: raise"))
             all_commands.append(PrintCommand(
-                type=CommandType.HOME_XY, label="Return to home position"))
-
+                type=CommandType.HOME_XY, label="Return home"))
         else:
             all_commands.append(PrintCommand(
-                type=CommandType.COMMENT,
-                label=f"Unknown step type: {step_type}",
-            ))
+                type=CommandType.COMMENT, label=f"Unknown: {stype}"))
 
     if not all_commands:
-        logger.warning("plan_to_commands produced no commands")
         return None
 
-    total_wells = getattr(plan, 'total_print_wells', '?')
-    total_runs = getattr(plan, 'total_runs', '?')
+    tw = getattr(plan, 'total_print_wells', '?')
+    tr = getattr(plan, 'total_runs', '?')
     return PrintJob(
-        name=f"Plan: {total_wells} wells, {total_runs} run(s)",
-        description="Generated from PrintPlanOfAction v7.2.6",
+        name=f"Plan: {tw} wells, {tr} run(s)",
+        description="Generated from PrintPlanOfAction v7.2.6b",
         settings=settings,
         commands=all_commands,
     )

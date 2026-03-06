@@ -760,23 +760,110 @@ class MainWindow(QMainWindow):
 
 
     def _on_monitor_start(self, job):
-        """Monitor requested start. v7.2.6: load_job then start.
+        """v7.3: Trajectory execution with configurable control mode.
 
-        PrintManager.start() takes no arguments — the job must be
-        loaded first via load_job(). The old code called start(job)
-        which raises TypeError.
+        Execution modes (set in settings.json → execution.mode):
+          "discrete"  — legacy command-based PrintManager (v7.0 behavior)
+          "position"  — trajectory waypoints with position commands (DEFAULT)
+          "kalman"    — velocity control via Kalman filter
+          "pid"       — velocity control via PID controller
+
+        Default is "position" — simplest and most reliable.
         """
         setup_page = self._page_widgets[4]
         if not hasattr(setup_page, "print_manager"):
             logger.error("No print_manager on setup page")
             return
+
         pm = setup_page.print_manager
+        waypoints = getattr(job, 'trajectory_waypoints', None)
+
+        # Read execution mode from settings (default: position)
+        exec_mode = "position"
+        if hasattr(self, '_settings') and self._settings:
+            exec_mode = self._settings.get("execution.mode", "position")
+        logger.info(f"Execution mode: {exec_mode}")
+
+        # ── Discrete mode: use legacy PrintManager ────────────────
+        if exec_mode == "discrete" or not waypoints or len(waypoints) == 0:
+            try:
+                pm.load_job(job)
+                pm.start()
+                logger.info(f"Print started (discrete): {job.name}")
+            except Exception as exc:
+                logger.error(f"PrintManager start failed: {exc}", exc_info=True)
+            return
+
+        # ── Trajectory modes: position / kalman / pid ─────────────
+        logger.info(
+            f"Starting trajectory ({exec_mode}): {job.name} "
+            f"({len(waypoints)} waypoints)")
         try:
-            pm.load_job(job)
-            pm.start()
-            logger.info(f"Print started: {job.name}")
+            from SupportClasses.PrintManager import PrintState
+            import threading
+
+            pm.job = job
+            pm._abort_flag.clear()
+            pm._pause_event.set()
+
+            # Choose executor based on mode
+            if exec_mode in ("kalman", "pid"):
+                try:
+                    from SupportClasses.VelocityExecutor import VelocityExecutor
+                    tex = VelocityExecutor(
+                        pm.controller, strategy=exec_mode,
+                        recorder=pm.recorder)
+                    logger.info(f"Using VelocityExecutor ({exec_mode})")
+                except ImportError:
+                    logger.warning("VelocityExecutor not available, using position mode")
+                    exec_mode = "position"
+
+            if exec_mode == "position":
+                # Use the v7.1 TrajectoryExecutor — simplest, most reliable
+                from SupportClasses.PrintManager import TrajectoryExecutor
+                tex = TrajectoryExecutor(pm.controller, recorder=pm.recorder)
+                logger.info("Using TrajectoryExecutor (position mode)")
+
+            pm._trajectory_executor = tex
+
+            # Start recording
+            if hasattr(pm, '_start_recorder'):
+                pm._start_recorder()
+
+            def _traj_thread():
+                pm._set_state(PrintState.RUNNING)
+                try:
+                    def on_prog(idx, total, msg):
+                        if pm.on_progress:
+                            pm.on_progress(idx, total, msg)
+
+                    success = tex.execute(
+                        waypoints=waypoints,
+                        pause_event=pm._pause_event,
+                        on_progress=on_prog,
+                    )
+                    if success:
+                        pm._set_state(PrintState.COMPLETED)
+                        if pm.on_progress:
+                            pm.on_progress(len(waypoints), len(waypoints),
+                                           "Complete!")
+                    else:
+                        pm._set_state(PrintState.ABORTED)
+                except Exception as exc:
+                    logger.error(f"Trajectory error: {exc}", exc_info=True)
+                    pm._set_state(PrintState.ERROR)
+                finally:
+                    if hasattr(pm, '_stop_recorder'):
+                        try:
+                            pm._stop_recorder(pm.state.name.lower())
+                        except Exception:
+                            pass
+
+            pm._thread = threading.Thread(target=_traj_thread, daemon=True)
+            pm._thread.start()
+
         except Exception as exc:
-            logger.error(f"PrintManager start failed: {exc}", exc_info=True)
+            logger.error(f"Trajectory start failed: {exc}", exc_info=True)
 
 
     def _on_monitor_pause(self):

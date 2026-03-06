@@ -1,21 +1,38 @@
 {
   "schema_version": "7.2.3",
   "metadata": {
-    "name": "Geeze",
+    "name": "Spys",
     "description": "",
     "created": "2026-03-05T21:00:52.710334+00:00",
     "modified": "2026-03-05T21:00:52.710334+00:00",
     "author": ""
   },
   "objects": {
-    "Circle_1": {
-      "object_type": "circle",
+    "Spiral_35": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        2.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": false
+    },
+    "Spiral_36": {
+      "object_type": "spiral",
+      "params": {
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
+      },
+      "position": [
+        3.0,
         0.0,
         0.0
       ],
@@ -25,15 +42,15 @@
       "layer_height": 0.2,
       "auto_layout": true
     },
-    "Circle_2": {
-      "object_type": "circle",
+    "Spiral_37": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        1.0000000000000002,
-        1.7320508075688772,
+        1.5000000000000004,
+        2.598076211353316,
         0.0
       ],
       "color": "#a6e3a1",
@@ -42,15 +59,15 @@
       "layer_height": 0.2,
       "auto_layout": true
     },
-    "Circle_3": {
-      "object_type": "circle",
+    "Spiral_38": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        -0.9999999999999996,
-        1.7320508075688774,
+        -1.4999999999999996,
+        2.598076211353316,
         0.0
       ],
       "color": "#a6e3a1",
@@ -59,15 +76,15 @@
       "layer_height": 0.2,
       "auto_layout": true
     },
-    "Circle_4": {
-      "object_type": "circle",
+    "Spiral_39": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        -2.0,
-        2.4492935982947064e-16,
+        -3.0,
+        3.6739403974420594e-16,
         0.0
       ],
       "color": "#a6e3a1",
@@ -76,15 +93,15 @@
       "layer_height": 0.2,
       "auto_layout": true
     },
-    "Circle_5": {
-      "object_type": "circle",
+    "Spiral_40": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        -1.0000000000000009,
-        -1.732050807568877,
+        -1.5000000000000013,
+        -2.598076211353315,
         0.0
       ],
       "color": "#a6e3a1",
@@ -93,15 +110,15 @@
       "layer_height": 0.2,
       "auto_layout": true
     },
-    "Circle_6": {
-      "object_type": "circle",
+    "Spiral_41": {
+      "object_type": "spiral",
       "params": {
-        "radius": 1.0,
-        "num_points": 64
+        "max_radius": 1.5,
+        "num_points_per_turn": 64
       },
       "position": [
-        1.0000000000000002,
-        -1.7320508075688772,
+        1.5000000000000004,
+        -2.598076211353316,
         0.0
       ],
       "color": "#a6e3a1",

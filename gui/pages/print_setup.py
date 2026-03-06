@@ -824,11 +824,14 @@ class PrintSetupPage(QWidget):
             return [(0.0, 0.0)]
 
     def _generate_print(self):
-        """v7.2.6: Store generated job for _send_to_monitor.
+        """v7.3: Use plan_to_trajectory for smooth execution.
 
-        Validate well setup, generate execution plan, and build the
-        complete PrintJob. Stores as self._generated_job.
+        Generates a time-parameterized trajectory instead of flat commands.
+        The trajectory encodes all axis positions with proper timing from
+        feedrate settings, enabling smooth coordinated motion.
         """
+        gen_label = getattr(self, '_gen_status_label', None)
+
         # Step 1: Validate
         if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, 'validate'):
             try:
@@ -836,20 +839,17 @@ class PrintSetupPage(QWidget):
             except Exception as exc:
                 is_valid, issues = False, [f"Validation error: {exc}"]
         else:
-            is_valid, issues = False, ["Well setup tab missing validate() method"]
-
-        gen_label = getattr(self, '_gen_status_label', None)
+            is_valid, issues = False, ["Well setup tab missing validate()"]
 
         if not is_valid:
-            text = (f"\u26a0 {len(issues)} issue(s):\n"
-                    + "\n".join(f"  \u2022 {i}" for i in issues[:5]))
             if gen_label:
-                gen_label.setText(text)
+                gen_label.setText(
+                    f"\u26a0 {len(issues)} issue(s):\n"
+                    + "\n".join(f"  \u2022 {i}" for i in issues[:5]))
                 gen_label.setStyleSheet(
                     f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
             if hasattr(self, 'btn_send_to_monitor'):
                 self.btn_send_to_monitor.setEnabled(False)
-            logger.warning(f"Generate Print: {len(issues)} validation issues")
             return
 
         # Step 2: Generate plan
@@ -860,7 +860,7 @@ class PrintSetupPage(QWidget):
                     self.tab_wells._generate_plan()
                 except Exception as e:
                     if gen_label:
-                        gen_label.setText(f"\u26a0 Plan generation failed: {e}")
+                        gen_label.setText(f"\u26a0 Plan failed: {e}")
                         gen_label.setStyleSheet(
                             f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
                     if hasattr(self, 'btn_send_to_monitor'):
@@ -869,44 +869,66 @@ class PrintSetupPage(QWidget):
             if hasattr(self.tab_wells, 'get_plan'):
                 plan = self.tab_wells.get_plan()
 
-        # Step 3: Build job — try plan-based first, fallback to simple
-        job = None
-        if plan is not None and hasattr(plan, 'steps') and len(plan.steps) > 0:
+        # Step 3: Get path points and settings
+        path_points = self._get_path_from_objects()
+        if not path_points:
             try:
-                from SupportClasses.PrintPlanOfAction import plan_to_commands
-                path_points = self._get_path_from_objects()
-                if not path_points:
-                    try:
-                        from SupportClasses.WellPlate import generate_meander_path
-                        model = self.tab_wells._model
-                        plate = getattr(model, 'plate', None)
-                        d = getattr(plate, 'well_diameter', 6.0) if plate else 6.0
-                        path_points = generate_meander_path(d * 0.7, d * 0.7, 0.5)
-                    except Exception:
-                        path_points = [(0.0, 0.0)]
-
-                settings = self._get_settings()
+                from SupportClasses.WellPlate import generate_meander_path
                 model = self.tab_wells._model
                 plate = getattr(model, 'plate', None)
-                hw = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
+                d = getattr(plate, 'well_diameter', 6.0) if plate else 6.0
+                path_points = generate_meander_path(d * 0.7, d * 0.7, 0.5)
+            except Exception:
+                path_points = [(0.0, 0.0)]
 
-                job = plan_to_commands(
-                    plan=plan,
-                    well_model=model,
-                    plate=plate,
-                    path_points=path_points,
-                    settings=settings,
-                    hw_config=hw,
-                )
-                if job:
-                    job.plan_of_action = plan
-                    logger.info(f"Plan-based job: {job.total_steps} commands")
+        settings = self._get_settings()
+        model = getattr(self.tab_wells, '_model', None)
+        plate = getattr(model, 'plate', None) if model else None
+        hw = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
+
+        # Step 4: Generate trajectory (preferred) or fall back to commands
+        job = None
+        trajectory_result = None
+
+        if plan is not None and plate is not None:
+            try:
+                from SupportClasses.PrintTrajectoryPlanner import plan_to_trajectory
+                trajectory_result = plan_to_trajectory(
+                    plan=plan, well_model=model, plate=plate,
+                    path_points=path_points, settings=settings, hw_config=hw)
+
+                if trajectory_result.valid:
+                    # Build a lightweight PrintJob that carries the waypoints
+                    from SupportClasses.PrintManager import PrintJob
+                    job = PrintJob(
+                        name=f"Trajectory: {trajectory_result.well_count} wells",
+                        description=trajectory_result.summary(),
+                        settings=settings,
+                        commands=[],  # empty — execution uses waypoints
+                    )
+                    job.trajectory_waypoints = trajectory_result.waypoints
+                    job.trajectory_result = trajectory_result
+                    if plan:
+                        job.plan_of_action = plan
+                    logger.info(
+                        f"Trajectory generated: {len(trajectory_result.waypoints)} "
+                        f"waypoints, {trajectory_result.total_duration_s:.1f}s")
+                else:
+                    logger.warning(f"Trajectory invalid: {trajectory_result.issues}")
+                    if gen_label:
+                        gen_label.setText(
+                            "\u26a0 " + "; ".join(trajectory_result.issues[:3]))
+                        gen_label.setStyleSheet(
+                            f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
+                    if hasattr(self, 'btn_send_to_monitor'):
+                        self.btn_send_to_monitor.setEnabled(False)
+                    return
             except ImportError:
-                logger.warning("plan_to_commands not available, falling back to simple build")
+                logger.warning("PrintTrajectoryPlanner not available, using commands")
             except Exception as exc:
-                logger.error(f"plan_to_commands failed: {exc}", exc_info=True)
+                logger.error(f"Trajectory generation failed: {exc}", exc_info=True)
 
-        # Fallback to simple build
+        # Fallback to command-based job
         if job is None:
             job = self._build_current_job()
 
@@ -919,23 +941,22 @@ class PrintSetupPage(QWidget):
                 self.btn_send_to_monitor.setEnabled(False)
             return
 
-        # Store for _send_to_monitor
         self._generated_job = job
 
-        # Step 4: Show success
-        summary_parts = [f"\u2713 Job ready: {job.total_steps} commands"]
-        if plan:
-            summary_parts.append(f"{getattr(plan, 'total_runs', '?')} run(s)")
-            est = getattr(plan, 'estimated_total_seconds', 0)
-            if est > 0:
-                summary_parts.append(f"~{est / 60:.1f} min")
+        # Step 5: Show success
+        parts = [f"\u2713 Ready: {getattr(job, 'name', '?')}"]
+        if trajectory_result:
+            parts.append(f"{trajectory_result.total_duration_s / 60:.1f} min")
+            parts.append(f"{len(trajectory_result.waypoints)} waypoints")
+        elif hasattr(job, 'total_steps'):
+            parts.append(f"{job.total_steps} commands")
         if gen_label:
-            gen_label.setText(" | ".join(summary_parts))
+            gen_label.setText(" | ".join(parts))
             gen_label.setStyleSheet(
                 f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
         if hasattr(self, 'btn_send_to_monitor'):
             self.btn_send_to_monitor.setEnabled(True)
-        logger.info(f"Generate Print complete: {job.total_steps} commands ready")
+        logger.info(f"Generate Print complete: {parts}")
 
 
     def _export_gcode(self):

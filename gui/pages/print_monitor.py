@@ -1,559 +1,524 @@
 """
-print_monitor.py — Print Monitor Page for MEBP v7.2.6.
+print_monitor.py — Print Monitor Page for MEBP v7.2.6b.
 
-Complete redesign: single XY live well preview with zoom/pan,
-compact plate overview, unified controls, clean progress display.
+Full rewrite with smooth interpolation, YZ view, syringe display.
 
 Layout:
-┌──────────────┬────────────────────────────────────────────────────┐
-│ Plate        │  Live Well Preview (XY, zoomable/pannable)         │
-│ Overview     │  - Well boundary, completed path, upcoming path    │
-│ (compact)    │  - Needle crosshair + tracking error ring          │
-│              │  - Grid + mm ruler + zoom toolbar                  │
-├──────────────┼─────────────────────────┬──────────────────────────┤
-│ Syringe      │  Print Progress          │  Controls + State       │
-│ P1/P2/P3     │  Job/Well/Layer/Step/ETA │  Start/Pause/Abort      │
-│ + Needle     │  Progress bar            │  Tracking + Controller  │
-└──────────────┴─────────────────────────┴──────────────────────────┘
-
-Context Panel: Job Queue + Recording Browser
+┌──────────────────────┬──────────────────────────┬──────────────┐
+│  Plate Overview       │  XY Detail View          │  YZ View     │
+│  (wells + needle)     │  (zoomed, waypoints)     │  (Z height)  │
+├──────────────────────┴──────────────────────────┴──────────────┤
+│  Syringe Pumps [P1][P2][P3]         │  Controls + Progress     │
+│  fill bars + µL readout             │  [Pause] [Abort] ████ 52%│
+└─────────────────────────────────────┴──────────────────────────┘
 """
 
 from __future__ import annotations
-import re
 
 import logging
 import math
+import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from enum import Enum
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QLabel, QPushButton, QFrame, QSplitter, QSizePolicy,
-    QProgressBar, QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
-    QListWidget, QListWidgetItem, QScrollArea, QToolBar,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QProgressBar, QGroupBox,
+    QSplitter, QListWidget, QFrame, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF
-from PySide6.QtGui import (
-    QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
-    QWheelEvent, QMouseEvent,
-)
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient
 
-from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.styles import COLORS
 
 try:
-    from SupportClasses.HardwareConfig import HardwareConfig
+    from SupportClasses.PrintManager import PrintState
 except ImportError:
-    HardwareConfig = None
+    class PrintState(Enum):
+        IDLE = "IDLE"; RUNNING = "RUNNING"; PAUSED = "PAUSED"
+        COMPLETED = "COMPLETED"; ABORTED = "ABORTED"; ERROR = "ERROR"
 
-from gui.unit_helpers import steps_to_um, DEFAULT_MICROSTEPS_PER_MICRON
-from gui.widgets.syringe_display import SyringeStatusPanel
-
-from SupportClasses.PhysicalModels import (
-    WorkspaceConfig, PumpLoadout, NeedleSpec, WellRole, ROLE_COLORS,
-)
-from SupportClasses.WellPlate import WellPlate, WellInfo, ROW_LABELS
-from SupportClasses.PrintManager import PrintState
-
+try:
+    from SupportClasses.PhysicalModels import WellRole, ROLE_COLORS, WorkspaceConfig
+except ImportError:
+    WellRole = None; ROLE_COLORS = {}
+    class WorkspaceConfig:
+        plate_format = 24
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Constants
+#  Position Interpolator
 # ═══════════════════════════════════════════════════════════════════
 
-# Well progress colors
-WELL_DONE_COLOR = "#a6e3a1"
-WELL_ACTIVE_COLOR = "#f9e2af"
-WELL_PENDING_COLOR = "#45475a"
-WELL_ERROR_COLOR = "#f38ba8"
-WELL_SKIP_COLOR = "#313244"
-
-# Mini plate scaling
-MINI_SCALE = 3.5
-MINI_WELL_RADIUS = 5
-
-# Live preview constants
-SCENE_SCALE = 20.0          # mm → scene pixels
-MIN_ZOOM = 0.1
-MAX_ZOOM = 10.0
-ZOOM_STEP = 1.15
-BG_COLOR = "#181825"
-WELL_BOUNDARY_COLOR = "#585b70"
-GRID_COLOR = "#313244"
-RULER_COLOR = "#6c7086"
-COMPLETED_PATH_COLOR = "#a6e3a1"
-UPCOMING_PATH_COLOR = "#f9e2af"
-NEEDLE_COLOR = "#f5c2e7"
-TRACKING_ERROR_COLOR = "#f38ba8"
-GRID_ALPHA = 50
-CROSSHAIR_SIZE = 12
-NEEDLE_DOT_RADIUS = 3
-MAX_COMPLETED_POINTS = 5000
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Mini Plate Overview (preserved from v7.1)
-# ═══════════════════════════════════════════════════════════════════
-
-class MiniPlateOverview(QGraphicsView):
+class PositionInterpolator:
     """
-    Miniature plate view showing per-well progress coloring.
+    Smooth position between controller samples using linear extrapolation.
 
-    Wells are colored by print state (done/active/pending/error)
-    or by role (ink/wash/waste/buffer) for service wells.
-    Clicking a well emits well_clicked(name).
+    Stores the last N timestamped samples and interpolates/extrapolates
+    to produce smooth position at any query time.
     """
 
-    well_clicked = Signal(str)
+    def __init__(self, history_size: int = 5):
+        self._history: deque[tuple[float, float, float, float, float]] = deque(maxlen=history_size)
+        # Each entry: (timestamp, x, y, z, p1)
+        self._vx = 0.0
+        self._vy = 0.0
+        self._vz = 0.0
+
+    def add_sample(self, t: float, x: float, y: float, z: float = 0.0, p1: float = 0.0):
+        """Add a new position sample with timestamp."""
+        if self._history:
+            prev = self._history[-1]
+            dt = t - prev[0]
+            if dt > 0.01:  # Avoid division by zero
+                self._vx = (x - prev[1]) / dt
+                self._vy = (y - prev[2]) / dt
+                self._vz = (z - prev[3]) / dt
+        self._history.append((t, x, y, z, p1))
+
+    def get_position(self, t: float) -> tuple[float, float, float]:
+        """Get interpolated (x, y, z) at time t."""
+        if not self._history:
+            return (0.0, 0.0, 0.0)
+        last = self._history[-1]
+        dt = t - last[0]
+        # Clamp extrapolation to 0.5s max to avoid runaway
+        dt = max(-0.5, min(0.5, dt))
+        x = last[1] + self._vx * dt
+        y = last[2] + self._vy * dt
+        z = last[3] + self._vz * dt
+        return (x, y, z)
+
+    @property
+    def last_sample(self):
+        return self._history[-1] if self._history else None
+
+    @property
+    def velocity(self):
+        return (self._vx, self._vy, self._vz)
+
+# ═══════════════════════════════════════════════════════════════════
+#  Plate Overview Widget
+# ═══════════════════════════════════════════════════════════════════
+
+class PlateOverviewWidget(QWidget):
+    """Miniature plate with color-coded wells + needle crosshair."""
+
+    STATE_COLORS = {
+        "pending": QColor("#585b70"), "active": QColor("#f9e2af"),
+        "done": QColor("#a6e3a1"), "error": QColor("#f38ba8"),
+    }
+    NEEDLE_COLOR = QColor("#f5c2e7")
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setStyleSheet(
-            f"background-color: {COLORS['surface0']}; "
-            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setMinimumSize(160, 100)
-        self.setMaximumHeight(200)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-
-        self._well_items: dict[str, QGraphicsEllipseItem] = {}
-        self._well_states: dict[str, str] = {}
-        self._well_roles: dict[str, WellRole] = {}
-
-    def _get_controller(self):
-        """v7.2.6: Helper to get controller reference.
-
-        The controller may be stored as _controller or controller.
-        """
-        ctrl = getattr(self, '_controller', None)
-        if ctrl is None:
-            ctrl = getattr(self, 'controller', None)
-        return ctrl
-
-
-    def set_plate(self, plate: WellPlate) -> None:
-        """Draw well positions from a WellPlate object."""
-        self._scene.clear()
-        self._well_items.clear()
-
-        for name, info in plate._wells.items():
-            x = info.x * MINI_SCALE
-            y = info.y * MINI_SCALE
-            r = MINI_WELL_RADIUS
-            item = self._scene.addEllipse(
-                x - r, y - r, 2 * r, 2 * r,
-                QPen(QColor(COLORS["surface2"]), 0.5),
-                QBrush(QColor(WELL_SKIP_COLOR)),
-            )
-            item.setToolTip(name)
-            self._well_items[name] = item
-
-        self._fit_view()
-
-    def set_well_roles(self, roles: dict[str, WellRole]) -> None:
-        self._well_roles = dict(roles)
-        for name in self._well_items:
-            self._update_well_color(name)
-
-    def set_all_states(self, states: dict[str, str]) -> None:
-        self._well_states = dict(states)
-        for name in self._well_items:
-            self._update_well_color(name)
-
-    def set_well_state(self, name: str, state: str) -> None:
-        self._well_states[name] = state
-        self._update_well_color(name)
-
-    def _update_well_color(self, name: str) -> None:
-        item = self._well_items.get(name)
-        if not item:
-            return
-
-        state = self._well_states.get(name, "")
-        role = self._well_roles.get(name, WellRole.EMPTY)
-
-        if state == "done":
-            color = WELL_DONE_COLOR
-        elif state == "active":
-            color = WELL_ACTIVE_COLOR
-        elif state == "pending":
-            color = WELL_PENDING_COLOR
-        elif state == "error":
-            color = WELL_ERROR_COLOR
-        elif role != WellRole.EMPTY and role != WellRole.PRINT:
-            color = ROLE_COLORS.get(role, WELL_SKIP_COLOR)
-        elif role == WellRole.PRINT:
-            color = WELL_PENDING_COLOR
-        else:
-            color = WELL_SKIP_COLOR
-
-        item.setBrush(QBrush(QColor(color)))
-
-    def _fit_view(self) -> None:
-        rect = self._scene.itemsBoundingRect().adjusted(-10, -10, 10, 10)
-        if not rect.isEmpty():
-            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._fit_view()
-
-    def mousePressEvent(self, event) -> None:
-        scene_pos = self.mapToScene(event.pos())
-        for name, item in self._well_items.items():
-            if item.contains(item.mapFromScene(scene_pos)):
-                self.well_clicked.emit(name)
-                break
-        super().mousePressEvent(event)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Live Well Preview — Real-time XY monitoring view
-# ═══════════════════════════════════════════════════════════════════
-
-class LiveWellPreview(QGraphicsView):
-    """
-    Zoomable/pannable XY well view for real-time print monitoring.
-
-    Features:
-    - Well boundary circle at correct diameter
-    - Completed path segments (solid, per-object color)
-    - Upcoming waypoints (dashed yellow)
-    - Needle crosshair with tracking error ring
-    - Grid + mm ruler
-    - Mouse wheel zoom, middle-click/Ctrl+click pan
-    - Auto-follow mode (centers on needle)
-    """
-
-    zoom_changed = Signal(float)  # emits zoom percentage
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._scene = QGraphicsScene(self)
-        self.setScene(self._scene)
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setStyleSheet(
-            f"background-color: {BG_COLOR}; "
-            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(180, 140)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._wells: list[dict] = []
+        self._well_roles: dict[str, str] = {}
+        self._well_states: dict[str, str] = {}
+        self._needle_x: float | None = None
+        self._needle_y: float | None = None
+        self._margin = 28
+        self._active_well = ""
 
-        # State
-        self._zoom_factor = 1.0
-        self._panning = False
-        self._pan_start = None
-        self._auto_follow = True
+    def set_plate(self, plate):
+        self._wells = [{"name": w.name, "x": w.x, "y": w.y,
+                        "diameter": w.diameter, "row": w.row, "col": w.col}
+                       for w in plate.get_all_wells()]
+        self._well_states.clear()
+        self._well_roles.clear()
+        self.update()
 
-        # Data
-        self._well_diameter_mm = 0.0
-        self._completed_points: deque[tuple[float, float]] = deque(maxlen=MAX_COMPLETED_POINTS)
-        self._upcoming_points: list[tuple[float, float]] = []
-        self._needle_pos: tuple[float, float] | None = None
-        self._tracking_error_mm = 0.0
-        self._object_paths: list[dict] = []  # [{color, points}]
+    def set_well_roles(self, roles: dict):
+        self._well_roles.clear()
+        fallback = {"print": "#a6e3a1", "wash": "#89b4fa", "waste": "#f38ba8",
+                    "buffer": "#cba6f7", "ink": "#f9e2af", "empty": "#585b70", "sorted": "#94e2d5"}
+        for name, role in roles.items():
+            if ROLE_COLORS and role in ROLE_COLORS:
+                self._well_roles[name] = ROLE_COLORS[role]
+            elif hasattr(role, 'value'):
+                self._well_roles[name] = fallback.get(role.value, "#585b70")
+        self.update()
 
-    # ── Public API ────────────────────────────────────────────────
+    def set_all_pending(self, names: list[str]):
+        for n in names: self._well_states[n] = "pending"
+        self.update()
 
-    def set_well_diameter(self, diameter_mm: float) -> None:
-        self._well_diameter_mm = diameter_mm
-        self.refresh()
+    def set_needle_position(self, x_mm, y_mm):
+        self._needle_x = x_mm; self._needle_y = y_mm; self.update()
 
-    def add_completed_point(self, x: float, y: float, z: float = 0.0) -> None:
-        self._completed_points.append((x, y))
+    def set_active_well(self, name: str):
+        """Mark a well as actively printing. Only print wells change state."""
+        if self._active_well and self._active_well != name:
+            prev = self._well_states.get(self._active_well)
+            if prev in ("active", "pending"):
+                self._well_states[self._active_well] = "done"
+        if self._well_states.get(name) in ("pending", None):
+            self._well_states[name] = "active"
+        self._active_well = name
+        self.update()
 
-    def set_upcoming_waypoints(self, waypoints: list[tuple[float, float, float]]) -> None:
-        self._upcoming_points = [(w[0], w[1]) for w in waypoints]
+    def paintEvent(self, event):
+        if not self._wells: return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(COLORS.get("mantle", "#181825")))
 
-    def set_needle_position(self, x: float | None, y: float | None, z: float | None) -> None:
-        if x is not None and y is not None:
-            self._needle_pos = (x, y)
-            if self._auto_follow and self._needle_pos:
-                sx = x * SCENE_SCALE
-                sy = -y * SCENE_SCALE  # flip Y for screen coords
-                self.centerOn(sx, sy)
-        else:
-            self._needle_pos = None
+        max_x = max((w["x"] for w in self._wells), default=1) or 1
+        max_y = max((w["y"] for w in self._wells), default=1) or 1
+        aw = self.width() - 2 * self._margin
+        ah = self.height() - 2 * self._margin
+        scale = min(aw / max(max_x, 0.1), ah / max(max_y, 0.1))
+        wr = max(self._wells[0]["diameter"] * scale / 2, 4) * 0.75
 
-    def set_tracking_error(self, error_mm: float) -> None:
-        self._tracking_error_mm = error_mm
+        for w in self._wells:
+            cx, cy = self._margin + w["x"] * scale, self._margin + w["y"] * scale
+            name = w["name"]
+            state = self._well_states.get(name)
+            if state and state in self.STATE_COLORS:
+                color = self.STATE_COLORS[state]
+            elif name in self._well_roles:
+                color = QColor(self._well_roles[name])
+            else:
+                color = QColor("#45475a")
+            p.setPen(QPen(QColor("#6c7086"), 1))
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cx, cy), wr, wr)
+            if scale > 3:
+                p.setPen(QColor("#cdd6f4"))
+                p.setFont(QFont("Arial", max(int(wr * 0.55), 5)))
+                p.drawText(QRectF(cx - wr, cy - wr, wr * 2, wr * 2),
+                           Qt.AlignmentFlag.AlignCenter, name)
 
-    def set_object_paths(self, paths: list[dict]) -> None:
-        """Set pre-computed object paths for the current well.
+        if self._needle_x is not None and self._needle_y is not None:
+            nx = self._margin + self._needle_x * scale
+            ny = self._margin + self._needle_y * scale
+            pen = QPen(self.NEEDLE_COLOR, 2)
+            p.setPen(pen)
+            p.drawLine(QPointF(nx - 8, ny), QPointF(nx + 8, ny))
+            p.drawLine(QPointF(nx, ny - 8), QPointF(nx, ny + 8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(nx, ny), 4, 4)
 
-        Each dict: {color: str, points: [(x,y,z), ...]}
-        """
-        self._object_paths = paths
-
-    def clear_path(self) -> None:
-        self._completed_points.clear()
-        self._upcoming_points.clear()
-        self._needle_pos = None
-        self._tracking_error_mm = 0.0
-        self._object_paths.clear()
-        self.refresh()
-
-    def set_auto_follow(self, enabled: bool) -> None:
-        self._auto_follow = enabled
-
-    def fit_to_well(self) -> None:
-        """Reset zoom to fit the well boundary."""
-        if self._well_diameter_mm > 0:
-            r = self._well_diameter_mm / 2 * SCENE_SCALE
-            rect = QRectF(-r - 20, -r - 20, 2 * r + 40, 2 * r + 40)
-        else:
-            rect = self._scene.itemsBoundingRect().adjusted(-20, -20, 20, 20)
-        if not rect.isEmpty():
-            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
-            t = self.transform()
-            self._zoom_factor = t.m11()
-            self.zoom_changed.emit(self._zoom_factor * 100.0)
-
-    def refresh(self) -> None:
-        """Full redraw of the scene."""
-        self._scene.clear()
-        self._draw_grid()
-        self._draw_well_boundary()
-        self._draw_object_paths()
-        self._draw_completed_path()
-        self._draw_upcoming_path()
-        self._draw_needle()
-
-    # ── Drawing Helpers ───────────────────────────────────────────
-
-    def _draw_grid(self) -> None:
-        """Draw mm grid lines and ruler."""
-        extent = max(self._well_diameter_mm / 2, 5.0) * 1.5
-        step = self._nice_step(extent * 2)
-        grid_pen = QPen(QColor(GRID_COLOR))
-        grid_pen.setCosmetic(True)
-        grid_color = QColor(GRID_COLOR)
-        grid_color.setAlpha(GRID_ALPHA)
-        grid_pen.setColor(grid_color)
-
-        n = int(extent / step) + 1
-        for i in range(-n, n + 1):
-            v = i * step * SCENE_SCALE
-            # vertical lines
-            self._scene.addLine(v, -extent * SCENE_SCALE, v, extent * SCENE_SCALE, grid_pen)
-            # horizontal lines
-            self._scene.addLine(-extent * SCENE_SCALE, v, extent * SCENE_SCALE, v, grid_pen)
-
-        # Ruler labels
-        font = QFont("Segoe UI", 7)
-        label_color = QColor(RULER_COLOR)
-        for i in range(-n, n + 1):
-            if i == 0:
-                continue
-            val = i * step
-            sx = val * SCENE_SCALE
-            # X axis label
-            txt = self._scene.addText(f"{val:.1f}", font)
-            txt.setDefaultTextColor(label_color)
-            txt.setPos(sx - 10, 4)
-            # Y axis label
-            txt2 = self._scene.addText(f"{val:.1f}", font)
-            txt2.setDefaultTextColor(label_color)
-            txt2.setPos(4, -val * SCENE_SCALE - 8)
-
-    def _draw_well_boundary(self) -> None:
-        """Draw the well boundary circle."""
-        if self._well_diameter_mm <= 0:
-            return
-        r = self._well_diameter_mm / 2 * SCENE_SCALE
-        pen = QPen(QColor(WELL_BOUNDARY_COLOR), 1.5)
-        pen.setCosmetic(True)
-        fill = QColor(WELL_BOUNDARY_COLOR)
-        fill.setAlpha(15)
-        self._scene.addEllipse(-r, -r, 2 * r, 2 * r, pen, QBrush(fill))
-
-    def _draw_object_paths(self) -> None:
-        """Draw pre-loaded object trajectory paths."""
-        for obj in self._object_paths:
-            points = obj.get("points", [])
-            color = obj.get("color", COMPLETED_PATH_COLOR)
-            if len(points) < 2:
-                continue
-            path = QPainterPath()
-            x0, y0 = points[0][0] * SCENE_SCALE, -points[0][1] * SCENE_SCALE
-            path.moveTo(x0, y0)
-            for pt in points[1:]:
-                path.lineTo(pt[0] * SCENE_SCALE, -pt[1] * SCENE_SCALE)
-            pen = QPen(QColor(color), 1.5)
-            pen.setCosmetic(True)
-            c = QColor(color)
-            c.setAlpha(80)
-            pen.setColor(c)
-            self._scene.addPath(path, pen)
-
-    def _draw_completed_path(self) -> None:
-        """Draw the completed print path."""
-        if len(self._completed_points) < 2:
-            return
-        path = QPainterPath()
-        pts = list(self._completed_points)
-        path.moveTo(pts[0][0] * SCENE_SCALE, -pts[0][1] * SCENE_SCALE)
-        for x, y in pts[1:]:
-            path.lineTo(x * SCENE_SCALE, -y * SCENE_SCALE)
-        pen = QPen(QColor(COMPLETED_PATH_COLOR), 2.0)
-        pen.setCosmetic(True)
-        self._scene.addPath(path, pen)
-
-    def _draw_upcoming_path(self) -> None:
-        """Draw upcoming waypoints as dashed yellow line."""
-        if len(self._upcoming_points) < 2:
-            return
-        path = QPainterPath()
-        path.moveTo(
-            self._upcoming_points[0][0] * SCENE_SCALE,
-            -self._upcoming_points[0][1] * SCENE_SCALE,
-        )
-        for x, y in self._upcoming_points[1:]:
-            path.lineTo(x * SCENE_SCALE, -y * SCENE_SCALE)
-        pen = QPen(QColor(UPCOMING_PATH_COLOR), 1.5)
-        pen.setCosmetic(True)
-        pen.setDashPattern([6, 4])
-        self._scene.addPath(path, pen)
-
-        # Waypoint dots
-        dot_pen = QPen(QColor(UPCOMING_PATH_COLOR), 1)
-        dot_pen.setCosmetic(True)
-        dot_brush = QBrush(QColor(UPCOMING_PATH_COLOR))
-        for x, y in self._upcoming_points:
-            sx, sy = x * SCENE_SCALE, -y * SCENE_SCALE
-            self._scene.addEllipse(sx - 2, sy - 2, 4, 4, dot_pen, dot_brush)
-
-    def _draw_needle(self) -> None:
-        """Draw needle crosshair and tracking error ring."""
-        if not self._needle_pos:
-            return
-        nx, ny = self._needle_pos
-        sx = nx * SCENE_SCALE
-        sy = -ny * SCENE_SCALE
-
-        # Tracking error ring
-        if self._tracking_error_mm > 0.01:
-            err_r = self._tracking_error_mm * SCENE_SCALE
-            err_pen = QPen(QColor(TRACKING_ERROR_COLOR), 1, Qt.PenStyle.DotLine)
-            err_pen.setCosmetic(True)
-            self._scene.addEllipse(
-                sx - err_r, sy - err_r, 2 * err_r, 2 * err_r, err_pen)
-
-        # Crosshair lines
-        needle_pen = QPen(QColor(NEEDLE_COLOR), 2)
-        needle_pen.setCosmetic(True)
-        self._scene.addLine(
-            sx - CROSSHAIR_SIZE, sy, sx + CROSSHAIR_SIZE, sy, needle_pen)
-        self._scene.addLine(
-            sx, sy - CROSSHAIR_SIZE, sx, sy + CROSSHAIR_SIZE, needle_pen)
-
-        # Center dot
-        self._scene.addEllipse(
-            sx - NEEDLE_DOT_RADIUS, sy - NEEDLE_DOT_RADIUS,
-            NEEDLE_DOT_RADIUS * 2, NEEDLE_DOT_RADIUS * 2,
-            QPen(QColor(NEEDLE_COLOR), 1),
-            QBrush(QColor(NEEDLE_COLOR)),
-        )
-
-    @staticmethod
-    def _nice_step(range_mm: float) -> float:
-        """Pick a readable grid spacing for a given axis range."""
-        if range_mm <= 0:
-            return 1.0
-        raw = range_mm / 6.0
-        mag = 10 ** math.floor(math.log10(max(raw, 1e-9)))
-        norm = raw / mag
-        if norm < 1.5:
-            return mag
-        elif norm < 3.5:
-            return 2 * mag
-        elif norm < 7.5:
-            return 5 * mag
-        return 10 * mag
-
-    # ── Mouse Interaction ─────────────────────────────────────────
-
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        """Zoom with mouse wheel."""
-        if event.angleDelta().y() > 0:
-            factor = ZOOM_STEP
-        else:
-            factor = 1.0 / ZOOM_STEP
-
-        new_zoom = self._zoom_factor * factor
-        if MIN_ZOOM <= new_zoom <= MAX_ZOOM:
-            self.scale(factor, factor)
-            self._zoom_factor = new_zoom
-            self.zoom_changed.emit(self._zoom_factor * 100.0)
-        event.accept()
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if (event.button() == Qt.MouseButton.MiddleButton
-                or (event.button() == Qt.MouseButton.LeftButton
-                    and event.modifiers() & Qt.KeyboardModifier.ControlModifier)):
-            self._panning = True
-            self._pan_start = event.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self._auto_follow = False
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._panning and self._pan_start is not None:
-            delta = event.position() - self._pan_start
-            self._pan_start = event.position()
-            self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - int(delta.x()))
-            self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - int(delta.y()))
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._panning:
-            self._panning = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+        # Headers
+        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 7))
+        rows_done, cols_done = set(), set()
+        for w in self._wells:
+            cx, cy = self._margin + w["x"] * scale, self._margin + w["y"] * scale
+            if w["col"] == 0 and w["row"] not in rows_done:
+                rows_done.add(w["row"]); p.drawText(QPointF(3, cy + 3), w["name"][0])
+            if w["row"] == 0 and w["col"] not in cols_done:
+                cols_done.add(w["col"]); p.drawText(QPointF(cx - 3, self._margin - 5), str(w["col"] + 1))
+        p.end()
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Print Monitor Page
+#  XY Detail View
+# ═══════════════════════════════════════════════════════════════════
+
+class XYDetailView(QWidget):
+    """Zoomed XY view: waypoints + completed/upcoming paths + needle."""
+
+    C_DONE = QColor("#a6e3a1"); C_NEXT = QColor("#f9e2af")
+    C_WP_EMPTY = QColor("#6c7086"); C_WP_FILL = QColor("#a6e3a1")
+    C_NEEDLE = QColor("#f5c2e7"); C_WELL = QColor("#585b70")
+    C_BG = QColor("#1e1e2e")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(250, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._waypoints: list[tuple[float, float]] = []
+        self._completed_idx = 0
+        self._nx: float | None = None; self._ny: float | None = None
+        self._well_diam = 15.0; self._view_r = 12.0
+        self._cx = 0.0; self._cy = 0.0
+
+    def set_waypoints(self, pts): self._waypoints = list(pts); self._completed_idx = 0; self.update()
+    def set_completed_index(self, i): self._completed_idx = min(i, len(self._waypoints)); self.update()
+    def set_well_diameter(self, d): self._well_diam = d; self._view_r = d * 0.8; self.update()
+    def clear(self): self._waypoints.clear(); self._completed_idx = 0; self._nx = self._ny = None; self.update()
+
+    def set_needle_position(self, x, y):
+        self._nx = x; self._ny = y; self._cx = x; self._cy = y; self.update()
+
+    def _to_px(self, xm, ym):
+        w, h = self.width(), self.height()
+        s = min(w, h) / (2 * self._view_r) if self._view_r > 0 else 1
+        return w / 2 + (xm - self._cx) * s, h / 2 + (ym - self._cy) * s
+
+    def paintEvent(self, event):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), self.C_BG)
+        w, h = self.width(), self.height()
+        if self._view_r <= 0: p.end(); return
+        s = min(w, h) / (2 * self._view_r)
+
+        # Well boundary
+        if self._well_diam > 0:
+            bx, by = self._to_px(0, 0)
+            p.setPen(QPen(self.C_WELL, 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(bx, by), self._well_diam / 2 * s, self._well_diam / 2 * s)
+
+        wp = self._waypoints
+        wpr = max(2.5, min(5, 50 / max(len(wp), 1)))
+
+        # Completed path (green)
+        if self._completed_idx > 1:
+            p.setPen(QPen(self.C_DONE, 2))
+            for i in range(1, min(self._completed_idx, len(wp))):
+                p.drawLine(QPointF(*self._to_px(*wp[i-1])), QPointF(*self._to_px(*wp[i])))
+
+        # Upcoming paths (yellow dashed, next 2 segments beyond completed)
+        if self._completed_idx < len(wp):
+            p.setPen(QPen(self.C_NEXT, 2, Qt.PenStyle.DashLine))
+            lo = max(0, self._completed_idx - 1)
+            hi = min(len(wp), self._completed_idx + 3)
+            for i in range(lo + 1, hi):
+                p.drawLine(QPointF(*self._to_px(*wp[i-1])), QPointF(*self._to_px(*wp[i])))
+
+        # Waypoints
+        for i, (wx, wy) in enumerate(wp):
+            px, py = self._to_px(wx, wy)
+            if not (-30 < px < w + 30 and -30 < py < h + 30): continue
+            if i < self._completed_idx:
+                p.setPen(QPen(self.C_WP_FILL, 1)); p.setBrush(QBrush(self.C_WP_FILL))
+            elif i == self._completed_idx:
+                p.setPen(QPen(self.C_NEXT, 1.5)); p.setBrush(QBrush(self.C_NEXT))
+            else:
+                p.setPen(QPen(self.C_WP_EMPTY, 1)); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(px, py), wpr, wpr)
+
+        # Needle
+        if self._nx is not None:
+            nx, ny = self._to_px(self._nx, self._ny)
+            p.setPen(QPen(self.C_NEEDLE, 2))
+            p.drawLine(QPointF(nx - 10, ny), QPointF(nx + 10, ny))
+            p.drawLine(QPointF(nx, ny - 10), QPointF(nx, ny + 10))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(nx, ny), 5, 5)
+
+        # Info
+        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 9))
+        if self._nx is not None:
+            p.drawText(6, h - 6, f"XY: ({self._nx:.1f}, {self._ny:.1f})")
+        if wp: p.drawText(6, 14, f"Waypoints: {self._completed_idx}/{len(wp)}")
+        p.end()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  YZ Side View
+# ═══════════════════════════════════════════════════════════════════
+
+class YZSideView(QWidget):
+    """Side view showing Z (needle height) vs Y position.
+
+    Visualises needle tip entering/retracting from wells.
+    Y axis = horizontal, Z axis = vertical (0 at top, deeper down).
+    """
+
+    C_NEEDLE = QColor("#f5c2e7"); C_PATH = QColor("#a6e3a1")
+    C_WELL_WALL = QColor("#585b70"); C_BG = QColor("#1e1e2e")
+    C_TRAVEL = QColor("#45475a")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(120, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._ny: float | None = None
+        self._nz: float | None = None
+        self._well_diam = 15.0
+        self._well_depth = 17.0      # mm
+        self._travel_z = 5.0         # mm above plate
+        self._print_z = 0.1          # mm printing height
+        self._z_history: deque[tuple[float, float]] = deque(maxlen=200)  # (y, z) pairs
+        self._margin = 20
+
+    def set_needle_position(self, y_mm, z_mm):
+        self._ny = y_mm; self._nz = z_mm
+        self._z_history.append((y_mm, z_mm))
+        self.update()
+
+    def set_well_geometry(self, diameter, depth=17.0, travel_z=5.0, print_z=0.1):
+        self._well_diam = diameter; self._well_depth = depth
+        self._travel_z = travel_z; self._print_z = print_z; self.update()
+
+    def clear(self): self._z_history.clear(); self._ny = self._nz = None; self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), self.C_BG)
+        w, h = self.width(), self.height()
+        m = self._margin
+
+        # Z range: travel_z (top) to -well_depth (bottom)
+        z_top = self._travel_z + 2
+        z_bot = -self._well_depth * 0.3
+        z_range = z_top - z_bot
+        if z_range <= 0: z_range = 1
+
+        def z_to_py(z_mm):
+            """Z in mm → pixel Y. Positive Z = higher = higher on screen."""
+            return m + (z_top - z_mm) / z_range * (h - 2 * m)
+
+        # Draw plate surface line (Z=0)
+        y_plate = z_to_py(0)
+        p.setPen(QPen(QColor("#585b70"), 2))
+        p.drawLine(QPointF(0, y_plate), QPointF(w, y_plate))
+        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 8))
+        p.drawText(QPointF(4, y_plate - 4), "plate surface")
+
+        # Travel height line
+        y_travel = z_to_py(self._travel_z)
+        p.setPen(QPen(self.C_TRAVEL, 1, Qt.PenStyle.DotLine))
+        p.drawLine(QPointF(0, y_travel), QPointF(w, y_travel))
+        p.setPen(QColor("#6c7086"))
+        p.drawText(QPointF(4, y_travel - 3), f"travel Z={self._travel_z:.1f}")
+
+        # Print height line
+        y_print = z_to_py(self._print_z)
+        p.setPen(QPen(QColor("#a6e3a1"), 1, Qt.PenStyle.DotLine))
+        p.drawLine(QPointF(0, y_print), QPointF(w, y_print))
+
+        # Z history trail
+        if len(self._z_history) > 1:
+            p.setPen(QPen(self.C_PATH, 1.5))
+            hist = list(self._z_history)
+            for i in range(1, len(hist)):
+                x0 = m + (i - 1) / max(len(hist) - 1, 1) * (w - 2 * m)
+                x1 = m + i / max(len(hist) - 1, 1) * (w - 2 * m)
+                y0 = z_to_py(hist[i-1][1])
+                y1 = z_to_py(hist[i][1])
+                p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+
+        # Needle tip
+        if self._nz is not None:
+            nx = w / 2
+            ny = z_to_py(self._nz)
+            p.setPen(QPen(self.C_NEEDLE, 2))
+            # Draw needle as a vertical line with tip
+            p.drawLine(QPointF(nx, m), QPointF(nx, ny))
+            # Tip triangle
+            p.setBrush(QBrush(self.C_NEEDLE))
+            from PySide6.QtGui import QPolygonF
+            tip = QPolygonF([QPointF(nx, ny + 4), QPointF(nx - 3, ny - 2), QPointF(nx + 3, ny - 2)])
+            p.drawPolygon(tip)
+
+        # Z readout
+        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", 9))
+        if self._nz is not None:
+            p.drawText(6, h - 6, f"Z: {self._nz:.2f} mm")
+        p.end()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Syringe Pump Display
+# ═══════════════════════════════════════════════════════════════════
+
+class SyringePumpWidget(QWidget):
+    """Single syringe pump visualization: fill bar + µL readout."""
+
+    def __init__(self, pump_id: str = "P1", parent=None):
+        super().__init__(parent)
+        self.pump_id = pump_id
+        self.setFixedWidth(60)
+        self.setMinimumHeight(100)
+        self._position_mm = 0.0       # Current plunger position
+        self._zero_mm = 0.0           # Zero reference
+        self._stroke_mm = 30.0        # Total syringe stroke
+        self._uL_per_mm = 3.378       # Default for 250µL syringe
+        self._ink_name = ""
+        self._ink_color = QColor("#89b4fa")
+        self._active = False
+        self._enabled = False
+
+    def set_config(self, enabled=True, stroke_mm=30.0, uL_per_mm=3.378,
+                   ink_name="", ink_color="#89b4fa"):
+        self._enabled = enabled; self._stroke_mm = stroke_mm
+        self._uL_per_mm = uL_per_mm; self._ink_name = ink_name
+        self._ink_color = QColor(ink_color); self.update()
+
+    def set_position(self, pos_mm: float, zero_mm: float = 0.0):
+        self._position_mm = pos_mm; self._zero_mm = zero_mm; self.update()
+
+    def set_active(self, active: bool):
+        self._active = active; self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        bg = QColor("#313244") if self._enabled else QColor("#1e1e2e")
+        p.fillRect(self.rect(), bg)
+
+        if not self._enabled:
+            p.setPen(QColor("#585b70")); p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.pump_id}\n—")
+            p.end(); return
+
+        # Syringe barrel
+        bx, bw = 15, 30
+        by, bh = 25, h - 55
+        p.setPen(QPen(QColor("#6c7086"), 1))
+        p.setBrush(QBrush(QColor("#45475a")))
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), 3, 3)
+
+        # Fill level
+        rel_pos = self._position_mm - self._zero_mm
+        fill_frac = max(0, min(1, rel_pos / self._stroke_mm)) if self._stroke_mm > 0 else 0
+        fill_h = bh * fill_frac
+        if fill_h > 0:
+            grad = QLinearGradient(bx, by + bh - fill_h, bx, by + bh)
+            grad.setColorAt(0, self._ink_color.lighter(120))
+            grad.setColorAt(1, self._ink_color)
+            p.setBrush(QBrush(grad))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(QRectF(bx + 1, by + bh - fill_h, bw - 2, fill_h), 2, 2)
+
+        # Active indicator
+        if self._active:
+            p.setPen(QPen(QColor("#f5c2e7"), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(QRectF(bx - 2, by - 2, bw + 4, bh + 4), 4, 4)
+
+        # Pump label
+        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        p.drawText(QRectF(0, 2, w, 20), Qt.AlignmentFlag.AlignCenter, self.pump_id)
+
+        # µL readout
+        uL = rel_pos * self._uL_per_mm
+        p.setFont(QFont("Arial", 8))
+        p.drawText(QRectF(0, h - 28, w, 14), Qt.AlignmentFlag.AlignCenter, f"{uL:.1f} µL")
+
+        # Ink name
+        if self._ink_name:
+            p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 7))
+            p.drawText(QRectF(0, h - 14, w, 14), Qt.AlignmentFlag.AlignCenter,
+                       self._ink_name[:8])
+        p.end()
+
+# ═══════════════════════════════════════════════════════════════════
+#  Print Monitor Page
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintMonitorPage(QWidget):
-    """
-    v7.2.6: Redesigned Print Monitor page.
+    """Print Monitor — v7.2.6b with interpolation, YZ view, syringe display."""
 
-    Single XY live well preview with zoom/pan, compact plate overview,
-    unified controls, and clean progress display.
-    """
-
-    # Signals (preserved API — wired by app.py)
     pause_requested = Signal()
     resume_requested = Signal()
     abort_requested = Signal()
     start_requested = Signal(object)
 
-    def __init__(
-        self,
-        controller=None,
-        settings=None,
-        workspace: WorkspaceConfig | None = None,
-        parent: QWidget | None = None,
-    ):
+    # Smooth update rate (60ms ≈ 16 fps) vs controller poll (300ms)
+    INTERP_INTERVAL_MS = 60
+
+    def __init__(self, controller=None, settings=None, workspace=None, parent=None):
         super().__init__(parent)
         self._controller = controller
         self._settings = settings
@@ -563,972 +528,506 @@ class PrintMonitorPage(QWidget):
         self._job_queue: list = []
         self._current_job = None
         self._context_widget = None
-        self._recorder = None
-        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
         self._hardware_config = None
-        self._position_timer = None
+        self._current_well_name = ""
+        self._is_trajectory_job = False
+        self._trajectory_waypoints = None
+        self._total_duration_s = 0.0
+        self._recorder = None
+        self._microsteps_per_micron = 10.0
+        self._active_pump = "P1"
+
+        # Position interpolation
+        self._interpolator = PositionInterpolator()
+        self._interp_timer = QTimer(self)
+        self._interp_timer.setInterval(self.INTERP_INTERVAL_MS)
+        self._interp_timer.timeout.connect(self._interp_tick)
 
         self._build_ui()
         self._connect_signals()
 
-    # ── Page Interface ────────────────────────────────────────────
+    # ── Page interface ────────────────────────────────────────────
 
+    def get_page_title(self) -> str: return "Print Monitor"
+    def get_page_subtitle(self) -> str: return "Live print visualization"
+    def set_hardware_config(self, config): self._hardware_config = config
+    def set_microsteps_per_micron(self, v): self._microsteps_per_micron = v
+    def set_recorder(self, r): self._recorder = r
     def _get_controller(self):
-        """v7.2.6: Helper to get controller reference."""
         return getattr(self, '_controller', None) or getattr(self, 'controller', None)
 
-    def get_page_title(self) -> str:
-        return "Print Monitor"
+    # ── UI construction ───────────────────────────────────────────
 
-    def set_hardware_config(self, config) -> None:
-        """v7.2: Set hardware config for µL pump display."""
-        self._hardware_config = config
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
 
-    def set_microsteps_per_micron(self, value: float) -> None:
-        self._microsteps_per_micron = value
+        # ── TOP ROW: Plate | XY Detail | YZ Side ─────────────────
+        top_split = QSplitter(Qt.Orientation.Horizontal)
 
-    def set_recorder(self, recorder) -> None:
-        """Set PrintRecorder reference (called by app.py)."""
-        self._recorder = recorder
+        # Plate overview
+        pg = QGroupBox("Plate Overview")
+        pg.setStyleSheet(self._gs())
+        pl = QVBoxLayout(pg)
+        self.plate_view = PlateOverviewWidget()
+        pl.addWidget(self.plate_view)
+        leg = QHBoxLayout()
+        for txt, c in [("Pending", "#585b70"), ("Active", "#f9e2af"),
+                       ("Done", "#a6e3a1"), ("Error", "#f38ba8")]:
+            l = QLabel(f"● {txt}"); l.setStyleSheet(f"color: {c}; font-size: 9px;")
+            leg.addWidget(l)
+        leg.addStretch()
+        pl.addLayout(leg)
+        top_split.addWidget(pg)
 
-    def set_workspace(self, workspace: WorkspaceConfig) -> None:
-        """Update workspace config."""
-        self._workspace = workspace
-        self.syringe_panel.update_from_workspace(workspace.pumps)
-        self._update_needle_info()
+        # XY Detail
+        xg = QGroupBox("XY Detail")
+        xg.setStyleSheet(self._gs())
+        xl = QVBoxLayout(xg)
+        self.xy_detail = XYDetailView()
+        xl.addWidget(self.xy_detail)
+        dl = QHBoxLayout()
+        for txt, c in [("── Done", "#a6e3a1"), ("╌╌ Next", "#f9e2af"), ("✛ Needle", "#f5c2e7")]:
+            l = QLabel(txt); l.setStyleSheet(f"color: {c}; font-size: 9px;")
+            dl.addWidget(l)
+        dl.addStretch()
+        xl.addLayout(dl)
+        top_split.addWidget(xg)
 
-    # ── UI Construction ───────────────────────────────────────────
+        # YZ Side view
+        yg = QGroupBox("YZ Side")
+        yg.setStyleSheet(self._gs())
+        yl = QVBoxLayout(yg)
+        self.yz_view = YZSideView()
+        yl.addWidget(self.yz_view)
+        top_split.addWidget(yg)
 
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        top_split.setStretchFactor(0, 2)
+        top_split.setStretchFactor(1, 3)
+        top_split.setStretchFactor(2, 1)
+        outer.addWidget(top_split, stretch=3)
 
-        # ══════════════════════════════════════════════════════════
-        #  TOP AREA: Plate overview (left) + Live well preview (right)
-        # ══════════════════════════════════════════════════════════
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # ── BOTTOM ROW: Syringes | Controls + Progress ───────────
+        bot = QWidget()
+        bot_lay = QHBoxLayout(bot)
+        bot_lay.setContentsMargins(0, 0, 0, 0)
+        bot_lay.setSpacing(8)
 
-        # ── Left: Plate overview + legend ─────────────────────────
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        # Syringe pumps
+        syr_group = QGroupBox("Syringe Pumps")
+        syr_group.setStyleSheet(self._gs())
+        syr_lay = QHBoxLayout(syr_group)
+        syr_lay.setSpacing(4)
+        self._pump_widgets: dict[str, SyringePumpWidget] = {}
+        for pid in ["P1", "P2", "P3"]:
+            pw = SyringePumpWidget(pid)
+            syr_lay.addWidget(pw)
+            self._pump_widgets[pid] = pw
+        bot_lay.addWidget(syr_group, stretch=1)
 
-        plate_group = QGroupBox("Plate Overview")
-        plate_group.setStyleSheet(SECTION_TITLE_STYLE)
-        plate_inner = QVBoxLayout(plate_group)
-        plate_inner.setSpacing(4)
+        # Controls + progress
+        ctrl_group = QGroupBox("Print Controls")
+        ctrl_group.setStyleSheet(self._gs())
+        ctrl_lay = QVBoxLayout(ctrl_group)
+        ctrl_lay.setSpacing(4)
 
-        self.mini_plate = MiniPlateOverview()
-        plate_inner.addWidget(self.mini_plate)
-
-        # Legend
-        legend = QGridLayout()
-        legend.setSpacing(2)
-        for i, (text, color) in enumerate([
-            ("Done", WELL_DONE_COLOR),
-            ("Active", WELL_ACTIVE_COLOR),
-            ("Pending", WELL_PENDING_COLOR),
-            ("Error", WELL_ERROR_COLOR),
-        ]):
-            lbl = QLabel(f"● {text}")
-            lbl.setStyleSheet(f"color: {color}; font-size: 9px;")
-            legend.addWidget(lbl, i // 2, i % 2)
-        plate_inner.addLayout(legend)
-
-        left_layout.addWidget(plate_group)
-
-        # Active well info
-        self._active_well_label = QLabel("Active: —")
-        self._active_well_label.setStyleSheet(
-            f"color: {COLORS['yellow']}; font-size: 11px; font-weight: bold;")
-        left_layout.addWidget(self._active_well_label)
-
-        left_layout.addStretch()
-        left_panel.setFixedWidth(200)
-        top_splitter.addWidget(left_panel)
-
-        # ── Right: Live well preview + zoom toolbar ───────────────
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
-
-        preview_group = QGroupBox("Live Well Preview")
-        preview_group.setStyleSheet(SECTION_TITLE_STYLE)
-        preview_inner = QVBoxLayout(preview_group)
-        preview_inner.setSpacing(2)
-
-        self.well_preview = LiveWellPreview()
-        preview_inner.addWidget(self.well_preview)
-
-        # Path legend + zoom toolbar
-        toolbar_row = QHBoxLayout()
-        toolbar_row.setSpacing(8)
-
-        # Path legend
-        toolbar_row.addWidget(self._color_label("── Completed", COMPLETED_PATH_COLOR))
-        toolbar_row.addWidget(self._color_label("╌╌ Upcoming", UPCOMING_PATH_COLOR))
-        toolbar_row.addWidget(self._color_label("✛ Needle", NEEDLE_COLOR))
-        toolbar_row.addStretch()
-
-        # Zoom controls
-        btn_fit = QPushButton("⊞ Fit")
-        btn_fit.setFixedWidth(50)
-        btn_fit.setToolTip("Fit view to well boundary")
-        btn_fit.clicked.connect(self._on_fit_clicked)
-        toolbar_row.addWidget(btn_fit)
-
-        btn_follow = QPushButton("◎ Follow")
-        btn_follow.setFixedWidth(64)
-        btn_follow.setCheckable(True)
-        btn_follow.setChecked(True)
-        btn_follow.setToolTip("Auto-center on needle position")
-        btn_follow.toggled.connect(self.well_preview.set_auto_follow)
-        self._btn_follow = btn_follow
-        toolbar_row.addWidget(btn_follow)
-
-        self._zoom_label = QLabel("100%")
-        self._zoom_label.setFixedWidth(45)
-        self._zoom_label.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self.well_preview.zoom_changed.connect(
-            lambda pct: self._zoom_label.setText(f"{pct:.0f}%"))
-        toolbar_row.addWidget(self._zoom_label)
-
-        preview_inner.addLayout(toolbar_row)
-        right_layout.addWidget(preview_group)
-
-        top_splitter.addWidget(right_panel)
-        top_splitter.setStretchFactor(0, 0)  # fixed left
-        top_splitter.setStretchFactor(1, 1)  # expanding right
-
-        layout.addWidget(top_splitter, stretch=3)
-
-        # ══════════════════════════════════════════════════════════
-        #  BOTTOM AREA: Syringe | Progress | Controls
-        # ══════════════════════════════════════════════════════════
-        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # ── Left: Syringe status + needle info ────────────────────
-        syringe_group = QGroupBox("Syringe Status")
-        syringe_group.setStyleSheet(SECTION_TITLE_STYLE)
-        syringe_layout = QVBoxLayout(syringe_group)
-
-        self.syringe_panel = SyringeStatusPanel()
-        syringe_layout.addWidget(self.syringe_panel)
-
-        self.needle_label = QLabel("Needle: —")
-        self.needle_label.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 11px;")
-        syringe_layout.addWidget(self.needle_label)
-
-        bottom_splitter.addWidget(syringe_group)
-
-        # ── Center: Print progress ────────────────────────────────
-        progress_group = QGroupBox("Print Progress")
-        progress_group.setStyleSheet(SECTION_TITLE_STYLE)
-        progress_layout = QVBoxLayout(progress_group)
-
-        info_grid = QGridLayout()
-        info_grid.setSpacing(4)
-
+        # Progress labels
+        info = QGridLayout(); info.setSpacing(3)
         self._progress_labels: dict[str, QLabel] = {}
-        fields = [
-            ("Job:", "job_name"),
-            ("Well:", "well_info"),
-            ("Layer:", "layer_info"),
-            ("Step:", "step_info"),
-            ("Time:", "time_info"),
-        ]
-        for row, (label_text, key) in enumerate(fields):
-            name_lbl = QLabel(label_text)
-            name_lbl.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 11px;")
-            info_grid.addWidget(name_lbl, row, 0)
-
-            val_lbl = QLabel("—")
-            val_lbl.setStyleSheet(
-                f"color: {COLORS['text']}; font-size: 11px; font-weight: bold;")
-            info_grid.addWidget(val_lbl, row, 1)
-            self._progress_labels[key] = val_lbl
-
-        progress_layout.addLayout(info_grid)
+        for col, (lbl, key) in enumerate([("Job:", "job_name"), ("Well:", "well_info"),
+                                           ("Step:", "step_info"), ("Time:", "time_info")]):
+            nl = QLabel(lbl); nl.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+            vl = QLabel("—"); vl.setStyleSheet(f"color: {COLORS.get('text', '#cdd6f4')}; font-size: 10px; font-weight: bold;")
+            info.addWidget(nl, 0, col * 2); info.addWidget(vl, 0, col * 2 + 1)
+            self._progress_labels[key] = vl
+        ctrl_lay.addLayout(info)
 
         # Progress bar
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFixedHeight(20)
-        self.progress_bar.setStyleSheet(
-            f"QProgressBar {{ border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: 4px; background: {COLORS['surface0']}; "
-            f"text-align: center; color: {COLORS['text']}; font-size: 10px; }}"
-            f"QProgressBar::chunk {{ background-color: {COLORS['green']}; "
-            f"border-radius: 3px; }}")
-        progress_layout.addWidget(self.progress_bar)
+        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
+        self.progress_bar.setMaximumHeight(18)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{ background: {COLORS.get('surface0','#313244')};
+                border: 1px solid {COLORS.get('surface1','#45475a')};
+                border-radius: 3px; text-align: center;
+                color: {COLORS.get('text','#cdd6f4')}; font-size: 9px; }}
+            QProgressBar::chunk {{ background: {COLORS.get('green','#a6e3a1')}; border-radius: 2px; }}""")
+        ctrl_lay.addWidget(self.progress_bar)
 
-        # Message label
-        self._message_label = QLabel("")
-        self._message_label.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        self._message_label.setWordWrap(True)
-        progress_layout.addWidget(self._message_label)
-
-        bottom_splitter.addWidget(progress_group)
-
-        # ── Right: Controls + state ───────────────────────────────
-        controls_group = QGroupBox("Controls")
-        controls_group.setStyleSheet(SECTION_TITLE_STYLE)
-        controls_layout = QVBoxLayout(controls_group)
-        controls_layout.setSpacing(6)
-
-        # Start button
-        self.btn_start = QPushButton("▶ Start Print")
-        self.btn_start.setMinimumHeight(36)
-        self.btn_start.setEnabled(False)
-        self.btn_start.setStyleSheet(
-            f"QPushButton {{ background-color: {COLORS['green']}; "
-            f"color: {COLORS['crust']}; font-weight: bold; border-radius: 6px; "
-            f"padding: 6px 16px; font-size: 12px; }}"
-            f"QPushButton:hover {{ background-color: #b5ecb1; }}"
-            f"QPushButton:disabled {{ background-color: {COLORS['surface1']}; "
-            f"color: {COLORS['overlay0']}; }}")
-        controls_layout.addWidget(self.btn_start)
-
-        # Pause + Abort row
-        btn_row = QHBoxLayout()
-        self.btn_pause = QPushButton("⏸ Pause")
-        self.btn_pause.setMinimumHeight(32)
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.setStyleSheet(
-            f"QPushButton {{ background-color: {COLORS['yellow']}; "
-            f"color: {COLORS['crust']}; font-weight: bold; border-radius: 4px; "
-            f"padding: 4px 12px; }}"
-            f"QPushButton:hover {{ background-color: #e8d49e; }}"
-            f"QPushButton:disabled {{ background-color: {COLORS['surface1']}; "
-            f"color: {COLORS['overlay0']}; }}")
-        btn_row.addWidget(self.btn_pause)
-
-        self.btn_abort = QPushButton("⏹ Abort")
-        self.btn_abort.setMinimumHeight(32)
-        self.btn_abort.setEnabled(False)
-        self.btn_abort.setStyleSheet(
-            f"QPushButton {{ background-color: {COLORS['red']}; "
-            f"color: {COLORS['crust']}; font-weight: bold; border-radius: 4px; "
-            f"padding: 4px 12px; }}"
-            f"QPushButton:hover {{ background-color: #e07a96; }}"
-            f"QPushButton:disabled {{ background-color: {COLORS['surface1']}; "
-            f"color: {COLORS['overlay0']}; }}")
-        btn_row.addWidget(self.btn_abort)
-        controls_layout.addLayout(btn_row)
-
-        # State label
+        # Buttons row
+        br = QHBoxLayout()
         self.state_label = QLabel("IDLE")
         self.state_label.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 14px; font-weight: bold;")
-        self.state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        controls_layout.addWidget(self.state_label)
+            f"color: {COLORS.get('overlay0','#6c7086')}; font-size: 13px; font-weight: bold;")
+        br.addWidget(self.state_label)
+        br.addStretch()
 
-        # Tracking error + controller
-        self.tracking_error_label = QLabel("Tracking: — µm")
-        self.tracking_error_label.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        controls_layout.addWidget(self.tracking_error_label)
+        self.btn_pause = QPushButton("⏸ Pause")
+        self.btn_pause.setMinimumHeight(30); self.btn_pause.setEnabled(False)
+        self.btn_pause.setStyleSheet(
+            f"QPushButton {{ background: {COLORS.get('yellow','#f9e2af')}; "
+            f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
+            f"border-radius: 4px; padding: 4px 14px; }}")
+        br.addWidget(self.btn_pause)
 
-        self.controller_label = QLabel("Controller: —")
-        self.controller_label.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px;")
-        controls_layout.addWidget(self.controller_label)
+        self.btn_abort = QPushButton("⏹ Abort")
+        self.btn_abort.setMinimumHeight(30); self.btn_abort.setEnabled(False)
+        self.btn_abort.setStyleSheet(
+            f"QPushButton {{ background: {COLORS.get('red','#f38ba8')}; "
+            f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
+            f"border-radius: 4px; padding: 4px 14px; }}")
+        br.addWidget(self.btn_abort)
+        ctrl_lay.addLayout(br)
 
-        controls_layout.addStretch()
-        bottom_splitter.addWidget(controls_group)
+        bot_lay.addWidget(ctrl_group, stretch=2)
+        outer.addWidget(bot, stretch=0)
 
-        bottom_splitter.setStretchFactor(0, 1)
-        bottom_splitter.setStretchFactor(1, 2)
-        bottom_splitter.setStretchFactor(2, 1)
+    def _connect_signals(self):
+        self.btn_pause.clicked.connect(self._on_pause)
+        self.btn_abort.clicked.connect(self._on_abort)
 
-        layout.addWidget(bottom_splitter, stretch=1)
+    # ── Context panel ─────────────────────────────────────────────
 
-    # ── Signal Connections ────────────────────────────────────────
+    def get_context_widget(self) -> QWidget:
+        if self._context_widget: return self._context_widget
+        ctx = QWidget()
+        lay = QVBoxLayout(ctx); lay.setContentsMargins(4, 4, 4, 4); lay.setSpacing(6)
 
-    def _connect_signals(self) -> None:
-        self.btn_start.clicked.connect(self._on_start_clicked)
-        self.btn_pause.clicked.connect(self._on_pause_clicked)
-        self.btn_abort.clicked.connect(self._on_abort_clicked)
-        self.mini_plate.well_clicked.connect(self._on_well_clicked)
+        self._ctx_btn_start = QPushButton("▶ Start Print")
+        self._ctx_btn_start.setMinimumHeight(34); self._ctx_btn_start.setEnabled(False)
+        self._ctx_btn_start.setStyleSheet(
+            f"QPushButton {{ background: {COLORS.get('green','#a6e3a1')}; "
+            f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
+            f"border-radius: 4px; padding: 6px; font-size: 12px; }}"
+            f"QPushButton:disabled {{ background: {COLORS.get('surface1','#45475a')}; "
+            f"color: {COLORS.get('overlay0','#6c7086')}; }}")
+        self._ctx_btn_start.clicked.connect(self._on_ctx_start)
+        lay.addWidget(self._ctx_btn_start)
 
-    def _on_start_clicked(self) -> None:
-        """v7.2.6: Start button in main page."""
-        if self._current_job is None:
-            logger.warning("No job to start")
+        lay.addWidget(QLabel("Job Queue"))
+        self._queue_list = QListWidget(); self._queue_list.setMaximumHeight(120)
+        self._queue_list.setStyleSheet(
+            f"QListWidget {{ background: {COLORS.get('surface0','#313244')}; "
+            f"color: {COLORS.get('text','#cdd6f4')}; border-radius: 4px; font-size: 10px; }}")
+        lay.addWidget(self._queue_list)
+
+        qb = QHBoxLayout()
+        br = QPushButton("Remove"); br.setMaximumHeight(22); br.clicked.connect(self._on_ctx_remove)
+        bc = QPushButton("Clear"); bc.setMaximumHeight(22); bc.clicked.connect(self._on_ctx_clear)
+        qb.addWidget(br); qb.addWidget(bc)
+        lay.addLayout(qb)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        lay.addWidget(sep)
+
+        self.needle_label = QLabel("Needle: —")
+        self.needle_label.setStyleSheet(f"color: {COLORS.get('subtext0','#a6adc8')}; font-size: 10px;")
+        lay.addWidget(self.needle_label)
+
+        lay.addStretch()
+        self._context_widget = ctx
+        return ctx
+
+    # ── Job management ────────────────────────────────────────────
+
+    def receive_job(self, job):
+        self._job_queue.append(job)
+        if self._current_job is None: self._current_job = job
+        self._refresh_queue()
+        if "job_name" in self._progress_labels:
+            self._progress_labels["job_name"].setText(job.name)
+        if "step_info" in self._progress_labels:
+            self._progress_labels["step_info"].setText(f"0 / {getattr(job, 'total_steps', 0):,}")
+        self._load_job_waypoints(job)
+        logger.info(f"Job received: {job.name} ({len(self._job_queue)} in queue)")
+
+    def setup_plate(self, plate, well_roles=None, print_wells=None, well_diameter_mm=0.0):
+        self.plate_view.set_plate(plate)
+        if well_roles: self.plate_view.set_well_roles(well_roles)
+        if print_wells: self.plate_view.set_all_pending(print_wells)
+        if well_diameter_mm > 0:
+            self.xy_detail.set_well_diameter(well_diameter_mm)
+            depth = getattr(plate, 'well_depth_mm', 17.0)
+            self.yz_view.set_well_geometry(well_diameter_mm, depth)
+        # Configure syringe widgets from hardware config
+        self._configure_pumps()
+        logger.info(f"Plate setup: {len(print_wells or [])} print wells, diam={well_diameter_mm:.1f}")
+
+    def _configure_pumps(self):
+        """Configure syringe pump widgets from HardwareConfig."""
+        hw = self._hardware_config
+        if hw is None: return
+        pumps = getattr(hw, 'pumps', {})
+        for pid, widget in self._pump_widgets.items():
+            pcfg = pumps.get(pid)
+            if pcfg and getattr(pcfg, 'enabled', False):
+                syringe = getattr(pcfg, 'syringe', None)
+                ink = getattr(pcfg, 'ink', None)
+                stroke = getattr(syringe, 'stroke_mm', 30.0) if syringe else 30.0
+                uL_mm = getattr(syringe, 'uL_per_mm', 3.378) if syringe else 3.378
+                ink_name = getattr(ink, 'name', '') if ink else ''
+                ink_color = getattr(ink, 'display_color', '#89b4fa') if ink else '#89b4fa'
+                widget.set_config(True, stroke, uL_mm, ink_name, ink_color)
+            else:
+                widget.set_config(enabled=False)
+
+    def _load_job_waypoints(self, job):
+        """v7.3: Load trajectory waypoints for full-path visualization.
+
+        Prefers trajectory_waypoints (from TrajectoryPlanner) which contain
+        the complete time-parameterized path. Falls back to extracting
+        MOVE_XY commands from the flat command list.
+        """
+        # ── Prefer trajectory waypoints (v7.3) ────────────────────
+        traj_wps = getattr(job, 'trajectory_waypoints', None)
+        if traj_wps and len(traj_wps) > 0:
+            self._trajectory_waypoints = traj_wps  # store for time-based progress
+            self._is_trajectory_job = True
+
+            # XY points (all, including travel — we'll color differently)
+            xy_print = [(wp.x, wp.y) for wp in traj_wps
+                        if not getattr(wp, 'is_travel', False)]
+            xy_all = [(wp.x, wp.y) for wp in traj_wps]
+
+            if xy_print:
+                self.xy_detail.set_waypoints(xy_print)
+            elif xy_all:
+                self.xy_detail.set_waypoints(xy_all)
+
+            # Z profile for YZ view
+            z_profile = [(wp.y, wp.z) for wp in traj_wps]
+            if z_profile and hasattr(self.yz_view, '_z_history'):
+                self.yz_view._z_history.clear()
+                for y, z in z_profile[::3]:  # every 3rd point to avoid overload
+                    self.yz_view._z_history.append((y, z))
+                self.yz_view.update()
+
+            # Total duration for time-based progress
+            traj_result = getattr(job, 'trajectory_result', None)
+            if traj_result:
+                self._total_duration_s = getattr(traj_result, 'total_duration_s', 0)
+            elif traj_wps:
+                self._total_duration_s = traj_wps[-1].t if traj_wps[-1].t > 0 else 0
+
+            logger.info(
+                f"Trajectory loaded: {len(traj_wps)} waypoints, "
+                f"{len(xy_print)} print points, "
+                f"{self._total_duration_s:.1f}s total")
             return
-        if self._print_state not in (
-            PrintState.IDLE, PrintState.COMPLETED,
-            PrintState.ABORTED, PrintState.ERROR,
-        ):
-            logger.warning(f"Cannot start: state is {self._print_state}")
-            return
-        logger.info(f"Starting job: {self._current_job.name}")
-        self.start_requested.emit(self._current_job)
 
-    def _on_pause_clicked(self) -> None:
-        if self._print_state == PrintState.RUNNING:
-            self.pause_requested.emit()
-        elif self._print_state == PrintState.PAUSED:
-            self.resume_requested.emit()
+        # ── Fallback: extract from commands ───────────────────────
+        self._is_trajectory_job = False
+        self._trajectory_waypoints = None
+        self._total_duration_s = 0
+        waypoints = []
+        try:
+            from SupportClasses.PrintManager import CommandType
+            for cmd in job.commands:
+                if cmd.type == CommandType.MOVE_XY:
+                    waypoints.append((cmd.params.get("x", 0), cmd.params.get("y", 0)))
+                elif cmd.type == CommandType.PRINT_PATH:
+                    for pt in cmd.params.get("points", []):
+                        if len(pt) >= 2:
+                            waypoints.append((pt[0], pt[1]))
+        except Exception as exc:
+            logger.debug(f"Waypoint extraction: {exc}")
 
-    def _on_abort_clicked(self) -> None:
+        if waypoints:
+            self.xy_detail.set_waypoints(waypoints)
+            logger.info(f"Loaded {len(waypoints)} command waypoints")
+    def _refresh_queue(self):
+        if not hasattr(self, '_queue_list') or self._queue_list is None: return
+        self._queue_list.clear()
+        for j in self._job_queue:
+            pfx = "▶ " if j is self._current_job else "  "
+            self._queue_list.addItem(f"{pfx}{j.name}  [{getattr(j, 'total_steps', '?')} steps]")
+        if hasattr(self, '_ctx_btn_start') and self._ctx_btn_start:
+            self._ctx_btn_start.setEnabled(
+                self._current_job is not None and
+                self._print_state in (PrintState.IDLE, PrintState.COMPLETED,
+                                      PrintState.ABORTED, PrintState.ERROR))
+
+    # ── Button handlers ───────────────────────────────────────────
+
+    def _on_pause(self):
+        if self._print_state == PrintState.RUNNING: self.pause_requested.emit()
+        elif self._print_state == PrintState.PAUSED: self.resume_requested.emit()
+
+    def _on_abort(self):
         if self._print_state in (PrintState.RUNNING, PrintState.PAUSED):
             self.abort_requested.emit()
 
-    def _on_well_clicked(self, well_name: str) -> None:
-        """User clicked a well in the plate overview."""
-        self._active_well_label.setText(f"Selected: {well_name}")
+    def _on_ctx_start(self):
+        if self._current_job and self._print_state in (
+            PrintState.IDLE, PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
+            self.start_requested.emit(self._current_job)
 
-    def _on_fit_clicked(self) -> None:
-        self.well_preview.fit_to_well()
-        self._btn_follow.setChecked(False)
+    def _on_ctx_remove(self):
+        if not hasattr(self, '_queue_list'): return
+        r = self._queue_list.currentRow()
+        if 0 <= r < len(self._job_queue):
+            rm = self._job_queue.pop(r)
+            if rm is self._current_job:
+                self._current_job = self._job_queue[0] if self._job_queue else None
+            self._refresh_queue()
 
-    # ── External Update API ───────────────────────────────────────
+    def _on_ctx_clear(self):
+        self._job_queue.clear(); self._current_job = None; self._refresh_queue()
 
-    def on_print_state_changed(self, state: PrintState) -> None:
-        """Called when print state changes."""
-        self._print_state = state
-        state_colors = {
-            PrintState.IDLE: COLORS["overlay0"],
-            PrintState.RUNNING: COLORS["green"],
-            PrintState.PAUSED: COLORS["yellow"],
-            PrintState.COMPLETED: COLORS["blue"],
-            PrintState.ABORTED: COLORS["red"],
-            PrintState.ERROR: COLORS["red"],
-        }
-        color = state_colors.get(state, COLORS["overlay0"])
-        self.state_label.setText(state.name)
-        self.state_label.setStyleSheet(
-            f"color: {color}; font-size: 14px; font-weight: bold;")
+    # ── Progress / state ──────────────────────────────────────────
 
-        # Update pause button text
-        if state == PrintState.PAUSED:
-            self.btn_pause.setText("▶ Resume")
+    def on_print_progress(self, step: int, total: int, message: str):
+        well = ""
+        wm = re.search(r'[Ww]ell\s+([A-P]\d{1,2})', message)
+        if wm:
+            well = wm.group(1); self._current_well_name = well
+            self.plate_view.set_active_well(well)
+
+        # Parse active pump from message
+        pm = re.search(r'\b(P[123])\b', message)
+        if pm: self._active_pump = pm.group(1)
+
+        # v7.3: Time-based progress for trajectory jobs
+        if self._is_trajectory_job and self._total_duration_s > 0 and self._print_start_time:
+            import time as _time
+            elapsed = _time.time() - self._print_start_time
+            pct = min(100, int(100 * elapsed / self._total_duration_s))
         else:
-            self.btn_pause.setText("⏸ Pause")
+            pct = int(100 * step / max(total, 1))
+        self.progress_bar.setValue(pct)
+        self.progress_bar.setFormat(f"{pct}%  {message[:35]}")
 
-        # Enable/disable buttons
-        active = state in (PrintState.RUNNING, PrintState.PAUSED)
-        self.btn_pause.setEnabled(active)
-        self.btn_abort.setEnabled(active)
+        self._progress_labels.get("job_name", QLabel()).setText(
+            self._current_job.name if self._current_job else "—")
+        self._progress_labels.get("well_info", QLabel()).setText(well or "—")
+        self._progress_labels.get("step_info", QLabel()).setText(f"{step:,} / {total:,}")
 
-        # Start button: enabled only when idle-ish and job loaded
-        idle_ish = state in (
-            PrintState.IDLE, PrintState.COMPLETED,
-            PrintState.ABORTED, PrintState.ERROR,
-        )
-        self.btn_start.setEnabled(idle_ish and self._current_job is not None)
+        if self._print_start_time:
+            el = time.time() - self._print_start_time
+            if pct > 0:
+                rem = el / (pct / 100) - el
+                self._progress_labels.get("time_info", QLabel()).setText(
+                    f"{self._ft(el)} / ~{self._ft(rem)}")
+            else:
+                self._progress_labels.get("time_info", QLabel()).setText(f"{self._ft(el)} / —")
 
-        # Track start time
-        if state == PrintState.RUNNING and self._print_start_time is None:
-            self._print_start_time = time.time()
-            self._start_position_poll()
-        elif state in (PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
+        # Update XY detail completed index
+        if total > 0 and self.xy_detail._waypoints:
+            self.xy_detail.set_completed_index(int(step / total * len(self.xy_detail._waypoints)))
+
+        # Update active pump indicator
+        for pid, pw in self._pump_widgets.items():
+            pw.set_active(pid == self._active_pump)
+
+    def on_print_state_changed(self, state):
+        self._print_state = state
+        styles = {
+            PrintState.IDLE: ("IDLE", "overlay0"), PrintState.RUNNING: ("RUNNING", "green"),
+            PrintState.PAUSED: ("PAUSED", "yellow"), PrintState.COMPLETED: ("COMPLETED", "green"),
+            PrintState.ABORTED: ("ABORTED", "red"), PrintState.ERROR: ("ERROR", "red"),
+        }
+        nm, ck = styles.get(state, (str(state), "overlay0"))
+        self.state_label.setText(nm)
+        self.state_label.setStyleSheet(
+            f"color: {COLORS.get(ck, '#a6adc8')}; font-size: 13px; font-weight: bold;")
+
+        if state == PrintState.RUNNING:
+            self.btn_pause.setText("⏸ Pause"); self.btn_pause.setEnabled(True)
+            if self._print_start_time is None: self._print_start_time = time.time()
+            self._interp_timer.start()
+        elif state == PrintState.PAUSED:
+            self.btn_pause.setText("▶ Resume"); self.btn_pause.setEnabled(True)
+            self._interp_timer.stop()
+        else:
+            self.btn_pause.setText("⏸ Pause"); self.btn_pause.setEnabled(False)
+            self._interp_timer.stop()
+
+        self.btn_abort.setEnabled(state in (PrintState.RUNNING, PrintState.PAUSED))
+
+        if state in (PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
             self._print_start_time = None
-            self._stop_position_poll()
-
-        # Queue advancement
         if state == PrintState.COMPLETED:
-            self._advance_queue()
-            self._refresh_job_queue_ui()
+            self.progress_bar.setValue(100); self._advance_queue()
+        self._refresh_queue()
+
+    def _advance_queue(self):
+        if self._current_job in self._job_queue: self._job_queue.remove(self._current_job)
+        self._current_job = self._job_queue[0] if self._job_queue else None
+        self._refresh_queue()
+        logger.info(f"Queue: {'next=' + self._current_job.name if self._current_job else 'empty'}")
+
+    # ── Position polling (300ms from app.py) + interpolation (60ms) ──
 
     def on_status_update(self):
-        """v7.2.6: Live position polling during print execution.
-
-        Called by MainWindow timer (~300ms). Updates live visualization
-        with current needle position during active printing.
-        """
-        from SupportClasses.PrintManager import PrintState
-
-        if self._print_state != PrintState.RUNNING:
-            return
-
-        controller = self._get_controller()
-        if controller is None:
-            return
+        """Called by MainWindow timer (~300ms). Feed raw sample to interpolator."""
+        if self._print_state != PrintState.RUNNING: return
+        ctrl = self._get_controller()
+        if ctrl is None: return
 
         try:
-            # Read cached positions (fast, no serial I/O)
-            xy_pos = None
-            zp_pos = None
-            if getattr(controller, 'is_xy_connected', False):
-                xy_pos = controller.get_xy_position(cached=True)
-            if getattr(controller, 'is_zp_connected', False):
-                zp_pos = controller.get_zp_position(cached=True)
+            xy = ctrl.get_xy_position(cached=True) if getattr(ctrl, 'is_xy_connected', False) else None
+            zp = ctrl.get_zp_position(cached=True) if getattr(ctrl, 'is_zp_connected', False) else None
         except Exception:
             return
 
-        # Update trajectory view with current position
-        if xy_pos and hasattr(self, 'trajectory_view'):
-            try:
-                x, y = xy_pos[0], xy_pos[1]
-                if x is not None and y is not None:
-                    self.trajectory_view.set_current_position(x, y)
-            except Exception:
-                pass
-
-        # Update plate overview — highlight active well
-        if hasattr(self, 'plate_view') and hasattr(self, '_current_well_name'):
-            try:
-                self.plate_view.set_active_well(self._current_well_name)
-            except Exception:
-                pass
-
-        # Update position readout labels
-        if hasattr(self, '_progress_labels'):
-            try:
-                if xy_pos and xy_pos[0] is not None:
-                    pos_text = f"XY: ({xy_pos[0]:.0f}, {xy_pos[1]:.0f})"
-                    if zp_pos:
-                        z_val = zp_pos.get('Z', zp_pos.get(0, None))
-                        if z_val is not None:
-                            pos_text += f"  Z: {z_val:.0f}"
-                    lbl = self._progress_labels.get("position")
-                    if lbl:
-                        lbl.setText(pos_text)
-            except Exception:
-                pass
-
-
-    def on_progress_update(
-        self,
-        current_step: int,
-        total_steps: int,
-        message: str = "",
-        job_name: str = "",
-        well_name: str = "",
-        well_index: int = 0,
-        total_wells: int = 0,
-        layer: int = 0,
-        total_layers: int = 0,
-    ) -> None:
-        """Called on each print step progress."""
-        if job_name:
-            self._progress_labels["job_name"].setText(job_name)
-        if well_name:
-            well_text = f"{well_name}"
-            if total_wells > 0:
-                well_text += f" ({well_index}/{total_wells})"
-            self._progress_labels["well_info"].setText(well_text)
-            self._active_well_label.setText(f"Active: {well_name}")
-            # Update plate overview
-            self.mini_plate.set_well_state(well_name, "active")
-
-        if total_layers > 0:
-            self._progress_labels["layer_info"].setText(
-                f"{layer} / {total_layers}")
-        if total_steps > 0:
-            self._progress_labels["step_info"].setText(
-                f"{current_step:,} / {total_steps:,}")
-            pct = int(100 * current_step / total_steps) if total_steps else 0
-            self.progress_bar.setValue(pct)
-
-        # Time / ETA
-        if self._print_start_time is not None and current_step > 0:
-            elapsed = time.time() - self._print_start_time
-            rate = current_step / elapsed if elapsed > 0 else 0
-            remaining = (total_steps - current_step) / rate if rate > 0 else 0
-            self._progress_labels["time_info"].setText(
-                f"{self._format_time(elapsed)} / "
-                f"~{self._format_time(elapsed + remaining)}")
-
-        if message:
-            self._message_label.setText(message)
-
-    def on_print_progress(self, step: int, total: int, message: str) -> None:
-        """v7.2.6: Parse well/layer info from progress message.
-
-        PrintManager sends messages like:
-            "[42/500] Travel to well A3"
-            "[42/500] Layer 2: print_path"
-            "[42/500] Well A3, Layer 2/5: meander"
-        We parse these to extract structured info for on_progress_update().
-        """
-        # Parse well name from message
-        well_name = ""
-        well_match = re.search(r'[Ww]ell\s+([A-H]\d{1,2})', message)
-        if well_match:
-            well_name = well_match.group(1)
-
-        # Parse layer info
-        layer = 0
-        total_layers = 0
-        layer_match = re.search(r'[Ll]ayer\s+(\d+)(?:\s*/\s*(\d+))?', message)
-        if layer_match:
-            layer = int(layer_match.group(1))
-            if layer_match.group(2):
-                total_layers = int(layer_match.group(2))
-
-        # Track current well name for position polling
-        if well_name:
-            self._current_well_name = well_name
-
-        self.on_progress_update(
-            current_step=step,
-            total_steps=total,
-            message=message,
-            job_name=self._current_job.name if self._current_job else "",
-            well_name=well_name,
-            layer=layer,
-            total_layers=total_layers,
-        )
-
-
-    def update_needle_position(self, x: float, y: float, z: float) -> None:
-        """Update needle position on the live well preview."""
-        self.well_preview.set_needle_position(x, y, z)
-        self.well_preview.add_completed_point(x, y, z)
-
-    def update_upcoming_waypoints(
-        self, waypoints: list[tuple[float, float, float]],
-    ) -> None:
-        """Update upcoming waypoint display."""
-        self.well_preview.set_upcoming_waypoints(waypoints)
-
-    def update_tracking_error(
-        self, error_mm: float, controller_type: str = "",
-    ) -> None:
-        """Update tracking error display."""
-        error_um = error_mm * 1000
-        self.tracking_error_label.setText(f"Tracking: {error_um:.0f} µm")
-        self.well_preview.set_tracking_error(error_mm)
-
-        if error_um < 50:
-            color = COLORS["green"]
-        elif error_um < 200:
-            color = COLORS["yellow"]
-        else:
-            color = COLORS["red"]
-        self.tracking_error_label.setStyleSheet(
-            f"color: {color}; font-size: 10px;")
-
-        if controller_type:
-            self.controller_label.setText(f"Controller: {controller_type}")
-
-    def update_syringe_state(
-        self, pumps: dict[str, PumpLoadout], active_pump: str | None = None,
-    ) -> None:
-        """Update syringe display from pump loadouts."""
-        self.syringe_panel.update_from_workspace(pumps)
-        for pid in ["P1", "P2", "P3"]:
-            self.syringe_panel.set_flowing(
-                pid,
-                pid == active_pump and self._print_state == PrintState.RUNNING,
-            )
-
-    def setup_plate(
-        self,
-        plate: WellPlate,
-        well_roles: dict[str, WellRole] | None = None,
-        print_wells: list[str] | None = None,
-        well_diameter_mm: float = 0.0,
-    ) -> None:
-        """Initialize plate overview and preview for a new print job."""
-        self.mini_plate.set_plate(plate)
-        if well_roles:
-            self.mini_plate.set_well_roles(well_roles)
-        if print_wells:
-            states = {name: "pending" for name in print_wells}
-            self.mini_plate.set_all_states(states)
-        if well_diameter_mm > 0:
-            self.well_preview.set_well_diameter(well_diameter_mm)
-        self.well_preview.clear_path()
-        self.well_preview.fit_to_well()
-
-    def receive_job(self, job) -> None:
-        """Receive a PrintJob from PrintSetup via app.py."""
-        if not hasattr(self, "_job_queue") or self._job_queue is None:
-            self._job_queue = []
-        if not hasattr(self, "_current_job"):
-            self._current_job = None
-
-        self._job_queue.append(job)
-        logger.info(f"Job received: {job.name} ({len(self._job_queue)} in queue)")
-
-        if self._current_job is None:
-            self._current_job = job
-
-        self._refresh_job_queue_ui()
-
-        # Update progress labels
-        if hasattr(self, "_progress_labels") and self._progress_labels:
-            try:
-                self._progress_labels["job_name"].setText(job.name)
-                total = getattr(job, "total_steps", 0)
-                self._progress_labels["step_info"].setText(f"0 / {total:,}")
-            except Exception:
-                pass
-
-        # Enable start button
-        idle_ish = self._print_state in (
-            PrintState.IDLE, PrintState.COMPLETED,
-            PrintState.ABORTED, PrintState.ERROR,
-        )
-        self.btn_start.setEnabled(idle_ish)
-
-        # Setup plate from job data
-        if hasattr(job, "well_setup") and job.well_setup:
-            try:
-                plate = getattr(job, "plate", None)
-                if plate:
-                    self.setup_plate(plate)
-            except Exception:
-                pass
-
-        logger.info(f"Monitor ready — job '{job.name}' queued.")
-
-    def reset(self) -> None:
-        """Reset monitor to idle state."""
-        self.on_print_state_changed(PrintState.IDLE)
-        self.progress_bar.setValue(0)
-        for lbl in self._progress_labels.values():
-            lbl.setText("—")
-        self.tracking_error_label.setText("Tracking: — µm")
-        self.controller_label.setText("Controller: —")
-        self._message_label.setText("")
-        self._active_well_label.setText("Active: —")
-        self.well_preview.clear_path()
-        self._print_start_time = None
-
-    # ── Position Polling ──────────────────────────────────────────
-
-    def _start_position_poll(self) -> None:
-        """Start polling stage positions for real-time display."""
-        if self._position_timer is None:
-            self._position_timer = QTimer(self)
-            self._position_timer.timeout.connect(self._poll_position)
-        self._position_timer.start(300)
-
-    def _stop_position_poll(self) -> None:
-        """Stop position polling."""
-        if self._position_timer is not None:
-            self._position_timer.stop()
-
-    def _poll_position(self) -> None:
-        """Timer callback: read stage position and update preview."""
-        try:
-            if self._controller is None:
-                return
-            xy = self._controller.get_xy_position(cached=True)
-            zp = self._controller.get_zp_position(cached=True)
-            if xy:
-                x_um = steps_to_um(xy[0], self._microsteps_per_micron)
-                y_um = steps_to_um(xy[1], self._microsteps_per_micron)
-                z_mm = zp[0] / 1000.0 if zp else 0.0
-                x_mm = x_um / 1000.0
-                y_mm = y_um / 1000.0
-                self.update_needle_position(x_mm, y_mm, z_mm)
-            # Refresh the preview periodically
-            self.well_preview.refresh()
-        except Exception as exc:
-            logger.debug(f"Position poll error: {exc}")
-
-    # ── Job Queue Management ──────────────────────────────────────
-
-    def _refresh_job_queue_ui(self) -> None:
-        """Update job queue list widget in context panel."""
-        if not hasattr(self, "_queue_list") or self._queue_list is None:
-            return
-        self._queue_list.clear()
-        for i, job in enumerate(self._job_queue):
-            prefix = "▶ " if job is self._current_job else "  "
-            steps = getattr(job, "total_steps", "?")
-            self._queue_list.addItem(f"{prefix}{job.name}  [{steps} steps]")
-
-        # Update start button
-        if hasattr(self, "btn_start"):
-            has_job = self._current_job is not None
-            idle_ish = self._print_state in (
-                PrintState.IDLE, PrintState.COMPLETED,
-                PrintState.ABORTED, PrintState.ERROR,
-            )
-            self.btn_start.setEnabled(has_job and idle_ish)
-
-        # Also update context start button
-        if hasattr(self, "_ctx_btn_start"):
-            has_job = self._current_job is not None
-            idle_ish = self._print_state in (
-                PrintState.IDLE, PrintState.COMPLETED,
-                PrintState.ABORTED, PrintState.ERROR,
-            )
-            self._ctx_btn_start.setEnabled(has_job and idle_ish)
-
-    def _on_ctx_start_clicked(self) -> None:
-        """Context panel start button."""
-        self._on_start_clicked()
-
-    def _on_ctx_remove_job(self) -> None:
-        """Remove selected job from queue."""
-        if not hasattr(self, "_queue_list"):
-            return
-        row = self._queue_list.currentRow()
-        if 0 <= row < len(self._job_queue):
-            removed = self._job_queue.pop(row)
-            if removed is self._current_job:
-                self._current_job = self._job_queue[0] if self._job_queue else None
-            self._refresh_job_queue_ui()
-            logger.info(f"Removed job: {removed.name}")
-
-    def _on_ctx_clear_queue(self) -> None:
-        """Clear all jobs from queue."""
-        self._job_queue.clear()
-        self._current_job = None
-        self._refresh_job_queue_ui()
-        logger.info("Job queue cleared")
-
-    def _advance_queue(self) -> None:
-        """After job completes, advance to next in queue."""
-        if self._current_job in self._job_queue:
-            self._job_queue.remove(self._current_job)
-        if self._job_queue:
-            self._current_job = self._job_queue[0]
-            logger.info(f"Queue advanced: next = {self._current_job.name}")
-        else:
-            self._current_job = None
-            logger.info("Job queue empty")
-
-    # ── Context Panel ─────────────────────────────────────────────
-
-    def get_context_widget(self) -> QWidget:
-        """Build context panel: job queue + recording browser."""
-        if self._context_widget is not None:
-            return self._context_widget
-
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        # ── Job Queue Section ─────────────────────────────────────
-        queue_title = QLabel("Job Queue")
-        queue_title.setStyleSheet(
-            f"font-size: 12pt; font-weight: bold; color: {COLORS['text']};")
-        layout.addWidget(queue_title)
-
-        self._ctx_btn_start = QPushButton("▶ Start Print")
-        self._ctx_btn_start.setStyleSheet(
-            f"QPushButton {{ background-color: {COLORS['green']}; "
-            f"color: {COLORS['crust']}; font-weight: bold; "
-            f"border-radius: 4px; padding: 6px; }}"
-            f"QPushButton:disabled {{ background-color: {COLORS['surface1']}; "
-            f"color: {COLORS['overlay0']}; }}")
-        self._ctx_btn_start.setEnabled(False)
-        self._ctx_btn_start.clicked.connect(self._on_ctx_start_clicked)
-        layout.addWidget(self._ctx_btn_start)
-
-        self._queue_list = QListWidget()
-        self._queue_list.setMaximumHeight(120)
-        self._queue_list.setStyleSheet(
-            f"QListWidget {{ background-color: {COLORS['surface0']}; "
-            f"color: {COLORS['text']}; border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: 4px; font-size: 10pt; }}")
-        layout.addWidget(self._queue_list)
-
-        queue_btns = QHBoxLayout()
-        btn_remove = QPushButton("Remove")
-        btn_remove.clicked.connect(self._on_ctx_remove_job)
-        queue_btns.addWidget(btn_remove)
-        btn_clear = QPushButton("Clear All")
-        btn_clear.clicked.connect(self._on_ctx_clear_queue)
-        queue_btns.addWidget(btn_clear)
-        layout.addLayout(queue_btns)
-
-        # ── Separator ─────────────────────────────────────────────
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {COLORS['surface1']};")
-        layout.addWidget(sep)
-
-        # ── Recording Browser Section ─────────────────────────────
-        rec_title = QLabel("Print Recordings")
-        rec_title.setStyleSheet(
-            f"font-size: 12pt; font-weight: bold; color: {COLORS['text']};")
-        layout.addWidget(rec_title)
-
-        btn_refresh = QPushButton("🔄 Refresh")
-        btn_refresh.clicked.connect(self._refresh_recording_list)
-        layout.addWidget(btn_refresh)
-
-        self._recording_list = QListWidget()
-        self._recording_list.setStyleSheet(
-            f"QListWidget {{ background-color: {COLORS['surface0']}; "
-            f"color: {COLORS['text']}; border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: 4px; font-size: 10pt; }}")
-        self._recording_list.currentItemChanged.connect(
-            self._on_recording_selected)
-        layout.addWidget(self._recording_list)
-
-        self._rec_info_label = QLabel("Select a recording to view")
-        self._rec_info_label.setWordWrap(True)
-        self._rec_info_label.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 10pt;")
-        layout.addWidget(self._rec_info_label)
-
-        replay_row = QHBoxLayout()
-        self._btn_load_replay = QPushButton("📂 Load Replay")
-        self._btn_load_replay.setToolTip("Load and overlay on preview")
-        self._btn_load_replay.clicked.connect(self._load_replay)
-        self._btn_load_replay.setEnabled(False)
-        replay_row.addWidget(self._btn_load_replay)
-
-        self._btn_clear_replay = QPushButton("✕ Clear")
-        self._btn_clear_replay.setToolTip("Clear replay overlay")
-        self._btn_clear_replay.clicked.connect(self._clear_replay)
-        self._btn_clear_replay.setEnabled(False)
-        replay_row.addWidget(self._btn_clear_replay)
-        layout.addLayout(replay_row)
-
-        self._replay_info = QLabel("")
-        self._replay_info.setWordWrap(True)
-        self._replay_info.setStyleSheet(
-            f"color: {COLORS['green']}; font-size: 10pt;")
-        layout.addWidget(self._replay_info)
-
-        self._btn_delete = QPushButton("🗑 Delete Recording")
-        self._btn_delete.setStyleSheet(
-            f"QPushButton {{ color: {COLORS['red']}; }}")
-        self._btn_delete.clicked.connect(self._delete_recording)
-        self._btn_delete.setEnabled(False)
-        layout.addWidget(self._btn_delete)
-
-        layout.addStretch()
-
-        # Initial refresh
-        QTimer.singleShot(500, self._refresh_recording_list)
-
-        # Refresh queue display
-        self._refresh_job_queue_ui()
-
-        self._context_widget = widget
-        return widget
-
-    # ── Recording Browser Methods ─────────────────────────────────
-
-    def _refresh_recording_list(self) -> None:
-        """Refresh the recording list from PrintRecorder."""
-        if not hasattr(self, "_recording_list"):
-            return
-        self._recording_list.clear()
-        try:
-            from SupportClasses.PrintRecorder import PrintRecorder
-            recorder = self._recorder or PrintRecorder()
-            recordings = recorder.list_recordings()
-            for rec in recordings:
-                name = rec.get("name", "Unknown")
-                date = rec.get("date", "")
-                self._recording_list.addItem(f"{name}  [{date}]")
-        except Exception as e:
-            logger.debug(f"Recording list refresh: {e}")
-
-    def _on_recording_selected(self, current, previous) -> None:
-        """Handle recording selection."""
-        has_selection = current is not None
-        if hasattr(self, "_btn_load_replay"):
-            self._btn_load_replay.setEnabled(has_selection)
-        if hasattr(self, "_btn_delete"):
-            self._btn_delete.setEnabled(has_selection)
-
-        if has_selection:
-            try:
-                from SupportClasses.PrintRecorder import PrintRecorder
-                recorder = self._recorder or PrintRecorder()
-                recordings = recorder.list_recordings()
-                idx = self._recording_list.currentRow()
-                if 0 <= idx < len(recordings):
-                    rec = recordings[idx]
-                    self._selected_recording_path = rec.get("path", "")
-                    info_parts = [
-                        f"Name: {rec.get('name', '?')}",
-                        f"Date: {rec.get('date', '?')}",
-                        f"Steps: {rec.get('steps', '?')}",
-                        f"Duration: {rec.get('duration', '?')}s",
-                    ]
-                    self._rec_info_label.setText("\n".join(info_parts))
-            except Exception as e:
-                self._rec_info_label.setText(f"Error: {e}")
-
-    def _load_replay(self) -> None:
-        """Load a recording and overlay on the preview."""
-        if not hasattr(self, "_selected_recording_path"):
-            return
-        try:
-            from SupportClasses.PrintRecorder import PrintRecorder
-            recorder = self._recorder or PrintRecorder()
-            data = recorder.load_recording(self._selected_recording_path)
-            if data and "positions" in data:
-                positions = data["positions"]
-                path_points = [
-                    {"color": "#89b4fa", "points": positions}
-                ]
-                self.well_preview.set_object_paths(path_points)
-                self.well_preview.refresh()
-                self._replay_info.setText(
-                    f"Loaded {len(positions)} points")
-                self._btn_clear_replay.setEnabled(True)
-        except Exception as e:
-            logger.warning(f"Replay load error: {e}")
-            self._replay_info.setText(f"Error: {e}")
-
-    def _clear_replay(self) -> None:
-        """Clear replay overlay."""
-        self.well_preview.set_object_paths([])
-        self.well_preview.refresh()
-        self._replay_info.setText("")
-        self._btn_clear_replay.setEnabled(False)
-
-    def _delete_recording(self) -> None:
-        """Delete selected recording."""
-        if not hasattr(self, "_selected_recording_path"):
-            return
-        try:
-            from SupportClasses.PrintRecorder import PrintRecorder
-            recorder = self._recorder or PrintRecorder()
-            recorder.delete_recording(self._selected_recording_path)
-            self._refresh_recording_list()
-            self._rec_info_label.setText("Recording deleted")
-        except Exception as e:
-            logger.warning(f"Delete error: {e}")
-            self._rec_info_label.setText(f"Error: {e}")
+        if xy and xy[0] is not None:
+            zero = getattr(ctrl, 'zero_position', {})
+            px = xy[0] - zero.get('x', 0)
+            py = xy[1] - zero.get('y', 0)
+            pz = (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0.0
+            p1 = (zp[1] - zero.get('P1', 0)) if zp and len(zp) > 1 and zp[1] is not None else 0.0
+
+            self._interpolator.add_sample(time.monotonic(), px, py, pz, p1)
+
+            # Also update pump positions
+            if zp:
+                for i, pid in enumerate(["P1", "P2", "P3"], 1):
+                    if i < len(zp) and zp[i] is not None:
+                        pw = self._pump_widgets.get(pid)
+                        if pw:
+                            pw.set_position(zp[i], zero.get(pid, 0))
+
+    def _interp_tick(self):
+        """Called at 60ms — update views with interpolated position."""
+        if self._print_state != PrintState.RUNNING: return
+        pos = self._interpolator.get_position(time.monotonic())
+        if pos is None: return
+        ix, iy, iz = pos
+
+        # Update all three views with smooth position
+        self.plate_view.set_needle_position(ix, iy)
+        self.xy_detail.set_needle_position(ix, iy)
+        self.yz_view.set_needle_position(iy, iz)
+
+        # v7.3: Advance XY completed index based on time
+        if self._is_trajectory_job and self._total_duration_s > 0 and self._print_start_time:
+            import time as _time
+            elapsed = _time.time() - self._print_start_time
+            frac = min(1.0, elapsed / self._total_duration_s)
+            wp_count = len(self.xy_detail._waypoints) if self.xy_detail._waypoints else 0
+            if wp_count > 0:
+                self.xy_detail.set_completed_index(int(frac * wp_count))
 
     # ── Helpers ───────────────────────────────────────────────────
 
-    def _update_needle_info(self) -> None:
-        """Update needle info label from workspace."""
-        needle = self._workspace.needle
-        if needle:
+    @staticmethod
+    def _ft(s):
+        s = max(0, s)
+        if s < 3600: return f"{int(s)//60}:{int(s)%60:02d}"
+        return f"{int(s)//3600}:{(int(s)%3600)//60:02d}:{int(s)%60:02d}"
+
+    @staticmethod
+    def _gs():
+        return (f"QGroupBox {{ color: {COLORS.get('text','#cdd6f4')}; font-weight: bold; "
+                f"border: 1px solid {COLORS.get('surface1','#45475a')}; border-radius: 4px; "
+                f"margin-top: 6px; padding-top: 14px; }}")
+
+    def _update_needle_info(self):
+        ws = self._workspace
+        needle = getattr(ws, 'needle', None)
+        if needle and hasattr(self, 'needle_label'):
             self.needle_label.setText(
-                f"Needle: {needle.gauge}G × {needle.length_inches}\"  "
-                f"ID: {needle.id_um:.0f} µm")
-        else:
-            self.needle_label.setText("Needle: —")
-
-    @staticmethod
-    def _format_time(seconds: float) -> str:
-        """Format seconds as M:SS or H:MM:SS."""
-        seconds = max(0, seconds)
-        if seconds < 3600:
-            m = int(seconds) // 60
-            s = int(seconds) % 60
-            return f"{m}:{s:02d}"
-        else:
-            h = int(seconds) // 3600
-            m = (int(seconds) % 3600) // 60
-            s = int(seconds) % 60
-            return f"{h}:{m:02d}:{s:02d}"
-
-    @staticmethod
-    def _color_label(text: str, color: str) -> QLabel:
-        """Create a colored label for legends."""
-        lbl = QLabel(text)
-        lbl.setStyleSheet(f"color: {color}; font-size: 10px;")
-        return lbl
+                f"Needle: {getattr(needle,'gauge','?')}G × "
+                f"{getattr(needle,'length_inches','?')}\"  "
+                f"ID: {getattr(needle,'id_um',0):.0f} µm")
