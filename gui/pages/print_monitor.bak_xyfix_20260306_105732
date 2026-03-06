@@ -144,8 +144,8 @@ class MiniPlateOverview(QGraphicsView):
         self._well_items.clear()
 
         for name, info in plate._wells.items():
-            x = info.x * MINI_SCALE
-            y = info.y * MINI_SCALE
+            x = info.x_mm * MINI_SCALE
+            y = info.y_mm * MINI_SCALE
             r = MINI_WELL_RADIUS
             item = self._scene.addEllipse(
                 x - r, y - r, 2 * r, 2 * r,

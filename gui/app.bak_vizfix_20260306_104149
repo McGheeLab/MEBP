@@ -648,116 +648,16 @@ class MainWindow(QMainWindow):
 
     def _send_job_to_monitor(self, job):
         """
-        v7.2.6: Forward job to monitor WITH visualization setup.
-
-        Initializes plate overview, trajectory view, and syringe displays
-        before the job is received by the monitor page.
+        Receive a PrintJob from PrintSetupPage, forward it to
+        PrintMonitorPage's job queue, and switch to the monitor page.
         """
         monitor_page = self._page_widgets[5]
-        setup_page = self._page_widgets[4]
-
-        # ── Initialize monitor visualization ──────────────────────
-        try:
-            self._setup_monitor_visualization(setup_page, monitor_page, job)
-        except Exception as exc:
-            logger.error(f"Monitor viz setup error: {exc}", exc_info=True)
 
         if hasattr(monitor_page, 'receive_job'):
             monitor_page.receive_job(job)
 
         # Auto-switch to Print Monitor page
         self._switch_page(5)
-    def _setup_monitor_visualization(self, setup_page, monitor_page, job):
-        """v7.2.6: Feed plate/trajectory/syringe data to monitor widgets."""
-        try:
-            # ── 1. Plate Overview ─────────────────────────────────
-            plate = None
-            well_roles = {}
-            print_wells = []
-
-            tab_wells = getattr(setup_page, 'tab_wells', None)
-            model = getattr(tab_wells, '_model', None) if tab_wells else None
-
-            if model is not None:
-                plate = getattr(model, 'plate', None)
-                assignments = getattr(model, 'assignments', {})
-
-                for name, assignment in assignments.items():
-                    role = getattr(assignment, 'role', None)
-                    if role is not None:
-                        well_roles[name] = role
-                        if getattr(role, 'value', '') == 'print':
-                            print_wells.append(name)
-
-            if plate is not None and hasattr(monitor_page, 'setup_plate'):
-                well_diam = getattr(plate, 'well_diameter', 0.0)
-                monitor_page.setup_plate(
-                    plate=plate,
-                    well_roles=well_roles if well_roles else None,
-                    print_wells=print_wells if print_wells else None,
-                    well_diameter_mm=well_diam,
-                )
-                logger.info(
-                    f"Monitor plate: {len(print_wells)} print wells, "
-                    f"diam={well_diam:.1f}mm")
-
-            # ── 2. Trajectory View — path segments from job ───────
-            if (hasattr(monitor_page, 'trajectory_view')
-                    and hasattr(job, 'get_path_segments')):
-                try:
-                    segments = job.get_path_segments()
-                    tv = monitor_page.trajectory_view
-                    if segments:
-                        if hasattr(tv, 'set_path_segments'):
-                            tv.set_path_segments(segments)
-                        elif hasattr(tv, 'load_path_segments'):
-                            tv.load_path_segments(segments)
-                        logger.info(f"Monitor trajectory: {len(segments)} segments")
-                except Exception as exc:
-                    logger.debug(f"Trajectory load skipped: {exc}")
-
-            # ── 3. Syringe Display from HardwareConfig ────────────
-            hw = getattr(self, '_hardware_config', None)
-            if hw is not None and hasattr(monitor_page, 'syringe_panel'):
-                try:
-                    sp = monitor_page.syringe_panel
-                    # Try different syringe panel APIs
-                    workspace = getattr(setup_page, '_workspace', None)
-                    if workspace:
-                        pump_loadouts = getattr(workspace, 'pumps', None)
-                        if pump_loadouts and hasattr(monitor_page, 'update_syringe_state'):
-                            active = getattr(
-                                getattr(job, 'settings', None), 'active_pump', 'P1')
-                            monitor_page.update_syringe_state(pump_loadouts, active)
-                except Exception as exc:
-                    logger.debug(f"Syringe setup skipped: {exc}")
-
-            # ── 4. Needle info label ──────────────────────────────
-            if hw and hasattr(monitor_page, 'needle_label'):
-                try:
-                    needle = getattr(hw, 'needle', None)
-                    if needle:
-                        g = getattr(needle, 'gauge', '?')
-                        l = getattr(needle, 'length_inches', '?')
-                        d = getattr(needle, 'id_um', 0)
-                        monitor_page.needle_label.setText(
-                            f"Needle: {g}G x {l}\"  ID: {d:.0f} um")
-                except Exception:
-                    pass
-
-            # ── 5. Push workspace to monitor ──────────────────────
-            workspace = getattr(setup_page, '_workspace', None)
-            if workspace and hasattr(monitor_page, '_workspace'):
-                monitor_page._workspace = workspace
-                if hasattr(monitor_page, '_update_needle_info'):
-                    try:
-                        monitor_page._update_needle_info()
-                    except Exception:
-                        pass
-
-        except Exception as exc:
-            logger.error(f"Monitor viz setup failed: {exc}", exc_info=True)
-
 
     def _on_monitor_start(self, job):
         """Monitor requested start. v7.2.6: load_job then start.

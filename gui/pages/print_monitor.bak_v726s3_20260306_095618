@@ -20,7 +20,6 @@ Context Panel: Job Queue + Recording Browser
 """
 
 from __future__ import annotations
-import re
 
 import logging
 import math
@@ -143,9 +142,9 @@ class MiniPlateOverview(QGraphicsView):
         self._scene.clear()
         self._well_items.clear()
 
-        for name, info in plate._wells.items():
-            x = info.x * MINI_SCALE
-            y = info.y * MINI_SCALE
+        for name, info in plate.wells.items():
+            x = info.x_mm * MINI_SCALE
+            y = info.y_mm * MINI_SCALE
             r = MINI_WELL_RADIUS
             item = self._scene.addEllipse(
                 x - r, y - r, 2 * r, 2 * r,
@@ -572,10 +571,6 @@ class PrintMonitorPage(QWidget):
         self._connect_signals()
 
     # ── Page Interface ────────────────────────────────────────────
-
-    def _get_controller(self):
-        """v7.2.6: Helper to get controller reference."""
-        return getattr(self, '_controller', None) or getattr(self, 'controller', None)
 
     def get_page_title(self) -> str:
         return "Print Monitor"
@@ -1046,43 +1041,13 @@ class PrintMonitorPage(QWidget):
             self._message_label.setText(message)
 
     def on_print_progress(self, step: int, total: int, message: str) -> None:
-        """v7.2.6: Parse well/layer info from progress message.
-
-        PrintManager sends messages like:
-            "[42/500] Travel to well A3"
-            "[42/500] Layer 2: print_path"
-            "[42/500] Well A3, Layer 2/5: meander"
-        We parse these to extract structured info for on_progress_update().
-        """
-        # Parse well name from message
-        well_name = ""
-        well_match = re.search(r'[Ww]ell\s+([A-H]\d{1,2})', message)
-        if well_match:
-            well_name = well_match.group(1)
-
-        # Parse layer info
-        layer = 0
-        total_layers = 0
-        layer_match = re.search(r'[Ll]ayer\s+(\d+)(?:\s*/\s*(\d+))?', message)
-        if layer_match:
-            layer = int(layer_match.group(1))
-            if layer_match.group(2):
-                total_layers = int(layer_match.group(2))
-
-        # Track current well name for position polling
-        if well_name:
-            self._current_well_name = well_name
-
+        """v7.2.3: Simplified callback (PrintManager-compatible)."""
         self.on_progress_update(
             current_step=step,
             total_steps=total,
             message=message,
             job_name=self._current_job.name if self._current_job else "",
-            well_name=well_name,
-            layer=layer,
-            total_layers=total_layers,
         )
-
 
     def update_needle_position(self, x: float, y: float, z: float) -> None:
         """Update needle position on the live well preview."""

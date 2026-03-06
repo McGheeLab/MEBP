@@ -535,408 +535,190 @@ class PrintSetupPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _send_to_monitor(self):
-        """v7.2.6: Prefer pre-generated job from _generate_print().
+        """
+        v7.2.4 S5.12: Build a print job with validation gate.
 
-        Build a print job and emit job_ready for Print Monitor.
         Validates well setup before sending. Shows issues dialog on failure.
         Includes PrintPlanOfAction in the job when valid.
         """
-        # Run validation
-        if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, 'validate'):
-            try:
-                is_valid, issues = self.tab_wells.validate()
-            except Exception as exc:
-                is_valid, issues = False, [f"Validation error: {exc}"]
-
+        # Run validation first
+        if hasattr(self.tab_wells, 'validate'):
+            is_valid, issues = self.tab_wells.validate()
             if not is_valid:
-                try:
-                    from PySide6.QtWidgets import QMessageBox
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle("Setup Validation Failed")
-                    msg.setIcon(QMessageBox.Icon.Warning)
-                    msg.setText(
-                        f"Cannot send to monitor: {len(issues)} issue(s) found.")
-                    msg.setDetailedText("\n".join(f"\u2022 {i}" for i in issues))
-                    msg.exec()
-                except Exception:
-                    pass
-                if hasattr(self, 'status_label'):
-                    self.status_label.setText(
-                        f"\u26a0 {len(issues)} validation issue(s)")
-                    self.status_label.setStyleSheet(
-                        f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Setup Validation Failed")
+                msg.setIcon(QMessageBox.Icon.Warning)
+                msg.setText(
+                    f"Cannot send to monitor: {len(issues)} issue(s) found."
+                )
+                msg.setDetailedText("\n".join(f"\u2022 {i}" for i in issues))
+                msg.exec()
+                self.status_label.setText(
+                    f"\u26a0 {len(issues)} validation issue(s)")
+                self.status_label.setStyleSheet(
+                    f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
                 logger.warning(f"Send-to-monitor blocked: {issues}")
                 return
 
-        # Use pre-generated job if available, otherwise build fresh
-        job = getattr(self, '_generated_job', None) or self._build_current_job()
+        # Build job
+        # v7.2.6: Use pre-generated job if available
+        job = self._generated_job or self._build_current_job()
         if job is None:
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("\u26a0 No job \u2014 configure wells first")
-                self.status_label.setStyleSheet(
-                    f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
+            self.status_label.setText("\u26a0 No job -- configure wells first")
+            self.status_label.setStyleSheet(
+                f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
             return
 
-        # Attach plan of action to job if available
-        if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, 'get_plan'):
+        # Attach plan of action to job
+        if hasattr(self.tab_wells, 'get_plan'):
             plan = self.tab_wells.get_plan()
             if plan is not None:
                 job.plan_of_action = plan
 
-        # Show confirmation dialog
-        summary_parts = [f"{job.total_steps} commands"]
-        if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, '_model'):
+        # Show confirmation
+        summary_parts = []
+        if hasattr(self.tab_wells, '_model'):
             model = self.tab_wells._model
             print_wells = [
                 n for n, a in model.assignments.items()
-                if getattr(getattr(a, 'role', None), 'value', None) == 'print'
+                if a.role.value == "print"
             ]
-            summary_parts.insert(0, f"{len(print_wells)} print wells")
-        plan = getattr(job, 'plan_of_action', None)
-        if plan:
-            summary_parts.append(f"{getattr(plan, 'total_runs', '?')} run(s)")
-            est = getattr(plan, 'estimated_total_seconds', 0)
-            if est > 0:
-                summary_parts.append(f"~{est / 60:.1f} min")
+            summary_parts.append(f"{len(print_wells)} print wells")
+        if hasattr(self.tab_wells, 'get_plan'):
+            plan = self.tab_wells.get_plan()
+            if plan:
+                summary_parts.append(f"{plan.total_runs} run(s)")
+                summary_parts.append(
+                    f"~{plan.estimated_total_seconds / 60:.1f} min")
 
-        try:
-            from PySide6.QtWidgets import QMessageBox
-            confirm = QMessageBox.question(
-                self,
-                "Send to Monitor",
-                f"Send job to Print Monitor?\n\n" + "\n".join(summary_parts),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                return
-        except Exception:
-            pass  # If dialog fails, proceed anyway
+        confirm = QMessageBox.question(
+            self,
+            "Send to Monitor",
+            f"Send job to Print Monitor?\n\n"
+            + "\n".join(summary_parts),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
 
         self.job_ready.emit(job)
-        self._generated_job = None  # Clear after sending
-        if hasattr(self, 'status_label'):
-            self.status_label.setText(f"\u2713 Job sent: {job.name}")
-            self.status_label.setStyleSheet(
-                f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
+        self._generated_job = None  # v7.2.6: clear after sending
+        self.status_label.setText(f"\u2713 Job sent: {job.name}")
+        self.status_label.setStyleSheet(
+            f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
         logger.info(f"Print job sent to Monitor: {job.name}")
 
 
     def _build_current_job(self):
-        """Build a PrintJob from current well setup + print objects.
-
-        v7.2.6: Fixed job builder with correct build_well_plate_job API.
-        Extracts geometry from Tab 2 objects, well positions from Tab 3 model.
-        """
-        # 1. Get well model from Tab 3
-        if not (hasattr(self, 'tab_wells') and hasattr(self.tab_wells, '_model')
-                and self.tab_wells._model):
-            logger.warning("No well model available for job building")
+        """Build a print job — v7.3.1: use correct build_well_plate_job API."""
+        if not (hasattr(self, "tab_wells") and self.tab_wells._model):
+            logger.warning("No well model available")
             return None
 
         model = self.tab_wells._model
-        plate = getattr(model, 'plate', None)
-        if plate is None:
-            logger.warning("No plate geometry available")
-            return None
+        plate = model.plate
+        settings = self._get_settings()
 
-        # 2. Get print wells
-        print_wells = []
-        for name, assignment in model.assignments.items():
-            role = getattr(assignment, 'role', None)
-            if role is not None and getattr(role, 'value', None) == 'print':
-                print_wells.append(name)
+        # Collect print wells
+        print_wells = [
+            name for name, a in model.assignments.items()
+            if getattr(getattr(a, "role", None), "value", None) == "print"
+        ]
 
         if not print_wells:
             logger.warning("No print wells assigned")
             return None
 
-        # 3. Build well_positions: list of (name, x_mm, y_mm)
-        well_positions = []
-        for name in print_wells:
-            try:
-                x, y = plate.get_well_position(name)
-            except Exception:
-                x, y = 0.0, 0.0
-            well_positions.append((name, x, y))
+        if plate is None:
+            logger.warning("No plate geometry available")
+            return None
 
-        # 4. Get path points from Tab 2 objects
-        path_points = self._get_path_from_objects()
-        if not path_points:
-            # Fallback: default meander pattern sized to well
-            try:
-                from SupportClasses.WellPlate import generate_meander_path
-                well_diam = getattr(plate, 'well_diameter', 6.0)
-                if well_diam <= 0:
-                    well_diam = 6.0
-                fill_frac = 0.7
-                path_points = generate_meander_path(
-                    well_diam * fill_frac,
-                    well_diam * fill_frac,
-                    0.5,
-                )
-            except Exception:
-                path_points = [(0.0, 0.0)]
-            logger.info(f"Using fallback meander pattern ({len(path_points)} pts)")
-
-        # 5. Get settings from context panel
-        settings = self._get_settings()
-
-        # 6. Get pump/flow info
-        pump = getattr(settings, 'active_pump', 'P1') or 'P1'
-        flow_rate = getattr(settings, 'flow_rate', 0.01) or 0.01
-
-        # 7. Build multi-material params from HardwareConfig
-        mm_params = {}
-        hw = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
-        if hw and hasattr(hw, 'pumps'):
-            active_pumps = [
-                pid for pid, pcfg in hw.pumps.items()
-                if getattr(pcfg, 'enabled', False)
-            ]
-            if len(active_pumps) > 1:
-                mm_params['pump_sequence'] = active_pumps
-
-        # 8. Build job with correct v7.0 API
+        # Build well_positions: list of (name, x_mm, y_mm)
         try:
-            from SupportClasses.PrintManager import build_well_plate_job
-            job = build_well_plate_job(
+            well_positions = []
+            for name in print_wells:
+                try:
+                    x, y = plate.get_well_position(name)
+                except Exception:
+                    x, y = 0.0, 0.0
+                well_positions.append((name, x, y))
+
+            # Default path: single center point per well
+            path_points = [(0.0, 0.0)]
+
+            return build_well_plate_job(
                 well_positions=well_positions,
                 path_points=path_points,
                 settings=settings,
-                pump=pump,
-                flow_rate=flow_rate,
-                job_name=f"Well Plate {getattr(plate, 'format', '?')}-well",
-                **mm_params,
             )
-            logger.info(
-                f"Built job: {job.name}, {job.total_steps} commands, "
-                f"{len(well_positions)} wells, {len(path_points)} path pts")
-            return job
+        except TypeError:
+            # Older API may use positional args only
+            try:
+                well_positions = []
+                for name in print_wells:
+                    try:
+                        x, y = plate.get_well_position(name)
+                    except Exception:
+                        x, y = 0.0, 0.0
+                    well_positions.append((name, x, y))
+                return build_well_plate_job(well_positions, [(0.0, 0.0)], settings)
+            except Exception as exc:
+                logger.error(f"build_well_plate_job failed: {exc}", exc_info=True)
+                return None
         except Exception as exc:
-            logger.error(f"build_well_plate_job failed: {exc}", exc_info=True)
+            logger.error(f"_build_current_job error: {exc}", exc_info=True)
             return None
 
 
-    def _get_path_from_objects(self):
-        """Extract path points from Tab 2 print objects.
-
-        v7.2.6: Bridge between PrintObjects tab geometry and job builder.
-        Returns list of (x, y) tuples or empty list.
-        """
-        if not hasattr(self, 'tab_objects'):
-            return []
-
-        tab = self.tab_objects
-
-        # Primary: read from _objects list (list of dicts)
-        objects_list = getattr(tab, '_objects', None)
-        if objects_list and isinstance(objects_list, list) and len(objects_list) > 0:
-            all_points = []
-            for obj in objects_list:
-                if not isinstance(obj, dict):
-                    continue
-                pts = self._single_object_to_points(obj)
-                pos = obj.get('position', (0, 0, 0))
-                if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                    all_points.extend([(x + pos[0], y + pos[1]) for x, y in pts])
-                else:
-                    all_points.extend(pts)
-            if all_points:
-                logger.info(f"Extracted {len(all_points)} path points from {len(objects_list)} objects")
-                return all_points
-
-        # Secondary: try PrintFileData objects dict
-        current_file = getattr(tab, '_current_file', None)
-        if current_file and hasattr(current_file, 'objects') and current_file.objects:
-            all_points = []
-            for obj_name, obj_data in current_file.objects.items():
-                if isinstance(obj_data, dict):
-                    pts = self._single_object_to_points(obj_data)
-                    pos = obj_data.get('position', [0, 0, 0])
-                    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                        all_points.extend([(x + pos[0], y + pos[1]) for x, y in pts])
-                    else:
-                        all_points.extend(pts)
-            if all_points:
-                logger.info(f"Extracted {len(all_points)} path points from file data")
-                return all_points
-
-        return []
-
-    def _single_object_to_points(self, obj_data) -> list:
-        """Convert a single print object dict to path point list.
-
-        v7.2.6: Supports line, meander, spiral, grid, and raw points.
-        """
-        if isinstance(obj_data, dict):
-            obj_type = obj_data.get('object_type', '')
-            params = obj_data.get('params', {})
-        else:
-            obj_type = getattr(obj_data, 'object_type', '')
-            params = getattr(obj_data, 'params', {})
-
-        if not isinstance(params, dict):
-            params = {}
-
-        try:
-            from SupportClasses.WellPlate import (
-                generate_line_path, generate_meander_path,
-                generate_spiral_path, generate_grid_path,
-            )
-        except ImportError:
-            logger.warning("WellPlate path generators not available")
-            return []
-
-        try:
-            if obj_type == 'line':
-                return generate_line_path(
-                    params.get('length', 5.0),
-                    params.get('angle', 0.0),
-                )
-            elif obj_type == 'meander':
-                return generate_meander_path(
-                    params.get('width', 5.0),
-                    params.get('height', 5.0),
-                    params.get('spacing', 0.5),
-                )
-            elif obj_type == 'spiral':
-                return generate_spiral_path(
-                    params.get('radius', 3.0),
-                    params.get('spacing', 0.5),
-                )
-            elif obj_type == 'grid':
-                return generate_grid_path(
-                    params.get('width', 5.0),
-                    params.get('height', 5.0),
-                    params.get('spacing_x', params.get('spacing', 1.0)),
-                    params.get('spacing_y', params.get('spacing', 1.0)),
-                )
-            elif obj_type == 'point' or obj_type == 'dot':
-                return [(0.0, 0.0)]
-            elif 'points' in params:
-                raw = params['points']
-                return [(p[0], p[1]) for p in raw if len(p) >= 2]
-            else:
-                logger.debug(f"Unknown object type '{obj_type}', using center point")
-                return [(0.0, 0.0)]
-        except Exception as exc:
-            logger.warning(f"Failed to generate path for {obj_type}: {exc}")
-            return [(0.0, 0.0)]
-
     def _generate_print(self):
-        """v7.2.6: Store generated job for _send_to_monitor.
+        """
+        v7.2.5: Validate well setup and generate execution plan.
 
-        Validate well setup, generate execution plan, and build the
-        complete PrintJob. Stores as self._generated_job.
+        This is the primary "prepare for print" action. It:
+        1. Validates the well setup (roles, inks, service wells)
+        2. Generates the execution plan (runs, service steps)
+        3. Shows results in the status label
+        4. Enables/disables Send to Monitor based on validity
         """
         # Step 1: Validate
-        if hasattr(self, 'tab_wells') and hasattr(self.tab_wells, 'validate'):
-            try:
-                is_valid, issues = self.tab_wells.validate()
-            except Exception as exc:
-                is_valid, issues = False, [f"Validation error: {exc}"]
+        if hasattr(self.tab_wells, 'validate'):
+            is_valid, issues = self.tab_wells.validate()
         else:
             is_valid, issues = False, ["Well setup tab missing validate() method"]
 
-        gen_label = getattr(self, '_gen_status_label', None)
-
         if not is_valid:
-            text = (f"\u26a0 {len(issues)} issue(s):\n"
-                    + "\n".join(f"  \u2022 {i}" for i in issues[:5]))
-            if gen_label:
-                gen_label.setText(text)
-                gen_label.setStyleSheet(
-                    f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-            if hasattr(self, 'btn_send_to_monitor'):
-                self.btn_send_to_monitor.setEnabled(False)
+            self._gen_status_label.setText(
+                f"⚠ {len(issues)} issue(s):\n" +
+                "\n".join(f"  • {i}" for i in issues[:5]))
+            self._gen_status_label.setStyleSheet(
+                f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
+            self.btn_send_to_monitor.setEnabled(False)
             logger.warning(f"Generate Print: {len(issues)} validation issues")
             return
 
         # Step 2: Generate plan
-        plan = None
-        if hasattr(self, 'tab_wells'):
-            if hasattr(self.tab_wells, '_generate_plan'):
-                try:
-                    self.tab_wells._generate_plan()
-                except Exception as e:
-                    if gen_label:
-                        gen_label.setText(f"\u26a0 Plan generation failed: {e}")
-                        gen_label.setStyleSheet(
-                            f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-                    if hasattr(self, 'btn_send_to_monitor'):
-                        self.btn_send_to_monitor.setEnabled(False)
-                    return
-            if hasattr(self.tab_wells, 'get_plan'):
-                plan = self.tab_wells.get_plan()
-
-        # Step 3: Build job — try plan-based first, fallback to simple
-        job = None
-        if plan is not None and hasattr(plan, 'steps') and len(plan.steps) > 0:
+        if hasattr(self.tab_wells, '_generate_plan'):
             try:
-                from SupportClasses.PrintPlanOfAction import plan_to_commands
-                path_points = self._get_path_from_objects()
-                if not path_points:
-                    try:
-                        from SupportClasses.WellPlate import generate_meander_path
-                        model = self.tab_wells._model
-                        plate = getattr(model, 'plate', None)
-                        d = getattr(plate, 'well_diameter', 6.0) if plate else 6.0
-                        path_points = generate_meander_path(d * 0.7, d * 0.7, 0.5)
-                    except Exception:
-                        path_points = [(0.0, 0.0)]
-
-                settings = self._get_settings()
-                model = self.tab_wells._model
-                plate = getattr(model, 'plate', None)
-                hw = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
-
-                job = plan_to_commands(
-                    plan=plan,
-                    well_model=model,
-                    plate=plate,
-                    path_points=path_points,
-                    settings=settings,
-                    hw_config=hw,
-                )
-                if job:
-                    job.plan_of_action = plan
-                    logger.info(f"Plan-based job: {job.total_steps} commands")
-            except ImportError:
-                logger.warning("plan_to_commands not available, falling back to simple build")
-            except Exception as exc:
-                logger.error(f"plan_to_commands failed: {exc}", exc_info=True)
-
-        # Fallback to simple build
-        if job is None:
-            job = self._build_current_job()
-
-        if job is None:
-            if gen_label:
-                gen_label.setText("\u26a0 Could not build print job")
-                gen_label.setStyleSheet(
+                self.tab_wells._generate_plan()
+            except Exception as e:
+                self._gen_status_label.setText(f"⚠ Plan generation failed: {e}")
+                self._gen_status_label.setStyleSheet(
                     f"color: {COLORS.get('red', '#f38ba8')}; font-size: 10px;")
-            if hasattr(self, 'btn_send_to_monitor'):
                 self.btn_send_to_monitor.setEnabled(False)
-            return
+                return
 
-        # Store for _send_to_monitor
-        self._generated_job = job
-
-        # Step 4: Show success
-        summary_parts = [f"\u2713 Job ready: {job.total_steps} commands"]
+        # Step 3: Show success
+        plan = self.tab_wells.get_plan() if hasattr(self.tab_wells, 'get_plan') else None
+        summary_parts = ["✓ Print plan generated"]
         if plan:
-            summary_parts.append(f"{getattr(plan, 'total_runs', '?')} run(s)")
-            est = getattr(plan, 'estimated_total_seconds', 0)
-            if est > 0:
-                summary_parts.append(f"~{est / 60:.1f} min")
-        if gen_label:
-            gen_label.setText(" | ".join(summary_parts))
-            gen_label.setStyleSheet(
-                f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
-        if hasattr(self, 'btn_send_to_monitor'):
-            self.btn_send_to_monitor.setEnabled(True)
-        logger.info(f"Generate Print complete: {job.total_steps} commands ready")
-
+            summary_parts.append(f"{plan.total_runs} run(s)")
+            if hasattr(plan, 'estimated_total_seconds') and plan.estimated_total_seconds > 0:
+                summary_parts.append(f"~{plan.estimated_total_seconds / 60:.1f} min")
+        self._gen_status_label.setText(" | ".join(summary_parts))
+        self._gen_status_label.setStyleSheet(
+            f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")
+        self.btn_send_to_monitor.setEnabled(True)
+        logger.info("Generate Print: plan ready")
 
     def _export_gcode(self):
         """Export the current job as G-code."""
