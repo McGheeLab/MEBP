@@ -622,10 +622,16 @@ class MainWindow(QMainWindow):
         self._switch_page(5)
 
     def _on_monitor_start(self, job):
-        """Monitor requested start — forward to PrintManager."""
+        """Monitor requested start — load job then start. v7.3.1 fix."""
         setup_page = self._page_widgets[4]
-        if hasattr(setup_page, 'print_manager'):
-            setup_page.print_manager.start(job)
+        if hasattr(setup_page, "print_manager"):
+            pm = setup_page.print_manager
+            try:
+                pm.load_job(job)   # load first — start() takes no args
+                pm.start()
+            except Exception as exc:
+                logger.error(f"PrintManager start failed: {exc}", exc_info=True)
+
 
     def _on_monitor_pause(self):
         """Monitor requested pause — forward to PrintManager."""

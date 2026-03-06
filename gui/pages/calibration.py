@@ -696,7 +696,7 @@ class CalibrationPage(QWidget):
         if self.settings is None:
             return
         cal_data = {
-            "plate_format": self._plate.format_key if self._plate else None,
+            "plate_format": self._plate.format if self._plate else None,
             "taught_a1": list(self._taught_a1) if self._taught_a1 else None,
             "taught_corner": list(self._taught_corner) if self._taught_corner else None,
             "offset_x": self._offset_x,

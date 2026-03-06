@@ -1005,7 +1005,7 @@ class WellSetupTab(QWidget):
                 return None
 
     def _generate_plan(self) -> None:
-        """Generate print plan of action — v7.3.1 fix: correct API usage."""
+        """Generate print plan — v7.3.1b: use classmethod generate_plan()."""
         lbl = getattr(self, "_plan_label", None)
         if self._hw_config is None:
             if lbl:
@@ -1019,17 +1019,16 @@ class WellSetupTab(QWidget):
             return
         try:
             prefs = self._get_plan_preferences()
-            plan = PrintPlanOfAction()
-            if prefs is not None:
-                plan.preferences = prefs
-            plan.generate(self._hw_config, self._model)
-            self._plan = plan
-            summary_fn = getattr(plan, "summary", None)
+            self._plan = PrintPlanOfAction.generate_plan(
+                self._hw_config, self._model, prefs
+            )
+            summary_fn = getattr(self._plan, "summary", None)
             if summary_fn and callable(summary_fn):
                 text = summary_fn()
             else:
-                steps = getattr(plan, "steps", [])
-                text = f"Plan generated: {len(steps)} step(s)."
+                steps = getattr(self._plan, "steps", [])
+                runs  = getattr(self._plan, "total_runs", "?")
+                text  = f"Plan: {len(steps)} steps, {runs} run(s)."
             if lbl:
                 lbl.setText(text)
         except Exception as exc:
@@ -1069,6 +1068,32 @@ class WellSetupTab(QWidget):
                 pass
 
     # ── Save / Load ───────────────────────────────────────────────
+
+    def validate(self) -> tuple:
+        """v7.3.1: Called by print_setup.py before sending job to monitor."""
+        if self._hw_config is None:
+            return False, ["No hardware configuration — complete Hardware Setup first"]
+        if self._plan is None:
+            try:
+                self._generate_plan()
+            except Exception as exc:
+                return False, [f"Plan generation error: {exc}"]
+        try:
+            from SupportClasses.PrintPlanOfAction import validate_well_setup
+            return validate_well_setup(
+                hw_config=self._hw_config,
+                well_model=self._model,
+                plan=self._plan,
+            )
+        except ImportError:
+            return False, ["PrintPlanOfAction module not available"]
+        except Exception as exc:
+            return False, [f"Validation error: {exc}"]
+
+    def get_plan(self):
+        """v7.3.1: Return the current PrintPlanOfAction (may be None)."""
+        return self._plan
+
 
     def _save_layout(self) -> None:
         """Save well setup to JSON."""

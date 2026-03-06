@@ -634,32 +634,64 @@ class PrintSetupPage(QWidget):
 
 
     def _build_current_job(self):
-        """Build a print job from current well setup and settings."""
-        # Check if Tab 3 has a well plate configured
-        if hasattr(self.tab_wells, '_model') and self.tab_wells._model:
-            model = self.tab_wells._model
-            plate = model.plate
-            settings = self._get_settings()
+        """Build a print job — v7.3.1: use correct build_well_plate_job API."""
+        if not (hasattr(self, "tab_wells") and self.tab_wells._model):
+            logger.warning("No well model available")
+            return None
 
-            # Get print wells
-            print_wells = [
-                name for name, a in model.assignments.items()
-                if a.role.value == "print"
-            ]
+        model = self.tab_wells._model
+        plate = model.plate
+        settings = self._get_settings()
 
-            if print_wells and plate:
-                return build_well_plate_job(
-                    plate=plate,
-                    selected_wells=print_wells,
-                    settings=settings,
-                )
+        # Collect print wells
+        print_wells = [
+            name for name, a in model.assignments.items()
+            if getattr(getattr(a, "role", None), "value", None) == "print"
+        ]
 
-        logger.warning("No printable job could be built from current setup")
-        return None
+        if not print_wells:
+            logger.warning("No print wells assigned")
+            return None
 
-    # ════════════════════════════════════════════════════════════════
-    #  EXPORT
-    # ════════════════════════════════════════════════════════════════
+        if plate is None:
+            logger.warning("No plate geometry available")
+            return None
+
+        # Build well_positions: list of (name, x_mm, y_mm)
+        try:
+            well_positions = []
+            for name in print_wells:
+                try:
+                    x, y = plate.get_well_position(name)
+                except Exception:
+                    x, y = 0.0, 0.0
+                well_positions.append((name, x, y))
+
+            # Default path: single center point per well
+            path_points = [(0.0, 0.0)]
+
+            return build_well_plate_job(
+                well_positions=well_positions,
+                path_points=path_points,
+                settings=settings,
+            )
+        except TypeError:
+            # Older API may use positional args only
+            try:
+                well_positions = []
+                for name in print_wells:
+                    try:
+                        x, y = plate.get_well_position(name)
+                    except Exception:
+                        x, y = 0.0, 0.0
+                    well_positions.append((name, x, y))
+                return build_well_plate_job(well_positions, [(0.0, 0.0)], settings)
+            except Exception as exc:
+                logger.error(f"build_well_plate_job failed: {exc}", exc_info=True)
+                return None
+        except Exception as exc:
+            logger.error(f"_build_current_job error: {exc}", exc_info=True)
+            return None
 
 
     def _generate_print(self):

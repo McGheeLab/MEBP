@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "saved_at": "2026-03-05T21:56:40.625404",
+  "current_step": 1,
+  "active_pump": "P1",
+  "job": {
+    "name": "Well Plate Print",
+    "description": "1 wells, 1 layers",
+    "source_file": "",
+    "settings": {
+      "xy_feedrate": 5.0,
+      "z_feedrate": 1.0,
+      "print_feedrate": 200.0,
+      "pump_feedrate": 30.0,
+      "travel_z_height": 5.0,
+      "print_z_height": 0.1,
+      "layer_height": 0.2,
+      "num_layers": 1,
+      "retract_amount": 0.0,
+      "prime_amount": 0.0,
+      "dwell_after_move": 0.0,
+      "retract_amounts": {
+        "P1": 0.5,
+        "P2": 0.5,
+        "P3": 0.5
+      },
+      "prime_amounts": {
+        "P1": 0.5,
+        "P2": 0.5,
+        "P3": 0.5
+      },
+      "pump_rate_uL_s": 0.25,
+      "retract_amounts_uL": {
+        "P1": 0.0,
+        "P2": 0.0,
+        "P3": 0.0
+      },
+      "prime_amounts_uL": {
+        "P1": 0.0,
+        "P2": 0.0,
+        "P3": 0.0
+      },
+      "pump_rates_uL_s": {
+        "P1": 0.25,
+        "P2": 0.25,
+        "P3": 0.25
+      }
+    },
+    "commands": [
+      {
+        "type": "comment",
+        "label": "=== Layer 1/1 (z=0.100) ==="
+      },
+      {
+        "type": "travel_up",
+        "label": "Travel up for A1"
+      },
+      {
+        "type": "move_xy",
+        "label": "Move to A1 start",
+        "x": 0.0,
+        "y": 0.0
+      },
+      {
+        "type": "move_z",
+        "label": "Lower to print height",
+        "z": 0.1
+      },
+      {
+        "type": "extrude",
+        "label": "Prime P1 (legacy)",
+        "pump": "P1",
+        "amount": 0.5,
+        "feedrate": 30.0
+      },
+      {
+        "type": "print_path",
+        "label": "Print in A1",
+        "points": [
+          [
+            0.0,
+            0.0
+          ]
+        ],
+        "pump": "P1",
+        "flow_rate": 0.01,
+        "flow_rate_uL_s": 0.25
+      },
+      {
+        "type": "extrude",
+        "label": "Retract P1 (legacy)",
+        "pump": "P1",
+        "amount": -0.5,
+        "feedrate": 30.0
+      },
+      {
+        "type": "travel_up",
+        "label": "Final travel up"
+      },
+      {
+        "type": "home_xy",
+        "label": "Return home"
+      }
+    ]
+  }
+}

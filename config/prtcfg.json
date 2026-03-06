@@ -1,0 +1,148 @@
+{
+  "plate_format": 24,
+  "assignments": {
+    "A1": {
+      "well_name": "A1",
+      "role": "print",
+      "role_index": 0,
+      "ink_name": null,
+      "print_collections": [
+        "Geeze"
+      ],
+      "print_offsets": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "rosette_name": null,
+      "subwell_roles": [],
+      "subwell_inks": [],
+      "subwell_labels": [],
+      "z_offset": 0.0,
+      "manually_taught_z": null,
+      "color": "#a6e3a1",
+      "wash_behavior": null,
+      "waste_behavior": null,
+      "buffer_behavior": null,
+      "ink_pickup": null,
+      "sorted_deposit": null
+    },
+    "A2": {
+      "well_name": "A2",
+      "role": "ink",
+      "role_index": 0,
+      "ink_name": "Hydrogel A",
+      "print_collections": [],
+      "print_offsets": [],
+      "rosette_name": null,
+      "subwell_roles": [],
+      "subwell_inks": [],
+      "subwell_labels": [],
+      "z_offset": 0.0,
+      "manually_taught_z": null,
+      "color": "#89b4fa",
+      "wash_behavior": null,
+      "waste_behavior": null,
+      "buffer_behavior": null,
+      "ink_pickup": {
+        "ink_depth_mm": 3.0,
+        "pickup_volume_uL": 2.0,
+        "fill_volume_uL": 0.0,
+        "refill_threshold_uL": 5.0,
+        "aspirate_rate_uL_s": 0.5,
+        "settle_time_s": 1.0
+      },
+      "sorted_deposit": null
+    },
+    "A3": {
+      "well_name": "A3",
+      "role": "wash",
+      "role_index": 0,
+      "ink_name": null,
+      "print_collections": [],
+      "print_offsets": [],
+      "rosette_name": null,
+      "subwell_roles": [],
+      "subwell_inks": [],
+      "subwell_labels": [],
+      "z_offset": 0.0,
+      "manually_taught_z": null,
+      "color": "#f9e2af",
+      "wash_behavior": {
+        "wash_depth_mm": 2.0,
+        "wash_duration_s": 5.0,
+        "jiggle_radius_mm": 2.0,
+        "jiggle_speed_mm_s": 5.0,
+        "num_jiggle_points": 20
+      },
+      "waste_behavior": null,
+      "buffer_behavior": null,
+      "ink_pickup": null,
+      "sorted_deposit": null
+    },
+    "A4": {
+      "well_name": "A4",
+      "role": "waste",
+      "role_index": 0,
+      "ink_name": null,
+      "print_collections": [],
+      "print_offsets": [],
+      "rosette_name": null,
+      "subwell_roles": [],
+      "subwell_inks": [],
+      "subwell_labels": [],
+      "z_offset": 0.0,
+      "manually_taught_z": null,
+      "color": "#f38ba8",
+      "wash_behavior": null,
+      "waste_behavior": {
+        "waste_depth_mm": 2.0,
+        "eject_rate_uL_s": 2.0,
+        "extra_push_uL": 5.0,
+        "settle_time_s": 0.5
+      },
+      "buffer_behavior": null,
+      "ink_pickup": null,
+      "sorted_deposit": null
+    },
+    "A5": {
+      "well_name": "A5",
+      "role": "buffer",
+      "role_index": 0,
+      "ink_name": null,
+      "print_collections": [],
+      "print_offsets": [],
+      "rosette_name": null,
+      "subwell_roles": [],
+      "subwell_inks": [],
+      "subwell_labels": [],
+      "z_offset": 0.0,
+      "manually_taught_z": null,
+      "color": "#cba6f7",
+      "wash_behavior": null,
+      "waste_behavior": null,
+      "buffer_behavior": {
+        "buffer_depth_mm": 2.0,
+        "aspirate_volume_uL": 5.0,
+        "aspirate_rate_uL_s": 0.5,
+        "settle_time_s": 1.0
+      },
+      "ink_pickup": null,
+      "sorted_deposit": null
+    }
+  },
+  "detector": {
+    "points": [],
+    "result": null
+  },
+  "service_sequence": {
+    "steps": [
+      "waste",
+      "wash",
+      "buffer",
+      "ink"
+    ]
+  }
+}

@@ -406,55 +406,65 @@ class PrintMonitorPage(QWidget):
         return widget
 
     def receive_job(self, job) -> None:
-        """
-        v7.2.3: Receive a print job from PrintSetupPage via app.py.
+        """v7.3.1: Receive a PrintJob — lazy-init queue attrs if missing."""
+        # Lazy-init queue attributes in case __init__ patch was not applied
+        if not hasattr(self, "_job_queue") or self._job_queue is None:
+            self._job_queue = []
+        if not hasattr(self, "_current_job"):
+            self._current_job = None
 
-        Adds the job to the queue and updates the context panel.
-        If no job is currently loaded, sets it as the active job.
-        """
         self._job_queue.append(job)
-        logger.info(f"Job received: {job.name} "
-                     f"({len(self._job_queue)} in queue)")
+        logger.info(
+            f"Job received: {job.name} ({len(self._job_queue)} in queue)")
 
-        # If this is the first/only job, make it active
         if self._current_job is None:
             self._current_job = job
 
-        # Update context panel
+        # Refresh queue UI
         self._refresh_job_queue_ui()
 
-        # Update progress labels
-        if hasattr(self, '_progress_labels'):
-            self._progress_labels["job_name"].setText(job.name)
-            self._progress_labels["step_info"].setText(
-                f"0 / {job.total_steps:,}")
-
-        # Setup plate overview if job has well data
-        if hasattr(job, 'well_setup') and job.well_setup:
+        # Update progress labels if they exist
+        if hasattr(self, "_progress_labels") and self._progress_labels:
             try:
-                from SupportClasses.WellPlate import WellPlate
-                plate = getattr(job, 'plate', None)
-                if plate:
-                    self.setup_plate(plate)
+                self._progress_labels["job_name"].setText(job.name)
+                total = getattr(job, "total_steps", 0)
+                self._progress_labels["step_info"].setText(f"0 / {total:,}")
             except Exception:
                 pass
 
-    def _refresh_job_queue_ui(self) -> None:
-        """Update the job queue list widget in context panel."""
-        if not hasattr(self, '_queue_list'):
-            return
-        self._queue_list.clear()
-        for i, job in enumerate(self._job_queue):
-            prefix = "▶ " if job is self._current_job else "  "
-            steps = getattr(job, 'total_steps', '?')
-            self._queue_list.addItem(f"{prefix}{job.name}  [{steps} steps]")
+        logger.info(f"Monitor ready — job '{job.name}' queued.")
 
-        # Enable/disable start button
-        if hasattr(self, '_ctx_btn_start'):
-            has_job = self._current_job is not None
-            idle = self._print_state in (PrintState.IDLE, PrintState.COMPLETED,
-                                          PrintState.ABORTED, PrintState.ERROR)
-            self._ctx_btn_start.setEnabled(has_job and idle)
+
+    def _refresh_job_queue_ui(self) -> None:
+        """v7.3.1: Update job queue list — safe against missing attrs."""
+        if not hasattr(self, "_job_queue"):
+            self._job_queue = []
+        if not hasattr(self, "_current_job"):
+            self._current_job = None
+
+        if hasattr(self, "_queue_list") and self._queue_list is not None:
+            try:
+                self._queue_list.clear()
+                for job in self._job_queue:
+                    prefix = "▶ " if job is self._current_job else "  "
+                    steps = getattr(job, "total_steps", "?")
+                    self._queue_list.addItem(
+                        f"{prefix}{job.name}  [{steps} steps]")
+            except Exception as exc:
+                logger.error(f"_refresh_job_queue_ui error: {exc}")
+
+        if hasattr(self, "_ctx_btn_start") and self._ctx_btn_start is not None:
+            try:
+                from SupportClasses.PrintManager import PrintState
+                has_job = self._current_job is not None
+                idle = getattr(self, "_print_state", PrintState.IDLE) in (
+                    PrintState.IDLE, PrintState.COMPLETED,
+                    PrintState.ABORTED, PrintState.ERROR,
+                )
+                self._ctx_btn_start.setEnabled(has_job and idle)
+            except Exception:
+                pass
+
 
     def _on_ctx_start_clicked(self) -> None:
         """v7.2.3: Start button clicked in context panel."""

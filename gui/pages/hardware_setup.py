@@ -904,6 +904,36 @@ class HardwareSetupPage(QWidget):
     #  CONFIG CHANGE / REBUILD
     # ════════════════════════════════════════════════════════════════
 
+    def _sync_validity_display(self) -> None:
+        """v7.3.1: Sync all validity labels to current config state.
+        Safe to call at any time — no-ops if widgets not yet created."""
+        valid = getattr(self._config, "is_valid", False)
+        _, issues = self._config.validate() if hasattr(self._config, "validate") else (valid, [])
+
+        # Main page label
+        if hasattr(self, "validity_label") and self.validity_label is not None:
+            if valid:
+                self.validity_label.setText("✓ Setup complete")
+                self.validity_label.setStyleSheet(
+                    f"color: {COLORS.get('green', '#a6e3a1')};")
+            else:
+                msg = issues[0] if issues else "Setup incomplete"
+                self.validity_label.setText(f"⚠ {msg}")
+                self.validity_label.setStyleSheet(
+                    f"color: {COLORS.get('yellow', '#f9e2af')};")
+
+        # Context panel label (lazily created — may not exist yet)
+        if hasattr(self, "_ctx_validity_label") and self._ctx_validity_label is not None:
+            if valid:
+                self._ctx_validity_label.setText("✓ Setup complete")
+                self._ctx_validity_label.setStyleSheet(
+                    f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 9pt;")
+            else:
+                msg = issues[0] if issues else "Setup incomplete"
+                self._ctx_validity_label.setText(f"⚠ {msg}")
+                self._ctx_validity_label.setStyleSheet(
+                    f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 9pt;")
+
     def _on_config_changed(self):
         """Called whenever any config widget changes."""
         if getattr(self, '_restoring', False):
@@ -937,6 +967,7 @@ class HardwareSetupPage(QWidget):
                     f"color: {COLORS.get('yellow', '#f9e2af')};")
 
         self.config_changed.emit(self._config)
+        self._sync_validity_display()  # v7.3.1: keep labels in sync
 
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
@@ -1400,6 +1431,9 @@ class HardwareSetupPage(QWidget):
         layout.addStretch()
 
         self._context_widget = ctx
+
+        # Sync validity label now that _ctx_validity_label exists
+        self._sync_validity_display()  # v7.3.1: sync on first show
 
         # Initial scan
         self._scan_config_directory()
