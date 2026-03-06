@@ -1788,7 +1788,6 @@ class PrintObjectsTab(QWidget):
 
     def _refresh_oob_state(self):
         """Recheck all objects for OOB and start/stop flash timer."""
-        self._stop_all_flashing()  # v7.2.6
         old_oob = set(self._oob_indices)
         new_oob = set()
         for i, entry in enumerate(self._objects):
@@ -2043,56 +2042,6 @@ class PrintObjectsTab(QWidget):
     #  SIGNALS & INTEGRATION (S4B.12, S4A.9)
     # ══════════════════════════════════════════════════════════════
 
-
-
-    def _staging_add_current(self):
-        """v7.2.6: Add currently loaded print to staging list."""
-        name = getattr(self, '_active_file_name', None)
-        if not name: return
-        if name not in self._staging_print_names:
-            self._staging_print_names.append(name)
-            self._prints_staging_list.addItem(name)
-
-    def _staging_remove_selected(self):
-        """v7.2.6: Remove selected from staging."""
-        for item in self._prints_staging_list.selectedItems():
-            name = item.text()
-            if name in self._staging_print_names: self._staging_print_names.remove(name)
-            self._prints_staging_list.takeItem(self._prints_staging_list.row(item))
-
-    def _send_staged_prints(self):
-        """v7.2.6: Send only staged prints to well setup."""
-        if not self._staging_print_names:
-            return
-        self.prints_changed.emit(list(self._staging_print_names))
-        n = len(self._staging_print_names)
-        if hasattr(self, '_btn_send_to_prints'):
-            self._btn_send_to_prints.setText(f"\u2713 {n} sent!")
-            QTimer.singleShot(1500, lambda: self._btn_send_to_prints.setText("\U0001f4cb Send"))
-
-    def _stop_all_flashing(self):
-        """v7.2.6: Stop OOB flash timers."""
-        for t in self._flash_timers.values():
-            if hasattr(t, 'stop'): t.stop()
-        self._flash_timers.clear()
-
-    def _start_flash_item(self, index: int):
-        """v7.2.6: Flash objects list item red for out-of-bounds."""
-        if index in self._flash_timers: return
-        if not hasattr(self, '_objects_list'): return
-        item = self._objects_list.item(index)
-        if not item: return
-        _state = [True]
-        def _toggle():
-            it = self._objects_list.item(index) if index < self._objects_list.count() else None
-            if it is None:
-                if index in self._flash_timers: self._flash_timers[index].stop(); del self._flash_timers[index]
-                return
-            it.setForeground(QColor(COLORS['red']) if _state[0] else QColor(COLORS['text']))
-            _state[0] = not _state[0]
-        timer = QTimer(self); timer.timeout.connect(_toggle); timer.start(500)
-        self._flash_timers[index] = timer
-        item.setForeground(QColor(COLORS['red']))
 
     def _send_to_available_prints(self):
         """v7.2.5: Explicitly send current prints list to well setup."""

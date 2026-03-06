@@ -351,19 +351,14 @@ class MainWindow(QMainWindow):
         # Page stack
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("pagesContainer")
-        self._page_stack.setMinimumHeight(200)  # v7.2.6
         self._splitter.addWidget(self._page_stack)
 
         # Console log
         self.console = ConsoleLogWidget()
-        self.console.setMinimumHeight(40)  # v7.2.6
         self._splitter.addWidget(self.console)
 
         self._splitter.setStretchFactor(0, 5)
         self._splitter.setStretchFactor(1, 1)
-
-        # v7.2.6: Prevent splitter collapse crash
-        self._splitter.setChildrenCollapsible(False)
 
         content_layout.addWidget(self._splitter)
 

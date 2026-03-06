@@ -469,36 +469,6 @@ class CalibrationPage(QWidget):
     #  STATUS UPDATE
     # ════════════════════════════════════════════════════════════════
 
-    def _on_detect_cameras(self):
-        """v7.2.6: Manually trigger camera detection in background."""
-        try:
-            from gui.widgets.camera_widget import detect_cameras_async, CV2_AVAILABLE
-        except ImportError:
-            logger.warning("camera_widget not available")
-            return
-
-        if not CV2_AVAILABLE:
-            logger.warning("OpenCV not installed — camera detection unavailable")
-            return
-
-        if hasattr(self, '_btn_detect_cameras'):
-            self._btn_detect_cameras.setEnabled(False)
-            self._btn_detect_cameras.setText("🔄 Detecting...")
-
-        def _on_found(indices):
-            from PySide6.QtCore import QTimer
-            def _apply():
-                self._available_cameras = indices
-                if hasattr(self, '_btn_detect_cameras'):
-                    self._btn_detect_cameras.setText(f"🔍 {len(indices)} camera(s)")
-                    self._btn_detect_cameras.setEnabled(True)
-                logger.info(f"Camera detection: {indices}")
-            QTimer.singleShot(0, _apply)
-
-        detect_cameras_async(_on_found, max_index=4)
-
-
-
     def on_status_update(self):
         """Called periodically by the main window."""
         ctrl = self.controller

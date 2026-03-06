@@ -83,14 +83,13 @@ SECTION_TITLE_STYLE = f"""
         color: {COLORS['text']};
         border: 1px solid {COLORS['surface1']};
         border-radius: 8px;
-        margin-top: 14px;
+        margin-top: 12px;
         padding: 16px 12px 10px 12px;
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
         subcontrol-position: top left;
         left: 12px;
-        top: 0px;
         padding: 2px 8px;
         background-color: {COLORS['base']};
         border-radius: 4px;

@@ -141,16 +141,19 @@ class PrintSetupPage(QWidget):
         The workspace tab receives the config and builds a WorkspaceConfig
         from it via the bridge method, then emits workspace_changed.
         """
+        self._hardware_config = config
 
-        # v7.2.6: Forward to ALL sub-tabs with error handling
-        self._hw_config = config
-        for tab_name in ['tab_workspace', 'tab_objects', 'tab_wells']:
-            tab = getattr(self, tab_name, None)
-            if tab and hasattr(tab, 'set_hardware_config'):
-                try:
-                    tab.set_hardware_config(config)
-                except Exception as e:
-                    logger.error(f"HW config forward to {tab_name} failed: {e}")
+        # v7.2.3: Forward to workspace tab (builds WorkspaceConfig)
+        if hasattr(self, 'tab_workspace') and hasattr(self.tab_workspace, 'set_hardware_config'):
+            self.tab_workspace.set_hardware_config(config)
+
+        # Forward to Print Objects tab
+        if hasattr(self, 'tab_objects') and hasattr(self.tab_objects, 'set_hardware_config'):
+            self.tab_objects.set_hardware_config(config)
+
+        # Forward to print manager
+        if hasattr(self.print_manager, 'hardware_config'):
+            self.print_manager.hardware_config = config
 
     def on_status_update(self):
         """Called by MainWindow timer (~300 ms)."""
@@ -230,8 +233,6 @@ class PrintSetupPage(QWidget):
         self.tabs.addTab(self.tab_workspace, "1. Workspace")
         self.tabs.addTab(self.tab_objects, "2. Print Objects")
         self.tabs.addTab(self.tab_wells, "3. Well Setup")
-
-        self._generated_job = None  # v7.2.6: pre-generated job
 
         # ── Wire cross-tab signals ────────────────────────────────
 
@@ -585,8 +586,7 @@ class PrintSetupPage(QWidget):
                 return
 
         # Build job
-        # v7.2.6: Use pre-generated job if available
-        job = self._generated_job or self._build_current_job()
+        job = self._build_current_job()
         if job is None:
             self.status_label.setText("\u26a0 No job -- configure wells first")
             self.status_label.setStyleSheet(
@@ -626,7 +626,6 @@ class PrintSetupPage(QWidget):
             return
 
         self.job_ready.emit(job)
-        self._generated_job = None  # v7.2.6: clear after sending
         self.status_label.setText(f"\u2713 Job sent: {job.name}")
         self.status_label.setStyleSheet(
             f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 10px;")

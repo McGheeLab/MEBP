@@ -461,7 +461,6 @@ class HardwareSetupPage(QWidget):
         # Current config
         self._config = HardwareConfig()
         self._last_valid = False
-        self._restoring = False  # v7.2.6: guard for config restore
 
         # v7.2.4: Channel mapping widgets (dynamic)
         self._channel_map_widgets: list[tuple[QLabel, QComboBox]] = []
@@ -906,8 +905,6 @@ class HardwareSetupPage(QWidget):
 
     def _on_config_changed(self):
         """Called whenever any config widget changes."""
-        if getattr(self, '_restoring', False):
-            return  # v7.2.6: skip during config restore
         self._rebuild_config()
         valid = self._config.is_valid
         if valid != self._last_valid:
@@ -1158,8 +1155,6 @@ class HardwareSetupPage(QWidget):
         7. Needle channel → pump map (v7.2.4 new)
         8. Emit signals
         """
-        self._restoring = True  # v7.2.6
-
         logger.info("Applying config to UI...")
 
         # ── 1. Name & Notes ──────────────────────────────────────
@@ -1220,10 +1215,7 @@ class HardwareSetupPage(QWidget):
         for pid, pw in self._pump_widgets.items():
             if pid in self._config.pumps:
                 pcfg = self._config.pumps[pid]
-                # v7.2.6: Block signals during pump restore
-                pw.blockSignals(True)
                 pw.set_config(pcfg, ink_names=ink_names)
-                pw.blockSignals(False)
                 logger.debug(
                     f"  {pid}: enabled={pcfg.enabled}, "
                     f"syringe={pcfg.syringe.volume_uL if pcfg.syringe else None}µL, "

@@ -308,22 +308,11 @@ class JogControlPage(QWidget):
             btn_ext.setEnabled(is_configured)
             btn_ret.setEnabled(is_configured)
             if is_configured:
-                # v7.2.6: Bright white text for active pumps
-                label.setStyleSheet(f"color: {COLORS['text']}; font-weight: bold;")
-                # Also brighten the readout label
-                lbl_attr = f"lbl_p{pump_name[-1]}"
-                if hasattr(self, lbl_attr):
-                    getattr(self, lbl_attr).setStyleSheet(
-                        f"color: {COLORS['text']}; font-size: 11px; font-weight: bold;")
+                label.setStyleSheet(f"color: {COLORS['text']};")
                 btn_ext.setToolTip(f"Extend {pump_name}")
                 btn_ret.setToolTip(f"Retract {pump_name}")
             else:
-                # v7.2.6: Dim text for inactive pumps
                 label.setStyleSheet(f"color: {COLORS.get('overlay0', '#6c7086')};")
-                lbl_attr = f"lbl_p{pump_name[-1]}"
-                if hasattr(self, lbl_attr):
-                    getattr(self, lbl_attr).setStyleSheet(
-                        f"color: {COLORS.get('overlay0', '#6c7086')}; font-size: 11px;")
                 btn_ext.setToolTip(f"{pump_name} not configured")
                 btn_ret.setToolTip(f"{pump_name} not configured")
 

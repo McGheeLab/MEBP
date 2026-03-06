@@ -265,10 +265,6 @@ class PrintObjectsTab(QWidget):
         # Edit mode tracking
         self._editing_index: int | None = None  # None = add mode, int = edit mode
 
-        # v7.2.6: Staging list + OOB flash timers
-        self._staging_print_names: list[str] = []
-        self._flash_timers: dict[int, QTimer] = {}
-
         # Auto-save timer
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
@@ -340,50 +336,41 @@ class PrintObjectsTab(QWidget):
         # ── Print File Bar ────────────────────────────────────────
         self._build_file_bar(outer)
 
-        # ── v7.2.6: All-splitter layout — every panel resizable ──
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
+        # ── Main splitter ─────────────────────────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: vertical splitter (Designer / Auto-Layout / CSV)
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
-        left_splitter.setChildrenCollapsible(False)
+        # Left panel: Designer + Auto-Layout
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
 
-        _dw = QWidget(); _dl = QVBoxLayout(_dw); _dl.setContentsMargins(4,4,4,4); _dl.setSpacing(4)
-        self._build_designer_section(_dl); _dw.setMinimumHeight(120)
-        left_splitter.addWidget(_dw)
+        self._build_designer_section(left_layout)
+        self._build_auto_layout_section(left_layout)
+        self._build_csv_import_section(left_layout)
+        left_layout.addStretch()
 
-        _aw = QWidget(); _al = QVBoxLayout(_aw); _al.setContentsMargins(4,4,4,4); _al.setSpacing(4)
-        self._build_auto_layout_section(_al); _aw.setMinimumHeight(80)
-        left_splitter.addWidget(_aw)
+        left_scroll.setWidget(left_widget)
+        splitter.addWidget(left_scroll)
 
-        _cw = QWidget(); _cl = QVBoxLayout(_cw); _cl.setContentsMargins(4,4,4,4); _cl.setSpacing(4)
-        self._build_csv_import_section(_cl); _cw.setMinimumHeight(60)
-        left_splitter.addWidget(_cw)
+        # Right panel: Preview + Objects List + Summary
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(4)
 
-        left_splitter.setStretchFactor(0, 3); left_splitter.setStretchFactor(1, 2); left_splitter.setStretchFactor(2, 1)
-        main_splitter.addWidget(left_splitter)
+        self._build_preview_section(right_layout)
+        self._build_objects_list_section(right_layout)
+        self._build_summary_section(right_layout)
 
-        # Right: vertical splitter (Preview / Objects List / Summary+Staging)
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.setChildrenCollapsible(False)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
 
-        _pw = QWidget(); _pl = QVBoxLayout(_pw); _pl.setContentsMargins(4,4,4,4); _pl.setSpacing(4)
-        self._build_preview_section(_pl); _pw.setMinimumHeight(150)
-        right_splitter.addWidget(_pw)
-
-        _ow = QWidget(); _ol = QVBoxLayout(_ow); _ol.setContentsMargins(4,4,4,4); _ol.setSpacing(4)
-        self._build_objects_list_section(_ol); _ow.setMinimumHeight(100)
-        right_splitter.addWidget(_ow)
-
-        _sw = QWidget(); _sl = QVBoxLayout(_sw); _sl.setContentsMargins(4,4,4,4); _sl.setSpacing(4)
-        self._build_summary_section(_sl); _sw.setMinimumHeight(60)
-        right_splitter.addWidget(_sw)
-
-        right_splitter.setStretchFactor(0, 4); right_splitter.setStretchFactor(1, 3); right_splitter.setStretchFactor(2, 1)
-        main_splitter.addWidget(right_splitter)
-        main_splitter.setStretchFactor(0, 2); main_splitter.setStretchFactor(1, 3)
-
-        outer.addWidget(main_splitter)
+        outer.addWidget(splitter)
 
     # ── File Bar ──────────────────────────────────────────────────
 
@@ -909,35 +896,33 @@ class PrintObjectsTab(QWidget):
     # ── Summary Section (S4B.11) ──────────────────────────────────
 
     def _build_summary_section(self, parent_layout):
-        """v7.2.6: Summary + staging list for selective print sending."""
         self._summary_label = QLabel("No objects")
+
+        # v7.2.5: "Send to Available Prints" button
+        self._btn_send_to_prints = QPushButton("📋 Send to Available Prints")
+        self._btn_send_to_prints.setToolTip(
+            "Refresh the list of available prints for well setup assignment")
+        self._btn_send_to_prints.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS.get('mauve', '#cba6f7')};
+                color: {COLORS.get('base', '#1e1e2e')};
+                font-weight: bold; padding: 6px 12px;
+                border-radius: 4px; font-size: 11px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS.get('pink', '#f5c2e7')};
+            }}
+        """)
+        self._btn_send_to_prints.clicked.connect(self._send_to_available_prints)
         self._summary_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; background: {COLORS['surface0']}; "
             f"padding: 4px 8px; border-radius: 4px; font-size: 11px;")
         parent_layout.addWidget(self._summary_label)
+        parent_layout.addWidget(self._btn_send_to_prints)
 
-        # Staging list
-        stg_lbl = QLabel("Prints to Send:")
-        stg_lbl.setStyleSheet(f"color: {COLORS['blue']}; font-weight: bold; font-size: 10px;")
-        parent_layout.addWidget(stg_lbl)
-
-        self._prints_staging_list = QListWidget()
-        self._prints_staging_list.setMaximumHeight(80)
-        self._prints_staging_list.setStyleSheet(f"""
-            QListWidget {{ background: {COLORS['surface0']}; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']}; border-radius: 4px; font-size: 10px; }}
-            QListWidget::item:selected {{ background: {COLORS['surface2']}; }}""")
-        parent_layout.addWidget(self._prints_staging_list)
-
-        btns = QHBoxLayout()
-        b1 = QPushButton("+ Add Current"); b1.setFixedHeight(24); b1.clicked.connect(self._staging_add_current); btns.addWidget(b1)
-        b2 = QPushButton("- Remove"); b2.setFixedHeight(24); b2.clicked.connect(self._staging_remove_selected); btns.addWidget(b2)
-        self._btn_send_to_prints = QPushButton("\U0001f4cb Send"); self._btn_send_to_prints.setFixedHeight(24)
-        self._btn_send_to_prints.setStyleSheet(f"QPushButton {{ background: {COLORS.get('mauve','#cba6f7')}; color: {COLORS.get('base','#1e1e2e')}; font-weight: bold; border-radius: 4px; font-size: 10px; }}")
-        self._btn_send_to_prints.clicked.connect(self._send_staged_prints); btns.addWidget(self._btn_send_to_prints)
-        btns.addStretch()
-        parent_layout.addLayout(btns)
-
+    # ══════════════════════════════════════════════════════════════
+    #  FILE BAR OPERATIONS
+    # ══════════════════════════════════════════════════════════════
 
     def _on_new_print(self):
         """Create a new empty print file."""
@@ -964,7 +949,6 @@ class PrintObjectsTab(QWidget):
         self._save_status.setText("✅ New print created")
         self._save_status.setStyleSheet(f"color: {COLORS['green']};")
         self._emit_prints_changed()
-        self._staging_add_current()  # v7.2.6
         self.file_changed.emit(name)
 
     def _on_load_print(self):
@@ -1788,7 +1772,6 @@ class PrintObjectsTab(QWidget):
 
     def _refresh_oob_state(self):
         """Recheck all objects for OOB and start/stop flash timer."""
-        self._stop_all_flashing()  # v7.2.6
         old_oob = set(self._oob_indices)
         new_oob = set()
         for i, entry in enumerate(self._objects):
@@ -2043,56 +2026,6 @@ class PrintObjectsTab(QWidget):
     #  SIGNALS & INTEGRATION (S4B.12, S4A.9)
     # ══════════════════════════════════════════════════════════════
 
-
-
-    def _staging_add_current(self):
-        """v7.2.6: Add currently loaded print to staging list."""
-        name = getattr(self, '_active_file_name', None)
-        if not name: return
-        if name not in self._staging_print_names:
-            self._staging_print_names.append(name)
-            self._prints_staging_list.addItem(name)
-
-    def _staging_remove_selected(self):
-        """v7.2.6: Remove selected from staging."""
-        for item in self._prints_staging_list.selectedItems():
-            name = item.text()
-            if name in self._staging_print_names: self._staging_print_names.remove(name)
-            self._prints_staging_list.takeItem(self._prints_staging_list.row(item))
-
-    def _send_staged_prints(self):
-        """v7.2.6: Send only staged prints to well setup."""
-        if not self._staging_print_names:
-            return
-        self.prints_changed.emit(list(self._staging_print_names))
-        n = len(self._staging_print_names)
-        if hasattr(self, '_btn_send_to_prints'):
-            self._btn_send_to_prints.setText(f"\u2713 {n} sent!")
-            QTimer.singleShot(1500, lambda: self._btn_send_to_prints.setText("\U0001f4cb Send"))
-
-    def _stop_all_flashing(self):
-        """v7.2.6: Stop OOB flash timers."""
-        for t in self._flash_timers.values():
-            if hasattr(t, 'stop'): t.stop()
-        self._flash_timers.clear()
-
-    def _start_flash_item(self, index: int):
-        """v7.2.6: Flash objects list item red for out-of-bounds."""
-        if index in self._flash_timers: return
-        if not hasattr(self, '_objects_list'): return
-        item = self._objects_list.item(index)
-        if not item: return
-        _state = [True]
-        def _toggle():
-            it = self._objects_list.item(index) if index < self._objects_list.count() else None
-            if it is None:
-                if index in self._flash_timers: self._flash_timers[index].stop(); del self._flash_timers[index]
-                return
-            it.setForeground(QColor(COLORS['red']) if _state[0] else QColor(COLORS['text']))
-            _state[0] = not _state[0]
-        timer = QTimer(self); timer.timeout.connect(_toggle); timer.start(500)
-        self._flash_timers[index] = timer
-        item.setForeground(QColor(COLORS['red']))
 
     def _send_to_available_prints(self):
         """v7.2.5: Explicitly send current prints list to well setup."""

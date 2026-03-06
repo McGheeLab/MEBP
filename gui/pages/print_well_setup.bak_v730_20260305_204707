@@ -349,55 +349,77 @@ class WellSetupTab(QWidget):
     # ── Selection Actions ─────────────────────────────────────────
 
 
-    def _build_role_bar(self, parent_layout) -> None:
-        """v7.3.0: role bar direct assign — clicking a role button
-        immediately assigns that role to selected wells."""
-        from PySide6.QtWidgets import QStackedWidget
-        from PySide6.QtGui import QColor
+    def _build_role_bar(self, parent_layout: QVBoxLayout) -> None:
+        """v7.2.5: Build role assignment button bar."""
+        bar_frame = QFrame()
+        bar_frame.setObjectName("cardFrame")
+        bar_layout = QHBoxLayout(bar_frame)
+        bar_layout.setContentsMargins(8, 4, 8, 4)
+        bar_layout.setSpacing(6)
 
-        role_frame = __import__('PySide6.QtWidgets', fromlist=['QFrame']).QFrame()
-        role_frame.setObjectName("cardFrame")
-        role_layout = __import__('PySide6.QtWidgets', fromlist=['QHBoxLayout']).QHBoxLayout(role_frame)
-        role_layout.setContentsMargins(6, 4, 6, 4)
-        role_layout.setSpacing(4)
+        bar_layout.addWidget(QLabel("Assign Role:"))
 
-        from PySide6.QtWidgets import QLabel, QPushButton, QHBoxLayout, QFrame
-        from SupportClasses.PhysicalModels import WellRole, ROLE_COLORS
-
-        lbl = QLabel("Assign Role:")
-        lbl.setStyleSheet("font-weight: bold; color: #cdd6f4;")
-        role_layout.addWidget(lbl)
-
-        ROLE_LABELS = {
-            WellRole.PRINT:        ("Print",   "#a6e3a1"),
-            WellRole.INK:          ("Ink",     "#89b4fa"),
-            WellRole.WASH:         ("Wash",    "#f9e2af"),
-            WellRole.WASTE:        ("Waste",   "#f38ba8"),
-            WellRole.BUFFER:       ("Buffer",  "#cba6f7"),
-            WellRole.SORTED_CELLS: ("Sorted",  "#fab387"),
-            WellRole.EMPTY:        ("Clear",   "#585b70"),
+        self._role_buttons = {}
+        role_styles = {
+            WellRole.PRINT:  ("Print",  ROLE_COLORS.get(WellRole.PRINT, "#a6e3a1")),
+            WellRole.INK:    ("Ink",    ROLE_COLORS.get(WellRole.INK, "#89b4fa")),
+            WellRole.WASH:   ("Wash",   ROLE_COLORS.get(WellRole.WASH, "#94e2d5")),
+            WellRole.WASTE:  ("Waste",  ROLE_COLORS.get(WellRole.WASTE, "#fab387")),
+            WellRole.BUFFER: ("Buffer", ROLE_COLORS.get(WellRole.BUFFER, "#cba6f7")),
+            WellRole.EMPTY:  ("Clear",  ROLE_COLORS.get(WellRole.EMPTY, "#585b70")),
         }
 
-        self._role_btns = {}
-        for role, (label, color) in ROLE_LABELS.items():
+        for role, (label, color) in role_styles.items():
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedHeight(28)
-            btn.setStyleSheet(
-                f"QPushButton {{ background-color: #313244; color: #cdd6f4; "
-                f"border: 1px solid {color}; border-radius: 4px; "
-                f"padding: 2px 8px; font-size: 11px; }}"
-                f"QPushButton:checked {{ background-color: {color}; color: #1e1e2e; "
-                f"font-weight: bold; }}"
-                f"QPushButton:hover:!checked {{ background-color: #45475a; }}"
-            )
-            btn.clicked.connect(lambda checked, r=role: self._on_role_btn_clicked(r))
-            role_layout.addWidget(btn)
-            self._role_btns[role] = btn
+            btn.setAutoExclusive(True)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS.get('surface0', '#313244')};
+                    color: {color};
+                    border: 2px solid {color};
+                    border-radius: 4px;
+                    padding: 4px 12px;
+                    font-weight: bold;
+                    font-size: 11px;
+                }}
+                QPushButton:checked {{
+                    background: {color};
+                    color: {COLORS.get('base', '#1e1e2e')};
+                }}
+                QPushButton:hover {{
+                    background: {COLORS.get('surface1', '#45475a')};
+                }}
+            """)
+            btn.clicked.connect(partial(self._on_role_button_clicked, role))
+            bar_layout.addWidget(btn)
+            self._role_buttons[role] = btn
 
-        role_layout.addStretch()
-        parent_layout.addWidget(role_frame)
+        # Default: Print selected
+        if WellRole.PRINT in self._role_buttons:
+            self._role_buttons[WellRole.PRINT].setChecked(True)
+        self._active_role = WellRole.PRINT
 
+        bar_layout.addStretch()
+
+        # Quick action buttons
+        btn_apply = QPushButton("Apply to Selected")
+        btn_apply.setObjectName("accentBtn")
+        btn_apply.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS.get('green', '#a6e3a1')};
+                color: {COLORS.get('base', '#1e1e2e')};
+                font-weight: bold; padding: 4px 12px;
+                border-radius: 4px; font-size: 11px;
+            }}
+            QPushButton:hover {{
+                background: {COLORS.get('teal', '#94e2d5')};
+            }}
+        """)
+        btn_apply.clicked.connect(self._apply_active_role)
+        bar_layout.addWidget(btn_apply)
+
+        parent_layout.addWidget(bar_frame)
 
     def _on_role_button_clicked(self, role: WellRole):
         """v7.2.5: Handle role button bar click."""
@@ -408,174 +430,47 @@ class WellSetupTab(QWidget):
             self._role_options_stack.setCurrentIndex(idx)
             self._role_options_stack.setVisible(True)  # v7.2.6
 
-    def _safe_refresh_summary(self) -> None:
-        """v7.3.0: Refresh summary table — handles both _refresh_summary_table
-        and _refresh_summary method names across versions."""
-        if hasattr(self, '_refresh_summary_table'):
-            try:
-                self._refresh_summary_table()
-                return
-            except Exception:
-                pass
-        if hasattr(self, '_refresh_summary'):
-            try:
-                self._refresh_summary()
-            except Exception:
-                pass
-
-    def _safe_refresh_plate_view(self) -> None:
-        """v7.3.0: Refresh plate view colors using whatever API is available.
-        Handles both self.plate_view and self._plate_view naming."""
-        pv = getattr(self, 'plate_view', getattr(self, '_plate_view', None))
-        if pv is None:
-            return
-        if hasattr(pv, 'update_well_roles') and hasattr(self._model, 'get_role_map'):
-            try:
-                pv.update_well_roles(self._model.get_role_map())
-                return
-            except Exception:
-                pass
-        if hasattr(pv, 'update_all_wells'):
-            try:
-                appearances = {
-                    n: (wa.role, wa.get_display_label())
-                    for n, wa in self._model.assignments.items()
-                }
-                pv.update_all_wells(appearances)
-            except Exception:
-                pass
-
-    def _refresh_role_options_for_selection(self, selected_wells=None) -> None:
-        """v7.3.0: Show/hide role options panel based on current selection state.
-
-        - No selection        → placeholder page (index 0)
-        - All same non-EMPTY  → that role's options page
-        - Mixed / all empty   → placeholder page
-        """
-        if not hasattr(self, '_role_options_stack'):
-            return
-
-        if selected_wells is None:
-            pv = getattr(self, 'plate_view', getattr(self, '_plate_view', None))
-            if pv is not None:
-                if hasattr(pv, 'get_selected_wells'):
-                    selected_wells = pv.get_selected_wells()
-                else:
-                    selected_wells = list(getattr(pv, 'selected_wells', set()))
-            else:
-                selected_wells = []
-
-        if not selected_wells:
-            self._role_options_stack.setCurrentIndex(0)
-            return
-
-        # Collect roles of all selected wells
-        try:
-            from SupportClasses.PhysicalModels import WellRole
-        except ImportError:
-            return
-
-        roles = set()
-        for wn in selected_wells:
-            wa = self._model.get_assignment(wn)
-            if wa is not None:
-                roles.add(wa.role)
-
-        if len(roles) == 1:
-            role = next(iter(roles))
-            if role != WellRole.EMPTY:
-                idx = getattr(self, '_role_stack_indices', {}).get(role, 0)
-                self._role_options_stack.setCurrentIndex(idx)
-                return
-
-        # Mixed roles or all empty → placeholder
-        self._role_options_stack.setCurrentIndex(0)
-
-    def _on_role_btn_clicked(self, role) -> None:
-        """v7.3.0: _on_role_btn_clicked — assign role to selected wells
-        and show role-specific options panel."""
-        pv = getattr(self, 'plate_view', getattr(self, '_plate_view', None))
-        if pv is None:
-            return
-        if hasattr(pv, 'get_selected_wells'):
-            selected = pv.get_selected_wells()
-        else:
-            selected = list(getattr(pv, 'selected_wells', set()))
-
+    def _apply_active_role(self):
+        """v7.2.5: Apply the currently active role to selected wells."""
+        selected = list(self._plate_view.selected_wells)
         if not selected:
-            return  # No wells selected — silently ignore
-
-        self._active_role = role
-
-        # Update button checked states
-        for r, btn in getattr(self, '_role_btns', {}).items():
-            btn.setChecked(r == role)
-
-        # Assign role in model
+            return
+        role = getattr(self, '_active_role', WellRole.PRINT)
         self._model.set_role(selected, role)
-
-        # Refresh plate view
-        self._safe_refresh_plate_view()
-
-        # Show role-specific options panel
-        if hasattr(self, '_role_options_stack') and hasattr(self, '_role_stack_indices'):
-            idx = self._role_stack_indices.get(role, 0)
-            self._role_options_stack.setCurrentIndex(idx)
-
-        # Refresh status colors and summary
+        self._plate_view.update_well_roles(self._model.get_role_map())
+        self._refresh_summary_table()
+        self._refresh_summary_table()
         self._refresh_well_status_colors()
-        self._safe_refresh_summary()
+        self._refresh_summary_table()
+        self._refresh_well_status_colors()
         self.setup_changed.emit()
-
         # Auto-regenerate plan if available
         if hasattr(self, '_on_plan_auto_regen'):
             self._on_plan_auto_regen()
 
-    def _set_active_role(self, role) -> None:
-        """Alias kept for backwards compatibility — delegates to _on_role_btn_clicked."""
-        self._on_role_btn_clicked(role)
 
-
-    def _build_role_options(self, parent_layout) -> None:
-        """v7.3.0: role options placeholder page — index 0 is shown until
-        wells are selected and a role is assigned."""
-        from PySide6.QtWidgets import (
-            QStackedWidget, QWidget, QHBoxLayout, QVBoxLayout,
-            QLabel, QComboBox, QPushButton, QDoubleSpinBox, QFrame,
-        )
-        from SupportClasses.PhysicalModels import WellRole
-
+    def _build_role_options(self, parent_layout: QVBoxLayout) -> None:
+        """v7.2.5: Build role-specific options panel (QStackedWidget)."""
         options_frame = QFrame()
         options_frame.setObjectName("cardFrame")
         options_layout = QVBoxLayout(options_frame)
         options_layout.setContentsMargins(8, 4, 8, 4)
-        options_layout.setSpacing(0)
 
         self._role_options_stack = QStackedWidget()
-        self._role_options_stack.setMaximumHeight(52)
+        self._role_options_stack.setVisible(False)  # v7.2.6: hidden until role assigned
         self._role_stack_indices = {}
 
-        # ── Page 0: Placeholder (shown until role is assigned) ────
-        placeholder_page = QWidget()
-        ph_layout = QHBoxLayout(placeholder_page)
-        ph_layout.setContentsMargins(4, 4, 4, 4)
-        ph_lbl = QLabel("← Select wells above, then click a role button to assign")
-        ph_lbl.setStyleSheet("color: #6c7086; font-style: italic; font-size: 11px;")
-        ph_lbl.setAlignment(__import__('PySide6.QtCore', fromlist=['Qt']).Qt.AlignmentFlag.AlignCenter)
-        ph_layout.addWidget(ph_lbl)
-        self._role_options_stack.addWidget(placeholder_page)   # index 0
-
-        # ── Page 1: Print options ──────────────────────────────────
+        # ── Page 0: Print options ──
         print_page = QWidget()
         print_layout = QHBoxLayout(print_page)
         print_layout.setContentsMargins(0, 0, 0, 0)
         print_layout.addWidget(QLabel("Print File:"))
         self.print_combo = QComboBox()
         self.print_combo.addItem("(no prints available)", None)
-        self.print_combo.setMinimumWidth(180)
+        self.print_combo.setMinimumWidth(200)
         print_layout.addWidget(self.print_combo, stretch=1)
         btn_assign_print = QPushButton("Assign")
-        btn_assign_print.clicked.connect(lambda: self._assign_print_to_selected(replace=True))
+        btn_assign_print.clicked.connect(lambda: self._assign_print(replace=True))
         print_layout.addWidget(btn_assign_print)
         btn_clear_print = QPushButton("Clear")
         btn_clear_print.clicked.connect(self._clear_selected_prints)
@@ -583,86 +478,55 @@ class WellSetupTab(QWidget):
         print_layout.addStretch()
         self._role_stack_indices[WellRole.PRINT] = self._role_options_stack.addWidget(print_page)
 
-        # ── Page 2: Ink options ────────────────────────────────────
+        # ── Page 1: Ink options ──
         ink_page = QWidget()
         ink_layout = QHBoxLayout(ink_page)
         ink_layout.setContentsMargins(0, 0, 0, 0)
         ink_layout.addWidget(QLabel("Ink:"))
         self.ink_combo = QComboBox()
         self.ink_combo.addItem("(none)", None)
-        self.ink_combo.setMinimumWidth(180)
+        self.ink_combo.setMinimumWidth(200)
         ink_layout.addWidget(self.ink_combo, stretch=1)
-        btn_set_ink = QPushButton("Assign")
-        btn_set_ink.clicked.connect(self._apply_ink)
-        ink_layout.addWidget(btn_set_ink)
+        btn_assign_ink = QPushButton("Assign")
+        btn_assign_ink.clicked.connect(self._apply_ink)
+        ink_layout.addWidget(btn_assign_ink)
         ink_layout.addStretch()
         self._role_stack_indices[WellRole.INK] = self._role_options_stack.addWidget(ink_page)
 
-        # ── Page 3: Wash options ───────────────────────────────────
+        # ── Page 2: Wash options ──
         wash_page = QWidget()
         wash_layout = QHBoxLayout(wash_page)
         wash_layout.setContentsMargins(0, 0, 0, 0)
-        wash_layout.addWidget(QLabel("Depth (mm):"))
-        self._wash_depth_spin = QDoubleSpinBox()
-        self._wash_depth_spin.setRange(0.1, 20.0)
-        self._wash_depth_spin.setValue(2.0)
-        self._wash_depth_spin.setSingleStep(0.1)
-        wash_layout.addWidget(self._wash_depth_spin)
-        wash_layout.addWidget(QLabel("Duration (s):"))
-        self._wash_duration_spin = QDoubleSpinBox()
-        self._wash_duration_spin.setRange(0.5, 60.0)
-        self._wash_duration_spin.setValue(3.0)
-        wash_layout.addWidget(self._wash_duration_spin)
+        wash_layout.addWidget(QLabel("Wash well — no additional options"))
         wash_layout.addStretch()
         self._role_stack_indices[WellRole.WASH] = self._role_options_stack.addWidget(wash_page)
 
-        # ── Page 4: Waste options ──────────────────────────────────
+        # ── Page 3: Waste options ──
         waste_page = QWidget()
         waste_layout = QHBoxLayout(waste_page)
         waste_layout.setContentsMargins(0, 0, 0, 0)
-        waste_layout.addWidget(QLabel("Depth (mm):"))
-        self._waste_depth_spin = QDoubleSpinBox()
-        self._waste_depth_spin.setRange(0.1, 20.0)
-        self._waste_depth_spin.setValue(1.0)
-        waste_layout.addWidget(self._waste_depth_spin)
+        waste_layout.addWidget(QLabel("Waste well — no additional options"))
         waste_layout.addStretch()
         self._role_stack_indices[WellRole.WASTE] = self._role_options_stack.addWidget(waste_page)
 
-        # ── Page 5: Buffer options ─────────────────────────────────
+        # ── Page 4: Buffer options ──
         buffer_page = QWidget()
         buffer_layout = QHBoxLayout(buffer_page)
         buffer_layout.setContentsMargins(0, 0, 0, 0)
-        buffer_layout.addWidget(QLabel("Volume (uL):"))
-        self._buffer_vol_spin = QDoubleSpinBox()
-        self._buffer_vol_spin.setRange(1.0, 500.0)
-        self._buffer_vol_spin.setValue(20.0)
-        self._buffer_vol_spin.setSuffix(" uL")
-        buffer_layout.addWidget(self._buffer_vol_spin)
+        buffer_layout.addWidget(QLabel("Buffer well — no additional options"))
         buffer_layout.addStretch()
         self._role_stack_indices[WellRole.BUFFER] = self._role_options_stack.addWidget(buffer_page)
 
-        # ── Page 6: Sorted cells options ──────────────────────────
-        sorted_page = QWidget()
-        sorted_layout = QHBoxLayout(sorted_page)
-        sorted_layout.setContentsMargins(0, 0, 0, 0)
-        sorted_layout.addWidget(QLabel("Sorted cells well assigned — no extra parameters needed."))
-        sorted_layout.addStretch()
-        self._role_stack_indices[WellRole.SORTED_CELLS] = self._role_options_stack.addWidget(sorted_page)
-
-        # ── Page 7: Empty/Clear ────────────────────────────────────
+        # ── Page 5: Empty/Clear options ──
         empty_page = QWidget()
         empty_layout = QHBoxLayout(empty_page)
         empty_layout.setContentsMargins(0, 0, 0, 0)
-        empty_layout.addWidget(QLabel("Role cleared — well set to EMPTY."))
+        empty_layout.addWidget(QLabel("Clear selection — removes role assignment"))
         empty_layout.addStretch()
         self._role_stack_indices[WellRole.EMPTY] = self._role_options_stack.addWidget(empty_page)
 
-        # Default: show placeholder
-        self._role_options_stack.setCurrentIndex(0)
-
         options_layout.addWidget(self._role_options_stack)
         parent_layout.addWidget(options_frame)
-
 
     def _clear_selected_prints(self):
         """v7.2.5: Clear print assignments from selected wells."""
@@ -1411,9 +1275,6 @@ class WellSetupTab(QWidget):
             self._refresh_rosette_editor(well_names[0])
         else:
             self._refresh_rosette_editor(None)
-        # v7.3.0: selection changed refresh options
-        self._refresh_role_options_for_selection(selected_wells)
-
 
     def _on_well_double_clicked(self, well_name: str) -> None:
         """Double-click: could open detail editor (future)."""
@@ -1469,27 +1330,6 @@ class WellSetupTab(QWidget):
         self._model.set_role(selected, role, idx)
         self._refresh_well_colors()
         self._refresh_summary()
-        self.setup_changed.emit()
-
-    def _assign_print_to_selected(self, replace: bool = False) -> None:
-        """v7.3.0: Assign selected print collection to selected wells."""
-        pv = getattr(self, 'plate_view', getattr(self, '_plate_view', None))
-        if pv is None:
-            return
-        selected = (pv.get_selected_wells() if hasattr(pv, 'get_selected_wells')
-                    else list(getattr(pv, 'selected_wells', set())))
-        if not selected:
-            return
-        combo = getattr(self, 'print_combo', None)
-        if combo is None:
-            return
-        print_name = combo.currentData()
-        if not print_name:
-            return
-        self._model.assign_print(selected, print_name, replace=replace)
-        self._safe_refresh_plate_view()
-        self._refresh_well_status_colors()
-        self._safe_refresh_summary()
         self.setup_changed.emit()
 
     def _apply_ink(self) -> None:
@@ -1846,25 +1686,22 @@ class WellSetupTab(QWidget):
 
 
 
-    def _refresh_well_status_colors(self) -> None:
-        """v7.3.0: _refresh_well_status_colors plate_view fix — Update well border
-        colors based on assignment status. Uses safe plate_view getter."""
-        pv = getattr(self, 'plate_view', getattr(self, '_plate_view', None))
-        if pv is None:
+    def _refresh_well_status_colors(self):
+        """v7.2.5: Update well border colors based on assignment status."""
+        if not hasattr(self, '_plate_view') or not self._plate_view:
             return
 
         status_map = {}
         for name, wa in self._model.assignments.items():
-            if wa.role.value == 'empty' if hasattr(wa.role, 'value') else wa.role == 'empty':
+            if wa.role == WellRole.EMPTY:
                 status_map[name] = "empty"
             elif self._check_well_ready(wa):
                 status_map[name] = "ready"
             else:
                 status_map[name] = "incomplete"
 
-        if hasattr(pv, 'update_well_status'):
-            pv.update_well_status(status_map)
-
+        if hasattr(self._plate_view, 'update_well_status'):
+            self._plate_view.update_well_status(status_map)
 
     def _save_layout(self) -> None:
         """Save well setup to JSON."""

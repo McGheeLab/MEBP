@@ -71,9 +71,6 @@ class ConsoleLogWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        # v7.2.6: Prevent resize crash
-        self.setMinimumHeight(40)
-
         # Toolbar
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)

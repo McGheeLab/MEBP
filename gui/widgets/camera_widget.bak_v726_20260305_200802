@@ -98,28 +98,6 @@ def detect_cameras(max_index: int = 4) -> list[int]:
     return available
 
 
-
-def detect_cameras_async(callback, max_index: int = 4):
-    """
-    v7.2.6: Detect cameras in a background thread.
-
-    Args:
-        callback: Called with list[int] of found camera indices.
-                  Called from background thread — use QTimer.singleShot(0, fn)
-                  to marshal back to main thread.
-        max_index: Max camera index to probe.
-    """
-    import threading
-
-    def _worker():
-        indices = detect_cameras(max_index)
-        callback(indices)
-
-    t = threading.Thread(target=_worker, daemon=True, name="CameraDetect")
-    t.start()
-    return t
-
-
 class CameraWidget(QWidget):
     """
     Live camera feed widget with crosshair overlay and software image
