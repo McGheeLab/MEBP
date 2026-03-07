@@ -155,6 +155,14 @@ class PrintSettings:
     prime_amounts_uL: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
     pump_rates_uL_s: dict = field(default_factory=lambda: {"P1": 0.25, "P2": 0.25, "P3": 0.25})
 
+    # v7.2.6-auto: top_z_height — calibration-derived Z heights and motion tiers
+    top_z_height: float = 0.0           # plate top surface (from calibration top_z)
+    fast_z_feedrate_mm_min: float = 120.0   # Z speed above well top (service/travel)
+    entry_z_feedrate_mm_min: float = 12.0   # Z speed entering well (slow, safe)
+    service_xy_speed_mm_s: float = 50.0     # XY speed for service moves (waste/wash/ink)
+    auto_pump_rate_uL_s: float = 0.0        # print pump rate from extrusion physics
+    service_pump_rate_uL_s: float = 5.0     # service pump rate (max for gauge)
+
     def get_retract_uL(self, pump: str) -> float:
         """Get retract amount for a pump in µL (v7.2). Falls back to legacy mm value."""
         uL = self.retract_amounts_uL.get(pump, 0.0)

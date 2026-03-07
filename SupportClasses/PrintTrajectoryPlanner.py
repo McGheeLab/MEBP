@@ -233,22 +233,31 @@ class PrintTrajectoryPlanner:
         self._t += seconds
         self._wp(segment=segment, well=well)
 
-    def _print_path_coordinated(self, path_points: list[tuple[float, float]],
-                                well_x: float, well_y: float,
-                                pump_id: str, flow_rate: float,
-                                feedrate_mm_min: float,
-                                settings, well_name: str = ""):
-        """Generate coordinated XY + pump waypoints for a print path.
+    def _print_path_coordinated(self, path_points, well_x, well_y,
+                                pump_id, flow_rate, feedrate_mm_min,
+                                settings, well_name=""):
+        """Coordinated XY + pump waypoints. # v7.2.6-auto-B4
 
-        path_points are relative to well center. flow_rate is mm-pump
-        per mm-XY-travel (dimensionless ratio).
+        Auto-derives pump flow rate from extrusion physics if
+        settings.auto_pump_rate_uL_s > 0 (set by _compute_auto_settings).
+
+        flow_rate here is pump-mm per XY-mm (dimensionless ratio).
+        If auto_pump_rate_uL_s is set, it overrides the passed flow_rate.
         """
         if len(path_points) < 2:
             return
 
         print_speed = max(feedrate_mm_min / 60.0, 0.1)
 
-        # Move to first point (already at print Z)
+        # Auto pump rate: derive flow_rate from physics if available
+        auto_rate = getattr(settings, 'auto_pump_rate_uL_s', 0.0)
+        if auto_rate > 0 and print_speed > 0:
+            uL_per_mm_pump = _get_uL_per_mm(settings, pump_id)
+            if uL_per_mm_pump > 0:
+                # flow_rate (mm-pump / mm-XY) = (uL/s) / (mm/s * uL/mm)
+                flow_rate = auto_rate / (print_speed * uL_per_mm_pump)
+
+        # Move to first point
         first_x = well_x + path_points[0][0]
         first_y = well_y + path_points[0][1]
         self._move_xy(first_x, first_y, feedrate_mm_min,
@@ -264,62 +273,145 @@ class PrintTrajectoryPlanner:
 
             duration = dist / print_speed
             n_steps = max(int(duration / self.DT_PRINT), 2)
-            pump_delta = dist * flow_rate  # total pump movement for segment
+            pump_delta = dist * flow_rate
 
             x_start, y_start = self._x, self._y
             p_start = self._pumps[pump_id]
 
             for j in range(1, n_steps + 1):
                 frac = j / n_steps
-                self._x = _interp(x_start, seg_x, frac)  # linear for print
+                self._x = _interp(x_start, seg_x, frac)
                 self._y = _interp(y_start, seg_y, frac)
                 self._pumps[pump_id] = _interp(p_start, p_start + pump_delta, frac)
                 self._t += duration / n_steps
                 self._wp(segment="print", well=well_name)
 
-            # Track fluid dispensed
             self._fluid_balance[pump_id] -= abs(pump_delta)
 
-    # ── High-level plan step handlers ─────────────────────────────
 
     def _travel_to_well(self, wx: float, wy: float, settings, well=""):
-        """Raise Z → travel XY → (stay at travel height)."""
+        """4-phase smart Z approach. # v7.2.6-auto-B1
+
+        Phase 1: Fast Z up to safe_z (travel_z_height) if not already there.
+        Phase 2: Fast XY to destination at service_xy_speed_mm_s.
+        Phase 3: Fast Z down to (top_z + 0.5mm buffer) — above well opening.
+        Phase 4: Slow Z entry to print_z_height — controlled needle insertion.
+
+        Falls back to single-phase if top_z_height == 0 (calibration not done).
+        """
         self._next_segment()
-        # Raise to travel height if not there
-        tz = settings.travel_z_height
-        if self._z < tz - 0.01:
-            self._move_z(tz, settings.z_feedrate, segment="travel", well=well)
-        # XY travel
-        self._move_xy(wx, wy, settings.xy_feedrate, segment="travel", well=well)
-        # Dwell after travel
+        safe_z   = settings.travel_z_height
+        top_z    = getattr(settings, 'top_z_height', 0.0)
+        fast_z   = getattr(settings, 'fast_z_feedrate_mm_min', settings.z_feedrate)
+        entry_z  = getattr(settings, 'entry_z_feedrate_mm_min', settings.z_feedrate)
+        svc_xy   = getattr(settings, 'service_xy_speed_mm_s', 10.0) * 60.0  # → mm/min
+
+        # Phase 1: raise to safe_z at fast speed
+        if self._z < safe_z - 0.01:
+            self._move_z(safe_z, fast_z, segment="travel", well=well)
+
+        # Phase 2: fast XY travel
+        self._move_xy(wx, wy, svc_xy, segment="travel", well=well)
+
+        # Phase 3+4: lower into well if calibration data available
+        if top_z > 0:
+            approach_z = top_z + 0.5  # 0.5 mm buffer above well top
+            # Phase 3: fast Z to just above well
+            if self._z > approach_z + 0.01:
+                self._move_z(approach_z, fast_z, segment="travel", well=well)
+            # Phase 4: slow Z entry to print height
+            self._move_z(settings.print_z_height, entry_z, segment="travel", well=well)
+        else:
+            # Fallback: single-phase lower (no calibration)
+            self._move_z(settings.print_z_height, settings.z_feedrate,
+                         segment="travel", well=well)
+
+        # Dwell after arrival
         if settings.dwell_after_move > 0:
             self._dwell(settings.dwell_after_move, well=well)
 
+
     def _lower_to_print(self, settings, well=""):
-        """Lower Z from travel height to print height."""
-        self._move_z(settings.print_z_height, settings.z_feedrate,
-                     segment="travel", well=well)
+        """Lower Z to print height. 2-phase if calibration available. # v7.2.6-auto-B2
+
+        Phase 1: Fast Z to (top_z + 0.5mm) if not already below that.
+        Phase 2: Slow entry to print_z_height.
+        Falls back to single-phase (z_feedrate) if top_z_height == 0.
+        """
+        top_z   = getattr(settings, 'top_z_height', 0.0)
+        fast_z  = getattr(settings, 'fast_z_feedrate_mm_min', settings.z_feedrate)
+        entry_z = getattr(settings, 'entry_z_feedrate_mm_min', settings.z_feedrate)
+        target  = settings.print_z_height
+
+        if self._z <= target + 0.001:
+            return  # Already at or below print height
+
+        if top_z > 0:
+            approach_z = top_z + 0.5
+            if self._z > approach_z + 0.01:
+                # Fast lower to just above well top
+                self._move_z(approach_z, fast_z, segment="travel", well=well)
+            # Slow entry into well
+            self._move_z(target, entry_z, segment="travel", well=well)
+        else:
+            self._move_z(target, settings.z_feedrate, segment="travel", well=well)
+
 
     def _raise_from_print(self, settings, well=""):
-        """Raise Z from print height to travel height."""
-        self._move_z(settings.travel_z_height, settings.z_feedrate,
-                     segment="travel", well=well)
+        """Raise Z from print height to safe travel height. # v7.2.6-auto-B3
+
+        Phase 1: Slow exit from well (entry_z_feedrate) to top_z + 0.5mm.
+        Phase 2: Fast raise to safe_z (fast_z_feedrate) to clear obstacles.
+        Falls back to single-phase if top_z_height == 0.
+        """
+        top_z   = getattr(settings, 'top_z_height', 0.0)
+        fast_z  = getattr(settings, 'fast_z_feedrate_mm_min', settings.z_feedrate)
+        entry_z = getattr(settings, 'entry_z_feedrate_mm_min', settings.z_feedrate)
+        safe_z  = settings.travel_z_height
+
+        if top_z > 0:
+            clear_z = top_z + 0.5
+            # Phase 1: slow exit from well
+            if self._z < clear_z - 0.01:
+                self._move_z(clear_z, entry_z, segment="travel", well=well)
+            # Phase 2: fast raise to safe travel height
+            if self._z < safe_z - 0.01:
+                self._move_z(safe_z, fast_z, segment="travel", well=well)
+        else:
+            self._move_z(safe_z, settings.z_feedrate, segment="travel", well=well)
+
 
     def _do_waste(self, plate, well_model, pump_id, settings):
-        """Waste sequence: travel → lower → eject → raise."""
+        """Waste: travel → lower → eject syringe contents → raise.
+        # v7.2.6-dsf: waste clamp
+        Ejects only what is currently loaded (no overshoot).
+        Uses service_pump_rate_uL_s from auto-settings if available.
+        """
         well = _find_well(well_model, plate, "waste")
         if not well:
             logger.info("Skipping: no waste well assigned — will proceed without")
             return
         name, wx, wy = well
+        uL_per_mm = _get_uL_per_mm(settings, pump_id)
+
+        # Eject the pump's current fluid balance (what was loaded)
+        # Clamp to a safe maximum to avoid runaway
+        fluid_loaded_mm = max(0.0, self._fluid_balance.get(pump_id, 0.0) / uL_per_mm
+                              if uL_per_mm > 0 else 0.0)
+        eject_vol_mm = min(fluid_loaded_mm + (5.0 / uL_per_mm), 50.0 / uL_per_mm)
+        eject_vol_mm = max(eject_vol_mm, 1.0 / uL_per_mm)  # at least 1 uL
+
+        svc_fr = getattr(settings, 'pump_feedrate', 30.0)
+
         self._travel_to_well(wx, wy, settings, well=name)
         self._lower_to_print(settings, well=name)
-        eject_vol_mm = 5.0 / _get_uL_per_mm(settings, pump_id)
-        self._move_pump(pump_id, eject_vol_mm, settings.pump_feedrate,
+        self._move_pump(pump_id, eject_vol_mm, svc_fr,
                         segment="service", well=name)
-        self._fluid_balance[pump_id] -= abs(eject_vol_mm)
+        # After waste, pump balance resets to zero
+        self._fluid_balance[pump_id] = 0.0
         self._dwell(0.5, well=name)
         self._raise_from_print(settings, well=name)
+
 
     def _do_wash(self, plate, well_model, settings):
         """Wash sequence: travel → lower → dwell → raise."""
@@ -512,13 +604,20 @@ class PrintTrajectoryPlanner:
             pump = getattr(step, 'pump_id', None) or getattr(settings, 'active_pump', 'P1') or 'P1'
 
             if stype == PlanStepType.PRINT:
-                # v7.3: Full service workflow before each print run
+                # v7.2.6-dsf: PRINT calls _do_print_wells directly
+                # The plan already contains all pre-print service steps
+                # (WASTE/WASH/BUFFER/LOAD_INK) added by _add_service_steps().
+                # Calling _do_service_and_print() here caused a double-cycle:
+                # syringe loaded ink twice, hitting safety limits.
+                # Now we just call _do_print_wells() — service steps
+                # were already executed as their own PlanStepType entries.
                 target_wells = getattr(step, 'target_wells', [])
                 flow = getattr(settings, 'flow_rate', 0.01) or 0.01
+                # Use auto pump rate if set by _compute_auto_settings
                 if target_wells:
-                    self._do_service_and_print(
-                        plate, well_model, target_wells, pump,
-                        path_points, flow, settings)
+                    self._do_print_wells(
+                        plate, target_wells, pump, path_points,
+                        flow, settings)
                     well_count += len(target_wells)
 
             elif stype == PlanStepType.RETURN_HOME:
@@ -528,7 +627,9 @@ class PrintTrajectoryPlanner:
                 self._do_wash(plate, well_model, settings)
                 self._move_z(settings.travel_z_height, settings.z_feedrate,
                              segment="travel")
-                self._move_xy(0, 0, settings.xy_feedrate, segment="travel")
+                # v7.2.6-tef-B2: return_home travel: use travel_speed_mm_s * 60 (mm/min)
+                _rh_travel_fr = getattr(settings, 'travel_speed_mm_s', 10.0) * 60.0
+                self._move_xy(0, 0, _rh_travel_fr, segment='travel')
                 self._wp(segment="end")
 
             elif stype in (PlanStepType.WASTE, PlanStepType.WASH,

@@ -4,7 +4,7 @@
     "y": 25,
     "width": 1296,
     "height": 792,
-    "active_tab": 3,
+    "active_tab": 5,
     "splitter_sizes": [
       706,
       0
@@ -75,19 +75,35 @@
   "calibration": {
     "plate_format": 24,
     "taught_a1": [
-      -12397.65,
-      -8820.46
+      -5633.9,
+      -6275.9
     ],
     "taught_corner": [
-      -22797.06,
-      -22365.15
+      90866.0,
+      51624.0
     ],
-    "corner_well": "H12",
-    "offset_x": -10054.98,
-    "offset_y": -7703.829999999999,
-    "rotation": -158.4802704427954,
-    "scale": 151.74057486979584,
-    "alignment_valid": false
+    "corner_well": "D6",
+    "offset_x": 0,
+    "offset_y": 0,
+    "rotation": 0.0,
+    "scale": 1.0,
+    "alignment_valid": false,
+    "safe_z": -0.9996,
+    "top_z": 3.9999,
+    "taught_a1_z": 9.0,
+    "taught_corner_z": 4.4999,
+    "taught_third": [
+      90866.0,
+      -6276.0
+    ],
+    "taught_third_z": 4.4997,
+    "third_well": "A6",
+    "z_plane": {
+      "a": -0.04663523316062176,
+      "b": 3.4542314335177505e-06,
+      "c": 8.999999999999998,
+      "r_squared": 1.0
+    }
   },
   "controller": {
     "controller_json": null,

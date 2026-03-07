@@ -507,6 +507,100 @@ class PrintSetupPage(QWidget):
     #  SETTINGS EXTRACTION
     # ════════════════════════════════════════════════════════════════
 
+    def _compute_auto_settings(self, s, hw_config=None):
+        """# v7.2.6-auto-C1: _compute_auto_settings
+        Auto-derive all motion parameters from hardware config + calibration.
+
+        Mutates PrintSettings s in-place. Called after _get_settings().
+
+        Derives:
+          - travel_z_height         from calibration safe_z
+          - top_z_height            from calibration top_z
+          - fast_z_feedrate_mm_min  max Z speed (above plate surface)
+          - entry_z_feedrate_mm_min z_feedrate (from GUI spinbox * 60)
+          - service_xy_speed_mm_s   fast XY for wash/waste/ink moves
+          - auto_pump_rate_uL_s     extrusion physics: v*OD*layer
+          - service_pump_rate_uL_s  GAUGE_MAX_FLOW[gauge]
+          - pump_feedrate           service rate in mm/min
+        """
+        # ── 1. Calibration data ──────────────────────────────────────
+        try:
+            _app_settings = getattr(self, '_app_settings', None)
+            if _app_settings is None:
+                _p = self.parent() if hasattr(self, 'parent') else None
+                while _p is not None:
+                    if hasattr(_p, 'settings') and hasattr(_p.settings, 'get_section'):
+                        _app_settings = _p.settings
+                        break
+                    _p = _p.parent() if hasattr(_p, 'parent') else None
+            if _app_settings:
+                cal = _app_settings.get_section('calibration') or {}
+                safe_z = cal.get('safe_z')
+                top_z  = cal.get('top_z')
+                if safe_z is not None and safe_z > 0:
+                    s.travel_z_height = float(safe_z)
+                if top_z is not None and top_z >= 0:
+                    s.top_z_height = float(top_z)
+        except Exception as _e:
+            import logging as _log
+            _log.getLogger(__name__).debug(f'Auto-settings: cal load: {_e}')
+
+        # ── 2. Z speed tiers ─────────────────────────────────────────
+        # fast_z: safe max Z travel speed (above plate surface)
+        s.fast_z_feedrate_mm_min = 120.0  # 2 mm/s
+        # entry_z: from GUI z_feed_spin (already stored as mm/min via prior patch)
+        s.entry_z_feedrate_mm_min = s.z_feedrate
+
+        # ── 3. Service XY speed ──────────────────────────────────────
+        s.service_xy_speed_mm_s = 50.0
+
+        # ── 4. Pump rates from needle + syringe ─────────────────────
+        GAUGE_MAX_FLOW = {
+            16: 50.0, 18: 30.0, 20: 15.0, 22: 8.0, 23: 5.0,
+            25: 3.0, 27: 1.5, 28: 1.0, 30: 0.5, 32: 0.2,
+        }
+        gauge = None
+        needle = None
+        if hw_config is not None:
+            needle = getattr(hw_config, 'needle', None)
+            if needle:
+                gauge = getattr(needle, 'gauge', None)
+
+        # Service pump rate (max safe for gauge)
+        if gauge and gauge in GAUGE_MAX_FLOW:
+            s.service_pump_rate_uL_s = GAUGE_MAX_FLOW[gauge]
+        else:
+            s.service_pump_rate_uL_s = 5.0
+
+        # Pump feedrate for service: convert uL/s to mm/min
+        _uL_per_mm = 3.378  # 250uL Hamilton default
+        if hw_config is not None:
+            try:
+                _active = getattr(s, 'active_pump', 'P1') or 'P1'
+                _pcfg = hw_config.pumps.get(_active)
+                if _pcfg and _pcfg.syringe:
+                    _uL_per_mm = _pcfg.syringe.uL_per_mm
+            except Exception:
+                pass
+        s.pump_feedrate = max(s.service_pump_rate_uL_s * 60.0 / _uL_per_mm, 0.5)
+
+        # Print pump rate: extrusion_flow_rate(v, needle_OD, layer_height)
+        if needle is not None:
+            try:
+                from SupportClasses.FlowPhysics import extrusion_flow_rate
+                od_mm = getattr(needle, 'od_mm', 0.0)
+                if od_mm <= 0:
+                    od_um = getattr(needle, 'od_um', 0)
+                    od_mm = od_um / 1000.0
+                if od_mm > 0:
+                    flow = extrusion_flow_rate(
+                        s.print_speed_mm_s, needle, s.layer_height)
+                    s.auto_pump_rate_uL_s = max(flow, 0.001)
+            except Exception as _e:
+                import logging as _log
+                _log.getLogger(__name__).debug(
+                    f'Auto-settings: extrusion calc: {_e}')
+
     def _get_settings(self) -> PrintSettings:
         """Build PrintSettings from context panel controls."""
         s = PrintSettings()
@@ -516,8 +610,14 @@ class PrintSetupPage(QWidget):
         s.travel_speed_mm_s = self.xy_feed_spin.value() * 2.0  # travel 2x faster
         # Also set legacy print_feedrate (mm/min) for backward compat
         s.print_feedrate = self.xy_feed_spin.value() * 60.0  # mm/s → mm/min
-        s.z_feedrate = self.z_feed_spin.value()
+        # v7.2.6-tef-A1: z_feedrate mm/min
+        # z_feed_spin is in mm/s; planner _move_z divides by 60 expecting mm/min
+        s.z_feedrate = self.z_feed_spin.value() * 60.0  # mm/s → mm/min
         s.pump_rate_uL_s = self.pump_feed_spin.value()
+        # v7.2.6-tef-A2: pump_feedrate from uL_s
+        # Convert µL/s → mm/min for service pump moves (default Hamilton 250µL = 3.378 µL/mm)
+        _uL_per_mm_default = 3.378
+        s.pump_feedrate = max(self.pump_feed_spin.value() * 60.0 / _uL_per_mm_default, 0.5)
         s.num_layers = self.layers_spin.value()
         s.layer_height = self.layer_height_spin.value()
         s.active_pump = self.pump_combo.currentText()
@@ -901,6 +1001,10 @@ class PrintSetupPage(QWidget):
                 path_points = [(0.0, 0.0)]
 
         settings = self._get_settings()
+        # v7.2.6-auto-C2: auto-derive speeds + pump rates from HW + calibration
+        _hw_for_auto = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
+        if hasattr(self, '_compute_auto_settings'):
+            self._compute_auto_settings(settings, _hw_for_auto)
         model = getattr(self.tab_wells, '_model', None)
         plate = getattr(model, 'plate', None) if model else None
         hw = getattr(self, '_hardware_config', None) or getattr(self, '_hw_config', None)
