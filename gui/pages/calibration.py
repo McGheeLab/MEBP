@@ -902,64 +902,71 @@ class CalibrationPage(QWidget):
     # ── Step 1: Zero Needle ──────────────────────────────────────
 
     def _safe_navigate_to(self, target_x_um, target_y_um, target_z_mm=None):
-        """v7.2.7-hotfix: safe_navigate — raise Z, wait, fast XY, lower Z."""
-        import time
+        """v7.2.7-simple: blocking absolute moves. Simulator now blocks like real hw."""
         ctrl = self.controller
         safe_z = getattr(self, '_safe_z', None) or 0.0
 
-        # Step 1: Raise to safe Z and wait
+        # Step 1: Raise Z
         if ctrl.is_zp_connected:
             ctrl.move_z_absolute(safe_z, from_zero_ref=True)
-            for _ in range(30):
-                time.sleep(0.1)
-                zp = ctrl.get_zp_position(cached=False)
-                if zp and zp[0] is not None:
-                    if abs(zp[0] - ctrl.zero_position.get("Z", 0) - safe_z) < 0.1:
-                        break
 
-        # Step 2: Fast XY travel
+        # Step 2: Fast XY travel (blocks until arrival on both real hw and simulator)
         if ctrl.is_xy_connected:
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
-                try:
-                    ctrl.xy_stage.set_speed_mm_s(10.0) if hasattr(ctrl.xy_stage, 'set_speed_mm_s') else ctrl.xy_stage.set_velocity(20)  # 20% ≈ 10mm/s
-                except Exception:
-                    pass
+                if hasattr(ctrl.xy_stage, 'set_speed_mm_s'):
+                    ctrl.xy_stage.set_speed_mm_s(50.0)
+                else:
+                    ctrl.xy_stage.set_velocity(100)
             ctrl.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
-            for _ in range(40):
-                time.sleep(0.1)
-                xy = ctrl.get_xy_position(cached=False)
-                if xy[0] is not None:
-                    if abs(xy[0] - target_x_um) < 50 and abs(xy[1] - target_y_um) < 50:
-                        break
 
         # Step 3: Lower Z
-        if target_z_mm is not None and ctrl.is_zp_connected:
-            ctrl.move_z_absolute(target_z_mm, from_zero_ref=True)
-        elif getattr(self, '_top_z', None) is not None and ctrl.is_zp_connected:
-            ctrl.move_z_absolute(self._top_z + getattr(self, '_z_buffer_mm', 0.5),
-                                 from_zero_ref=True)
+        if ctrl.is_zp_connected:
+            if target_z_mm is not None:
+                ctrl.move_z_absolute(target_z_mm, from_zero_ref=True)
+            elif getattr(self, '_top_z', None) is not None:
+                approach = self._top_z + getattr(self, '_z_buffer_mm', 0.5)
+                ctrl.move_z_absolute(approach, from_zero_ref=True)
 
         logger.info(f"Safe navigate to ({target_x_um:.0f}, {target_y_um:.0f}) µm")
 
 
     def _estimate_well_position_um(self, well_name):
-        """v7.2.7-hotfix: estimate absolute stage pos for a well from A1 + plate."""
+        """v7.2.7-scalefix: estimate well position — ignore scale/rotation until calibrated.
+
+        After A1 is taught but BEFORE corner is taught, scale/rotation
+        should be 1.0/0.0. Only apply non-identity transform if both
+        A1 and corner have been taught AND scale is reasonable.
+        """
         if self._taught_a1 is None or self._plate is None:
             return None
         try:
             wx, wy = self._plate.get_well_position(well_name)
             a1x, a1y = self._plate.get_well_position("A1")
-            dx_mm = (wx - a1x) * getattr(self, '_scale', 1.0)
-            dy_mm = (wy - a1y) * getattr(self, '_scale', 1.0)
-            rot = getattr(self, '_rotation', 0)
-            if abs(rot) > 0.001:
-                rad = math.radians(rot)
-                dx_mm, dy_mm = (dx_mm*math.cos(rad) - dy_mm*math.sin(rad),
-                                dx_mm*math.sin(rad) + dy_mm*math.cos(rad))
+            dx_mm = wx - a1x
+            dy_mm = wy - a1y
+
+            # Only apply scale/rotation if both points taught AND scale is sane
+            scale = getattr(self, '_scale', 1.0)
+            rot = getattr(self, '_rotation', 0.0)
+            has_corner = getattr(self, '_taught_corner', None) is not None
+
+            if has_corner and 0.8 < scale < 1.2 and abs(rot) < 10:
+                # Apply calibrated transform
+                if abs(rot) > 0.001:
+                    import math as _m
+                    rad = _m.radians(rot)
+                    dx_mm, dy_mm = (dx_mm*_m.cos(rad) - dy_mm*_m.sin(rad),
+                                    dx_mm*_m.sin(rad) + dy_mm*_m.cos(rad))
+                dx_mm *= scale
+                dy_mm *= scale
+            elif has_corner and (scale < 0.8 or scale > 1.2):
+                logger.warning(f"Ignoring stale scale={scale:.2f} (out of range 0.8-1.2)")
+
             tx = self._taught_a1[0] + dx_mm * 1000.0
             ty = self._taught_a1[1] + dy_mm * 1000.0
-            logger.info(f"Est {well_name}: offset ({dx_mm:.2f},{dy_mm:.2f})mm "
-                        f"-> ({tx:.0f},{ty:.0f})µm")
+            logger.info(f"Est {well_name}: offset ({dx_mm:.2f},{dy_mm:.2f})mm, "
+                        f"scale={scale:.4f}, rot={rot:.2f}° "
+                        f"-> ({tx:.0f},{ty:.0f}) µm")
             return (tx, ty)
         except Exception as e:
             logger.warning(f"Cannot estimate {well_name}: {e}")
@@ -1042,6 +1049,11 @@ class CalibrationPage(QWidget):
         if hasattr(self, '_cal_plate_view'):
             self._cal_plate_view.set_taught_a1((ax / 1000.0, ay / 1000.0))
             self._cal_plate_view._rebuild()
+        # v7.2.7-scalefix: reset scale/rotation — only valid after corner is taught
+        self._scale = 1.0
+        self._rotation = 0.0
+        self._offset_x = 0
+        self._offset_y = 0
         logger.info(f"Taught A1 XYZ: {self._taught_a1}, Z={self._taught_a1_z}")
 
     def _goto_corner_auto(self):
@@ -1187,6 +1199,9 @@ class CalibrationPage(QWidget):
             self.val_well_combo.clear()
             self.val_well_combo.addItems(self._plate.well_names)
         self._taught_a1 = None
+        self._scale = 1.0
+        self._rotation = 0.0
+
         self._taught_corner = None
         if hasattr(self, '_taught_third'): self._taught_third = None
         for attr in ['lbl_a1','lbl_corner','lbl_third']:

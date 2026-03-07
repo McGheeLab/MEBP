@@ -239,6 +239,20 @@ class XYStageSimulator:
     # ══════════════════════════════════════════════════════════════
 
     def send_command(self, command: str) -> str:
+        """v7.2.7-block-v2: Delegate to raw handler, then block for absolute moves.
+
+        Real Prior hardware: G/GR commands block until stage arrives.
+        This wrapper replicates that behavior for the simulator.
+        """
+        response = self._send_command_raw(command)
+        # Block if the command triggered an absolute move
+        with self._lock:
+            is_moving = (self.mode == "absolute")
+        if is_moving:
+            self._wait_for_idle()
+        return response
+
+    def _send_command_raw(self, command: str) -> str:
         """Process command with baud-rate-accurate timing.
 
         Simulates the full round-trip:
@@ -494,6 +508,9 @@ class XYStageSimulator:
             elif direction == "R": self.target_x = self.current_x + amount
             elif direction == "F": self.target_y = self.current_y + amount
             elif direction == "B": self.target_y = self.current_y - amount
+        # v7.2.7: blocking move
+        self._wait_for_idle()
+
         return "R"
 
     def _cmd_Z(self) -> str:
@@ -522,6 +539,9 @@ class XYStageSimulator:
         with self._lock:
             self.mode = "absolute"
             self.target_x = self.target_y = 0.0
+
+        # v7.2.7: blocking move
+        self._wait_for_idle()
         return "R"
 
     def _cmd_STAGE(self) -> str:
@@ -535,6 +555,22 @@ class XYStageSimulator:
             f"END")
 
     # ── Direct position access ────────────────────────────────────
+
+    def _wait_for_idle(self, timeout_s: float = 60.0):
+        """v7.2.7: blocking move — wait for physics loop to reach target.
+
+        Real Prior G command blocks until the stage arrives and returns R.
+        This makes the simulator behave identically.
+        """
+        import time
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            with self._lock:
+                if self.mode == "idle":
+                    return True
+            time.sleep(0.005)  # 5ms poll — fast enough, low CPU
+        logger.warning(f"Simulator settle timeout after {timeout_s}s")
+        return False
 
     def get_current_position(self) -> tuple[float, float, float]:
         with self._lock:

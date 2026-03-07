@@ -4,7 +4,7 @@
     "y": 25,
     "width": 1296,
     "height": 792,
-    "active_tab": 1,
+    "active_tab": 3,
     "splitter_sizes": [
       706,
       0
@@ -63,8 +63,8 @@
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
-    "enabled": true,
-    "max_flow_rate_p1_uL_s": 0.0,
+    "enabled": false,
+    "max_flow_rate_p1_uL_s": 8.0,
     "max_flow_rate_p2_uL_s": 0.0,
     "max_flow_rate_p3_uL_s": 0.0
   },
