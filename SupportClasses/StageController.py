@@ -684,6 +684,20 @@ class StageController:
                 logger.debug(f"XY direct query error: {e}")
         return (None, None, None)
 
+    def get_xy_position_mm(self, cached: bool = True) -> tuple:
+        """Get XY position in mm (relative to zero reference).
+
+        v7.3: Convenience method for callers that need mm.
+        Returns (x_mm, y_mm) or (None, None) if not connected.
+        """
+        pos = self.get_xy_position(cached)
+        if pos[0] is not None:
+            zx = self.zero_position.get("x", 0)
+            zy = self.zero_position.get("y", 0)
+            return ((pos[0] - zx) / 1000.0, (pos[1] - zy) / 1000.0)
+        return (None, None)
+
+
     def get_zp_position(self, cached: bool = True) -> tuple:
         """Get ZP position. cached=True returns polled value (non-blocking)."""
         if cached:
@@ -748,17 +762,32 @@ class StageController:
         self, x: float, y: float, from_zero_ref: bool = True, fast: bool = False
     ) -> None:
         """Move XY to absolute position, optionally relative to zero ref."""
+        """v7.3: Accept mm, convert to µm internally.
+
+        When from_zero_ref=True, x/y are in mm (from WellPlate/trajectory).
+        Converts to µm, applies safety limits, adds zero reference (µm),
+        then sends to stage which expects µm (Prior manual page 36).
+        """
         if not self.xy_stage:
             return
-        if self.safety_limits.enabled and from_zero_ref:
-            x, y = self.safety_limits.clamp_xy(x, y)
+
         if from_zero_ref:
-            x += self.zero_position["x"]
-            y += self.zero_position["y"]
-        self.xy_stage.move_stage_to_position(x, y, fast)
+            # Convert mm → µm, then add zero reference (which is in µm)
+            x_um = x * 1000.0
+            y_um = y * 1000.0
+            if self.safety_limits.enabled:
+                x_um, y_um = self.safety_limits.clamp_xy(x_um, y_um)
+            x_um += self.zero_position["x"]
+            y_um += self.zero_position["y"]
+        else:
+            # Legacy: raw values passed directly (assumed µm already)
+            x_um = x
+            y_um = y
+
+        self.xy_stage.move_stage_to_position(x_um, y_um, fast)
     def move_xy_relative(self, dx: float, dy: float) -> None:
         """
-        Move XY stage by a relative offset (microsteps).
+        Move XY stage by a relative offset in µm.
 
         BUG-1 FIX: Sends relative moves directly to hardware, eliminating
         dependency on stale cached position data.
@@ -881,7 +910,7 @@ class StageController:
         P8.24: Send continuous velocity command to XY stage.
 
         Used by the MotionController for trajectory tracking. Velocity
-        units match the stage's native format (typically µsteps/s for Prior).
+        units match the stage's native format (µm/s for Prior (VS command default unit per manual)).
 
         Args:
             vx: X velocity

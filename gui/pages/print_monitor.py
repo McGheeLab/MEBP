@@ -973,8 +973,9 @@ class PrintMonitorPage(QWidget):
 
         if xy and xy[0] is not None:
             zero = getattr(ctrl, 'zero_position', {})
-            px = xy[0] - zero.get('x', 0)
-            py = xy[1] - zero.get('y', 0)
+            # v7.3: Stage returns µm, convert to mm for display
+            px = (xy[0] - zero.get('x', 0)) / 1000.0
+            py = (xy[1] - zero.get('y', 0)) / 1000.0
             pz = (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0.0
             p1 = (zp[1] - zero.get('P1', 0)) if zp and len(zp) > 1 and zp[1] is not None else 0.0
 

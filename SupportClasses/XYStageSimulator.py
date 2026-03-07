@@ -1,92 +1,125 @@
 """
-XY Stage Simulator — Physics-based simulator for the Prior ProScan III XY stage.
+XY Stage Simulator v5 — Prior ProScan II with realistic serial timing.
 
-Simulates velocity-mode and absolute-move commands with realistic acceleration
-ramps and proportional-control positioning.  Presents the same serial-like
-interface that :class:`XYStageManager` expects, so it can be used as a drop-in
-replacement when ``simulate=True``.
+Implements both interfaces:
+  1. send_command(cmd) → response  (direct, for simulate=True mode)
+  2. write/flush/read_all          (pyserial-like, for serial interface testing)
 
-The simulator runs a background update loop at a configurable rate (default
-100 Hz) to smoothly interpolate position.
+Serial timing at 38400 baud (8N1 = 10 bits/byte = 3840 bytes/s):
+  TX "G 19300,0\\r" (13 bytes)  → 3.4ms
+  RX "R\\r"          (2 bytes)  → 0.5ms
+  RX "19300.0,0.0,0.0\\r" (20 bytes) → 5.2ms
+  Controller processing: ~2ms
+  Round-trip position query: ~8ms → max ~125 Hz poll rate
 
-v7.1.2 BUG-2 FIX: Speed parameters are now scaled to microstep units.
-    Prior ProScan III default: 10 microsteps/µm, max speed ~50,000 µsteps/s.
-    The old default max_speed=100 was far too slow for microstep-scale positions,
-    causing 500-step moves (50 µm jog) to take ~5 seconds instead of <0.1s.
+All positions in µm per Prior manual page 36.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import queue
 import threading
 import time
 
 logger = logging.getLogger(__name__)
 
-# ── Realistic defaults for Prior ProScan III ──────────────────────
-# ProScan III: 10 microsteps/µm, max velocity ~5mm/s = 50,000 µsteps/s
-# These can be overridden by the caller (e.g., from protocol JSON params)
-DEFAULT_MAX_SPEED = 100_000.0         # microsteps/s  (was 100!)
-DEFAULT_ACCELERATION = 200_000.0      # microsteps/s²  (was 100!)
-DEFAULT_KP = 20.0                     # Proportional gain for abs moves (was 2.0)
-DEFAULT_SETTLING_THRESHOLD = 2.0      # Consider "arrived" within 2 microsteps
+# ═══════════════════════════════════════════════════════════════════
+#  Physical constants
+# ═══════════════════════════════════════════════════════════════════
+
+MAX_SPEED_UM_S = 20_000.0
+MAX_ACCEL_UM_S2 = 50_000.0
+DEFAULT_SPEED_PCT = 50
+DEFAULT_ACCEL_PCT = 50
+MICROSTEPS_PER_MICRON = 10
+DEFAULT_KP = 15.0
+SETTLE_THRESHOLD_UM = 0.5
+PHYSICS_HZ = 200
+
+# Serial timing
+DEFAULT_BAUD = 38400
+BITS_PER_BYTE = 10          # 8N1: start + 8 data + stop
+# Per-command processing times (measured on real Prior ProScan II at 9600 baud)
+# Position query is fast, movement commands need motor ramp time
+PROCESSING_TIMES = {
+    "position":  0.050,   # 50ms  — P query: fast firmware response
+    "move":      0.100,   # 100ms — G/GR: start move, respond immediately
+    "velocity":  0.800,   # 800ms — VS: motor ramp + settle (measured ~1Hz)
+    "setting":   0.050,   # 50ms  — SMS/SAS: register write
+    "stop":      0.010,   # 10ms  — I/K: immediate
+    "default":   0.050,   # 50ms  — everything else
+}
+PROCESSING_TIME_S = 0.050  # backward compat default
 
 
 class XYStageSimulator:
     """
-    Threaded XY stage simulator with velocity and absolute positioning modes.
+    Prior ProScan II simulator with baud-rate-accurate serial timing.
 
-    Public interface mirrors the subset of ``serial.Serial`` that
-    :class:`XYStageManager` uses, plus a direct ``send_command`` path
-    used when ``simulate=True``.
+    Two interfaces:
+      Direct:  response = sim.send_command("G 19300,0")
+      Serial:  sim.write(b"G 19300,0\\r"); sim.flush(); data = sim.read_all()
 
-    Parameters:
-        update_rate_hz:       Physics update frequency (Hz).
-        acceleration_rate:    Maximum velocity change per second (microsteps/s²).
-        communication_delay:  Simulated serial latency (seconds).
-        max_speed:            Velocity clamp (microsteps/s).
+    Both produce identical results. The serial interface adds realistic
+    baud-rate delays so position polling and command throughput match
+    real hardware behavior.
     """
 
     def __init__(
         self,
-        update_rate_hz: int = 100,
-        acceleration_rate: float = DEFAULT_ACCELERATION,
-        communication_delay: float = 0.0,
-        max_speed: float = DEFAULT_MAX_SPEED,
+        microsteps_per_micron: float = MICROSTEPS_PER_MICRON,
+        update_rate_hz: int = PHYSICS_HZ,
+        baud_rate: int = DEFAULT_BAUD,
     ):
-        # Position state (microsteps)
+        self._usteps_per_um = microsteps_per_micron
+        self._baud = baud_rate
+        self._bytes_per_second = baud_rate / BITS_PER_BYTE
+
+        # ── Position state (µm) ───────────────────────────────────
         self.current_x: float = 0.0
         self.current_y: float = 0.0
-
-        # Velocity state (microsteps/s)
         self.current_vx: float = 0.0
         self.current_vy: float = 0.0
 
-        # Target state (depends on mode)
-        self.target_vx: float = 0.0
-        self.target_vy: float = 0.0
+        # ── Mode & targets ────────────────────────────────────────
+        self.mode: str = "idle"
         self.target_x: float = 0.0
         self.target_y: float = 0.0
+        self.target_vx: float = 0.0
+        self.target_vy: float = 0.0
 
-        # Mode: "velocity" or "absolute"
-        self.mode: str = "velocity"
+        # ── Settings (1-100 percentage) ───────────────────────────
+        self._speed_pct: int = DEFAULT_SPEED_PCT
+        self._accel_pct: int = DEFAULT_ACCEL_PCT
+        self._scurve_pct: int = 50
+        self._max_speed = (self._speed_pct / 100.0) * MAX_SPEED_UM_S
+        self._max_accel = (self._accel_pct / 100.0) * MAX_ACCEL_UM_S2
+        self._kp = DEFAULT_KP
+        self._settle = SETTLE_THRESHOLD_UM
+        self._step_x: float = 100.0
+        self._step_y: float = 100.0
 
-        # Proportional gain for absolute-move mode
-        # Higher kp = faster approach but potential overshoot
-        self.kp: float = DEFAULT_KP
+        # Compat property
+        self.max_speed = self._max_speed
 
-        # Settling threshold — position is "reached" when within this
-        self.settling_threshold: float = DEFAULT_SETTLING_THRESHOLD
+        # ── Serial buffers ────────────────────────────────────────
+        self._rx_buffer: bytes = b""              # incoming from "host"
+        self._tx_queue: queue.Queue[str] = queue.Queue()  # responses waiting
+        self._serial_lock = threading.Lock()
 
-        # Timing
-        self._last_update_time: float = time.time()
-        self.acceleration_rate: float = acceleration_rate
-        self.update_rate_hz: int = update_rate_hz
-        self._update_interval: float = 1.0 / update_rate_hz
-        self.communication_delay: float = communication_delay
-        self.max_speed: float = max_speed
+        # ── Stage info ────────────────────────────────────────────
+        self._stage_name = "H101 Simulator"
+        self._size_x_mm = 108
+        self._size_y_mm = 71
 
-        # Threading
+        # ── Physics timing ────────────────────────────────────────
+        self.update_rate_hz = update_rate_hz
+        self._update_interval = 1.0 / update_rate_hz
+        self._last_update_time = time.time()
+
+        # ── Threading ─────────────────────────────────────────────
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -94,323 +127,469 @@ class XYStageSimulator:
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the simulator physics loop."""
         if self._running:
             return
         self._running = True
         self._last_update_time = time.time()
         self._thread = threading.Thread(
-            target=self._update_loop, daemon=True, name="XYSimulator"
-        )
+            target=self._update_loop, daemon=True, name="XYSimulator")
         self._thread.start()
-        logger.debug(
-            f"XYStageSimulator started (max_speed={self.max_speed:.0f}, "
-            f"accel={self.acceleration_rate:.0f}, kp={self.kp:.1f})"
-        )
+        logger.info(
+            f"XY stage simulator started "
+            f"(baud={self._baud}, SMS={self._speed_pct}, "
+            f"max={self._max_speed:.0f} µm/s)")
 
     def stop(self) -> None:
-        """Stop the simulator."""
         self._running = False
-        if self._thread is not None:
+        if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
-        logger.debug("XYStageSimulator stopped")
+        logger.info("XY stage stopped")
 
     def close(self) -> None:
-        """Alias for stop — matches pyserial interface."""
         self.stop()
 
     @property
     def is_running(self) -> bool:
         return self._running
 
-    # ── Configuration ─────────────────────────────────────────────
+    @property
+    def is_open(self) -> bool:
+        """Pyserial compatibility."""
+        return self._running
 
-    def configure_from_protocol(
-        self,
-        max_speed: float | None = None,
-        acceleration: float | None = None,
-        kp: float | None = None,
-    ) -> None:
-        """
-        Update simulator parameters from controller protocol.
+    @property
+    def in_waiting(self) -> int:
+        """Pyserial compatibility — bytes available to read."""
+        return self._tx_queue.qsize() * 5  # approximate
 
-        Called by XYStageManager when a protocol is loaded, even in
-        simulation mode (BUG-3 fix).
-        """
+    def configure_from_protocol(self, max_speed=None, acceleration=None,
+                                kp=None) -> None:
         with self._lock:
-            if max_speed is not None and max_speed > 0:
-                self.max_speed = max_speed
-            if acceleration is not None and acceleration > 0:
-                self.acceleration_rate = acceleration
             if kp is not None and kp > 0:
-                self.kp = kp
-        logger.debug(
-            f"Simulator configured: max_speed={self.max_speed:.0f}, "
-            f"accel={self.acceleration_rate:.0f}, kp={self.kp:.1f}"
-        )
+                self._kp = kp
 
-    # ── Command Interface ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  SERIAL INTERFACE (pyserial-compatible)
+    # ══════════════════════════════════════════════════════════════
+
+    def write(self, data: bytes) -> int:
+        """Buffer incoming bytes. Simulates TX time at baud rate."""
+        tx_time = len(data) / self._bytes_per_second
+        time.sleep(tx_time)
+        with self._serial_lock:
+            self._rx_buffer += data
+        return len(data)
+
+    def flush(self) -> None:
+        """Parse complete lines from buffer and process commands."""
+        with self._serial_lock:
+            buf = self._rx_buffer
+            self._rx_buffer = b""
+
+        text = buf.decode("utf-8", errors="replace")
+        # Split on CR, LF, or CRLF
+        lines = text.replace("\r\n", "\r").replace("\n", "\r").split("\r")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Process command with per-type delay
+            response = self._process_command(line)
+            delay = self._get_processing_time(line)
+            time.sleep(delay)
+            if response is not None:
+                self._tx_queue.put(response + "\r")
+
+    def read_all(self) -> bytes:
+        """Read all queued responses. Simulates RX time at baud rate."""
+        responses = []
+        while not self._tx_queue.empty():
+            try:
+                responses.append(self._tx_queue.get_nowait())
+            except queue.Empty:
+                break
+        result = "".join(responses)
+        if result:
+            rx_time = len(result) / self._bytes_per_second
+            time.sleep(rx_time)
+        return result.encode("utf-8")
+
+    def readline(self) -> bytes:
+        """Read one line from response queue."""
+        try:
+            resp = self._tx_queue.get(timeout=0.5)
+            rx_time = len(resp) / self._bytes_per_second
+            time.sleep(rx_time)
+            return resp.encode("utf-8")
+        except queue.Empty:
+            return b""
+
+    def reset_input_buffer(self) -> None:
+        while not self._tx_queue.empty():
+            try: self._tx_queue.get_nowait()
+            except queue.Empty: break
+
+    def reset_output_buffer(self) -> None:
+        with self._serial_lock:
+            self._rx_buffer = b""
+
+    # ══════════════════════════════════════════════════════════════
+    #  DIRECT INTERFACE (for simulate=True send_command path)
+    # ══════════════════════════════════════════════════════════════
 
     def send_command(self, command: str) -> str:
+        """Process command with baud-rate-accurate timing.
+
+        Simulates the full round-trip:
+          TX command bytes → processing delay → RX response bytes
         """
-        Process a ProScan-style command and return the response string.
+        cmd = command.strip().replace("\r", "").replace("\n", "")
+        if not cmd:
+            cmd = "P"  # empty CR = position query
 
-        Supported commands:
-            VS,vx,vy   — set velocity mode with target velocities
-            PA,x,y     — absolute move (used by internal code)
-            G x,y      — absolute move (ProScan syntax)
-            GR dx,dy   — relative move
-            P           — query current position
-            V           — query firmware version (simulated)
-            Z           — set home position
-            SMS,speed   — set max speed
-            SAS,accel   — set acceleration
-            SCS,jerk    — set jerk (no-op in sim)
-            BAUD b      — baud rate change (no-op in sim)
-            STAGE       — stage query (returns identifier)
-            I           — stop (immediate)
-        """
-        if self.communication_delay > 0:
-            time.sleep(self.communication_delay)
+        # Simulate TX time
+        tx_bytes = len(cmd) + 1  # +1 for CR
+        time.sleep(tx_bytes / self._bytes_per_second)
 
-        command = command.strip()
+        # Execute command
+        response = self._process_command(cmd)
 
-        # Velocity command: VS,vx,vy
-        if command.startswith("VS"):
-            return self._handle_velocity(command)
-        # Absolute move: PA,x,y (internal format)
-        if command.startswith("PA"):
-            return self._handle_absolute_pa(command)
-        # Absolute move: G x,y (ProScan format)
-        if command.startswith("G ") or command.startswith("G,"):
-            return self._handle_absolute_g(command)
-        # Relative move: GR dx,dy
-        if command.startswith("GR"):
-            return self._handle_relative(command)
-        # Position query
-        if command == "P":
-            return self._handle_position_query()
-        # Firmware version
-        if command == "V":
-            return "Prior ProScan III Simulator v7.1.2"
-        # Set home
-        if command == "Z":
-            return self._handle_set_home()
-        # Max speed
-        if command.startswith("SMS"):
-            return self._handle_set_speed(command)
-        # Acceleration
-        if command.startswith("SAS"):
-            return self._handle_set_acceleration(command)
-        # Jerk (no-op)
-        if command.startswith("SCS"):
-            return "R"
-        # Stop (immediate)
-        if command == "I":
-            return self._handle_stop()
-        # Baud rate (no-op)
-        if command.startswith("BAUD"):
-            return "R"
-        # Stage query
-        if command == "STAGE":
-            return "ProScan III Simulator"
+        # Per-command-type processing delay
+        delay = self._get_processing_time(cmd)
+        time.sleep(delay)
 
-        logger.debug(f"Unknown simulator command: {command}")
+        # Simulate RX time
+        rx_bytes = len(response) + 1  # +1 for CR
+        time.sleep(rx_bytes / self._bytes_per_second)
+
+        return response
+
+    # ══════════════════════════════════════════════════════════════
+    #  COMMAND PROCESSING (shared by both interfaces)
+    # ══════════════════════════════════════════════════════════════
+
+    def _get_processing_time(self, cmd: str) -> float:
+        """Get realistic processing delay for this command type."""
+        upper = cmd.upper().strip()
+        if upper in ("P", "PS") or upper.startswith("P ") or upper.startswith("P,"):
+            return PROCESSING_TIMES["position"]
+        if upper.startswith("VS"):
+            return PROCESSING_TIMES["velocity"]
+        if upper.startswith("G") and not upper.startswith("GR"):
+            return PROCESSING_TIMES["move"]
+        if upper.startswith("GR"):
+            return PROCESSING_TIMES["move"]
+        if upper.startswith("SMS") or upper.startswith("SAS") or upper.startswith("SCS"):
+            return PROCESSING_TIMES["setting"]
+        if upper in ("I", "K"):
+            return PROCESSING_TIMES["stop"]
+        return PROCESSING_TIMES["default"]
+
+    def _process_command(self, cmd: str) -> str:
+        """Parse and execute a ProScan II command. Returns response string."""
+        upper = cmd.upper().strip()
+        if not upper:
+            return self._cmd_P()
+
+        # Position
+        if upper == "P":
+            return self._cmd_P()
+        if upper == "PS":
+            with self._lock:
+                return f"{self.current_x:.1f},{self.current_y:.1f}"
+        if upper.startswith("P ") or upper.startswith("P,"):
+            return self._cmd_P_set(cmd)
+
+        # Movement
+        if upper.startswith("GR"):
+            return self._cmd_GR(cmd)
+        if upper.startswith("GX"):
+            return self._cmd_GX(cmd)
+        if upper.startswith("GY"):
+            return self._cmd_GY(cmd)
+        if upper.startswith("G ") or upper.startswith("G,"):
+            return self._cmd_G(cmd)
+
+        # Velocity
+        if upper.startswith("VS"):
+            return self._cmd_VS(cmd)
+
+        # Settings
+        if upper.startswith("SMS"):
+            return self._cmd_SMS(cmd)
+        if upper.startswith("SAS"):
+            return self._cmd_SAS(cmd)
+        if upper.startswith("SCS"):
+            return self._cmd_SCS(cmd)
+
+        # Home/stop
+        if upper == "Z":
+            return self._cmd_Z()
+        if upper == "I":
+            return self._cmd_I()
+        if upper == "K":
+            return self._cmd_K()
+        if upper == "M":
+            return self._cmd_M()
+
+        # Joystick
+        if upper == "H": return "0"
+        if upper == "J": return "0"
+
+        # Step size
+        if upper == "X":
+            return f"{self._step_x:.0f},{self._step_y:.0f}"
+
+        # Directional
+        for d in ("L", "R", "F", "B"):
+            if upper == d or (upper.startswith(d) and len(upper) > 1 and
+                              upper[1:].strip().lstrip(",").replace("-","").replace(".","").isdigit()):
+                return self._cmd_dir(cmd, d)
+
+        # Info
+        if upper == "V":
+            return "Prior ProScan II Simulator v7.3"
+        if upper == "STAGE":
+            return self._cmd_STAGE()
+        if upper.startswith("$"):
+            with self._lock:
+                moving = abs(self.current_vx) > 0.1 or abs(self.current_vy) > 0.1
+            return "1" if moving else "0"
+
+        # Misc
+        if upper.startswith("COMP"): return "0"
+        if upper.startswith("SS"): return "0"
+        if upper == "O": return str(self._speed_pct)
+        return "0"
+
+    # ── Command implementations ───────────────────────────────────
+
+    @staticmethod
+    def _parse_args(cmd: str, skip: int = 0) -> list[str]:
+        import re
+        raw = cmd[skip:] if skip else cmd
+        return [p for p in re.split(r'[,\s\t=;:]+', raw.strip()) if p]
+
+    def _cmd_P(self) -> str:
+        with self._lock:
+            return f"{self.current_x:.1f},{self.current_y:.1f},0.0"
+
+    def _cmd_P_set(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 1)
+        if len(parts) >= 2:
+            try:
+                with self._lock:
+                    self.current_x = float(parts[0])
+                    self.current_y = float(parts[1])
+                    self.target_x = self.current_x
+                    self.target_y = self.current_y
+                return "0"
+            except ValueError: pass
         return "E"
 
-    # ── Command Handlers ──────────────────────────────────────────
-
-    def _handle_velocity(self, command: str) -> str:
-        """Handle 'VS,vx,vy' velocity command."""
-        parts = command.split(",")
-        if len(parts) != 3:
-            return "E"
+    def _cmd_G(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 1)
+        if len(parts) < 2: return "E"
         try:
-            vx = float(parts[1])
-            vy = float(parts[2])
-        except ValueError:
-            return "E"
-        with self._lock:
-            self.mode = "velocity"
-            self.target_vx = max(-self.max_speed, min(self.max_speed, vx))
-            self.target_vy = max(-self.max_speed, min(self.max_speed, vy))
-        return "R"
-
-    def _handle_absolute_pa(self, command: str) -> str:
-        """Handle 'PA,x,y' absolute move (internal format)."""
-        parts = command.split(",")
-        if len(parts) != 3:
-            return "E"
-        try:
-            x = float(parts[1])
-            y = float(parts[2])
-        except ValueError:
-            return "E"
+            x, y = float(parts[0]), float(parts[1])
+        except ValueError: return "E"
         with self._lock:
             self.mode = "absolute"
-            self.target_x = x
-            self.target_y = y
+            self.target_x = x; self.target_y = y
         return "R"
 
-    def _handle_absolute_g(self, command: str) -> str:
-        """Handle 'G x,y' absolute move (ProScan format)."""
-        # Format: "G x,y" or "G x,y\r"
-        payload = command[2:].strip()
-        parts = payload.split(",")
-        if len(parts) != 2:
-            return "E"
+    def _cmd_GR(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 2)
+        if len(parts) < 2: return "E"
         try:
-            x = float(parts[0])
-            y = float(parts[1])
-        except ValueError:
-            return "E"
+            dx, dy = float(parts[0]), float(parts[1])
+        except ValueError: return "E"
         with self._lock:
             self.mode = "absolute"
-            self.target_x = x
-            self.target_y = y
+            self.target_x = self.current_x + dx
+            self.target_y = self.current_y + dy
         return "R"
 
-    def _handle_relative(self, command: str) -> str:
-        """
-        Handle 'GR dx,dy' relative move.
-
-        CRITICAL FIX: Accumulates offset onto the TARGET position, not the
-        current (moving) position. When rapid GR commands arrive in sequence:
-
-            Old (buggy):  target = current_pos + dx  → loses accumulated offset
-            New (correct): target = target_pos + dx  → properly accumulates
-
-        If already in velocity mode, switches to absolute and uses current
-        position as the base.
-        """
-        payload = command[3:].strip()
-        parts = payload.split(",")
-        if len(parts) != 2:
-            return "E"
-        try:
-            dx = float(parts[0])
-            dy = float(parts[1])
-        except ValueError:
-            return "E"
+    def _cmd_GX(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 2)
+        if not parts: return "E"
+        try: x = float(parts[0])
+        except ValueError: return "E"
         with self._lock:
-            if self.mode == "absolute":
-                # Already moving toward a target — accumulate on the target
-                self.target_x += dx
-                self.target_y += dy
+            self.mode = "absolute"; self.target_x = x
+        return "R"
+
+    def _cmd_GY(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 2)
+        if not parts: return "E"
+        try: y = float(parts[0])
+        except ValueError: return "E"
+        with self._lock:
+            self.mode = "absolute"; self.target_y = y
+        return "R"
+
+    def _cmd_VS(self, cmd: str) -> str:
+        """VS x,y[,u] — velocity. Default µm/s, with ,p = µsteps/s."""
+        parts = self._parse_args(cmd, 2)
+        if len(parts) < 2: return "E"
+        try:
+            vx_raw, vy_raw = float(parts[0]), float(parts[1])
+        except ValueError: return "E"
+        use_usteps = len(parts) >= 3 and parts[2].lower() == "p"
+        with self._lock:
+            if use_usteps:
+                self.target_vx = vx_raw / self._usteps_per_um
+                self.target_vy = vy_raw / self._usteps_per_um
             else:
-                # Was in velocity mode — switch to absolute from current position
-                self.mode = "absolute"
-                self.target_x = self.current_x + dx
-                self.target_y = self.current_y + dy
+                self.target_vx = vx_raw
+                self.target_vy = vy_raw
+            if abs(self.target_vx) < 0.01 and abs(self.target_vy) < 0.01:
+                self.mode = "idle"
+                self.target_vx = self.target_vy = 0.0
+            else:
+                self.mode = "velocity"
         return "R"
 
-    def _handle_position_query(self) -> str:
-        with self._lock:
-            return f"{self.current_x:.2f},{self.current_y:.2f},0.00"
-
-    def _handle_set_home(self) -> str:
-        with self._lock:
-            self.current_x = 0.0
-            self.current_y = 0.0
-            self.target_x = 0.0
-            self.target_y = 0.0
-            self.current_vx = 0.0
-            self.current_vy = 0.0
-            self.target_vx = 0.0
-            self.target_vy = 0.0
-        return "R"
-
-    def _handle_set_speed(self, command: str) -> str:
-        parts = command.split(",")
-        if len(parts) == 2:
+    def _cmd_SMS(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 3)
+        if parts:
             try:
-                self.max_speed = float(parts[1])
-            except ValueError:
-                return "E"
-        return "R"
+                m = max(1, min(100, int(float(parts[0]))))
+                with self._lock:
+                    self._speed_pct = m
+                    self._max_speed = (m / 100.0) * MAX_SPEED_UM_S
+                    self.max_speed = self._max_speed
+                return "0"
+            except ValueError: return "E"
+        return str(self._speed_pct)
 
-    def _handle_set_acceleration(self, command: str) -> str:
-        """Handle 'SAS,accel' acceleration command."""
-        parts = command.split(",")
-        if len(parts) == 2:
+    def _cmd_SAS(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 3)
+        if parts:
             try:
-                self.acceleration_rate = float(parts[1])
-            except ValueError:
-                return "E"
-        return "R"
+                a = max(1, min(100, int(float(parts[0]))))
+                with self._lock:
+                    self._accel_pct = a
+                    self._max_accel = (a / 100.0) * MAX_ACCEL_UM_S2
+                return "0"
+            except ValueError: return "E"
+        return str(self._accel_pct)
 
-    def _handle_stop(self) -> str:
-        """Handle 'I' immediate stop command."""
+    def _cmd_SCS(self, cmd: str) -> str:
+        parts = self._parse_args(cmd, 3)
+        if parts:
+            try:
+                self._scurve_pct = max(1, min(100, int(float(parts[0]))))
+                return "0"
+            except ValueError: return "E"
+        return str(self._scurve_pct)
+
+    def _cmd_dir(self, cmd: str, direction: str) -> str:
+        parts = self._parse_args(cmd, 1)
+        amount = float(parts[0]) if parts else self._step_x
         with self._lock:
-            self.mode = "velocity"
-            self.target_vx = 0.0
-            self.target_vy = 0.0
-            self.current_vx = 0.0
-            self.current_vy = 0.0
+            self.mode = "absolute"
+            if direction == "L": self.target_x = self.current_x - amount
+            elif direction == "R": self.target_x = self.current_x + amount
+            elif direction == "F": self.target_y = self.current_y + amount
+            elif direction == "B": self.target_y = self.current_y - amount
         return "R"
 
-    # ── Position Query (direct, for convenience) ──────────────────
+    def _cmd_Z(self) -> str:
+        with self._lock:
+            self.current_x = self.current_y = 0.0
+            self.target_x = self.target_y = 0.0
+            self.current_vx = self.current_vy = 0.0
+            self.target_vx = self.target_vy = 0.0
+            self.mode = "idle"
+        return "0"
+
+    def _cmd_I(self) -> str:
+        with self._lock:
+            self.mode = "idle"
+            self.target_vx = self.target_vy = 0.0
+        return "R"
+
+    def _cmd_K(self) -> str:
+        with self._lock:
+            self.mode = "idle"
+            self.current_vx = self.current_vy = 0.0
+            self.target_vx = self.target_vy = 0.0
+        return "R"
+
+    def _cmd_M(self) -> str:
+        with self._lock:
+            self.mode = "absolute"
+            self.target_x = self.target_y = 0.0
+        return "R"
+
+    def _cmd_STAGE(self) -> str:
+        return (
+            f"STAGE = {self._stage_name}\n"
+            f"TYPE = 1\n"
+            f"SIZE_X = {self._size_x_mm} MM\n"
+            f"SIZE_Y = {self._size_y_mm} MM\n"
+            f"MICROSTEPS/MICRON = {int(self._usteps_per_um)}\n"
+            f"LIMITS = NORMALLY CLOSED\n"
+            f"END")
+
+    # ── Direct position access ────────────────────────────────────
 
     def get_current_position(self) -> tuple[float, float, float]:
-        """Return (x, y, 0.0) — thread-safe direct access."""
         with self._lock:
             return self.current_x, self.current_y, 0.0
 
     # ── Physics Loop ──────────────────────────────────────────────
 
-    def _ramp_velocity(self, current: float, target: float, dt: float) -> float:
-        """Linear velocity ramp toward target with acceleration limit."""
-        max_change = self.acceleration_rate * dt
-        if current < target:
-            return min(current + max_change, target)
-        elif current > target:
-            return max(current - max_change, target)
-        return current
+    def _ramp(self, current: float, target: float, dt: float) -> float:
+        max_d = self._max_accel * dt
+        diff = target - current
+        return target if abs(diff) <= max_d else current + math.copysign(max_d, diff)
 
     def _update_loop(self) -> None:
-        """Continuous physics update loop."""
         while self._running:
-            start = time.time()
-
+            t0 = time.time()
             with self._lock:
-                dt = start - self._last_update_time
-                self._last_update_time = start
-
-                # Prevent huge dt jumps (e.g., system sleep)
-                dt = min(dt, 0.1)
+                dt = min(t0 - self._last_update_time, 0.05)
+                self._last_update_time = t0
 
                 if self.mode == "absolute":
-                    # Proportional controller toward target position
-                    error_x = self.target_x - self.current_x
-                    error_y = self.target_y - self.current_y
-
-                    # If within settling threshold, snap to target and stop
-                    if abs(error_x) < self.settling_threshold and abs(error_y) < self.settling_threshold:
+                    ex = self.target_x - self.current_x
+                    ey = self.target_y - self.current_y
+                    dist = math.sqrt(ex*ex + ey*ey)
+                    if dist < self._settle:
                         self.current_x = self.target_x
                         self.current_y = self.target_y
-                        self.current_vx = 0.0
-                        self.current_vy = 0.0
+                        self.current_vx = self.current_vy = 0.0
+                        self.mode = "idle"
                     else:
-                        desired_vx = max(-self.max_speed, min(self.max_speed, self.kp * error_x))
-                        desired_vy = max(-self.max_speed, min(self.max_speed, self.kp * error_y))
-
-                        self.current_vx = self._ramp_velocity(self.current_vx, desired_vx, dt)
-                        self.current_vy = self._ramp_velocity(self.current_vy, desired_vy, dt)
-
+                        decel_speed = math.sqrt(2.0 * self._max_accel * dist)
+                        speed_lim = min(self._max_speed, decel_speed)
+                        nx, ny = ex / dist, ey / dist
+                        self.current_vx = self._ramp(self.current_vx, nx * speed_lim, dt)
+                        self.current_vy = self._ramp(self.current_vy, ny * speed_lim, dt)
                         self.current_x += self.current_vx * dt
                         self.current_y += self.current_vy * dt
-                else:
-                    # Velocity mode
-                    desired_vx = self.target_vx
-                    desired_vy = self.target_vy
 
-                    self.current_vx = self._ramp_velocity(self.current_vx, desired_vx, dt)
-                    self.current_vy = self._ramp_velocity(self.current_vy, desired_vy, dt)
-
+                elif self.mode == "velocity":
+                    tvx, tvy = self.target_vx, self.target_vy
+                    mag = math.sqrt(tvx*tvx + tvy*tvy)
+                    if mag > self._max_speed and mag > 0:
+                        s = self._max_speed / mag
+                        tvx *= s; tvy *= s
+                    self.current_vx = self._ramp(self.current_vx, tvx, dt)
+                    self.current_vy = self._ramp(self.current_vy, tvy, dt)
                     self.current_x += self.current_vx * dt
                     self.current_y += self.current_vy * dt
 
-            elapsed = time.time() - start
-            sleep_time = max(0.0, self._update_interval - elapsed)
-            time.sleep(sleep_time)
+                elif self.mode == "idle":
+                    if abs(self.current_vx) > 0.01 or abs(self.current_vy) > 0.01:
+                        self.current_vx = self._ramp(self.current_vx, 0.0, dt)
+                        self.current_vy = self._ramp(self.current_vy, 0.0, dt)
+                        self.current_x += self.current_vx * dt
+                        self.current_y += self.current_vy * dt
+                    else:
+                        self.current_vx = self.current_vy = 0.0
+
+            time.sleep(max(0.0, self._update_interval - (time.time() - t0)))

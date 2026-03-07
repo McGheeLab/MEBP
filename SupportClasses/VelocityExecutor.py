@@ -190,8 +190,9 @@ class VelocityExecutor:
                         zero = getattr(ctrl, 'zero_position', {})
 
                         if xy[0] is not None:
-                            measured_x = xy[0] - zero.get('x', 0)
-                            measured_y = xy[1] - zero.get('y', 0)
+                            # v7.3: Convert µm → mm (waypoints are in mm)
+                            measured_x = (xy[0] - zero.get('x', 0)) / 1000.0
+                            measured_y = (xy[1] - zero.get('y', 0)) / 1000.0
                             last_position_time = t_now
 
                         if zp and zp[0] is not None:
