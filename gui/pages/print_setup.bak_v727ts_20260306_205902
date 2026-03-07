@@ -686,20 +686,6 @@ class PrintSetupPage(QWidget):
         # 5. Get settings from context panel
         settings = self._get_settings()
 
-        # v7.2.7: push speed to workspace
-        # Sync GUI speed to workspace so TrajectoryPlanner uses it
-        try:
-            _ws = getattr(self, "_workspace", None)
-            if _ws is None:
-                _ws = getattr(getattr(self, "tab_objects", None), "_workspace", None)
-            if _ws and hasattr(_ws, "print_settings"):
-                if isinstance(_ws.print_settings, dict):
-                    _ws.print_settings["print_speed_mm_s"] = settings.print_speed_mm_s
-                    _ws.print_settings["travel_speed_mm_s"] = getattr(settings, "travel_speed_mm_s", 10.0)
-                    logger.info(f"Workspace speed synced: {settings.print_speed_mm_s:.1f} mm/s")
-        except Exception as _e:
-            logger.debug(f"Workspace speed sync: {_e}")
-
         # 6. Get pump/flow info
         pump = getattr(settings, 'active_pump', 'P1') or 'P1'
         flow_rate = getattr(settings, 'flow_rate', 0.01) or 0.01
@@ -912,77 +898,6 @@ class PrintSetupPage(QWidget):
         if plan is not None and plate is not None:
             try:
                 from SupportClasses.PrintTrajectoryPlanner import plan_to_trajectory
-                # v7.2.7: rescale trajectory speed
-                # Object trajectories were time-parameterized at object creation
-                # speed (default 5mm/s). Rescale timestamps to match GUI speed.
-                _gui_speed = getattr(settings, "print_speed_mm_s", 5.0)
-                if _gui_speed > 0 and _gui_speed != 5.0:
-                    try:
-                        _objects_tab = getattr(self, "tab_objects", None)
-                        if _objects_tab:
-                            _objs = getattr(_objects_tab, "_objects", [])
-                            for _odata in _objs:
-                                _obj = _odata if not isinstance(_odata, dict) else None
-                                if _obj is None and isinstance(_odata, dict):
-                                    _obj = _odata.get("_print_object")
-                                if _obj and hasattr(_obj, "trajectory") and _obj.trajectory is not None:
-                                    import numpy as _np
-                                    _traj = _obj.trajectory
-                                    if len(_traj) > 1:
-                                        # Compute what speed the trajectory was generated at
-                                        _dx = _np.diff(_traj[:, 0])
-                                        _dy = _np.diff(_traj[:, 1])
-                                        _dt = _np.diff(_traj[:, 6])
-                                        _dt_safe = _np.maximum(_dt, 1e-9)
-                                        _dists = _np.sqrt(_dx**2 + _dy**2)
-                                        _speeds = _dists / _dt_safe
-                                        _mask = _dists > 0.001
-                                        if _np.any(_mask):
-                                            _orig_speed = float(_np.median(_speeds[_mask]))
-                                            if _orig_speed > 0.1:
-                                                _scale = _orig_speed / _gui_speed
-                                                _traj[:, 6] *= _scale
-                                                logger.info(f"Rescaled trajectory: "
-                                                           f"{_orig_speed:.1f} -> {_gui_speed:.1f} mm/s "
-                                                           f"(scale={_scale:.3f})")
-                    except Exception as _e:
-                        logger.warning(f"Trajectory speed rescale failed: {_e}")
-
-                # v7.2.7: sync all speeds to workspace
-
-                try:
-
-                    _ws = getattr(self, "_workspace", None)
-
-                    if _ws is None:
-
-                        _ws = getattr(getattr(self, "tab_objects", None), "_workspace", None)
-
-                    if _ws and hasattr(_ws, "print_settings") and isinstance(_ws.print_settings, dict):
-
-                        _gui_spd = getattr(settings, "print_speed_mm_s", 5.0)
-
-                        _gui_travel = getattr(settings, "travel_speed_mm_s", _gui_spd * 2)
-
-                        _gui_z = getattr(settings, "z_feedrate", 60.0)
-
-                        _ws.print_settings["print_speed_mm_s"] = _gui_spd
-
-                        _ws.print_settings["travel_speed_mm_s"] = _gui_travel
-
-                        _ws.print_settings["z_feed_rate_mm_s"] = _gui_z if _gui_z < 20 else _gui_z / 60.0
-
-                        _ws.print_settings["travel_z_mm"] = getattr(settings, "travel_z_height", 5.0)
-
-                        logger.info(f"Workspace synced: print={_gui_spd:.1f}, "
-
-                                   f"travel={_gui_travel:.1f}, z={_ws.print_settings['z_feed_rate_mm_s']:.1f} mm/s")
-
-                except Exception as _e:
-
-                    logger.debug(f"Workspace speed sync: {_e}")
-
-
                 trajectory_result = plan_to_trajectory(
                     plan=plan, well_model=model, plate=plate,
                     path_points=path_points, settings=settings, hw_config=hw)

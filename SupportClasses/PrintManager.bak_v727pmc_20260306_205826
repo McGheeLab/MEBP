@@ -711,12 +711,8 @@ class TrajectoryExecutor:
                     _spd = math.sqrt(_dx*_dx + _dy*_dy) / _dt_wp
                     _max_spd = max(_max_spd, _spd)
             if _max_spd > 0 and hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
-                # v7.2.7: use set_speed_mm_s for trajectory
-                if hasattr(ctrl.xy_stage, "set_speed_mm_s"):
-                    ctrl.xy_stage.set_speed_mm_s(_max_spd * 1.5)
-                else:
-                    _sms_val = int(min(_max_spd * 1.5 * 1000.0, 50000))
-                    ctrl.xy_stage.set_velocity(_sms_val)
+                _sms_val = int(min(_max_spd * 1.5 * 1000.0, 50000))
+                ctrl.xy_stage.set_velocity(_sms_val)
                 logger.info(f"v7.2.7: Trajectory speed {_max_spd:.1f} mm/s, SMS={_sms_val}")
         except Exception as _e:
             logger.warning(f"v7.2.7: Could not set trajectory speed: {_e}")
@@ -1404,13 +1400,7 @@ class PrintManager:
             _tspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
                 try:
-                    if hasattr(ctrl.xy_stage, "set_speed_mm_s"):
-
-                        ctrl.xy_stage.set_speed_mm_s(_tspd)
-
-                    else:
-
-                        ctrl.xy_stage.set_velocity(max(1, min(100, int(_tspd * 1000 / 50000 * 100))))
+                    ctrl.xy_stage.set_velocity(int(min(_tspd * 1000, 50000)))
                 except Exception:
                     pass
             ctrl.move_xy_absolute(x, y, from_zero_ref=True)
@@ -1481,13 +1471,7 @@ class PrintManager:
             _hspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
                 try:
-                    if hasattr(ctrl.xy_stage, "set_speed_mm_s"):
-
-                        ctrl.xy_stage.set_speed_mm_s(_hspd)
-
-                    else:
-
-                        ctrl.xy_stage.set_velocity(max(1, min(100, int(_hspd * 1000 / 50000 * 100))))
+                    ctrl.xy_stage.set_velocity(int(min(_hspd * 1000, 50000)))
                 except Exception:
                     pass
             ctrl.move_xy_absolute(0, 0, from_zero_ref=True)
@@ -1663,23 +1647,31 @@ class PrintManager:
             logger.warning(f"Failed to stop recording: {e}")
 
     def _set_xy_speed_for_print(self, speed_mm_s: float = 0):
-        """v7.2.7: use set_speed_mm_s — Set Prior XY stage speed before print."""
+        """v7.2.7: Set Prior XY stage max speed before print execution.
+
+        Converts mm/s to the stage's native speed parameter and sends SMS.
+        Must be called before any print path or trajectory execution.
+        """
         settings = self.job.settings if self.job else None
         if speed_mm_s <= 0 and settings:
             speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
         if speed_mm_s <= 0 and settings:
             speed_mm_s = max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
         if speed_mm_s <= 0:
-            speed_mm_s = 5.0
+            speed_mm_s = 5.0  # safe default
+
         ctrl = self.controller
         if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
-            if hasattr(ctrl.xy_stage, 'set_speed_mm_s'):
-                ctrl.xy_stage.set_speed_mm_s(speed_mm_s)
-            else:
-                pct = max(1, min(100, int(speed_mm_s * 1000 / 50000 * 100)))
-                ctrl.xy_stage.set_velocity(pct)
-            logger.info(f"Print speed set: {speed_mm_s:.1f} mm/s")
-
+            # Prior SMS expects speed in µm/s (stage native units)
+            speed_um_s = speed_mm_s * 1000.0
+            # Add 50% headroom so stage can reach target before next command
+            target = int(min(speed_um_s * 1.5, 50000))
+            try:
+                ctrl.xy_stage.set_velocity(target)
+                logger.info(f"v7.2.7: Set XY speed: {speed_mm_s:.1f} mm/s "
+                           f"→ SMS {target} µm/s (with 50% headroom)")
+            except Exception as e:
+                logger.warning(f"Failed to set XY speed: {e}")
 
     def _execute_print_path(self, cmd: PrintCommand):
         """

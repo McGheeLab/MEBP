@@ -921,7 +921,7 @@ class CalibrationPage(QWidget):
         if ctrl.is_xy_connected:
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
                 try:
-                    ctrl.xy_stage.set_speed_mm_s(10.0) if hasattr(ctrl.xy_stage, 'set_speed_mm_s') else ctrl.xy_stage.set_velocity(20)  # 20% ≈ 10mm/s
+                    ctrl.xy_stage.set_velocity(int(min(10000, 50000)))
                 except Exception:
                     pass
             ctrl.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)

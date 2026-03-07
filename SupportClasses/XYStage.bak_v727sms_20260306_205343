@@ -476,47 +476,13 @@ class XYStageManager:
     # ── Stage Settings (P8.19, P8.20) ────────────────────────────
 
     def set_velocity(self, velocity: int) -> None:
-        """v7.2.7: SMS percentage — Set max stage velocity.
-
-        The Prior SMS command takes a percentage (1-100), not µm/s.
-        If the caller passes a value > 100, we assume it's µm/s and convert.
-        If <= 100, we assume it's already a percentage.
-
-        For explicit mm/s control, use set_speed_mm_s() instead.
-        """
-        if velocity > 100:
-            # Caller sent µm/s — convert to percentage
-            max_speed = getattr(self, '_protocol_max_speed_um_s', 50000)
-            pct = max(1, min(100, int(velocity / max_speed * 100)))
-            logger.debug(f"set_velocity: {velocity} µm/s → SMS {pct}%")
-        else:
-            pct = max(1, min(100, int(velocity)))
+        """Set maximum stage velocity (1–max)."""
+        velocity = max(0, min(self.max_speed, velocity))
         self._send_protocol_command(
             "set_max_speed",
-            fallback_cmd=f"SMS,{pct}",
-            speed=pct,
+            fallback_cmd=f"SMS,{int(velocity)}",
+            speed=int(velocity),
         )
-
-    def set_speed_mm_s(self, speed_mm_s: float) -> None:
-        """v7.2.7: Set stage speed in mm/s — converts to SMS percentage.
-
-        This is the preferred method for all print/calibration code.
-        Handles the full conversion: mm/s → µm/s → percentage of max.
-
-        Args:
-            speed_mm_s: Desired speed in mm/s (e.g., 1.0, 5.0, 50.0)
-        """
-        max_speed_um_s = getattr(self, '_protocol_max_speed_um_s', 50000)
-        speed_um_s = speed_mm_s * 1000.0
-        pct = max(1, min(100, int(speed_um_s / max_speed_um_s * 100)))
-        logger.info(f"set_speed_mm_s: {speed_mm_s:.1f} mm/s = {speed_um_s:.0f} µm/s "
-                    f"= SMS {pct}% (max={max_speed_um_s} µm/s)")
-        self._send_protocol_command(
-            "set_max_speed",
-            fallback_cmd=f"SMS,{pct}",
-            speed=pct,
-        )
-
 
     def set_acceleration(self, acceleration: int) -> None:
         """Set stage acceleration (min–max)."""

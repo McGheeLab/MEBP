@@ -948,41 +948,6 @@ class PrintSetupPage(QWidget):
                     except Exception as _e:
                         logger.warning(f"Trajectory speed rescale failed: {_e}")
 
-                # v7.2.7: sync all speeds to workspace
-
-                try:
-
-                    _ws = getattr(self, "_workspace", None)
-
-                    if _ws is None:
-
-                        _ws = getattr(getattr(self, "tab_objects", None), "_workspace", None)
-
-                    if _ws and hasattr(_ws, "print_settings") and isinstance(_ws.print_settings, dict):
-
-                        _gui_spd = getattr(settings, "print_speed_mm_s", 5.0)
-
-                        _gui_travel = getattr(settings, "travel_speed_mm_s", _gui_spd * 2)
-
-                        _gui_z = getattr(settings, "z_feedrate", 60.0)
-
-                        _ws.print_settings["print_speed_mm_s"] = _gui_spd
-
-                        _ws.print_settings["travel_speed_mm_s"] = _gui_travel
-
-                        _ws.print_settings["z_feed_rate_mm_s"] = _gui_z if _gui_z < 20 else _gui_z / 60.0
-
-                        _ws.print_settings["travel_z_mm"] = getattr(settings, "travel_z_height", 5.0)
-
-                        logger.info(f"Workspace synced: print={_gui_spd:.1f}, "
-
-                                   f"travel={_gui_travel:.1f}, z={_ws.print_settings['z_feed_rate_mm_s']:.1f} mm/s")
-
-                except Exception as _e:
-
-                    logger.debug(f"Workspace speed sync: {_e}")
-
-
                 trajectory_result = plan_to_trajectory(
                     plan=plan, well_model=model, plate=plate,
                     path_points=path_points, settings=settings, hw_config=hw)

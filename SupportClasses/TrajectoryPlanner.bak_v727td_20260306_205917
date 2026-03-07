@@ -328,7 +328,7 @@ def create_travel_move(
     current_z: float,
     t_start: float,
     z_speed_mm_s: float = 2.0,
-    xy_speed_mm_s: float = 50.0,
+    xy_speed_mm_s: float = 20.0,
     pump_positions: tuple[float, float, float] = (0, 0, 0),
 ) -> np.ndarray:
     """
@@ -579,10 +579,6 @@ class TrajectoryPlanner:
 
         travel_z = self._settings.get("travel_z_mm", 5.0)
         z_speed = self._settings.get("z_feed_rate_mm_s", 2.0)
-        # v7.2.7: XY travel speed from workspace settings
-        xy_travel_speed = self._settings.get("travel_speed_mm_s",
-                            self._settings.get("xy_travel_speed_mm_s", 50.0))
-
         retract_uL = self._settings.get("retract_distance_uL", 0.5)
         prime_uL = self._settings.get("prime_distance_uL", 0.5)
         retract_speed = self._settings.get("retract_speed_uL_s", 2.0)
@@ -625,7 +621,6 @@ class TrajectoryPlanner:
                 current_z=prev_z,
                 t_start=t_current,
                 z_speed_mm_s=z_speed,
-                xy_speed_mm_s=xy_travel_speed,
                 pump_positions=tuple(p_start),
             )
             if len(travel) > 0:

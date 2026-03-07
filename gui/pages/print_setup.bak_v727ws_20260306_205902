@@ -686,20 +686,6 @@ class PrintSetupPage(QWidget):
         # 5. Get settings from context panel
         settings = self._get_settings()
 
-        # v7.2.7: push speed to workspace
-        # Sync GUI speed to workspace so TrajectoryPlanner uses it
-        try:
-            _ws = getattr(self, "_workspace", None)
-            if _ws is None:
-                _ws = getattr(getattr(self, "tab_objects", None), "_workspace", None)
-            if _ws and hasattr(_ws, "print_settings"):
-                if isinstance(_ws.print_settings, dict):
-                    _ws.print_settings["print_speed_mm_s"] = settings.print_speed_mm_s
-                    _ws.print_settings["travel_speed_mm_s"] = getattr(settings, "travel_speed_mm_s", 10.0)
-                    logger.info(f"Workspace speed synced: {settings.print_speed_mm_s:.1f} mm/s")
-        except Exception as _e:
-            logger.debug(f"Workspace speed sync: {_e}")
-
         # 6. Get pump/flow info
         pump = getattr(settings, 'active_pump', 'P1') or 'P1'
         flow_rate = getattr(settings, 'flow_rate', 0.01) or 0.01
@@ -947,41 +933,6 @@ class PrintSetupPage(QWidget):
                                                            f"(scale={_scale:.3f})")
                     except Exception as _e:
                         logger.warning(f"Trajectory speed rescale failed: {_e}")
-
-                # v7.2.7: sync all speeds to workspace
-
-                try:
-
-                    _ws = getattr(self, "_workspace", None)
-
-                    if _ws is None:
-
-                        _ws = getattr(getattr(self, "tab_objects", None), "_workspace", None)
-
-                    if _ws and hasattr(_ws, "print_settings") and isinstance(_ws.print_settings, dict):
-
-                        _gui_spd = getattr(settings, "print_speed_mm_s", 5.0)
-
-                        _gui_travel = getattr(settings, "travel_speed_mm_s", _gui_spd * 2)
-
-                        _gui_z = getattr(settings, "z_feedrate", 60.0)
-
-                        _ws.print_settings["print_speed_mm_s"] = _gui_spd
-
-                        _ws.print_settings["travel_speed_mm_s"] = _gui_travel
-
-                        _ws.print_settings["z_feed_rate_mm_s"] = _gui_z if _gui_z < 20 else _gui_z / 60.0
-
-                        _ws.print_settings["travel_z_mm"] = getattr(settings, "travel_z_height", 5.0)
-
-                        logger.info(f"Workspace synced: print={_gui_spd:.1f}, "
-
-                                   f"travel={_gui_travel:.1f}, z={_ws.print_settings['z_feed_rate_mm_s']:.1f} mm/s")
-
-                except Exception as _e:
-
-                    logger.debug(f"Workspace speed sync: {_e}")
-
 
                 trajectory_result = plan_to_trajectory(
                     plan=plan, well_model=model, plate=plate,

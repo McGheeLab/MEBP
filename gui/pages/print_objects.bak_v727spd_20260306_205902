@@ -1603,17 +1603,6 @@ class PrintObjectsTab(QWidget):
         needle = None
         syringe_map = {}
         speed = 5.0
-        # v7.2.7: fallback speed from parent
-        # Try to get speed from parent PrintSetup page's GUI
-        try:
-            _parent = self.parent()
-            while _parent is not None:
-                if hasattr(_parent, "xy_feed_spin"):
-                    speed = _parent.xy_feed_spin.value()
-                    break
-                _parent = _parent.parent() if hasattr(_parent, "parent") else None
-        except Exception:
-            pass
         layer_h = 0.2
 
         if self._workspace:
