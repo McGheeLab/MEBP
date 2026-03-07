@@ -147,6 +147,10 @@ class PrintSettings:
 
     # v7.2: µL-based pump settings
     pump_rate_uL_s: float = 0.25         # Default pump flow rate (µL/s)
+    # v7.2.7: print_speed_mm_s — explicit mm/s speed from GUI
+    print_speed_mm_s: float = 5.0        # XY speed during printing (mm/s)
+    travel_speed_mm_s: float = 10.0       # XY speed during travel (mm/s)
+
     retract_amounts_uL: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
     prime_amounts_uL: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
     pump_rates_uL_s: dict = field(default_factory=lambda: {"P1": 0.25, "P2": 0.25, "P3": 0.25})
@@ -175,7 +179,27 @@ class PrintSettings:
         """Create from dictionary, ignoring unknown keys."""
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in d.items() if k in valid_keys}
-        return cls(**filtered)
+        instance = cls(**filtered)
+
+        # v7.2.7: infer mm/s from legacy print_feedrate if not set
+
+        if getattr(instance, 'print_speed_mm_s', 0) <= 0 and instance.print_feedrate > 0:
+
+            instance.print_speed_mm_s = instance.print_feedrate / 60.0
+
+        if getattr(instance, 'travel_speed_mm_s', 0) <= 0 and instance.xy_feedrate > 0:
+
+            # xy_feedrate could be mm/s (new GUI) or old stage-units/s
+
+            if instance.xy_feedrate < 100:  # likely mm/s
+
+                instance.travel_speed_mm_s = instance.xy_feedrate
+
+            else:  # likely legacy stage units
+
+                instance.travel_speed_mm_s = instance.xy_feedrate / 1000.0
+
+        return instance
 
     def get_retract_amount(self, pump: str) -> float:
         """Get retract amount for a specific pump (falls back to global)."""
@@ -676,6 +700,28 @@ class TrajectoryExecutor:
         logger.info(f"TrajectoryExecutor: starting {total} waypoints, "
                      f"duration={waypoints[-1].t:.2f}s")
 
+        # v7.2.7: Set stage speed for trajectory
+        try:
+            _max_spd = 0.0
+            for _j in range(1, min(len(waypoints), 100)):
+                _dt_wp = waypoints[_j].t - waypoints[_j-1].t
+                if _dt_wp > 1e-6:
+                    _dx = waypoints[_j].x - waypoints[_j-1].x
+                    _dy = waypoints[_j].y - waypoints[_j-1].y
+                    _spd = math.sqrt(_dx*_dx + _dy*_dy) / _dt_wp
+                    _max_spd = max(_max_spd, _spd)
+            if _max_spd > 0 and hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+                _sms_val = int(min(_max_spd * 1.5 * 1000.0, 50000))
+                ctrl.xy_stage.set_velocity(_sms_val)
+                logger.info(f"v7.2.7: Trajectory speed {_max_spd:.1f} mm/s, SMS={_sms_val}")
+        except Exception as _e:
+            logger.warning(f"v7.2.7: Could not set trajectory speed: {_e}")
+
+        # v7.2.7: Track previous axis values to skip unchanged commands
+        _prev_z = None
+        _prev_pumps = [None, None, None]
+
+
         for i, wp in enumerate(waypoints):
             # Check abort
             if self._abort_flag.is_set():
@@ -701,7 +747,13 @@ class TrajectoryExecutor:
 
             # Z axis
             if ctrl.is_zp_connected:
-                ctrl.move_z_absolute(wp.z, from_zero_ref=True)
+                # v7.2.7: skip Z if unchanged
+
+                if _prev_z is None or abs(wp.z - _prev_z) > 0.001:
+
+                    ctrl.move_z_absolute(wp.z, from_zero_ref=True)
+
+                    _prev_z = wp.z
 
             # Pumps (move to absolute plunger position)
             if ctrl.is_zp_connected and ctrl.zp_stage:
@@ -1344,6 +1396,13 @@ class PrintManager:
 
         elif cmd.type == CommandType.MOVE_XY:
             x, y = p.get("x", 0), p.get("y", 0)
+            # v7.2.7: Set travel speed before XY move
+            _tspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
+            if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+                try:
+                    ctrl.xy_stage.set_velocity(int(min(_tspd * 1000, 50000)))
+                except Exception:
+                    pass
             ctrl.move_xy_absolute(x, y, from_zero_ref=True)
             self._wait_for_xy_settle(x, y, timeout=10.0)
 
@@ -1408,6 +1467,13 @@ class PrintManager:
             time.sleep(0.3)
 
         elif cmd.type == CommandType.HOME_XY:
+            # v7.2.7: Set travel speed before HOME_XY
+            _hspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
+            if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+                try:
+                    ctrl.xy_stage.set_velocity(int(min(_hspd * 1000, 50000)))
+                except Exception:
+                    pass
             ctrl.move_xy_absolute(0, 0, from_zero_ref=True)
             self._wait_for_xy_settle(0, 0, timeout=15.0)
 
@@ -1580,6 +1646,33 @@ class PrintManager:
         except Exception as e:
             logger.warning(f"Failed to stop recording: {e}")
 
+    def _set_xy_speed_for_print(self, speed_mm_s: float = 0):
+        """v7.2.7: Set Prior XY stage max speed before print execution.
+
+        Converts mm/s to the stage's native speed parameter and sends SMS.
+        Must be called before any print path or trajectory execution.
+        """
+        settings = self.job.settings if self.job else None
+        if speed_mm_s <= 0 and settings:
+            speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
+        if speed_mm_s <= 0 and settings:
+            speed_mm_s = max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+        if speed_mm_s <= 0:
+            speed_mm_s = 5.0  # safe default
+
+        ctrl = self.controller
+        if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+            # Prior SMS expects speed in µm/s (stage native units)
+            speed_um_s = speed_mm_s * 1000.0
+            # Add 50% headroom so stage can reach target before next command
+            target = int(min(speed_um_s * 1.5, 50000))
+            try:
+                ctrl.xy_stage.set_velocity(target)
+                logger.info(f"v7.2.7: Set XY speed: {speed_mm_s:.1f} mm/s "
+                           f"→ SMS {target} µm/s (with 50% headroom)")
+            except Exception as e:
+                logger.warning(f"Failed to set XY speed: {e}")
+
     def _execute_print_path(self, cmd: PrintCommand):
         """
         Execute a coordinated print path: move XY while extruding.
@@ -1595,6 +1688,9 @@ class PrintManager:
 
         if len(points) < 2:
             return
+
+        # v7.2.7: Set stage speed before print path
+        self._set_xy_speed_for_print()
 
         # Move to start of path
         start_x, start_y = points[0][0], points[0][1]
@@ -1616,8 +1712,11 @@ class PrintManager:
             # v7.2: Extrude using µL/s flow rate or legacy ratio
             if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0:
                 # Calculate volume from flow rate × segment time
-                xy_speed = max(settings.print_feedrate, 1.0)
-                seg_time = seg_length / (xy_speed / 60.0) if xy_speed > 0 else 0
+                # v7.2.7: Use mm/s for extrusion timing
+                _ext_speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
+                if _ext_speed_mm_s <= 0:
+                    _ext_speed_mm_s = max(settings.print_feedrate, 1.0) / 60.0
+                seg_time = seg_length / max(_ext_speed_mm_s, 0.01) if xy_speed > 0 else 0
                 volume_uL = flow_rate_uL_s * seg_time
                 if volume_uL > 0.001 and hasattr(ctrl, 'move_pump_uL'):
                     ctrl.move_pump_uL(pump, volume_uL, flow_rate_uL_s)
@@ -1641,44 +1740,44 @@ class PrintManager:
 
             # Move XY
             ctrl.move_xy_absolute(x2, y2, from_zero_ref=True)
-            move_time = seg_length / max(settings.print_feedrate, 1) * 60
+            # v7.2.7: speed_mm_s — use explicit mm/s, fallback to legacy mm/min
+            _speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
+            if _speed_mm_s <= 0:
+                _speed_mm_s = max(settings.print_feedrate, 1) / 60.0
+            move_time = seg_length / max(_speed_mm_s, 0.01)
             time.sleep(max(move_time, 0.05))
 
-    def _wait_for_xy_settle(self, target_x, target_y, timeout=10.0, tolerance=50):
+    def _wait_for_xy_settle(self, target_x, target_y, timeout=3.0, tolerance=50):
         """
         Wait for XY stage to reach target position.
-        Falls back to a fixed delay if position can't be read.
+
+        v7.2.7: mm-based settle — shorter timeout, better logging.
+        target_x/y are in mm (zero-ref). tolerance in µm.
         """
-        if not self.controller.is_xy_connected:
-            time.sleep(0.5)
+        ctrl = self.controller
+        if not hasattr(ctrl, 'xy_stage') or not ctrl.xy_stage:
+            time.sleep(0.1)
             return
 
-        machine_x = target_x + self.controller.zero_position["x"]
-        machine_y = target_y + self.controller.zero_position["y"]
+        # Convert target mm → µm for comparison with stage position
+        target_x_um = target_x * 1000.0 + ctrl.zero_position.get("x", 0)
+        target_y_um = target_y * 1000.0 + ctrl.zero_position.get("y", 0)
 
-        start = time.time()
-        while time.time() - start < timeout:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
             if self._abort_flag.is_set():
                 return
+            pos = ctrl.get_xy_position(cached=False)
+            if pos[0] is not None:
+                dx = abs(pos[0] - target_x_um)
+                dy = abs(pos[1] - target_y_um)
+                if dx < tolerance and dy < tolerance:
+                    return
+            time.sleep(0.05)
 
-            try:
-                pos = self.controller.get_xy_position()
-                if pos[0] is not None:
-                    dx = abs(pos[0] - machine_x)
-                    dy = abs(pos[1] - machine_y)
-                    if dx < tolerance and dy < tolerance:
-                        return
-            except Exception:
-                pass
+        logger.debug(f"v7.2.7: Settle timeout after {timeout}s "
+                     f"(target={target_x:.2f},{target_y:.2f}mm)")
 
-            time.sleep(0.1)
-
-        logger.warning(f"XY settle timeout after {timeout}s")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Print Queue (Session 4, Task 6)
-# ═══════════════════════════════════════════════════════════════════
 
 class PrintQueue:
     """

@@ -291,21 +291,6 @@ class CalibrationPage(QWidget):
         self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
         self._hardware_config = None  # v7.2: HardwareConfig
 
-        # v7.2.7-hotfix: ensure all calibration attrs
-
-        for _a in ['_safe_z','_top_z','_taught_a1_z','_taught_corner_z',
-
-                  '_taught_third','_taught_third_z','_third_well',
-
-                  '_z_plane_result']:
-
-            if not hasattr(self, _a): setattr(self, _a, None)
-
-        if not hasattr(self, '_z_buffer_mm'): self._z_buffer_mm = 0.5
-
-        if not hasattr(self, '_corner_well'): self._corner_well = 'H12'
-
-
         self._setup_ui()
 
     def get_page_title(self) -> str:
@@ -902,69 +887,64 @@ class CalibrationPage(QWidget):
     # ── Step 1: Zero Needle ──────────────────────────────────────
 
     def _safe_navigate_to(self, target_x_um, target_y_um, target_z_mm=None):
-        """v7.2.7-hotfix: safe_navigate — raise Z, wait, fast XY, lower Z."""
-        import time
-        ctrl = self.controller
-        safe_z = getattr(self, '_safe_z', None) or 0.0
+        """v7.2.7: Safe travel — raise Z, fast XY move, lower Z.
 
-        # Step 1: Raise to safe Z and wait
+        Pattern:
+          1. Raise to Safe Z (or zero if not set)
+          2. Fast XY travel to target
+          3. Lower to target_z or (Top Z - buffer)
+        """
+        ctrl = self.controller
+        safe_z = self._safe_z if self._safe_z is not None else 0.0
+
+        # Step 1: Raise to safe Z
         if ctrl.is_zp_connected:
             ctrl.move_z_absolute(safe_z, from_zero_ref=True)
-            for _ in range(30):
-                time.sleep(0.1)
-                zp = ctrl.get_zp_position(cached=False)
-                if zp and zp[0] is not None:
-                    if abs(zp[0] - ctrl.zero_position.get("Z", 0) - safe_z) < 0.1:
-                        break
+            import time; time.sleep(0.5)
 
-        # Step 2: Fast XY travel
-        if ctrl.is_xy_connected:
-            if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
-                try:
-                    ctrl.xy_stage.set_velocity(int(min(10000, 50000)))
-                except Exception:
-                    pass
+        # Step 2: Set fast XY speed and travel
+        if ctrl.is_xy_connected and hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+            try:
+                ctrl.xy_stage.set_velocity(int(min(10000, 50000)))
+            except Exception:
+                pass
+            # target is absolute µm — use from_zero_ref=False
             ctrl.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
-            for _ in range(40):
-                time.sleep(0.1)
-                xy = ctrl.get_xy_position(cached=False)
-                if xy[0] is not None:
-                    if abs(xy[0] - target_x_um) < 50 and abs(xy[1] - target_y_um) < 50:
-                        break
+            # Wait for settle
+            import time
+            time.sleep(1.0)
 
         # Step 3: Lower Z
         if target_z_mm is not None and ctrl.is_zp_connected:
             ctrl.move_z_absolute(target_z_mm, from_zero_ref=True)
-        elif getattr(self, '_top_z', None) is not None and ctrl.is_zp_connected:
-            ctrl.move_z_absolute(self._top_z + getattr(self, '_z_buffer_mm', 0.5),
-                                 from_zero_ref=True)
+        elif self._top_z is not None and ctrl.is_zp_connected:
+            approach_z = self._top_z + self._z_buffer_mm
+            ctrl.move_z_absolute(approach_z, from_zero_ref=True)
 
         logger.info(f"Safe navigate to ({target_x_um:.0f}, {target_y_um:.0f}) µm")
 
-
     def _estimate_well_position_um(self, well_name):
-        """v7.2.7-hotfix: estimate absolute stage pos for a well from A1 + plate."""
+        """v7.2.7: Estimate absolute stage position for a well from A1 + plate geometry.
+
+        Returns (x_um, y_um) or None if A1 not taught.
+        """
         if self._taught_a1 is None or self._plate is None:
             return None
         try:
-            wx, wy = self._plate.get_well_position(well_name)
-            a1x, a1y = self._plate.get_well_position("A1")
-            dx_mm = (wx - a1x) * getattr(self, '_scale', 1.0)
-            dy_mm = (wy - a1y) * getattr(self, '_scale', 1.0)
-            rot = getattr(self, '_rotation', 0)
-            if abs(rot) > 0.001:
-                rad = math.radians(rot)
-                dx_mm, dy_mm = (dx_mm*math.cos(rad) - dy_mm*math.sin(rad),
-                                dx_mm*math.sin(rad) + dy_mm*math.cos(rad))
-            tx = self._taught_a1[0] + dx_mm * 1000.0
-            ty = self._taught_a1[1] + dy_mm * 1000.0
-            logger.info(f"Est {well_name}: offset ({dx_mm:.2f},{dy_mm:.2f})mm "
-                        f"-> ({tx:.0f},{ty:.0f})µm")
-            return (tx, ty)
-        except Exception as e:
-            logger.warning(f"Cannot estimate {well_name}: {e}")
+            # Plate gives well position in mm relative to A1
+            rel_x_mm, rel_y_mm = self._plate.get_well_position(well_name)
+            # A1 position in mm relative to A1 is (0, 0)
+            a1_rel_x, a1_rel_y = self._plate.get_well_position("A1")
+            # Offset from A1 in mm
+            dx_mm = rel_x_mm - a1_rel_x
+            dy_mm = rel_y_mm - a1_rel_y
+            # Convert to µm and add to taught A1 absolute position
+            target_x = self._taught_a1[0] + dx_mm * 1000.0
+            target_y = self._taught_a1[1] + dy_mm * 1000.0
+            return (target_x, target_y)
+        except (KeyError, TypeError) as e:
+            logger.warning(f"Cannot estimate position for {well_name}: {e}")
             return None
-
 
     def _pick_third_well(self):
         """v7.2.7: Choose a third teach point that maximizes triangle area.
@@ -1117,35 +1097,38 @@ class CalibrationPage(QWidget):
         self._try_fit_z_plane()
 
     def _try_fit_z_plane(self):
-        """v7.2.7-hotfix: try_fit — Z-plane fit with 3 points."""
+        """v7.2.7: Attempt Z-plane fit if 3 points available."""
         points = []
-        if getattr(self, '_taught_a1', None) and getattr(self, '_taught_a1_z', None) is not None:
+        if self._taught_a1 is not None and self._taught_a1_z is not None:
             points.append(("A1", self._taught_a1_z))
-        if getattr(self, '_taught_corner', None) and getattr(self, '_taught_corner_z', None) is not None:
-            points.append((getattr(self, '_corner_well', 'corner'), self._taught_corner_z))
-        if getattr(self, '_taught_third', None) and getattr(self, '_taught_third_z', None) is not None:
-            points.append((getattr(self, '_third_well', '3rd'), self._taught_third_z))
+        if self._taught_corner is not None and self._taught_corner_z is not None:
+            points.append((self._corner_well, self._taught_corner_z))
+        if self._taught_third is not None and self._taught_third_z is not None:
+            points.append((self._third_well or "3rd", self._taught_third_z))
+
         if len(points) < 3:
             if hasattr(self, 'lbl_zplane'):
                 self.lbl_zplane.setText(f"{len(points)}/3 points — need {3-len(points)} more")
             return
+
         try:
             from SupportClasses.WellSetup import WellBottomDetector
-            det = WellBottomDetector(self._plate)
+            detector = WellBottomDetector(self._plate)
             for name, z in points:
-                det.add_point(name, z)
-            result = det.fit_plane()
+                detector.add_point(name, z)
+            result = detector.fit_plane()
             if result:
                 self._z_plane_result = result
                 if hasattr(self, 'lbl_zplane'):
-                    self.lbl_zplane.setText(f"Z plane: {result.describe()}")
+                    self.lbl_zplane.setText(
+                        f"Z plane: {result.describe()}")
                     self.lbl_zplane.setStyleSheet(f"color: {COLORS['green']};")
-                logger.info(f"Z plane: {result.describe()}")
+                logger.info(f"Z plane fitted: {result.describe()}")
         except Exception as e:
             logger.error(f"Z plane fit failed: {e}")
             if hasattr(self, 'lbl_zplane'):
                 self.lbl_zplane.setText(f"Fit failed: {e}")
-
+                self.lbl_zplane.setStyleSheet(f"color: {COLORS['red']};")
 
     def _navigate_to_well(self, well_name):
         """v7.2.7: Navigate to any well via plate view click."""
@@ -1172,29 +1155,32 @@ class CalibrationPage(QWidget):
         logger.info(f"Navigated to well {well_name}")
 
     def _on_plate_changed(self, idx):
-        """v7.2.7-hotfix: plate_changed — guards all widget refs."""
+        """Handle plate format change."""
         sender = self.sender()
         if sender is None:
             return
+
         fmt = sender.currentData()
         if fmt is None:
             return
+
         self._plate = WellPlate.from_format(fmt)
         defn = PLATE_DEFINITIONS[fmt]
         rows, cols = defn["rows"], defn["cols"]
-        self._corner_well = f"{chr(ord('A') + rows - 1)}{cols}"
-        if hasattr(self, 'val_well_combo'):
-            self.val_well_combo.clear()
-            self.val_well_combo.addItems(self._plate.well_names)
+
+        row_letter = chr(ord('A') + rows - 1)
+        self._corner_well = f"{row_letter}{cols}"
+
+        wells = self._plate.well_names
+        self.val_well_combo.clear()
+        self.val_well_combo.addItems(wells)
+
+        # Reset taught positions
         self._taught_a1 = None
         self._taught_corner = None
-        if hasattr(self, '_taught_third'): self._taught_third = None
-        for attr in ['lbl_a1','lbl_corner','lbl_third']:
-            if hasattr(self, attr): getattr(self, attr).setText("—")
-        if hasattr(self, 'lbl_alignment'): self.lbl_alignment.setText("")
-        if hasattr(self, '_cal_plate_view') and self._cal_plate_view:
-            self._cal_plate_view.set_plate(self._plate)
-
+        self.lbl_a1.setText("—")
+        self.lbl_corner.setText("—")
+        self.lbl_alignment.setText("")
 
     def _record_a1(self):
 
@@ -1473,10 +1459,6 @@ class CalibrationPage(QWidget):
             except (ValueError, KeyError):
                 pass
 
-
-                # v7.2.7-hotfix: plate view on load
-                if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
-                    self._cal_plate_view.set_plate(self._plate)
         if cal.get("taught_a1"):
             self._taught_a1 = tuple(cal["taught_a1"])
             # Display zero-ref position directly (positions are µm)

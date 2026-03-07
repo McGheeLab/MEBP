@@ -511,6 +511,11 @@ class PrintSetupPage(QWidget):
         """Build PrintSettings from context panel controls."""
         s = PrintSettings()
         s.xy_feedrate = self.xy_feed_spin.value()
+        # v7.2.7: print_speed_mm_s — explicit mm/s for print execution
+        s.print_speed_mm_s = self.xy_feed_spin.value()  # mm/s from GUI
+        s.travel_speed_mm_s = self.xy_feed_spin.value() * 2.0  # travel 2x faster
+        # Also set legacy print_feedrate (mm/min) for backward compat
+        s.print_feedrate = self.xy_feed_spin.value() * 60.0  # mm/s → mm/min
         s.z_feedrate = self.z_feed_spin.value()
         s.pump_rate_uL_s = self.pump_feed_spin.value()
         s.num_layers = self.layers_spin.value()

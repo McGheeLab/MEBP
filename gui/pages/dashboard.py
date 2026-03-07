@@ -356,11 +356,11 @@ class DashboardPage(QWidget):
         # XY position (converted to µm)
         xy = ctrl.get_xy_position(cached=True)
         if xy[0] is not None:
-            zx = xy[0] - ctrl.zero_position["x"]
-            zy = xy[1] - ctrl.zero_position["y"]
-            # Convert steps → µm
-            ux = zx / self._microsteps_per_micron
-            uy = zy / self._microsteps_per_micron
+            # v7.2.7: controller reports µm directly — no conversion needed
+
+            ux = xy[0] - ctrl.zero_position["x"]
+
+            uy = xy[1] - ctrl.zero_position["y"]
             self.lbl_x.setText(f"{ux:,.1f}")
             self.lbl_y.setText(f"{uy:,.1f}")
             self.lbl_xy_status.setText("Connected")
