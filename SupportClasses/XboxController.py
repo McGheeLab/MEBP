@@ -61,12 +61,21 @@ def xbox_polling_worker(
         avg_interval:  Seconds between averaged axis updates.
         deadzone:      Axis deadzone threshold (0–1).
     """
+    # v7.2.7: SDL Bluetooth hints
+    import os as _os
+    _os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "1")
+    _os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+    _os.environ["SDL_VIDEODRIVER"] = "dummy"  # v7.2.7: suppress cv2 SDL conflict
+    _os.environ["SDL_AUDIODRIVER"] = "dummy"
+
     try:
         import pygame
     except ImportError:
         out_queue.put({"debug": "pygame not installed -- Xbox controller unavailable"})
         return
 
+    # v7.2.7: Use pygame.init() with SDL_VIDEODRIVER=dummy (set above)
+    # to get event system without Cocoa main-thread requirement.
     pygame.init()
 
     # Load initial mapping
@@ -81,19 +90,26 @@ def xbox_polling_worker(
         )
 
     def _find_controller():
-        """Retry until a controller is found. Sends status messages."""
+        """Retry until a controller is found. v7.2.7: Bluetooth-aware detection."""
+        _attempt = 0
         while True:
+            _attempt += 1
+            pygame.event.pump()  # Critical for Bluetooth on macOS
             pygame.joystick.quit()
             pygame.joystick.init()
             count = pygame.joystick.get_count()
             if count > 0:
                 js = pygame.joystick.Joystick(0)
                 js.init()
-                out_queue.put({"debug": f"Controller connected: {js.get_name()}"})
+                out_queue.put({"debug": f"Controller connected: {js.get_name()} "
+                               f"(axes={js.get_numaxes()}, btns={js.get_numbuttons()}, "
+                               f"hats={js.get_numhats()}, attempt={_attempt})"})
                 out_queue.put({"status": "connected"})
                 return js
             else:
-                out_queue.put({"debug": "No controller found, retrying in 2s..."})
+                if _attempt <= 3 or _attempt % 10 == 0:
+                    out_queue.put({"debug": f"No controller found "
+                                   f"(attempt {_attempt}), retrying in 2s..."})
                 out_queue.put({"status": "waiting"})
                 time.sleep(2.0)
 
@@ -106,6 +122,7 @@ def xbox_polling_worker(
     last_mapping_time = time.time()
     last_heartbeat   = time.time()
     last_hat = (0, 0)
+    _btn_debounce = {}  # v7.2.7: button debounce: last-fire time per button
     last_sent: dict = {}
 
     axis_groups = [
@@ -132,12 +149,17 @@ def xbox_polling_worker(
                 out_queue.put({"status": "alive"})
                 last_heartbeat = current_time
 
-            # ── Button Presses ─────────────────────────────────────
+            # ── Button Presses (debounced) ─────────────────
             for i in range(joystick.get_numbuttons()):
                 if joystick.get_button(i):
+                    # 300ms debounce per button
+                    _last = _btn_debounce.get(i, 0)
+                    if current_time - _last < 0.3:
+                        continue
                     mapped_func = mapping.get("buttons", {}).get(str(i))
                     if mapped_func and mapped_func != "None":
                         out_queue.put({"button": i, "command": mapped_func})
+                        _btn_debounce[i] = current_time
 
             # ── Axis Accumulation ──────────────────────────────────
             for i in range(num_axes):
@@ -206,6 +228,28 @@ def xbox_polling_worker(
                         if cmd and cmd != "None":
                             out_queue.put({"dpad": "left", "command": cmd})
                     last_hat = current_hat
+
+
+            # v7.2.7: dpad-as-buttons
+            # D-pad as buttons fallback (Xbox Series X Bluetooth: hats=0)
+            if joystick.get_numhats() == 0:
+                _dpad_btns = {"11": "up", "12": "down", "13": "left", "14": "right"}
+                _hx = (1 if 14 < joystick.get_numbuttons() and joystick.get_button(14) else 0) - \
+                      (1 if 13 < joystick.get_numbuttons() and joystick.get_button(13) else 0)
+                _hy = (1 if 11 < joystick.get_numbuttons() and joystick.get_button(11) else 0) - \
+                      (1 if 12 < joystick.get_numbuttons() and joystick.get_button(12) else 0)
+                _hat_now = (_hx, _hy)
+                if _hat_now != last_hat:
+                    if _hat_now != (0, 0):
+                        for _dir, _cond in [("up", _hy>0), ("down", _hy<0), ("left", _hx<0), ("right", _hx>0)]:
+                            if _cond:
+                                _cmd = mapping.get("dpad", {}).get(_dir)
+                                if _cmd and _cmd != "None":
+                                    _dlast = _btn_debounce.get(("dpad", _dir), 0)  # v7.2.7: dpad debounce
+                                if current_time - _dlast >= 0.3:
+                                    out_queue.put({"dpad": _dir, "command": _cmd})
+                                    _btn_debounce[("dpad", _dir)] = current_time
+                    last_hat = _hat_now
 
             time.sleep(0.02)
 

@@ -1061,7 +1061,7 @@ class MainWindow(QMainWindow):
         # Connection indicators
         xy_ok = self.controller.is_xy_connected
         zp_ok = self.controller.is_zp_connected
-        xbox_ok = getattr(self.controller, 'is_xbox_connected', False)
+        xbox_ok = getattr(self.controller, "is_xbox_connected", False)  # v7.2.7: xbox property check
 
         self._update_conn_dot("xy", xy_ok)
         self._update_conn_dot("zp", zp_ok)

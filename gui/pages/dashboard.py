@@ -356,8 +356,19 @@ class DashboardPage(QWidget):
         self._update_conn_status("xy", self.controller.is_xy_connected)
         self._update_conn_status("zp", self.controller.is_zp_connected)
         # v7.2.6: S5-D xbox status — use rich status property
-        _xbox_st = getattr(self.controller, "xbox_status", "disconnected")
+        _xbox_st = getattr(self.controller, "xbox_status", "disconnected")  # v7.2.7: xbox tooltip
         self._update_conn_status("xbox", _xbox_st in ("connected", "alive"))
+        # v7.2.7: Update Xbox tooltip with status detail
+        _xbox_dot = getattr(self, "ctx_dot_xbox", None)
+        if _xbox_dot:
+            if _xbox_st == "waiting":
+                _xbox_dot.setToolTip("Searching for Xbox controller...")
+            elif _xbox_st in ("connected", "alive"):
+                _xbox_dot.setToolTip("Xbox controller active")
+            elif _xbox_st == "unknown":
+                _xbox_dot.setToolTip("Xbox worker running, status unknown")
+            else:
+                _xbox_dot.setToolTip("Xbox controller disconnected")
 
         # Update log count in context panel
         if hasattr(self, 'ctx_lbl_log_count'):
@@ -496,10 +507,18 @@ class DashboardPage(QWidget):
             logger.error(f"ZP disconnect failed: {e}")
 
     def _connect_xbox(self):
+        """Connect Xbox controller. v7.2.7: thread mode option"""
         try:
-            self.controller.connect_xbox()
+            import platform
+            use_thread = platform.system() == "Darwin"
+            if use_thread:
+                logger.info("macOS detected — using thread mode for Bluetooth compatibility")
+            mapping = getattr(self.controller, "_mapping_file",
+                              "current_button_mapping.json")
+            self.controller.connect_xbox(mapping_file=mapping, use_thread=use_thread)
         except Exception as e:
             logger.error(f"Xbox connect failed: {e}")
+
 
     def _disconnect_xbox(self):
         try:

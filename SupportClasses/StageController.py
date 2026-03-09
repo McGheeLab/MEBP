@@ -119,7 +119,7 @@ class ZPJogHandler:
 
         # Tuning parameters
         self.segment_time: float = 0.12   # seconds per move segment
-        self.z_speed: float = 0.5         # Z speed multiplier
+        self.z_speed: float = 1.0         # Z speed multiplier
         self.p_speed: float = 0.5         # Pump speed multiplier
         self.max_speed: float = 1.0
 
@@ -197,41 +197,28 @@ class ZPJogHandler:
         with self._lock:
             self.vel_z = self._clamp_vel(raw, self.z_speed)
 
-    def _clamp_pump_flow(self, vel_dimensionless: float, pump_id: str) -> float:
-        """Clamp pump velocity to max safe flow rate.
-
-        v7.2.6: S7-A — converts dimensionless vel → µL/s, clamps, converts back.
-        Falls through unchanged when hardware config or safety limits not set.
-
-        Args:
-            vel_dimensionless: Velocity in handler units (segment_time × p_speed)
-            pump_id: 'P1', 'P2', or 'P3'
-        Returns:
-            Clamped velocity in same units.
-        """
-        hw = self._hardware_config
-        sl = self.safety_limits
-        if hw is None or sl is None or not sl.enabled:
-            return vel_dimensionless
-        pump_cfg = hw.pumps.get(pump_id)
-        if pump_cfg is None or not pump_cfg.is_configured:
-            return vel_dimensionless
-        max_rate = sl.get_max_flow_rate(pump_id)
-        if max_rate <= 0:
-            return vel_dimensionless
+    def _clamp_pump_flow(self, vel, pump_id):  # v7.2.7: safe _hardware_config access
+        """Clamp pump velocity to max safe flow rate if hw config available."""
+        hw = getattr(self, "_hardware_config", None)
+        if hw is None:
+            return vel
+        sl = getattr(self, "safety_limits", None)
+        if sl is None:
+            return vel
         try:
-            # vel_dimensionless ~ mm/s of plunger travel
-            rate_uL_s = abs(pump_cfg.mm_to_uL(abs(vel_dimensionless)))
-            if rate_uL_s > max_rate:
-                scale = max_rate / rate_uL_s
-                logger.debug(
-                    f"{pump_id} jog flow clamped: {rate_uL_s:.3f} → "
-                    f"{max_rate:.3f} µL/s (scale={scale:.3f})"
-                )
-                return vel_dimensionless * scale
-        except (ValueError, AttributeError):
-            pass
-        return vel_dimensionless
+            max_rate = sl.get_max_flow_rate(pump_id)
+            if max_rate is not None and max_rate > 0:
+                # Convert vel to flow rate, clamp, convert back
+                pump_cfg = hw.pumps.get(pump_id)
+                if pump_cfg and pump_cfg.is_configured:
+                    rate = abs(pump_cfg.mm_to_uL(abs(vel)))
+                    if rate > max_rate:
+                        clamped_mm = pump_cfg.uL_to_mm(max_rate)
+                        vel = clamped_mm if vel > 0 else -clamped_mm
+        except Exception:
+            pass  # Safe fallback — no clamping if anything fails
+        return vel
+
 
     def _handle_p1_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
@@ -255,23 +242,25 @@ class ZPJogHandler:
             self.vel_p3 = vel
 
 
-    def _incr_z_up(self, *a, **kw):
-        self.z_speed = min(self.z_speed * 2, 100)
+    def _incr_z_up(self, *a, **kw):  # v7.2.7: decade speed
+        self.z_speed = min(self.z_speed * 10, 100)
         logger.info(f"Z speed: {self.z_speed}")
 
-    def _incr_z_down(self, *a, **kw):
-        self.z_speed = max(self.z_speed / 2, 0.1)
+
+    def _incr_z_down(self, *a, **kw):  # v7.2.7: decade speed
+        self.z_speed = max(self.z_speed / 10, 0.01)
         logger.info(f"Z speed: {self.z_speed}")
 
-    def _incr_p_up(self, *a, **kw):
-        self.p_speed = min(self.p_speed * 2, 100)
+
+    def _incr_p_up(self, *a, **kw):  # v7.2.7: decade speed
+        self.p_speed = min(self.p_speed * 10, 100)
         logger.info(f"P speed: {self.p_speed}")
 
-    def _incr_p_down(self, *a, **kw):
-        self.p_speed = max(self.p_speed / 2, 0.1)
+
+    def _incr_p_down(self, *a, **kw):  # v7.2.7: decade speed
+        self.p_speed = max(self.p_speed / 10, 0.01)
         logger.info(f"P speed: {self.p_speed}")
 
-    # ── Jog Loop ──────────────────────────────────────────────────
 
     def _jog_loop(self) -> None:
         while self._running:
@@ -417,13 +406,15 @@ class XYJogHandler:
             self.vel_x = max(-self.max_speed, min(self.max_speed, vx * self.xy_speed))
             self.vel_y = max(-self.max_speed, min(self.max_speed, vy * self.xy_speed))
 
-    def _incr_up(self, *a, **kw):
-        self.xy_speed = min(self.xy_speed * 2, 10000)
+    def _incr_up(self, *a, **kw):  # v7.2.7: decade speed
+        self.xy_speed = min(self.xy_speed * 10, 10000)
         logger.info(f"XY speed: {self.xy_speed}")
 
-    def _incr_down(self, *a, **kw):
-        self.xy_speed = max(self.xy_speed / 2, 1)
+
+    def _incr_down(self, *a, **kw):  # v7.2.7: decade speed
+        self.xy_speed = max(self.xy_speed / 10, 1)
         logger.info(f"XY speed: {self.xy_speed}")
+
 
     def _jog_loop(self) -> None:
         while self._running:
@@ -487,6 +478,9 @@ class PositionPoller:
         self._lock = threading.Lock()
         self._xy_pos: tuple = (None, None, None)
         self._zp_pos: tuple = (None, None, None, None)
+
+        # v7.2.7: init _hardware_config
+        self._hardware_config = None
 
     def set_stages(
         self,
@@ -753,36 +747,63 @@ class StageController:
 
     # ── Xbox Controller ───────────────────────────────────────────
 
-    def connect_xbox(self, mapping_file: str = "current_button_mapping.json") -> None:
-        """Connect Xbox controller.
-        v7.2.6: S5-A mapping path — resolves to absolute so subprocess finds same file.
+    def connect_xbox(self, mapping_file: str = "current_button_mapping.json",
+                     use_thread: bool = False) -> None:
+        """Connect Xbox controller. v7.2.7: thread fallback
+
+        Args:
+            mapping_file: Path to button mapping JSON.
+            use_thread: If True, run worker in a thread instead of process.
+                        Use this for macOS Bluetooth controllers that are
+                        invisible to spawned subprocesses.
         """
         if self.xbox_process and self.xbox_process.is_alive():
             logger.warning("Xbox already connected")
             return
-        # v7.2.6: S5-A mapping path — resolve now so worker and editor use same file
+        # Also check thread-based worker
+        if getattr(self, "_xbox_thread", None) and self._xbox_thread.is_alive():
+            logger.warning("Xbox already connected (thread mode)")
+            return
+
         from pathlib import Path as _Path
         self._mapping_file = str(_Path(mapping_file).resolve())
-        # v7.2.6: connect order warning
+
         if self.xy_stage is None and self.zp_stage is None:
             logger.warning(
-                "Xbox connected but no stages are connected -- "
+                "Xbox started but no stages are connected -- "
                 "controller input will have no effect until stages connect"
             )
+
         self.xbox_queue = Queue()
-        self.xbox_process = Process(
-            target=xbox_polling_worker,
-            args=(self.xbox_queue,),
-            kwargs={"mapping_file": self._mapping_file},
-            daemon=True,
-        )
-        self.xbox_process.start()
+
+        if use_thread:
+            import threading
+            self._xbox_thread = threading.Thread(
+                target=xbox_polling_worker,
+                args=(self.xbox_queue,),
+                kwargs={"mapping_file": self._mapping_file},
+                daemon=True,
+                name="XboxWorkerThread",
+            )
+            self._xbox_thread.start()
+            self.xbox_process = None  # Not using process mode
+            logger.info(f"Xbox worker started (THREAD mode, mapping: {self._mapping_file})")
+        else:
+            self.xbox_process = Process(
+                target=xbox_polling_worker,
+                args=(self.xbox_queue,),
+                kwargs={"mapping_file": self._mapping_file},
+                daemon=True,
+            )
+            self.xbox_process.start()
+            logger.info(f"Xbox worker started (PROCESS mode, mapping: {self._mapping_file})")
+
         self.xbox_poller = XboxQueuePoller(self.xbox_queue, self.processor)
         self.xbox_poller.start()
-        logger.info(f"Xbox controller connected (mapping: {self._mapping_file})")
 
 
     def disconnect_xbox(self) -> None:
+        """Disconnect Xbox controller. v7.2.7: thread cleanup"""
         if self.xbox_poller:
             self.xbox_poller.stop()
             self.xbox_poller = None
@@ -790,13 +811,18 @@ class StageController:
             self.xbox_process.terminate()
             self.xbox_process.join(timeout=2.0)
             self.xbox_process = None
+        # v7.2.7: thread mode cleanup
+        _xt = getattr(self, "_xbox_thread", None)
+        if _xt and _xt.is_alive():
+            # Thread mode — worker checks queue; we signal via _running
+            # but it's a daemon thread, so it dies when main exits.
+            # We can't cleanly stop it, but we nil the poller so no more dispatch.
+            pass
+        self._xbox_thread = None
         self.xbox_queue = None
         logger.info("Xbox controller disconnected")
 
-    # ── Position Queries ──────────────────────────────────────────
 
-    # v7.2.6: S4-E xbox_status property
-    @property
     def xbox_status(self) -> str:
         """Return Xbox connection status string.
 
@@ -812,7 +838,17 @@ class StageController:
     @property
     def is_xbox_connected(self) -> bool:
         """Backward-compatible bool: True when controller is active."""
-        return self.xbox_status in ("connected", "alive")
+        # v7.2.7: is_xbox_connected thread
+        status = self.xbox_status
+        if status in ("connected", "alive"):
+            return True
+        # Fallback: check if process or thread is alive
+        if self.xbox_process and self.xbox_process.is_alive():
+            return False  # Process alive but controller not found yet
+        _xt = getattr(self, "_xbox_thread", None)
+        if _xt and _xt.is_alive():
+            return False  # Thread alive but controller not found yet
+        return False
 
 
     def get_xy_position(self, cached: bool = True) -> tuple:
