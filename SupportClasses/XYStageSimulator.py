@@ -1,16 +1,16 @@
 """
-XY Stage Simulator v5 — Prior ProScan II with realistic serial timing.
+XY Stage Simulator v6 — Diagnostic-profile-driven timing — Prior ProScan II with realistic serial timing.
 
 Implements both interfaces:
   1. send_command(cmd) → response  (direct, for simulate=True mode)
   2. write/flush/read_all          (pyserial-like, for serial interface testing)
 
-Serial timing at 38400 baud (8N1 = 10 bits/byte = 3840 bytes/s):
-  TX "G 19300,0\\r" (13 bytes)  → 3.4ms
-  RX "R\\r"          (2 bytes)  → 0.5ms
-  RX "19300.0,0.0,0.0\\r" (20 bytes) → 5.2ms
-  Controller processing: ~2ms
-  Round-trip position query: ~8ms → max ~125 Hz poll rate
+Timing loaded from config/xy_diagnostic_profile.json at import time.
+Diagnostic results (38400 baud, 2026-03-09):
+  ALL commands: ~12ms round-trip, ~83 Hz burst, ~62.5 Hz sustained
+  Processing (excl baud delay): ~8ms uniform across P, VS, G, GR, $
+  VS is NOT slower than P — the old 800ms value was incorrect
+  Sine-wave tracking: clean to 1.0 Hz (1885 µm/s peak) at 50 Hz VS rate
 
 All positions in µm per Prior manual page 36.
 """
@@ -21,7 +21,9 @@ import logging
 import math
 import queue
 import threading
+import json
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +43,75 @@ PHYSICS_HZ = 200
 # Serial timing
 DEFAULT_BAUD = 38400
 BITS_PER_BYTE = 10          # 8N1: start + 8 data + stop
-# Per-command processing times (measured on real Prior ProScan II at 9600 baud)
-# Position query is fast, movement commands need motor ramp time
-PROCESSING_TIMES = {
-    "position":  0.050,   # 50ms  — P query: fast firmware response
-    "move":      0.100,   # 100ms — G/GR: start move, respond immediately
-    "velocity":  0.800,   # 800ms — VS: motor ramp + settle (measured ~1Hz)
-    "setting":   0.050,   # 50ms  — SMS/SAS: register write
-    "stop":      0.010,   # 10ms  — I/K: immediate
-    "default":   0.050,   # 50ms  — everything else
+# v7.2.8: load timing from diagnostic profile
+# Hardcoded fallback — used only if config/xy_diagnostic_profile.json is missing.
+# These defaults are from the 2026-03-09 diagnostic run at 38400 baud.
+_DEFAULT_PROCESSING_TIMES = {
+    "position":  0.008,
+    "move":      0.008,
+    "velocity":  0.008,
+    "setting":   0.008,
+    "stop":      0.005,
+    "default":   0.008,
 }
-PROCESSING_TIME_S = 0.050  # backward compat default
+
+# Diagnostic profile path (relative to project root)
+_DIAGNOSTIC_PROFILE_PATH = "config/xy_diagnostic_profile.json"
+
+
+def _load_diagnostic_profile():
+    """Load timing constants from xy_diagnostic_profile.json.
+
+    Searches for the profile JSON relative to this file's location,
+    walking up to find the project root (directory containing config/).
+
+    Returns:
+        (processing_times_dict, baud_rate, stage_info_dict) or defaults.
+    """
+    # Walk up from this file to find project root
+    here = Path(__file__).resolve().parent
+    for ancestor in [here] + list(here.parents):
+        candidate = ancestor / _DIAGNOSTIC_PROFILE_PATH
+        if candidate.exists():
+            try:
+                with open(candidate) as f:
+                    profile = json.load(f)
+
+                # Extract processing times
+                derived = profile.get("simulator_derived_constants", {})
+                proc_times = {
+                    "position": derived.get("processing_time_position_s", 0.008),
+                    "move":     derived.get("processing_time_move_s", 0.008),
+                    "velocity": derived.get("processing_time_velocity_s", 0.008),
+                    "setting":  derived.get("processing_time_setting_s", 0.008),
+                    "stop":     derived.get("processing_time_stop_s", 0.005),
+                    "default":  derived.get("processing_time_default_s", 0.008),
+                }
+
+                # Extract baud rate
+                comm = profile.get("communication", {})
+                baud = comm.get("baud_rate", DEFAULT_BAUD)
+
+                # Extract stage info
+                stage_info = profile.get("stage_info", {})
+
+                logger.info(
+                    f"Loaded XY diagnostic profile from {candidate} "
+                    f"(baud={baud}, VS={proc_times['velocity']*1000:.0f}ms)"
+                )
+                return proc_times, baud, stage_info
+
+            except Exception as e:
+                logger.warning(f"Failed to load diagnostic profile {candidate}: {e}")
+                break
+
+    logger.info("No diagnostic profile found — using default timing constants")
+    return dict(_DEFAULT_PROCESSING_TIMES), DEFAULT_BAUD, {}
+
+
+# Load at module import time so all instances share the same profile
+PROCESSING_TIMES, _PROFILE_BAUD, _PROFILE_STAGE_INFO = _load_diagnostic_profile()
+PROCESSING_TIME_S = PROCESSING_TIMES.get("default", 0.008)
 
 
 class XYStageSimulator:
@@ -71,7 +131,7 @@ class XYStageSimulator:
         self,
         microsteps_per_micron: float = MICROSTEPS_PER_MICRON,
         update_rate_hz: int = PHYSICS_HZ,
-        baud_rate: int = DEFAULT_BAUD,
+        baud_rate: int = _PROFILE_BAUD,
     ):
         self._usteps_per_um = microsteps_per_micron
         self._baud = baud_rate
@@ -109,10 +169,10 @@ class XYStageSimulator:
         self._tx_queue: queue.Queue[str] = queue.Queue()  # responses waiting
         self._serial_lock = threading.Lock()
 
-        # ── Stage info ────────────────────────────────────────────
-        self._stage_name = "H101 Simulator"
-        self._size_x_mm = 108
-        self._size_y_mm = 71
+        # ── Stage info (v7.2.8: from diagnostic profile) ──────────
+        self._stage_name = _PROFILE_STAGE_INFO.get("stage_name", "H101 Simulator")
+        self._size_x_mm = _PROFILE_STAGE_INFO.get("size_x_mm", 108)
+        self._size_y_mm = _PROFILE_STAGE_INFO.get("size_y_mm", 71)
 
         # ── Physics timing ────────────────────────────────────────
         self.update_rate_hz = update_rate_hz

@@ -1,97 +1,98 @@
 {
-  "controller_name": "Prior ProScan III",
-  "manufacturer": "Prior Scientific",
-  "protocol_version": "III",
-  "communication": {
-    "line_terminator_tx": "\\r\\n",
-    "line_terminator_rx": "\\r\\n",
-    "default_baud_rate": 38400,
-    "byte_size": 8,
-    "stop_bits": 1,
-    "timeout_s": 1.0,
-    "encoding": "ascii"
-  },
-  "detection": {
-    "wake_command": "STAGE",
-    "wake_delay_ms": 100,
-    "firmware_query": "V",
-    "identify_tokens": [
-      "E",
-      "R",
-      "ProScan"
-    ],
-    "notes": "Send STAGE first to wake, then V to get firmware string"
-  },
-  "commands": {
-    "position_query": {
-      "cmd": "P",
-      "response": "{x},{y},{z}"
+    "controller_name": "Prior ProScan III",
+    "manufacturer": "Prior Scientific",
+    "protocol_version": "III",
+    "communication": {
+        "line_terminator_tx": "\\r\\n",
+        "line_terminator_rx": "\\r\\n",
+        "default_baud_rate": 38400,
+        "byte_size": 8,
+        "stop_bits": 1,
+        "timeout_s": 1.0,
+        "encoding": "ascii"
     },
-    "move_absolute": {
-      "cmd": "G {x},{y}",
-      "response": "R"
+    "detection": {
+        "wake_command": "STAGE",
+        "wake_delay_ms": 100,
+        "firmware_query": "V",
+        "identify_tokens": [
+            "ProScan",
+            "III",
+            "R"
+        ],
+        "notes": "v7.2.8: Removed bare 'E' token (matched ProScan II error codes). Send STAGE first to wake, then V to get firmware string. response_pattern excludes E,N error format.",
+        "response_pattern": "^(?!E,\\d).*(?:ProScan|\\d+\\.\\d+)"
     },
-    "move_relative": {
-      "cmd": "GR {dx},{dy}",
-      "response": "R"
+    "commands": {
+        "position_query": {
+            "cmd": "P",
+            "response": "{x},{y},{z}"
+        },
+        "move_absolute": {
+            "cmd": "G {x},{y}",
+            "response": "R"
+        },
+        "move_relative": {
+            "cmd": "GR {dx},{dy}",
+            "response": "R"
+        },
+        "set_velocity": {
+            "cmd": "VS,{vx},{vy}",
+            "response": "R"
+        },
+        "set_max_speed": {
+            "cmd": "SMS,{speed}",
+            "response": "R"
+        },
+        "set_acceleration": {
+            "cmd": "SAS,{accel}",
+            "response": "R"
+        },
+        "set_jerk": {
+            "cmd": "SCS,{jerk}",
+            "response": "R"
+        },
+        "set_home": {
+            "cmd": "Z",
+            "response": "R"
+        },
+        "stop": {
+            "cmd": "I",
+            "response": "R"
+        },
+        "firmware_version": {
+            "cmd": "V",
+            "response": "{version}"
+        },
+        "stage_type": {
+            "cmd": "STAGE",
+            "response": "{type}"
+        }
     },
-    "set_velocity": {
-      "cmd": "VS,{vx},{vy}",
-      "response": "R"
-    },
-    "set_max_speed": {
-      "cmd": "SMS,{speed}",
-      "response": "R"
-    },
-    "set_acceleration": {
-      "cmd": "SAS,{accel}",
-      "response": "R"
-    },
-    "set_jerk": {
-      "cmd": "SCS,{jerk}",
-      "response": "R"
-    },
-    "set_home": {
-      "cmd": "Z",
-      "response": "R"
-    },
-    "stop": {
-      "cmd": "I",
-      "response": "R"
-    },
-    "firmware_version": {
-      "cmd": "V",
-      "response": "{version}"
-    },
-    "stage_type": {
-      "cmd": "STAGE",
-      "response": "{type}"
+    "parameters": {
+        "speed_range": [
+            1,
+            100
+        ],
+        "acceleration_range": [
+            1,
+            100
+        ],
+        "jerk_range": [
+            1,
+            100
+        ],
+        "position_units": "microsteps",
+        "microsteps_per_micron": 10.0,
+        "position_range_x": [
+            -100000,
+            100000
+        ],
+        "position_range_y": [
+            -100000,
+            100000
+        ],
+        "max_speed": 50000,
+        "acceleration": 100000
     }
-  },
-  "parameters": {
-    "speed_range": [
-      1,
-      100
-    ],
-    "acceleration_range": [
-      1,
-      100
-    ],
-    "jerk_range": [
-      1,
-      100
-    ],
-    "position_units": "microsteps",
-    "microsteps_per_micron": 10.0,
-    "position_range_x": [
-      -100000,
-      100000
-    ],
-    "position_range_y": [
-      -100000,
-      100000
-    ],
-    "max_speed": 50000,
-    "acceleration": 100000
-  }
 }

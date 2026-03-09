@@ -50,6 +50,18 @@ except ImportError:
     CV2_AVAILABLE = False
     logger.info("OpenCV (cv2) not installed — camera widget disabled")
 
+# v7.3-camera: Try to import ToupCam backend
+try:
+    from gui.widgets.toupcam_backend import ToupCamBackend, TOUPCAM_AVAILABLE
+except ImportError:
+    TOUPCAM_AVAILABLE = False
+    ToupCamBackend = None
+    logger.info("ToupCam backend not available")
+
+# v7.3-camera: Unified availability flag
+CAMERA_AVAILABLE = CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE)
+
+
 
 def detect_cameras(max_index: int = 4) -> list[int]:
     """Probe camera indices and return those that are available.
@@ -96,6 +108,21 @@ def detect_cameras(max_index: int = 4) -> list[int]:
     logger.info(f"Camera detection: found {len(available)} camera(s) "
                f"at indices {available}")
     return available
+
+
+def detect_toupcam_cameras() -> list[dict]:
+    """v7.3-camera: Detect ToupTek/Bestscope cameras.
+    
+    Returns list of dicts with 'id' and 'displayname' keys.
+    """
+    if not TOUPCAM_AVAILABLE or ToupCamBackend is None:
+        return []
+    try:
+        return ToupCamBackend.enumerate()
+    except Exception as e:
+        logger.warning(f"ToupCam detection error: {e}")
+        return []
+
 
 
 
@@ -162,6 +189,10 @@ class CameraWidget(QWidget):
         self._gamma: float = 1.0        # 0.1 … 3.0
         self._gamma_lut = None          # Precomputed LUT for speed
 
+        # v7.3-camera: ToupCam backend state
+        self._toupcam = None
+        self._backend_type = "opencv"  # "opencv" or "toupcam"
+
         self._setup_ui(show_controls)
 
     # ── UI Construction ──────────────────────────────────────────
@@ -171,9 +202,9 @@ class CameraWidget(QWidget):
         layout.setSpacing(4)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        if not CV2_AVAILABLE:
+        if not CAMERA_AVAILABLE:
             layout.addWidget(QLabel(
-                "Camera unavailable — install OpenCV:\n"
+                "Camera unavailable — install OpenCV or ToupTek SDK:\n"
                 "  pip install opencv-python"
             ))
             return
@@ -267,18 +298,32 @@ class CameraWidget(QWidget):
 
         v7.2.5 S7: Triggers lazy camera detection on first start.
         """
-        if not CV2_AVAILABLE or self._running:
+        # v7.3-camera: Support either backend
+        if not CAMERA_AVAILABLE or self._running:
             return
 
         # Lazy detection: probe hardware on first start
         if not getattr(self, "_cameras_detected", False):
             self.refresh_cameras()
 
-        idx = self.camera_combo.currentData()
-        if idx is None or idx < 0:
+        cam_data = self.camera_combo.currentData()
+        if cam_data is None or cam_data == -1:
             self.video_label.setText("No camera available")
             return
-        self.start_with_index(idx)
+
+        # v7.3-camera: Route by backend type
+        if isinstance(cam_data, tuple) and len(cam_data) == 2:
+            backend_type, identifier = cam_data
+            if backend_type == "toupcam":
+                self._start_toupcam(identifier)
+                return
+            else:
+                self.start_with_index(identifier)
+                return
+
+        # Legacy: plain integer index (backward compat)
+        if isinstance(cam_data, int) and cam_data >= 0:
+            self.start_with_index(cam_data)
 
     def start_with_index(self, camera_index: int):
         """Start the camera feed with a specific device index."""
@@ -309,6 +354,26 @@ class CameraWidget(QWidget):
         if hasattr(self, 'btn_start'):
             self.btn_start.setText("▶")
         logger.info(f"{self._camera_label}: camera stopped")
+
+    def _start_toupcam(self, device_id: str):
+        """v7.3-camera: Start a ToupCam camera feed."""
+        if not TOUPCAM_AVAILABLE or ToupCamBackend is None or self._running:
+            return
+
+        self._toupcam = ToupCamBackend()
+        if not self._toupcam.open(device_id):
+            self.video_label.setText(f"Failed to open ToupCam")
+            self._toupcam = None
+            return
+
+        w, h = self._toupcam.get_resolution()
+        self._running = True
+        self._backend_type = "toupcam"
+        self._timer.start(int(1000 / self._fps))
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setText("\u23f9")
+        logger.info(f"{self._camera_label}: ToupCam started ({w}x{h}) at {self._fps} FPS")
+
 
     def toggle(self):
         """Toggle camera on/off."""

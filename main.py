@@ -129,9 +129,13 @@ def main():
     if args.real_zp:
         simulate_zp = False
 
+    # v7.2.8: Pass controller_json from settings for hardware auto-detect
+    controller_json = settings.get("controller.controller_json", "auto")
+
     controller = StageController(
         simulate_xy=simulate_xy,
         simulate_zp=simulate_zp,
+        controller_json=controller_json,
     )
 
     saved_zero = settings.get_section("zero_position")

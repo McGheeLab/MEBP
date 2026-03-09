@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # Optional camera support
 try:
     from gui.widgets.camera_widget import CameraWidget, CV2_AVAILABLE, detect_cameras
+    try:
+        from gui.widgets.camera_widget import CAMERA_AVAILABLE
+    except ImportError:
+        CAMERA_AVAILABLE = CV2_AVAILABLE
 except ImportError:
     CameraWidget = None
     CV2_AVAILABLE = False
@@ -720,7 +724,7 @@ class CalibrationPage(QWidget):
         cam_title.setObjectName("sectionLabel")
         cam_layout.addWidget(cam_title)
 
-        if CV2_AVAILABLE and CameraWidget is not None:
+        if CAMERA_AVAILABLE and CameraWidget is not None:
             self._cam_grid = QHBoxLayout()
             self._cam_grid.setSpacing(6)
 
@@ -761,8 +765,8 @@ class CalibrationPage(QWidget):
             logger.warning("camera_widget not available")
             return
 
-        if not CV2_AVAILABLE:
-            logger.warning("OpenCV not installed — camera detection unavailable")
+        if not CAMERA_AVAILABLE:
+            logger.warning("No camera backend available")
             return
 
         if hasattr(self, '_btn_detect_cameras'):

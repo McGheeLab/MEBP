@@ -599,7 +599,7 @@ class StageController:
         self._watchdog.start()
 
         # Background position cache
-        self._pos_poller = PositionPoller(poll_interval=1.0)  # v7.2.6: poll interval 1.0s
+        self._pos_poller = PositionPoller(poll_interval=0.3)  # v7.2.8: poll interval restored  # v7.2.6: poll interval 1.0s
         self._pos_poller.start()
 
         # Disconnect callback (GUI can set this)
@@ -628,10 +628,18 @@ class StageController:
             zp: If True, connect the ZP stage (default True).
         """
         if xy and self.xy_stage is None:
-            self.xy_stage = XYStageManager(
-                simulate=self.simulate_xy,
-                controller_json=self.controller_json,
-            )
+            # v7.2.8: connection error handling
+            try:
+                self.xy_stage = XYStageManager(
+                    simulate=self.simulate_xy,
+                    controller_json=self.controller_json,
+                )
+            except (ConnectionError, ImportError, OSError) as e:
+                logger.error(f"XY stage connection failed: {e}")
+                self.xy_stage = None
+                if self.on_disconnect:
+                    self.on_disconnect("XY")
+                return
             # v7.2.6: stop old jog handlers before creating new ones
             if self.xy_jog is not None:
                 self.xy_jog.stop()
@@ -651,7 +659,15 @@ class StageController:
             logger.info("XY stage connected")
 
         if zp and self.zp_stage is None:
-            self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
+            # v7.2.8: ZP connection error handling
+            try:
+                self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
+            except (ConnectionError, ImportError, OSError) as e:
+                logger.error(f"ZP stage connection failed: {e}")
+                self.zp_stage = None
+                if self.on_disconnect:
+                    self.on_disconnect("ZP")
+                return
             # v7.2.6: stop old ZP jog handler
             if self.zp_jog is not None:
                 self.zp_jog.stop()

@@ -14,12 +14,12 @@
     "detection": {
         "wake_command": null,
         "wake_delay_ms": 0,
-        "firmware_query": "V",
+        "firmware_query": "P",
         "identify_tokens": [
-            "ProScan",
-            "II"
+            ","
         ],
-        "notes": "No STAGE command; go straight to firmware query with CR only"
+        "response_pattern": "^-?\\d+,-?\\d+",
+        "notes": "v7.2.8: V returns E,4 on some firmware; P always works. Response is x,y,z. Pattern ensures comma-separated numbers."
     },
     "commands": {
         "position_query": {

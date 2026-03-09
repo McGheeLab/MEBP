@@ -43,6 +43,38 @@ from SupportClasses.ControllerProtocol import (
     discover_controller_files,
     DEFAULT_CONTROLLERS_DIR,
 )
+import re  # v7.2.8: response_pattern matching
+
+
+# v7.2.8: CR-aware detection read
+def _read_response_cr(spo, timeout=0.3):
+    """Read bytes until CR or LF, with short timeout for detection probes.
+
+    pyserial's readline() reads until LF (\\n), but Prior ProScan II
+    terminates responses with CR (\\r) only. This causes readline() to
+    block until the full timeout (1s+) on every detection probe.
+    """
+    old_timeout = spo.timeout
+    spo.timeout = timeout
+    buf = b""
+    try:
+        while True:
+            ch = spo.read(1)
+            if not ch:  # timeout
+                break
+            if ch in (b"\\r", b"\\n"):
+                if buf:  # got data before terminator
+                    break
+                continue  # skip leading CR/LF
+            buf += ch
+    except Exception:
+        pass
+    finally:
+        try:
+            spo.timeout = old_timeout
+        except Exception:
+            pass
+    return buf.decode("ascii", errors="replace").strip()
 
 
 class XYStageManager:
@@ -91,13 +123,11 @@ class XYStageManager:
         # P8.17: Load controller protocol JSON
         # BUG-3 FIX (v7.1.2): Always load protocol, even in sim mode,
         # so parameters like microsteps_per_micron are accessible.
-        if controller_json is not None:
-            self._load_protocol(controller_json)
-            self._apply_protocol_parameters()
-        elif not simulate:
-            # Real hardware without explicit protocol → try default/auto-detect
-            self._load_protocol(controller_json)
-            self._apply_protocol_parameters()
+        # v7.2.8: always load protocol (auto-detect for None/auto,
+        # explicit path otherwise). Sim mode also needs protocol
+        # for parameters like microsteps_per_micron.
+        self._load_protocol(controller_json)
+        self._apply_protocol_parameters()
 
         # Apply any user-provided settings (override protocol defaults)
         if settings:
@@ -124,19 +154,15 @@ class XYStageManager:
     # ── Protocol Loading (P8.17) ──────────────────────────────────
 
     def _load_protocol(self, controller_json: Optional[str]) -> None:
-        """Load controller protocol from JSON file or auto-detect."""
-        if controller_json is None:
-            # Default: ProScan III
-            default_path = Path(DEFAULT_CONTROLLERS_DIR) / "proscan_iii.json"
-            if default_path.exists():
-                try:
-                    self._protocol = ControllerProtocol.load(default_path)
-                    logger.info(f"Loaded default protocol: {self._protocol.controller_name}")
-                    return
-                except Exception as e:
-                    logger.warning(f"Failed to load default protocol: {e}")
-            # Fallback: no protocol loaded (will use hardcoded commands)
-            logger.warning("No controller protocol loaded — using hardcoded defaults")
+        """Load controller protocol from JSON file or auto-detect.
+        v7.2.8: auto-detect as default when controller_json is None.
+        """
+        if controller_json is None or controller_json.lower() == "auto":
+            # v7.2.8: Auto-detect by default — try all protocols
+            # instead of assuming ProScan III. The actual detection
+            # happens in _auto_detect_controller() during _find_controller().
+            logger.info("Controller protocol set to auto-detect")
+            return
 
         elif controller_json.lower() == "auto":
             # Auto-detect will happen during serial initialisation
@@ -249,13 +275,16 @@ class XYStageManager:
         # P8.21: Auto-detect — try each JSON file
         return self._auto_detect_controller()
 
-    def _find_with_protocol(self, protocol: ControllerProtocol) -> Optional[serial.Serial]:
-        """Try to find a controller matching the given protocol."""
+    def _find_with_protocol(self, protocol: ControllerProtocol) -> "Optional[serial.Serial]":
+        """Try to find a controller matching the given protocol.
+        v7.2.8: CR-aware detection read + response_pattern support.
+        """
         detection = protocol.get_detection_info()
         wake_cmd = detection.get("wake_command")
         wake_delay = detection.get("wake_delay_ms", 100) / 1000.0
         fw_query = detection.get("firmware_query", "V")
         tokens = detection.get("identify_tokens", [])
+        resp_pattern = detection.get("response_pattern")
         baud = protocol.baud_rate
 
         ports = serial.tools.list_ports.comports()
@@ -266,33 +295,53 @@ class XYStageManager:
                     port_info.device,
                     baudrate=baud,
                     bytesize=protocol.byte_size,
-                    timeout=protocol.timeout,
+                    timeout=0.5,  # v7.2.8: short timeout for detection
                     stopbits=serial.STOPBITS_ONE,
                 )
+                time.sleep(0.1)  # let port settle
+                spo.reset_input_buffer()
+                spo.reset_output_buffer()
 
-                # P8.18: Use protocol terminators
                 tx_term = protocol.tx_terminator
 
                 # Wake command (if defined)
                 if wake_cmd:
                     spo.write(wake_cmd.encode(protocol.encoding) + tx_term)
                     time.sleep(wake_delay)
-                    spo.readline()  # discard wake-up response
+                    _read_response_cr(spo, timeout=0.3)  # discard wake response
                     spo.reset_input_buffer()
-                    spo.reset_output_buffer()
 
-                # Firmware query
+                # Detection query
                 spo.write(fw_query.encode(protocol.encoding) + tx_term)
-                time.sleep(0.1)
-                response = spo.readline().decode(protocol.encoding, errors="replace").strip()
-                logger.debug(f"Response from {port_info.device}: {response}")
+                time.sleep(0.05)
+                response = _read_response_cr(spo, timeout=0.3)  # v7.2.8: CR-aware
+                logger.debug(f"Detection response from {port_info.device}: {response!r}")
 
-                # Check identification tokens
+                if not response:
+                    spo.close()
+                    continue
+
+                # v7.2.8: Check response_pattern first (more specific)
+                if resp_pattern:
+                    if re.match(resp_pattern, response):
+                        logger.info(
+                            f"{protocol.controller_name} found on "
+                            f"{port_info.device} @ {baud} baud (pattern match: {response!r})"
+                        )
+                        spo.timeout = protocol.timeout
+                        self._detected_controller = protocol.controller_name
+                        return spo
+                    else:
+                        spo.close()
+                        continue
+
+                # Fallback: token-based check (only if no response_pattern)
                 if tokens and any(tok in response for tok in tokens):
                     logger.info(
                         f"{protocol.controller_name} found on "
-                        f"{port_info.device} @ {baud} baud"
+                        f"{port_info.device} @ {baud} baud (token match: {response!r})"
                     )
+                    spo.timeout = protocol.timeout
                     self._detected_controller = protocol.controller_name
                     return spo
 
@@ -403,10 +452,8 @@ class XYStageManager:
             return self._parse_position_response(response)
         try:
             self._send_protocol_command("position_query", fallback_cmd="P")
-            response = self.spo.readline().decode(
-                self._protocol.encoding if self._protocol else "ascii",
-                errors="replace"
-            ).strip()
+            # v7.2.8: CR-aware read (Prior sends \r not \n)
+            response = _read_response_cr(self.spo, timeout=0.5)
             return self._parse_position_response(response)
         except Exception as e:
             logger.debug(f"XY position query error: {e}")
@@ -549,10 +596,8 @@ class XYStageManager:
 
         try:
             self._send_protocol_command("firmware_version", fallback_cmd="V")
-            response = self.spo.readline().decode(
-                self._protocol.encoding if self._protocol else "ascii",
-                errors="replace"
-            ).strip()
+            # v7.2.8: CR-aware read
+            response = _read_response_cr(self.spo, timeout=0.5)
             return response
         except Exception as e:
             logger.debug(f"Firmware version query error: {e}")
