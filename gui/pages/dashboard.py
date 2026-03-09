@@ -421,11 +421,13 @@ class DashboardPage(QWidget):
             self.lbl_zp_status.setStyleSheet(f"color: {color};")
 
         # Speeds
-        speeds = ctrl.get_speed_info()
-        self.lbl_speed_xy.setText(f"{speeds['xy']:.0f}")
-        self.lbl_speed_z.setText(f"{speeds['z']:.1f}")
-        self.lbl_speed_p.setText(f"{speeds['p']:.1f}")
-
+        try:
+            speeds = ctrl.get_speed_info()
+            self.lbl_speed_xy.setText(f"{float(speeds.get('xy', 0)):.0f}")
+            self.lbl_speed_z.setText(f"{float(speeds.get('z', 0)):.1f}")
+            self.lbl_speed_p.setText(f"{float(speeds.get('p', 0)):.1f}")
+        except (TypeError, ValueError, AttributeError):
+            pass  # Speed info temporarily unavailable
         # Zero reference
         for key, lbl in self.zero_labels.items():
             lbl.setText(f"{ctrl.zero_position.get(key, 0):.1f}")

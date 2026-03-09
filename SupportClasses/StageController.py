@@ -852,12 +852,16 @@ class StageController:
         return (None, None, None, None)
 
     def get_speed_info(self) -> dict:
-        return {
-            "xy": self.xy_jog.speed if self.xy_jog else 0,
-            "z": self.zp_jog.speeds["z"] if self.zp_jog else 0,
-            "p": self.zp_jog.speeds["p"] if self.zp_jog else 0,
-        }
+        """Return current jog speeds as numeric values.
 
+        v7.2.8: Reads .xy_speed/.z_speed/.p_speed directly
+        to avoid broken @property decorators.
+        """
+        return {
+            "xy": getattr(self.xy_jog, "xy_speed", 0) if self.xy_jog else 0,
+            "z": getattr(self.zp_jog, "z_speed", 0) if self.zp_jog else 0,
+            "p": getattr(self.zp_jog, "p_speed", 0) if self.zp_jog else 0,
+        }
     @property
     def is_xy_connected(self) -> bool:
         return self.xy_stage is not None
