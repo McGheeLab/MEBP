@@ -458,15 +458,16 @@ class DashboardPage(QWidget):
             )
 
     def _update_conn_status(self, name: str, connected: bool):
-        """Update context panel connection dot."""
+        """Update context panel connection dot.
+        v7.2.7: unpolish/polish conn status — setStyleSheet no-op fix.
+        """
         dot = getattr(self, f'ctx_dot_{name}', None)
         if dot:
             dot.setObjectName("connDotOn" if connected else "connDotOff")
-            dot.setStyleSheet(dot.styleSheet())  # Force refresh
+            dot.style().unpolish(dot)
+            dot.style().polish(dot)
+            dot.update()
 
-    # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL ACTIONS
-    # ════════════════════════════════════════════════════════════════
 
     def _connect_xy(self):
         try:

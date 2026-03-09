@@ -395,7 +395,8 @@ class XYStageManager:
 
     def get_current_position(self) -> "tuple[float | None, float | None, float | None]":
         """Query stage position.
-        v7.2.6: XY serial lock wraps hardware send+readline.
+        v7.2.7: no lock on readline — send_command handles write lock internally.
+        Holding lock across readline() starves jog handler threads.
         """
         if self.simulate:
             response = self.spo.send_command("P")
@@ -412,6 +413,7 @@ class XYStageManager:
             return (None, None, None)
 
 
+    @staticmethod
     def _parse_position_response(response: str) -> tuple[float | None, float | None, float | None]:
         """Parse 'x,y,z' position response string."""
         try:

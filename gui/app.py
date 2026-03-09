@@ -1149,7 +1149,9 @@ class MainWindow(QMainWindow):
             page.on_status_update()
 
     def _update_conn_dot(self, name: str, connected: bool):
-        """Update a connection status dot (green/red)."""
+        """Update a connection status dot (green/red).
+        v7.2.7: unpolish/polish dot refresh — setStyleSheet was no-op for app QSS.
+        """
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
         if dot is None:
@@ -1162,13 +1164,15 @@ class MainWindow(QMainWindow):
             dot.setObjectName("connDotOff")
             if lbl:
                 lbl.setObjectName("connLabelOff")
-        dot.setStyleSheet(dot.styleSheet())
+        # v7.2.7: proper QSS refresh — unpolish/polish forces objectName re-eval
+        dot.style().unpolish(dot)
+        dot.style().polish(dot)
+        dot.update()
         if lbl:
-            lbl.setStyleSheet(lbl.styleSheet())
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
+            lbl.update()
 
-    # ════════════════════════════════════════════════════════════════
-    #  KEYBOARD SHORTCUTS
-    # ════════════════════════════════════════════════════════════════
 
     def keyPressEvent(self, event: QKeyEvent):
         """Global keyboard handling — Escape triggers E-stop."""
