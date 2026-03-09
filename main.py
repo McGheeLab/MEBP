@@ -108,7 +108,12 @@ def main():
     parser.add_argument("--real-xy", action="store_true",
                         help="Use real XY stage hardware (default: simulate)")
     parser.add_argument("--real-zp", action="store_true",
-                        help="Use real ZP stage hardware (default: simulate)")
+                        help="Use real ZP stage hardware")
+    # v7.2.8s2: default simulate False — add explicit simulate flags
+    parser.add_argument("--simulate-xy", action="store_true",
+                        help="Force XY stage simulation")
+    parser.add_argument("--simulate-zp", action="store_true",
+                        help="Force ZP stage simulation")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
     parser.add_argument("--settings", default="settings.json",
@@ -121,13 +126,19 @@ def main():
     verbose = args.verbose or settings.get("logging.verbose", False)
     setup_logging(verbose)
 
-    simulate_xy = not args.real_xy and settings.get("simulation.simulate_xy", True)
-    simulate_zp = not args.real_zp and settings.get("simulation.simulate_zp", True)
+    # v7.2.8s2: default simulate False — real hardware is the default
+    simulate_xy = settings.get("simulation.simulate_xy", False)
+    simulate_zp = settings.get("simulation.simulate_zp", False)
 
+    # CLI overrides
     if args.real_xy:
         simulate_xy = False
     if args.real_zp:
         simulate_zp = False
+    if getattr(args, "simulate_xy", False):
+        simulate_xy = True
+    if getattr(args, "simulate_zp", False):
+        simulate_zp = True
 
     # v7.2.8: Pass controller_json from settings for hardware auto-detect
     controller_json = settings.get("controller.controller_json", "auto")

@@ -42,8 +42,8 @@ DEFAULTS: dict[str, Any] = {
         "splitter_sizes": [500, 150],
     },
     "simulation": {
-        "simulate_xy": True,
-        "simulate_zp": True,
+        "simulate_xy": False,  # v7.2.8s2: default simulate False (lab instrument)
+        "simulate_zp": False,
     },
     "speeds": {
         "xy": 250.0,

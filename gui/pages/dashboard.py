@@ -487,24 +487,28 @@ class DashboardPage(QWidget):
             self.controller.connect_xy()
         except Exception as e:
             logger.error(f"XY connect failed: {e}")
+        self.on_status_update()  # v7.2.7: disconnect refresh
 
     def _disconnect_xy(self):
         try:
             self.controller.disconnect_xy()
         except Exception as e:
             logger.error(f"XY disconnect failed: {e}")
+        self.on_status_update()  # v7.2.7: disconnect refresh
 
     def _connect_zp(self):
         try:
             self.controller.connect_zp()
         except Exception as e:
             logger.error(f"ZP connect failed: {e}")
+        self.on_status_update()  # v7.2.7: disconnect refresh
 
     def _disconnect_zp(self):
         try:
             self.controller.disconnect_zp()
         except Exception as e:
             logger.error(f"ZP disconnect failed: {e}")
+        self.on_status_update()  # v7.2.7: disconnect refresh
 
     def _connect_xbox(self):
         """Connect Xbox controller. v7.2.7: thread mode option"""
@@ -525,6 +529,7 @@ class DashboardPage(QWidget):
             self.controller.disconnect_xbox()
         except Exception as e:
             logger.error(f"Xbox disconnect failed: {e}")
+        self.on_status_update()  # v7.2.7: disconnect refresh
 
     def _open_xbox_editor(self):
         # v7.2.6: S5-B mapping path — use the resolved path from StageController

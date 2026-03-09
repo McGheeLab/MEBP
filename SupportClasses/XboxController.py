@@ -47,7 +47,7 @@ def load_xbox_mapping(mapping_file: str = "current_button_mapping.json") -> dict
 def xbox_polling_worker(
     out_queue: Queue,
     mapping_file: str = "current_button_mapping.json",
-    avg_interval: float = 0.5,
+    avg_interval: float = 0.1,
     deadzone: float = 0.2,
 ) -> None:
     """
@@ -63,10 +63,15 @@ def xbox_polling_worker(
     """
     # v7.2.7: SDL Bluetooth hints
     import os as _os
+    # v7.2.7: cross-platform: platform-aware SDL configuration
+    import platform as _platform
+    _is_macos = _platform.system() == "Darwin"
     _os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "1")
     _os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
-    _os.environ["SDL_VIDEODRIVER"] = "dummy"  # v7.2.7: suppress cv2 SDL conflict
-    _os.environ["SDL_AUDIODRIVER"] = "dummy"
+    if _is_macos:
+        # macOS: dummy video driver prevents Cocoa main-thread crash
+        _os.environ["SDL_VIDEODRIVER"] = "dummy"
+        _os.environ["SDL_AUDIODRIVER"] = "dummy"
 
     try:
         import pygame
@@ -132,6 +137,18 @@ def xbox_polling_worker(
         {"name": "5",   "axes": [5],    "type": "trigger"},
     ]
 
+
+    # v7.2.7: trigger normalization
+    # Windows Xbox triggers rest at -1.0; macOS at 0.0.
+    # Read initial trigger values to use as zero-offset.
+    pygame.event.pump()
+    _trigger_offsets = {}
+    for _ti in [4, 5]:
+        if _ti < num_axes:
+            _tval = joystick.get_axis(_ti)
+            # If rest value is < -0.5, this is Windows-style (-1 to +1)
+            _trigger_offsets[_ti] = _tval if _tval < -0.1 else 0.0
+
     # ── Main Loop ─────────────────────────────────────────────────
     while True:
         current_time = time.time()
@@ -164,6 +181,9 @@ def xbox_polling_worker(
             # ── Axis Accumulation ──────────────────────────────────
             for i in range(num_axes):
                 raw = joystick.get_axis(i)
+                # Normalize triggers: subtract rest offset, remap to 0..1
+                if i in _trigger_offsets and _trigger_offsets[i] < -0.5:
+                    raw = (raw - _trigger_offsets[i]) / 2.0  # -1..+1 → 0..+1
                 if abs(raw) > deadzone:
                     axis_accum[i] += raw
                     axis_count[i] += 1
@@ -189,6 +209,9 @@ def xbox_polling_worker(
                     else:
                         a = axes[0]
                         avg_val = axis_accum[a] / axis_count[a] if axis_count[a] else 0.0
+                        # v7.2.7: LT retract: LT (axis 4) = retract (negative)
+                        if a == 4:
+                            avg_val = -avg_val
 
                     zero_value = (0.0, 0.0) if group["type"] == "axis" else 0.0
                     prev = last_sent.get(group["name"], zero_value)

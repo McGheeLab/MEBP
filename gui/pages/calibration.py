@@ -44,6 +44,10 @@ try:
         from gui.widgets.camera_widget import CAMERA_AVAILABLE
     except ImportError:
         CAMERA_AVAILABLE = CV2_AVAILABLE
+    try:
+        from gui.widgets.camera_widget import CAMERA_AVAILABLE
+    except ImportError:
+        CAMERA_AVAILABLE = CV2_AVAILABLE
 except ImportError:
     CameraWidget = None
     CV2_AVAILABLE = False

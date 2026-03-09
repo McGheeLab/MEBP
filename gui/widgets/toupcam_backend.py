@@ -224,6 +224,12 @@ def _load_library():
         # Snap(handle, nResolutionIndex) -> HRESULT
         lib.Toupcam_Snap.argtypes = [ctypes.c_void_p, ctypes.c_uint]
         lib.Toupcam_Snap.restype = ctypes.c_int
+
+        # StartPullModeWithCallback(handle, callback, ctx) -> HRESULT
+        lib.Toupcam_StartPullModeWithCallback.argtypes = [
+            ctypes.c_void_p, _EVENT_CALLBACK, ctypes.c_void_p,
+        ]
+        lib.Toupcam_StartPullModeWithCallback.restype = ctypes.c_int
         
         _lib = lib
         logger.info(f"ToupCam library loaded: {dll_path}")
@@ -280,7 +286,12 @@ TOUPCAM_EVENT_ERROR         = 0x80
 TOUPCAM_EVENT_DISCONNECTED  = 0x40
 
 # Callback type: void (__stdcall*)(unsigned nEvent, void* pCtx)
-_EVENT_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_uint, ctypes.c_void_p)
+# v7.3-camera fix: Use WINFUNCTYPE (stdcall) on Windows, CFUNCTYPE (cdecl) elsewhere
+import platform as _platform
+if _platform.system() == 'Windows':
+    _EVENT_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.c_uint, ctypes.c_void_p)
+else:
+    _EVENT_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_uint, ctypes.c_void_p)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -411,8 +422,10 @@ class ToupCamBackend:
             return False
         self._lib = lib
         
-        self._handle = lib.Toupcam_Open(device_id)
-        if not self._handle:
+        # v7.3-camera fix: Wrap handle as c_void_p for Python 3.12+ ctypes safety
+        _raw_handle = lib.Toupcam_Open(device_id)
+        self._handle = ctypes.c_void_p(_raw_handle)
+        if self._handle is None or not self._handle:
             logger.warning(f"ToupCam: failed to open {device_id[:30]}")
             return False
         
@@ -503,7 +516,9 @@ class ToupCamBackend:
     
     def isOpened(self) -> bool:
         """Check if camera is open and running."""
-        return self._handle is not None and self._running
+        # v7.3-camera fix: c_void_p(0) is falsy, c_void_p(None) is falsy
+        handle_ok = self._handle is not None and bool(self._handle)
+        return handle_ok and self._running
     
     def read(self) -> tuple[bool, np.ndarray | None]:
         """Read the latest frame (BGR numpy array).
@@ -526,7 +541,7 @@ class ToupCamBackend:
     
     def release(self):
         """Stop and close the camera."""
-        if self._handle and self._lib:
+        if self._handle is not None and bool(self._handle) and self._lib:
             try:
                 self._lib.Toupcam_Stop(self._handle)
             except Exception:

@@ -402,6 +402,8 @@ class XYStageManager:
                 encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
             else:
                 encoded = f"{command}\r\n".encode("ascii")
+            # v7.2.8s2: lock is acquired by caller (get_current_position etc.)
+            # for atomic write+read. Bare writes (VS, G) don't need response.
             self.spo.write(encoded)
             return None
         except (Exception,) as e:
@@ -444,16 +446,16 @@ class XYStageManager:
 
     def get_current_position(self) -> "tuple[float | None, float | None, float | None]":
         """Query stage position.
-        v7.2.7: no lock on readline — send_command handles write lock internally.
-        Holding lock across readline() starves jog handler threads.
+        v7.2.8s2: atomic position query — lock protects write+read from
+        concurrent JogHandler/PositionPoller contention.
         """
         if self.simulate:
             response = self.spo.send_command("P")
             return self._parse_position_response(response)
         try:
-            self._send_protocol_command("position_query", fallback_cmd="P")
-            # v7.2.8: CR-aware read (Prior sends \r not \n)
-            response = _read_response_cr(self.spo, timeout=0.5)
+            with self._serial_lock:
+                self._send_protocol_command("position_query", fallback_cmd="P")
+                response = _read_response_cr(self.spo, timeout=0.5)
             return self._parse_position_response(response)
         except Exception as e:
             logger.debug(f"XY position query error: {e}")
@@ -478,12 +480,15 @@ class XYStageManager:
     # ── Movement Commands (P8.19) ─────────────────────────────────
 
     def move_stage_at_velocity(self, vx: float, vy: float) -> None:
-        """Set XY velocity (continuous jog mode)."""
-        self._send_protocol_command(
-            "set_velocity",
-            fallback_cmd=f"VS,{vx},{vy}",
-            vx=vx, vy=vy,
-        )
+        """Set XY velocity (continuous jog mode).
+        v7.2.8s2: serial lock prevents collision with position polling.
+        """
+        with self._serial_lock:
+            self._send_protocol_command(
+                "set_velocity",
+                fallback_cmd=f"VS,{vx},{vy}",
+                vx=vx, vy=vy,
+            )
 
     def move_stage_to_position(self, x: float, y: float, fast: bool = False) -> None:
         """Move to absolute position (x, y) in stage coordinates."""
@@ -590,18 +595,20 @@ class XYStageManager:
         self.set_velocity(self.default_velocity)
 
     def get_firmware_version(self) -> Optional[str]:
-        """Query the controller firmware version."""
+        """Query controller firmware version.
+        v7.2.8s2: atomic with serial lock + CR-aware read.
+        """
         if self.simulate:
             return "Simulator v1.0"
-
         try:
-            self._send_protocol_command("firmware_version", fallback_cmd="V")
-            # v7.2.8: CR-aware read
-            response = _read_response_cr(self.spo, timeout=0.5)
-            return response
+            with self._serial_lock:
+                self._send_protocol_command("firmware_version", fallback_cmd="V")
+                response = _read_response_cr(self.spo, timeout=0.5)
+            return response if response else None
         except Exception as e:
             logger.debug(f"Firmware version query error: {e}")
             return None
+
 
     def check_stage_limits(self, x: float, y: float) -> bool:
         """Return True if (x, y) is within the stage's physical range."""

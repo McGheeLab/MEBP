@@ -1,9 +1,9 @@
 {
   "window": {
-    "x": 1220,
-    "y": 574,
-    "width": 1400,
-    "height": 850,
+    "x": 0,
+    "y": -11,
+    "width": 3840,
+    "height": 2054,
     "active_tab": 0,
     "splitter_sizes": [
       706,
@@ -52,7 +52,7 @@
     "xy_min_y": -100000.0,
     "xy_max_x": 100000.0,
     "xy_max_y": 100000.0,
-    "z_min": -10.0,
+    "z_min": -50.0,
     "z_max": 50.0,
     "p1_min": -50.0,
     "p1_max": 50.0,
@@ -63,13 +63,13 @@
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
-    "enabled": false,
     "max_flow_rate_p1_uL_s": 8.0,
     "max_flow_rate_p2_uL_s": 0.0,
-    "max_flow_rate_p3_uL_s": 0.0
+    "max_flow_rate_p3_uL_s": 0.0,
+    "enabled": true
   },
   "polling": {
-    "position_interval_ms": 300,
+    "position_interval_ms": 100,
     "watchdog_interval_s": 3.0
   },
   "calibration": {

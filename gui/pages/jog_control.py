@@ -292,12 +292,31 @@ class JogControlPage(QWidget):
     #  STATUS UPDATE
     # ════════════════════════════════════════════════════════════════
 
-    def set_hardware_config(self, config):
-        """v7.2.5: Receive hardware config — enable/disable pump buttons, µL display."""
+    def set_hardware_config(self, config):  # v7.2.7: pump visibility
+        """Update jog page from hardware config — show/hide pump controls."""
         self._hardware_config = config
-        self._update_pump_states()
-        self._refresh_pump_step_combo()
-        self._refresh_pump_step_combo()
+        self._update_pump_step_combo()
+        # Update pump section visibility based on configured pumps
+        if config:
+            configured = set(config.configured_pump_ids) if hasattr(config, "configured_pump_ids") else set()
+        else:
+            configured = set()
+        for pid in ["P1", "P2", "P3"]:
+            frame = getattr(self, f"_pump_frame_{pid.lower()}", None)
+            if frame is not None:
+                frame.setVisible(pid in configured)
+            # Also update labels
+            lbl = getattr(self, f"lbl_{pid.lower()}_name", None)
+            if lbl and config:
+                pcfg = config.pumps.get(pid)
+                if pcfg and pcfg.is_configured:
+                    ink = getattr(pcfg, "ink_name", "") or pid
+                    lbl.setText(f"{pid}: {ink}")
+                else:
+                    lbl.setText(f"{pid}: (not configured)")
+        logger.info(f"Jog: pump visibility updated — active: {configured or 'none'}")
+
+
     def _update_pump_states(self):
         """v7.2.5: Enable/disable pump buttons based on HardwareConfig."""
         if not hasattr(self, '_pump_buttons'):

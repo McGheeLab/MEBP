@@ -279,19 +279,27 @@ class CameraWidget(QWidget):
     def refresh_cameras(self):
         """Detect cameras and populate the combo.
 
-        v7.2.5 S7: This is now the only path that probes hardware.
-        Called by user clicking Detect, or automatically on first start().
+        v7.3-camera: Detects both OpenCV and ToupCam cameras.
+        Combo item data is a tuple: ("opencv", index) or ("toupcam", device_id).
         """
         self.camera_combo.clear()
-        if not CV2_AVAILABLE:
+        if not CAMERA_AVAILABLE:
             return
-        for idx in detect_cameras():
-            self.camera_combo.addItem(f"Camera {idx}", idx)
+
+        # OpenCV cameras
+        if CV2_AVAILABLE:
+            for idx in detect_cameras():
+                self.camera_combo.addItem(f"CV2: Camera {idx}", ("opencv", idx))
+
+        # ToupCam cameras  (v7.3-camera)
+        for tc_dev in detect_toupcam_cameras():
+            name = tc_dev.get('displayname', 'ToupCam')
+            dev_id = tc_dev.get('id', '')
+            self.camera_combo.addItem(f"TC: {name}", ("toupcam", dev_id))
+
         if self.camera_combo.count() == 0:
             self.camera_combo.addItem("No cameras found", -1)
         self._cameras_detected = True
-
-    # ── Start / Stop ──────────────────────────────────────────────
 
     def start(self):
         """Start the camera feed using the currently selected combo index.
@@ -408,16 +416,35 @@ class CameraWidget(QWidget):
     # ── Frame Capture ─────────────────────────────────────────────
 
     def _grab_frame(self):
-        """Capture, adjust, and display one frame."""
-        if not self._capture or not self._capture.isOpened():
-            self.stop()
+        """Capture, adjust, and display one frame.
+
+        v7.3-camera: Reads from OpenCV or ToupCam backend.
+        """
+        # v7.3-camera: Dual backend read
+        backend = getattr(self, '_backend_type', 'opencv')
+        if backend == 'toupcam':
+            tc = getattr(self, '_toupcam', None)
+            if tc is None or not tc.isOpened():
+                self.stop()
+                return
+            ret, frame = tc.read()
+        else:
+            if not self._capture or not self._capture.isOpened():
+                self.stop()
+                return
+            ret, frame = self._capture.read()
+
+        if not ret or frame is None:
             return
 
-        ret, frame = self._capture.read()
-        if not ret:
+        # Import numpy/cv2 for processing
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
             return
 
-        # Convert BGR → RGB
+        # Convert BGR -> RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         # Apply software brightness
@@ -447,6 +474,7 @@ class CameraWidget(QWidget):
         self.video_label.setPixmap(scaled)
 
         self.frame_captured.emit(q_img)
+
 
     def _draw_crosshair(self, pixmap: QPixmap):
         """Draw a crosshair overlay on the pixmap."""

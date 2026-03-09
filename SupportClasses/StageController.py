@@ -816,6 +816,7 @@ class StageController:
 
         self.xbox_poller = XboxQueuePoller(self.xbox_queue, self.processor)
         self.xbox_poller.start()
+        self.xbox_poller._xbox_status = "waiting"  # v7.2.7: force initial status
 
 
     def disconnect_xbox(self) -> None:
