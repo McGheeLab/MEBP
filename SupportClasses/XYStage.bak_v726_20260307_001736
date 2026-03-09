@@ -348,16 +348,17 @@ class XYStageManager:
             return None
         if self.simulate:
             return self.spo.send_command(command)
-        try:
-            if self._protocol:
-                encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
-            else:
-                encoded = f"{command}\r\n".encode("ascii")
-            self.spo.write(encoded)
-            return None
-        except (Exception,) as e:
-            logger.error(f"XY send_command error: {e}")
-            return None
+        with self._serial_lock:
+            try:
+                if self._protocol:
+                    encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{command}\r\n".encode("ascii")
+                self.spo.write(encoded)
+                return None
+            except (Exception,) as e:
+                logger.error(f"XY send_command error: {e}")
+                return None
 
 
     def _send_protocol_command(
@@ -400,16 +401,17 @@ class XYStageManager:
         if self.simulate:
             response = self.spo.send_command("P")
             return self._parse_position_response(response)
-        try:
-            self._send_protocol_command("position_query", fallback_cmd="P")
-            response = self.spo.readline().decode(
-                self._protocol.encoding if self._protocol else "ascii",
-                errors="replace"
-            ).strip()
-            return self._parse_position_response(response)
-        except Exception as e:
-            logger.debug(f"XY position query error: {e}")
-            return (None, None, None)
+        with self._serial_lock:
+            try:
+                self._send_protocol_command("position_query", fallback_cmd="P")
+                response = self.spo.readline().decode(
+                    self._protocol.encoding if self._protocol else "ascii",
+                    errors="replace"
+                ).strip()
+                return self._parse_position_response(response)
+            except Exception as e:
+                logger.debug(f"XY position query error: {e}")
+                return (None, None, None)
 
 
     def _parse_position_response(response: str) -> tuple[float | None, float | None, float | None]:

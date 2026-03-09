@@ -47,6 +47,9 @@ class XboxQueuePoller:
         self.processor = processor
         self._running = False
         self._thread: threading.Thread | None = None
+        # v7.2.6: S4-D status handler — track controller state from worker
+        self._xbox_status: str = "disconnected"
+
 
     def start(self) -> None:
         self._running = True
@@ -68,7 +71,11 @@ class XboxQueuePoller:
                 except Exception:
                     break
 
-                if "debug" in msg:
+                if "status" in msg:
+                    # v7.2.6: S4-D — store Xbox worker status for StageController
+                    self._xbox_status = msg["status"]
+                    logger.info(f"[Xbox] Status: {self._xbox_status}")
+                elif "debug" in msg:
                     text = msg["debug"]
                     if "connect" in text.lower() or "found" in text.lower():
                         logger.info(f"[Xbox] {text}")
@@ -82,11 +89,6 @@ class XboxQueuePoller:
                     self.processor.add_command(msg["command"], direction=msg["dpad"])
 
             time.sleep(0.02)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# ZP Jog Handler
-# ═══════════════════════════════════════════════════════════════════
 
 class ZPJogHandler:
     """
@@ -135,6 +137,18 @@ class ZPJogHandler:
         self.processor.register_handler("increment_pspeed_up", self._incr_p_up)
         self.processor.register_handler("increment_pspeed_down", self._incr_p_down)
 
+        # v7.2.6: ZP registered handlers — track for unregister on stop()
+        self._registered_handlers: list = [
+            ("move_z_at_velocity",       self._handle_z_vel),
+            ("move_p1_at_velocity",      self._handle_p1_vel),
+            ("move_p2_at_velocity",      self._handle_p2_vel),
+            ("move_p3_at_velocity",      self._handle_p3_vel),
+            ("increment_zspeed_up",      self._incr_z_up),
+            ("increment_zspeed_down",    self._incr_z_down),
+            ("increment_pspeed_up",      self._incr_p_up),
+            ("increment_pspeed_down",    self._incr_p_down),
+        ]
+
     def start(self) -> None:
         self._running = True
         self._thread = threading.Thread(
@@ -143,11 +157,23 @@ class ZPJogHandler:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop jog loop and unregister all Processor handlers.
+        v7.2.6: ZP unregister — prevents stale callbacks on reconnect.
+        """
         self._running = False
+        for cmd, handler in getattr(self, "_registered_handlers", []):
+            try:
+                self.processor.unregister_handler(cmd, handler)
+            except Exception:
+                pass
+        try:
+            self.stage.move_relative({}, None)
+        except Exception:
+            pass
         if self._thread:
             self._thread.join(timeout=1.0)
 
-    @property
+
     def speeds(self) -> dict[str, float]:
         return {"z": self.z_speed, "p": self.p_speed}
 
@@ -171,20 +197,63 @@ class ZPJogHandler:
         with self._lock:
             self.vel_z = self._clamp_vel(raw, self.z_speed)
 
+    def _clamp_pump_flow(self, vel_dimensionless: float, pump_id: str) -> float:
+        """Clamp pump velocity to max safe flow rate.
+
+        v7.2.6: S7-A — converts dimensionless vel → µL/s, clamps, converts back.
+        Falls through unchanged when hardware config or safety limits not set.
+
+        Args:
+            vel_dimensionless: Velocity in handler units (segment_time × p_speed)
+            pump_id: 'P1', 'P2', or 'P3'
+        Returns:
+            Clamped velocity in same units.
+        """
+        hw = self._hardware_config
+        sl = self.safety_limits
+        if hw is None or sl is None or not sl.enabled:
+            return vel_dimensionless
+        pump_cfg = hw.pumps.get(pump_id)
+        if pump_cfg is None or not pump_cfg.is_configured:
+            return vel_dimensionless
+        max_rate = sl.get_max_flow_rate(pump_id)
+        if max_rate <= 0:
+            return vel_dimensionless
+        try:
+            # vel_dimensionless ~ mm/s of plunger travel
+            rate_uL_s = abs(pump_cfg.mm_to_uL(abs(vel_dimensionless)))
+            if rate_uL_s > max_rate:
+                scale = max_rate / rate_uL_s
+                logger.debug(
+                    f"{pump_id} jog flow clamped: {rate_uL_s:.3f} → "
+                    f"{max_rate:.3f} µL/s (scale={scale:.3f})"
+                )
+                return vel_dimensionless * scale
+        except (ValueError, AttributeError):
+            pass
+        return vel_dimensionless
+
     def _handle_p1_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
+        vel = self._clamp_vel(raw, self.p_speed)
+        vel = self._clamp_pump_flow(vel, "P1")  # v7.2.6: S7-A flow clamp
         with self._lock:
-            self.vel_p1 = self._clamp_vel(raw, self.p_speed)
+            self.vel_p1 = vel
 
     def _handle_p2_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
+        vel = self._clamp_vel(raw, self.p_speed)
+        vel = self._clamp_pump_flow(vel, "P2")  # v7.2.6: S7-A flow clamp
         with self._lock:
-            self.vel_p2 = self._clamp_vel(raw, self.p_speed)
+            self.vel_p2 = vel
 
     def _handle_p3_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
+        vel = self._clamp_vel(raw, self.p_speed)
+        vel = self._clamp_pump_flow(vel, "P3")  # v7.2.6: S7-A flow clamp
         with self._lock:
-            self.vel_p3 = self._clamp_vel(raw, self.p_speed)
+            self.vel_p3 = vel
+
 
     def _incr_z_up(self, *a, **kw):
         self.z_speed = min(self.z_speed * 2, 100)
@@ -245,15 +314,18 @@ class ZPJogHandler:
             if self.safety_limits and self.safety_limits.enabled:
                 feedrate = min(feedrate, self.safety_limits.max_z_feedrate)
 
-            self.stage.move_relative(
-                {"X": dz, "Y": dp1, "Z": dp2, "E": dp3}, feedrate
-            )
+            # v7.2.6: ZP jog serial guard — protect against disconnected stage
+            try:
+                self.stage.move_relative(
+                    {"X": dz, "Y": dp1, "Z": dp2, "E": dp3}, feedrate
+                )
+            except Exception as e:
+                logger.warning(f"[ZP] Jog move failed: {e}")
+                with self._lock:
+                    self.vel_z = self.vel_p1 = self.vel_p2 = self.vel_p3 = 0.0
+                break
+
             time.sleep(self.segment_time)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# XY Jog Handler
-# ═══════════════════════════════════════════════════════════════════
 
 class XYJogHandler:
     """
@@ -292,6 +364,13 @@ class XYJogHandler:
         self.processor.register_handler("increment_xyspeed_up", self._incr_up)
         self.processor.register_handler("increment_xyspeed_down", self._incr_down)
 
+        # v7.2.6: XY registered handlers
+        self._registered_handlers: list = [
+            ("move_stage_at_velocity", self._handle_vel),
+            ("increment_xyspeed_up",   self._incr_up),
+            ("increment_xyspeed_down", self._incr_down),
+        ]
+
 
     # v7.2: Hardware config for µL conversion
     _hardware_config = None
@@ -308,7 +387,15 @@ class XYJogHandler:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop jog loop and unregister all Processor handlers.
+        v7.2.6: XY unregister — prevents stale callbacks on reconnect.
+        """
         self._running = False
+        for cmd, handler in getattr(self, "_registered_handlers", []):
+            try:
+                self.processor.unregister_handler(cmd, handler)
+            except Exception:
+                pass
         try:
             self.stage.move_stage_at_velocity(0, 0)
         except Exception:
@@ -316,7 +403,7 @@ class XYJogHandler:
         if self._thread:
             self._thread.join(timeout=1.0)
 
-    @property
+
     def speed(self) -> float:
         return self.xy_speed
 
@@ -370,7 +457,14 @@ class XYJogHandler:
                 except Exception:
                     pass
 
-            self.stage.move_stage_at_velocity(vx, vy)
+            # v7.2.6: XY jog serial guard
+            try:
+                self.stage.move_stage_at_velocity(vx, vy)
+            except Exception as e:
+                logger.warning(f"[XY] Jog move failed: {e}")
+                with self._lock:
+                    self.vel_x = self.vel_y = 0.0
+                break
             time.sleep(self.update_interval)
 
 
@@ -511,7 +605,7 @@ class StageController:
         self._watchdog.start()
 
         # Background position cache
-        self._pos_poller = PositionPoller(poll_interval=0.3)
+        self._pos_poller = PositionPoller(poll_interval=1.0)  # v7.2.6: poll interval 1.0s
         self._pos_poller.start()
 
         # Disconnect callback (GUI can set this)
@@ -522,8 +616,15 @@ class StageController:
 
         # Register calibration handler
         self.processor.register_handler("zero_needle_pos", self._calibrate_zero)
+        # v7.2.6: debug handler — ensures Xbox debug messages always dispatch
+        self.processor.register_handler("debug", self._handle_debug)
 
     # ── Connection Management ─────────────────────────────────────
+
+    def _handle_debug(self, *args, **kwargs) -> None:
+        """v7.2.6: debug handler — logs Xbox worker debug messages."""
+        msg = kwargs.get("message", "") or (args[0] if args else "")
+        logger.info(f"[Debug] {msg}")
 
     def connect_stages(self, xy: bool = True, zp: bool = True) -> None:
         """Initialise and connect stages.
@@ -537,6 +638,10 @@ class StageController:
                 simulate=self.simulate_xy,
                 controller_json=self.controller_json,
             )
+            # v7.2.6: stop old jog handlers before creating new ones
+            if self.xy_jog is not None:
+                self.xy_jog.stop()
+                self.xy_jog = None
             self.xy_jog = XYJogHandler(
                 self.processor, self.xy_stage,
                 safety_limits=self.safety_limits,
@@ -553,6 +658,10 @@ class StageController:
 
         if zp and self.zp_stage is None:
             self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
+            # v7.2.6: stop old ZP jog handler
+            if self.zp_jog is not None:
+                self.zp_jog.stop()
+                self.zp_jog = None
             self.zp_jog = ZPJogHandler(
                 self.processor, self.zp_stage,
                 safety_limits=self.safety_limits,
@@ -645,20 +754,33 @@ class StageController:
     # ── Xbox Controller ───────────────────────────────────────────
 
     def connect_xbox(self, mapping_file: str = "current_button_mapping.json") -> None:
+        """Connect Xbox controller.
+        v7.2.6: S5-A mapping path — resolves to absolute so subprocess finds same file.
+        """
         if self.xbox_process and self.xbox_process.is_alive():
             logger.warning("Xbox already connected")
             return
+        # v7.2.6: S5-A mapping path — resolve now so worker and editor use same file
+        from pathlib import Path as _Path
+        self._mapping_file = str(_Path(mapping_file).resolve())
+        # v7.2.6: connect order warning
+        if self.xy_stage is None and self.zp_stage is None:
+            logger.warning(
+                "Xbox connected but no stages are connected -- "
+                "controller input will have no effect until stages connect"
+            )
         self.xbox_queue = Queue()
         self.xbox_process = Process(
             target=xbox_polling_worker,
             args=(self.xbox_queue,),
-            kwargs={"mapping_file": mapping_file},
+            kwargs={"mapping_file": self._mapping_file},
             daemon=True,
         )
         self.xbox_process.start()
         self.xbox_poller = XboxQueuePoller(self.xbox_queue, self.processor)
         self.xbox_poller.start()
-        logger.info("Xbox controller connected")
+        logger.info(f"Xbox controller connected (mapping: {self._mapping_file})")
+
 
     def disconnect_xbox(self) -> None:
         if self.xbox_poller:
@@ -672,6 +794,26 @@ class StageController:
         logger.info("Xbox controller disconnected")
 
     # ── Position Queries ──────────────────────────────────────────
+
+    # v7.2.6: S4-E xbox_status property
+    @property
+    def xbox_status(self) -> str:
+        """Return Xbox connection status string.
+
+        Returns: 'disconnected', 'waiting', 'connected', or 'alive'.
+        'waiting'   = worker running, searching for controller
+        'connected' = controller just found
+        'alive'     = controller confirmed active (heartbeat)
+        """
+        if self.xbox_poller is None:
+            return "disconnected"
+        return getattr(self.xbox_poller, "_xbox_status", "unknown")
+
+    @property
+    def is_xbox_connected(self) -> bool:
+        """Backward-compatible bool: True when controller is active."""
+        return self.xbox_status in ("connected", "alive")
+
 
     def get_xy_position(self, cached: bool = True) -> tuple:
         """Get XY position. cached=True returns polled value (non-blocking)."""

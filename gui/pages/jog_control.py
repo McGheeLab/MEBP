@@ -144,18 +144,22 @@ class JogControlPage(QWidget):
 
         # XY speed
         self.lbl_xy_speed = QLabel("100")
+        # v7.2.6: S6-C slider refs
         layout.addWidget(self._make_ctx_slider(
-            "XY:", self.lbl_xy_speed, 1, 10000, 100, self._on_xy_speed))
+            "XY:", self.lbl_xy_speed, 1, 10000, 100, self._on_xy_speed,
+            store_as="_sld_xy_speed"))
 
         # Z speed
         self.lbl_z_speed = QLabel("0.50")
         layout.addWidget(self._make_ctx_slider(
-            "Z:", self.lbl_z_speed, 1, 500, 50, self._on_z_speed))
+            "Z:", self.lbl_z_speed, 1, 500, 50, self._on_z_speed,
+            store_as="_sld_z_speed"))
 
         # Pump speed
         self.lbl_p_speed = QLabel("0.50")
         layout.addWidget(self._make_ctx_slider(
-            "P:", self.lbl_p_speed, 1, 500, 50, self._on_p_speed))
+            "P:", self.lbl_p_speed, 1, 500, 50, self._on_p_speed,
+            store_as="_sld_p_speed"))
 
         layout.addStretch()
         self._context_widget = ctx
@@ -394,6 +398,8 @@ class JogControlPage(QWidget):
     # ════════════════════════════════════════════════════════════════
     #  KEYBOARD SHORTCUTS
     # ════════════════════════════════════════════════════════════════
+        # v7.2.6: S6-D sync speeds
+        self._sync_speed_sliders()
 
 
     def _refresh_pump_step_combo(self):
@@ -555,16 +561,91 @@ class JogControlPage(QWidget):
             self.controller.zp_jog.z_speed = speed
 
     def _on_p_speed(self, value):
-        speed = value / 100.0
-        self.lbl_p_speed.setText(f"{speed:.2f}")
-        if hasattr(self.controller, 'zp_jog') and self.controller.zp_jog:
-            self.controller.zp_jog.pump_speed = speed
+        # v7.2.6: S6-A p_speed fix + S7-B uL/s mode
+        if (self._hardware_config and
+                self._hardware_config.configured_pump_ids):
+            # Slider 1-500 → 0.01-5.00 µL/s
+            rate_uL_s = value / 100.0
+            self.lbl_p_speed.setText(f"{rate_uL_s:.2f} µL/s")
+            if getattr(self.controller, 'zp_jog', None):
+                pid = self._hardware_config.configured_pump_ids[0]
+                try:
+                    mm_per_s = self._hardware_config.uL_to_mm(pid, rate_uL_s)
+                    self.controller.zp_jog.p_speed = mm_per_s
+                except (ValueError, AttributeError):
+                    self.controller.zp_jog.p_speed = rate_uL_s
+        else:
+            # Fallback: raw multiplier (v7.2.6: S6-A fix — p_speed not pump_speed)
+            speed = value / 100.0
+            self.lbl_p_speed.setText(f"{speed:.2f}")
+            if getattr(self.controller, 'zp_jog', None):
+                self.controller.zp_jog.p_speed = speed
 
-    # ── Widget Helpers ───────────────────────────────────────────
+
+    def _sync_speed_sliders(self):
+        """Read current speeds from jog handlers and update sliders + labels.
+
+        v7.2.6: S6-E + S7-C — Xbox speed changes reflected on jog page;
+        reconnect resets handled; pump shows µL/s when hw config available.
+        """
+        ctrl = self.controller
+
+        # XY speed
+        if getattr(ctrl, 'xy_jog', None):
+            actual_xy = ctrl.xy_jog.xy_speed
+            sld = getattr(self, '_sld_xy_speed', None)
+            if sld is not None and abs(sld.value() - actual_xy) > 0.5:
+                sld.blockSignals(True)
+                sld.setValue(max(sld.minimum(), min(sld.maximum(), int(actual_xy))))
+                sld.blockSignals(False)
+                self.lbl_xy_speed.setText(f"{int(actual_xy)}")
+
+        # Z speed
+        if getattr(ctrl, 'zp_jog', None):
+            actual_z = ctrl.zp_jog.z_speed
+            sld_z = getattr(self, '_sld_z_speed', None)
+            if sld_z is not None:
+                slider_z = sld_z.value() / 100.0
+                if abs(slider_z - actual_z) > 0.005:
+                    sld_z.blockSignals(True)
+                    sld_z.setValue(max(sld_z.minimum(),
+                                      min(sld_z.maximum(), int(actual_z * 100))))
+                    sld_z.blockSignals(False)
+                    self.lbl_z_speed.setText(f"{actual_z:.2f}")
+
+            # Pump speed — show µL/s when hw config available (v7.2.6: S7-C uL/s display)
+            actual_p = ctrl.zp_jog.p_speed
+            sld_p = getattr(self, '_sld_p_speed', None)
+            if sld_p is not None:
+                hw = self._hardware_config
+                if hw and hw.configured_pump_ids:
+                    pid = hw.configured_pump_ids[0]
+                    try:
+                        rate_uL_s = abs(hw.mm_to_uL(pid, abs(actual_p)))
+                        slider_target = int(rate_uL_s * 100)
+                        if abs(sld_p.value() - slider_target) > 1:
+                            sld_p.blockSignals(True)
+                            sld_p.setValue(max(sld_p.minimum(),
+                                              min(sld_p.maximum(), slider_target)))
+                            sld_p.blockSignals(False)
+                        self.lbl_p_speed.setText(f"{rate_uL_s:.2f} µL/s")
+                    except (ValueError, AttributeError):
+                        self.lbl_p_speed.setText(f"{actual_p:.2f}")
+                else:
+                    slider_p = sld_p.value() / 100.0
+                    if abs(slider_p - actual_p) > 0.005:
+                        sld_p.blockSignals(True)
+                        sld_p.setValue(max(sld_p.minimum(),
+                                          min(sld_p.maximum(), int(actual_p * 100))))
+                        sld_p.blockSignals(False)
+                        self.lbl_p_speed.setText(f"{actual_p:.2f}")
+
 
     def _make_ctx_slider(self, label_text, value_label, min_val, max_val,
-                         default, callback):
-        """Create a labeled slider row for the context panel."""
+                         default, callback, store_as=None):
+        """Create a labeled slider row for the context panel.
+        v7.2.6: S6-B store_as — when given, stores slider ref as self.<store_as>.
+        """
         frame = QFrame()
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -581,4 +662,10 @@ class JogControlPage(QWidget):
         layout.addWidget(slider, stretch=1)
 
         layout.addWidget(value_label)
+
+        # v7.2.6: S6-B store_as — store slider ref for readback
+        if store_as is not None:
+            setattr(self, store_as, slider)
+
         return frame
+

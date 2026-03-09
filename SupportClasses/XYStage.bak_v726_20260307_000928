@@ -84,10 +84,6 @@ class XYStageManager:
         self.default_acceleration: int = self.DEFAULT_ACCELERATION
         self.default_velocity: int = self.DEFAULT_VELOCITY
 
-        # v7.2.6: serial lock — must be created BEFORE _initialise_serial()
-        # because send_command() acquires it during port detection
-        self._serial_lock = threading.RLock()
-
         # P8.17: Load controller protocol JSON
         # BUG-3 FIX (v7.1.2): Always load protocol, even in sim mode,
         # so parameters like microsteps_per_micron are accessible.
@@ -120,6 +116,9 @@ class XYStageManager:
             logger.info("XY stage simulator started")
         else:
             self.spo = self._initialise_serial()
+        # v7.2.6: XY serial lock — RLock allows re-entry from move->send chain
+        self._serial_lock = threading.RLock()
+
 
     # ── Protocol Loading (P8.17) ──────────────────────────────────
 
@@ -348,16 +347,17 @@ class XYStageManager:
             return None
         if self.simulate:
             return self.spo.send_command(command)
-        try:
-            if self._protocol:
-                encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
-            else:
-                encoded = f"{command}\r\n".encode("ascii")
-            self.spo.write(encoded)
-            return None
-        except (Exception,) as e:
-            logger.error(f"XY send_command error: {e}")
-            return None
+        with self._serial_lock:
+            try:
+                if self._protocol:
+                    encoded = command.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{command}\r\n".encode("ascii")
+                self.spo.write(encoded)
+                return None
+            except (Exception,) as e:
+                logger.error(f"XY send_command error: {e}")
+                return None
 
 
     def _send_protocol_command(
@@ -400,16 +400,17 @@ class XYStageManager:
         if self.simulate:
             response = self.spo.send_command("P")
             return self._parse_position_response(response)
-        try:
-            self._send_protocol_command("position_query", fallback_cmd="P")
-            response = self.spo.readline().decode(
-                self._protocol.encoding if self._protocol else "ascii",
-                errors="replace"
-            ).strip()
-            return self._parse_position_response(response)
-        except Exception as e:
-            logger.debug(f"XY position query error: {e}")
-            return (None, None, None)
+        with self._serial_lock:
+            try:
+                self._send_protocol_command("position_query", fallback_cmd="P")
+                response = self.spo.readline().decode(
+                    self._protocol.encoding if self._protocol else "ascii",
+                    errors="replace"
+                ).strip()
+                return self._parse_position_response(response)
+            except Exception as e:
+                logger.debug(f"XY position query error: {e}")
+                return (None, None, None)
 
 
     def _parse_position_response(response: str) -> tuple[float | None, float | None, float | None]:

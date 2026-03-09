@@ -43,6 +43,7 @@ def load_xbox_mapping(mapping_file: str = "current_button_mapping.json") -> dict
         return {"buttons": {}, "axes": {}, "dpad": {}}
 
 
+
 def xbox_polling_worker(
     out_queue: Queue,
     mapping_file: str = "current_button_mapping.json",
@@ -51,9 +52,8 @@ def xbox_polling_worker(
 ) -> None:
     """
     Main polling loop — runs in a separate process.
-
-    Continuously reads the Xbox controller via Pygame and sends events
-    to *out_queue*.  The mapping file is hot-reloaded every 5 seconds.
+    v7.2.6: S4 resilient worker — retry loop on startup, crash recovery,
+    periodic heartbeat. Worker never exits; reconnects automatically.
 
     Args:
         out_queue:     Multiprocessing queue for outbound messages.
@@ -64,168 +64,162 @@ def xbox_polling_worker(
     try:
         import pygame
     except ImportError:
-        out_queue.put({"debug": "pygame not installed — Xbox controller unavailable"})
+        out_queue.put({"debug": "pygame not installed -- Xbox controller unavailable"})
         return
 
     pygame.init()
-    pygame.joystick.init()
 
     # Load initial mapping
     mapping = load_xbox_mapping(mapping_file)
 
-    # Check for connected controllers
-    count = pygame.joystick.get_count()
-    out_queue.put({"debug": f"Found {count} joystick(s)."})
+    def _init_accumulators(js):
+        """Build fresh axis accumulators for a joystick."""
+        n = js.get_numaxes()
+        return (
+            {i: 0.0 for i in range(n)},
+            {i: 0   for i in range(n)},
+        )
 
-    if count == 0:
-        out_queue.put({"debug": "No controller connected."})
-        return
+    def _find_controller():
+        """Retry until a controller is found. Sends status messages."""
+        while True:
+            pygame.joystick.quit()
+            pygame.joystick.init()
+            count = pygame.joystick.get_count()
+            if count > 0:
+                js = pygame.joystick.Joystick(0)
+                js.init()
+                out_queue.put({"debug": f"Controller connected: {js.get_name()}"})
+                out_queue.put({"status": "connected"})
+                return js
+            else:
+                out_queue.put({"debug": "No controller found, retrying in 2s..."})
+                out_queue.put({"status": "waiting"})
+                time.sleep(2.0)
 
-    # Initialise the first joystick
-    joystick = pygame.joystick.Joystick(0)
-    joystick.init()
-    out_queue.put({
-        "debug": f"Controller connected: {joystick.get_name()}",
-        "joystick_info": {
-            "numbuttons": joystick.get_numbuttons(),
-            "numaxes": joystick.get_numaxes(),
-            "numhats": joystick.get_numhats(),
-        },
-    })
+    # ── Initial controller acquisition ────────────────────────────
+    joystick = _find_controller()
 
-    # Axis averaging accumulators
+    axis_accum, axis_count = _init_accumulators(joystick)
     num_axes = joystick.get_numaxes()
-    axis_accum = {i: 0.0 for i in range(num_axes)}
-    axis_count = {i: 0 for i in range(num_axes)}
-    last_axis_time = time.time()
+    last_axis_time   = time.time()
     last_mapping_time = time.time()
+    last_heartbeat   = time.time()
     last_hat = (0, 0)
     last_sent: dict = {}
 
-    # Axis groups define how physical axes are combined and labelled
     axis_groups = [
-        {"name": "0-1", "axes": [0, 1], "type": "axis"},      # Left stick
-        {"name": "2-3", "axes": [2, 3], "type": "axis"},      # Right stick
-        {"name": "4",   "axes": [4],    "type": "trigger"},   # Left trigger
-        {"name": "5",   "axes": [5],    "type": "trigger"},   # Right trigger
+        {"name": "0-1", "axes": [0, 1], "type": "axis"},
+        {"name": "2-3", "axes": [2, 3], "type": "axis"},
+        {"name": "4",   "axes": [4],    "type": "trigger"},
+        {"name": "5",   "axes": [5],    "type": "trigger"},
     ]
 
     # ── Main Loop ─────────────────────────────────────────────────
     while True:
         current_time = time.time()
-        pygame.event.pump()
 
-        # Hot-reload mapping every 5 seconds
-        if current_time - last_mapping_time >= 5:
-            mapping = load_xbox_mapping(mapping_file)
-            last_mapping_time = current_time
+        try:
+            pygame.event.pump()
 
-        # ── Button Presses ────────────────────────────────────────
-        for i in range(joystick.get_numbuttons()):
-            if joystick.get_button(i):
-                mapped_cmd = mapping.get("buttons", {}).get(str(i))
-                if mapped_cmd and mapped_cmd != "None":
-                    out_queue.put({"button": i, "command": mapped_cmd})
-                    time.sleep(0.2)  # Debounce
+            # Hot-reload mapping every 5 seconds
+            if current_time - last_mapping_time >= 5:
+                mapping = load_xbox_mapping(mapping_file)
+                last_mapping_time = current_time
 
-        # ── Accumulate Axis Readings ──────────────────────────────
-        for axis_id in range(num_axes):
-            val = joystick.get_axis(axis_id)
-            axis_accum[axis_id] += val
-            axis_count[axis_id] += 1
+            # Heartbeat every 3 seconds
+            if current_time - last_heartbeat >= 3.0:
+                out_queue.put({"status": "alive"})
+                last_heartbeat = current_time
 
-        # ── Process Averaged Axes ─────────────────────────────────
-        if current_time - last_axis_time >= avg_interval:
-            for group in axis_groups:
-                averages = []
-                for axis_id in group["axes"]:
-                    if axis_count[axis_id] > 0:
-                        avg_val = axis_accum[axis_id] / axis_count[axis_id]
+            # ── Button Presses ─────────────────────────────────────
+            for i in range(joystick.get_numbuttons()):
+                if joystick.get_button(i):
+                    mapped_func = mapping.get("buttons", {}).get(str(i))
+                    if mapped_func and mapped_func != "None":
+                        out_queue.put({"button": i, "command": mapped_func})
+
+            # ── Axis Accumulation ──────────────────────────────────
+            for i in range(num_axes):
+                raw = joystick.get_axis(i)
+                if abs(raw) > deadzone:
+                    axis_accum[i] += raw
+                    axis_count[i] += 1
+
+            if current_time - last_axis_time >= avg_interval:
+                for group in axis_groups:
+                    axes = group["axes"]
+                    cmd = mapping.get("axes", {}).get(group["name"])
+                    if not cmd or cmd == "None":
+                        for a in axes:
+                            axis_accum[a] = 0.0; axis_count[a] = 0
+                        continue
+
+                    if group["type"] == "axis":
+                        counts = [axis_count[a] for a in axes]
+                        total = sum(counts)
+                        if total > 0:
+                            avgs = [axis_accum[a] / axis_count[a] if axis_count[a] else 0.0
+                                    for a in axes]
+                        else:
+                            avgs = [0.0] * len(axes)
+                        avg_val = tuple(avgs)
                     else:
-                        avg_val = 0.0
+                        a = axes[0]
+                        avg_val = axis_accum[a] / axis_count[a] if axis_count[a] else 0.0
 
-                    # Triggers: remap from [-1, 1] to [0, 2] range
-                    if group["type"] == "trigger":
-                        avg_val += 1.0
-                        # Invert left trigger (axis 4)
-                        if group["axes"][0] == 4:
-                            avg_val = -avg_val
+                    zero_value = (0.0, 0.0) if group["type"] == "axis" else 0.0
+                    prev = last_sent.get(group["name"], zero_value)
 
-                    averages.append(avg_val)
-
-                # Determine if the movement exceeds deadzone
-                is_active = any(abs(v) > deadzone for v in averages)
-
-                mapped_cmd = mapping.get("axes", {}).get(group["name"])
-                if not mapped_cmd or mapped_cmd == "None":
-                    # Reset accumulators even if no command mapped
-                    for axis_id in group["axes"]:
-                        axis_accum[axis_id] = 0.0
-                        axis_count[axis_id] = 0
-                    continue
-
-                # Build the value to send
-                if len(averages) == 1:
-                    current_value = averages[0]
-                    zero_value = 0
-                else:
-                    current_value = tuple(round(v, 2) for v in averages)
-                    zero_value = tuple(0 for _ in group["axes"])
-
-                if is_active:
-                    out_queue.put({
-                        "axis": group["name"],
-                        "average": current_value,
-                        "command": mapped_cmd,
-                    })
-                    last_sent[group["name"]] = current_value
-                else:
-                    # Send zero when axis returns to neutral
-                    prev = last_sent.get(group["name"])
-                    if prev is not None and prev != zero_value:
+                    # Only send if changed or non-zero
+                    if avg_val != zero_value or prev != zero_value:
                         out_queue.put({
-                            "axis": group["name"],
-                            "average": zero_value,
-                            "command": mapped_cmd,
+                            "axis":    group["name"],
+                            "average": avg_val,
+                            "command": cmd,
                         })
-                        last_sent[group["name"]] = zero_value
-                    elif prev is None:
-                        last_sent[group["name"]] = zero_value
+                        last_sent[group["name"]] = avg_val
 
-                # Reset accumulators
-                for axis_id in group["axes"]:
-                    axis_accum[axis_id] = 0.0
-                    axis_count[axis_id] = 0
+                    for a in axes:
+                        axis_accum[a] = 0.0; axis_count[a] = 0
+                last_axis_time = current_time
 
-            last_axis_time = current_time
+            # ── D-Pad (Hat) ────────────────────────────────────────
+            if joystick.get_numhats() > 0:
+                current_hat = joystick.get_hat(0)
+                if current_hat != last_hat:
+                    dpad_map = mapping.get("dpad", {})
+                    if current_hat[1] == 1:
+                        cmd = dpad_map.get("up")
+                        if cmd and cmd != "None":
+                            out_queue.put({"dpad": "up", "command": cmd})
+                    elif current_hat[1] == -1:
+                        cmd = dpad_map.get("down")
+                        if cmd and cmd != "None":
+                            out_queue.put({"dpad": "down", "command": cmd})
+                    if current_hat[0] == 1:
+                        cmd = dpad_map.get("right")
+                        if cmd and cmd != "None":
+                            out_queue.put({"dpad": "right", "command": cmd})
+                    elif current_hat[0] == -1:
+                        cmd = dpad_map.get("left")
+                        if cmd and cmd != "None":
+                            out_queue.put({"dpad": "left", "command": cmd})
+                    last_hat = current_hat
 
-        # ── D-Pad (Hat) ───────────────────────────────────────────
-        if joystick.get_numhats() > 0:
-            current_hat = joystick.get_hat(0)
-            if current_hat != last_hat:
-                dpad_map = mapping.get("dpad", {})
+            time.sleep(0.02)
 
-                # Vertical: up/down
-                if current_hat[1] == 1:
-                    cmd = dpad_map.get("up")
-                    if cmd and cmd != "None":
-                        out_queue.put({"dpad": "up", "command": cmd})
-                elif current_hat[1] == -1:
-                    cmd = dpad_map.get("down")
-                    if cmd and cmd != "None":
-                        out_queue.put({"dpad": "down", "command": cmd})
+        except Exception as e:
+            # v7.2.6: Crash recovery — reconnect instead of dying
+            out_queue.put({"debug": f"Controller error: {e}"})
+            out_queue.put({"status": "disconnected"})
+            joystick = _find_controller()
+            # Re-init accumulators for the new joystick
+            axis_accum, axis_count = _init_accumulators(joystick)
+            num_axes = joystick.get_numaxes()
+            last_axis_time   = time.time()
+            last_mapping_time = time.time()
+            last_heartbeat   = time.time()
+            last_hat = (0, 0)
+            last_sent = {}
 
-                # Horizontal: left/right
-                if current_hat[0] == 1:
-                    cmd = dpad_map.get("right")
-                    if cmd and cmd != "None":
-                        out_queue.put({"dpad": "right", "command": cmd})
-                elif current_hat[0] == -1:
-                    cmd = dpad_map.get("left")
-                    if cmd and cmd != "None":
-                        out_queue.put({"dpad": "left", "command": cmd})
-
-                last_hat = current_hat
-
-        # Prevent busy-spin
-        time.sleep(0.02)

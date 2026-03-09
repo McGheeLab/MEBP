@@ -75,10 +75,9 @@ class ZPStageManager:
         default_feedrate: float = DEFAULT_FEEDRATE,
         steps_per_mm: int = DEFAULT_STEPS_PER_MM,
     ):
-        # v7.2.6: lock before init
-        self._serial_lock = threading.RLock()  # v7.2.6: ZP serial lock
         self.simulate = simulate
         # v7.2.6: ZP serial lock — thread-safe serial access
+        self._serial_lock = threading.RLock()
         self.baudrate = baudrate
         self.feedrate = default_feedrate
         self.steps_per_mm = steps_per_mm

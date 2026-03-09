@@ -86,13 +86,54 @@ class XboxMappingEditor(QDialog):
         self._populate_tables()
 
     def _load_mapping(self) -> dict:
-        """Load current mapping from file."""
+        """Load current mapping from file.
+        v7.2.6: S5-C create default — creates file with defaults if missing.
+        """
+        # v7.2.6: S5-C create default mapping file if it doesn't exist
+        path = Path(self.mapping_file)
+        if not path.exists():
+            defaults = {
+                "buttons": {
+                    "0": "zero_needle_pos",
+                    "1": "None", "2": "None", "3": "None",
+                    "4": "increment_zspeed_down",
+                    "5": "increment_zspeed_up",
+                    "6": "increment_pspeed_down",
+                    "7": "increment_pspeed_up",
+                    "8": "increment_xyspeed_down",
+                    "9": "increment_xyspeed_up",
+                    "10": "None", "11": "None",
+                },
+                "axes": {
+                    "0-1": "move_stage_at_velocity",
+                    "2-3": "move_z_at_velocity",
+                    "4": "move_p3_at_velocity",
+                    "5": "move_p3_at_velocity",
+                },
+                "dpad": {
+                    "up": "increment_zspeed_up",
+                    "down": "increment_zspeed_down",
+                    "left": "increment_pspeed_down",
+                    "right": "increment_pspeed_up",
+                },
+            }
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "w") as f:
+                    import json as _json
+                    _json.dump(defaults, f, indent=4)
+                logger.info(f"Created default mapping file: {path}")
+            except Exception as e:
+                logger.warning(f"Could not create default mapping: {e}")
+            return defaults
+
         try:
             with open(self.mapping_file, "r") as f:
                 return json.load(f)
         except Exception as e:
             logger.warning(f"Failed to load mapping: {e}")
             return {"buttons": {}, "axes": {}, "dpad": {}}
+
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)

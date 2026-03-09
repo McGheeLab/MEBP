@@ -336,6 +336,18 @@ class DashboardPage(QWidget):
     #  STATUS UPDATES
     # ════════════════════════════════════════════════════════════════
 
+
+    def _update_xbox_btn_state(self) -> None:
+        """v7.2.6: xbox button awareness — grey out Xbox connect when no stages connected."""
+        if not hasattr(self, "_btn_connect_xbox"):
+            return
+        xy_ok = getattr(self.controller, "xy_stage", None) is not None
+        zp_ok = getattr(self.controller, "zp_stage", None) is not None
+        enabled = xy_ok or zp_ok
+        self._btn_connect_xbox.setEnabled(enabled)
+        tip = "" if enabled else "Connect XY or ZP stage first"
+        self._btn_connect_xbox.setToolTip(tip)
+
     def on_status_update(self):
         """Called by MainWindow timer — refresh all readouts."""
         self.update_data()
@@ -343,11 +355,14 @@ class DashboardPage(QWidget):
         # Update context panel connection statuses
         self._update_conn_status("xy", self.controller.is_xy_connected)
         self._update_conn_status("zp", self.controller.is_zp_connected)
-        self._update_conn_status("xbox", getattr(self.controller, 'is_xbox_connected', False))
+        # v7.2.6: S5-D xbox status — use rich status property
+        _xbox_st = getattr(self.controller, "xbox_status", "disconnected")
+        self._update_conn_status("xbox", _xbox_st in ("connected", "alive"))
 
         # Update log count in context panel
         if hasattr(self, 'ctx_lbl_log_count'):
             self.ctx_lbl_log_count.setText(f"Entries: {self.controller.position_logger.count}")
+        self._update_xbox_btn_state()
 
     def update_data(self):
         """Update all data readouts."""
@@ -490,9 +505,14 @@ class DashboardPage(QWidget):
             logger.error(f"Xbox disconnect failed: {e}")
 
     def _open_xbox_editor(self):
+        # v7.2.6: S5-B mapping path — use the resolved path from StageController
         from gui.widgets.xbox_mapping_editor import XboxMappingEditor
-        editor = XboxMappingEditor(self)
+        mapping_path = getattr(
+            self.controller, "_mapping_file", "current_button_mapping.json"
+        )
+        editor = XboxMappingEditor(mapping_file=mapping_path, parent=self)
         editor.exec()
+
 
     def _export_log_csv(self):
         if hasattr(self.controller, 'position_logger'):
