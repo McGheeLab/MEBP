@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
     QTabWidget, QFileDialog, QProgressBar, QFrame,
-    QCheckBox, QGroupBox, QSizePolicy, QMessageBox,
+    QCheckBox, QGroupBox, QSizePolicy, QMessageBox, QSlider,
 )
 from PySide6.QtCore import Qt, Signal, QObject
 
@@ -144,6 +144,10 @@ class PrintSetupPage(QWidget):
 
         # v7.2.6: Forward to ALL sub-tabs with error handling
         self._hw_config = config
+        self._hardware_config = config
+        # Recalculate derived parameters with new hardware
+        if hasattr(self, '_calc_labels'):
+            self._update_derived()
         for tab_name in ['tab_workspace', 'tab_objects', 'tab_wells']:
             tab = getattr(self, tab_name, None)
             if tab and hasattr(tab, 'set_hardware_config'):
@@ -263,37 +267,144 @@ class PrintSetupPage(QWidget):
     #  CONTEXT PANEL — Print Settings Only (v7.2.3)
     # ════════════════════════════════════════════════════════════════
 
-    def _build_context_panel(self) -> QWidget:
-        """
-        Build the context panel with print settings only.
+    # ── Gauge max flow lookup (µL/s) ─────────────────────────────
+    GAUGE_MAX_FLOW = {
+        16: 50.0, 18: 30.0, 20: 15.0, 22: 8.0, 23: 5.0,
+        25: 3.0, 27: 1.5, 28: 1.0, 30: 0.5, 32: 0.2,
+    }
 
-        v7.2.3: Execution controls (Start/Pause/Abort, progress bar,
-        print queue) have been removed. They will move to Print Monitor
-        in Session 3.
-        """
+    def _build_context_panel(self) -> QWidget:
+        """Build the simplified print settings context panel."""
+        import math
         ctx = QWidget()
         ctx.setObjectName("contextPanel")
         layout = QVBoxLayout(ctx)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(6)
 
-        # ── Print Settings ────────────────────────────────────────
-        settings_label = QLabel("Print Settings")
-        settings_label.setObjectName("contextSectionLabel")
-        settings_label.setStyleSheet(
-            f"font-weight: bold; color: {COLORS['text']}; font-size: 13px;")
-        layout.addWidget(settings_label)
+        grp_style = f"""
+            QGroupBox {{
+                font-weight: bold; font-size: 12px;
+                color: {COLORS.get('text', '#cdd6f4')};
+                background: {COLORS.get('base', '#1e1e2e')};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px; right: 0px; top: 0px;
+                padding: 6px 10px;
+                background: {COLORS.get('surface1', '#45475a')};
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+        """
+        dim_style = f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;"
 
-        # XY Feed
-        fr_row = QHBoxLayout()
-        fr_row.addWidget(QLabel("XY Feed:"))
-        self.xy_feed_spin = QDoubleSpinBox()
-        self.xy_feed_spin.setRange(0.1, 50.0)
-        self.xy_feed_spin.setValue(5.0)
-        self.xy_feed_spin.setSuffix(" mm/s")
-        self.xy_feed_spin.setDecimals(1)
-        fr_row.addWidget(self.xy_feed_spin)
-        layout.addLayout(fr_row)
+        # ══════════════════════════════════════════════════════════
+        #  Section 1: Extrusion — Volume Fraction + Speed Scale
+        # ══════════════════════════════════════════════════════════
+        ext_grp = QGroupBox("Extrusion")
+        ext_grp.setStyleSheet(grp_style)
+        ext_lay = QVBoxLayout(ext_grp)
+        ext_lay.setSpacing(4)
+
+        # Volume Fraction (%)
+        vf_row = QHBoxLayout()
+        vf_row.addWidget(QLabel("Fill:"))
+        self.volume_fraction_spin = QSpinBox()
+        self.volume_fraction_spin.setRange(1, 100)
+        self.volume_fraction_spin.setValue(50)
+        self.volume_fraction_spin.setSuffix(" %")
+        self.volume_fraction_spin.setToolTip(
+            "Volume fraction of needle bore cylinder to fill (0-100%)")
+        self.volume_fraction_spin.valueChanged.connect(self._update_derived)
+        vf_row.addWidget(self.volume_fraction_spin)
+        ext_lay.addLayout(vf_row)
+
+        # Speed Scale (%)
+        sp_row = QHBoxLayout()
+        sp_row.addWidget(QLabel("Speed:"))
+        self.speed_scale_spin = QSpinBox()
+        self.speed_scale_spin.setRange(1, 100)
+        self.speed_scale_spin.setValue(50)
+        self.speed_scale_spin.setSuffix(" %")
+        self.speed_scale_spin.setToolTip(
+            "Percentage of maximum print speed (higher = faster but less accurate)")
+        self.speed_scale_spin.valueChanged.connect(self._update_derived)
+        sp_row.addWidget(self.speed_scale_spin)
+        ext_lay.addLayout(sp_row)
+
+        layout.addWidget(ext_grp)
+
+        # ══════════════════════════════════════════════════════════
+        #  Section 2: Derived Parameters (read-only display)
+        # ══════════════════════════════════════════════════════════
+        calc_grp = QGroupBox("Calculated")
+        calc_grp.setStyleSheet(grp_style)
+        calc_lay = QVBoxLayout(calc_grp)
+        calc_lay.setSpacing(2)
+
+        self._calc_labels = {}
+        for key, label_text in [
+            ("needle_bore", "Bore:"),
+            ("max_flow", "Max Flow:"),
+            ("max_speed", "Max Speed:"),
+            ("print_speed", "Print Speed:"),
+            ("flow_rate", "Flow Rate:"),
+            ("pump_speed", "Pump Speed:"),
+        ]:
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(75)
+            row.addWidget(lbl)
+            val = QLabel("—")
+            val.setStyleSheet(dim_style)
+            row.addWidget(val)
+            calc_lay.addLayout(row)
+            self._calc_labels[key] = val
+
+        layout.addWidget(calc_grp)
+
+        # ══════════════════════════════════════════════════════════
+        #  Section 3: Layer Settings
+        # ══════════════════════════════════════════════════════════
+        layer_grp = QGroupBox("Layers")
+        layer_grp.setStyleSheet(grp_style)
+        layer_lay = QVBoxLayout(layer_grp)
+        layer_lay.setSpacing(4)
+
+        ly_row = QHBoxLayout()
+        ly_row.addWidget(QLabel("Count:"))
+        self.layers_spin = QSpinBox()
+        self.layers_spin.setRange(1, 100)
+        self.layers_spin.setValue(1)
+        ly_row.addWidget(self.layers_spin)
+        layer_lay.addLayout(ly_row)
+
+        lh_row = QHBoxLayout()
+        lh_row.addWidget(QLabel("Height:"))
+        self.layer_height_spin = QDoubleSpinBox()
+        self.layer_height_spin.setRange(0.01, 5.0)
+        self.layer_height_spin.setValue(0.2)
+        self.layer_height_spin.setSuffix(" mm")
+        self.layer_height_spin.setDecimals(2)
+        self.layer_height_spin.valueChanged.connect(self._update_derived)
+        lh_row.addWidget(self.layer_height_spin)
+        layer_lay.addLayout(lh_row)
+
+        layout.addWidget(layer_grp)
+
+        # ══════════════════════════════════════════════════════════
+        #  Section 4: Advanced (travel, retract/prime, settle)
+        # ══════════════════════════════════════════════════════════
+        adv_grp = QGroupBox("Advanced")
+        adv_grp.setStyleSheet(grp_style)
+        adv_grp.setCheckable(True)
+        adv_grp.setChecked(False)
+        adv_lay = QVBoxLayout(adv_grp)
+        adv_lay.setSpacing(4)
 
         # Z Feed
         zf_row = QHBoxLayout()
@@ -304,58 +415,7 @@ class PrintSetupPage(QWidget):
         self.z_feed_spin.setSuffix(" mm/s")
         self.z_feed_spin.setDecimals(2)
         zf_row.addWidget(self.z_feed_spin)
-        layout.addLayout(zf_row)
-
-        # Pump Rate (default)
-        pf_row = QHBoxLayout()
-        pf_row.addWidget(QLabel("Pump Rate:"))
-        self.pump_feed_spin = QDoubleSpinBox()
-        self.pump_feed_spin.setRange(0.001, 50.0)
-        self.pump_feed_spin.setValue(0.25)
-        self.pump_feed_spin.setSuffix(" µL/s")
-        self.pump_feed_spin.setDecimals(3)
-        self.pump_feed_spin.setToolTip("Default pump flow rate in µL/s")
-        pf_row.addWidget(self.pump_feed_spin)
-        layout.addLayout(pf_row)
-
-        # Layers
-        ly_row = QHBoxLayout()
-        ly_row.addWidget(QLabel("Layers:"))
-        self.layers_spin = QSpinBox()
-        self.layers_spin.setRange(1, 100)
-        self.layers_spin.setValue(1)
-        ly_row.addWidget(self.layers_spin)
-        layout.addLayout(ly_row)
-
-        # Layer Height
-        lh_row = QHBoxLayout()
-        lh_row.addWidget(QLabel("Layer H:"))
-        self.layer_height_spin = QDoubleSpinBox()
-        self.layer_height_spin.setRange(0.01, 5.0)
-        self.layer_height_spin.setValue(0.2)
-        self.layer_height_spin.setSuffix(" mm")
-        self.layer_height_spin.setDecimals(2)
-        lh_row.addWidget(self.layer_height_spin)
-        layout.addLayout(lh_row)
-
-        # Active Pump
-        ap_row = QHBoxLayout()
-        ap_row.addWidget(QLabel("Active Pump:"))
-        self.pump_combo = QComboBox()
-        self.pump_combo.addItems(["P1", "P2", "P3"])
-        ap_row.addWidget(self.pump_combo)
-        layout.addLayout(ap_row)
-
-        # Flow Rate
-        fl_row = QHBoxLayout()
-        fl_row.addWidget(QLabel("Flow Rate:"))
-        self.flow_spin = QDoubleSpinBox()
-        self.flow_spin.setRange(0.001, 100.0)
-        self.flow_spin.setValue(1.0)
-        self.flow_spin.setSuffix(" µL/s")
-        self.flow_spin.setDecimals(3)
-        fl_row.addWidget(self.flow_spin)
-        layout.addLayout(fl_row)
+        adv_lay.addLayout(zf_row)
 
         # Travel Z
         tz_row = QHBoxLayout()
@@ -366,20 +426,20 @@ class PrintSetupPage(QWidget):
         self.travel_z_spin.setSuffix(" mm")
         self.travel_z_spin.setDecimals(1)
         tz_row.addWidget(self.travel_z_spin)
-        layout.addLayout(tz_row)
+        adv_lay.addLayout(tz_row)
 
-        # ── Per-Pump Retract / Prime (v7.2.3: NEW) ───────────────
-        pump_grp = QGroupBox("Per-Pump Retract / Prime")
-        pump_grp.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 6px; padding-top: 14px;
-            }}
-        """)
-        pump_grp_lay = QVBoxLayout(pump_grp)
-        pump_grp_lay.setSpacing(3)
+        # Settle Delay
+        sd_row = QHBoxLayout()
+        sd_row.addWidget(QLabel("Settle:"))
+        self.settle_spin = QDoubleSpinBox()
+        self.settle_spin.setRange(0.0, 10.0)
+        self.settle_spin.setValue(0.0)
+        self.settle_spin.setSuffix(" s")
+        self.settle_spin.setDecimals(1)
+        sd_row.addWidget(self.settle_spin)
+        adv_lay.addLayout(sd_row)
 
+        # Per-Pump Retract / Prime
         self._retract_spins: dict[str, QDoubleSpinBox] = {}
         self._prime_spins: dict[str, QDoubleSpinBox] = {}
 
@@ -397,39 +457,27 @@ class PrintSetupPage(QWidget):
             ret_spin.setValue(0.5)
             ret_spin.setSuffix(" µL")
             ret_spin.setDecimals(2)
-            ret_spin.setToolTip(f"{pid} retract volume after path segment")
             ret_spin.setMaximumWidth(80)
             row.addWidget(ret_spin)
             self._retract_spins[pid] = ret_spin
 
-            row.addWidget(QLabel("Prime:"))
+            row.addWidget(QLabel("Pri:"))
             prime_spin = QDoubleSpinBox()
             prime_spin.setRange(0.0, 20.0)
             prime_spin.setValue(0.5)
             prime_spin.setSuffix(" µL")
             prime_spin.setDecimals(2)
-            prime_spin.setToolTip(f"{pid} prime volume before path segment")
             prime_spin.setMaximumWidth(80)
             row.addWidget(prime_spin)
             self._prime_spins[pid] = prime_spin
 
-            pump_grp_lay.addLayout(row)
+            adv_lay.addLayout(row)
 
-        layout.addWidget(pump_grp)
+        layout.addWidget(adv_grp)
 
-        # ── Settle Delay ──────────────────────────────────────────
-        sd_row = QHBoxLayout()
-        sd_row.addWidget(QLabel("Settle:"))
-        self.settle_spin = QDoubleSpinBox()
-        self.settle_spin.setRange(0.0, 10.0)
-        self.settle_spin.setValue(0.0)
-        self.settle_spin.setSuffix(" s")
-        self.settle_spin.setDecimals(1)
-        self.settle_spin.setToolTip("Wait time after travel moves (seconds)")
-        sd_row.addWidget(self.settle_spin)
-        layout.addLayout(sd_row)
-
-        # ── Send to Monitor (v7.2.3: replaces Start Print) ───────
+        # ══════════════════════════════════════════════════════════
+        #  Section 5: Actions
+        # ══════════════════════════════════════════════════════════
         layout.addSpacing(10)
 
         sep = QFrame()
@@ -437,8 +485,7 @@ class PrintSetupPage(QWidget):
         sep.setStyleSheet(f"color: {COLORS.get('surface1', '#45475a')};")
         layout.addWidget(sep)
 
-        # v7.2.5: Generate Print button — validate + build execution plan
-        self.btn_generate_print = QPushButton("⚙ Generate Print")
+        self.btn_generate_print = QPushButton("Generate Print")
         self.btn_generate_print.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS.get('blue', '#89b4fa')};
@@ -450,20 +497,15 @@ class PrintSetupPage(QWidget):
                 background: {COLORS.get('sapphire', '#74c7ec')};
             }}
         """)
-        self.btn_generate_print.setToolTip(
-            "Validate well setup and generate execution plan")
         self.btn_generate_print.clicked.connect(self._generate_print)
         layout.addWidget(self.btn_generate_print)
 
-        # Generation status label
         self._gen_status_label = QLabel("")
-        self._gen_status_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+        self._gen_status_label.setStyleSheet(dim_style)
         self._gen_status_label.setWordWrap(True)
         layout.addWidget(self._gen_status_label)
 
-
-        self.btn_send_to_monitor = QPushButton("📤 Send to Monitor ▶")
+        self.btn_send_to_monitor = QPushButton("Send to Monitor")
         self.btn_send_to_monitor.setObjectName("accentBtn")
         self.btn_send_to_monitor.setStyleSheet(f"""
             QPushButton {{
@@ -476,18 +518,15 @@ class PrintSetupPage(QWidget):
                 background: {COLORS.get('teal', '#94e2d5')};
             }}
         """)
-        self.btn_send_to_monitor.setToolTip(
-            "Build print job and send to Print Monitor for execution")
         self.btn_send_to_monitor.clicked.connect(self._send_to_monitor)
         layout.addWidget(self.btn_send_to_monitor)
 
         self.status_label = QLabel("Configure wells → Send to Monitor")
         self.status_label.setObjectName("dimLabel")
-        self.status_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;")
+        self.status_label.setStyleSheet(dim_style)
         layout.addWidget(self.status_label)
 
-        # ── Export Actions ────────────────────────────────────────
+        # Export
         export_row = QHBoxLayout()
         btn_export = QPushButton("Export G-code")
         btn_export.setMaximumHeight(24)
@@ -501,29 +540,72 @@ class PrintSetupPage(QWidget):
 
         layout.addStretch()
         self._context_widget = ctx
+
+        # Initial derived calculation
+        self._update_derived()
+
         return ctx
+
+    def _update_derived(self):
+        """Recalculate derived print parameters from volume fraction + speed scale."""
+        import math
+
+        hw = getattr(self, '_hardware_config', None)
+        needle = getattr(hw, 'needle', None) if hw else None
+
+        if needle is None:
+            for v in self._calc_labels.values():
+                v.setText("— (no needle)")
+            return
+
+        bore_mm = needle.id_mm
+        bore_area_mm2 = math.pi * (bore_mm / 2) ** 2  # mm²
+
+        vf = self.volume_fraction_spin.value() / 100.0  # 0-1
+        speed_pct = self.speed_scale_spin.value() / 100.0  # 0-1
+
+        # Volume per mm of travel at this fill fraction (µL/mm, since 1 mm³ = 1 µL)
+        flow_per_mm = vf * bore_area_mm2  # µL/mm
+
+        # Max flow rate for this gauge
+        gauge = needle.gauge
+        max_flow = self.GAUGE_MAX_FLOW.get(gauge, 5.0)  # µL/s
+
+        # Max print speed = max_flow / flow_per_mm
+        if flow_per_mm > 0:
+            max_speed = max_flow / flow_per_mm  # mm/s
+        else:
+            max_speed = 0.0
+
+        # Actual print speed
+        print_speed = max_speed * speed_pct  # mm/s
+        actual_flow = print_speed * flow_per_mm  # µL/s
+
+        # Pump plunger speed (if syringe available)
+        pump_speed_str = "—"
+        if hw:
+            for pid, pcfg in hw.pumps.items():
+                if pcfg.is_configured and pcfg.syringe:
+                    ps_mm_s = actual_flow * pcfg.syringe.mm_per_uL
+                    pump_speed_str = f"{ps_mm_s:.4f} mm/s"
+                    break
+
+        self._calc_labels["needle_bore"].setText(f"{bore_mm*1000:.0f} µm ({gauge}G)")
+        self._calc_labels["max_flow"].setText(f"{max_flow:.1f} µL/s")
+        self._calc_labels["max_speed"].setText(f"{max_speed:.2f} mm/s")
+        self._calc_labels["print_speed"].setText(f"{print_speed:.2f} mm/s")
+        self._calc_labels["flow_rate"].setText(f"{actual_flow:.3f} µL/s")
+        self._calc_labels["pump_speed"].setText(pump_speed_str)
 
     # ════════════════════════════════════════════════════════════════
     #  SETTINGS EXTRACTION
     # ════════════════════════════════════════════════════════════════
 
     def _compute_auto_settings(self, s, hw_config=None):
-        """# v7.2.6-auto-C1: _compute_auto_settings
-        Auto-derive all motion parameters from hardware config + calibration.
+        """Auto-derive motion parameters from hardware config + calibration."""
+        import math
 
-        Mutates PrintSettings s in-place. Called after _get_settings().
-
-        Derives:
-          - travel_z_height         from calibration safe_z
-          - top_z_height            from calibration top_z
-          - fast_z_feedrate_mm_min  max Z speed (above plate surface)
-          - entry_z_feedrate_mm_min z_feedrate (from GUI spinbox * 60)
-          - service_xy_speed_mm_s   fast XY for wash/waste/ink moves
-          - auto_pump_rate_uL_s     extrusion physics: v*OD*layer
-          - service_pump_rate_uL_s  GAUGE_MAX_FLOW[gauge]
-          - pump_feedrate           service rate in mm/min
-        """
-        # ── 1. Calibration data ──────────────────────────────────────
+        # Calibration data (travel Z, top Z)
         try:
             _app_settings = getattr(self, '_app_settings', None)
             if _app_settings is None:
@@ -536,94 +618,104 @@ class PrintSetupPage(QWidget):
             if _app_settings:
                 cal = _app_settings.get_section('calibration') or {}
                 safe_z = cal.get('safe_z')
-                top_z  = cal.get('top_z')
+                top_z = cal.get('top_z')
                 if safe_z is not None and safe_z > 0:
                     s.travel_z_height = float(safe_z)
                 if top_z is not None and top_z >= 0:
                     s.top_z_height = float(top_z)
-        except Exception as _e:
-            import logging as _log
-            _log.getLogger(__name__).debug(f'Auto-settings: cal load: {_e}')
+        except Exception:
+            pass
 
-        # ── 2. Z speed tiers ─────────────────────────────────────────
-        # fast_z: safe max Z travel speed (above plate surface)
-        s.fast_z_feedrate_mm_min = 120.0  # 2 mm/s
-        # entry_z: from GUI z_feed_spin (already stored as mm/min via prior patch)
+        # Z speed tiers
+        s.fast_z_feedrate_mm_min = 120.0
         s.entry_z_feedrate_mm_min = s.z_feedrate
 
-        # ── 3. Service XY speed ──────────────────────────────────────
+        # Service XY speed
         s.service_xy_speed_mm_s = 50.0
 
-        # ── 4. Pump rates from needle + syringe ─────────────────────
-        GAUGE_MAX_FLOW = {
-            16: 50.0, 18: 30.0, 20: 15.0, 22: 8.0, 23: 5.0,
-            25: 3.0, 27: 1.5, 28: 1.0, 30: 0.5, 32: 0.2,
-        }
-        gauge = None
-        needle = None
-        if hw_config is not None:
-            needle = getattr(hw_config, 'needle', None)
-            if needle:
-                gauge = getattr(needle, 'gauge', None)
+        # Needle-derived rates
+        needle = getattr(hw_config, 'needle', None) if hw_config else None
+        gauge = getattr(needle, 'gauge', None) if needle else None
 
-        # Service pump rate (max safe for gauge)
-        if gauge and gauge in GAUGE_MAX_FLOW:
-            s.service_pump_rate_uL_s = GAUGE_MAX_FLOW[gauge]
-        else:
-            s.service_pump_rate_uL_s = 5.0
+        max_flow = self.GAUGE_MAX_FLOW.get(gauge, 5.0) if gauge else 5.0
+        s.service_pump_rate_uL_s = max_flow
 
-        # Pump feedrate for service: convert uL/s to mm/min
-        _uL_per_mm = 3.378  # 250uL Hamilton default
-        if hw_config is not None:
-            try:
-                _active = getattr(s, 'active_pump', 'P1') or 'P1'
-                _pcfg = hw_config.pumps.get(_active)
-                if _pcfg and _pcfg.syringe:
-                    _uL_per_mm = _pcfg.syringe.uL_per_mm
-            except Exception:
-                pass
-        s.pump_feedrate = max(s.service_pump_rate_uL_s * 60.0 / _uL_per_mm, 0.5)
+        # Pump feedrate for service moves
+        _uL_per_mm = 3.378
+        if hw_config:
+            for pid, pcfg in hw_config.pumps.items():
+                if pcfg.is_configured and pcfg.syringe:
+                    _uL_per_mm = pcfg.syringe.uL_per_mm
+                    break
+        s.pump_feedrate = max(max_flow * 60.0 / _uL_per_mm, 0.5)
 
-        # Print pump rate: extrusion_flow_rate(v, needle_OD, layer_height)
-        if needle is not None:
-            try:
-                from SupportClasses.FlowPhysics import extrusion_flow_rate
-                od_mm = getattr(needle, 'od_mm', 0.0)
-                if od_mm <= 0:
-                    od_um = getattr(needle, 'od_um', 0)
-                    od_mm = od_um / 1000.0
-                if od_mm > 0:
-                    flow = extrusion_flow_rate(
-                        s.print_speed_mm_s, needle, s.layer_height)
-                    s.auto_pump_rate_uL_s = max(flow, 0.001)
-            except Exception as _e:
-                import logging as _log
-                _log.getLogger(__name__).debug(
-                    f'Auto-settings: extrusion calc: {_e}')
+        # Auto pump rate from extrusion cylinder model
+        s.auto_pump_rate_uL_s = s.pump_rate_uL_s
+
+    def _get_derived_speed_and_flow(self):
+        """Calculate print speed and flow rate from volume fraction + speed scale.
+
+        Returns (print_speed_mm_s, flow_rate_uL_s, max_speed_mm_s).
+        """
+        import math
+
+        hw = getattr(self, '_hardware_config', None)
+        needle = getattr(hw, 'needle', None) if hw else None
+        if needle is None:
+            return (1.0, 0.1, 1.0)
+
+        bore_mm = needle.id_mm
+        bore_area = math.pi * (bore_mm / 2) ** 2
+        vf = self.volume_fraction_spin.value() / 100.0
+        speed_pct = self.speed_scale_spin.value() / 100.0
+        flow_per_mm = vf * bore_area
+
+        max_flow = self.GAUGE_MAX_FLOW.get(needle.gauge, 5.0)
+        max_speed = max_flow / flow_per_mm if flow_per_mm > 0 else 1.0
+        print_speed = max_speed * speed_pct
+        flow_rate = print_speed * flow_per_mm
+
+        return (print_speed, flow_rate, max_speed)
 
     def _get_settings(self) -> PrintSettings:
-        """Build PrintSettings from context panel controls."""
+        """Build PrintSettings from simplified context panel controls."""
         s = PrintSettings()
-        s.xy_feedrate = self.xy_feed_spin.value()
-        # v7.2.7: print_speed_mm_s — explicit mm/s for print execution
-        s.print_speed_mm_s = self.xy_feed_spin.value()  # mm/s from GUI
-        s.travel_speed_mm_s = self.xy_feed_spin.value() * 2.0  # travel 2x faster
-        # Also set legacy print_feedrate (mm/min) for backward compat
-        s.print_feedrate = self.xy_feed_spin.value() * 60.0  # mm/s → mm/min
-        # v7.2.6-tef-A1: z_feedrate mm/min
-        # z_feed_spin is in mm/s; planner _move_z divides by 60 expecting mm/min
+
+        # Derive print speed and flow from volume fraction + speed scale
+        print_speed, flow_rate, _ = self._get_derived_speed_and_flow()
+
+        s.print_speed_mm_s = print_speed
+        s.travel_speed_mm_s = print_speed * 2.0
+        s.xy_feedrate = print_speed
+        s.print_feedrate = print_speed * 60.0  # mm/min compat
+
         s.z_feedrate = self.z_feed_spin.value() * 60.0  # mm/s → mm/min
-        s.pump_rate_uL_s = self.pump_feed_spin.value()
-        # v7.2.6-tef-A2: pump_feedrate from uL_s
-        # Convert µL/s → mm/min for service pump moves (default Hamilton 250µL = 3.378 µL/mm)
-        _uL_per_mm_default = 3.378
-        s.pump_feedrate = max(self.pump_feed_spin.value() * 60.0 / _uL_per_mm_default, 0.5)
+        s.pump_rate_uL_s = flow_rate
+        s.flow_rate = flow_rate
+        s.auto_pump_rate_uL_s = flow_rate
+
+        # Convert flow to pump feedrate
+        _uL_per_mm = 3.378
+        hw = getattr(self, '_hardware_config', None)
+        if hw:
+            for pid, pcfg in hw.pumps.items():
+                if pcfg.is_configured and pcfg.syringe:
+                    _uL_per_mm = pcfg.syringe.uL_per_mm
+                    break
+        s.pump_feedrate = max(flow_rate * 60.0 / _uL_per_mm, 0.5)
+
         s.num_layers = self.layers_spin.value()
         s.layer_height = self.layer_height_spin.value()
-        s.active_pump = self.pump_combo.currentText()
-        s.flow_rate = self.flow_spin.value()
         s.travel_z_height = self.travel_z_spin.value()
         s.settle_delay = self.settle_spin.value()
+
+        # Find first enabled pump as active
+        s.active_pump = "P1"
+        if hw:
+            for pid, pcfg in hw.pumps.items():
+                if pcfg.is_configured:
+                    s.active_pump = pid
+                    break
 
         # Per-pump retract/prime
         s.retract_amounts = {

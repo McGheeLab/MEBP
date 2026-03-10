@@ -63,6 +63,74 @@ from SupportClasses.WellPlate import PLATE_DEFINITIONS
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Ink Swap Strategy
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class InkSwapStrategy:
+    """
+    Configurable ink swap sequence for single-syringe multi-ink workflows.
+
+    When a pump needs to switch between inks, the planner inserts a
+    cleaning/loading sequence. Each step can be toggled on/off.
+
+    Full sequence: waste → wash → buffer → wash → ink_load → wash → print
+    """
+    waste: bool = True          # Expel remaining ink to waste reservoir
+    wash_pre: bool = True       # Wash line before buffer
+    buffer: bool = True         # Flush with buffer solution
+    wash_post: bool = True      # Wash line after buffer
+    ink_load: bool = True       # Load new ink into syringe (always recommended)
+    wash_final: bool = True     # Final wash before resuming print
+
+    # Volumes for each step (µL) — sensible defaults
+    waste_volume_uL: float = 50.0
+    wash_volume_uL: float = 100.0
+    buffer_volume_uL: float = 100.0
+    ink_load_volume_uL: float = 50.0
+
+    def get_enabled_steps(self) -> list[str]:
+        """Return ordered list of enabled step names."""
+        steps = []
+        if self.waste:      steps.append("waste")
+        if self.wash_pre:   steps.append("wash")
+        if self.buffer:     steps.append("buffer")
+        if self.wash_post:  steps.append("wash")
+        if self.ink_load:   steps.append("ink_load")
+        if self.wash_final: steps.append("wash")
+        return steps
+
+    def to_dict(self) -> dict:
+        return {
+            "waste": self.waste,
+            "wash_pre": self.wash_pre,
+            "buffer": self.buffer,
+            "wash_post": self.wash_post,
+            "ink_load": self.ink_load,
+            "wash_final": self.wash_final,
+            "waste_volume_uL": self.waste_volume_uL,
+            "wash_volume_uL": self.wash_volume_uL,
+            "buffer_volume_uL": self.buffer_volume_uL,
+            "ink_load_volume_uL": self.ink_load_volume_uL,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> InkSwapStrategy:
+        return cls(
+            waste=data.get("waste", True),
+            wash_pre=data.get("wash_pre", True),
+            buffer=data.get("buffer", True),
+            wash_post=data.get("wash_post", True),
+            ink_load=data.get("ink_load", True),
+            wash_final=data.get("wash_final", True),
+            waste_volume_uL=data.get("waste_volume_uL", 50.0),
+            wash_volume_uL=data.get("wash_volume_uL", 100.0),
+            buffer_volume_uL=data.get("buffer_volume_uL", 100.0),
+            ink_load_volume_uL=data.get("ink_load_volume_uL", 50.0),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Pump Channel Configuration
 # ═══════════════════════════════════════════════════════════════════
 
@@ -71,15 +139,37 @@ class PumpChannelConfig:
     """
     Configuration for a single pump channel (P1, P2, or P3).
 
-    Tracks what syringe is installed, what ink is loaded, printing mode,
-    and the current fluid column state. All user-facing values are in µL.
+    Tracks what syringe is installed, which inks it can handle (multi-ink),
+    printing mode, and the current fluid column state.
+    All user-facing values are in µL.
+
+    A pump with multiple inks will require ink swap sequences between
+    objects that use different inks (configured via InkSwapStrategy).
     """
     pump_id: str = "P1"
     syringe: SyringeSpec | None = None
-    ink: InkSpec | None = None
+    inks: list[InkSpec] = field(default_factory=list)  # All inks this pump can handle
     printing_mode: PrintingMode = PrintingMode.INCREMENTAL
     fluid_column: FluidColumn = field(default_factory=FluidColumn)
     enabled: bool = False  # True once syringe is assigned
+
+    @property
+    def ink(self) -> InkSpec | None:
+        """Backward compat: return first ink (or None)."""
+        return self.inks[0] if self.inks else None
+
+    @ink.setter
+    def ink(self, value: InkSpec | None):
+        """Backward compat: set single ink (replaces list with one item)."""
+        if value is None:
+            self.inks = []
+        else:
+            self.inks = [value]
+
+    @property
+    def ink_names(self) -> list[str]:
+        """List of ink names this pump can handle."""
+        return [ink.name for ink in self.inks]
 
     @property
     def is_configured(self) -> bool:
@@ -88,8 +178,21 @@ class PumpChannelConfig:
 
     @property
     def has_ink(self) -> bool:
-        """True if ink is assigned to this channel."""
-        return self.ink is not None and self.is_configured
+        """True if at least one ink is assigned to this channel."""
+        return len(self.inks) > 0 and self.is_configured
+
+    def can_handle_ink(self, ink_name: str) -> bool:
+        """Check if this pump is configured to handle a specific ink."""
+        return ink_name in self.ink_names
+
+    def add_ink(self, ink: InkSpec) -> None:
+        """Add an ink to this pump's capability list (no duplicates)."""
+        if ink.name not in self.ink_names:
+            self.inks.append(ink)
+
+    def remove_ink(self, ink_name: str) -> None:
+        """Remove an ink from this pump's capability list."""
+        self.inks = [i for i in self.inks if i.name != ink_name]
 
     def uL_to_mm(self, volume_uL: float) -> float:
         """Convert µL to mm of plunger travel. Raises if no syringe."""
@@ -122,7 +225,7 @@ class PumpChannelConfig:
             "pump_id": self.pump_id,
             "syringe_volume_uL": self.syringe.volume_uL if self.syringe else None,
             "syringe": self.syringe.to_dict() if self.syringe else None,
-            "ink": self.ink.to_dict() if self.ink else None,
+            "inks": [ink.to_dict() for ink in self.inks],
             "printing_mode": self.printing_mode.value,
             "fluid_column": {
                 "oil_volume_uL": self.fluid_column.oil_volume_uL,
@@ -136,20 +239,29 @@ class PumpChannelConfig:
     @classmethod
     def from_dict(cls, data: dict) -> PumpChannelConfig:
         syringe = SyringeSpec.from_dict(data["syringe"]) if data.get("syringe") else None
-        ink = InkSpec.from_dict(data["ink"]) if data.get("ink") else None
+
+        # Load inks — support both new "inks" list and old single "ink"
+        inks = []
+        if "inks" in data:
+            for ink_data in data["inks"]:
+                inks.append(InkSpec.from_dict(ink_data))
+        elif data.get("ink"):
+            inks.append(InkSpec.from_dict(data["ink"]))
+
         mode = PrintingMode(data.get("printing_mode", "incremental"))
         fc_data = data.get("fluid_column", {})
+        first_ink = inks[0] if inks else None
         fluid_column = FluidColumn(
             oil_volume_uL=fc_data.get("oil_volume_uL", 0.0),
             buffer_volume_uL=fc_data.get("buffer_volume_uL", 0.0),
             ink_volume_uL=fc_data.get("ink_volume_uL", 0.0),
             dead_volume_uL=fc_data.get("dead_volume_uL", 2.0),
-            ink_spec=ink,
+            ink_spec=first_ink,
         )
         return cls(
             pump_id=data.get("pump_id", "P1"),
             syringe=syringe,
-            ink=ink,
+            inks=inks,
             printing_mode=mode,
             fluid_column=fluid_column,
             enabled=data.get("enabled", syringe is not None),
@@ -197,6 +309,9 @@ class HardwareConfig:
     # Single-channel needle: {0: "P1"}
     # Multi-channel: {0: "P1", 1: "P2", 2: "P3"}
 
+    # ── v7.2.8: Ink swap strategy for single-pump multi-ink ──────
+    ink_swap_strategy: InkSwapStrategy = field(default_factory=InkSwapStrategy)
+
     # ── Metadata ──────────────────────────────────────────────────
     config_name: str = "Untitled Setup"
     notes: str = ""
@@ -206,33 +321,34 @@ class HardwareConfig:
     # ══════════════════════════════════════════════════════════════
 
     @property
-    def pump_ink_map(self) -> dict[str, str | None]:
+    def pump_ink_map(self) -> dict[str, list[str]]:
         """
-        Get pump → ink_name mapping for quick lookup.
+        Get pump → ink_names mapping for quick lookup.
 
-        Returns dict like {"P1": "Hydrogel A", "P2": "MSC Cells", "P3": None}
+        Returns dict like {"P1": ["Hydrogel A", "MSC Cells"], "P2": ["Buffer"], "P3": []}
         Only includes enabled pumps.
         """
         result = {}
         for pid, pcfg in self.pumps.items():
             if pcfg.enabled:
-                result[pid] = pcfg.ink.name if pcfg.ink else None
+                result[pid] = pcfg.ink_names
             else:
-                result[pid] = None
+                result[pid] = []
         return result
 
     @property
-    def ink_pump_map(self) -> dict[str, str]:
+    def ink_pump_map(self) -> dict[str, list[str]]:
         """
-        Get ink_name → pump_id reverse lookup.
+        Get ink_name → [pump_ids] reverse lookup.
 
-        Returns dict like {"Hydrogel A": "P1", "MSC Cells": "P2"}
-        Only includes pumps that have an ink assigned.
+        Returns dict like {"Hydrogel A": ["P1"], "MSC Cells": ["P1", "P2"]}
+        An ink may be handled by multiple pumps.
         """
-        result = {}
+        result: dict[str, list[str]] = {}
         for pid, pcfg in self.pumps.items():
-            if pcfg.enabled and pcfg.ink:
-                result[pcfg.ink.name] = pid
+            if pcfg.enabled:
+                for ink_name in pcfg.ink_names:
+                    result.setdefault(ink_name, []).append(pid)
         return result
 
     @property
@@ -267,25 +383,14 @@ class HardwareConfig:
         if not configured_pumps:
             issues.append("At least one pump must be enabled with a syringe")
 
-        # Enabled pumps must have inks assigned
+        # Enabled pumps must have at least one ink assigned
         for pid, pcfg in self.pumps.items():
-            if pcfg.enabled and pcfg.syringe and not pcfg.ink:
+            if pcfg.enabled and pcfg.syringe and not pcfg.has_ink:
                 issues.append(f"{pid} is enabled but has no ink assigned")
 
         # Plate format
         if self.plate_format not in PLATE_DEFINITIONS:
             issues.append(f"Invalid plate format: {self.plate_format}")
-
-        # Ink uniqueness — each ink assigned to at most one pump
-        ink_assignments: dict[str, list[str]] = {}
-        for pid, pcfg in self.pumps.items():
-            if pcfg.enabled and pcfg.ink:
-                ink_assignments.setdefault(pcfg.ink.name, []).append(pid)
-        for ink_name, pump_ids in ink_assignments.items():
-            if len(pump_ids) > 1:
-                issues.append(
-                    f"Ink '{ink_name}' assigned to multiple pumps: "
-                    f"{', '.join(pump_ids)}")
 
         # Needle channel-pump mapping
         if self.needle is not None:
@@ -369,10 +474,28 @@ class HardwareConfig:
         self._clear_invalid_channel_mappings()
 
     def set_pump_ink(self, pump: str, ink: InkSpec | None):
-        """Assign ink to a pump. None to remove."""
+        """Backward compat: assign single ink (replaces all inks on pump)."""
         if pump not in self.pumps:
             raise ValueError(f"Unknown pump: {pump}")
-        self.pumps[pump].ink = ink
+        self.pumps[pump].ink = ink  # Uses the property setter
+
+    def set_pump_inks(self, pump: str, inks: list[InkSpec]):
+        """Assign multiple inks to a pump."""
+        if pump not in self.pumps:
+            raise ValueError(f"Unknown pump: {pump}")
+        self.pumps[pump].inks = list(inks)
+
+    def add_pump_ink(self, pump: str, ink: InkSpec):
+        """Add an ink to a pump's capability list."""
+        if pump not in self.pumps:
+            raise ValueError(f"Unknown pump: {pump}")
+        self.pumps[pump].add_ink(ink)
+
+    def remove_pump_ink(self, pump: str, ink_name: str):
+        """Remove an ink from a pump by name."""
+        if pump not in self.pumps:
+            raise ValueError(f"Unknown pump: {pump}")
+        self.pumps[pump].remove_ink(ink_name)
 
     def set_pump_mode(self, pump: str, mode: PrintingMode):
         """Set printing mode for a pump."""
@@ -433,8 +556,9 @@ class HardwareConfig:
             del self.needle_channel_pump_map[ch]
 
     def get_pump_for_ink(self, ink_name: str) -> str | None:
-        """Get the pump ID that has the given ink assigned, or None."""
-        return self.ink_pump_map.get(ink_name)
+        """Get the first pump ID that can handle the given ink, or None."""
+        pumps = self.ink_pump_map.get(ink_name, [])
+        return pumps[0] if pumps else None
 
     def get_channel_for_ink(self, ink_name: str) -> int | None:
         """Get the needle channel index that carries the given ink, or None."""
@@ -487,6 +611,8 @@ class HardwareConfig:
             "needle_channel_pump_map": {
                 str(ch): pid for ch, pid in self.needle_channel_pump_map.items()
             },
+            # v7.2.8: Ink swap strategy
+            "ink_swap_strategy": self.ink_swap_strategy.to_dict(),
         }
 
     @classmethod
@@ -526,6 +652,10 @@ class HardwareConfig:
         config.needle_channel_pump_map = {
             int(ch): pid for ch, pid in raw_map.items()
         }
+
+        # v7.2.8: Ink swap strategy
+        if "ink_swap_strategy" in data:
+            config.ink_swap_strategy = InkSwapStrategy.from_dict(data["ink_swap_strategy"])
 
         return config
 

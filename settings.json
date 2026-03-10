@@ -4,7 +4,7 @@
     "y": 25,
     "width": 1296,
     "height": 792,
-    "active_tab": 4,
+    "active_tab": 0,
     "splitter_sizes": [
       706,
       0
@@ -182,15 +182,17 @@
           "barrel_id_mm": 3.256,
           "part_number": "1725"
         },
-        "ink": {
-          "name": "Hydrogel A",
-          "ink_type": "hydrogel",
-          "viscosity_cP": 50.0,
-          "granule_diameter_um": 0.0,
-          "cell_diameter_um": 0.0,
-          "density_g_mL": 1.0,
-          "color": "#a6e3a1"
-        },
+        "inks": [
+          {
+            "name": "Hydrogel A",
+            "ink_type": "hydrogel",
+            "viscosity_cP": 50.0,
+            "granule_diameter_um": 0.0,
+            "cell_diameter_um": 0.0,
+            "density_g_mL": 1.0,
+            "color": "#a6e3a1"
+          }
+        ],
         "printing_mode": "incremental",
         "fluid_column": {
           "oil_volume_uL": 0.0,
@@ -204,7 +206,7 @@
         "pump_id": "P2",
         "syringe_volume_uL": null,
         "syringe": null,
-        "ink": null,
+        "inks": [],
         "printing_mode": "incremental",
         "fluid_column": {
           "oil_volume_uL": 0.0,
@@ -218,7 +220,7 @@
         "pump_id": "P3",
         "syringe_volume_uL": null,
         "syringe": null,
-        "ink": null,
+        "inks": [],
         "printing_mode": "incremental",
         "fluid_column": {
           "oil_volume_uL": 0.0,
@@ -256,13 +258,34 @@
         "granule_diameter_um": 0.0,
         "cell_diameter_um": 0.0,
         "density_g_mL": 1.0,
-        "color": "#74c7ec"
+        "color": "#e959ed"
+      },
+      "Alginate": {
+        "name": "Alginate",
+        "ink_type": "hydrogel",
+        "viscosity_cP": 1.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#a6e3a1"
       }
     },
     "rosette_library": {},
     "buffer_ink_name": "DPBS",
     "needle_channel_pump_map": {
       "0": "P1"
+    },
+    "ink_swap_strategy": {
+      "waste": true,
+      "wash_pre": true,
+      "buffer": true,
+      "wash_post": true,
+      "ink_load": true,
+      "wash_final": true,
+      "waste_volume_uL": 50.0,
+      "wash_volume_uL": 100.0,
+      "buffer_volume_uL": 100.0,
+      "ink_load_volume_uL": 50.0
     }
   },
   "ui": {

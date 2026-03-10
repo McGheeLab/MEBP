@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QStandardItem
 
-from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
+from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig, InkSwapStrategy
 from SupportClasses.PhysicalModels import (
     NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert,
     load_needle_catalog, load_syringe_catalog,
@@ -126,14 +126,33 @@ class InkEditorDialog(QDialog):
         self.density_spin.setValue(ink.density_g_mL if ink else 1.0)
         layout.addRow("Density:", self.density_spin)
 
-        self.color_edit = QLineEdit(ink.color if ink else "#a6e3a1")
-        self.color_edit.setPlaceholderText("#RRGGBB")
-        layout.addRow("Color:", self.color_edit)
+        color_row = QHBoxLayout()
+        self._ink_color = ink.color if ink else "#a6e3a1"
+        self.color_btn = QPushButton()
+        self.color_btn.setFixedSize(28, 28)
+        self.color_btn.setStyleSheet(
+            f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: 4px;")
+        self.color_btn.clicked.connect(self._pick_ink_color)
+        color_row.addWidget(self.color_btn)
+        self.color_label = QLabel(self._ink_color)
+        self.color_label.setStyleSheet("color: #cdd6f4;")
+        color_row.addWidget(self.color_label)
+        color_row.addStretch()
+        layout.addRow("Color:", color_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
+
+    def _pick_ink_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        color = QColorDialog.getColor(QColor(self._ink_color), self, "Ink Color")
+        if color.isValid():
+            self._ink_color = color.name()
+            self.color_btn.setStyleSheet(
+                f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: 4px;")
+            self.color_label.setText(self._ink_color)
 
     def get_ink(self) -> InkSpec | None:
         name = self.name_edit.text().strip()
@@ -146,7 +165,7 @@ class InkEditorDialog(QDialog):
             granule_diameter_um=self.granule_spin.value(),
             cell_diameter_um=self.cell_spin.value(),
             density_g_mL=self.density_spin.value(),
-            color=self.color_edit.text().strip() or "#a6e3a1",
+            color=self._ink_color,
         )
 
 
@@ -281,12 +300,16 @@ class PumpChannelWidget(QGroupBox):
         self.syringe_combo.currentIndexChanged.connect(self._on_change)
         layout.addWidget(self.syringe_combo, 0, 2)
 
-        # Row 1: Ink + Mode
-        layout.addWidget(QLabel("Ink:"), 1, 0)
-        self.ink_combo = QComboBox()
-        self.ink_combo.addItem("— None —", None)
-        self.ink_combo.currentIndexChanged.connect(self._on_change)
-        layout.addWidget(self.ink_combo, 1, 1, 1, 2)
+        # Row 1: Ink(s) — multi-select checklist
+        layout.addWidget(QLabel("Inks:"), 1, 0, Qt.AlignmentFlag.AlignTop)
+        self.ink_list = QListWidget()
+        self.ink_list.setMaximumHeight(70)
+        self.ink_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.ink_list.itemChanged.connect(self._on_change)
+        layout.addWidget(self.ink_list, 1, 1, 1, 2)
+
+        # Backward-compat shim: ink_combo property for code that still references it
+        self.ink_combo = None  # Removed — use ink_list
 
         layout.addWidget(QLabel("Mode:"), 2, 0)
         self.mode_combo = QComboBox()
@@ -314,7 +337,7 @@ class PumpChannelWidget(QGroupBox):
     def _update_controls(self):
         enabled = self.enable_check.isChecked()
         self.syringe_combo.setEnabled(enabled)
-        self.ink_combo.setEnabled(enabled)
+        self.ink_list.setEnabled(enabled)
         self.mode_combo.setEnabled(enabled)
         self._update_info()
 
@@ -331,34 +354,26 @@ class PumpChannelWidget(QGroupBox):
 
     def set_ink_names(self, ink_names: list[str], excluded: set[str] | None = None):
         """
-        Update ink combo options.
+        Update ink checklist options. Preserves check state.
 
-        v7.2.4: excluded inks are shown grayed out (assigned to other pumps).
+        v7.2.8: Multi-ink per pump — exclusion no longer enforced.
         """
-        current = self.ink_combo.currentData()
+        # Remember currently checked inks
+        checked = set(self.get_selected_ink_names())
         self._ink_names = ink_names
-        self._excluded_inks = excluded or set()
 
-        self.ink_combo.blockSignals(True)
-        self.ink_combo.clear()
-        self.ink_combo.addItem("— None —", None)
+        self.ink_list.blockSignals(True)
+        self.ink_list.clear()
 
         for name in ink_names:
-            self.ink_combo.addItem(name, name)
-            idx = self.ink_combo.count() - 1
-            # v7.2.4: Gray out inks assigned to other pumps
-            if name in self._excluded_inks:
-                item = self.ink_combo.model().item(idx)
-                if item:
-                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
-                    item.setForeground(QColor(COLORS.get('surface2', '#585b70')))
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if name in checked
+                else Qt.CheckState.Unchecked)
+            self.ink_list.addItem(item)
 
-        # Restore selection if still available and not excluded
-        if current:
-            idx = self.ink_combo.findData(current)
-            if idx >= 0:
-                self.ink_combo.setCurrentIndex(idx)
-        self.ink_combo.blockSignals(False)
+        self.ink_list.blockSignals(False)
 
     def get_config(self) -> PumpChannelConfig:
         """Extract current config from the widget state."""
@@ -369,10 +384,8 @@ class PumpChannelWidget(QGroupBox):
         if vol and vol in self.syringe_catalog:
             config.syringe = self.syringe_catalog[vol]
 
-        ink_name = self.ink_combo.currentData()
-        if ink_name:
-            # Placeholder — parent resolves full InkSpec from library
-            config.ink = InkSpec(name=ink_name)
+        # Multi-ink: collect all checked ink names as placeholder InkSpecs
+        config.inks = [InkSpec(name=n) for n in self.get_selected_ink_names()]
 
         mode_val = self.mode_combo.currentData()
         config.printing_mode = PrintingMode(mode_val) if mode_val else PrintingMode.INCREMENTAL
@@ -383,8 +396,7 @@ class PumpChannelWidget(QGroupBox):
         """
         Apply a config to this widget.
 
-        v7.2.3 FIX: Accepts optional ink_names to ensure the ink combo
-        is populated BEFORE attempting to set the ink selection.
+        Populates the ink checklist before restoring selections.
         """
         self.blockSignals(True)
 
@@ -406,17 +418,15 @@ class PumpChannelWidget(QGroupBox):
         else:
             self.syringe_combo.setCurrentIndex(0)
 
-        # Ink
-        if config.ink:
-            idx = self.ink_combo.findData(config.ink.name)
-            if idx >= 0:
-                self.ink_combo.setCurrentIndex(idx)
-            else:
-                logger.warning(
-                    f"{self.pump_id}: Ink '{config.ink.name}' "
-                    f"not found in ink combo")
-        else:
-            self.ink_combo.setCurrentIndex(0)
+        # Inks — check matching items
+        assigned_names = set(config.ink_names)
+        self.ink_list.blockSignals(True)
+        for i in range(self.ink_list.count()):
+            item = self.ink_list.item(i)
+            item.setCheckState(
+                Qt.CheckState.Checked if item.text() in assigned_names
+                else Qt.CheckState.Unchecked)
+        self.ink_list.blockSignals(False)
 
         # Mode
         mode_idx = self.mode_combo.findData(config.printing_mode.value)
@@ -426,9 +436,19 @@ class PumpChannelWidget(QGroupBox):
         self._update_controls()
         self.blockSignals(False)
 
+    def get_selected_ink_names(self) -> list[str]:
+        """Get list of checked ink names."""
+        names = []
+        for i in range(self.ink_list.count()):
+            item = self.ink_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                names.append(item.text())
+        return names
+
     def get_selected_ink_name(self) -> str | None:
-        """Get currently selected ink name (for exclusion tracking)."""
-        return self.ink_combo.currentData()
+        """Backward compat: return first checked ink name, or None."""
+        names = self.get_selected_ink_names()
+        return names[0] if names else None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -583,6 +603,53 @@ class HardwareSetupPage(QWidget):
         pump_lay.addWidget(self.pump_ink_summary)
 
         self._content_layout.addWidget(pump_group)
+
+        # ── Section 4b: Ink Swap Strategy (v7.2.8) ────────────────
+        swap_group = QGroupBox("Ink Swap Strategy")
+        swap_group.setStyleSheet(self._group_style())
+        swap_group.setToolTip(
+            "When a pump switches between inks, these steps run.\n"
+            "Sequence: waste → wash → buffer → wash → ink load → wash → print")
+        swap_lay = QVBoxLayout(swap_group)
+
+        self._swap_checks = {}
+        swap_steps = [
+            ("waste", "Waste (expel remaining ink)"),
+            ("wash_pre", "Wash (pre-buffer rinse)"),
+            ("buffer", "Buffer flush"),
+            ("wash_post", "Wash (post-buffer rinse)"),
+            ("ink_load", "Load new ink"),
+            ("wash_final", "Wash (final, before print)"),
+        ]
+        for key, label in swap_steps:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(self._on_config_changed)
+            swap_lay.addWidget(cb)
+            self._swap_checks[key] = cb
+
+        # Volume settings row
+        vol_form = QFormLayout()
+        vol_form.setSpacing(4)
+        self._swap_waste_vol = QDoubleSpinBox()
+        self._swap_wash_vol = QDoubleSpinBox()
+        self._swap_buffer_vol = QDoubleSpinBox()
+        self._swap_ink_load_vol = QDoubleSpinBox()
+        for spin, label, default in [
+            (self._swap_waste_vol, "Waste vol:", 50.0),
+            (self._swap_wash_vol, "Wash vol:", 100.0),
+            (self._swap_buffer_vol, "Buffer vol:", 100.0),
+            (self._swap_ink_load_vol, "Ink load vol:", 50.0),
+        ]:
+            spin.setRange(0, 5000)
+            spin.setSuffix(" µL")
+            spin.setDecimals(1)
+            spin.setValue(default)
+            spin.valueChanged.connect(self._on_config_changed)
+            vol_form.addRow(label, spin)
+        swap_lay.addLayout(vol_form)
+
+        self._content_layout.addWidget(swap_group)
 
         # ── Section 5: Needle Configuration (v7.2.4: MOVED DOWN) ─
         needle_group = QGroupBox("Needle Configuration")
@@ -767,29 +834,24 @@ class HardwareSetupPage(QWidget):
 
     def _refresh_pump_ink_exclusions(self):
         """
-        v7.2.4 S3.5: Update ink combos to gray out inks
-        already assigned to other pumps.
+        v7.2.8: Refresh ink checklists in all pump widgets.
+        No exclusion — inks can be assigned to multiple pumps.
         """
         ink_names = list(self._config.ink_library.keys())
-
         for pid, pw in self._pump_widgets.items():
-            # Collect inks used by OTHER pumps
-            excluded = set()
-            for other_pid, other_pw in self._pump_widgets.items():
-                if other_pid != pid:
-                    selected = other_pw.get_selected_ink_name()
-                    if selected:
-                        excluded.add(selected)
-            pw.set_ink_names(ink_names, excluded)
+            pw.set_ink_names(ink_names)
 
     def _update_pump_ink_summary(self):
-        """v7.2.4 S3.6: Update pump-ink summary label."""
+        """v7.2.8: Update pump-ink summary label (multi-ink)."""
         parts = []
         for pid in ["P1", "P2", "P3"]:
             pw = self._pump_widgets[pid]
             if pw.enable_check.isChecked():
-                ink_name = pw.get_selected_ink_name()
-                parts.append(f"{pid}→{ink_name or '(none)'}")
+                ink_names = pw.get_selected_ink_names()
+                if ink_names:
+                    parts.append(f"{pid}→[{', '.join(ink_names)}]")
+                else:
+                    parts.append(f"{pid}→(none)")
         if parts:
             self.pump_ink_summary.setText("Assignment: " + ", ".join(parts))
         else:
@@ -975,13 +1037,16 @@ class HardwareSetupPage(QWidget):
         else:
             self._config.needle = None
 
-        # Pumps — resolve ink from library
+        # Pumps — resolve inks from library
         for pid, pw in self._pump_widgets.items():
             pcfg = pw.get_config()
-            if pcfg.ink and pcfg.ink.name in self._config.ink_library:
-                pcfg.ink = self._config.ink_library[pcfg.ink.name]
-            elif pcfg.ink:
-                pcfg.ink = None  # Ink no longer in library
+            resolved_inks = []
+            for ink in pcfg.inks:
+                if ink.name in self._config.ink_library:
+                    resolved_inks.append(self._config.ink_library[ink.name])
+                else:
+                    logger.warning(f"{pid}: Ink '{ink.name}' no longer in library")
+            pcfg.inks = resolved_inks
             self._config.pumps[pid] = pcfg
 
         # v7.2.4 S3.12: Capture channel map state
@@ -990,6 +1055,20 @@ class HardwareSetupPage(QWidget):
             pid = combo.currentData()
             if pid:
                 self._config.needle_channel_pump_map[ch_idx] = pid
+
+        # v7.2.8: Ink swap strategy
+        self._config.ink_swap_strategy = InkSwapStrategy(
+            waste=self._swap_checks["waste"].isChecked(),
+            wash_pre=self._swap_checks["wash_pre"].isChecked(),
+            buffer=self._swap_checks["buffer"].isChecked(),
+            wash_post=self._swap_checks["wash_post"].isChecked(),
+            ink_load=self._swap_checks["ink_load"].isChecked(),
+            wash_final=self._swap_checks["wash_final"].isChecked(),
+            waste_volume_uL=self._swap_waste_vol.value(),
+            wash_volume_uL=self._swap_wash_vol.value(),
+            buffer_volume_uL=self._swap_buffer_vol.value(),
+            ink_load_volume_uL=self._swap_ink_load_vol.value(),
+        )
 
     # ════════════════════════════════════════════════════════════════
     #  INK LIBRARY CRUD
@@ -1240,64 +1319,18 @@ class HardwareSetupPage(QWidget):
                 logger.debug(
                     f"  {pid}: enabled={pcfg.enabled}, "
                     f"syringe={pcfg.syringe.volume_uL if pcfg.syringe else None}µL, "
-                    f"ink={pcfg.ink.name if pcfg.ink else None}, "
+                    f"inks={pcfg.ink_names}, "
                     f"mode={pcfg.printing_mode.value}")
 
-        # v7.2.5: Verify pump ink assignments after restore
+        # v7.2.8: Verify pump ink assignments after restore
         for pid, pw in self._pump_widgets.items():
-            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
-            expected_ink = self._config.pumps[pid].ink.name if (
-                pid in self._config.pumps and self._config.pumps[pid].ink) else None
-            if expected_ink and actual_ink != expected_ink:
-                logger.warning(
-                    f"  {pid} ink mismatch: expected={expected_ink}, "
-                    f"actual={actual_ink}. Re-applying...")
-                # Force re-apply: set the combo directly
-                idx = pw.ink_combo.findText(expected_ink)
-                if idx >= 0:
-                    pw.ink_combo.blockSignals(True)
-                    pw.ink_combo.setCurrentIndex(idx)
-                    pw.ink_combo.blockSignals(False)
-                else:
-                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
+            actual = set(pw.get_selected_ink_names())
+            expected = set(self._config.pumps[pid].ink_names) if pid in self._config.pumps else set()
+            if expected and actual != expected:
+                logger.warning(f"  {pid} ink mismatch: expected={expected}, actual={actual}")
+                pw.set_config(self._config.pumps[pid], ink_names=ink_names)
 
-        # v7.2.5: Verify pump ink assignments after restore
-        for pid, pw in self._pump_widgets.items():
-            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
-            expected_ink = self._config.pumps[pid].ink.name if (
-                pid in self._config.pumps and self._config.pumps[pid].ink) else None
-            if expected_ink and actual_ink != expected_ink:
-                logger.warning(
-                    f"  {pid} ink mismatch: expected={expected_ink}, "
-                    f"actual={actual_ink}. Re-applying...")
-                # Force re-apply: set the combo directly
-                idx = pw.ink_combo.findText(expected_ink)
-                if idx >= 0:
-                    pw.ink_combo.blockSignals(True)
-                    pw.ink_combo.setCurrentIndex(idx)
-                    pw.ink_combo.blockSignals(False)
-                else:
-                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
-
-        # v7.2.5: Verify pump ink assignments after restore
-        for pid, pw in self._pump_widgets.items():
-            actual_ink = pw.ink_combo.currentData() if hasattr(pw, "ink_combo") else None
-            expected_ink = self._config.pumps[pid].ink.name if (
-                pid in self._config.pumps and self._config.pumps[pid].ink) else None
-            if expected_ink and actual_ink != expected_ink:
-                logger.warning(
-                    f"  {pid} ink mismatch: expected={expected_ink}, "
-                    f"actual={actual_ink}. Re-applying...")
-                # Force re-apply: set the combo directly
-                idx = pw.ink_combo.findText(expected_ink)
-                if idx >= 0:
-                    pw.ink_combo.blockSignals(True)
-                    pw.ink_combo.setCurrentIndex(idx)
-                    pw.ink_combo.blockSignals(False)
-                else:
-                    logger.warning(f"  {pid}: ink {expected_ink!r} not in combo options")
-
-        # Refresh exclusions after all pumps loaded
+        # Refresh ink lists after all pumps loaded
         self._refresh_pump_ink_exclusions()
         self._update_pump_ink_summary()
 
@@ -1320,7 +1353,26 @@ class HardwareSetupPage(QWidget):
         logger.debug(
             f"  Channel map: {self._config.needle_channel_pump_map}")
 
-        # ── 8. Emit signals ──────────────────────────────────────
+        # ── 8. Ink Swap Strategy (v7.2.8) ────────────────────────
+        strat = self._config.ink_swap_strategy
+        for key, cb in self._swap_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(getattr(strat, key, True))
+            cb.blockSignals(False)
+        self._swap_waste_vol.blockSignals(True)
+        self._swap_waste_vol.setValue(strat.waste_volume_uL)
+        self._swap_waste_vol.blockSignals(False)
+        self._swap_wash_vol.blockSignals(True)
+        self._swap_wash_vol.setValue(strat.wash_volume_uL)
+        self._swap_wash_vol.blockSignals(False)
+        self._swap_buffer_vol.blockSignals(True)
+        self._swap_buffer_vol.setValue(strat.buffer_volume_uL)
+        self._swap_buffer_vol.blockSignals(False)
+        self._swap_ink_load_vol.blockSignals(True)
+        self._swap_ink_load_vol.setValue(strat.ink_load_volume_uL)
+        self._swap_ink_load_vol.blockSignals(False)
+
+        # ── 9. Emit signals ──────────────────────────────────────
         self._restoring = False
         self._on_config_changed()
         logger.info("Config restore complete")

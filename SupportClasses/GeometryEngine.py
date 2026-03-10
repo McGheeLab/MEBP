@@ -585,6 +585,41 @@ def generate_elliptical_meander_fill(
     return np.vstack(points) if points else np.empty((0, 2))
 
 
+def generate_triangular_meander_fill(
+    cx: float, cy: float,
+    side: float,
+    spacing_mm: float,
+    points_per_line: int = 20,
+) -> np.ndarray:
+    """
+    Generate a meander fill constrained to an equilateral triangle region.
+
+    Triangle vertices centered at (cx, cy).
+    """
+    h = side * math.sqrt(3) / 2
+    # Vertices: top, bottom-left, bottom-right (centered at cx, cy)
+    y_top = cy + 2 * h / 3
+    y_bot = cy - h / 3
+    # Scan lines from bottom to top
+    num_lines = max(1, int(h / spacing_mm) + 1)
+    y_positions = np.linspace(y_bot, y_top, num_lines)
+
+    points = []
+    for i, y in enumerate(y_positions):
+        # At height y, triangle width narrows linearly from base to apex
+        frac = (y - y_bot) / h if h > 0 else 0
+        half_width = (side / 2.0) * (1.0 - frac)
+        if half_width < spacing_mm * 0.1:
+            continue
+        if i % 2 == 0:
+            xs = np.linspace(cx - half_width, cx + half_width, points_per_line)
+        else:
+            xs = np.linspace(cx + half_width, cx - half_width, points_per_line)
+        ys = np.full(points_per_line, y)
+        points.append(np.column_stack([xs, ys]))
+    return np.vstack(points) if points else np.empty((0, 2))
+
+
 def generate_spiral_fill(
     cx: float, cy: float,
     radius: float,
@@ -693,23 +728,35 @@ def generate_object_trajectory(
         obj.num_layers = 1
 
     elif otype == ObjectType.CIRCLE.value:
+        if p.get("filled", False):
+            pts = generate_circular_meander_fill(
+                ox, oy, p.get("radius", 1.0), spacing)
+        else:
+            pts = generate_circle(ox, oy, p.get("radius", 1.0), p.get("num_points", 64))
         traj = _gen_2d_trajectory(
-            generate_circle(ox, oy, p.get("radius", 1.0), p.get("num_points", 64)),
-            oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
         )
         obj.num_layers = 1
 
     elif otype == ObjectType.SQUARE.value:
+        side = p.get("side", 2.0)
+        if p.get("filled", False):
+            pts = generate_meander_fill(ox, oy, side, side, spacing)
+        else:
+            pts = generate_square(ox, oy, side, p.get("points_per_side", 20))
         traj = _gen_2d_trajectory(
-            generate_square(ox, oy, p.get("side", 2.0), p.get("points_per_side", 20)),
-            oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
         )
         obj.num_layers = 1
 
     elif otype == ObjectType.TRIANGLE.value:
+        if p.get("filled", False):
+            pts = generate_triangular_meander_fill(
+                ox, oy, p.get("side", 2.0), spacing)
+        else:
+            pts = generate_triangle(ox, oy, p.get("side", 2.0), p.get("points_per_side", 20))
         traj = _gen_2d_trajectory(
-            generate_triangle(ox, oy, p.get("side", 2.0), p.get("points_per_side", 20)),
-            oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
         )
         obj.num_layers = 1
 
@@ -722,10 +769,14 @@ def generate_object_trajectory(
         obj.num_layers = 1
 
     elif otype == ObjectType.ELLIPSE.value:
+        if p.get("filled", False):
+            pts = generate_elliptical_meander_fill(
+                ox, oy, p.get("a", 2.0), p.get("b", 1.0), spacing)
+        else:
+            pts = generate_ellipse(ox, oy, p.get("a", 2.0), p.get("b", 1.0),
+                                  p.get("num_points", 64))
         traj = _gen_2d_trajectory(
-            generate_ellipse(ox, oy, p.get("a", 2.0), p.get("b", 1.0),
-                            p.get("num_points", 64)),
-            oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
         )
         obj.num_layers = 1
 

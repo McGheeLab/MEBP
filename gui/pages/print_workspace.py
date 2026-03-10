@@ -78,16 +78,21 @@ class HardwareSummaryWidget(QWidget):
         self._build_ui()
 
     def _build_ui(self):
+        _bg = COLORS.get('base', '#1e1e2e')
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
+        self.setStyleSheet(f"background: {_bg};")
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background: {_bg}; border: none; }}")
 
         scroll_content = QWidget()
+        scroll_content.setStyleSheet(f"background: {_bg};")
         self._content = QVBoxLayout(scroll_content)
         self._content.setContentsMargins(4, 4, 4, 4)
         self._content.setSpacing(8)
@@ -196,12 +201,20 @@ class HardwareSummaryWidget(QWidget):
         group = QGroupBox(title)
         group.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
+                font-weight: bold; font-size: 12px;
+                color: {COLORS.get('text', '#cdd6f4')};
+                background: {COLORS.get('base', '#1e1e2e')};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
+                border-radius: 4px; margin-top: 10px; padding-top: 24px;
             }}
             QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px; right: 0px; top: 0px;
+                padding: 6px 10px;
+                background: {COLORS.get('surface1', '#45475a')};
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
             }}
         """)
         layout = QVBoxLayout(group)

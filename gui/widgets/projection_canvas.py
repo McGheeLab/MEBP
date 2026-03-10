@@ -134,6 +134,7 @@ class PlacedObject:
     y_offset: float = 0.0
     z_offset: float = 0.0
     library_key: str = ""    # key back into the object library dict
+    sphere_radius_mm: float = 0.0  # >0 for point objects — renders as filled sphere
 
     @property
     def offset_points(self) -> list[tuple[float, float, float]]:
@@ -926,6 +927,22 @@ class DraggableObjectItem(QGraphicsPathItem):
         path = QPainterPath()
         pts = self.placed.points
         s = self._scale
+        color = QColor(self.placed.color)
+
+        # Sphere rendering for point objects
+        if self.placed.sphere_radius_mm > 0 and len(pts) >= 1:
+            h0, v0 = _project_point(pts[0], self._mode)
+            r = self.placed.sphere_radius_mm * s
+            r = max(r, 2)  # minimum visible size
+            path.addEllipse(h0 * s - r, v0 * s - r, r * 2, r * 2)
+            self.setPath(path)
+            self.setPen(QPen(color, 1.0))
+            fill = QColor(color)
+            fill.setAlpha(120)
+            self.setBrush(QBrush(fill))
+            self.sync_position_from_placed()
+            return
+
         if len(pts) >= 2:
             h0, v0 = _project_point(pts[0], self._mode)
             path.moveTo(h0 * s, v0 * s)
@@ -937,7 +954,7 @@ class DraggableObjectItem(QGraphicsPathItem):
             r = 3
             path.addEllipse(h0 * s - r, v0 * s - r, r * 2, r * 2)
         self.setPath(path)
-        self.setPen(QPen(QColor(self.placed.color), PATH_PEN_WIDTH))
+        self.setPen(QPen(color, PATH_PEN_WIDTH))
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.sync_position_from_placed()
 

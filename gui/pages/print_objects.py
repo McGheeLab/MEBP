@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem,
     QSplitter, QScrollArea, QSizePolicy, QLineEdit, QFormLayout,
     QColorDialog, QSlider, QMessageBox, QStackedWidget,
-    QInputDialog, QToolBar,
+    QInputDialog, QToolBar, QCheckBox,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon
@@ -118,48 +118,45 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════
 
 # Object type definitions: key → (label, icon_text)
-# Built dynamically from GeometryEngine when available, with fallback
+# Consolidated: no shell/solid split — the filled checkbox handles that.
 _ICON_MAP = {
     "point": "●", "line": "╱", "circle": "◯", "square": "□",
     "triangle": "△", "spiral": "◎", "ellipse": "⬭",
-    "sphere_shell": "○", "sphere_solid": "●",
-    "cube_shell": "◻", "cube_solid": "◼",
-    "cylinder_shell": "◯", "cylinder_solid": "⬤",
-    "ellipsoid_shell": "⬭", "ellipsoid_solid": "⬬",
+    "sphere": "◉", "cube": "◼", "cylinder": "⬤", "ellipsoid": "⬬",
     "csv_import": "📄",
 }
 
-_CATEGORY_ICONS = {"2D": "╱", "3D": "▦"}
+# Category for each consolidated type
+_TYPE_CATEGORY = {
+    "point": "1D",
+    "line": "2D", "circle": "2D", "square": "2D",
+    "triangle": "2D", "spiral": "2D", "ellipse": "2D",
+    "sphere": "3D", "cube": "3D", "cylinder": "3D", "ellipsoid": "3D",
+    "csv_import": "Import",
+}
 
+OBJECT_TYPES: dict[str, tuple[str, str]] = {
+    "point":     ("Point",     "●"),
+    "line":      ("Line",      "╱"),
+    "circle":    ("Circle",    "◯"),
+    "square":    ("Square",    "□"),
+    "triangle":  ("Triangle",  "△"),
+    "spiral":    ("Spiral",    "◎"),
+    "ellipse":   ("Ellipse",   "⬭"),
+    "sphere":    ("Sphere",    "◉"),
+    "cube":      ("Cube",      "◼"),
+    "cylinder":  ("Cylinder",  "⬤"),
+    "ellipsoid": ("Ellipsoid", "⬬"),
+    "csv_import": ("CSV Import", "📄"),
+}
 
-def _build_object_types() -> dict[str, tuple[str, str]]:
-    """Build OBJECT_TYPES dict from GeometryEngine or fallback."""
-    types = {}
-    if HAS_GEOMETRY:
-        for key, info in OBJECT_TYPE_INFO.items():
-            label = info.get("label", key.replace("_", " ").title())
-            icon = _ICON_MAP.get(key, _CATEGORY_ICONS.get(info.get("category", ""), "?"))
-            types[key] = (label, icon)
-    else:
-        # Fallback — basic set
-        types = {
-            "point":           ("Dot",             "●"),
-            "line":            ("Line",            "╱"),
-            "circle":          ("Circle",          "◯"),
-            "spiral":          ("Spiral",          "◎"),
-            "cylinder_solid":  ("Cylinder (solid)", "⬤"),
-            "cylinder_shell":  ("Cylinder (shell)", "◯"),
-            "sphere_solid":    ("Sphere (solid)",   "●"),
-            "sphere_shell":    ("Sphere (shell)",   "○"),
-            "cube_solid":      ("Cube (solid)",     "◼"),
-            "cube_shell":      ("Cube (shell)",     "◻"),
-        }
-    # Always include CSV import
-    types["csv_import"] = ("CSV Import", "📄")
-    return types
-
-
-OBJECT_TYPES = _build_object_types()
+# Map consolidated 3D GUI type → engine type based on filled flag
+_3D_TYPE_MAP = {
+    ("sphere", True): "sphere_solid",    ("sphere", False): "sphere_shell",
+    ("cube", True): "cube_solid",        ("cube", False): "cube_shell",
+    ("cylinder", True): "cylinder_solid", ("cylinder", False): "cylinder_shell",
+    ("ellipsoid", True): "ellipsoid_solid", ("ellipsoid", False): "ellipsoid_shell",
+}
 
 # Parameter names that must be integers (count/index values)
 INT_PARAMS = {
@@ -202,17 +199,31 @@ def _auto_name(obj_type: str) -> str:
     return f"{label}_{_type_counters[obj_type]}"
 
 
+# Default params for consolidated 3D types (superset of shell+solid params)
+_CONSOLIDATED_3D_PARAMS = {
+    "sphere":    {"radius": 1.0, "layer_height": 0.2, "num_points": 64},
+    "cube":      {"side": 2.0, "height": 2.0, "layer_height": 0.2, "points_per_side": 20},
+    "cylinder":  {"radius": 1.0, "height": 2.0, "layer_height": 0.2, "num_points": 64},
+    "ellipsoid": {"a": 2.0, "b": 1.5, "c": 1.0, "layer_height": 0.2, "num_points": 64},
+}
+
+
 def _get_type_params(obj_type: str) -> dict:
     """Get default parameters for an object type from GeometryEngine."""
+    # Consolidated 3D types — use local defaults
+    if obj_type in _CONSOLIDATED_3D_PARAMS:
+        return dict(_CONSOLIDATED_3D_PARAMS[obj_type])
     if HAS_GEOMETRY:
         return get_default_params(obj_type)
     # Fallback defaults
     fallbacks = {
-        "point": {"cx": 0.0, "cy": 0.0, "dwell_time_s": 1.0},
+        "point": {"cx": 0.0, "cy": 0.0, "dwell_time_s": 1.0, "dispense_volume_uL": 0.1},
         "line": {"x1": -1.0, "y1": 0.0, "x2": 1.0, "y2": 0.0, "num_points": 50},
         "circle": {"radius": 1.0, "num_points": 64},
+        "square": {"side": 2.0, "points_per_side": 20},
+        "triangle": {"side": 2.0, "points_per_side": 20},
         "spiral": {"max_radius": 2.0, "num_points_per_turn": 64},
-        "cylinder_solid": {"radius": 1.0, "height": 2.0, "layer_height": 0.2},
+        "ellipse": {"a": 2.0, "b": 1.0, "num_points": 64},
         "csv_import": {},
     }
     return dict(fallbacks.get(obj_type, {}))
@@ -259,7 +270,7 @@ class PrintObjectsTab(QWidget):
         self._active_file_name: str | None = None
 
         # Objects list: ordered list of dicts
-        # Each: {name, object_type, params, position, color, ink_pump, num_layers, layer_height, auto_layout}
+        # Each: {name, object_type, params, position, color, ink, auto_layout, in_well}
         self._objects: list[dict] = []
 
         # Edit mode tracking
@@ -280,6 +291,13 @@ class PrintObjectsTab(QWidget):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(100)
         self._preview_timer.timeout.connect(self._update_live_preview)
+
+        # Designer preview blink (not-yet-added indicator)
+        self._designer_blink_timer = QTimer(self)
+        self._designer_blink_timer.setInterval(600)
+        self._designer_blink_timer.timeout.connect(self._toggle_designer_blink)
+        self._designer_blink_dim = False
+        self._designer_preview_obj = None  # cached for blink redraws
 
         # Simulation
         self._sim_timer = QTimer(self)
@@ -332,58 +350,139 @@ class PrintObjectsTab(QWidget):
     #  UI CONSTRUCTION
     # ══════════════════════════════════════════════════════════════
 
+    def _make_collapsible_group(self, title: str, layout_target,
+                                expanded: bool = True) -> QGroupBox:
+        """Create a collapsible QGroupBox with a visible header bar."""
+        grp = QGroupBox(title)
+        grp.setCheckable(True)
+        grp.setChecked(expanded)
+        grp.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; font-size: 12px;
+                color: {COLORS.get('text', '#cdd6f4')};
+                background: {COLORS.get('base', '#1e1e2e')};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px; right: 0px; top: 0px;
+                padding: 6px 10px;
+                background: {COLORS.get('surface1', '#45475a')};
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QGroupBox::indicator {{
+                width: 12px; height: 12px;
+            }}
+        """)
+        inner = QVBoxLayout(grp)
+        inner.setContentsMargins(6, 4, 6, 6)
+        inner.setSpacing(4)
+        content = QWidget()
+        content_lay = QVBoxLayout(content)
+        content_lay.setContentsMargins(0, 0, 0, 0)
+        content_lay.setSpacing(4)
+        inner.addWidget(content)
+
+        def _toggle(checked, w=content):
+            w.setVisible(checked)
+        grp.toggled.connect(_toggle)
+        content.setVisible(expanded)
+
+        layout_target.addWidget(grp)
+        return grp, content_lay
+
     def _build_ui(self):
+        _bg = COLORS.get('base', '#1e1e2e')
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(4)
+        outer.setSpacing(0)
+        self.setStyleSheet(f"background: {_bg};")
 
-        # ── Print File Bar ────────────────────────────────────────
+        # ── Print File Bar (always visible, pinned top) ──────────
         self._build_file_bar(outer)
 
-        # ── v7.2.6: All-splitter layout — every panel resizable ──
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
+        # ── Two-column layout: left (builders) | right (preview + list) ──
+        columns = QSplitter(Qt.Orientation.Horizontal)
+        columns.setChildrenCollapsible(False)
+        columns.setStyleSheet(f"QSplitter {{ background: {_bg}; }}")
 
-        # Left: vertical splitter (Designer / Auto-Layout / CSV)
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
-        left_splitter.setChildrenCollapsible(False)
+        # ── LEFT: Scrollable builder sections ────────────────────
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setStyleSheet(f"QScrollArea {{ background: {_bg}; border: none; }}")
 
-        _dw = QWidget(); _dl = QVBoxLayout(_dw); _dl.setContentsMargins(4,4,4,4); _dl.setSpacing(4)
-        self._build_designer_section(_dl); _dw.setMinimumHeight(120)
-        left_splitter.addWidget(_dw)
+        left_content = QWidget()
+        left_content.setStyleSheet(f"background: {_bg};")
+        left_lay = QVBoxLayout(left_content)
+        left_lay.setContentsMargins(4, 4, 4, 4)
+        left_lay.setSpacing(4)
 
-        _aw = QWidget(); _al = QVBoxLayout(_aw); _al.setContentsMargins(4,4,4,4); _al.setSpacing(4)
-        self._build_auto_layout_section(_al); _aw.setMinimumHeight(80)
-        left_splitter.addWidget(_aw)
+        _, designer_lay = self._make_collapsible_group(
+            "Object Designer", left_lay, expanded=True)
+        self._build_designer_section(designer_lay)
 
-        _cw = QWidget(); _cl = QVBoxLayout(_cw); _cl.setContentsMargins(4,4,4,4); _cl.setSpacing(4)
-        self._build_csv_import_section(_cl); _cw.setMinimumHeight(60)
-        left_splitter.addWidget(_cw)
+        _, auto_lay = self._make_collapsible_group(
+            "Auto-Layout", left_lay, expanded=False)
+        self._build_auto_layout_section(auto_lay)
 
-        left_splitter.setStretchFactor(0, 3); left_splitter.setStretchFactor(1, 2); left_splitter.setStretchFactor(2, 1)
-        main_splitter.addWidget(left_splitter)
+        _, csv_lay = self._make_collapsible_group(
+            "CSV Import", left_lay, expanded=False)
+        self._build_csv_import_section(csv_lay)
 
-        # Right: vertical splitter (Preview / Objects List / Summary+Staging)
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.setChildrenCollapsible(False)
+        left_lay.addStretch()
+        left_scroll.setWidget(left_content)
+        columns.addWidget(left_scroll)
 
-        _pw = QWidget(); _pl = QVBoxLayout(_pw); _pl.setContentsMargins(4,4,4,4); _pl.setSpacing(4)
-        self._build_preview_section(_pl); _pw.setMinimumHeight(150)
-        right_splitter.addWidget(_pw)
+        # ── RIGHT: Preview (fixed) + Objects/Summary (scrollable) ─
+        right = QWidget()
+        right.setStyleSheet(f"background: {_bg};")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(4, 4, 4, 4)
+        right_lay.setSpacing(4)
 
-        _ow = QWidget(); _ol = QVBoxLayout(_ow); _ol.setContentsMargins(4,4,4,4); _ol.setSpacing(4)
-        self._build_objects_list_section(_ol); _ow.setMinimumHeight(100)
-        right_splitter.addWidget(_ow)
+        # Preview — always visible, not collapsible
+        self._build_preview_section(right_lay)
 
-        _sw = QWidget(); _sl = QVBoxLayout(_sw); _sl.setContentsMargins(4,4,4,4); _sl.setSpacing(4)
-        self._build_summary_section(_sl); _sw.setMinimumHeight(60)
-        right_splitter.addWidget(_sw)
+        # Objects + Summary in a scroll area below preview
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setStyleSheet(f"QScrollArea {{ background: {_bg}; border: none; }}")
 
-        right_splitter.setStretchFactor(0, 4); right_splitter.setStretchFactor(1, 3); right_splitter.setStretchFactor(2, 1)
-        main_splitter.addWidget(right_splitter)
-        main_splitter.setStretchFactor(0, 2); main_splitter.setStretchFactor(1, 3)
+        right_scroll_content = QWidget()
+        right_scroll_content.setStyleSheet(f"background: {_bg};")
+        right_scroll_lay = QVBoxLayout(right_scroll_content)
+        right_scroll_lay.setContentsMargins(0, 0, 0, 0)
+        right_scroll_lay.setSpacing(4)
 
-        outer.addWidget(main_splitter)
+        _, objects_lay = self._make_collapsible_group(
+            "Objects in This Print", right_scroll_lay, expanded=True)
+        self._build_objects_list_section(objects_lay)
+
+        _, summary_lay = self._make_collapsible_group(
+            "Summary & Staging", right_scroll_lay, expanded=True)
+        self._build_summary_section(summary_lay)
+
+        right_scroll_lay.addStretch()
+        right_scroll.setWidget(right_scroll_content)
+        right_lay.addWidget(right_scroll)
+
+        columns.addWidget(right)
+
+        # Left gets less space, right (preview) gets more
+        columns.setStretchFactor(0, 2)
+        columns.setStretchFactor(1, 3)
+
+        outer.addWidget(columns)
 
     # ── File Bar ──────────────────────────────────────────────────
 
@@ -459,18 +558,7 @@ class PrintObjectsTab(QWidget):
     # ── Object Designer ───────────────────────────────────────────
 
     def _build_designer_section(self, parent_layout):
-        group = QGroupBox("Object Designer")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
+        layout = parent_layout
 
         # S4B.1: Object type categorised list (replaces icon button row)
         type_label = QLabel("Object Type:")
@@ -478,7 +566,15 @@ class PrintObjectsTab(QWidget):
         layout.addWidget(type_label)
 
         self._type_list = QListWidget()
-        self._type_list.setMaximumHeight(140)
+        # Size to always show exactly 6 items regardless of DPI/resolution
+        self._type_list.addItem("")  # temp item to measure row height
+        row_h = self._type_list.sizeHintForRow(0)
+        self._type_list.clear()
+        if row_h < 1:
+            row_h = 20  # fallback
+        margins = self._type_list.contentsMargins()
+        frame = self._type_list.frameWidth() * 2
+        self._type_list.setFixedHeight(row_h * 6 + margins.top() + margins.bottom() + frame)
         self._type_list.setStyleSheet(f"""
             QListWidget {{
                 background: {COLORS['surface0']}; color: {COLORS['text']};
@@ -535,6 +631,9 @@ class PrintObjectsTab(QWidget):
 
         # S4B.2: Dynamic parameters panel (QStackedWidget)
         self._param_stack = QStackedWidget()
+        self._param_stack.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self._param_stack.currentChanged.connect(self._resize_param_stack)
         self._param_widgets: dict[str, dict] = {}  # type → {param_name: widget}
         self._param_stack_indices: dict[str, int] = {}
 
@@ -546,28 +645,49 @@ class PrintObjectsTab(QWidget):
 
         layout.addWidget(self._param_stack)
 
-        # Common fields: ink/pump, color, position, layers
+        # Common fields: ink, position
         common = QFormLayout()
         common.setSpacing(4)
 
-        # Ink/Pump selector
+        # Ink selector + read-only color swatch
+        ink_row = QHBoxLayout()
         self._ink_combo = QComboBox()
-        self._ink_combo.addItem("P1 (default)", "P1")
-        common.addRow("Pump / Ink:", self._ink_combo)
+        self._ink_combo.addItem("(no inks defined)", "")
+        self._ink_combo.currentIndexChanged.connect(self._on_ink_combo_changed)
+        ink_row.addWidget(self._ink_combo)
 
-        # Color picker
-        color_row = QHBoxLayout()
-        self._color_btn = QPushButton()
-        self._color_btn.setFixedSize(24, 24)
+        self._ink_color_swatch = QLabel()
+        self._ink_color_swatch.setFixedSize(24, 24)
         self._current_color = DEFAULT_COLORS[0]
-        self._color_btn.setStyleSheet(
+        self._ink_color_swatch.setStyleSheet(
             f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
             f"border-radius: 4px;")
-        self._color_btn.clicked.connect(self._pick_color)
-        color_row.addWidget(self._color_btn)
-        color_row.addWidget(QLabel("Object color"))
-        color_row.addStretch()
-        common.addRow("Color:", color_row)
+        self._ink_color_swatch.setToolTip("Ink color (set in Hardware Setup)")
+        ink_row.addWidget(self._ink_color_swatch)
+        ink_row.addStretch()
+        common.addRow("Ink:", ink_row)
+
+        # Filled checkbox + fill pattern combo
+        fill_row = QHBoxLayout()
+        self._filled_check = QCheckBox("Filled / Solid")
+        self._filled_check.setToolTip(
+            "2D: fill interior with pattern\n"
+            "3D: solid fill instead of shell")
+        self._filled_check.stateChanged.connect(self._on_filled_toggled)
+        fill_row.addWidget(self._filled_check)
+
+        self._fill_pattern_label = QLabel("Pattern:")
+        self._fill_pattern_label.setVisible(False)
+        fill_row.addWidget(self._fill_pattern_label)
+        self._fill_pattern_combo = QComboBox()
+        self._fill_pattern_combo.addItem("Meander", "meander")
+        self._fill_pattern_combo.addItem("Spiral", "spiral")
+        self._fill_pattern_combo.setVisible(False)
+        self._fill_pattern_combo.setMaximumWidth(100)
+        self._fill_pattern_combo.currentIndexChanged.connect(self._schedule_preview)
+        fill_row.addWidget(self._fill_pattern_combo)
+        fill_row.addStretch()
+        common.addRow("Fill:", fill_row)
 
         # Position
         pos_row = QHBoxLayout()
@@ -585,26 +705,6 @@ class PrintObjectsTab(QWidget):
             pos_row.addWidget(spin)
         pos_row.addStretch()
         common.addRow("Position:", pos_row)
-
-        # Layers
-        layer_row = QHBoxLayout()
-        self._num_layers = QSpinBox()
-        self._num_layers.setRange(1, 100)
-        self._num_layers.setValue(1)
-        self._num_layers.valueChanged.connect(self._schedule_preview)
-        layer_row.addWidget(QLabel("Layers:"))
-        layer_row.addWidget(self._num_layers)
-
-        self._layer_height = QDoubleSpinBox()
-        self._layer_height.setRange(0.01, 5.0)
-        self._layer_height.setValue(0.2)
-        self._layer_height.setSingleStep(0.05)
-        self._layer_height.setSuffix(" mm")
-        self._layer_height.valueChanged.connect(self._schedule_preview)
-        layer_row.addWidget(QLabel("Height:"))
-        layer_row.addWidget(self._layer_height)
-        layer_row.addStretch()
-        common.addRow("", layer_row)
 
         layout.addLayout(common)
 
@@ -638,8 +738,6 @@ class PrintObjectsTab(QWidget):
             f"color: {COLORS['yellow']}; font-weight: bold; font-size: 11px;")
         self._edit_indicator.setVisible(False)
         layout.addWidget(self._edit_indicator)
-
-        parent_layout.addWidget(group)
 
     def _build_param_page(self, obj_type: str) -> tuple[QWidget, dict]:
         """Build a parameter form for one object type. Returns (widget, {name: spinbox})."""
@@ -697,18 +795,7 @@ class PrintObjectsTab(QWidget):
     # ── Auto-Layout Section ───────────────────────────────────────
 
     def _build_auto_layout_section(self, parent_layout):
-        group = QGroupBox("Auto-Layout")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
+        layout = parent_layout
 
         # Pattern selector
         pat_row = QHBoxLayout()
@@ -765,8 +852,6 @@ class PrintObjectsTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        parent_layout.addWidget(group)
-
     def _build_layout_param_page(self, pattern: str) -> tuple[QWidget, dict]:
         """Build parameter controls for one auto-layout pattern."""
         page = QWidget()
@@ -816,18 +901,7 @@ class PrintObjectsTab(QWidget):
     # ── CSV Import Section ────────────────────────────────────────
 
     def _build_csv_import_section(self, parent_layout):
-        group = QGroupBox("📂 CSV Import")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 8px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
+        layout = parent_layout
 
         btn = QPushButton("Import CSV Trajectory")
         btn.setStyleSheet(
@@ -839,8 +913,6 @@ class PrintObjectsTab(QWidget):
         self._csv_info.setStyleSheet(
             f"color: {COLORS['overlay0']}; font-size: 10px; font-style: italic;")
         layout.addWidget(self._csv_info)
-
-        parent_layout.addWidget(group)
 
     # ── Preview Section ───────────────────────────────────────────
 
@@ -865,21 +937,10 @@ class PrintObjectsTab(QWidget):
     # ── Objects List Section (S4B.5) ──────────────────────────────
 
     def _build_objects_list_section(self, parent_layout):
-        group = QGroupBox("Objects in This Print")
-        group.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS['text']};
-                border: 1px solid {COLORS['surface1']};
-                border-radius: 6px; margin-top: 4px; padding-top: 14px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: 10px; padding: 0 6px;
-            }}
-        """)
-        layout = QVBoxLayout(group)
+        layout = parent_layout
 
         self._objects_list = QListWidget()
-        self._objects_list.setMaximumHeight(160)
+        self._objects_list.setMaximumHeight(200)
         self._objects_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._objects_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self._objects_list.currentRowChanged.connect(self._on_object_selected)
@@ -901,10 +962,15 @@ class PrintObjectsTab(QWidget):
             btn.setMaximumWidth(50)
             btn.clicked.connect(slot)
             btn_row.addWidget(btn)
+
+        self._btn_remove_from_well = QPushButton("Remove from Well")
+        self._btn_remove_from_well.setToolTip("Remove selected object from the well preview")
+        self._btn_remove_from_well.setFixedHeight(24)
+        self._btn_remove_from_well.setEnabled(False)
+        self._btn_remove_from_well.clicked.connect(self._remove_from_well)
+        btn_row.addWidget(self._btn_remove_from_well)
         btn_row.addStretch()
         layout.addLayout(btn_row)
-
-        parent_layout.addWidget(group)
 
     # ── Summary Section (S4B.11) ──────────────────────────────────
 
@@ -1064,10 +1130,9 @@ class PrintObjectsTab(QWidget):
                         "params": obj_data.get("params", {}),
                         "position": tuple(obj_data.get("position", [0, 0, 0])),
                         "color": obj_data.get("color", DEFAULT_COLORS[0]),
-                        "ink_pump": obj_data.get("ink_pump", "P1"),
-                        "num_layers": obj_data.get("num_layers", 1),
-                        "layer_height": obj_data.get("layer_height", 0.2),
+                        "ink": obj_data.get("ink", obj_data.get("ink_pump", "")),
                         "auto_layout": obj_data.get("auto_layout", False),
+                        "in_well": obj_data.get("in_well", True),
                     }
                     self._objects.append(entry)
 
@@ -1142,42 +1207,64 @@ class PrintObjectsTab(QWidget):
         self._current_type = obj_type
         idx = self._param_stack_indices.get(obj_type, 0)
         self._param_stack.setCurrentIndex(idx)
+        self._sync_filled_checkbox(obj_type)
         self._schedule_preview()
+
+    def _resize_param_stack(self, index: int):
+        """Resize the stacked widget to fit only the current page."""
+        for i in range(self._param_stack.count()):
+            w = self._param_stack.widget(i)
+            if w is not None:
+                if i == index:
+                    w.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                    QSizePolicy.Policy.Preferred)
+                else:
+                    w.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                    QSizePolicy.Policy.Ignored)
+        self._param_stack.adjustSize()
+
+    # Types where the filled checkbox row is hidden
+    _NO_FILL_TYPES = {"point", "line", "spiral", "csv_import"}
+
+    def _sync_filled_checkbox(self, obj_type: str):
+        """Show/hide the filled checkbox + fill-pattern combo based on object type."""
+        if not hasattr(self, '_filled_check'):
+            return
+        hide = obj_type in self._NO_FILL_TYPES
+        self._filled_check.setVisible(not hide)
+        # Show fill-pattern combo only when filled is checked and visible
+        if hasattr(self, '_fill_pattern_combo'):
+            show_pattern = not hide and self._filled_check.isChecked()
+            self._fill_pattern_combo.setVisible(show_pattern)
+            self._fill_pattern_label.setVisible(show_pattern)
 
     @staticmethod
     def _categorize_object_types() -> list[tuple[str, list]]:
         """Group OBJECT_TYPES into (category_name, [(key, (label, icon))]) sections."""
+        cats_1d = []
         cats_2d = []
-        cats_3d_shell = []
-        cats_3d_solid = []
+        cats_3d = []
         cats_other = []
 
         for obj_type, (label, icon_text) in OBJECT_TYPES.items():
             entry = (obj_type, (label, icon_text))
-            if obj_type == "csv_import":
-                cats_other.append(entry)
-            elif HAS_GEOMETRY and obj_type in OBJECT_TYPE_INFO:
-                cat = OBJECT_TYPE_INFO[obj_type].get("category", "")
-                if cat == "3D" and "shell" in obj_type:
-                    cats_3d_shell.append(entry)
-                elif cat == "3D":
-                    cats_3d_solid.append(entry)
-                else:
-                    cats_2d.append(entry)
-            elif "shell" in obj_type:
-                cats_3d_shell.append(entry)
-            elif "solid" in obj_type or "sphere" in obj_type or "cube" in obj_type or "cylinder" in obj_type or "ellipsoid" in obj_type:
-                cats_3d_solid.append(entry)
-            else:
+            cat = _TYPE_CATEGORY.get(obj_type, "")
+            if cat == "1D":
+                cats_1d.append(entry)
+            elif cat == "2D":
                 cats_2d.append(entry)
+            elif cat == "3D":
+                cats_3d.append(entry)
+            else:
+                cats_other.append(entry)
 
         result = []
+        if cats_1d:
+            result.append(("1D Objects", cats_1d))
         if cats_2d:
             result.append(("2D Objects", cats_2d))
-        if cats_3d_solid:
-            result.append(("3D Solid", cats_3d_solid))
-        if cats_3d_shell:
-            result.append(("3D Shell", cats_3d_shell))
+        if cats_3d:
+            result.append(("3D Objects", cats_3d))
         if cats_other:
             result.append(("Import", cats_other))
         return result
@@ -1202,6 +1289,11 @@ class PrintObjectsTab(QWidget):
                     params[pname] = val
             elif isinstance(widget, QLineEdit):
                 params[pname] = widget.text()
+        # Add filled flag and fill pattern from common widgets
+        if hasattr(self, '_filled_check'):
+            params["filled"] = self._filled_check.isChecked()
+        if hasattr(self, '_fill_pattern_combo') and self._filled_check.isChecked():
+            params["fill_pattern"] = self._fill_pattern_combo.currentData() or "meander"
         return params
 
     def _set_params_from_dict(self, obj_type: str, params: dict):
@@ -1221,6 +1313,27 @@ class PrintObjectsTab(QWidget):
                 w.blockSignals(False)
             elif isinstance(w, QLineEdit):
                 w.setText(str(val))
+        # Restore filled checkbox + fill pattern state
+        if hasattr(self, '_filled_check'):
+            self._filled_check.blockSignals(True)
+            self._filled_check.setChecked(params.get("filled", False))
+            self._filled_check.blockSignals(False)
+        if hasattr(self, '_fill_pattern_combo'):
+            pat = params.get("fill_pattern", "meander")
+            idx = self._fill_pattern_combo.findData(pat)
+            if idx >= 0:
+                self._fill_pattern_combo.blockSignals(True)
+                self._fill_pattern_combo.setCurrentIndex(idx)
+                self._fill_pattern_combo.blockSignals(False)
+        self._sync_filled_checkbox(obj_type)
+
+    def _on_filled_toggled(self, _state):
+        """Handle filled checkbox toggled — show/hide fill pattern combo."""
+        if hasattr(self, '_fill_pattern_combo'):
+            show = self._filled_check.isChecked()
+            self._fill_pattern_combo.setVisible(show)
+            self._fill_pattern_label.setVisible(show)
+        self._schedule_preview()
 
     def _schedule_preview(self, *_args):
         """Schedule a debounced preview update."""
@@ -1229,6 +1342,8 @@ class PrintObjectsTab(QWidget):
     def _update_live_preview(self):
         """Generate trajectory for current designer state and show in preview (S4B.3)."""
         if self._current_type == "csv_import":
+            self._designer_preview_obj = None
+            self._designer_blink_timer.stop()
             return
 
         params = self._get_current_params()
@@ -1245,7 +1360,11 @@ class PrintObjectsTab(QWidget):
         )
 
         if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+            self._designer_preview_obj = obj
+            self._designer_blink_dim = False
             self._show_single_preview(obj, ghost=True)
+            if not self._designer_blink_timer.isActive():
+                self._designer_blink_timer.start()
             info_parts = []
             if hasattr(obj, 'num_waypoints') and obj.num_waypoints:
                 info_parts.append(f"{obj.num_waypoints} pts")
@@ -1265,28 +1384,34 @@ class PrintObjectsTab(QWidget):
 
         params = self._get_current_params()
         position = (self._pos_x.value(), self._pos_y.value(), self._pos_z.value())
-        pump_id = self._ink_combo.currentData() or "P1"
+        ink_name = self._ink_combo.currentData() or ""
 
         entry = {
             "object_type": self._current_type,
             "params": dict(params),
             "position": position,
             "color": self._current_color,
-            "ink_pump": pump_id,
-            "num_layers": self._num_layers.value(),
-            "layer_height": self._layer_height.value(),
+            "ink": ink_name,
+            "num_layers": 1,
+            "layer_height": 0.2,
             "auto_layout": False,
         }
 
         if self._editing_index is not None:
-            # Update existing
+            # Update existing — preserve in_well state
             entry["name"] = self._objects[self._editing_index]["name"]
+            entry["in_well"] = self._objects[self._editing_index].get("in_well", True)
             self._objects[self._editing_index] = entry
             self._cancel_edit_mode()
         else:
-            # Add new
+            # Add new — adding from designer means it goes into the well
             entry["name"] = _auto_name(self._current_type)
+            entry["in_well"] = True
             self._objects.append(entry)
+
+        # Stop designer blink — object is now committed
+        self._designer_blink_timer.stop()
+        self._designer_preview_obj = None
 
         self._refresh_objects_list()
         self._refresh_preview_all()
@@ -1311,40 +1436,56 @@ class PrintObjectsTab(QWidget):
         self._editing_index = index
         entry = self._objects[index]
 
-        # Set type via list selection
+        # Map old shell/solid types to consolidated GUI type
         obj_type = entry["object_type"]
-        self._current_type = obj_type
+        gui_type = obj_type
+        infer_filled = None
+        if obj_type.endswith("_solid"):
+            gui_type = obj_type.replace("_solid", "")
+            infer_filled = True
+        elif obj_type.endswith("_shell"):
+            gui_type = obj_type.replace("_shell", "")
+            infer_filled = False
+
+        self._current_type = gui_type
         for i in range(self._type_list.count()):
             item = self._type_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == obj_type:
+            if item.data(Qt.ItemDataRole.UserRole) == gui_type:
                 self._type_list.blockSignals(True)
                 self._type_list.setCurrentItem(item)
                 self._type_list.blockSignals(False)
                 break
-        self._param_stack.setCurrentIndex(self._param_stack_indices.get(obj_type, 0))
+        self._param_stack.setCurrentIndex(self._param_stack_indices.get(gui_type, 0))
 
         # Set params
-        self._set_params_from_dict(obj_type, entry.get("params", {}))
+        self._set_params_from_dict(gui_type, entry.get("params", {}))
 
         # Set common fields
         pos = entry.get("position", (0, 0, 0))
         self._pos_x.setValue(pos[0])
         self._pos_y.setValue(pos[1])
         self._pos_z.setValue(pos[2] if len(pos) > 2 else 0.0)
-        self._num_layers.setValue(entry.get("num_layers", 1))
-        self._layer_height.setValue(entry.get("layer_height", 0.2))
-
-        # Color
+        # Color from ink (read-only)
         self._current_color = entry.get("color", DEFAULT_COLORS[0])
-        self._color_btn.setStyleSheet(
+        self._ink_color_swatch.setStyleSheet(
             f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
             f"border-radius: 4px;")
 
-        # Ink/pump
-        pump_id = entry.get("ink_pump", "P1")
-        idx = self._ink_combo.findData(pump_id)
+        # Ink
+        ink_name = entry.get("ink", entry.get("ink_pump", ""))
+        idx = self._ink_combo.findData(ink_name)
         if idx >= 0:
             self._ink_combo.setCurrentIndex(idx)
+
+        # Filled checkbox — restore from params or infer from old type
+        if hasattr(self, '_filled_check'):
+            filled = entry.get("params", {}).get("filled", False)
+            if infer_filled is not None:
+                filled = infer_filled
+            self._filled_check.blockSignals(True)
+            self._filled_check.setChecked(filled)
+            self._filled_check.blockSignals(False)
+            self._sync_filled_checkbox(gui_type)
 
         # UI indicators
         self._add_btn.setText("✓ Update Object")
@@ -1368,10 +1509,11 @@ class PrintObjectsTab(QWidget):
             type_info = OBJECT_TYPES.get(obj["object_type"], ("?", "?"))
             icon_text = type_info[1]
             pos = obj.get("position", (0, 0, 0))
-            pump = obj.get("ink_pump", "P1")
+            ink = obj.get("ink", obj.get("ink_pump", ""))
             auto = " [auto]" if obj.get("auto_layout") else ""
+            well_tag = " [IN WELL]" if obj.get("in_well") else ""
             text = (f"{i+1}. {icon_text} {obj['name']} "
-                    f"{pump} @ ({pos[0]:.1f}, {pos[1]:.1f}){auto}")
+                    f"[{ink}] @ ({pos[0]:.1f}, {pos[1]:.1f}){auto}{well_tag}")
             item = QListWidgetItem(text)
             color = QColor(obj.get("color", DEFAULT_COLORS[0]))
             item.setForeground(color)
@@ -1382,9 +1524,21 @@ class PrintObjectsTab(QWidget):
             self._refresh_objects_list_colors()
 
     def _on_object_selected(self, row: int):
-        """Highlight selected object in preview."""
+        """Update button states when selection changes (no auto-preview)."""
+        has_sel = 0 <= row < len(self._objects)
+        if hasattr(self, '_btn_remove_from_well'):
+            in_well = self._objects[row].get("in_well", False) if has_sel else False
+            self._btn_remove_from_well.setEnabled(has_sel and in_well)
+
+    def _remove_from_well(self):
+        """Remove selected object from the well preview."""
+        row = self._objects_list.currentRow()
         if 0 <= row < len(self._objects):
-            self._refresh_preview_all(highlight_index=row)
+            self._objects[row]["in_well"] = False
+            self._refresh_objects_list()
+            self._objects_list.setCurrentRow(row)
+            self._refresh_preview_all()
+            self._trigger_auto_save()
 
     def _on_objects_reordered(self, *_args):
         """Handle drag reorder in objects list."""
@@ -1507,7 +1661,7 @@ class PrintObjectsTab(QWidget):
         # Use current designer params as template
         obj_type = self._current_type
         obj_params = self._get_current_params()
-        pump_id = self._ink_combo.currentData() or "P1"
+        ink_name = self._ink_combo.currentData() or ""
 
         for x, y in positions:
             entry = {
@@ -1516,9 +1670,9 @@ class PrintObjectsTab(QWidget):
                 "params": dict(obj_params),
                 "position": (x, y, self._pos_z.value()),
                 "color": self._current_color,
-                "ink_pump": pump_id,
-                "num_layers": self._num_layers.value(),
-                "layer_height": self._layer_height.value(),
+                "ink": ink_name,
+                "num_layers": 1,
+                "layer_height": 0.2,
                 "auto_layout": True,
             }
             self._objects.append(entry)
@@ -1577,9 +1731,7 @@ class PrintObjectsTab(QWidget):
                 "params": {"source_file": str(path)},
                 "position": (0.0, 0.0, 0.0),
                 "color": DEFAULT_COLORS[len(self._objects) % len(DEFAULT_COLORS)],
-                "ink_pump": self._ink_combo.currentData() or "P1",
-                "num_layers": 1,
-                "layer_height": 0.2,
+                "ink": self._ink_combo.currentData() or "",
                 "auto_layout": False,
                 "_csv_data": data if HAS_NUMPY else None,
             }
@@ -1649,9 +1801,13 @@ class PrintObjectsTab(QWidget):
         if not HAS_GEOMETRY:
             return None
 
+        # Resolve consolidated 3D GUI type → engine type via filled flag
+        filled = params.get("filled", False)
+        effective_type = _3D_TYPE_MAP.get((obj_type, filled), obj_type)
+
         obj = PrintObject(
             name=name,
-            object_type=obj_type,
+            object_type=effective_type,
             params=dict(params),
             position=position,
             ink_assignments={pump_id: "ink"},
@@ -1663,10 +1819,12 @@ class PrintObjectsTab(QWidget):
             return obj
 
         try:
+            fill_pattern = params.get("fill_pattern", "meander")
             generate_object_trajectory(
                 obj, needle, syringe_map,
                 print_speed_mm_s=speed,
                 layer_height_mm=layer_h,
+                fill_pattern=fill_pattern,
                 pump_id=pump_id,
             )
         except Exception as e:
@@ -1674,7 +1832,24 @@ class PrintObjectsTab(QWidget):
 
         return obj
 
-    def _show_single_preview(self, obj, ghost=False):
+    @staticmethod
+    def _darken_color(hex_color: str, factor: float = 0.4) -> str:
+        """Return a darker version of a hex color (factor 0-1, lower=darker)."""
+        c = QColor(hex_color)
+        return QColor.fromHslF(
+            c.hslHueF(), c.hslSaturationF(),
+            max(0.0, c.lightnessF() * factor)).name()
+
+    def _toggle_designer_blink(self):
+        """Alternate the designer preview between normal and dim."""
+        obj = self._designer_preview_obj
+        if obj is None or not hasattr(obj, 'trajectory') or obj.trajectory is None:
+            self._designer_blink_timer.stop()
+            return
+        self._designer_blink_dim = not self._designer_blink_dim
+        self._show_single_preview(obj, ghost=True, dim=self._designer_blink_dim)
+
+    def _show_single_preview(self, obj, ghost=False, dim=False):
         """Show a single object trajectory in the preview."""
         if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
             return
@@ -1685,89 +1860,160 @@ class PrintObjectsTab(QWidget):
         pts = [(float(traj[i, 0]), float(traj[i, 1]), float(traj[i, 2]))
                for i in range(len(traj))]
         color = getattr(obj, 'color', "#a6e3a1")
+        if dim:
+            color = self._darken_color(color)
         obj_path = ObjectPath(name=obj.name, color=color, points=pts)
         self._preview.set_object_paths([obj_path])
         self._update_well_diameter()
         self._preview.refresh()
 
     def _refresh_preview_all(self, highlight_index=None):
-        """Regenerate preview showing all objects in current print."""
+        """Regenerate preview showing all objects as draggable items."""
+        # Run OOB check first so we can color paths red
+        self._refresh_oob_state()
 
+        self._update_well_diameter()
+
+        # Use the draggable PlacedObject system so users can drag objects
+        if HAS_PROJECTION_CANVAS and hasattr(self._preview, 'clear_placed_objects'):
+            self._preview.clear_placed_objects()
+            if hasattr(self._preview, 'clear_object_paths'):
+                self._preview.clear_object_paths()
+
+            for i, entry in enumerate(self._objects):
+                # Only show objects explicitly added to well
+                if not entry.get("in_well", False):
+                    continue
+                # Build trajectory at ORIGIN so PlacedObject offsets control position
+                obj = self._build_print_object(
+                    name=entry["name"],
+                    obj_type=entry["object_type"],
+                    params=entry.get("params", {}),
+                    position=(0, 0, 0),
+                    color=entry.get("color", DEFAULT_COLORS[0]),
+                    pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),
+                )
+                if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
+                    traj = obj.trajectory
+                    pts = [(float(traj[j, 0]), float(traj[j, 1]), float(traj[j, 2]))
+                           for j in range(len(traj))]
+
+                    # OOB = red, highlighted = white, else original
+                    if i in self._oob_indices:
+                        color = "#f38ba8"
+                    elif highlight_index is not None and i == highlight_index:
+                        color = "#ffffff"
+                    else:
+                        color = entry.get("color", DEFAULT_COLORS[0])
+
+                    pos = entry.get("position", (0, 0, 0))
+                    # For point objects, compute sphere radius from volume
+                    sphere_r = 0.0
+                    if entry.get("object_type") == "point":
+                        vol_uL = entry.get("params", {}).get("dispense_volume_uL", 0.1)
+                        vol_mm3 = vol_uL  # 1 µL = 1 mm³
+                        sphere_r = (3 * vol_mm3 / (4 * 3.14159265)) ** (1/3)
+
+                    placed = PlacedObject(
+                        name=entry["name"],
+                        color=color,
+                        points=pts,
+                        x_offset=float(pos[0]),
+                        y_offset=float(pos[1]),
+                        z_offset=float(pos[2]) if len(pos) > 2 else 0.0,
+                        library_key=entry["name"],
+                        sphere_radius_mm=sphere_r,
+                    )
+                    self._preview._add_placed_object(placed)
+
+            if hasattr(self._preview, 'refresh'):
+                self._preview.refresh()
+            return
+
+        # Fallback: static paths for non-interactive preview
         all_paths = []
         for i, entry in enumerate(self._objects):
+            if not entry.get("in_well", False):
+                continue
             obj = self._build_print_object(
                 name=entry["name"],
                 obj_type=entry["object_type"],
                 params=entry.get("params", {}),
                 position=entry.get("position", (0, 0, 0)),
                 color=entry.get("color", DEFAULT_COLORS[0]),
-                pump_id=entry.get("ink_pump", "P1"),
+                pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),
             )
             if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
                 traj = obj.trajectory
                 pts = [(float(traj[j, 0]), float(traj[j, 1]), float(traj[j, 2]))
                        for j in range(len(traj))]
                 color = entry.get("color", DEFAULT_COLORS[0])
-                if highlight_index is not None and i == highlight_index:
-                    color = "#ffffff"
-
-                # v7.2.4: Use WPObjectPath for WellPreviewWidget
-                if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
-                    all_paths.append(WPObjectPath(
-                        name=entry["name"], color=color, points=pts))
-                else:
-                    all_paths.append(ObjectPath(
-                        name=entry["name"], color=color, points=pts))
+                all_paths.append(ObjectPath(
+                    name=entry["name"], color=color, points=pts))
 
         if all_paths:
             self._preview.set_object_paths(all_paths)
-            if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
-                self._preview.set_highlight(highlight_index)
         else:
             if hasattr(self._preview, 'clear_object_paths'):
                 self._preview.clear_object_paths()
-            elif hasattr(self._preview, 'clear_path'):
-                self._preview.clear_path()
 
-        self._update_well_diameter()
         if hasattr(self._preview, 'refresh'):
             self._preview.refresh()
 
-        # v7.2.4: Refresh OOB state after preview update
-        self._refresh_oob_state()
 
+    def _resolve_ink_to_pump(self, ink_name: str | None) -> str:
+        """Look up which pump can handle this ink. Falls back to P1."""
+        if ink_name and hasattr(self, '_hw_config') and self._hw_config:
+            for pid, pcfg in self._hw_config.pumps.items():
+                if pcfg.enabled and pcfg.can_handle_ink(ink_name):
+                    return pid
+        return "P1"
+
+    def _on_ink_combo_changed(self, index: int):
+        """Update color swatch when ink selection changes."""
+        ink_name = self._ink_combo.currentData()
+        if ink_name and hasattr(self, '_hw_config') and self._hw_config:
+            ink = self._hw_config.ink_library.get(ink_name)
+            if ink:
+                self._current_color = getattr(ink, 'color', DEFAULT_COLORS[0])
+                self._ink_color_swatch.setStyleSheet(
+                    f"background: {self._current_color}; "
+                    f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+                self._schedule_preview()
+                return
+        # Fallback
+        self._current_color = DEFAULT_COLORS[0]
+        self._ink_color_swatch.setStyleSheet(
+            f"background: {self._current_color}; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
 
     def _refresh_ink_options_from_config(self):
-        """v7.2.4: Update ink selection options from HardwareConfig."""
+        """Update ink combo from HardwareConfig ink library (all defined inks)."""
         if not hasattr(self, '_hw_config') or not self._hw_config:
             return
-        ink_names = list(self._hw_config.ink_library.keys())
-        # Update ink combo in the designer if it exists
-        if hasattr(self, '_ink_combo'):
-            current = self._ink_combo.currentData()
-            self._ink_combo.clear()
-            for name in ink_names:
-                pump_id = None
-                for pid, pcfg in self._hw_config.pumps.items():
-                    if pcfg.ink and pcfg.ink.name == name:
-                        pump_id = pid
-                        break
-                label = f"{pump_id}: {name}" if pump_id else name
-                self._ink_combo.addItem(label, name)
-            if current:
-                idx = self._ink_combo.findData(current)
-                if idx >= 0:
-                    self._ink_combo.setCurrentIndex(idx)
-        # Update well diameter from plate format
+        if not hasattr(self, '_ink_combo'):
+            return
+        current = self._ink_combo.currentData()
+        self._ink_combo.blockSignals(True)
+        self._ink_combo.clear()
+        # Show all inks from the library — pump resolution happens at print time
+        for ink_name, ink_spec in self._hw_config.ink_library.items():
+            self._ink_combo.addItem(ink_name, ink_name)
+        if current:
+            idx = self._ink_combo.findData(current)
+            if idx >= 0:
+                self._ink_combo.setCurrentIndex(idx)
+        self._ink_combo.blockSignals(False)
+        # Sync color swatch to current selection
+        self._on_ink_combo_changed(self._ink_combo.currentIndex())
         self._update_well_diameter()
-        logger.debug(f"PrintObjects: refreshed ink options: {ink_names}")
+        logger.debug(f"PrintObjects: refreshed ink options from config")
 
     def _update_well_diameter(self):
         """Set well boundary circle on preview from workspace/HW config."""
         diam = self._get_well_diameter_mm()
-        if HAS_WELL_PREVIEW and isinstance(self._preview, WellPreviewWidget):
+        if hasattr(self._preview, 'set_well_diameter'):
             self._preview.set_well_diameter(diam)
-            return
 
     # ── Out-of-Bounds Detection (v7.2.4 S4.9-S4.11) ─────────────
 
@@ -1787,7 +2033,7 @@ class PrintObjectsTab(QWidget):
             params=entry.get("params", {}),
             position=entry.get("position", (0, 0, 0)),
             color=entry.get("color", "#ffffff"),
-            pump_id=entry.get("ink_pump", "P1"),
+            pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),
         )
         if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
             traj = obj.trajectory
@@ -1880,22 +2126,6 @@ class PrintObjectsTab(QWidget):
                 pass
         return 6.0  # Default 96-well plate
 
-        if not HAS_PROJECTION_CANVAS or not isinstance(self._preview, ProjectionCanvas):
-            return
-        try:
-            from SupportClasses.WellPlate import PLATE_DEFINITIONS
-            plate_fmt = "96-well"
-            if self._workspace and hasattr(self._workspace, 'plate_format'):
-                plate_fmt = self._workspace.plate_format
-            elif self._hw_config and hasattr(self._hw_config, 'plate_format'):
-                plate_fmt = self._hw_config.plate_format
-            defn = PLATE_DEFINITIONS.get(plate_fmt, {})
-            diameter = defn.get("well_diameter_mm", 6.86)
-            if hasattr(self._preview, 'set_well_diameter'):
-                self._preview.set_well_diameter(diameter)
-        except Exception:
-            pass
-
     def _resolve_library_object(self, library_key, x_mm, y_mm):
         """Resolve a library key to a PlacedObject (for drag-drop compat)."""
         for entry in self._objects:
@@ -1905,7 +2135,7 @@ class PrintObjectsTab(QWidget):
                     obj_type=entry["object_type"],
                     params=entry.get("params", {}),
                     color=entry.get("color", DEFAULT_COLORS[0]),
-                    pump_id=entry.get("ink_pump", "P1"),
+                    pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),
                 )
                 pts = []
                 if obj and hasattr(obj, 'trajectory') and obj.trajectory is not None:
@@ -2010,10 +2240,9 @@ class PrintObjectsTab(QWidget):
                 "params": obj.get("params", {}),
                 "position": list(obj.get("position", (0, 0, 0))),
                 "color": obj.get("color", DEFAULT_COLORS[0]),
-                "ink_pump": obj.get("ink_pump", "P1"),
-                "num_layers": obj.get("num_layers", 1),
-                "layer_height": obj.get("layer_height", 0.2),
+                "ink": obj.get("ink", ""),
                 "auto_layout": obj.get("auto_layout", False),
+                "in_well": obj.get("in_well", True),
             }
             objects[obj["name"]] = obj_data
 
@@ -2040,11 +2269,13 @@ class PrintObjectsTab(QWidget):
             self._summary_label.setText("No objects")
             return
 
-        pumps = set(o.get("ink_pump", "P1") for o in self._objects)
+        inks = set(o.get("ink", o.get("ink_pump", "")) for o in self._objects)
+        inks.discard("")
         auto_count = sum(1 for o in self._objects if o.get("auto_layout"))
 
         parts = [f"{n} objects"]
-        parts.append(f"Pumps: {', '.join(sorted(pumps))}")
+        if inks:
+            parts.append(f"Inks: {', '.join(sorted(inks))}")
         if auto_count:
             parts.append(f"{auto_count} auto-layout")
 
@@ -2157,7 +2388,7 @@ class PrintObjectsTab(QWidget):
                 object_type=entry["object_type"],
                 params=entry.get("params", {}),
                 position=entry.get("position", (0, 0, 0)),
-                ink_assignments={entry.get("ink_pump", "P1"): "ink"},
+                ink_assignments={self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))): entry.get("ink", "ink")},
                 color=entry.get("color", DEFAULT_COLORS[0]),
             )
             coll.add_object(obj)
@@ -2169,42 +2400,12 @@ class PrintObjectsTab(QWidget):
     # ══════════════════════════════════════════════════════════════
 
     def _refresh_ink_pump_combos(self):
-        """Update ink/pump combo from hardware config."""
-        self._ink_combo.clear()
-
-        # Default entries
-        self._ink_combo.addItem("P1 (default)", "P1")
-
-        if self._hw_config and hasattr(self._hw_config, 'pumps'):
-            self._ink_combo.clear()
-            for pid, pump_cfg in self._hw_config.pumps.items():
-                if hasattr(pump_cfg, 'enabled') and not pump_cfg.enabled:
-                    continue
-                ink_name = ""
-                if hasattr(pump_cfg, 'ink_name') and pump_cfg.ink_name:
-                    ink_name = f": {pump_cfg.ink_name}"
-                self._ink_combo.addItem(f"{pid}{ink_name}", pid)
-        elif self._workspace:
-            self._ink_combo.clear()
-            pumps = getattr(self._workspace, 'pumps', {})
-            for pid in sorted(pumps.keys()):
-                self._ink_combo.addItem(pid, pid)
-            if not pumps:
-                self._ink_combo.addItem("P1", "P1")
+        """Update ink combo from hardware config."""
+        self._refresh_ink_options_from_config()
 
     # ══════════════════════════════════════════════════════════════
     #  COLOR PICKER
     # ══════════════════════════════════════════════════════════════
-
-    def _pick_color(self):
-        color = QColorDialog.getColor(
-            QColor(self._current_color), self, "Object Color")
-        if color.isValid():
-            self._current_color = color.name()
-            self._color_btn.setStyleSheet(
-                f"background: {self._current_color}; "
-                f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
-            self._schedule_preview()
 
     # ══════════════════════════════════════════════════════════════
     #  CONTEXT WIDGET (for sidebar panel)
@@ -2259,10 +2460,9 @@ class PrintObjectsTab(QWidget):
         legend_parts = []
         seen = set()
         for obj in self._objects:
-            pump = obj.get("ink_pump", "P1")
+            ink = obj.get("ink", obj.get("ink_pump", ""))
             color = obj.get("color", "#a6e3a1")
-            key = (pump, color)
-            if key not in seen:
-                seen.add(key)
-                legend_parts.append(f"■ {pump} = {color}")
-        self._legend_label.setText("\n".join(legend_parts) if legend_parts else "No inks")
+            if ink and ink not in seen:
+                seen.add(ink)
+                legend_parts.append(f'<span style="color:{color}">■</span> {ink}')
+        self._legend_label.setText("<br>".join(legend_parts) if legend_parts else "No inks")
