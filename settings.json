@@ -4,7 +4,7 @@
     "y": 25,
     "width": 1296,
     "height": 792,
-    "active_tab": 7,
+    "active_tab": 2,
     "splitter_sizes": [
       706,
       0
@@ -42,7 +42,8 @@
     "dwell_after_move": 0.0
   },
   "xbox": {
-    "mapping_file": "current_button_mapping.json"
+    "mapping_file": "current_button_mapping.json",
+    "reconnect_timeout_s": 30
   },
   "logging": {
     "verbose": false

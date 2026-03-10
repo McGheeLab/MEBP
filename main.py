@@ -153,6 +153,16 @@ def main():
     if saved_zero:
         controller.zero_position.update(saved_zero)
 
+    # v7.2.6: Load safety_limits from settings
+    saved_limits = settings.get_section("safety_limits")
+    if saved_limits:
+        from SupportClasses.SafetyLimits import SafetyLimits
+        controller.safety_limits = SafetyLimits.from_dict(saved_limits)
+        import logging as _log
+        _log.getLogger(__name__).info(
+            f"Safety limits loaded from settings "
+            f"(enabled={controller.safety_limits.enabled})")
+
     if args.headless:
         run_headless(controller)
     else:

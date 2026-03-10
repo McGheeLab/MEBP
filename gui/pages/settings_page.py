@@ -574,19 +574,46 @@ class SettingsPage(QWidget):
         grid.addLayout(btn_z_row, row, 0, 1, 4)
         row += 1
 
-        # Pump limits
-        grid.addWidget(QLabel("Pump Min:"), row, 0)
-        self.spin_p_min = QDoubleSpinBox()
-        self.spin_p_min.setRange(-200, 200)
-        self.spin_p_min.setDecimals(1)
-        self.spin_p_min.setSuffix(" mm")
-        grid.addWidget(self.spin_p_min, row, 1)
-        grid.addWidget(QLabel("Pump Max:"), row, 2)
-        self.spin_p_max = QDoubleSpinBox()
-        self.spin_p_max.setRange(-200, 200)
-        self.spin_p_max.setDecimals(1)
-        self.spin_p_max.setSuffix(" mm")
-        grid.addWidget(self.spin_p_max, row, 3)
+        # v7.2.6: Per-pump limit spinboxes
+        self._pump_min_spins = {}
+        self._pump_max_spins = {}
+        for pid in ['P1', 'P2', 'P3']:
+            grid.addWidget(QLabel(f'{pid} Min:'), row, 0)
+            spin_min = QDoubleSpinBox()
+            spin_min.setRange(-200, 200)
+            spin_min.setDecimals(1)
+            spin_min.setSuffix(' mm')
+            grid.addWidget(spin_min, row, 1)
+            grid.addWidget(QLabel(f'{pid} Max:'), row, 2)
+            spin_max = QDoubleSpinBox()
+            spin_max.setRange(-200, 200)
+            spin_max.setDecimals(1)
+            spin_max.setSuffix(' mm')
+            grid.addWidget(spin_max, row, 3)
+            self._pump_min_spins[pid] = spin_min
+            self._pump_max_spins[pid] = spin_max
+            row += 1
+
+        # v7.2.6: Per-pump quick-set and zero-reset buttons
+        for pid in ['P1', 'P2', 'P3']:
+            btn_row_p = QHBoxLayout()
+            btn_p_min = QPushButton(f'Set {pid} Min from Current')
+            btn_p_min.setMaximumHeight(26)
+            btn_p_min.clicked.connect(
+                lambda checked, p=pid: self._set_pump_from_current(p, as_max=False))
+            btn_row_p.addWidget(btn_p_min)
+            btn_p_max = QPushButton(f'Set {pid} Max from Current')
+            btn_p_max.setMaximumHeight(26)
+            btn_p_max.clicked.connect(
+                lambda checked, p=pid: self._set_pump_from_current(p, as_max=True))
+            btn_row_p.addWidget(btn_p_max)
+            btn_p_zero = QPushButton(f'Reset {pid} Zero')
+            btn_p_zero.setMaximumHeight(26)
+            btn_p_zero.clicked.connect(
+                lambda checked, p=pid: self._reset_pump_zero(p))
+            btn_row_p.addWidget(btn_p_zero)
+            grid.addLayout(btn_row_p, row, 0, 1, 4)
+            row += 1
         row += 1
 
         # Speed limits
@@ -715,8 +742,15 @@ class SettingsPage(QWidget):
         self.spin_xy_max_y.setValue(sl.xy_max_y)
         self.spin_z_min.setValue(sl.z_min)
         self.spin_z_max.setValue(sl.z_max)
-        self.spin_p_min.setValue(sl.p1_min)
-        self.spin_p_max.setValue(sl.p1_max)
+        # v7.2.6: Load per-pump limits
+        for pid, attr_min, attr_max in [
+            ('P1', 'p1_min', 'p1_max'),
+            ('P2', 'p2_min', 'p2_max'),
+            ('P3', 'p3_min', 'p3_max'),
+        ]:
+            if pid in self._pump_min_spins:
+                self._pump_min_spins[pid].setValue(getattr(sl, attr_min))
+                self._pump_max_spins[pid].setValue(getattr(sl, attr_max))
         self.spin_max_z_feed.setValue(sl.max_z_feedrate)
         self.spin_max_p_feed.setValue(sl.max_pump_feedrate)
 
@@ -783,8 +817,15 @@ class SettingsPage(QWidget):
         sl.xy_max_y = self.spin_xy_max_y.value()
         sl.z_min = self.spin_z_min.value()
         sl.z_max = self.spin_z_max.value()
-        sl.p1_min = sl.p2_min = sl.p3_min = self.spin_p_min.value()
-        sl.p1_max = sl.p2_max = sl.p3_max = self.spin_p_max.value()
+        # v7.2.6: Apply per-pump limits
+        for pid, attr_min, attr_max in [
+            ('P1', 'p1_min', 'p1_max'),
+            ('P2', 'p2_min', 'p2_max'),
+            ('P3', 'p3_min', 'p3_max'),
+        ]:
+            if pid in self._pump_min_spins:
+                setattr(sl, attr_min, self._pump_min_spins[pid].value())
+                setattr(sl, attr_max, self._pump_max_spins[pid].value())
         sl.max_z_feedrate = self.spin_max_z_feed.value()
         sl.max_pump_feedrate = self.spin_max_p_feed.value()
 
@@ -915,3 +956,34 @@ class SettingsPage(QWidget):
                 self.spin_z_min.setValue(zero_z)
             logger.info(
                 f"Z {'max' if as_max else 'min'} set to {zero_z:.2f} mm")
+
+    def _set_pump_from_current(self, pump: str, as_max: bool = True):
+        """v7.2.6: Set pump limit from the current position."""
+        pos = self.controller.get_zp_position(cached=True)
+        if pos[0] is not None:
+            idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
+            if idx < len(pos) and pos[idx] is not None:
+                zero_ref = self.controller.zero_position.get(pump, 0)
+                rel_mm = pos[idx] - zero_ref
+                if as_max:
+                    self._pump_max_spins[pump].setValue(rel_mm)
+                else:
+                    self._pump_min_spins[pump].setValue(rel_mm)
+                logger.info(
+                    f"{pump} {'max' if as_max else 'min'} set to "
+                    f"{rel_mm:.2f} mm (from current)")
+
+    def _reset_pump_zero(self, pump: str):
+        """v7.2.6: Reset the zero reference for a single pump."""
+        if hasattr(self.controller, 'reset_pump_zero'):
+            self.controller.reset_pump_zero(pump)
+            # Save the updated zero_position to settings
+            self.settings.set_section(
+                "zero_position", dict(self.controller.zero_position))
+            self.settings.save()
+            logger.info(f"{pump} zero reference reset and saved")
+            if self._context_widget:
+                self.ctx_status_label.setText(f"{pump} zero reset ✓")
+                self.ctx_status_label.setStyleSheet(
+                    f"color: {COLORS['green']};")
+

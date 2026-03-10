@@ -49,6 +49,7 @@ def xbox_polling_worker(
     mapping_file: str = "current_button_mapping.json",
     avg_interval: float = 0.1,
     deadzone: float = 0.2,
+    reconnect_timeout: float = 30.0,
 ) -> None:
     """
     Main polling loop — runs in a separate process.
@@ -56,10 +57,11 @@ def xbox_polling_worker(
     periodic heartbeat. Worker never exits; reconnects automatically.
 
     Args:
-        out_queue:     Multiprocessing queue for outbound messages.
-        mapping_file:  Path to the button mapping JSON file.
-        avg_interval:  Seconds between averaged axis updates.
-        deadzone:      Axis deadzone threshold (0–1).
+        out_queue:          Multiprocessing queue for outbound messages.
+        mapping_file:       Path to the button mapping JSON file.
+        avg_interval:       Seconds between averaged axis updates.
+        deadzone:           Axis deadzone threshold (0–1).
+        reconnect_timeout:  Seconds to attempt reconnection before giving up.
     """
     # v7.2.7: SDL Bluetooth hints
     import os as _os
@@ -94,11 +96,24 @@ def xbox_polling_worker(
             {i: 0   for i in range(n)},
         )
 
-    def _find_controller():
-        """Retry until a controller is found. v7.2.7: Bluetooth-aware detection."""
+    def _find_controller(timeout: float = 0.0, status_key: str = "waiting"):
+        """Retry until a controller is found or timeout expires.
+
+        Args:
+            timeout:    Max seconds to search. 0 = no limit (initial connect).
+            status_key: Status string to send while searching
+                        ("waiting" for initial, "reconnecting" after loss).
+        Returns:
+            Joystick object on success, None if timeout expired.
+        """
         _attempt = 0
+        _start = time.time()
         while True:
             _attempt += 1
+            if timeout > 0 and (time.time() - _start) >= timeout:
+                out_queue.put({"debug": f"Reconnect timeout ({timeout:.0f}s) expired"})
+                out_queue.put({"status": "disconnected"})
+                return None
             pygame.event.pump()  # Critical for Bluetooth on macOS
             pygame.joystick.quit()
             pygame.joystick.init()
@@ -115,7 +130,7 @@ def xbox_polling_worker(
                 if _attempt <= 3 or _attempt % 10 == 0:
                     out_queue.put({"debug": f"No controller found "
                                    f"(attempt {_attempt}), retrying in 2s..."})
-                out_queue.put({"status": "waiting"})
+                out_queue.put({"status": status_key})
                 time.sleep(2.0)
 
     # ── Initial controller acquisition ────────────────────────────
@@ -161,8 +176,15 @@ def xbox_polling_worker(
                 mapping = load_xbox_mapping(mapping_file)
                 last_mapping_time = current_time
 
-            # Heartbeat every 3 seconds
+            # Heartbeat every 3 seconds — with active presence check
             if current_time - last_heartbeat >= 3.0:
+                # Re-enumerate joysticks to detect silent Bluetooth disconnection
+                pygame.joystick.quit()
+                pygame.joystick.init()
+                if pygame.joystick.get_count() == 0:
+                    raise RuntimeError("Controller lost (no joysticks detected)")
+                joystick = pygame.joystick.Joystick(0)
+                joystick.init()
                 out_queue.put({"status": "alive"})
                 last_heartbeat = current_time
 
@@ -277,10 +299,16 @@ def xbox_polling_worker(
             time.sleep(0.02)
 
         except Exception as e:
-            # v7.2.6: Crash recovery — reconnect instead of dying
+            # v7.2.8: Crash recovery — reconnect with timeout
             out_queue.put({"debug": f"Controller error: {e}"})
-            out_queue.put({"status": "disconnected"})
-            joystick = _find_controller()
+            out_queue.put({"status": "reconnecting"})
+            joystick = _find_controller(
+                timeout=reconnect_timeout, status_key="reconnecting"
+            )
+            if joystick is None:
+                # Timeout expired — give up
+                out_queue.put({"debug": "Controller lost — reconnect timed out, stopping worker"})
+                break
             # Re-init accumulators for the new joystick
             axis_accum, axis_count = _init_accumulators(joystick)
             num_axes = joystick.get_numaxes()

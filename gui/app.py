@@ -467,7 +467,7 @@ class MainWindow(QMainWindow):
 
         pages = [
             HardwareSetupPage(),                                          # 0
-            DashboardPage(self.controller, self.print_history),           # 1
+            DashboardPage(self.controller, self.print_history, settings=self.settings),  # 1
             JogControlPage(self.controller),                              # 2
             CalibrationPage(self.controller, settings=self.settings),     # 3
             PrintSetupPage(self.controller),                              # 4
@@ -1125,11 +1125,19 @@ class MainWindow(QMainWindow):
         # Connection indicators
         xy_ok = self.controller.is_xy_connected
         zp_ok = self.controller.is_zp_connected
-        xbox_ok = getattr(self.controller, "is_xbox_connected", False)  # v7.2.7: xbox property check
+        self._update_conn_dot("xy", "on" if xy_ok else "off")
+        self._update_conn_dot("zp", "on" if zp_ok else "off")
 
-        self._update_conn_dot("xy", xy_ok)
-        self._update_conn_dot("zp", zp_ok)
-        self._update_conn_dot("xbox", xbox_ok)
+        # Xbox: tri-state — green/yellow/red
+        _xbox_st = getattr(self.controller, "xbox_status", "disconnected")
+        if callable(_xbox_st):
+            _xbox_st = _xbox_st()
+        if _xbox_st in ("connected", "alive"):
+            self._update_conn_dot("xbox", "on")
+        elif _xbox_st == "reconnecting":
+            self._update_conn_dot("xbox", "warn")
+        else:
+            self._update_conn_dot("xbox", "off")
 
         # Protocol check on first XY connect
         if xy_ok and not self._protocol_checked:
@@ -1212,23 +1220,22 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'on_status_update'):
             page.on_status_update()
 
-    def _update_conn_dot(self, name: str, connected: bool):
-        """Update a connection status dot (green/red).
-        v7.2.7: unpolish/polish dot refresh — setStyleSheet was no-op for app QSS.
+    def _update_conn_dot(self, name: str, state: str):
+        """Update a connection status dot.
+
+        Args:
+            name:  Device key ("xy", "zp", "xbox").
+            state: "on" (green), "warn" (yellow), or "off" (red).
         """
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
         if dot is None:
             return
-        if connected:
-            dot.setObjectName("connDotOn")
-            if lbl:
-                lbl.setObjectName("connLabelOn")
-        else:
-            dot.setObjectName("connDotOff")
-            if lbl:
-                lbl.setObjectName("connLabelOff")
-        # v7.2.7: proper QSS refresh — unpolish/polish forces objectName re-eval
+        _dot_names = {"on": "connDotOn", "warn": "connDotWarn", "off": "connDotOff"}
+        _lbl_names = {"on": "connLabelOn", "warn": "connLabelWarn", "off": "connLabelOff"}
+        dot.setObjectName(_dot_names.get(state, "connDotOff"))
+        if lbl:
+            lbl.setObjectName(_lbl_names.get(state, "connLabelOff"))
         dot.style().unpolish(dot)
         dot.style().polish(dot)
         dot.update()

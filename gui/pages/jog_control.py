@@ -295,7 +295,7 @@ class JogControlPage(QWidget):
     def set_hardware_config(self, config):  # v7.2.7: pump visibility
         """Update jog page from hardware config — show/hide pump controls."""
         self._hardware_config = config
-        self._update_pump_step_combo()
+        self._refresh_pump_step_combo()
         # Update pump section visibility based on configured pumps
         if config:
             configured = set(config.configured_pump_ids) if hasattr(config, "configured_pump_ids") else set()
@@ -526,11 +526,13 @@ class JogControlPage(QWidget):
             self.controller.move_z_relative(direction * self.z_step_combo.currentData())
 
     def _jog_pump(self, pump: str, direction: int):
-        """v7.2.5: Jog pump — convert µL step to mm if HW config available."""
+        """Jog pump — convert µL step to mm if HW config available."""
         if not self.controller.is_zp_connected:
             return
+        if not self.controller.is_pump_enabled(pump):
+            logger.warning(f"{pump} is disabled — enable it in Hardware Setup to jog")
+            return
         step_val = self.p_step_combo.currentData()
-        # v7.2.5: If HW config available, step_val is in µL — convert to mm
         if self._hardware_config:
             pump_cfg = self._hardware_config.pumps.get(pump)
             if pump_cfg and pump_cfg.is_configured:
@@ -580,25 +582,16 @@ class JogControlPage(QWidget):
             self.controller.zp_jog.z_speed = speed
 
     def _on_p_speed(self, value):
-        # v7.2.6: S6-A p_speed fix + S7-B uL/s mode
+        # p_speed is natively µL/s when hw config available
+        rate = value / 100.0
+        jog = getattr(self.controller, 'zp_jog', None)
         if (self._hardware_config and
                 self._hardware_config.configured_pump_ids):
-            # Slider 1-500 → 0.01-5.00 µL/s
-            rate_uL_s = value / 100.0
-            self.lbl_p_speed.setText(f"{rate_uL_s:.2f} µL/s")
-            if getattr(self.controller, 'zp_jog', None):
-                pid = self._hardware_config.configured_pump_ids[0]
-                try:
-                    mm_per_s = self._hardware_config.uL_to_mm(pid, rate_uL_s)
-                    self.controller.zp_jog.p_speed = mm_per_s
-                except (ValueError, AttributeError):
-                    self.controller.zp_jog.p_speed = rate_uL_s
+            self.lbl_p_speed.setText(f"{rate:.2f} µL/s")
         else:
-            # Fallback: raw multiplier (v7.2.6: S6-A fix — p_speed not pump_speed)
-            speed = value / 100.0
-            self.lbl_p_speed.setText(f"{speed:.2f}")
-            if getattr(self.controller, 'zp_jog', None):
-                self.controller.zp_jog.p_speed = speed
+            self.lbl_p_speed.setText(f"{rate:.2f}")
+        if jog:
+            jog.p_speed = rate
 
 
     def _sync_speed_sliders(self):
@@ -632,32 +625,21 @@ class JogControlPage(QWidget):
                     sld_z.blockSignals(False)
                     self.lbl_z_speed.setText(f"{actual_z:.2f}")
 
-            # Pump speed — show µL/s when hw config available (v7.2.6: S7-C uL/s display)
+            # Pump speed — p_speed is natively µL/s when hw config available
             actual_p = ctrl.zp_jog.p_speed
             sld_p = getattr(self, '_sld_p_speed', None)
             if sld_p is not None:
+                slider_target = int(actual_p * 100)
+                if abs(sld_p.value() - slider_target) > 1:
+                    sld_p.blockSignals(True)
+                    sld_p.setValue(max(sld_p.minimum(),
+                                      min(sld_p.maximum(), slider_target)))
+                    sld_p.blockSignals(False)
                 hw = self._hardware_config
                 if hw and hw.configured_pump_ids:
-                    pid = hw.configured_pump_ids[0]
-                    try:
-                        rate_uL_s = abs(hw.mm_to_uL(pid, abs(actual_p)))
-                        slider_target = int(rate_uL_s * 100)
-                        if abs(sld_p.value() - slider_target) > 1:
-                            sld_p.blockSignals(True)
-                            sld_p.setValue(max(sld_p.minimum(),
-                                              min(sld_p.maximum(), slider_target)))
-                            sld_p.blockSignals(False)
-                        self.lbl_p_speed.setText(f"{rate_uL_s:.2f} µL/s")
-                    except (ValueError, AttributeError):
-                        self.lbl_p_speed.setText(f"{actual_p:.2f}")
+                    self.lbl_p_speed.setText(f"{actual_p:.2f} µL/s")
                 else:
-                    slider_p = sld_p.value() / 100.0
-                    if abs(slider_p - actual_p) > 0.005:
-                        sld_p.blockSignals(True)
-                        sld_p.setValue(max(sld_p.minimum(),
-                                          min(sld_p.maximum(), int(actual_p * 100))))
-                        sld_p.blockSignals(False)
-                        self.lbl_p_speed.setText(f"{actual_p:.2f}")
+                    self.lbl_p_speed.setText(f"{actual_p:.2f}")
 
 
     def _make_ctx_slider(self, label_text, value_label, min_val, max_val,

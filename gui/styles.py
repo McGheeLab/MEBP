@@ -429,6 +429,11 @@ QToolTip {
     font-size: 10px;
 }
 
+#connDotWarn {
+    color: #f9e2af;
+    font-size: 10px;
+}
+
 #connLabelOff {
     font: 9pt "Segoe UI";
     color: #6c7086;
@@ -437,6 +442,11 @@ QToolTip {
 #connLabelOn {
     font: 9pt "Segoe UI";
     color: #a6e3a1;
+}
+
+#connLabelWarn {
+    font: 9pt "Segoe UI";
+    color: #f9e2af;
 }
 
 /* /////////////////////////////////////////////////////////////////////////////////////////////////

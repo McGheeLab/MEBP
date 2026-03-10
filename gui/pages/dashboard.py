@@ -34,10 +34,12 @@ class DashboardPage(QWidget):
     """Dashboard: read-only overview of device state."""
 
     def __init__(self, controller: StageController,
-                 print_history: PrintHistory | None = None, parent=None):
+                 print_history: PrintHistory | None = None,
+                 settings: dict | None = None, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.print_history = print_history
+        self.settings = settings or {}
         self._context_widget = None
 
         # Microsteps per micron — set by MainWindow
@@ -349,31 +351,35 @@ class DashboardPage(QWidget):
         self._btn_connect_xbox.setToolTip(tip)
 
     def on_status_update(self):
-        """Called by MainWindow timer — refresh all readouts.  # v7.2.8: xbox status"""
+        """Called by MainWindow timer — refresh all readouts."""
         self.update_data()
 
         # Update context panel connection statuses
-        self._update_conn_status("xy", self.controller.is_xy_connected)
-        self._update_conn_status("zp", self.controller.is_zp_connected)
+        self._update_conn_status("xy", "on" if self.controller.is_xy_connected else "off")
+        self._update_conn_status("zp", "on" if self.controller.is_zp_connected else "off")
 
-        # Xbox: use the rich status property for dot + tooltip
-        _xbox_connected = getattr(self.controller, "is_xbox_connected", False)
-        self._update_conn_status("xbox", _xbox_connected)
+        # Xbox: tri-state — green/yellow/red + tooltip
+        _xbox_st = self.controller.xbox_status if hasattr(self.controller, "xbox_status") else "disconnected"
+        if callable(_xbox_st):
+            _xbox_st = _xbox_st()
+        if _xbox_st in ("connected", "alive"):
+            self._update_conn_status("xbox", "on")
+        elif _xbox_st == "reconnecting":
+            self._update_conn_status("xbox", "warn")
+        else:
+            self._update_conn_status("xbox", "off")
 
-        # Xbox tooltip detail (uses xbox_status property)
+        # Xbox tooltip detail
         _xbox_dot = getattr(self, "ctx_dot_xbox", None)
         if _xbox_dot:
-            _xbox_st = self.controller.xbox_status if hasattr(self.controller, "xbox_status") else "disconnected"
-            if callable(_xbox_st):
-                _xbox_st = _xbox_st()  # fallback if not @property
-            if _xbox_st == "waiting":
-                _xbox_dot.setToolTip("Searching for Xbox controller...")
-            elif _xbox_st in ("connected", "alive"):
-                _xbox_dot.setToolTip("Xbox controller active")
-            elif _xbox_st == "unknown":
-                _xbox_dot.setToolTip("Xbox worker running, status unknown")
-            else:
-                _xbox_dot.setToolTip("Xbox controller disconnected")
+            _tooltips = {
+                "waiting": "Searching for Xbox controller...",
+                "connected": "Xbox controller active",
+                "alive": "Xbox controller active",
+                "reconnecting": "Attempting to reconnect...",
+                "unknown": "Xbox worker running, status unknown",
+            }
+            _xbox_dot.setToolTip(_tooltips.get(_xbox_st, "Xbox controller disconnected"))
 
         # Update log count in context panel
         if hasattr(self, 'ctx_lbl_log_count'):
@@ -456,11 +462,23 @@ class DashboardPage(QWidget):
             self.lbl_safety_status.setText("🛡️ Enabled")
             self.lbl_safety_status.setStyleSheet(
                 f"color: {COLORS['green']}; font-weight: bold;")
+            # v7.2.6: Show per-pump limits
+            pump_parts = []
+            for pid, pmin, pmax in [
+                ('P1', sl.p1_min, sl.p1_max),
+                ('P2', sl.p2_min, sl.p2_max),
+                ('P3', sl.p3_min, sl.p3_max),
+            ]:
+                pump_parts.append(f'{pid}:[{pmin:.1f}..{pmax:.1f}]')
+            all_same = (sl.p1_min == sl.p2_min == sl.p3_min
+                        and sl.p1_max == sl.p2_max == sl.p3_max)
+            pump_str = (f'P:[{sl.p1_min:.1f}..{sl.p1_max:.1f}]'
+                        if all_same else '  '.join(pump_parts))
             self.lbl_safety_info.setText(
                 f"XY: [{sl.xy_min_x:.0f}..{sl.xy_max_x:.0f}] × "
                 f"[{sl.xy_min_y:.0f}..{sl.xy_max_y:.0f}]  "
                 f"Z: [{sl.z_min:.1f}..{sl.z_max:.1f}]  "
-                f"P: [{sl.p1_min:.1f}..{sl.p1_max:.1f}]"
+                f"{pump_str}"
             )
         else:
             self.lbl_safety_status.setText("⚠ Disabled")
@@ -477,13 +495,17 @@ class DashboardPage(QWidget):
                 f"Total time: {stats.get('total_time_str', '—')}"
             )
 
-    def _update_conn_status(self, name: str, connected: bool):
+    def _update_conn_status(self, name: str, state: str):
         """Update context panel connection dot.
-        v7.2.7: unpolish/polish conn status — setStyleSheet no-op fix.
+
+        Args:
+            name:  Device key ("xy", "zp", "xbox").
+            state: "on" (green), "warn" (yellow), or "off" (red).
         """
         dot = getattr(self, f'ctx_dot_{name}', None)
         if dot:
-            dot.setObjectName("connDotOn" if connected else "connDotOff")
+            _names = {"on": "connDotOn", "warn": "connDotWarn", "off": "connDotOff"}
+            dot.setObjectName(_names.get(state, "connDotOff"))
             dot.style().unpolish(dot)
             dot.style().polish(dot)
             dot.update()
@@ -526,7 +548,11 @@ class DashboardPage(QWidget):
                 logger.info("macOS detected — using thread mode for Bluetooth compatibility")
             mapping = getattr(self.controller, "_mapping_file",
                               "current_button_mapping.json")
-            self.controller.connect_xbox(mapping_file=mapping, use_thread=use_thread)
+            timeout = self.settings.get("xbox", {}).get("reconnect_timeout_s", 30)
+            self.controller.connect_xbox(
+                mapping_file=mapping, use_thread=use_thread,
+                reconnect_timeout=timeout,
+            )
         except Exception as e:
             logger.error(f"Xbox connect failed: {e}")
 

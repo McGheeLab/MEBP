@@ -49,6 +49,7 @@ class XboxQueuePoller:
         self._thread: threading.Thread | None = None
         # v7.2.6: S4-D status handler — track controller state from worker
         self._xbox_status: str = "disconnected"
+        self._last_heartbeat_time: float = time.time()
 
 
     def start(self) -> None:
@@ -72,6 +73,7 @@ class XboxQueuePoller:
                     break
 
                 if "status" in msg:
+                    self._last_heartbeat_time = time.time()
                     # v7.2.8: quiet heartbeat — only log on change
                     _prev = self._xbox_status
                     self._xbox_status = msg["status"]
@@ -90,6 +92,12 @@ class XboxQueuePoller:
                 elif "dpad" in msg:
                     self.processor.add_command(msg["command"], direction=msg["dpad"])
 
+            # Heartbeat staleness: worker sends every 3s, stale after 10s
+            if self._xbox_status in ("connected", "alive"):
+                if time.time() - self._last_heartbeat_time > 10.0:
+                    self._xbox_status = "disconnected"
+                    logger.warning("[Xbox] Heartbeat stale — marking disconnected")
+
             time.sleep(0.02)
 
 class ZPJogHandler:
@@ -106,11 +114,13 @@ class ZPJogHandler:
         zp_stage: ZPStageManager,
         safety_limits: SafetyLimits | None = None,
         get_zp_position: Callable | None = None,
+        zero_position: dict | None = None,  # v7.2.6: zero ref for clamping
     ):
         self.processor = processor
         self.stage = zp_stage
         self.safety_limits = safety_limits
         self._get_zp_position = get_zp_position
+        self._zero_position = zero_position or {}  # v7.2.6: zero ref for jog clamping
 
         # Velocity state (updated by command handlers)
         self.vel_z: float = 0.0
@@ -122,12 +132,14 @@ class ZPJogHandler:
         # Tuning parameters
         self.segment_time: float = 0.12   # seconds per move segment
         self.z_speed: float = 1.0         # Z speed multiplier
-        self.p_speed: float = 0.5         # Pump speed multiplier
+        self.p_speed: float = 0.5         # Pump speed: µL/s when hw config, mm/s otherwise
         self.max_speed: float = 1.0
+        self._hardware_config = None      # Set via set_hardware_config()
 
         self._was_moving = False
         self._running = False
         self._thread: threading.Thread | None = None
+        self._pump_disabled_warned: set = set()  # debounce warnings
 
         # Register processor handlers
         self.processor.register_handler("move_z_at_velocity", self._handle_z_vel)
@@ -176,6 +188,20 @@ class ZPJogHandler:
             self._thread.join(timeout=1.0)
 
 
+    def set_hardware_config(self, config):
+        """Enable µL-based pump jog. p_speed becomes µL/s."""
+        self._hardware_config = config
+        self._pump_disabled_warned.clear()  # re-evaluate on config change
+        if config and config.configured_pump_ids:
+            self.p_speed = 1.0  # sensible default: 1 µL/s
+            logger.info("ZPJog: µL mode enabled, p_speed = 1.0 µL/s")
+
+    @property
+    def p_speed_is_uL(self) -> bool:
+        """True when p_speed represents µL/s (HardwareConfig available)."""
+        hw = self._hardware_config
+        return hw is not None and bool(hw.configured_pump_ids)
+
     def speeds(self) -> dict[str, float]:
         return {"z": self.z_speed, "p": self.p_speed}
 
@@ -192,25 +218,52 @@ class ZPJogHandler:
     def _clamp_vel(self, raw: float, multiplier: float) -> float:
         return max(-self.max_speed, min(self.max_speed, raw * multiplier))
 
+    def _pump_vel_mm_s(self, raw: float, pump_id: str) -> float:
+        """Convert raw Xbox axis to pump velocity in mm/s.
+
+        When HardwareConfig is available, p_speed is in µL/s and we
+        convert per-pump using the syringe geometry.  Otherwise p_speed
+        is a raw mm/s multiplier (legacy).
+        """
+        hw = self._hardware_config
+        if hw:
+            pump_cfg = hw.pumps.get(pump_id)
+            if pump_cfg and pump_cfg.is_configured:
+                target_uL_s = raw * self.p_speed  # µL/s
+                vel_mm_s = pump_cfg.uL_to_mm(abs(target_uL_s))
+                vel_mm_s = min(vel_mm_s, self.max_speed)
+                return vel_mm_s if target_uL_s >= 0 else -vel_mm_s
+        # Fallback: mm/s mode
+        return self._clamp_vel(raw, self.p_speed)
+
     # ── Command Handlers ──────────────────────────────────────────
+
+    def _is_pump_enabled(self, pump_id: str) -> bool:
+        """Check if pump is enabled in hardware config. True if no config."""
+        hw = self._hardware_config
+        if hw is None:
+            return True
+        pump_cfg = hw.pumps.get(pump_id)
+        if pump_cfg is None:
+            return True
+        return pump_cfg.is_configured
 
     def _handle_z_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
         with self._lock:
             self.vel_z = self._clamp_vel(raw, self.z_speed)
 
-    def _clamp_pump_flow(self, vel, pump_id):  # v7.2.7: safe _hardware_config access
-        """Clamp pump velocity to max safe flow rate if hw config available."""
-        hw = getattr(self, "_hardware_config", None)
+    def _clamp_pump_flow(self, vel, pump_id):
+        """Clamp pump velocity (mm/s) to max safe flow rate."""
+        hw = self._hardware_config
         if hw is None:
             return vel
-        sl = getattr(self, "safety_limits", None)
+        sl = self.safety_limits
         if sl is None:
             return vel
         try:
             max_rate = sl.get_max_flow_rate(pump_id)
             if max_rate is not None and max_rate > 0:
-                # Convert vel to flow rate, clamp, convert back
                 pump_cfg = hw.pumps.get(pump_id)
                 if pump_cfg and pump_cfg.is_configured:
                     rate = abs(pump_cfg.mm_to_uL(abs(vel)))
@@ -218,50 +271,56 @@ class ZPJogHandler:
                         clamped_mm = pump_cfg.uL_to_mm(max_rate)
                         vel = clamped_mm if vel > 0 else -clamped_mm
         except Exception:
-            pass  # Safe fallback — no clamping if anything fails
+            pass
         return vel
 
+    def _handle_pump_vel(self, pump_id: str, vel_attr: str, *args, **kwargs):
+        """Common handler for pump velocity commands."""
+        raw = self._extract_velocity(*args, **kwargs)
+        if not self._is_pump_enabled(pump_id):
+            # Block movement — warn once per pump
+            if pump_id not in self._pump_disabled_warned and abs(raw) > 0.05:
+                self._pump_disabled_warned.add(pump_id)
+                logger.warning(
+                    f"[Xbox] {pump_id} is disabled — ignoring jog. "
+                    f"Enable {pump_id} in Hardware Setup or change your Xbox mapping."
+                )
+            with self._lock:
+                setattr(self, vel_attr, 0.0)
+            return
+        # Clear warning debounce when pump becomes enabled again
+        self._pump_disabled_warned.discard(pump_id)
+        vel = self._pump_vel_mm_s(raw, pump_id)
+        vel = self._clamp_pump_flow(vel, pump_id)
+        with self._lock:
+            setattr(self, vel_attr, vel)
 
     def _handle_p1_vel(self, *args, **kwargs):
-        raw = self._extract_velocity(*args, **kwargs)
-        vel = self._clamp_vel(raw, self.p_speed)
-        vel = self._clamp_pump_flow(vel, "P1")  # v7.2.6: S7-A flow clamp
-        with self._lock:
-            self.vel_p1 = vel
+        self._handle_pump_vel("P1", "vel_p1", *args, **kwargs)
 
     def _handle_p2_vel(self, *args, **kwargs):
-        raw = self._extract_velocity(*args, **kwargs)
-        vel = self._clamp_vel(raw, self.p_speed)
-        vel = self._clamp_pump_flow(vel, "P2")  # v7.2.6: S7-A flow clamp
-        with self._lock:
-            self.vel_p2 = vel
+        self._handle_pump_vel("P2", "vel_p2", *args, **kwargs)
 
     def _handle_p3_vel(self, *args, **kwargs):
-        raw = self._extract_velocity(*args, **kwargs)
-        vel = self._clamp_vel(raw, self.p_speed)
-        vel = self._clamp_pump_flow(vel, "P3")  # v7.2.6: S7-A flow clamp
-        with self._lock:
-            self.vel_p3 = vel
+        self._handle_pump_vel("P3", "vel_p3", *args, **kwargs)
 
-
-    def _incr_z_up(self, *a, **kw):  # v7.2.7: decade speed
+    def _incr_z_up(self, *a, **kw):
         self.z_speed = min(self.z_speed * 10, 100)
         logger.info(f"Z speed: {self.z_speed}")
 
-
-    def _incr_z_down(self, *a, **kw):  # v7.2.7: decade speed
+    def _incr_z_down(self, *a, **kw):
         self.z_speed = max(self.z_speed / 10, 0.01)
         logger.info(f"Z speed: {self.z_speed}")
 
-
-    def _incr_p_up(self, *a, **kw):  # v7.2.7: decade speed
+    def _incr_p_up(self, *a, **kw):
         self.p_speed = min(self.p_speed * 10, 100)
-        logger.info(f"P speed: {self.p_speed}")
+        unit = "µL/s" if self.p_speed_is_uL else "mm/s"
+        logger.info(f"P speed: {self.p_speed} {unit}")
 
-
-    def _incr_p_down(self, *a, **kw):  # v7.2.7: decade speed
+    def _incr_p_down(self, *a, **kw):
         self.p_speed = max(self.p_speed / 10, 0.01)
-        logger.info(f"P speed: {self.p_speed}")
+        unit = "µL/s" if self.p_speed_is_uL else "mm/s"
+        logger.info(f"P speed: {self.p_speed} {unit}")
 
 
     def _jog_loop(self) -> None:
@@ -292,10 +351,18 @@ class ZPJogHandler:
                     pos = self._get_zp_position()
                     if pos[0] is not None:
                         cz, cp1, cp2, cp3 = pos
-                        dz = self.safety_limits.clamp_z(cz + dz) - cz
-                        dp1 = self.safety_limits.clamp_pump(cp1 + dp1, "P1") - cp1
-                        dp2 = self.safety_limits.clamp_pump(cp2 + dp2, "P2") - cp2
-                        dp3 = self.safety_limits.clamp_pump(cp3 + dp3, "P3") - cp3
+                        # v7.2.6: Subtract zero_position before clamping
+                        # clamp_z/clamp_pump expect zero-referenced values
+                        _zp = getattr(self, '_zero_position', {})
+                        z0 = _zp.get('Z', 0.0)
+                        # target_zr = (abs_pos + delta) - zero; clamp; new_delta = clamped_abs - abs_pos
+                        dz = self.safety_limits.clamp_z((cz + dz) - z0) + z0 - cz
+                        p10 = _zp.get('P1', 0.0)
+                        dp1 = self.safety_limits.clamp_pump((cp1 + dp1) - p10, "P1") + p10 - cp1
+                        p20 = _zp.get('P2', 0.0)
+                        dp2 = self.safety_limits.clamp_pump((cp2 + dp2) - p20, "P2") + p20 - cp2
+                        p30 = _zp.get('P3', 0.0)
+                        dp3 = self.safety_limits.clamp_pump((cp3 + dp3) - p30, "P3") + p30 - cp3
                 except Exception:
                     pass
 
@@ -678,6 +745,7 @@ class StageController:
                 self.processor, self.zp_stage,
                 safety_limits=self.safety_limits,
                 get_zp_position=lambda: self._pos_poller.zp_position,
+                zero_position=self.zero_position,
             )
             self.zp_jog.start()
             if not self.simulate_zp:
@@ -766,7 +834,8 @@ class StageController:
     # ── Xbox Controller ───────────────────────────────────────────
 
     def connect_xbox(self, mapping_file: str = "current_button_mapping.json",
-                     use_thread: bool = False) -> None:
+                     use_thread: bool = False,
+                     reconnect_timeout: float = 30.0) -> None:
         """Connect Xbox controller. v7.2.7: thread fallback
 
         Args:
@@ -774,6 +843,7 @@ class StageController:
             use_thread: If True, run worker in a thread instead of process.
                         Use this for macOS Bluetooth controllers that are
                         invisible to spawned subprocesses.
+            reconnect_timeout: Seconds to attempt reconnection after loss.
         """
         if self.xbox_process and self.xbox_process.is_alive():
             logger.warning("Xbox already connected")
@@ -794,12 +864,17 @@ class StageController:
 
         self.xbox_queue = Queue()
 
+        _worker_kwargs = {
+            "mapping_file": self._mapping_file,
+            "reconnect_timeout": reconnect_timeout,
+        }
+
         if use_thread:
             import threading
             self._xbox_thread = threading.Thread(
                 target=xbox_polling_worker,
                 args=(self.xbox_queue,),
-                kwargs={"mapping_file": self._mapping_file},
+                kwargs=_worker_kwargs,
                 daemon=True,
                 name="XboxWorkerThread",
             )
@@ -810,7 +885,7 @@ class StageController:
             self.xbox_process = Process(
                 target=xbox_polling_worker,
                 args=(self.xbox_queue,),
-                kwargs={"mapping_file": self._mapping_file},
+                kwargs=_worker_kwargs,
                 daemon=True,
             )
             self.xbox_process.start()
@@ -926,10 +1001,6 @@ class StageController:
     def is_zp_connected(self) -> bool:
         return self.zp_stage is not None
 
-    @property
-    def is_xbox_connected(self) -> bool:
-        return self.xbox_process is not None and self.xbox_process.is_alive()
-
     # ── Calibration ───────────────────────────────────────────────
 
     def _calibrate_zero(self, *args, **kwargs) -> None:
@@ -959,6 +1030,59 @@ class StageController:
         )
 
     # ── Movement (for GUI / Print commands) ───────────────────────
+
+    def reset_pump_zero(self, pump: str) -> None:
+        """
+        v7.2.6: Reset zero reference for a single pump axis.
+
+        Sets the current absolute position as the new zero point
+        for the specified pump, without affecting other axes.
+
+        Args:
+            pump: Pump identifier ("P1", "P2", "P3")
+        """
+        if pump not in ("P1", "P2", "P3"):
+            logger.warning(f"Invalid pump ID for zero reset: {pump}")
+            return
+
+        pos = self.get_zp_position(cached=True)
+        if pos[0] is None:
+            logger.warning(f"Cannot reset {pump} zero — ZP stage not connected")
+            return
+
+        idx = {"P1": 1, "P2": 2, "P3": 3}[pump]
+        if idx < len(pos) and pos[idx] is not None:
+            self.zero_position[pump] = pos[idx]
+            logger.info(f"{pump} zero set to {pos[idx]:.3f} mm (absolute)")
+
+            # Log the event
+            self.position_logger.record(
+                f"zero_reset_{pump.lower()}",
+                zp_pos=pos,
+                metadata={"pump": pump, "new_zero": pos[idx]},
+            )
+
+    def reset_z_zero(self) -> None:
+        """
+        v7.2.6: Reset zero reference for Z axis only.
+
+        Sets the current absolute position as the new zero point
+        for Z, without affecting XY or pump axes.
+        """
+        pos = self.get_zp_position(cached=True)
+        if pos[0] is None:
+            logger.warning("Cannot reset Z zero — ZP stage not connected")
+            return
+
+        self.zero_position["Z"] = pos[0]
+        logger.info(f"Z zero set to {pos[0]:.3f} mm (absolute)")
+
+        self.position_logger.record(
+            "zero_reset_z",
+            zp_pos=pos,
+            metadata={"new_zero": pos[0]},
+        )
+
 
     def move_xy_absolute(
         self, x: float, y: float, from_zero_ref: bool = True, fast: bool = False
@@ -1082,11 +1206,24 @@ class StageController:
                 pass
         self.zp_stage.move_relative({AXIS_MAP["Z"]: distance}, feedrate)
 
+    def is_pump_enabled(self, pump: str) -> bool:
+        """Check if a pump is enabled in the hardware config."""
+        hw = self._hardware_config
+        if hw is None:
+            return True  # No config → allow all (legacy behavior)
+        pump_cfg = hw.pumps.get(pump)
+        if pump_cfg is None:
+            return True  # Unknown pump → allow
+        return pump_cfg.is_configured
+
     def move_pump_relative(
         self, pump: str, distance: float, feedrate: float | None = None
     ) -> None:
         """Move a pump (P1/P2/P3) by relative distance."""
         if not self.zp_stage:
+            return
+        if not self.is_pump_enabled(pump):
+            logger.warning(f"Pump {pump} is disabled — move blocked")
             return
         if feedrate and self.safety_limits.enabled:
             feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
