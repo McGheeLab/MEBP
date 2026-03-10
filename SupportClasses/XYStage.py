@@ -62,7 +62,7 @@ def _read_response_cr(spo, timeout=0.3):
             ch = spo.read(1)
             if not ch:  # timeout
                 break
-            if ch in (b"\\r", b"\\n"):
+            if ch in (b"\r", b"\n"):
                 if buf:  # got data before terminator
                     break
                 continue  # skip leading CR/LF
@@ -277,7 +277,11 @@ class XYStageManager:
 
     def _find_with_protocol(self, protocol: ControllerProtocol) -> "Optional[serial.Serial]":
         """Try to find a controller matching the given protocol.
-        v7.2.8: CR-aware detection read + response_pattern support.
+        v7.2.8s3: Increased settle time + retry on error for reliable detection.
+        
+        Prior ProScan II returns E,5 ("not initialized") if queried too soon
+        after port open, especially when the USB subsystem was churned by
+        scanning other ports first. Fix: longer settle + DTR toggle + retry.
         """
         detection = protocol.get_detection_info()
         wake_cmd = detection.get("wake_command")
@@ -295,10 +299,17 @@ class XYStageManager:
                     port_info.device,
                     baudrate=baud,
                     bytesize=protocol.byte_size,
-                    timeout=0.5,  # v7.2.8: short timeout for detection
+                    timeout=0.5,
                     stopbits=serial.STOPBITS_ONE,
                 )
-                time.sleep(0.1)  # let port settle
+
+                # v7.2.8s3: DTR toggle + longer settle for USB-serial adapters.
+                # Rapid open/close of other ports can leave the USB subsystem
+                # unsettled, causing E,5 (not initialized) on first query.
+                spo.dtr = False
+                time.sleep(0.05)
+                spo.dtr = True
+                time.sleep(0.3)  # 300ms settle (was 100ms — too short)
                 spo.reset_input_buffer()
                 spo.reset_output_buffer()
 
@@ -308,25 +319,48 @@ class XYStageManager:
                 if wake_cmd:
                     spo.write(wake_cmd.encode(protocol.encoding) + tx_term)
                     time.sleep(wake_delay)
-                    _read_response_cr(spo, timeout=0.3)  # discard wake response
+                    _read_response_cr(spo, timeout=0.3)
                     spo.reset_input_buffer()
 
-                # Detection query
-                spo.write(fw_query.encode(protocol.encoding) + tx_term)
-                time.sleep(0.05)
-                response = _read_response_cr(spo, timeout=0.3)  # v7.2.8: CR-aware
-                logger.debug(f"Detection response from {port_info.device}: {response!r}")
+                # v7.2.8s3: Detection with retry on error.
+                # ProScan returns E,N error codes if not ready.
+                # Retry once after a longer delay.
+                response = ""
+                for attempt in range(2):
+                    spo.write(fw_query.encode(protocol.encoding) + tx_term)
+                    time.sleep(0.05)
+                    response = _read_response_cr(spo, timeout=0.3)
+                    logger.debug(
+                        f"Detection response from {port_info.device} "
+                        f"(attempt {attempt+1}): {response!r}"
+                    )
+
+                    if not response:
+                        break  # no device here
+
+                    # If we got an error response (E,N), retry after delay
+                    if response.startswith("E,") and attempt == 0:
+                        logger.debug(
+                            f"{port_info.device}: got error {response!r}, "
+                            f"retrying after 500ms settle..."
+                        )
+                        spo.reset_input_buffer()
+                        time.sleep(0.5)
+                        continue
+
+                    break  # got a real response (or empty on retry)
 
                 if not response:
                     spo.close()
                     continue
 
-                # v7.2.8: Check response_pattern first (more specific)
+                # Check response_pattern first (more specific)
                 if resp_pattern:
                     if re.match(resp_pattern, response):
                         logger.info(
                             f"{protocol.controller_name} found on "
-                            f"{port_info.device} @ {baud} baud (pattern match: {response!r})"
+                            f"{port_info.device} @ {baud} baud "
+                            f"(pattern match: {response!r})"
                         )
                         spo.timeout = protocol.timeout
                         self._detected_controller = protocol.controller_name
@@ -335,11 +369,12 @@ class XYStageManager:
                         spo.close()
                         continue
 
-                # Fallback: token-based check (only if no response_pattern)
+                # Fallback: token-based check
                 if tokens and any(tok in response for tok in tokens):
                     logger.info(
                         f"{protocol.controller_name} found on "
-                        f"{port_info.device} @ {baud} baud (token match: {response!r})"
+                        f"{port_info.device} @ {baud} baud "
+                        f"(token match: {response!r})"
                     )
                     spo.timeout = protocol.timeout
                     self._detected_controller = protocol.controller_name
@@ -352,8 +387,6 @@ class XYStageManager:
 
         logger.debug(f"{protocol.controller_name} not found on any port")
         return None
-
-    # ── P8.21: Auto-Detection ────────────────────────────────────
 
     def _auto_detect_controller(self) -> Optional[serial.Serial]:
         """

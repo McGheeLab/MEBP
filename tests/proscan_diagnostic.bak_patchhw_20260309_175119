@@ -27,7 +27,6 @@ Requires: pyserial (pip install pyserial)
 
 import sys
 import time
-import json
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -320,100 +319,10 @@ def run(port_name):
             d = ProScanDiag(port_name, baud=9600, timeout=2.0)
             d.connect()
 
-    # ensure sine_results defined if section 10 was skipped
-    if 'sine_results' not in dir(): sine_results = []; max_good_freq = 0.0; SINE_AMP_UM = 300; VS_RATE_HZ = 50; ERROR_THRESH = 0.15
-
     # ── Cleanup ───────────────────────────────────────────────────
     d.send_raw("VS,0,0")
     d.send_raw("J")  # re-enable joystick
     d.disconnect()
-
-
-    # ── JSON profile export ───────────────────────────────────────
-    log(f"\n{chr(9472)*50}")
-    log("EXPORTING HARDWARE PROFILE JSON")
-
-    # Collect measured values into a profile dict
-    hw_profile = {
-        "source": "proscan_diagnostic.py",
-        "timestamp": datetime.now().isoformat(),
-        "port": spo.port if spo and spo.is_open else port_name,
-        "baud": baud,
-        "stage_info": {},
-        "timing": {},
-        "sine_geometry": {},
-    }
-
-    # Stage info from section 2
-    hw_profile["stage_info"] = {
-        "comp_mode": 0,   # forced Standard mode in section 3
-        "max_speed_pct": 100,
-        "accel_pct": 100,
-    }
-
-    # Timing from section 4 (re-measure quickly: 5 samples each)
-    log("  Measuring command timing for profile (5 samples each)...", 1)
-    timing_cmds = [
-        ("P",        "position_query_ms"),
-        ("$",        "motion_status_ms"),
-        ("VS,0,0",   "velocity_cmd_ms"),
-        ("GR,1,0",   "relative_move_ms"),
-    ]
-    for cmd, key in timing_cmds:
-        times = []
-        for _ in range(5):
-            _, dt = send_cmd(spo, cmd)
-            times.append(dt * 1000)
-        avg = sum(times) / len(times)
-        hw_profile["timing"][key] = round(avg, 2)
-        log(f"    {key}: {avg:.1f}ms", 2)
-
-    send_cmd(spo, "VS,0,0")
-
-    # Sustained rate
-    t0 = time.time()
-    count = 0
-    while time.time() - t0 < 2.0:
-        send_cmd(spo, "P")
-        count += 1
-    hw_profile["timing"]["sustained_poll_hz"] = round(count / (time.time() - t0), 1)
-    log(f"    sustained_poll_hz: {hw_profile['timing']['sustained_poll_hz']}", 2)
-
-    # Sine geometry results (from section 10 if it ran)
-    if sine_results:
-        hw_profile["sine_geometry"] = {
-            "amplitude_um": SINE_AMP_UM,
-            "vs_rate_hz": VS_RATE_HZ,
-            "error_threshold_fraction": ERROR_THRESH,
-            "max_good_freq_hz": max_good_freq,
-            "results": [
-                {
-                    "freq_hz": r["freq"],
-                    "rms_error_um": round(r["rms_um"], 2),
-                    "max_error_um": round(r["max_um"], 2),
-                    "phase_lag_ms": r["lag_ms"],
-                    "passed": r["passed"],
-                }
-                for r in sine_results
-            ],
-        }
-
-    # Processing time for simulator calibration
-    avg_cmd_ms = hw_profile["timing"].get("position_query_ms", 12.0)
-    hw_profile["simulator_calibration"] = {
-        "processing_time_s": round(avg_cmd_ms / 1000.0, 4),
-        "max_speed_um_s": SINE_AMP_UM * 2 * 3.14159 * max(
-            (r["freq"] for r in sine_results if r["passed"]), default=1.0
-        ) * 2,
-        "note": "max_speed_um_s is conservative estimate from sine test peak velocity",
-    }
-
-    # Save JSON
-    profile_path = Path("proscan_hw_profile.json")
-    profile_path.write_text(json.dumps(hw_profile, indent=2), encoding="utf-8")
-    log(f"  Profile saved: {profile_path.absolute()}", 1)
-    log("  Use this file to calibrate XYStageSimulator timing.", 1)
-
 
     # ── Summary ───────────────────────────────────────────────────
     log(f"\n{'='*70}")

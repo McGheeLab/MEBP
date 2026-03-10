@@ -8,7 +8,7 @@
         "default_baud_rate": 38400,
         "byte_size": 8,
         "stop_bits": 1,
-        "timeout_s": 0.1,
+        "timeout_s": 1.0,
         "encoding": "ascii"
     },
     "detection": {
@@ -16,11 +16,10 @@
         "wake_delay_ms": 0,
         "firmware_query": "P",
         "identify_tokens": [
-            "0",
-            "1"
+            ","
         ],
         "response_pattern": "^-?\\d+,-?\\d+",
-        "notes": "v7.2.8-fix: Use P (position query) for detection. V returns E,4 on ProScan II. COMP returns 0/1 which doesn't match the response_pattern. P always works and returns comma-separated numbers that match the pattern."
+        "notes": "v7.2.8: V returns E,4 on some firmware; P always works. Response is x,y,z. Pattern ensures comma-separated numbers."
     },
     "commands": {
         "position_query": {

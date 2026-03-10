@@ -1,10 +1,10 @@
 {
   "window": {
-    "x": 0,
-    "y": -11,
-    "width": 3840,
-    "height": 2054,
-    "active_tab": 0,
+    "x": 1220,
+    "y": 574,
+    "width": 1400,
+    "height": 850,
+    "active_tab": 2,
     "splitter_sizes": [
       706,
       0
@@ -63,10 +63,10 @@
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
+    "enabled": true,
     "max_flow_rate_p1_uL_s": 8.0,
     "max_flow_rate_p2_uL_s": 0.0,
-    "max_flow_rate_p3_uL_s": 0.0,
-    "enabled": true
+    "max_flow_rate_p3_uL_s": 0.0
   },
   "polling": {
     "position_interval_ms": 100,

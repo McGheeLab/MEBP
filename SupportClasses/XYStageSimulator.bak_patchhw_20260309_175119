@@ -46,20 +46,14 @@ BITS_PER_BYTE = 10          # 8N1: start + 8 data + stop
 # v7.2.8: load timing from diagnostic profile
 # Hardcoded fallback — used only if config/xy_diagnostic_profile.json is missing.
 # These defaults are from the 2026-03-09 diagnostic run at 38400 baud.
-# Per-command processing times measured on real Prior ProScan II
-# (COM4 @ 38400 baud, 2026-03-09 diagnostic).
-# All commands return in ~12ms; sustained poll rate ~62 Hz
-# including Python serial overhead. VS has NO extra motor-ramp
-# blocking in Standard (COMP,0) mode — it responds immediately.
-PROCESSING_TIMES = {
-    "position":  0.012,   # 12ms — P query (measured avg)
-    "move":      0.012,   # 12ms — G/GR: responds immediately, stage moves async
-    "velocity":  0.012,   # 12ms — VS: responds immediately in COMP,0 mode
-    "setting":   0.012,   # 12ms — SMS/SAS/SCS register write
-    "stop":      0.012,   # 12ms — I/K
-    "default":   0.012,   # 12ms — everything else
+_DEFAULT_PROCESSING_TIMES = {
+    "position":  0.008,
+    "move":      0.008,
+    "velocity":  0.008,
+    "setting":   0.008,
+    "stop":      0.005,
+    "default":   0.008,
 }
-PROCESSING_TIME_S = 0.012  # backward compat
 
 # Diagnostic profile path (relative to project root)
 _DIAGNOSTIC_PROFILE_PATH = "config/xy_diagnostic_profile.json"
