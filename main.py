@@ -82,7 +82,10 @@ def run_gui(controller: StageController, settings: Settings):
     app.setApplicationName("MEBP Bioprinter")
     app.setOrganizationName("Lab")
 
-    window = MainWindow(controller, settings)
+    from SupportClasses.PrintRecorder import PrintRecorder
+    recorder = PrintRecorder()
+
+    window = MainWindow(controller, settings, recorder=recorder)
 
     # Wire Python logging → console widget
     qt_handler = QtLogHandler(window.console)

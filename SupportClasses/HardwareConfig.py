@@ -255,110 +255,70 @@ class HardwareConfig:
         Check if the hardware setup is complete enough to proceed.
 
         Returns (is_valid, list_of_issues).
-        Minimum requirement: at least one pump configured with a syringe.
-
-        v7.2.4: Added checks for:
-          - Unique ink-per-pump (no two pumps share same ink)
-          - Needle channel-pump mapping completeness
-          - Channel mapping uniqueness (no two channels share same pump)
         """
         issues = []
 
-        # Must have a needle
+        # Needle
         if self.needle is None:
             issues.append("No needle gauge selected")
 
-        # Must have at least one pump with a syringe
+        # Pumps — at least one enabled with syringe
         configured_pumps = [p for p in self.pumps.values() if p.is_configured]
         if not configured_pumps:
-            issues.append("At least one pump must have a syringe assigned")
+            issues.append("At least one pump must be enabled with a syringe")
 
-        # Plate format must be valid
+        # Enabled pumps must have inks assigned
+        for pid, pcfg in self.pumps.items():
+            if pcfg.enabled and pcfg.syringe and not pcfg.ink:
+                issues.append(f"{pid} is enabled but has no ink assigned")
+
+        # Plate format
         if self.plate_format not in PLATE_DEFINITIONS:
             issues.append(f"Invalid plate format: {self.plate_format}")
 
-        # v7.2.4: Ink uniqueness — each ink assigned to at most one pump
+        # Ink uniqueness — each ink assigned to at most one pump
         ink_assignments: dict[str, list[str]] = {}
         for pid, pcfg in self.pumps.items():
             if pcfg.enabled and pcfg.ink:
-                ink_name = pcfg.ink.name
-                ink_assignments.setdefault(ink_name, []).append(pid)
+                ink_assignments.setdefault(pcfg.ink.name, []).append(pid)
         for ink_name, pump_ids in ink_assignments.items():
             if len(pump_ids) > 1:
                 issues.append(
                     f"Ink '{ink_name}' assigned to multiple pumps: "
                     f"{', '.join(pump_ids)}")
 
-        # v7.2.4: Needle channel-pump mapping
+        # Needle channel-pump mapping
         if self.needle is not None:
             num_channels = self.needle.num_channels
             enabled_ids = self.enabled_pump_ids
 
-            if num_channels > 0 and enabled_ids:
-                # Check that channel map has correct number of entries
-                if len(self.needle_channel_pump_map) != num_channels:
+            if num_channels > 0:
+                if not enabled_ids:
                     issues.append(
                         f"Needle has {num_channels} channel(s) but "
-                        f"{len(self.needle_channel_pump_map)} mapped — "
-                        f"all channels must be assigned to pumps")
-
-                # Check all mapped pumps are enabled
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    if pump_id not in enabled_ids:
-                        issues.append(
-                            f"Channel {ch_idx + 1} mapped to {pump_id} "
-                            f"but {pump_id} is not enabled/configured")
-
-                # Check uniqueness — no two channels map to same pump
-                mapped_pumps: dict[str, list[int]] = {}
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    mapped_pumps.setdefault(pump_id, []).append(ch_idx)
-                for pump_id, channels in mapped_pumps.items():
-                    if len(channels) > 1:
-                        ch_strs = [str(c + 1) for c in channels]
-                        issues.append(
-                            f"Pump {pump_id} assigned to multiple channels: "
-                            f"{', '.join(ch_strs)}")
-
-        # v7.2.4: Ink uniqueness — each ink assigned to at most one pump
-        ink_assignments: dict[str, list[str]] = {}
-        for pid, pcfg in self.pumps.items():
-            if pcfg.enabled and pcfg.ink:
-                ink_name = pcfg.ink.name
-                ink_assignments.setdefault(ink_name, []).append(pid)
-        for ink_name, pump_ids in ink_assignments.items():
-            if len(pump_ids) > 1:
-                issues.append(
-                    f"Ink '{ink_name}' assigned to multiple pumps: "
-                    f"{', '.join(pump_ids)}")
-
-        # v7.2.4: Needle channel-pump mapping
-        if self.needle is not None:
-            num_channels = self.needle.num_channels
-            enabled_ids = self.enabled_pump_ids
-
-            if num_channels > 0 and enabled_ids:
-                if len(self.needle_channel_pump_map) != num_channels:
+                        f"no pumps are enabled")
+                elif len(self.needle_channel_pump_map) != num_channels:
                     issues.append(
                         f"Needle has {num_channels} channel(s) but "
-                        f"{len(self.needle_channel_pump_map)} mapped — "
-                        f"all channels must be assigned to pumps")
+                        f"{len(self.needle_channel_pump_map)} mapped")
+                else:
+                    # Check mapped pumps are enabled
+                    for ch_idx, pump_id in self.needle_channel_pump_map.items():
+                        if pump_id not in enabled_ids:
+                            issues.append(
+                                f"Channel {ch_idx + 1} → {pump_id} "
+                                f"but {pump_id} is not enabled")
 
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    if pump_id not in enabled_ids:
-                        issues.append(
-                            f"Channel {ch_idx + 1} mapped to {pump_id} "
-                            f"but {pump_id} is not enabled/configured")
-
-                mapped_pumps: dict[str, list[int]] = {}
-                for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                    mapped_pumps.setdefault(pump_id, []).append(ch_idx)
-                for pump_id, channels in mapped_pumps.items():
-                    if len(channels) > 1:
-                        ch_strs = [str(c + 1) for c in channels]
-                        issues.append(
-                            f"Pump {pump_id} assigned to multiple channels: "
-                            f"{', '.join(ch_strs)}")
+                    # Check uniqueness
+                    mapped_pumps: dict[str, list[int]] = {}
+                    for ch_idx, pump_id in self.needle_channel_pump_map.items():
+                        mapped_pumps.setdefault(pump_id, []).append(ch_idx)
+                    for pump_id, channels in mapped_pumps.items():
+                        if len(channels) > 1:
+                            ch_strs = [str(c + 1) for c in channels]
+                            issues.append(
+                                f"{pump_id} mapped to multiple channels: "
+                                f"{', '.join(ch_strs)}")
 
         return (len(issues) == 0, issues)
 

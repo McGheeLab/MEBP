@@ -1,7 +1,7 @@
 """
-print_monitor.py — Print Monitor Page for MEBP v7.2.6b.
+print_monitor.py — Print Monitor Page for MEBP v7.2.8.
 
-Full rewrite with smooth interpolation, YZ view, syringe display.
+Direct position polling, YZ view, syringe display.
 
 Layout:
 ┌──────────────────────┬──────────────────────────┬──────────────┐
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QProgressBar, QGroupBox,
     QSplitter, QListWidget, QFrame, QSizePolicy,
 )
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient
 
 from gui.styles import COLORS
@@ -48,57 +48,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  Position Interpolator
-# ═══════════════════════════════════════════════════════════════════
-
-class PositionInterpolator:
-    """
-    Smooth position between controller samples using linear extrapolation.
-
-    Stores the last N timestamped samples and interpolates/extrapolates
-    to produce smooth position at any query time.
-    """
-
-    def __init__(self, history_size: int = 5):
-        self._history: deque[tuple[float, float, float, float, float]] = deque(maxlen=history_size)
-        # Each entry: (timestamp, x, y, z, p1)
-        self._vx = 0.0
-        self._vy = 0.0
-        self._vz = 0.0
-
-    def add_sample(self, t: float, x: float, y: float, z: float = 0.0, p1: float = 0.0):
-        """Add a new position sample with timestamp."""
-        if self._history:
-            prev = self._history[-1]
-            dt = t - prev[0]
-            if dt > 0.01:  # Avoid division by zero
-                self._vx = (x - prev[1]) / dt
-                self._vy = (y - prev[2]) / dt
-                self._vz = (z - prev[3]) / dt
-        self._history.append((t, x, y, z, p1))
-
-    def get_position(self, t: float) -> tuple[float, float, float]:
-        """Get interpolated (x, y, z) at time t."""
-        if not self._history:
-            return (0.0, 0.0, 0.0)
-        last = self._history[-1]
-        dt = t - last[0]
-        # Clamp extrapolation to 0.5s max to avoid runaway
-        dt = max(-0.5, min(0.5, dt))
-        x = last[1] + self._vx * dt
-        y = last[2] + self._vy * dt
-        z = last[3] + self._vz * dt
-        return (x, y, z)
-
-    @property
-    def last_sample(self):
-        return self._history[-1] if self._history else None
-
-    @property
-    def velocity(self):
-        return (self._vx, self._vy, self._vz)
 
 # ═══════════════════════════════════════════════════════════════════
 #  Plate Overview Widget
@@ -508,15 +457,12 @@ class SyringePumpWidget(QWidget):
 # ═══════════════════════════════════════════════════════════════════
 
 class PrintMonitorPage(QWidget):
-    """Print Monitor — v7.2.6b with interpolation, YZ view, syringe display."""
+    """Print Monitor — v7.2.8 with direct position polling."""
 
     pause_requested = Signal()
     resume_requested = Signal()
     abort_requested = Signal()
     start_requested = Signal(object)
-
-    # Smooth update rate (60ms ≈ 16 fps) vs controller poll (300ms)
-    INTERP_INTERVAL_MS = 60
 
     def __init__(self, controller=None, settings=None, workspace=None, parent=None):
         super().__init__(parent)
@@ -536,12 +482,6 @@ class PrintMonitorPage(QWidget):
         self._recorder = None
         self._microsteps_per_micron = 10.0
         self._active_pump = "P1"
-
-        # Position interpolation
-        self._interpolator = PositionInterpolator()
-        self._interp_timer = QTimer(self)
-        self._interp_timer.setInterval(self.INTERP_INTERVAL_MS)
-        self._interp_timer.timeout.connect(self._interp_tick)
 
         self._build_ui()
         self._connect_signals()
@@ -935,13 +875,10 @@ class PrintMonitorPage(QWidget):
         if state == PrintState.RUNNING:
             self.btn_pause.setText("⏸ Pause"); self.btn_pause.setEnabled(True)
             if self._print_start_time is None: self._print_start_time = time.time()
-            self._interp_timer.start()
         elif state == PrintState.PAUSED:
             self.btn_pause.setText("▶ Resume"); self.btn_pause.setEnabled(True)
-            self._interp_timer.stop()
         else:
             self.btn_pause.setText("⏸ Pause"); self.btn_pause.setEnabled(False)
-            self._interp_timer.stop()
 
         self.btn_abort.setEnabled(state in (PrintState.RUNNING, PrintState.PAUSED))
 
@@ -957,13 +894,15 @@ class PrintMonitorPage(QWidget):
         self._refresh_queue()
         logger.info(f"Queue: {'next=' + self._current_job.name if self._current_job else 'empty'}")
 
-    # ── Position polling (300ms from app.py) + interpolation (60ms) ──
+    # ── Position polling (300ms from app.py) ─────────────────────
 
     def on_status_update(self):
-        """Called by MainWindow timer (~300ms). Feed raw sample to interpolator."""
-        if self._print_state != PrintState.RUNNING: return
+        """Called by MainWindow timer (~300ms). Update needle position directly."""
+        if self._print_state != PrintState.RUNNING:
+            return
         ctrl = self._get_controller()
-        if ctrl is None: return
+        if ctrl is None:
+            return
 
         try:
             xy = ctrl.get_xy_position(cached=True) if getattr(ctrl, 'is_xy_connected', False) else None
@@ -973,42 +912,22 @@ class PrintMonitorPage(QWidget):
 
         if xy and xy[0] is not None:
             zero = getattr(ctrl, 'zero_position', {})
-            # v7.3: Stage returns µm, convert to mm for display
             px = (xy[0] - zero.get('x', 0)) / 1000.0
             py = (xy[1] - zero.get('y', 0)) / 1000.0
             pz = (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0.0
-            p1 = (zp[1] - zero.get('P1', 0)) if zp and len(zp) > 1 and zp[1] is not None else 0.0
 
-            self._interpolator.add_sample(time.monotonic(), px, py, pz, p1)
+            # Update all views directly from polled position
+            self.plate_view.set_needle_position(px, py)
+            self.xy_detail.set_needle_position(px, py)
+            self.yz_view.set_needle_position(py, pz)
 
-            # Also update pump positions
+            # Update pump positions
             if zp:
                 for i, pid in enumerate(["P1", "P2", "P3"], 1):
                     if i < len(zp) and zp[i] is not None:
                         pw = self._pump_widgets.get(pid)
                         if pw:
                             pw.set_position(zp[i], zero.get(pid, 0))
-
-    def _interp_tick(self):
-        """Called at 60ms — update views with interpolated position."""
-        if self._print_state != PrintState.RUNNING: return
-        pos = self._interpolator.get_position(time.monotonic())
-        if pos is None: return
-        ix, iy, iz = pos
-
-        # Update all three views with smooth position
-        self.plate_view.set_needle_position(ix, iy)
-        self.xy_detail.set_needle_position(ix, iy)
-        self.yz_view.set_needle_position(iy, iz)
-
-        # v7.3: Advance XY completed index based on time
-        if self._is_trajectory_job and self._total_duration_s > 0 and self._print_start_time:
-            import time as _time
-            elapsed = _time.time() - self._print_start_time
-            frac = min(1.0, elapsed / self._total_duration_s)
-            wp_count = len(self.xy_detail._waypoints) if self.xy_detail._waypoints else 0
-            if wp_count > 0:
-                self.xy_detail.set_completed_index(int(frac * wp_count))
 
     # ── Helpers ───────────────────────────────────────────────────
 

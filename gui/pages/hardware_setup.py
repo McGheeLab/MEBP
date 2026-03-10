@@ -684,26 +684,34 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(ros_group)
 
-        # ── Section 8: Actions ────────────────────────────────────
-        actions_group = QGroupBox("Actions")
-        actions_group.setStyleSheet(self._group_style())
-        actions_lay = QHBoxLayout(actions_group)
-
-        btn_save = QPushButton("💾 Save Config")
-        btn_save.clicked.connect(self._save_config)
-        actions_lay.addWidget(btn_save)
-
-        btn_load = QPushButton("📂 Load Config")
-        btn_load.clicked.connect(self._load_config)
-        actions_lay.addWidget(btn_load)
-
-        actions_lay.addStretch()
+        # ── Section 8: Setup Status ──────────────────────────────
+        status_group = QGroupBox("Setup Status")
+        status_group.setStyleSheet(self._group_style())
+        status_lay = QVBoxLayout(status_group)
 
         self.validity_label = QLabel("⚠ Setup incomplete")
         self.validity_label.setStyleSheet(
             f"color: {COLORS.get('yellow', '#f9e2af')};")
         self.validity_label.setFont(QFont("", 10, QFont.Bold))
-        actions_lay.addWidget(self.validity_label)
+        self.validity_label.setWordWrap(True)
+        status_lay.addWidget(self.validity_label)
+
+        self._content_layout.addWidget(status_group)
+
+        # ── Section 9: Actions ────────────────────────────────────
+        actions_group = QGroupBox("Actions")
+        actions_group.setStyleSheet(self._group_style())
+        actions_lay = QHBoxLayout(actions_group)
+
+        btn_save = QPushButton("Save Config")
+        btn_save.clicked.connect(self._save_config)
+        actions_lay.addWidget(btn_save)
+
+        btn_load = QPushButton("Load Config")
+        btn_load.clicked.connect(self._load_config)
+        actions_lay.addWidget(btn_load)
+
+        actions_lay.addStretch()
 
         self._content_layout.addWidget(actions_group)
 
@@ -905,69 +913,43 @@ class HardwareSetupPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _sync_validity_display(self) -> None:
-        """v7.3.1: Sync all validity labels to current config state.
-        Safe to call at any time — no-ops if widgets not yet created."""
-        valid = getattr(self._config, "is_valid", False)
-        _, issues = self._config.validate() if hasattr(self._config, "validate") else (valid, [])
+        """Sync all validity labels to current config state."""
+        valid, issues = self._config.validate() if hasattr(self._config, "validate") else (True, [])
 
-        # Main page label
-        if hasattr(self, "validity_label") and self.validity_label is not None:
-            if valid:
-                self.validity_label.setText("✓ Setup complete")
-                self.validity_label.setStyleSheet(
-                    f"color: {COLORS.get('green', '#a6e3a1')};")
-            else:
-                msg = issues[0] if issues else "Setup incomplete"
-                self.validity_label.setText(f"⚠ {msg}")
-                self.validity_label.setStyleSheet(
-                    f"color: {COLORS.get('yellow', '#f9e2af')};")
+        if valid:
+            full_text = "✓ Setup complete"
+            color = COLORS.get('green', '#a6e3a1')
+        else:
+            lines = [f"⚠ {issue}" for issue in issues] or ["⚠ Setup incomplete"]
+            full_text = "\n".join(lines)
+            color = COLORS.get('yellow', '#f9e2af')
 
-        # Context panel label (lazily created — may not exist yet)
-        if hasattr(self, "_ctx_validity_label") and self._ctx_validity_label is not None:
-            if valid:
-                self._ctx_validity_label.setText("✓ Setup complete")
-                self._ctx_validity_label.setStyleSheet(
-                    f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 9pt;")
-            else:
-                msg = issues[0] if issues else "Setup incomplete"
-                self._ctx_validity_label.setText(f"⚠ {msg}")
-                self._ctx_validity_label.setStyleSheet(
-                    f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 9pt;")
+        # Main page label — show all issues
+        lbl = getattr(self, "validity_label", None)
+        if lbl is not None:
+            lbl.setText(full_text)
+            lbl.setStyleSheet(f"color: {color};")
+
+        # Context panel label — show first issue only (compact)
+        ctx_lbl = getattr(self, "_ctx_validity_label", None)
+        if ctx_lbl is not None:
+            ctx_text = "✓ Setup complete" if valid else (
+                f"⚠ {issues[0]}" if issues else "⚠ Setup incomplete")
+            ctx_lbl.setText(ctx_text)
+            ctx_lbl.setStyleSheet(f"color: {color}; font-size: 9pt;")
 
     def _on_config_changed(self):
         """Called whenever any config widget changes."""
         if getattr(self, '_restoring', False):
-            return  # v7.2.6: skip during config restore
+            return
         self._rebuild_config()
         valid = self._config.is_valid
         if valid != self._last_valid:
             self._last_valid = valid
             self.config_validated.emit(valid)
 
-        if valid:
-            self.validity_label.setText("✓ Setup complete")
-            self.validity_label.setStyleSheet(
-                f"color: {COLORS.get('green', '#a6e3a1')};")
-            # v7.2.4: Also update context panel validity
-            if hasattr(self, '_ctx_validity_label'):
-                self._ctx_validity_label.setText("✓ Setup complete")
-                self._ctx_validity_label.setStyleSheet(
-                    f"color: {COLORS.get('green', '#a6e3a1')};")
-        else:
-            _, issues = self._config.validate()
-            self.validity_label.setText(
-                f"⚠ {issues[0]}" if issues else "⚠ Setup incomplete")
-            self.validity_label.setStyleSheet(
-                f"color: {COLORS.get('yellow', '#f9e2af')};")
-            # v7.2.4: Also update context panel validity
-            if hasattr(self, '_ctx_validity_label'):
-                issue_text = issues[0] if issues else "Setup incomplete"
-                self._ctx_validity_label.setText(f"⚠ {issue_text}")
-                self._ctx_validity_label.setStyleSheet(
-                    f"color: {COLORS.get('yellow', '#f9e2af')};")
-
+        self._sync_validity_display()
         self.config_changed.emit(self._config)
-        self._sync_validity_display()  # v7.3.1: keep labels in sync
 
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
@@ -1339,6 +1321,7 @@ class HardwareSetupPage(QWidget):
             f"  Channel map: {self._config.needle_channel_pump_map}")
 
         # ── 8. Emit signals ──────────────────────────────────────
+        self._restoring = False
         self._on_config_changed()
         logger.info("Config restore complete")
 

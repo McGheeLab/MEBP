@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-03-10T18:11:37.142749+00:00",
+  "timestamp_str": "20260310_181137",
+  "job_name": "Trajectory: 1 wells",
+  "status": "completed",
+  "workspace": {},
+  "well_setup": {},
+  "duration_s": 171.358,
+  "num_samples": 1615,
+  "end_time": "2026-03-10T18:14:28.503148+00:00",
+  "summary": {
+    "total_samples": 1615,
+    "print_samples": 1429,
+    "travel_samples": 176,
+    "retract_samples": 10,
+    "num_segments": 5,
+    "tracking_error_xy_mean_mm": 4527.4121,
+    "tracking_error_xy_max_mm": 43114.7894,
+    "tracking_error_z_mean_mm": 0.0048,
+    "tracking_error_z_max_mm": 5.0,
+    "actual_print_path_length_mm": 234393.256
+  }
+}
