@@ -72,9 +72,11 @@ class XboxQueuePoller:
                     break
 
                 if "status" in msg:
-                    # v7.2.6: S4-D — store Xbox worker status for StageController
+                    # v7.2.8: quiet heartbeat — only log on change
+                    _prev = self._xbox_status
                     self._xbox_status = msg["status"]
-                    logger.info(f"[Xbox] Status: {self._xbox_status}")
+                    if self._xbox_status != _prev:
+                        logger.info(f"[Xbox] Status: {self._xbox_status}")
                 elif "debug" in msg:
                     text = msg["debug"]
                     if "connect" in text.lower() or "found" in text.lower():
@@ -840,6 +842,7 @@ class StageController:
         logger.info("Xbox controller disconnected")
 
 
+    @property  # v7.2.8: xbox_status property
     def xbox_status(self) -> str:
         """Return Xbox connection status string.
 

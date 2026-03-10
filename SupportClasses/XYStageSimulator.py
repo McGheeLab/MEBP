@@ -7,8 +7,8 @@ Implements both interfaces:
 
 Timing loaded from config/xy_diagnostic_profile.json at import time.
 Diagnostic results (38400 baud, 2026-03-09):
-  ALL commands: ~12ms round-trip, ~83 Hz burst, ~62.5 Hz sustained
-  Processing (excl baud delay): ~8ms uniform across P, VS, G, GR, $
+  ALL commands: ~4.2ms round-trip, ~240 Hz burst, ~41 Hz sustained (with pacing)
+  Processing (excl baud delay): ~0ms — baud delay accounts for entire round-trip
   VS is NOT slower than P — the old 800ms value was incorrect
   Sine-wave tracking: clean to 1.0 Hz (1885 µm/s peak) at 50 Hz VS rate
 
@@ -32,11 +32,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════
 
 MAX_SPEED_UM_S = 20_000.0
-MAX_ACCEL_UM_S2 = 50_000.0
+MAX_ACCEL_UM_S2 = 400_000.0  # v7.2.8-cal: real settles 300µm in 59ms
 DEFAULT_SPEED_PCT = 50
 DEFAULT_ACCEL_PCT = 50
 MICROSTEPS_PER_MICRON = 10
-DEFAULT_KP = 15.0
+DEFAULT_KP = 50.0  # v7.2.8-cal: faster convergence to match real settle time
 SETTLE_THRESHOLD_UM = 0.5
 PHYSICS_HZ = 200
 
@@ -46,20 +46,25 @@ BITS_PER_BYTE = 10          # 8N1: start + 8 data + stop
 # v7.2.8: load timing from diagnostic profile
 # Hardcoded fallback — used only if config/xy_diagnostic_profile.json is missing.
 # These defaults are from the 2026-03-09 diagnostic run at 38400 baud.
-# Per-command processing times measured on real Prior ProScan II
-# (COM4 @ 38400 baud, 2026-03-09 diagnostic).
-# All commands return in ~12ms; sustained poll rate ~62 Hz
-# including Python serial overhead. VS has NO extra motor-ramp
-# blocking in Standard (COMP,0) mode — it responds immediately.
+# v7.2.8-cal: Per-command processing measured from sim_calibration_report.json.
+# Real ProScan II @ 38400 baud: position query = 4.16ms total round-trip.
+# Controller processing is ~0ms. The 4.16ms is entirely baud-rate TX/RX delay.
+# Sustained poll rate: ~41 Hz (with 20ms inter-command pacing).
+# These near-zero values let the baud-rate model handle all timing.
+# v7.2.8-cal: Tuned from sim_calibration_report.json
+# Real ProScan II: 4.16ms total round-trip at 38400 baud.
+# TX delay (0.52ms) + RX delay (3.6ms) = 4.12ms.
+# Controller processing = 4.16 - 4.12 = ~0ms.
+# Set processing times to near-zero; baud model handles the rest.
 PROCESSING_TIMES = {
-    "position":  0.012,   # 12ms — P query (measured avg)
-    "move":      0.012,   # 12ms — G/GR: responds immediately, stage moves async
-    "velocity":  0.012,   # 12ms — VS: responds immediately in COMP,0 mode
-    "setting":   0.012,   # 12ms — SMS/SAS/SCS register write
-    "stop":      0.012,   # 12ms — I/K
-    "default":   0.012,   # 12ms — everything else
+    "position":  0.0001,   # 12ms — P query (measured avg)
+    "move":      0.0001,   # 12ms — G/GR: responds immediately, stage moves async
+    "velocity":  0.0001,   # 12ms — VS: responds immediately in COMP,0 mode
+    "setting":   0.0001,   # 12ms — SMS/SAS/SCS register write
+    "stop":      0.0001,   # 12ms — I/K
+    "default":   0.0001,   # 12ms — everything else
 }
-PROCESSING_TIME_S = 0.012  # backward compat
+PROCESSING_TIME_S = 0.0001  # v7.2.8-cal: tuned from real hardware  # backward compat
 
 # Diagnostic profile path (relative to project root)
 _DIAGNOSTIC_PROFILE_PATH = "config/xy_diagnostic_profile.json"
@@ -112,7 +117,7 @@ def _load_diagnostic_profile():
                 break
 
     logger.info("No diagnostic profile found — using default timing constants")
-    return dict(_DEFAULT_PROCESSING_TIMES), DEFAULT_BAUD, {}
+    return dict(PROCESSING_TIMES), DEFAULT_BAUD, {}
 
 
 # Load at module import time so all instances share the same profile

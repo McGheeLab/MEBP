@@ -349,18 +349,23 @@ class DashboardPage(QWidget):
         self._btn_connect_xbox.setToolTip(tip)
 
     def on_status_update(self):
-        """Called by MainWindow timer — refresh all readouts."""
+        """Called by MainWindow timer — refresh all readouts.  # v7.2.8: xbox status"""
         self.update_data()
 
         # Update context panel connection statuses
         self._update_conn_status("xy", self.controller.is_xy_connected)
         self._update_conn_status("zp", self.controller.is_zp_connected)
-        # v7.2.6: S5-D xbox status — use rich status property
-        _xbox_st = getattr(self.controller, "xbox_status", "disconnected")  # v7.2.7: xbox tooltip
-        self._update_conn_status("xbox", _xbox_st in ("connected", "alive"))
-        # v7.2.7: Update Xbox tooltip with status detail
+
+        # Xbox: use the rich status property for dot + tooltip
+        _xbox_connected = getattr(self.controller, "is_xbox_connected", False)
+        self._update_conn_status("xbox", _xbox_connected)
+
+        # Xbox tooltip detail (uses xbox_status property)
         _xbox_dot = getattr(self, "ctx_dot_xbox", None)
         if _xbox_dot:
+            _xbox_st = self.controller.xbox_status if hasattr(self.controller, "xbox_status") else "disconnected"
+            if callable(_xbox_st):
+                _xbox_st = _xbox_st()  # fallback if not @property
             if _xbox_st == "waiting":
                 _xbox_dot.setToolTip("Searching for Xbox controller...")
             elif _xbox_st in ("connected", "alive"):
@@ -372,8 +377,10 @@ class DashboardPage(QWidget):
 
         # Update log count in context panel
         if hasattr(self, 'ctx_lbl_log_count'):
-            self.ctx_lbl_log_count.setText(f"Entries: {self.controller.position_logger.count}")
+            self.ctx_lbl_log_count.setText(
+                f"Entries: {self.controller.position_logger.count}")
         self._update_xbox_btn_state()
+
 
     def update_data(self):
         """Update all data readouts."""

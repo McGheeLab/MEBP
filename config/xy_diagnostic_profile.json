@@ -1,9 +1,8 @@
 {
     "_description": "ProScan II communication profile measured 2026-03-09 via proscan_diagnostic.py",
-    "_controller": "Prior ProScan II — H117(2MM)PHY stage, TYPE 8",
+    "_controller": "Prior ProScan II \u2014 H117(2MM)PHY stage, TYPE 8",
     "_port": "COM4",
     "_baud": 38400,
-
     "stage_info": {
         "stage_name": "H117(2MM)PHY",
         "stage_type": 8,
@@ -12,56 +11,142 @@
         "microsteps_per_micron": 25,
         "limits": "normally_closed"
     },
-
     "communication": {
         "baud_rate": 38400,
         "tx_terminator": "CR",
         "mode": "standard",
         "firmware_response_to_V": "E,4"
     },
-
     "round_trip_timing_ms": {
         "_note": "20 samples each at 38400 baud, all commands",
-        "position_query_P": {"avg": 12.0, "min": 11.5, "max": 12.2, "stdev": 0.2, "rate_hz": 83.1},
-        "stage_pos_PS":     {"avg": 12.0, "min": 11.5, "max": 12.3, "stdev": 0.2, "rate_hz": 83.2},
-        "motion_status_$":  {"avg": 12.0, "min": 11.7, "max": 12.2, "stdev": 0.1, "rate_hz": 83.2},
-        "stage_status_$S":  {"avg": 12.0, "min": 11.4, "max": 12.4, "stdev": 0.3, "rate_hz": 83.0},
-        "query_speed_SMS":  {"avg": 12.1, "min": 11.6, "max": 12.3, "stdev": 0.1, "rate_hz": 82.5},
-        "query_accel_SAS":  {"avg": 12.1, "min": 12.0, "max": 12.3, "stdev": 0.1, "rate_hz": 82.4},
-        "firmware_V":       {"avg": 12.1, "min": 11.5, "max": 12.3, "stdev": 0.2, "rate_hz": 82.8},
-        "query_mode_COMP":  {"avg": 12.0, "min": 11.3, "max": 12.2, "stdev": 0.2, "rate_hz": 83.0}
+        "position_query_P": {
+            "avg": 12.0,
+            "min": 11.5,
+            "max": 12.2,
+            "stdev": 0.2,
+            "rate_hz": 83.1
+        },
+        "stage_pos_PS": {
+            "avg": 12.0,
+            "min": 11.5,
+            "max": 12.3,
+            "stdev": 0.2,
+            "rate_hz": 83.2
+        },
+        "motion_status_$": {
+            "avg": 12.0,
+            "min": 11.7,
+            "max": 12.2,
+            "stdev": 0.1,
+            "rate_hz": 83.2
+        },
+        "stage_status_$S": {
+            "avg": 12.0,
+            "min": 11.4,
+            "max": 12.4,
+            "stdev": 0.3,
+            "rate_hz": 83.0
+        },
+        "query_speed_SMS": {
+            "avg": 12.1,
+            "min": 11.6,
+            "max": 12.3,
+            "stdev": 0.1,
+            "rate_hz": 82.5
+        },
+        "query_accel_SAS": {
+            "avg": 12.1,
+            "min": 12.0,
+            "max": 12.3,
+            "stdev": 0.1,
+            "rate_hz": 82.4
+        },
+        "firmware_V": {
+            "avg": 12.1,
+            "min": 11.5,
+            "max": 12.3,
+            "stdev": 0.2,
+            "rate_hz": 82.8
+        },
+        "query_mode_COMP": {
+            "avg": 12.0,
+            "min": 11.3,
+            "max": 12.2,
+            "stdev": 0.2,
+            "rate_hz": 83.0
+        }
     },
-
     "movement_timing_ms": {
-        "GR_plus_1um":  {"avg": 12.1, "rate_hz": 82.8},
-        "GR_minus_1um": {"avg": 12.1, "rate_hz": 82.6},
-        "G_same_pos":   {"avg": 12.2, "rate_hz": 82.0}
+        "GR_plus_1um": {
+            "avg": 12.1,
+            "rate_hz": 82.8
+        },
+        "GR_minus_1um": {
+            "avg": 12.1,
+            "rate_hz": 82.6
+        },
+        "G_same_pos": {
+            "avg": 12.2,
+            "rate_hz": 82.0
+        }
     },
-
     "vs_velocity_timing_ms": {
-        "VS_stop":       {"avg": 11.9, "rate_hz": 83.8},
-        "VS_100":        {"avg": 12.0, "rate_hz": 83.7},
-        "VS_500_diag":   {"avg": 12.0, "rate_hz": 83.1},
-        "VS_1000":       {"avg": 11.9, "rate_hz": 84.2},
-        "VS_5000":       {"avg": 12.0, "rate_hz": 83.5},
-        "direction_alternation": {"avg": 12.0, "min": 9.7, "max": 12.4, "rate_hz": 83.2}
+        "VS_stop": {
+            "avg": 11.9,
+            "rate_hz": 83.8
+        },
+        "VS_100": {
+            "avg": 12.0,
+            "rate_hz": 83.7
+        },
+        "VS_500_diag": {
+            "avg": 12.0,
+            "rate_hz": 83.1
+        },
+        "VS_1000": {
+            "avg": 11.9,
+            "rate_hz": 84.2
+        },
+        "VS_5000": {
+            "avg": 12.0,
+            "rate_hz": 83.5
+        },
+        "direction_alternation": {
+            "avg": 12.0,
+            "min": 9.7,
+            "max": 12.4,
+            "rate_hz": 83.2
+        }
     },
-
     "timing_breakdown_ms": {
         "_note": "write / controller_wait / total",
-        "P":        {"write": 0.1, "wait": 11.8, "total": 11.9},
-        "VS_100_0": {"write": 0.1, "wait": 11.4, "total": 11.6},
-        "GR_1_0":   {"write": 0.1, "wait": 11.8, "total": 11.9},
-        "$":        {"write": 0.1, "wait": 11.9, "total": 12.0}
+        "P": {
+            "write": 0.1,
+            "wait": 11.8,
+            "total": 11.9
+        },
+        "VS_100_0": {
+            "write": 0.1,
+            "wait": 11.4,
+            "total": 11.6
+        },
+        "GR_1_0": {
+            "write": 0.1,
+            "wait": 11.8,
+            "total": 11.9
+        },
+        "$": {
+            "write": 0.1,
+            "wait": 11.9,
+            "total": 12.0
+        }
     },
-
     "sustained_rate_hz": {
         "_note": "5 second tests",
-        "position":  62.5,
-        "status":    62.5,
+        "position": 62.5,
+        "status": 62.5,
         "vs_update": 62.5
     },
-
     "sine_wave_geometry": {
         "amplitude_um": 300,
         "vs_rate_hz": 50,
@@ -69,23 +154,72 @@
         "max_pass_freq_hz": 1.0,
         "peak_velocity_um_s": 1885,
         "results": [
-            {"freq_hz": 0.10, "rms_um": 4.9,  "max_um": 9.0,   "lag_ms": 30, "pass": true},
-            {"freq_hz": 0.20, "rms_um": 9.6,  "max_um": 17.3,  "lag_ms": 30, "pass": true},
-            {"freq_hz": 0.30, "rms_um": 14.0, "max_um": 24.6,  "lag_ms": 30, "pass": true},
-            {"freq_hz": 0.50, "rms_um": 22.9, "max_um": 40.1,  "lag_ms": 30, "pass": true},
-            {"freq_hz": 0.75, "rms_um": 33.6, "max_um": 57.9,  "lag_ms": 30, "pass": true},
-            {"freq_hz": 1.00, "rms_um": 44.7, "max_um": 76.2,  "lag_ms": 30, "pass": true},
-            {"freq_hz": 1.50, "rms_um": 67.8, "max_um": 111.0, "lag_ms": 35, "pass": false}
+            {
+                "freq_hz": 0.1,
+                "rms_um": 4.9,
+                "max_um": 9.0,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 0.2,
+                "rms_um": 9.6,
+                "max_um": 17.3,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 0.3,
+                "rms_um": 14.0,
+                "max_um": 24.6,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 0.5,
+                "rms_um": 22.9,
+                "max_um": 40.1,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 0.75,
+                "rms_um": 33.6,
+                "max_um": 57.9,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 1.0,
+                "rms_um": 44.7,
+                "max_um": 76.2,
+                "lag_ms": 30,
+                "pass": true
+            },
+            {
+                "freq_hz": 1.5,
+                "rms_um": 67.8,
+                "max_um": 111.0,
+                "lag_ms": 35,
+                "pass": false
+            }
         ]
     },
-
     "simulator_derived_constants": {
-        "_note": "Processing time = total_roundtrip - TX_baud_delay - RX_baud_delay. At 38400 baud (3840 bytes/s): TX 'P\\r' = 0.52ms, RX '23223,20169,0\\r' = 3.6ms. So processing ~8ms.",
-        "processing_time_position_s":  0.008,
-        "processing_time_move_s":      0.008,
-        "processing_time_velocity_s":  0.008,
-        "processing_time_setting_s":   0.008,
-        "processing_time_stop_s":      0.005,
-        "processing_time_default_s":   0.008
+        "_note": "v7.2.8-cal: Tuned from sim_calibration_report.json. Real position query = 4.16ms total. Processing = ~0ms. All timing is baud-rate TX/RX delay.",
+        "processing_time_position_s": 0.0001,
+        "processing_time_move_s": 0.0001,
+        "processing_time_velocity_s": 0.0001,
+        "processing_time_setting_s": 0.0001,
+        "processing_time_stop_s": 0.0001,
+        "processing_time_default_s": 0.0001
+    },
+    "calibration_summary": {
+        "_source": "sim_calibration_report.json",
+        "xy_real_position_query_ms": 4.16,
+        "xy_real_sustained_rate_hz": 40.8,
+        "xy_real_settle_300um_ms": 59.0,
+        "zp_real_position_query_ms": 11.01,
+        "zp_real_sustained_rate_hz": 9.0
     }
 }

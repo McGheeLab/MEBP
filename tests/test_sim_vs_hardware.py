@@ -701,21 +701,17 @@ def _wait_for_position_stable(
 def _zp_read_position(stage: ZPStageManager) -> tuple:
     """Read ZP position reliably, draining stale serial buffer data first.
 
-    The ZP simulator's buffered serial path has a ~40ms round-trip.
-    receive_data() only sleeps 10ms before reading, so calling
-    get_current_position() can return STALE data from a previous query.
-
-    Fix: drain the response buffer WITHOUT sending new commands, then
-    do a single clean M114 query with enough processing time.
+    Drains any stale responses from the buffer, then does a clean M114
+    query with adequate processing time for both tuned and un-tuned sims.
     """
     # Drain any stale responses (don't send new commands)
     stage.receive_data()
-    time.sleep(0.05)
+    time.sleep(0.03)
     stage.receive_data()
-    time.sleep(0.05)
-    # Fresh M114 query with adequate processing time
+    time.sleep(0.03)
+    # Fresh M114 query — 80ms wait covers both tuned (4ms) and old (40ms) sim
     stage.send_data("M114")
-    time.sleep(0.15)  # 150ms: 30ms comm + 10ms proc + 110ms margin
+    time.sleep(0.08)
     resp = stage.receive_data()
     stage._parse_position(resp)
     return (stage.x_pos, stage.y_pos, stage.z_pos, stage.e_pos)
@@ -748,14 +744,12 @@ def _xy_read_position(stage: XYStageManager) -> tuple:
 
 
 # ── ZP sim timing constants ───────────────────────────────────────
-# The ZP simulator is slow by design:
-#   - Each command: 30ms comm_delay + 10ms processing = ~40ms
-#   - move_absolute: sends 3 G-codes (G90+G0+G91) = ~120ms command overhead
-#   - Physics: P-controller with kp=2.0, max_speed=100 → ~500ms per mm
-# These constants ensure tests wait long enough for convergence.
-ZP_SIM_CMD_OVERHEAD_S = 0.15    # Single command overhead (40ms + margin)
-ZP_SIM_MOVE_ABS_OVERHEAD_S = 0.5  # move_absolute sends 3 commands
-ZP_SIM_MM_PER_S = 2.0          # Approximate convergence speed (kp * typical_error / 2)
+# v7.2.8-cal: Updated for tuned ZP simulator.
+# Tuned sim: comm_delay=2ms, processing=2ms, kp=10, max_speed=500.
+# These constants are still generous to work with un-tuned sim too.
+ZP_SIM_CMD_OVERHEAD_S = 0.05    # Single command overhead (4ms tuned / 40ms old + margin)
+ZP_SIM_MOVE_ABS_OVERHEAD_S = 0.2  # move_absolute sends 3 commands
+ZP_SIM_MM_PER_S = 20.0         # Approximate convergence speed (kp=10, typical error)
 
 
 def _zp_sim_wait(distance_mm: float, n_commands: int = 1) -> float:

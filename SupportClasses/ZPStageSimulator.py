@@ -29,8 +29,8 @@ class ZPStageSimulator:
     :class:`ZPStageManager`, not here.
 
     Parameters:
-        communication_delay:          Simulated serial write latency (s).
-        processing_time_per_command:  Simulated per-command processing time (s).
+        communication_delay:          Simulated serial write latency (s). Default 0.002.
+        processing_time_per_command:  Simulated per-command processing time (s). Default 0.002.
         acceleration_rate:            Max velocity change per second.
         max_speed:                    Velocity clamp per axis.
         kp:                           Proportional gain for position tracking.
@@ -41,11 +41,11 @@ class ZPStageSimulator:
 
     def __init__(
         self,
-        communication_delay: float = 0.03,
-        processing_time_per_command: float = 0.01,
-        acceleration_rate: float = 100.0,
-        max_speed: float = 100.0,
-        kp: float = 2.0,
+        communication_delay: float = 0.002,  # v7.2.8-cal: real Marlin serial ~2ms
+        processing_time_per_command: float = 0.002,  # v7.2.8-cal: real Marlin proc ~2ms
+        acceleration_rate: float = 500.0,  # v7.2.8-cal: real stepper accel is fast
+        max_speed: float = 500.0,  # v7.2.8-cal: real Marlin max feedrate is higher
+        kp: float = 10.0,  # v7.2.8-cal: faster convergence, matches real 0.0mm error
     ):
         # Serial-style buffer and queues
         self._buffer: bytes = b""

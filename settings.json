@@ -1,18 +1,18 @@
 {
   "window": {
-    "x": 1220,
-    "y": 574,
-    "width": 1400,
-    "height": 850,
-    "active_tab": 2,
+    "x": 0,
+    "y": 25,
+    "width": 1296,
+    "height": 792,
+    "active_tab": 5,
     "splitter_sizes": [
       706,
       0
     ]
   },
   "simulation": {
-    "simulate_xy": false,
-    "simulate_zp": false
+    "simulate_xy": true,
+    "simulate_zp": true
   },
   "speeds": {
     "xy": 0,

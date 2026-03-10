@@ -46,6 +46,8 @@ from gui.pages.calibration import CalibrationPage
 from gui.pages.print_setup import PrintSetupPage
 from gui.pages.settings_page import SettingsPage
 from gui.pages.print_monitor import PrintMonitorPage
+from gui.pages.helper_functions import HelperFunctionsPage
+from gui.pages.print_results import PrintResultsPage  # v7.2.6
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
 
@@ -231,7 +233,9 @@ class MainWindow(QMainWindow):
             ("btn_jog",       "🕹️", "Jog Control"),
             ("btn_calibrate", "📐", "Calibration"),
             ("btn_print",     "🖨️", "Print Setup"),
-            ("btn_monitor",   "📈", "Print Monitor"),
+            ("btn_monitor",   "📈", "Print Monitor"),            ("btn_results",  "📋", "Print Results"),  # v7.2.6
+
+            ("btn_helpers",  "🧰", "Helper Functions"),
         ]
         for obj_name, icon_text, label_text in menu_items:
             btn = self._make_menu_button(obj_name, icon_text, label_text)
@@ -468,7 +472,10 @@ class MainWindow(QMainWindow):
             CalibrationPage(self.controller, settings=self.settings),     # 3
             PrintSetupPage(self.controller),                              # 4
             PrintMonitorPage(self.controller, self.settings),             # 5
-            SettingsPage(self.controller, self.settings),                 # 6
+            PrintResultsPage(self.controller, self.settings),             # 6  v7.2.6
+            HelperFunctionsPage(),                                        # 7  v7.2.7
+
+            SettingsPage(self.controller, self.settings),                 # 8  ← was 7  v7.2.6
         ]
 
         # Wire Hardware Setup signals
@@ -485,6 +492,11 @@ class MainWindow(QMainWindow):
             monitor = pages[5]
             if hasattr(monitor, 'set_recorder'):
                 monitor.set_recorder(self.recorder)
+
+            # v7.2.6: wire recorder to results
+            results_page = pages[6]
+            if hasattr(results_page, 'set_recorder'):
+                results_page.set_recorder(self.recorder)
             setup = pages[4]
             if hasattr(setup, 'print_manager') and setup.print_manager:
                 setup.print_manager.recorder = self.recorder
@@ -524,6 +536,13 @@ class MainWindow(QMainWindow):
         # ── v7.2.3: Wire job pipeline and execution controls ─────
         self._wire_job_pipeline()
         self._wire_print_manager_to_monitor()
+
+
+        # v7.2.7: Wire helper functions signal
+        for pg in self._page_widgets:
+            if hasattr(pg, 'print_file_created'):
+                pg.print_file_created.connect(self._on_helper_print_created)
+                break
 
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
@@ -638,6 +657,13 @@ class MainWindow(QMainWindow):
                 pass
             try:
                 bridge.state_signal.emit(state)
+            except Exception:
+                pass
+            # v7.2.6: notify results page on completion
+            try:
+                from SupportClasses.PrintManager import PrintState as _PS
+                if state == _PS.COMPLETED:
+                    self._on_print_completed_v726()
             except Exception:
                 pass
 
@@ -884,6 +910,40 @@ class MainWindow(QMainWindow):
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.abort()
 
+    def _on_print_completed_v726(self):
+        """v7.2.6: On print completion, notify results page."""
+        if len(self._page_widgets) > 6:
+            results_page = self._page_widgets[6]
+            if hasattr(results_page, 'load_latest_recording'):
+                try:
+                    results_page.load_latest_recording()
+                    logger.info(
+                        "v7.2.6: Loaded latest recording into results"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "v7.2.6: Failed to load recording: "
+                        + str(e)
+                    )
+
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.2.7: HELPER FUNCTIONS INTEGRATION
+    # ════════════════════════════════════════════════════════════════
+
+    def _on_helper_print_created(self, filename: str):
+        """Helper Functions page created a print file — notify Print Objects tab."""
+        setup_page = self._page_widgets[4]
+        if hasattr(setup_page, 'tab_objects'):
+            tab = setup_page.tab_objects
+            if hasattr(tab, '_load_file_by_name'):
+                tab._load_file_by_name(filename)
+            elif hasattr(tab, '_emit_prints_changed'):
+                tab._emit_prints_changed()
+        # Auto-switch to Print Setup page
+        self._navigate_to(4)
+
+
     # ════════════════════════════════════════════════════════════════
     #  HARDWARE CONFIG MANAGEMENT
     # ════════════════════════════════════════════════════════════════
@@ -936,13 +996,13 @@ class MainWindow(QMainWindow):
     def _update_page_gating(self, hardware_valid: bool):
         """Enable/disable navigation buttons for pages requiring hardware setup."""
         # Page indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibrate,
-        #               4=Print, 5=Monitor, 6=Settings
+        #               4=Print, 5=Monitor, 6=Results, 7=Helpers, 8=Settings  # v7.2.6
         for i, btn in enumerate(self._menu_buttons):
             if i == 0:
                 # Hardware Setup — always enabled
                 btn.setEnabled(True)
                 btn.setToolTip("Hardware Setup")
-            elif i == 6 or btn.objectName() == "btn_settings":
+            elif i == 8 or btn.objectName() == "btn_settings":  # v7.2.7: settings at 8
                 # Settings — always enabled
                 btn.setEnabled(True)
                 btn.setToolTip("Settings")
@@ -990,7 +1050,9 @@ class MainWindow(QMainWindow):
             "btn_calibrate": 3,
             "btn_print":     4,
             "btn_monitor":   5,
-            "btn_settings":  6,
+            "btn_results":   6,   # v7.2.6
+            "btn_helpers":   7,   # v7.2.7
+            "btn_settings":  8,   # v7.2.7
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
@@ -1011,12 +1073,14 @@ class MainWindow(QMainWindow):
         else:
             titles = ["Hardware Setup", "Dashboard", "Jog Control",
                       "Calibration", "Print Setup", "Print Monitor",
+                      "Print Results", "Helper Functions",
                       "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
         context_titles = ["Hardware", "Dashboard", "Jog Settings",
                           "Calibration", "Print Settings", "Recordings",
+                          "Results", "Helpers",
                           "Settings"]
         self._context_title.setText(
             context_titles[index] if index < len(context_titles) else "Settings"

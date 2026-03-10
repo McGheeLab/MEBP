@@ -1,0 +1,30 @@
+{
+  "schema_version": "7.2.3",
+  "metadata": {
+    "name": "AzA",
+    "description": "",
+    "created": "2026-03-10T05:14:45.461260+00:00",
+    "modified": "2026-03-10T05:14:45.461260+00:00",
+    "author": ""
+  },
+  "objects": {
+    "CSV_image_toolpath": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "/Users/alexmcghee/Documents/GitHub/MEBP/PrintImages/AzA/image_toolpath.csv"
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink_pump": "P1",
+      "num_layers": 1,
+      "layer_height": 0.2,
+      "auto_layout": false
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}
