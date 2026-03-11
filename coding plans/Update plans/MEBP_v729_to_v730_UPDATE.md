@@ -10,12 +10,13 @@
 
 This update package redesigns the **Print Plan of Action** system to be the single source of truth for all print execution behavior, adds a **Finalize tab** to the print setup workflow, and addresses a **critical needle safety issue** during well-to-well travel. Previously, execution parameters were scattered across HardwareConfig (ink swap strategy), the context panel (print settings), and the Well Setup tab (plan generation). v7.2.9 consolidates everything into a comprehensive `PrintExecutionConfig` with full UI controls in a new Finalize tab, covering ink swap sequences, ink gathering, Z travel behavior, XY travel, plunge-in buffering, and final cleanup.
 
-### Four Major Areas
+### Five Major Areas
 
 1. **Print Plan of Action redesign** — New `PrintExecutionConfig` replaces `PlanPreferences`, 5 new step types, 6 new dataclasses
 2. **Print Setup UI overhaul** — New 4th tab (Finalize) with two-column layout; context panel simplified to display options only; Plan of Action section removed from Well Setup tab
 3. **Trajectory planner updates** — Handlers for all new step types, simplified service logic
 4. **Needle safety fix** — XY arrival confirmation before Z descent prevents needle breakage during well-to-well travel
+5. **Vision-based autocalibration** — Well detection, needle detection, focus assist, simulated camera, detection overlay. Full details in `MEBP_v730_AUTOCALIBRATION_UPDATE.md`
 
 ---
 

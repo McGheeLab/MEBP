@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -58,8 +59,16 @@ except ImportError:
     ToupCamBackend = None
     logger.info("ToupCam backend not available")
 
+# v7.3.0: Try to import SimulatedCamera backend
+try:
+    from SupportClasses.SimulatedCamera import SimulatedCamera
+    SIM_AVAILABLE = True
+except ImportError:
+    SIM_AVAILABLE = False
+    SimulatedCamera = None
+
 # v7.3-camera: Unified availability flag
-CAMERA_AVAILABLE = CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE)
+CAMERA_AVAILABLE = CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE) or SIM_AVAILABLE
 
 
 
@@ -193,6 +202,10 @@ class CameraWidget(QWidget):
         self._toupcam = None
         self._backend_type = "opencv"  # "opencv" or "toupcam"
 
+        # v7.3.0: Thread-safe frame buffer for detection workers
+        self._current_frame = None        # Latest BGR numpy array (or None)
+        self._frame_lock = threading.Lock()
+
         self._setup_ui(show_controls)
 
     # ── UI Construction ──────────────────────────────────────────
@@ -263,6 +276,15 @@ class CameraWidget(QWidget):
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.video_label, stretch=1)
 
+        # v7.3.0: Detection overlay (transparent, sits on top of video_label)
+        try:
+            from gui.widgets.detection_overlay import DetectionOverlay
+            self._detection_overlay = DetectionOverlay(parent=self.video_label)
+            self._detection_overlay.setGeometry(self.video_label.rect())
+            self._detection_overlay.show()
+        except ImportError:
+            self._detection_overlay = None
+
     def _populate_cameras(self):
         """Show placeholder in camera combo -- no hardware probe.
 
@@ -297,6 +319,11 @@ class CameraWidget(QWidget):
             dev_id = tc_dev.get('id', '')
             self.camera_combo.addItem(f"TC: {name}", ("toupcam", dev_id))
 
+        # v7.3.0: Simulated camera
+        if SIM_AVAILABLE:
+            self.camera_combo.addItem(
+                "SIM: Microscope", ("simulated", "microscope"))
+
         if self.camera_combo.count() == 0:
             self.camera_combo.addItem("No cameras found", -1)
         self._cameras_detected = True
@@ -324,6 +351,9 @@ class CameraWidget(QWidget):
             backend_type, identifier = cam_data
             if backend_type == "toupcam":
                 self._start_toupcam(identifier)
+                return
+            elif backend_type == "simulated":
+                self._start_simulated(identifier)
                 return
             else:
                 self.start_with_index(identifier)
@@ -358,6 +388,12 @@ class CameraWidget(QWidget):
         if self._capture:
             self._capture.release()
             self._capture = None
+        # v7.3.0: Clear simulated camera reference
+        if hasattr(self, '_simulated_camera'):
+            self._simulated_camera = None
+        # v7.3.0: Clear frame buffer
+        with self._frame_lock:
+            self._current_frame = None
         self.video_label.setText(f"{self._camera_label} — stopped")
         if hasattr(self, 'btn_start'):
             self.btn_start.setText("▶")
@@ -382,6 +418,24 @@ class CameraWidget(QWidget):
             self.btn_start.setText("\u23f9")
         logger.info(f"{self._camera_label}: ToupCam started ({w}x{h}) at {self._fps} FPS")
 
+    def _start_simulated(self, mode: str = "microscope"):
+        """v7.3.0: Start the simulated microscope camera."""
+        if not SIM_AVAILABLE or SimulatedCamera is None or self._running:
+            return
+
+        self._simulated_camera = SimulatedCamera()
+        self._capture = self._simulated_camera  # read() compatible API
+        self._backend_type = "simulated"
+        self._running = True
+        self._timer.start(int(1000 / self._fps))
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setText("\u23f9")
+        logger.info(f"{self._camera_label}: Simulated camera started at {self._fps} FPS")
+
+    @property
+    def simulated_camera(self) -> SimulatedCamera | None:
+        """Access the SimulatedCamera instance (if backend is simulated)."""
+        return getattr(self, '_simulated_camera', None)
 
     def toggle(self):
         """Toggle camera on/off."""
@@ -444,6 +498,10 @@ class CameraWidget(QWidget):
         except ImportError:
             return
 
+        # v7.3.0: Store raw BGR frame for detection workers (thread-safe)
+        with self._frame_lock:
+            self._current_frame = frame.copy()
+
         # Convert BGR -> RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -501,6 +559,23 @@ class CameraWidget(QWidget):
     def _on_crosshair_toggle(self, checked: bool):
         self._show_crosshair = checked
 
+    # ── Frame Access (v7.3.0 — for detection workers) ────────────
+
+    def get_current_frame(self):
+        """
+        Get a copy of the latest captured frame as a BGR numpy array.
+
+        Thread-safe — can be called from any thread (e.g. DetectionWorker).
+        Returns None if no frame has been captured yet or camera is stopped.
+
+        Returns:
+            np.ndarray (BGR, uint8) or None
+        """
+        with self._frame_lock:
+            if self._current_frame is not None:
+                return self._current_frame.copy()
+            return None
+
     # ── Snapshot ──────────────────────────────────────────────────
 
     def take_snapshot(self):
@@ -523,7 +598,23 @@ class CameraWidget(QWidget):
             cv2.imwrite(filepath, frame)
             logger.info(f"Snapshot saved to {filepath}")
 
+    # ── Detection Overlay Access (v7.3.0) ─────────────────────────
+
+    @property
+    def detection_overlay(self):
+        """Access the detection overlay widget (or None if unavailable)."""
+        return getattr(self, '_detection_overlay', None)
+
     # ── Cleanup ───────────────────────────────────────────────────
+
+    def resizeEvent(self, event):
+        """Keep detection overlay sized to match video_label."""
+        super().resizeEvent(event)
+        overlay = getattr(self, '_detection_overlay', None)
+        if overlay is not None and hasattr(self, 'video_label'):
+            # rect() not geometry() — overlay is a child of video_label,
+            # so coordinates must be relative to video_label, not parent.
+            overlay.setGeometry(self.video_label.rect())
 
     def closeEvent(self, event):
         self.stop()

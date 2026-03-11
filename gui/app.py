@@ -1356,5 +1356,11 @@ class MainWindow(QMainWindow):
         self.save_settings()
         if self.recorder and self.recorder.is_recording:
             self.recorder.stop_recording()
+
+        # Shut down any background threads owned by pages
+        for page in self._page_widgets:
+            if hasattr(page, '_shutdown_detection_worker'):
+                page._shutdown_detection_worker()
+
         self.controller.shutdown()
         event.accept()

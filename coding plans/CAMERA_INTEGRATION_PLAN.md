@@ -76,6 +76,13 @@ Changes:
 - Add auto-exposure toggle
 - Add white balance controls
 
+### Session 3: Autocalibration (v7.3.0)
+- See: `coding plans/Update plans/MEBP_v730_AUTOCALIBRATION_UPDATE.md`
+- Well center auto-detection via HoughCircles
+- Needle auto-detection & focus assist
+- Parallel detection processing via QThread
+- Camera config with micron/pixel calibration
+
 ---
 
 ## Key Design Decisions

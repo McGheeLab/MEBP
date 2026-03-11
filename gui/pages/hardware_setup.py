@@ -53,10 +53,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QStandardItem
 
-from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
+from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig, CameraConfig
 from SupportClasses.PhysicalModels import (
-    NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert,
-    load_needle_catalog, load_syringe_catalog,
+    NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert, CameraSpec,
+    load_needle_catalog, load_syringe_catalog, load_camera_catalog,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 
 # v7.2.4: Default directory for hardware config files
 CONFIG_HARDWARE_DIR = Path(__file__).resolve().parent.parent.parent / "config" / "hardware"
+
+# v7.3.0: Nikon Ti2-U objective magnifications available on the microscope
+NIKON_TI2U_OBJECTIVES = [2.0, 4.0, 10.0, 20.0]
 
 
 
@@ -477,6 +480,7 @@ class HardwareSetupPage(QWidget):
         # Load catalogs
         self._needle_catalog = load_needle_catalog()
         self._syringe_catalog = load_syringe_catalog()
+        self._camera_catalog = load_camera_catalog()
 
         # Current config
         self._config = HardwareConfig()
@@ -706,7 +710,66 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(ros_group)
 
-        # ── Section 8: Setup Status ──────────────────────────────
+        # ── Section 8: Camera Configuration (v7.3.0) ─────────────
+        cam_group = QGroupBox("Camera Configuration")
+        cam_group.setStyleSheet(self._group_style())
+        cam_lay = QGridLayout(cam_group)
+
+        # Row 0: Camera selection
+        cam_lay.addWidget(QLabel("Camera:"), 0, 0)
+        self.camera_combo = QComboBox()
+        self.camera_combo.addItem("None", None)
+        for name, spec in self._camera_catalog.items():
+            self.camera_combo.addItem(name, name)
+        self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
+        cam_lay.addWidget(self.camera_combo, 0, 1, 1, 2)
+
+        # Row 1: Resolution
+        cam_lay.addWidget(QLabel("Resolution:"), 1, 0)
+        self.cam_resolution_combo = QComboBox()
+        self.cam_resolution_combo.currentIndexChanged.connect(self._on_camera_changed)
+        cam_lay.addWidget(self.cam_resolution_combo, 1, 1, 1, 2)
+
+        # Row 2: Objective selection (Nikon Ti2-U)
+        cam_lay.addWidget(QLabel("Objective:"), 2, 0)
+        self.cam_objective_combo = QComboBox()
+        # Nikon Ti2-U standard objectives
+        for mag in NIKON_TI2U_OBJECTIVES:
+            self.cam_objective_combo.addItem(f"{mag}×", mag)
+        self.cam_objective_combo.currentIndexChanged.connect(self._on_camera_changed)
+        cam_lay.addWidget(self.cam_objective_combo, 2, 1, 1, 2)
+
+        # Row 3: Computed pixel scale (read-only)
+        cam_lay.addWidget(QLabel("Pixel Scale:"), 3, 0)
+        self.cam_scale_label = QLabel("—")
+        self.cam_scale_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')};")
+        cam_lay.addWidget(self.cam_scale_label, 3, 1, 1, 2)
+
+        # Row 4: Override checkbox + custom scale
+        self.cam_override_check = QCheckBox("Use custom scale")
+        self.cam_override_check.toggled.connect(self._on_camera_override_toggled)
+        cam_lay.addWidget(self.cam_override_check, 4, 0, 1, 2)
+
+        self.cam_override_spin = QDoubleSpinBox()
+        self.cam_override_spin.setRange(0.01, 1000.0)
+        self.cam_override_spin.setDecimals(2)
+        self.cam_override_spin.setSuffix(" µm/px")
+        self.cam_override_spin.setValue(1.67)
+        self.cam_override_spin.setEnabled(False)
+        self.cam_override_spin.valueChanged.connect(self._on_config_changed)
+        cam_lay.addWidget(self.cam_override_spin, 4, 2)
+
+        # Row 5: FOV info (read-only)
+        cam_lay.addWidget(QLabel("Camera FOV:"), 5, 0)
+        self.cam_fov_label = QLabel("—")
+        self.cam_fov_label.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')};")
+        cam_lay.addWidget(self.cam_fov_label, 5, 1, 1, 2)
+
+        self._content_layout.addWidget(cam_group)
+
+        # ── Section 9: Setup Status ───────────────────────────────
         status_group = QGroupBox("Setup Status")
         status_group.setStyleSheet(self._group_style())
         status_lay = QVBoxLayout(status_group)
@@ -811,6 +874,71 @@ class HardwareSetupPage(QWidget):
             self.pump_ink_summary.setText("Assignment: " + ", ".join(parts))
         else:
             self.pump_ink_summary.setText("No pumps enabled")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.3.0: CAMERA CONFIGURATION
+    # ════════════════════════════════════════════════════════════════
+
+    def _on_camera_changed(self):
+        """Called when camera selection, resolution, or magnification changes."""
+        cam_name = self.camera_combo.currentData()
+        spec = self._camera_catalog.get(cam_name) if cam_name else None
+
+        # Rebuild resolution combo when camera changes
+        sender = self.sender()
+        if sender is self.camera_combo:
+            self.cam_resolution_combo.blockSignals(True)
+            self.cam_resolution_combo.clear()
+            if spec:
+                for res in spec.preview_resolutions:
+                    self.cam_resolution_combo.addItem(
+                        f"{res[0]} × {res[1]}", list(res))
+                # Default to lowest resolution for live preview
+                if spec.preview_resolutions:
+                    self.cam_resolution_combo.setCurrentIndex(
+                        len(spec.preview_resolutions) - 1)
+            self.cam_resolution_combo.blockSignals(False)
+
+        self._update_camera_info_labels()
+        self._on_config_changed()
+
+    def _on_camera_override_toggled(self, checked: bool):
+        """Toggle between computed and custom micron/pixel scale."""
+        self.cam_override_spin.setEnabled(checked)
+        self._update_camera_info_labels()
+        self._on_config_changed()
+
+    def _update_camera_info_labels(self):
+        """Update computed pixel scale and FOV labels."""
+        cam_name = self.camera_combo.currentData()
+        spec = self._camera_catalog.get(cam_name) if cam_name else None
+        mag = self.cam_objective_combo.currentData() or 2.0
+
+        res_data = self.cam_resolution_combo.currentData()
+        active_res = tuple(res_data) if res_data else (916, 686)
+
+        if spec is not None:
+            effective = spec.effective_pixel_size_um(active_res)
+            computed = effective / mag
+            self.cam_scale_label.setText(
+                f"{computed:.2f} µm/px  (sensor: {spec.sensor_pixel_size_um} µm, "
+                f"bin: {spec.max_resolution[0] // max(active_res[0], 1)}×, "
+                f"mag: {mag}×)")
+
+            # Determine active scale
+            if self.cam_override_check.isChecked():
+                scale = self.cam_override_spin.value()
+            else:
+                scale = computed
+
+            fov_w = active_res[0] * scale
+            fov_h = active_res[1] * scale
+            self.cam_fov_label.setText(
+                f"{fov_w:.0f} × {fov_h:.0f} µm  "
+                f"({fov_w / 1000:.2f} × {fov_h / 1000:.2f} mm)")
+        else:
+            self.cam_scale_label.setText("—")
+            self.cam_fov_label.setText("—")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.2.4: NEEDLE CHANNEL MAP (S3.7-S3.10)
@@ -1013,6 +1141,21 @@ class HardwareSetupPage(QWidget):
 
         # v7.2.9: Ink swap strategy UI moved to Print Setup → Plan of Action
         # Keep existing ink_swap_strategy in config unchanged
+
+        # v7.3.0: Camera config
+        cam_name = self.camera_combo.currentData()
+        cam_spec = self._camera_catalog.get(cam_name) if cam_name else None
+        res_data = self.cam_resolution_combo.currentData()
+        active_res = tuple(res_data) if res_data else (916, 686)
+        override = (self.cam_override_spin.value()
+                     if self.cam_override_check.isChecked() else None)
+        self._config.camera_config = CameraConfig(
+            camera_spec=cam_spec,
+            objective_magnification=self.cam_objective_combo.currentData() or 2.0,
+            active_resolution=active_res,
+            micron_per_pixel_override=override,
+            camera_to_needle_offset_um=self._config.camera_config.camera_to_needle_offset_um,
+        )
 
     # ════════════════════════════════════════════════════════════════
     #  INK LIBRARY CRUD
@@ -1298,6 +1441,52 @@ class HardwareSetupPage(QWidget):
             f"  Channel map: {self._config.needle_channel_pump_map}")
 
         # v7.2.9: Ink swap strategy UI moved to Print Setup → Plan of Action
+
+        # ── 8. Camera Configuration (v7.3.0) ──────────────────────
+        cam_cfg = self._config.camera_config
+        self.camera_combo.blockSignals(True)
+        if cam_cfg.camera_spec:
+            cidx = self.camera_combo.findData(cam_cfg.camera_spec.name)
+            if cidx >= 0:
+                self.camera_combo.setCurrentIndex(cidx)
+            # Populate resolution combo for this camera
+            self.cam_resolution_combo.blockSignals(True)
+            self.cam_resolution_combo.clear()
+            for res in cam_cfg.camera_spec.preview_resolutions:
+                self.cam_resolution_combo.addItem(
+                    f"{res[0]} × {res[1]}", list(res))
+            # Select matching resolution
+            for ri in range(self.cam_resolution_combo.count()):
+                rd = self.cam_resolution_combo.itemData(ri)
+                if rd and tuple(rd) == cam_cfg.active_resolution:
+                    self.cam_resolution_combo.setCurrentIndex(ri)
+                    break
+            self.cam_resolution_combo.blockSignals(False)
+        else:
+            self.camera_combo.setCurrentIndex(0)  # "None"
+        self.camera_combo.blockSignals(False)
+
+        self.cam_objective_combo.blockSignals(True)
+        oidx = self.cam_objective_combo.findData(cam_cfg.objective_magnification)
+        if oidx >= 0:
+            self.cam_objective_combo.setCurrentIndex(oidx)
+        self.cam_objective_combo.blockSignals(False)
+
+        self.cam_override_check.blockSignals(True)
+        has_override = cam_cfg.micron_per_pixel_override is not None
+        self.cam_override_check.setChecked(has_override)
+        self.cam_override_spin.setEnabled(has_override)
+        if has_override:
+            self.cam_override_spin.blockSignals(True)
+            self.cam_override_spin.setValue(cam_cfg.micron_per_pixel_override)
+            self.cam_override_spin.blockSignals(False)
+        self.cam_override_check.blockSignals(False)
+
+        self._update_camera_info_labels()
+        logger.debug(
+            f"  Camera: {cam_cfg.camera_spec.name if cam_cfg.camera_spec else 'None'}, "
+            f"mag={cam_cfg.objective_magnification}×, "
+            f"scale={cam_cfg.micron_per_pixel}")
 
         # ── 9. Emit signals ──────────────────────────────────────
         self._restoring = False

@@ -1,5 +1,5 @@
 """
-PhysicalModels.py — Physical hardware models and data layer for MEBP v7.1.
+PhysicalModels.py — Physical hardware models and data layer for MEBP v7.3.
 
 Dataclasses representing:
 - NeedleSpec: Needle gauge specifications (loaded from JSON)
@@ -9,6 +9,7 @@ Dataclasses representing:
 - PumpLoadout: Complete pump channel configuration
 - PrintingMode: Incremental vs continuous dispensing
 - RosetteSubWell / RosetteInsert: Well insert geometry
+- CameraSpec: Microscope camera sensor specifications (v7.3.0)
 - WorkspaceConfig: Complete session configuration
 
 All needle/syringe catalogs are loaded from user-editable JSON files
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 # Default config paths (relative to application root)
 DEFAULT_NEEDLES_JSON = "config/hardware/needles.json"
 DEFAULT_SYRINGES_JSON = "config/hardware/syringes.json"
+DEFAULT_CAMERAS_JSON = "config/hardware/cameras.json"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +260,87 @@ def load_syringe_catalog(path: str | Path = DEFAULT_SYRINGES_JSON) -> dict[int, 
         return catalog
     except (json.JSONDecodeError, KeyError) as e:
         logger.error(f"Error loading syringe catalog from {path}: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Camera Specification (v7.3.0)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CameraSpec:
+    """
+    Microscope camera sensor specification — loaded from cameras.json.
+
+    Stores physical sensor properties needed for pixel-to-micron conversion
+    in autocalibration. The effective pixel size depends on the active
+    resolution (binning/downscaling from max resolution).
+    """
+    name: str                                       # e.g. "BUC3D-1000C"
+    sensor_pixel_size_um: float                     # Physical pixel pitch on sensor (µm)
+    max_resolution: tuple[int, int] = (3664, 2748)  # (width, height) at full res
+    preview_resolutions: list[tuple[int, int]] = field(default_factory=list)
+    interface: str = "USB 3.0"
+    notes: str = ""
+
+    def effective_pixel_size_um(self, active_resolution: tuple[int, int]) -> float:
+        """
+        Compute effective pixel size at a given active resolution.
+
+        When the camera is binning or downscaling from max resolution,
+        each output pixel covers more physical area.
+        """
+        if active_resolution[0] <= 0:
+            return self.sensor_pixel_size_um
+        bin_factor = self.max_resolution[0] / active_resolution[0]
+        return self.sensor_pixel_size_um * bin_factor
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "sensor_pixel_size_um": self.sensor_pixel_size_um,
+            "max_resolution": list(self.max_resolution),
+            "preview_resolutions": [list(r) for r in self.preview_resolutions],
+            "interface": self.interface,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CameraSpec:
+        return cls(
+            name=data["name"],
+            sensor_pixel_size_um=data["sensor_pixel_size_um"],
+            max_resolution=tuple(data.get("max_resolution", [3664, 2748])),
+            preview_resolutions=[
+                tuple(r) for r in data.get("preview_resolutions", [])
+            ],
+            interface=data.get("interface", "USB 3.0"),
+            notes=data.get("notes", ""),
+        )
+
+
+def load_camera_catalog(path: str | Path = DEFAULT_CAMERAS_JSON) -> dict[str, CameraSpec]:
+    """
+    Load camera specs from JSON.
+
+    Returns: {camera_name: CameraSpec} e.g. {"BUC3D-1000C": CameraSpec(...)}
+    """
+    path = Path(path)
+    if not path.exists():
+        logger.warning(f"Camera catalog not found at {path}, returning empty catalog")
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        catalog = {}
+        for name, spec in data.get("cameras", {}).items():
+            spec_with_name = dict(spec)
+            spec_with_name.setdefault("name", name)
+            catalog[name] = CameraSpec.from_dict(spec_with_name)
+        logger.info(f"Loaded {len(catalog)} camera specs from {path}")
+        return catalog
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Error loading camera catalog from {path}: {e}")
         return {}
 
 

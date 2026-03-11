@@ -4,7 +4,7 @@
     "y": 25,
     "width": 1296,
     "height": 792,
-    "active_tab": 7,
+    "active_tab": 3,
     "splitter_sizes": [
       706,
       0
@@ -158,7 +158,7 @@
     "P3": null
   },
   "hardware_config": {
-    "version": "7.2.4",
+    "version": "7.3.0",
     "config_name": "Standard Bioprinting Setup",
     "notes": "22G needle, 100\u00b5L syringe on P1, 250\u00b5L on P2",
     "needle": {
@@ -286,6 +286,42 @@
       "wash_volume_uL": 100.0,
       "buffer_volume_uL": 100.0,
       "ink_load_volume_uL": 50.0
+    },
+    "camera_config": {
+      "camera_spec": {
+        "name": "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)",
+        "sensor_pixel_size_um": 1.67,
+        "max_resolution": [
+          3664,
+          2748
+        ],
+        "preview_resolutions": [
+          [
+            3664,
+            2748
+          ],
+          [
+            1832,
+            1374
+          ],
+          [
+            916,
+            686
+          ]
+        ],
+        "interface": "USB 3.0",
+        "notes": "10MP CMOS, 1/2.3 inch sensor, VID_0547 PID_1377"
+      },
+      "objective_magnification": 4.0,
+      "active_resolution": [
+        916,
+        686
+      ],
+      "micron_per_pixel_override": null,
+      "camera_to_needle_offset_um": [
+        0.0,
+        0.0
+      ]
     }
   },
   "ui": {

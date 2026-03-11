@@ -31,9 +31,10 @@ from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import steps_to_um, format_um, DEFAULT_MICROSTEPS_PER_MICRON
 
 try:
-    from SupportClasses.HardwareConfig import HardwareConfig
+    from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig
 except ImportError:
     HardwareConfig = None
+    CameraConfig = None
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,18 @@ except ImportError:
 
     def detect_cameras(max_index=8):
         return []
+
+# v7.3.0: Optional vision detection support
+try:
+    from gui.widgets.detection_worker import DetectionWorker, DetectionMode
+    from SupportClasses.VisionDetector import (
+        DetectionResult, FocusResult, pixel_offset_to_stage_um,
+    )
+    VISION_AVAILABLE = True
+except ImportError:
+    VISION_AVAILABLE = False
+    DetectionWorker = None
+    DetectionMode = None
 
 # Maximum simultaneous cameras
 MAX_CAMERAS = 3
@@ -299,6 +312,18 @@ class CalibrationPage(QWidget):
         self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
         self._hardware_config = None  # v7.2: HardwareConfig
 
+        # v7.3.0: Auto-detection state
+        self._detection_worker: DetectionWorker | None = None
+        self._last_well_result = None       # Latest DetectionResult from worker
+        self._autodetect_target: str = ""   # "a1", "corner", "third"
+
+        # v7.3.0 Phase 6: Needle detection + focus assist state
+        self._last_needle_result = None     # Latest needle DetectionResult
+        self._needle_detecting: bool = False
+        self._focus_assisting: bool = False
+        self._best_focus_z: float | None = None       # Best-focus Z (mm, zero-ref)
+        self._best_focus_score: float = 0.0            # Score at best Z
+
         # v7.2.7-hotfix: ensure all calibration attrs
 
         for _a in ['_safe_z','_top_z','_taught_a1_z','_taught_corner_z',
@@ -468,6 +493,52 @@ class CalibrationPage(QWidget):
         self.lbl_zero_status.setStyleSheet(f"color: {COLORS['yellow']};")
         layout.addWidget(self.lbl_zero_status)
 
+        # v7.3.0 Phase 6: Needle detection + focus assist
+        if VISION_AVAILABLE:
+            needle_label = QLabel("Needle Alignment")
+            needle_label.setObjectName("contextSectionLabel")
+            layout.addWidget(needle_label)
+
+            # Detect Needle button row
+            nd_row = QHBoxLayout()
+            self._btn_detect_needle = QPushButton("Detect Needle")
+            self._btn_detect_needle.setMaximumHeight(24)
+            self._btn_detect_needle.setCheckable(True)
+            self._btn_detect_needle.setToolTip(
+                "Detect needle tip in camera FOV using vision")
+            self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
+            nd_row.addWidget(self._btn_detect_needle)
+
+            self._btn_focus_assist = QPushButton("Focus Assist")
+            self._btn_focus_assist.setMaximumHeight(24)
+            self._btn_focus_assist.setCheckable(True)
+            self._btn_focus_assist.setToolTip(
+                "Real-time focus quality bar — adjust Z for sharpest image")
+            self._btn_focus_assist.setEnabled(False)
+            self._btn_focus_assist.toggled.connect(self._toggle_focus_assist)
+            nd_row.addWidget(self._btn_focus_assist)
+            layout.addLayout(nd_row)
+
+            # Needle detection status
+            self._lbl_needle_status = QLabel("")
+            self._lbl_needle_status.setWordWrap(True)
+            self._lbl_needle_status.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_needle_status)
+
+            # Focus quality display
+            self._lbl_focus_status = QLabel("")
+            self._lbl_focus_status.setWordWrap(True)
+            self._lbl_focus_status.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_focus_status)
+
+            # Best focus Z
+            self._lbl_best_focus = QLabel("")
+            self._lbl_best_focus.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_best_focus)
+
         # ── Step 2: Teach Plate Position ─────────────────────────
         # ── Step 2A — Safe Z ─────────────────────────────
         s2a_label = QLabel("Step 2A — Safe Z")
@@ -522,6 +593,41 @@ class CalibrationPage(QWidget):
         a1_row.addWidget(btn_go_a1)
         layout.addLayout(a1_row)
 
+        # v7.3.0: Auto-detect controls for A1
+        if VISION_AVAILABLE:
+            a1_detect_row = QHBoxLayout()
+            self._btn_detect_a1 = QPushButton("Auto-Detect Well")
+            self._btn_detect_a1.setMaximumHeight(24)
+            self._btn_detect_a1.setCheckable(True)
+            self._btn_detect_a1.setToolTip("Use camera to detect well center automatically")
+            self._btn_detect_a1.toggled.connect(
+                lambda on: self._toggle_well_detect("a1", on))
+            a1_detect_row.addWidget(self._btn_detect_a1)
+            self._btn_center_a1 = QPushButton("Center")
+            self._btn_center_a1.setMaximumHeight(24)
+            self._btn_center_a1.setMaximumWidth(50)
+            self._btn_center_a1.setToolTip("Move stage to center well in camera FOV")
+            self._btn_center_a1.setEnabled(False)
+            self._btn_center_a1.clicked.connect(
+                lambda: self._center_on_detection("a1"))
+            a1_detect_row.addWidget(self._btn_center_a1)
+            self._btn_accept_a1 = QPushButton("Accept")
+            self._btn_accept_a1.setMaximumHeight(24)
+            self._btn_accept_a1.setMaximumWidth(50)
+            self._btn_accept_a1.setToolTip("Accept detected position as A1")
+            self._btn_accept_a1.setEnabled(False)
+            self._btn_accept_a1.clicked.connect(
+                lambda: self._accept_detection("a1"))
+            a1_detect_row.addWidget(self._btn_accept_a1)
+            layout.addLayout(a1_detect_row)
+
+            # Detection status label for A1
+            self._lbl_detect_a1 = QLabel("")
+            self._lbl_detect_a1.setWordWrap(True)
+            self._lbl_detect_a1.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_detect_a1)
+
         # ── Step 2D — Teach Corner (auto-navigate) ──────
         s2d_label = QLabel("Step 2D — Teach Corner (Auto-Navigate)")
         s2d_label.setObjectName("contextSectionLabel")
@@ -543,6 +649,39 @@ class CalibrationPage(QWidget):
         btn_rec_corner.clicked.connect(self._record_corner_xyz)
         cr_row.addWidget(btn_rec_corner)
         layout.addLayout(cr_row)
+
+        # v7.3.0: Auto-detect controls for Corner
+        if VISION_AVAILABLE:
+            cr_detect_row = QHBoxLayout()
+            self._btn_detect_corner = QPushButton("Auto-Detect Well")
+            self._btn_detect_corner.setMaximumHeight(24)
+            self._btn_detect_corner.setCheckable(True)
+            self._btn_detect_corner.setToolTip(
+                "Use camera to detect corner well center")
+            self._btn_detect_corner.toggled.connect(
+                lambda on: self._toggle_well_detect("corner", on))
+            cr_detect_row.addWidget(self._btn_detect_corner)
+            self._btn_center_corner = QPushButton("Center")
+            self._btn_center_corner.setMaximumHeight(24)
+            self._btn_center_corner.setMaximumWidth(50)
+            self._btn_center_corner.setEnabled(False)
+            self._btn_center_corner.clicked.connect(
+                lambda: self._center_on_detection("corner"))
+            cr_detect_row.addWidget(self._btn_center_corner)
+            self._btn_accept_corner = QPushButton("Accept")
+            self._btn_accept_corner.setMaximumHeight(24)
+            self._btn_accept_corner.setMaximumWidth(50)
+            self._btn_accept_corner.setEnabled(False)
+            self._btn_accept_corner.clicked.connect(
+                lambda: self._accept_detection("corner"))
+            cr_detect_row.addWidget(self._btn_accept_corner)
+            layout.addLayout(cr_detect_row)
+
+            self._lbl_detect_corner = QLabel("")
+            self._lbl_detect_corner.setWordWrap(True)
+            self._lbl_detect_corner.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_detect_corner)
 
         # ── Step 2E — Teach Third Point ──────────────────
         s2e_label = QLabel("Step 2E — Third Point (Z Plane)")
@@ -873,8 +1012,39 @@ class CalibrationPage(QWidget):
             self._cal_yz_view.set_well_z_offsets(offsets)
 
 
+    def _configure_simulated_cameras(self):
+        """v7.3.0: Push world state to any simulated camera backends."""
+        for cam in self._cameras:
+            sim = cam.simulated_camera
+            if sim is None:
+                continue
+
+            # Wire controller for auto position pull
+            if sim._controller is None and self.controller is not None:
+                sim.set_controller(self.controller)
+
+            # Push plate geometry
+            if self._plate is not None:
+                origin = self._taught_a1 if self._taught_a1 else (50000.0, 50000.0)
+                sim.set_plate(self._plate, plate_origin_um=origin)
+
+            # Push camera config
+            cam_cfg = self._get_camera_config()
+            if cam_cfg is not None and cam_cfg.micron_per_pixel:
+                sim._um_per_px = cam_cfg.micron_per_pixel
+                sim._fov_w_um = sim._width * sim._um_per_px
+                sim._fov_h_um = sim._height * sim._um_per_px
+
+            # Push needle spec
+            hw = self._hardware_config
+            if hw is not None and getattr(hw, 'needle', None) is not None:
+                sim.set_needle(hw.needle.od_um, hw.needle.id_um)
+
     def on_status_update(self):
         """Called periodically by the main window."""
+        # v7.3.0: Keep simulated cameras synced
+        self._configure_simulated_cameras()
+
         ctrl = self.controller
 
         # Update position readout
@@ -1581,4 +1751,590 @@ class CalibrationPage(QWidget):
                 self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['green']};")
 
         logger.info("Calibration loaded from settings (v7.2.7)")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.3.0: WELL AUTO-DETECTION
+    # ════════════════════════════════════════════════════════════════
+
+    def _get_camera_config(self):
+        """Get CameraConfig from hardware config, or None."""
+        if self._hardware_config is None:
+            return None
+        return getattr(self._hardware_config, 'camera_config', None)
+
+    def _get_expected_diameter_px(self) -> float | None:
+        """Compute expected well diameter in pixels from plate geometry + camera config."""
+        if self._plate is None:
+            return None
+        cam_cfg = self._get_camera_config()
+        if cam_cfg is None or cam_cfg.micron_per_pixel is None:
+            return None
+        # well_diameter is in mm → convert to µm → convert to pixels
+        diameter_um = self._plate.well_diameter * 1000.0
+        return cam_cfg.um_to_pixel(diameter_um)
+
+    def _get_primary_camera(self):
+        """Get the first running camera widget, or first camera if none running."""
+        for cam in self._cameras:
+            if cam.is_running:
+                return cam
+        return self._cameras[0] if self._cameras else None
+
+    def _ensure_detection_worker(self) -> bool:
+        """Create or reconfigure the DetectionWorker. Returns True if ready."""
+        if not VISION_AVAILABLE or DetectionWorker is None:
+            return False
+
+        cam = self._get_primary_camera()
+        if cam is None:
+            return False
+
+        if self._detection_worker is None:
+            self._detection_worker = DetectionWorker(
+                camera_widget=cam, parent=self)
+            self._detection_worker.well_detected.connect(
+                self._on_well_detected)
+            self._detection_worker.needle_detected.connect(
+                self._on_needle_detected)
+            self._detection_worker.focus_updated.connect(
+                self._on_focus_updated)
+            self._detection_worker.detection_cleared.connect(
+                self._on_detection_cleared)
+        else:
+            self._detection_worker.set_camera_widget(cam)
+
+        return True
+
+    def _toggle_well_detect(self, target: str, enabled: bool) -> None:
+        """Toggle well auto-detection for a target ('a1', 'corner')."""
+        if not enabled:
+            self._stop_detection()
+            return
+
+        # Uncheck the other detect button
+        if target == "a1" and hasattr(self, '_btn_detect_corner'):
+            self._btn_detect_corner.setChecked(False)
+        elif target == "corner" and hasattr(self, '_btn_detect_a1'):
+            self._btn_detect_a1.setChecked(False)
+
+        # Check prerequisites
+        diameter_px = self._get_expected_diameter_px()
+        if diameter_px is None:
+            QMessageBox.warning(
+                self, "Cannot Auto-Detect",
+                "Configure plate format and camera settings first.\n"
+                "Camera config is set in Hardware Setup (Page 0).")
+            # Uncheck the button
+            btn = (self._btn_detect_a1 if target == "a1"
+                   else self._btn_detect_corner)
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+            return
+
+        cam = self._get_primary_camera()
+        if cam is None or not cam.is_running:
+            QMessageBox.warning(
+                self, "Cannot Auto-Detect",
+                "Start a camera feed first.")
+            btn = (self._btn_detect_a1 if target == "a1"
+                   else self._btn_detect_corner)
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+            return
+
+        if not self._ensure_detection_worker():
+            return
+
+        self._autodetect_target = target
+        self._last_well_result = None
+
+        # Configure and start worker
+        self._detection_worker.set_mode(
+            DetectionMode.WELL_DETECT,
+            expected_diameter_px=diameter_px,
+        )
+
+        # Set frame size on overlay
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            frame = cam.get_current_frame()
+            if frame is not None:
+                overlay.set_frame_size(frame.shape[1], frame.shape[0])
+            overlay.set_info_text(
+                f"Detecting well ({target.upper()})...")
+
+        if not self._detection_worker.isRunning():
+            self._detection_worker.start()
+
+        self._update_detect_buttons(target, detecting=True)
+        logger.info(f"Well auto-detect started for {target}, "
+                    f"expected diameter: {diameter_px:.0f}px")
+
+    def _shutdown_detection_worker(self) -> None:
+        """Fully stop and join the detection thread (for cleanup/close)."""
+        if self._detection_worker is not None:
+            self._detection_worker.stop_detection()
+            if self._detection_worker.isRunning():
+                self._detection_worker.wait(2000)  # 2s timeout
+            self._detection_worker = None
+
+    def closeEvent(self, event):
+        """Ensure DetectionWorker thread is stopped before destruction."""
+        self._shutdown_detection_worker()
+        super().closeEvent(event)
+
+    def _stop_detection(self) -> None:
+        """Stop the detection worker and clear overlays."""
+        if self._detection_worker is not None:
+            self._detection_worker.set_mode(DetectionMode.IDLE)
+
+        self._autodetect_target = ""
+        self._last_well_result = None
+        self._last_needle_result = None
+        self._needle_detecting = False
+        self._focus_assisting = False
+
+        # Clear overlays on all cameras
+        for cam in self._cameras:
+            overlay = cam.detection_overlay
+            if overlay is not None:
+                overlay.clear()
+
+        # Reset well detect button states
+        for attr in ('_btn_detect_a1', '_btn_detect_corner'):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
+        # Reset needle/focus button states
+        for attr in ('_btn_detect_needle', '_btn_focus_assist'):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
+        # Disable focus assist button when needle detection stops
+        btn_fa = getattr(self, '_btn_focus_assist', None)
+        if btn_fa is not None:
+            btn_fa.setEnabled(False)
+
+        self._update_detect_buttons("", detecting=False)
+
+    def _update_detect_buttons(self, target: str, detecting: bool) -> None:
+        """Enable/disable Center and Accept buttons based on detection state."""
+        for tgt, btn_center, btn_accept in [
+            ("a1",
+             getattr(self, '_btn_center_a1', None),
+             getattr(self, '_btn_accept_a1', None)),
+            ("corner",
+             getattr(self, '_btn_center_corner', None),
+             getattr(self, '_btn_accept_corner', None)),
+        ]:
+            if btn_center is not None:
+                btn_center.setEnabled(detecting and tgt == target)
+            if btn_accept is not None:
+                btn_accept.setEnabled(detecting and tgt == target)
+
+    def _on_well_detected(self, result) -> None:
+        """Slot: DetectionWorker found a well. Update overlay and status."""
+        self._last_well_result = result
+        target = self._autodetect_target
+
+        cam = self._get_primary_camera()
+        if cam is None:
+            return
+
+        # Update overlay
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            overlay.set_well_detection(result)
+
+            # Compute and display offset from frame center
+            cam_cfg = self._get_camera_config()
+            frame = cam.get_current_frame()
+            if frame is not None and cam_cfg is not None and cam_cfg.micron_per_pixel:
+                dx_um, dy_um = pixel_offset_to_stage_um(
+                    result.center_px,
+                    (frame.shape[1], frame.shape[0]),
+                    cam_cfg.micron_per_pixel,
+                )
+                overlay.set_offset_text(
+                    f"\u0394x: {dx_um:+.0f} \u00b5m, "
+                    f"\u0394y: {dy_um:+.0f} \u00b5m")
+
+        # Update status label
+        lbl = getattr(self, f'_lbl_detect_{target}', None)
+        if lbl is not None:
+            conf_pct = result.confidence * 100
+            lbl.setText(
+                f"Well detected ({result.method}) — "
+                f"confidence: {conf_pct:.0f}%  "
+                f"r: {result.radius_px:.0f}px")
+            color = COLORS['green'] if result.confidence >= 0.6 else COLORS['yellow']
+            lbl.setStyleSheet(f"color: {color}; font-size: 9pt;")
+
+        # Enable Center/Accept if confidence is reasonable
+        has_result = result.confidence >= 0.3
+        btn_center = getattr(self, f'_btn_center_{target}', None)
+        btn_accept = getattr(self, f'_btn_accept_{target}', None)
+        if btn_center is not None:
+            btn_center.setEnabled(has_result)
+        if btn_accept is not None:
+            btn_accept.setEnabled(has_result)
+
+    def _on_detection_cleared(self) -> None:
+        """Slot: DetectionWorker found nothing this cycle."""
+        target = self._autodetect_target
+
+        cam = self._get_primary_camera()
+        overlay = cam.detection_overlay if cam is not None else None
+
+        # Handle well detection clearing
+        if target in ("a1", "corner"):
+            self._last_well_result = None
+            if overlay is not None:
+                overlay.set_well_detection(None)
+                overlay.set_offset_text("")
+
+            lbl = getattr(self, f'_lbl_detect_{target}', None)
+            if lbl is not None:
+                lbl.setText("Searching for well...")
+                lbl.setStyleSheet(
+                    f"color: {COLORS['overlay0']}; font-size: 9pt;")
+
+            # Disable Center/Accept when no detection
+            btn_center = getattr(self, f'_btn_center_{target}', None)
+            btn_accept = getattr(self, f'_btn_accept_{target}', None)
+            if btn_center is not None:
+                btn_center.setEnabled(False)
+            if btn_accept is not None:
+                btn_accept.setEnabled(False)
+
+        # Handle needle detection clearing
+        if self._needle_detecting:
+            self._last_needle_result = None
+            if overlay is not None:
+                overlay.set_needle_detection(None)
+
+            lbl = getattr(self, '_lbl_needle_status', None)
+            if lbl is not None:
+                lbl.setText("Searching for needle tip...")
+                lbl.setStyleSheet(
+                    f"color: {COLORS['overlay0']}; font-size: 9pt;")
+
+    def _center_on_detection(self, target: str) -> None:
+        """Move stage so the detected well center aligns with camera center."""
+        result = self._last_well_result
+        if result is None:
+            return
+
+        cam = self._get_primary_camera()
+        cam_cfg = self._get_camera_config()
+        if cam is None or cam_cfg is None or cam_cfg.micron_per_pixel is None:
+            return
+
+        frame = cam.get_current_frame()
+        if frame is None:
+            return
+
+        dx_um, dy_um = pixel_offset_to_stage_um(
+            result.center_px,
+            (frame.shape[1], frame.shape[0]),
+            cam_cfg.micron_per_pixel,
+        )
+
+        offset_mag = math.sqrt(dx_um ** 2 + dy_um ** 2)
+        logger.info(f"Centering on well: dx={dx_um:.1f}µm, dy={dy_um:.1f}µm "
+                    f"(magnitude: {offset_mag:.1f}µm)")
+
+        if offset_mag < 5.0:
+            lbl = getattr(self, f'_lbl_detect_{target}', None)
+            if lbl is not None:
+                lbl.setText(f"Already centered (offset: {offset_mag:.1f} \u00b5m)")
+            return
+
+        # Get current position and move relative
+        xy = self.controller.get_xy_position(cached=False)
+        if xy[0] is None:
+            return
+
+        # Move by the detected offset (µm → absolute position)
+        # Note: sign convention may need calibration per microscope mounting
+        new_x = xy[0] + dx_um
+        new_y = xy[1] + dy_um
+        self.controller.move_xy_absolute(new_x, new_y, from_zero_ref=False)
+
+        lbl = getattr(self, f'_lbl_detect_{target}', None)
+        if lbl is not None:
+            lbl.setText(f"Moved {offset_mag:.0f} \u00b5m to center well")
+
+    def _accept_detection(self, target: str) -> None:
+        """Accept the current detection as the taught position."""
+        # Stop detection
+        self._stop_detection()
+
+        # Record position using the existing record methods
+        if target == "a1":
+            self._record_a1_xyz()
+            logger.info("Auto-detection accepted for A1")
+        elif target == "corner":
+            self._record_corner_xyz()
+            logger.info("Auto-detection accepted for corner")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.3.0 Phase 6: NEEDLE AUTO-DETECTION & FOCUS ASSIST
+    # ════════════════════════════════════════════════════════════════
+
+    def _get_expected_od_px(self) -> float | None:
+        """Compute expected needle OD in pixels from HardwareConfig + CameraConfig."""
+        if self._hardware_config is None:
+            return None
+        needle = getattr(self._hardware_config, 'needle', None)
+        if needle is None:
+            return None
+        cam_cfg = self._get_camera_config()
+        if cam_cfg is None or cam_cfg.micron_per_pixel is None:
+            return None
+        return cam_cfg.um_to_pixel(needle.od_um)
+
+    def _toggle_needle_detect(self, enabled: bool) -> None:
+        """Toggle needle tip auto-detection."""
+        if not enabled:
+            self._stop_detection()
+            return
+
+        # Stop any active well detection
+        for attr in ('_btn_detect_a1', '_btn_detect_corner'):
+            btn = getattr(self, attr, None)
+            if btn is not None and btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
+        # Check prerequisites: needle spec + camera config
+        od_px = self._get_expected_od_px()
+        if od_px is None:
+            QMessageBox.warning(
+                self, "Cannot Detect Needle",
+                "Configure needle gauge and camera settings first.\n"
+                "Needle is set in Hardware Setup (Page 0).")
+            btn = getattr(self, '_btn_detect_needle', None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            return
+
+        cam = self._get_primary_camera()
+        if cam is None or not cam.is_running:
+            QMessageBox.warning(
+                self, "Cannot Detect Needle",
+                "Start a camera feed first.")
+            btn = getattr(self, '_btn_detect_needle', None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            return
+
+        if not self._ensure_detection_worker():
+            return
+
+        self._needle_detecting = True
+        self._last_needle_result = None
+
+        # Configure and start worker in NEEDLE_DETECT mode
+        self._detection_worker.set_mode(
+            DetectionMode.NEEDLE_DETECT,
+            expected_od_px=od_px,
+        )
+
+        # Set frame size on overlay
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            frame = cam.get_current_frame()
+            if frame is not None:
+                overlay.set_frame_size(frame.shape[1], frame.shape[0])
+            overlay.set_info_text("Detecting needle...")
+
+        if not self._detection_worker.isRunning():
+            self._detection_worker.start()
+
+        # Enable focus assist button
+        btn_fa = getattr(self, '_btn_focus_assist', None)
+        if btn_fa is not None:
+            btn_fa.setEnabled(True)
+
+        lbl = getattr(self, '_lbl_needle_status', None)
+        if lbl is not None:
+            lbl.setText("Searching for needle tip...")
+            lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
+
+        logger.info(f"Needle detection started, expected OD: {od_px:.0f}px")
+
+    def _toggle_focus_assist(self, enabled: bool) -> None:
+        """Toggle focus assist mode (real-time focus quality bar)."""
+        if not enabled:
+            # If needle detection is still active, switch back to it
+            if self._needle_detecting:
+                od_px = self._get_expected_od_px()
+                if od_px is not None and self._detection_worker is not None:
+                    self._detection_worker.set_mode(
+                        DetectionMode.NEEDLE_DETECT,
+                        expected_od_px=od_px,
+                    )
+            else:
+                self._stop_detection()
+            self._focus_assisting = False
+            lbl = getattr(self, '_lbl_focus_status', None)
+            if lbl is not None:
+                lbl.setText("")
+            # Clear focus overlay
+            cam = self._get_primary_camera()
+            if cam is not None:
+                overlay = cam.detection_overlay
+                if overlay is not None:
+                    overlay.set_focus_result(None)
+            return
+
+        if not self._ensure_detection_worker():
+            return
+
+        self._focus_assisting = True
+        self._best_focus_z = None
+        self._best_focus_score = 0.0
+
+        cam = self._get_primary_camera()
+        if cam is not None:
+            overlay = cam.detection_overlay
+            if overlay is not None:
+                frame = cam.get_current_frame()
+                if frame is not None:
+                    overlay.set_frame_size(frame.shape[1], frame.shape[0])
+                overlay.set_info_text("Focus Assist — adjust Z")
+
+        self._detection_worker.set_mode(DetectionMode.FOCUS_ASSIST)
+
+        if not self._detection_worker.isRunning():
+            self._detection_worker.start()
+
+        lbl = getattr(self, '_lbl_focus_status', None)
+        if lbl is not None:
+            lbl.setText("Adjust Z axis — watching focus quality...")
+            lbl.setStyleSheet(f"color: {COLORS['blue']}; font-size: 9pt;")
+
+        logger.info("Focus assist started")
+
+    def _on_needle_detected(self, result) -> None:
+        """Slot: DetectionWorker found a needle tip."""
+        if not self._needle_detecting:
+            return
+
+        self._last_needle_result = result
+
+        cam = self._get_primary_camera()
+        if cam is None:
+            return
+
+        # Update overlay
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            overlay.set_needle_detection(result)
+
+        # Update status label
+        lbl = getattr(self, '_lbl_needle_status', None)
+        if lbl is not None:
+            conf_pct = result.confidence * 100
+            od_px = result.diameter_px
+
+            # Show expected vs detected OD
+            expected_od_px = self._get_expected_od_px()
+            if expected_od_px is not None:
+                cam_cfg = self._get_camera_config()
+                if cam_cfg is not None and cam_cfg.micron_per_pixel:
+                    detected_od_um = cam_cfg.pixel_to_um(od_px)
+                    expected_od_um = cam_cfg.pixel_to_um(expected_od_px)
+                    lbl.setText(
+                        f"Needle detected — confidence: {conf_pct:.0f}%  "
+                        f"OD: {detected_od_um:.0f} \u00b5m "
+                        f"(expected: {expected_od_um:.0f} \u00b5m)")
+                else:
+                    lbl.setText(
+                        f"Needle detected — confidence: {conf_pct:.0f}%  "
+                        f"OD: {od_px:.0f}px")
+            else:
+                lbl.setText(
+                    f"Needle detected — confidence: {conf_pct:.0f}%  "
+                    f"OD: {od_px:.0f}px")
+
+            color = COLORS['green'] if result.confidence >= 0.6 else COLORS['yellow']
+            lbl.setStyleSheet(f"color: {color}; font-size: 9pt;")
+
+    def _on_focus_updated(self, result) -> None:
+        """Slot: DetectionWorker computed a new focus score."""
+        if not self._focus_assisting:
+            return
+
+        cam = self._get_primary_camera()
+        if cam is None:
+            return
+
+        # Update overlay focus bar
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            overlay.set_focus_result(result)
+
+        # Track best focus Z
+        zp = self.controller.get_zp_position(cached=True)
+        current_z = None
+        if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
+            current_z = zp[0] - self.controller.zero_position.get("Z", 0)
+
+        if result.normalized_score > self._best_focus_score:
+            self._best_focus_score = result.normalized_score
+            if current_z is not None:
+                self._best_focus_z = current_z
+
+        # Get focus trend from worker's tracker
+        trend = "unknown"
+        if (self._detection_worker is not None
+                and self._detection_worker.focus_tracker is not None):
+            trend = self._detection_worker.focus_tracker.get_trend()
+
+        # Update focus status label with directional hint
+        lbl = getattr(self, '_lbl_focus_status', None)
+        if lbl is not None:
+            score_pct = result.normalized_score * 100
+
+            if trend == "improving":
+                hint = "Getting sharper — keep going"
+                color = COLORS['green']
+            elif trend == "declining":
+                hint = "Getting blurrier — reverse Z direction"
+                color = COLORS['red']
+            elif trend == "stable" and result.is_in_focus:
+                hint = "In focus!"
+                color = COLORS['green']
+            elif trend == "stable":
+                hint = "Stable — try moving Z"
+                color = COLORS['yellow']
+            else:
+                hint = "Adjust Z axis..."
+                color = COLORS['blue']
+
+            lbl.setText(f"Focus: {score_pct:.0f}%  — {hint}")
+            lbl.setStyleSheet(f"color: {color}; font-size: 9pt;")
+
+        # Update best focus label
+        lbl_best = getattr(self, '_lbl_best_focus', None)
+        if lbl_best is not None and self._best_focus_z is not None:
+            lbl_best.setText(
+                f"Best focus at Z = {self._best_focus_z:.3f} mm "
+                f"({self._best_focus_score * 100:.0f}%)")
+            lbl_best.setStyleSheet(f"color: {COLORS['green']}; font-size: 9pt;")
 

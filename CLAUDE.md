@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.2.9** — Multi-Extrusion Bioprinting Platform
+**V7.3.0** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.2.9`
+Branch: `Version-7.3.0`
 
 ---
 
@@ -77,6 +77,7 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v730_AUTOCALIBRATION_UPDATE.md` | v7.3.0 autocalibration: well/needle detection, focus assist, simulated camera, detection overlay, parallel vision (7 phases complete) |
 | `MEBP_v729_to_v730_UPDATE.md` | Plan of Action redesign, PrintExecutionConfig, Finalize tab, new step types |
 | `MEBP_v728_to_v729_UPDATE.md` | Object consolidation, multi-ink, ink swap strategy, triangle fill |
 | `V726_PRINT_RESTORATION_PLAN.md` | Print execution restoration (7 critical fixes) |
@@ -93,7 +94,8 @@ Each update plan is a **living document** that must include:
 - **Trajectories**: Nx7 numpy arrays `[x, y, z, p1, p2, p3, t]`
 - **Serial**: pyserial RS-232, retry decorator with exponential backoff
 - **Threading**: `Processor` command bus for thread safety; Qt signals for GUI updates
-- **Testing**: unittest + physics-based simulators (`XYStageSimulator`, `ZPStageSimulator`)
+- **Testing**: unittest + physics-based simulators (`XYStageSimulator`, `ZPStageSimulator`, `SimulatedCamera`)
+- **Vision**: OpenCV-based detection in `VisionDetector.py`; `DetectionWorker` QThread for parallel processing; `DetectionOverlay` for camera feed annotations
 
 ---
 

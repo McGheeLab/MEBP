@@ -1,5 +1,5 @@
 """
-HardwareConfig.py — Central hardware configuration for MEBP v7.2.4.
+HardwareConfig.py — Central hardware configuration for MEBP v7.3.0.
 
 Bundles all physical setup into one saveable/loadable unit:
     - Per-pump syringe selection and ink assignment
@@ -56,8 +56,10 @@ from SupportClasses.PhysicalModels import (
     PumpLoadout,
     PrintingMode,
     RosetteInsert,
+    CameraSpec,
     load_needle_catalog,
     load_syringe_catalog,
+    load_camera_catalog,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 
@@ -69,6 +71,88 @@ from SupportClasses.WellPlate import PLATE_DEFINITIONS
 # v7.2.9: InkSwapStrategy moved to PrintPlanOfAction.py as the single
 # source of truth. Re-exported here for backwards compatibility.
 from SupportClasses.PrintPlanOfAction import InkSwapStrategy  # noqa: F401
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Camera Configuration (v7.3.0)
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class CameraConfig:
+    """
+    Camera calibration configuration for autocalibration.
+
+    Stores the camera spec, objective magnification, active resolution,
+    and computed or user-overridden micron-per-pixel scale. Also stores
+    the XY offset from camera center to needle tip (calibrated externally).
+    """
+    camera_spec: CameraSpec | None = None
+    objective_magnification: float = 2.0   # Nikon Ti2-U: 2x, 4x, 10x, 20x
+    active_resolution: tuple[int, int] = (916, 686)
+    micron_per_pixel_override: float | None = None
+    camera_to_needle_offset_um: tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def computed_micron_per_pixel(self) -> float | None:
+        """µm/px from sensor spec, resolution, and magnification."""
+        if self.camera_spec is None:
+            return None
+        effective = self.camera_spec.effective_pixel_size_um(self.active_resolution)
+        return effective / self.objective_magnification
+
+    @property
+    def micron_per_pixel(self) -> float | None:
+        """Active µm/px scale (override takes priority over computed)."""
+        if self.micron_per_pixel_override is not None:
+            return self.micron_per_pixel_override
+        return self.computed_micron_per_pixel
+
+    @property
+    def fov_um(self) -> tuple[float, float] | None:
+        """Field of view in micrometers (width, height), or None."""
+        scale = self.micron_per_pixel
+        if scale is None:
+            return None
+        return (
+            self.active_resolution[0] * scale,
+            self.active_resolution[1] * scale,
+        )
+
+    def pixel_to_um(self, px: float) -> float:
+        """Convert pixel distance to micrometers."""
+        scale = self.micron_per_pixel
+        if scale is None:
+            raise ValueError("No micron/pixel calibration available")
+        return px * scale
+
+    def um_to_pixel(self, um: float) -> float:
+        """Convert micrometers to pixel distance."""
+        scale = self.micron_per_pixel
+        if scale is None:
+            raise ValueError("No micron/pixel calibration available")
+        return um / scale
+
+    def to_dict(self) -> dict:
+        return {
+            "camera_spec": self.camera_spec.to_dict() if self.camera_spec else None,
+            "objective_magnification": self.objective_magnification,
+            "active_resolution": list(self.active_resolution),
+            "micron_per_pixel_override": self.micron_per_pixel_override,
+            "camera_to_needle_offset_um": list(self.camera_to_needle_offset_um),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CameraConfig:
+        spec_data = data.get("camera_spec")
+        return cls(
+            camera_spec=CameraSpec.from_dict(spec_data) if spec_data else None,
+            objective_magnification=data.get("objective_magnification", 2.0),
+            active_resolution=tuple(data.get("active_resolution", [916, 686])),
+            micron_per_pixel_override=data.get("micron_per_pixel_override"),
+            camera_to_needle_offset_um=tuple(
+                data.get("camera_to_needle_offset_um", [0.0, 0.0])
+            ),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -252,6 +336,9 @@ class HardwareConfig:
 
     # ── v7.2.8: Ink swap strategy for single-pump multi-ink ──────
     ink_swap_strategy: InkSwapStrategy = field(default_factory=InkSwapStrategy)
+
+    # ── v7.3.0: Camera configuration for autocalibration ──────────
+    camera_config: CameraConfig = field(default_factory=CameraConfig)
 
     # ── Metadata ──────────────────────────────────────────────────
     config_name: str = "Untitled Setup"
@@ -537,7 +624,7 @@ class HardwareConfig:
     def to_dict(self) -> dict:
         """Serialize complete hardware config to a dictionary."""
         return {
-            "version": "7.2.4",
+            "version": "7.3.0",
             "config_name": self.config_name,
             "notes": self.notes,
             "needle": self.needle.to_dict() if self.needle else None,
@@ -554,6 +641,8 @@ class HardwareConfig:
             },
             # v7.2.8: Ink swap strategy
             "ink_swap_strategy": self.ink_swap_strategy.to_dict(),
+            # v7.3.0: Camera config for autocalibration
+            "camera_config": self.camera_config.to_dict(),
         }
 
     @classmethod
@@ -597,6 +686,10 @@ class HardwareConfig:
         # v7.2.8: Ink swap strategy
         if "ink_swap_strategy" in data:
             config.ink_swap_strategy = InkSwapStrategy.from_dict(data["ink_swap_strategy"])
+
+        # v7.3.0: Camera config
+        if "camera_config" in data:
+            config.camera_config = CameraConfig.from_dict(data["camera_config"])
 
         return config
 
