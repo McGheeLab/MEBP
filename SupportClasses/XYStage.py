@@ -136,6 +136,12 @@ class XYStageManager:
         # Initialise the communication backend
         if self.simulate:
             self.spo = XYStageSimulator()
+            # v7.2.9: Ensure SMS percentage conversion uses the simulator's
+            # actual MAX_SPEED, not the protocol default (which may differ).
+            # Without this, set_speed_mm_s(20) → SMS=40 → only 8 mm/s actual
+            # instead of the intended 20 mm/s.
+            from SupportClasses.XYStageSimulator import MAX_SPEED_UM_S as _SIM_MAX
+            self._protocol_max_speed_um_s = _SIM_MAX
             # BUG-3 FIX: Configure simulator with protocol-derived parameters
             if self._protocol:
                 params = self._protocol._config.get("parameters", {})
@@ -483,6 +489,11 @@ class XYStageManager:
         concurrent JogHandler/PositionPoller contention.
         """
         if self.simulate:
+            # v7.2.9: Use direct position read (non-blocking) if available.
+            # The serial-sim path send_command("P") blocks during moves,
+            # returning a stale snapshot from before the move completed.
+            if hasattr(self.spo, 'get_current_position'):
+                return self.spo.get_current_position()
             response = self.spo.send_command("P")
             return self._parse_position_response(response)
         try:
@@ -524,12 +535,34 @@ class XYStageManager:
             )
 
     def move_stage_to_position(self, x: float, y: float, fast: bool = False) -> None:
-        """Move to absolute position (x, y) in stage coordinates."""
-        self._send_protocol_command(
-            "move_absolute",
-            fallback_cmd=f"G {round(x)},{round(y)}",
-            x=round(x), y=round(y),
-        )
+        """Move to absolute position (x, y) in stage coordinates.
+
+        v7.2.9: Consumes the "R" response under serial lock to prevent
+        buffer pollution that breaks PositionPoller queries.
+        """
+        if self.simulate:
+            self._send_protocol_command(
+                "move_absolute",
+                fallback_cmd=f"G {round(x)},{round(y)}",
+                x=round(x), y=round(y),
+            )
+        elif self.spo is not None:
+            if self._protocol:
+                cmd = self._protocol.format_command(
+                    "move_absolute", x=round(x), y=round(y))
+            else:
+                cmd = f"G {round(x)},{round(y)}"
+            if cmd:
+                if self._protocol:
+                    encoded = cmd.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{cmd}\r\n".encode("ascii")
+                try:
+                    with self._serial_lock:
+                        self.spo.write(encoded)
+                        _read_response_cr(self.spo, timeout=0.05)
+                except Exception as e:
+                    logger.debug(f"XY move_stage_to_position: {e}")
         logger.debug(f"XY absolute move: ({x:.0f}, {y:.0f}) fast={fast}")
 
     def move_stage_relative(self, dx: float, dy: float) -> None:

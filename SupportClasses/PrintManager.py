@@ -240,6 +240,13 @@ class PrintJob:
     well_setup: object = None         # WellSetupModel reference (same reason)
     trajectory_waypoints: list = field(default_factory=list)  # Waypoint list for trajectory mode
 
+    # v7.2.9: Hybrid execution — plan steps drive execution, not waypoints
+    plan_of_action: object = None     # PrintPlanOfAction
+    plate: object = None              # WellPlate for well position lookups
+    path_points: list = field(default_factory=list)  # Print geometry [(x,y), ...]
+    hw_config: object = None          # HardwareConfig
+    estimated_duration_s: float = 0.0  # Hybrid executor time estimate
+
     @property
     def total_steps(self) -> int:
         return len(self.commands)
@@ -720,19 +727,21 @@ class TrajectoryExecutor:
                     _max_spd = max(_max_spd, _spd)
             if _max_spd > 0 and hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
                 # v7.2.7: use set_speed_mm_s for trajectory
+                _speed_info = ""
                 if hasattr(ctrl.xy_stage, "set_speed_mm_s"):
                     ctrl.xy_stage.set_speed_mm_s(_max_spd * 1.5)
+                    _speed_info = f"{_max_spd * 1.5:.1f} mm/s"
                 else:
                     _sms_val = int(min(_max_spd * 1.5 * 1000.0, 50000))
                     ctrl.xy_stage.set_velocity(_sms_val)
-                logger.info(f"v7.2.7: Trajectory speed {_max_spd:.1f} mm/s, SMS={_sms_val}")
+                    _speed_info = f"SMS={_sms_val}"
+                logger.info(f"v7.2.7: Trajectory speed {_max_spd:.1f} mm/s, {_speed_info}")
         except Exception as _e:
             logger.warning(f"v7.2.7: Could not set trajectory speed: {_e}")
 
         # v7.2.7: Track previous axis values to skip unchanged commands
         _prev_z = None
         _prev_pumps = [None, None, None]
-
 
         for i, wp in enumerate(waypoints):
             # Check abort
@@ -760,11 +769,8 @@ class TrajectoryExecutor:
             # Z axis
             if ctrl.is_zp_connected:
                 # v7.2.7: skip Z if unchanged
-
                 if _prev_z is None or abs(wp.z - _prev_z) > 0.001:
-
                     ctrl.move_z_absolute(wp.z, from_zero_ref=True)
-
                     _prev_z = wp.z
 
             # Pumps (move to absolute plunger position)
@@ -818,6 +824,678 @@ class TrajectoryExecutor:
     def reset(self):
         """Reset abort flag for reuse."""
         self._abort_flag.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v7.2.9: Direct Command Executor (blocking hardware moves)
+# ═══════════════════════════════════════════════════════════════════
+
+class DirectCommandExecutor:
+    """Executes individual hardware moves with completion confirmation.
+
+    Used by HybridPlanExecutor for service steps (travel, waste, wash,
+    ink load) where we need to wait for the stage to physically arrive
+    before proceeding.
+    """
+
+    def __init__(self, controller: "StageController"):
+        self.ctrl = controller
+        self._abort = threading.Event()
+
+    def abort(self):
+        self._abort.set()
+
+    def move_xy(self, x_mm: float, y_mm: float,
+                timeout_s: float = 15.0) -> bool:
+        """Move XY to position and wait for arrival."""
+        if not self.ctrl.is_xy_connected:
+            return True
+        self.ctrl.move_xy_absolute(x_mm, y_mm, from_zero_ref=True, fast=False)
+        return self.ctrl.wait_for_xy_arrival(
+            x_mm, y_mm, tolerance_mm=0.5, timeout_s=timeout_s)
+
+    def move_z(self, z_mm: float, feedrate_mm_min: float | None = None,
+               timeout_s: float = 10.0) -> bool:
+        """Move Z to position and wait for arrival."""
+        if not self.ctrl.is_zp_connected:
+            return True
+        self.ctrl.move_z_absolute(z_mm, from_zero_ref=True,
+                                  feedrate_mm_min=feedrate_mm_min)
+        return self.ctrl.wait_for_z_arrival(
+            z_mm, tolerance_mm=0.1, timeout_s=timeout_s)
+
+    def move_pump(self, pump_id: str, volume_uL: float,
+                  rate_uL_s: float | None = None) -> bool:
+        """Move pump and wait estimated duration."""
+        if not self.ctrl.is_zp_connected:
+            return True
+        self.ctrl.move_pump_uL(pump_id, volume_uL, rate_uL_s)
+        # Estimate pump move duration and wait
+        rate = rate_uL_s or 5.0
+        est_s = abs(volume_uL) / rate + 0.5  # generous margin
+        deadline = time.monotonic() + est_s
+        while time.monotonic() < deadline:
+            if self._abort.is_set():
+                return False
+            time.sleep(0.1)
+        return True
+
+    def dwell(self, seconds: float) -> bool:
+        """Hold position for a duration (with abort check)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._abort.is_set():
+                return False
+            time.sleep(min(0.1, seconds))
+        return True
+
+    def travel_to_well(self, wx: float, wy: float, settings) -> bool:
+        """5-phase blocking travel with settle delays between axes.
+
+        Phase 1: Z up to safe height (fast feedrate)
+        Phase 2: 1s settle
+        Phase 3: XY fast travel (at service_xy_speed)
+        Phase 4: 1s settle
+        Phase 5: Z down into well (fast above top_z, slow entry below)
+        """
+        safe_z = settings.travel_z_height
+        top_z = getattr(settings, 'top_z_height', 0.0)
+        print_z = settings.print_z_height
+        z_fast = getattr(settings, 'fast_z_feedrate_mm_min', None)
+        z_entry = getattr(settings, 'entry_z_feedrate_mm_min', None)
+
+        # Phase 1: raise to safe Z (fast)
+        if not self.move_z(safe_z, feedrate_mm_min=z_fast):
+            return False
+        self.dwell(1.0)  # settle after Z up
+
+        # v7.2.9: Set XY speed to service speed before travel.
+        # Without this, the stage uses whatever SMS was last set
+        # (e.g. the slower print speed), causing travel to take
+        # much longer than the estimate predicts.
+        service_speed = getattr(settings, 'service_xy_speed_mm_s', None)
+        if service_speed and self.ctrl.is_xy_connected:
+            xy = self.ctrl.xy_stage
+            if xy and hasattr(xy, 'set_speed_mm_s'):
+                xy.set_speed_mm_s(service_speed)
+
+        # Phase 2: fast XY travel (blocking)
+        if not self.move_xy(wx, wy, timeout_s=20.0):
+            logger.warning(f"XY travel to ({wx:.1f}, {wy:.1f}) timed out")
+        self.dwell(1.0)  # settle after XY travel
+
+        # Phase 3: lower into well
+        if top_z > 0:
+            approach_z = top_z + 0.5
+            if not self.move_z(approach_z, feedrate_mm_min=z_fast):
+                return False
+            if not self.move_z(print_z, feedrate_mm_min=z_entry):
+                return False
+        else:
+            if not self.move_z(print_z, feedrate_mm_min=z_entry):
+                return False
+
+        # Dwell after arrival
+        dwell_s = getattr(settings, 'dwell_after_move', 0)
+        if dwell_s > 0:
+            self.dwell(dwell_s)
+        return True
+
+    def raise_from_well(self, settings) -> bool:
+        """Raise Z to safe travel height (fast feedrate)."""
+        z_fast = getattr(settings, 'fast_z_feedrate_mm_min', None)
+        return self.move_z(settings.travel_z_height, feedrate_mm_min=z_fast)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v7.2.9: Hybrid Plan Executor
+# ═══════════════════════════════════════════════════════════════════
+
+class HybridPlanExecutor:
+    """Iterates PlanSteps — service steps as blocking commands, PRINT
+    steps as coordinated trajectory playback.
+
+    This replaces the all-in-one trajectory approach where every step
+    (travel, waste, wash, ink, print) was pre-compiled into a single
+    time-parameterized waypoint list.
+    """
+
+    def __init__(self, controller: "StageController",
+                 plan, well_model, plate, path_points,
+                 settings: PrintSettings, hw_config=None,
+                 recorder=None):
+        self.controller = controller
+        self.plan = plan
+        self.well_model = well_model
+        self.plate = plate
+        self.path_points = path_points
+        self.settings = settings
+        self.hw_config = hw_config
+        self.recorder = recorder
+        self._abort_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # not paused initially
+
+    def abort(self):
+        self._abort_flag.set()
+
+    # ── Time estimation ───────────────────────────────────────────
+
+    def estimate_time(self) -> float:
+        """Estimate total execution time in seconds.
+
+        Walks every plan step and sums:
+        - XY travel time (distance / speed)
+        - Z travel time (distance / feedrate)
+        - Pump time (volume / rate)
+        - Fixed dwells (settle, wash, etc.)
+        - Print trajectory time (path length / print speed)
+        """
+        try:
+            from SupportClasses.PrintPlanOfAction import PlanStepType
+        except ImportError:
+            return 0.0
+
+        steps = getattr(self.plan, 'steps', [])
+        if not steps:
+            return 0.0
+
+        s = self.settings
+        safe_z = s.travel_z_height
+        print_z = s.print_z_height
+        top_z = getattr(s, 'top_z_height', 0.0)
+        z_fast = getattr(s, 'fast_z_feedrate_mm_min', s.z_feedrate) / 60.0
+        z_entry = getattr(s, 'entry_z_feedrate_mm_min', s.z_feedrate) / 60.0
+        xy_travel = getattr(s, 'service_xy_speed_mm_s', 10.0)
+        xy_print = getattr(s, 'print_speed_mm_s', 5.0)
+        pump_rate = getattr(s, 'service_pump_rate_uL_s', 5.0)
+
+        # Precompute print path length once
+        path_len = 0.0
+        pts = self.path_points
+        if pts and len(pts) >= 2:
+            for i in range(1, len(pts)):
+                dx = pts[i][0] - pts[i - 1][0]
+                dy = pts[i][1] - pts[i - 1][1]
+                path_len += math.sqrt(dx * dx + dy * dy)
+
+        # Track current position for distance calculations
+        cur_x, cur_y, cur_z = 0.0, 0.0, safe_z
+        total = 0.0
+        SETTLE = 1.0  # 1s settle between axis changes
+
+        def _z_travel(from_z, to_z):
+            """Time for a Z move.
+
+            Descending: fast above top_z, slow entry below.
+            Ascending: always fast (raise_from_well uses z_fast).
+            """
+            dist = abs(to_z - from_z)
+            if dist < 0.01:
+                return 0.0
+            # Ascending: always fast
+            if to_z > from_z:
+                return dist / max(z_fast, 0.1)
+            # Descending: split at top_z boundary
+            if top_z > 0 and from_z > top_z:
+                fast_dist = max(0, from_z - top_z)
+                slow_dist = max(0, top_z - to_z)
+                return fast_dist / max(z_fast, 0.1) + slow_dist / max(z_entry, 0.1)
+            # Descending but already below top_z: all slow
+            if top_z > 0 and from_z <= top_z:
+                return dist / max(z_entry, 0.1)
+            return dist / max(z_fast, 0.1)
+
+        def _xy_travel(x1, y1, x2, y2, speed):
+            d = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            return d / max(speed, 0.1) if d > 0.01 else 0.0
+
+        def _service_time(role, step):
+            """Time for the action inside a well (not counting travel)."""
+            if role == "waste":
+                vol = getattr(step, 'volume_uL', 50.0) or 50.0
+                return vol / max(pump_rate, 0.1) + 0.5
+            elif role == "wash":
+                return 5.0
+            elif role == "buffer":
+                vol = getattr(step, 'volume_uL', 5.0) or 5.0
+                return vol / max(pump_rate, 0.1) + 1.0
+            elif role == "ink":
+                vol = getattr(step, 'volume_uL', 50.0) or 50.0
+                return vol / max(pump_rate, 0.1) + 1.0
+            return 0.0
+
+        def _travel_to_well_time(wx, wy):
+            """Time for full travel_to_well: Z up, settle, XY, settle, Z down."""
+            nonlocal cur_x, cur_y, cur_z
+            t = 0.0
+            # Z up
+            t += _z_travel(cur_z, safe_z) + SETTLE
+            # XY travel
+            t += _xy_travel(cur_x, cur_y, wx, wy, xy_travel) + SETTLE
+            # Z down
+            t += _z_travel(safe_z, print_z)
+            t += getattr(s, 'dwell_after_move', 0)
+            cur_x, cur_y, cur_z = wx, wy, print_z
+            return t
+
+        def _raise_time():
+            nonlocal cur_z
+            t = _z_travel(cur_z, safe_z)
+            cur_z = safe_z
+            return t
+
+        for step in steps:
+            stype = getattr(step, 'step_type', None)
+            if stype is None:
+                continue
+
+            if stype == PlanStepType.PRINT:
+                target_wells = getattr(step, 'target_wells', [])
+                for wn in target_wells:
+                    try:
+                        wx, wy = self.plate.get_well_position(wn)
+                    except Exception:
+                        continue
+                    # First path point offset
+                    fx = wx + (pts[0][0] if pts else 0.0)
+                    fy = wy + (pts[0][1] if pts else 0.0)
+                    # Z up + settle + XY to first point + settle + Z down
+                    total += _z_travel(cur_z, safe_z) + SETTLE
+                    total += _xy_travel(cur_x, cur_y, fx, fy, xy_travel) + SETTLE
+                    total += _z_travel(safe_z, print_z)
+                    total += getattr(s, 'dwell_after_move', 0)
+                    # v7.2.9: Estimate trajectory time accounting for
+                    # per-waypoint blocking.  TrajectoryExecutor sends a
+                    # blocking move_xy_absolute per waypoint — each blocks
+                    # until the stage settles.  When blocking time exceeds
+                    # the inter-waypoint interval, the executor falls behind
+                    # and total time = sum(blocking times), not the planned
+                    # trajectory duration.
+                    #
+                    # Blocking time per waypoint ≈ move_time + settle_overhead
+                    #   move_time = segment_distance / effective_speed
+                    #   settle_overhead ≈ 0.1s (PD controller exponential decay)
+                    #   effective_speed = max_waypoint_speed * 1.5
+                    #     (TrajectoryExecutor sets SMS to 1.5× max segment speed)
+                    SETTLE_OVERHEAD_S = 0.25  # per-waypoint blocking settle+cmd
+                    traj_time = 0.0
+                    try:
+                        from SupportClasses.PrintTrajectoryPlanner import (
+                            PrintTrajectoryPlanner)
+                        _planner = PrintTrajectoryPlanner()
+                        _result = _planner.generate_inwell_print(
+                            well_x=wx, well_y=wy,
+                            pump_id=getattr(step, 'pump_id', 'P1') or 'P1',
+                            path_points=pts,
+                            settings=s,
+                            well_name=wn,
+                        )
+                        if _result.valid and _result.waypoints:
+                            wps = _result.waypoints
+                            # Compute max segment speed (same as executor)
+                            _max_spd = 0.0
+                            for _j in range(1, min(len(wps), 100)):
+                                _dt_wp = wps[_j].t - wps[_j-1].t
+                                if _dt_wp > 1e-6:
+                                    _dx = wps[_j].x - wps[_j-1].x
+                                    _dy = wps[_j].y - wps[_j-1].y
+                                    _spd = math.sqrt(_dx*_dx + _dy*_dy) / _dt_wp
+                                    _max_spd = max(_max_spd, _spd)
+                            eff_speed = max(_max_spd * 1.5, 0.1)
+                            # Sum per-waypoint blocking times
+                            block_total = 0.0
+                            for _j in range(1, len(wps)):
+                                _dx = wps[_j].x - wps[_j-1].x
+                                _dy = wps[_j].y - wps[_j-1].y
+                                seg_d = math.sqrt(_dx*_dx + _dy*_dy)
+                                dt_plan = wps[_j].t - wps[_j-1].t
+                                # Blocking time = move + settle, but at
+                                # least the planned interval (sleep covers
+                                # idle time if move is fast enough)
+                                t_block = seg_d / eff_speed + SETTLE_OVERHEAD_S
+                                block_total += max(t_block, dt_plan)
+                            traj_time = block_total
+                    except Exception:
+                        pass
+                    # Fallback to naive formula if planner unavailable
+                    if traj_time <= 0 and xy_print > 0 and path_len > 0:
+                        traj_time = (path_len / xy_print) * s.num_layers
+                    total += traj_time
+                    # Raise + settle
+                    total += SETTLE + _z_travel(print_z, safe_z)
+                    cur_x, cur_y, cur_z = fx, fy, safe_z
+
+            elif stype in (PlanStepType.WASTE, PlanStepType.WASH,
+                           PlanStepType.REFILL_BUFFER,
+                           PlanStepType.LOAD_INK, PlanStepType.GATHER_INK):
+                role_map = {
+                    PlanStepType.WASTE: "waste", PlanStepType.WASH: "wash",
+                    PlanStepType.REFILL_BUFFER: "buffer",
+                    PlanStepType.LOAD_INK: "ink",
+                    PlanStepType.GATHER_INK: "ink",
+                }
+                role = role_map.get(stype, "waste")
+                well = self._find_well(role)
+                if well:
+                    _, wx, wy = well
+                    total += _travel_to_well_time(wx, wy)
+                    total += _service_time(role, step)
+                    total += _raise_time()
+
+            elif stype == PlanStepType.MOVE_SAFE_Z:
+                total += _z_travel(cur_z, safe_z)
+                cur_z = safe_z
+
+            elif stype == PlanStepType.TRAVEL_XY:
+                tw = getattr(step, 'target_wells', [])
+                if tw:
+                    try:
+                        wx, wy = self.plate.get_well_position(tw[0])
+                        total += _xy_travel(cur_x, cur_y, wx, wy, xy_travel)
+                        cur_x, cur_y = wx, wy
+                    except Exception:
+                        pass
+
+            elif stype == PlanStepType.INK_SWAP:
+                sub_steps = getattr(step, 'sub_steps', [])
+                for sub in sub_steps:
+                    role = sub if isinstance(sub, str) else "waste"
+                    well = self._find_well(role)
+                    if well:
+                        _, wx, wy = well
+                        total += _travel_to_well_time(wx, wy)
+                        total += _service_time(role, step)
+                        total += _raise_time()
+
+            elif stype == PlanStepType.FINAL_CLEANUP:
+                sub_steps = getattr(step, 'sub_steps', [])
+                for sub in ("waste", "wash"):
+                    if sub in sub_steps:
+                        well = self._find_well(sub)
+                        if well:
+                            _, wx, wy = well
+                            total += _travel_to_well_time(wx, wy)
+                            total += _service_time(sub, step)
+                            total += _raise_time()
+
+            elif stype == PlanStepType.RETURN_HOME:
+                total += _z_travel(cur_z, safe_z) + SETTLE
+                total += _xy_travel(cur_x, cur_y, 0, 0, xy_travel)
+                cur_x, cur_y, cur_z = 0.0, 0.0, safe_z
+
+        return total
+
+    def execute(self, pause_event: threading.Event | None = None,
+                on_progress=None) -> bool:
+        """Execute the plan step by step.
+
+        Returns True if completed, False if aborted.
+        """
+        if pause_event is not None:
+            self._pause_event = pause_event
+
+        try:
+            from SupportClasses.PrintPlanOfAction import PlanStepType
+        except ImportError:
+            logger.error("HybridPlanExecutor: PrintPlanOfAction not available")
+            return False
+
+        steps = getattr(self.plan, 'steps', [])
+        if not steps:
+            logger.warning("HybridPlanExecutor: no steps in plan")
+            return True
+
+        direct = DirectCommandExecutor(self.controller)
+        total_steps = len(steps)
+
+        logger.info(f"HybridPlanExecutor: starting {total_steps} plan steps")
+
+        for step_idx, step in enumerate(steps):
+            # Check abort
+            if self._abort_flag.is_set():
+                logger.info("HybridPlanExecutor: aborted")
+                direct.abort()
+                return False
+
+            # Check pause
+            self._pause_event.wait()
+            if self._abort_flag.is_set():
+                return False
+
+            stype = getattr(step, 'step_type', None)
+            pump = (getattr(step, 'pump_id', None)
+                    or getattr(self.settings, 'active_pump', 'P1') or 'P1')
+
+            step_name = stype.name if stype else "UNKNOWN"
+            logger.info(f"HybridPlanExecutor: step {step_idx+1}/{total_steps}"
+                        f" — {step_name}")
+            if on_progress:
+                on_progress(step_idx, total_steps,
+                            f"Step {step_idx+1}/{total_steps}: {step_name}")
+
+            # ── PRINT step: use trajectory ──────────────────────────
+            if stype == PlanStepType.PRINT:
+                self._execute_print_step(step, pump, pause_event, on_progress)
+
+            # ── Service steps: blocking commands ────────────────────
+            elif stype == PlanStepType.WASTE:
+                self._execute_service(direct, step, pump, "waste")
+
+            elif stype == PlanStepType.WASH:
+                self._execute_service(direct, step, pump, "wash")
+
+            elif stype == PlanStepType.REFILL_BUFFER:
+                self._execute_service(direct, step, pump, "buffer")
+
+            elif stype in (PlanStepType.LOAD_INK, PlanStepType.GATHER_INK):
+                self._execute_service(direct, step, pump, "ink")
+
+            elif stype == PlanStepType.MOVE_SAFE_Z:
+                z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
+                direct.move_z(self.settings.travel_z_height,
+                              feedrate_mm_min=z_fast)
+
+            elif stype == PlanStepType.TRAVEL_XY:
+                target_wells = getattr(step, 'target_wells', [])
+                if target_wells:
+                    try:
+                        # v7.2.9: Set service speed for XY travel
+                        _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
+                        if _svc_spd and self.controller.is_xy_connected:
+                            _xy = self.controller.xy_stage
+                            if _xy and hasattr(_xy, 'set_speed_mm_s'):
+                                _xy.set_speed_mm_s(_svc_spd)
+                        wx, wy = self.plate.get_well_position(target_wells[0])
+                        direct.move_xy(wx, wy, timeout_s=20.0)
+                    except Exception as e:
+                        logger.warning(f"TRAVEL_XY failed: {e}")
+
+            elif stype == PlanStepType.INK_SWAP:
+                sub_steps = getattr(step, 'sub_steps', [])
+                for sub in sub_steps:
+                    if self._abort_flag.is_set():
+                        return False
+                    if sub == "waste":
+                        self._execute_service(direct, step, pump, "waste")
+                    elif sub == "wash":
+                        self._execute_service(direct, step, pump, "wash")
+                    elif sub == "buffer":
+                        self._execute_service(direct, step, pump, "buffer")
+                    elif sub == "ink":
+                        self._execute_service(direct, step, pump, "ink")
+
+            elif stype == PlanStepType.FINAL_CLEANUP:
+                sub_steps = getattr(step, 'sub_steps', [])
+                if "waste" in sub_steps:
+                    self._execute_service(direct, step, pump, "waste")
+                if "wash" in sub_steps:
+                    self._execute_service(direct, step, pump, "wash")
+
+            elif stype == PlanStepType.RETURN_HOME:
+                z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
+                direct.move_z(self.settings.travel_z_height,
+                              feedrate_mm_min=z_fast)
+                # v7.2.9: Set service speed for return travel
+                _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
+                if _svc_spd and self.controller.is_xy_connected:
+                    _xy = self.controller.xy_stage
+                    if _xy and hasattr(_xy, 'set_speed_mm_s'):
+                        _xy.set_speed_mm_s(_svc_spd)
+                direct.move_xy(0, 0, timeout_s=20.0)
+
+        logger.info("HybridPlanExecutor: all steps complete")
+        if on_progress:
+            on_progress(total_steps, total_steps, "Complete!")
+        return True
+
+    # ── Internal helpers ──────────────────────────────────────────
+
+    def _find_well(self, role: str):
+        """Find first well with given role. Returns (name, x, y) or None."""
+        from SupportClasses.PrintTrajectoryPlanner import _find_well
+        return _find_well(self.well_model, self.plate, role)
+
+    def _execute_service(self, direct: DirectCommandExecutor,
+                         step, pump_id: str, role: str):
+        """Execute a service step: travel to well → action → raise."""
+        well = self._find_well(role)
+        if not well:
+            logger.info(f"Skipping service '{role}': no well assigned")
+            return
+
+        name, wx, wy = well
+
+        # Travel to well and lower
+        direct.travel_to_well(wx, wy, self.settings)
+
+        # Action depends on role
+        if role == "waste":
+            vol = getattr(step, 'volume_uL', 50.0) or 50.0
+            direct.move_pump(pump_id, vol)  # eject (positive = push)
+            direct.dwell(0.5)
+
+        elif role == "wash":
+            direct.dwell(5.0)
+
+        elif role == "buffer":
+            vol = getattr(step, 'volume_uL', 5.0) or 5.0
+            direct.move_pump(pump_id, -vol)  # aspirate (negative)
+            direct.dwell(1.0)
+
+        elif role == "ink":
+            vol = getattr(step, 'volume_uL', 50.0) or 50.0
+            direct.move_pump(pump_id, -vol)  # aspirate
+            direct.dwell(1.0)
+
+        # Raise from well
+        direct.raise_from_well(self.settings)
+
+    def _execute_print_step(self, step, pump_id: str,
+                            pause_event, on_progress):
+        """Execute a PRINT step: for each well, use blocking moves for
+        travel/Z, then trajectory playback for in-well printing only.
+
+        Sequence per well:
+          1. Z up to safe height
+          2. XY travel to first path point (well_center + path_offset)
+          3. Z down to print height
+          4. TrajectoryExecutor: in-well print (prime → XY+pump → retract)
+          5. Z up to safe height
+        """
+        target_wells = getattr(step, 'target_wells', [])
+        if not target_wells:
+            logger.warning("PRINT step with no target wells")
+            return
+
+        direct = DirectCommandExecutor(self.controller)
+        safe_z = self.settings.travel_z_height
+        print_z = self.settings.print_z_height
+        top_z = getattr(self.settings, 'top_z_height', 0.0)
+        z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
+        z_entry = getattr(self.settings, 'entry_z_feedrate_mm_min', None)
+
+        try:
+            from SupportClasses.PrintTrajectoryPlanner import (
+                PrintTrajectoryPlanner)
+
+            for well_name in target_wells:
+                if self._abort_flag.is_set():
+                    return
+
+                try:
+                    wx, wy = self.plate.get_well_position(well_name)
+                except Exception:
+                    logger.error(f"Well {well_name}: position lookup failed")
+                    continue
+
+                # Compute first path point in absolute coords
+                first_x = wx + (self.path_points[0][0] if self.path_points else 0.0)
+                first_y = wy + (self.path_points[0][1] if self.path_points else 0.0)
+
+                logger.info(f"PRINT: well {well_name} — "
+                            f"first point ({first_x:.1f}, {first_y:.1f})")
+
+                # 1. Z up to safe height (fast)
+                direct.move_z(safe_z, feedrate_mm_min=z_fast)
+                direct.dwell(1.0)
+
+                # 2. XY travel to first path point (at service speed)
+                _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
+                if _svc_spd and self.controller.is_xy_connected:
+                    _xy = self.controller.xy_stage
+                    if _xy and hasattr(_xy, 'set_speed_mm_s'):
+                        _xy.set_speed_mm_s(_svc_spd)
+                if not direct.move_xy(first_x, first_y, timeout_s=20.0):
+                    logger.warning(f"XY travel to first point timed out")
+                direct.dwell(1.0)
+
+                # 3. Z down to print height (fast above top_z, slow entry)
+                if top_z > 0:
+                    direct.move_z(top_z + 0.5, feedrate_mm_min=z_fast)
+                    direct.dwell(1.0)
+                direct.move_z(print_z, feedrate_mm_min=z_entry)
+
+                # Dwell after arrival
+                dwell_s = getattr(self.settings, 'dwell_after_move', 0)
+                if dwell_s > 0:
+                    direct.dwell(dwell_s)
+
+                # 4. Generate in-well print trajectory (XY + pump only, no Z travel)
+                planner = PrintTrajectoryPlanner()
+                result = planner.generate_inwell_print(
+                    well_x=wx, well_y=wy,
+                    pump_id=pump_id,
+                    path_points=self.path_points,
+                    settings=self.settings,
+                    well_name=well_name,
+                )
+
+                if not result.valid:
+                    logger.error(f"In-well trajectory invalid for "
+                                 f"{well_name}: {result.issues}")
+                    direct.move_z(safe_z)
+                    continue
+
+                logger.info(
+                    f"PRINT {well_name}: {len(result.waypoints)} waypoints, "
+                    f"{result.total_duration_s:.1f}s")
+
+                # 5. Play back the in-well trajectory
+                tex = TrajectoryExecutor(
+                    self.controller, recorder=self.recorder)
+                tex.execute(
+                    waypoints=result.waypoints,
+                    pause_event=pause_event,
+                    on_progress=on_progress,
+                )
+
+                # 6. Raise from well (fast)
+                direct.dwell(1.0)
+                direct.move_z(safe_z, feedrate_mm_min=z_fast)
+
+        except Exception as e:
+            logger.error(f"Print step execution failed: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════

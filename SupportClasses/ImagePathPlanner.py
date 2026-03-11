@@ -17,7 +17,8 @@ Pump flow is proportional to greyscale intensity (within threshold):
   invert=True  (default): pixel 0 → 100%, pixel=threshold → 0%, above threshold → 0%
   invert=False:           pixel 0 → 0%, pixel=threshold → 100%, above threshold → 0%
 
-Output: Nx7 array [x, y, z, p1, p2, p3, t] — microns and seconds.
+Output: Nx7 array [x, y, z, p1, p2, p3, t] — mm and seconds.
+Internal computation uses microns; output is converted to mm for MEBP compatibility.
 """
 
 from __future__ import annotations
@@ -62,6 +63,8 @@ class ImagePathPlanner:
         initial_z: float = 0.0,
         z_increment: float = 10.0,
         invert: bool = True,
+        target_width_um: float | None = None,
+        target_height_um: float | None = None,
     ):
         self.threshold = threshold
         self.tool_diameter = tool_diameter
@@ -74,6 +77,10 @@ class ImagePathPlanner:
         self.initial_z = initial_z
         self.z_increment = z_increment
         self.invert = invert
+        # Target footprint: if set, pixels_per_micron is auto-calculated
+        # from image dimensions to fit within the target size (aspect-preserving).
+        self.target_width_um = target_width_um
+        self.target_height_um = target_height_um
 
         # Per-pump layer stacks: pump_layers[pump_idx] = [layer0, layer1, ...]
         self._pump_layers: list[list[np.ndarray]] = [[] for _ in range(MAX_PUMPS)]
@@ -518,6 +525,37 @@ class ImagePathPlanner:
     #  MAIN ENTRY: GENERATE ALL LAYERS
     # ══════════════════════════════════════════════════════════════
 
+    def _apply_target_footprint(self):
+        """If target footprint is set, compute pixels_per_micron to fit image."""
+        if self._width == 0 or self._height == 0:
+            return
+        tw = self.target_width_um
+        th = self.target_height_um
+        if tw is None and th is None:
+            return
+
+        # Compute scale for each constrained axis
+        if tw is not None and tw > 0 and th is not None and th > 0:
+            # Both axes constrained — use the tighter one to preserve aspect ratio
+            ppm_w = self._width / tw
+            ppm_h = self._height / th
+            ppm = max(ppm_w, ppm_h)
+        elif tw is not None and tw > 0:
+            ppm = self._width / tw
+        elif th is not None and th > 0:
+            ppm = self._height / th
+        else:
+            return
+
+        old_ppm = self.pixels_per_micron
+        self.pixels_per_micron = ppm
+        actual_w = self._width / ppm
+        actual_h = self._height / ppm
+        logger.info(
+            f"Target footprint: {actual_w:.0f} x {actual_h:.0f} um "
+            f"(pixels_per_micron: {old_ppm:.4f} -> {ppm:.4f})"
+        )
+
     def generate_toolpath(self) -> np.ndarray:
         """
         Generate toolpaths for all loaded layers.
@@ -526,6 +564,9 @@ class ImagePathPlanner:
         """
         if self._num_layers == 0:
             raise ValueError("No images loaded.")
+
+        # Auto-calculate pixels_per_micron from target footprint if set
+        self._apply_target_footprint()
 
         self.waypoints.clear()
         self.pump_states_all.clear()
@@ -571,6 +612,14 @@ class ImagePathPlanner:
 
             z_pos += self.z_increment
 
+        # Convert spatial coordinates from µm to mm for MEBP compatibility.
+        # Pump displacements and time remain unchanged.
+        self.waypoints = [
+            (wp[0] / 1000.0, wp[1] / 1000.0, wp[2] / 1000.0,
+             wp[3], wp[4], wp[5], wp[6])
+            for wp in self.waypoints
+        ]
+
         traj = np.array(self.waypoints, dtype=np.float64) if self.waypoints else np.zeros((0, 7))
         logger.info(
             f"Generated {len(self.waypoints)} waypoints across "
@@ -607,13 +656,18 @@ class ImagePathPlanner:
         if self.waypoints:
             last = self.waypoints[-1]
             pump_disps = [last[3], last[4], last[5]]
+        um_per_px = self._microns_per_pixel()
         return {
             "num_layers": self._num_layers,
             "layers_per_pump": [len(s) for s in self._pump_layers],
             "image_width_px": self._width,
             "image_height_px": self._height,
-            "image_width_um": self._width * self._microns_per_pixel(),
-            "image_height_um": self._height * self._microns_per_pixel(),
+            # Output in mm (matching waypoint units)
+            "image_width_mm": self._width * um_per_px / 1000.0,
+            "image_height_mm": self._height * um_per_px / 1000.0,
+            # Keep µm versions for backward compat
+            "image_width_um": self._width * um_per_px,
+            "image_height_um": self._height * um_per_px,
             "num_waypoints": len(self.waypoints),
             "estimated_time_s": self.waypoints[-1][-1] if self.waypoints else 0.0,
             "pump_displacements": pump_disps,

@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-03-11T00:02:59.051183+00:00",
+  "timestamp_str": "20260311_000259",
+  "job_name": "unnamed",
+  "status": "aborted",
+  "workspace": {},
+  "well_setup": {},
+  "duration_s": 67.556,
+  "num_samples": 0,
+  "end_time": "2026-03-11T00:04:06.607698+00:00",
+  "summary": {
+    "empty": true
+  }
+}

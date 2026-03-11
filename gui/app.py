@@ -804,11 +804,81 @@ class MainWindow(QMainWindow):
         pm = setup_page.print_manager
         waypoints = getattr(job, 'trajectory_waypoints', None)
 
-        # Read execution mode from settings (default: position)
-        exec_mode = "position"
+        # Read execution mode from settings (default: hybrid)
+        exec_mode = "hybrid"
         if hasattr(self, '_settings') and self._settings:
-            exec_mode = self._settings.get("execution.mode", "position")
+            exec_mode = self._settings.get("execution.mode", "hybrid")
         logger.info(f"Execution mode: {exec_mode}")
+
+        # ── Hybrid mode: plan-step-driven execution ─────────────
+        plan = getattr(job, 'plan_of_action', None)
+        if exec_mode == "hybrid" and plan is not None:
+            try:
+                from SupportClasses.PrintManager import (
+                    HybridPlanExecutor, PrintState)
+                import threading
+                pm._set_state(PrintState.IDLE)
+                pm._pause_event.set()
+
+                executor = HybridPlanExecutor(
+                    controller=pm.controller,
+                    plan=plan,
+                    well_model=getattr(job, 'well_setup', None),
+                    plate=getattr(job, 'plate', None),
+                    path_points=getattr(job, 'path_points', []),
+                    settings=job.settings,
+                    hw_config=getattr(job, 'hw_config', None),
+                    recorder=pm.recorder,
+                )
+
+                # Estimate total print time
+                try:
+                    est = executor.estimate_time()
+                    job.estimated_duration_s = est
+                    logger.info(f"Hybrid estimated duration: {est:.1f}s")
+                except Exception as e:
+                    logger.warning(f"Time estimate failed: {e}")
+
+                # Start recording
+                if hasattr(pm, '_start_recorder'):
+                    pm._start_recorder()
+
+                def _hybrid_thread():
+                    pm._set_state(PrintState.RUNNING)
+                    try:
+                        def on_prog(idx, total, msg):
+                            if pm.on_progress:
+                                pm.on_progress(idx, total, msg)
+
+                        success = executor.execute(
+                            pause_event=pm._pause_event,
+                            on_progress=on_prog,
+                        )
+                        if success:
+                            pm._set_state(PrintState.COMPLETED)
+                        else:
+                            pm._set_state(PrintState.ABORTED)
+                    except Exception as exc:
+                        logger.error(f"Hybrid exec error: {exc}",
+                                     exc_info=True)
+                        pm._set_state(PrintState.ERROR)
+                    finally:
+                        if hasattr(pm, '_stop_recorder'):
+                            try:
+                                pm._stop_recorder(pm.state.name.lower())
+                            except Exception:
+                                pass
+
+                pm._thread = threading.Thread(
+                    target=_hybrid_thread, daemon=True)
+                pm._thread.start()
+                logger.info(f"Hybrid execution started: {job.name}")
+                return
+
+            except Exception as exc:
+                logger.error(f"Hybrid start failed: {exc}", exc_info=True)
+                logger.info("Falling back to trajectory mode")
+                exec_mode = "position"  # ensure trajectory fallback works
 
         # ── Discrete mode: use legacy PrintManager ────────────────
         if exec_mode == "discrete" or not waypoints or len(waypoints) == 0:

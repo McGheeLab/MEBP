@@ -456,7 +456,29 @@ class HelperFunctionsPage(QWidget):
         self._spin_threshold = _ispin("Threshold:", 128, 0, 255)
         self._spin_tool_diam = _dspin("Tool Diameter:", 300.0, 1.0, 10000.0, 1, "um")
         self._spin_overlap = _dspin("Path Overlap:", 0.8, 0.01, 1.0, 2)
-        self._spin_px_per_um = _dspin("Pixels/um:", 0.09, 0.001, 10.0, 3)
+
+        # Sizing mode: manual pixels/µm vs target footprint
+        grid.addWidget(QLabel("Sizing Mode:"), row, 0)
+        self._sizing_combo = QComboBox()
+        self._sizing_combo.addItem("Pixels/µm (manual)", "manual")
+        self._sizing_combo.addItem("Target Footprint (mm)", "footprint")
+        self._sizing_combo.setCurrentIndex(1)  # Default to footprint
+        self._sizing_combo.currentIndexChanged.connect(self._on_sizing_mode_changed)
+        grid.addWidget(self._sizing_combo, row, 1); row += 1
+
+        # Manual: pixels/µm
+        self._spin_px_per_um = _dspin("Pixels/µm:", 0.09, 0.001, 10.0, 3)
+        self._lbl_px_per_um = grid.itemAtPosition(row - 1, 0).widget()
+
+        # Target footprint: width/height in mm
+        self._spin_footprint_w = _dspin("Footprint Width:", 4.0, 0.1, 100.0, 2, "mm")
+        self._lbl_footprint_w = grid.itemAtPosition(row - 1, 0).widget()
+        self._spin_footprint_h = _dspin("Footprint Height:", 4.0, 0.1, 100.0, 2, "mm")
+        self._lbl_footprint_h = grid.itemAtPosition(row - 1, 0).widget()
+
+        # Trigger initial visibility
+        self._on_sizing_mode_changed()
+
         self._spin_feedrate = _dspin("Feedrate:", 1000.0, 1.0, 100000.0, 0, "um/s")
         self._spin_corner_slow = _dspin("Corner Slowdown:", 0.5, 0.01, 1.0, 2)
         self._spin_corner_angle = _dspin("Corner Angle:", 120.0, 0.0, 180.0, 0, "deg")
@@ -507,6 +529,18 @@ class HelperFunctionsPage(QWidget):
         row.addWidget(btn_print)
         layout.addLayout(row)
         parent_layout.addWidget(group)
+
+    # ── Sizing Mode Toggle ─────────────────────────────────────────
+
+    def _on_sizing_mode_changed(self):
+        """Show/hide sizing controls based on selected mode."""
+        is_footprint = (self._sizing_combo.currentData() == "footprint")
+        self._spin_px_per_um.setVisible(not is_footprint)
+        self._lbl_px_per_um.setVisible(not is_footprint)
+        self._spin_footprint_w.setVisible(is_footprint)
+        self._lbl_footprint_w.setVisible(is_footprint)
+        self._spin_footprint_h.setVisible(is_footprint)
+        self._lbl_footprint_h.setVisible(is_footprint)
 
     # ══════════════════════════════════════════════════════════════
     #  FILE BROWSING
@@ -577,6 +611,14 @@ class HelperFunctionsPage(QWidget):
             QMessageBox.critical(self, "Missing Module",
                 "ImagePathPlanner not available.\nEnsure SupportClasses/ImagePathPlanner.py exists.")
             return None
+
+        # Determine sizing: target footprint (mm→µm) or manual pixels/µm
+        target_w_um = None
+        target_h_um = None
+        if self._sizing_combo.currentData() == "footprint":
+            target_w_um = self._spin_footprint_w.value() * 1000.0  # mm → µm
+            target_h_um = self._spin_footprint_h.value() * 1000.0
+
         return PlannerClass(
             threshold=self._spin_threshold.value(),
             tool_diameter=self._spin_tool_diam.value(),
@@ -589,6 +631,8 @@ class HelperFunctionsPage(QWidget):
             initial_z=self._spin_z_start.value(),
             z_increment=self._spin_z_inc.value(),
             invert=self._chk_invert.isChecked(),
+            target_width_um=target_w_um,
+            target_height_um=target_h_um,
         )
 
     def _load_images_into_planner(self, planner) -> bool:
@@ -635,20 +679,22 @@ class HelperFunctionsPage(QWidget):
             self._planner = planner
 
             summary = planner.get_summary()
+            # Waypoints are in mm; use mm image size for preview
             self._path_preview.set_data(
                 planner.waypoints,
-                (summary["image_width_um"], summary["image_height_um"]),
+                (summary["image_width_mm"], summary["image_height_mm"]),
                 planner.pump_states_all,
             )
 
             disps = summary["pump_displacements"]
             disp_parts = [f"P{i+1}={d:.2f}" for i, d in enumerate(disps) if d > 0]
+            w_mm = summary["image_width_mm"]
+            h_mm = summary["image_height_mm"]
             self._status_label.setText(
                 f"OK: {summary['num_waypoints']} waypoints | "
                 f"{summary['num_layers']} layer(s) | "
                 f"~{summary['estimated_time_s']:.1f}s\n"
-                f"Image: {summary['image_width_um']:.0f}x"
-                f"{summary['image_height_um']:.0f} um | "
+                f"Footprint: {w_mm:.2f} x {h_mm:.2f} mm | "
                 f"Pump disp: {', '.join(disp_parts) or 'none'}"
             )
             self._status_label.setStyleSheet(
@@ -701,8 +747,8 @@ class HelperFunctionsPage(QWidget):
                     "description": (
                         f"Image toolpath: {summary['num_waypoints']} wpts, "
                         f"{summary['num_layers']} layers, "
-                        f"{summary['image_width_um']:.0f}x"
-                        f"{summary['image_height_um']:.0f} um"
+                        f"{summary['image_width_mm']:.2f}x"
+                        f"{summary['image_height_mm']:.2f} mm"
                     ),
                     "created": datetime.now(timezone.utc).isoformat(),
                     "modified": datetime.now(timezone.utc).isoformat(),

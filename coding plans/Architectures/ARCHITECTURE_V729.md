@@ -91,7 +91,7 @@ MEBP/
 │   ├── MotionController.py              # Kalman/PID motion tracking
 │   ├── FlowPhysics.py                   # Pressure/flow validation
 │   ├── GeometryEngine.py               # Parametric object generation + fill patterns
-│   ├── ImagePathPlanner.py              # Image-based toolpath generation
+│   ├── ImagePathPlanner.py              # Image-stack-to-toolpath raster generator  ← v7.2.9
 │   ├── VelocityExecutor.py              # Velocity-based motion execution
 │   └── auto_layout.py                   # Ring/grid/hex layout generators
 │
@@ -186,7 +186,15 @@ PrintManager (execution engine)
 
 PrintPlanOfAction (plan generation)
 ├── PlanStep / PlanStepType (typed plan nodes)
-├── PlanPreferences (ordering, optimization hints)
+│   └── Step types: LOAD_INK, WASH, WASTE, REFILL_BUFFER, PRINT, RETURN_HOME,
+│                    GATHER_INK, FINAL_CLEANUP, TRAVEL_XY, MOVE_SAFE_Z, INK_SWAP  ← v7.2.9
+├── PrintExecutionConfig (comprehensive execution config)  ← v7.2.9 replaces PlanPreferences
+│   ├── InkSwapStrategy (6-step cleaning sequence)  ← moved from HardwareConfig
+│   ├── InkGatherConfig (per-ink pickup volume + extra %)
+│   ├── ZTravelConfig (safe Z, plunge buffer, fast entry/exit)
+│   ├── XYTravelConfig (fast travel speed)
+│   └── FinalCleanupConfig (end-of-print cleanup sequence)
+├── PLAN_STEP_COLORS / PLAN_STEP_ICONS (Catppuccin Mocha visualization maps)
 └── generate_plan() → plan_to_commands() pipeline
 ```
 
@@ -194,7 +202,7 @@ PrintPlanOfAction (plan generation)
 1. Hardware Setup (Page 0) → validates HardwareConfig
 2. Print Objects Tab (Page 4, Tab 2) → design objects with GeometryEngine
 3. Well Setup Tab (Page 4, Tab 3) → assign objects to wells
-4. Print Setup (Page 4) → generate PrintPlanOfAction → build PrintJob
+4. Finalize Tab (Page 4, Tab 4) → configure PrintExecutionConfig → generate PrintPlanOfAction → build PrintJob  ← v7.2.9
 5. Print Monitor (Page 5) → execute via PrintManager
 6. Print Results (Page 6) → analyze recorded data
 
@@ -210,7 +218,7 @@ HardwareConfig (central authority for µL↔mm conversions)
 │   └── enabled: bool
 ├── InkLibrary: dict[str, InkSpec]
 │   └── InkSpec (name, viscosity, granule_diameter, density, color)
-├── InkSwapStrategy  ← v7.2.9: configurable cleaning sequence
+├── InkSwapStrategy  ← v7.2.9: re-exported from PrintPlanOfAction for backward compat
 │   ├── 6 step toggles: waste, wash_pre, buffer, wash_post, ink_load, wash_final
 │   └── 4 volumes: waste_volume_uL, wash_volume_uL, buffer_volume_uL, ink_load_volume_uL
 └── RosetteInsert (rosette geometry for guided deposition)
@@ -258,10 +266,11 @@ MainWindow (app.py)
 │   ├── Page 1: DashboardPage           — connection status, position readouts
 │   ├── Page 2: JogControlPage          — manual jogging, Xbox mapping
 │   ├── Page 3: CalibrationPage         — camera, teach points, Z-plane fit
-│   ├── Page 4: PrintSetupPage          — 3-tab print designer
+│   ├── Page 4: PrintSetupPage          — 4-tab print designer  ← v7.2.9
 │   │   ├── Tab 1: WorkspaceTab         — read-only hardware summary
 │   │   ├── Tab 2: PrintObjectsTab      — CAD-like object editor
-│   │   └── Tab 3: WellSetupTab         — well assignments + roles
+│   │   ├── Tab 3: WellSetupTab         — well assignments + roles
+│   │   └── Tab 4: FinalizeTab          — execution config, plan of action, generate & send  ← v7.2.9
 │   ├── Page 5: PrintMonitorPage        — execution visualization
 │   ├── Page 6: PrintResultsPage        — post-print analysis
 │   └── Page 7: SettingsPage            — safety limits, serial ports
@@ -292,9 +301,44 @@ Single source of truth for hardware state. All µL↔mm conversions route throug
 
 **v7.2.9 Changes:**
 - `PumpChannelConfig.inks: list[InkSpec]` — multi-ink per pump with backward-compat `ink` property
-- `InkSwapStrategy` dataclass — 6-step configurable cleaning sequence
+- `InkSwapStrategy` moved to `PrintPlanOfAction.py` (canonical location), re-exported here for backward compat
 - `pump_ink_map` → `dict[str, list[str]]`, `ink_pump_map` → `dict[str, list[str]]`
 - `can_handle_ink(ink_name)` for pump-ink resolution
+
+### 5.6 PrintPlanOfAction.py — Plan Generation & Execution Config
+
+Generates typed execution plans from well assignments and hardware configuration.
+
+**v7.2.9 Changes:**
+- `PrintExecutionConfig` replaces `PlanPreferences` as the comprehensive execution configuration
+  - Composes: `InkSwapStrategy`, `InkGatherConfig`, `ZTravelConfig`, `XYTravelConfig`, `FinalCleanupConfig`
+  - Per-ink overrides via `ink_gather_configs` dict with fallback to `default_gather_config`
+  - Migration: `PrintExecutionConfig.from_preferences(old_prefs)` for backward compat
+- `InkSwapStrategy` is now canonical here (moved from HardwareConfig)
+- 5 new `PlanStepType` values: `GATHER_INK`, `FINAL_CLEANUP`, `TRAVEL_XY`, `MOVE_SAFE_Z`, `INK_SWAP`
+- `PlanStep` enriched with: `z_behavior`, `travel_mode`, `wait_for_z_confirm`, `extra_percent`, `max_pickup_uL`, `sub_steps`
+- `PLAN_STEP_COLORS` and `PLAN_STEP_ICONS` maps for Catppuccin Mocha visualization
+- `PlanStep.icon` and `PlanStep.color` convenience properties
+
+### 5.7 PrintTrajectoryPlanner.py — Plan-to-Trajectory
+
+Converts `PrintPlanOfAction` into time-parameterized waypoint arrays.
+
+**v7.2.9 Changes:**
+- Handles all new step types: `GATHER_INK` (delegates to `_do_load_ink()`), `MOVE_SAFE_Z` (fast Z raise), `TRAVEL_XY` (fast XY move with speed override), `FINAL_CLEANUP` (sub-step sequence: waste/wash), `INK_SWAP` (compound: waste→wash→buffer→ink_load)
+- Uses `PlanStep.sub_steps` list for ordered compound step execution
+
+### 5.8 ImagePathPlanner.py — Image-to-Toolpath Generator
+
+Converts image stacks into raster toolpaths for image-based printing.
+
+**Features:**
+- Three loading modes: TIFF stack, numbered image sequence, single image × N layers
+- Per-pump greyscale intensity mapping to flow rates
+- Raster toolpath generation with alternating layer direction
+- Closest-point segment reordering between layers
+- Output: Nx7 array `[x, y, z, p1, p2, p3, t]` (mm/s units)
+- CSV export via `save_csv()`
 
 ### 5.3 GeometryEngine.py — Parametric Object Generation
 
@@ -310,7 +354,7 @@ Generates time-parameterized trajectories as Nx7 numpy arrays.
 
 Executes print jobs as sequences of typed commands:
 
-- **Command types**: MOVE_XY, MOVE_Z, EXTRUDE, RETRACT, PRIME, SWITCH_PUMP, TRAJECTORY, SERVICE_SEQUENCE, WAIT, SET_FEEDRATE
+- **Command types**: MOVE_XY, MOVE_Z, EXTRUDE, RETRACT, PRIME, SWITCH_PUMP, TRAJECTORY, SERVICE_SEQUENCE, WAIT, SET_FEEDRATE, GATHER_INK, TRAVEL_XY, MOVE_SAFE_Z, INK_SWAP, FINAL_CLEANUP
 - **TrajectoryExecutor**: Smooth path tracking using MotionController (Kalman/PID)
 - **ServiceSequenceExecutor**: Automated cleaning cycles (waste→wash→buffer→ink)
 - **FluidColumnTracker**: Tracks per-syringe oil/buffer/ink volumes
@@ -394,11 +438,10 @@ Robust serial communication layer:
    - Syringe selection (Hamilton catalog)
    - Multi-ink checklist (`QListWidget` with checkable items) ← v7.2.9
    - Fluid column volumes (oil/buffer/ink)
-4. **Ink Swap Strategy** ← v7.2.9
-   - 6 step toggles: waste, wash_pre, buffer, wash_post, ink_load, wash_final
-   - 4 volume spinboxes (µL)
-5. **Ink Library** — define ink specs (name, viscosity, density, color)
-6. **Rosette Configuration** — insert geometry for guided deposition
+4. **Ink Library** — define ink specs (name, viscosity, density, color)
+5. **Rosette Configuration** — insert geometry for guided deposition
+
+> **Note:** Ink Swap Strategy UI moved from Hardware Setup → Print Setup Finalize tab in v7.2.9 (execution config is per-print, not per-hardware).
 
 **Output:** `HardwareConfig` instance propagated to all pages via `_propagate_hardware_config()`.
 
@@ -434,6 +477,26 @@ _3D_TYPE_MAP (gui_type, filled) → engine_type:
 2. User checks "Filled" → `filled=True`
 3. `_build_print_object()` resolves: `_3D_TYPE_MAP[("sphere", True)]` → `"sphere_solid"`
 4. GeometryEngine generates trajectory for `sphere_solid` type
+
+### Page 4, Tab 3: Well Setup (`print_well_setup.py`)
+
+**v7.2.9 Changes:**
+- Plan of Action section **removed** from this tab (moved to Finalize tab)
+- `_generate_plan()` still callable but invoked from Finalize tab with `execution_config` parameter
+
+### Page 4, Tab 4: Finalize (`print_setup.py`)  ← v7.2.9 NEW
+
+**Purpose:** Configure execution parameters, generate plan of action, and send to monitor.
+
+**Layout:** Two-column design:
+- **Left column — Print Parameters:** Ink swap strategy (6 toggles + 4 volume spinboxes), Z travel config, XY travel config, ink gather configs, final cleanup config
+- **Right column — Plan of Action:** Generated plan preview with step-type colors/icons, generate button, send-to-monitor button
+
+**Data flow:**
+1. User configures `PrintExecutionConfig` sub-configs via UI widgets
+2. "Generate Print" builds `PrintPlanOfAction` using execution config
+3. `plan_to_commands()` → `PrintJob` with all service and motion steps
+4. "Send to Monitor" emits `job_ready` signal → `PrintMonitorPage`
 
 ### Page 5: Print Monitor (`print_monitor.py`)
 
@@ -476,8 +539,14 @@ PrintObjectsTab (design objects)
     ▼
 WellSetupTab (assign to wells)
     ▼
+FinalizeTab (configure PrintExecutionConfig)  ← v7.2.9
+    ├── InkSwapStrategy, ZTravelConfig, XYTravelConfig,
+    │   InkGatherConfig, FinalCleanupConfig
+    ▼
 PrintSetupPage._generate_print()
-    ├── PrintPlanOfAction.generate_plan()
+    ├── PrintPlanOfAction.generate_plan(execution_config=...)
+    │   └── Generates: GATHER_INK, TRAVEL_XY, MOVE_SAFE_Z,
+    │                   PRINT, INK_SWAP, FINAL_CLEANUP steps
     └── plan_to_commands() → PrintJob
             ▼
 PrintMonitorPage.receive_job()
@@ -648,7 +717,7 @@ Auto-saved on application exit via `Settings.save()`.
 | v7.2.6 | Print execution restoration (7 critical fixes) |
 | v7.2.7 | Print speed display, execution mode selection |
 | v7.2.8 | Xbox controller polling fixes, ProScan detection, stable build |
-| v7.2.9 | Object type consolidation, filled/shell checkbox, multi-ink per pump, ink swap strategy, triangle fill |
+| v7.2.9 | Object type consolidation, filled/shell checkbox, multi-ink per pump, ink swap strategy, triangle fill, PrintExecutionConfig (replaces PlanPreferences), 5 new step types (GATHER_INK, FINAL_CLEANUP, TRAVEL_XY, MOVE_SAFE_Z, INK_SWAP), Finalize tab (Tab 4), InkSwapStrategy relocated to PrintPlanOfAction, ImagePathPlanner for image-based toolpaths |
 
 ---
 

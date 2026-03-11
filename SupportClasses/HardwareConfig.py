@@ -63,71 +63,12 @@ from SupportClasses.WellPlate import PLATE_DEFINITIONS
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Ink Swap Strategy
+# Ink Swap Strategy (v7.2.9: canonical definition in PrintPlanOfAction.py)
 # ═══════════════════════════════════════════════════════════════════
 
-@dataclass
-class InkSwapStrategy:
-    """
-    Configurable ink swap sequence for single-syringe multi-ink workflows.
-
-    When a pump needs to switch between inks, the planner inserts a
-    cleaning/loading sequence. Each step can be toggled on/off.
-
-    Full sequence: waste → wash → buffer → wash → ink_load → wash → print
-    """
-    waste: bool = True          # Expel remaining ink to waste reservoir
-    wash_pre: bool = True       # Wash line before buffer
-    buffer: bool = True         # Flush with buffer solution
-    wash_post: bool = True      # Wash line after buffer
-    ink_load: bool = True       # Load new ink into syringe (always recommended)
-    wash_final: bool = True     # Final wash before resuming print
-
-    # Volumes for each step (µL) — sensible defaults
-    waste_volume_uL: float = 50.0
-    wash_volume_uL: float = 100.0
-    buffer_volume_uL: float = 100.0
-    ink_load_volume_uL: float = 50.0
-
-    def get_enabled_steps(self) -> list[str]:
-        """Return ordered list of enabled step names."""
-        steps = []
-        if self.waste:      steps.append("waste")
-        if self.wash_pre:   steps.append("wash")
-        if self.buffer:     steps.append("buffer")
-        if self.wash_post:  steps.append("wash")
-        if self.ink_load:   steps.append("ink_load")
-        if self.wash_final: steps.append("wash")
-        return steps
-
-    def to_dict(self) -> dict:
-        return {
-            "waste": self.waste,
-            "wash_pre": self.wash_pre,
-            "buffer": self.buffer,
-            "wash_post": self.wash_post,
-            "ink_load": self.ink_load,
-            "wash_final": self.wash_final,
-            "waste_volume_uL": self.waste_volume_uL,
-            "wash_volume_uL": self.wash_volume_uL,
-            "buffer_volume_uL": self.buffer_volume_uL,
-            "ink_load_volume_uL": self.ink_load_volume_uL,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> InkSwapStrategy:
-        return cls(
-            waste=data.get("waste", True),
-            wash_pre=data.get("wash_pre", True),
-            buffer=data.get("buffer", True),
-            wash_post=data.get("wash_post", True),
-            ink_load=data.get("ink_load", True),
-            wash_final=data.get("wash_final", True),
-            waste_volume_uL=data.get("waste_volume_uL", 50.0),
-            wash_volume_uL=data.get("wash_volume_uL", 100.0),
-            buffer_volume_uL=data.get("buffer_volume_uL", 100.0),
-            ink_load_volume_uL=data.get("ink_load_volume_uL", 50.0),
-        )
+# v7.2.9: InkSwapStrategy moved to PrintPlanOfAction.py as the single
+# source of truth. Re-exported here for backwards compatibility.
+from SupportClasses.PrintPlanOfAction import InkSwapStrategy  # noqa: F401
 
 
 # ═══════════════════════════════════════════════════════════════════

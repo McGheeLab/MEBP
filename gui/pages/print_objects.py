@@ -1733,6 +1733,7 @@ class PrintObjectsTab(QWidget):
                 "color": DEFAULT_COLORS[len(self._objects) % len(DEFAULT_COLORS)],
                 "ink": self._ink_combo.currentData() or "",
                 "auto_layout": False,
+                "in_well": True,
                 "_csv_data": data if HAS_NUMPY else None,
             }
             self._objects.append(entry)
@@ -1814,6 +1815,27 @@ class PrintObjectsTab(QWidget):
             color=color,
         )
 
+        # CSV import: use pre-loaded trajectory directly (skip GeometryEngine)
+        if obj_type == "csv_import":
+            csv_data = params.get("_csv_data")
+            if csv_data is None and "source_file" in params:
+                try:
+                    from SupportClasses.TrajectoryPlanner import import_csv_trajectory
+                    csv_data = import_csv_trajectory(params["source_file"])
+                except Exception as e:
+                    logger.error(f"Failed to load CSV trajectory for '{name}': {e}")
+            if csv_data is not None and HAS_NUMPY:
+                arr = np.asarray(csv_data, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] >= 7:
+                    obj.trajectory = arr[:, :7]
+                    obj.total_time_s = float(arr[-1, 6] - arr[0, 6]) if len(arr) > 0 else 0.0
+                    dx = np.diff(arr[:, 0])
+                    dy = np.diff(arr[:, 1])
+                    dz = np.diff(arr[:, 2])
+                    obj.total_length_mm = float(np.sum(np.sqrt(dx**2 + dy**2 + dz**2)))
+                    obj.num_layers = 1
+            return obj
+
         needle, syringe_map, speed, layer_h = self._extract_needle_syringe()
         if needle is None:
             return obj
@@ -1885,10 +1907,15 @@ class PrintObjectsTab(QWidget):
                 if not entry.get("in_well", False):
                     continue
                 # Build trajectory at ORIGIN so PlacedObject offsets control position
+                # For csv_import, pass cached _csv_data through params
+                build_params = entry.get("params", {})
+                if entry["object_type"] == "csv_import" and "_csv_data" in entry:
+                    build_params = dict(build_params)
+                    build_params["_csv_data"] = entry["_csv_data"]
                 obj = self._build_print_object(
                     name=entry["name"],
                     obj_type=entry["object_type"],
-                    params=entry.get("params", {}),
+                    params=build_params,
                     position=(0, 0, 0),
                     color=entry.get("color", DEFAULT_COLORS[0]),
                     pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),
@@ -1935,10 +1962,14 @@ class PrintObjectsTab(QWidget):
         for i, entry in enumerate(self._objects):
             if not entry.get("in_well", False):
                 continue
+            build_params = entry.get("params", {})
+            if entry["object_type"] == "csv_import" and "_csv_data" in entry:
+                build_params = dict(build_params)
+                build_params["_csv_data"] = entry["_csv_data"]
             obj = self._build_print_object(
                 name=entry["name"],
                 obj_type=entry["object_type"],
-                params=entry.get("params", {}),
+                params=build_params,
                 position=entry.get("position", (0, 0, 0)),
                 color=entry.get("color", DEFAULT_COLORS[0]),
                 pump_id=self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))),

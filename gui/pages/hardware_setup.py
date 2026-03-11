@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QStandardItem
 
-from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig, InkSwapStrategy
+from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
 from SupportClasses.PhysicalModels import (
     NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert,
     load_needle_catalog, load_syringe_catalog,
@@ -604,52 +604,7 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(pump_group)
 
-        # ── Section 4b: Ink Swap Strategy (v7.2.8) ────────────────
-        swap_group = QGroupBox("Ink Swap Strategy")
-        swap_group.setStyleSheet(self._group_style())
-        swap_group.setToolTip(
-            "When a pump switches between inks, these steps run.\n"
-            "Sequence: waste → wash → buffer → wash → ink load → wash → print")
-        swap_lay = QVBoxLayout(swap_group)
-
-        self._swap_checks = {}
-        swap_steps = [
-            ("waste", "Waste (expel remaining ink)"),
-            ("wash_pre", "Wash (pre-buffer rinse)"),
-            ("buffer", "Buffer flush"),
-            ("wash_post", "Wash (post-buffer rinse)"),
-            ("ink_load", "Load new ink"),
-            ("wash_final", "Wash (final, before print)"),
-        ]
-        for key, label in swap_steps:
-            cb = QCheckBox(label)
-            cb.setChecked(True)
-            cb.toggled.connect(self._on_config_changed)
-            swap_lay.addWidget(cb)
-            self._swap_checks[key] = cb
-
-        # Volume settings row
-        vol_form = QFormLayout()
-        vol_form.setSpacing(4)
-        self._swap_waste_vol = QDoubleSpinBox()
-        self._swap_wash_vol = QDoubleSpinBox()
-        self._swap_buffer_vol = QDoubleSpinBox()
-        self._swap_ink_load_vol = QDoubleSpinBox()
-        for spin, label, default in [
-            (self._swap_waste_vol, "Waste vol:", 50.0),
-            (self._swap_wash_vol, "Wash vol:", 100.0),
-            (self._swap_buffer_vol, "Buffer vol:", 100.0),
-            (self._swap_ink_load_vol, "Ink load vol:", 50.0),
-        ]:
-            spin.setRange(0, 5000)
-            spin.setSuffix(" µL")
-            spin.setDecimals(1)
-            spin.setValue(default)
-            spin.valueChanged.connect(self._on_config_changed)
-            vol_form.addRow(label, spin)
-        swap_lay.addLayout(vol_form)
-
-        self._content_layout.addWidget(swap_group)
+        # v7.2.9: Ink Swap Strategy UI moved to Print Setup → Plan of Action
 
         # ── Section 5: Needle Configuration (v7.2.4: MOVED DOWN) ─
         needle_group = QGroupBox("Needle Configuration")
@@ -1056,19 +1011,8 @@ class HardwareSetupPage(QWidget):
             if pid:
                 self._config.needle_channel_pump_map[ch_idx] = pid
 
-        # v7.2.8: Ink swap strategy
-        self._config.ink_swap_strategy = InkSwapStrategy(
-            waste=self._swap_checks["waste"].isChecked(),
-            wash_pre=self._swap_checks["wash_pre"].isChecked(),
-            buffer=self._swap_checks["buffer"].isChecked(),
-            wash_post=self._swap_checks["wash_post"].isChecked(),
-            ink_load=self._swap_checks["ink_load"].isChecked(),
-            wash_final=self._swap_checks["wash_final"].isChecked(),
-            waste_volume_uL=self._swap_waste_vol.value(),
-            wash_volume_uL=self._swap_wash_vol.value(),
-            buffer_volume_uL=self._swap_buffer_vol.value(),
-            ink_load_volume_uL=self._swap_ink_load_vol.value(),
-        )
+        # v7.2.9: Ink swap strategy UI moved to Print Setup → Plan of Action
+        # Keep existing ink_swap_strategy in config unchanged
 
     # ════════════════════════════════════════════════════════════════
     #  INK LIBRARY CRUD
@@ -1353,24 +1297,7 @@ class HardwareSetupPage(QWidget):
         logger.debug(
             f"  Channel map: {self._config.needle_channel_pump_map}")
 
-        # ── 8. Ink Swap Strategy (v7.2.8) ────────────────────────
-        strat = self._config.ink_swap_strategy
-        for key, cb in self._swap_checks.items():
-            cb.blockSignals(True)
-            cb.setChecked(getattr(strat, key, True))
-            cb.blockSignals(False)
-        self._swap_waste_vol.blockSignals(True)
-        self._swap_waste_vol.setValue(strat.waste_volume_uL)
-        self._swap_waste_vol.blockSignals(False)
-        self._swap_wash_vol.blockSignals(True)
-        self._swap_wash_vol.setValue(strat.wash_volume_uL)
-        self._swap_wash_vol.blockSignals(False)
-        self._swap_buffer_vol.blockSignals(True)
-        self._swap_buffer_vol.setValue(strat.buffer_volume_uL)
-        self._swap_buffer_vol.blockSignals(False)
-        self._swap_ink_load_vol.blockSignals(True)
-        self._swap_ink_load_vol.setValue(strat.ink_load_volume_uL)
-        self._swap_ink_load_vol.blockSignals(False)
+        # v7.2.9: Ink swap strategy UI moved to Print Setup → Plan of Action
 
         # ── 9. Emit signals ──────────────────────────────────────
         self._restoring = False

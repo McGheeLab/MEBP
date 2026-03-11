@@ -170,80 +170,288 @@ class PlateOverviewWidget(QWidget):
 # ═══════════════════════════════════════════════════════════════════
 
 class XYDetailView(QWidget):
-    """Zoomed XY view: waypoints + completed/upcoming paths + needle."""
+    """Zoomed XY view: planned trajectory + actual needle trail.
 
-    C_DONE = QColor("#a6e3a1"); C_NEXT = QColor("#f9e2af")
-    C_WP_EMPTY = QColor("#6c7086"); C_WP_FILL = QColor("#a6e3a1")
-    C_NEEDLE = QColor("#f5c2e7"); C_WELL = QColor("#585b70")
-    C_BG = QColor("#1e1e2e")
+    Displays planned print waypoints color-coded by completion state,
+    the actual needle trail from position polling, travel segments,
+    and a well boundary circle centered on the current well.
+
+    Coordinate system: all positions in plate-absolute mm (zero-referenced).
+    View auto-centers on the current well's waypoints.
+    """
+
+    C_DONE = QColor("#a6e3a1")        # Completed print path
+    C_NEXT = QColor("#f9e2af")        # Upcoming print path
+    C_TRAVEL = QColor("#45475a")      # Travel segments
+    C_WP_DONE = QColor("#a6e3a1")     # Completed waypoint dot
+    C_WP_CURRENT = QColor("#f9e2af")  # Current waypoint dot
+    C_WP_EMPTY = QColor("#6c7086")    # Upcoming waypoint dot
+    C_TRAIL = QColor("#cba6f7")       # Actual needle trail (purple)
+    C_NEEDLE = QColor("#f5c2e7")      # Needle crosshair
+    C_WELL = QColor("#585b70")        # Well boundary
+    C_BG = QColor("#1e1e2e")          # Background
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(250, 200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._waypoints: list[tuple[float, float]] = []
-        self._completed_idx = 0
-        self._nx: float | None = None; self._ny: float | None = None
-        self._well_diam = 15.0; self._view_r = 12.0
-        self._cx = 0.0; self._cy = 0.0
 
-    def set_waypoints(self, pts): self._waypoints = list(pts); self._completed_idx = 0; self.update()
-    def set_completed_index(self, i): self._completed_idx = min(i, len(self._waypoints)); self.update()
-    def set_well_diameter(self, d): self._well_diam = d; self._view_r = d * 0.8; self.update()
-    def clear(self): self._waypoints.clear(); self._completed_idx = 0; self._nx = self._ny = None; self.update()
+        # Planned trajectory — ALL waypoints (print + travel)
+        self._waypoints: list[tuple[float, float]] = []
+        self._wp_is_travel: list[bool] = []    # parallel: True = travel move
+        self._wp_well: list[str] = []          # parallel: well name
+        self._completed_idx = 0
+
+        # Actual needle trail from position polling
+        self._needle_trail: deque[tuple[float, float]] = deque(maxlen=2000)
+        self._nx: float | None = None
+        self._ny: float | None = None
+
+        # View parameters
+        self._well_diam = 15.0
+        self._well_center_x = 0.0
+        self._well_center_y = 0.0
+        self._view_cx = 0.0       # center of view in mm
+        self._view_cy = 0.0
+        self._view_radius = 12.0  # half-extent of view in mm
+
+        # Per-well centers cache
+        self._well_centers: dict[str, tuple[float, float]] = {}
+        self._current_well = ""
+
+    # ── Data setters ──────────────────────────────────────────────
+
+    def set_trajectory(self, waypoints, is_travel=None, wells=None):
+        """Set the full planned trajectory with metadata.
+
+        Args:
+            waypoints: list of (x, y) tuples in plate-absolute mm.
+            is_travel: parallel list of booleans (True = travel move).
+            wells: parallel list of well name strings.
+        """
+        self._waypoints = list(waypoints)
+        n = len(self._waypoints)
+        self._wp_is_travel = list(is_travel) if is_travel else [False] * n
+        self._wp_well = list(wells) if wells else [""] * n
+        self._completed_idx = 0
+        self._needle_trail.clear()
+
+        # Compute per-well centers from print waypoints
+        self._well_centers.clear()
+        well_points: dict[str, list[tuple[float, float]]] = {}
+        for i, (x, y) in enumerate(self._waypoints):
+            w = self._wp_well[i] if i < len(self._wp_well) else ""
+            if w and (i >= len(self._wp_is_travel) or not self._wp_is_travel[i]):
+                well_points.setdefault(w, []).append((x, y))
+        for w, pts in well_points.items():
+            self._well_centers[w] = (
+                sum(p[0] for p in pts) / len(pts),
+                sum(p[1] for p in pts) / len(pts),
+            )
+
+        # Focus on first well with print waypoints
+        first_well = ""
+        for w in self._wp_well:
+            if w:
+                first_well = w
+                break
+        if first_well:
+            self._focus_well(first_well)
+        else:
+            self._auto_fit_view()
+        self.update()
+
+    def set_waypoints(self, pts):
+        """Legacy API: set print waypoints without metadata."""
+        self.set_trajectory(pts)
+
+    def set_completed_index(self, i):
+        self._completed_idx = min(i, len(self._waypoints))
+        self.update()
+
+    def set_well_diameter(self, d):
+        self._well_diam = d
+        self.update()
 
     def set_needle_position(self, x, y):
-        self._nx = x; self._ny = y; self._cx = x; self._cy = y; self.update()
+        self._nx = x
+        self._ny = y
+        self._needle_trail.append((x, y))
+        self.update()
+
+    def focus_well(self, well_name):
+        """Center and zoom the view on a specific well's waypoints."""
+        if well_name and well_name != self._current_well:
+            self._focus_well(well_name)
+            self.update()
+
+    def clear(self):
+        self._waypoints.clear()
+        self._wp_is_travel.clear()
+        self._wp_well.clear()
+        self._completed_idx = 0
+        self._needle_trail.clear()
+        self._nx = self._ny = None
+        self._current_well = ""
+        self._well_centers.clear()
+        self.update()
+
+    # ── View management ───────────────────────────────────────────
+
+    def _focus_well(self, well_name):
+        """Center and zoom view on a specific well's print waypoints."""
+        self._current_well = well_name
+
+        # Gather this well's print waypoints
+        well_pts = [
+            self._waypoints[i]
+            for i in range(len(self._waypoints))
+            if (i < len(self._wp_well) and self._wp_well[i] == well_name
+                and (i >= len(self._wp_is_travel) or not self._wp_is_travel[i]))
+        ]
+
+        if well_pts:
+            xs = [p[0] for p in well_pts]
+            ys = [p[1] for p in well_pts]
+            cx = (min(xs) + max(xs)) / 2
+            cy = (min(ys) + max(ys)) / 2
+            span = max(max(xs) - min(xs), max(ys) - min(ys), self._well_diam)
+            self._view_cx = cx
+            self._view_cy = cy
+            self._view_radius = span / 2 + 2.0  # padding
+            self._well_center_x = cx
+            self._well_center_y = cy
+        elif well_name in self._well_centers:
+            cx, cy = self._well_centers[well_name]
+            self._view_cx = cx
+            self._view_cy = cy
+            self._view_radius = self._well_diam / 2 + 2.0
+            self._well_center_x = cx
+            self._well_center_y = cy
+
+    def _auto_fit_view(self):
+        """Fit view to all waypoints (used when no well info available)."""
+        if not self._waypoints:
+            return
+        xs = [p[0] for p in self._waypoints]
+        ys = [p[1] for p in self._waypoints]
+        self._view_cx = (min(xs) + max(xs)) / 2
+        self._view_cy = (min(ys) + max(ys)) / 2
+        span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+        self._view_radius = span / 2 + 2.0
+        self._well_center_x = self._view_cx
+        self._well_center_y = self._view_cy
+
+    # ── Coordinate transform ──────────────────────────────────────
 
     def _to_px(self, xm, ym):
+        """Convert plate-absolute mm → pixel coordinates."""
         w, h = self.width(), self.height()
-        s = min(w, h) / (2 * self._view_r) if self._view_r > 0 else 1
-        return w / 2 + (xm - self._cx) * s, h / 2 + (ym - self._cy) * s
+        r = self._view_radius if self._view_radius > 0 else 1.0
+        s = min(w, h) / (2 * r)
+        return w / 2 + (xm - self._view_cx) * s, h / 2 + (ym - self._view_cy) * s
+
+    def _get_scale(self):
+        w, h = self.width(), self.height()
+        r = self._view_radius if self._view_radius > 0 else 1.0
+        return min(w, h) / (2 * r)
+
+    # ── Drawing ───────────────────────────────────────────────────
 
     def paintEvent(self, event):
-        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), self.C_BG)
         w, h = self.width(), self.height()
-        if self._view_r <= 0: p.end(); return
-        s = min(w, h) / (2 * self._view_r)
 
-        # Well boundary
-        if self._well_diam > 0:
-            bx, by = self._to_px(0, 0)
-            p.setPen(QPen(self.C_WELL, 1, Qt.PenStyle.DashLine))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(bx, by), self._well_diam / 2 * s, self._well_diam / 2 * s)
+        if self._view_radius <= 0:
+            p.end()
+            return
 
+        s = self._get_scale()
         wp = self._waypoints
+        ci = self._completed_idx
         wpr = max(2.5, min(5, 50 / max(len(wp), 1)))
 
-        # Completed path (green)
-        if self._completed_idx > 1:
+        # 1. Well boundary circle (at well center, not origin)
+        if self._well_diam > 0:
+            wcx, wcy = self._to_px(self._well_center_x, self._well_center_y)
+            r_px = self._well_diam / 2 * s
+            p.setPen(QPen(self.C_WELL, 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(wcx, wcy), r_px, r_px)
+
+        # 2. Completed print path (solid green)
+        if ci > 1:
             p.setPen(QPen(self.C_DONE, 2))
-            for i in range(1, min(self._completed_idx, len(wp))):
-                p.drawLine(QPointF(*self._to_px(*wp[i-1])), QPointF(*self._to_px(*wp[i])))
+            for i in range(1, min(ci, len(wp))):
+                # Skip travel segments in print path
+                if (i < len(self._wp_is_travel) and self._wp_is_travel[i]) or \
+                   (i - 1 < len(self._wp_is_travel) and self._wp_is_travel[i - 1]):
+                    continue
+                p.drawLine(QPointF(*self._to_px(*wp[i - 1])),
+                           QPointF(*self._to_px(*wp[i])))
 
-        # Upcoming paths (yellow dashed, next 2 segments beyond completed)
-        if self._completed_idx < len(wp):
-            p.setPen(QPen(self.C_NEXT, 2, Qt.PenStyle.DashLine))
-            lo = max(0, self._completed_idx - 1)
-            hi = min(len(wp), self._completed_idx + 3)
+        # 3. Upcoming print path (dashed yellow, next 30 segments)
+        if ci < len(wp):
+            p.setPen(QPen(self.C_NEXT, 1.5, Qt.PenStyle.DashLine))
+            lo = max(0, ci - 1)
+            hi = min(len(wp), ci + 30)
             for i in range(lo + 1, hi):
-                p.drawLine(QPointF(*self._to_px(*wp[i-1])), QPointF(*self._to_px(*wp[i])))
+                if (i < len(self._wp_is_travel) and self._wp_is_travel[i]) or \
+                   (i - 1 < len(self._wp_is_travel) and self._wp_is_travel[i - 1]):
+                    continue
+                p.drawLine(QPointF(*self._to_px(*wp[i - 1])),
+                           QPointF(*self._to_px(*wp[i])))
 
-        # Waypoints
+        # 4. Travel segments (thin grey dotted, only if on-screen)
+        p.setPen(QPen(self.C_TRAVEL, 1, Qt.PenStyle.DotLine))
+        for i in range(1, len(wp)):
+            if i >= len(self._wp_is_travel):
+                break
+            if not (self._wp_is_travel[i] or self._wp_is_travel[i - 1]):
+                continue
+            px0, py0 = self._to_px(*wp[i - 1])
+            px1, py1 = self._to_px(*wp[i])
+            if (px0 < -50 and px1 < -50) or (px0 > w + 50 and px1 > w + 50):
+                continue
+            if (py0 < -50 and py1 < -50) or (py0 > h + 50 and py1 > h + 50):
+                continue
+            p.drawLine(QPointF(px0, py0), QPointF(px1, py1))
+
+        # 5. Waypoint dots (print waypoints only)
         for i, (wx, wy) in enumerate(wp):
+            if i < len(self._wp_is_travel) and self._wp_is_travel[i]:
+                continue
             px, py = self._to_px(wx, wy)
-            if not (-30 < px < w + 30 and -30 < py < h + 30): continue
-            if i < self._completed_idx:
-                p.setPen(QPen(self.C_WP_FILL, 1)); p.setBrush(QBrush(self.C_WP_FILL))
-            elif i == self._completed_idx:
-                p.setPen(QPen(self.C_NEXT, 1.5)); p.setBrush(QBrush(self.C_NEXT))
+            if not (-30 < px < w + 30 and -30 < py < h + 30):
+                continue
+            if i < ci:
+                p.setPen(QPen(self.C_WP_DONE, 1))
+                p.setBrush(QBrush(self.C_WP_DONE))
+            elif i == ci:
+                p.setPen(QPen(self.C_WP_CURRENT, 1.5))
+                p.setBrush(QBrush(self.C_WP_CURRENT))
             else:
-                p.setPen(QPen(self.C_WP_EMPTY, 1)); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(self.C_WP_EMPTY, 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(px, py), wpr, wpr)
 
-        # Needle
+        # 6. Actual needle trail (purple line — where the needle really went)
+        trail = list(self._needle_trail)
+        if len(trail) > 1:
+            p.setPen(QPen(self.C_TRAIL, 1.5))
+            for i in range(1, len(trail)):
+                px0, py0 = self._to_px(*trail[i - 1])
+                px1, py1 = self._to_px(*trail[i])
+                # Skip off-screen segments
+                if (px0 < -50 and px1 < -50) or (px0 > w + 50 and px1 > w + 50):
+                    continue
+                if (py0 < -50 and py1 < -50) or (py0 > h + 50 and py1 > h + 50):
+                    continue
+                p.drawLine(QPointF(px0, py0), QPointF(px1, py1))
+
+        # 7. Needle crosshair
         if self._nx is not None:
             nx, ny = self._to_px(self._nx, self._ny)
             p.setPen(QPen(self.C_NEEDLE, 2))
@@ -252,11 +460,19 @@ class XYDetailView(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(nx, ny), 5, 5)
 
-        # Info
-        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 9))
+        # 8. Info overlay
+        p.setPen(QColor("#6c7086"))
+        p.setFont(QFont("Arial", 9))
         if self._nx is not None:
             p.drawText(6, h - 6, f"XY: ({self._nx:.1f}, {self._ny:.1f})")
-        if wp: p.drawText(6, 14, f"Waypoints: {self._completed_idx}/{len(wp)}")
+        if wp:
+            done_print = sum(1 for i in range(min(ci, len(wp)))
+                             if i >= len(self._wp_is_travel) or not self._wp_is_travel[i])
+            total_print = sum(1 for i in range(len(wp))
+                              if i >= len(self._wp_is_travel) or not self._wp_is_travel[i])
+            p.drawText(6, 14, f"Waypoints: {done_print}/{total_print}")
+        if self._current_well:
+            p.drawText(6, 28, f"Well: {self._current_well}")
         p.end()
 
 
@@ -528,7 +744,8 @@ class PrintMonitorPage(QWidget):
         self.xy_detail = XYDetailView()
         xl.addWidget(self.xy_detail)
         dl = QHBoxLayout()
-        for txt, c in [("── Done", "#a6e3a1"), ("╌╌ Next", "#f9e2af"), ("✛ Needle", "#f5c2e7")]:
+        for txt, c in [("── Done", "#a6e3a1"), ("╌╌ Next", "#f9e2af"),
+                        ("── Trail", "#cba6f7"), ("✛ Needle", "#f5c2e7")]:
             l = QLabel(txt); l.setStyleSheet(f"color: {c}; font-size: 9px;")
             dl.addWidget(l)
         dl.addStretch()
@@ -713,47 +930,60 @@ class PrintMonitorPage(QWidget):
                 widget.set_config(enabled=False)
 
     def _load_job_waypoints(self, job):
-        """v7.3: Load trajectory waypoints for full-path visualization.
+        """Load trajectory waypoints for full-path visualization.
 
-        Prefers trajectory_waypoints (from TrajectoryPlanner) which contain
-        the complete time-parameterized path. Falls back to extracting
-        MOVE_XY commands from the flat command list.
+        Stores ALL waypoints (print + travel) with per-waypoint metadata
+        (well name, travel flag) so the XY detail view can:
+        - Center on the current well
+        - Draw travel segments differently
+        - Track completed waypoints robustly across well transitions
+
+        Prefers trajectory_waypoints, falls back to command extraction.
         """
-        # ── Prefer trajectory waypoints (v7.3) ────────────────────
+        # ── v7.2.9: Hybrid estimate — use step-based progress, not time ──
+        hybrid_est = getattr(job, 'estimated_duration_s', 0.0)
+        if hybrid_est > 0:
+            self._is_trajectory_job = False
+            self._total_duration_s = hybrid_est
+            logger.info(f"Hybrid time estimate: {hybrid_est:.1f}s (step-based progress)")
+
+        # ── Prefer trajectory waypoints ───────────────────────────
         traj_wps = getattr(job, 'trajectory_waypoints', None)
         if traj_wps and len(traj_wps) > 0:
-            self._trajectory_waypoints = traj_wps  # store for time-based progress
-            self._is_trajectory_job = True
+            self._trajectory_waypoints = traj_wps
 
-            # XY points (all, including travel — we'll color differently)
-            xy_print = [(wp.x, wp.y) for wp in traj_wps
-                        if not getattr(wp, 'is_travel', False)]
+            if hybrid_est <= 0:
+                self._is_trajectory_job = True
+
+            # Build full waypoint list with metadata for XY detail
             xy_all = [(wp.x, wp.y) for wp in traj_wps]
+            is_travel = [getattr(wp, 'is_travel', False) for wp in traj_wps]
+            wells = [getattr(wp, 'well', '') for wp in traj_wps]
 
-            if xy_print:
-                self.xy_detail.set_waypoints(xy_print)
-            elif xy_all:
-                self.xy_detail.set_waypoints(xy_all)
+            self.xy_detail.set_trajectory(xy_all, is_travel=is_travel, wells=wells)
 
             # Z profile for YZ view
             z_profile = [(wp.y, wp.z) for wp in traj_wps]
             if z_profile and hasattr(self.yz_view, '_z_history'):
                 self.yz_view._z_history.clear()
-                for y, z in z_profile[::3]:  # every 3rd point to avoid overload
+                for y, z in z_profile[::3]:
                     self.yz_view._z_history.append((y, z))
                 self.yz_view.update()
 
-            # Total duration for time-based progress
-            traj_result = getattr(job, 'trajectory_result', None)
-            if traj_result:
-                self._total_duration_s = getattr(traj_result, 'total_duration_s', 0)
-            elif traj_wps:
-                self._total_duration_s = traj_wps[-1].t if traj_wps[-1].t > 0 else 0
+            # Total duration — hybrid estimate takes precedence
+            if hybrid_est <= 0:
+                traj_result = getattr(job, 'trajectory_result', None)
+                if traj_result:
+                    self._total_duration_s = getattr(traj_result, 'total_duration_s', 0)
+                elif traj_wps:
+                    self._total_duration_s = traj_wps[-1].t if traj_wps[-1].t > 0 else 0
 
+            n_print = sum(1 for t in is_travel if not t)
             logger.info(
                 f"Trajectory loaded: {len(traj_wps)} waypoints, "
-                f"{len(xy_print)} print points, "
-                f"{self._total_duration_s:.1f}s total")
+                f"{n_print} print points, "
+                f"{self._total_duration_s:.1f}s total, "
+                f"progress={'time' if self._is_trajectory_job else 'step'}")
             return
 
         # ── Fallback: extract from commands ───────────────────────
@@ -774,7 +1004,7 @@ class PrintMonitorPage(QWidget):
             logger.debug(f"Waypoint extraction: {exc}")
 
         if waypoints:
-            self.xy_detail.set_waypoints(waypoints)
+            self.xy_detail.set_trajectory(waypoints)
             logger.info(f"Loaded {len(waypoints)} command waypoints")
     def _refresh_queue(self):
         if not hasattr(self, '_queue_list') or self._queue_list is None: return
@@ -821,14 +1051,19 @@ class PrintMonitorPage(QWidget):
         well = ""
         wm = re.search(r'[Ww]ell\s+([A-P]\d{1,2})', message)
         if wm:
-            well = wm.group(1); self._current_well_name = well
+            well = wm.group(1)
+            self._current_well_name = well
             self.plate_view.set_active_well(well)
+            # Re-center XY detail on the new well (message-based detection
+            # complements position-based detection in on_status_update)
+            self.xy_detail.focus_well(well)
 
         # Parse active pump from message
         pm = re.search(r'\b(P[123])\b', message)
-        if pm: self._active_pump = pm.group(1)
+        if pm:
+            self._active_pump = pm.group(1)
 
-        # v7.3: Time-based progress for trajectory jobs
+        # Time-based progress for trajectory jobs, step-based otherwise
         if self._is_trajectory_job and self._total_duration_s > 0 and self._print_start_time:
             import time as _time
             elapsed = _time.time() - self._print_start_time
@@ -845,16 +1080,17 @@ class PrintMonitorPage(QWidget):
 
         if self._print_start_time:
             el = time.time() - self._print_start_time
-            if pct > 0:
+            if self._total_duration_s > 0:
+                rem = max(0, self._total_duration_s - el)
+                self._progress_labels.get("time_info", QLabel()).setText(
+                    f"{self._ft(el)} / ~{self._ft(rem)}")
+            elif pct > 0:
                 rem = el / (pct / 100) - el
                 self._progress_labels.get("time_info", QLabel()).setText(
                     f"{self._ft(el)} / ~{self._ft(rem)}")
             else:
-                self._progress_labels.get("time_info", QLabel()).setText(f"{self._ft(el)} / —")
-
-        # Update XY detail completed index
-        if total > 0 and self.xy_detail._waypoints:
-            self.xy_detail.set_completed_index(int(step / total * len(self.xy_detail._waypoints)))
+                self._progress_labels.get("time_info", QLabel()).setText(
+                    f"{self._ft(el)} / —")
 
         # Update active pump indicator
         for pid, pw in self._pump_widgets.items():
@@ -897,7 +1133,12 @@ class PrintMonitorPage(QWidget):
     # ── Position polling (300ms from app.py) ─────────────────────
 
     def on_status_update(self):
-        """Called by MainWindow timer (~300ms). Update needle position directly."""
+        """Called by MainWindow timer (~300ms). Update needle position and tracking.
+
+        Polls the controller for current position, updates all visualization
+        widgets, and performs robust waypoint-to-position matching with
+        well transition detection.
+        """
         if self._print_state != PrintState.RUNNING:
             return
         ctrl = self._get_controller()
@@ -916,10 +1157,50 @@ class PrintMonitorPage(QWidget):
             py = (xy[1] - zero.get('y', 0)) / 1000.0
             pz = (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0.0
 
-            # Update all views directly from polled position
+            # Update all views (set_needle_position appends to trail)
             self.plate_view.set_needle_position(px, py)
             self.xy_detail.set_needle_position(px, py)
             self.yz_view.set_needle_position(py, pz)
+
+            # Position-based trajectory progress — robust two-phase search
+            wps = self.xy_detail._waypoints
+            if wps and len(wps) > 1:
+                cur_idx = self.xy_detail._completed_idx
+                best_idx = self._find_nearest_waypoint(px, py, wps, cur_idx)
+
+                # Only advance forward (never regress)
+                if best_idx > cur_idx:
+                    self.xy_detail.set_completed_index(best_idx)
+
+                    # Detect well transition from waypoint metadata
+                    wp_wells = self.xy_detail._wp_well
+                    if wp_wells and best_idx < len(wp_wells):
+                        new_well = wp_wells[best_idx]
+                        if new_well and new_well != self.xy_detail._current_well:
+                            self.xy_detail.focus_well(new_well)
+                            logger.debug(f"XY view: focused on well {new_well}")
+
+            # Positional well detection fallback — if the needle has
+            # drifted far from the current view center, find the nearest
+            # well center and re-focus.  This handles cases where waypoint
+            # index matching fails (e.g., same pattern in multiple wells).
+            well_centers = self.xy_detail._well_centers
+            if well_centers and self.xy_detail._well_diam > 0:
+                vcx = self.xy_detail._view_cx
+                vcy = self.xy_detail._view_cy
+                drift_sq = (px - vcx) ** 2 + (py - vcy) ** 2
+                threshold_sq = (self.xy_detail._well_diam * 1.2) ** 2
+                if drift_sq > threshold_sq:
+                    best_well = ""
+                    best_d = float('inf')
+                    for name, (cx, cy) in well_centers.items():
+                        d = (px - cx) ** 2 + (py - cy) ** 2
+                        if d < best_d:
+                            best_d = d
+                            best_well = name
+                    if best_well and best_well != self.xy_detail._current_well:
+                        self.xy_detail.focus_well(best_well)
+                        logger.debug(f"XY view: proximity focus → {best_well}")
 
             # Update pump positions
             if zp:
@@ -928,6 +1209,49 @@ class PrintMonitorPage(QWidget):
                         pw = self._pump_widgets.get(pid)
                         if pw:
                             pw.set_position(zp[i], zero.get(pid, 0))
+
+    def _find_nearest_waypoint(self, px, py, waypoints, current_idx):
+        """Find the nearest waypoint to the current needle position.
+
+        Two-phase search for robustness:
+        1. Local: search current_idx to current_idx + 200 (normal progression)
+        2. Forward-only global: search current_idx to end if local match is
+           too far (handles well-to-well jumps across service sequences)
+
+        Both phases only search FORWARD from current_idx to avoid matching
+        earlier waypoints in a different well that happen to share the same
+        spatial pattern (same object printed in multiple wells).
+
+        Returns the index of the best matching waypoint (>= current_idx).
+        """
+        n = len(waypoints)
+        if n == 0:
+            return 0
+
+        best_idx = current_idx
+        best_dist = float('inf')
+
+        # Phase 1: Local forward search (current to current + 200)
+        hi = min(n, current_idx + 200)
+        for i in range(current_idx, hi):
+            dx = waypoints[i][0] - px
+            dy = waypoints[i][1] - py
+            d = dx * dx + dy * dy
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+
+        # Phase 2: Extended forward search if local match is > 2mm away
+        if best_dist > 4.0:
+            for i in range(current_idx, n):
+                dx = waypoints[i][0] - px
+                dy = waypoints[i][1] - py
+                d = dx * dx + dy * dy
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+
+        return best_idx
 
     # ── Helpers ───────────────────────────────────────────────────
 

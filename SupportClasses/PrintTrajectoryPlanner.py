@@ -554,6 +554,69 @@ class PrintTrajectoryPlanner:
             # Raise
             self._raise_from_print(settings, well=well_name)
 
+    # ── In-well print trajectory (for hybrid execution) ───────────
+
+    def generate_inwell_print(self, well_x, well_y, pump_id, path_points,
+                              settings, well_name="") -> TrajectoryResult:
+        """Generate trajectory for in-well printing ONLY.
+
+        v7.2.9: Used by HybridPlanExecutor. Assumes the needle is already
+        lowered to print_z_height inside the well. Generates ONLY:
+          - Prime pump
+          - Print path (coordinated XY + pump)
+          - Retract pump
+
+        No travel, no Z lower, no Z raise — DirectCommandExecutor handles
+        all of that with blocking absolute moves.
+        """
+        self._waypoints = []
+        self._t = 0.0
+        self._x = well_x + (path_points[0][0] if path_points else 0.0)
+        self._y = well_y + (path_points[0][1] if path_points else 0.0)
+        self._z = settings.print_z_height  # already at print height
+        self._issues = []
+
+        flow = getattr(settings, 'flow_rate', 0.01) or 0.01
+
+        # Starting waypoint
+        self._wp(segment="start", well=well_name)
+
+        # Prime
+        prime_mm = (settings.get_retract_amount(pump_id)
+                    if hasattr(settings, 'get_retract_amount') else 0)
+        if prime_mm > 0:
+            self._move_pump(pump_id, prime_mm, settings.pump_feedrate,
+                            segment="prime", well=well_name)
+
+        # Print layers
+        for layer in range(settings.num_layers):
+            if layer > 0:
+                self._move_z(self._z + settings.layer_height,
+                             settings.z_feedrate, segment="print",
+                             well=well_name)
+
+            self._print_path_coordinated(
+                path_points, well_x, well_y, pump_id, flow,
+                settings.print_feedrate, settings, well_name)
+
+        # Retract
+        retract_mm = (settings.get_retract_amount(pump_id)
+                      if hasattr(settings, 'get_retract_amount') else 0)
+        if retract_mm > 0:
+            self._move_pump(pump_id, -retract_mm, settings.pump_feedrate,
+                            segment="retract", well=well_name)
+
+        # End waypoint
+        self._wp(segment="end", well=well_name)
+
+        return TrajectoryResult(
+            waypoints=self._waypoints,
+            valid=len(self._waypoints) > 1 and not self._issues,
+            issues=self._issues,
+            total_duration_s=self._t,
+            well_count=1,
+        )
+
     # ── Main entry point ──────────────────────────────────────────
 
     def generate(self, plan, well_model, plate, path_points, settings,
@@ -604,16 +667,10 @@ class PrintTrajectoryPlanner:
             pump = getattr(step, 'pump_id', None) or getattr(settings, 'active_pump', 'P1') or 'P1'
 
             if stype == PlanStepType.PRINT:
-                # v7.2.6-dsf: PRINT calls _do_print_wells directly
-                # The plan already contains all pre-print service steps
-                # (WASTE/WASH/BUFFER/LOAD_INK) added by _add_service_steps().
-                # Calling _do_service_and_print() here caused a double-cycle:
-                # syringe loaded ink twice, hitting safety limits.
-                # Now we just call _do_print_wells() — service steps
-                # were already executed as their own PlanStepType entries.
+                # PRINT calls _do_print_wells directly.
+                # Service steps were already executed as their own entries.
                 target_wells = getattr(step, 'target_wells', [])
                 flow = getattr(settings, 'flow_rate', 0.01) or 0.01
-                # Use auto pump rate if set by _compute_auto_settings
                 if target_wells:
                     self._do_print_wells(
                         plate, target_wells, pump, path_points,
@@ -622,29 +679,76 @@ class PrintTrajectoryPlanner:
 
             elif stype == PlanStepType.RETURN_HOME:
                 self._next_segment()
-                # Final waste + wash to leave needle clean
-                self._do_waste(plate, well_model, pump, settings)
-                self._do_wash(plate, well_model, settings)
                 self._move_z(settings.travel_z_height, settings.z_feedrate,
                              segment="travel")
-                # v7.2.6-tef-B2: return_home travel: use travel_speed_mm_s * 60 (mm/min)
                 _rh_travel_fr = getattr(settings, 'travel_speed_mm_s', 10.0) * 60.0
                 self._move_xy(0, 0, _rh_travel_fr, segment='travel')
                 self._wp(segment="end")
 
-            elif stype in (PlanStepType.WASTE, PlanStepType.WASH,
-                           PlanStepType.REFILL_BUFFER, PlanStepType.LOAD_INK):
-                # Service steps are now auto-included in _do_service_and_print
-                # Only execute standalone service steps if they appear without a PRINT
-                if stype == PlanStepType.WASTE:
+            elif stype == PlanStepType.WASTE:
+                self._do_waste(plate, well_model, pump, settings)
+            elif stype == PlanStepType.WASH:
+                self._do_wash(plate, well_model, settings)
+            elif stype == PlanStepType.REFILL_BUFFER:
+                self._do_buffer(plate, well_model, pump, settings)
+            elif stype == PlanStepType.LOAD_INK:
+                vol = step.volume_uL if step.volume_uL > 0 else 50.0
+                self._do_load_ink(plate, well_model, pump, vol, settings)
+
+            # ── v7.2.9: New step types ────────────────────────────
+            elif stype == PlanStepType.GATHER_INK:
+                # Same as LOAD_INK but volume already includes extra %
+                vol = step.volume_uL if step.volume_uL > 0 else 50.0
+                self._do_load_ink(plate, well_model, pump, vol, settings)
+
+            elif stype == PlanStepType.MOVE_SAFE_Z:
+                # Raise to safe Z for fast travel
+                self._next_segment()
+                safe_z = settings.travel_z_height
+                if self._z < safe_z - 0.01:
+                    fast_z = getattr(settings, 'fast_z_feedrate_mm_min',
+                                     settings.z_feedrate)
+                    self._move_z(safe_z, fast_z, segment="travel")
+
+            elif stype == PlanStepType.TRAVEL_XY:
+                # Fast XY travel to target well
+                self._next_segment()
+                target_wells = getattr(step, 'target_wells', [])
+                if target_wells:
+                    try:
+                        wx, wy = plate.get_well_position(target_wells[0])
+                        speed = getattr(step, 'travel_speed_mm_s', 10.0)
+                        self._move_xy(wx, wy, speed * 60.0,
+                                      segment="travel",
+                                      well=target_wells[0])
+                    except Exception:
+                        self._issues.append(
+                            f"TRAVEL_XY: can't resolve {target_wells[0]}")
+
+            elif stype == PlanStepType.FINAL_CLEANUP:
+                # End-of-print cleanup: waste + wash as configured
+                self._next_segment()
+                sub_steps = getattr(step, 'sub_steps', [])
+                if "waste" in sub_steps:
                     self._do_waste(plate, well_model, pump, settings)
-                elif stype == PlanStepType.WASH:
+                if "wash" in sub_steps:
                     self._do_wash(plate, well_model, settings)
-                elif stype == PlanStepType.REFILL_BUFFER:
-                    self._do_buffer(plate, well_model, pump, settings)
-                elif stype == PlanStepType.LOAD_INK:
-                    vol = step.volume_uL if step.volume_uL > 0 else 50.0
-                    self._do_load_ink(plate, well_model, pump, vol, settings)
+
+            elif stype == PlanStepType.INK_SWAP:
+                # Full ink swap sequence — execute sub_steps in order
+                self._next_segment()
+                sub_steps = getattr(step, 'sub_steps', [])
+                for sub in sub_steps:
+                    if sub == "waste":
+                        self._do_waste(plate, well_model, pump, settings)
+                    elif sub == "wash":
+                        self._do_wash(plate, well_model, settings)
+                    elif sub == "buffer":
+                        self._do_buffer(plate, well_model, pump, settings)
+                    elif sub == "ink_load":
+                        vol = step.volume_uL if step.volume_uL > 0 else 50.0
+                        self._do_load_ink(
+                            plate, well_model, pump, vol, settings)
 
         # Fluid balance info — log for diagnostics, never block execution
         for pid, balance in self._fluid_balance.items():

@@ -288,9 +288,6 @@ class WellSetupTab(QWidget):
         # ── Role-specific options ─────────────────────────────────
         self._build_role_options(main)
 
-        # ── Print plan of action ──────────────────────────────────
-        self._build_plan_section(main)
-
         # ── Bottom buttons ────────────────────────────────────────
         self._build_bottom_buttons(main)
 
@@ -1007,8 +1004,13 @@ class WellSetupTab(QWidget):
             except Exception:
                 return None
 
-    def _generate_plan(self) -> None:
-        """Generate print plan — v7.3.1b: use classmethod generate_plan()."""
+    def _generate_plan(self, execution_config=None) -> None:
+        """Generate print plan — v7.2.9: accepts PrintExecutionConfig.
+
+        Args:
+            execution_config: Optional PrintExecutionConfig from Plan of Action UI.
+                If provided, takes priority over legacy PlanPreferences.
+        """
         lbl = getattr(self, "_plan_label", None)
         if self._hw_config is None:
             if lbl:
@@ -1023,7 +1025,8 @@ class WellSetupTab(QWidget):
         try:
             prefs = self._get_plan_preferences()
             self._plan = PrintPlanOfAction.generate_plan(
-                self._hw_config, self._model, prefs
+                self._hw_config, self._model, prefs,
+                execution_config=execution_config,
             )
             summary_fn = getattr(self._plan, "summary", None)
             if summary_fn and callable(summary_fn):

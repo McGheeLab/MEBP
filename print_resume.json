@@ -1,16 +1,16 @@
 {
   "version": 1,
-  "saved_at": "2026-03-10T11:53:31.628405",
+  "saved_at": "2026-03-10T16:43:59.368776",
   "current_step": 0,
   "active_pump": "P1",
   "job": {
     "name": "Trajectory: 1 wells",
-    "description": "1562 waypoints, 1.0 min, 1 wells, 6 segments",
+    "description": "1786 waypoints, 1.8 min, 1 wells, 13 segments",
     "source_file": "",
     "settings": {
-      "xy_feedrate": 11.943455560953403,
+      "xy_feedrate": 59.71727780476701,
       "z_feedrate": 60.0,
-      "print_feedrate": 716.6073336572042,
+      "print_feedrate": 3583.0366682860204,
       "pump_feedrate": 57.599999999999994,
       "travel_z_height": 5.0,
       "print_z_height": 0.1,
@@ -29,9 +29,9 @@
         "P2": 0.5,
         "P3": 0.5
       },
-      "pump_rate_uL_s": 1.6,
-      "print_speed_mm_s": 11.943455560953403,
-      "travel_speed_mm_s": 23.886911121906806,
+      "pump_rate_uL_s": 4.0,
+      "print_speed_mm_s": 59.71727780476701,
+      "travel_speed_mm_s": 119.43455560953402,
       "retract_amounts_uL": {
         "P1": 0.0,
         "P2": 0.0,
@@ -51,7 +51,7 @@
       "fast_z_feedrate_mm_min": 120.0,
       "entry_z_feedrate_mm_min": 60.0,
       "service_xy_speed_mm_s": 50.0,
-      "auto_pump_rate_uL_s": 1.6,
+      "auto_pump_rate_uL_s": 4.0,
       "service_pump_rate_uL_s": 8.0
     },
     "commands": []

@@ -1,17 +1,14 @@
 """
-Print Setup Page — v7.2.3 Tabbed Workspace with Settings Context Panel.
+Print Setup Page — v7.2.9 Tabbed Workspace with Finalize Tab.
 
-v7.2.3 Changes:
-    - Tab 1 (Workspace) is now read-only hardware summary
-    - Context panel: execution controls REMOVED (move to Print Monitor in S3)
-    - Context panel: enhanced grouped print settings per pump
-    - HardwareConfig forwarded to WorkspaceTab for bridge to WorkspaceConfig
-    - WorkspaceTab.navigate_to_page signal wired to page navigation
-    - PrintManager/PrintQueue still owned here (moved in Session 3)
+v7.2.9 Changes:
+    - Tab 4 (Finalize) added: print settings, plan of action, generate & send
+    - Context panel simplified to display style options only
+    - Plan of Action removed from Well Setup tab (now in Finalize tab)
 
 PyDracula layout:
-    Main content  = 3-tab workflow (Workspace / Print Objects / Well Setup)
-    Context panel = Print Settings only (grouped per-pump)
+    Main content  = 4-tab workflow (Workspace / Print Objects / Well Setup / Finalize)
+    Context panel = Display style options only
 
 Interface contract:
     get_page_title()     → str
@@ -30,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
     QTabWidget, QFileDialog, QProgressBar, QFrame,
     QCheckBox, QGroupBox, QSizePolicy, QMessageBox, QSlider,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, Signal, QObject
 
@@ -45,6 +43,15 @@ try:
     from SupportClasses.HardwareConfig import HardwareConfig
 except ImportError:
     HardwareConfig = None
+
+from SupportClasses.PrintPlanOfAction import (
+    PrintExecutionConfig,
+    InkSwapStrategy,
+    InkGatherConfig,
+    ZTravelConfig,
+    XYTravelConfig,
+    FinalCleanupConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +74,15 @@ class PrintSignalBridge(QObject):
 
 class PrintSetupPage(QWidget):
     """
-    Print setup: 3-tab workflow + print settings context panel.
+    Print setup: 4-tab workflow + display options context panel.
 
-    v7.2.3:
+    v7.2.9:
         Tab 1 — Workspace:    READ-ONLY hardware summary + WorkspaceConfig bridge
         Tab 2 — Print Objects: Design objects, import CSV, build collections
         Tab 3 — Well Setup:   Assign prints to wells, calibrate plane, set roles
+        Tab 4 — Finalize:     Print settings, plan of action, generate & send
 
-    Context panel provides print settings ONLY.
-    Execution controls move to Print Monitor in Session 3.
+    Context panel provides display style options for the print setup page.
     """
 
     # Emitted when workspace config changes (for app.py to forward to monitor)
@@ -235,6 +242,10 @@ class PrintSetupPage(QWidget):
         self.tabs.addTab(self.tab_objects, "2. Print Objects")
         self.tabs.addTab(self.tab_wells, "3. Well Setup")
 
+        # Tab 4: Finalize — print settings, plan of action, generate & send
+        self.tab_finalize = self._build_finalize_tab()
+        self.tabs.addTab(self.tab_finalize, "4. Finalize")
+
         self._generated_job = None  # v7.2.6: pre-generated job
 
         # ── Wire cross-tab signals ────────────────────────────────
@@ -264,18 +275,11 @@ class PrintSetupPage(QWidget):
         outer.addWidget(self.tabs)
 
     # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL — Print Settings Only (v7.2.3)
+    #  CONTEXT PANEL — Display Style Options (v7.2.9)
     # ════════════════════════════════════════════════════════════════
 
-    # ── Gauge max flow lookup (µL/s) ─────────────────────────────
-    GAUGE_MAX_FLOW = {
-        16: 50.0, 18: 30.0, 20: 15.0, 22: 8.0, 23: 5.0,
-        25: 3.0, 27: 1.5, 28: 1.0, 30: 0.5, 32: 0.2,
-    }
-
     def _build_context_panel(self) -> QWidget:
-        """Build the simplified print settings context panel."""
-        import math
+        """Build display style options for the print setup page."""
         ctx = QWidget()
         ctx.setObjectName("contextPanel")
         layout = QVBoxLayout(ctx)
@@ -300,17 +304,134 @@ class PrintSetupPage(QWidget):
                 border-top-right-radius: 4px;
             }}
         """
+
+        title = QLabel("Display Options")
+        title.setStyleSheet(
+            f"font-weight: bold; font-size: 13px; "
+            f"color: {COLORS.get('peach', '#fab387')}; "
+            f"padding: 4px 0px;")
+        layout.addWidget(title)
+
+        # ── Well Plate Display ────────────────────────────────────
+        plate_grp = QGroupBox("Well Plate")
+        plate_grp.setStyleSheet(grp_style)
+        plate_lay = QVBoxLayout(plate_grp)
+        plate_lay.setSpacing(4)
+
+        self._show_well_labels_cb = QCheckBox("Show well labels")
+        self._show_well_labels_cb.setChecked(True)
+        plate_lay.addWidget(self._show_well_labels_cb)
+
+        self._show_trajectory_cb = QCheckBox("Show trajectory paths")
+        self._show_trajectory_cb.setChecked(True)
+        plate_lay.addWidget(self._show_trajectory_cb)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color by:"))
+        self._color_mode_combo = QComboBox()
+        self._color_mode_combo.addItems(["Role", "Ink", "Status"])
+        color_row.addWidget(self._color_mode_combo)
+        plate_lay.addLayout(color_row)
+
+        layout.addWidget(plate_grp)
+
+        # ── Object Preview ────────────────────────────────────────
+        obj_grp = QGroupBox("Object Preview")
+        obj_grp.setStyleSheet(grp_style)
+        obj_lay = QVBoxLayout(obj_grp)
+        obj_lay.setSpacing(4)
+
+        self._show_grid_cb = QCheckBox("Show grid")
+        self._show_grid_cb.setChecked(True)
+        obj_lay.addWidget(self._show_grid_cb)
+
+        self._show_axes_cb = QCheckBox("Show axes")
+        self._show_axes_cb.setChecked(True)
+        obj_lay.addWidget(self._show_axes_cb)
+
+        self._show_dimensions_cb = QCheckBox("Show dimensions")
+        self._show_dimensions_cb.setChecked(False)
+        obj_lay.addWidget(self._show_dimensions_cb)
+
+        layout.addWidget(obj_grp)
+
+        layout.addStretch()
+        self._context_widget = ctx
+        return ctx
+
+    # ════════════════════════════════════════════════════════════════
+    #  FINALIZE TAB — Print Settings + Plan of Action (v7.2.9)
+    # ════════════════════════════════════════════════════════════════
+
+    # ── Gauge max flow lookup (µL/s) ─────────────────────────────
+    GAUGE_MAX_FLOW = {
+        16: 50.0, 18: 30.0, 20: 15.0, 22: 8.0, 23: 5.0,
+        25: 3.0, 27: 1.5, 28: 1.0, 30: 0.5, 32: 0.2,
+    }
+
+    def _build_finalize_tab(self) -> QWidget:
+        """Tab 4: Finalize — print settings, plan of action, generate & send."""
+        import math
+
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(f"background: {COLORS.get('base', '#1e1e2e')};")
+
+        content = QWidget()
+        outer = QVBoxLayout(content)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(8)
+
+        grp_style = f"""
+            QGroupBox {{
+                font-weight: bold; font-size: 12px;
+                color: {COLORS.get('text', '#cdd6f4')};
+                background: {COLORS.get('base', '#1e1e2e')};
+                border: 1px solid {COLORS.get('surface1', '#45475a')};
+                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 0px; right: 0px; top: 0px;
+                padding: 6px 10px;
+                background: {COLORS.get('surface1', '#45475a')};
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+        """
         dim_style = f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;"
 
+        # ── Two-column layout ─────────────────────────────────────
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        left_col = QVBoxLayout()
+        left_col.setSpacing(6)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+
         # ══════════════════════════════════════════════════════════
-        #  Section 1: Extrusion — Volume Fraction + Speed Scale
+        #  LEFT COLUMN: Print Parameters
         # ══════════════════════════════════════════════════════════
+
+        left_title = QLabel("Print Parameters")
+        left_title.setStyleSheet(
+            f"font-weight: bold; font-size: 13px; "
+            f"color: {COLORS.get('blue', '#89b4fa')}; "
+            f"padding: 2px 0px;")
+        left_col.addWidget(left_title)
+
+        # ── Extrusion ─────────────────────────────────────────────
         ext_grp = QGroupBox("Extrusion")
         ext_grp.setStyleSheet(grp_style)
         ext_lay = QVBoxLayout(ext_grp)
         ext_lay.setSpacing(4)
 
-        # Volume Fraction (%)
         vf_row = QHBoxLayout()
         vf_row.addWidget(QLabel("Fill:"))
         self.volume_fraction_spin = QSpinBox()
@@ -323,7 +444,6 @@ class PrintSetupPage(QWidget):
         vf_row.addWidget(self.volume_fraction_spin)
         ext_lay.addLayout(vf_row)
 
-        # Speed Scale (%)
         sp_row = QHBoxLayout()
         sp_row.addWidget(QLabel("Speed:"))
         self.speed_scale_spin = QSpinBox()
@@ -336,11 +456,9 @@ class PrintSetupPage(QWidget):
         sp_row.addWidget(self.speed_scale_spin)
         ext_lay.addLayout(sp_row)
 
-        layout.addWidget(ext_grp)
+        left_col.addWidget(ext_grp)
 
-        # ══════════════════════════════════════════════════════════
-        #  Section 2: Derived Parameters (read-only display)
-        # ══════════════════════════════════════════════════════════
+        # ── Calculated (derived read-only) ────────────────────────
         calc_grp = QGroupBox("Calculated")
         calc_grp.setStyleSheet(grp_style)
         calc_lay = QVBoxLayout(calc_grp)
@@ -357,7 +475,7 @@ class PrintSetupPage(QWidget):
         ]:
             row = QHBoxLayout()
             lbl = QLabel(label_text)
-            lbl.setFixedWidth(75)
+            lbl.setFixedWidth(80)
             row.addWidget(lbl)
             val = QLabel("—")
             val.setStyleSheet(dim_style)
@@ -365,11 +483,9 @@ class PrintSetupPage(QWidget):
             calc_lay.addLayout(row)
             self._calc_labels[key] = val
 
-        layout.addWidget(calc_grp)
+        left_col.addWidget(calc_grp)
 
-        # ══════════════════════════════════════════════════════════
-        #  Section 3: Layer Settings
-        # ══════════════════════════════════════════════════════════
+        # ── Layers ────────────────────────────────────────────────
         layer_grp = QGroupBox("Layers")
         layer_grp.setStyleSheet(grp_style)
         layer_lay = QVBoxLayout(layer_grp)
@@ -394,11 +510,9 @@ class PrintSetupPage(QWidget):
         lh_row.addWidget(self.layer_height_spin)
         layer_lay.addLayout(lh_row)
 
-        layout.addWidget(layer_grp)
+        left_col.addWidget(layer_grp)
 
-        # ══════════════════════════════════════════════════════════
-        #  Section 4: Advanced (travel, retract/prime, settle)
-        # ══════════════════════════════════════════════════════════
+        # ── Advanced ──────────────────────────────────────────────
         adv_grp = QGroupBox("Advanced")
         adv_grp.setStyleSheet(grp_style)
         adv_grp.setCheckable(True)
@@ -406,7 +520,6 @@ class PrintSetupPage(QWidget):
         adv_lay = QVBoxLayout(adv_grp)
         adv_lay.setSpacing(4)
 
-        # Z Feed
         zf_row = QHBoxLayout()
         zf_row.addWidget(QLabel("Z Feed:"))
         self.z_feed_spin = QDoubleSpinBox()
@@ -417,7 +530,6 @@ class PrintSetupPage(QWidget):
         zf_row.addWidget(self.z_feed_spin)
         adv_lay.addLayout(zf_row)
 
-        # Travel Z
         tz_row = QHBoxLayout()
         tz_row.addWidget(QLabel("Travel Z:"))
         self.travel_z_spin = QDoubleSpinBox()
@@ -428,7 +540,6 @@ class PrintSetupPage(QWidget):
         tz_row.addWidget(self.travel_z_spin)
         adv_lay.addLayout(tz_row)
 
-        # Settle Delay
         sd_row = QHBoxLayout()
         sd_row.addWidget(QLabel("Settle:"))
         self.settle_spin = QDoubleSpinBox()
@@ -439,7 +550,6 @@ class PrintSetupPage(QWidget):
         sd_row.addWidget(self.settle_spin)
         adv_lay.addLayout(sd_row)
 
-        # Per-Pump Retract / Prime
         self._retract_spins: dict[str, QDoubleSpinBox] = {}
         self._prime_spins: dict[str, QDoubleSpinBox] = {}
 
@@ -455,9 +565,9 @@ class PrintSetupPage(QWidget):
             ret_spin = QDoubleSpinBox()
             ret_spin.setRange(0.0, 20.0)
             ret_spin.setValue(0.5)
-            ret_spin.setSuffix(" µL")
+            ret_spin.setSuffix(" uL")
             ret_spin.setDecimals(2)
-            ret_spin.setMaximumWidth(80)
+            ret_spin.setMaximumWidth(90)
             row.addWidget(ret_spin)
             self._retract_spins[pid] = ret_spin
 
@@ -465,45 +575,237 @@ class PrintSetupPage(QWidget):
             prime_spin = QDoubleSpinBox()
             prime_spin.setRange(0.0, 20.0)
             prime_spin.setValue(0.5)
-            prime_spin.setSuffix(" µL")
+            prime_spin.setSuffix(" uL")
             prime_spin.setDecimals(2)
-            prime_spin.setMaximumWidth(80)
+            prime_spin.setMaximumWidth(90)
             row.addWidget(prime_spin)
             self._prime_spins[pid] = prime_spin
 
             adv_lay.addLayout(row)
 
-        layout.addWidget(adv_grp)
+        left_col.addWidget(adv_grp)
+        left_col.addStretch()
 
         # ══════════════════════════════════════════════════════════
-        #  Section 5: Actions
+        #  RIGHT COLUMN: Plan of Action
         # ══════════════════════════════════════════════════════════
-        layout.addSpacing(10)
 
+        right_title = QLabel("Plan of Action")
+        right_title.setStyleSheet(
+            f"font-weight: bold; font-size: 13px; "
+            f"color: {COLORS.get('peach', '#fab387')}; "
+            f"padding: 2px 0px;")
+        right_col.addWidget(right_title)
+
+        # ── Ink Swap Strategy ─────────────────────────────────────
+        swap_grp = QGroupBox("Ink Swap Sequence")
+        swap_grp.setStyleSheet(grp_style)
+        swap_grp.setCheckable(True)
+        swap_grp.setChecked(True)
+        swap_grp.setToolTip(
+            "When a pump switches between inks, these steps run.\n"
+            "Sequence: waste > wash > buffer > wash > ink load > wash")
+        swap_lay = QVBoxLayout(swap_grp)
+        swap_lay.setSpacing(2)
+
+        self._swap_checks = {}
+        swap_steps = [
+            ("waste", "Waste (expel remaining ink)"),
+            ("wash_pre", "Wash (pre-buffer rinse)"),
+            ("buffer", "Buffer flush"),
+            ("wash_post", "Wash (post-buffer rinse)"),
+            ("ink_load", "Load new ink"),
+            ("wash_final", "Wash (final, before print)"),
+        ]
+        for key, label in swap_steps:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            swap_lay.addWidget(cb)
+            self._swap_checks[key] = cb
+
+        vol_form = QHBoxLayout()
+        vol_form.setSpacing(4)
+        self._swap_waste_vol = QDoubleSpinBox()
+        self._swap_wash_vol = QDoubleSpinBox()
+        self._swap_buffer_vol = QDoubleSpinBox()
+        self._swap_ink_load_vol = QDoubleSpinBox()
+        for spin, tip, default in [
+            (self._swap_waste_vol, "Waste", 50.0),
+            (self._swap_wash_vol, "Wash", 100.0),
+            (self._swap_buffer_vol, "Buff", 100.0),
+            (self._swap_ink_load_vol, "Ink", 50.0),
+        ]:
+            spin.setRange(0, 5000)
+            spin.setSuffix(" uL")
+            spin.setDecimals(0)
+            spin.setValue(default)
+            spin.setToolTip(f"{tip} volume")
+            spin.setMaximumWidth(85)
+            vol_form.addWidget(QLabel(f"{tip}:"))
+            vol_form.addWidget(spin)
+        swap_lay.addLayout(vol_form)
+
+        right_col.addWidget(swap_grp)
+
+        # ── Ink Gathering ─────────────────────────────────────────
+        gather_grp = QGroupBox("Ink Gathering")
+        gather_grp.setStyleSheet(grp_style)
+        gather_lay = QVBoxLayout(gather_grp)
+        gather_lay.setSpacing(4)
+
+        extra_row = QHBoxLayout()
+        extra_row.addWidget(QLabel("Extra:"))
+        self._ink_extra_pct_spin = QDoubleSpinBox()
+        self._ink_extra_pct_spin.setRange(0, 100)
+        self._ink_extra_pct_spin.setValue(10.0)
+        self._ink_extra_pct_spin.setSuffix(" %")
+        self._ink_extra_pct_spin.setDecimals(0)
+        self._ink_extra_pct_spin.setToolTip(
+            "Extra ink percentage to pick up beyond what is needed.\n"
+            "E.g. 10% = pick up 10% more than calculated need.")
+        extra_row.addWidget(self._ink_extra_pct_spin)
+        gather_lay.addLayout(extra_row)
+
+        max_row = QHBoxLayout()
+        max_row.addWidget(QLabel("Max:"))
+        self._ink_max_pickup_spin = QDoubleSpinBox()
+        self._ink_max_pickup_spin.setRange(0, 5000)
+        self._ink_max_pickup_spin.setValue(0)
+        self._ink_max_pickup_spin.setSuffix(" uL")
+        self._ink_max_pickup_spin.setDecimals(0)
+        self._ink_max_pickup_spin.setToolTip(
+            "Maximum ink pickup per run (0 = use syringe capacity)")
+        max_row.addWidget(self._ink_max_pickup_spin)
+        gather_lay.addLayout(max_row)
+
+        right_col.addWidget(gather_grp)
+
+        # ── Z Travel ──────────────────────────────────────────────
+        z_grp = QGroupBox("Z Travel")
+        z_grp.setStyleSheet(grp_style)
+        z_lay = QVBoxLayout(z_grp)
+        z_lay.setSpacing(2)
+
+        self._z_wait_confirm_cb = QCheckBox("Wait for Z position confirm")
+        self._z_wait_confirm_cb.setChecked(True)
+        self._z_wait_confirm_cb.setToolTip(
+            "Wait for Z axis to reach target and confirm\n"
+            "position before proceeding. Slower but safer.")
+        z_lay.addWidget(self._z_wait_confirm_cb)
+
+        self._z_fast_exit_cb = QCheckBox("Fast Z exit from well")
+        self._z_fast_exit_cb.setChecked(True)
+        self._z_fast_exit_cb.setToolTip(
+            "Use fast Z speed when raising needle out of a well")
+        z_lay.addWidget(self._z_fast_exit_cb)
+
+        self._z_fast_enter_cb = QCheckBox("Fast Z entry into well")
+        self._z_fast_enter_cb.setChecked(False)
+        self._z_fast_enter_cb.setToolTip(
+            "Use fast Z speed when lowering needle into a well.\n"
+            "When disabled, needle enters slowly for safety.")
+        z_lay.addWidget(self._z_fast_enter_cb)
+
+        self._z_plunge_cb = QCheckBox("Plunge buffer before print Z")
+        self._z_plunge_cb.setChecked(True)
+        self._z_plunge_cb.setToolTip(
+            "Travel fast to (print_z + buffer), then slowly\n"
+            "cover the last buffer distance to print height.")
+        z_lay.addWidget(self._z_plunge_cb)
+
+        buf_row = QHBoxLayout()
+        buf_row.addWidget(QLabel("Buffer:"))
+        self._z_plunge_buffer_spin = QDoubleSpinBox()
+        self._z_plunge_buffer_spin.setRange(0, 5000)
+        self._z_plunge_buffer_spin.setValue(500)
+        self._z_plunge_buffer_spin.setSuffix(" um")
+        self._z_plunge_buffer_spin.setDecimals(0)
+        self._z_plunge_buffer_spin.setToolTip(
+            "Distance in microns above print Z to switch\n"
+            "from fast travel to slow plunge.")
+        buf_row.addWidget(self._z_plunge_buffer_spin)
+        z_lay.addLayout(buf_row)
+
+        right_col.addWidget(z_grp)
+
+        # ── XY Travel ─────────────────────────────────────────────
+        xy_grp = QGroupBox("XY Travel")
+        xy_grp.setStyleSheet(grp_style)
+        xy_lay = QVBoxLayout(xy_grp)
+        xy_lay.setSpacing(2)
+
+        self._xy_fast_cb = QCheckBox("Fast XY travel between wells")
+        self._xy_fast_cb.setChecked(True)
+        self._xy_fast_cb.setToolTip(
+            "Move XY at max speed between wells.\n"
+            "Disable for slower, more controlled travel.")
+        xy_lay.addWidget(self._xy_fast_cb)
+
+        xy_spd_row = QHBoxLayout()
+        xy_spd_row.addWidget(QLabel("Speed:"))
+        self._xy_travel_speed_spin = QDoubleSpinBox()
+        self._xy_travel_speed_spin.setRange(0.1, 50.0)
+        self._xy_travel_speed_spin.setValue(10.0)
+        self._xy_travel_speed_spin.setSuffix(" mm/s")
+        self._xy_travel_speed_spin.setDecimals(1)
+        xy_spd_row.addWidget(self._xy_travel_speed_spin)
+        xy_lay.addLayout(xy_spd_row)
+
+        right_col.addWidget(xy_grp)
+
+        # ── Final Cleanup ─────────────────────────────────────────
+        clean_grp = QGroupBox("Final Cleanup")
+        clean_grp.setStyleSheet(grp_style)
+        clean_grp.setCheckable(True)
+        clean_grp.setChecked(True)
+        clean_lay = QVBoxLayout(clean_grp)
+        clean_lay.setSpacing(2)
+        self._cleanup_grp = clean_grp
+
+        self._cleanup_waste_cb = QCheckBox("Waste (eject remaining)")
+        self._cleanup_waste_cb.setChecked(True)
+        clean_lay.addWidget(self._cleanup_waste_cb)
+
+        self._cleanup_wash_cb = QCheckBox("Wash needle")
+        self._cleanup_wash_cb.setChecked(True)
+        clean_lay.addWidget(self._cleanup_wash_cb)
+
+        self._cleanup_dry_cb = QCheckBox("Dry run (clear residual)")
+        self._cleanup_dry_cb.setChecked(False)
+        clean_lay.addWidget(self._cleanup_dry_cb)
+
+        right_col.addWidget(clean_grp)
+        right_col.addStretch()
+
+        columns.addLayout(left_col, stretch=1)
+        columns.addLayout(right_col, stretch=1)
+        outer.addLayout(columns)
+
+        # ══════════════════════════════════════════════════════════
+        #  Bottom: Validate, Generate & Send
+        # ══════════════════════════════════════════════════════════
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet(f"color: {COLORS.get('surface1', '#45475a')};")
-        layout.addWidget(sep)
+        outer.addWidget(sep)
 
-        self.btn_generate_print = QPushButton("Generate Print")
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        self.btn_generate_print = QPushButton("Validate & Generate Print")
         self.btn_generate_print.setStyleSheet(f"""
             QPushButton {{
                 background: {COLORS.get('blue', '#89b4fa')};
                 color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 8px 16px;
-                border-radius: 4px;
+                font-weight: bold; padding: 10px 20px;
+                border-radius: 4px; font-size: 13px;
             }}
             QPushButton:hover {{
                 background: {COLORS.get('sapphire', '#74c7ec')};
             }}
         """)
         self.btn_generate_print.clicked.connect(self._generate_print)
-        layout.addWidget(self.btn_generate_print)
-
-        self._gen_status_label = QLabel("")
-        self._gen_status_label.setStyleSheet(dim_style)
-        self._gen_status_label.setWordWrap(True)
-        layout.addWidget(self._gen_status_label)
+        btn_row.addWidget(self.btn_generate_print)
 
         self.btn_send_to_monitor = QPushButton("Send to Monitor")
         self.btn_send_to_monitor.setObjectName("accentBtn")
@@ -511,40 +813,53 @@ class PrintSetupPage(QWidget):
             QPushButton {{
                 background: {COLORS.get('green', '#a6e3a1')};
                 color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 8px 16px;
-                border-radius: 4px;
+                font-weight: bold; padding: 10px 20px;
+                border-radius: 4px; font-size: 13px;
             }}
             QPushButton:hover {{
                 background: {COLORS.get('teal', '#94e2d5')};
             }}
         """)
         self.btn_send_to_monitor.clicked.connect(self._send_to_monitor)
-        layout.addWidget(self.btn_send_to_monitor)
+        btn_row.addWidget(self.btn_send_to_monitor)
 
-        self.status_label = QLabel("Configure wells → Send to Monitor")
+        outer.addLayout(btn_row)
+
+        # Status + export row
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+
+        self._gen_status_label = QLabel("")
+        self._gen_status_label.setStyleSheet(dim_style)
+        self._gen_status_label.setWordWrap(True)
+        status_row.addWidget(self._gen_status_label, stretch=1)
+
+        self.status_label = QLabel("Configure wells > Finalize > Generate")
         self.status_label.setObjectName("dimLabel")
         self.status_label.setStyleSheet(dim_style)
-        layout.addWidget(self.status_label)
+        status_row.addWidget(self.status_label, stretch=1)
 
-        # Export
+        outer.addLayout(status_row)
+
         export_row = QHBoxLayout()
         btn_export = QPushButton("Export G-code")
-        btn_export.setMaximumHeight(24)
+        btn_export.setMaximumHeight(28)
         btn_export.clicked.connect(self._export_gcode)
         export_row.addWidget(btn_export)
         btn_save = QPushButton("Save JSON")
-        btn_save.setMaximumHeight(24)
+        btn_save.setMaximumHeight(28)
         btn_save.clicked.connect(self._save_job)
         export_row.addWidget(btn_save)
-        layout.addLayout(export_row)
+        export_row.addStretch()
+        outer.addLayout(export_row)
 
-        layout.addStretch()
-        self._context_widget = ctx
+        scroll.setWidget(content)
+        wrapper_layout.addWidget(scroll)
 
         # Initial derived calculation
         self._update_derived()
 
-        return ctx
+        return wrapper
 
     def _update_derived(self):
         """Recalculate derived print parameters from volume fraction + speed scale."""
@@ -792,6 +1107,11 @@ class PrintSetupPage(QWidget):
         plan = getattr(job, 'plan_of_action', None)
         if plan:
             summary_parts.append(f"{getattr(plan, 'total_runs', '?')} run(s)")
+        # v7.2.9: Prefer hybrid estimate over plan's naive estimate
+        _hybrid_est = getattr(job, 'estimated_duration_s', 0.0)
+        if _hybrid_est > 0:
+            summary_parts.append(f"~{_hybrid_est / 60:.1f} min")
+        elif plan:
             est = getattr(plan, 'estimated_total_seconds', 0)
             if est > 0:
                 summary_parts.append(f"~{est / 60:.1f} min")
@@ -978,6 +1298,7 @@ class PrintSetupPage(QWidget):
         """Convert a single print object dict to path point list.
 
         v7.2.6: Supports line, meander, spiral, grid, and raw points.
+        v7.2.9: Added csv_import support — extracts XY from Nx7 trajectory.
         """
         if isinstance(obj_data, dict):
             obj_type = obj_data.get('object_type', '')
@@ -988,6 +1309,27 @@ class PrintSetupPage(QWidget):
 
         if not isinstance(params, dict):
             params = {}
+
+        # CSV import: extract XY from stored trajectory data
+        if obj_type == 'csv_import':
+            csv_data = obj_data.get('_csv_data') if isinstance(obj_data, dict) else None
+            if csv_data is None and 'source_file' in params:
+                try:
+                    from SupportClasses.TrajectoryPlanner import import_csv_trajectory
+                    csv_data = import_csv_trajectory(params['source_file'])
+                except Exception as e:
+                    logger.warning(f"Failed to load CSV for path extraction: {e}")
+                    return [(0.0, 0.0)]
+            if csv_data is not None:
+                try:
+                    import numpy as np
+                    arr = np.asarray(csv_data, dtype=np.float64)
+                    if arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) > 0:
+                        return [(float(arr[i, 0]), float(arr[i, 1]))
+                                for i in range(len(arr))]
+                except Exception as e:
+                    logger.warning(f"Failed to extract XY from CSV data: {e}")
+            return [(0.0, 0.0)]
 
         try:
             from SupportClasses.WellPlate import (
@@ -1034,12 +1376,78 @@ class PrintSetupPage(QWidget):
             logger.warning(f"Failed to generate path for {obj_type}: {exc}")
             return [(0.0, 0.0)]
 
+    def _build_execution_config(self) -> PrintExecutionConfig:
+        """v7.2.9: Read Plan of Action UI widgets into a PrintExecutionConfig."""
+        cfg = PrintExecutionConfig()
+
+        # Ink swap strategy
+        cfg.ink_swap = InkSwapStrategy(
+            waste=self._swap_checks.get("waste", None) is not None
+                  and self._swap_checks["waste"].isChecked(),
+            wash_pre=self._swap_checks.get("wash_pre", None) is not None
+                     and self._swap_checks["wash_pre"].isChecked(),
+            buffer=self._swap_checks.get("buffer", None) is not None
+                   and self._swap_checks["buffer"].isChecked(),
+            wash_post=self._swap_checks.get("wash_post", None) is not None
+                      and self._swap_checks["wash_post"].isChecked(),
+            ink_load=self._swap_checks.get("ink_load", None) is not None
+                     and self._swap_checks["ink_load"].isChecked(),
+            wash_final=self._swap_checks.get("wash_final", None) is not None
+                       and self._swap_checks["wash_final"].isChecked(),
+            waste_volume_uL=self._swap_waste_vol.value(),
+            wash_volume_uL=self._swap_wash_vol.value(),
+            buffer_volume_uL=self._swap_buffer_vol.value(),
+            ink_load_volume_uL=self._swap_ink_load_vol.value(),
+        )
+
+        # Service sequence toggles (derived from ink swap enables)
+        cfg.use_waste = cfg.ink_swap.waste
+        cfg.use_wash = cfg.ink_swap.wash_pre or cfg.ink_swap.wash_post
+        cfg.use_buffer = cfg.ink_swap.buffer
+
+        # Ink gathering
+        extra_pct = self._ink_extra_pct_spin.value()
+        max_pickup = self._ink_max_pickup_spin.value()
+        cfg.default_gather_config = InkGatherConfig(
+            ink_name="default",
+            max_pickup_uL=max_pickup,
+            extra_percent=extra_pct,
+        )
+
+        # Z travel
+        cfg.z_travel = ZTravelConfig(
+            safe_z_mm=self.travel_z_spin.value(),
+            wait_for_z_confirm=self._z_wait_confirm_cb.isChecked(),
+            fast_z_exit_well=self._z_fast_exit_cb.isChecked(),
+            fast_z_enter_well=self._z_fast_enter_cb.isChecked(),
+            use_plunge_buffer=self._z_plunge_cb.isChecked(),
+            plunge_buffer_um=self._z_plunge_buffer_spin.value(),
+        )
+
+        # XY travel
+        cfg.xy_travel = XYTravelConfig(
+            fast_xy_travel=self._xy_fast_cb.isChecked(),
+            fast_xy_speed_mm_s=self._xy_travel_speed_spin.value(),
+        )
+
+        # Final cleanup
+        cleanup_grp = getattr(self, '_cleanup_grp', None)
+        cfg.final_cleanup = FinalCleanupConfig(
+            enabled=cleanup_grp.isChecked() if cleanup_grp else True,
+            do_waste=self._cleanup_waste_cb.isChecked(),
+            do_wash=self._cleanup_wash_cb.isChecked(),
+            do_dry_run=self._cleanup_dry_cb.isChecked(),
+        )
+
+        return cfg
+
     def _generate_print(self):
-        """v7.3: Use plan_to_trajectory for smooth execution.
+        """v7.2.9: Use plan_to_trajectory with PrintExecutionConfig.
 
         Generates a time-parameterized trajectory instead of flat commands.
         The trajectory encodes all axis positions with proper timing from
         feedrate settings, enabling smooth coordinated motion.
+        Reads Plan of Action config from UI before generating.
         """
         gen_label = getattr(self, '_gen_status_label', None)
 
@@ -1063,12 +1471,13 @@ class PrintSetupPage(QWidget):
                 self.btn_send_to_monitor.setEnabled(False)
             return
 
-        # Step 2: Generate plan
+        # Step 2: Build execution config from Plan of Action UI + generate plan
+        exec_cfg = self._build_execution_config()
         plan = None
         if hasattr(self, 'tab_wells'):
             if hasattr(self.tab_wells, '_generate_plan'):
                 try:
-                    self.tab_wells._generate_plan()
+                    self.tab_wells._generate_plan(execution_config=exec_cfg)
                 except Exception as e:
                     if gen_label:
                         gen_label.setText(f"\u26a0 Plan failed: {e}")
@@ -1196,6 +1605,30 @@ class PrintSetupPage(QWidget):
                     job.trajectory_result = trajectory_result
                     if plan:
                         job.plan_of_action = plan
+                    # v7.2.9: Attach context for hybrid execution
+                    job.plate = plate
+                    job.path_points = path_points
+                    job.well_setup = model
+                    job.hw_config = hw
+
+                    # v7.2.9: Compute hybrid time estimate (blocking-aware)
+                    # This replaces the naive trajectory_result.total_duration_s
+                    # which doesn't account for per-waypoint blocking overhead.
+                    try:
+                        from SupportClasses.PrintManager import HybridPlanExecutor
+                        _est_executor = HybridPlanExecutor(
+                            controller=None,  # estimate_time doesn't need HW
+                            plan=plan, well_model=model, plate=plate,
+                            path_points=path_points, settings=settings,
+                            hw_config=hw)
+                        hybrid_est = _est_executor.estimate_time()
+                        job.estimated_duration_s = hybrid_est
+                        logger.info(f"Hybrid time estimate: {hybrid_est:.1f}s "
+                                    f"(vs trajectory {trajectory_result.total_duration_s:.1f}s)")
+                    except Exception as e:
+                        logger.warning(f"Hybrid estimate failed: {e}")
+                        job.estimated_duration_s = 0.0
+
                     logger.info(
                         f"Trajectory generated: {len(trajectory_result.waypoints)} "
                         f"waypoints, {trajectory_result.total_duration_s:.1f}s")
@@ -1232,7 +1665,11 @@ class PrintSetupPage(QWidget):
         # Step 5: Show success
         parts = [f"\u2713 Ready: {getattr(job, 'name', '?')}"]
         if trajectory_result:
-            parts.append(f"{trajectory_result.total_duration_s / 60:.1f} min")
+            # v7.2.9: Show hybrid estimate if available (blocking-aware)
+            _est_s = getattr(job, 'estimated_duration_s', 0.0)
+            if _est_s <= 0:
+                _est_s = trajectory_result.total_duration_s
+            parts.append(f"{_est_s / 60:.1f} min")
             parts.append(f"{len(trajectory_result.waypoints)} waypoints")
         elif hasattr(job, 'total_steps'):
             parts.append(f"{job.total_steps} commands")

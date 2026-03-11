@@ -498,6 +498,10 @@ class XYJogHandler:
                 logger.debug("[XY] Jog stop")
             self._was_moving = is_moving
 
+            if not is_moving:
+                time.sleep(0.01)
+                continue
+
             # Dampen near limits
             if is_moving and self.safety_limits and self.safety_limits.enabled and self._get_xy_position:
                 try:
@@ -971,6 +975,76 @@ class StageController:
         return (None, None)
 
 
+    def wait_for_xy_arrival(
+        self, target_x_mm: float, target_y_mm: float,
+        tolerance_mm: float = 0.1, timeout_s: float = 10.0,
+    ) -> bool:
+        """Block until XY stage reaches target position (zero-ref mm).
+
+        v7.2.9: Safety method — call before Z descent to confirm XY is at
+        the correct well position, preventing needle breakage.
+
+        Returns True if position reached within tolerance, False on timeout.
+        """
+        import time
+        import math
+
+        if not self.is_xy_connected:
+            return True  # No stage to wait for
+
+        deadline = time.monotonic() + timeout_s
+        poll_interval = 0.15  # 150ms between polls
+
+        while time.monotonic() < deadline:
+            pos = self.get_xy_position_mm(cached=False)
+            if pos[0] is not None and pos[1] is not None:
+                dx = pos[0] - target_x_mm
+                dy = pos[1] - target_y_mm
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist <= tolerance_mm:
+                    return True
+            time.sleep(poll_interval)
+
+        # Timeout — log warning but don't block forever
+        pos = self.get_xy_position_mm(cached=False)
+        logger.warning(
+            f"wait_for_xy_arrival timeout ({timeout_s}s): "
+            f"target=({target_x_mm:.2f}, {target_y_mm:.2f}), "
+            f"actual={pos}")
+        return False
+
+    def wait_for_z_arrival(
+        self, target_z_mm: float,
+        tolerance_mm: float = 0.05, timeout_s: float = 10.0,
+    ) -> bool:
+        """Block until Z axis reaches target position (zero-ref mm).
+
+        v7.2.9: Companion to wait_for_xy_arrival for hybrid execution.
+        Returns True if position reached within tolerance, False on timeout.
+        """
+        import time
+        import math
+
+        if not self.is_zp_connected:
+            return True
+
+        deadline = time.monotonic() + timeout_s
+        poll_interval = 0.15
+
+        while time.monotonic() < deadline:
+            pos = self.get_zp_position(cached=False)
+            if pos[0] is not None:
+                z_mm = (pos[0] - self.zero_position.get("Z", 0))
+                if abs(z_mm - target_z_mm) <= tolerance_mm:
+                    return True
+            time.sleep(poll_interval)
+
+        pos = self.get_zp_position(cached=False)
+        logger.warning(
+            f"wait_for_z_arrival timeout ({timeout_s}s): "
+            f"target={target_z_mm:.2f}, actual={pos}")
+        return False
+
     def get_zp_position(self, cached: bool = True) -> tuple:
         """Get ZP position. cached=True returns polled value (non-blocking)."""
         if cached:
@@ -1177,9 +1251,17 @@ class StageController:
 
 
     def move_z_absolute(
-        self, z_value: float, from_zero_ref: bool = True, fast: bool = False
+        self, z_value: float, from_zero_ref: bool = True, fast: bool = False,
+        feedrate_mm_min: float | None = None,
     ) -> None:
-        """Move Z needle to absolute position."""
+        """Move Z needle to absolute position.
+
+        Args:
+            z_value: Target Z in mm (zero-ref or raw).
+            from_zero_ref: If True, add zero reference offset.
+            fast: If True, use maximum feedrate.
+            feedrate_mm_min: Optional per-move feedrate (mm/min).
+        """
         if not self.zp_stage:
             return
         if self.safety_limits.enabled and from_zero_ref:
@@ -1187,7 +1269,9 @@ class StageController:
         position = z_value
         if from_zero_ref:
             position += self.zero_position["Z"]
-        self.zp_stage.move_absolute({AXIS_MAP["Z"]: position}, fast)
+        self.zp_stage.move_absolute(
+            {AXIS_MAP["Z"]: position}, fast,
+            feedrate_mm_min=feedrate_mm_min)
 
     def move_z_relative(self, distance: float, feedrate: float | None = None) -> None:
         """Move Z by relative distance."""

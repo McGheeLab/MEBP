@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-03-11T02:24:01.899613+00:00",
+  "timestamp_str": "20260311_022401",
+  "job_name": "unnamed",
+  "status": "completed",
+  "workspace": {},
+  "well_setup": {},
+  "duration_s": 502.898,
+  "num_samples": 1328,
+  "end_time": "2026-03-11T02:32:24.804979+00:00",
+  "summary": {
+    "total_samples": 1328,
+    "print_samples": 1318,
+    "travel_samples": 0,
+    "retract_samples": 10,
+    "num_segments": 1,
+    "tracking_error_xy_mean_mm": 3555.7055,
+    "tracking_error_xy_max_mm": 4978.7465,
+    "tracking_error_z_mean_mm": 0.0003,
+    "tracking_error_z_max_mm": 0.365,
+    "actual_print_path_length_mm": 107091.129
+  }
+}

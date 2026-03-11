@@ -238,7 +238,8 @@ class ZPStageManager:
         fr = feedrate if feedrate is not None else self.feedrate
         self.send_data(f"G0 F{fr} {axis_str}")
 
-    def move_absolute(self, axes: dict[str, float], fast: bool = False) -> None:
+    def move_absolute(self, axes: dict[str, float], fast: bool = False,
+                      feedrate_mm_min: float | None = None) -> None:
         """
         Move axes to absolute positions.
 
@@ -248,15 +249,17 @@ class ZPStageManager:
         Args:
             axes: Dict of {printer_axis: position}
             fast: If True, use maximum feedrate.
+            feedrate_mm_min: Optional feedrate for this move (mm/min).
         """
         active = {a: p for a, p in axes.items() if True}  # include all
         if not active:
             return
 
         axis_str = " ".join(f"{a}{p}" for a, p in active.items())
+        feed_str = f" F{feedrate_mm_min:.0f}" if feedrate_mm_min else ""
 
         self.send_data("G90")  # Absolute mode
-        self.send_data(f"G0 {axis_str}")
+        self.send_data(f"G0 {axis_str}{feed_str}")
         self.send_data("G91")  # Back to relative
 
     # ── Position Query ────────────────────────────────────────────

@@ -253,7 +253,7 @@ class ZPStageSimulator:
 
     def _cmd_move(self, cmd: str) -> str:
         """Handle G0 movement command (lock must be held)."""
-        axes = re.findall(r"([XYZE])([-+]?\d*\.?\d+)", cmd)
+        axes = re.findall(r"([XYZEF])([-+]?\d*\.?\d+)", cmd)
         if not axes:
             return "ok"
 
@@ -261,6 +261,10 @@ class ZPStageSimulator:
             try:
                 val = float(value_str)
             except ValueError:
+                continue
+            if axis == "F":
+                # Feedrate: F is mm/min, max_speed is mm/s
+                self.max_speed = min(val / 60.0, 500.0)
                 continue
             if axis not in self.position:
                 continue

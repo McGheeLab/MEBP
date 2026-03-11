@@ -20,10 +20,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": false
+      "ink": "P1",
+      "auto_layout": false,
+      "in_well": true
     },
     "Triangle_2": {
       "object_type": "triangle",
@@ -37,10 +36,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
     },
     "Triangle_3": {
       "object_type": "triangle",
@@ -54,10 +52,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
     },
     "Triangle_4": {
       "object_type": "triangle",
@@ -71,10 +68,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
     },
     "Triangle_5": {
       "object_type": "triangle",
@@ -88,10 +84,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
     },
     "Triangle_6": {
       "object_type": "triangle",
@@ -105,10 +100,9 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
     },
     "Triangle_7": {
       "object_type": "triangle",
@@ -122,10 +116,26 @@
         0.0
       ],
       "color": "#a6e3a1",
-      "ink_pump": "P1",
-      "num_layers": 1,
-      "layer_height": 0.10000000000000002,
-      "auto_layout": true
+      "ink": "P1",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Circle_1": {
+      "object_type": "circle",
+      "params": {
+        "radius": 1.0,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": false,
+      "in_well": true
     }
   },
   "collections": {},

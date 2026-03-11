@@ -8,8 +8,9 @@ A desktop application for controlling laboratory-scale bioprinting hardware. MEB
 
 ## Features
 
-- **Multi-material printing** — Up to 3 independent syringe pumps with per-pump ink assignment and configurable ink swap strategies
+- **Multi-material printing** — Up to 3 independent syringe pumps with multi-ink per pump, configurable ink swap strategies, and per-ink gather configs
 - **Parametric object designer** — 1D (point), 2D (line, circle, square, triangle, spiral, ellipse), and 3D (sphere, cube, cylinder, ellipsoid) with shell/solid and fill pattern options
+- **Image-based toolpaths** — Import TIFF stacks, image sequences, or single images to generate raster toolpaths with per-pump intensity mapping
 - **Well plate support** — Standard 6, 12, 24, 48, 96, and 384-well plates with per-well object assignment
 - **Real-time jogging** — Xbox controller support for manual stage positioning with configurable button mapping
 - **Z-plane calibration** — 3-point teach + least-squares plane fit for automatic tilt compensation
@@ -133,7 +134,6 @@ Configure your hardware before accessing other pages:
    - Check one or more inks from the ink library
    - Set fluid column volumes (oil, buffer, ink)
 4. **Ink Library** — Define ink specifications (name, viscosity, density, color)
-5. **Ink Swap Strategy** — Configure cleaning steps for multi-ink single-syringe workflows
 
 ### 2. Dashboard (Page 1)
 
@@ -153,11 +153,12 @@ Align your well plate using 3-point teach:
 
 ### 5. Print Setup (Page 4)
 
-Design your print across three tabs:
+Design your print across four tabs:
 
 - **Workspace** — Review hardware configuration summary
 - **Objects** — Add parametric print objects (circles, spheres, etc.) with fill options and ink assignment
 - **Wells** — Assign objects to well plate positions and set well roles
+- **Finalize** — Configure execution parameters (ink swap strategy, Z/XY travel, ink gather, cleanup), generate plan of action, and send to monitor
 
 ### 6. Print Monitor (Page 5)
 
@@ -189,6 +190,8 @@ MEBP/
 │   ├── HardwareConfig.py      # Central µL↔mm configuration
 │   ├── GeometryEngine.py      # Parametric trajectory generation
 │   ├── PrintManager.py        # Print execution engine
+│   ├── PrintPlanOfAction.py   # Plan generation + PrintExecutionConfig
+│   ├── ImagePathPlanner.py    # Image-to-toolpath raster generator
 │   └── ...
 ├── gui/                       # Frontend (PySide6)
 │   ├── app.py                 # Main window
