@@ -1,4 +1,4 @@
-# MEBP — Multi-Extrusion Bioprinting Platform
+# MEBP — Microscope-Enabled Bioprinting Platform
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
