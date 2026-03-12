@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.0** — Microscope-Enabled Bioprinting Platform
+**V7.3.1** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.0`
+Branch: `Version-7.3.1`
 
 ---
 
@@ -77,6 +77,7 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v730_to_v731_UPDATE.md` | v7.3.1 calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (no manual teach steps), per-well 50% overlap scanning, jog page well plate navigator, 110 tests |
 | `MEBP_v730_AUTOCALIBRATION_UPDATE.md` | v7.3.0 autocalibration: well/needle detection, focus assist, simulated camera, detection overlay, parallel vision (7 phases complete) |
 | `MEBP_v729_to_v730_UPDATE.md` | Plan of Action redesign, PrintExecutionConfig, Finalize tab, new step types |
 | `MEBP_v728_to_v729_UPDATE.md` | Object consolidation, multi-ink, ink swap strategy, triangle fill |

@@ -29,6 +29,14 @@ from PySide6.QtGui import QFont, QKeyEvent
 from SupportClasses.StageController import StageController
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 
+# v7.3.1: Optional well plate navigator
+try:
+    from gui.widgets.jog_well_plate import WellPlateNavigator
+    WELL_NAV_AVAILABLE = True
+except ImportError:
+    WellPlateNavigator = None
+    WELL_NAV_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Step sizes in microns (µm) for the XY stage
@@ -66,6 +74,12 @@ class JogControlPage(QWidget):
         self._last_jog_step_um: float = 0.0
         self._last_xy_before: tuple = (None, None)
         self._conversion_factor_set: bool = False  # True once protocol loads
+
+        # v7.3.1: Well plate navigation state
+        self._well_positions: dict[str, tuple[float, float]] | None = None
+        self._safe_z: float | None = None
+        self._plate = None
+        self._well_nav: WellPlateNavigator | None = None
 
         self._setup_ui()
         self._setup_shortcuts()
@@ -286,6 +300,27 @@ class JogControlPage(QWidget):
         actions_layout.addWidget(btn_estop)
 
         main_layout.addWidget(actions_frame)
+
+        # ── v7.3.1: Well Plate Navigator ──────────────────────
+        if WELL_NAV_AVAILABLE:
+            nav_frame = QFrame()
+            nav_frame.setObjectName("cardFrame")
+            nav_layout = QVBoxLayout(nav_frame)
+            nav_layout.setContentsMargins(4, 4, 4, 4)
+            nav_layout.setSpacing(2)
+            nav_label = QLabel("Well Plate — Click to Fast Travel")
+            nav_label.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            nav_layout.addWidget(nav_label)
+            self._well_nav = WellPlateNavigator(parent=self)
+            self._well_nav.setMinimumHeight(120)
+            self._well_nav.well_clicked.connect(self._on_well_nav_click)
+            nav_layout.addWidget(self._well_nav, stretch=1)
+            self._well_nav_status = QLabel("")
+            self._well_nav_status.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            nav_layout.addWidget(self._well_nav_status)
+            main_layout.addWidget(nav_frame, stretch=1)
+
         main_layout.addStretch()
 
     # ════════════════════════════════════════════════════════════════
@@ -399,6 +434,10 @@ class JogControlPage(QWidget):
         else:
             for lbl in [self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3]:
                 lbl.setText("—")
+
+        # v7.3.1: Update well plate navigator current-well highlight
+        if self._well_nav is not None and xy[0] is not None:
+            self._well_nav.update_current_from_position(xy[0], xy[1])
 
         # v7.2.4: Step verification — show measured delta after jog
         if (self._last_jog_step_um > 0 and
@@ -553,6 +592,57 @@ class JogControlPage(QWidget):
     def _goto_zero(self):
         self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
         self.controller.move_z_absolute(0, from_zero_ref=True)
+
+    # ── v7.3.1: Well Plate Navigation ────────────────────────────
+
+    def set_calibration_data(self, plate, well_positions, safe_z):
+        """Receive calibration state from the calibration page.
+
+        Args:
+            plate: WellPlate instance (or None).
+            well_positions: Dict mapping well_name → (x_um, y_um), or None.
+            safe_z: Safe travel Z height in mm (zero-ref), or None.
+        """
+        self._plate = plate
+        self._well_positions = well_positions
+        self._safe_z = safe_z
+        if self._well_nav is not None:
+            if plate:
+                self._well_nav.set_plate(plate)
+            if well_positions:
+                self._well_nav.set_well_positions(well_positions)
+            status_parts = []
+            if plate:
+                status_parts.append(f"{plate.format}-well")
+            if well_positions:
+                status_parts.append(f"{len(well_positions)} positions")
+            if safe_z is not None:
+                status_parts.append(f"safe Z={safe_z:.1f}mm")
+            if hasattr(self, '_well_nav_status'):
+                self._well_nav_status.setText(" | ".join(status_parts) if status_parts else "")
+
+    def _on_well_nav_click(self, well_name: str):
+        """Handle click on well plate navigator — safe fast-travel."""
+        from PySide6.QtWidgets import QMessageBox
+        if self._safe_z is None:
+            QMessageBox.warning(self, "No Safe Z",
+                                "Set Safe Z on the Calibration page before fast-traveling.\n"
+                                "This ensures the needle is raised before XY travel.")
+            return
+        if self._well_positions is None or well_name not in self._well_positions:
+            QMessageBox.warning(self, "No Position",
+                                f"Well {well_name} has no calibrated position.\n"
+                                "Run calibration first.")
+            return
+        target_x, target_y = self._well_positions[well_name]
+        self.controller.safe_travel_to(
+            target_x, target_y, self._safe_z)
+        if hasattr(self, '_well_nav_status'):
+            rel_x = target_x - self.controller.zero_position["x"]
+            rel_y = target_y - self.controller.zero_position["y"]
+            self._well_nav_status.setText(
+                f"Traveled to {well_name}: ({rel_x:,.0f}, {rel_y:,.0f}) µm")
+        logger.info(f"Fast travel to well {well_name}")
 
     def _emergency_stop(self):
         if self.controller.zp_stage:

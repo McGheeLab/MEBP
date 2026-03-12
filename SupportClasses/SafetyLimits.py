@@ -34,11 +34,11 @@ logger = logging.getLogger(__name__)
 class SafetyLimits:
     """Software endstops for XY, Z, and pump axes."""
 
-    # XY limits (steps, relative to zero reference)
-    xy_min_x: float = -100_000.0
-    xy_min_y: float = -100_000.0
-    xy_max_x: float = 100_000.0
-    xy_max_y: float = 100_000.0
+    # XY limits (µm, relative to zero reference)
+    xy_min_x: float = -130_000.0
+    xy_min_y: float = -85_000.0
+    xy_max_x: float = 130_000.0
+    xy_max_y: float = 85_000.0
 
     # Z needle limits (mm, relative to zero reference)
     z_min: float = -10.0

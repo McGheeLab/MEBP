@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 CONFIG_HARDWARE_DIR = Path(__file__).resolve().parent.parent.parent / "config" / "hardware"
 
 # v7.3.0: Nikon Ti2-U objective magnifications available on the microscope
-NIKON_TI2U_OBJECTIVES = [2.0, 4.0, 10.0, 20.0]
+NIKON_TI2U_OBJECTIVES = [1.0, 2.0, 4.0, 10.0, 20.0]
 
 
 

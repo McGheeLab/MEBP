@@ -1290,6 +1290,44 @@ class StageController:
                 pass
         self.zp_stage.move_relative({AXIS_MAP["Z"]: distance}, feedrate)
 
+    def safe_travel_to(
+        self,
+        target_x_um: float,
+        target_y_um: float,
+        safe_z_mm: float,
+        target_z_mm: float | None = None,
+        fast_xy_speed_mm_s: float = 50.0,
+    ) -> None:
+        """v7.3.1: Safe 3-step travel: raise Z → fast XY → lower Z.
+
+        Args:
+            target_x_um: Absolute target X in µm.
+            target_y_um: Absolute target Y in µm.
+            safe_z_mm: Safe travel height in mm (zero-referenced).
+            target_z_mm: Optional target Z after XY move (zero-referenced).
+                         If None, stays at safe_z.
+            fast_xy_speed_mm_s: XY travel speed in mm/s.
+        """
+        # Step 1: Raise Z to safe height
+        if self.is_zp_connected:
+            self.move_z_absolute(safe_z_mm, from_zero_ref=True)
+
+        # Step 2: Fast XY travel
+        if self.is_xy_connected:
+            if hasattr(self, 'xy_stage') and self.xy_stage:
+                if hasattr(self.xy_stage, 'set_speed_mm_s'):
+                    self.xy_stage.set_speed_mm_s(fast_xy_speed_mm_s)
+                else:
+                    self.xy_stage.set_velocity(100)
+            self.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
+
+        # Step 3: Lower Z to target
+        if self.is_zp_connected and target_z_mm is not None:
+            self.move_z_absolute(target_z_mm, from_zero_ref=True)
+
+        logger.info(f"Safe travel to ({target_x_um:.0f}, {target_y_um:.0f}) µm, "
+                    f"safe_z={safe_z_mm:.2f} mm")
+
     def is_pump_enabled(self, pump: str) -> bool:
         """Check if a pump is enabled in the hardware config."""
         hw = self._hardware_config

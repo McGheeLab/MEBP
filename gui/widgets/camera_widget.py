@@ -576,6 +576,27 @@ class CameraWidget(QWidget):
                 return self._current_frame.copy()
             return None
 
+    def capture_fresh_frame(self):
+        """Capture a fresh frame directly from the camera backend.
+
+        Unlike get_current_frame() which returns the last timer-grabbed frame,
+        this forces a new read() call. Essential after stage movement to ensure
+        the frame content matches the current stage position.
+
+        Returns:
+            np.ndarray (BGR, uint8) or None
+        """
+        if not self._capture or not self._capture.isOpened():
+            return None
+        # Use read_fresh() if available (SimulatedCamera) for uncached position
+        if hasattr(self._capture, 'read_fresh'):
+            ret, frame = self._capture.read_fresh()
+        else:
+            ret, frame = self._capture.read()
+        if ret and frame is not None:
+            return frame.copy()
+        return None
+
     # ── Snapshot ──────────────────────────────────────────────────
 
     def take_snapshot(self):

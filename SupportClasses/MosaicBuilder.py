@@ -1,0 +1,1174 @@
+"""
+MosaicBuilder — Full-plate mosaic stitching and affine calibration.
+
+Collects camera frames captured during a serpentine raster scan,
+stitches them into a seamless composite using industry-standard
+microscopy techniques, and fits an affine transform between
+predicted and detected well centres.
+
+v7.3.1 — Phase 2 (rewrite)
+
+Stitching pipeline:
+  1. Acquire tiles in serpentine raster with configurable overlap (default 10%)
+  2. Pairwise registration via phase cross-correlation on overlap regions
+  3. Global least-squares optimization of all tile positions
+  4. Linear feathered blending in overlap zones
+  5. Progressive composite update (call stitch_incremental after each frame)
+
+Usage::
+
+    builder = MosaicBuilder(frame_size_px=(916, 686), micron_per_pixel=3.34)
+    positions = builder.generate_raster_positions(bounds, overlap=0.10)
+    for i, (x, y) in enumerate(positions):
+        stage.move_to(x, y)
+        frame = camera.capture_fresh_frame()
+        builder.add_raster_frame(frame, x, y, index=i)
+        composite = builder.stitch_incremental()   # updated composite
+    result = builder.build(predicted_positions)
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    CV2_AVAILABLE = False
+
+try:
+    from skimage.registration import phase_cross_correlation
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    phase_cross_correlation = None
+    SKIMAGE_AVAILABLE = False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Data Structures
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class FrameRecord:
+    """A single captured frame with its metadata."""
+    well_name: str
+    frame: np.ndarray                           # BGR image
+    stage_x_um: float                           # Absolute stage X (µm)
+    stage_y_um: float                           # Absolute stage Y (µm)
+    detected_offset_um: tuple[float, float] | None = None  # (dx, dy) from frame center
+    confidence: float = 0.0
+    # Refined position after registration (pixels on composite canvas)
+    refined_x_px: float | None = None
+    refined_y_px: float | None = None
+
+
+@dataclass
+class AffineCalibration:
+    """Result of affine fitting between predicted and detected positions.
+
+    The transform maps predicted → corrected coordinates:
+        corrected = R @ (predicted - center) + center + translation
+
+    where R is a rotation+scale matrix.
+    """
+    rotation_deg: float = 0.0       # Plate rotation (degrees, CCW positive)
+    scale: float = 1.0              # Uniform scale factor
+    translation_um: tuple[float, float] = (0.0, 0.0)  # (tx, ty) shift in µm
+    center_um: tuple[float, float] = (0.0, 0.0)       # Rotation center (µm)
+    num_points: int = 0             # Points used in fit
+    residual_um: float = 0.0        # RMS residual after fit (µm)
+
+    def correct_position(self, x_um: float, y_um: float) -> tuple[float, float]:
+        """Apply affine correction to a single predicted position."""
+        rad = math.radians(self.rotation_deg)
+        cos_r = math.cos(rad) * self.scale
+        sin_r = math.sin(rad) * self.scale
+        cx, cy = self.center_um
+        tx, ty = self.translation_um
+        # Translate to center, rotate+scale, translate back + shift
+        dx = x_um - cx
+        dy = y_um - cy
+        rx = cos_r * dx - sin_r * dy + cx + tx
+        ry = sin_r * dx + cos_r * dy + cy + ty
+        return (rx, ry)
+
+    def correct_positions(
+        self, predicted: dict[str, tuple[float, float]]
+    ) -> dict[str, tuple[float, float]]:
+        """Apply affine correction to all predicted positions."""
+        return {
+            name: self.correct_position(x, y)
+            for name, (x, y) in predicted.items()
+        }
+
+    @property
+    def is_identity(self) -> bool:
+        """True if this calibration is essentially a no-op."""
+        return (abs(self.rotation_deg) < 0.01
+                and abs(self.scale - 1.0) < 0.001
+                and abs(self.translation_um[0]) < 1.0
+                and abs(self.translation_um[1]) < 1.0)
+
+
+@dataclass
+class MosaicResult:
+    """Complete result from a mosaic scan."""
+    mosaic_image: np.ndarray | None = None      # Composite stitched image (BGR)
+    calibration: AffineCalibration = field(default_factory=AffineCalibration)
+    frames_captured: int = 0
+    frames_detected: int = 0                    # Frames where well was detected
+    detected_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
+
+    def correct_positions(
+        self, predicted: dict[str, tuple[float, float]]
+    ) -> dict[str, tuple[float, float]]:
+        """Convenience: apply calibration to predicted positions."""
+        return self.calibration.correct_positions(predicted)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Stitching helpers
+# ═══════════════════════════════════════════════════════════════════
+
+def _phase_correlate_overlap(
+    tile_a: np.ndarray,
+    tile_b: np.ndarray,
+) -> tuple[float, float, float]:
+    """Compute sub-pixel translation between two overlap regions.
+
+    Uses phase cross-correlation (frequency domain) with Hanning window
+    for robust, sub-pixel registration.
+
+    Args:
+        tile_a: Overlap region from tile A (grayscale uint8).
+        tile_b: Overlap region from tile B (grayscale uint8).
+
+    Returns:
+        (dy, dx, confidence) — sub-pixel shift and peak confidence.
+    """
+    if not SKIMAGE_AVAILABLE:
+        return 0.0, 0.0, 0.0
+
+    # Apply Hanning window to reduce edge artifacts
+    h, w = tile_a.shape[:2]
+    if h < 4 or w < 4:
+        return 0.0, 0.0, 0.0
+
+    win_y = np.hanning(h)
+    win_x = np.hanning(w)
+    window = np.outer(win_y, win_x)
+
+    a = tile_a.astype(np.float64) * window
+    b = tile_b.astype(np.float64) * window
+
+    # Phase cross-correlation with sub-pixel refinement
+    shift, error, phase_diff = phase_cross_correlation(
+        a, b, upsample_factor=10, normalization="phase"
+    )
+
+    # Confidence: inverse of the error (higher = better match)
+    # error from phase_cross_correlation is already a quality metric
+    confidence = max(0.0, 1.0 - abs(error)) if error is not None else 0.5
+
+    return float(shift[0]), float(shift[1]), confidence
+
+
+def _build_neighbor_graph(
+    n_tiles: int,
+    grid_cols: int,
+    grid_rows: int,
+) -> list[tuple[int, int, str]]:
+    """Build adjacency graph for a serpentine raster grid.
+
+    Returns list of (tile_i, tile_j, direction) edges where direction
+    is 'h' (horizontal neighbor) or 'v' (vertical neighbor).
+    """
+    edges = []
+    for row in range(grid_rows):
+        for col in range(grid_cols):
+            idx = row * grid_cols + col
+            if idx >= n_tiles:
+                break
+            # Serpentine: even rows L→R, odd rows R→L
+            if row % 2 == 0:
+                actual_col = col
+            else:
+                actual_col = grid_cols - 1 - col
+            # Horizontal neighbor (next in same row)
+            if col < grid_cols - 1:
+                neighbor_idx = idx + 1
+                if neighbor_idx < n_tiles:
+                    edges.append((idx, neighbor_idx, 'h'))
+            # Vertical neighbor (same column position in next row)
+            if row < grid_rows - 1:
+                # Find tile in next row at same column position
+                next_row_start = (row + 1) * grid_cols
+                if (row + 1) % 2 == 0:
+                    # Next row is L→R, column `actual_col` is at position actual_col
+                    v_neighbor = next_row_start + actual_col
+                else:
+                    # Next row is R→L, column `actual_col` is at position (cols-1-actual_col)
+                    v_neighbor = next_row_start + (grid_cols - 1 - actual_col)
+                if v_neighbor < n_tiles:
+                    edges.append((idx, v_neighbor, 'v'))
+    return edges
+
+
+def _global_optimize_positions(
+    n_tiles: int,
+    nominal_positions_px: np.ndarray,
+    edges: list[tuple[int, int, str]],
+    measured_offsets: list[tuple[float, float]],
+    confidences: list[float],
+    min_confidence: float = 0.1,
+) -> np.ndarray:
+    """Globally optimize tile positions using least-squares.
+
+    Solves for tile positions that minimize the weighted sum of squared
+    differences between measured pairwise offsets and the implied offsets
+    from the solved positions.
+
+    minimize  Σ  w_ij * || (pos_j - pos_i) - measured_offset_ij ||²
+
+    The first tile is anchored at its nominal position.
+
+    Args:
+        n_tiles: Number of tiles.
+        nominal_positions_px: (N, 2) array of nominal [x, y] positions in pixels.
+        edges: List of (i, j, direction) adjacency pairs.
+        measured_offsets: List of (dx, dy) measured pixel offsets for each edge.
+        confidences: Confidence weight for each edge.
+        min_confidence: Minimum confidence to include an edge.
+
+    Returns:
+        (N, 2) array of optimized [x, y] positions in pixels.
+    """
+    if n_tiles <= 1:
+        return nominal_positions_px.copy()
+
+    # Filter edges by confidence
+    valid_edges = []
+    valid_offsets = []
+    valid_weights = []
+    for k, (i, j, d) in enumerate(edges):
+        if confidences[k] >= min_confidence:
+            valid_edges.append((i, j))
+            valid_offsets.append(measured_offsets[k])
+            valid_weights.append(confidences[k])
+
+    if not valid_edges:
+        logger.warning("No valid edges for global optimization; using nominal positions")
+        return nominal_positions_px.copy()
+
+    # Build overdetermined linear system: A @ pos = b
+    # For each edge (i, j): pos_j - pos_i = offset_ij
+    # → -pos_i + pos_j = offset_ij
+    # Solve for x and y independently
+    n_edges = len(valid_edges)
+
+    # We anchor tile 0 to its nominal position
+    # For the remaining tiles, solve via least-squares
+    # System: for each edge (i,j) and each axis:
+    #   w * (pos[j] - pos[i]) = w * measured_offset
+
+    A = np.zeros((n_edges + 1, n_tiles))
+    bx = np.zeros(n_edges + 1)
+    by = np.zeros(n_edges + 1)
+    w_diag = np.zeros(n_edges + 1)
+
+    for k, (i, j) in enumerate(valid_edges):
+        w = valid_weights[k]
+        A[k, i] = -w
+        A[k, j] = w
+        bx[k] = w * valid_offsets[k][0]
+        by[k] = w * valid_offsets[k][1]
+        w_diag[k] = w
+
+    # Anchor constraint: tile 0 at nominal position (high weight)
+    anchor_w = 10.0 * max(valid_weights) if valid_weights else 1.0
+    A[n_edges, 0] = anchor_w
+    bx[n_edges] = anchor_w * nominal_positions_px[0, 0]
+    by[n_edges] = anchor_w * nominal_positions_px[0, 1]
+
+    # Solve
+    opt_x, _, _, _ = np.linalg.lstsq(A, bx, rcond=None)
+    opt_y, _, _, _ = np.linalg.lstsq(A, by, rcond=None)
+
+    result = np.column_stack([opt_x, opt_y])
+    return result
+
+
+def _compute_feather_weights(tile_h: int, tile_w: int, margin_px: int) -> np.ndarray:
+    """Create a 2D feathering weight map for linear blending.
+
+    Uses separable 1D ramps multiplied together. Each ramp goes from
+    0 at the tile edge to 1 at `margin_px` inward, linearly. The
+    product of the horizontal and vertical ramps gives the 2D weight.
+
+    This ensures that in overlap zones, the sum of weights from
+    adjacent tiles equals 1.0 along each axis. At corners where
+    four tiles meet, the weights are lower but still sum correctly
+    because each axis contribution sums independently.
+
+    Returns:
+        float32 array of shape (tile_h, tile_w) with values in [0, 1].
+    """
+    if margin_px < 1:
+        return np.ones((tile_h, tile_w), dtype=np.float32)
+
+    # Build 1D ramp for horizontal axis
+    ramp_x = np.ones(tile_w, dtype=np.float32)
+    m = min(margin_px, tile_w // 2)
+    for i in range(m):
+        alpha = (i + 0.5) / margin_px  # half-pixel offset for symmetry
+        ramp_x[i] = alpha
+        ramp_x[tile_w - 1 - i] = alpha
+
+    # Build 1D ramp for vertical axis
+    ramp_y = np.ones(tile_h, dtype=np.float32)
+    m = min(margin_px, tile_h // 2)
+    for i in range(m):
+        alpha = (i + 0.5) / margin_px
+        ramp_y[i] = alpha
+        ramp_y[tile_h - 1 - i] = alpha
+
+    # 2D weight = product of separable ramps
+    weights = np.outer(ramp_y, ramp_x)
+    return weights
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MosaicBuilder
+# ═══════════════════════════════════════════════════════════════════
+
+class MosaicBuilder:
+    """Collects frames during plate scan, stitches mosaic, fits affine transform.
+
+    Uses an industry-standard microscopy stitching pipeline:
+    - Phase cross-correlation for pairwise tile registration
+    - Global least-squares optimization of tile positions
+    - Linear feathered blending in overlap zones
+
+    Args:
+        frame_size_px: (width, height) of each camera frame in pixels.
+        micron_per_pixel: Camera scale factor (µm per pixel).
+        overlap: Expected fractional overlap between tiles (0.0–0.5).
+        target_mosaic_px: Target size (longest edge) for the mosaic image.
+    """
+
+    def __init__(
+        self,
+        frame_size_px: tuple[int, int] = (916, 686),
+        micron_per_pixel: float = 3.34,
+        overlap: float = 0.10,
+        target_mosaic_px: int = 2000,
+    ):
+        self._frame_size_px = frame_size_px
+        self._um_per_px = micron_per_pixel
+        self._overlap = overlap
+        self._target_mosaic_px = target_mosaic_px
+        self._records: list[FrameRecord] = []
+
+        # Grid shape (set during raster generation)
+        self._grid_cols: int = 0
+        self._grid_rows: int = 0
+
+        # Composite state for incremental stitching
+        self._composite: np.ndarray | None = None        # float64 accumulator
+        self._weight_sum: np.ndarray | None = None       # float64 weight accumulator
+        self._display_cache: np.ndarray | None = None    # uint8 cached normalized output
+        self._mosaic_scale: float = 1.0  # µm → mosaic pixels
+        self._canvas_origin_um: tuple[float, float] = (0.0, 0.0)
+        self._feather_weights: np.ndarray | None = None
+
+    @property
+    def frame_count(self) -> int:
+        return len(self._records)
+
+    @property
+    def canvas_extent_um(self) -> tuple[float, float, float, float] | None:
+        """World extent of the composite canvas (min_x, min_y, max_x, max_y) in µm.
+
+        Includes half-FOV padding beyond the scan bounds on each side.
+        Returns None if canvas not yet initialized.
+        """
+        return getattr(self, '_canvas_extent_um', None)
+
+    @property
+    def composite(self) -> np.ndarray | None:
+        """Current composite image (may be partially built during scan).
+
+        Returns cached display image. Updated incrementally by _blend_tile_to_composite.
+        """
+        return self._display_cache
+
+    def _normalize_full(self):
+        """Normalize the entire composite accumulator into the display cache."""
+        if self._composite is None or self._weight_sum is None:
+            return
+        ch, cw = self._composite.shape[:2]
+        self._display_cache = np.zeros((ch, cw, 3), dtype=np.uint8)
+        mask = self._weight_sum > 0
+        for c in range(3):
+            channel = self._composite[:, :, c].copy()
+            channel[mask] = (channel[mask] / self._weight_sum[mask]).clip(0, 255)
+            self._display_cache[:, :, c] = channel.astype(np.uint8)
+
+    def reset(self):
+        """Clear all collected frames and composite state."""
+        self._records.clear()
+        self._composite = None
+        self._weight_sum = None
+        self._display_cache = None
+        self._feather_weights = None
+
+    # ── Raster grid generation ────────────────────────────────────
+
+    def generate_raster_positions(
+        self,
+        bounds_um: tuple[float, float, float, float],
+        overlap: float = 0.1,
+    ) -> list[tuple[float, float]]:
+        """Generate a serpentine raster grid of scan positions covering the given area.
+
+        The grid is based on the camera's field of view, not per-well positions.
+        Each position is the stage (X, Y) where the camera center should be placed.
+
+        Args:
+            bounds_um: (min_x, min_y, max_x, max_y) of the scan area in µm.
+            overlap: Fractional overlap between adjacent frames (0.0–0.5).
+                     Default 10% ensures seamless stitching.
+
+        Returns:
+            List of (x_um, y_um) stage positions in serpentine (meander) order.
+        """
+        self._overlap = overlap
+        min_x, min_y, max_x, max_y = bounds_um
+
+        # FOV in µm
+        fov_w = self._frame_size_px[0] * self._um_per_px
+        fov_h = self._frame_size_px[1] * self._um_per_px
+
+        # Step size with overlap
+        step_x = fov_w * (1.0 - overlap)
+        step_y = fov_h * (1.0 - overlap)
+
+        # Inset by half-FOV so the camera center stays within bounds
+        # while the frame edges still cover the boundary
+        start_x = min_x + fov_w / 2.0
+        start_y = min_y + fov_h / 2.0
+        end_x = max_x - fov_w / 2.0
+        end_y = max_y - fov_h / 2.0
+
+        # Handle case where scan area is smaller than one FOV
+        if start_x > end_x:
+            start_x = end_x = (min_x + max_x) / 2.0
+        if start_y > end_y:
+            start_y = end_y = (min_y + max_y) / 2.0
+
+        # Generate grid
+        cols = max(1, int(math.ceil((end_x - start_x) / step_x)) + 1) if step_x > 0 else 1
+        rows = max(1, int(math.ceil((end_y - start_y) / step_y)) + 1) if step_y > 0 else 1
+
+        self._grid_cols = cols
+        self._grid_rows = rows
+
+        positions: list[tuple[float, float]] = []
+        for row in range(rows):
+            y = start_y + row * step_y if rows > 1 else start_y
+            y = min(y, end_y)  # clamp last row
+
+            col_range = range(cols) if row % 2 == 0 else range(cols - 1, -1, -1)
+            for col in col_range:
+                x = start_x + col * step_x if cols > 1 else start_x
+                x = min(x, end_x)  # clamp last col
+                positions.append((x, y))
+
+        # Pre-allocate composite canvas
+        self._init_composite(bounds_um)
+
+        logger.info(
+            f"Raster grid: {cols}×{rows} = {len(positions)} positions, "
+            f"FOV {fov_w:.0f}×{fov_h:.0f} µm, step {step_x:.0f}×{step_y:.0f} µm"
+        )
+        return positions
+
+    def generate_spiral_scan_positions(
+        self,
+        center_um: tuple[float, float],
+        max_radius_um: float,
+        bounds_um: tuple[float, float, float, float],
+        overlap: float = 0.12,
+    ) -> list[tuple[float, float]]:
+        """Generate an Archimedean spiral of scan positions from center outward.
+
+        Used for discovery scanning: spiral from the assumed plate center
+        to detect wells and determine plate orientation before committing
+        to a full raster scan.
+
+        Args:
+            center_um: (x, y) spiral center in µm (typically plate center).
+            max_radius_um: Maximum spiral radius in µm.
+            bounds_um: (min_x, min_y, max_x, max_y) — positions outside
+                       this box are skipped (stage travel limits).
+            overlap: Fractional overlap between adjacent passes (0.0–0.5).
+
+        Returns:
+            List of (x_um, y_um) stage positions in spiral order.
+        """
+        self._overlap = overlap
+        cx, cy = center_um
+        min_x, min_y, max_x, max_y = bounds_um
+
+        fov_w = self._frame_size_px[0] * self._um_per_px
+        fov_h = self._frame_size_px[1] * self._um_per_px
+
+        # Radial pitch: distance between rings (use smaller FOV dim for overlap)
+        pitch = min(fov_w, fov_h) * (1.0 - overlap)
+        # Arc-length step: distance between frames along a ring
+        arc_step = max(fov_w, fov_h) * (1.0 - overlap)
+
+        # Spiral has no grid structure — disable neighbor-graph in build_mosaic
+        self._grid_cols = 0
+        self._grid_rows = 0
+
+        positions: list[tuple[float, float]] = []
+
+        # First position: center itself
+        if min_x <= cx <= max_x and min_y <= cy <= max_y:
+            positions.append((cx, cy))
+
+        # Walk the Archimedean spiral: r(theta) = pitch * theta / (2*pi)
+        theta = 0.0
+        while True:
+            # Advance theta by arc_step / r (clamped to avoid tiny r near center)
+            r = pitch * theta / (2.0 * math.pi)
+            if r > max_radius_um:
+                break
+
+            effective_r = max(r, pitch * 0.5)
+            theta += arc_step / effective_r
+
+            r = pitch * theta / (2.0 * math.pi)
+            if r > max_radius_um:
+                break
+
+            x = cx + r * math.cos(theta)
+            y = cy + r * math.sin(theta)
+
+            # Skip positions outside bounds
+            if x < min_x or x > max_x or y < min_y or y > max_y:
+                continue
+
+            positions.append((x, y))
+
+        # Pre-allocate composite canvas
+        self._init_composite(bounds_um)
+
+        logger.info(
+            f"Spiral scan: {len(positions)} positions from center "
+            f"({cx:.0f}, {cy:.0f}) µm, max_radius={max_radius_um:.0f} µm, "
+            f"pitch={pitch:.0f} µm"
+        )
+        return positions
+
+    # ── Composite canvas management ────────────────────────────────
+
+    def _init_composite(self, bounds_um: tuple[float, float, float, float]):
+        """Pre-allocate the composite canvas based on scan bounds."""
+        if not CV2_AVAILABLE:
+            return
+
+        min_x, min_y, max_x, max_y = bounds_um
+        fov_w = self._frame_size_px[0] * self._um_per_px
+        fov_h = self._frame_size_px[1] * self._um_per_px
+
+        # Canvas covers scan bounds + half-FOV padding on each side
+        canvas_w_um = (max_x - min_x) + fov_w
+        canvas_h_um = (max_y - min_y) + fov_h
+
+        # Scale factor: µm → mosaic pixels
+        self._mosaic_scale = self._target_mosaic_px / max(canvas_w_um, canvas_h_um, 1.0)
+
+        canvas_w = max(1, int(canvas_w_um * self._mosaic_scale))
+        canvas_h = max(1, int(canvas_h_um * self._mosaic_scale))
+
+        # Origin: top-left of canvas in µm (min position minus half-FOV)
+        self._canvas_origin_um = (min_x - fov_w / 2.0, min_y - fov_h / 2.0)
+        # Store the full canvas world extent for display coordinate mapping
+        self._canvas_extent_um = (
+            self._canvas_origin_um[0],
+            self._canvas_origin_um[1],
+            self._canvas_origin_um[0] + canvas_w_um,
+            self._canvas_origin_um[1] + canvas_h_um,
+        )
+
+        # Float accumulator for weighted blending
+        self._composite = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
+        self._weight_sum = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+        self._display_cache = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+        # Pre-compute feather weights for one tile at mosaic resolution
+        tile_w = max(1, int(fov_w * self._mosaic_scale))
+        tile_h = max(1, int(fov_h * self._mosaic_scale))
+        overlap_px = int(tile_w * self._overlap)
+        margin = max(1, overlap_px)
+        self._feather_weights = _compute_feather_weights(tile_h, tile_w, margin)
+
+        logger.info(
+            f"Composite canvas: {canvas_w}×{canvas_h} px, "
+            f"scale={self._mosaic_scale:.4f} px/µm"
+        )
+
+    # ── Frame collection ───────────────────────────────────────────
+
+    def add_frame(
+        self,
+        well_name: str,
+        frame: np.ndarray,
+        stage_x_um: float,
+        stage_y_um: float,
+        detection: Any | None = None,
+    ) -> FrameRecord:
+        """Add a captured frame with its stage position and optional detection result.
+
+        Args:
+            well_name: Well being imaged (e.g. "A1").
+            frame: BGR camera frame.
+            stage_x_um: Absolute stage X position (µm) when frame was captured.
+            stage_y_um: Absolute stage Y position (µm) when frame was captured.
+            detection: Optional DetectionResult from WellDetector.detect_well().
+
+        Returns:
+            The created FrameRecord.
+        """
+        offset_um = None
+        confidence = 0.0
+
+        if detection is not None:
+            cx_px, cy_px = detection.center_px
+            fw, fh = self._frame_size_px
+            dx_px = cx_px - fw / 2.0
+            dy_px = cy_px - fh / 2.0
+            offset_um = (dx_px * self._um_per_px, dy_px * self._um_per_px)
+            confidence = detection.confidence
+
+        record = FrameRecord(
+            well_name=well_name,
+            frame=frame,
+            stage_x_um=stage_x_um,
+            stage_y_um=stage_y_um,
+            detected_offset_um=offset_um,
+            confidence=confidence,
+        )
+        self._records.append(record)
+        return record
+
+    def add_raster_frame(
+        self,
+        frame: np.ndarray,
+        stage_x_um: float,
+        stage_y_um: float,
+        index: int = 0,
+    ) -> FrameRecord:
+        """Add a raster-scan frame (no well association).
+
+        Args:
+            frame: BGR camera frame.
+            stage_x_um: Absolute stage X position (µm).
+            stage_y_um: Absolute stage Y position (µm).
+            index: Frame index (used as label).
+
+        Returns:
+            The created FrameRecord.
+        """
+        record = FrameRecord(
+            well_name=f"R{index}",
+            frame=frame,
+            stage_x_um=stage_x_um,
+            stage_y_um=stage_y_um,
+        )
+        self._records.append(record)
+        return record
+
+    # ── Incremental stitching (called after each frame) ────────────
+
+    def stitch_incremental(self) -> np.ndarray | None:
+        """Add the latest frame to the composite using feathered blending.
+
+        Called after each add_frame/add_raster_frame to progressively
+        build the mosaic. Uses stage coordinates for placement.
+
+        Returns:
+            Current composite image (BGR uint8) or None.
+        """
+        if not CV2_AVAILABLE or not self._records:
+            return None
+        if self._composite is None or self._weight_sum is None:
+            return None
+
+        rec = self._records[-1]
+        self._blend_tile_to_composite(rec)
+        return self.composite
+
+    def _blend_tile_to_composite(self, rec: FrameRecord):
+        """Blend a single tile into the composite canvas with feathering."""
+        if self._composite is None or self._weight_sum is None:
+            return
+
+        fov_w_um = self._frame_size_px[0] * self._um_per_px
+        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        scale = self._mosaic_scale
+        ox, oy = self._canvas_origin_um
+
+        # Top-left corner of this tile on the canvas (in µm, then pixels)
+        tile_left_um = rec.stage_x_um - fov_w_um / 2.0
+        tile_top_um = rec.stage_y_um - fov_h_um / 2.0
+        px = int((tile_left_um - ox) * scale)
+        py = int((tile_top_um - oy) * scale)
+
+        # Target tile size on canvas
+        tile_w = max(1, int(fov_w_um * scale))
+        tile_h = max(1, int(fov_h_um * scale))
+
+        # Resize the frame to canvas resolution
+        try:
+            resized = cv2.resize(rec.frame, (tile_w, tile_h),
+                                 interpolation=cv2.INTER_AREA)
+        except Exception:
+            return
+
+        # Get feather weights (resize if dimensions don't match)
+        if (self._feather_weights is not None
+                and self._feather_weights.shape == (tile_h, tile_w)):
+            weights = self._feather_weights
+        else:
+            overlap_px = max(1, int(tile_w * self._overlap))
+            weights = _compute_feather_weights(tile_h, tile_w, overlap_px)
+
+        # Clip to canvas bounds
+        ch, cw = self._composite.shape[:2]
+        x1 = max(0, px)
+        y1 = max(0, py)
+        x2 = min(cw, px + tile_w)
+        y2 = min(ch, py + tile_h)
+
+        # Source region within the tile
+        sx1 = x1 - px
+        sy1 = y1 - py
+        sx2 = sx1 + (x2 - x1)
+        sy2 = sy1 + (y2 - y1)
+
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        # Accumulate weighted pixel values
+        tile_crop = resized[sy1:sy2, sx1:sx2].astype(np.float64)
+        w_crop = weights[sy1:sy2, sx1:sx2]
+
+        for c in range(3):
+            self._composite[y1:y2, x1:x2, c] += tile_crop[:, :, c] * w_crop
+        self._weight_sum[y1:y2, x1:x2] += w_crop
+
+        # Update display cache for only the affected region (fast)
+        if self._display_cache is not None:
+            region_ws = self._weight_sum[y1:y2, x1:x2]
+            mask = region_ws > 0
+            for c in range(3):
+                ch = self._composite[y1:y2, x1:x2, c].copy()
+                ch[mask] = (ch[mask] / region_ws[mask]).clip(0, 255)
+                self._display_cache[y1:y2, x1:x2, c] = ch.astype(np.uint8)
+
+        # Store refined position on canvas
+        rec.refined_x_px = float(px + tile_w / 2.0)
+        rec.refined_y_px = float(py + tile_h / 2.0)
+
+    # ── Full stitching with registration + global optimization ─────
+
+    def _ensure_composite(self):
+        """Ensure composite canvas exists; auto-initialize from frame records if needed.
+
+        Called by build_mosaic when frames were added via add_frame() without
+        a prior generate_raster_positions() call.
+        """
+        if self._composite is not None:
+            return
+
+        if not self._records or not CV2_AVAILABLE:
+            return
+
+        # Derive bounds from stage positions
+        xs = [r.stage_x_um for r in self._records]
+        ys = [r.stage_y_um for r in self._records]
+        fov_w = self._frame_size_px[0] * self._um_per_px
+        fov_h = self._frame_size_px[1] * self._um_per_px
+        bounds = (
+            min(xs) - fov_w / 2.0,
+            min(ys) - fov_h / 2.0,
+            max(xs) + fov_w / 2.0,
+            max(ys) + fov_h / 2.0,
+        )
+        self._init_composite(bounds)
+
+        # Blend all existing frames into the fresh canvas
+        for rec in self._records:
+            self._blend_tile_to_composite(rec)
+
+    def build_mosaic(self) -> np.ndarray | None:
+        """Build the final mosaic with pairwise registration and global optimization.
+
+        Pipeline:
+          1. Compute nominal tile positions from stage coordinates
+          2. Pairwise phase correlation on overlap regions between neighbors
+          3. Global least-squares optimization of all tile positions
+          4. Re-blend all tiles at optimized positions with feathering
+
+        Returns:
+            BGR numpy array of the composite, or None if no frames.
+        """
+        if not self._records or not CV2_AVAILABLE:
+            return None
+
+        n_tiles = len(self._records)
+
+        # If only 1 tile or no skimage, fall back to stage-coordinate blending
+        if n_tiles == 1 or not SKIMAGE_AVAILABLE:
+            self._ensure_composite()
+            return self.composite
+
+        # For very large grids (>200 tiles), phase correlation is too slow.
+        # Motorized stage coordinates are reliable enough — use feathered
+        # blending from stitch_incremental which already looks good.
+        MAX_TILES_FOR_REGISTRATION = 200
+        if n_tiles > MAX_TILES_FOR_REGISTRATION:
+            logger.info(
+                f"Skipping registration for {n_tiles} tiles (>{MAX_TILES_FOR_REGISTRATION}); "
+                f"using stage-coordinate placement with feathered blending"
+            )
+            return self.composite
+
+        fov_w_um = self._frame_size_px[0] * self._um_per_px
+        fov_h_um = self._frame_size_px[1] * self._um_per_px
+
+        # Compute stage bounds for canvas
+        xs = [r.stage_x_um for r in self._records]
+        ys = [r.stage_y_um for r in self._records]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        canvas_w_um = (max_x - min_x) + fov_w_um
+        canvas_h_um = (max_y - min_y) + fov_h_um
+        scale = self._target_mosaic_px / max(canvas_w_um, canvas_h_um, 1.0)
+        origin_x = min_x - fov_w_um / 2.0
+        origin_y = min_y - fov_h_um / 2.0
+
+        tile_w = max(1, int(fov_w_um * scale))
+        tile_h = max(1, int(fov_h_um * scale))
+
+        # Step 1: Nominal positions in pixels
+        nominal = np.zeros((n_tiles, 2), dtype=np.float64)
+        for i, rec in enumerate(self._records):
+            nominal[i, 0] = (rec.stage_x_um - fov_w_um / 2.0 - origin_x) * scale
+            nominal[i, 1] = (rec.stage_y_um - fov_h_um / 2.0 - origin_y) * scale
+
+        # Step 2: Resize all tiles to mosaic resolution + convert to gray
+        tiles_resized = []
+        tiles_gray = []
+        for rec in self._records:
+            try:
+                resized = cv2.resize(rec.frame, (tile_w, tile_h),
+                                     interpolation=cv2.INTER_AREA)
+                gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                resized = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+                gray = np.zeros((tile_h, tile_w), dtype=np.uint8)
+            tiles_resized.append(resized)
+            tiles_gray.append(gray)
+
+        # Step 3: Build neighbor graph
+        # If we have fewer tiles than the full grid (e.g. partial scan),
+        # recompute grid dims from actual tile count
+        full_grid = self._grid_cols * self._grid_rows
+        if self._grid_cols > 0 and n_tiles == full_grid:
+            grid_cols = self._grid_cols
+            grid_rows = self._grid_rows
+        elif self._grid_cols > 0 and n_tiles < full_grid:
+            grid_cols = min(self._grid_cols, n_tiles)
+            grid_rows = max(1, (n_tiles + grid_cols - 1) // grid_cols)
+        else:
+            grid_cols = n_tiles
+            grid_rows = 1
+        edges = _build_neighbor_graph(n_tiles, grid_cols, grid_rows)
+
+        # Step 4: Pairwise registration via phase correlation
+        measured_offsets = []
+        confidences = []
+        overlap_frac = self._overlap
+
+        for i, j, direction in edges:
+            if i >= n_tiles or j >= n_tiles:
+                measured_offsets.append((nominal[j, 0] - nominal[i, 0],
+                                        nominal[j, 1] - nominal[i, 1]))
+                confidences.append(0.0)
+                continue
+
+            # Expected offset from nominal positions
+            nom_dx = nominal[j, 0] - nominal[i, 0]
+            nom_dy = nominal[j, 1] - nominal[i, 1]
+
+            # Extract overlap regions based on direction
+            gray_a = tiles_gray[i]
+            gray_b = tiles_gray[j]
+
+            overlap_w = max(4, int(tile_w * overlap_frac * 1.5))
+            overlap_h = max(4, int(tile_h * overlap_frac * 1.5))
+
+            try:
+                if direction == 'h':
+                    # Horizontal neighbor: overlap on right edge of A, left edge of B
+                    if nom_dx > 0:  # B is to the right
+                        region_a = gray_a[:, -overlap_w:]
+                        region_b = gray_b[:, :overlap_w]
+                    else:  # B is to the left
+                        region_a = gray_a[:, :overlap_w]
+                        region_b = gray_b[:, -overlap_w:]
+                else:  # direction == 'v'
+                    # Vertical neighbor: overlap on bottom of A, top of B
+                    if nom_dy > 0:  # B is below
+                        region_a = gray_a[-overlap_h:, :]
+                        region_b = gray_b[:overlap_h, :]
+                    else:  # B is above
+                        region_a = gray_a[:overlap_h, :]
+                        region_b = gray_b[-overlap_h:, :]
+
+                dy, dx, conf = _phase_correlate_overlap(region_a, region_b)
+
+                # Convert correlation shift to absolute offset
+                # The measured offset = nominal offset + correction
+                measured_offsets.append((nom_dx + dx, nom_dy + dy))
+                confidences.append(conf)
+
+            except Exception as e:
+                logger.debug(f"Phase correlation failed for edge ({i},{j}): {e}")
+                measured_offsets.append((nom_dx, nom_dy))
+                confidences.append(0.0)
+
+        # Step 5: Global optimization
+        if any(c > 0.1 for c in confidences):
+            optimized = _global_optimize_positions(
+                n_tiles, nominal, edges, measured_offsets, confidences,
+                min_confidence=0.1,
+            )
+        else:
+            # No confident registrations — the incremental composite
+            # (stage-coordinate placement with feathering) is already optimal.
+            logger.info("No confident registrations; returning incremental composite")
+            self._ensure_composite()
+            return self.composite
+
+        # Step 6: Re-blend at optimized positions with feathering
+        canvas_w = max(1, int(canvas_w_um * scale))
+        canvas_h = max(1, int(canvas_h_um * scale))
+
+        composite = np.zeros((canvas_h, canvas_w, 3), dtype=np.float64)
+        weight_sum = np.zeros((canvas_h, canvas_w), dtype=np.float64)
+
+        overlap_px = max(1, int(tile_w * overlap_frac))
+        feather = _compute_feather_weights(tile_h, tile_w, overlap_px)
+
+        for i, rec in enumerate(self._records):
+            px = int(optimized[i, 0])
+            py = int(optimized[i, 1])
+
+            x1 = max(0, px)
+            y1 = max(0, py)
+            x2 = min(canvas_w, px + tile_w)
+            y2 = min(canvas_h, py + tile_h)
+
+            sx1 = x1 - px
+            sy1 = y1 - py
+            sx2 = sx1 + (x2 - x1)
+            sy2 = sy1 + (y2 - y1)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            tile_crop = tiles_resized[i][sy1:sy2, sx1:sx2].astype(np.float64)
+            w_crop = feather[sy1:sy2, sx1:sx2]
+
+            for c in range(3):
+                composite[y1:y2, x1:x2, c] += tile_crop[:, :, c] * w_crop
+            weight_sum[y1:y2, x1:x2] += w_crop
+
+            # Update record with optimized position
+            rec.refined_x_px = float(px + tile_w / 2.0)
+            rec.refined_y_px = float(py + tile_h / 2.0)
+
+        # Normalize
+        mask = weight_sum > 0
+        result = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        for c in range(3):
+            ch = composite[:, :, c].copy()
+            ch[mask] = (ch[mask] / weight_sum[mask]).clip(0, 255)
+            result[:, :, c] = ch.astype(np.uint8)
+
+        # Update display cache with the registered result
+        self._display_cache = result
+
+        n_registered = sum(1 for c in confidences if c > 0.1)
+        logger.info(
+            f"Mosaic built: {canvas_w}×{canvas_h} px from {n_tiles} tiles, "
+            f"{n_registered}/{len(edges)} edges registered"
+        )
+        return result
+
+    # ── Affine fitting ─────────────────────────────────────────────
+
+    def fit_affine(
+        self,
+        predicted_positions: dict[str, tuple[float, float]],
+        min_confidence: float = 0.3,
+    ) -> AffineCalibration:
+        """Fit rotation + scale + translation from predicted vs detected positions.
+
+        Uses only frames where well detection succeeded (above *min_confidence*).
+        Fits a rigid similarity transform (4 DOF: rotation, uniform scale, tx, ty)
+        using least-squares.
+
+        Args:
+            predicted_positions: Dict mapping well_name → (x_um, y_um) predicted.
+            min_confidence: Minimum detection confidence to include a point.
+
+        Returns:
+            AffineCalibration with fitted parameters.
+        """
+        # Collect matched point pairs: (predicted, detected_absolute)
+        pred_pts = []
+        det_pts = []
+
+        for rec in self._records:
+            if rec.detected_offset_um is None or rec.confidence < min_confidence:
+                continue
+            if rec.well_name not in predicted_positions:
+                continue
+
+            px, py = predicted_positions[rec.well_name]
+            # Detected absolute = stage position + detection offset
+            dx, dy = rec.detected_offset_um
+            det_x = rec.stage_x_um + dx
+            det_y = rec.stage_y_um + dy
+
+            pred_pts.append((px, py))
+            det_pts.append((det_x, det_y))
+
+        n = len(pred_pts)
+        if n < 2:
+            logger.warning(f"Affine fit: only {n} matched points, need ≥2. Returning identity.")
+            return AffineCalibration(num_points=n)
+
+        pred_arr = np.array(pred_pts)  # (N, 2)
+        det_arr = np.array(det_pts)    # (N, 2)
+
+        # Compute centroids
+        pred_center = pred_arr.mean(axis=0)
+        det_center = det_arr.mean(axis=0)
+
+        # Center both point sets
+        p = pred_arr - pred_center
+        d = det_arr - det_center
+
+        # Solve for rotation + scale using Procrustes
+        A_rows = []
+        b_rows = []
+        for i in range(n):
+            px_i, py_i = p[i]
+            dx_i, dy_i = d[i]
+            A_rows.append([px_i, -py_i, 1.0, 0.0])
+            A_rows.append([py_i,  px_i, 0.0, 1.0])
+            b_rows.append(dx_i)
+            b_rows.append(dy_i)
+
+        A = np.array(A_rows)
+        b_vec = np.array(b_rows)
+
+        result, residuals, rank, sv = np.linalg.lstsq(A, b_vec, rcond=None)
+        a, b, tx, ty = result
+
+        scale = math.sqrt(a * a + b * b)
+        rotation_deg = math.degrees(math.atan2(b, a))
+
+        total_tx = det_center[0] - pred_center[0] + tx
+        total_ty = det_center[1] - pred_center[1] + ty
+
+        # Compute RMS residual
+        corrected = np.column_stack([
+            a * p[:, 0] - b * p[:, 1] + tx,
+            b * p[:, 0] + a * p[:, 1] + ty,
+        ])
+        residual_rms = float(np.sqrt(np.mean((corrected - d) ** 2)))
+
+        cal = AffineCalibration(
+            rotation_deg=rotation_deg,
+            scale=scale,
+            translation_um=(total_tx, total_ty),
+            center_um=(float(pred_center[0]), float(pred_center[1])),
+            num_points=n,
+            residual_um=residual_rms,
+        )
+        logger.info(
+            f"Affine fit: {n} points, rotation={rotation_deg:.3f}°, "
+            f"scale={scale:.5f}, translation=({total_tx:.1f}, {total_ty:.1f}) µm, "
+            f"RMS residual={residual_rms:.1f} µm"
+        )
+        return cal
+
+    # ── High-level build ───────────────────────────────────────────
+
+    def build(
+        self,
+        predicted_positions: dict[str, tuple[float, float]] | None = None,
+        min_confidence: float = 0.3,
+    ) -> MosaicResult:
+        """Build final mosaic with registration + optimization, and fit affine.
+
+        Args:
+            predicted_positions: Dict of predicted well positions for affine fitting.
+                                 If None, only the mosaic image is built.
+            min_confidence: Minimum detection confidence for affine fitting.
+
+        Returns:
+            MosaicResult with mosaic image, calibration, and statistics.
+        """
+        mosaic_img = self.build_mosaic()
+
+        # Collect detected absolute positions
+        detected = {}
+        for rec in self._records:
+            if rec.detected_offset_um is not None and rec.confidence >= min_confidence:
+                dx, dy = rec.detected_offset_um
+                detected[rec.well_name] = (
+                    rec.stage_x_um + dx,
+                    rec.stage_y_um + dy,
+                )
+
+        # Fit affine if we have predictions
+        cal = AffineCalibration()
+        if predicted_positions is not None and len(detected) >= 2:
+            cal = self.fit_affine(predicted_positions, min_confidence)
+
+        return MosaicResult(
+            mosaic_image=mosaic_img,
+            calibration=cal,
+            frames_captured=len(self._records),
+            frames_detected=len(detected),
+            detected_positions=detected,
+        )

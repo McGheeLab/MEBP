@@ -74,7 +74,8 @@ class SimulatedCamera:
         resolution: tuple[int, int] = (916, 686),
         micron_per_pixel: float = 3.34,
         plate: WellPlate | None = None,
-        plate_origin_um: tuple[float, float] = (50000.0, 50000.0),
+        plate_origin_um: tuple[float, float] | None = None,
+        plate_center_um: tuple[float, float] | None = None,
         needle_od_um: float = 910.0,
         needle_id_um: float = 0.0,
         focal_z_mm: float = 0.0,
@@ -86,6 +87,12 @@ class SimulatedCamera:
             micron_per_pixel: µm per pixel at current magnification.
             plate: WellPlate geometry object (None = no wells drawn).
             plate_origin_um: (x, y) µm — absolute stage position of well A1.
+                             If None and plate_center_um is given, A1 is
+                             auto-computed from plate center using ANSI/SLAS geometry.
+            plate_center_um: (x, y) µm — plate center position. Used to
+                             auto-compute A1 when plate_origin_um is None.
+                             Defaults to stage center (65000, 42500) based on
+                             130×85mm travel.
             needle_od_um: Needle outer diameter in µm.
             needle_id_um: Needle inner diameter in µm (0 = solid).
             focal_z_mm: Z position (mm, zero-ref) where needle is in focus.
@@ -95,10 +102,18 @@ class SimulatedCamera:
         self._width, self._height = resolution
         self._um_per_px = micron_per_pixel
         self._plate = plate
-        self._plate_origin_um = plate_origin_um
         self._needle_od_um = needle_od_um
         self._needle_id_um = needle_id_um
         self._focal_z_mm = focal_z_mm
+
+        # Resolve plate origin: explicit A1 > auto from center > legacy default
+        if plate_origin_um is not None:
+            self._plate_origin_um = plate_origin_um
+        elif plate is not None:
+            center = plate_center_um or (65000.0, 42500.0)
+            self._plate_origin_um = plate.get_a1_from_plate_center(*center)
+        else:
+            self._plate_origin_um = plate_center_um or (65000.0, 42500.0)
 
         # Depth of field: either explicit or derived from pixel scale
         if dof_halfwidth_mm is not None:
@@ -107,8 +122,8 @@ class SimulatedCamera:
             self._dof_hw_mm = self._compute_dof_halfwidth(micron_per_pixel)
 
         # Current state (updated externally or via controller)
-        self._stage_x_um = plate_origin_um[0]
-        self._stage_y_um = plate_origin_um[1]
+        self._stage_x_um = self._plate_origin_um[0]
+        self._stage_y_um = self._plate_origin_um[1]
         self._z_mm = 0.0
 
         # Show needle in frame (can be toggled)
@@ -175,11 +190,24 @@ class SimulatedCamera:
 
     # ── Configuration ──────────────────────────────────────────
 
-    def set_plate(self, plate, plate_origin_um: tuple[float, float] | None = None):
-        """Set or change the well plate geometry."""
+    def set_plate(
+        self,
+        plate,
+        plate_origin_um: tuple[float, float] | None = None,
+        plate_center_um: tuple[float, float] | None = None,
+    ):
+        """Set or change the well plate geometry.
+
+        Args:
+            plate: WellPlate geometry object.
+            plate_origin_um: Explicit A1 position (µm). Takes priority.
+            plate_center_um: Plate center (µm). A1 is auto-computed.
+        """
         self._plate = plate
         if plate_origin_um is not None:
             self._plate_origin_um = plate_origin_um
+        elif plate is not None and plate_center_um is not None:
+            self._plate_origin_um = plate.get_a1_from_plate_center(*plate_center_um)
 
     def set_needle(self, od_um: float, id_um: float = 0.0):
         """Set needle dimensions."""
@@ -232,19 +260,23 @@ class SimulatedCamera:
 
     # ── Frame Generation ───────────────────────────────────────
 
-    def _pull_position(self):
-        """Pull current position from controller if available."""
+    def _pull_position(self, cached=True):
+        """Pull current position from controller if available.
+
+        Args:
+            cached: If False, forces a fresh position read from hardware.
+        """
         if self._controller is None:
             return
         try:
-            xy = self._controller.get_xy_position(cached=True)
+            xy = self._controller.get_xy_position(cached=cached)
             if xy[0] is not None:
                 self._stage_x_um = float(xy[0])
                 self._stage_y_um = float(xy[1])
         except Exception:
             pass
         try:
-            zp = self._controller.get_zp_position(cached=True)
+            zp = self._controller.get_zp_position(cached=cached)
             if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
                 zero_z = 0.0
                 if hasattr(self._controller, 'zero_position'):
@@ -371,6 +403,15 @@ class SimulatedCamera:
 
     def read(self) -> tuple[bool, np.ndarray]:
         """Generate and return the next frame (VideoCapture API)."""
+        return True, self.generate_frame()
+
+    def read_fresh(self) -> tuple[bool, np.ndarray]:
+        """Generate a frame with a fresh (uncached) position read.
+
+        Use this after stage movement to ensure the frame reflects
+        the current hardware position, not stale cached data.
+        """
+        self._pull_position(cached=False)
         return True, self.generate_frame()
 
     def isOpened(self) -> bool:

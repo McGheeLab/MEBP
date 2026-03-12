@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════
+# ANSI/SLAS Standard Plate Footprint (all microplates share this)
+# ═══════════════════════════════════════════════════════════════════
+
+PLATE_FOOTPRINT_X_MM = 127.76   # Length (mm) — long axis
+PLATE_FOOTPRINT_Y_MM = 85.48    # Width (mm) — short axis
+
+# Stage travel limits (mm) — raw stage coordinate range (0 to max)
+STAGE_TRAVEL_X_MM = 130.0
+STAGE_TRAVEL_Y_MM = 85.0
+
+
+# ═══════════════════════════════════════════════════════════════════
 # ANSI/SLAS Standard Plate Definitions (all measurements in mm)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -293,6 +305,154 @@ class WellPlate:
         """Plate bounding box relative to A1: (min_x, min_y, max_x, max_y)."""
         r = self.well_diameter / 2
         return (-r, -r, self.plate_width + r, self.plate_height + r)
+
+    # ── v7.3.1: Geometry-predicted positions ───────────────────────
+
+    def get_all_positions_from_a1(
+        self, a1_x_um: float, a1_y_um: float
+    ) -> dict[str, tuple[float, float]]:
+        """Compute absolute stage positions (µm) for every well given A1's position.
+
+        Uses plate geometry (well spacing) to predict all well centres.
+        Coordinates are in the same frame as *a1_x_um / a1_y_um* (absolute stage µm).
+
+        Returns:
+            Dict mapping well name → (x_um, y_um).
+        """
+        positions: dict[str, tuple[float, float]] = {}
+        for well in self.get_all_wells():
+            # well.x / well.y are mm relative to A1
+            positions[well.name] = (
+                a1_x_um + well.x * 1000.0,
+                a1_y_um + well.y * 1000.0,
+            )
+        return positions
+
+    def get_a1_from_plate_center(
+        self, center_x_um: float, center_y_um: float
+    ) -> tuple[float, float]:
+        """Compute A1 absolute position (µm) given the plate center position.
+
+        Uses ANSI/SLAS footprint (127.76 × 85.48 mm) and the per-format
+        A1 offset from the top-left corner of the plate.
+
+        Args:
+            center_x_um: Plate center X in µm (absolute stage coords).
+            center_y_um: Plate center Y in µm (absolute stage coords).
+
+        Returns:
+            (a1_x_um, a1_y_um) — absolute stage position of well A1.
+        """
+        # A1 is offset from the plate's top-left corner by (a1_offset_x, a1_offset_y).
+        # Plate center is at (footprint/2) from that corner.
+        a1_x_um = center_x_um + (self.a1_offset_x - PLATE_FOOTPRINT_X_MM / 2.0) * 1000.0
+        a1_y_um = center_y_um + (self.a1_offset_y - PLATE_FOOTPRINT_Y_MM / 2.0) * 1000.0
+        return (a1_x_um, a1_y_um)
+
+    def get_all_positions_from_plate_center(
+        self, center_x_um: float, center_y_um: float
+    ) -> dict[str, tuple[float, float]]:
+        """Compute all well positions (µm) from the plate center position.
+
+        Convenience method combining get_a1_from_plate_center + get_all_positions_from_a1.
+
+        Args:
+            center_x_um: Plate center X in µm (absolute stage coords).
+            center_y_um: Plate center Y in µm (absolute stage coords).
+
+        Returns:
+            Dict mapping well name → (x_um, y_um).
+        """
+        a1_x, a1_y = self.get_a1_from_plate_center(center_x_um, center_y_um)
+        return self.get_all_positions_from_a1(a1_x, a1_y)
+
+    def get_well_area_bounds_um(
+        self, center_x_um: float, center_y_um: float
+    ) -> tuple[float, float, float, float]:
+        """Bounding box (µm) of the well area from plate center, for raster scanning.
+
+        Returns the min/max stage coordinates that enclose all wells with
+        a half-well-diameter margin, clamped to stage travel limits.
+
+        Args:
+            center_x_um: Plate center X in µm.
+            center_y_um: Plate center Y in µm.
+
+        Returns:
+            (min_x_um, min_y_um, max_x_um, max_y_um)
+        """
+        a1_x, a1_y = self.get_a1_from_plate_center(center_x_um, center_y_um)
+        return self.get_well_area_bounds_from_a1_um(a1_x, a1_y)
+
+    def get_well_area_bounds_from_a1_um(
+        self, a1_x_um: float, a1_y_um: float
+    ) -> tuple[float, float, float, float]:
+        """Bounding box (µm) of the well area from A1 position.
+
+        Returns the min/max stage coordinates that enclose all wells with
+        a half-well-diameter margin, clamped to stage travel limits.
+
+        Args:
+            a1_x_um: Well A1 X in µm (absolute stage coords).
+            a1_y_um: Well A1 Y in µm (absolute stage coords).
+
+        Returns:
+            (min_x_um, min_y_um, max_x_um, max_y_um)
+        """
+        r_um = self.well_diameter * 1000.0 / 2.0
+
+        # Plate-relative bounding box (from A1)
+        min_x = a1_x_um - r_um
+        min_y = a1_y_um - r_um
+        max_x = a1_x_um + (self.cols - 1) * self.well_spacing_x * 1000.0 + r_um
+        max_y = a1_y_um + (self.rows - 1) * self.well_spacing_y * 1000.0 + r_um
+
+        # Clamp to stage travel limits (stage range: 0 to travel_mm * 1000)
+        max_travel_x = STAGE_TRAVEL_X_MM * 1000.0
+        max_travel_y = STAGE_TRAVEL_Y_MM * 1000.0
+        min_x = max(min_x, 0.0)
+        min_y = max(min_y, 0.0)
+        max_x = min(max_x, max_travel_x)
+        max_y = min(max_y, max_travel_y)
+
+        return (min_x, min_y, max_x, max_y)
+
+    def get_single_well_scan_bounds_um(
+        self,
+        well_x_um: float,
+        well_y_um: float,
+        margin_factor: float = 1.25,
+    ) -> tuple[float, float, float, float]:
+        """Bounding box (µm) for scanning a single well.
+
+        Args:
+            well_x_um: Well center X in µm (absolute stage coords).
+            well_y_um: Well center Y in µm (absolute stage coords).
+            margin_factor: Multiplier on well diameter for scan area
+                          (1.25 = 25% margin around the well).
+
+        Returns:
+            (min_x_um, min_y_um, max_x_um, max_y_um)
+        """
+        half_span = self.well_diameter * 1000.0 * margin_factor / 2.0
+        min_x = max(well_x_um - half_span, 0.0)
+        min_y = max(well_y_um - half_span, 0.0)
+        max_x = min(well_x_um + half_span, STAGE_TRAVEL_X_MM * 1000.0)
+        max_y = min(well_y_um + half_span, STAGE_TRAVEL_Y_MM * 1000.0)
+        return (min_x, min_y, max_x, max_y)
+
+    def meander_order(self) -> list[str]:
+        """Return well names in row-meander (serpentine) traversal order.
+
+        Even rows (A, C, …) go left-to-right (col 1 → N),
+        odd rows (B, D, …) go right-to-left (col N → 1).
+        """
+        order: list[str] = []
+        for r in range(self.rows):
+            cols = range(self.cols) if r % 2 == 0 else range(self.cols - 1, -1, -1)
+            for c in cols:
+                order.append(f"{ROW_LABELS[r]}{c + 1}")
+        return order
 
 
 # ═══════════════════════════════════════════════════════════════════

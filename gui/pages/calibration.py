@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QFrame, QSizePolicy, QMessageBox, QCheckBox, QSlider,
     QScrollArea,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor
@@ -80,9 +80,11 @@ class _CalibrationPlateView(QGraphicsView):
     """Top-down plate view for calibration page — shows needle XY position."""
 
     # v7.2.7: Click signal for well navigation
+    # v7.3.1: Double-click signal for per-well scanning
     try:
         from PySide6.QtCore import Signal as _Sig
         well_clicked = _Sig(str)
+        well_double_clicked = _Sig(str)
     except Exception:
         pass
 
@@ -108,8 +110,13 @@ class _CalibrationPlateView(QGraphicsView):
         self._z_buffer_mm = 0.5      # approach buffer above Top Z
 
         self._corner_well  = "H12"
+        self._predicted_positions: dict[str, tuple[float, float]] | None = None  # v7.3.1
+        self._calibrated_positions: dict[str, tuple[float, float]] | None = None  # v7.3.1
         self._needle_xy    = None
         self._needle_item  = None
+        self._well_composites: dict[str, tuple] = {}  # well_name → (bgr, diameter_mm)
+        self._well_composite_items: dict = {}  # well_name → QGraphicsPixmapItem
+        self._calibration_wells: set[str] = set()  # v7.3.1: wells used for 3-point calibration
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setStyleSheet("background: #11111b; border: 1px solid #45475a;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -127,6 +134,21 @@ class _CalibrationPlateView(QGraphicsView):
         self._taught_corner = pt
         self._corner_well   = corner_well
 
+    def set_predicted_positions(self, positions: dict[str, tuple[float, float]] | None):
+        """v7.3.1: Store geometry-predicted positions and refresh view."""
+        self._predicted_positions = positions
+        self._rebuild()
+
+    def set_calibrated_positions(self, positions: dict[str, tuple[float, float]] | None):
+        """v7.3.1: Store mosaic-calibrated positions and refresh view."""
+        self._calibrated_positions = positions
+        self._rebuild()
+
+    def set_calibration_wells(self, well_names: set):
+        """v7.3.1: Mark wells used for 3-point auto-calibration (highlighted on plate view)."""
+        self._calibration_wells = well_names
+        self._rebuild()
+
     def set_needle_xy(self, x_mm, y_mm):
         self._needle_xy = (x_mm, y_mm)
         self._update_needle()
@@ -143,11 +165,45 @@ class _CalibrationPlateView(QGraphicsView):
             self._scene.addEllipse(
                 cx - r, cy - r, 2 * r, 2 * r,
                 QPen(QColor("#585b70"), 0.5),
-                QBrush(QColor("#313244")),
+                QBrush(QColor("#45475a")),
             ).setToolTip(well.name)
 
-        # Highlight A1 and corner well
+        # v7.3.1: Show predicted-position dots (yellow) for geometry-predicted wells
+        if self._predicted_positions and self._taught_a1 is not None:
+            a1_x_mm, a1_y_mm = self._taught_a1  # plate view coords are mm relative to A1
+            pred_pen = QPen(QColor("#f9e2af"), 0.5)
+            pred_brush = QBrush(QColor("#f9e2af80"))
+            pr = 1.8  # small dot radius
+            for wname, (px_um, py_um) in self._predicted_positions.items():
+                # Convert absolute µm to mm-relative-to-A1 for plate view
+                rx_mm = (px_um / 1000.0) - a1_x_mm
+                ry_mm = (py_um / 1000.0) - a1_y_mm
+                dot = self._scene.addEllipse(
+                    rx_mm * S - pr, ry_mm * S - pr, 2 * pr, 2 * pr,
+                    pred_pen, pred_brush,
+                )
+                dot.setToolTip(f"{wname} (predicted)")
+                dot.setZValue(5)
+
+        # v7.3.1: Show calibrated-position dots (green) — override predicted dots
+        if self._calibrated_positions and self._taught_a1 is not None:
+            a1_x_mm, a1_y_mm = self._taught_a1
+            cal_pen = QPen(QColor("#a6e3a1"), 0.8)
+            cal_brush = QBrush(QColor("#a6e3a1a0"))
+            cr = 2.0
+            for wname, (cx_um, cy_um) in self._calibrated_positions.items():
+                rx_mm = (cx_um / 1000.0) - a1_x_mm
+                ry_mm = (cy_um / 1000.0) - a1_y_mm
+                dot = self._scene.addEllipse(
+                    rx_mm * S - cr, ry_mm * S - cr, 2 * cr, 2 * cr,
+                    cal_pen, cal_brush,
+                )
+                dot.setToolTip(f"{wname} (calibrated)")
+                dot.setZValue(6)
+
+        # Highlight A1, corner well, and calibration reference wells
         wmap = {w.name: w for w in wells}
+        highlighted = set()
         for wname, color in [("A1", "#89b4fa"), (self._corner_well, "#74c7ec")]:
             w = wmap.get(wname)
             if w:
@@ -158,6 +214,19 @@ class _CalibrationPlateView(QGraphicsView):
                     QPen(QColor(color), 1.5),
                     QBrush(QColor("#00000000")),
                 )
+                highlighted.add(wname)
+        # v7.3.1: Highlight 3-well calibration reference wells
+        for wname in self._calibration_wells:
+            if wname in highlighted or wname not in wmap:
+                continue
+            w = wmap[wname]
+            cx, cy = w.x * S, w.y * S
+            r2 = self.WELL_R + 1.5
+            self._scene.addEllipse(
+                cx - r2, cy - r2, 2 * r2, 2 * r2,
+                QPen(QColor("#89b4fa"), 1.5),
+                QBrush(QColor("#00000000")),
+            )
 
         # Needle placeholder
         self._needle_item = self._scene.addEllipse(
@@ -167,6 +236,10 @@ class _CalibrationPlateView(QGraphicsView):
         )
         self._needle_item.setVisible(False)
         self._needle_item.setZValue(10)
+
+        # v7.3.1: Re-apply per-well composite overlays after rebuild
+        self._well_composite_items.clear()
+        self._reapply_well_composites()
 
         rect = self._scene.itemsBoundingRect().adjusted(-8, -8, 8, 8)
         if not rect.isEmpty():
@@ -212,6 +285,177 @@ class _CalibrationPlateView(QGraphicsView):
             logger.debug(f"Plate view clicked: {best_well}")
         else:
             super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """v7.3.1: Double-click a well to trigger per-well scan."""
+        if self._plate is None:
+            super().mouseDoubleClickEvent(event)
+            return
+        scene_pos = self.mapToScene(event.pos())
+        S = self.SCALE
+        best_well = None
+        best_dist = float('inf')
+        for well in self._plate.get_all_wells():
+            cx, cy = well.x * S, well.y * S
+            dx = scene_pos.x() - cx
+            dy = scene_pos.y() - cy
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < self.WELL_R + 2 and dist < best_dist:
+                best_dist = dist
+                best_well = well.name
+        if best_well:
+            try:
+                self.well_double_clicked.emit(best_well)
+            except AttributeError:
+                pass
+            logger.debug(f"Plate view double-clicked: {best_well}")
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    # ── v7.3.1: Per-well composite display ────────────────────────
+
+    def set_well_composite(self, well_name: str, composite_bgr,
+                           well_diameter_mm: float):
+        """Display a per-well mosaic composite overlaying the well circle.
+
+        Args:
+            well_name: Well to overlay (e.g. "B3").
+            composite_bgr: BGR uint8 numpy array from per-well scan.
+            well_diameter_mm: Well diameter in mm (used for sizing).
+        """
+        import numpy as np
+        self._well_composites[well_name] = (composite_bgr, well_diameter_mm)
+        self._apply_well_composite(well_name)
+
+    def _apply_well_composite(self, well_name: str):
+        """Create/update a QGraphicsPixmapItem for a per-well composite."""
+        try:
+            import cv2
+            from PySide6.QtGui import QImage, QPixmap
+            from PySide6.QtWidgets import QGraphicsPixmapItem
+        except ImportError:
+            return
+
+        if well_name not in self._well_composites:
+            return
+        if self._plate is None:
+            return
+
+        composite_bgr, diameter_mm = self._well_composites[well_name]
+        if composite_bgr is None:
+            return
+
+        S = self.SCALE
+        wmap = {w.name: w for w in self._plate.get_all_wells()}
+        well = wmap.get(well_name)
+        if well is None:
+            return
+
+        # Scene size for this well
+        well_size = int(diameter_mm * S)
+        if well_size < 2:
+            return
+
+        # Resize composite to fit the well circle on the plate view
+        resized = cv2.resize(composite_bgr, (well_size, well_size),
+                             interpolation=cv2.INTER_AREA)
+        resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+        qimg = QImage(resized_rgb.data, well_size, well_size,
+                      well_size * 3, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg.copy())
+
+        # Position at well center in scene coordinates
+        cx = well.x * S - well_size / 2.0
+        cy = well.y * S - well_size / 2.0
+
+        # Reuse existing item or create new one
+        if well_name in self._well_composite_items:
+            item = self._well_composite_items[well_name]
+            item.setPixmap(pixmap)
+            item.setPos(cx, cy)
+        else:
+            item = self._scene.addPixmap(pixmap)
+            item.setPos(cx, cy)
+            item.setZValue(2)  # above well circles (0), below predicted dots (5)
+            item.setOpacity(0.90)
+            self._well_composite_items[well_name] = item
+
+    def _reapply_well_composites(self):
+        """Re-create all per-well composite pixmaps after scene rebuild."""
+        self._well_composite_items.clear()
+        for well_name in self._well_composites:
+            self._apply_well_composite(well_name)
+
+    # ── v7.3.1: Progressive mosaic display ────────────────────────
+
+    def update_scan_composite(self, composite_bgr, canvas_extent_um,
+                              a1_x_um: float, a1_y_um: float):
+        """Replace the mosaic overlay with the latest composite image.
+
+        Called during raster scan to progressively display the growing stitched
+        mosaic. A single pixmap item is reused and repositioned each update.
+
+        Args:
+            composite_bgr: Full composite image (BGR uint8 from MosaicBuilder).
+            canvas_extent_um: (min_x, min_y, max_x, max_y) world extent of the
+                             composite canvas in µm (includes FOV padding).
+            a1_x_um: A1 X position in absolute µm (coordinate reference).
+            a1_y_um: A1 Y position in absolute µm (coordinate reference).
+        """
+        try:
+            import cv2
+            from PySide6.QtGui import QImage, QPixmap
+
+            if composite_bgr is None:
+                return
+
+            S = self.SCALE
+            min_x, min_y, max_x, max_y = canvas_extent_um
+
+            # Canvas world extent in mm (relative to A1)
+            canvas_w_mm = (max_x - min_x) / 1000.0
+            canvas_h_mm = (max_y - min_y) / 1000.0
+
+            # Top-left of canvas relative to A1 in mm
+            rel_min_x_mm = (min_x - a1_x_um) / 1000.0
+            rel_min_y_mm = (min_y - a1_y_um) / 1000.0
+
+            # Scene coordinates matching the canvas world extent
+            sx = rel_min_x_mm * S
+            sy = rel_min_y_mm * S
+            sw = max(1, int(canvas_w_mm * S))
+            sh = max(1, int(canvas_h_mm * S))
+
+            # Resize composite to scene dimensions
+            ch, cw = composite_bgr.shape[:2]
+            if cw < 1 or ch < 1:
+                return
+
+            resized = cv2.resize(composite_bgr, (sw, sh), interpolation=cv2.INTER_AREA)
+            resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+            qimg = QImage(resized_rgb.data, sw, sh,
+                          sw * 3, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())
+
+            # Reuse existing pixmap item or create new one
+            if not hasattr(self, '_scan_composite_item') or self._scan_composite_item is None:
+                self._scan_composite_item = self._scene.addPixmap(pixmap)
+                self._scan_composite_item.setZValue(1)
+                self._scan_composite_item.setOpacity(0.85)
+            else:
+                self._scan_composite_item.setPixmap(pixmap)
+
+            self._scan_composite_item.setPos(sx, sy)
+        except Exception as e:
+            logger.debug(f"Failed to update scan composite: {e}")
+
+    def clear_scan_frames(self):
+        """Remove all scan frame overlays from the plate view."""
+        self._scan_composite_item = None
+        # Rebuild removes everything and re-adds wells/dots
+        self._rebuild()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -289,6 +533,9 @@ class CalibrationPage(QWidget):
 
     _page_title_text = "Calibration"
 
+    # v7.3.1: Emitted when calibration data changes (safe_z, positions, plate)
+    calibration_data_changed = Signal()
+
     def __init__(self, controller: StageController, settings=None, parent=None):
         super().__init__(parent)
         self.controller = controller
@@ -312,6 +559,19 @@ class CalibrationPage(QWidget):
         self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
         self._hardware_config = None  # v7.2: HardwareConfig
 
+        # v7.3.1: Geometry-predicted positions (well_name → (x_um, y_um) absolute)
+        self._predicted_positions: dict[str, tuple[float, float]] | None = None
+        # v7.3.1: Calibrated positions after mosaic scan (affine-corrected)
+        self._calibrated_positions: dict[str, tuple[float, float]] | None = None
+        # v7.3.1: Mosaic scan state
+        self._mosaic_builder = None   # MosaicBuilder instance during scan
+        self._scan_positions: list[tuple[float, float]] = []  # Raster scan positions (µm)
+        self._scan_index: int = 0         # Current well index during scan
+        self._scan_timer = None           # QTimer for scan ticks
+        self._scanning: bool = False
+        # v7.3.1: Z-offset teaching state
+        self._z_teach_points: dict[str, float] = {}  # well_name → Z offset (mm, zero-ref)
+
         # v7.3.0: Auto-detection state
         self._detection_worker: DetectionWorker | None = None
         self._last_well_result = None       # Latest DetectionResult from worker
@@ -323,6 +583,22 @@ class CalibrationPage(QWidget):
         self._focus_assisting: bool = False
         self._best_focus_z: float | None = None       # Best-focus Z (mm, zero-ref)
         self._best_focus_score: float = 0.0            # Score at best Z
+
+        # v7.3.1: Auto Z-calibration state
+        self._auto_z_scanning: bool = False
+        self._auto_z_phase: str = "idle"
+        self._auto_z_wells: list[str] = []
+        self._auto_z_well_idx: int = 0
+        self._auto_z_results: dict[str, float] = {}  # well_name → Z bottom (mm, zero-ref)
+        self._auto_z_current_z: float = 0.0
+        self._auto_z_best_z: float | None = None
+        self._auto_z_best_score: float = 0.0
+        self._auto_z_baseline_score: float = 0.0
+        self._auto_z_decline_count: int = 0
+        self._auto_z_timer = None
+        self._auto_z_coarse_step: float = 0.15  # mm
+        self._auto_z_fine_step: float = 0.03    # mm
+        self._auto_z_sweep_end: float = 0.0
 
         # v7.2.7-hotfix: ensure all calibration attrs
 
@@ -343,6 +619,18 @@ class CalibrationPage(QWidget):
 
     def get_page_title(self) -> str:
         return "Calibration"
+
+    def get_calibration_data(self):
+        """v7.3.1: Return (plate, well_positions, safe_z) for jog page fast-travel.
+
+        Returns calibrated positions if available, otherwise predicted positions.
+        """
+        positions = self._calibrated_positions or self._predicted_positions
+        return self._plate, positions, getattr(self, '_safe_z', None)
+
+    def _emit_calibration_data_changed(self):
+        """v7.3.1: Notify listeners that calibration data has changed."""
+        self.calibration_data_changed.emit()
 
     def set_microsteps_per_micron(self, value: float):
         """Update the microsteps-per-micron conversion factor."""
@@ -493,52 +781,6 @@ class CalibrationPage(QWidget):
         self.lbl_zero_status.setStyleSheet(f"color: {COLORS['yellow']};")
         layout.addWidget(self.lbl_zero_status)
 
-        # v7.3.0 Phase 6: Needle detection + focus assist
-        if VISION_AVAILABLE:
-            needle_label = QLabel("Needle Alignment")
-            needle_label.setObjectName("contextSectionLabel")
-            layout.addWidget(needle_label)
-
-            # Detect Needle button row
-            nd_row = QHBoxLayout()
-            self._btn_detect_needle = QPushButton("Detect Needle")
-            self._btn_detect_needle.setMaximumHeight(24)
-            self._btn_detect_needle.setCheckable(True)
-            self._btn_detect_needle.setToolTip(
-                "Detect needle tip in camera FOV using vision")
-            self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
-            nd_row.addWidget(self._btn_detect_needle)
-
-            self._btn_focus_assist = QPushButton("Focus Assist")
-            self._btn_focus_assist.setMaximumHeight(24)
-            self._btn_focus_assist.setCheckable(True)
-            self._btn_focus_assist.setToolTip(
-                "Real-time focus quality bar — adjust Z for sharpest image")
-            self._btn_focus_assist.setEnabled(False)
-            self._btn_focus_assist.toggled.connect(self._toggle_focus_assist)
-            nd_row.addWidget(self._btn_focus_assist)
-            layout.addLayout(nd_row)
-
-            # Needle detection status
-            self._lbl_needle_status = QLabel("")
-            self._lbl_needle_status.setWordWrap(True)
-            self._lbl_needle_status.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_needle_status)
-
-            # Focus quality display
-            self._lbl_focus_status = QLabel("")
-            self._lbl_focus_status.setWordWrap(True)
-            self._lbl_focus_status.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_focus_status)
-
-            # Best focus Z
-            self._lbl_best_focus = QLabel("")
-            self._lbl_best_focus.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_best_focus)
-
         # ── Step 2: Teach Plate Position ─────────────────────────
         # ── Step 2A — Safe Z ─────────────────────────────
         s2a_label = QLabel("Step 2A — Safe Z")
@@ -571,144 +813,206 @@ class CalibrationPage(QWidget):
         s2b_row.addWidget(self.lbl_top_z, stretch=1)
         layout.addLayout(s2b_row)
 
-        # ── Step 2C — Teach A1 XYZ ──────────────────────
-        s2c_label = QLabel("Step 2C — Teach A1 (Center Bottom)")
-        s2c_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2c_label)
-        layout.addWidget(QLabel("Jog to center bottom of well A1."))
-        a1_row = QHBoxLayout()
-        a1_row.addWidget(QLabel("A1:"))
-        self.lbl_a1 = QLabel("—")
-        self.lbl_a1.setStyleSheet(f"color: {COLORS['overlay0']};")
-        a1_row.addWidget(self.lbl_a1, stretch=1)
-        btn_rec_a1 = QPushButton("Rec XYZ")
-        btn_rec_a1.setMaximumHeight(24)
-        btn_rec_a1.setMaximumWidth(60)
-        btn_rec_a1.clicked.connect(self._record_a1_xyz)
-        a1_row.addWidget(btn_rec_a1)
-        btn_go_a1 = QPushButton("Go")
-        btn_go_a1.setMaximumHeight(24)
-        btn_go_a1.setMaximumWidth(30)
-        btn_go_a1.clicked.connect(self._goto_a1)
-        a1_row.addWidget(btn_go_a1)
-        layout.addLayout(a1_row)
+        # ── Step 2C — Auto-Calibrate (v7.3.1) ────────────────
+        s2d_scan_label = QLabel("Step 2C \u2014 Auto-Calibrate (3-Well)")
+        s2d_scan_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s2d_scan_label)
+        layout.addWidget(QLabel("Auto-detect 3 wells to calibrate plate position and orientation."))
 
-        # v7.3.0: Auto-detect controls for A1
+        scan_btn_row = QHBoxLayout()
+        self._btn_start_scan = QPushButton("Auto-Calibrate")
+        self._btn_start_scan.setObjectName("successBtn")
+        self._btn_start_scan.setMaximumHeight(26)
+        self._btn_start_scan.setToolTip(
+            "Move to 3 reference wells, auto-detect each, fit affine correction")
+        self._btn_start_scan.clicked.connect(self._start_plate_scan)
+        scan_btn_row.addWidget(self._btn_start_scan)
+
+        self._btn_cancel_scan = QPushButton("Cancel")
+        self._btn_cancel_scan.setMaximumHeight(26)
+        self._btn_cancel_scan.setMaximumWidth(60)
+        self._btn_cancel_scan.setEnabled(False)
+        self._btn_cancel_scan.clicked.connect(self._cancel_plate_scan)
+        scan_btn_row.addWidget(self._btn_cancel_scan)
+
+        self._btn_accept_scan = QPushButton("Accept")
+        self._btn_accept_scan.setMaximumHeight(26)
+        self._btn_accept_scan.setMaximumWidth(60)
+        self._btn_accept_scan.setEnabled(False)
+        self._btn_accept_scan.clicked.connect(self._accept_plate_scan)
+        scan_btn_row.addWidget(self._btn_accept_scan)
+        layout.addLayout(scan_btn_row)
+
+        self._lbl_scan_progress = QLabel("")
+        self._lbl_scan_progress.setWordWrap(True)
+        self._lbl_scan_progress.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_scan_progress)
+
+        self._lbl_scan_result = QLabel("")
+        self._lbl_scan_result.setWordWrap(True)
+        self._lbl_scan_result.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_scan_result)
+
+        # ── Fast-travel buttons for calibration wells (shown after auto-cal) ──
+        self._cal_travel_frame = QWidget()
+        cal_travel_layout = QHBoxLayout(self._cal_travel_frame)
+        cal_travel_layout.setContentsMargins(0, 0, 0, 0)
+        cal_travel_layout.addWidget(QLabel("Go to:"))
+        self._cal_travel_btns: list[QPushButton] = []
+        for i in range(3):
+            btn = QPushButton("—")
+            btn.setMaximumHeight(24)
+            btn.setMaximumWidth(60)
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda checked, idx=i: self._goto_calibration_well(idx))
+            cal_travel_layout.addWidget(btn)
+            self._cal_travel_btns.append(btn)
+        cal_travel_layout.addStretch()
+        self._cal_travel_frame.setVisible(False)
+        layout.addWidget(self._cal_travel_frame)
+
+        # ── Step 3 — Z-Bottom Calibration (v7.3.1) ─────────────
+        s3_label = QLabel("Step 3 \u2014 Z-Bottom Calibration")
+        s3_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s3_label)
+        layout.addWidget(QLabel(
+            "Find well bottom Z by lowering needle and tracking focus peak."))
+
+        # Well depth field (editable, pre-populated from plate)
+        depth_row = QHBoxLayout()
+        depth_row.addWidget(QLabel("Well depth:"))
+        self._well_depth_spin = QDoubleSpinBox()
+        self._well_depth_spin.setRange(1.0, 50.0)
+        self._well_depth_spin.setDecimals(2)
+        self._well_depth_spin.setSuffix(" mm")
+        self._well_depth_spin.setValue(17.4)  # default (6/12/24/48 well)
+        self._well_depth_spin.setMaximumWidth(100)
+        self._well_depth_spin.setToolTip(
+            "Distance from plate top surface to well bottom glass")
+        depth_row.addWidget(self._well_depth_spin)
+        depth_row.addStretch()
+        layout.addLayout(depth_row)
+
+        # Auto Z-Cal button row
+        auto_z_row = QHBoxLayout()
+        self._btn_auto_z_cal = QPushButton("Auto Z-Cal")
+        self._btn_auto_z_cal.setObjectName("successBtn")
+        self._btn_auto_z_cal.setMaximumHeight(26)
+        self._btn_auto_z_cal.setToolTip(
+            "Automatically find Z bottom at 3 calibration wells using focus search")
+        self._btn_auto_z_cal.clicked.connect(self._start_auto_z_cal)
+        auto_z_row.addWidget(self._btn_auto_z_cal)
+        self._btn_cancel_auto_z = QPushButton("Cancel")
+        self._btn_cancel_auto_z.setMaximumHeight(26)
+        self._btn_cancel_auto_z.setMaximumWidth(60)
+        self._btn_cancel_auto_z.setEnabled(False)
+        self._btn_cancel_auto_z.clicked.connect(self._cancel_auto_z)
+        auto_z_row.addWidget(self._btn_cancel_auto_z)
+        layout.addLayout(auto_z_row)
+
+        # Auto Z-Cal progress
+        self._lbl_auto_z_progress = QLabel("")
+        self._lbl_auto_z_progress.setWordWrap(True)
+        self._lbl_auto_z_progress.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_auto_z_progress)
+
+        # v7.3.0: Needle detection + focus assist (moved from Step 1 area)
         if VISION_AVAILABLE:
-            a1_detect_row = QHBoxLayout()
-            self._btn_detect_a1 = QPushButton("Auto-Detect Well")
-            self._btn_detect_a1.setMaximumHeight(24)
-            self._btn_detect_a1.setCheckable(True)
-            self._btn_detect_a1.setToolTip("Use camera to detect well center automatically")
-            self._btn_detect_a1.toggled.connect(
-                lambda on: self._toggle_well_detect("a1", on))
-            a1_detect_row.addWidget(self._btn_detect_a1)
-            self._btn_center_a1 = QPushButton("Center")
-            self._btn_center_a1.setMaximumHeight(24)
-            self._btn_center_a1.setMaximumWidth(50)
-            self._btn_center_a1.setToolTip("Move stage to center well in camera FOV")
-            self._btn_center_a1.setEnabled(False)
-            self._btn_center_a1.clicked.connect(
-                lambda: self._center_on_detection("a1"))
-            a1_detect_row.addWidget(self._btn_center_a1)
-            self._btn_accept_a1 = QPushButton("Accept")
-            self._btn_accept_a1.setMaximumHeight(24)
-            self._btn_accept_a1.setMaximumWidth(50)
-            self._btn_accept_a1.setToolTip("Accept detected position as A1")
-            self._btn_accept_a1.setEnabled(False)
-            self._btn_accept_a1.clicked.connect(
-                lambda: self._accept_detection("a1"))
-            a1_detect_row.addWidget(self._btn_accept_a1)
-            layout.addLayout(a1_detect_row)
+            nd_row = QHBoxLayout()
+            self._btn_detect_needle = QPushButton("Detect Needle")
+            self._btn_detect_needle.setMaximumHeight(24)
+            self._btn_detect_needle.setCheckable(True)
+            self._btn_detect_needle.setToolTip(
+                "Detect needle tip in camera FOV using vision")
+            self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
+            nd_row.addWidget(self._btn_detect_needle)
+            self._btn_focus_assist = QPushButton("Focus Assist")
+            self._btn_focus_assist.setMaximumHeight(24)
+            self._btn_focus_assist.setCheckable(True)
+            self._btn_focus_assist.setToolTip(
+                "Real-time focus quality bar \u2014 adjust Z for sharpest image")
+            self._btn_focus_assist.setEnabled(False)
+            self._btn_focus_assist.toggled.connect(self._toggle_focus_assist)
+            nd_row.addWidget(self._btn_focus_assist)
+            layout.addLayout(nd_row)
 
-            # Detection status label for A1
-            self._lbl_detect_a1 = QLabel("")
-            self._lbl_detect_a1.setWordWrap(True)
-            self._lbl_detect_a1.setStyleSheet(
+            self._lbl_needle_status = QLabel("")
+            self._lbl_needle_status.setWordWrap(True)
+            self._lbl_needle_status.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_detect_a1)
-
-        # ── Step 2D — Teach Corner (auto-navigate) ──────
-        s2d_label = QLabel("Step 2D — Teach Corner (Auto-Navigate)")
-        s2d_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2d_label)
-        cr_row = QHBoxLayout()
-        cr_row.addWidget(QLabel("Corner:"))
-        self.lbl_corner = QLabel("—")
-        self.lbl_corner.setStyleSheet(f"color: {COLORS['overlay0']};")
-        cr_row.addWidget(self.lbl_corner, stretch=1)
-        btn_go_corner_auto = QPushButton("Go ▶")
-        btn_go_corner_auto.setMaximumHeight(24)
-        btn_go_corner_auto.setMaximumWidth(40)
-        btn_go_corner_auto.setToolTip("Safe-travel to estimated corner position")
-        btn_go_corner_auto.clicked.connect(self._goto_corner_auto)
-        cr_row.addWidget(btn_go_corner_auto)
-        btn_rec_corner = QPushButton("Rec XYZ")
-        btn_rec_corner.setMaximumHeight(24)
-        btn_rec_corner.setMaximumWidth(60)
-        btn_rec_corner.clicked.connect(self._record_corner_xyz)
-        cr_row.addWidget(btn_rec_corner)
-        layout.addLayout(cr_row)
-
-        # v7.3.0: Auto-detect controls for Corner
-        if VISION_AVAILABLE:
-            cr_detect_row = QHBoxLayout()
-            self._btn_detect_corner = QPushButton("Auto-Detect Well")
-            self._btn_detect_corner.setMaximumHeight(24)
-            self._btn_detect_corner.setCheckable(True)
-            self._btn_detect_corner.setToolTip(
-                "Use camera to detect corner well center")
-            self._btn_detect_corner.toggled.connect(
-                lambda on: self._toggle_well_detect("corner", on))
-            cr_detect_row.addWidget(self._btn_detect_corner)
-            self._btn_center_corner = QPushButton("Center")
-            self._btn_center_corner.setMaximumHeight(24)
-            self._btn_center_corner.setMaximumWidth(50)
-            self._btn_center_corner.setEnabled(False)
-            self._btn_center_corner.clicked.connect(
-                lambda: self._center_on_detection("corner"))
-            cr_detect_row.addWidget(self._btn_center_corner)
-            self._btn_accept_corner = QPushButton("Accept")
-            self._btn_accept_corner.setMaximumHeight(24)
-            self._btn_accept_corner.setMaximumWidth(50)
-            self._btn_accept_corner.setEnabled(False)
-            self._btn_accept_corner.clicked.connect(
-                lambda: self._accept_detection("corner"))
-            cr_detect_row.addWidget(self._btn_accept_corner)
-            layout.addLayout(cr_detect_row)
-
-            self._lbl_detect_corner = QLabel("")
-            self._lbl_detect_corner.setWordWrap(True)
-            self._lbl_detect_corner.setStyleSheet(
+            layout.addWidget(self._lbl_needle_status)
+            self._lbl_focus_status = QLabel("")
+            self._lbl_focus_status.setWordWrap(True)
+            self._lbl_focus_status.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_detect_corner)
+            layout.addWidget(self._lbl_focus_status)
+            self._lbl_best_focus = QLabel("")
+            self._lbl_best_focus.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_best_focus)
 
-        # ── Step 2E — Teach Third Point ──────────────────
-        s2e_label = QLabel("Step 2E — Third Point (Z Plane)")
-        s2e_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2e_label)
-        th_row = QHBoxLayout()
-        self.lbl_third = QLabel("—")
-        self.lbl_third.setStyleSheet(f"color: {COLORS['overlay0']};")
-        th_row.addWidget(self.lbl_third, stretch=1)
-        btn_go_third = QPushButton("Go ▶")
-        btn_go_third.setMaximumHeight(24)
-        btn_go_third.setMaximumWidth(40)
-        btn_go_third.setToolTip("Safe-travel to estimated third point")
-        btn_go_third.clicked.connect(self._goto_third_auto)
-        th_row.addWidget(btn_go_third)
-        btn_rec_third = QPushButton("Rec XYZ")
-        btn_rec_third.setMaximumHeight(24)
-        btn_rec_third.setMaximumWidth(60)
-        btn_rec_third.clicked.connect(self._record_third_xyz)
-        th_row.addWidget(btn_rec_third)
-        layout.addLayout(th_row)
+        # ── Manual Z teaching (fallback) ──
+        manual_z_label = QLabel("Manual Z Teaching")
+        manual_z_label.setObjectName("contextSectionLabel")
+        manual_z_label.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(manual_z_label)
 
-        # ── Z Plane Status ────────────────────────────────
+        zteach_row = QHBoxLayout()
+        zteach_row.addWidget(QLabel("Well:"))
+        self._zteach_well_combo = QComboBox()
+        self._zteach_well_combo.setMaximumWidth(70)
+        zteach_row.addWidget(self._zteach_well_combo)
+        btn_zteach_go = QPushButton("Go \u25b6")
+        btn_zteach_go.setMaximumHeight(24)
+        btn_zteach_go.setMaximumWidth(40)
+        btn_zteach_go.setToolTip("Safe-travel to selected well")
+        btn_zteach_go.clicked.connect(self._zteach_goto_well)
+        zteach_row.addWidget(btn_zteach_go)
+        btn_zteach_next = QPushButton("Next")
+        btn_zteach_next.setMaximumHeight(24)
+        btn_zteach_next.setMaximumWidth(40)
+        btn_zteach_next.setToolTip("Advance to next well and navigate")
+        btn_zteach_next.clicked.connect(self._zteach_next_well)
+        zteach_row.addWidget(btn_zteach_next)
+        layout.addLayout(zteach_row)
+
+        try:
+            from gui.widgets.jog_button_array import JogButtonArray
+            self._zteach_jog = JogButtonArray(compact=True, parent=self)
+            self._zteach_jog.jog_xy_requested.connect(self._zteach_jog_xy)
+            self._zteach_jog.jog_z_requested.connect(self._zteach_jog_z)
+            self._zteach_jog.home_requested.connect(self._jog_xy_home)
+            layout.addWidget(self._zteach_jog)
+        except ImportError:
+            pass
+
+        zrec_row = QHBoxLayout()
+        btn_rec_z = QPushButton("Record Z")
+        btn_rec_z.setObjectName("successBtn")
+        btn_rec_z.setMaximumHeight(26)
+        btn_rec_z.setToolTip("Record current Z position for selected well")
+        btn_rec_z.clicked.connect(self._zteach_record_z)
+        zrec_row.addWidget(btn_rec_z)
+        btn_fit_z = QPushButton("Fit Z-Plane")
+        btn_fit_z.setMaximumHeight(26)
+        btn_fit_z.setToolTip("Fit Z plane from recorded points (need \u22653)")
+        btn_fit_z.clicked.connect(self._try_fit_z_plane)
+        zrec_row.addWidget(btn_fit_z)
+        layout.addLayout(zrec_row)
+
         self.lbl_zplane = QLabel("0/3 teach points")
         self.lbl_zplane.setWordWrap(True)
         self.lbl_zplane.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
         layout.addWidget(self.lbl_zplane)
+
+        # Legacy third point support (kept for backwards compat with existing save data)
+        self.lbl_third = QLabel("")
+        self.lbl_third.setVisible(False)
+        layout.addWidget(self.lbl_third)
 
         self._gen_status = QLabel("")
         self._gen_status.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
@@ -948,6 +1252,9 @@ class CalibrationPage(QWidget):
         # v7.2.7: Connect click-to-navigate
         if hasattr(self._cal_plate_view, 'well_clicked'):
             self._cal_plate_view.well_clicked.connect(self._navigate_to_well)
+        # v7.3.1: Connect double-click for per-well scanning
+        if hasattr(self._cal_plate_view, 'well_double_clicked'):
+            self._cal_plate_view.well_double_clicked.connect(self._start_well_scan)
 
         grp_layout.addWidget(self._cal_plate_view, stretch=1)
 
@@ -1025,8 +1332,12 @@ class CalibrationPage(QWidget):
 
             # Push plate geometry
             if self._plate is not None:
-                origin = self._taught_a1 if self._taught_a1 else (50000.0, 50000.0)
-                sim.set_plate(self._plate, plate_origin_um=origin)
+                if self._taught_a1:
+                    sim.set_plate(self._plate, plate_origin_um=self._taught_a1)
+                else:
+                    # v7.3.1: Auto-compute A1 from plate center assumption
+                    # Stage center = (65000, 42500) µm for 130×85mm travel
+                    sim.set_plate(self._plate, plate_center_um=(65000.0, 42500.0))
 
             # Push camera config
             cam_cfg = self._get_camera_config()
@@ -1039,6 +1350,13 @@ class CalibrationPage(QWidget):
             hw = self._hardware_config
             if hw is not None and getattr(hw, 'needle', None) is not None:
                 sim.set_needle(hw.needle.od_um, hw.needle.id_um)
+
+            # v7.3.1: Set focal plane at well bottom (top_z - well_depth)
+            if self._top_z is not None and self._plate is not None:
+                well_depth = self._plate.well_depth_mm
+                if hasattr(self, '_well_depth_spin'):
+                    well_depth = self._well_depth_spin.value()
+                sim.set_focal_z(self._top_z - well_depth)
 
     def on_status_update(self):
         """Called periodically by the main window."""
@@ -1079,8 +1397,16 @@ class CalibrationPage(QWidget):
 
     # ── Step 1: Zero Needle ──────────────────────────────────────
 
-    def _safe_navigate_to(self, target_x_um, target_y_um, target_z_mm=None):
-        """v7.2.7-simple: blocking absolute moves. Simulator now blocks like real hw."""
+    def _safe_navigate_to(self, target_x_um, target_y_um, target_z_mm=None,
+                          lower_z=True):
+        """v7.2.7-simple: blocking absolute moves. Simulator now blocks like real hw.
+
+        Args:
+            target_x_um: Absolute X in µm (raw stage coords).
+            target_y_um: Absolute Y in µm (raw stage coords).
+            target_z_mm: Optional Z to lower to (mm, zero-ref). Ignored if lower_z=False.
+            lower_z: If False, stay at safe Z after XY move (used during plate calibration).
+        """
         ctrl = self.controller
         safe_z = getattr(self, '_safe_z', None) or 0.0
 
@@ -1097,8 +1423,8 @@ class CalibrationPage(QWidget):
                     ctrl.xy_stage.set_velocity(100)
             ctrl.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
 
-        # Step 3: Lower Z
-        if ctrl.is_zp_connected:
+        # Step 3: Lower Z (skip during plate calibration to keep needle safe)
+        if lower_z and ctrl.is_zp_connected:
             if target_z_mm is not None:
                 ctrl.move_z_absolute(target_z_mm, from_zero_ref=True)
             elif getattr(self, '_top_z', None) is not None:
@@ -1150,6 +1476,1244 @@ class CalibrationPage(QWidget):
             logger.warning(f"Cannot estimate {well_name}: {e}")
             return None
 
+    def _compute_predicted_positions(self):
+        """v7.3.1: Compute geometry-predicted positions for all wells from A1 + plate spacing.
+
+        Called after A1 is taught (manual or auto-detect) and after loading calibration.
+        Updates both internal state and the plate view overlay.
+        """
+        if self._taught_a1 is None or self._plate is None:
+            self._predicted_positions = None
+            return
+        self._predicted_positions = self._plate.get_all_positions_from_a1(
+            self._taught_a1[0], self._taught_a1[1]
+        )
+        logger.info(f"Predicted {len(self._predicted_positions)} well positions from A1 + geometry")
+        # Update plate view
+        if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
+            self._cal_plate_view.set_predicted_positions(self._predicted_positions)
+        # v7.3.1: Populate Z-teach well combo
+        self._zteach_populate_wells()
+        self._emit_calibration_data_changed()
+
+    # ── v7.3.1: 3-Well Auto-Calibration ────────────────────────────
+
+    def _get_calibration_wells(self) -> list[str]:
+        """Return 3 well names forming a right triangle for plate calibration.
+
+        Uses A1, A(last_col), (last_row)(last_col) — e.g. for 96-well: A1, A12, H12.
+        """
+        from SupportClasses.WellPlate import ROW_LABELS
+        if self._plate is None:
+            return []
+        rows = self._plate.rows
+        cols = self._plate.cols
+        return [
+            "A1",
+            f"A{cols}",
+            f"{ROW_LABELS[rows - 1]}{cols}",
+        ]
+
+    def _compute_approach_position(self, well_x_um: float, well_y_um: float,
+                                   well_index: int) -> tuple[float, float]:
+        """Compute the stage position for approaching a calibration well.
+
+        If the well diameter fits within 80% of the camera FOV, go to the
+        well center. Otherwise, offset to an edge so the circle boundary
+        is visible for detection.
+
+        Args:
+            well_x_um: Predicted well center X (absolute µm).
+            well_y_um: Predicted well center Y (absolute µm).
+            well_index: 0, 1, or 2 — determines offset direction for large wells.
+
+        Returns:
+            (approach_x_um, approach_y_um)
+        """
+        if self._plate is None:
+            return (well_x_um, well_y_um)
+
+        well_diam_um = self._plate.well_diameter * 1000.0
+
+        # Determine FOV size
+        cam = self._get_primary_camera()
+        cam_cfg = self._get_camera_config()
+        um_per_px = getattr(self, '_scan_um_per_px', 3.34)
+        if cam_cfg and cam_cfg.micron_per_pixel:
+            um_per_px = cam_cfg.micron_per_pixel
+        frame = cam.get_current_frame() if cam else None
+        if frame is not None:
+            fh, fw = frame.shape[:2]
+        else:
+            fw, fh = 3664, 2748  # default camera resolution
+        fov_w_um = fw * um_per_px
+        fov_h_um = fh * um_per_px
+        fov_min = min(fov_w_um, fov_h_um)
+
+        # Decision: center vs edge approach
+        if well_diam_um < fov_min * 0.8:
+            # Well fits comfortably in FOV — go to center
+            return (well_x_um, well_y_um)
+
+        # Large well — offset from center so we see the edge
+        well_radius_um = well_diam_um / 2.0
+        offset = well_radius_um - fov_min / 4.0
+
+        # Vary offset direction per well for better geometry
+        if well_index == 0:
+            return (well_x_um - offset, well_y_um)  # approach from left
+        elif well_index == 1:
+            return (well_x_um, well_y_um + offset)   # approach from bottom
+        else:
+            return (well_x_um, well_y_um - offset)   # approach from top
+
+    def _detect_well_at_position(self, approach_x_um: float,
+                                 approach_y_um: float,
+                                 well_index: int = 0) -> tuple[float, float] | None:
+        """Navigate to a position, capture frame, detect well, return absolute coords.
+
+        For small wells (fit in FOV): uses circle detection.
+        For large wells (larger than FOV): uses intensity-profile edge detection.
+
+        Args:
+            approach_x_um: Target stage X position.
+            approach_y_um: Target stage Y position.
+            well_index: 0, 1, or 2 — determines edge detection axis for large wells.
+
+        Returns:
+            (detected_x_um, detected_y_um) in absolute stage coords, or None.
+        """
+        import numpy as np
+
+        self._safe_navigate_to(approach_x_um, approach_y_um, lower_z=False)
+
+        cam = self._get_primary_camera()
+        if cam is None:
+            return None
+        frame = cam.capture_fresh_frame() if hasattr(cam, 'capture_fresh_frame') else cam.get_current_frame()
+        if frame is None:
+            return None
+
+        # Get actual stage position
+        xy = self.controller.get_xy_position(cached=False)
+        stage_x = xy[0] if xy and xy[0] is not None else approach_x_um
+        stage_y = xy[1] if xy and xy[1] is not None else approach_y_um
+
+        if self._plate is None:
+            return None
+
+        fh, fw = frame.shape[:2]
+        cam_cfg = self._get_camera_config()
+        um_per_px = getattr(self, '_scan_um_per_px', 3.34)
+        if cam_cfg and cam_cfg.micron_per_pixel:
+            um_per_px = cam_cfg.micron_per_pixel
+
+        diameter_um = self._plate.well_diameter * 1000.0
+        fov_min = min(fw, fh) * um_per_px
+
+        # ── Small well: circle detection ──
+        if diameter_um < fov_min * 0.8 and VISION_AVAILABLE:
+            expected_diam_px = diameter_um / um_per_px
+            if expected_diam_px < 10:
+                return None
+            try:
+                from SupportClasses.VisionDetector import WellDetector
+                detection = WellDetector.detect_well_with_fallback(
+                    frame, expected_diam_px, tolerance=0.5)
+                if detection is None:
+                    return None
+                dx_um, dy_um = pixel_offset_to_stage_um(
+                    detection.center_px, (fw, fh), um_per_px)
+                return (stage_x + dx_um, stage_y + dy_um)
+            except Exception as e:
+                logger.debug(f"Circle detection failed: {e}")
+                return None
+
+        # ── Large well: intensity-profile edge detection ──
+        # The well edge appears as a strong bright↔dark transition.
+        # We project the image along the axis parallel to the edge to get
+        # a 1D intensity profile, then find the steepest gradient.
+        well_radius_um = diameter_um / 2.0
+
+        # Convert to grayscale
+        if frame.ndim == 3:
+            gray = np.mean(frame, axis=2).astype(np.float64)
+        else:
+            gray = frame.astype(np.float64)
+
+        # Smooth kernel for noise rejection
+        kernel_size = max(11, int(min(fw, fh) * 0.03) | 1)  # odd, ~3% of frame
+        kernel = np.ones(kernel_size) / kernel_size
+        # Margin: ignore frame edges (artifacts from camera/rendering)
+        margin = max(20, int(min(fw, fh) * 0.05))
+
+        if well_index == 0:
+            # Approach from -X: edge runs vertically, profile along X
+            profile = gray.mean(axis=0)  # average over Y → shape (fw,)
+            smooth = np.convolve(profile, kernel, mode='same')
+            grad = np.diff(smooth)
+            # Search only interior of frame (skip margin on both sides)
+            search = np.abs(grad[margin:fw - margin])
+            edge_idx = int(np.argmax(search)) + margin
+            edge_x_um = stage_x + (edge_idx - fw / 2.0) * um_per_px
+            # Positive gradient (dark→bright, L→R) = left edge → center to the right
+            # Negative gradient (bright→dark, L→R) = right edge → center to the left
+            if grad[edge_idx] > 0:
+                center_x = edge_x_um + well_radius_um
+            else:
+                center_x = edge_x_um - well_radius_um
+            logger.debug(f"Edge detection [X]: edge at px {edge_idx}, "
+                         f"grad={grad[edge_idx]:.1f}, center_x={center_x:.0f}")
+            return (center_x, stage_y)
+
+        else:
+            # Approach from +Y (index 1) or -Y (index 2): edge runs horizontally
+            profile = gray.mean(axis=1)  # average over X → shape (fh,)
+            smooth = np.convolve(profile, kernel, mode='same')
+            grad = np.diff(smooth)
+            search = np.abs(grad[margin:fh - margin])
+            edge_idx = int(np.argmax(search)) + margin
+            edge_y_um = stage_y + (edge_idx - fh / 2.0) * um_per_px
+            # Positive gradient (dark→bright, top→bottom) = top edge → center below
+            # Negative gradient (bright→dark, top→bottom) = bottom edge → center above
+            if grad[edge_idx] > 0:
+                center_y = edge_y_um + well_radius_um
+            else:
+                center_y = edge_y_um - well_radius_um
+            logger.debug(f"Edge detection [Y]: edge at px {edge_idx}, "
+                         f"grad={grad[edge_idx]:.1f}, center_y={center_y:.0f}")
+            return (stage_x, center_y)
+
+    def _start_plate_scan(self):
+        """Begin 3-well auto-calibration.
+
+        v7.3.1: Moves to 3 strategically chosen wells (right triangle),
+        auto-detects each via circle fitting, then computes a similarity
+        transform to correct predicted well positions for plate orientation.
+        """
+        if self._plate is None:
+            QMessageBox.warning(self, "Cannot Scan",
+                                "Select a plate format first.")
+            return
+        safe_z = getattr(self, '_safe_z', None)
+        if safe_z is None:
+            QMessageBox.warning(self, "Cannot Scan",
+                                "Set Safe Z first (Step 2A).")
+            return
+
+        # Get camera and config
+        cam = self._get_primary_camera()
+        cam_cfg = self._get_camera_config()
+        if cam is None or not getattr(cam, 'is_running', False):
+            QMessageBox.warning(self, "No Camera",
+                                "Start a camera before scanning.")
+            return
+
+        frame = cam.get_current_frame()
+        if frame is None:
+            QMessageBox.warning(self, "No Frame",
+                                "Camera is not producing frames.")
+            return
+        um_per_px = 3.34
+        if cam_cfg is not None:
+            scale = cam_cfg.micron_per_pixel or getattr(cam_cfg, 'computed_micron_per_pixel', None)
+            if scale:
+                um_per_px = scale
+        self._scan_um_per_px = um_per_px
+
+        # Compute predicted positions from A1 or plate-center assumption
+        stage_center = (65000.0, 42500.0)  # 130×85mm travel center
+        if self._taught_a1 is not None:
+            self._predicted_positions = self._plate.get_all_positions_from_a1(
+                *self._taught_a1)
+        else:
+            self._predicted_positions = self._plate.get_all_positions_from_plate_center(
+                *stage_center)
+            # Set plate view reference A1 from computed position
+            if "A1" in self._predicted_positions:
+                a1_um = self._predicted_positions["A1"]
+                zero_x = self.controller.zero_position.get("x", 0)
+                zero_y = self.controller.zero_position.get("y", 0)
+                a1_mm = ((a1_um[0] - zero_x) / 1000.0, (a1_um[1] - zero_y) / 1000.0)
+                if hasattr(self, '_cal_plate_view'):
+                    self._cal_plate_view.set_taught_a1(a1_mm)
+
+        # Update plate view with predicted positions
+        if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
+            if self._predicted_positions:
+                self._cal_plate_view.set_predicted_positions(self._predicted_positions)
+
+        # Identify the 3 calibration wells
+        self._cal_well_names = self._get_calibration_wells()
+        self._cal_well_detected: dict[str, tuple[float, float]] = {}
+        self._cal_well_index = 0
+        self._scanning = True
+        self._scan_phase = "three_well"
+
+        # Show calibration wells on plate view
+        if hasattr(self, '_cal_plate_view'):
+            self._cal_plate_view.set_calibration_wells(set(self._cal_well_names))
+
+        # UI state
+        self._btn_start_scan.setEnabled(False)
+        self._btn_cancel_scan.setEnabled(True)
+        self._btn_accept_scan.setEnabled(False)
+        self._lbl_scan_result.setText("")
+        self._lbl_scan_progress.setText(
+            f"Auto-calibrating: 0/{len(self._cal_well_names)} wells...")
+
+        # Start scan timer
+        from PySide6.QtCore import QTimer as _QT
+        self._scan_timer = _QT(self)
+        self._scan_timer.setSingleShot(True)
+        self._scan_timer.timeout.connect(self._scan_tick)
+        self._scan_timer.start(0)
+        logger.info(f"3-well auto-calibration started: {self._cal_well_names}")
+
+    def _scan_tick(self):
+        """Process one calibration well per tick in 3-well auto-calibration."""
+        if not self._scanning:
+            return
+
+        cal_names = getattr(self, '_cal_well_names', [])
+        idx = getattr(self, '_cal_well_index', 0)
+
+        if idx >= len(cal_names):
+            self._finish_plate_scan()
+            return
+
+        well_name = cal_names[idx]
+
+        # Get predicted position
+        if self._predicted_positions is None or well_name not in self._predicted_positions:
+            logger.warning(f"No predicted position for {well_name}, skipping")
+            self._cal_well_index += 1
+            self._scan_timer.start(0)
+            return
+
+        pred_x, pred_y = self._predicted_positions[well_name]
+
+        # Compute approach position (center vs edge)
+        approach_x, approach_y = self._compute_approach_position(
+            pred_x, pred_y, idx)
+
+        # Navigate and detect
+        detected = self._detect_well_at_position(approach_x, approach_y, well_index=idx)
+        if detected is not None:
+            self._cal_well_detected[well_name] = detected
+            logger.info(f"Calibration well {well_name} detected at "
+                        f"({detected[0]:.0f}, {detected[1]:.0f}) µm")
+        else:
+            logger.warning(f"Calibration well {well_name} not detected")
+
+        # Update progress
+        self._cal_well_index += 1
+        n_detected = len(self._cal_well_detected)
+        self._lbl_scan_progress.setText(
+            f"Auto-calibrating: {self._cal_well_index}/{len(cal_names)} wells "
+            f"({n_detected} detected)...")
+
+        # Schedule next tick
+        if self._scanning:
+            self._scan_timer.start(0)
+
+    def _detect_well_in_fov(self, frame, stage_x_um, stage_y_um):
+        """Attempt well detection only when a predicted well is within the camera FOV.
+
+        Returns:
+            (well_name, DetectionResult) or (None, None)
+        """
+        import math as _m
+        fh, fw = frame.shape[:2]
+        cam_cfg = self._get_camera_config()
+        um_per_px = 3.34
+        if cam_cfg and cam_cfg.micron_per_pixel:
+            um_per_px = cam_cfg.micron_per_pixel
+
+        fov_w_um = fw * um_per_px
+        fov_h_um = fh * um_per_px
+        half_fov = min(fov_w_um, fov_h_um) / 2.0
+
+        # Find the nearest predicted well within the FOV
+        nearest_well = None
+        nearest_dist = float('inf')
+        for name, (wx, wy) in self._predicted_positions.items():
+            d = _m.sqrt((stage_x_um - wx) ** 2 + (stage_y_um - wy) ** 2)
+            if d < nearest_dist:
+                nearest_dist = d
+                nearest_well = name
+
+        # Only attempt detection if the well center is within the FOV
+        if nearest_well is None or nearest_dist > half_fov:
+            return None, None
+
+        # Compute expected diameter in pixels, capped to 80% of smaller frame dim
+        if self._plate is None:
+            return None, None
+        diameter_um = self._plate.well_diameter * 1000.0
+        expected_diam_px = diameter_um / um_per_px
+        max_diam_px = min(fw, fh) * 0.8
+        expected_diam_px = min(expected_diam_px, max_diam_px)
+
+        if expected_diam_px < 10:
+            return None, None
+
+        try:
+            from SupportClasses.VisionDetector import WellDetector
+            detection = WellDetector.detect_well_with_fallback(
+                frame, expected_diam_px, tolerance=0.5)
+            if detection is not None:
+                return nearest_well, detection
+        except Exception as e:
+            logger.debug(f"Detection failed near {nearest_well}: {e}")
+
+        return None, None
+
+    def _display_composite(self, composite):
+        """Update the plate view with the current stitched composite image."""
+        if not hasattr(self, '_cal_plate_view') or self._cal_plate_view is None:
+            return
+        if composite is None:
+            return
+        if self._mosaic_builder is None:
+            return
+
+        # Use the actual canvas extent (includes half-FOV padding), not scan_bounds
+        canvas_extent = self._mosaic_builder.canvas_extent_um
+        if canvas_extent is None:
+            return
+
+        # Determine A1 position (absolute µm) for coordinate conversion
+        if self._taught_a1 is not None:
+            a1_x_um = self._taught_a1[0]
+            a1_y_um = self._taught_a1[1]
+        elif self._predicted_positions and "A1" in self._predicted_positions:
+            a1_x_um, a1_y_um = self._predicted_positions["A1"]
+        else:
+            return
+
+        self._cal_plate_view.update_scan_composite(
+            composite, canvas_extent, a1_x_um, a1_y_um)
+
+    def _identify_nearest_well(self, x_um: float, y_um: float) -> str | None:
+        """Find the nearest predicted well to a stage position."""
+        if self._predicted_positions is None:
+            return None
+        import math as _m
+        best_name = None
+        best_dist = float('inf')
+        for name, (wx, wy) in self._predicted_positions.items():
+            d = _m.sqrt((x_um - wx) ** 2 + (y_um - wy) ** 2)
+            if d < best_dist:
+                best_dist = d
+                best_name = name
+        # Only match if within half the well spacing
+        if self._plate and best_dist < self._plate.well_spacing_x * 1000.0 * 0.5:
+            return best_name
+        return None
+
+    def _finish_plate_scan(self):
+        """Complete 3-well auto-calibration — fit similarity transform from detections."""
+        import numpy as np
+
+        self._scanning = False
+        if self._scan_timer:
+            self._scan_timer.stop()
+
+        cal_names = getattr(self, '_cal_well_names', [])
+        detected = getattr(self, '_cal_well_detected', {})
+        n_detected = len(detected)
+
+        self._btn_start_scan.setEnabled(True)
+        self._btn_cancel_scan.setEnabled(False)
+        self._scan_phase = "idle"
+
+        if n_detected < 2 or self._predicted_positions is None:
+            self._btn_accept_scan.setEnabled(False)
+            self._lbl_scan_result.setText(
+                f"Only {n_detected} well(s) detected — need \u22652 for calibration. "
+                f"Try adjusting camera or plate position.")
+            self._lbl_scan_result.setStyleSheet(f"color: {COLORS['yellow']}; font-size: 9pt;")
+            self._lbl_scan_progress.setText(
+                f"Auto-calibration complete: {n_detected}/{len(cal_names)} wells detected")
+            logger.warning(f"3-well calibration: only {n_detected} detected")
+            return
+
+        # Build matched point arrays: predicted → detected
+        pred_pts = []
+        det_pts = []
+        for wname in cal_names:
+            if wname in detected and wname in self._predicted_positions:
+                pred_pts.append(self._predicted_positions[wname])
+                det_pts.append(detected[wname])
+
+        pred_arr = np.array(pred_pts, dtype=np.float64)
+        det_arr = np.array(det_pts, dtype=np.float64)
+
+        # Procrustes: find rotation, scale, translation mapping predicted → detected
+        # Centroids
+        pred_centroid = pred_arr.mean(axis=0)
+        det_centroid = det_arr.mean(axis=0)
+        pred_c = pred_arr - pred_centroid
+        det_c = det_arr - det_centroid
+
+        # SVD for optimal rotation
+        H = pred_c.T @ det_c
+        U, S, Vt = np.linalg.svd(H)
+        d = np.linalg.det(Vt.T @ U.T)
+        D = np.diag([1.0, 1.0 if d >= 0 else -1.0])
+        R = Vt.T @ D @ U.T
+
+        # Scale: ratio of spreads
+        pred_spread = np.sqrt((pred_c ** 2).sum())
+        det_spread = np.sqrt((det_c ** 2).sum())
+        scale = det_spread / pred_spread if pred_spread > 1e-6 else 1.0
+
+        # Translation
+        t = det_centroid - scale * (R @ pred_centroid)
+
+        # Compute residuals
+        transformed = scale * (pred_arr @ R.T) + t
+        residuals = np.sqrt(((transformed - det_arr) ** 2).sum(axis=1))
+        residual_um = float(residuals.mean())
+
+        # Extract rotation angle
+        rotation_deg = float(math.degrees(math.atan2(R[1, 0], R[0, 0])))
+
+        # Store calibration as AffineCalibration-compatible object
+        from SupportClasses.MosaicBuilder import AffineCalibration
+        self._three_well_calibration = AffineCalibration(
+            rotation_deg=rotation_deg,
+            scale=scale,
+            translation_um=(float(t[0]), float(t[1])),
+            num_points=n_detected,
+            residual_um=residual_um,
+        )
+
+        # Show detected positions on plate view
+        if hasattr(self, '_cal_plate_view'):
+            cal_positions = {wname: detected[wname] for wname in detected}
+            self._cal_plate_view.set_calibrated_positions(cal_positions)
+
+        self._btn_accept_scan.setEnabled(True)
+        self._lbl_scan_result.setText(
+            f"Rotation: {rotation_deg:.3f}\u00b0 | "
+            f"Scale: {scale:.5f} | "
+            f"Residual: {residual_um:.1f} \u00b5m")
+        self._lbl_scan_result.setStyleSheet(f"color: {COLORS['green']}; font-size: 9pt;")
+        self._lbl_scan_progress.setText(
+            f"{n_detected}/{len(cal_names)} wells detected. "
+            f"Double-click any well to scan.")
+
+        logger.info(f"3-well calibration done: {n_detected} detected, "
+                    f"rotation={rotation_deg:.3f}\u00b0, scale={scale:.5f}, "
+                    f"residual={residual_um:.1f} µm")
+
+    def _cancel_plate_scan(self):
+        """Cancel an in-progress plate or well scan."""
+        self._scanning = False
+        self._scan_phase = "idle"
+        if self._scan_timer:
+            self._scan_timer.stop()
+        # Also cancel per-well scan if active
+        if getattr(self, '_well_scan_timer', None):
+            self._well_scan_timer.stop()
+        self._well_scan_active = None
+        self._btn_start_scan.setEnabled(True)
+        self._btn_cancel_scan.setEnabled(False)
+        self._btn_accept_scan.setEnabled(False)
+        self._lbl_scan_progress.setText("Scan cancelled")
+        self._lbl_scan_result.setText("")
+        logger.info("Plate scan cancelled")
+
+    # ── v7.3.1: Per-well on-demand scanning ────────────────────────
+
+    def _start_well_scan(self, well_name: str):
+        """Start a local raster scan of a single well area.
+
+        Triggered by double-clicking a well in the plate view. Creates a
+        fresh MosaicBuilder scoped to the well's bounding box and runs a
+        small serpentine raster scan to produce a high-detail composite.
+        """
+        scan_phase = getattr(self, '_scan_phase', 'idle')
+        if scan_phase != 'idle':
+            QMessageBox.warning(self, "Scan Active",
+                                "Wait for current scan to complete.")
+            return
+
+        if self._plate is None:
+            return
+
+        # Get well position (prefer calibrated, fall back to predicted)
+        positions = getattr(self, '_calibrated_positions', None) or \
+                    getattr(self, '_predicted_positions', None)
+        if positions is None or well_name not in positions:
+            logger.warning(f"Cannot scan well {well_name}: no position known")
+            return
+
+        well_x_um, well_y_um = positions[well_name]
+
+        # Compute local scan bounds
+        well_bounds = self._plate.get_single_well_scan_bounds_um(
+            well_x_um, well_y_um, margin_factor=1.25)
+
+        # Get camera and config
+        cam = self._get_primary_camera()
+        cam_cfg = self._get_camera_config()
+        if cam is None or not getattr(cam, 'is_running', False):
+            QMessageBox.warning(self, "No Camera",
+                                "Start a camera before scanning.")
+            return
+
+        frame = cam.get_current_frame()
+        if frame is None:
+            return
+        fh, fw = frame.shape[:2]
+        um_per_px = getattr(self, '_scan_um_per_px', 3.34)
+
+        # Import MosaicBuilder
+        try:
+            from SupportClasses.MosaicBuilder import MosaicBuilder
+        except ImportError:
+            return
+
+        # Create per-well MosaicBuilder with 50% overlap for good stitching
+        self._well_scan_builder = MosaicBuilder(
+            frame_size_px=(fw, fh),
+            micron_per_pixel=um_per_px,
+            overlap=0.50,
+        )
+        self._well_scan_positions = self._well_scan_builder.generate_raster_positions(
+            well_bounds, overlap=0.50)
+        self._well_scan_index = 0
+        self._well_scan_active = well_name
+        self._scan_phase = "well_scan"
+
+        # UI state
+        self._btn_start_scan.setEnabled(False)
+        self._btn_cancel_scan.setEnabled(True)
+        total = len(self._well_scan_positions)
+        self._lbl_scan_progress.setText(
+            f"Scanning well {well_name}: 0/{total} positions...")
+
+        # Start timer
+        from PySide6.QtCore import QTimer as _QT
+        self._well_scan_timer = _QT(self)
+        self._well_scan_timer.setSingleShot(True)
+        self._well_scan_timer.timeout.connect(self._well_scan_tick)
+        self._well_scan_timer.start(0)
+        logger.info(f"Per-well scan started: {well_name}, {total} positions")
+
+    def _well_scan_tick(self):
+        """Process one position in a per-well scan."""
+        builder = getattr(self, '_well_scan_builder', None)
+        active = getattr(self, '_well_scan_active', None)
+        if builder is None or active is None:
+            return
+
+        positions = self._well_scan_positions
+        total = len(positions)
+        idx = self._well_scan_index
+
+        if idx >= total:
+            self._finish_well_scan()
+            return
+
+        tx, ty = positions[idx]
+        self._safe_navigate_to(tx, ty)
+
+        cam = self._get_primary_camera()
+        frame = cam.capture_fresh_frame() if cam else None
+        if frame is None:
+            self._well_scan_index += 1
+            self._well_scan_timer.start(0)
+            return
+
+        xy = self.controller.get_xy_position(cached=False)
+        sx = xy[0] if xy and xy[0] is not None else tx
+        sy = xy[1] if xy and xy[1] is not None else ty
+
+        builder.add_raster_frame(frame, sx, sy, index=idx)
+        builder.stitch_incremental()
+
+        self._well_scan_index += 1
+        self._lbl_scan_progress.setText(
+            f"Scanning well {active}: {self._well_scan_index}/{total} positions...")
+
+        if self._well_scan_active is not None:
+            self._well_scan_timer.start(0)
+
+    def _finish_well_scan(self):
+        """Complete a per-well scan — store composite and display on plate view."""
+        well_name = getattr(self, '_well_scan_active', None)
+        self._well_scan_active = None
+        self._scan_phase = "idle"
+
+        if getattr(self, '_well_scan_timer', None):
+            self._well_scan_timer.stop()
+
+        builder = getattr(self, '_well_scan_builder', None)
+        if builder is None or well_name is None:
+            return
+
+        # Build final mosaic for this well
+        composite = builder.build_mosaic()
+        if composite is not None:
+            if not hasattr(self, '_per_well_composites'):
+                self._per_well_composites = {}
+            self._per_well_composites[well_name] = composite
+
+            # Display on plate view
+            if hasattr(self, '_cal_plate_view') and self._plate is not None:
+                self._cal_plate_view.set_well_composite(
+                    well_name, composite, self._plate.well_diameter)
+
+        self._well_scan_builder = None
+
+        # UI state
+        self._btn_start_scan.setEnabled(True)
+        self._btn_cancel_scan.setEnabled(False)
+        self._lbl_scan_progress.setText(
+            f"Well {well_name} scanned. Double-click another well to scan.")
+        logger.info(f"Per-well scan finished: {well_name}")
+
+    def _accept_plate_scan(self):
+        """Accept the 3-well calibration — apply affine correction to all wells."""
+        import numpy as np
+
+        cal = getattr(self, '_three_well_calibration', None)
+        if cal is None or self._predicted_positions is None:
+            return
+
+        # Apply the similarity transform to all predicted positions
+        self._calibrated_positions = cal.correct_positions(self._predicted_positions)
+
+        # Always set _taught_a1 from calibrated A1 position
+        # (use direct detection if available, otherwise calibrated prediction)
+        zero_x = self.controller.zero_position.get("x", 0)
+        zero_y = self.controller.zero_position.get("y", 0)
+        detected = getattr(self, '_cal_well_detected', {})
+        if "A1" in detected:
+            a1_pos = detected["A1"]
+        elif "A1" in self._calibrated_positions:
+            a1_pos = self._calibrated_positions["A1"]
+        else:
+            a1_pos = None
+        if a1_pos is not None:
+            self._taught_a1 = (a1_pos[0], a1_pos[1])
+            a1_mm = ((a1_pos[0] - zero_x) / 1000.0, (a1_pos[1] - zero_y) / 1000.0)
+            if hasattr(self, '_cal_plate_view'):
+                self._cal_plate_view.set_taught_a1(a1_mm)
+
+        # Update scale/rotation for legacy compatibility
+        self._scale = cal.scale
+        self._rotation = cal.rotation_deg
+
+        # Update plate view
+        if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
+            self._cal_plate_view.set_calibrated_positions(self._calibrated_positions)
+
+        # Show fast-travel buttons for calibration wells
+        cal_names = getattr(self, '_cal_well_names', [])
+        if hasattr(self, '_cal_travel_frame') and cal_names:
+            for i, btn in enumerate(self._cal_travel_btns):
+                if i < len(cal_names):
+                    btn.setText(cal_names[i])
+                    btn.setEnabled(True)
+                else:
+                    btn.setText("—")
+                    btn.setEnabled(False)
+            self._cal_travel_frame.setVisible(True)
+
+        # Populate Z-teach combo now that positions are known
+        self._zteach_populate_wells()
+
+        self._btn_accept_scan.setEnabled(False)
+        self._lbl_scan_progress.setText(
+            f"\u2705 Calibrated {len(self._calibrated_positions)} wells from 3-well detection")
+        self._lbl_scan_progress.setStyleSheet(f"color: {COLORS['green']}; font-size: 9pt;")
+
+        logger.info(f"3-well calibration accepted: {len(self._calibrated_positions)} wells, "
+                    f"rotation={cal.rotation_deg:.3f}\u00b0, scale={cal.scale:.5f}")
+        self._emit_calibration_data_changed()
+
+    # ── v7.3.1: Auto Z-Bottom Calibration ─────────────────────────
+
+    def _start_auto_z_cal(self):
+        """Start automated Z-bottom calibration for the 3 calibration wells.
+
+        For each well:
+        1. Navigate XY to calibration well (at safe Z)
+        2. Fast descend to estimated bottom + margin
+        3. Coarse sweep downward watching focus score
+        4. Fine sweep around the focus peak
+        5. Record best-focus Z as well bottom
+        6. Retract to safe Z, move to next well
+        7. Fit Z plane from 3 results
+        """
+        # Validation
+        if self._plate is None:
+            QMessageBox.warning(self, "Cannot Auto Z-Cal",
+                                "Select a plate format first.")
+            return
+        if getattr(self, '_safe_z', None) is None:
+            QMessageBox.warning(self, "Cannot Auto Z-Cal",
+                                "Set Safe Z first (Step 2A).")
+            return
+        if getattr(self, '_top_z', None) is None:
+            QMessageBox.warning(self, "Cannot Auto Z-Cal",
+                                "Set Top Z first (Step 2B).")
+            return
+        # Need position data to navigate to wells
+        if not self._calibrated_positions and not self._predicted_positions:
+            QMessageBox.warning(self, "Cannot Auto Z-Cal",
+                                "Run Auto-Calibrate (Step 2C) first.")
+            return
+
+        cam = self._get_primary_camera()
+        if cam is None or not getattr(cam, 'is_running', False):
+            QMessageBox.warning(self, "No Camera",
+                                "Start a camera before auto Z calibration.")
+            return
+
+        # Get well depth from spinbox
+        well_depth_mm = self._well_depth_spin.value()
+        self._auto_z_well_depth = well_depth_mm
+
+        # Wells to calibrate (same 3 as plate calibration)
+        self._auto_z_wells = self._get_calibration_wells()
+        self._auto_z_well_idx = 0
+        self._auto_z_results = {}
+        self._auto_z_scanning = True
+        self._auto_z_phase = "navigate"
+
+        # UI state
+        self._btn_auto_z_cal.setEnabled(False)
+        self._btn_cancel_auto_z.setEnabled(True)
+        self._lbl_auto_z_progress.setText(
+            f"Auto Z-Cal: 0/{len(self._auto_z_wells)} wells...")
+        self._lbl_auto_z_progress.setStyleSheet(
+            f"color: {COLORS['blue']}; font-size: 9pt;")
+
+        # Turn on needle detection + focus assist for visual feedback
+        if VISION_AVAILABLE and self._ensure_detection_worker():
+            # Start needle detection (also enables focus assist button)
+            self._needle_detecting = True
+            self._focus_assisting = True
+            self._best_focus_z = None
+            self._best_focus_score = 0.0
+            od_px = self._get_expected_od_px()
+            if od_px is not None:
+                from gui.widgets.detection_worker import DetectionMode
+                self._detection_worker.set_mode(
+                    DetectionMode.FOCUS_ASSIST)
+                if not self._detection_worker.isRunning():
+                    self._detection_worker.start()
+            # Activate the toggle buttons so the user sees them on
+            btn = getattr(self, '_btn_detect_needle', None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(True)
+                btn.blockSignals(False)
+            btn_fa = getattr(self, '_btn_focus_assist', None)
+            if btn_fa is not None:
+                btn_fa.setEnabled(True)
+                btn_fa.blockSignals(True)
+                btn_fa.setChecked(True)
+                btn_fa.blockSignals(False)
+
+        # Start timer
+        from PySide6.QtCore import QTimer as _QT
+        self._auto_z_timer = _QT(self)
+        self._auto_z_timer.setSingleShot(True)
+        self._auto_z_timer.timeout.connect(self._auto_z_tick)
+        self._auto_z_timer.start(0)
+
+        logger.info(f"Auto Z-Cal started: {self._auto_z_wells}, "
+                    f"well_depth={well_depth_mm:.2f}mm")
+
+    def _cancel_auto_z(self):
+        """Cancel the auto Z-calibration in progress."""
+        self._auto_z_scanning = False
+        self._auto_z_phase = "idle"
+        if self._auto_z_timer is not None:
+            self._auto_z_timer.stop()
+        # Retract to safe Z
+        if self.controller.is_zp_connected and self._safe_z is not None:
+            self.controller.move_z_absolute(self._safe_z, from_zero_ref=True)
+        # Stop detection worker
+        self._stop_detection()
+        self._auto_z_uncheck_vision_buttons()
+        # UI
+        self._btn_auto_z_cal.setEnabled(True)
+        self._btn_cancel_auto_z.setEnabled(False)
+        self._lbl_auto_z_progress.setText("Auto Z-Cal cancelled.")
+        self._lbl_auto_z_progress.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: 9pt;")
+        logger.info("Auto Z-Cal cancelled")
+
+    def _auto_z_tick(self):
+        """State machine for auto Z-bottom calibration."""
+        if not self._auto_z_scanning:
+            return
+
+        idx = self._auto_z_well_idx
+        wells = self._auto_z_wells
+
+        if idx >= len(wells):
+            self._auto_z_finish()
+            return
+
+        well_name = wells[idx]
+
+        if self._auto_z_phase == "navigate":
+            # Navigate to well XY at safe Z (no Z lowering)
+            est = None
+            if self._calibrated_positions and well_name in self._calibrated_positions:
+                est = self._calibrated_positions[well_name]
+            elif self._predicted_positions and well_name in self._predicted_positions:
+                est = self._predicted_positions[well_name]
+            if est is None:
+                logger.warning(f"Auto Z-Cal: no position for {well_name}, skipping")
+                self._auto_z_well_idx += 1
+                self._auto_z_phase = "navigate"
+                self._auto_z_timer.start(0)
+                return
+
+            self._safe_navigate_to(est[0], est[1], lower_z=False)
+            self._lbl_auto_z_progress.setText(
+                f"Auto Z-Cal: {well_name} — descending to search region...")
+
+            # Compute sweep range — SAFETY: never go below estimated bottom
+            well_depth = self._auto_z_well_depth
+            estimated_bottom = self._top_z - well_depth
+            approach_margin = 2.0   # mm above estimated bottom to start search
+
+            self._auto_z_current_z = estimated_bottom + approach_margin
+            # Hard safety floor: never descend below estimated bottom
+            self._auto_z_sweep_end = estimated_bottom
+            self._auto_z_best_z = None
+            self._auto_z_best_score = 0.0
+            self._auto_z_baseline_score = 0.0
+            self._auto_z_decline_count = 0
+
+            # Fast descend to approach position
+            self.controller.move_z_absolute(
+                self._auto_z_current_z, from_zero_ref=True)
+
+            # Capture baseline focus score (no needle in focus here)
+            self._auto_z_capture_baseline()
+
+            self._auto_z_phase = "coarse"
+            self._auto_z_timer.start(300)
+
+        elif self._auto_z_phase == "coarse":
+            # Coarse sweep: 0.15mm steps, descending from above.
+            # Looking for needle to first appear (blurry focus rising).
+            # SAFETY: never descend below estimated bottom.
+            score = self._auto_z_get_focus_score()
+            z = self._auto_z_current_z
+
+            self._lbl_auto_z_progress.setText(
+                f"Auto Z-Cal: {well_name} \u2014 coarse Z={z:.3f}mm  "
+                f"focus={score:.1f}")
+
+            # Track best seen so far
+            if score > self._auto_z_best_score:
+                self._auto_z_best_score = score
+                self._auto_z_best_z = z
+                self._auto_z_decline_count = 0
+            elif self._auto_z_best_z is not None:
+                self._auto_z_decline_count += 1
+
+            # Detect needle appearing: score rising above 2x baseline
+            needle_detected = (
+                self._auto_z_baseline_score > 0
+                and score > 2.0 * self._auto_z_baseline_score
+            ) or (
+                self._auto_z_best_score > 0
+                and self._auto_z_best_score > 2.0 * max(self._auto_z_baseline_score, 1.0)
+            )
+
+            if needle_detected:
+                # Needle is appearing — switch to fine sweep.
+                # Back up above best Z to re-approach slowly.
+                fine_start = self._auto_z_best_z + 0.3
+                self._auto_z_current_z = fine_start
+                self.controller.move_z_absolute(fine_start, from_zero_ref=True)
+                self._auto_z_best_z = None
+                self._auto_z_best_score = 0.0
+                self._auto_z_decline_count = 0
+                self._auto_z_phase = "fine"
+                self._auto_z_timer.start(300)
+                return
+
+            # SAFETY: hit the floor — do not descend further
+            if z <= self._auto_z_sweep_end:
+                if self._auto_z_best_z is not None:
+                    # Had some focus signal, refine it
+                    fine_start = self._auto_z_best_z + 0.3
+                    self._auto_z_current_z = fine_start
+                    self.controller.move_z_absolute(fine_start, from_zero_ref=True)
+                    self._auto_z_best_z = None
+                    self._auto_z_best_score = 0.0
+                    self._auto_z_decline_count = 0
+                    self._auto_z_phase = "fine"
+                    self._auto_z_timer.start(300)
+                else:
+                    logger.warning(f"Auto Z-Cal: no focus found for {well_name} "
+                                   f"(stopped at safety floor Z={z:.3f}mm)")
+                    self._lbl_auto_z_progress.setText(
+                        f"Auto Z-Cal: {well_name} \u2014 no focus detected "
+                        f"(stopped at safety floor)")
+                    self._auto_z_phase = "retract"
+                    self._auto_z_timer.start(0)
+                return
+
+            # Step down (coarse)
+            next_z = self._auto_z_current_z - self._auto_z_coarse_step
+            # Clamp to safety floor
+            if next_z < self._auto_z_sweep_end:
+                next_z = self._auto_z_sweep_end
+            self._auto_z_current_z = next_z
+            self.controller.move_z_absolute(next_z, from_zero_ref=True)
+            self._auto_z_timer.start(300)
+
+        elif self._auto_z_phase == "fine":
+            # Fine sweep: 0.03mm steps, tracking peak focus.
+            # SAFETY: approach from above only. Stop as soon as focus
+            # declines — the peak IS the well bottom, do not go past it.
+            score = self._auto_z_get_focus_score()
+            z = self._auto_z_current_z
+
+            self._lbl_auto_z_progress.setText(
+                f"Auto Z-Cal: {well_name} \u2014 fine Z={z:.3f}mm  "
+                f"focus={score:.1f}  "
+                f"best={self._auto_z_best_score:.1f}")
+
+            if score > self._auto_z_best_score:
+                self._auto_z_best_score = score
+                self._auto_z_best_z = z
+                self._auto_z_decline_count = 0
+            elif self._auto_z_best_z is not None:
+                self._auto_z_decline_count += 1
+
+            # Peak found: 3 consecutive declining steps → stop immediately.
+            # The needle is approaching the glass — do NOT continue down.
+            if self._auto_z_decline_count >= 3 and self._auto_z_best_z is not None:
+                self._auto_z_results[well_name] = self._auto_z_best_z
+                self._z_teach_points[well_name] = self._auto_z_best_z
+                logger.info(f"Auto Z-Cal: {well_name} bottom at "
+                            f"Z={self._auto_z_best_z:.3f}mm "
+                            f"(score={self._auto_z_best_score:.1f})")
+                self._auto_z_phase = "retract"
+                self._auto_z_timer.start(0)
+                return
+
+            # SAFETY: hard floor — never descend below estimated bottom
+            if z <= self._auto_z_sweep_end:
+                if self._auto_z_best_z is not None:
+                    self._auto_z_results[well_name] = self._auto_z_best_z
+                    self._z_teach_points[well_name] = self._auto_z_best_z
+                    logger.info(f"Auto Z-Cal: {well_name} bottom at "
+                                f"Z={self._auto_z_best_z:.3f}mm "
+                                f"(stopped at safety floor)")
+                else:
+                    logger.warning(f"Auto Z-Cal: {well_name} no clear peak "
+                                   f"(stopped at safety floor)")
+                self._auto_z_phase = "retract"
+                self._auto_z_timer.start(0)
+                return
+
+            # Step down (fine) — clamp to safety floor
+            next_z = self._auto_z_current_z - self._auto_z_fine_step
+            if next_z < self._auto_z_sweep_end:
+                next_z = self._auto_z_sweep_end
+            self._auto_z_current_z = next_z
+            self.controller.move_z_absolute(next_z, from_zero_ref=True)
+            self._auto_z_timer.start(300)
+
+        elif self._auto_z_phase == "retract":
+            # Retract to safe Z, then move to next well
+            self.controller.move_z_absolute(self._safe_z, from_zero_ref=True)
+
+            # Update progress
+            n_done = len(self._auto_z_results)
+            n_total = len(self._auto_z_wells)
+            self._lbl_auto_z_progress.setText(
+                f"Auto Z-Cal: {n_done}/{n_total} wells done")
+
+            # Update Z teach display
+            if hasattr(self, 'lbl_zplane'):
+                self.lbl_zplane.setText(
+                    f"{len(self._z_teach_points)}/3 teach points")
+                if len(self._z_teach_points) >= 3:
+                    self.lbl_zplane.setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 9pt;")
+
+            # Next well
+            self._auto_z_well_idx += 1
+            self._auto_z_phase = "navigate"
+            self._auto_z_timer.start(200)
+
+    def _auto_z_uncheck_vision_buttons(self):
+        """Uncheck the detect needle / focus assist toggle buttons without triggering handlers."""
+        for attr in ('_btn_detect_needle', '_btn_focus_assist'):
+            btn = getattr(self, attr, None)
+            if btn is not None and btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
+    def _auto_z_capture_baseline(self):
+        """Capture baseline focus score at approach position (no needle in focus)."""
+        cam = self._get_primary_camera()
+        if cam is None:
+            self._auto_z_baseline_score = 0.0
+            return
+        import time
+        time.sleep(0.2)  # brief settle for camera
+        frame = cam.get_current_frame()
+        if frame is None:
+            self._auto_z_baseline_score = 0.0
+            return
+        try:
+            from SupportClasses.VisionDetector import NeedleDetector
+            result = NeedleDetector.compute_focus_score(frame)
+            self._auto_z_baseline_score = result.score
+            logger.debug(f"Auto Z baseline focus: {result.score:.1f}")
+        except Exception:
+            self._auto_z_baseline_score = 0.0
+
+    def _auto_z_get_focus_score(self) -> float:
+        """Grab current frame and compute focus score synchronously."""
+        cam = self._get_primary_camera()
+        if cam is None:
+            return 0.0
+        frame = cam.get_current_frame()
+        if frame is None:
+            return 0.0
+        try:
+            from SupportClasses.VisionDetector import NeedleDetector
+            result = NeedleDetector.compute_focus_score(frame)
+            return result.score
+        except Exception:
+            return 0.0
+
+    def _auto_z_finish(self):
+        """Complete auto Z-cal: fit Z plane from recorded points."""
+        self._auto_z_scanning = False
+        self._auto_z_phase = "idle"
+        # Stop detection worker
+        self._stop_detection()
+        self._auto_z_uncheck_vision_buttons()
+
+        n_found = len(self._auto_z_results)
+        if n_found == 0:
+            self._lbl_auto_z_progress.setText(
+                "Auto Z-Cal failed: no well bottoms detected.")
+            self._lbl_auto_z_progress.setStyleSheet(
+                f"color: {COLORS['red']}; font-size: 9pt;")
+        else:
+            # Build result summary
+            parts = [f"{w}: Z={z:.3f}mm" for w, z in self._auto_z_results.items()]
+            self._lbl_auto_z_progress.setText(
+                f"\u2705 Auto Z-Cal: {n_found} wells \u2014 {', '.join(parts)}")
+            self._lbl_auto_z_progress.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 9pt;")
+
+            # Auto-fit Z plane if we have 3+ points
+            if n_found >= 3:
+                self._try_fit_z_plane()
+
+        # UI state
+        self._btn_auto_z_cal.setEnabled(True)
+        self._btn_cancel_auto_z.setEnabled(False)
+
+        logger.info(f"Auto Z-Cal finished: {n_found} wells, "
+                    f"results={self._auto_z_results}")
+
+    # ── v7.3.1: Manual Z-Offset Teaching ──────────────────────────
+
+    def _zteach_populate_wells(self):
+        """Populate the Z-teach well combo from the current plate."""
+        if not hasattr(self, '_zteach_well_combo'):
+            return
+        self._zteach_well_combo.clear()
+        if self._plate is None:
+            return
+        # Pre-select strategic wells for plane fitting
+        wells = self._plate.well_names
+        self._zteach_well_combo.addItems(wells)
+        # Default to A1
+        self._zteach_well_combo.setCurrentIndex(0)
+
+    def _zteach_goto_well(self):
+        """Navigate to the selected Z-teach well."""
+        well_name = self._zteach_well_combo.currentText()
+        if not well_name:
+            return
+        self._navigate_to_well(well_name)
+
+    def _zteach_next_well(self):
+        """Advance to the next well in the combo and navigate there."""
+        if not hasattr(self, '_zteach_well_combo'):
+            return
+        idx = self._zteach_well_combo.currentIndex()
+        if idx < self._zteach_well_combo.count() - 1:
+            self._zteach_well_combo.setCurrentIndex(idx + 1)
+        else:
+            self._zteach_well_combo.setCurrentIndex(0)
+        self._zteach_goto_well()
+
+    def _zteach_record_z(self):
+        """Record current Z position for the selected well."""
+        well_name = self._zteach_well_combo.currentText()
+        if not well_name:
+            return
+        zp = self.controller.get_zp_position(cached=False)
+        if zp is None or zp[0] is None:
+            return
+        z_offset = zp[0] - self.controller.zero_position.get("Z", 0)
+        self._z_teach_points[well_name] = z_offset
+
+        # Also store as taught_a1_z / taught_corner_z / taught_third_z for legacy compat
+        if well_name == "A1":
+            self._taught_a1_z = z_offset
+        elif well_name == self._corner_well:
+            self._taught_corner_z = z_offset
+        elif self._taught_third is None or well_name == getattr(self, '_third_well', None):
+            self._taught_third_z = z_offset
+            self._third_well = well_name
+            xy = self.controller.get_xy_position(cached=False)
+            if xy and xy[0] is not None:
+                self._taught_third = (xy[0], xy[1])
+
+        n = len(self._z_teach_points)
+        if hasattr(self, 'lbl_zplane'):
+            wells_str = ", ".join(sorted(self._z_teach_points.keys()))
+            self.lbl_zplane.setText(f"{n}/3 teach points: {wells_str}")
+            color = COLORS['green'] if n >= 3 else COLORS['yellow']
+            self.lbl_zplane.setStyleSheet(f"color: {color}; font-size: 9pt;")
+
+        logger.info(f"Z-teach: {well_name} = {z_offset:.3f} mm ({n} points total)")
+
+    def _zteach_jog_xy(self, dx_um: float, dy_um: float):
+        """Handle XY jog from embedded jog array."""
+        if self.controller.is_xy_connected:
+            self.controller.move_xy_relative_um(dx_um, dy_um)
+
+    def _zteach_jog_z(self, dz_mm: float):
+        """Handle Z jog from embedded jog array."""
+        if self.controller.is_zp_connected:
+            self.controller.move_z_relative(dz_mm)
+
+    def _jog_xy_home(self):
+        """Move to zero reference."""
+        if self.controller.is_xy_connected:
+            self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
+        if self.controller.is_zp_connected:
+            self.controller.move_z_absolute(0, from_zero_ref=True)
 
     def _pick_third_well(self):
         """v7.2.7: Choose a third teach point that maximizes triangle area.
@@ -1196,6 +2760,7 @@ class CalibrationPage(QWidget):
             self.lbl_safe_z.setText(f"Safe Z: {self._safe_z:.2f} mm")
             self.lbl_safe_z.setStyleSheet(f"color: {COLORS['green']};")
         logger.info(f"Safe Z set: {self._safe_z:.2f} mm")
+        self._emit_calibration_data_changed()
 
     def _set_top_z(self):
         """v7.2.7: Record current Z as plate top surface."""
@@ -1233,6 +2798,8 @@ class CalibrationPage(QWidget):
         self._offset_x = 0
         self._offset_y = 0
         logger.info(f"Taught A1 XYZ: {self._taught_a1}, Z={self._taught_a1_z}")
+        # v7.3.1: Compute geometry-predicted positions for all wells
+        self._compute_predicted_positions()
 
     def _goto_corner_auto(self):
         """v7.2.7: Auto-navigate to estimated corner position with safe travel."""
@@ -1307,14 +2874,21 @@ class CalibrationPage(QWidget):
         self._try_fit_z_plane()
 
     def _try_fit_z_plane(self):
-        """v7.2.7-hotfix: try_fit — Z-plane fit with 3 points."""
-        points = []
+        """v7.3.1: Z-plane fit using all available teach points.
+        Combines legacy A1/corner/third points with v7.3.1 z_teach_points.
+        """
+        # Collect all unique points (z_teach_points override legacy)
+        points_dict: dict[str, float] = {}
         if getattr(self, '_taught_a1', None) and getattr(self, '_taught_a1_z', None) is not None:
-            points.append(("A1", self._taught_a1_z))
+            points_dict["A1"] = self._taught_a1_z
         if getattr(self, '_taught_corner', None) and getattr(self, '_taught_corner_z', None) is not None:
-            points.append((getattr(self, '_corner_well', 'corner'), self._taught_corner_z))
+            points_dict[getattr(self, '_corner_well', 'corner')] = self._taught_corner_z
         if getattr(self, '_taught_third', None) and getattr(self, '_taught_third_z', None) is not None:
-            points.append((getattr(self, '_third_well', '3rd'), self._taught_third_z))
+            points_dict[getattr(self, '_third_well', '3rd')] = self._taught_third_z
+        # v7.3.1: Z-teach points override legacy
+        for name, z in self._z_teach_points.items():
+            points_dict[name] = z
+        points = list(points_dict.items())
         if len(points) < 3:
             if hasattr(self, 'lbl_zplane'):
                 self.lbl_zplane.setText(f"{len(points)}/3 points — need {3-len(points)} more")
@@ -1338,16 +2912,25 @@ class CalibrationPage(QWidget):
 
 
     def _navigate_to_well(self, well_name):
-        """v7.2.7: Navigate to any well via plate view click."""
+        """v7.2.7: Navigate to any well via plate view click.
+        v7.3.1: Prefers calibrated > predicted > estimated positions.
+        """
         if self._safe_z is None:
             QMessageBox.warning(self, "No Safe Z",
                                 "Set Safe Z height before navigating.")
             return
-        if self._taught_a1 is None:
-            QMessageBox.warning(self, "No A1",
-                                "Teach A1 position before navigating to wells.")
+        # v7.3.1: Use calibrated position if available, then predicted, then estimated
+        est = None
+        if self._calibrated_positions and well_name in self._calibrated_positions:
+            est = self._calibrated_positions[well_name]
+        elif self._predicted_positions and well_name in self._predicted_positions:
+            est = self._predicted_positions[well_name]
+        elif self._taught_a1 is not None:
+            est = self._estimate_well_position_um(well_name)
+        if est is None:
+            QMessageBox.warning(self, "No Position Data",
+                                "Run Auto-Calibrate first, or select a plate format.")
             return
-        est = self._estimate_well_position_um(well_name)
         if est is None:
             return
         # Estimate Z from plane if available
@@ -1360,6 +2943,13 @@ class CalibrationPage(QWidget):
                 pass
         self._safe_navigate_to(est[0], est[1], target_z)
         logger.info(f"Navigated to well {well_name}")
+
+    def _goto_calibration_well(self, idx: int):
+        """Fast-travel to one of the 3 calibration wells."""
+        cal_names = getattr(self, '_cal_well_names', [])
+        if idx >= len(cal_names):
+            return
+        self._navigate_to_well(cal_names[idx])
 
     def _on_plate_changed(self, idx):
         """v7.2.7-hotfix: plate_changed — guards all widget refs."""
@@ -1381,12 +2971,26 @@ class CalibrationPage(QWidget):
         self._rotation = 0.0
 
         self._taught_corner = None
+        self._predicted_positions = None  # v7.3.1: clear predictions on plate change
+        self._calibrated_positions = None
+        self._three_well_calibration = None
         if hasattr(self, '_taught_third'): self._taught_third = None
         for attr in ['lbl_a1','lbl_corner','lbl_third']:
             if hasattr(self, attr): getattr(self, attr).setText("—")
         if hasattr(self, 'lbl_alignment'): self.lbl_alignment.setText("")
+        # Reset fast-travel buttons
+        if hasattr(self, '_cal_travel_frame'):
+            self._cal_travel_frame.setVisible(False)
+            for btn in self._cal_travel_btns:
+                btn.setText("—")
+                btn.setEnabled(False)
         if hasattr(self, '_cal_plate_view') and self._cal_plate_view:
+            self._cal_plate_view._predicted_positions = None
             self._cal_plate_view.set_plate(self._plate)
+
+        # Update well depth spinbox from plate definition
+        if hasattr(self, '_well_depth_spin') and self._plate is not None:
+            self._well_depth_spin.setValue(self._plate.well_depth_mm)
 
 
     def _record_a1(self):
@@ -1420,7 +3024,8 @@ class CalibrationPage(QWidget):
             self._taught_a1_z = zp[0] - self.controller.zero_position.get("Z", 0)
 
         logger.info(f"Taught A1: {self._taught_a1}")
-
+        # v7.3.1: Compute geometry-predicted positions for all wells
+        self._compute_predicted_positions()
 
     def _goto_a1(self):
 
@@ -1560,45 +3165,59 @@ class CalibrationPage(QWidget):
 
     def _goto_well(self):
         """v7.2.7: goto_well µm — navigate to computed well position.
+        v7.3.1: Prefers calibrated positions, lowers needle to focus Z.
 
-        Uses plate geometry (mm) + taught A1 (µm) + scale/rotation
-        to compute the absolute stage position for any well.
+        Navigates XY to the well, then lowers the needle to the
+        Z-plane-predicted bottom (focus position) so the user can
+        verify the needle is at the correct well center and depth.
         """
         well = self.val_well_combo.currentText()
-        if not well or not self._plate or not self._taught_a1:
+        if not well or not self._plate:
             return
 
-        try:
-            pos = self._plate.get_well_position(well)
-        except KeyError:
+        # v7.3.1: Use calibrated > predicted > estimated positions
+        target_x_um = target_y_um = None
+        if self._calibrated_positions and well in self._calibrated_positions:
+            target_x_um, target_y_um = self._calibrated_positions[well]
+        elif self._predicted_positions and well in self._predicted_positions:
+            target_x_um, target_y_um = self._predicted_positions[well]
+        elif self._taught_a1 is not None:
+            try:
+                pos = self._plate.get_well_position(well)
+            except KeyError:
+                return
+            if pos is None:
+                return
+            a1_expected = self._plate.get_well_position("A1")
+            if a1_expected is None:
+                return
+            dx_mm = pos[0] - a1_expected[0]
+            dy_mm = pos[1] - a1_expected[1]
+            rad = math.radians(self._rotation)
+            rx = dx_mm * math.cos(rad) - dy_mm * math.sin(rad)
+            ry = dx_mm * math.sin(rad) + dy_mm * math.cos(rad)
+            target_x_um = self._taught_a1[0] + rx * self._scale * 1000.0
+            target_y_um = self._taught_a1[1] + ry * self._scale * 1000.0
+        if target_x_um is None:
             return
-        if pos is None:
-            return
 
-        a1_expected = self._plate.get_well_position("A1")
-        if a1_expected is None:
-            return
+        # Compute target Z: Z-plane predicted bottom, or recorded teach point
+        target_z = None
+        z_source = ""
+        if self._z_plane_result:
+            try:
+                rel_x, rel_y = self._plate.get_well_position(well)
+                target_z = self._z_plane_result.z_at(rel_x, rel_y)
+                z_source = "Z-plane"
+            except Exception:
+                pass
+        if target_z is None and well in self._z_teach_points:
+            target_z = self._z_teach_points[well]
+            z_source = "recorded"
 
-        # Vector from A1 to target well in plate mm
-        dx_mm = pos[0] - a1_expected[0]
-        dy_mm = pos[1] - a1_expected[1]
-
-        # Apply rotation
-        rad = math.radians(self._rotation)
-        rx = dx_mm * math.cos(rad) - dy_mm * math.sin(rad)
-        ry = dx_mm * math.sin(rad) + dy_mm * math.cos(rad)
-
-        # Apply scale, convert to µm, add A1 absolute position
-        target_x_um = self._taught_a1[0] + rx * self._scale * 1000.0
-        target_y_um = self._taught_a1[1] + ry * self._scale * 1000.0
-
-        # Safe travel if safe_z is available
+        # Navigate XY at safe Z, then lower to target Z (focus position)
         if hasattr(self, '_safe_z') and self._safe_z is not None:
-            if hasattr(self, '_safe_navigate_to'):
-                self._safe_navigate_to(target_x_um, target_y_um)
-            else:
-                self.controller.move_xy_absolute(
-                    target_x_um, target_y_um, from_zero_ref=False)
+            self._safe_navigate_to(target_x_um, target_y_um, target_z)
         else:
             self.controller.move_xy_absolute(
                 target_x_um, target_y_um, from_zero_ref=False)
@@ -1606,9 +3225,12 @@ class CalibrationPage(QWidget):
         # Display
         rel_x = target_x_um - self.controller.zero_position["x"]
         rel_y = target_y_um - self.controller.zero_position["y"]
+        z_str = ""
+        if target_z is not None:
+            z_str = f"  Z={target_z:.3f}mm ({z_source})"
         if hasattr(self, 'lbl_val_result'):
             self.lbl_val_result.setText(
-                f"Moving to {well} \u2192 ({rel_x:,.1f}, {rel_y:,.1f}) \u00b5m")
+                f"Moving to {well} \u2192 ({rel_x:,.1f}, {rel_y:,.1f}) \u00b5m{z_str}")
 
 
     def _save_calibration(self):
@@ -1633,6 +3255,17 @@ class CalibrationPage(QWidget):
             "third_well": getattr(self, '_third_well', None),
             "corner_well": getattr(self, '_corner_well', "H12"),
         }
+        # v7.3.1: Save 3-well affine calibration
+        three_well_cal = getattr(self, '_three_well_calibration', None)
+        if three_well_cal is not None and not three_well_cal.is_identity:
+            cal_data["mosaic_affine"] = {
+                "rotation_deg": three_well_cal.rotation_deg,
+                "scale": three_well_cal.scale,
+                "translation_um": list(three_well_cal.translation_um),
+                "center_um": list(three_well_cal.center_um),
+                "num_points": three_well_cal.num_points,
+                "residual_um": three_well_cal.residual_um,
+            }
         # Save Z plane coefficients if fitted
         zp = getattr(self, '_z_plane_result', None)
         if zp is not None:
@@ -1670,6 +3303,9 @@ class CalibrationPage(QWidget):
                 # v7.2.7-hotfix: plate view on load
                 if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
                     self._cal_plate_view.set_plate(self._plate)
+                # Update well depth spinbox from plate definition
+                if hasattr(self, '_well_depth_spin'):
+                    self._well_depth_spin.setValue(self._plate.well_depth_mm)
         if cal.get("taught_a1"):
             self._taught_a1 = tuple(cal["taught_a1"])
             # Display zero-ref position directly (positions are µm)
@@ -1750,7 +3386,50 @@ class CalibrationPage(QWidget):
                 self.ctx_lbl_cal_status.setText("\u2705 Loaded from settings")
                 self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['green']};")
 
+        # v7.3.1: Recompute predicted positions from loaded A1 + plate
+        self._compute_predicted_positions()
+
+        # v7.3.1: Restore mosaic affine calibration and recompute calibrated positions
+        affine_data = cal.get("mosaic_affine")
+        if affine_data and self._predicted_positions:
+            try:
+                from SupportClasses.MosaicBuilder import AffineCalibration
+                mcal = AffineCalibration(
+                    rotation_deg=affine_data["rotation_deg"],
+                    scale=affine_data["scale"],
+                    translation_um=tuple(affine_data["translation_um"]),
+                    center_um=tuple(affine_data["center_um"]),
+                    num_points=affine_data.get("num_points", 0),
+                    residual_um=affine_data.get("residual_um", 0.0),
+                )
+                self._three_well_calibration = mcal
+                self._calibrated_positions = mcal.correct_positions(self._predicted_positions)
+                if hasattr(self, '_cal_plate_view') and self._cal_plate_view is not None:
+                    self._cal_plate_view.set_calibrated_positions(self._calibrated_positions)
+                if hasattr(self, '_lbl_scan_progress'):
+                    self._lbl_scan_progress.setText(
+                        f"\u2705 Loaded: {len(self._calibrated_positions)} calibrated wells")
+                    self._lbl_scan_progress.setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 9pt;")
+                logger.info(f"3-well affine restored: {mcal.rotation_deg:.3f}\u00b0, "
+                            f"scale={mcal.scale:.5f}")
+                # Restore fast-travel buttons
+                cal_names = self._get_calibration_wells()
+                if hasattr(self, '_cal_travel_frame') and cal_names:
+                    self._cal_well_names = cal_names
+                    for i, btn in enumerate(self._cal_travel_btns):
+                        if i < len(cal_names):
+                            btn.setText(cal_names[i])
+                            btn.setEnabled(True)
+                        else:
+                            btn.setText("—")
+                            btn.setEnabled(False)
+                    self._cal_travel_frame.setVisible(True)
+            except (ImportError, KeyError) as e:
+                logger.debug(f"Could not restore mosaic affine: {e}")
+
         logger.info("Calibration loaded from settings (v7.2.7)")
+        self._emit_calibration_data_changed()
 
     # ════════════════════════════════════════════════════════════════
     #  v7.3.0: WELL AUTO-DETECTION

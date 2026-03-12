@@ -32,7 +32,7 @@ The application is written in Python with PySide6 for the GUI, using RS-232 seri
 | Theme | Catppuccin Mocha dark theme (QSS) |
 | Serial Communication | pyserial (RS-232) |
 | Numerical Computation | NumPy, SciPy |
-| Computer Vision | OpenCV (optional, for camera calibration) |
+| Computer Vision | OpenCV (well/needle detection, focus scoring, calibration) |
 | Input Devices | pygame (Xbox controller via multiprocessing) |
 | Configuration | JSON (hardware, controllers, prints, settings) |
 | Testing | unittest + physics-based simulators |
@@ -93,7 +93,10 @@ MEBP/
 │   ├── GeometryEngine.py               # Parametric object generation + fill patterns
 │   ├── ImagePathPlanner.py              # Image-stack-to-toolpath raster generator  ← v7.2.9
 │   ├── VelocityExecutor.py              # Velocity-based motion execution
-│   └── auto_layout.py                   # Ring/grid/hex layout generators
+│   ├── auto_layout.py                   # Ring/grid/hex layout generators
+│   ├── VisionDetector.py                # Well/needle detection, focus scoring  ← v7.3.0
+│   ├── SimulatedCamera.py               # Synthetic microscope with DOF model   ← v7.3.0
+│   └── MosaicBuilder.py                 # Affine calibration (Procrustes SVD)   ← v7.3.1
 │
 ├── gui/                                 # Frontend — PySide6 / Qt 6
 │   ├── __init__.py
@@ -123,7 +126,11 @@ MEBP/
 │       ├── projection_canvas.py        # L-shaped triple projection (XY/ZY/XZ)
 │       ├── syringe_display.py          # Pump volume indicator
 │       ├── xbox_mapping_editor.py      # Controller config dialog
-│       └── toupcam_backend.py          # ToupTek camera DLL wrapper
+│       ├── toupcam_backend.py          # ToupTek camera DLL wrapper
+│       ├── detection_overlay.py        # QPainter vision overlay              ← v7.3.0
+│       ├── detection_worker.py         # QThread pull-based frame consumer    ← v7.3.0
+│       ├── jog_button_array.py         # Reusable jog XY+Z widget            ← v7.3.1
+│       └── jog_well_plate.py           # Well plate navigator for Jog page   ← v7.3.1
 │
 ├── tests/                               # Test suite
 │   ├── test_v726_print_execution.py
@@ -265,7 +272,7 @@ MainWindow (app.py)
 │   ├── Page 0: HardwareSetupPage      — needle, pumps, inks, ink swap strategy
 │   ├── Page 1: DashboardPage           — connection status, position readouts
 │   ├── Page 2: JogControlPage          — manual jogging, Xbox mapping
-│   ├── Page 3: CalibrationPage         — camera, teach points, Z-plane fit
+│   ├── Page 3: CalibrationPage         — 3-well auto-cal, auto Z-bottom, validation
 │   ├── Page 4: PrintSetupPage          — 4-tab print designer  ← v7.2.9
 │   │   ├── Tab 1: WorkspaceTab         — read-only hardware summary
 │   │   ├── Tab 2: PrintObjectsTab      — CAD-like object editor
@@ -339,6 +346,38 @@ Converts image stacks into raster toolpaths for image-based printing.
 - Closest-point segment reordering between layers
 - Output: Nx7 array `[x, y, z, p1, p2, p3, t]` (mm/s units)
 - CSV export via `save_csv()`
+
+### 5.9 Vision & Calibration System (v7.3.0 / v7.3.1)
+
+```
+VisionDetector.py
+├── WellDetector (HoughCircles + contour fallback)
+│   ├── detect_well() → DetectionResult (center_x, center_y, radius, confidence)
+│   └── detect_well_with_fallback(frame, expected_diam_px, tolerance)
+├── NeedleDetector (3-strategy: HoughCircles + contour + radial profile)
+│   ├── detect_needle() → NeedleDetectionResult
+│   └── compute_focus_score() → FocusResult (score: 70% Laplacian + 30% Tenengrad)
+└── FocusTracker (temporal smoothing for focus assist display)
+
+SimulatedCamera.py
+├── Synthetic microscope renderer (well plate + needle)
+├── DOF model: opacity = exp(-0.5*(defocus/dof_hw)²)
+├── Blur model: sigma = normalized_defocus * BLUR_REFERENCE_UM / um_per_px
+├── set_focal_z(z_mm) — sets focal plane (typically top_z - well_depth)
+└── set_stage_position(x, y, z_mm) — updates camera viewpoint
+
+MosaicBuilder.py
+├── AffineCalibration (Procrustes SVD similarity transform)
+│   ├── correct_positions(predicted) → calibrated dict
+│   └── rotation_deg, scale, translation, rms_residual
+└── Frame collection + composite stitching (legacy mosaic support)
+
+Detection Pipeline (GUI)
+├── DetectionWorker (QThread, pull-based frame consumer)
+│   ├── DetectionMode: WELL_ONLY, NEEDLE_ONLY, BOTH, FOCUS_ASSIST
+│   └── Emits: detection_result, focus_updated signals
+└── DetectionOverlay (QPainter overlay with aspect-ratio-aware mapping)
+```
 
 ### 5.3 GeometryEngine.py — Parametric Object Generation
 
@@ -609,7 +648,26 @@ For 2D shapes (circle, square, triangle, ellipse):
 3. Alternate left-to-right and right-to-left (serpentine)
 4. Triangle: scan line width narrows linearly from base to apex
 
-### 9.4 Shell vs. Solid 3D Generation
+### 9.4 3-Well Auto-Calibration (v7.3.1)
+
+Determines plate position and orientation from 3 reference wells:
+1. Select calibration wells: A1, A(last_col), (last_row)(last_col) — right triangle
+2. For each well, compute approach position (center if well < 80% FOV, edge offset otherwise)
+3. Navigate to approach, capture frame, run well detection via `WellDetector`
+4. Convert pixel offset to stage coords using `pixel_offset_to_stage_um()`
+5. Fit Procrustes SVD similarity transform from (predicted, detected) pairs
+6. Apply `AffineCalibration.correct_positions()` to all predicted positions
+
+### 9.5 Auto Z-Bottom Calibration (v7.3.1)
+
+Focus-sweep algorithm to find well bottom Z:
+1. **Coarse sweep** (0.15mm steps): Lower needle from safe Z, capture focus score at each step. Baseline score captured at approach. Detect needle entry when score > 2× baseline. Hard safety floor at `top_z - well_depth_mm`
+2. **Fine sweep** (0.03mm steps): Track peak focus score. Stop immediately on 3 consecutive declining steps
+3. Repeat for 3 calibration wells, fit Z-plane: `z = ax + by + c`
+
+Focus scoring: `NeedleDetector.compute_focus_score()` — 70% Laplacian variance + 30% Tenengrad (Sobel gradient)
+
+### 9.6 Shell vs. Solid 3D Generation
 
 - **Shell**: Generate shape perimeter at each Z layer (stacked outlines)
 - **Solid**: Generate filled cross-section at each Z layer (meander fill per slice)
@@ -718,6 +776,8 @@ Auto-saved on application exit via `Settings.save()`.
 | v7.2.7 | Print speed display, execution mode selection |
 | v7.2.8 | Xbox controller polling fixes, ProScan detection, stable build |
 | v7.2.9 | Object type consolidation, filled/shell checkbox, multi-ink per pump, ink swap strategy, triangle fill, PrintExecutionConfig (replaces PlanPreferences), 5 new step types (GATHER_INK, FINAL_CLEANUP, TRAVEL_XY, MOVE_SAFE_Z, INK_SWAP), Finalize tab (Tab 4), InkSwapStrategy relocated to PrintPlanOfAction, ImagePathPlanner for image-based toolpaths |
+| v7.3.0 | Autocalibration: VisionDetector (well/needle detection, 3-strategy needle, focus scoring), SimulatedCamera (Gaussian DOF model), DetectionOverlay + DetectionWorker QThread, camera integration (BUC3D-1000C ToupTek), 59 vision/camera tests |
+| v7.3.1 | Calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (removed manual Teach A1/Corner), per-well 50% overlap scanning, jog page well plate navigator, MosaicBuilder affine engine, 110 tests total |
 
 ---
 

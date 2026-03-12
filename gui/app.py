@@ -544,6 +544,14 @@ class MainWindow(QMainWindow):
                 pg.print_file_created.connect(self._on_helper_print_created)
                 break
 
+        # v7.3.1: Wire calibration data → jog page (well positions, safe_z)
+        cal_page = pages[3]   # CalibrationPage
+        jog_page = pages[2]   # JogControlPage
+        if hasattr(cal_page, 'calibration_data_changed') and hasattr(jog_page, 'set_calibration_data'):
+            cal_page.calibration_data_changed.connect(
+                lambda: jog_page.set_calibration_data(*cal_page.get_calibration_data())
+            )
+
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
     # ════════════════════════════════════════════════════════════════
