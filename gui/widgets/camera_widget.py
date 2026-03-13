@@ -231,32 +231,33 @@ class CameraWidget(QWidget):
 
             header.addWidget(QLabel("Src:"))
             self.camera_combo = QComboBox()
-            self.camera_combo.setMaximumWidth(100)
+            self.camera_combo.setMinimumWidth(100)
+            self.camera_combo.setMaximumWidth(180)
             self._populate_cameras()
             header.addWidget(self.camera_combo)
 
-            self.btn_start = QPushButton("▶")
-            self.btn_start.setFixedWidth(32)
+            self.btn_start = QPushButton("▶ Start")
+            self.btn_start.setMinimumWidth(64)
             self.btn_start.setToolTip("Start / Stop camera")
             self.btn_start.clicked.connect(self.toggle)
             header.addWidget(self.btn_start)
 
-            self.chk_crosshair = QCheckBox("✛")
+            self.chk_crosshair = QCheckBox("✛ Crosshair")
             self.chk_crosshair.setChecked(True)
             self.chk_crosshair.setToolTip("Toggle crosshair overlay")
             self.chk_crosshair.toggled.connect(self._on_crosshair_toggle)
             header.addWidget(self.chk_crosshair)
 
-            btn_snap = QPushButton("📷")
-            btn_snap.setFixedWidth(32)
-            btn_snap.setToolTip("Save snapshot")
+            btn_snap = QPushButton("📷 Snap")
+            btn_snap.setMinimumWidth(56)
+            btn_snap.setToolTip("Save snapshot to file")
             btn_snap.clicked.connect(self.take_snapshot)
             header.addWidget(btn_snap)
 
             # v7.3.2: Per-camera settings toggle
-            self._btn_settings = QPushButton("⚙")
-            self._btn_settings.setFixedWidth(32)
-            self._btn_settings.setToolTip("Camera settings")
+            self._btn_settings = QPushButton("⚙ Settings")
+            self._btn_settings.setMinimumWidth(72)
+            self._btn_settings.setToolTip("Brightness, gamma, FPS")
             self._btn_settings.setCheckable(True)
             self._btn_settings.toggled.connect(self._toggle_settings_panel)
             header.addWidget(self._btn_settings)
@@ -433,7 +434,7 @@ class CameraWidget(QWidget):
         self._running = True
         self._timer.start(int(1000 / self._fps))
         if hasattr(self, 'btn_start'):
-            self.btn_start.setText("⏹")
+            self.btn_start.setText("⏹ Stop")
         logger.info(f"{self._camera_label}: camera {camera_index} started at {self._fps} FPS")
 
     def stop(self):
@@ -451,7 +452,7 @@ class CameraWidget(QWidget):
             self._current_frame = None
         self.video_label.setText(f"{self._camera_label} — stopped")
         if hasattr(self, 'btn_start'):
-            self.btn_start.setText("▶")
+            self.btn_start.setText("▶ Start")
         logger.info(f"{self._camera_label}: camera stopped")
 
     def _start_toupcam(self, device_id: str):

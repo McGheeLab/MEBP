@@ -52,6 +52,7 @@ class DetectionMode(Enum):
     IDLE = auto()            # Paused — no processing
     WELL_DETECT = auto()     # Detect circular well edges
     NEEDLE_DETECT = auto()   # Detect needle tip (dark circle)
+    NEEDLE_DETECT_RELAXED = auto()  # v7.3.3: Relaxed needle detection (wide tolerance)
     FOCUS_ASSIST = auto()    # Compute focus quality score
 
 
@@ -216,6 +217,8 @@ class DetectionWorker(QThread):
                     self._detect_well(frame)
                 elif self._mode == DetectionMode.NEEDLE_DETECT:
                     self._detect_needle(frame)
+                elif self._mode == DetectionMode.NEEDLE_DETECT_RELAXED:
+                    self._detect_needle_relaxed(frame)
                 elif self._mode == DetectionMode.FOCUS_ASSIST:
                     self._compute_focus(frame)
             except Exception as e:
@@ -268,6 +271,19 @@ class DetectionWorker(QThread):
             expected_od_px=self._expected_od_px,
             tolerance=self._needle_tolerance,
             min_circularity=self._needle_min_circularity,
+        )
+
+        if result is not None:
+            self.needle_detected.emit(result)
+        else:
+            self.detection_cleared.emit()
+
+    def _detect_needle_relaxed(self, frame) -> None:
+        """Run relaxed needle detection (wide tolerance) and emit result."""
+        result = NeedleDetector.detect_needle_relaxed(
+            frame,
+            expected_od_px=self._expected_od_px,  # may be 0 for unconstrained
+            min_circularity=0.4,
         )
 
         if result is not None:

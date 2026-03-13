@@ -706,6 +706,228 @@ class NeedleDetector:
             method="radial",
         )
 
+    # ── Relaxed detection + edge refinement (v7.3.3) ────────────
+
+    @staticmethod
+    def detect_needle_relaxed(
+        frame: np.ndarray,
+        expected_od_px: float = 0.0,
+        min_circularity: float = 0.4,
+        **kwargs,
+    ) -> DetectionResult | None:
+        """
+        Detect needle tip with very relaxed size constraints.
+
+        Used when the µm/px calibration may be inaccurate, so the expected
+        diameter could be far off. If expected_od_px is 0, searches for any
+        prominent dark circle in the frame.
+
+        Args:
+            frame: BGR image from camera
+            expected_od_px: Expected OD in pixels (0 = unconstrained)
+            min_circularity: Minimum circularity for contour strategy
+
+        Returns:
+            DetectionResult if a circle is found, None otherwise
+        """
+        if frame is None or frame.size == 0:
+            return None
+
+        gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if len(frame.shape) == 3 else frame.copy())
+        frame_center = (gray.shape[1] / 2.0, gray.shape[0] / 2.0)
+        h, w = gray.shape[:2]
+
+        if expected_od_px > 0:
+            # Wide tolerance: ±80%
+            expected_r = expected_od_px / 2.0
+            tolerance = 0.8
+        else:
+            # Unconstrained: search from 10px to 1/3 of min dimension
+            expected_r = min(h, w) / 6.0  # midpoint of search range
+            tolerance = 0.9  # covers 10% to 190% of midpoint
+
+        result_hough = NeedleDetector._detect_hough(
+            gray, expected_r, tolerance, frame_center)
+        result_contour = NeedleDetector._detect_contour(
+            gray, expected_r, tolerance, min_circularity, frame_center)
+        result_radial = NeedleDetector._detect_radial(
+            gray, expected_r, tolerance, frame_center)
+
+        best = None
+        for r in (result_hough, result_contour, result_radial):
+            if r is not None and (best is None or r.confidence > best.confidence):
+                best = r
+        return best
+
+    @staticmethod
+    def refine_to_edge(
+        frame: np.ndarray,
+        initial_center: tuple[float, float],
+        initial_radius: float,
+        n_angles: int = 72,
+        search_range: float = 0.5,
+    ) -> DetectionResult | None:
+        """
+        Refine a detected circle to snap to the actual needle edge.
+
+        Samples radial intensity profiles from the initial center and finds
+        the strongest dark→bright gradient near the initial radius. Fits a
+        circle through those edge points using the Kasa algebraic method.
+
+        Args:
+            frame: BGR image from camera
+            initial_center: (cx, cy) initial circle center in pixels
+            initial_radius: Initial radius in pixels
+            n_angles: Number of radial directions to sample
+            search_range: Fraction of radius to search (±50% default)
+
+        Returns:
+            Refined DetectionResult, or None if refinement fails
+        """
+        if frame is None or frame.size == 0:
+            return None
+        if initial_radius < 3:
+            return None
+
+        gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if len(frame.shape) == 3 else frame.copy())
+        h, w = gray.shape[:2]
+        cx, cy = initial_center
+
+        r_min = max(3, int(initial_radius * (1.0 - search_range)))
+        r_max = min(int(initial_radius * (1.0 + search_range)),
+                    int(min(cx, cy, w - cx, h - cy) - 1))
+        if r_max <= r_min:
+            return None
+
+        edge_points = []
+        gradient_strengths = []
+
+        for i in range(n_angles):
+            angle = 2.0 * math.pi * i / n_angles
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+
+            # Build radial intensity profile from r_min to r_max
+            profile = []
+            for r in range(r_min, r_max + 1):
+                px = int(cx + r * cos_a)
+                py = int(cy + r * sin_a)
+                if 0 <= px < w and 0 <= py < h:
+                    profile.append(float(gray[py, px]))
+                else:
+                    break
+
+            if len(profile) < 5:
+                continue
+
+            profile_arr = np.array(profile)
+            # Smooth to suppress noise
+            if len(profile_arr) > 5:
+                kernel = np.ones(5) / 5.0
+                profile_arr = np.convolve(profile_arr, kernel, mode='same')
+
+            # Find strongest positive gradient (dark → bright = needle edge)
+            gradient = np.diff(profile_arr)
+            if len(gradient) < 2:
+                continue
+
+            peak_idx = int(np.argmax(gradient))
+            peak_val = gradient[peak_idx]
+
+            if peak_val > 1.5:  # Meaningful transition
+                edge_r = r_min + peak_idx
+                edge_x = cx + edge_r * cos_a
+                edge_y = cy + edge_r * sin_a
+                edge_points.append((edge_x, edge_y))
+                gradient_strengths.append(peak_val)
+
+        if len(edge_points) < 12:
+            return None
+
+        points = np.array(edge_points)
+
+        # Filter outliers: remove points > 2σ from median radius
+        radii = np.sqrt((points[:, 0] - cx) ** 2 + (points[:, 1] - cy) ** 2)
+        median_r = np.median(radii)
+        std_r = np.std(radii)
+        if std_r > 0:
+            mask = np.abs(radii - median_r) < 2.0 * std_r
+            points = points[mask]
+
+        if len(points) < 12:
+            return None
+
+        # Fit circle through edge points
+        fit = NeedleDetector._fit_circle_kasa(points)
+        if fit is None:
+            return None
+
+        fit_cx, fit_cy, fit_r = fit
+
+        # Validate: refined center shouldn't drift too far from initial
+        center_drift = math.sqrt((fit_cx - cx) ** 2 + (fit_cy - cy) ** 2)
+        if center_drift > initial_radius * 0.5:
+            # Fallback: use initial center with median radius
+            fit_cx, fit_cy = cx, cy
+            fit_r = float(np.median(
+                np.sqrt((points[:, 0] - cx) ** 2 + (points[:, 1] - cy) ** 2)))
+
+        # Confidence from edge consistency and angular coverage
+        refined_radii = np.sqrt(
+            (points[:, 0] - fit_cx) ** 2 + (points[:, 1] - fit_cy) ** 2)
+        consistency = max(0.0, 1.0 - float(np.std(refined_radii)) /
+                         (fit_r * 0.15)) if fit_r > 0 else 0.0
+        coverage = min(len(points) / n_angles, 1.0)
+        confidence = min(0.5 * consistency + 0.5 * coverage, 1.0)
+
+        return DetectionResult(
+            center_px=(float(fit_cx), float(fit_cy)),
+            radius_px=float(fit_r),
+            confidence=confidence,
+            method="edge_refine",
+        )
+
+    @staticmethod
+    def _fit_circle_kasa(points: np.ndarray) -> tuple[float, float, float] | None:
+        """
+        Fit a circle to 2D points using the Kasa algebraic method.
+
+        Solves the over-determined system: x² + y² = A·x + B·y + C
+        Then: cx = A/2, cy = B/2, r = sqrt(C + cx² + cy²)
+
+        Args:
+            points: Nx2 array of (x, y) coordinates
+
+        Returns:
+            (cx, cy, radius) or None if fit fails
+        """
+        if points is None or len(points) < 3:
+            return None
+
+        x = points[:, 0]
+        y = points[:, 1]
+        rhs = x ** 2 + y ** 2
+
+        # Build matrix [x, y, 1]
+        A = np.column_stack([x, y, np.ones(len(x))])
+
+        # Solve least-squares: A @ [a, b, c] = rhs
+        try:
+            result, residuals, rank, sv = np.linalg.lstsq(A, rhs, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+
+        a, b, c = result
+        cx = a / 2.0
+        cy = b / 2.0
+        r_sq = c + cx ** 2 + cy ** 2
+
+        if r_sq <= 0:
+            return None
+
+        return (float(cx), float(cy), float(math.sqrt(r_sq)))
+
     @staticmethod
     def compute_focus_score(
         frame: np.ndarray,
@@ -871,3 +1093,62 @@ class FocusTracker:
         """Reset session state for a new focus assist session."""
         self._session_max = 0.0
         self._score_history.clear()
+
+
+# ---------------------------------------------------------------------------
+# Pixel Displacement Measurement (v7.3.3 — camera µm/px calibration)
+# ---------------------------------------------------------------------------
+
+def measure_pixel_displacement(
+    frame_before: np.ndarray,
+    frame_after: np.ndarray,
+) -> tuple[float, float, float]:
+    """
+    Measure sub-pixel displacement between two frames using phase correlation.
+
+    Used for camera µm/px calibration: capture before/after a known stage move,
+    then compute µm/px = move_distance / pixel_displacement.
+
+    Args:
+        frame_before: BGR image captured before stage move
+        frame_after: BGR image captured after stage move
+
+    Returns:
+        (dx_pixels, dy_pixels, confidence) where confidence is 0.0–1.0
+        from the phase correlation response. dx/dy follow image convention
+        (positive dx = rightward, positive dy = downward).
+
+    Raises:
+        ValueError: If frames have different shapes or are empty.
+    """
+    if frame_before is None or frame_after is None:
+        raise ValueError("Both frames must be non-None")
+    if frame_before.shape[:2] != frame_after.shape[:2]:
+        raise ValueError(
+            f"Frame shapes differ: {frame_before.shape[:2]} vs {frame_after.shape[:2]}")
+    if frame_before.size == 0:
+        raise ValueError("Frames are empty")
+
+    # Convert to grayscale float64 (required by cv2.phaseCorrelate)
+    if len(frame_before.shape) == 3:
+        gray_before = cv2.cvtColor(frame_before, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_before = frame_before.copy()
+    if len(frame_after.shape) == 3:
+        gray_after = cv2.cvtColor(frame_after, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_after = frame_after.copy()
+
+    a = gray_before.astype(np.float64)
+    b = gray_after.astype(np.float64)
+
+    # Hanning window suppresses edge artifacts in FFT-based correlation
+    h, w = a.shape
+    hann = cv2.createHanningWindow((w, h), cv2.CV_64F)
+
+    (dx, dy), response = cv2.phaseCorrelate(a, b, hann)
+
+    # response is the peak value of the normalized cross-power spectrum (0–1)
+    confidence = float(max(0.0, min(response, 1.0)))
+
+    return (float(dx), float(dy), confidence)

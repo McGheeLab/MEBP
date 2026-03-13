@@ -511,8 +511,11 @@ class HardwareSetupPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        _bg = COLORS['base']
+        scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
 
         scroll_content = QWidget()
+        scroll_content.setStyleSheet(f"background-color: {_bg};")
         self._content_layout = QVBoxLayout(scroll_content)
         self._content_layout.setSpacing(12)
         self._content_layout.setContentsMargins(12, 12, 12, 12)
@@ -524,11 +527,13 @@ class HardwareSetupPage(QWidget):
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("My Experiment Setup")
+        self.name_edit.setMinimumWidth(350)
         self.name_edit.textChanged.connect(self._on_config_changed)
         name_lay.addRow("Name:", self.name_edit)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes...")
+        self.notes_edit.setMinimumWidth(350)
         self.notes_edit.textChanged.connect(self._on_config_changed)
         name_lay.addRow("Notes:", self.notes_edit)
 
@@ -769,6 +774,87 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(cam_group)
 
+        # ── Section 8b: Live Camera Sources (v7.3.3) ─────────────
+        live_cam_group = QGroupBox("Live Camera Sources")
+        live_cam_group.setStyleSheet(self._group_style())
+        live_cam_lay = QVBoxLayout(live_cam_group)
+
+        # Detect row
+        detect_row = QHBoxLayout()
+        self._btn_detect_live_cams = QPushButton("Detect Cameras")
+        self._btn_detect_live_cams.setMinimumWidth(130)
+        self._btn_detect_live_cams.setToolTip(
+            "Scan for available cameras (OpenCV, ToupCam, Simulated)")
+        self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
+        detect_row.addWidget(self._btn_detect_live_cams)
+        self._lbl_live_cam_count = QLabel("0 found")
+        self._lbl_live_cam_count.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
+        detect_row.addWidget(self._lbl_live_cam_count)
+        detect_row.addStretch()
+        live_cam_lay.addLayout(detect_row)
+
+        # Per-camera rows (created dynamically, up to max_cameras from manager)
+        self._live_cam_rows_container = QVBoxLayout()
+        self._live_cam_source_combos: list[QComboBox] = []
+        self._live_cam_umpx_spins: list[QDoubleSpinBox] = []
+        self._live_cam_mag_combos: list[QComboBox] = []
+
+        max_cams = 3  # will be updated from camera_manager if set
+        for i in range(max_cams):
+            row = QFrame()
+            row.setStyleSheet(
+                f"QFrame {{ border: 1px solid {COLORS.get('surface1', '#45475a')}; "
+                f"border-radius: 4px; padding: 2px; }}")
+            rl = QGridLayout(row)
+            rl.setContentsMargins(6, 4, 6, 4)
+            rl.setSpacing(4)
+
+            rl.addWidget(QLabel(f"<b>Cam {i+1}</b>"), 0, 0)
+            src = QComboBox()
+            src.addItem("— None —", None)
+            src.setMinimumWidth(120)
+            rl.addWidget(src, 0, 1, 1, 2)
+            self._live_cam_source_combos.append(src)
+
+            rl.addWidget(QLabel("µm/px:"), 1, 0)
+            umpx = QDoubleSpinBox()
+            umpx.setRange(0.01, 1000.0)
+            umpx.setDecimals(3)
+            umpx.setSuffix(" µm/px")
+            umpx.setValue(1.67)
+            umpx.valueChanged.connect(
+                lambda v, idx=i: self._on_live_cam_umpx_changed(idx, v))
+            rl.addWidget(umpx, 1, 1, 1, 2)
+            self._live_cam_umpx_spins.append(umpx)
+
+            rl.addWidget(QLabel("Mag:"), 2, 0)
+            mag_combo = QComboBox()
+            for m in NIKON_TI2U_OBJECTIVES:
+                mag_combo.addItem(f"{m}×", m)
+            mag_combo.currentIndexChanged.connect(
+                lambda idx_combo, cam_i=i: self._on_live_cam_mag_changed(cam_i))
+            rl.addWidget(mag_combo, 2, 1, 1, 2)
+            self._live_cam_mag_combos.append(mag_combo)
+
+            self._live_cam_rows_container.addWidget(row)
+
+        live_cam_lay.addLayout(self._live_cam_rows_container)
+
+        # Calibrate µm/px button (v7.3.3)
+        cal_row = QHBoxLayout()
+        self._btn_calibrate_umpx = QPushButton("Calibrate µm/px")
+        self._btn_calibrate_umpx.setToolTip(
+            "Measure actual µm/px by moving the stage a known distance "
+            "and correlating pixel displacement")
+        self._btn_calibrate_umpx.setMinimumWidth(140)
+        self._btn_calibrate_umpx.clicked.connect(self._on_calibrate_umpx)
+        cal_row.addWidget(self._btn_calibrate_umpx)
+        cal_row.addStretch()
+        live_cam_lay.addLayout(cal_row)
+
+        self._content_layout.addWidget(live_cam_group)
+
         # ── Section 9: Setup Status ───────────────────────────────
         status_group = QGroupBox("Setup Status")
         status_group.setStyleSheet(self._group_style())
@@ -907,6 +993,107 @@ class HardwareSetupPage(QWidget):
         self.cam_override_spin.setEnabled(checked)
         self._update_camera_info_labels()
         self._on_config_changed()
+
+    # ── Live Camera Sources (v7.3.3) ─────────────────────────────
+
+    def set_camera_manager(self, manager):
+        """v7.3.3: Receive shared CameraManager for live camera detection."""
+        self._camera_manager = manager
+
+    def set_controller(self, controller):
+        """v7.3.3: Receive StageController for pixel calibration."""
+        self._controller = controller
+
+    def set_calibrated_um_per_px(self, cam_idx: int, value: float):
+        """v7.3.3: Set calibrated µm/px from external source (e.g., needle-based)."""
+        if 0 <= cam_idx < len(self._live_cam_umpx_spins):
+            self._live_cam_umpx_spins[cam_idx].setValue(value)
+            logger.info(f"Camera {cam_idx + 1} µm/px set to {value:.4f} "
+                        f"from external calibration")
+
+    def _on_calibrate_umpx(self):
+        """Launch pixel calibration dialog for the first running camera."""
+        from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
+        from PySide6.QtWidgets import QDialog, QMessageBox
+
+        mgr = getattr(self, '_camera_manager', None)
+        ctrl = getattr(self, '_controller', None)
+
+        if mgr is None:
+            QMessageBox.warning(self, "Cannot Calibrate",
+                                "Camera manager not available.")
+            return
+        if ctrl is None:
+            QMessageBox.warning(self, "Cannot Calibrate",
+                                "Stage controller not connected.")
+            return
+
+        # Find first running camera
+        cam_idx = None
+        for i, cam in enumerate(mgr.cameras):
+            if getattr(cam, '_running', False):
+                cam_idx = i
+                break
+        if cam_idx is None:
+            QMessageBox.warning(self, "Cannot Calibrate",
+                                "Start a camera first, then retry.")
+            return
+
+        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            result = dlg.result_um_per_px
+            if result is not None and cam_idx < len(self._live_cam_umpx_spins):
+                self._live_cam_umpx_spins[cam_idx].setValue(result)
+                logger.info(f"Pixel calibration applied: camera {cam_idx + 1} "
+                            f"= {result:.4f} µm/px")
+
+    def _on_detect_live_cameras(self):
+        """Detect live cameras via CameraManager and populate source combos."""
+        mgr = getattr(self, '_camera_manager', None)
+        if mgr is None:
+            logger.warning("No CameraManager set on HardwareSetupPage")
+            return
+
+        self._btn_detect_live_cams.setEnabled(False)
+        self._btn_detect_live_cams.setText("Detecting...")
+
+        mgr.detect_cameras()
+        sources = mgr.available_sources
+        num = len(sources)
+
+        self._lbl_live_cam_count.setText(f"{num} found")
+
+        # Populate each per-camera source combo
+        for combo in self._live_cam_source_combos:
+            prev = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— None —", None)
+            for text, data in sources:
+                combo.addItem(text, data)
+            if prev:
+                idx = combo.findData(prev)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+        self._btn_detect_live_cams.setText("Detect Cameras")
+        self._btn_detect_live_cams.setEnabled(True)
+        logger.info(f"Hardware Setup: detected {num} live camera sources")
+
+    def _on_live_cam_umpx_changed(self, cam_idx: int, value: float):
+        """Update CameraManager's µm/px for a specific camera."""
+        mgr = getattr(self, '_camera_manager', None)
+        if mgr:
+            mgr.set_um_per_px(cam_idx, value)
+
+    def _on_live_cam_mag_changed(self, cam_idx: int):
+        """Update CameraManager's magnification for a specific camera."""
+        mgr = getattr(self, '_camera_manager', None)
+        combo = self._live_cam_mag_combos[cam_idx]
+        mag = combo.currentData() or 2.0
+        if mgr:
+            mgr.set_magnification(cam_idx, mag)
 
     def _update_camera_info_labels(self):
         """Update computed pixel scale and FOV labels."""

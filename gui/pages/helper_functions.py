@@ -223,6 +223,7 @@ class HelperFunctionsPage(QWidget):
     # ══════════════════════════════════════════════════════════════
 
     def _build_ui(self):
+        _bg = COLORS.get('base', '#1e1e2e')
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -234,7 +235,9 @@ class HelperFunctionsPage(QWidget):
         left_scroll.setWidgetResizable(True)
         left_scroll.setMinimumWidth(360)
         left_scroll.setMaximumWidth(460)
+        left_scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
         left_widget = QWidget()
+        left_widget.setStyleSheet(f"background-color: {_bg};")
         left_layout = QVBoxLayout(left_widget)
         left_layout.setSpacing(8)
         left_layout.setContentsMargins(12, 12, 12, 12)
@@ -268,6 +271,7 @@ class HelperFunctionsPage(QWidget):
 
         # ── Right Panel ───────────────────────────────────────────
         right_widget = QWidget()
+        right_widget.setStyleSheet(f"background-color: {_bg};")
         right_layout = QVBoxLayout(right_widget)
         right_layout.setSpacing(8)
         right_layout.setContentsMargins(8, 8, 8, 8)

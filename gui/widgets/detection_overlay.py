@@ -90,6 +90,10 @@ class DetectionOverlay(QWidget):
         self._focus_bar_width = 16
         self._focus_bar_margin = 8
 
+        # v7.3.3: Adjustable needle circle (interactive accept/reject)
+        self._adjustable_center: tuple[float, float] | None = None
+        self._adjustable_radius: float = 0.0
+
         # Font
         self._font = QFont("monospace", 9)
         self._font_small = QFont("monospace", 8)
@@ -133,6 +137,35 @@ class DetectionOverlay(QWidget):
         self._focus_result = None
         self._offset_text = ""
         self._info_text = ""
+        self._adjustable_center = None
+        self._adjustable_radius = 0.0
+        self.update()
+
+    # ── v7.3.3: Adjustable needle circle ──────────────────────
+
+    def set_adjustable_needle(self, center_px: tuple[float, float],
+                              radius_px: float) -> None:
+        """Show an adjustable needle circle (blue) for user verification."""
+        self._adjustable_center = center_px
+        self._adjustable_radius = max(3.0, radius_px)
+        self.update()
+
+    def adjust_radius(self, delta_px: float) -> None:
+        """Increase/decrease the adjustable circle radius by delta pixels."""
+        if self._adjustable_center is not None:
+            self._adjustable_radius = max(3.0, self._adjustable_radius + delta_px)
+            self.update()
+
+    def get_adjustable_circle(self) -> tuple[tuple[float, float], float] | None:
+        """Return (center_px, radius_px) of adjustable circle, or None."""
+        if self._adjustable_center is not None:
+            return (self._adjustable_center, self._adjustable_radius)
+        return None
+
+    def clear_adjustable(self) -> None:
+        """Remove the adjustable circle without clearing other overlays."""
+        self._adjustable_center = None
+        self._adjustable_radius = 0.0
         self.update()
 
     # ── Coordinate Mapping ─────────────────────────────────────
@@ -194,6 +227,9 @@ class DetectionOverlay(QWidget):
 
         if self._focus_result is not None:
             self._paint_focus_bar(painter, self._focus_result)
+
+        if self._adjustable_center is not None:
+            self._paint_adjustable_needle(painter)
 
         if self._info_text:
             self._paint_info_text(painter, self._info_text)
@@ -282,6 +318,44 @@ class DetectionOverlay(QWidget):
         painter.drawText(
             int(cx + r + 10), int(cy),
             f"Needle {confidence * 100:.0f}%",
+        )
+
+    # ── Adjustable Needle Circle (v7.3.3) ───────────────────────
+
+    def _paint_adjustable_needle(self, painter: QPainter) -> None:
+        """Draw the user-adjustable needle circle in blue for verification."""
+        if self._adjustable_center is None:
+            return
+
+        cx = self._map_x(self._adjustable_center[0])
+        cy = self._map_y(self._adjustable_center[1])
+        r = self._map_radius(self._adjustable_radius)
+
+        # Main circle — blue (#89b4fa)
+        color = QColor(OverlayColors.CROSSHAIR)  # Blue
+        color.setAlpha(220)
+        pen = QPen(color, 2.5)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        # Crosshair at center
+        self._draw_crosshair(painter, cx, cy, r * 0.3, color)
+
+        # Dashed range ring (shows adjustment bounds)
+        dash_color = QColor(OverlayColors.CROSSHAIR)
+        dash_color.setAlpha(80)
+        dash_pen = QPen(dash_color, 1, Qt.PenStyle.DashLine)
+        painter.setPen(dash_pen)
+        painter.drawEllipse(QPointF(cx, cy), r + 8, r + 8)
+
+        # Label
+        painter.setFont(self._font_small)
+        painter.setPen(QPen(OverlayColors.TEXT, 1))
+        od_px = self._adjustable_radius * 2
+        painter.drawText(
+            int(cx + r + 10), int(cy),
+            f"OD: {od_px:.0f} px  [+/- to adjust]",
         )
 
     # ── Focus Quality Bar ──────────────────────────────────────

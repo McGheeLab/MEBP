@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.2** — Microscope-Enabled Bioprinting Platform
+**V7.3.3** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.2`
+Branch: `Version-7.3.3`
 
 ---
 
@@ -28,7 +28,7 @@ MEBP is a Python/PySide6 desktop application for controlling laboratory bioprint
 |------|---------|
 | `main.py` | Entry point — CLI args, mode selection |
 | `SupportClasses/` | Backend modules — zero GUI dependencies |
-| `gui/` | PySide6 frontend — pages, widgets, styles |
+| `gui/` | PySide6 frontend — pages, widgets, dialogs, styles |
 | `config/` | Hardware configs, controller protocols, print files |
 | `coding plans/` | Architecture docs, update plans, readmes |
 | `tests/` | Test suite |
@@ -77,6 +77,7 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v732_to_v733_UPDATE.md` | v7.3.3 Mode-based navigation + Pick & Place: ModePage base class with right-side icon nav, Printing mode (wraps print sub-pages), Pick & Place mode (config-first workflow, live camera target overlays, auto-queue building, execution monitoring), CameraManager shared feeds, camera µm/px empirical calibration (stage-move phase correlation), relaxed needle detection with interactive edge refinement + accept/reject UI, needle-based µm/px bridge |
 | `MEBP_v731_to_v732_UPDATE.md` | v7.3.2 QoL upgrades: camera config persistence, jog page startup well plate, axis flip checkboxes, custom step sizes + absolute goto, calibration page restructure (steps to main, configurable cameras, deprecate needle zero), print monitor camera overlay |
 | `MEBP_v730_to_v731_UPDATE.md` | v7.3.1 calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (no manual teach steps), per-well 50% overlap scanning, jog page well plate navigator, 110 tests |
 | `MEBP_v730_AUTOCALIBRATION_UPDATE.md` | v7.3.0 autocalibration: well/needle detection, focus assist, simulated camera, detection overlay, parallel vision (7 phases complete) |

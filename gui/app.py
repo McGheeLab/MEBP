@@ -1,6 +1,14 @@
 """
 app.py — MEBP Main Window with PyDracula-style sidebar navigation.
 
+v7.3.3 changes:
+    - Mode-based navigation: Printing + Pick & Place are mode pages
+      with right-side sub-page icon columns
+    - Printing mode wraps: Print Setup, Monitor, Results, Helpers
+    - Pick & Place mode: Target Selection, Operation Queue, Execution
+    - Page indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibration,
+      4=Printing(mode), 5=PickPlace(mode), 6=Settings
+
 v7.2.3 changes:
     - Hardware Setup page added as page 0 (🔧)
     - Pages 1-5 gated until hardware config is valid
@@ -43,13 +51,12 @@ from gui.pages.hardware_setup import HardwareSetupPage
 from gui.pages.dashboard import DashboardPage
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
-from gui.pages.print_setup import PrintSetupPage
+from gui.pages.printing_mode import PrintingModePage      # v7.3.3
+from gui.pages.pick_place_mode import PickPlaceModePage   # v7.3.3
 from gui.pages.settings_page import SettingsPage
-from gui.pages.print_monitor import PrintMonitorPage
-from gui.pages.helper_functions import HelperFunctionsPage
-from gui.pages.print_results import PrintResultsPage  # v7.2.6
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
+from gui.widgets.camera_manager import CameraManager       # v7.3.3
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +102,7 @@ class MainWindow(QMainWindow):
         self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.2.3")
+        self.setWindowTitle("MEBP Bioprinter — v7.3.3")
         self.setMinimumSize(1100, 700)
         self.resize(1400, 850)
 
@@ -111,7 +118,7 @@ class MainWindow(QMainWindow):
         # Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized (v7.2.3)")
+        logger.info("MainWindow initialized (v7.3.3)")
 
     # ════════════════════════════════════════════════════════════════
     #  MICROSTEPS-PER-MICRON PROPERTY
@@ -227,15 +234,14 @@ class MainWindow(QMainWindow):
         top_menu_layout.setContentsMargins(0, 4, 0, 4)
 
         # Page buttons — Hardware Setup is first
+        # v7.3.3: Printing + Pick & Place are mode pages (sub-pages inside)
         menu_items = [
-            ("btn_hardware",  "🔧", "Hardware Setup"),
-            ("btn_dashboard", "📊", "Dashboard"),
-            ("btn_jog",       "🕹️", "Jog Control"),
-            ("btn_calibrate", "📐", "Calibration"),
-            ("btn_print",     "🖨️", "Print Setup"),
-            ("btn_monitor",   "📈", "Print Monitor"),            ("btn_results",  "📋", "Print Results"),  # v7.2.6
-
-            ("btn_helpers",  "🧰", "Helper Functions"),
+            ("btn_hardware",   "🔧", "Hardware Setup"),
+            ("btn_dashboard",  "📊", "Dashboard"),
+            ("btn_jog",        "🕹️", "Jog Control"),
+            ("btn_calibrate",  "📐", "Calibration"),
+            ("btn_printing",   "🖨️", "Printing"),            # mode page
+            ("btn_pickplace",  "🔬", "Pick & Place"),         # mode page
         ]
         for obj_name, icon_text, label_text in menu_items:
             btn = self._make_menu_button(obj_name, icon_text, label_text)
@@ -464,9 +470,14 @@ class MainWindow(QMainWindow):
         """
         Instantiate all page widgets.
 
-        Page 0: Hardware Setup (always enabled)
-        Pages 1-5: Gated until hardware config is valid
-        Page 6: Settings (always enabled)
+        v7.3.3 page indices:
+            0: Hardware Setup (always enabled)
+            1: Dashboard
+            2: Jog Control
+            3: Calibration
+            4: Printing (mode — sub-pages: Setup, Monitor, Results, Helpers)
+            5: Pick & Place (mode — sub-pages: Targets, Queue, Execution)
+            6: Settings (always enabled)
 
         v7.2.3: Also wires the job pipeline (Setup → Monitor)
         and execution control signals (Monitor → PrintManager).
@@ -474,21 +485,30 @@ class MainWindow(QMainWindow):
         # Restore hardware config from settings
         self._hardware_config = self._restore_hardware_config()
 
+        # v7.3.3: Shared camera manager for all pages
+        self._camera_manager = CameraManager(max_cameras=3)
+
+        # v7.3.3: Mode pages wrap sub-pages internally
+        self._printing_mode = PrintingModePage(self.controller, self.settings)
+        self._pick_place_mode = PickPlaceModePage(
+            self.controller, self.settings,
+            camera_manager=self._camera_manager)
+
         pages = [
             HardwareSetupPage(),                                          # 0
             DashboardPage(self.controller, self.print_history, settings=self.settings),  # 1
             JogControlPage(self.controller),                              # 2
-            CalibrationPage(self.controller, settings=self.settings),     # 3
-            PrintSetupPage(self.controller),                              # 4
-            PrintMonitorPage(self.controller, self.settings),             # 5
-            PrintResultsPage(self.controller, self.settings),             # 6  v7.2.6
-            HelperFunctionsPage(),                                        # 7  v7.2.7
-
-            SettingsPage(self.controller, self.settings),                 # 8  ← was 7  v7.2.6
+            CalibrationPage(self.controller, settings=self.settings,
+                           camera_manager=self._camera_manager),          # 3
+            self._printing_mode,                                          # 4  v7.3.3 mode
+            self._pick_place_mode,                                        # 5  v7.3.3 mode
+            SettingsPage(self.controller, self.settings),                 # 6
         ]
 
         # Wire Hardware Setup signals
         hw_page = pages[0]
+        hw_page.set_camera_manager(self._camera_manager)  # v7.3.3
+        hw_page.set_controller(self.controller)  # v7.3.3: for pixel calibration
         hw_page.config_changed.connect(self._on_hardware_config_changed)
         hw_page.config_validated.connect(self._on_hardware_validated)
 
@@ -496,42 +516,55 @@ class MainWindow(QMainWindow):
         if self._hardware_config:
             hw_page.set_config(self._hardware_config)
 
-        # Wire recorder
+        # Wire recorder to printing mode sub-pages
         if self.recorder:
-            monitor = pages[5]
+            monitor = self._printing_mode.monitor_page
             if hasattr(monitor, 'set_recorder'):
                 monitor.set_recorder(self.recorder)
 
-            # v7.2.6: wire recorder to results
-            results_page = pages[6]
+            results_page = self._printing_mode.results_page
             if hasattr(results_page, 'set_recorder'):
                 results_page.set_recorder(self.recorder)
-            setup = pages[4]
+
+            setup = self._printing_mode.setup_page
             if hasattr(setup, 'print_manager') and setup.print_manager:
                 setup.print_manager.recorder = self.recorder
 
         # Register all pages with the stacked widgets
+        from gui.pages.mode_page import ModePage
         for page in pages:
             self._page_widgets.append(page)
             self._page_stack.addWidget(page)
 
             # Create context panel
-            ctx = None
-            if hasattr(page, 'get_context_widget'):
-                ctx = page.get_context_widget()
-            if ctx is not None:
-                scroll = QScrollArea()
-                scroll.setObjectName("contextScrollArea")
-                scroll.setWidgetResizable(True)
-                scroll.setWidget(ctx)
-                self._context_stack.addWidget(scroll)
-            else:
+            # v7.3.3: Mode pages manage context dynamically via
+            # _update_mode_context — use placeholder to avoid double-wrap
+            if isinstance(page, ModePage):
                 placeholder = QWidget()
                 self._context_stack.addWidget(placeholder)
+            else:
+                ctx = None
+                if hasattr(page, 'get_context_widget'):
+                    ctx = page.get_context_widget()
+                if ctx is not None:
+                    scroll = QScrollArea()
+                    scroll.setObjectName("contextScrollArea")
+                    scroll.setWidgetResizable(True)
+                    scroll.setWidget(ctx)
+                    self._context_stack.addWidget(scroll)
+                else:
+                    placeholder = QWidget()
+                    self._context_stack.addWidget(placeholder)
 
             # Propagate microsteps_per_micron
             if hasattr(page, 'set_microsteps_per_micron'):
                 page.set_microsteps_per_micron(self._microsteps_per_micron)
+
+        # v7.3.3: Wire mode page sub-page changes → context panel updates
+        for i, page in enumerate(self._page_widgets):
+            if isinstance(page, ModePage):
+                page.sub_page_changed.connect(
+                    lambda idx, page_idx=i: self._on_mode_sub_page_changed(page_idx))
 
         # Propagate existing hardware config to pages
         if self._hardware_config:
@@ -546,12 +579,10 @@ class MainWindow(QMainWindow):
         self._wire_job_pipeline()
         self._wire_print_manager_to_monitor()
 
-
         # v7.2.7: Wire helper functions signal
-        for pg in self._page_widgets:
-            if hasattr(pg, 'print_file_created'):
-                pg.print_file_created.connect(self._on_helper_print_created)
-                break
+        helpers = self._printing_mode.helpers_page
+        if hasattr(helpers, 'print_file_created'):
+            helpers.print_file_created.connect(self._on_helper_print_created)
 
         # v7.3.1: Wire calibration data → jog page (well positions, safe_z)
         cal_page = pages[3]   # CalibrationPage
@@ -565,6 +596,12 @@ class MainWindow(QMainWindow):
         if hasattr(jog_page, 'load_startup_plate'):
             jog_page.load_startup_plate(self.settings)
 
+        # v7.3.3: CameraManager is shared — no need to manually wire cameras
+
+        # v7.3.3: Wire calibration → hardware page µm/px updates
+        if hasattr(cal_page, 'um_per_px_calibrated'):
+            cal_page.um_per_px_calibrated.connect(hw_page.set_calibrated_um_per_px)
+
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
     # ════════════════════════════════════════════════════════════════
@@ -574,11 +611,13 @@ class MainWindow(QMainWindow):
         Wire the print job flow from PrintSetupPage through to
         PrintMonitorPage, and connect execution control signals.
 
+        v7.3.3: Access sub-pages through PrintingModePage.
+
         Signal flow:
             PrintSetup.job_ready(PrintJob)
                 → app._send_job_to_monitor(job)
                 → Monitor.receive_job(job)
-                → auto-switch to page 5
+                → auto-switch to Printing mode, Monitor sub-page
 
             PrintSetup.navigate_to_page(int)
                 → app._switch_page(index)
@@ -591,8 +630,8 @@ class MainWindow(QMainWindow):
             Monitor.resume_requested() → PrintManager.resume()
             Monitor.abort_requested()  → PrintManager.abort()
         """
-        setup_page = self._page_widgets[4]   # PrintSetupPage
-        monitor_page = self._page_widgets[5]  # PrintMonitorPage
+        setup_page = self._printing_mode.setup_page
+        monitor_page = self._printing_mode.monitor_page
 
         # Job pipeline: PrintSetup → app → PrintMonitor
         if hasattr(setup_page, 'job_ready'):
@@ -619,9 +658,11 @@ class MainWindow(QMainWindow):
         Direct widget calls from threads cause SIGSEGV on macOS/PySide6.
         We bounce through a QObject signal bridge so all GUI updates
         execute on the main thread.
+
+        v7.3.3: Access sub-pages through PrintingModePage.
         """
-        setup_page = self._page_widgets[4]
-        monitor_page = self._page_widgets[5]
+        setup_page = self._printing_mode.setup_page
+        monitor_page = self._printing_mode.monitor_page
 
         if not hasattr(setup_page, "print_manager"):
             logger.warning("_wire_print_manager_to_monitor: no print_manager")
@@ -699,9 +740,11 @@ class MainWindow(QMainWindow):
 
         Initializes plate overview, trajectory view, and syringe displays
         before the job is received by the monitor page.
+
+        v7.3.3: Access via PrintingModePage + auto-switch to monitor sub-page.
         """
-        monitor_page = self._page_widgets[5]
-        setup_page = self._page_widgets[4]
+        monitor_page = self._printing_mode.monitor_page
+        setup_page = self._printing_mode.setup_page
 
         # ── Initialize monitor visualization ──────────────────────
         try:
@@ -712,8 +755,9 @@ class MainWindow(QMainWindow):
         if hasattr(monitor_page, 'receive_job'):
             monitor_page.receive_job(job)
 
-        # Auto-switch to Print Monitor page
-        self._switch_page(5)
+        # v7.3.3: Switch to Printing mode page + Monitor sub-page
+        self._printing_mode.switch_to_monitor()
+        self._switch_page(4)  # Printing mode is page 4
     def _setup_monitor_visualization(self, setup_page, monitor_page, job):
         """v7.2.6: Feed plate/trajectory/syringe data to monitor widgets."""
         try:
@@ -817,7 +861,7 @@ class MainWindow(QMainWindow):
 
         Default is "position" — simplest and most reliable.
         """
-        setup_page = self._page_widgets[4]
+        setup_page = self._printing_mode.setup_page
         if not hasattr(setup_page, "print_manager"):
             logger.error("No print_manager on setup page")
             return
@@ -985,37 +1029,39 @@ class MainWindow(QMainWindow):
 
     def _on_monitor_pause(self):
         """Monitor requested pause — forward to PrintManager."""
-        setup_page = self._page_widgets[4]
+        setup_page = self._printing_mode.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.pause()
 
     def _on_monitor_resume(self):
         """Monitor requested resume — forward to PrintManager."""
-        setup_page = self._page_widgets[4]
+        setup_page = self._printing_mode.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.resume()
 
     def _on_monitor_abort(self):
         """Monitor requested abort — forward to PrintManager."""
-        setup_page = self._page_widgets[4]
+        setup_page = self._printing_mode.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.abort()
 
     def _on_print_completed_v726(self):
-        """v7.2.6: On print completion, notify results page."""
-        if len(self._page_widgets) > 6:
-            results_page = self._page_widgets[6]
-            if hasattr(results_page, 'load_latest_recording'):
-                try:
-                    results_page.load_latest_recording()
-                    logger.info(
-                        "v7.2.6: Loaded latest recording into results"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "v7.2.6: Failed to load recording: "
-                        + str(e)
-                    )
+        """v7.2.6: On print completion, notify results page.
+
+        v7.3.3: Access results page through PrintingModePage.
+        """
+        results_page = self._printing_mode.results_page
+        if hasattr(results_page, 'load_latest_recording'):
+            try:
+                results_page.load_latest_recording()
+                logger.info(
+                    "v7.2.6: Loaded latest recording into results"
+                )
+            except Exception as e:
+                logger.warning(
+                    "v7.2.6: Failed to load recording: "
+                    + str(e)
+                )
 
 
     # ════════════════════════════════════════════════════════════════
@@ -1023,15 +1069,19 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def _on_helper_print_created(self, filename: str):
-        """Helper Functions page created a print file — notify Print Objects tab."""
-        setup_page = self._page_widgets[4]
+        """Helper Functions page created a print file — notify Print Objects tab.
+
+        v7.3.3: Access setup through PrintingModePage, switch to setup sub-page.
+        """
+        setup_page = self._printing_mode.setup_page
         if hasattr(setup_page, 'tab_objects'):
             tab = setup_page.tab_objects
             if hasattr(tab, '_load_file_by_name'):
                 tab._load_file_by_name(filename)
             elif hasattr(tab, '_emit_prints_changed'):
                 tab._emit_prints_changed()
-        # Auto-switch to Print Setup page
+        # Switch to Printing mode, Setup sub-page
+        self._printing_mode.switch_to_setup()
         self._navigate_to(4)
 
 
@@ -1085,15 +1135,17 @@ class MainWindow(QMainWindow):
                 logger.debug(f"HW config → Page {i}: {page_name} (no set_hardware_config)")
 
     def _update_page_gating(self, hardware_valid: bool):
-        """Enable/disable navigation buttons for pages requiring hardware setup."""
-        # Page indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibrate,
-        #               4=Print, 5=Monitor, 6=Results, 7=Helpers, 8=Settings  # v7.2.6
+        """Enable/disable navigation buttons for pages requiring hardware setup.
+
+        v7.3.3 indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibrate,
+                        4=Printing(mode), 5=PickPlace(mode), 6=Settings
+        """
         for i, btn in enumerate(self._menu_buttons):
             if i == 0:
                 # Hardware Setup — always enabled
                 btn.setEnabled(True)
                 btn.setToolTip("Hardware Setup")
-            elif i == 8 or btn.objectName() == "btn_settings":  # v7.2.7: settings at 8
+            elif btn.objectName() == "btn_settings":
                 # Settings — always enabled
                 btn.setEnabled(True)
                 btn.setToolTip("Settings")
@@ -1134,48 +1186,56 @@ class MainWindow(QMainWindow):
         if not btn:
             return
 
+        # v7.3.3: Updated indices for mode-based navigation
         btn_map = {
             "btn_hardware":  0,
             "btn_dashboard": 1,
             "btn_jog":       2,
             "btn_calibrate": 3,
-            "btn_print":     4,
-            "btn_monitor":   5,
-            "btn_results":   6,   # v7.2.6
-            "btn_helpers":   7,   # v7.2.7
-            "btn_settings":  8,   # v7.2.7
+            "btn_printing":  4,   # v7.3.3 mode page
+            "btn_pickplace": 5,   # v7.3.3 mode page
+            "btn_settings":  6,
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
 
     def _navigate_to(self, index: int):
-        """Switch to the page at the given index."""
+        """Switch to the page at the given index.
+
+        v7.3.3: Mode pages (Printing, Pick & Place) delegate title/context
+        to their active sub-page.
+        """
         if index < 0 or index >= len(self._page_widgets):
             return
 
         self._current_page_index = index
         self._page_stack.setCurrentIndex(index)
-        self._context_stack.setCurrentIndex(index)
 
         page = self._page_widgets[index]
+
+        # Title: mode pages delegate to active sub-page
         title = "MEBP Bioprinter"
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
             titles = ["Hardware Setup", "Dashboard", "Jog Control",
-                      "Calibration", "Print Setup", "Print Monitor",
-                      "Print Results", "Helper Functions",
+                      "Calibration", "Printing", "Pick & Place",
                       "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
-        context_titles = ["Hardware", "Dashboard", "Jog Settings",
-                          "Calibration", "Print Settings", "Recordings",
-                          "Results", "Helpers",
-                          "Settings"]
-        self._context_title.setText(
-            context_titles[index] if index < len(context_titles) else "Settings"
-        )
+        # Context panel: mode pages may need dynamic context from sub-page
+        from gui.pages.mode_page import ModePage
+        if isinstance(page, ModePage):
+            self._update_mode_context(index, page)
+        else:
+            self._context_stack.setCurrentIndex(index)
+            context_titles = ["Hardware", "Dashboard", "Jog Settings",
+                              "Calibration", "Printing", "Pick & Place",
+                              "Settings"]
+            self._context_title.setText(
+                context_titles[index] if index < len(context_titles) else "Settings"
+            )
 
         # Highlight the active menu button
         for i, btn in enumerate(self._menu_buttons):
@@ -1193,6 +1253,39 @@ class MainWindow(QMainWindow):
         else:
             if self.ui_extraLeftBox.isVisible():
                 UIFunctions.toggleLeftBox(self)
+
+    def _on_mode_sub_page_changed(self, mode_page_index: int):
+        """v7.3.3: When a mode page switches sub-pages, update context panel."""
+        if self._current_page_index == mode_page_index:
+            page = self._page_widgets[mode_page_index]
+            if hasattr(page, 'get_page_title'):
+                self._page_title.setText(page.get_page_title())
+            self._update_mode_context(mode_page_index, page)
+
+    def _update_mode_context(self, page_index: int, mode_page):
+        """v7.3.3: Update context panel for a mode page's active sub-page."""
+        ctx = mode_page.get_context_widget()
+        if ctx is not None:
+            # Check if this widget is already inside a QScrollArea in the stack
+            for i in range(self._context_stack.count()):
+                wrapper = self._context_stack.widget(i)
+                if isinstance(wrapper, QScrollArea) and wrapper.widget() is ctx:
+                    self._context_stack.setCurrentIndex(i)
+                    break
+            else:
+                # First time seeing this context widget — wrap and add
+                scroll = QScrollArea()
+                scroll.setObjectName("contextScrollArea")
+                scroll.setWidgetResizable(True)
+                scroll.setWidget(ctx)
+                new_idx = self._context_stack.addWidget(scroll)
+                self._context_stack.setCurrentIndex(new_idx)
+
+            sub_title = mode_page.get_sub_page_title() if hasattr(
+                mode_page, 'get_sub_page_title') else "Settings"
+            self._context_title.setText(sub_title)
+        else:
+            self._context_stack.setCurrentIndex(page_index)
 
     def _switch_page(self, index: int):
         """
@@ -1383,6 +1476,10 @@ class MainWindow(QMainWindow):
         for page in self._page_widgets:
             if hasattr(page, '_shutdown_detection_worker'):
                 page._shutdown_detection_worker()
+
+        # v7.3.3: Stop all cameras
+        if hasattr(self, '_camera_manager'):
+            self._camera_manager.shutdown()
 
         self.controller.shutdown()
         event.accept()

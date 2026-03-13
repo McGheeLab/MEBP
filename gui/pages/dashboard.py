@@ -154,15 +154,18 @@ class DashboardPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
+        _bg = COLORS['base']
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
 
         container = QWidget()
+        container.setStyleSheet(f"background-color: {_bg};")
         layout = QVBoxLayout(container)
         layout.setSpacing(8)
         layout.setContentsMargins(16, 12, 16, 12)

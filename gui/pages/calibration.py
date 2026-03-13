@@ -539,11 +539,15 @@ class CalibrationPage(QWidget):
 
     # v7.3.1: Emitted when calibration data changes (safe_z, positions, plate)
     calibration_data_changed = Signal()
+    # v7.3.3: Emitted when µm/px is calibrated via needle detection (cam_idx, value)
+    um_per_px_calibrated = Signal(int, float)
 
-    def __init__(self, controller: StageController, settings=None, parent=None):
+    def __init__(self, controller: StageController, settings=None,
+                 camera_manager=None, parent=None):
         super().__init__(parent)
         self.controller = controller
         self.settings = settings
+        self._camera_manager = camera_manager  # v7.3.3: shared CameraManager
 
         # Calibration state
         self._plate: WellPlate | None = None
@@ -555,8 +559,12 @@ class CalibrationPage(QWidget):
         self._rotation = 0.0
         self._scale = 1.0
 
-        # Camera widgets (up to MAX_CAMERAS)
-        self._cameras: list[CameraWidget] = []
+        # Camera widgets — from CameraManager if available, else empty
+        if camera_manager is not None:
+            self._cameras = camera_manager.cameras
+            camera_manager.cameras_detected.connect(self._refresh_source_combos)
+        else:
+            self._cameras: list = []
         self._context_widget = None
 
         # v7.1.1: Microsteps-to-microns conversion factor
@@ -588,6 +596,8 @@ class CalibrationPage(QWidget):
         # v7.3.0 Phase 6: Needle detection + focus assist state
         self._last_needle_result = None     # Latest needle DetectionResult
         self._needle_detecting: bool = False
+        self._needle_relaxed_mode: bool = False   # v7.3.3: relaxed detect active
+        self._needle_interactive: bool = False     # v7.3.3: in accept/reject mode
         self._focus_assisting: bool = False
         self._best_focus_z: float | None = None       # Best-focus Z (mm, zero-ref)
         self._best_focus_score: float = 0.0            # Score at best Z
@@ -697,7 +707,7 @@ class CalibrationPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def get_context_widget(self) -> QWidget:
-        """Build the context panel: wizard steps + plate view + plate config."""
+        """Build the context panel: camera controls + plate config + wizard."""
         if self._context_widget is not None:
             return self._context_widget
 
@@ -705,6 +715,154 @@ class CalibrationPage(QWidget):
         layout = QVBoxLayout(ctx)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(5)
+
+        # ── Camera Controls (collapsible) ────────────────────────
+        cam_header_row = QHBoxLayout()
+        self._ctx_cam_toggle = QPushButton("▾ Camera Controls")
+        self._ctx_cam_toggle.setObjectName("flatBtn")
+        self._ctx_cam_toggle.setStyleSheet(
+            f"text-align: left; font-weight: 600; color: {COLORS['blue']}; "
+            f"padding: 6px 0px 2px 0px; border: none; background: transparent;"
+            f"border-bottom: 1px solid {COLORS['surface1']}; margin-bottom: 4px;")
+        self._ctx_cam_toggle.setCursor(Qt.PointingHandCursor)
+        self._ctx_cam_toggle.clicked.connect(self._toggle_cam_section)
+        cam_header_row.addWidget(self._ctx_cam_toggle, stretch=1)
+        layout.addLayout(cam_header_row)
+
+        self._ctx_cam_container = QWidget()
+        cam_lay = QVBoxLayout(self._ctx_cam_container)
+        cam_lay.setContentsMargins(0, 0, 0, 4)
+        cam_lay.setSpacing(4)
+
+        # Row 1: Refresh sources (detection is done in Hardware Setup)
+        refresh_row = QHBoxLayout()
+        self._btn_refresh_sources = QPushButton("Refresh Sources")
+        self._btn_refresh_sources.setMinimumWidth(110)
+        self._btn_refresh_sources.setToolTip(
+            "Refresh camera sources (detect in Hardware Setup)")
+        self._btn_refresh_sources.clicked.connect(self._refresh_source_combos)
+        refresh_row.addWidget(self._btn_refresh_sources)
+        self._lbl_cam_count = QLabel("0 sources")
+        self._lbl_cam_count.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        refresh_row.addWidget(self._lbl_cam_count)
+        refresh_row.addStretch()
+        cam_lay.addLayout(refresh_row)
+
+        # Row 2: Tile arrangement
+        opts_row = QHBoxLayout()
+        opts_row.addWidget(QLabel("Layout:"))
+        self._cam_tile_combo = QComboBox()
+        self._cam_tile_combo.addItem("Single", "single")
+        self._cam_tile_combo.addItem("Horizontal", "horizontal")
+        self._cam_tile_combo.addItem("Vertical", "vertical")
+        self._cam_tile_combo.addItem("Square (2x2)", "square")
+        self._cam_tile_combo.setMaximumWidth(110)
+        self._cam_tile_combo.currentIndexChanged.connect(self._on_tile_changed)
+        opts_row.addWidget(self._cam_tile_combo)
+        opts_row.addStretch()
+        cam_lay.addLayout(opts_row)
+
+        # Per-camera control rows
+        self._ctx_cam_rows: list[QWidget] = []
+        self._ctx_cam_src_combos: list[QComboBox] = []
+        self._ctx_cam_start_btns: list[QPushButton] = []
+        self._ctx_cam_settings_panels: list[QFrame] = []
+        self._ctx_cam_checkboxes: list[QCheckBox] = []
+        for i in range(MAX_CAMERAS):
+            row_frame = QFrame()
+            row_frame.setStyleSheet(
+                f"QFrame {{ border: 1px solid {COLORS['surface1']}; "
+                f"border-radius: 4px; padding: 2px; }}")
+            row_lay = QVBoxLayout(row_frame)
+            row_lay.setContentsMargins(4, 3, 4, 3)
+            row_lay.setSpacing(2)
+
+            # Top: checkbox + label + source combo
+            top_row = QHBoxLayout()
+            chk = QCheckBox()
+            chk.setChecked(i == 0)  # First camera checked by default
+            chk.setToolTip(f"Show Camera {i+1} in display")
+            chk.toggled.connect(lambda checked, idx=i: self._on_cam_checkbox_toggled(idx, checked))
+            top_row.addWidget(chk)
+            self._ctx_cam_checkboxes.append(chk)
+            top_row.addWidget(QLabel(f"<b>Cam {i+1}</b>"))
+            src_combo = QComboBox()
+            src_combo.setMinimumWidth(80)
+            src_combo.setToolTip(f"Camera {i+1} source")
+            top_row.addWidget(src_combo, stretch=1)
+            self._ctx_cam_src_combos.append(src_combo)
+            row_lay.addLayout(top_row)
+
+            # Bottom: buttons
+            btn_row = QHBoxLayout()
+            btn_row.setSpacing(3)
+            btn_start = QPushButton("Start")
+            btn_start.setMinimumWidth(50)
+            btn_start.clicked.connect(lambda checked=False, idx=i: self._ctx_toggle_cam(idx))
+            btn_row.addWidget(btn_start)
+            self._ctx_cam_start_btns.append(btn_start)
+
+            btn_snap = QPushButton("Snap")
+            btn_snap.setMinimumWidth(42)
+            btn_snap.clicked.connect(lambda checked=False, idx=i: self._ctx_snap_cam(idx))
+            btn_row.addWidget(btn_snap)
+
+            btn_xhair = QCheckBox("Crosshair")
+            btn_xhair.setChecked(True)
+            btn_xhair.toggled.connect(lambda checked, idx=i: self._ctx_crosshair_cam(idx, checked))
+            btn_row.addWidget(btn_xhair)
+
+            btn_settings = QPushButton("Settings")
+            btn_settings.setCheckable(True)
+            btn_settings.setMinimumWidth(56)
+            btn_settings.toggled.connect(lambda checked, idx=i: self._ctx_toggle_settings(idx, checked))
+            btn_row.addWidget(btn_settings)
+            row_lay.addLayout(btn_row)
+
+            # Collapsible settings panel (brightness, gamma, FPS)
+            settings_panel = QFrame()
+            settings_panel.setVisible(False)
+            sp_lay = QVBoxLayout(settings_panel)
+            sp_lay.setContentsMargins(4, 2, 4, 2)
+            sp_lay.setSpacing(2)
+
+            from PySide6.QtWidgets import QSlider, QSpinBox
+            bri_row = QHBoxLayout()
+            bri_row.addWidget(QLabel("Bri:"))
+            sld_bri = QSlider(Qt.Horizontal)
+            sld_bri.setRange(-100, 100)
+            sld_bri.setValue(0)
+            sld_bri.valueChanged.connect(lambda v, idx=i: self._ctx_set_brightness(idx, v))
+            bri_row.addWidget(sld_bri)
+            sp_lay.addLayout(bri_row)
+
+            gam_row = QHBoxLayout()
+            gam_row.addWidget(QLabel("Gam:"))
+            sld_gam = QSlider(Qt.Horizontal)
+            sld_gam.setRange(10, 300)
+            sld_gam.setValue(100)
+            sld_gam.valueChanged.connect(lambda v, idx=i: self._ctx_set_gamma(idx, v))
+            gam_row.addWidget(sld_gam)
+            sp_lay.addLayout(gam_row)
+
+            fps_row = QHBoxLayout()
+            fps_row.addWidget(QLabel("FPS:"))
+            spn_fps = QSpinBox()
+            spn_fps.setRange(1, 60)
+            spn_fps.setValue(15)
+            spn_fps.valueChanged.connect(lambda v, idx=i: self._ctx_set_fps(idx, v))
+            fps_row.addWidget(spn_fps)
+            fps_row.addStretch()
+            sp_lay.addLayout(fps_row)
+
+            row_lay.addWidget(settings_panel)
+            self._ctx_cam_settings_panels.append(settings_panel)
+
+            cam_lay.addWidget(row_frame)
+            self._ctx_cam_rows.append(row_frame)
+
+        layout.addWidget(self._ctx_cam_container)
 
         # ── Plate Configuration ──────────────────────────────────
         plate_label = QLabel("Plate Configuration")
@@ -736,26 +894,245 @@ class CalibrationPage(QWidget):
 
         return ctx
 
-    def _on_cam_count_changed(self, index: int):
-        """v7.3.2: Show/hide cameras based on selected count."""
-        count = self._cam_count_combo.currentData() or 1
-        for i, cam in enumerate(self._cameras):
-            cam.setVisible(i < count)
+    def _get_max_slots(self) -> int:
+        """Return max display slots for the current tile mode."""
+        mode = getattr(self, '_cam_tile_mode', 'single')
+        if mode == "square":
+            return 4
+        elif mode in ("horizontal", "vertical"):
+            return MAX_CAMERAS
+        else:  # single
+            return 1
+
+    def _get_checked_camera_indices(self) -> list[int]:
+        """Return indices of cameras whose checkboxes are checked."""
+        checkboxes = getattr(self, '_ctx_cam_checkboxes', [])
+        return [i for i, chk in enumerate(checkboxes) if chk.isChecked()]
+
+    def _on_cam_checkbox_toggled(self, idx: int, checked: bool):
+        """v7.3.3: Toggle camera visibility via checkbox, enforce slot limit."""
+        checkboxes = getattr(self, '_ctx_cam_checkboxes', [])
+        if not checkboxes:
+            return
+        max_slots = self._get_max_slots()
+        checked_indices = self._get_checked_camera_indices()
+
+        if checked and len(checked_indices) > max_slots:
+            # Too many checked — uncheck oldest checked cameras (not the one just toggled)
+            others = [i for i in checked_indices if i != idx]
+            while len(others) + 1 > max_slots and others:
+                old = others.pop(0)
+                checkboxes[old].blockSignals(True)
+                checkboxes[old].setChecked(False)
+                checkboxes[old].blockSignals(False)
+
+        self._relayout_cameras()
+
+    def _on_tile_changed(self, index: int):
+        """v7.3.3: Change camera tile arrangement."""
+        tile = getattr(self, '_cam_tile_combo', None)
+        if tile is None:
+            return
+        self._cam_tile_mode = tile.currentData() or "single"
+        max_slots = self._get_max_slots()
+        # If too many cameras checked for new mode, uncheck extras
+        checkboxes = getattr(self, '_ctx_cam_checkboxes', [])
+        checked_indices = self._get_checked_camera_indices()
+        while len(checked_indices) > max_slots:
+            # Uncheck the last checked camera
+            last = checked_indices.pop()
+            checkboxes[last].blockSignals(True)
+            checkboxes[last].setChecked(False)
+            checkboxes[last].blockSignals(False)
+        self._relayout_cameras()
+
+    def _relayout_cameras(self):
+        """v7.3.3: Re-arrange camera widgets in the grid layout using checkboxes."""
+        grid = getattr(self, '_cam_grid_layout', None)
+        if grid is None:
+            return
+        mode = getattr(self, '_cam_tile_mode', 'single')
+        checked = self._get_checked_camera_indices()
+
+        # Remove all widgets from grid without setParent(None)
+        # (setParent(None) kills the display of running cameras)
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.hide()
+                grid.removeWidget(w)
+
+        # Determine grid positions based on tile mode
+        if mode == "square":
+            slots = 4
+            positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        elif mode == "vertical":
+            slots = max(len(checked), 1)
+            positions = [(i, 0) for i in range(slots)]
+        elif mode == "horizontal":
+            slots = max(len(checked), 1)
+            positions = [(0, i) for i in range(slots)]
+        else:  # single
+            slots = 1
+            positions = [(0, 0)]
+
+        # Place checked camera feed views into slots; fill remaining with placeholders
+        feed_views = getattr(self, '_cam_feed_views', [])
+        for slot_idx, (r, c) in enumerate(positions):
+            if slot_idx < len(checked):
+                cam_idx = checked[slot_idx]
+                if cam_idx < len(feed_views):
+                    fv = feed_views[cam_idx]
+                    fv.setVisible(True)
+                    grid.addWidget(fv, r, c)
+                    continue
+            # Empty slot — show placeholder
+            placeholders = getattr(self, '_cam_placeholders', [])
+            if slot_idx < len(placeholders):
+                ph = placeholders[slot_idx]
+                ph.setVisible(True)
+                grid.addWidget(ph, r, c)
+
+        # Hide all unchecked feed views
+        for i in range(len(feed_views)):
+            if i not in checked:
+                feed_views[i].setVisible(False)
+
+        # Clear ALL old stretch factors first (max possible is 2 rows x 2 cols)
+        for r in range(max(grid.rowCount(), 2)):
+            grid.setRowStretch(r, 0)
+        for c in range(max(grid.columnCount(), 2)):
+            grid.setColumnStretch(c, 0)
+
+        # Set equal stretch only for rows/cols actually in use
+        max_r = max(r for r, c in positions) + 1 if positions else 1
+        max_c = max(c for r, c in positions) + 1 if positions else 1
+        for r in range(max_r):
+            grid.setRowStretch(r, 1)
+        for c in range(max_c):
+            grid.setColumnStretch(c, 1)
+
+    def _toggle_cam_section(self):
+        """v7.3.3: Collapse/expand camera controls section."""
+        container = getattr(self, '_ctx_cam_container', None)
+        toggle = getattr(self, '_ctx_cam_toggle', None)
+        if container is None or toggle is None:
+            return
+        visible = container.isVisible()
+        container.setVisible(not visible)
+        prefix = "▸" if visible else "▾"
+        toggle.setText(f"{prefix} Camera Controls")
+
+    def _refresh_source_combos(self):
+        """v7.3.3: Refresh source combos from CameraManager (no detection)."""
+        mgr = self._camera_manager
+        if mgr is None:
+            return
+
+        src_items = mgr.available_sources
+        num = len(src_items)
+
+        # Sync context panel source combos
+        for ctx_combo in getattr(self, '_ctx_cam_src_combos', []):
+            prev_data = ctx_combo.currentData()
+            ctx_combo.blockSignals(True)
+            ctx_combo.clear()
+            ctx_combo.addItem("— None —", None)
+            for text, data in src_items:
+                ctx_combo.addItem(text, data)
+            if prev_data:
+                idx = ctx_combo.findData(prev_data)
+                if idx >= 0:
+                    ctx_combo.setCurrentIndex(idx)
+            ctx_combo.blockSignals(False)
+
+        lbl = getattr(self, '_lbl_cam_count', None)
+        if lbl:
+            lbl.setText(f"{num} sources")
+
+    # ── Context panel camera button callbacks ─────────────────
+
+    def _ctx_toggle_cam(self, idx: int):
+        """Start/stop camera from context panel."""
+        if idx >= len(self._cameras):
+            return
+        mgr = self._camera_manager
+
+        # Set camera source from context combo before starting
+        ctx_combos = getattr(self, '_ctx_cam_src_combos', [])
+        if idx < len(ctx_combos) and mgr:
+            src_data = ctx_combos[idx].currentData()
+            if src_data:
+                mgr.set_source(idx, src_data)
+
+        if mgr:
+            mgr.toggle(idx)
+        else:
+            self._cameras[idx].toggle()
+        running = getattr(self._cameras[idx], '_running', False)
+        btn = self._ctx_cam_start_btns[idx]
+        btn.setText("Stop" if running else "Start")
+
+        # Auto-check the checkbox and relayout so camera appears in the live view
+        checkboxes = getattr(self, '_ctx_cam_checkboxes', [])
+        if running and idx < len(checkboxes) and not checkboxes[idx].isChecked():
+            checkboxes[idx].setChecked(True)  # triggers _on_cam_checkbox_toggled → _relayout
+        else:
+            # Checkbox was already checked — force relayout so the widget refreshes
+            self._relayout_cameras()
+
+    def _ctx_snap_cam(self, idx: int):
+        """Take snapshot from context panel."""
+        if idx < len(self._cameras):
+            self._cameras[idx].take_snapshot()
+
+    def _ctx_crosshair_cam(self, idx: int, checked: bool):
+        """Toggle crosshair from context panel."""
+        if idx < len(self._cameras):
+            self._cameras[idx]._show_crosshair = checked
+
+    def _ctx_toggle_settings(self, idx: int, checked: bool):
+        """Show/hide per-camera settings in context panel."""
+        panels = getattr(self, '_ctx_cam_settings_panels', [])
+        if idx < len(panels):
+            panels[idx].setVisible(checked)
+
+    def _ctx_set_brightness(self, idx: int, value: int):
+        """Set camera brightness from context panel slider."""
+        if idx < len(self._cameras):
+            self._cameras[idx].set_brightness(value)
+
+    def _ctx_set_gamma(self, idx: int, value: int):
+        """Set camera gamma from context panel slider (10-300 → 0.1-3.0)."""
+        if idx < len(self._cameras):
+            self._cameras[idx].set_gamma(value / 100.0)
+
+    def _ctx_set_fps(self, idx: int, value: int):
+        """Set camera FPS from context panel spinner."""
+        if idx < len(self._cameras):
+            cam = self._cameras[idx]
+            cam._fps = value
+            if cam._running:
+                cam._timer.setInterval(int(1000 / max(1, value)))
 
     # ════════════════════════════════════════════════════════════════
     #  MAIN CONTENT UI  (position readout + camera feeds)
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
+        _bg = COLORS['base']
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
         outer.addWidget(scroll)
 
         container = QWidget()
+        container.setStyleSheet(f"background-color: {_bg};")
         layout = QVBoxLayout(container)
         layout.setSpacing(8)
         layout.setContentsMargins(12, 8, 12, 8)
@@ -778,58 +1155,60 @@ class CalibrationPage(QWidget):
         pos_layout.addStretch()
         layout.addWidget(pos_card)
 
-        # ── Camera Feeds Grid ─────────────────────────────────────
-        # v7.3.2: Per-camera settings via CameraWidget's built-in settings panel
+        # ── Camera Feeds (grid layout, controls in context panel) ───
         cam_card = QFrame()
         cam_card.setObjectName("cardFrame")
-        cam_layout = QVBoxLayout(cam_card)
-        cam_layout.setSpacing(4)
+        cam_card_layout = QVBoxLayout(cam_card)
+        cam_card_layout.setSpacing(0)
+        cam_card_layout.setContentsMargins(4, 4, 4, 4)
 
-        cam_title_row = QHBoxLayout()
-        cam_title = QLabel("Camera Feeds")
-        cam_title.setObjectName("sectionLabel")
-        cam_title_row.addWidget(cam_title)
-        # v7.3.2: Camera count selector
-        cam_title_row.addStretch()
-        cam_title_row.addWidget(QLabel("Show:"))
-        self._cam_count_combo = QComboBox()
-        self._cam_count_combo.addItem("1 camera", 1)
-        self._cam_count_combo.addItem("2 cameras", 2)
-        self._cam_count_combo.addItem("3 cameras", 3)
-        self._cam_count_combo.setCurrentIndex(0)  # Default: 1 camera
-        self._cam_count_combo.setMaximumWidth(100)
-        self._cam_count_combo.currentIndexChanged.connect(self._on_cam_count_changed)
-        cam_title_row.addWidget(self._cam_count_combo)
-        cam_layout.addLayout(cam_title_row)
+        self._cam_grid_widget = QWidget()
+        self._cam_grid_layout = QGridLayout(self._cam_grid_widget)
+        self._cam_grid_layout.setSpacing(4)
+        self._cam_grid_layout.setContentsMargins(0, 0, 0, 0)
 
-        if CAMERA_AVAILABLE and CameraWidget is not None:
-            self._cam_grid = QHBoxLayout()
-            self._cam_grid.setSpacing(6)
+        if self._camera_manager and self._camera_manager.is_available:
+            from gui.widgets.camera_feed_view import CameraFeedView
 
+            # Create feed views — lightweight displays subscribed to CameraWidgets
+            self._cam_feed_views: list[CameraFeedView] = []
             for i in range(MAX_CAMERAS):
-                cam = CameraWidget(
-                    camera_label=f"Camera {i + 1}",
-                    compact=(MAX_CAMERAS > 1),
-                    show_controls=True,
+                fv = CameraFeedView(
+                    camera_manager=self._camera_manager,
+                    cam_idx=i,
+                    show_crosshair=True,
+                    label=f"Camera {i + 1}",
                     parent=self,
                 )
-                self._cameras.append(cam)
-                self._cam_grid.addWidget(cam, stretch=1)
+                self._cam_feed_views.append(fv)
 
-            # v7.3.2: Only show first camera by default
-            for i, cam in enumerate(self._cameras):
-                cam.setVisible(i == 0)
+            # Placeholder labels for empty slots (square mode)
+            self._cam_placeholders: list[QLabel] = []
+            for i in range(MAX_CAMERAS):
+                ph = QLabel(f"Camera {i + 1}")
+                ph.setAlignment(Qt.AlignCenter)
+                ph.setStyleSheet(
+                    f"background-color: #181825; border: 1px solid {COLORS['surface1']}; "
+                    f"color: {COLORS['text']}; font-size: 12pt; font-weight: 600;")
+                ph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                ph.setMinimumSize(200, 150)
+                self._cam_placeholders.append(ph)
 
-            cam_layout.addLayout(self._cam_grid, stretch=1)
+            # Initial layout: single camera, first checked
+            self._cam_tile_mode = "single"
+            self._relayout_cameras()
         else:
+            self._cam_feed_views = []
+            self._cam_placeholders = []
             no_cam = QLabel(
                 "Camera unavailable\n"
                 "Install: pip install opencv-python"
             )
             no_cam.setAlignment(Qt.AlignCenter)
             no_cam.setStyleSheet(f"color: {COLORS['overlay0']};")
-            cam_layout.addWidget(no_cam, stretch=1)
+            self._cam_grid_layout.addWidget(no_cam, 0, 0)
 
+        cam_card_layout.addWidget(self._cam_grid_widget, stretch=1)
         layout.addWidget(cam_card, stretch=1)
 
     # ════════════════════════════════════════════════════════════════
@@ -850,15 +1229,19 @@ class CalibrationPage(QWidget):
 
         if hasattr(self, '_btn_detect_cameras'):
             self._btn_detect_cameras.setEnabled(False)
-            self._btn_detect_cameras.setText("🔄 Detecting...")
+            self._btn_detect_cameras.setText("Detecting...")
 
         def _on_found(indices):
             from PySide6.QtCore import QTimer
             def _apply():
                 self._available_cameras = indices
                 if hasattr(self, '_btn_detect_cameras'):
-                    self._btn_detect_cameras.setText(f"🔍 {len(indices)} camera(s)")
+                    self._btn_detect_cameras.setText("Detect Cameras")
                     self._btn_detect_cameras.setEnabled(True)
+                lbl = getattr(self, '_lbl_cam_count', None)
+                if lbl:
+                    lbl.setText(f"{len(indices)} found")
+                # Checkboxes manage visibility now; no combo to refresh
                 logger.info(f"Camera detection: {indices}")
             QTimer.singleShot(0, _apply)
 
@@ -1105,6 +1488,53 @@ class CalibrationPage(QWidget):
             self._lbl_needle_status.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: 9pt;")
             layout.addWidget(self._lbl_needle_status)
+
+            # v7.3.3: Relaxed detect + accept/reject/adjust row
+            relax_row = QHBoxLayout()
+            self._btn_detect_needle_relaxed = QPushButton("Relaxed Detect")
+            self._btn_detect_needle_relaxed.setMaximumHeight(24)
+            self._btn_detect_needle_relaxed.setCheckable(True)
+            self._btn_detect_needle_relaxed.setToolTip(
+                "Detect needle with wide tolerance (when µm/px may be wrong)")
+            self._btn_detect_needle_relaxed.toggled.connect(
+                self._toggle_needle_detect_relaxed)
+            relax_row.addWidget(self._btn_detect_needle_relaxed)
+            layout.addLayout(relax_row)
+
+            # Accept/Reject/Adjust row (hidden until detection)
+            self._needle_ar_frame = QFrame()
+            ar_layout = QHBoxLayout(self._needle_ar_frame)
+            ar_layout.setContentsMargins(0, 0, 0, 0)
+            ar_layout.setSpacing(4)
+            self._btn_needle_minus = QPushButton("\u2212")  # minus sign
+            self._btn_needle_minus.setFixedWidth(28)
+            self._btn_needle_minus.setMaximumHeight(24)
+            self._btn_needle_minus.setToolTip("Shrink circle")
+            self._btn_needle_minus.clicked.connect(
+                lambda: self._adjust_needle_radius(-2))
+            ar_layout.addWidget(self._btn_needle_minus)
+            self._btn_needle_plus = QPushButton("+")
+            self._btn_needle_plus.setFixedWidth(28)
+            self._btn_needle_plus.setMaximumHeight(24)
+            self._btn_needle_plus.setToolTip("Expand circle")
+            self._btn_needle_plus.clicked.connect(
+                lambda: self._adjust_needle_radius(2))
+            ar_layout.addWidget(self._btn_needle_plus)
+            self._btn_needle_accept = QPushButton("Accept")
+            self._btn_needle_accept.setMaximumHeight(24)
+            self._btn_needle_accept.setStyleSheet(
+                f"color: {COLORS['green']}; font-weight: bold;")
+            self._btn_needle_accept.clicked.connect(self._accept_needle_detection)
+            ar_layout.addWidget(self._btn_needle_accept)
+            self._btn_needle_reject = QPushButton("Reject")
+            self._btn_needle_reject.setMaximumHeight(24)
+            self._btn_needle_reject.setStyleSheet(
+                f"color: {COLORS['red']};")
+            self._btn_needle_reject.clicked.connect(self._reject_needle_detection)
+            ar_layout.addWidget(self._btn_needle_reject)
+            self._needle_ar_frame.setVisible(False)
+            layout.addWidget(self._needle_ar_frame)
+
             self._lbl_focus_status = QLabel("")
             self._lbl_focus_status.setWordWrap(True)
             self._lbl_focus_status.setStyleSheet(
@@ -4104,12 +4534,251 @@ class CalibrationPage(QWidget):
 
         logger.info("Focus assist started")
 
+    # ── v7.3.3: Relaxed needle detection + interactive refinement ──
+
+    def _toggle_needle_detect_relaxed(self, enabled: bool) -> None:
+        """Toggle relaxed needle detection (wide tolerance)."""
+        if not enabled:
+            self._stop_detection()
+            self._needle_relaxed_mode = False
+            self._needle_interactive = False
+            ar = getattr(self, '_needle_ar_frame', None)
+            if ar is not None:
+                ar.setVisible(False)
+            return
+
+        # Uncheck strict detect if on
+        btn_strict = getattr(self, '_btn_detect_needle', None)
+        if btn_strict is not None and btn_strict.isChecked():
+            btn_strict.blockSignals(True)
+            btn_strict.setChecked(False)
+            btn_strict.blockSignals(False)
+
+        cam = self._get_primary_camera()
+        if cam is None or not cam.is_running:
+            QMessageBox.warning(self, "Cannot Detect",
+                                "Start a camera feed first.")
+            btn = getattr(self, '_btn_detect_needle_relaxed', None)
+            if btn is not None:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            return
+
+        if not self._ensure_detection_worker():
+            return
+
+        self._needle_detecting = True
+        self._needle_relaxed_mode = True
+        self._needle_interactive = False
+        self._last_needle_result = None
+
+        # Use expected OD if available, else 0 for unconstrained
+        od_px = self._get_expected_od_px() or 0.0
+
+        self._detection_worker.set_mode(
+            DetectionMode.NEEDLE_DETECT_RELAXED,
+            expected_od_px=od_px,
+        )
+
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            frame = cam.get_current_frame()
+            if frame is not None:
+                overlay.set_frame_size(frame.shape[1], frame.shape[0])
+            overlay.set_info_text("Relaxed needle detection...")
+
+        if not self._detection_worker.isRunning():
+            self._detection_worker.start()
+
+        lbl = getattr(self, '_lbl_needle_status', None)
+        if lbl is not None:
+            lbl.setText("Searching (relaxed tolerance)...")
+            lbl.setStyleSheet(f"color: {COLORS['blue']}; font-size: 9pt;")
+
+        logger.info(f"Relaxed needle detection started (expected OD: {od_px:.0f}px)")
+
+    def _enter_interactive_needle_mode(self, result) -> None:
+        """Switch from continuous detection to interactive accept/reject."""
+        self._needle_interactive = True
+
+        # Stop the detection worker (single-shot result)
+        if self._detection_worker is not None:
+            self._detection_worker.set_mode(DetectionMode.IDLE)
+
+        cam = self._get_primary_camera()
+        if cam is not None:
+            overlay = cam.detection_overlay
+            if overlay is not None:
+                # Clear auto-detected circle, show adjustable one
+                overlay.set_needle_detection(None)
+                overlay.set_adjustable_needle(
+                    result.center_px, result.radius_px)
+                overlay.set_info_text("Verify needle — Accept or Reject")
+
+        # Try to refine to edge
+        if VISION_AVAILABLE and cam is not None:
+            frame = cam.get_current_frame()
+            if frame is not None:
+                try:
+                    from SupportClasses.VisionDetector import NeedleDetector
+                    refined = NeedleDetector.refine_to_edge(
+                        frame, result.center_px, result.radius_px)
+                    if refined is not None:
+                        result = refined
+                        if cam is not None:
+                            overlay = cam.detection_overlay
+                            if overlay is not None:
+                                overlay.set_adjustable_needle(
+                                    refined.center_px, refined.radius_px)
+                        logger.info(f"Needle refined to edge: r={refined.radius_px:.1f}px")
+                except Exception as e:
+                    logger.debug(f"Edge refinement failed: {e}")
+
+        self._last_needle_result = result
+
+        # Show accept/reject buttons
+        ar = getattr(self, '_needle_ar_frame', None)
+        if ar is not None:
+            ar.setVisible(True)
+
+        # Update status
+        lbl = getattr(self, '_lbl_needle_status', None)
+        if lbl is not None:
+            od_px = result.radius_px * 2
+            lbl.setText(
+                f"Detected OD: {od_px:.0f} px  |  "
+                f"Adjust with +/\u2212, then Accept or Reject")
+            lbl.setStyleSheet(f"color: {COLORS['blue']}; font-size: 9pt;")
+
+    def _adjust_needle_radius(self, delta_px: float) -> None:
+        """Adjust the interactive needle circle radius."""
+        cam = self._get_primary_camera()
+        if cam is None:
+            return
+        overlay = cam.detection_overlay
+        if overlay is not None:
+            overlay.adjust_radius(delta_px)
+            circle = overlay.get_adjustable_circle()
+            if circle is not None:
+                center, r = circle
+                lbl = getattr(self, '_lbl_needle_status', None)
+                if lbl is not None:
+                    lbl.setText(
+                        f"OD: {r * 2:.0f} px  |  "
+                        f"Adjust with +/\u2212, then Accept or Reject")
+
+    def _accept_needle_detection(self) -> None:
+        """Accept the current needle detection result."""
+        cam = self._get_primary_camera()
+        overlay = cam.detection_overlay if cam else None
+
+        # Get final circle from overlay (may have been adjusted)
+        if overlay is not None:
+            circle = overlay.get_adjustable_circle()
+            if circle is not None:
+                center, radius = circle
+                # Update the stored result with adjusted values
+                if self._last_needle_result is not None:
+                    from SupportClasses.VisionDetector import DetectionResult
+                    self._last_needle_result = DetectionResult(
+                        center_px=center,
+                        radius_px=radius,
+                        confidence=self._last_needle_result.confidence,
+                        method=self._last_needle_result.method + "_accepted",
+                    )
+            overlay.clear_adjustable()
+            overlay.set_info_text("")
+
+        # Hide accept/reject UI
+        ar = getattr(self, '_needle_ar_frame', None)
+        if ar is not None:
+            ar.setVisible(False)
+
+        self._needle_interactive = False
+        self._needle_detecting = False
+        self._needle_relaxed_mode = False
+
+        # Uncheck the relaxed detect button
+        for attr in ('_btn_detect_needle_relaxed', '_btn_detect_needle'):
+            btn = getattr(self, attr, None)
+            if btn is not None and btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
+        # If needle gauge is known, compute implied µm/px
+        result = self._last_needle_result
+        if result is not None:
+            od_px = result.radius_px * 2
+            hw_cfg = getattr(self, '_hardware_config', None)
+            needle = hw_cfg.needle if hw_cfg else None
+            if needle is not None and needle.od_um > 0:
+                implied_umpx = needle.od_um / od_px
+                lbl = getattr(self, '_lbl_needle_status', None)
+                if lbl is not None:
+                    lbl.setText(
+                        f"Accepted — OD: {od_px:.0f} px  |  "
+                        f"Known OD: {needle.od_um:.0f} µm ({needle.gauge}G)  |  "
+                        f"Implied µm/px: {implied_umpx:.3f}")
+                    lbl.setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 9pt;")
+
+                # Emit signal to update hardware page
+                cam_idx = getattr(self, '_primary_cam_idx', 0)
+                self.um_per_px_calibrated.emit(cam_idx, implied_umpx)
+                logger.info(
+                    f"Needle-based µm/px calibration: {implied_umpx:.4f} "
+                    f"(needle {needle.gauge}G OD={needle.od_um:.0f}µm, "
+                    f"detected {od_px:.0f}px)")
+            else:
+                lbl = getattr(self, '_lbl_needle_status', None)
+                if lbl is not None:
+                    lbl.setText(f"Accepted — OD: {od_px:.0f} px")
+                    lbl.setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 9pt;")
+
+    def _reject_needle_detection(self) -> None:
+        """Reject the current detection and re-enable detection."""
+        cam = self._get_primary_camera()
+        if cam is not None:
+            overlay = cam.detection_overlay
+            if overlay is not None:
+                overlay.clear_adjustable()
+                overlay.clear()
+
+        ar = getattr(self, '_needle_ar_frame', None)
+        if ar is not None:
+            ar.setVisible(False)
+
+        self._needle_interactive = False
+        self._last_needle_result = None
+
+        lbl = getattr(self, '_lbl_needle_status', None)
+        if lbl is not None:
+            lbl.setText("Rejected — click detect to retry")
+            lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
+
+        # Stop detection, uncheck buttons
+        self._stop_detection()
+        for attr in ('_btn_detect_needle_relaxed', '_btn_detect_needle'):
+            btn = getattr(self, attr, None)
+            if btn is not None and btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+
     def _on_needle_detected(self, result) -> None:
         """Slot: DetectionWorker found a needle tip."""
         if not self._needle_detecting:
             return
 
         self._last_needle_result = result
+
+        # v7.3.3: In relaxed mode, enter interactive accept/reject
+        if self._needle_relaxed_mode and not self._needle_interactive:
+            self._enter_interactive_needle_mode(result)
+            return
 
         cam = self._get_primary_camera()
         if cam is None:
