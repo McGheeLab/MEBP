@@ -288,30 +288,7 @@
       "ink_load_volume_uL": 50.0
     },
     "camera_config": {
-      "camera_spec": {
-        "name": "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)",
-        "sensor_pixel_size_um": 1.67,
-        "max_resolution": [
-          3664,
-          2748
-        ],
-        "preview_resolutions": [
-          [
-            3664,
-            2748
-          ],
-          [
-            1832,
-            1374
-          ],
-          [
-            916,
-            686
-          ]
-        ],
-        "interface": "USB 3.0",
-        "notes": "10MP CMOS, 1/2.3 inch sensor, VID_0547 PID_1377"
-      },
+      "camera_spec": null,
       "objective_magnification": 1.0,
       "active_resolution": [
         916,

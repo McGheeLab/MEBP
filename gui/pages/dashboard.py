@@ -549,9 +549,14 @@ class DashboardPage(QWidget):
             mapping = getattr(self.controller, "_mapping_file",
                               "current_button_mapping.json")
             timeout = self.settings.get("xbox", {}).get("reconnect_timeout_s", 30)
+            # v7.3.2: Load stick calibration offsets
+            stick_offsets = self.settings.get_section("xbox_stick_offsets")
+            if stick_offsets:
+                stick_offsets = {int(k): v for k, v in stick_offsets.items()}
             self.controller.connect_xbox(
                 mapping_file=mapping, use_thread=use_thread,
                 reconnect_timeout=timeout,
+                stick_offsets=stick_offsets or None,
             )
         except Exception as e:
             logger.error(f"Xbox connect failed: {e}")

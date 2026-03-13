@@ -183,6 +183,10 @@ class TestSafeTravelTo(unittest.TestCase):
         ctrl.zp_stage = MagicMock() if zp_connected else None
         ctrl.move_z_absolute = MagicMock()
         ctrl.move_xy_absolute = MagicMock()
+        # v7.3.2: safe_travel_to now waits for arrival — mock the wait methods
+        ctrl.wait_for_z_arrival = MagicMock(return_value=True)
+        ctrl.wait_for_xy_arrival = MagicMock(return_value=True)
+        ctrl.zero_position = {"x": 0, "y": 0, "f": 0, "Z": 0, "P1": 0, "P2": 0, "P3": 0}
         return ctrl
 
     def test_full_sequence(self):

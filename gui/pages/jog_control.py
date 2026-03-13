@@ -21,7 +21,7 @@ from functools import partial
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QComboBox, QSlider, QFrame, QSizePolicy,
-    QScrollArea,
+    QScrollArea, QDoubleSpinBox, QCheckBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QKeyEvent
@@ -118,7 +118,7 @@ class JogControlPage(QWidget):
         step_label.setObjectName("contextSectionLabel")
         layout.addWidget(step_label)
 
-        # XY step (in µm)
+        # XY step (in µm) — v7.3.2: editable with custom option
         xy_row = QHBoxLayout()
         xy_row.addWidget(QLabel("XY:"))
         self.xy_step_combo = QComboBox()
@@ -127,29 +127,100 @@ class JogControlPage(QWidget):
                 self.xy_step_combo.addItem(f"{s:g} µm", s)
             else:
                 self.xy_step_combo.addItem(f"{s:.2f} µm", s)
+        self.xy_step_combo.addItem("Custom…", "custom")
         self.xy_step_combo.setCurrentIndex(3)  # Default: 50 µm
+        self.xy_step_combo.currentIndexChanged.connect(self._on_xy_step_changed)
         xy_row.addWidget(self.xy_step_combo, stretch=1)
         layout.addLayout(xy_row)
+        # Custom XY spinbox (hidden until "Custom…" selected)
+        self._xy_custom_spin = QDoubleSpinBox()
+        self._xy_custom_spin.setRange(0.1, 50000.0)
+        self._xy_custom_spin.setDecimals(1)
+        self._xy_custom_spin.setSuffix(" µm")
+        self._xy_custom_spin.setValue(50.0)
+        self._xy_custom_spin.setVisible(False)
+        layout.addWidget(self._xy_custom_spin)
 
-        # Z step (in mm)
+        # Z step (in mm) — v7.3.2: editable with custom option
         z_row = QHBoxLayout()
         z_row.addWidget(QLabel("Z:"))
         self.z_step_combo = QComboBox()
         for s in Z_STEPS:
             self.z_step_combo.addItem(f"{s} mm", s)
+        self.z_step_combo.addItem("Custom…", "custom")
         self.z_step_combo.setCurrentIndex(2)
+        self.z_step_combo.currentIndexChanged.connect(self._on_z_step_changed)
         z_row.addWidget(self.z_step_combo, stretch=1)
         layout.addLayout(z_row)
+        # Custom Z spinbox
+        self._z_custom_spin = QDoubleSpinBox()
+        self._z_custom_spin.setRange(0.001, 50.0)
+        self._z_custom_spin.setDecimals(3)
+        self._z_custom_spin.setSuffix(" mm")
+        self._z_custom_spin.setValue(0.1)
+        self._z_custom_spin.setVisible(False)
+        layout.addWidget(self._z_custom_spin)
 
-        # Pump step (in mm)
+        # Pump step (in mm) — v7.3.2: editable with custom option
         p_row = QHBoxLayout()
         p_row.addWidget(QLabel("Pump:"))
         self.p_step_combo = QComboBox()
         for s in P_STEPS:
             self.p_step_combo.addItem(f"{s} mm", s)
+        self.p_step_combo.addItem("Custom…", "custom")
         self.p_step_combo.setCurrentIndex(2)
+        self.p_step_combo.currentIndexChanged.connect(self._on_p_step_changed)
         p_row.addWidget(self.p_step_combo, stretch=1)
         layout.addLayout(p_row)
+        # Custom pump spinbox
+        self._p_custom_spin = QDoubleSpinBox()
+        self._p_custom_spin.setRange(0.001, 100.0)
+        self._p_custom_spin.setDecimals(3)
+        self._p_custom_spin.setSuffix(" mm")
+        self._p_custom_spin.setValue(0.1)
+        self._p_custom_spin.setVisible(False)
+        layout.addWidget(self._p_custom_spin)
+
+        # ── Absolute Go To ────────────────────────────────────────
+        goto_label = QLabel("Absolute Go To")
+        goto_label.setObjectName("contextSectionLabel")
+        layout.addWidget(goto_label)
+
+        goto_grid = QGridLayout()
+        goto_grid.setSpacing(4)
+        goto_grid.addWidget(QLabel("X (µm):"), 0, 0)
+        self._goto_x = QDoubleSpinBox()
+        self._goto_x.setRange(-999999, 999999)
+        self._goto_x.setDecimals(1)
+        self._goto_x.setValue(0.0)
+        goto_grid.addWidget(self._goto_x, 0, 1)
+        goto_grid.addWidget(QLabel("Y (µm):"), 1, 0)
+        self._goto_y = QDoubleSpinBox()
+        self._goto_y.setRange(-999999, 999999)
+        self._goto_y.setDecimals(1)
+        self._goto_y.setValue(0.0)
+        goto_grid.addWidget(self._goto_y, 1, 1)
+        goto_grid.addWidget(QLabel("Z (mm):"), 2, 0)
+        self._goto_z = QDoubleSpinBox()
+        self._goto_z.setRange(-100.0, 100.0)
+        self._goto_z.setDecimals(3)
+        self._goto_z.setValue(0.0)
+        goto_grid.addWidget(self._goto_z, 2, 1)
+        layout.addLayout(goto_grid)
+
+        self._goto_safe = QCheckBox("Safe Travel")
+        self._goto_safe.setChecked(True)
+        self._goto_safe.setToolTip(
+            "Raise Z to safe height before XY move, then lower")
+        layout.addWidget(self._goto_safe)
+
+        btn_goto = QPushButton("Go To")
+        btn_goto.setStyleSheet(
+            f"background-color: {COLORS['blue']}; color: {COLORS['crust']}; "
+            f"font-weight: bold; padding: 4px 12px;")
+        btn_goto.setMaximumHeight(28)
+        btn_goto.clicked.connect(self._absolute_goto)
+        layout.addWidget(btn_goto)
 
         # ── Speed Multipliers ────────────────────────────────────
         speed_label = QLabel("Speed (Xbox Jog)")
@@ -471,6 +542,10 @@ class JogControlPage(QWidget):
             # Use µL step sizes
             for s in P_STEPS_UL:
                 self.p_step_combo.addItem(f"{s:g} µL", s)
+            self.p_step_combo.addItem("Custom…", "custom")
+            # Update custom spinbox suffix
+            self._p_custom_spin.setSuffix(" µL")
+            self._p_custom_spin.setRange(0.01, 500.0)
             # Try to restore selection
             idx = self.p_step_combo.findData(current_data)
             if idx >= 0:
@@ -481,6 +556,9 @@ class JogControlPage(QWidget):
             # Fallback: mm step sizes
             for s in P_STEPS:
                 self.p_step_combo.addItem(f"{s:g} mm", s)
+            self.p_step_combo.addItem("Custom…", "custom")
+            self._p_custom_spin.setSuffix(" mm")
+            self._p_custom_spin.setRange(0.001, 100.0)
             idx = self.p_step_combo.findData(current_data)
             if idx >= 0:
                 self.p_step_combo.setCurrentIndex(idx)
@@ -531,8 +609,8 @@ class JogControlPage(QWidget):
         if not self.controller.is_xy_connected:
             return
 
-        # Get step size in microns from combo box
-        step_um = self.xy_step_combo.currentData()
+        # Get step size in microns (preset or custom)
+        step_um = self._get_xy_step()
 
         # v7.2.5: Record pre-jog position for verification display
         self._last_xy_before = self.controller.get_xy_position(cached=True)
@@ -562,7 +640,7 @@ class JogControlPage(QWidget):
 
     def _jog_z(self, direction: int):
         if self.controller.is_zp_connected:
-            self.controller.move_z_relative(direction * self.z_step_combo.currentData())
+            self.controller.move_z_relative(direction * self._get_z_step())
 
     def _jog_pump(self, pump: str, direction: int):
         """Jog pump — convert µL step to mm if HW config available."""
@@ -571,7 +649,7 @@ class JogControlPage(QWidget):
         if not self.controller.is_pump_enabled(pump):
             logger.warning(f"{pump} is disabled — enable it in Hardware Setup to jog")
             return
-        step_val = self.p_step_combo.currentData()
+        step_val = self._get_p_step()
         if self._hardware_config:
             pump_cfg = self._hardware_config.pumps.get(pump)
             if pump_cfg and pump_cfg.is_configured:
@@ -621,6 +699,45 @@ class JogControlPage(QWidget):
             if hasattr(self, '_well_nav_status'):
                 self._well_nav_status.setText(" | ".join(status_parts) if status_parts else "")
 
+    def load_startup_plate(self, settings):
+        """v7.3.2: Populate well plate navigator with geometry-predicted positions.
+
+        Called on startup before calibration. Uses plate format from settings
+        and stage center as approximate plate center.
+        """
+        if self._well_nav is None:
+            return
+        try:
+            from SupportClasses.WellPlate import WellPlate
+        except ImportError:
+            return
+
+        # Get plate format from calibration settings, then workspace fallback
+        plate_format = (settings.get("calibration.plate_format")
+                        or settings.get("workspace.plate_format")
+                        or 96)
+        try:
+            plate = WellPlate.from_format(int(plate_format))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid plate format {plate_format}, defaulting to 96")
+            plate = WellPlate.from_format(96)
+
+        # Use stage center as approximate plate center
+        # ProScan typical travel: 130mm x 85mm → center at 65000 x 42500 µm
+        center_x = 65000.0
+        center_y = 42500.0
+        approx_positions = plate.get_all_positions_from_plate_center(center_x, center_y)
+
+        self._plate = plate
+        self._well_positions = approx_positions
+        self._well_nav.set_plate(plate)
+        self._well_nav.set_approximate_positions(approx_positions)
+
+        if hasattr(self, '_well_nav_status'):
+            self._well_nav_status.setText(
+                f"{plate.format}-well | {len(approx_positions)} approx positions")
+        logger.info(f"Startup plate: {plate.format}-well with geometry-predicted positions")
+
     def _on_well_nav_click(self, well_name: str):
         """Handle click on well plate navigator — safe fast-travel."""
         from PySide6.QtWidgets import QMessageBox
@@ -643,6 +760,76 @@ class JogControlPage(QWidget):
             self._well_nav_status.setText(
                 f"Traveled to {well_name}: ({rel_x:,.0f}, {rel_y:,.0f}) µm")
         logger.info(f"Fast travel to well {well_name}")
+
+    # ── v7.3.2: Custom Step Size Handlers ─────────────────────
+
+    def _on_xy_step_changed(self, index):
+        is_custom = self.xy_step_combo.currentData() == "custom"
+        self._xy_custom_spin.setVisible(is_custom)
+
+    def _on_z_step_changed(self, index):
+        is_custom = self.z_step_combo.currentData() == "custom"
+        self._z_custom_spin.setVisible(is_custom)
+
+    def _on_p_step_changed(self, index):
+        is_custom = self.p_step_combo.currentData() == "custom"
+        self._p_custom_spin.setVisible(is_custom)
+
+    def _get_xy_step(self) -> float:
+        """Get current XY step size in µm (preset or custom)."""
+        val = self.xy_step_combo.currentData()
+        if val == "custom":
+            return self._xy_custom_spin.value()
+        return val
+
+    def _get_z_step(self) -> float:
+        """Get current Z step size in mm (preset or custom)."""
+        val = self.z_step_combo.currentData()
+        if val == "custom":
+            return self._z_custom_spin.value()
+        return val
+
+    def _get_p_step(self) -> float:
+        """Get current pump step size (mm or µL depending on mode)."""
+        val = self.p_step_combo.currentData()
+        if val == "custom":
+            return self._p_custom_spin.value()
+        return val
+
+    # ── v7.3.2: Absolute Go To ─────────────────────────────────
+
+    def _absolute_goto(self):
+        """Move to absolute coordinates (zero-referenced)."""
+        target_x_um = self._goto_x.value()
+        target_y_um = self._goto_y.value()
+        target_z_mm = self._goto_z.value()
+
+        # Convert from zero-ref to absolute stage coords
+        zero = self.controller.zero_position
+        abs_x_um = target_x_um + zero["x"]
+        abs_y_um = target_y_um + zero["y"]
+
+        if self._goto_safe.isChecked():
+            safe_z = self._safe_z
+            if safe_z is None:
+                safe_z = 0.0  # Default: fully retracted
+                logger.warning("Absolute Go To: no safe Z set, using 0.0 mm")
+            self.controller.safe_travel_to(
+                abs_x_um, abs_y_um,
+                safe_z_mm=safe_z,
+                target_z_mm=target_z_mm + zero["Z"],
+            )
+        else:
+            # Direct moves — no safe Z retract
+            if self.controller.is_xy_connected:
+                self.controller.move_xy_absolute(
+                    target_x_um, target_y_um, from_zero_ref=True)
+            if self.controller.is_zp_connected:
+                self.controller.move_z_absolute(
+                    target_z_mm, from_zero_ref=True)
+        logger.info(f"Absolute Go To: X={target_x_um:.1f}µm, "
+                    f"Y={target_y_um:.1f}µm, Z={target_z_mm:.3f}mm "
+                    f"(safe={'yes' if self._goto_safe.isChecked() else 'no'})")
 
     def _emergency_stop(self):
         if self.controller.zp_stage:

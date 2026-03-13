@@ -44,17 +44,78 @@ def load_xbox_mapping(mapping_file: str = "current_button_mapping.json") -> dict
 
 
 
+def calibrate_sticks(
+    duration: float = 2.0,
+    deadzone: float = 0.05,
+) -> dict[str, float]:
+    """
+    Sample stick axes at rest for *duration* seconds and return center offsets.
+
+    Run this with sticks untouched. Returns a dict like
+    ``{0: 0.012, 1: -0.003, 2: 0.008, 3: -0.015}`` mapping axis index to
+    its measured center offset.
+
+    v7.3.2
+    """
+    import os as _os
+    import platform as _platform
+    _is_macos = _platform.system() == "Darwin"
+    _os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "1")
+    _os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+    if _is_macos:
+        _os.environ["SDL_VIDEODRIVER"] = "dummy"
+        _os.environ["SDL_AUDIODRIVER"] = "dummy"
+
+    try:
+        import pygame
+    except ImportError:
+        raise RuntimeError("pygame not installed")
+
+    pygame.init()
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0:
+        pygame.quit()
+        raise RuntimeError("No controller found")
+
+    js = pygame.joystick.Joystick(0)
+    js.init()
+    num_axes = js.get_numaxes()
+    stick_axes = [i for i in range(min(num_axes, 4))]  # axes 0-3 (sticks)
+
+    sums: dict[int, float] = {a: 0.0 for a in stick_axes}
+    counts: dict[int, int] = {a: 0 for a in stick_axes}
+
+    start = time.time()
+    while time.time() - start < duration:
+        pygame.event.pump()
+        for a in stick_axes:
+            val = js.get_axis(a)
+            sums[a] += val
+            counts[a] += 1
+        time.sleep(0.02)
+
+    offsets = {}
+    for a in stick_axes:
+        avg = sums[a] / counts[a] if counts[a] else 0.0
+        offsets[a] = avg if abs(avg) > deadzone else 0.0
+
+    pygame.quit()
+    return offsets
+
+
 def xbox_polling_worker(
     out_queue: Queue,
     mapping_file: str = "current_button_mapping.json",
     avg_interval: float = 0.1,
     deadzone: float = 0.2,
     reconnect_timeout: float = 30.0,
+    stick_offsets: dict | None = None,
 ) -> None:
     """
     Main polling loop — runs in a separate process.
     v7.2.6: S4 resilient worker — retry loop on startup, crash recovery,
     periodic heartbeat. Worker never exits; reconnects automatically.
+    v7.3.2: stick_offsets — per-axis center offsets to subtract before deadzone.
 
     Args:
         out_queue:          Multiprocessing queue for outbound messages.
@@ -62,6 +123,7 @@ def xbox_polling_worker(
         avg_interval:       Seconds between averaged axis updates.
         deadzone:           Axis deadzone threshold (0–1).
         reconnect_timeout:  Seconds to attempt reconnection before giving up.
+        stick_offsets:      Dict mapping axis index → center offset (v7.3.2).
     """
     # v7.2.7: SDL Bluetooth hints
     import os as _os
@@ -201,11 +263,15 @@ def xbox_polling_worker(
                         _btn_debounce[i] = current_time
 
             # ── Axis Accumulation ──────────────────────────────────
+            _stick_off = stick_offsets or {}
             for i in range(num_axes):
                 raw = joystick.get_axis(i)
                 # Normalize triggers: subtract rest offset, remap to 0..1
                 if i in _trigger_offsets and _trigger_offsets[i] < -0.5:
                     raw = (raw - _trigger_offsets[i]) / 2.0  # -1..+1 → 0..+1
+                # v7.3.2: Subtract stick center offset
+                if i in _stick_off:
+                    raw -= _stick_off[i]
                 if abs(raw) > deadzone:
                     axis_accum[i] += raw
                     axis_count[i] += 1

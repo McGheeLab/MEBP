@@ -119,47 +119,20 @@ class UIFunctions:
 
     @staticmethod
     def toggleLeftBox(window, animate: bool = True):
-        """Open or close the extra-left context panel."""
+        """Open or close the extra-left context panel (resizable via splitter)."""
         box = window.ui_extraLeftBox
-        width = box.width()
-        target = AppSettings.LEFT_BOX_WIDTH if width == 0 else 0
+        splitter = window._context_splitter
 
-        if animate:
-            group = QParallelAnimationGroup()
-            for prop in (b"minimumWidth", b"maximumWidth"):
-                anim = QPropertyAnimation(box, prop)
-                anim.setDuration(AppSettings.TIME_ANIMATION)
-                anim.setStartValue(width)
-                anim.setEndValue(target)
-                anim.setEasingCurve(QEasingCurve.InOutQuart)
-                group.addAnimation(anim)
-            window._left_box_anim = group
-            group.start()
+        if box.isVisible():
+            # Closing — save current width for next open
+            window._context_panel_width = box.width() or AppSettings.LEFT_BOX_WIDTH
+            box.hide()
         else:
-            box.setMinimumWidth(target)
-            box.setMaximumWidth(target if target > 0 else 0)
-
-    @staticmethod
-    def setLeftBoxWidth(window, width: int, animate: bool = True):
-        """Set the extra-left box to a specific width."""
-        box = window.ui_extraLeftBox
-        current = box.width()
-        if current == width:
-            return
-        if animate:
-            group = QParallelAnimationGroup()
-            for prop in (b"minimumWidth", b"maximumWidth"):
-                anim = QPropertyAnimation(box, prop)
-                anim.setDuration(AppSettings.TIME_ANIMATION)
-                anim.setStartValue(current)
-                anim.setEndValue(width)
-                anim.setEasingCurve(QEasingCurve.InOutQuart)
-                group.addAnimation(anim)
-            window._left_box_anim = group
-            group.start()
-        else:
-            box.setMinimumWidth(width)
-            box.setMaximumWidth(width if width > 0 else 0)
+            # Opening — restore saved width
+            target = getattr(window, '_context_panel_width', AppSettings.LEFT_BOX_WIDTH)
+            box.show()
+            total = splitter.width()
+            splitter.setSizes([target, total - target])
 
     # ── Menu Selection Styling ───────────────────────────────────
 

@@ -5,6 +5,7 @@ Emits signals when the user clicks a direction button. The parent page
 is responsible for wiring signals to the StageController.
 
 v7.3.1 — Phase 4
+v7.3.2 — Added optional pump jog buttons and pump signal
 
 Supports two modes:
 - **full**: All step sizes, larger buttons (default)
@@ -12,9 +13,10 @@ Supports two modes:
 
 Usage::
 
-    array = JogButtonArray(compact=True)
+    array = JogButtonArray(compact=True, show_pumps=True)
     array.jog_xy_requested.connect(lambda dx, dy: controller.move_xy_relative_um(dx, dy))
     array.jog_z_requested.connect(lambda dz: controller.move_z_relative(dz))
+    array.jog_pump_requested.connect(lambda pump, dist: controller.move_pump_relative(pump, dist))
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ XY_STEPS_FULL = [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 XY_STEPS_COMPACT = [1.0, 10.0, 50.0, 100.0, 500.0]
 Z_STEPS_FULL = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
 Z_STEPS_COMPACT = [0.01, 0.05, 0.1, 0.5, 1.0]
+P_STEPS_MM = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+P_STEPS_UL = [0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
 
 
 class JogButtonArray(QWidget):
@@ -42,16 +46,21 @@ class JogButtonArray(QWidget):
     Signals:
         jog_xy_requested(float, float): (dx_um, dy_um) relative XY move requested.
         jog_z_requested(float): dz_mm relative Z move requested.
+        jog_pump_requested(str, float): (pump_id, distance) pump move requested.
         home_requested(): Move-to-zero requested.
     """
 
     jog_xy_requested = Signal(float, float)
     jog_z_requested = Signal(float)
+    jog_pump_requested = Signal(str, float)  # v7.3.2
     home_requested = Signal()
 
-    def __init__(self, compact: bool = False, parent: QWidget | None = None):
+    def __init__(self, compact: bool = False, show_pumps: bool = False,
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self._compact = compact
+        self._show_pumps = show_pumps
+        self._pump_step_is_uL = False
         self._setup_ui()
 
     @property
@@ -63,6 +72,30 @@ class JogButtonArray(QWidget):
     def z_step_mm(self) -> float:
         """Currently selected Z step size in mm."""
         return self._z_combo.currentData() or 0.1
+
+    @property
+    def pump_step(self) -> float:
+        """Currently selected pump step size (mm or µL depending on mode)."""
+        if hasattr(self, '_p_combo'):
+            return self._p_combo.currentData() or 0.1
+        return 0.1
+
+    def set_pump_step_mode(self, use_uL: bool) -> None:
+        """Switch pump step selector between µL and mm mode."""
+        if not hasattr(self, '_p_combo'):
+            return
+        self._pump_step_is_uL = use_uL
+        self._p_combo.blockSignals(True)
+        current = self._p_combo.currentData()
+        self._p_combo.clear()
+        steps = P_STEPS_UL if use_uL else P_STEPS_MM
+        unit = "µL" if use_uL else "mm"
+        for s in steps:
+            self._p_combo.addItem(f"{s:g} {unit}", s)
+        # Restore or default
+        idx = self._p_combo.findData(current)
+        self._p_combo.setCurrentIndex(idx if idx >= 0 else 2)
+        self._p_combo.blockSignals(False)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -143,6 +176,39 @@ class JogButtonArray(QWidget):
         step_row.addStretch()
         layout.addLayout(step_row)
 
+        # ── v7.3.2: Pump Buttons (optional) ───────────────────
+        if self._show_pumps:
+            pump_row = QHBoxLayout()
+            pump_row.setSpacing(2)
+            self._pump_buttons = {}
+            for pump_id in ["P1", "P2", "P3"]:
+                btn_ext = QPushButton(f"{pump_id}▲")
+                btn_ext.setFixedSize(btn_size + 4, btn_size)
+                btn_ext.setToolTip(f"Extend {pump_id}")
+                btn_ext.clicked.connect(partial(self._on_pump, pump_id, 1))
+                pump_row.addWidget(btn_ext)
+                btn_ret = QPushButton(f"{pump_id}▼")
+                btn_ret.setFixedSize(btn_size + 4, btn_size)
+                btn_ret.setToolTip(f"Retract {pump_id}")
+                btn_ret.clicked.connect(partial(self._on_pump, pump_id, -1))
+                pump_row.addWidget(btn_ret)
+                self._pump_buttons[pump_id] = (btn_ext, btn_ret)
+            pump_row.addStretch()
+            layout.addLayout(pump_row)
+
+            # Pump step selector
+            p_step_row = QHBoxLayout()
+            p_step_row.setSpacing(4)
+            p_step_row.addWidget(QLabel("Pump:"))
+            self._p_combo = QComboBox()
+            for s in P_STEPS_MM:
+                self._p_combo.addItem(f"{s:g} mm", s)
+            self._p_combo.setCurrentIndex(2)  # 0.1 mm
+            self._p_combo.setMaximumWidth(90)
+            p_step_row.addWidget(self._p_combo)
+            p_step_row.addStretch()
+            layout.addLayout(p_step_row)
+
     def _on_xy(self, dx: int, dy: int):
         step = self.xy_step_um
         self.jog_xy_requested.emit(dx * step, dy * step)
@@ -150,3 +216,7 @@ class JogButtonArray(QWidget):
     def _on_z(self, direction: int):
         step = self.z_step_mm
         self.jog_z_requested.emit(direction * step)
+
+    def _on_pump(self, pump_id: str, direction: int):
+        step = self.pump_step
+        self.jog_pump_requested.emit(pump_id, direction * step)

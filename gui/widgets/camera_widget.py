@@ -35,7 +35,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QCheckBox, QGroupBox, QFileDialog, QSlider,
-    QFrame, QSizePolicy,
+    QFrame, QSizePolicy, QSpinBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
@@ -253,8 +253,63 @@ class CameraWidget(QWidget):
             btn_snap.clicked.connect(self.take_snapshot)
             header.addWidget(btn_snap)
 
+            # v7.3.2: Per-camera settings toggle
+            self._btn_settings = QPushButton("⚙")
+            self._btn_settings.setFixedWidth(32)
+            self._btn_settings.setToolTip("Camera settings")
+            self._btn_settings.setCheckable(True)
+            self._btn_settings.toggled.connect(self._toggle_settings_panel)
+            header.addWidget(self._btn_settings)
+
             header.addStretch()
             layout.addLayout(header)
+
+            # v7.3.2: Collapsible per-camera settings panel
+            self._settings_panel = QFrame()
+            self._settings_panel.setObjectName("cardFrame")
+            self._settings_panel.setVisible(False)
+            sp_layout = QVBoxLayout(self._settings_panel)
+            sp_layout.setSpacing(3)
+            sp_layout.setContentsMargins(6, 4, 6, 4)
+
+            # Brightness slider
+            bri_row = QHBoxLayout()
+            bri_row.addWidget(QLabel("Brightness:"))
+            self._sld_brightness = QSlider(Qt.Horizontal)
+            self._sld_brightness.setRange(-100, 100)
+            self._sld_brightness.setValue(0)
+            self._sld_brightness.valueChanged.connect(self._on_brightness_slider)
+            bri_row.addWidget(self._sld_brightness)
+            self._lbl_brightness = QLabel("0")
+            self._lbl_brightness.setMinimumWidth(28)
+            bri_row.addWidget(self._lbl_brightness)
+            sp_layout.addLayout(bri_row)
+
+            # Gamma slider
+            gam_row = QHBoxLayout()
+            gam_row.addWidget(QLabel("Gamma:"))
+            self._sld_gamma = QSlider(Qt.Horizontal)
+            self._sld_gamma.setRange(10, 300)
+            self._sld_gamma.setValue(100)
+            self._sld_gamma.valueChanged.connect(self._on_gamma_slider)
+            gam_row.addWidget(self._sld_gamma)
+            self._lbl_gamma = QLabel("1.00")
+            self._lbl_gamma.setMinimumWidth(28)
+            gam_row.addWidget(self._lbl_gamma)
+            sp_layout.addLayout(gam_row)
+
+            # FPS spinner
+            fps_row = QHBoxLayout()
+            fps_row.addWidget(QLabel("FPS:"))
+            self._spn_fps = QSpinBox()
+            self._spn_fps.setRange(1, 60)
+            self._spn_fps.setValue(self._fps)
+            self._spn_fps.valueChanged.connect(self._on_fps_spinner)
+            fps_row.addWidget(self._spn_fps)
+            fps_row.addStretch()
+            sp_layout.addLayout(fps_row)
+
+            layout.addWidget(self._settings_panel)
         else:
             # Even without controls, provide a combo for internal use
             self.camera_combo = QComboBox()
@@ -558,6 +613,27 @@ class CameraWidget(QWidget):
 
     def _on_crosshair_toggle(self, checked: bool):
         self._show_crosshair = checked
+
+    # ── v7.3.2: Per-camera settings panel callbacks ───────────────
+
+    def _toggle_settings_panel(self, checked: bool):
+        if hasattr(self, '_settings_panel'):
+            self._settings_panel.setVisible(checked)
+
+    def _on_brightness_slider(self, value: int):
+        self.set_brightness(value)
+        if hasattr(self, '_lbl_brightness'):
+            self._lbl_brightness.setText(str(value))
+
+    def _on_gamma_slider(self, value: int):
+        self.set_gamma(value / 100.0)
+        if hasattr(self, '_lbl_gamma'):
+            self._lbl_gamma.setText(f"{value / 100.0:.2f}")
+
+    def _on_fps_spinner(self, value: int):
+        self._fps = value
+        if self._running:
+            self._timer.setInterval(int(1000 / value))
 
     # ── Frame Access (v7.3.0 — for detection workers) ────────────
 

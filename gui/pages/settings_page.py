@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QScrollArea, QFrame, QFileDialog,
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 
 from SupportClasses.StageController import StageController
 from SupportClasses.Settings import Settings
@@ -38,6 +39,7 @@ from gui.unit_helpers import (
     steps_to_um, um_to_steps, convert_safety_xy_text,
     DEFAULT_MICROSTEPS_PER_MICRON,
 )
+from gui.widgets.jog_button_array import JogButtonArray
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,31 @@ class SettingsPage(QWidget):
         return "Settings"
 
     def on_status_update(self):
-        """Called by MainWindow timer. No periodic refresh needed."""
+        """Called by MainWindow timer. Update position readout in context panel."""
+        if not hasattr(self, '_ctx_pos_labels'):
+            return
+        try:
+            xy = self.controller.get_xy_position(cached=True)
+            zp = self.controller.get_zp_position(cached=True)
+            zero = self.controller.zero_position
+
+            if xy[0] is not None:
+                rel_x = steps_to_um(xy[0] - zero.get("x", 0),
+                                    self._microsteps_per_micron)
+                rel_y = steps_to_um(xy[1] - zero.get("y", 0),
+                                    self._microsteps_per_micron)
+                self._ctx_pos_labels["X"].setText(f"{rel_x:,.1f}")
+                self._ctx_pos_labels["Y"].setText(f"{rel_y:,.1f}")
+
+            if zp[0] is not None:
+                rel_z = zp[0] - zero.get("Z", 0)
+                self._ctx_pos_labels["Z"].setText(f"{rel_z:.3f}")
+                for i, pid in enumerate(["P1", "P2", "P3"], start=1):
+                    if i < len(zp) and zp[i] is not None:
+                        rel_p = zp[i] - zero.get(pid, 0)
+                        self._ctx_pos_labels[pid].setText(f"{rel_p:.3f}")
+        except Exception:
+            pass
 
     def set_microsteps_per_micron(self, value: float):
         """Update the conversion factor and refresh related UI."""
@@ -155,6 +181,79 @@ class SettingsPage(QWidget):
         btn_refresh.clicked.connect(self._refresh_ports)
         lay.addWidget(btn_refresh)
 
+        # ── Manual Calibration (v7.3.2) ─────────────────────────
+        cal_lbl = QLabel("Manual Zero Calibration")
+        cal_lbl.setObjectName("contextSectionLabel")
+        lay.addWidget(cal_lbl)
+
+        cal_desc = QLabel("Jog to desired zero position, then set zero per axis.")
+        cal_desc.setWordWrap(True)
+        cal_desc.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        lay.addWidget(cal_desc)
+
+        # Embedded jog controls (compact + pumps)
+        self._ctx_jog = JogButtonArray(compact=True, show_pumps=True)
+        self._ctx_jog.jog_xy_requested.connect(self._ctx_jog_xy)
+        self._ctx_jog.jog_z_requested.connect(self._ctx_jog_z)
+        self._ctx_jog.jog_pump_requested.connect(self._ctx_jog_pump)
+        self._ctx_jog.home_requested.connect(self._ctx_jog_home)
+        lay.addWidget(self._ctx_jog)
+
+        # Position readout
+        pos_frame = QFrame()
+        pos_frame.setStyleSheet(
+            f"background: {COLORS['mantle']}; border-radius: 4px; padding: 4px;")
+        pos_grid = QGridLayout(pos_frame)
+        pos_grid.setSpacing(2)
+        pos_grid.setContentsMargins(4, 4, 4, 4)
+
+        mono = QFont("Consolas, Courier New, monospace")
+        mono.setPointSize(9)
+
+        self._ctx_pos_labels: dict[str, QLabel] = {}
+        for i, axis in enumerate(["X", "Y", "Z", "P1", "P2", "P3"]):
+            lbl_name = QLabel(f"{axis}:")
+            lbl_name.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            pos_grid.addWidget(lbl_name, i // 3, (i % 3) * 2)
+            lbl_val = QLabel("—")
+            lbl_val.setFont(mono)
+            lbl_val.setStyleSheet(f"color: {COLORS['text']}; font-size: 9pt;")
+            lbl_val.setMinimumWidth(60)
+            pos_grid.addWidget(lbl_val, i // 3, (i % 3) * 2 + 1)
+            self._ctx_pos_labels[axis] = lbl_val
+        lay.addWidget(pos_frame)
+
+        # Zero-set buttons
+        zero_row1 = QHBoxLayout()
+        zero_row1.setSpacing(4)
+        btn_zero_xy = QPushButton("Set XY Zero")
+        btn_zero_xy.setMaximumHeight(24)
+        btn_zero_xy.setToolTip("Set current XY position as zero reference")
+        btn_zero_xy.clicked.connect(self._ctx_set_zero_xy)
+        zero_row1.addWidget(btn_zero_xy)
+        btn_zero_z = QPushButton("Set Z Zero")
+        btn_zero_z.setMaximumHeight(24)
+        btn_zero_z.setToolTip("Set current Z position as zero reference")
+        btn_zero_z.clicked.connect(self._ctx_set_zero_z)
+        zero_row1.addWidget(btn_zero_z)
+        lay.addLayout(zero_row1)
+
+        zero_row2 = QHBoxLayout()
+        zero_row2.setSpacing(4)
+        for pid in ["P1", "P2", "P3"]:
+            btn = QPushButton(f"Set {pid} Zero")
+            btn.setMaximumHeight(24)
+            btn.setToolTip(f"Set current {pid} position as zero reference")
+            btn.clicked.connect(lambda checked, p=pid: self._ctx_set_zero_pump(p))
+            zero_row2.addWidget(btn)
+        lay.addLayout(zero_row2)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {COLORS['surface0']};")
+        lay.addWidget(sep)
+
         # ── Actions ──────────────────────────────────────────────
         act_lbl = QLabel("Actions")
         act_lbl.setObjectName("contextSectionLabel")
@@ -199,6 +298,57 @@ class SettingsPage(QWidget):
             self.ctx_safety_status.setStyleSheet(
                 f"color: {COLORS['red']};")
 
+    # ── v7.3.2: Manual calibration jog handlers ──────────────
+
+    def _ctx_jog_xy(self, dx: float, dy: float):
+        self.controller.move_xy_relative_um(dx, dy)
+
+    def _ctx_jog_z(self, dz: float):
+        self.controller.move_z_relative(dz)
+
+    def _ctx_jog_pump(self, pump: str, dist: float):
+        self.controller.move_pump_relative(pump, dist)
+
+    def _ctx_jog_home(self):
+        self.controller.move_to_zero()
+
+    def _ctx_set_zero_xy(self):
+        if hasattr(self.controller, 'calibrate_zero_xy'):
+            self.controller.calibrate_zero_xy()
+        else:
+            # Fallback: set both X and Y from current position
+            pos = self.controller.get_xy_position(cached=True)
+            if pos[0] is not None:
+                self.controller.zero_position["x"] = pos[0]
+                self.controller.zero_position["y"] = pos[1]
+        self.settings.set_section(
+            "zero_position", dict(self.controller.zero_position))
+        self.settings.save()
+        logger.info("XY zero set from manual calibration")
+        if self._context_widget:
+            self.ctx_status_label.setText("XY zero set ✓")
+            self.ctx_status_label.setStyleSheet(f"color: {COLORS['green']};")
+
+    def _ctx_set_zero_z(self):
+        self.controller.reset_z_zero()
+        self.settings.set_section(
+            "zero_position", dict(self.controller.zero_position))
+        self.settings.save()
+        logger.info("Z zero set from manual calibration")
+        if self._context_widget:
+            self.ctx_status_label.setText("Z zero set ✓")
+            self.ctx_status_label.setStyleSheet(f"color: {COLORS['green']};")
+
+    def _ctx_set_zero_pump(self, pump: str):
+        self.controller.reset_pump_zero(pump)
+        self.settings.set_section(
+            "zero_position", dict(self.controller.zero_position))
+        self.settings.save()
+        logger.info(f"{pump} zero set from manual calibration")
+        if self._context_widget:
+            self.ctx_status_label.setText(f"{pump} zero set ✓")
+            self.ctx_status_label.setStyleSheet(f"color: {COLORS['green']};")
+
     def _update_context_sim_labels(self):
         """Refresh simulation status labels in context panel."""
         if self._context_widget is None:
@@ -233,6 +383,7 @@ class SettingsPage(QWidget):
         self._build_safety_card(layout)
         self._build_polling_card(layout)
         self._build_xbox_card(layout)
+        self._build_axis_flip_card(layout)
         self._build_logging_card(layout)
 
         # Apply / Reset buttons (also in main content for convenience)
@@ -700,7 +851,68 @@ class SettingsPage(QWidget):
         grid.addWidget(btn_browse, row, 2)
         row += 1
 
+        # v7.3.2: Stick calibration
+        grid.addWidget(QLabel("Stick Calibration:"), row, 0)
+        cal_row = QHBoxLayout()
+        btn_cal = QPushButton("Calibrate Sticks")
+        btn_cal.setMaximumHeight(26)
+        btn_cal.setToolTip(
+            "Hold sticks in neutral position, then click.\n"
+            "Samples for 2 seconds to measure center offsets.")
+        btn_cal.clicked.connect(self._calibrate_xbox_sticks)
+        cal_row.addWidget(btn_cal)
+        btn_clear_cal = QPushButton("Clear")
+        btn_clear_cal.setMaximumHeight(26)
+        btn_clear_cal.setToolTip("Remove stick calibration offsets")
+        btn_clear_cal.clicked.connect(self._clear_xbox_stick_cal)
+        cal_row.addWidget(btn_clear_cal)
+        grid.addLayout(cal_row, row, 1, 1, 2)
+        row += 1
+
+        self.xbox_cal_label = QLabel("")
+        self.xbox_cal_label.setWordWrap(True)
+        self.xbox_cal_label.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        grid.addWidget(self.xbox_cal_label, row, 0, 1, 3)
+        row += 1
+
         layout.addLayout(grid)
+        self._load_xbox_cal_label()
+        parent_layout.addWidget(card)
+
+    # ── Axis Flip Card (v7.3.2) ─────────────────────────────────
+
+    def _build_axis_flip_card(self, parent_layout):
+        """Card with checkboxes to flip positive direction for Z and pumps."""
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        layout = QVBoxLayout(card)
+        layout.setSpacing(6)
+
+        title = QLabel("Axis Direction (Flip Positive)")
+        title.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; "
+            f"color: {COLORS['text']};")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "If a motor moves the wrong way, flip its positive direction.\n"
+            "This is a per-machine setting stored locally.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(desc)
+
+        self._flip_checks: dict[str, QCheckBox] = {}
+        row_lay = QHBoxLayout()
+        row_lay.setSpacing(12)
+        for axis in ["Z", "P1", "P2", "P3"]:
+            chk = QCheckBox(f"Flip {axis}")
+            chk.setToolTip(f"Invert the positive direction for {axis}")
+            row_lay.addWidget(chk)
+            self._flip_checks[axis] = chk
+        row_lay.addStretch()
+        layout.addLayout(row_lay)
+
         parent_layout.addWidget(card)
 
     # ── Logging Card ──────────────────────────────────────────────
@@ -768,6 +980,11 @@ class SettingsPage(QWidget):
         # Logging
         self.chk_verbose.setChecked(
             self.settings.get("logging.verbose", False))
+
+        # v7.3.2: Axis flip
+        saved_flips = self.settings.get_section("axis_flip") or {}
+        for axis, chk in self._flip_checks.items():
+            chk.setChecked(bool(saved_flips.get(axis, False)))
 
         # Unit conversion factor
         um_val = self.settings.get("stage.microsteps_per_micron",
@@ -854,6 +1071,12 @@ class SettingsPage(QWidget):
         log_level = logging.DEBUG if verbose else logging.INFO
         logging.getLogger().setLevel(log_level)
 
+        # v7.3.2: Axis flip → controller + settings
+        flip_dict = {axis: chk.isChecked()
+                     for axis, chk in self._flip_checks.items()}
+        self.controller.set_axis_flips(flip_dict)
+        self.settings.set_section("axis_flip", flip_dict)
+
         # P8.23: Controller protocol selection
         ctrl_data = self.combo_controller.currentData()
         self.settings.set("controller.controller_json", ctrl_data)
@@ -926,6 +1149,50 @@ class SettingsPage(QWidget):
             "JSON (*.json);;All (*)")
         if filepath:
             self.xbox_mapping_label.setText(filepath)
+
+    def _calibrate_xbox_sticks(self):
+        """v7.3.2: Run stick center calibration and save offsets."""
+        self.xbox_cal_label.setText("Sampling... keep sticks centered!")
+        self.xbox_cal_label.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: 9pt;")
+        # Force UI repaint before blocking call
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            offsets = self.controller.calibrate_xbox_sticks(duration=2.0)
+            # Save as string keys for JSON
+            save_dict = {str(k): round(v, 6) for k, v in offsets.items()}
+            self.settings.set_section("xbox_stick_offsets", save_dict)
+            self.settings.save()
+
+            parts = [f"Axis {k}: {v:+.4f}" for k, v in sorted(offsets.items())]
+            self.xbox_cal_label.setText("Calibrated: " + ", ".join(parts))
+            self.xbox_cal_label.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 9pt;")
+            logger.info(f"Xbox stick calibration saved: {save_dict}")
+        except Exception as e:
+            self.xbox_cal_label.setText(f"Calibration failed: {e}")
+            self.xbox_cal_label.setStyleSheet(
+                f"color: {COLORS['red']}; font-size: 9pt;")
+
+    def _clear_xbox_stick_cal(self):
+        """v7.3.2: Clear saved stick calibration offsets."""
+        self.settings.set_section("xbox_stick_offsets", {})
+        self.settings.save()
+        self.xbox_cal_label.setText("Calibration cleared")
+        self.xbox_cal_label.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        logger.info("Xbox stick calibration cleared")
+
+    def _load_xbox_cal_label(self):
+        """v7.3.2: Show saved calibration in label."""
+        saved = self.settings.get_section("xbox_stick_offsets")
+        if saved and any(v != 0 for v in saved.values()):
+            parts = [f"Axis {k}: {v:+.4f}" for k, v in sorted(saved.items())]
+            self.xbox_cal_label.setText("Saved: " + ", ".join(parts))
+        else:
+            self.xbox_cal_label.setText("No calibration (using defaults)")
 
     def _set_xy_from_current(self, as_max=True):
         """Set XY limits from the current stage position."""

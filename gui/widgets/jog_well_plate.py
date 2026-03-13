@@ -8,6 +8,7 @@ v7.3.1 — Phase 6
 
 Colour coding:
 - Grey (#313244): uncalibrated well
+- Yellow (#f9e2af): approximate well (geometry-predicted, pre-calibration)
 - Green (#a6e3a1): calibrated well (position known from mosaic scan)
 - Blue (#89b4fa): current position (nearest well)
 - Orange (#fab387): selected/hovered well
@@ -47,6 +48,8 @@ class WellPlateNavigator(QWidget):
     _CLR_UNCAL_BORDER = QColor("#585b70")
     _CLR_CAL = QColor("#a6e3a180")
     _CLR_CAL_BORDER = QColor("#a6e3a1")
+    _CLR_APPROX = QColor("#f9e2af60")       # v7.3.2: Yellow (semi-transparent): approximate
+    _CLR_APPROX_BORDER = QColor("#f9e2af")  # v7.3.2: Yellow border
     _CLR_CURRENT = QColor("#89b4fa80")
     _CLR_CURRENT_BORDER = QColor("#89b4fa")
     _CLR_HOVER = QColor("#fab38780")
@@ -58,6 +61,7 @@ class WellPlateNavigator(QWidget):
         super().__init__(parent)
         self._plate = None
         self._calibrated_wells: set[str] = set()
+        self._approximate_wells: set[str] = set()  # v7.3.2: geometry-predicted positions
         self._current_well: str | None = None
         self._hover_well: str | None = None
         self._well_positions: dict[str, tuple[float, float]] | None = None  # well → (x_um, y_um)
@@ -81,10 +85,24 @@ class WellPlateNavigator(QWidget):
         self.update()
 
     def set_well_positions(self, positions: dict[str, tuple[float, float]] | None):
-        """Store well positions for tooltip display."""
+        """Store well positions for tooltip display (calibrated — green)."""
         self._well_positions = positions
         if positions:
             self._calibrated_wells = set(positions.keys())
+            self._approximate_wells.clear()  # Calibrated replaces approximate
+        self.update()
+
+    def set_approximate_positions(self, positions: dict[str, tuple[float, float]] | None):
+        """v7.3.2: Store geometry-predicted positions (yellow, pre-calibration).
+
+        These are replaced when set_well_positions() is called with calibrated data.
+        """
+        self._well_positions = positions
+        if positions:
+            self._approximate_wells = set(positions.keys())
+            self._calibrated_wells.clear()
+        else:
+            self._approximate_wells.clear()
         self.update()
 
     def set_current_well(self, well_name: str | None):
@@ -220,6 +238,9 @@ class WellPlateNavigator(QWidget):
             elif name in self._calibrated_wells:
                 fill = self._CLR_CAL
                 border = self._CLR_CAL_BORDER
+            elif name in self._approximate_wells:
+                fill = self._CLR_APPROX
+                border = self._CLR_APPROX_BORDER
             else:
                 fill = self._CLR_UNCAL
                 border = self._CLR_UNCAL_BORDER
@@ -240,8 +261,10 @@ class WellPlateNavigator(QWidget):
         # Tooltip
         if well and self._well_positions and well in self._well_positions:
             x, y = self._well_positions[well]
+            prefix = "~" if well in self._approximate_wells else ""
             QToolTip.showText(event.globalPosition().toPoint(),
-                              f"{well}: ({x:.0f}, {y:.0f}) µm")
+                              f"{well}: {prefix}({x:.0f}, {y:.0f}) µm"
+                              + (" (approx)" if well in self._approximate_wells else ""))
         elif well:
             QToolTip.showText(event.globalPosition().toPoint(), well)
         else:

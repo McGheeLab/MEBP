@@ -25,10 +25,10 @@ from enum import Enum
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QProgressBar, QGroupBox,
-    QSplitter, QListWidget, QFrame, QSizePolicy,
+    QSplitter, QListWidget, QFrame, QSizePolicy, QCheckBox,
 )
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient, QImage
 
 from gui.styles import COLORS
 
@@ -219,6 +219,11 @@ class XYDetailView(QWidget):
         self._well_centers: dict[str, tuple[float, float]] = {}
         self._current_well = ""
 
+        # v7.3.2: Camera overlay
+        self._cam_frame: QImage | None = None   # Latest camera QImage
+        self._cam_um_per_px: float = 0.0        # Camera scale
+        self._cam_overlay_enabled: bool = False  # Toggle
+
     # ── Data setters ──────────────────────────────────────────────
 
     def set_trajectory(self, waypoints, is_travel=None, wells=None):
@@ -277,6 +282,44 @@ class XYDetailView(QWidget):
         self._nx = x
         self._ny = y
         self._needle_trail.append((x, y))
+        self.update()
+
+    # ── v7.3.2: Camera overlay ───────────────────────────────────
+
+    def set_camera_overlay(self, enabled: bool):
+        """Enable/disable camera overlay on the XY view."""
+        self._cam_overlay_enabled = enabled
+        self.update()
+
+    def set_camera_frame(self, qimage: QImage | None, um_per_px: float = 0.0):
+        """Set the latest camera frame for overlay.
+
+        Args:
+            qimage: Camera frame as QImage (RGB888 or similar).
+            um_per_px: Microns per pixel — used to scale the frame to stage coords.
+        """
+        self._cam_frame = qimage
+        if um_per_px > 0:
+            self._cam_um_per_px = um_per_px
+        if self._cam_overlay_enabled:
+            self.update()
+
+    def zoom_to_camera(self):
+        """Zoom the view to fit the camera FOV around the needle."""
+        if self._cam_frame is None or self._cam_um_per_px <= 0:
+            return
+        if self._nx is None:
+            return
+        fov_w_mm = self._cam_frame.width() * self._cam_um_per_px / 1000.0
+        fov_h_mm = self._cam_frame.height() * self._cam_um_per_px / 1000.0
+        self._view_cx = self._nx
+        self._view_cy = self._ny
+        self._view_radius = max(fov_w_mm, fov_h_mm) / 2 + 1.0
+        self.update()
+
+    def zoom_to_plate(self):
+        """Zoom the view to fit the entire trajectory."""
+        self._auto_fit_view()
         self.update()
 
     def focus_well(self, well_name):
@@ -450,6 +493,29 @@ class XYDetailView(QWidget):
                 if (py0 < -50 and py1 < -50) or (py0 > h + 50 and py1 > h + 50):
                     continue
                 p.drawLine(QPointF(px0, py0), QPointF(px1, py1))
+
+        # 6.5 v7.3.2: Camera overlay (semi-transparent, true-to-scale)
+        if (self._cam_overlay_enabled and self._cam_frame is not None
+                and self._cam_um_per_px > 0 and self._nx is not None):
+            cam_mm_per_px = self._cam_um_per_px / 1000.0
+            cam_w_mm = self._cam_frame.width() * cam_mm_per_px
+            cam_h_mm = self._cam_frame.height() * cam_mm_per_px
+            # Camera top-left in stage mm (centered on needle)
+            cam_tl_x = self._nx - cam_w_mm / 2
+            cam_tl_y = self._ny - cam_h_mm / 2
+            # Convert to pixel coords
+            px_tl = self._to_px(cam_tl_x, cam_tl_y)
+            px_br = self._to_px(cam_tl_x + cam_w_mm, cam_tl_y + cam_h_mm)
+            target_rect = QRectF(
+                px_tl[0], px_tl[1],
+                px_br[0] - px_tl[0], px_br[1] - px_tl[1])
+            p.setOpacity(0.5)
+            p.drawImage(target_rect, self._cam_frame)
+            p.setOpacity(1.0)
+            # Draw camera FOV border
+            p.setPen(QPen(QColor("#89b4fa"), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(target_rect)
 
         # 7. Needle crosshair
         if self._nx is not None:
@@ -749,6 +815,24 @@ class PrintMonitorPage(QWidget):
             l = QLabel(txt); l.setStyleSheet(f"color: {c}; font-size: 9px;")
             dl.addWidget(l)
         dl.addStretch()
+        # v7.3.2: Camera overlay toggle + zoom controls
+        self._chk_cam_overlay = QCheckBox("Camera")
+        self._chk_cam_overlay.setStyleSheet("font-size: 9px;")
+        self._chk_cam_overlay.setToolTip("Overlay live camera feed on XY view")
+        self._chk_cam_overlay.toggled.connect(self._toggle_cam_overlay)
+        dl.addWidget(self._chk_cam_overlay)
+        btn_zoom_cam = QPushButton("Zoom Cam")
+        btn_zoom_cam.setMaximumHeight(20)
+        btn_zoom_cam.setStyleSheet("font-size: 9px; padding: 1px 4px;")
+        btn_zoom_cam.setToolTip("Zoom to camera FOV")
+        btn_zoom_cam.clicked.connect(lambda: self.xy_detail.zoom_to_camera())
+        dl.addWidget(btn_zoom_cam)
+        btn_zoom_plate = QPushButton("Zoom All")
+        btn_zoom_plate.setMaximumHeight(20)
+        btn_zoom_plate.setStyleSheet("font-size: 9px; padding: 1px 4px;")
+        btn_zoom_plate.setToolTip("Zoom to fit all waypoints")
+        btn_zoom_plate.clicked.connect(lambda: self.xy_detail.zoom_to_plate())
+        dl.addWidget(btn_zoom_plate)
         xl.addLayout(dl)
         top_split.addWidget(xg)
 
@@ -843,6 +927,53 @@ class PrintMonitorPage(QWidget):
     def _connect_signals(self):
         self.btn_pause.clicked.connect(self._on_pause)
         self.btn_abort.clicked.connect(self._on_abort)
+
+    # ── v7.3.2: Camera overlay ─────────────────────────────────────
+
+    def _toggle_cam_overlay(self, checked: bool):
+        """Toggle camera overlay on XY detail view."""
+        self.xy_detail.set_camera_overlay(checked)
+
+    def _feed_camera_frame(self):
+        """Capture latest camera frame and push to XY detail view.
+
+        Called from on_status_update when camera overlay is enabled.
+        """
+        if not self._chk_cam_overlay.isChecked():
+            return
+        # Get camera widget from calibration page (shared camera)
+        # Access through main window's page list
+        try:
+            main_win = self.window()
+            cal_page = None
+            if hasattr(main_win, '_page_widgets'):
+                for pg in main_win._page_widgets:
+                    if hasattr(pg, '_cameras') and pg._cameras:
+                        cal_page = pg
+                        break
+            if cal_page is None:
+                return
+            for cam in cal_page._cameras:
+                if cam.isVisible() and hasattr(cam, '_last_frame') and cam._last_frame is not None:
+                    import numpy as np
+                    frame = cam._last_frame  # BGR numpy array
+                    h, w = frame.shape[:2]
+                    if frame.ndim == 3:
+                        # BGR → RGB
+                        rgb = frame[:, :, ::-1].copy()
+                        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+                    else:
+                        qimg = QImage(frame.data, w, h, w, QImage.Format.Format_Grayscale8)
+                    # Get um_per_px from hardware config
+                    um_per_px = 0.0
+                    if self._hardware_config and hasattr(self._hardware_config, 'camera_config'):
+                        cc = self._hardware_config.camera_config
+                        if cc and hasattr(cc, 'micron_per_pixel') and cc.micron_per_pixel:
+                            um_per_px = cc.micron_per_pixel
+                    self.xy_detail.set_camera_frame(qimg.copy(), um_per_px)
+                    break
+        except Exception as e:
+            logger.debug(f"Camera overlay feed error: {e}")
 
     # ── Context panel ─────────────────────────────────────────────
 
@@ -1161,6 +1292,9 @@ class PrintMonitorPage(QWidget):
             self.plate_view.set_needle_position(px, py)
             self.xy_detail.set_needle_position(px, py)
             self.yz_view.set_needle_position(py, pz)
+
+            # v7.3.2: Feed camera frame to XY overlay
+            self._feed_camera_frame()
 
             # Position-based trajectory progress — robust two-phase search
             wps = self.xy_detail._waypoints

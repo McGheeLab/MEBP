@@ -1,9 +1,13 @@
 """
-Calibration Page — Multi-camera layout with calibration steps in context panel.
+Calibration Page — Multi-camera layout with calibration wizard.
 
-Main content: Position readout + up to 3 simultaneous camera feeds
-Context panel (left box): Camera settings, plate config, 3-step calibration
-    wizard (zero needle, teach plate, validate), calibration save/load
+v7.3.2: Layout restructured.
+    Context panel (left box): Calibration wizard + plate position view + plate config.
+    Main content: Position readout, camera feeds (configurable count).
+    Per-camera settings (brightness, gamma, FPS) via CameraWidget's built-in settings panel.
+    Step 1 "Zero Needle" removed — use jog page Set Zero instead.
+    Steps renumbered: Safe Z (1A), Top Z (1B), Auto-Calibrate (1C), Z-Cal (2).
+    Camera feed count selectable (1/2/3).
 
 Camera feeds support software brightness and gamma adjustment which works
 regardless of webcam hardware capabilities.
@@ -16,8 +20,8 @@ import logging
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QPushButton, QLabel, QComboBox, QDoubleSpinBox, QSpinBox,
-    QFrame, QSizePolicy, QMessageBox, QCheckBox, QSlider,
+    QPushButton, QLabel, QComboBox, QDoubleSpinBox,
+    QFrame, QSizePolicy, QMessageBox, QCheckBox,
     QScrollArea,
 )
 from PySide6.QtCore import Qt, Signal
@@ -571,6 +575,10 @@ class CalibrationPage(QWidget):
         self._scanning: bool = False
         # v7.3.1: Z-offset teaching state
         self._z_teach_points: dict[str, float] = {}  # well_name → Z offset (mm, zero-ref)
+        # v7.3.2: Manual XY teaching state
+        self._xy_teach_points: dict[str, tuple[float, float]] = {}  # well_name → (x_um, y_um) absolute
+        self._edge_left: tuple[float, float] | None = None   # left edge (x_um, y_um)
+        self._edge_right: tuple[float, float] | None = None  # right edge (x_um, y_um)
 
         # v7.3.0: Auto-detection state
         self._detection_worker: DetectionWorker | None = None
@@ -685,11 +693,11 @@ class CalibrationPage(QWidget):
 
 
     # ════════════════════════════════════════════════════════════════
-    #  CONTEXT PANEL  (Steps 1-2-3 + Camera Settings + Plate Config)
+    #  CONTEXT PANEL  (Plate Config + Plate View + Wizard Steps)
     # ════════════════════════════════════════════════════════════════
 
     def get_context_widget(self) -> QWidget:
-        """Build the context panel with calibration steps and settings."""
+        """Build the context panel: wizard steps + plate view + plate config."""
         if self._context_widget is not None:
             return self._context_widget
 
@@ -697,50 +705,6 @@ class CalibrationPage(QWidget):
         layout = QVBoxLayout(ctx)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(5)
-
-        # ── Camera Controls (global) ─────────────────────────────
-        cam_label = QLabel("Camera Controls")
-        cam_label.setObjectName("contextSectionLabel")
-        layout.addWidget(cam_label)
-
-        if CV2_AVAILABLE:
-            # Brightness slider
-            layout.addWidget(self._make_slider_row(
-                "Brightness:", -100, 100, 0,
-                "cam_brightness", self._on_brightness_changed,
-            ))
-
-            # Gamma slider
-            layout.addWidget(self._make_slider_row(
-                "Gamma:", 10, 300, 100,
-                "cam_gamma", self._on_gamma_changed,
-            ))
-
-            # FPS
-            fps_row = QHBoxLayout()
-            fps_row.addWidget(QLabel("FPS:"))
-            self._cam_fps_spin = QSpinBox()
-            self._cam_fps_spin.setRange(1, 60)
-            self._cam_fps_spin.setValue(15)
-            self._cam_fps_spin.valueChanged.connect(self._on_fps_changed)
-            fps_row.addWidget(self._cam_fps_spin)
-            layout.addLayout(fps_row)
-
-            # Crosshair toggle
-            self._chk_crosshair = QCheckBox("Show Crosshair (all cameras)")
-            self._chk_crosshair.setChecked(True)
-            self._chk_crosshair.toggled.connect(self._on_crosshair_toggled)
-            layout.addWidget(self._chk_crosshair)
-
-            # Detect cameras button
-            btn_detect = QPushButton("🔄 Detect Cameras")
-            btn_detect.setObjectName("flatBtn")
-            btn_detect.clicked.connect(self._refresh_all_cameras)
-            layout.addWidget(btn_detect)
-        else:
-            layout.addWidget(QLabel(
-                "Camera unavailable.\nInstall: pip install opencv-python"
-            ))
 
         # ── Plate Configuration ──────────────────────────────────
         plate_label = QLabel("Plate Configuration")
@@ -757,307 +721,11 @@ class CalibrationPage(QWidget):
         plate_row.addWidget(self.ctx_plate_combo, stretch=1)
         layout.addLayout(plate_row)
 
-        # ── Step 1: Zero Needle ──────────────────────────────────
-        s1_label = QLabel("Step 1 — Zero Needle")
-        s1_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s1_label)
+        # v7.3.2: Plate position view in context panel
+        self._build_cal_views(layout)
 
-        layout.addWidget(QLabel("Jog to contact, then Set Zero."))
-
-        s1_row = QHBoxLayout()
-        btn_set_zero = QPushButton("Set Zero")
-        btn_set_zero.setObjectName("successBtn")
-        btn_set_zero.setMaximumHeight(26)
-        btn_set_zero.clicked.connect(self._set_zero)
-        s1_row.addWidget(btn_set_zero)
-
-        btn_goto_zero = QPushButton("Go to Zero")
-        btn_goto_zero.setMaximumHeight(26)
-        btn_goto_zero.clicked.connect(self._goto_zero)
-        s1_row.addWidget(btn_goto_zero)
-        layout.addLayout(s1_row)
-
-        self.lbl_zero_status = QLabel("Not set")
-        self.lbl_zero_status.setStyleSheet(f"color: {COLORS['yellow']};")
-        layout.addWidget(self.lbl_zero_status)
-
-        # ── Step 2: Teach Plate Position ─────────────────────────
-        # ── Step 2A — Safe Z ─────────────────────────────
-        s2a_label = QLabel("Step 2A — Safe Z")
-        s2a_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2a_label)
-        layout.addWidget(QLabel("Raise needle to safe travel height, then set."))
-        s2a_row = QHBoxLayout()
-        btn_safe_z = QPushButton("Set Safe Z")
-        btn_safe_z.setObjectName("successBtn")
-        btn_safe_z.setMaximumHeight(26)
-        btn_safe_z.clicked.connect(self._set_safe_z)
-        s2a_row.addWidget(btn_safe_z)
-        self.lbl_safe_z = QLabel("Not set")
-        self.lbl_safe_z.setStyleSheet(f"color: {COLORS['yellow']};")
-        s2a_row.addWidget(self.lbl_safe_z, stretch=1)
-        layout.addLayout(s2a_row)
-
-        # ── Step 2B — Top Z ──────────────────────────────
-        s2b_label = QLabel("Step 2B — Top Z (Plate Surface)")
-        s2b_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2b_label)
-        layout.addWidget(QLabel("Lower needle to plate top surface, then set."))
-        s2b_row = QHBoxLayout()
-        btn_top_z = QPushButton("Set Top Z")
-        btn_top_z.setMaximumHeight(26)
-        btn_top_z.clicked.connect(self._set_top_z)
-        s2b_row.addWidget(btn_top_z)
-        self.lbl_top_z = QLabel("Not set")
-        self.lbl_top_z.setStyleSheet(f"color: {COLORS['yellow']};")
-        s2b_row.addWidget(self.lbl_top_z, stretch=1)
-        layout.addLayout(s2b_row)
-
-        # ── Step 2C — Auto-Calibrate (v7.3.1) ────────────────
-        s2d_scan_label = QLabel("Step 2C \u2014 Auto-Calibrate (3-Well)")
-        s2d_scan_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s2d_scan_label)
-        layout.addWidget(QLabel("Auto-detect 3 wells to calibrate plate position and orientation."))
-
-        scan_btn_row = QHBoxLayout()
-        self._btn_start_scan = QPushButton("Auto-Calibrate")
-        self._btn_start_scan.setObjectName("successBtn")
-        self._btn_start_scan.setMaximumHeight(26)
-        self._btn_start_scan.setToolTip(
-            "Move to 3 reference wells, auto-detect each, fit affine correction")
-        self._btn_start_scan.clicked.connect(self._start_plate_scan)
-        scan_btn_row.addWidget(self._btn_start_scan)
-
-        self._btn_cancel_scan = QPushButton("Cancel")
-        self._btn_cancel_scan.setMaximumHeight(26)
-        self._btn_cancel_scan.setMaximumWidth(60)
-        self._btn_cancel_scan.setEnabled(False)
-        self._btn_cancel_scan.clicked.connect(self._cancel_plate_scan)
-        scan_btn_row.addWidget(self._btn_cancel_scan)
-
-        self._btn_accept_scan = QPushButton("Accept")
-        self._btn_accept_scan.setMaximumHeight(26)
-        self._btn_accept_scan.setMaximumWidth(60)
-        self._btn_accept_scan.setEnabled(False)
-        self._btn_accept_scan.clicked.connect(self._accept_plate_scan)
-        scan_btn_row.addWidget(self._btn_accept_scan)
-        layout.addLayout(scan_btn_row)
-
-        self._lbl_scan_progress = QLabel("")
-        self._lbl_scan_progress.setWordWrap(True)
-        self._lbl_scan_progress.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 9pt;")
-        layout.addWidget(self._lbl_scan_progress)
-
-        self._lbl_scan_result = QLabel("")
-        self._lbl_scan_result.setWordWrap(True)
-        self._lbl_scan_result.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 9pt;")
-        layout.addWidget(self._lbl_scan_result)
-
-        # ── Fast-travel buttons for calibration wells (shown after auto-cal) ──
-        self._cal_travel_frame = QWidget()
-        cal_travel_layout = QHBoxLayout(self._cal_travel_frame)
-        cal_travel_layout.setContentsMargins(0, 0, 0, 0)
-        cal_travel_layout.addWidget(QLabel("Go to:"))
-        self._cal_travel_btns: list[QPushButton] = []
-        for i in range(3):
-            btn = QPushButton("—")
-            btn.setMaximumHeight(24)
-            btn.setMaximumWidth(60)
-            btn.setEnabled(False)
-            btn.clicked.connect(lambda checked, idx=i: self._goto_calibration_well(idx))
-            cal_travel_layout.addWidget(btn)
-            self._cal_travel_btns.append(btn)
-        cal_travel_layout.addStretch()
-        self._cal_travel_frame.setVisible(False)
-        layout.addWidget(self._cal_travel_frame)
-
-        # ── Step 3 — Z-Bottom Calibration (v7.3.1) ─────────────
-        s3_label = QLabel("Step 3 \u2014 Z-Bottom Calibration")
-        s3_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s3_label)
-        layout.addWidget(QLabel(
-            "Find well bottom Z by lowering needle and tracking focus peak."))
-
-        # Well depth field (editable, pre-populated from plate)
-        depth_row = QHBoxLayout()
-        depth_row.addWidget(QLabel("Well depth:"))
-        self._well_depth_spin = QDoubleSpinBox()
-        self._well_depth_spin.setRange(1.0, 50.0)
-        self._well_depth_spin.setDecimals(2)
-        self._well_depth_spin.setSuffix(" mm")
-        self._well_depth_spin.setValue(17.4)  # default (6/12/24/48 well)
-        self._well_depth_spin.setMaximumWidth(100)
-        self._well_depth_spin.setToolTip(
-            "Distance from plate top surface to well bottom glass")
-        depth_row.addWidget(self._well_depth_spin)
-        depth_row.addStretch()
-        layout.addLayout(depth_row)
-
-        # Auto Z-Cal button row
-        auto_z_row = QHBoxLayout()
-        self._btn_auto_z_cal = QPushButton("Auto Z-Cal")
-        self._btn_auto_z_cal.setObjectName("successBtn")
-        self._btn_auto_z_cal.setMaximumHeight(26)
-        self._btn_auto_z_cal.setToolTip(
-            "Automatically find Z bottom at 3 calibration wells using focus search")
-        self._btn_auto_z_cal.clicked.connect(self._start_auto_z_cal)
-        auto_z_row.addWidget(self._btn_auto_z_cal)
-        self._btn_cancel_auto_z = QPushButton("Cancel")
-        self._btn_cancel_auto_z.setMaximumHeight(26)
-        self._btn_cancel_auto_z.setMaximumWidth(60)
-        self._btn_cancel_auto_z.setEnabled(False)
-        self._btn_cancel_auto_z.clicked.connect(self._cancel_auto_z)
-        auto_z_row.addWidget(self._btn_cancel_auto_z)
-        layout.addLayout(auto_z_row)
-
-        # Auto Z-Cal progress
-        self._lbl_auto_z_progress = QLabel("")
-        self._lbl_auto_z_progress.setWordWrap(True)
-        self._lbl_auto_z_progress.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 9pt;")
-        layout.addWidget(self._lbl_auto_z_progress)
-
-        # v7.3.0: Needle detection + focus assist (moved from Step 1 area)
-        if VISION_AVAILABLE:
-            nd_row = QHBoxLayout()
-            self._btn_detect_needle = QPushButton("Detect Needle")
-            self._btn_detect_needle.setMaximumHeight(24)
-            self._btn_detect_needle.setCheckable(True)
-            self._btn_detect_needle.setToolTip(
-                "Detect needle tip in camera FOV using vision")
-            self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
-            nd_row.addWidget(self._btn_detect_needle)
-            self._btn_focus_assist = QPushButton("Focus Assist")
-            self._btn_focus_assist.setMaximumHeight(24)
-            self._btn_focus_assist.setCheckable(True)
-            self._btn_focus_assist.setToolTip(
-                "Real-time focus quality bar \u2014 adjust Z for sharpest image")
-            self._btn_focus_assist.setEnabled(False)
-            self._btn_focus_assist.toggled.connect(self._toggle_focus_assist)
-            nd_row.addWidget(self._btn_focus_assist)
-            layout.addLayout(nd_row)
-
-            self._lbl_needle_status = QLabel("")
-            self._lbl_needle_status.setWordWrap(True)
-            self._lbl_needle_status.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_needle_status)
-            self._lbl_focus_status = QLabel("")
-            self._lbl_focus_status.setWordWrap(True)
-            self._lbl_focus_status.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_focus_status)
-            self._lbl_best_focus = QLabel("")
-            self._lbl_best_focus.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: 9pt;")
-            layout.addWidget(self._lbl_best_focus)
-
-        # ── Manual Z teaching (fallback) ──
-        manual_z_label = QLabel("Manual Z Teaching")
-        manual_z_label.setObjectName("contextSectionLabel")
-        manual_z_label.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 9pt;")
-        layout.addWidget(manual_z_label)
-
-        zteach_row = QHBoxLayout()
-        zteach_row.addWidget(QLabel("Well:"))
-        self._zteach_well_combo = QComboBox()
-        self._zteach_well_combo.setMaximumWidth(70)
-        zteach_row.addWidget(self._zteach_well_combo)
-        btn_zteach_go = QPushButton("Go \u25b6")
-        btn_zteach_go.setMaximumHeight(24)
-        btn_zteach_go.setMaximumWidth(40)
-        btn_zteach_go.setToolTip("Safe-travel to selected well")
-        btn_zteach_go.clicked.connect(self._zteach_goto_well)
-        zteach_row.addWidget(btn_zteach_go)
-        btn_zteach_next = QPushButton("Next")
-        btn_zteach_next.setMaximumHeight(24)
-        btn_zteach_next.setMaximumWidth(40)
-        btn_zteach_next.setToolTip("Advance to next well and navigate")
-        btn_zteach_next.clicked.connect(self._zteach_next_well)
-        zteach_row.addWidget(btn_zteach_next)
-        layout.addLayout(zteach_row)
-
-        try:
-            from gui.widgets.jog_button_array import JogButtonArray
-            self._zteach_jog = JogButtonArray(compact=True, parent=self)
-            self._zteach_jog.jog_xy_requested.connect(self._zteach_jog_xy)
-            self._zteach_jog.jog_z_requested.connect(self._zteach_jog_z)
-            self._zteach_jog.home_requested.connect(self._jog_xy_home)
-            layout.addWidget(self._zteach_jog)
-        except ImportError:
-            pass
-
-        zrec_row = QHBoxLayout()
-        btn_rec_z = QPushButton("Record Z")
-        btn_rec_z.setObjectName("successBtn")
-        btn_rec_z.setMaximumHeight(26)
-        btn_rec_z.setToolTip("Record current Z position for selected well")
-        btn_rec_z.clicked.connect(self._zteach_record_z)
-        zrec_row.addWidget(btn_rec_z)
-        btn_fit_z = QPushButton("Fit Z-Plane")
-        btn_fit_z.setMaximumHeight(26)
-        btn_fit_z.setToolTip("Fit Z plane from recorded points (need \u22653)")
-        btn_fit_z.clicked.connect(self._try_fit_z_plane)
-        zrec_row.addWidget(btn_fit_z)
-        layout.addLayout(zrec_row)
-
-        self.lbl_zplane = QLabel("0/3 teach points")
-        self.lbl_zplane.setWordWrap(True)
-        self.lbl_zplane.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
-        layout.addWidget(self.lbl_zplane)
-
-        # Legacy third point support (kept for backwards compat with existing save data)
-        self.lbl_third = QLabel("")
-        self.lbl_third.setVisible(False)
-        layout.addWidget(self.lbl_third)
-
-        self._gen_status = QLabel("")
-        self._gen_status.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
-        layout.addWidget(self._gen_status)
-
-        s3_label = QLabel("Step 3 — Validate")
-        s3_label.setObjectName("contextSectionLabel")
-        layout.addWidget(s3_label)
-
-        val_row = QHBoxLayout()
-        val_row.addWidget(QLabel("Well:"))
-        self.val_well_combo = QComboBox()
-        val_row.addWidget(self.val_well_combo, stretch=1)
-        btn_goto_well = QPushButton("Go")
-        btn_goto_well.setMaximumHeight(24)
-        btn_goto_well.clicked.connect(self._goto_well)
-        val_row.addWidget(btn_goto_well)
-        layout.addLayout(val_row)
-
-        self.lbl_val_result = QLabel("")
-        self.lbl_val_result.setWordWrap(True)
-        self.lbl_val_result.setStyleSheet(f"color: {COLORS['subtext0']};")
-        layout.addWidget(self.lbl_val_result)
-
-        # ── Calibration Persistence ──────────────────────────────
-        persist_label = QLabel("Calibration Data")
-        persist_label.setObjectName("contextSectionLabel")
-        layout.addWidget(persist_label)
-
-        self.ctx_lbl_cal_status = QLabel("Not calibrated")
-        self.ctx_lbl_cal_status.setObjectName("contextLabel")
-        self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
-        layout.addWidget(self.ctx_lbl_cal_status)
-
-        cal_btn_row = QHBoxLayout()
-        btn_save_cal = QPushButton("💾 Save")
-        btn_save_cal.setMaximumHeight(26)
-        btn_save_cal.clicked.connect(self._save_calibration)
-        cal_btn_row.addWidget(btn_save_cal)
-
-        btn_load_cal = QPushButton("📂 Load")
-        btn_load_cal.setMaximumHeight(26)
-        btn_load_cal.clicked.connect(self._load_calibration)
-        cal_btn_row.addWidget(btn_load_cal)
-        layout.addLayout(cal_btn_row)
+        # v7.3.2: Calibration wizard steps in context panel
+        self._build_wizard_steps(layout)
 
         layout.addStretch()
 
@@ -1068,65 +736,14 @@ class CalibrationPage(QWidget):
 
         return ctx
 
-    # ── Context panel helpers ─────────────────────────────────────
-
-    def _make_slider_row(self, label: str, min_val: int, max_val: int,
-                         default: int, attr_name: str, slot) -> QWidget:
-        """Create a compact labeled slider row."""
-        widget = QWidget()
-        lay = QVBoxLayout(widget)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(2)
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel(label))
-        value_lbl = QLabel(str(default))
-        value_lbl.setObjectName("dimLabel")
-        value_lbl.setMinimumWidth(30)
-        top.addStretch()
-        top.addWidget(value_lbl)
-        lay.addLayout(top)
-
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(min_val, max_val)
-        slider.setValue(default)
-        slider.valueChanged.connect(lambda v: value_lbl.setText(str(v)))
-        slider.valueChanged.connect(slot)
-        setattr(self, f"_slider_{attr_name}", slider)
-        lay.addWidget(slider)
-
-        return widget
-
-    # ── Camera settings callbacks (apply to ALL cameras) ──────────
-
-    def _on_brightness_changed(self, value: int):
-        for cam in self._cameras:
-            cam.set_brightness(value)
-
-    def _on_gamma_changed(self, value: int):
-        for cam in self._cameras:
-            cam.set_gamma(value / 100.0)
-
-    def _on_fps_changed(self, value: int):
-        for cam in self._cameras:
-            cam._fps = value
-            if cam._running:
-                cam._timer.setInterval(int(1000 / value))
-
-    def _on_crosshair_toggled(self, checked: bool):
-        for cam in self._cameras:
-            cam._show_crosshair = checked
-            if hasattr(cam, 'chk_crosshair'):
-                cam.chk_crosshair.blockSignals(True)
-                cam.chk_crosshair.setChecked(checked)
-                cam.chk_crosshair.blockSignals(False)
-
-    def _refresh_all_cameras(self):
-        for cam in self._cameras:
-            cam.refresh_cameras()
+    def _on_cam_count_changed(self, index: int):
+        """v7.3.2: Show/hide cameras based on selected count."""
+        count = self._cam_count_combo.currentData() or 1
+        for i, cam in enumerate(self._cameras):
+            cam.setVisible(i < count)
 
     # ════════════════════════════════════════════════════════════════
-    #  MAIN CONTENT UI  (position readout + multi-camera grid)
+    #  MAIN CONTENT UI  (position readout + camera feeds)
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
@@ -1162,14 +779,28 @@ class CalibrationPage(QWidget):
         layout.addWidget(pos_card)
 
         # ── Camera Feeds Grid ─────────────────────────────────────
+        # v7.3.2: Per-camera settings via CameraWidget's built-in settings panel
         cam_card = QFrame()
         cam_card.setObjectName("cardFrame")
         cam_layout = QVBoxLayout(cam_card)
         cam_layout.setSpacing(4)
 
+        cam_title_row = QHBoxLayout()
         cam_title = QLabel("Camera Feeds")
         cam_title.setObjectName("sectionLabel")
-        cam_layout.addWidget(cam_title)
+        cam_title_row.addWidget(cam_title)
+        # v7.3.2: Camera count selector
+        cam_title_row.addStretch()
+        cam_title_row.addWidget(QLabel("Show:"))
+        self._cam_count_combo = QComboBox()
+        self._cam_count_combo.addItem("1 camera", 1)
+        self._cam_count_combo.addItem("2 cameras", 2)
+        self._cam_count_combo.addItem("3 cameras", 3)
+        self._cam_count_combo.setCurrentIndex(0)  # Default: 1 camera
+        self._cam_count_combo.setMaximumWidth(100)
+        self._cam_count_combo.currentIndexChanged.connect(self._on_cam_count_changed)
+        cam_title_row.addWidget(self._cam_count_combo)
+        cam_layout.addLayout(cam_title_row)
 
         if CAMERA_AVAILABLE and CameraWidget is not None:
             self._cam_grid = QHBoxLayout()
@@ -1185,6 +816,10 @@ class CalibrationPage(QWidget):
                 self._cameras.append(cam)
                 self._cam_grid.addWidget(cam, stretch=1)
 
+            # v7.3.2: Only show first camera by default
+            for i, cam in enumerate(self._cameras):
+                cam.setVisible(i == 0)
+
             cam_layout.addLayout(self._cam_grid, stretch=1)
         else:
             no_cam = QLabel(
@@ -1196,9 +831,6 @@ class CalibrationPage(QWidget):
             cam_layout.addWidget(no_cam, stretch=1)
 
         layout.addWidget(cam_card, stretch=1)
-
-        # v7.3.1-calviews: plate + YZ views
-        self._build_cal_views(layout)
 
     # ════════════════════════════════════════════════════════════════
     #  STATUS UPDATE
@@ -1237,7 +869,7 @@ class CalibrationPage(QWidget):
     # ── Plate + YZ views (v7.3.1-calviews) ──────────────────────
 
     def _build_cal_views(self, parent_layout) -> None:
-        """Add plate-view + YZ-view row below camera card."""
+        """Add plate-view + YZ-view to context panel."""
         from PySide6.QtWidgets import QGroupBox
         grp = QGroupBox("Plate Position View")
         grp.setStyleSheet(
@@ -1262,6 +894,357 @@ class CalibrationPage(QWidget):
         grp_layout.addWidget(self._cal_yz_view)
 
         parent_layout.addWidget(grp)
+
+    def _build_wizard_steps(self, parent_layout) -> None:
+        """v7.3.2: Build calibration wizard steps in context panel.
+
+        Step 1 (Zero Needle) removed — use jog page Set Zero instead.
+        """
+        wiz_frame = QFrame()
+        wiz_frame.setObjectName("cardFrame")
+        layout = QVBoxLayout(wiz_frame)
+        layout.setSpacing(5)
+        layout.setContentsMargins(8, 6, 8, 6)
+
+        wiz_title = QLabel("Calibration Wizard")
+        wiz_title.setStyleSheet(SECTION_TITLE_STYLE)
+        layout.addWidget(wiz_title)
+
+        # ── Step 1A — Safe Z ─────────────────────────────
+        s1a_label = QLabel("Step 1A \u2014 Safe Z")
+        s1a_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s1a_label)
+        layout.addWidget(QLabel("Raise needle to safe travel height, then set."))
+        s1a_row = QHBoxLayout()
+        btn_safe_z = QPushButton("Set Safe Z")
+        btn_safe_z.setObjectName("successBtn")
+        btn_safe_z.setMaximumHeight(26)
+        btn_safe_z.clicked.connect(self._set_safe_z)
+        s1a_row.addWidget(btn_safe_z)
+        self.lbl_safe_z = QLabel("Not set")
+        self.lbl_safe_z.setStyleSheet(f"color: {COLORS['yellow']};")
+        s1a_row.addWidget(self.lbl_safe_z, stretch=1)
+        layout.addLayout(s1a_row)
+
+        # ── Step 1B — Top Z ──────────────────────────────
+        s1b_label = QLabel("Step 1B \u2014 Top Z (Plate Surface)")
+        s1b_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s1b_label)
+        layout.addWidget(QLabel("Lower needle to plate top surface, then set."))
+        s1b_row = QHBoxLayout()
+        btn_top_z = QPushButton("Set Top Z")
+        btn_top_z.setMaximumHeight(26)
+        btn_top_z.clicked.connect(self._set_top_z)
+        s1b_row.addWidget(btn_top_z)
+        self.lbl_top_z = QLabel("Not set")
+        self.lbl_top_z.setStyleSheet(f"color: {COLORS['yellow']};")
+        s1b_row.addWidget(self.lbl_top_z, stretch=1)
+        layout.addLayout(s1b_row)
+
+        # ── Step 1C — Auto-Calibrate (3-Well) ────────────
+        s1c_label = QLabel("Step 1C \u2014 Auto-Calibrate (3-Well)")
+        s1c_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s1c_label)
+        layout.addWidget(QLabel("Auto-detect 3 wells to calibrate plate position and orientation."))
+
+        scan_btn_row = QHBoxLayout()
+        self._btn_start_scan = QPushButton("Auto-Calibrate")
+        self._btn_start_scan.setObjectName("successBtn")
+        self._btn_start_scan.setMaximumHeight(26)
+        self._btn_start_scan.setToolTip(
+            "Move to 3 reference wells, auto-detect each, fit affine correction")
+        self._btn_start_scan.clicked.connect(self._start_plate_scan)
+        scan_btn_row.addWidget(self._btn_start_scan)
+
+        self._btn_cancel_scan = QPushButton("Cancel")
+        self._btn_cancel_scan.setMaximumHeight(26)
+        self._btn_cancel_scan.setMaximumWidth(60)
+        self._btn_cancel_scan.setEnabled(False)
+        self._btn_cancel_scan.clicked.connect(self._cancel_plate_scan)
+        scan_btn_row.addWidget(self._btn_cancel_scan)
+
+        self._btn_accept_scan = QPushButton("Accept")
+        self._btn_accept_scan.setMaximumHeight(26)
+        self._btn_accept_scan.setMaximumWidth(60)
+        self._btn_accept_scan.setEnabled(False)
+        self._btn_accept_scan.clicked.connect(self._accept_plate_scan)
+        scan_btn_row.addWidget(self._btn_accept_scan)
+        layout.addLayout(scan_btn_row)
+
+        self._lbl_scan_progress = QLabel("")
+        self._lbl_scan_progress.setWordWrap(True)
+        self._lbl_scan_progress.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_scan_progress)
+
+        self._lbl_scan_result = QLabel("")
+        self._lbl_scan_result.setWordWrap(True)
+        self._lbl_scan_result.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_scan_result)
+
+        # Fast-travel buttons for calibration wells
+        self._cal_travel_frame = QWidget()
+        cal_travel_layout = QHBoxLayout(self._cal_travel_frame)
+        cal_travel_layout.setContentsMargins(0, 0, 0, 0)
+        cal_travel_layout.addWidget(QLabel("Go to:"))
+        self._cal_travel_btns: list[QPushButton] = []
+        for i in range(3):
+            btn = QPushButton("\u2014")
+            btn.setMaximumHeight(24)
+            btn.setMaximumWidth(60)
+            btn.setEnabled(False)
+            btn.clicked.connect(lambda checked, idx=i: self._goto_calibration_well(idx))
+            cal_travel_layout.addWidget(btn)
+            self._cal_travel_btns.append(btn)
+        cal_travel_layout.addStretch()
+        self._cal_travel_frame.setVisible(False)
+        layout.addWidget(self._cal_travel_frame)
+
+        # ── Step 2 — Z-Bottom Calibration ─────────────────
+        s2_label = QLabel("Step 2 \u2014 Z-Bottom Calibration")
+        s2_label.setObjectName("contextSectionLabel")
+        layout.addWidget(s2_label)
+        layout.addWidget(QLabel(
+            "Find well bottom Z by lowering needle and tracking focus peak."))
+
+        depth_row = QHBoxLayout()
+        depth_row.addWidget(QLabel("Well depth:"))
+        self._well_depth_spin = QDoubleSpinBox()
+        self._well_depth_spin.setRange(1.0, 50.0)
+        self._well_depth_spin.setDecimals(2)
+        self._well_depth_spin.setSuffix(" mm")
+        self._well_depth_spin.setValue(17.4)
+        self._well_depth_spin.setMaximumWidth(100)
+        self._well_depth_spin.setToolTip(
+            "Distance from plate top surface to well bottom glass")
+        depth_row.addWidget(self._well_depth_spin)
+        depth_row.addStretch()
+        layout.addLayout(depth_row)
+
+        auto_z_row = QHBoxLayout()
+        self._btn_auto_z_cal = QPushButton("Auto Z-Cal")
+        self._btn_auto_z_cal.setObjectName("successBtn")
+        self._btn_auto_z_cal.setMaximumHeight(26)
+        self._btn_auto_z_cal.setToolTip(
+            "Automatically find Z bottom at 3 calibration wells using focus search")
+        self._btn_auto_z_cal.clicked.connect(self._start_auto_z_cal)
+        auto_z_row.addWidget(self._btn_auto_z_cal)
+        self._btn_cancel_auto_z = QPushButton("Cancel")
+        self._btn_cancel_auto_z.setMaximumHeight(26)
+        self._btn_cancel_auto_z.setMaximumWidth(60)
+        self._btn_cancel_auto_z.setEnabled(False)
+        self._btn_cancel_auto_z.clicked.connect(self._cancel_auto_z)
+        auto_z_row.addWidget(self._btn_cancel_auto_z)
+        layout.addLayout(auto_z_row)
+
+        self._lbl_auto_z_progress = QLabel("")
+        self._lbl_auto_z_progress.setWordWrap(True)
+        self._lbl_auto_z_progress.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_auto_z_progress)
+
+        # ── Manual Teaching ─────────────────────────────────
+        manual_label = QLabel("Manual Teaching")
+        manual_label.setObjectName("contextSectionLabel")
+        layout.addWidget(manual_label)
+
+        # Well selector + navigation
+        teach_nav_row = QHBoxLayout()
+        teach_nav_row.addWidget(QLabel("Well:"))
+        self._zteach_well_combo = QComboBox()
+        self._zteach_well_combo.setMaximumWidth(70)
+        teach_nav_row.addWidget(self._zteach_well_combo)
+        btn_zteach_go = QPushButton("Go \u25b6")
+        btn_zteach_go.setMaximumHeight(24)
+        btn_zteach_go.setMaximumWidth(40)
+        btn_zteach_go.setToolTip("Safe-travel to selected well")
+        btn_zteach_go.clicked.connect(self._zteach_goto_well)
+        teach_nav_row.addWidget(btn_zteach_go)
+        btn_zteach_next = QPushButton("Next")
+        btn_zteach_next.setMaximumHeight(24)
+        btn_zteach_next.setMaximumWidth(40)
+        btn_zteach_next.setToolTip("Advance to next well and navigate")
+        btn_zteach_next.clicked.connect(self._zteach_next_well)
+        teach_nav_row.addWidget(btn_zteach_next)
+        layout.addLayout(teach_nav_row)
+
+        # Embedded jog controls
+        try:
+            from gui.widgets.jog_button_array import JogButtonArray
+            self._zteach_jog = JogButtonArray(compact=True, parent=self)
+            self._zteach_jog.jog_xy_requested.connect(self._zteach_jog_xy)
+            self._zteach_jog.jog_z_requested.connect(self._zteach_jog_z)
+            self._zteach_jog.home_requested.connect(self._jog_xy_home)
+            layout.addWidget(self._zteach_jog)
+        except ImportError:
+            pass
+
+        # Vision tools (detect needle + focus assist)
+        if VISION_AVAILABLE:
+            nd_row = QHBoxLayout()
+            self._btn_detect_needle = QPushButton("Detect Needle")
+            self._btn_detect_needle.setMaximumHeight(24)
+            self._btn_detect_needle.setCheckable(True)
+            self._btn_detect_needle.setToolTip(
+                "Detect needle tip in camera FOV using vision")
+            self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
+            nd_row.addWidget(self._btn_detect_needle)
+            self._btn_focus_assist = QPushButton("Focus Assist")
+            self._btn_focus_assist.setMaximumHeight(24)
+            self._btn_focus_assist.setCheckable(True)
+            self._btn_focus_assist.setToolTip(
+                "Real-time focus quality bar \u2014 adjust Z for sharpest image")
+            self._btn_focus_assist.setEnabled(False)
+            self._btn_focus_assist.toggled.connect(self._toggle_focus_assist)
+            nd_row.addWidget(self._btn_focus_assist)
+            layout.addLayout(nd_row)
+
+            self._lbl_needle_status = QLabel("")
+            self._lbl_needle_status.setWordWrap(True)
+            self._lbl_needle_status.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_needle_status)
+            self._lbl_focus_status = QLabel("")
+            self._lbl_focus_status.setWordWrap(True)
+            self._lbl_focus_status.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_focus_status)
+            self._lbl_best_focus = QLabel("")
+            self._lbl_best_focus.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 9pt;")
+            layout.addWidget(self._lbl_best_focus)
+
+        # XY well center: edge-finding (mark left + right edges, auto-center)
+        edge_label = QLabel("Find Well Center")
+        edge_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt; font-weight: bold;")
+        layout.addWidget(edge_label)
+
+        edge_row = QHBoxLayout()
+        self._btn_mark_left = QPushButton("\u25c0 Mark Left")
+        self._btn_mark_left.setMaximumHeight(26)
+        self._btn_mark_left.setToolTip(
+            "Jog crosshair to the left edge of the well, then click")
+        self._btn_mark_left.clicked.connect(self._manual_mark_left)
+        edge_row.addWidget(self._btn_mark_left)
+        self._btn_mark_right = QPushButton("Mark Right \u25b6")
+        self._btn_mark_right.setMaximumHeight(26)
+        self._btn_mark_right.setToolTip(
+            "Jog crosshair to the right edge of the well, then click")
+        self._btn_mark_right.clicked.connect(self._manual_mark_right)
+        edge_row.addWidget(self._btn_mark_right)
+        layout.addLayout(edge_row)
+
+        self._lbl_edge_status = QLabel("")
+        self._lbl_edge_status.setWordWrap(True)
+        self._lbl_edge_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_edge_status)
+
+        # Direct record buttons: Record XY (center), Record Z, Record XYZ
+        rec_row1 = QHBoxLayout()
+        btn_rec_xy = QPushButton("Record XY")
+        btn_rec_xy.setObjectName("successBtn")
+        btn_rec_xy.setMaximumHeight(26)
+        btn_rec_xy.setToolTip(
+            "Record current crosshair position as this well's center")
+        btn_rec_xy.clicked.connect(self._manual_record_xy)
+        rec_row1.addWidget(btn_rec_xy)
+        btn_rec_z = QPushButton("Record Z")
+        btn_rec_z.setObjectName("successBtn")
+        btn_rec_z.setMaximumHeight(26)
+        btn_rec_z.setToolTip("Record current Z as this well's bottom")
+        btn_rec_z.clicked.connect(self._zteach_record_z)
+        rec_row1.addWidget(btn_rec_z)
+        btn_rec_both = QPushButton("Record XYZ")
+        btn_rec_both.setMaximumHeight(26)
+        btn_rec_both.setToolTip("Record current position as well center + Z bottom")
+        btn_rec_both.clicked.connect(self._manual_record_xyz)
+        rec_row1.addWidget(btn_rec_both)
+        layout.addLayout(rec_row1)
+
+        # Fit buttons
+        fit_row = QHBoxLayout()
+        btn_fit_xy = QPushButton("Fit XY (\u22652)")
+        btn_fit_xy.setMaximumHeight(26)
+        btn_fit_xy.setToolTip(
+            "Compute calibrated positions from taught XY points (need \u22652)")
+        btn_fit_xy.clicked.connect(self._manual_fit_xy)
+        fit_row.addWidget(btn_fit_xy)
+        btn_fit_z = QPushButton("Fit Z-Plane (\u22653)")
+        btn_fit_z.setMaximumHeight(26)
+        btn_fit_z.setToolTip("Fit Z plane from recorded Z points (need \u22653)")
+        btn_fit_z.clicked.connect(self._try_fit_z_plane)
+        fit_row.addWidget(btn_fit_z)
+        layout.addLayout(fit_row)
+
+        # Status labels
+        self._lbl_manual_xy_status = QLabel("XY: 0 wells taught")
+        self._lbl_manual_xy_status.setWordWrap(True)
+        self._lbl_manual_xy_status.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(self._lbl_manual_xy_status)
+
+        self.lbl_zplane = QLabel("Z: 0 teach points")
+        self.lbl_zplane.setWordWrap(True)
+        self.lbl_zplane.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(self.lbl_zplane)
+
+        # Legacy third point support
+        self.lbl_third = QLabel("")
+        self.lbl_third.setVisible(False)
+        layout.addWidget(self.lbl_third)
+
+        self._gen_status = QLabel("")
+        self._gen_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        layout.addWidget(self._gen_status)
+
+        # ── Validate ──────────────────────────────────────
+        val_label = QLabel("Validate")
+        val_label.setObjectName("contextSectionLabel")
+        layout.addWidget(val_label)
+
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel("Well:"))
+        self.val_well_combo = QComboBox()
+        val_row.addWidget(self.val_well_combo, stretch=1)
+        btn_goto_well = QPushButton("Go")
+        btn_goto_well.setMaximumHeight(24)
+        btn_goto_well.clicked.connect(self._goto_well)
+        val_row.addWidget(btn_goto_well)
+        layout.addLayout(val_row)
+
+        self.lbl_val_result = QLabel("")
+        self.lbl_val_result.setWordWrap(True)
+        self.lbl_val_result.setStyleSheet(f"color: {COLORS['subtext0']};")
+        layout.addWidget(self.lbl_val_result)
+
+        # ── Calibration Persistence ──────────────────────
+        persist_label = QLabel("Calibration Data")
+        persist_label.setObjectName("contextSectionLabel")
+        layout.addWidget(persist_label)
+
+        self.ctx_lbl_cal_status = QLabel("Not calibrated")
+        self.ctx_lbl_cal_status.setObjectName("contextLabel")
+        self.ctx_lbl_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
+        layout.addWidget(self.ctx_lbl_cal_status)
+
+        cal_btn_row = QHBoxLayout()
+        btn_save_cal = QPushButton("Save")
+        btn_save_cal.setMaximumHeight(26)
+        btn_save_cal.clicked.connect(self._save_calibration)
+        cal_btn_row.addWidget(btn_save_cal)
+
+        btn_load_cal = QPushButton("Load")
+        btn_load_cal.setMaximumHeight(26)
+        btn_load_cal.clicked.connect(self._load_calibration)
+        cal_btn_row.addWidget(btn_load_cal)
+        layout.addLayout(cal_btn_row)
+
+        parent_layout.addWidget(wiz_frame)
 
     def _start_cal_position_poll(self) -> None:
         """Start 250 ms timer to poll needle position."""
@@ -1399,7 +1382,10 @@ class CalibrationPage(QWidget):
 
     def _safe_navigate_to(self, target_x_um, target_y_um, target_z_mm=None,
                           lower_z=True):
-        """v7.2.7-simple: blocking absolute moves. Simulator now blocks like real hw.
+        """Safe navigation using StageController.safe_travel_to().
+
+        v7.3.2: Delegates to the standard safe_travel_to() which waits for
+        Z arrival before XY move and XY arrival before Z descent.
 
         Args:
             target_x_um: Absolute X in µm (raw stage coords).
@@ -1407,30 +1393,21 @@ class CalibrationPage(QWidget):
             target_z_mm: Optional Z to lower to (mm, zero-ref). Ignored if lower_z=False.
             lower_z: If False, stay at safe Z after XY move (used during plate calibration).
         """
-        ctrl = self.controller
         safe_z = getattr(self, '_safe_z', None) or 0.0
 
-        # Step 1: Raise Z
-        if ctrl.is_zp_connected:
-            ctrl.move_z_absolute(safe_z, from_zero_ref=True)
-
-        # Step 2: Fast XY travel (blocks until arrival on both real hw and simulator)
-        if ctrl.is_xy_connected:
-            if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
-                if hasattr(ctrl.xy_stage, 'set_speed_mm_s'):
-                    ctrl.xy_stage.set_speed_mm_s(50.0)
-                else:
-                    ctrl.xy_stage.set_velocity(100)
-            ctrl.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
-
-        # Step 3: Lower Z (skip during plate calibration to keep needle safe)
-        if lower_z and ctrl.is_zp_connected:
+        # Compute final Z target
+        final_z = None
+        if lower_z:
             if target_z_mm is not None:
-                ctrl.move_z_absolute(target_z_mm, from_zero_ref=True)
+                final_z = target_z_mm
             elif getattr(self, '_top_z', None) is not None:
-                approach = self._top_z + getattr(self, '_z_buffer_mm', 0.5)
-                ctrl.move_z_absolute(approach, from_zero_ref=True)
+                final_z = self._top_z + getattr(self, '_z_buffer_mm', 0.5)
 
+        self.controller.safe_travel_to(
+            target_x_um, target_y_um,
+            safe_z_mm=safe_z,
+            target_z_mm=final_z,
+        )
         logger.info(f"Safe navigate to ({target_x_um:.0f}, {target_y_um:.0f}) µm")
 
 
@@ -2698,6 +2675,235 @@ class CalibrationPage(QWidget):
 
         logger.info(f"Z-teach: {well_name} = {z_offset:.3f} mm ({n} points total)")
 
+    # ── v7.3.2: Manual XY + XYZ Teaching ──────────────────────────
+
+    def _manual_mark_left(self):
+        """Mark the left edge of the well at the current crosshair position."""
+        xy = self.controller.get_xy_position(cached=False)
+        if xy is None or xy[0] is None:
+            return
+        self._edge_left = (xy[0], xy[1])
+        self._btn_mark_left.setStyleSheet(
+            f"background-color: {COLORS['green']}; color: {COLORS['crust']};")
+        if hasattr(self, '_lbl_edge_status'):
+            if self._edge_right is not None:
+                self._lbl_edge_status.setText("Both edges marked. Computing center...")
+                self._compute_center_from_edges()
+            else:
+                self._lbl_edge_status.setText(
+                    f"Left: ({xy[0]:.0f}, {xy[1]:.0f}) \u2014 now mark right edge")
+        logger.debug(f"Edge left: ({xy[0]:.1f}, {xy[1]:.1f})")
+
+    def _manual_mark_right(self):
+        """Mark the right edge of the well at the current crosshair position."""
+        xy = self.controller.get_xy_position(cached=False)
+        if xy is None or xy[0] is None:
+            return
+        self._edge_right = (xy[0], xy[1])
+        self._btn_mark_right.setStyleSheet(
+            f"background-color: {COLORS['green']}; color: {COLORS['crust']};")
+        if hasattr(self, '_lbl_edge_status'):
+            if self._edge_left is not None:
+                self._lbl_edge_status.setText("Both edges marked. Computing center...")
+                self._compute_center_from_edges()
+            else:
+                self._lbl_edge_status.setText(
+                    f"Right: ({xy[0]:.0f}, {xy[1]:.0f}) \u2014 now mark left edge")
+        logger.debug(f"Edge right: ({xy[0]:.1f}, {xy[1]:.1f})")
+
+    def _compute_center_from_edges(self):
+        """Compute well center as midpoint of left and right edges, record it."""
+        if self._edge_left is None or self._edge_right is None:
+            return
+        cx = (self._edge_left[0] + self._edge_right[0]) / 2.0
+        cy = (self._edge_left[1] + self._edge_right[1]) / 2.0
+
+        well_name = self._zteach_well_combo.currentText()
+        if not well_name:
+            return
+
+        self._xy_teach_points[well_name] = (cx, cy)
+
+        # Wire into legacy refs
+        if well_name == "A1":
+            self._taught_a1 = (cx, cy)
+            self._compute_predicted_positions()
+        elif well_name == self._corner_well:
+            self._taught_corner = (cx, cy)
+
+        # Compute diameter for info
+        import math
+        dx = self._edge_right[0] - self._edge_left[0]
+        dy = self._edge_right[1] - self._edge_left[1]
+        diameter_um = math.sqrt(dx * dx + dy * dy)
+
+        self._update_manual_xy_status()
+        if hasattr(self, '_lbl_edge_status'):
+            self._lbl_edge_status.setText(
+                f"\u2705 {well_name} center: ({cx:.0f}, {cy:.0f}) \u00b5m "
+                f"| \u00d8 {diameter_um:.0f} \u00b5m")
+            self._lbl_edge_status.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 9pt;")
+        logger.info(f"Edge-center: {well_name} = ({cx:.1f}, {cy:.1f}) "
+                    f"\u00b5m, diameter={diameter_um:.0f} \u00b5m")
+
+        # Reset edge state + button styles for next well
+        self._edge_left = None
+        self._edge_right = None
+        self._btn_mark_left.setStyleSheet("")
+        self._btn_mark_right.setStyleSheet("")
+
+    def _manual_record_xy(self):
+        """Record current XY position as the selected well's center."""
+        well_name = self._zteach_well_combo.currentText()
+        if not well_name:
+            return
+        xy = self.controller.get_xy_position(cached=False)
+        if xy is None or xy[0] is None:
+            return
+        self._xy_teach_points[well_name] = (xy[0], xy[1])
+
+        # Also wire into legacy A1/corner refs
+        if well_name == "A1":
+            self._taught_a1 = (xy[0], xy[1])
+            self._compute_predicted_positions()
+        elif well_name == self._corner_well:
+            self._taught_corner = (xy[0], xy[1])
+
+        self._update_manual_xy_status()
+        logger.info(f"XY-teach: {well_name} = ({xy[0]:.1f}, {xy[1]:.1f}) \u00b5m "
+                    f"({len(self._xy_teach_points)} points)")
+
+    def _manual_record_xyz(self):
+        """Record current XY + Z for the selected well."""
+        self._manual_record_xy()
+        self._zteach_record_z()
+
+    def _update_manual_xy_status(self):
+        """Update the manual XY teaching status label."""
+        if not hasattr(self, '_lbl_manual_xy_status'):
+            return
+        n = len(self._xy_teach_points)
+        if n == 0:
+            self._lbl_manual_xy_status.setText("XY: 0 wells taught")
+            self._lbl_manual_xy_status.setStyleSheet(
+                f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        else:
+            names = ", ".join(sorted(self._xy_teach_points.keys()))
+            color = COLORS['green'] if n >= 2 else COLORS['yellow']
+            self._lbl_manual_xy_status.setText(f"XY: {n} wells taught: {names}")
+            self._lbl_manual_xy_status.setStyleSheet(
+                f"color: {color}; font-size: 9pt;")
+
+    def _manual_fit_xy(self):
+        """Compute calibrated well positions from manually taught XY points.
+
+        With 1 point: uses geometry prediction from A1.
+        With 2 points: computes scale + rotation (legacy alignment).
+        With 3+ points: uses Procrustes SVD if available, else scale+rotation from first 2.
+        """
+        n = len(self._xy_teach_points)
+        if n == 0:
+            if hasattr(self, '_gen_status'):
+                self._gen_status.setText("Need at least 1 taught XY point.")
+                self._gen_status.setStyleSheet(f"color: {COLORS['red']}; font-size: 9pt;")
+            return
+
+        # With just A1, compute geometry-predicted positions
+        if n == 1 and "A1" in self._xy_teach_points:
+            self._taught_a1 = self._xy_teach_points["A1"]
+            self._compute_predicted_positions()
+            if hasattr(self, '_gen_status'):
+                self._gen_status.setText(
+                    "1 point (A1): geometry-predicted positions applied.")
+                self._gen_status.setStyleSheet(f"color: {COLORS['green']}; font-size: 9pt;")
+            self._emit_calibration_data_changed()
+            return
+
+        # With 2+ points, try Procrustes/affine fit
+        if self._plate is None:
+            if hasattr(self, '_gen_status'):
+                self._gen_status.setText("Select a plate format first.")
+                self._gen_status.setStyleSheet(f"color: {COLORS['red']}; font-size: 9pt;")
+            return
+
+        # Build predicted vs measured point pairs
+        if self._predicted_positions is None:
+            # Need A1 to compute predictions
+            if "A1" in self._xy_teach_points:
+                self._taught_a1 = self._xy_teach_points["A1"]
+                self._compute_predicted_positions()
+            else:
+                # Use stage center as rough estimate
+                center_x, center_y = 65000.0, 42500.0
+                self._predicted_positions = \
+                    self._plate.get_all_positions_from_plate_center(center_x, center_y)
+
+        if self._predicted_positions is None:
+            return
+
+        # Collect matched point pairs (predicted, measured)
+        pred_pts = []
+        meas_pts = []
+        for name, (mx, my) in self._xy_teach_points.items():
+            if name in self._predicted_positions:
+                px, py = self._predicted_positions[name]
+                pred_pts.append((px, py))
+                meas_pts.append((mx, my))
+
+        if len(pred_pts) < 2:
+            if hasattr(self, '_gen_status'):
+                self._gen_status.setText(
+                    f"Need \u22652 matched wells (have {len(pred_pts)}). "
+                    "Ensure taught wells exist in plate format.")
+                self._gen_status.setStyleSheet(f"color: {COLORS['red']}; font-size: 9pt;")
+            return
+
+        # Try 3-well Procrustes SVD calibration
+        try:
+            from SupportClasses.MosaicCalibrator import MosaicCalibrator
+            mcal = MosaicCalibrator()
+            for (px, py), (mx, my) in zip(pred_pts, meas_pts):
+                mcal.add_point(px, py, mx, my)
+            mcal.solve()
+            self._calibrated_positions = mcal.correct_positions(
+                self._predicted_positions)
+            if hasattr(self, '_cal_plate_view'):
+                self._cal_plate_view.set_calibrated_positions(
+                    self._calibrated_positions)
+            n_cal = len(self._calibrated_positions)
+            err = mcal.rms_error_um if hasattr(mcal, 'rms_error_um') else 0
+            if hasattr(self, '_gen_status'):
+                self._gen_status.setText(
+                    f"\u2705 Calibrated {n_cal} wells from {n} taught points"
+                    + (f" (RMS: {err:.1f} \u00b5m)" if err else ""))
+                self._gen_status.setStyleSheet(
+                    f"color: {COLORS['green']}; font-size: 9pt;")
+            logger.info(f"Manual XY fit: {n_cal} wells from {n} taught points")
+        except (ImportError, Exception) as e:
+            # Fallback: 2-point scale+rotation via legacy method
+            if "A1" in self._xy_teach_points:
+                self._taught_a1 = self._xy_teach_points["A1"]
+            corner_key = self._corner_well
+            if corner_key in self._xy_teach_points:
+                self._taught_corner = self._xy_teach_points[corner_key]
+            if self._taught_a1 and self._taught_corner:
+                self._calculate_alignment()
+                if hasattr(self, '_gen_status'):
+                    self._gen_status.setText(
+                        f"\u2705 2-point alignment (A1 + {corner_key})")
+                    self._gen_status.setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 9pt;")
+            else:
+                if hasattr(self, '_gen_status'):
+                    self._gen_status.setText(f"Fit failed: {e}")
+                    self._gen_status.setStyleSheet(
+                        f"color: {COLORS['red']}; font-size: 9pt;")
+                logger.warning(f"Manual XY fit failed: {e}")
+                return
+
+        self._emit_calibration_data_changed()
+
     def _zteach_jog_xy(self, dx_um: float, dy_um: float):
         """Handle XY jog from embedded jog array."""
         if self.controller.is_xy_connected:
@@ -2733,22 +2939,9 @@ class CalibrationPage(QWidget):
             third = f"{corner_letter}1"
         return third
 
-    def _set_zero(self):
-        self.controller._calibrate_zero()
-        z = self.controller.zero_position
-        # v7.2.7: zero positions already in µm
-        zx_um = z['x']
-        zy_um = z['y']
-        self.lbl_zero_status.setText(
-            f"Set: X={zx_um:,.1f} µm  Y={zy_um:,.1f} µm  Z={z['Z']:.2f} mm")
-        self.lbl_zero_status.setStyleSheet(f"color: {COLORS['green']};")
-        logger.info(f"Zero set: {z}")
+    # v7.3.2: Step 1 "Zero Needle" removed — use jog page Set Zero instead.
 
-    def _goto_zero(self):
-        self.controller.move_xy_absolute(0, 0, from_zero_ref=True)
-        self.controller.move_z_absolute(0, from_zero_ref=True)
-
-    # ── Step 2: Teach Well Plate ─────────────────────────────────
+    # ── Teach Well Plate ──────────────────────────────────────────
 
     def _set_safe_z(self):
         """v7.2.7: Record current Z as safe travel height."""
@@ -2973,6 +3166,8 @@ class CalibrationPage(QWidget):
         self._taught_corner = None
         self._predicted_positions = None  # v7.3.1: clear predictions on plate change
         self._calibrated_positions = None
+        self._xy_teach_points.clear()  # v7.3.2: clear manual XY teach points
+        self._z_teach_points.clear()   # v7.3.2: clear manual Z teach points
         self._three_well_calibration = None
         if hasattr(self, '_taught_third'): self._taught_third = None
         for attr in ['lbl_a1','lbl_corner','lbl_third']:

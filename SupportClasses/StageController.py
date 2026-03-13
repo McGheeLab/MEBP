@@ -23,7 +23,7 @@ from typing import Callable, Optional
 from SupportClasses.Processor import Processor
 from SupportClasses.XYStage import XYStageManager
 from SupportClasses.ZPStage import ZPStageManager, AXIS_MAP
-from SupportClasses.XboxController import xbox_polling_worker
+from SupportClasses.XboxController import xbox_polling_worker, calibrate_sticks
 from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
 from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.HardwareConfig import HardwareConfig
@@ -681,6 +681,11 @@ class StageController:
         # v7.2: Hardware configuration (set by GUI when hardware setup completes)
         self._hardware_config: HardwareConfig | None = None
 
+        # v7.3.2: Axis direction flip (per-machine, loaded from settings)
+        self._axis_flip: dict[str, bool] = {
+            "Z": False, "P1": False, "P2": False, "P3": False,
+        }
+
         # Register calibration handler
         self.processor.register_handler("zero_needle_pos", self._calibrate_zero)
         # v7.2.6: debug handler — ensures Xbox debug messages always dispatch
@@ -839,8 +844,9 @@ class StageController:
 
     def connect_xbox(self, mapping_file: str = "current_button_mapping.json",
                      use_thread: bool = False,
-                     reconnect_timeout: float = 30.0) -> None:
-        """Connect Xbox controller. v7.2.7: thread fallback
+                     reconnect_timeout: float = 30.0,
+                     stick_offsets: dict | None = None) -> None:
+        """Connect Xbox controller. v7.2.7: thread fallback, v7.3.2: stick offsets
 
         Args:
             mapping_file: Path to button mapping JSON.
@@ -848,6 +854,7 @@ class StageController:
                         Use this for macOS Bluetooth controllers that are
                         invisible to spawned subprocesses.
             reconnect_timeout: Seconds to attempt reconnection after loss.
+            stick_offsets: Per-axis center offsets from calibration (v7.3.2).
         """
         if self.xbox_process and self.xbox_process.is_alive():
             logger.warning("Xbox already connected")
@@ -868,9 +875,15 @@ class StageController:
 
         self.xbox_queue = Queue()
 
+        # v7.3.2: Convert stick_offsets keys to int for multiprocessing
+        _so = None
+        if stick_offsets:
+            _so = {int(k): v for k, v in stick_offsets.items()}
+
         _worker_kwargs = {
             "mapping_file": self._mapping_file,
             "reconnect_timeout": reconnect_timeout,
+            "stick_offsets": _so,
         }
 
         if use_thread:
@@ -920,6 +933,14 @@ class StageController:
         self.xbox_queue = None
         logger.info("Xbox controller disconnected")
 
+
+    def calibrate_xbox_sticks(self, duration: float = 2.0) -> dict:
+        """Run stick center calibration. Returns offsets dict.
+
+        v7.3.2: Should be called with sticks untouched. Returns
+        ``{0: offset, 1: offset, 2: offset, 3: offset}``.
+        """
+        return calibrate_sticks(duration=duration)
 
     @property  # v7.2.8: xbox_status property
     def xbox_status(self) -> str:
@@ -1103,6 +1124,48 @@ class StageController:
             metadata={"zero_position": dict(self.zero_position)},
         )
 
+    # ── v7.3.2: Axis Flip ──────────────────────────────────────────
+
+    def set_axis_flip(self, axis: str, flipped: bool) -> None:
+        """Set direction flip for an axis. Flipped axes invert move direction."""
+        if axis in self._axis_flip:
+            self._axis_flip[axis] = flipped
+            logger.info(f"Axis {axis} flip set to {flipped}")
+
+    def get_axis_flip(self, axis: str) -> bool:
+        """Get whether an axis direction is flipped."""
+        return self._axis_flip.get(axis, False)
+
+    def set_axis_flips(self, flips: dict[str, bool]) -> None:
+        """Bulk-set axis flips from a dict (e.g. loaded from settings)."""
+        for axis, flipped in flips.items():
+            if axis in self._axis_flip:
+                self._axis_flip[axis] = flipped
+        logger.info(f"Axis flips loaded: {self._axis_flip}")
+
+    def _flip_sign(self, axis: str) -> float:
+        """Return -1.0 if axis is flipped, 1.0 otherwise."""
+        return -1.0 if self._axis_flip.get(axis, False) else 1.0
+
+    # ── v7.3.2: Per-Axis Zero Calibration ────────────────────────
+
+    def calibrate_zero_xy(self) -> None:
+        """Set only XY zero from current position."""
+        if not self.xy_stage:
+            logger.warning("Cannot zero XY — stage not connected")
+            return
+        pos = self.xy_stage.get_current_position()
+        if pos[0] is not None:
+            self.zero_position["x"] = pos[0]
+            self.zero_position["y"] = pos[1]
+            self.zero_position["f"] = pos[2] if pos[2] else 0.0
+            logger.info(f"XY zero set to ({pos[0]:.1f}, {pos[1]:.1f}) µm")
+            self.position_logger.record(
+                "zero_xy",
+                xy_pos=pos,
+                metadata={"zero_x": pos[0], "zero_y": pos[1]},
+            )
+
     # ── Movement (for GUI / Print commands) ───────────────────────
 
     def reset_pump_zero(self, pump: str) -> None:
@@ -1274,9 +1337,10 @@ class StageController:
             feedrate_mm_min=feedrate_mm_min)
 
     def move_z_relative(self, distance: float, feedrate: float | None = None) -> None:
-        """Move Z by relative distance."""
+        """Move Z by relative distance. v7.3.2: applies axis flip."""
         if not self.zp_stage:
             return
+        distance = distance * self._flip_sign("Z")
         if feedrate and self.safety_limits.enabled:
             feedrate = self.safety_limits.clamp_z_feedrate(feedrate)
         if self.safety_limits.enabled:
@@ -1297,22 +1361,40 @@ class StageController:
         safe_z_mm: float,
         target_z_mm: float | None = None,
         fast_xy_speed_mm_s: float = 50.0,
-    ) -> None:
-        """v7.3.1: Safe 3-step travel: raise Z → fast XY → lower Z.
+        z_timeout_s: float = 15.0,
+        xy_timeout_s: float = 30.0,
+    ) -> bool:
+        """Safe 3-step travel: raise Z → wait → fast XY → wait → lower Z.
+
+        v7.3.2: Now blocks until Z reaches safe height before starting XY
+        move, and waits for XY arrival before lowering Z. This prevents
+        needle crashes from premature XY moves while Z is still retracting.
 
         Args:
-            target_x_um: Absolute target X in µm.
-            target_y_um: Absolute target Y in µm.
+            target_x_um: Absolute target X in µm (raw stage coords).
+            target_y_um: Absolute target Y in µm (raw stage coords).
             safe_z_mm: Safe travel height in mm (zero-referenced).
             target_z_mm: Optional target Z after XY move (zero-referenced).
                          If None, stays at safe_z.
             fast_xy_speed_mm_s: XY travel speed in mm/s.
+            z_timeout_s: Max seconds to wait for Z arrival.
+            xy_timeout_s: Max seconds to wait for XY arrival.
+
+        Returns:
+            True if all moves completed successfully, False if any timed out.
         """
-        # Step 1: Raise Z to safe height
+        ok = True
+
+        # Step 1: Raise Z to safe height and WAIT for arrival
         if self.is_zp_connected:
             self.move_z_absolute(safe_z_mm, from_zero_ref=True)
+            if not self.wait_for_z_arrival(safe_z_mm, tolerance_mm=0.1,
+                                           timeout_s=z_timeout_s):
+                logger.warning("safe_travel_to: Z retract timed out — "
+                               "proceeding with XY move anyway")
+                ok = False
 
-        # Step 2: Fast XY travel
+        # Step 2: Fast XY travel and WAIT for arrival
         if self.is_xy_connected:
             if hasattr(self, 'xy_stage') and self.xy_stage:
                 if hasattr(self.xy_stage, 'set_speed_mm_s'):
@@ -1321,12 +1403,29 @@ class StageController:
                     self.xy_stage.set_velocity(100)
             self.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
 
-        # Step 3: Lower Z to target
+            # Convert raw stage coords to zero-ref mm (matching get_xy_position_mm)
+            zero_x = self.zero_position.get("x", 0)
+            zero_y = self.zero_position.get("y", 0)
+            target_x_mm = (target_x_um - zero_x) / 1000.0
+            target_y_mm = (target_y_um - zero_y) / 1000.0
+            if not self.wait_for_xy_arrival(target_x_mm, target_y_mm,
+                                            tolerance_mm=0.5,
+                                            timeout_s=xy_timeout_s):
+                logger.warning("safe_travel_to: XY arrival timed out — "
+                               "proceeding with Z descent anyway")
+                ok = False
+
+        # Step 3: Lower Z to target and WAIT for arrival
         if self.is_zp_connected and target_z_mm is not None:
             self.move_z_absolute(target_z_mm, from_zero_ref=True)
+            if not self.wait_for_z_arrival(target_z_mm, tolerance_mm=0.1,
+                                           timeout_s=z_timeout_s):
+                logger.warning("safe_travel_to: Z descent timed out")
+                ok = False
 
         logger.info(f"Safe travel to ({target_x_um:.0f}, {target_y_um:.0f}) µm, "
-                    f"safe_z={safe_z_mm:.2f} mm")
+                    f"safe_z={safe_z_mm:.2f} mm, ok={ok}")
+        return ok
 
     def is_pump_enabled(self, pump: str) -> bool:
         """Check if a pump is enabled in the hardware config."""
@@ -1341,12 +1440,13 @@ class StageController:
     def move_pump_relative(
         self, pump: str, distance: float, feedrate: float | None = None
     ) -> None:
-        """Move a pump (P1/P2/P3) by relative distance."""
+        """Move a pump (P1/P2/P3) by relative distance. v7.3.2: applies axis flip."""
         if not self.zp_stage:
             return
         if not self.is_pump_enabled(pump):
             logger.warning(f"Pump {pump} is disabled — move blocked")
             return
+        distance = distance * self._flip_sign(pump)
         if feedrate and self.safety_limits.enabled:
             feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
         if self.safety_limits.enabled:

@@ -731,6 +731,13 @@ QCheckBox::indicator:checked {
 
 QSplitter::handle {
     background-color: #313244;
+}
+
+QSplitter::handle:horizontal {
+    width: 4px;
+}
+
+QSplitter::handle:vertical {
     height: 2px;
 }
 

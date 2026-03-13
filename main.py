@@ -36,7 +36,7 @@ def setup_logging(verbose=False):
     )
 
 
-def run_headless(controller: StageController):
+def run_headless(controller: StageController, settings: Settings):
     """Run in headless mode (Xbox controller only, no GUI)."""
     print("=" * 50)
     print("MEBP Bioprinter - Headless Mode")
@@ -46,7 +46,11 @@ def run_headless(controller: StageController):
     print("=" * 50)
 
     controller.connect_stages()
-    controller.connect_xbox()
+    # v7.3.2: Load stick calibration offsets for headless mode
+    _stick_offsets = settings.get_section("xbox_stick_offsets")
+    if _stick_offsets:
+        _stick_offsets = {int(k): v for k, v in _stick_offsets.items()}
+    controller.connect_xbox(stick_offsets=_stick_offsets or None)
 
     print("Ready. Press Ctrl+C to exit.\n")
 
@@ -156,6 +160,11 @@ def main():
     if saved_zero:
         controller.zero_position.update(saved_zero)
 
+    # v7.3.2: Load axis flip settings
+    saved_flips = settings.get_section("axis_flip")
+    if saved_flips and isinstance(saved_flips, dict):
+        controller.set_axis_flips(saved_flips)
+
     # v7.2.6: Load safety_limits from settings
     saved_limits = settings.get_section("safety_limits")
     if saved_limits:
@@ -167,7 +176,7 @@ def main():
             f"(enabled={controller.safety_limits.enabled})")
 
     if args.headless:
-        run_headless(controller)
+        run_headless(controller, settings)
     else:
         run_gui(controller, settings)
 

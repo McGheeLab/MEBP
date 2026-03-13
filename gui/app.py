@@ -263,8 +263,6 @@ class MainWindow(QMainWindow):
         # ── Extra Left Box (context panel) ───────────────────────
         self.ui_extraLeftBox = QFrame()
         self.ui_extraLeftBox.setObjectName("extraLeftBox")
-        self.ui_extraLeftBox.setMinimumWidth(0)
-        self.ui_extraLeftBox.setMaximumWidth(0)
         self.ui_extraLeftBox.setFrameShape(QFrame.NoFrame)
 
         extra_layout = QVBoxLayout(self.ui_extraLeftBox)
@@ -296,8 +294,6 @@ class MainWindow(QMainWindow):
         self._context_stack.setObjectName("extraContent")
         extra_layout.addWidget(self._context_stack)
 
-        app_layout.addWidget(self.ui_extraLeftBox)
-
         # ── Content Area ─────────────────────────────────────────
         content_frame = QFrame()
         content_frame.setObjectName("contentBox")
@@ -312,6 +308,15 @@ class MainWindow(QMainWindow):
         top_bar.setMaximumHeight(40)
         top_bar_layout = QHBoxLayout(top_bar)
         top_bar_layout.setContentsMargins(12, 0, 12, 0)
+
+        # Context panel toggle — left side, next to where panel opens
+        btn_context = QPushButton("☰")
+        btn_context.setObjectName("extraBtn")
+        btn_context.setFixedSize(32, 32)
+        btn_context.setCursor(Qt.PointingHandCursor)
+        btn_context.setToolTip("Toggle context panel")
+        btn_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
+        top_bar_layout.addWidget(btn_context)
 
         title_frame = QWidget()
         title_layout = QVBoxLayout(title_frame)
@@ -336,15 +341,6 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(self._make_conn_dot("ZP"))
         conn_layout.addWidget(self._make_conn_dot("Xbox"))
         top_bar_layout.addWidget(conn_frame)
-
-        # Context panel toggle
-        btn_context = QPushButton("☰")
-        btn_context.setObjectName("extraBtn")
-        btn_context.setFixedSize(32, 32)
-        btn_context.setCursor(Qt.PointingHandCursor)
-        btn_context.setToolTip("Toggle context panel")
-        btn_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
-        top_bar_layout.addWidget(btn_context)
 
         content_layout.addWidget(top_bar)
 
@@ -371,7 +367,20 @@ class MainWindow(QMainWindow):
 
         content_layout.addWidget(self._splitter)
 
-        app_layout.addWidget(content_frame)
+        # v7.3.2: Horizontal splitter for resizable context panel + content
+        self._context_splitter = QSplitter(Qt.Horizontal)
+        self._context_splitter.setObjectName("contextSplitter")
+        self._context_splitter.addWidget(self.ui_extraLeftBox)
+        self._context_splitter.addWidget(content_frame)
+        self._context_splitter.setStretchFactor(0, 0)  # context: fixed
+        self._context_splitter.setStretchFactor(1, 1)   # content: stretches
+        self._context_splitter.setChildrenCollapsible(True)
+        self._context_splitter.setHandleWidth(4)
+        # Start with context panel hidden
+        self.ui_extraLeftBox.hide()
+        self._context_panel_width = AppSettings.LEFT_BOX_WIDTH  # remember last width
+
+        app_layout.addWidget(self._context_splitter)
 
     def _make_menu_button(self, obj_name: str, icon_text: str,
                           label: str) -> QPushButton:
@@ -551,6 +560,10 @@ class MainWindow(QMainWindow):
             cal_page.calibration_data_changed.connect(
                 lambda: jog_page.set_calibration_data(*cal_page.get_calibration_data())
             )
+
+        # v7.3.2: Load approximate well plate on startup (geometry-predicted)
+        if hasattr(jog_page, 'load_startup_plate'):
+            jog_page.load_startup_plate(self.settings)
 
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
@@ -1172,13 +1185,14 @@ class MainWindow(QMainWindow):
                 btn.setStyleSheet(UIFunctions.deselectMenu(btn.styleSheet()))
 
         # Auto-show/hide context panel based on page
-        if (hasattr(page, 'get_context_widget')
-                and page.get_context_widget() is not None):
-            if self.ui_extraLeftBox.width() == 0:
-                UIFunctions.setLeftBoxWidth(self, AppSettings.LEFT_BOX_WIDTH)
+        has_context = (hasattr(page, 'get_context_widget')
+                       and page.get_context_widget() is not None)
+        if has_context:
+            if not self.ui_extraLeftBox.isVisible():
+                UIFunctions.toggleLeftBox(self)
         else:
-            if self.ui_extraLeftBox.width() > 0:
-                UIFunctions.setLeftBoxWidth(self, 0)
+            if self.ui_extraLeftBox.isVisible():
+                UIFunctions.toggleLeftBox(self)
 
     def _switch_page(self, index: int):
         """
