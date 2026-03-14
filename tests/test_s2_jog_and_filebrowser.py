@@ -6,6 +6,9 @@ Tests for:
     S2.1-S2.4:  Jog step conversion and verification
     S2.5-S2.9:  Hardware config file browser
     S2.10:      End-to-end step size verification
+
+v7.3.5: Renamed from microsteps_per_micron to xy_position_scale.
+        ProScan speaks µm natively — default scale = 1.0.
 """
 
 import json
@@ -18,8 +21,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
 # Add project root to path
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from SupportClasses.StageController import StageController
 
@@ -29,43 +31,43 @@ from SupportClasses.StageController import StageController
 # ═══════════════════════════════════════════════════════════════════
 
 class TestJogStepConversion(unittest.TestCase):
-    """Verify that µm → microstep conversion is exact and reversible."""
+    """Verify that µm → stage-unit conversion is exact and reversible."""
 
     def test_standard_steps_exact(self):
-        """All standard step sizes produce exact integer microsteps at factor=10."""
-        factor = 10.0
+        """All standard step sizes produce exact integer stage units at scale=10."""
+        scale = 10.0
         for step_um in [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]:
-            microsteps = step_um * factor
+            stage_units = step_um * scale
             self.assertEqual(
-                microsteps, round(microsteps),
-                f"{step_um} µm × {factor} = {microsteps}, not integer"
+                stage_units, round(stage_units),
+                f"{step_um} µm × {scale} = {stage_units}, not integer"
             )
 
     def test_roundtrip_accuracy(self):
-        """Converting µm→steps→µm preserves value within float precision."""
-        factor = 10.0
+        """Converting µm→stage→µm preserves value within float precision."""
+        scale = 10.0
         for step_um in [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]:
-            microsteps = step_um * factor
-            recovered_um = microsteps / factor
+            stage_units = step_um * scale
+            recovered_um = stage_units / scale
             self.assertAlmostEqual(step_um, recovered_um, places=10)
 
     def test_proscan_ii_factor(self):
-        """ProScan II typical factor of 20.0 produces exact steps."""
-        factor = 20.0
+        """ProScan II at scale 20.0 produces exact stage values."""
+        scale = 20.0
         for step_um in [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]:
-            microsteps = step_um * factor
+            stage_units = step_um * scale
             self.assertEqual(
-                microsteps, round(microsteps),
-                f"{step_um} µm × {factor} = {microsteps}, not integer"
+                stage_units, round(stage_units),
+                f"{step_um} µm × {scale} = {stage_units}, not integer"
             )
 
     def test_fractional_factor(self):
-        """Non-integer factor still produces round()able values for standard steps."""
-        factor = 12.5  # Hypothetical
+        """Non-integer scale still produces round()able values for standard steps."""
+        scale = 12.5  # Hypothetical
         for step_um in [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]:
-            microsteps = step_um * factor
-            rounded = round(microsteps)
-            error_um = abs(microsteps - rounded) / factor
+            stage_units = step_um * scale
+            rounded = round(stage_units)
+            error_um = abs(stage_units - rounded) / scale
             self.assertLess(
                 error_um, 0.1,
                 f"Rounding error {error_um:.4f} µm too large for {step_um} µm"
@@ -77,7 +79,7 @@ class TestJogStepConversion(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════
 
 class TestMoveXYRelativeExact(unittest.TestCase):
-    """Verify move_xy_relative sends exact microstep counts to hardware."""
+    """Verify move_xy_relative sends exact values to hardware."""
 
     def setUp(self):
         """Create a controller with a mock XY stage."""
@@ -90,22 +92,22 @@ class TestMoveXYRelativeExact(unittest.TestCase):
                                          "P1": 0, "P2": 0, "P3": 0}
         self.controller._position_cache = {"xy": (5000, 5000), "zp": None}
 
-    def test_50um_at_factor_10(self):
-        """50 µm at factor 10 → exactly 500 microsteps."""
+    def test_50um_at_scale_10(self):
+        """50 µm at scale 10 → exactly 500 stage units."""
         step_um = 50.0
-        factor = 10.0
-        dx = step_um * factor  # 500.0
+        scale = 10.0
+        dx = step_um * scale  # 500.0
         dy = 0.0
         self.controller.move_xy_relative(dx, dy)
         call_args = self.controller.xy_stage.move_stage_relative.call_args
         self.assertEqual(call_args[0], (500.0, 0.0))
 
-    def test_1um_at_factor_10(self):
-        """1 µm at factor 10 → exactly 10 microsteps."""
+    def test_1um_at_scale_10(self):
+        """1 µm at scale 10 → exactly 10 stage units."""
         step_um = 1.0
-        factor = 10.0
+        scale = 10.0
         dx = 0.0
-        dy = step_um * factor  # 10.0
+        dy = step_um * scale  # 10.0
         self.controller.move_xy_relative(dx, dy)
         call_args = self.controller.xy_stage.move_stage_relative.call_args
         self.assertEqual(call_args[0], (0.0, 10.0))
@@ -216,35 +218,35 @@ class TestConfigFileBrowser(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════
 
 class TestConversionFactorWarning(unittest.TestCase):
-    """Verify the warning logic for default vs set conversion factor."""
+    """Verify the warning logic for default vs set position scale factor."""
 
     def test_default_factor_shows_warning(self):
-        """Before set_microsteps_per_micron is called, warning should show."""
+        """Before set_xy_position_scale is called, warning should show."""
         # Simulating the flag logic
         conversion_factor_set = False
         self.assertFalse(conversion_factor_set)
 
     def test_set_factor_hides_warning(self):
-        """After set_microsteps_per_micron is called, warning should hide."""
+        """After set_xy_position_scale is called, warning should hide."""
         conversion_factor_set = False
-        # Simulate calling set_microsteps_per_micron
-        value = 10.0
-        microsteps_per_micron = max(0.001, value)
+        # v7.3.5: ProScan speaks µm natively → scale = 1.0
+        value = 1.0
+        xy_position_scale = max(0.001, value)
         conversion_factor_set = True
         self.assertTrue(conversion_factor_set)
-        self.assertEqual(microsteps_per_micron, 10.0)
+        self.assertEqual(xy_position_scale, 1.0)
 
     def test_factor_zero_clamped(self):
-        """Factor of 0 should be clamped to minimum."""
+        """Scale of 0 should be clamped to minimum."""
         value = 0.0
-        microsteps_per_micron = max(0.001, value)
-        self.assertEqual(microsteps_per_micron, 0.001)
+        xy_position_scale = max(0.001, value)
+        self.assertEqual(xy_position_scale, 0.001)
 
     def test_negative_factor_clamped(self):
-        """Negative factor should be clamped to minimum."""
+        """Negative scale should be clamped to minimum."""
         value = -5.0
-        microsteps_per_micron = max(0.001, value)
-        self.assertEqual(microsteps_per_micron, 0.001)
+        xy_position_scale = max(0.001, value)
+        self.assertEqual(xy_position_scale, 0.001)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -252,47 +254,47 @@ class TestConversionFactorWarning(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════
 
 class TestEndToEndStepVerification(unittest.TestCase):
-    """Simulate full jog cycle: step_um → microsteps → send → read back → verify."""
+    """Simulate full jog cycle: step_um → stage units → send → read back → verify."""
 
     def test_full_cycle_all_steps(self):
         """For each standard step size, verify the complete conversion chain."""
-        factor = 10.0
+        scale = 10.0
         standard_steps = [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
 
         for step_um in standard_steps:
             with self.subTest(step_um=step_um):
                 # 1. User selects step in µm
-                # 2. Convert to microsteps
-                step_microsteps = step_um * factor
+                # 2. Convert to stage units
+                step_stage = step_um * scale
                 # 3. Round for hardware (as XYStage.move_stage_relative does)
-                sent_microsteps = round(step_microsteps)
-                # 4. Stage moves exactly that many microsteps (simulated)
-                new_pos = 5000 + sent_microsteps  # start at 5000
+                sent_stage = round(step_stage)
+                # 4. Stage moves exactly that many units (simulated)
+                new_pos = 5000 + sent_stage  # start at 5000
                 # 5. Read back and convert to µm
-                delta_steps = new_pos - 5000
-                delta_um = delta_steps / factor
+                delta = new_pos - 5000
+                delta_um = delta / scale
 
                 # Verify: displayed delta matches requested step
                 self.assertAlmostEqual(
                     delta_um, step_um, places=6,
-                    msg=f"Step {step_um} µm: sent {sent_microsteps} steps, "
+                    msg=f"Step {step_um} µm: sent {sent_stage} units, "
                         f"measured {delta_um} µm"
                 )
 
     def test_diagonal_move_both_axes(self):
         """Diagonal jog (dx=1, dy=1) should move sqrt(2) * step_um total distance."""
-        factor = 10.0
+        scale = 10.0
         step_um = 100.0
-        dx_steps = round(step_um * factor)
-        dy_steps = round(step_um * factor)
+        dx_stage = round(step_um * scale)
+        dy_stage = round(step_um * scale)
 
         # Simulate position change
         start = (5000, 5000)
-        end = (5000 + dx_steps, 5000 + dy_steps)
+        end = (5000 + dx_stage, 5000 + dy_stage)
 
         # Measured delta in µm
-        delta_x_um = (end[0] - start[0]) / factor
-        delta_y_um = (end[1] - start[1]) / factor
+        delta_x_um = (end[0] - start[0]) / scale
+        delta_y_um = (end[1] - start[1]) / scale
         total_um = math.sqrt(delta_x_um**2 + delta_y_um**2)
 
         expected_total = math.sqrt(2) * step_um
@@ -300,17 +302,17 @@ class TestEndToEndStepVerification(unittest.TestCase):
 
     def test_repeated_jogs_accumulate_correctly(self):
         """10 consecutive 100µm jogs should total exactly 1000µm."""
-        factor = 10.0
+        scale = 1.0  # v7.3.5: ProScan speaks µm natively
         step_um = 100.0
-        pos = 5000.0  # starting position in microsteps
+        pos = 5000.0  # starting position in µm
 
         for _ in range(10):
-            step_steps = round(step_um * factor)
-            pos += step_steps
+            step_stage = round(step_um * scale)
+            pos += step_stage
 
-        total_um = (pos - 5000) / factor
+        total_um = (pos - 5000) / scale
         self.assertAlmostEqual(total_um, 1000.0, places=6)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

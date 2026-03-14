@@ -5,7 +5,7 @@ Main content: XY pad, Z/pump buttons, position readouts, quick actions
 Context panel: step sizes, speed multipliers
 
 v7.1.1: XY step sizes and positions displayed in microns (µm).
-         Conversion to/from microsteps handled internally via microsteps_per_micron.
+v7.3.5: ProScan speaks µm natively — microsteps_per_micron = 1.0 (identity).
 
 v7.1.2: BUG-1 FIX — XY jog now uses relative moves (move_xy_relative) instead
          of computing absolute targets from cached (stale) position data.
@@ -67,8 +67,9 @@ class JogControlPage(QWidget):
         # v7.2.5: Hardware config for pump enable/disable and µL display
         self._hardware_config = None
 
-        # Microsteps per micron — set by MainWindow, default 10 (ProScan III typical)
-        self._microsteps_per_micron: float = 10.0
+        # Microsteps per micron — set by MainWindow (ProScan speaks µm natively → 1.0)
+        from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
+        self._xy_position_scale: float = DEFAULT_XY_POSITION_SCALE
 
         # v7.2.4: Step verification tracking
         self._last_jog_step_um: float = 0.0
@@ -87,21 +88,21 @@ class JogControlPage(QWidget):
     def get_page_title(self) -> str:
         return "Jog Control"
 
-    def set_microsteps_per_micron(self, value: float):
-        """Called by MainWindow when the conversion factor changes.
+    def set_xy_position_scale(self, value: float):
+        """Called by MainWindow when the XY position scale factor changes.
 
-        v7.2.4: Also updates the conversion factor display and hides
+        v7.2.4: Also updates the scale display and hides
         the warning banner once a real value is set.
         """
-        self._microsteps_per_micron = max(0.001, value)
+        self._xy_position_scale = max(0.001, value)
         self._conversion_factor_set = True
         # Update context panel labels if they exist
         if hasattr(self, '_lbl_conversion_factor'):
             self._lbl_conversion_factor.setText(
-                f"Scale: {self._microsteps_per_micron:.1f} steps/µm")
+                f"Scale: {self._xy_position_scale:.1f} units/µm")
         if hasattr(self, '_lbl_factor_warning'):
             self._lbl_factor_warning.setVisible(False)
-        logger.info(f"Jog: microsteps_per_micron set to {value}")
+        logger.info(f"Jog: xy_position_scale set to {value}")
 
     def get_context_widget(self) -> QWidget:
         """Context panel: step sizes + speed multipliers."""
@@ -617,9 +618,7 @@ class JogControlPage(QWidget):
         self._last_jog_step_um = step_um
 
         # v7.2.5 FIX: Send microns directly to controller.
-        # The Prior ProScan expects movement values in microns,
-        # NOT microsteps. The old code multiplied by microsteps_per_micron
-        # which caused incorrect movement distances.
+        # The Prior ProScan expects movement values in microns.
         self.controller.move_xy_relative_um(dx * step_um, dy * step_um)
 
         # Update step verification display

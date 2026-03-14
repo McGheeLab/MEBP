@@ -26,7 +26,7 @@ import logging
 from typing import Optional
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QSizePolicy
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QEvent
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QMouseEvent
 
 from gui.styles import COLORS
@@ -86,6 +86,11 @@ class CameraFeedView(QWidget):
             f"color: {COLORS.get('text', '#cdd6f4')}; "
             f"font-size: 11pt;")
         layout.addWidget(self._display, stretch=1)
+
+        # v7.3.5 BF-2: Install event filter on the QLabel to reliably
+        # capture mouse clicks. Relying on event propagation from QLabel
+        # to parent QWidget is unreliable in PySide6 when a pixmap is set.
+        self._display.installEventFilter(self)
 
     # ── Camera connection ─────────────────────────────────────────
 
@@ -187,15 +192,24 @@ class CameraFeedView(QWidget):
 
     # ── Mouse interaction ─────────────────────────────────────────
 
-    def mousePressEvent(self, event: QMouseEvent):
-        """Emit clicked signal with image pixel coordinates."""
-        if event.button() == Qt.LeftButton and self._last_pixmap:
-            # Convert widget coords → image pixel coords
+    def eventFilter(self, obj, event):
+        """v7.3.5 BF-2: Intercept mouse clicks on the QLabel directly.
+
+        This is more reliable than overriding mousePressEvent on the parent
+        and waiting for event propagation from the child QLabel, which can
+        fail in PySide6 when the QLabel has a pixmap set.
+        """
+        if (obj is self._display
+                and event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.LeftButton
+                and self._last_pixmap):
+            # event.position() is in QLabel coordinates
             img_coords = self._widget_to_image(
                 event.position().x(), event.position().y())
             if img_coords:
                 self.clicked.emit(img_coords[0], img_coords[1])
-        super().mousePressEvent(event)
+                return True  # consumed
+        return super().eventFilter(obj, event)
 
     def _widget_to_image(self, wx: float, wy: float
                          ) -> Optional[tuple[float, float]]:

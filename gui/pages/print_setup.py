@@ -117,7 +117,8 @@ class PrintSetupPage(QWidget):
         self._workspace = WorkspaceConfig()
 
         self._context_widget = None
-        self._microsteps_per_micron = 10.0
+        from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
+        self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
         self._hardware_config = None
         self._setup_ui()
 
@@ -131,8 +132,8 @@ class PrintSetupPage(QWidget):
     def get_page_subtitle(self) -> str:
         return "Configure workspace, design objects, assign wells"
 
-    def set_microsteps_per_micron(self, value: float):
-        self._microsteps_per_micron = value
+    def set_xy_position_scale(self, value: float):
+        self._xy_position_scale = value
 
     def set_hardware_config(self, config):
         """

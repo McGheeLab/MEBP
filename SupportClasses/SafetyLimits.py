@@ -6,7 +6,7 @@ bounds.  Limits are persisted via :class:`Settings` and can be toggled
 at runtime (e.g. disabled during calibration).
 
 All positions use the same units as their respective controllers:
-    - XY: steps (Prior ProScan III)
+    - XY: µm (Prior ProScan speaks µm natively)
     - Z / Pumps: mm (Marlin G-code)
 
 v7.1 additions:
@@ -53,7 +53,7 @@ class SafetyLimits:
     p3_max: float = 50.0
 
     # Speed/feedrate limits
-    max_xy_speed: float = 10_000.0     # steps/s
+    max_xy_speed: float = 10_000.0     # µm/s
     max_z_feedrate: float = 500.0      # mm/min
     max_pump_feedrate: float = 200.0   # mm/min
 

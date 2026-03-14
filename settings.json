@@ -1,18 +1,18 @@
 {
   "window": {
-    "x": 1268,
-    "y": 475,
-    "width": 1400,
-    "height": 1449,
-    "active_tab": 2,
+    "x": 0,
+    "y": 25,
+    "width": 1296,
+    "height": 792,
+    "active_tab": 3,
     "splitter_sizes": [
       706,
       0
     ]
   },
   "simulation": {
-    "simulate_xy": false,
-    "simulate_zp": false
+    "simulate_xy": true,
+    "simulate_zp": true
   },
   "speeds": {
     "xy": 0,
@@ -86,10 +86,12 @@
       33869.0
     ],
     "taught_corner": null,
+    "corner_well": "D6",
     "offset_x": 0,
     "offset_y": 0,
     "rotation": 0.0,
     "scale": 1.0,
+    "alignment_valid": false,
     "safe_z": 16.06,
     "top_z": 11.4,
     "taught_a1_z": 9.0,
@@ -100,7 +102,6 @@
     ],
     "taught_third_z": -19.02,
     "third_well": "A6",
-    "corner_well": "D6",
     "mosaic_affine": {
       "rotation_deg": -179.98158475180406,
       "scale": 0.9994922796041877,

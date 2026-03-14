@@ -73,7 +73,7 @@
         ],
         "jerk_range": null,
         "position_units": "microns",
-        "microsteps_per_micron": 10.0,
+        "xy_position_scale": 1.0,
         "position_range_x": [
             -100000,
             100000

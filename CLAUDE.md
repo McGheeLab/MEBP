@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.4** — Microscope-Enabled Bioprinting Platform
+**V7.3.5** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.4`
+Branch: `Version-7.3.5`
 
 ---
 
@@ -12,7 +12,7 @@ Branch: `Version-7.3.4`
 
 **Before making ANY code changes, read the architecture document for this version:**
 
-`coding plans/Architectures/ARCHITECTURE_V729.md`
+`coding plans/Architectures/ARCHITECTURE_V735.md`
 
 This document contains the full system architecture, module responsibilities, data flow diagrams, communication protocols, and key algorithms. Understanding this is mandatory before modifying any code.
 
@@ -77,6 +77,7 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v734_to_v735_UPDATE.md` | v7.3.5 Critical fixes: safe Z flush_moves() stale "ok" drain (serial buffer race), click-to-move QLabel event filter, XY unit fix (renamed microsteps_per_micron → xy_position_scale, 10→1), ZP stage settings card (feedrates + EEPROM save), watchdog periodic M500, simulation state persistence (ZP EEPROM + XY position to JSON) |
 | `MEBP_v733_to_v734_UPDATE.md` | v7.3.4 Objective-based µm/px calibration (per-camera selector, objectives.json, ObjectiveCalibration.py), MosaicCalibrator.py (manual SVD training persistence fix), XY lag fix (ProScan R-ack), XY stop fix (VS 0,0 on jog stop), CSS overhead fix, Xbox trigger creep fix (platform normalization + heartbeat suppression + velocity zeroing), Xbox debug mode (settings toggle → subprocess), calibration click-to-move (Click→Move toggle + CameraFeedView.clicked), safe navigation Z-wait fix (ZPStage.flush_moves M400 + PositionPoller.suspend/resume) |
 | `MEBP_v732_to_v733_UPDATE.md` | v7.3.3 Mode-based navigation + Pick & Place: ModePage base class with right-side icon nav, Printing mode (wraps print sub-pages), Pick & Place mode (config-first workflow, live camera target overlays, auto-queue building, execution monitoring), CameraManager shared feeds, camera µm/px empirical calibration (stage-move phase correlation), relaxed needle detection with interactive edge refinement + accept/reject UI, needle-based µm/px bridge |
 | `MEBP_v731_to_v732_UPDATE.md` | v7.3.2 QoL upgrades: camera config persistence, jog page startup well plate, axis flip checkboxes, custom step sizes + absolute goto, calibration page restructure (steps to main, configurable cameras, deprecate needle zero), print monitor camera overlay |

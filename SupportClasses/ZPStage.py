@@ -288,6 +288,12 @@ class ZPStageManager:
         Should be called with the PositionPoller suspended to avoid racing on
         the serial port for the 'ok' response.
 
+        v7.3.5 BF-1: Drains the serial RX buffer before sending M400. Prior
+        G-code commands (G90, G0, G91 from move_absolute) generate "ok"
+        responses that send_data() never reads. Without draining, readline()
+        would return a stale "ok" and falsely indicate M400 completion while
+        the Z axis is still moving — causing XY to start prematurely.
+
         Returns:
             True  — Marlin confirmed completion within timeout.
             False — Timed out (caller should log a warning and decide how to proceed).
@@ -295,7 +301,17 @@ class ZPStageManager:
         if self.serial is None or self.simulate:
             return True  # Simulated or disconnected — treat as immediate success
 
-        self.send_data("M400")
+        # Drain stale "ok" responses and send M400 in a single locked section
+        # to prevent any new stale data from arriving between drain and send.
+        with self._serial_lock:
+            try:
+                self.serial.reset_input_buffer()
+                self.serial.write(b"M400\n")
+                self.serial.flush()
+            except Exception as e:
+                logger.warning(f"flush_moves send error: {e}")
+                return False
+
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:

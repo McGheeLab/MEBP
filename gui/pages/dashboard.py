@@ -58,8 +58,9 @@ class DashboardPage(QWidget):
         self.settings = settings or {}
         self._context_widget = None
 
-        # Microsteps per micron — set by MainWindow
-        self._microsteps_per_micron: float = 10.0
+        # Microsteps per micron — set by MainWindow (ProScan speaks µm natively → 1.0)
+        from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
+        self._xy_position_scale: float = DEFAULT_XY_POSITION_SCALE
         self._hardware_config = None  # v7.2: HardwareConfig for µL display
 
         self._setup_ui()
@@ -67,9 +68,9 @@ class DashboardPage(QWidget):
     def get_page_title(self) -> str:
         return "Dashboard"
 
-    def set_microsteps_per_micron(self, value: float):
-        """Called by MainWindow when the conversion factor changes."""
-        self._microsteps_per_micron = max(0.001, value)
+    def set_xy_position_scale(self, value: float):
+        """Called by MainWindow when the XY position scale factor changes."""
+        self._xy_position_scale = max(0.001, value)
 
     def set_hardware_config(self, config):
         """v7.2: Set hardware config for µL pump display."""

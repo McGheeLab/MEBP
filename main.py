@@ -176,6 +176,16 @@ def main():
     if saved_flips and isinstance(saved_flips, dict):
         controller.set_axis_flips(saved_flips)
 
+    # v7.3.5: Load ZP stage feedrate settings
+    from SupportClasses.ZPStage import ZPStageManager
+    _default_fr = ZPStageManager.DEFAULT_FEEDRATE
+    controller._zp_retract_feedrate = settings.get(
+        "zp_stage.retract_feedrate", _default_fr)
+    controller._zp_insert_feedrate = settings.get(
+        "zp_stage.insert_feedrate", _default_fr / 2)
+    controller._zp_auto_save_position = bool(
+        settings.get("zp_stage.auto_save_position", False))
+
     # v7.2.6: Load safety_limits from settings
     saved_limits = settings.get_section("safety_limits")
     if saved_limits:

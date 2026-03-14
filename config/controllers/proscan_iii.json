@@ -82,8 +82,8 @@
             1,
             100
         ],
-        "position_units": "microsteps",
-        "microsteps_per_micron": 10.0,
+        "position_units": "microns",
+        "xy_position_scale": 1.0,
         "position_range_x": [
             -100000,
             100000

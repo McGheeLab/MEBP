@@ -32,7 +32,7 @@ from PySide6.QtGui import QPainter, QPen, QBrush, QColor
 from SupportClasses.StageController import StageController
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
-from gui.unit_helpers import steps_to_um, format_um, DEFAULT_MICROSTEPS_PER_MICRON
+from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig
@@ -585,7 +585,7 @@ class CalibrationPage(QWidget):
         self._context_widget = None
 
         # v7.1.1: Microsteps-to-microns conversion factor
-        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
+        self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
         self._hardware_config = None  # v7.2: HardwareConfig
 
         # v7.3.1: Geometry-predicted positions (well_name → (x_um, y_um) absolute)
@@ -667,9 +667,9 @@ class CalibrationPage(QWidget):
         """v7.3.1: Notify listeners that calibration data has changed."""
         self.calibration_data_changed.emit()
 
-    def set_microsteps_per_micron(self, value: float):
-        """Update the microsteps-per-micron conversion factor."""
-        self._microsteps_per_micron = value
+    def set_xy_position_scale(self, value: float):
+        """Update the XY position scale factor."""
+        self._xy_position_scale = value
 
     def set_hardware_config(self, config):
         """v7.2.4: Set hardware config — sync plate format, needle info, and plate model.
@@ -2075,7 +2075,7 @@ class CalibrationPage(QWidget):
             zp = ctrl.get_zp_position()
         except Exception:
             return
-        mpm = self._microsteps_per_micron or 1.0
+        scale = self._xy_position_scale or 1.0
         try:
             if isinstance(xy, dict):
                 x_s, y_s = xy.get("x", 0) or 0, xy.get("y", 0) or 0
@@ -2083,8 +2083,8 @@ class CalibrationPage(QWidget):
                 x_s, y_s = xy[0], xy[1]
             else:
                 return
-            x_mm = float(x_s) / (mpm * 1000.0)
-            y_mm = float(y_s) / (mpm * 1000.0)
+            x_mm = float(x_s) / (scale * 1000.0)
+            y_mm = float(y_s) / (scale * 1000.0)
         except Exception:
             return
         try:

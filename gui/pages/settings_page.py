@@ -36,8 +36,8 @@ from SupportClasses.ControllerProtocol import (
 )
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.unit_helpers import (
-    steps_to_um, um_to_steps, convert_safety_xy_text,
-    DEFAULT_MICROSTEPS_PER_MICRON,
+    stage_to_um, um_to_stage, convert_safety_xy_text,
+    DEFAULT_XY_POSITION_SCALE,
 )
 from gui.widgets.jog_button_array import JogButtonArray
 
@@ -60,7 +60,7 @@ class SettingsPage(QWidget):
         self.controller = controller
         self.settings = settings
         self._context_widget = None
-        self._microsteps_per_micron = DEFAULT_MICROSTEPS_PER_MICRON
+        self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
         self._setup_ui()
         self._load_from_controller()
 
@@ -81,10 +81,10 @@ class SettingsPage(QWidget):
             zero = self.controller.zero_position
 
             if xy[0] is not None:
-                rel_x = steps_to_um(xy[0] - zero.get("x", 0),
-                                    self._microsteps_per_micron)
-                rel_y = steps_to_um(xy[1] - zero.get("y", 0),
-                                    self._microsteps_per_micron)
+                rel_x = stage_to_um(xy[0] - zero.get("x", 0),
+                                    self._xy_position_scale)
+                rel_y = stage_to_um(xy[1] - zero.get("y", 0),
+                                    self._xy_position_scale)
                 self._ctx_pos_labels["X"].setText(f"{rel_x:,.1f}")
                 self._ctx_pos_labels["Y"].setText(f"{rel_y:,.1f}")
 
@@ -98,9 +98,9 @@ class SettingsPage(QWidget):
         except Exception:
             pass
 
-    def set_microsteps_per_micron(self, value: float):
-        """Update the conversion factor and refresh related UI."""
-        self._microsteps_per_micron = value
+    def set_xy_position_scale(self, value: float):
+        """Update the XY position scale factor and refresh related UI."""
+        self._xy_position_scale = value
 
     _hardware_config = None
 
@@ -380,6 +380,7 @@ class SettingsPage(QWidget):
 
         self._build_connection_card(layout)
         self._build_controller_card(layout)
+        self._build_zp_stage_card(layout)
         self._build_safety_card(layout)
         self._build_polling_card(layout)
         self._build_xbox_card(layout)
@@ -584,6 +585,100 @@ class SettingsPage(QWidget):
         self.settings.set("motion_controller.rate_test_results", result)
         self.settings.save()
 
+    # ── ZP Stage Settings Card (v7.3.5) ─────────────────────────
+
+    def _build_zp_stage_card(self, parent_layout):
+        """Build the ZP stage feedrate and position save settings card."""
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        layout = QVBoxLayout(card)
+        layout.setSpacing(6)
+
+        title = QLabel("ZP Stage (Z-Needle / Pumps)")
+        title.setObjectName("sectionLabel")
+        title.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; "
+            f"color: {COLORS['text']};")
+        layout.addWidget(title)
+
+        desc = QLabel(
+            "Feedrate settings for the Marlin Z/pump stage. "
+            "Max feedrate sets M203 (hardware limit). Retract and insert "
+            "feedrates are used by safe Z travel sequences.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        layout.addWidget(desc)
+
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        row = 0
+
+        # Max feedrate (M203 hardware limit)
+        grid.addWidget(QLabel("Max Feedrate:"), row, 0)
+        self.spin_zp_max_feedrate = QDoubleSpinBox()
+        self.spin_zp_max_feedrate.setRange(10, 2000)
+        self.spin_zp_max_feedrate.setDecimals(0)
+        self.spin_zp_max_feedrate.setSuffix(" mm/min")
+        self.spin_zp_max_feedrate.setSingleStep(10)
+        self.spin_zp_max_feedrate.setToolTip(
+            "Hardware speed limit for all ZP axes (sent via M203).\n"
+            "Default: 200 mm/min")
+        grid.addWidget(self.spin_zp_max_feedrate, row, 1)
+        row += 1
+
+        # Retract feedrate (safe Z up)
+        grid.addWidget(QLabel("Safe Z Retract Feedrate:"), row, 0)
+        self.spin_zp_retract_feedrate = QDoubleSpinBox()
+        self.spin_zp_retract_feedrate.setRange(10, 2000)
+        self.spin_zp_retract_feedrate.setDecimals(0)
+        self.spin_zp_retract_feedrate.setSuffix(" mm/min")
+        self.spin_zp_retract_feedrate.setSingleStep(10)
+        self.spin_zp_retract_feedrate.setToolTip(
+            "Feedrate when retracting needle to safe height.\n"
+            "Should be at or near max for fastest retract.")
+        grid.addWidget(self.spin_zp_retract_feedrate, row, 1)
+        row += 1
+
+        # Insert feedrate (safe Z down)
+        grid.addWidget(QLabel("Safe Z Insert Feedrate:"), row, 0)
+        self.spin_zp_insert_feedrate = QDoubleSpinBox()
+        self.spin_zp_insert_feedrate.setRange(1, 2000)
+        self.spin_zp_insert_feedrate.setDecimals(0)
+        self.spin_zp_insert_feedrate.setSuffix(" mm/min")
+        self.spin_zp_insert_feedrate.setSingleStep(10)
+        self.spin_zp_insert_feedrate.setToolTip(
+            "Feedrate when lowering needle into a well.\n"
+            "Can be slower than retract for precision.")
+        grid.addWidget(self.spin_zp_insert_feedrate, row, 1)
+        row += 1
+
+        # Default jog feedrate
+        grid.addWidget(QLabel("Default Jog Feedrate:"), row, 0)
+        self.spin_zp_jog_feedrate = QDoubleSpinBox()
+        self.spin_zp_jog_feedrate.setRange(1, 2000)
+        self.spin_zp_jog_feedrate.setDecimals(0)
+        self.spin_zp_jog_feedrate.setSuffix(" mm/min")
+        self.spin_zp_jog_feedrate.setSingleStep(10)
+        self.spin_zp_jog_feedrate.setToolTip(
+            "Feedrate for manual jog / step moves.")
+        grid.addWidget(self.spin_zp_jog_feedrate, row, 1)
+        row += 1
+
+        # Position save to EEPROM
+        grid.addWidget(QLabel("Auto-Save Position:"), row, 0)
+        self.chk_zp_position_save = QCheckBox(
+            "Save position to EEPROM at watchdog interval")
+        self.chk_zp_position_save.setToolTip(
+            "Periodically sends M500 to save the current Marlin position\n"
+            "to EEPROM. On crash/reset, Marlin restores the last saved\n"
+            "position. Interval is controlled by the Watchdog Interval setting.")
+        grid.addWidget(self.chk_zp_position_save, row, 1)
+        row += 1
+
+        layout.addLayout(grid)
+        parent_layout.addWidget(card)
+
     # ── Safety Limits Card ────────────────────────────────────────
 
     def _build_unit_conversion_card(self, parent_layout):
@@ -600,24 +695,24 @@ class SettingsPage(QWidget):
         layout.addWidget(title)
 
         desc = QLabel(
-            "The XY stage reports positions in microsteps.\n"
-            "Set the conversion factor to display in microns (µm).\n"
-            "ProScan III default: 10.0 microsteps/µm (0.1 µm resolution)")
+            "The Prior ProScan XY stage speaks µm natively.\n"
+            "Set to 1.0 for standard ProScan II/III. Only change if\n"
+            "the stage has been configured for a different resolution.")
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
         layout.addWidget(desc)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Microsteps per µm:"))
+        row.addWidget(QLabel("Stage units per µm:"))
         self.spin_um_factor = QDoubleSpinBox()
         self.spin_um_factor.setRange(0.001, 10000.0)
         self.spin_um_factor.setDecimals(3)
         self.spin_um_factor.setSingleStep(0.1)
-        self.spin_um_factor.setValue(self._microsteps_per_micron)
+        self.spin_um_factor.setValue(self._xy_position_scale)
         self.spin_um_factor.setToolTip(
-            "Conversion factor: microsteps_per_micron\n"
-            "ProScan III: 10.0 (0.1 µm/step)\n"
-            "ProScan II: 10.0 (0.1 µm/step)")
+            "Conversion factor: stage_units_per_micron\n"
+            "ProScan II/III: 1.0 (stage speaks µm natively)\n"
+            "Only change if stage resolution has been reconfigured.")
         row.addWidget(self.spin_um_factor)
         layout.addLayout(row)
 
@@ -656,13 +751,13 @@ class SettingsPage(QWidget):
         self.spin_xy_min_x = QDoubleSpinBox()
         self.spin_xy_min_x.setRange(-999999, 999999)
         self.spin_xy_min_x.setDecimals(0)
-        self.spin_xy_min_x.setSuffix(" steps")
+        self.spin_xy_min_x.setSuffix(" µm")
         grid.addWidget(self.spin_xy_min_x, row, 1)
         grid.addWidget(QLabel("Max X:"), row, 2)
         self.spin_xy_max_x = QDoubleSpinBox()
         self.spin_xy_max_x.setRange(-999999, 999999)
         self.spin_xy_max_x.setDecimals(0)
-        self.spin_xy_max_x.setSuffix(" steps")
+        self.spin_xy_max_x.setSuffix(" µm")
         grid.addWidget(self.spin_xy_max_x, row, 3)
         row += 1
 
@@ -670,13 +765,13 @@ class SettingsPage(QWidget):
         self.spin_xy_min_y = QDoubleSpinBox()
         self.spin_xy_min_y.setRange(-999999, 999999)
         self.spin_xy_min_y.setDecimals(0)
-        self.spin_xy_min_y.setSuffix(" steps")
+        self.spin_xy_min_y.setSuffix(" µm")
         grid.addWidget(self.spin_xy_min_y, row, 1)
         grid.addWidget(QLabel("Max Y:"), row, 2)
         self.spin_xy_max_y = QDoubleSpinBox()
         self.spin_xy_max_y.setRange(-999999, 999999)
         self.spin_xy_max_y.setDecimals(0)
-        self.spin_xy_max_y.setSuffix(" steps")
+        self.spin_xy_max_y.setSuffix(" µm")
         grid.addWidget(self.spin_xy_max_y, row, 3)
         row += 1
 
@@ -991,6 +1086,20 @@ class SettingsPage(QWidget):
         self.chk_sim_xy.setChecked(self.controller.simulate_xy)
         self.chk_sim_zp.setChecked(self.controller.simulate_zp)
 
+        # v7.3.5: ZP Stage settings
+        from SupportClasses.ZPStage import ZPStageManager
+        default_fr = ZPStageManager.DEFAULT_FEEDRATE
+        self.spin_zp_max_feedrate.setValue(
+            self.settings.get("zp_stage.max_feedrate", default_fr))
+        self.spin_zp_retract_feedrate.setValue(
+            self.settings.get("zp_stage.retract_feedrate", default_fr))
+        self.spin_zp_insert_feedrate.setValue(
+            self.settings.get("zp_stage.insert_feedrate", default_fr / 2))
+        self.spin_zp_jog_feedrate.setValue(
+            self.settings.get("zp_stage.jog_feedrate", default_fr))
+        self.chk_zp_position_save.setChecked(
+            bool(self.settings.get("zp_stage.auto_save_position", False)))
+
         # Safety limits
         self.chk_safety_enabled.setChecked(sl.enabled)
         self.spin_xy_min_x.setValue(sl.xy_min_x)
@@ -1044,11 +1153,11 @@ class SettingsPage(QWidget):
             chk.setChecked(bool(saved_flips.get(axis, False)))
 
         # Unit conversion factor
-        um_val = self.settings.get("stage.microsteps_per_micron",
-                                   DEFAULT_MICROSTEPS_PER_MICRON)
-        self._microsteps_per_micron = float(um_val)
+        um_val = self.settings.get("stage.xy_position_scale",
+                                   DEFAULT_XY_POSITION_SCALE)
+        self._xy_position_scale = float(um_val)
         if hasattr(self, 'spin_um_factor'):
-            self.spin_um_factor.setValue(self._microsteps_per_micron)
+            self.spin_um_factor.setValue(self._xy_position_scale)
 
         self._refresh_ports()
         self._update_context_sim_labels()
@@ -1105,6 +1214,31 @@ class SettingsPage(QWidget):
 
         self.settings.set_section("safety_limits", sl.to_dict())
 
+        # v7.3.5: ZP Stage settings → apply to hardware + persist
+        zp_max_fr = self.spin_zp_max_feedrate.value()
+        zp_retract_fr = self.spin_zp_retract_feedrate.value()
+        zp_insert_fr = self.spin_zp_insert_feedrate.value()
+        zp_jog_fr = self.spin_zp_jog_feedrate.value()
+        zp_auto_save = self.chk_zp_position_save.isChecked()
+
+        self.settings.set("zp_stage.max_feedrate", zp_max_fr)
+        self.settings.set("zp_stage.retract_feedrate", zp_retract_fr)
+        self.settings.set("zp_stage.insert_feedrate", zp_insert_fr)
+        self.settings.set("zp_stage.jog_feedrate", zp_jog_fr)
+        self.settings.set("zp_stage.auto_save_position", zp_auto_save)
+
+        # Apply max feedrate to hardware (M203)
+        if self.controller.is_zp_connected and self.controller.zp_stage:
+            self.controller.zp_stage.set_max_feedrate(zp_max_fr)
+            self.controller.zp_stage.feedrate = zp_jog_fr
+
+        # Store retract/insert feedrates on controller for safe_travel_to
+        self.controller._zp_retract_feedrate = zp_retract_fr
+        self.controller._zp_insert_feedrate = zp_insert_fr
+
+        # Enable/disable periodic position save
+        self.controller._zp_auto_save_position = zp_auto_save
+
         # Polling → apply immediately (GUI timer reads setting on next tick)
         poll_ms = self.spin_poll_interval.value()
         self.controller._pos_poller.poll_interval = poll_ms / 1000.0
@@ -1155,8 +1289,8 @@ class SettingsPage(QWidget):
         # Unit conversion factor
         if hasattr(self, 'spin_um_factor'):
             um_val = self.spin_um_factor.value()
-            self.settings.set("stage.microsteps_per_micron", um_val)
-            self._microsteps_per_micron = um_val
+            self.settings.set("stage.xy_position_scale", um_val)
+            self._xy_position_scale = um_val
 
         self.settings.save()
         logger.info("Settings applied and saved")
@@ -1197,7 +1331,7 @@ class SettingsPage(QWidget):
         try:
             sl = self.controller.safety_limits
             self.lbl_safety_um.setText(
-                convert_safety_xy_text(sl, self._microsteps_per_micron))
+                convert_safety_xy_text(sl, self._xy_position_scale))
         except Exception:
             self.lbl_safety_um.setText("")
 
@@ -1277,8 +1411,8 @@ class SettingsPage(QWidget):
             else:
                 self.spin_xy_min_x.setValue(zero_x)
                 self.spin_xy_min_y.setValue(zero_y)
-            ux = steps_to_um(zero_x, self._microsteps_per_micron)
-            uy = steps_to_um(zero_y, self._microsteps_per_micron)
+            ux = stage_to_um(zero_x, self._xy_position_scale)
+            uy = stage_to_um(zero_y, self._xy_position_scale)
             logger.info(
                 f"XY {'max' if as_max else 'min'} set to "
                 f"({ux:,.1f}, {uy:,.1f}) µm")

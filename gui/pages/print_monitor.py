@@ -762,7 +762,8 @@ class PrintMonitorPage(QWidget):
         self._trajectory_waypoints = None
         self._total_duration_s = 0.0
         self._recorder = None
-        self._microsteps_per_micron = 10.0
+        from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
+        self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
         self._active_pump = "P1"
 
         self._build_ui()
@@ -773,7 +774,7 @@ class PrintMonitorPage(QWidget):
     def get_page_title(self) -> str: return "Print Monitor"
     def get_page_subtitle(self) -> str: return "Live print visualization"
     def set_hardware_config(self, config): self._hardware_config = config
-    def set_microsteps_per_micron(self, v): self._microsteps_per_micron = v
+    def set_xy_position_scale(self, v): self._xy_position_scale = v
     def set_recorder(self, r): self._recorder = r
     def _get_controller(self):
         return getattr(self, '_controller', None) or getattr(self, 'controller', None)

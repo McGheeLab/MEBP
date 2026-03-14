@@ -733,6 +733,12 @@ class StageController:
             "Z": False, "P1": False, "P2": False, "P3": False,
         }
 
+        # v7.3.5: Configurable ZP feedrates (mm/min), set from Settings page
+        self._zp_retract_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE
+        self._zp_insert_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE / 2
+        # v7.3.5: Periodic position save to Marlin EEPROM (M500)
+        self._zp_auto_save_position: bool = False
+
         # Register calibration handler
         self.processor.register_handler("zero_needle_pos", self._calibrate_zero)
         # v7.2.6: debug handler — ensures Xbox debug messages always dispatch
@@ -810,9 +816,30 @@ class StageController:
                     lambda: getattr(self.zp_stage, "serial", None),
                     lambda: self._handle_disconnect("ZP"),
                 )
+                # v7.3.5: Register periodic position save (M500)
+                self._watchdog.add_periodic(self._periodic_zp_position_save)
             logger.info("ZP stage connected")
 
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
+
+    def _periodic_zp_position_save(self) -> None:
+        """v7.3.5: Called by watchdog — saves ZP position to EEPROM (M500).
+
+        Only sends M500 when auto-save is enabled and the ZP stage is
+        connected on real hardware. On crash/reset, Marlin restores the
+        last saved position so the user doesn't lose their reference.
+        """
+        if not self._zp_auto_save_position:
+            return
+        if self.zp_stage is None or self.simulate_zp:
+            return
+        if self._pos_poller._suspended:
+            return  # Don't interfere with safe_travel_to
+        try:
+            self.zp_stage.save_settings()  # M500
+            logger.debug("Periodic ZP position save (M500)")
+        except Exception as e:
+            logger.debug(f"ZP position save failed: {e}")
 
     # ── Convenience connection methods (used by Dashboard) ────────
 
@@ -1348,9 +1375,8 @@ class StageController:
                 dx = clamped_x - cur_zr_x
                 dy = clamped_y - cur_zr_y
 
-        # v7.2.4: Verification logging — exact microstep values
         logger.debug(f"move_xy_relative: sending dx={round(dx)} dy={round(dy)} "
-                     f"microsteps (raw: dx={dx:.2f} dy={dy:.2f})")
+                     f"µm (raw: dx={dx:.2f} dy={dy:.2f})")
         self.xy_stage.move_stage_relative(dx, dy)
 
     def move_xy_relative_um(self, dx_um: float, dy_um: float) -> None:
@@ -1455,6 +1481,11 @@ class StageController:
         move, and waits for XY arrival before lowering Z. This prevents
         needle crashes from premature XY moves while Z is still retracting.
 
+        v7.3.5: Two-layer Z verification (belt and suspenders):
+          1. flush_moves() — M400 command-level wait (Marlin confirms done)
+          2. wait_for_z_arrival() — position polling via M114 (physical verification)
+        XY will NOT start unless both layers confirm Z is at safe height.
+
         Args:
             target_x_um: Absolute target X in µm (raw stage coords).
             target_y_um: Absolute target Y in µm (raw stage coords).
@@ -1474,21 +1505,27 @@ class StageController:
         # serial races between the poller thread and our M400 / M114 waits.
         self._pos_poller.suspend()
         try:
-            # Step 1: Raise Z to safe height and WAIT for physical completion
+            # Step 1: Raise Z to safe height at retract feedrate and WAIT
             if self.is_zp_connected:
-                self.move_z_absolute(safe_z_mm, from_zero_ref=True)
+                self.move_z_absolute(safe_z_mm, from_zero_ref=True,
+                                     feedrate_mm_min=self._zp_retract_feedrate)
+
+                # Layer 1: M400 command-level wait
                 if hasattr(self.zp_stage, 'flush_moves'):
-                    # M400: Marlin only responds 'ok' after all moves are done
                     if not self.zp_stage.flush_moves(timeout_s=z_timeout_s):
-                        logger.warning("safe_travel_to: Z retract timed out (M400) — "
-                                       "proceeding with XY move anyway")
-                        ok = False
-                else:
-                    if not self.wait_for_z_arrival(safe_z_mm, tolerance_mm=0.1,
-                                                   timeout_s=z_timeout_s):
-                        logger.warning("safe_travel_to: Z retract timed out — "
-                                       "proceeding with XY move anyway")
-                        ok = False
+                        logger.error("safe_travel_to: Z retract M400 timed out — "
+                                     "ABORTING, will not start XY move")
+                        return False
+
+                # Layer 2: Poll actual Z position to verify physical arrival
+                if not self.wait_for_z_arrival(safe_z_mm, tolerance_mm=0.1,
+                                               timeout_s=z_timeout_s):
+                    logger.error("safe_travel_to: Z position verification failed — "
+                                 "ABORTING, will not start XY move")
+                    return False
+
+                logger.info(f"safe_travel_to: Z confirmed at safe height "
+                            f"{safe_z_mm:.2f} mm — proceeding to XY")
 
             # Step 2: Fast XY travel and WAIT for arrival
             if self.is_xy_connected:
@@ -1511,18 +1548,22 @@ class StageController:
                                    "proceeding with Z descent anyway")
                     ok = False
 
-            # Step 3: Lower Z to target and WAIT for physical completion
+            # Step 3: Lower Z to target at insert feedrate and WAIT
             if self.is_zp_connected and target_z_mm is not None:
-                self.move_z_absolute(target_z_mm, from_zero_ref=True)
+                self.move_z_absolute(target_z_mm, from_zero_ref=True,
+                                     feedrate_mm_min=self._zp_insert_feedrate)
+
+                # Layer 1: M400 command-level wait
                 if hasattr(self.zp_stage, 'flush_moves'):
                     if not self.zp_stage.flush_moves(timeout_s=z_timeout_s):
-                        logger.warning("safe_travel_to: Z descent timed out (M400)")
+                        logger.warning("safe_travel_to: Z descent M400 timed out")
                         ok = False
-                else:
-                    if not self.wait_for_z_arrival(target_z_mm, tolerance_mm=0.1,
-                                                   timeout_s=z_timeout_s):
-                        logger.warning("safe_travel_to: Z descent timed out")
-                        ok = False
+
+                # Layer 2: Poll actual Z position to verify
+                if not self.wait_for_z_arrival(target_z_mm, tolerance_mm=0.1,
+                                               timeout_s=z_timeout_s):
+                    logger.warning("safe_travel_to: Z descent position verification failed")
+                    ok = False
 
         finally:
             self._pos_poller.resume()

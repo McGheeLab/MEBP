@@ -43,9 +43,9 @@ from SupportClasses.HardwareConfig import HardwareConfig
 from gui.styles import DARK_THEME, COLORS
 from gui.ui_functions import UIFunctions, AppSettings
 from gui.unit_helpers import (
-    steps_to_um, um_to_steps, format_um,
-    get_microsteps_per_micron_from_protocol,
-    DEFAULT_MICROSTEPS_PER_MICRON,
+    stage_to_um, um_to_stage, format_um,
+    get_position_scale_from_protocol,
+    DEFAULT_XY_POSITION_SCALE,
 )
 from gui.pages.hardware_setup import HardwareSetupPage
 from gui.pages.dashboard import DashboardPage
@@ -98,8 +98,8 @@ class MainWindow(QMainWindow):
         # v7.2: Hardware configuration
         self._hardware_config: HardwareConfig | None = None
 
-        # Microsteps-per-micron conversion factor
-        self._microsteps_per_micron: float = self._resolve_microsteps_per_micron()
+        # XY position scale factor (stage readout units per µm, 1.0 for ProScan)
+        self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
         self.setWindowTitle("MEBP Bioprinter — v7.3.3")
@@ -121,37 +121,28 @@ class MainWindow(QMainWindow):
         logger.info("MainWindow initialized (v7.3.3)")
 
     # ════════════════════════════════════════════════════════════════
-    #  MICROSTEPS-PER-MICRON PROPERTY
+    #  XY POSITION SCALE PROPERTY
     # ════════════════════════════════════════════════════════════════
 
     @property
-    def microsteps_per_micron(self) -> float:
-        return self._microsteps_per_micron
+    def xy_position_scale(self) -> float:
+        return self._xy_position_scale
 
-    @microsteps_per_micron.setter
-    def microsteps_per_micron(self, value: float):
-        self._microsteps_per_micron = max(0.001, value)
-        self.settings.set("stage.microsteps_per_micron", self._microsteps_per_micron)
+    @xy_position_scale.setter
+    def xy_position_scale(self, value: float):
+        self._xy_position_scale = max(0.001, value)
+        self.settings.set("stage.xy_position_scale", self._xy_position_scale)
         for page in self._page_widgets:
-            # v7.2.5 NOTE: Jog page now sends microns directly to the
-            # Prior controller via move_xy_relative_um(). The microsteps_per_micron
-            # factor is kept for backward compat with other pages that may need it.
-            # v7.2.5 NOTE: Jog page now sends microns directly to the
-            # Prior controller via move_xy_relative_um(). The microsteps_per_micron
-            # factor is kept for backward compat with other pages that may need it.
-            # v7.2.5 NOTE: Jog page now sends microns directly to the
-            # Prior controller via move_xy_relative_um(). The microsteps_per_micron
-            # factor is kept for backward compat with other pages that may need it.
-            if hasattr(page, 'set_microsteps_per_micron'):
-                page.set_microsteps_per_micron(self._microsteps_per_micron)
-        logger.info(f"microsteps_per_micron set to {self._microsteps_per_micron}")
+            if hasattr(page, 'set_xy_position_scale'):
+                page.set_xy_position_scale(self._xy_position_scale)
+        logger.info(f"xy_position_scale set to {self._xy_position_scale}")
 
-    def _resolve_microsteps_per_micron(self) -> float:
+    def _resolve_xy_position_scale(self) -> float:
         proto_val = self._try_load_from_protocol()
         if proto_val is not None:
-            self.settings.set("stage.microsteps_per_micron", proto_val)
+            self.settings.set("stage.xy_position_scale", proto_val)
             return proto_val
-        saved = self.settings.get("stage.microsteps_per_micron")
+        saved = self.settings.get("stage.xy_position_scale")
         if saved is not None:
             try:
                 val = float(saved)
@@ -159,14 +150,14 @@ class MainWindow(QMainWindow):
                     return val
             except (TypeError, ValueError):
                 pass
-        return DEFAULT_MICROSTEPS_PER_MICRON
+        return DEFAULT_XY_POSITION_SCALE
 
     def _try_load_from_protocol(self) -> float | None:
         xy = getattr(self.controller, 'xy_stage', None)
         if xy is None:
             return None
         protocol = getattr(xy, '_protocol', None)
-        return get_microsteps_per_micron_from_protocol(protocol)
+        return get_position_scale_from_protocol(protocol)
 
     # ════════════════════════════════════════════════════════════════
     #  UI CONSTRUCTION
@@ -556,9 +547,9 @@ class MainWindow(QMainWindow):
                     placeholder = QWidget()
                     self._context_stack.addWidget(placeholder)
 
-            # Propagate microsteps_per_micron
-            if hasattr(page, 'set_microsteps_per_micron'):
-                page.set_microsteps_per_micron(self._microsteps_per_micron)
+            # Propagate XY position scale
+            if hasattr(page, 'set_xy_position_scale'):
+                page.set_xy_position_scale(self._xy_position_scale)
 
         # v7.3.3: Wire mode page sub-page changes → context panel updates
         for i, page in enumerate(self._page_widgets):
@@ -1345,8 +1336,8 @@ class MainWindow(QMainWindow):
         if xy_ok and not self._protocol_checked:
             self._protocol_checked = True
             proto_val = self._try_load_from_protocol()
-            if proto_val is not None and proto_val != self._microsteps_per_micron:
-                self.microsteps_per_micron = proto_val
+            if proto_val is not None and proto_val != self._xy_position_scale:
+                self.xy_position_scale = proto_val
 
         # Position readouts
         try:
@@ -1358,8 +1349,8 @@ class MainWindow(QMainWindow):
             if xy[0] is not None:
                 zx = xy[0] - self.controller.zero_position["x"]
                 zy = xy[1] - self.controller.zero_position["y"]
-                ux = steps_to_um(zx, self._microsteps_per_micron)
-                uy = steps_to_um(zy, self._microsteps_per_micron)
+                ux = stage_to_um(zx, self._xy_position_scale)
+                uy = stage_to_um(zy, self._xy_position_scale)
                 self.sb_xy.setText(f"XY: {ux:,.1f} , {uy:,.1f} µm")
             else:
                 self.sb_xy.setText("XY: — , — µm")

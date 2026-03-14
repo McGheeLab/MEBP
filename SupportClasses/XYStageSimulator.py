@@ -13,6 +13,10 @@ Diagnostic results (38400 baud, 2026-03-09):
   Sine-wave tracking: clean to 1.0 Hz (1885 µm/s peak) at 50 Hz VS rate
 
 All positions in µm per Prior manual page 36.
+
+v7.3.5: Persistent state via ``config/sim_xy_state.json``.
+    Position and settings are saved on stop() and restored on startup,
+    so the simulation maintains continuity across sessions.
 """
 
 from __future__ import annotations
@@ -27,6 +31,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Default path for persisted simulator state
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_XY_STATE_PATH = _PROJECT_ROOT / "config" / "sim_xy_state.json"
+
 # ═══════════════════════════════════════════════════════════════════
 #  Physical constants
 # ═══════════════════════════════════════════════════════════════════
@@ -35,7 +43,7 @@ MAX_SPEED_UM_S = 20_000.0
 MAX_ACCEL_UM_S2 = 400_000.0  # v7.2.8-cal: real settles 300µm in 59ms
 DEFAULT_SPEED_PCT = 50
 DEFAULT_ACCEL_PCT = 50
-MICROSTEPS_PER_MICRON = 10
+XY_POSITION_SCALE = 1  # ProScan reports in µm natively (1:1 scale)
 DEFAULT_KP = 50.0  # v7.2.8-cal: faster convergence to match real settle time
 SETTLE_THRESHOLD_UM = 0.5
 PHYSICS_HZ = 200
@@ -140,13 +148,15 @@ class XYStageSimulator:
 
     def __init__(
         self,
-        microsteps_per_micron: float = MICROSTEPS_PER_MICRON,
+        xy_position_scale: float = XY_POSITION_SCALE,
         update_rate_hz: int = PHYSICS_HZ,
         baud_rate: int = _PROFILE_BAUD,
+        state_file: Path | str | None = None,
     ):
-        self._usteps_per_um = microsteps_per_micron
+        self._position_scale = xy_position_scale
         self._baud = baud_rate
         self._bytes_per_second = baud_rate / BITS_PER_BYTE
+        self._state_file = Path(state_file) if state_file else _DEFAULT_XY_STATE_PATH
 
         # ── Position state (µm) ───────────────────────────────────
         self.current_x: float = 0.0
@@ -195,6 +205,9 @@ class XYStageSimulator:
         self._running = False
         self._thread: threading.Thread | None = None
 
+        # Load persisted state
+        self._load_state()
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -215,6 +228,7 @@ class XYStageSimulator:
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+        self._save_state()
         logger.info("XY stage stopped")
 
     def close(self) -> None:
@@ -524,8 +538,8 @@ class XYStageSimulator:
         use_usteps = len(parts) >= 3 and parts[2].lower() == "p"
         with self._lock:
             if use_usteps:
-                self.target_vx = vx_raw / self._usteps_per_um
-                self.target_vy = vy_raw / self._usteps_per_um
+                self.target_vx = vx_raw / self._position_scale
+                self.target_vy = vy_raw / self._position_scale
             else:
                 self.target_vx = vx_raw
                 self.target_vy = vy_raw
@@ -621,7 +635,7 @@ class XYStageSimulator:
             f"TYPE = 1\n"
             f"SIZE_X = {self._size_x_mm} MM\n"
             f"SIZE_Y = {self._size_y_mm} MM\n"
-            f"MICROSTEPS/MICRON = {int(self._usteps_per_um)}\n"
+            f"POSITION_SCALE = {int(self._position_scale)}\n"
             f"LIMITS = NORMALLY CLOSED\n"
             f"END")
 
@@ -700,3 +714,69 @@ class XYStageSimulator:
                         self.current_vx = self.current_vy = 0.0
 
             time.sleep(max(0.0, self._update_interval - (time.time() - t0)))
+
+    # ── State Persistence ─────────────────────────────────────────
+
+    def _save_state(self) -> None:
+        """Save position and settings to JSON for session continuity."""
+        from datetime import datetime, timezone
+        state = {
+            "_description": "Simulated Prior ProScan state — saved on stop()",
+            "_last_saved": datetime.now(timezone.utc).isoformat(),
+            "position": {
+                "x": self.current_x,
+                "y": self.current_y,
+            },
+            "settings": {
+                "speed_pct": self._speed_pct,
+                "accel_pct": self._accel_pct,
+                "scurve_pct": self._scurve_pct,
+            },
+            "stage_info": {
+                "stage_name": self._stage_name,
+                "size_x_mm": self._size_x_mm,
+                "size_y_mm": self._size_y_mm,
+                "position_scale": self._position_scale,
+            },
+        }
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._state_file, "w") as f:
+                json.dump(state, f, indent=4)
+            logger.info(f"XYSim: state saved to {self._state_file.name}")
+        except Exception as e:
+            logger.warning(f"XYSim: failed to save state: {e}")
+
+    def _load_state(self) -> None:
+        """Load position and settings from JSON if available."""
+        if not self._state_file.exists():
+            logger.debug(f"XYSim: no state file at {self._state_file} — using defaults")
+            return
+        try:
+            with open(self._state_file, "r") as f:
+                state = json.load(f)
+
+            if "position" in state:
+                self.current_x = float(state["position"].get("x", 0.0))
+                self.current_y = float(state["position"].get("y", 0.0))
+                self.target_x = self.current_x
+                self.target_y = self.current_y
+
+            if "settings" in state:
+                s = state["settings"]
+                if "speed_pct" in s:
+                    self._speed_pct = int(s["speed_pct"])
+                    self._max_speed = (self._speed_pct / 100.0) * MAX_SPEED_UM_S
+                    self.max_speed = self._max_speed
+                if "accel_pct" in s:
+                    self._accel_pct = int(s["accel_pct"])
+                    self._max_accel = (self._accel_pct / 100.0) * MAX_ACCEL_UM_S2
+                if "scurve_pct" in s:
+                    self._scurve_pct = int(s["scurve_pct"])
+
+            logger.info(
+                f"XYSim: state loaded from {self._state_file.name} "
+                f"(pos {self.current_x:.1f}, {self.current_y:.1f} µm)"
+            )
+        except Exception as e:
+            logger.warning(f"XYSim: failed to load state: {e}")

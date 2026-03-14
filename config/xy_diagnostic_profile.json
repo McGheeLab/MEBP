@@ -8,7 +8,7 @@
         "stage_type": 8,
         "size_x_mm": 114,
         "size_y_mm": 75,
-        "microsteps_per_micron": 25,
+        "xy_position_scale": 25,
         "limits": "normally_closed"
     },
     "communication": {

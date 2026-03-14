@@ -215,7 +215,7 @@ class HelperFunctionsPage(QWidget):
     def set_hardware_config(self, config):
         self._hw_config = config
 
-    def set_microsteps_per_micron(self, value: float):
+    def set_xy_position_scale(self, value: float):
         pass
 
     # ══════════════════════════════════════════════════════════════

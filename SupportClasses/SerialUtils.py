@@ -259,6 +259,7 @@ class ConnectionWatchdog:
     def __init__(self, check_interval: float = 2.0):
         self.check_interval = check_interval
         self._watches: dict[str, dict] = {}
+        self._periodic_callbacks: list[Callable] = []  # v7.3.5
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -288,6 +289,19 @@ class ConnectionWatchdog:
         """Stop watching a named connection."""
         with self._lock:
             self._watches.pop(name, None)
+
+    def add_periodic(self, callback: Callable) -> None:
+        """v7.3.5: Register a callback to run on every watchdog cycle."""
+        with self._lock:
+            self._periodic_callbacks.append(callback)
+
+    def remove_periodic(self, callback: Callable) -> None:
+        """v7.3.5: Remove a periodic callback."""
+        with self._lock:
+            try:
+                self._periodic_callbacks.remove(callback)
+            except ValueError:
+                pass
 
     def start(self) -> None:
         """Start the watchdog thread."""
@@ -328,5 +342,14 @@ class ConnectionWatchdog:
                     info["was_connected"] = is_connected
                 except Exception:
                     pass  # Don't crash the watchdog
+
+            # v7.3.5: Run periodic callbacks (e.g. position save)
+            with self._lock:
+                callbacks = list(self._periodic_callbacks)
+            for cb in callbacks:
+                try:
+                    cb()
+                except Exception as e:
+                    logger.debug(f"[Watchdog] Periodic callback error: {e}")
 
             time.sleep(self.check_interval)
