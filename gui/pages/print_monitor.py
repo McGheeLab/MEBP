@@ -31,6 +31,7 @@ from PySide6.QtCore import Qt, Signal, QRectF, QPointF
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient, QImage
 
 from gui.styles import COLORS
+from gui.scaling import s as _sc, scaled_font_size
 
 try:
     from SupportClasses.PrintManager import PrintState
@@ -64,7 +65,7 @@ class PlateOverviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(180, 140)
+        self.setMinimumSize(_sc(180), _sc(140))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._wells: list[dict] = []
         self._well_roles: dict[str, str] = {}
@@ -154,7 +155,7 @@ class PlateOverviewWidget(QWidget):
             p.drawEllipse(QPointF(nx, ny), 4, 4)
 
         # Headers
-        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 7))
+        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", scaled_font_size(7)))
         rows_done, cols_done = set(), set()
         for w in self._wells:
             cx, cy = self._margin + w["x"] * scale, self._margin + w["y"] * scale
@@ -193,7 +194,7 @@ class XYDetailView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(250, 200)
+        self.setMinimumSize(_sc(250), _sc(200))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # Planned trajectory — ALL waypoints (print + travel)
@@ -528,7 +529,7 @@ class XYDetailView(QWidget):
 
         # 8. Info overlay
         p.setPen(QColor("#6c7086"))
-        p.setFont(QFont("Arial", 9))
+        p.setFont(QFont("Arial", scaled_font_size(9)))
         if self._nx is not None:
             p.drawText(6, h - 6, f"XY: ({self._nx:.1f}, {self._ny:.1f})")
         if wp:
@@ -559,7 +560,7 @@ class YZSideView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(120, 200)
+        self.setMinimumSize(_sc(120), _sc(200))
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._ny: float | None = None
         self._nz: float | None = None
@@ -601,7 +602,7 @@ class YZSideView(QWidget):
         y_plate = z_to_py(0)
         p.setPen(QPen(QColor("#585b70"), 2))
         p.drawLine(QPointF(0, y_plate), QPointF(w, y_plate))
-        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 8))
+        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", scaled_font_size(8)))
         p.drawText(QPointF(4, y_plate - 4), "plate surface")
 
         # Travel height line
@@ -641,7 +642,7 @@ class YZSideView(QWidget):
             p.drawPolygon(tip)
 
         # Z readout
-        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", 9))
+        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", scaled_font_size(9)))
         if self._nz is not None:
             p.drawText(6, h - 6, f"Z: {self._nz:.2f} mm")
         p.end()
@@ -657,8 +658,8 @@ class SyringePumpWidget(QWidget):
     def __init__(self, pump_id: str = "P1", parent=None):
         super().__init__(parent)
         self.pump_id = pump_id
-        self.setFixedWidth(60)
-        self.setMinimumHeight(100)
+        self.setFixedWidth(_sc(60))
+        self.setMinimumHeight(_sc(100))
         self._position_mm = 0.0       # Current plunger position
         self._zero_mm = 0.0           # Zero reference
         self._stroke_mm = 30.0        # Total syringe stroke
@@ -689,7 +690,7 @@ class SyringePumpWidget(QWidget):
         p.fillRect(self.rect(), bg)
 
         if not self._enabled:
-            p.setPen(QColor("#585b70")); p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            p.setPen(QColor("#585b70")); p.setFont(QFont("Arial", scaled_font_size(10), QFont.Weight.Bold))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"{self.pump_id}\n—")
             p.end(); return
 
@@ -719,17 +720,17 @@ class SyringePumpWidget(QWidget):
             p.drawRoundedRect(QRectF(bx - 2, by - 2, bw + 4, bh + 4), 4, 4)
 
         # Pump label
-        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        p.setPen(QColor("#cdd6f4")); p.setFont(QFont("Arial", scaled_font_size(10), QFont.Weight.Bold))
         p.drawText(QRectF(0, 2, w, 20), Qt.AlignmentFlag.AlignCenter, self.pump_id)
 
         # µL readout
         uL = rel_pos * self._uL_per_mm
-        p.setFont(QFont("Arial", 8))
+        p.setFont(QFont("Arial", scaled_font_size(8)))
         p.drawText(QRectF(0, h - 28, w, 14), Qt.AlignmentFlag.AlignCenter, f"{uL:.1f} µL")
 
         # Ink name
         if self._ink_name:
-            p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", 7))
+            p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", scaled_font_size(7)))
             p.drawText(QRectF(0, h - 14, w, 14), Qt.AlignmentFlag.AlignCenter,
                        self._ink_name[:8])
         p.end()
@@ -823,13 +824,13 @@ class PrintMonitorPage(QWidget):
         self._chk_cam_overlay.toggled.connect(self._toggle_cam_overlay)
         dl.addWidget(self._chk_cam_overlay)
         btn_zoom_cam = QPushButton("Zoom Cam")
-        btn_zoom_cam.setMaximumHeight(20)
+        btn_zoom_cam.setMaximumHeight(_sc(20))
         btn_zoom_cam.setStyleSheet("font-size: 9px; padding: 1px 4px;")
         btn_zoom_cam.setToolTip("Zoom to camera FOV")
         btn_zoom_cam.clicked.connect(lambda: self.xy_detail.zoom_to_camera())
         dl.addWidget(btn_zoom_cam)
         btn_zoom_plate = QPushButton("Zoom All")
-        btn_zoom_plate.setMaximumHeight(20)
+        btn_zoom_plate.setMaximumHeight(_sc(20))
         btn_zoom_plate.setStyleSheet("font-size: 9px; padding: 1px 4px;")
         btn_zoom_plate.setToolTip("Zoom to fit all waypoints")
         btn_zoom_plate.clicked.connect(lambda: self.xy_detail.zoom_to_plate())
@@ -888,7 +889,7 @@ class PrintMonitorPage(QWidget):
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
-        self.progress_bar.setMaximumHeight(18)
+        self.progress_bar.setMaximumHeight(_sc(18))
         self.progress_bar.setStyleSheet(f"""
             QProgressBar {{ background: {COLORS.get('surface0','#313244')};
                 border: 1px solid {COLORS.get('surface1','#45475a')};
@@ -906,7 +907,7 @@ class PrintMonitorPage(QWidget):
         br.addStretch()
 
         self.btn_pause = QPushButton("⏸ Pause")
-        self.btn_pause.setMinimumHeight(30); self.btn_pause.setEnabled(False)
+        self.btn_pause.setMinimumHeight(_sc(30)); self.btn_pause.setEnabled(False)
         self.btn_pause.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('yellow','#f9e2af')}; "
             f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
@@ -914,7 +915,7 @@ class PrintMonitorPage(QWidget):
         br.addWidget(self.btn_pause)
 
         self.btn_abort = QPushButton("⏹ Abort")
-        self.btn_abort.setMinimumHeight(30); self.btn_abort.setEnabled(False)
+        self.btn_abort.setMinimumHeight(_sc(30)); self.btn_abort.setEnabled(False)
         self.btn_abort.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('red','#f38ba8')}; "
             f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
@@ -984,7 +985,7 @@ class PrintMonitorPage(QWidget):
         lay = QVBoxLayout(ctx); lay.setContentsMargins(4, 4, 4, 4); lay.setSpacing(6)
 
         self._ctx_btn_start = QPushButton("▶ Start Print")
-        self._ctx_btn_start.setMinimumHeight(34); self._ctx_btn_start.setEnabled(False)
+        self._ctx_btn_start.setMinimumHeight(_sc(34)); self._ctx_btn_start.setEnabled(False)
         self._ctx_btn_start.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('green','#a6e3a1')}; "
             f"color: {COLORS.get('crust','#11111b')}; font-weight: bold; "
@@ -995,15 +996,15 @@ class PrintMonitorPage(QWidget):
         lay.addWidget(self._ctx_btn_start)
 
         lay.addWidget(QLabel("Job Queue"))
-        self._queue_list = QListWidget(); self._queue_list.setMaximumHeight(120)
+        self._queue_list = QListWidget(); self._queue_list.setMaximumHeight(_sc(120))
         self._queue_list.setStyleSheet(
             f"QListWidget {{ background: {COLORS.get('surface0','#313244')}; "
             f"color: {COLORS.get('text','#cdd6f4')}; border-radius: 4px; font-size: 10px; }}")
         lay.addWidget(self._queue_list)
 
         qb = QHBoxLayout()
-        br = QPushButton("Remove"); br.setMaximumHeight(22); br.clicked.connect(self._on_ctx_remove)
-        bc = QPushButton("Clear"); bc.setMaximumHeight(22); bc.clicked.connect(self._on_ctx_clear)
+        br = QPushButton("Remove"); br.setMaximumHeight(_sc(22)); br.clicked.connect(self._on_ctx_remove)
+        bc = QPushButton("Clear"); bc.setMaximumHeight(_sc(22)); bc.clicked.connect(self._on_ctx_clear)
         qb.addWidget(br); qb.addWidget(bc)
         lay.addLayout(qb)
 

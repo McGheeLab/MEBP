@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from gui.styles import COLORS
+from gui.scaling import s, scaled_font_size
 from SupportClasses.PickAndPlaceManager import (
     PickPlaceTarget, PickPlaceOperation, OperationType, OperationStatus,
     OperationQueue, SpheroidPickupConfig, TrypsinPickupConfig,
@@ -127,7 +128,7 @@ class PPOperationQueuePage(QWidget):
                 background-color: {COLORS['surface1']};
             }}
         """)
-        self._queue_list.setMinimumHeight(200)
+        self._queue_list.setMinimumHeight(s(200))
         queue_layout.addWidget(self._queue_list)
 
         # Queue buttons
@@ -164,7 +165,7 @@ class PPOperationQueuePage(QWidget):
         dest_layout.addWidget(QLabel("Dest well:"))
         self._dest_well_combo = QComboBox()
         self._dest_well_combo.setPlaceholderText("Select destination well")
-        self._dest_well_combo.setMinimumWidth(120)
+        self._dest_well_combo.setMinimumWidth(s(120))
         dest_layout.addWidget(self._dest_well_combo)
         dest_layout.addStretch()
         content_layout.addWidget(dest_group)

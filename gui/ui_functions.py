@@ -20,13 +20,14 @@ from gui.styles import (
     COLORS, MENU_SELECTED_STYLESHEET,
     MENU_BTN_COLLAPSED_STYLE, MENU_BTN_EXPANDED_STYLE,
 )
+from gui.scaling import s
 
 
 class AppSettings:
     """Global UI settings — tweak these to customize the shell."""
     ENABLE_CUSTOM_TITLE_BAR = False      # Use native title bar (safer cross-platform)
-    MENU_WIDTH = 200                     # Expanded left menu width (px)
-    LEFT_BOX_WIDTH = 260                 # Extra-left context panel width (px)
+    MENU_WIDTH = 200                     # Expanded left menu width (base px, scaled at runtime)
+    LEFT_BOX_WIDTH = 260                 # Extra-left context panel width (base px, scaled at runtime)
     TIME_ANIMATION = 300                 # Animation duration (ms)
 
     # Dynamic style fragments
@@ -45,10 +46,12 @@ class UIFunctions:
         """Expand or collapse the left navigation sidebar."""
         menu = window.ui_leftMenuBg
         width = menu.width()
-        target = AppSettings.MENU_WIDTH if width <= 60 else 60
+        collapsed_w = s(60)
+        expanded_w = s(AppSettings.MENU_WIDTH)
+        target = expanded_w if width <= collapsed_w else collapsed_w
 
         # Show/hide text labels when expanding/collapsing
-        expanding = target > 60
+        expanding = target > collapsed_w
         if hasattr(window, '_logo_text'):
             window._logo_text.setVisible(expanding)
 
@@ -125,11 +128,11 @@ class UIFunctions:
 
         if box.isVisible():
             # Closing — save current width for next open
-            window._context_panel_width = box.width() or AppSettings.LEFT_BOX_WIDTH
+            window._context_panel_width = box.width() or s(AppSettings.LEFT_BOX_WIDTH)
             box.hide()
         else:
             # Opening — restore saved width
-            target = getattr(window, '_context_panel_width', AppSettings.LEFT_BOX_WIDTH)
+            target = getattr(window, '_context_panel_width', s(AppSettings.LEFT_BOX_WIDTH))
             box.show()
             total = splitter.width()
             splitter.setSizes([target, total - target])

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from gui.styles import COLORS
+from gui.scaling import s as _sc
 
 # Step size presets
 XY_STEPS_FULL = [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
@@ -102,7 +103,7 @@ class JogButtonArray(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        btn_size = 32 if self._compact else 44
+        btn_size = _sc(32) if self._compact else _sc(44)
 
         # ── XY Direction Pad ──────────────────────────────────
         xy_grid = QGridLayout()
@@ -159,7 +160,7 @@ class JogButtonArray(QWidget):
         # Default to 50 µm
         idx = next((i for i, s in enumerate(xy_steps) if s == 50.0), 2)
         self._xy_combo.setCurrentIndex(idx)
-        self._xy_combo.setMaximumWidth(90)
+        self._xy_combo.setMaximumWidth(_sc(90))
         step_row.addWidget(self._xy_combo)
 
         step_row.addWidget(QLabel("Z:"))
@@ -170,7 +171,7 @@ class JogButtonArray(QWidget):
         # Default to 0.1 mm
         idx = next((i for i, s in enumerate(z_steps) if s == 0.1), 2)
         self._z_combo.setCurrentIndex(idx)
-        self._z_combo.setMaximumWidth(80)
+        self._z_combo.setMaximumWidth(_sc(80))
         step_row.addWidget(self._z_combo)
 
         step_row.addStretch()
@@ -204,7 +205,7 @@ class JogButtonArray(QWidget):
             for s in P_STEPS_MM:
                 self._p_combo.addItem(f"{s:g} mm", s)
             self._p_combo.setCurrentIndex(2)  # 0.1 mm
-            self._p_combo.setMaximumWidth(90)
+            self._p_combo.setMaximumWidth(_sc(90))
             p_step_row.addWidget(self._p_combo)
             p_step_row.addStretch()
             layout.addLayout(p_step_row)

@@ -1,0 +1,30 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+!MEBP.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Runtime / user data
+settings.json
+print_resume.json
+current_button_mapping.json
+print_records/
+config/sim_xy_state.json
+config/sim_zp_state.json
+xy_debug_*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/

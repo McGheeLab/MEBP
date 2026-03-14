@@ -21,6 +21,7 @@ from PySide6.QtGui import QFont
 from SupportClasses.StageController import StageController
 from SupportClasses.PrintHistory import PrintHistory
 from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.scaling import s, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig
@@ -84,8 +85,8 @@ class DashboardPage(QWidget):
 
         ctx = QWidget()
         layout = QVBoxLayout(ctx)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(s(12), s(8), s(12), s(8))
+        layout.setSpacing(s(6))
 
         # ── Connections ──────────────────────────────────────────
         conn_label = QLabel("Connections")
@@ -100,7 +101,7 @@ class DashboardPage(QWidget):
             row = QHBoxLayout()
             self._ctx_status = QLabel("●")
             self._ctx_status.setObjectName("connDotOff")
-            self._ctx_status.setFixedWidth(14)
+            self._ctx_status.setFixedWidth(s(14))
             row.addWidget(self._ctx_status)
             row.addWidget(QLabel(name), stretch=1)
 
@@ -111,7 +112,7 @@ class DashboardPage(QWidget):
 
             btn_disc = QPushButton("✕")
             btn_disc.setObjectName("dangerBtn")
-            btn_disc.setFixedWidth(30)
+            btn_disc.setFixedWidth(s(30))
             btn_disc.clicked.connect(disconnect_fn)
             row.addWidget(btn_disc)
 
@@ -185,29 +186,29 @@ class DashboardPage(QWidget):
         container = QWidget()
         container.setStyleSheet(f"background-color: {_bg};")
         layout = QVBoxLayout(container)
-        layout.setSpacing(8)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(s(8))
+        layout.setContentsMargins(s(16), s(12), s(16), s(12))
         scroll.setWidget(container)
 
-        mono = QFont("Consolas", 12)
-        small_mono = QFont("Consolas", 10)
+        mono = QFont("Consolas", scaled_font_size(12))
+        small_mono = QFont("Consolas", scaled_font_size(10))
 
         # ── Positions row (XY + ZP side by side) ─────────────────
         pos_row = QHBoxLayout()
-        pos_row.setSpacing(8)
+        pos_row.setSpacing(s(8))
 
         # XY card (displayed in µm)
         xy_card = QFrame()
         xy_card.setObjectName("cardFrame")
         xy_layout = QVBoxLayout(xy_card)
-        xy_layout.setSpacing(4)
+        xy_layout.setSpacing(s(4))
 
         xy_title = QLabel("XY Stage Position (µm)")
         xy_title.setObjectName("sectionLabel")
         xy_layout.addWidget(xy_title)
 
         xy_grid = QGridLayout()
-        xy_grid.setSpacing(4)
+        xy_grid.setSpacing(s(4))
         xy_grid.addWidget(QLabel("X:"), 0, 0)
         self.lbl_x = QLabel("—")
         self.lbl_x.setFont(mono)
@@ -237,14 +238,14 @@ class DashboardPage(QWidget):
         zp_card = QFrame()
         zp_card.setObjectName("cardFrame")
         zp_layout = QVBoxLayout(zp_card)
-        zp_layout.setSpacing(4)
+        zp_layout.setSpacing(s(4))
 
         zp_title = QLabel("ZP Stage Position (mm)")
         zp_title.setObjectName("sectionLabel")
         zp_layout.addWidget(zp_title)
 
         zp_grid = QGridLayout()
-        zp_grid.setSpacing(4)
+        zp_grid.setSpacing(s(4))
         for col, (name, attr) in enumerate([
             ("Z", "lbl_z"), ("P1", "lbl_p1"), ("P2", "lbl_p2"), ("P3", "lbl_p3")
         ]):
@@ -268,14 +269,14 @@ class DashboardPage(QWidget):
         speed_card = QFrame()
         speed_card.setObjectName("cardFrame")
         speed_layout = QVBoxLayout(speed_card)
-        speed_layout.setSpacing(4)
+        speed_layout.setSpacing(s(4))
 
         speed_title = QLabel("Speeds")
         speed_title.setObjectName("sectionLabel")
         speed_layout.addWidget(speed_title)
 
         speed_grid = QGridLayout()
-        speed_grid.setSpacing(4)
+        speed_grid.setSpacing(s(4))
         for col, (name, attr, unit) in enumerate([
             ("XY", "lbl_speed_xy", ""), ("Z", "lbl_speed_z", "mm/s"),
             ("Pump", "lbl_speed_p", "mm/s"),
@@ -294,14 +295,14 @@ class DashboardPage(QWidget):
         zero_card = QFrame()
         zero_card.setObjectName("cardFrame")
         zero_layout = QVBoxLayout(zero_card)
-        zero_layout.setSpacing(4)
+        zero_layout.setSpacing(s(4))
 
         zero_title = QLabel("Zero Reference")
         zero_title.setObjectName("sectionLabel")
         zero_layout.addWidget(zero_title)
 
         zero_grid = QGridLayout()
-        zero_grid.setSpacing(4)
+        zero_grid.setSpacing(s(4))
         self.zero_labels = {}
         for col, key in enumerate(["x", "y", "Z", "P1", "P2", "P3"]):
             display_name = key.upper() if key in ("x", "y") else key
@@ -319,14 +320,14 @@ class DashboardPage(QWidget):
         safety_card = QFrame()
         safety_card.setObjectName("cardFrame")
         safety_layout = QVBoxLayout(safety_card)
-        safety_layout.setSpacing(4)
+        safety_layout.setSpacing(s(4))
 
         safety_title = QLabel("Safety Limits")
         safety_title.setObjectName("sectionLabel")
         safety_layout.addWidget(safety_title)
 
         self.lbl_safety_status = QLabel("Loading...")
-        self.lbl_safety_status.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.lbl_safety_status.setFont(QFont("Segoe UI", scaled_font_size(10), QFont.Bold))
         safety_layout.addWidget(self.lbl_safety_status)
 
         self.lbl_safety_info = QLabel("")
@@ -340,7 +341,7 @@ class DashboardPage(QWidget):
         history_card = QFrame()
         history_card.setObjectName("cardFrame")
         history_layout = QVBoxLayout(history_card)
-        history_layout.setSpacing(4)
+        history_layout.setSpacing(s(4))
 
         history_title = QLabel("Print History")
         history_title.setObjectName("sectionLabel")

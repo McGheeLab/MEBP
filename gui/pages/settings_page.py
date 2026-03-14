@@ -40,6 +40,7 @@ from gui.unit_helpers import (
     DEFAULT_XY_POSITION_SCALE,
 )
 from gui.widgets.jog_button_array import JogButtonArray
+from gui.scaling import s, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,7 @@ class SettingsPage(QWidget):
         lay.addWidget(self.ctx_port_label)
 
         btn_refresh = QPushButton("🔄 Refresh Ports")
-        btn_refresh.setMaximumHeight(26)
+        btn_refresh.setMaximumHeight(s(26))
         btn_refresh.clicked.connect(self._refresh_ports)
         lay.addWidget(btn_refresh)
 
@@ -208,7 +209,7 @@ class SettingsPage(QWidget):
         pos_grid.setContentsMargins(4, 4, 4, 4)
 
         mono = QFont("Consolas, Courier New, monospace")
-        mono.setPointSize(9)
+        mono.setPointSize(scaled_font_size(9))
 
         self._ctx_pos_labels: dict[str, QLabel] = {}
         for i, axis in enumerate(["X", "Y", "Z", "P1", "P2", "P3"]):
@@ -218,7 +219,7 @@ class SettingsPage(QWidget):
             lbl_val = QLabel("—")
             lbl_val.setFont(mono)
             lbl_val.setStyleSheet(f"color: {COLORS['text']}; font-size: 9pt;")
-            lbl_val.setMinimumWidth(60)
+            lbl_val.setMinimumWidth(s(60))
             pos_grid.addWidget(lbl_val, i // 3, (i % 3) * 2 + 1)
             self._ctx_pos_labels[axis] = lbl_val
         lay.addWidget(pos_frame)
@@ -227,12 +228,12 @@ class SettingsPage(QWidget):
         zero_row1 = QHBoxLayout()
         zero_row1.setSpacing(4)
         btn_zero_xy = QPushButton("Set XY Zero")
-        btn_zero_xy.setMaximumHeight(24)
+        btn_zero_xy.setMaximumHeight(s(24))
         btn_zero_xy.setToolTip("Set current XY position as zero reference")
         btn_zero_xy.clicked.connect(self._ctx_set_zero_xy)
         zero_row1.addWidget(btn_zero_xy)
         btn_zero_z = QPushButton("Set Z Zero")
-        btn_zero_z.setMaximumHeight(24)
+        btn_zero_z.setMaximumHeight(s(24))
         btn_zero_z.setToolTip("Set current Z position as zero reference")
         btn_zero_z.clicked.connect(self._ctx_set_zero_z)
         zero_row1.addWidget(btn_zero_z)
@@ -242,7 +243,7 @@ class SettingsPage(QWidget):
         zero_row2.setSpacing(4)
         for pid in ["P1", "P2", "P3"]:
             btn = QPushButton(f"Set {pid} Zero")
-            btn.setMaximumHeight(24)
+            btn.setMaximumHeight(s(24))
             btn.setToolTip(f"Set current {pid} position as zero reference")
             btn.clicked.connect(lambda checked, p=pid: self._ctx_set_zero_pump(p))
             zero_row2.addWidget(btn)
@@ -261,13 +262,13 @@ class SettingsPage(QWidget):
 
         btn_apply = QPushButton("✓ Apply Settings")
         btn_apply.setObjectName("successBtn")
-        btn_apply.setMaximumHeight(28)
+        btn_apply.setMaximumHeight(s(28))
         btn_apply.clicked.connect(self._apply_settings)
         lay.addWidget(btn_apply)
 
         btn_reset = QPushButton("↺ Reset to Defaults")
         btn_reset.setObjectName("dangerBtn")
-        btn_reset.setMaximumHeight(28)
+        btn_reset.setMaximumHeight(s(28))
         btn_reset.clicked.connect(self._reset_defaults)
         lay.addWidget(btn_reset)
 
@@ -778,12 +779,12 @@ class SettingsPage(QWidget):
         # Quick-set XY
         btn_xy_row = QHBoxLayout()
         btn_xy_min = QPushButton("Set XY Min from Current")
-        btn_xy_min.setMaximumHeight(26)
+        btn_xy_min.setMaximumHeight(s(26))
         btn_xy_min.clicked.connect(
             lambda: self._set_xy_from_current(as_max=False))
         btn_xy_row.addWidget(btn_xy_min)
         btn_xy_max = QPushButton("Set XY Max from Current")
-        btn_xy_max.setMaximumHeight(26)
+        btn_xy_max.setMaximumHeight(s(26))
         btn_xy_max.clicked.connect(
             lambda: self._set_xy_from_current(as_max=True))
         btn_xy_row.addWidget(btn_xy_max)
@@ -808,12 +809,12 @@ class SettingsPage(QWidget):
         # Quick-set Z
         btn_z_row = QHBoxLayout()
         btn_z_min = QPushButton("Set Z Min from Current")
-        btn_z_min.setMaximumHeight(26)
+        btn_z_min.setMaximumHeight(s(26))
         btn_z_min.clicked.connect(
             lambda: self._set_z_from_current(as_max=False))
         btn_z_row.addWidget(btn_z_min)
         btn_z_max = QPushButton("Set Z Max from Current")
-        btn_z_max.setMaximumHeight(26)
+        btn_z_max.setMaximumHeight(s(26))
         btn_z_max.clicked.connect(
             lambda: self._set_z_from_current(as_max=True))
         btn_z_row.addWidget(btn_z_max)
@@ -844,17 +845,17 @@ class SettingsPage(QWidget):
         for pid in ['P1', 'P2', 'P3']:
             btn_row_p = QHBoxLayout()
             btn_p_min = QPushButton(f'Set {pid} Min from Current')
-            btn_p_min.setMaximumHeight(26)
+            btn_p_min.setMaximumHeight(s(26))
             btn_p_min.clicked.connect(
                 lambda checked, p=pid: self._set_pump_from_current(p, as_max=False))
             btn_row_p.addWidget(btn_p_min)
             btn_p_max = QPushButton(f'Set {pid} Max from Current')
-            btn_p_max.setMaximumHeight(26)
+            btn_p_max.setMaximumHeight(s(26))
             btn_p_max.clicked.connect(
                 lambda checked, p=pid: self._set_pump_from_current(p, as_max=True))
             btn_row_p.addWidget(btn_p_max)
             btn_p_zero = QPushButton(f'Reset {pid} Zero')
-            btn_p_zero.setMaximumHeight(26)
+            btn_p_zero.setMaximumHeight(s(26))
             btn_p_zero.clicked.connect(
                 lambda checked, p=pid: self._reset_pump_zero(p))
             btn_row_p.addWidget(btn_p_zero)
@@ -941,7 +942,7 @@ class SettingsPage(QWidget):
             f"color: {COLORS['subtext0']};")
         grid.addWidget(self.xbox_mapping_label, row, 1)
         btn_browse = QPushButton("Browse...")
-        btn_browse.setMaximumHeight(26)
+        btn_browse.setMaximumHeight(s(26))
         btn_browse.clicked.connect(self._browse_mapping)
         grid.addWidget(btn_browse, row, 2)
         row += 1
@@ -950,14 +951,14 @@ class SettingsPage(QWidget):
         grid.addWidget(QLabel("Stick Calibration:"), row, 0)
         cal_row = QHBoxLayout()
         btn_cal = QPushButton("Calibrate Sticks")
-        btn_cal.setMaximumHeight(26)
+        btn_cal.setMaximumHeight(s(26))
         btn_cal.setToolTip(
             "Hold sticks in neutral position, then click.\n"
             "Samples for 2 seconds to measure center offsets.")
         btn_cal.clicked.connect(self._calibrate_xbox_sticks)
         cal_row.addWidget(btn_cal)
         btn_clear_cal = QPushButton("Clear")
-        btn_clear_cal.setMaximumHeight(26)
+        btn_clear_cal.setMaximumHeight(s(26))
         btn_clear_cal.setToolTip("Remove stick calibration offsets")
         btn_clear_cal.clicked.connect(self._clear_xbox_stick_cal)
         cal_row.addWidget(btn_clear_cal)
@@ -982,7 +983,7 @@ class SettingsPage(QWidget):
         self.xbox_stick_dz_spin.setToolTip(
             "Deadzone for left and right sticks (axes 0–3).\n"
             "Input below this % of full deflection is ignored.")
-        self.xbox_stick_dz_spin.setMaximumWidth(90)
+        self.xbox_stick_dz_spin.setMaximumWidth(s(90))
         grid.addWidget(self.xbox_stick_dz_spin, row, 1)
         row += 1
 
@@ -996,7 +997,7 @@ class SettingsPage(QWidget):
             "Deadzone for left and right triggers (axes 4–5).\n"
             "Input below this % of full deflection is ignored.\n"
             "Keep low — triggers often rest at a non-zero value.")
-        self.xbox_trigger_dz_spin.setMaximumWidth(90)
+        self.xbox_trigger_dz_spin.setMaximumWidth(s(90))
         grid.addWidget(self.xbox_trigger_dz_spin, row, 1)
         row += 1
 

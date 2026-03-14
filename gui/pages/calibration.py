@@ -33,6 +33,7 @@ from SupportClasses.StageController import StageController
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
+from gui.scaling import s, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig
@@ -142,7 +143,7 @@ class _CalibrationPlateView(QGraphicsView):
         self.setStyleSheet("background: #11111b; border: 1px solid #45475a;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setMinimumHeight(130)
+        self.setMinimumHeight(s(130))
 
     def set_plate(self, plate):
         self._plate = plate
@@ -501,8 +502,8 @@ class _CalibrationYZView(QGraphicsView):
         self.setStyleSheet("background: #11111b; border: 1px solid #45475a;")
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setFixedWidth(90)
-        self.setMinimumHeight(130)
+        self.setFixedWidth(s(90))
+        self.setMinimumHeight(s(130))
 
     def set_well_z_offsets(self, offsets: dict):
         self._offsets = offsets
@@ -779,7 +780,7 @@ class CalibrationPage(QWidget):
         # Row 1: Refresh sources (detection is done in Hardware Setup)
         refresh_row = QHBoxLayout()
         self._btn_refresh_sources = QPushButton("Refresh Sources")
-        self._btn_refresh_sources.setMinimumWidth(110)
+        self._btn_refresh_sources.setMinimumWidth(s(110))
         self._btn_refresh_sources.setToolTip(
             "Refresh camera sources (detect in Hardware Setup)")
         self._btn_refresh_sources.clicked.connect(self._refresh_source_combos)
@@ -799,14 +800,14 @@ class CalibrationPage(QWidget):
         self._cam_tile_combo.addItem("Horizontal", "horizontal")
         self._cam_tile_combo.addItem("Vertical", "vertical")
         self._cam_tile_combo.addItem("Square (2x2)", "square")
-        self._cam_tile_combo.setMaximumWidth(110)
+        self._cam_tile_combo.setMaximumWidth(s(110))
         self._cam_tile_combo.currentIndexChanged.connect(self._on_tile_changed)
         opts_row.addWidget(self._cam_tile_combo)
         opts_row.addStretch()
         self._btn_click_to_move = QPushButton("Click→Move: OFF")
         self._btn_click_to_move.setCheckable(True)
         self._btn_click_to_move.setChecked(False)
-        self._btn_click_to_move.setMaximumWidth(130)
+        self._btn_click_to_move.setMaximumWidth(s(130))
         self._btn_click_to_move.setToolTip(
             "Click on the camera feed to move the XY stage so that\n"
             "the clicked point is centred under the camera.")
@@ -844,7 +845,7 @@ class CalibrationPage(QWidget):
             self._ctx_cam_checkboxes.append(chk)
             top_row.addWidget(QLabel(f"<b>Cam {i+1}</b>"))
             src_combo = QComboBox()
-            src_combo.setMinimumWidth(80)
+            src_combo.setMinimumWidth(s(80))
             src_combo.setToolTip(f"Camera {i+1} source")
             top_row.addWidget(src_combo, stretch=1)
             self._ctx_cam_src_combos.append(src_combo)
@@ -854,13 +855,13 @@ class CalibrationPage(QWidget):
             btn_row = QHBoxLayout()
             btn_row.setSpacing(3)
             btn_start = QPushButton("Start")
-            btn_start.setMinimumWidth(50)
+            btn_start.setMinimumWidth(s(50))
             btn_start.clicked.connect(lambda checked=False, idx=i: self._ctx_toggle_cam(idx))
             btn_row.addWidget(btn_start)
             self._ctx_cam_start_btns.append(btn_start)
 
             btn_snap = QPushButton("Snap")
-            btn_snap.setMinimumWidth(42)
+            btn_snap.setMinimumWidth(s(42))
             btn_snap.clicked.connect(lambda checked=False, idx=i: self._ctx_snap_cam(idx))
             btn_row.addWidget(btn_snap)
 
@@ -871,7 +872,7 @@ class CalibrationPage(QWidget):
 
             btn_settings = QPushButton("Settings")
             btn_settings.setCheckable(True)
-            btn_settings.setMinimumWidth(56)
+            btn_settings.setMinimumWidth(s(56))
             btn_settings.toggled.connect(lambda checked, idx=i: self._ctx_toggle_settings(idx, checked))
             btn_row.addWidget(btn_settings)
             row_lay.addLayout(btn_row)
@@ -926,7 +927,7 @@ class CalibrationPage(QWidget):
             obj_row = QHBoxLayout()
             obj_row.addWidget(QLabel("Obj:"))
             obj_combo = QComboBox()
-            obj_combo.setMinimumWidth(70)
+            obj_combo.setMinimumWidth(s(70))
             obj_combo.setToolTip("Select the installed objective lens")
             # Populate with standard objectives (or whatever the store has)
             if OBJECTIVE_CAL_AVAILABLE:
@@ -1513,7 +1514,7 @@ class CalibrationPage(QWidget):
         layout.setContentsMargins(12, 8, 12, 8)
         scroll.setWidget(container)
 
-        mono = QFont("Consolas", 12)
+        mono = QFont("Consolas", scaled_font_size(12))
 
         # ── Position Readout (compact) ────────────────────────────
         pos_card = QFrame()
@@ -1571,7 +1572,7 @@ class CalibrationPage(QWidget):
                     f"background-color: #181825; border: 1px solid {COLORS['surface1']}; "
                     f"color: {COLORS['text']}; font-size: 12pt; font-weight: 600;")
                 ph.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-                ph.setMinimumSize(200, 150)
+                ph.setMinimumSize(s(200), s(150))
                 self._cam_placeholders.append(ph)
 
             # Initial layout: single camera, first checked
@@ -1682,7 +1683,7 @@ class CalibrationPage(QWidget):
         s1a_row = QHBoxLayout()
         btn_safe_z = QPushButton("Set Safe Z")
         btn_safe_z.setObjectName("successBtn")
-        btn_safe_z.setMaximumHeight(26)
+        btn_safe_z.setMaximumHeight(s(26))
         btn_safe_z.clicked.connect(self._set_safe_z)
         s1a_row.addWidget(btn_safe_z)
         self.lbl_safe_z = QLabel("Not set")
@@ -1697,7 +1698,7 @@ class CalibrationPage(QWidget):
         layout.addWidget(QLabel("Lower needle to plate top surface, then set."))
         s1b_row = QHBoxLayout()
         btn_top_z = QPushButton("Set Top Z")
-        btn_top_z.setMaximumHeight(26)
+        btn_top_z.setMaximumHeight(s(26))
         btn_top_z.clicked.connect(self._set_top_z)
         s1b_row.addWidget(btn_top_z)
         self.lbl_top_z = QLabel("Not set")
@@ -1714,22 +1715,22 @@ class CalibrationPage(QWidget):
         scan_btn_row = QHBoxLayout()
         self._btn_start_scan = QPushButton("Auto-Calibrate")
         self._btn_start_scan.setObjectName("successBtn")
-        self._btn_start_scan.setMaximumHeight(26)
+        self._btn_start_scan.setMaximumHeight(s(26))
         self._btn_start_scan.setToolTip(
             "Move to 3 reference wells, auto-detect each, fit affine correction")
         self._btn_start_scan.clicked.connect(self._start_plate_scan)
         scan_btn_row.addWidget(self._btn_start_scan)
 
         self._btn_cancel_scan = QPushButton("Cancel")
-        self._btn_cancel_scan.setMaximumHeight(26)
-        self._btn_cancel_scan.setMaximumWidth(60)
+        self._btn_cancel_scan.setMaximumHeight(s(26))
+        self._btn_cancel_scan.setMaximumWidth(s(60))
         self._btn_cancel_scan.setEnabled(False)
         self._btn_cancel_scan.clicked.connect(self._cancel_plate_scan)
         scan_btn_row.addWidget(self._btn_cancel_scan)
 
         self._btn_accept_scan = QPushButton("Accept")
-        self._btn_accept_scan.setMaximumHeight(26)
-        self._btn_accept_scan.setMaximumWidth(60)
+        self._btn_accept_scan.setMaximumHeight(s(26))
+        self._btn_accept_scan.setMaximumWidth(s(60))
         self._btn_accept_scan.setEnabled(False)
         self._btn_accept_scan.clicked.connect(self._accept_plate_scan)
         scan_btn_row.addWidget(self._btn_accept_scan)
@@ -1755,8 +1756,8 @@ class CalibrationPage(QWidget):
         self._cal_travel_btns: list[QPushButton] = []
         for i in range(3):
             btn = QPushButton("\u2014")
-            btn.setMaximumHeight(24)
-            btn.setMaximumWidth(60)
+            btn.setMaximumHeight(s(24))
+            btn.setMaximumWidth(s(60))
             btn.setEnabled(False)
             btn.clicked.connect(lambda checked, idx=i: self._goto_calibration_well(idx))
             cal_travel_layout.addWidget(btn)
@@ -1779,7 +1780,7 @@ class CalibrationPage(QWidget):
         self._well_depth_spin.setDecimals(2)
         self._well_depth_spin.setSuffix(" mm")
         self._well_depth_spin.setValue(17.4)
-        self._well_depth_spin.setMaximumWidth(100)
+        self._well_depth_spin.setMaximumWidth(s(100))
         self._well_depth_spin.setToolTip(
             "Distance from plate top surface to well bottom glass")
         depth_row.addWidget(self._well_depth_spin)
@@ -1789,14 +1790,14 @@ class CalibrationPage(QWidget):
         auto_z_row = QHBoxLayout()
         self._btn_auto_z_cal = QPushButton("Auto Z-Cal")
         self._btn_auto_z_cal.setObjectName("successBtn")
-        self._btn_auto_z_cal.setMaximumHeight(26)
+        self._btn_auto_z_cal.setMaximumHeight(s(26))
         self._btn_auto_z_cal.setToolTip(
             "Automatically find Z bottom at 3 calibration wells using focus search")
         self._btn_auto_z_cal.clicked.connect(self._start_auto_z_cal)
         auto_z_row.addWidget(self._btn_auto_z_cal)
         self._btn_cancel_auto_z = QPushButton("Cancel")
-        self._btn_cancel_auto_z.setMaximumHeight(26)
-        self._btn_cancel_auto_z.setMaximumWidth(60)
+        self._btn_cancel_auto_z.setMaximumHeight(s(26))
+        self._btn_cancel_auto_z.setMaximumWidth(s(60))
         self._btn_cancel_auto_z.setEnabled(False)
         self._btn_cancel_auto_z.clicked.connect(self._cancel_auto_z)
         auto_z_row.addWidget(self._btn_cancel_auto_z)
@@ -1817,17 +1818,17 @@ class CalibrationPage(QWidget):
         teach_nav_row = QHBoxLayout()
         teach_nav_row.addWidget(QLabel("Well:"))
         self._zteach_well_combo = QComboBox()
-        self._zteach_well_combo.setMaximumWidth(70)
+        self._zteach_well_combo.setMaximumWidth(s(70))
         teach_nav_row.addWidget(self._zteach_well_combo)
         btn_zteach_go = QPushButton("Go \u25b6")
-        btn_zteach_go.setMaximumHeight(24)
-        btn_zteach_go.setMaximumWidth(40)
+        btn_zteach_go.setMaximumHeight(s(24))
+        btn_zteach_go.setMaximumWidth(s(40))
         btn_zteach_go.setToolTip("Safe-travel to selected well")
         btn_zteach_go.clicked.connect(self._zteach_goto_well)
         teach_nav_row.addWidget(btn_zteach_go)
         btn_zteach_next = QPushButton("Next")
-        btn_zteach_next.setMaximumHeight(24)
-        btn_zteach_next.setMaximumWidth(40)
+        btn_zteach_next.setMaximumHeight(s(24))
+        btn_zteach_next.setMaximumWidth(s(40))
         btn_zteach_next.setToolTip("Advance to next well and navigate")
         btn_zteach_next.clicked.connect(self._zteach_next_well)
         teach_nav_row.addWidget(btn_zteach_next)
@@ -1848,14 +1849,14 @@ class CalibrationPage(QWidget):
         if VISION_AVAILABLE:
             nd_row = QHBoxLayout()
             self._btn_detect_needle = QPushButton("Detect Needle")
-            self._btn_detect_needle.setMaximumHeight(24)
+            self._btn_detect_needle.setMaximumHeight(s(24))
             self._btn_detect_needle.setCheckable(True)
             self._btn_detect_needle.setToolTip(
                 "Detect needle tip in camera FOV using vision")
             self._btn_detect_needle.toggled.connect(self._toggle_needle_detect)
             nd_row.addWidget(self._btn_detect_needle)
             self._btn_focus_assist = QPushButton("Focus Assist")
-            self._btn_focus_assist.setMaximumHeight(24)
+            self._btn_focus_assist.setMaximumHeight(s(24))
             self._btn_focus_assist.setCheckable(True)
             self._btn_focus_assist.setToolTip(
                 "Real-time focus quality bar \u2014 adjust Z for sharpest image")
@@ -1873,7 +1874,7 @@ class CalibrationPage(QWidget):
             # v7.3.3: Relaxed detect + accept/reject/adjust row
             relax_row = QHBoxLayout()
             self._btn_detect_needle_relaxed = QPushButton("Relaxed Detect")
-            self._btn_detect_needle_relaxed.setMaximumHeight(24)
+            self._btn_detect_needle_relaxed.setMaximumHeight(s(24))
             self._btn_detect_needle_relaxed.setCheckable(True)
             self._btn_detect_needle_relaxed.setToolTip(
                 "Detect needle with wide tolerance (when µm/px may be wrong)")
@@ -1888,27 +1889,27 @@ class CalibrationPage(QWidget):
             ar_layout.setContentsMargins(0, 0, 0, 0)
             ar_layout.setSpacing(4)
             self._btn_needle_minus = QPushButton("\u2212")  # minus sign
-            self._btn_needle_minus.setFixedWidth(28)
-            self._btn_needle_minus.setMaximumHeight(24)
+            self._btn_needle_minus.setFixedWidth(s(28))
+            self._btn_needle_minus.setMaximumHeight(s(24))
             self._btn_needle_minus.setToolTip("Shrink circle")
             self._btn_needle_minus.clicked.connect(
                 lambda: self._adjust_needle_radius(-2))
             ar_layout.addWidget(self._btn_needle_minus)
             self._btn_needle_plus = QPushButton("+")
-            self._btn_needle_plus.setFixedWidth(28)
-            self._btn_needle_plus.setMaximumHeight(24)
+            self._btn_needle_plus.setFixedWidth(s(28))
+            self._btn_needle_plus.setMaximumHeight(s(24))
             self._btn_needle_plus.setToolTip("Expand circle")
             self._btn_needle_plus.clicked.connect(
                 lambda: self._adjust_needle_radius(2))
             ar_layout.addWidget(self._btn_needle_plus)
             self._btn_needle_accept = QPushButton("Accept")
-            self._btn_needle_accept.setMaximumHeight(24)
+            self._btn_needle_accept.setMaximumHeight(s(24))
             self._btn_needle_accept.setStyleSheet(
                 f"color: {COLORS['green']}; font-weight: bold;")
             self._btn_needle_accept.clicked.connect(self._accept_needle_detection)
             ar_layout.addWidget(self._btn_needle_accept)
             self._btn_needle_reject = QPushButton("Reject")
-            self._btn_needle_reject.setMaximumHeight(24)
+            self._btn_needle_reject.setMaximumHeight(s(24))
             self._btn_needle_reject.setStyleSheet(
                 f"color: {COLORS['red']};")
             self._btn_needle_reject.clicked.connect(self._reject_needle_detection)
@@ -1934,13 +1935,13 @@ class CalibrationPage(QWidget):
 
         edge_row = QHBoxLayout()
         self._btn_mark_left = QPushButton("\u25c0 Mark Left")
-        self._btn_mark_left.setMaximumHeight(26)
+        self._btn_mark_left.setMaximumHeight(s(26))
         self._btn_mark_left.setToolTip(
             "Jog crosshair to the left edge of the well, then click")
         self._btn_mark_left.clicked.connect(self._manual_mark_left)
         edge_row.addWidget(self._btn_mark_left)
         self._btn_mark_right = QPushButton("Mark Right \u25b6")
-        self._btn_mark_right.setMaximumHeight(26)
+        self._btn_mark_right.setMaximumHeight(s(26))
         self._btn_mark_right.setToolTip(
             "Jog crosshair to the right edge of the well, then click")
         self._btn_mark_right.clicked.connect(self._manual_mark_right)
@@ -1957,19 +1958,19 @@ class CalibrationPage(QWidget):
         rec_row1 = QHBoxLayout()
         btn_rec_xy = QPushButton("Record XY")
         btn_rec_xy.setObjectName("successBtn")
-        btn_rec_xy.setMaximumHeight(26)
+        btn_rec_xy.setMaximumHeight(s(26))
         btn_rec_xy.setToolTip(
             "Record current crosshair position as this well's center")
         btn_rec_xy.clicked.connect(self._manual_record_xy)
         rec_row1.addWidget(btn_rec_xy)
         btn_rec_z = QPushButton("Record Z")
         btn_rec_z.setObjectName("successBtn")
-        btn_rec_z.setMaximumHeight(26)
+        btn_rec_z.setMaximumHeight(s(26))
         btn_rec_z.setToolTip("Record current Z as this well's bottom")
         btn_rec_z.clicked.connect(self._zteach_record_z)
         rec_row1.addWidget(btn_rec_z)
         btn_rec_both = QPushButton("Record XYZ")
-        btn_rec_both.setMaximumHeight(26)
+        btn_rec_both.setMaximumHeight(s(26))
         btn_rec_both.setToolTip("Record current position as well center + Z bottom")
         btn_rec_both.clicked.connect(self._manual_record_xyz)
         rec_row1.addWidget(btn_rec_both)
@@ -1978,13 +1979,13 @@ class CalibrationPage(QWidget):
         # Fit buttons
         fit_row = QHBoxLayout()
         btn_fit_xy = QPushButton("Fit XY (\u22652)")
-        btn_fit_xy.setMaximumHeight(26)
+        btn_fit_xy.setMaximumHeight(s(26))
         btn_fit_xy.setToolTip(
             "Compute calibrated positions from taught XY points (need \u22652)")
         btn_fit_xy.clicked.connect(self._manual_fit_xy)
         fit_row.addWidget(btn_fit_xy)
         btn_fit_z = QPushButton("Fit Z-Plane (\u22653)")
-        btn_fit_z.setMaximumHeight(26)
+        btn_fit_z.setMaximumHeight(s(26))
         btn_fit_z.setToolTip("Fit Z plane from recorded Z points (need \u22653)")
         btn_fit_z.clicked.connect(self._try_fit_z_plane)
         fit_row.addWidget(btn_fit_z)
@@ -2023,7 +2024,7 @@ class CalibrationPage(QWidget):
         self.val_well_combo = QComboBox()
         val_row.addWidget(self.val_well_combo, stretch=1)
         btn_goto_well = QPushButton("Go")
-        btn_goto_well.setMaximumHeight(24)
+        btn_goto_well.setMaximumHeight(s(24))
         btn_goto_well.clicked.connect(self._goto_well)
         val_row.addWidget(btn_goto_well)
         layout.addLayout(val_row)
@@ -2045,12 +2046,12 @@ class CalibrationPage(QWidget):
 
         cal_btn_row = QHBoxLayout()
         btn_save_cal = QPushButton("Save")
-        btn_save_cal.setMaximumHeight(26)
+        btn_save_cal.setMaximumHeight(s(26))
         btn_save_cal.clicked.connect(self._save_calibration)
         cal_btn_row.addWidget(btn_save_cal)
 
         btn_load_cal = QPushButton("Load")
-        btn_load_cal.setMaximumHeight(26)
+        btn_load_cal.setMaximumHeight(s(26))
         btn_load_cal.clicked.connect(self._load_calibration)
         cal_btn_row.addWidget(btn_load_cal)
         layout.addLayout(cal_btn_row)

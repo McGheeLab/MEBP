@@ -35,12 +35,15 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 
 try:
     from gui.styles import COLORS
+    from gui.scaling import s as _sc, scaled_font_size
 except ImportError:
     COLORS = {
         "base": "#1e1e2e", "text": "#cdd6f4", "surface0": "#313244",
         "surface1": "#45475a", "blue": "#89b4fa", "green": "#a6e3a1",
         "red": "#f38ba8", "yellow": "#f9e2af", "mauve": "#cba6f7",
     }
+    def _sc(x): return int(x)
+    def scaled_font_size(x): return int(x)
 
 try:
     import numpy as np
@@ -87,7 +90,7 @@ class _PathPreviewWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(200, 200)
+        self.setMinimumSize(_sc(200), _sc(200))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._waypoints = None
         self._pump_states = None
@@ -233,8 +236,8 @@ class HelperFunctionsPage(QWidget):
         # ── Left Panel ────────────────────────────────────────────
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setMinimumWidth(360)
-        left_scroll.setMaximumWidth(460)
+        left_scroll.setMinimumWidth(_sc(360))
+        left_scroll.setMaximumWidth(_sc(460))
         left_scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
         left_widget = QWidget()
         left_widget.setStyleSheet(f"background-color: {_bg};")
@@ -243,7 +246,7 @@ class HelperFunctionsPage(QWidget):
         left_layout.setContentsMargins(12, 12, 12, 12)
 
         title = QLabel("Image -> Toolpath Generator")
-        title.setFont(QFont("Segoe UI", 13, QFont.Bold))
+        title.setFont(QFont("Segoe UI", scaled_font_size(13), QFont.Bold))
         title.setStyleSheet(f"color: {COLORS.get('text', '#cdd6f4')};")
         left_layout.addWidget(title)
 
@@ -278,7 +281,7 @@ class HelperFunctionsPage(QWidget):
 
         # Thumbnails
         thumb_label = QLabel("Loaded Images")
-        thumb_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        thumb_label.setFont(QFont("Segoe UI", scaled_font_size(11), QFont.Bold))
         thumb_label.setStyleSheet(f"color: {COLORS.get('text', '#cdd6f4')};")
         right_layout.addWidget(thumb_label)
 
@@ -292,8 +295,8 @@ class HelperFunctionsPage(QWidget):
                 f"border: 1px solid {COLORS.get('surface1', '#45475a')}; "
                 f"border-radius: 4px; }}"
             )
-            frame.setMinimumSize(120, 120)
-            frame.setMaximumSize(200, 200)
+            frame.setMinimumSize(_sc(120), _sc(120))
+            frame.setMaximumSize(_sc(200), _sc(200))
             fl = QVBoxLayout(frame)
             fl.setContentsMargins(4, 4, 4, 4)
             lbl = QLabel(f"P{i + 1}: No image")
@@ -306,7 +309,7 @@ class HelperFunctionsPage(QWidget):
 
         # Path preview
         plbl = QLabel("Toolpath Preview")
-        plbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        plbl.setFont(QFont("Segoe UI", scaled_font_size(11), QFont.Bold))
         plbl.setStyleSheet(f"color: {COLORS.get('text', '#cdd6f4')};")
         right_layout.addWidget(plbl)
 
@@ -379,11 +382,11 @@ class HelperFunctionsPage(QWidget):
             btn.clicked.connect(lambda checked, idx=i: self._browse_sequence(idx))
             row.addWidget(btn)
             btn_clear = QPushButton("x")
-            btn_clear.setFixedWidth(28)
+            btn_clear.setFixedWidth(_sc(28))
             btn_clear.clicked.connect(lambda checked, idx=i: self._clear_sequence(idx))
             row.addWidget(btn_clear)
             lw = QListWidget()
-            lw.setMaximumHeight(60)
+            lw.setMaximumHeight(_sc(60))
             lw.setStyleSheet(
                 f"QListWidget {{ background: {COLORS.get('surface0', '#313244')}; "
                 f"color: {COLORS.get('text', '#cdd6f4')}; font-size: 9px; }}"
@@ -409,7 +412,7 @@ class HelperFunctionsPage(QWidget):
             btn.clicked.connect(lambda checked, idx=i: self._browse_single(idx))
             row.addWidget(btn)
             btn_clear = QPushButton("x")
-            btn_clear.setFixedWidth(28)
+            btn_clear.setFixedWidth(_sc(28))
             btn_clear.clicked.connect(lambda checked, idx=i: self._clear_single(idx))
             row.addWidget(btn_clear)
             lbl = QLabel("No file")
@@ -510,7 +513,7 @@ class HelperFunctionsPage(QWidget):
         layout.setSpacing(6)
 
         btn_gen = QPushButton("Generate Toolpath")
-        btn_gen.setMinimumHeight(36)
+        btn_gen.setMinimumHeight(_sc(36))
         btn_gen.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('blue', '#89b4fa')}; "
             f"color: {COLORS.get('base', '#1e1e2e')}; font-weight: bold; "

@@ -40,8 +40,9 @@ from SupportClasses.PrintHistory import PrintHistory
 from SupportClasses.PrintManager import load_print_progress, clear_print_progress
 from SupportClasses.PrintRecorder import PrintRecorder
 from SupportClasses.HardwareConfig import HardwareConfig
-from gui.styles import DARK_THEME, COLORS
+from gui.styles import DARK_THEME, COLORS, build_theme, apply_scaled_styles
 from gui.ui_functions import UIFunctions, AppSettings
+from gui.scaling import s, scale_factor, scaled_font_size
 from gui.unit_helpers import (
     stage_to_um, um_to_stage, format_um,
     get_position_scale_from_protocol,
@@ -63,8 +64,10 @@ logger = logging.getLogger(__name__)
 
 # ── Emoji → colored pixmap icon helper ───────────────────────────
 
-def _make_text_icon(text: str, size: int = 24, color: str = "#a6adc8") -> QIcon:
+def _make_text_icon(text: str, size: int = 0, color: str = "#a6adc8") -> QIcon:
     """Create a QIcon from a text character (emoji or symbol)."""
+    if size == 0:
+        size = s(24)
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
@@ -103,11 +106,13 @@ class MainWindow(QMainWindow):
         self._protocol_checked = False
 
         self.setWindowTitle("MEBP Bioprinter — v7.3.3")
-        self.setMinimumSize(1100, 700)
-        self.resize(1400, 850)
+        self.setMinimumSize(s(1100), s(700))
+        self.resize(s(1400), s(850))
 
-        # Apply dark theme
-        self.setStyleSheet(DARK_THEME)
+        # Apply DPI-scaled dark theme
+        k = scale_factor()
+        apply_scaled_styles(k)
+        self.setStyleSheet(build_theme(k))
 
         # Build the UI shell
         self._build_ui()
@@ -174,8 +179,8 @@ class MainWindow(QMainWindow):
         # ── Left Menu (icon sidebar) ─────────────────────────────
         self.ui_leftMenuBg = QFrame()
         self.ui_leftMenuBg.setObjectName("leftMenuBg")
-        self.ui_leftMenuBg.setMinimumWidth(60)
-        self.ui_leftMenuBg.setMaximumWidth(60)
+        self.ui_leftMenuBg.setMinimumWidth(s(60))
+        self.ui_leftMenuBg.setMaximumWidth(s(60))
         self.ui_leftMenuBg.setFrameShape(QFrame.NoFrame)
 
         left_layout = QVBoxLayout(self.ui_leftMenuBg)
@@ -185,12 +190,12 @@ class MainWindow(QMainWindow):
         # Logo
         logo_frame = QFrame()
         logo_frame.setObjectName("topLogo")
-        logo_frame.setMinimumHeight(50)
-        logo_frame.setMaximumHeight(50)
+        logo_frame.setMinimumHeight(s(50))
+        logo_frame.setMaximumHeight(s(50))
         logo_layout = QHBoxLayout(logo_frame)
         logo_layout.setContentsMargins(8, 0, 8, 0)
         logo_label = QLabel("🧬")
-        logo_label.setFont(QFont("Segoe UI Emoji", 18))
+        logo_label.setFont(QFont("Segoe UI Emoji", scaled_font_size(18)))
         logo_label.setAlignment(Qt.AlignCenter)
         logo_layout.addWidget(logo_label)
         self._logo_text = QLabel("MEBP")
@@ -203,7 +208,7 @@ class MainWindow(QMainWindow):
         # Toggle button
         self._toggle_btn = QPushButton("≡")
         self._toggle_btn.setObjectName("toggleButton")
-        self._toggle_btn.setMinimumHeight(36)
+        self._toggle_btn.setMinimumHeight(s(36))
         self._toggle_btn.setCursor(Qt.PointingHandCursor)
         self._toggle_btn.setToolTip("Expand menu")
         self._toggle_btn.clicked.connect(lambda: UIFunctions.toggleMenu(self))
@@ -213,7 +218,7 @@ class MainWindow(QMainWindow):
         sep = QFrame()
         sep.setObjectName("leftMenuFrame")
         sep.setFrameShape(QFrame.HLine)
-        sep.setMaximumHeight(2)
+        sep.setMaximumHeight(s(2))
         left_layout.addWidget(sep)
 
         # Top menu (workflow buttons)
@@ -268,10 +273,10 @@ class MainWindow(QMainWindow):
 
         extra_top = QFrame()
         extra_top.setObjectName("extraTopBg")
-        extra_top.setMinimumHeight(40)
-        extra_top.setMaximumHeight(40)
+        extra_top.setMinimumHeight(s(40))
+        extra_top.setMaximumHeight(s(40))
         extra_top_layout = QHBoxLayout(extra_top)
-        extra_top_layout.setContentsMargins(10, 0, 6, 0)
+        extra_top_layout.setContentsMargins(s(10), 0, s(6), 0)
 
         self._context_title = QLabel("Settings")
         self._context_title.setObjectName("extraLabel")
@@ -280,7 +285,7 @@ class MainWindow(QMainWindow):
 
         btn_close_context = QPushButton("✕")
         btn_close_context.setObjectName("extraCloseColumnBtn")
-        btn_close_context.setFixedSize(28, 28)
+        btn_close_context.setFixedSize(s(28), s(28))
         btn_close_context.setCursor(Qt.PointingHandCursor)
         btn_close_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
         extra_top_layout.addWidget(btn_close_context)
@@ -301,15 +306,15 @@ class MainWindow(QMainWindow):
         # Top bar
         top_bar = QFrame()
         top_bar.setObjectName("contentTopBg")
-        top_bar.setMinimumHeight(40)
-        top_bar.setMaximumHeight(40)
+        top_bar.setMinimumHeight(s(40))
+        top_bar.setMaximumHeight(s(40))
         top_bar_layout = QHBoxLayout(top_bar)
-        top_bar_layout.setContentsMargins(12, 0, 12, 0)
+        top_bar_layout.setContentsMargins(s(12), 0, s(12), 0)
 
         # Context panel toggle — left side, next to where panel opens
         btn_context = QPushButton("☰")
         btn_context.setObjectName("extraBtn")
-        btn_context.setFixedSize(32, 32)
+        btn_context.setFixedSize(s(32), s(32))
         btn_context.setCursor(Qt.PointingHandCursor)
         btn_context.setToolTip("Toggle context panel")
         btn_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
@@ -322,7 +327,7 @@ class MainWindow(QMainWindow):
 
         self._page_title = QLabel("Hardware Setup")
         self._page_title.setObjectName("pageTitle")
-        self._page_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self._page_title.setFont(QFont("Segoe UI", scaled_font_size(12), QFont.Bold))
         title_layout.addWidget(self._page_title)
 
         top_bar_layout.addWidget(title_frame)
@@ -332,7 +337,7 @@ class MainWindow(QMainWindow):
         conn_frame = QFrame()
         conn_frame.setObjectName("connStatusFrame")
         conn_layout = QHBoxLayout(conn_frame)
-        conn_layout.setSpacing(12)
+        conn_layout.setSpacing(s(12))
         conn_layout.setContentsMargins(0, 0, 0, 0)
         conn_layout.addWidget(self._make_conn_dot("XY"))
         conn_layout.addWidget(self._make_conn_dot("ZP"))
@@ -348,12 +353,12 @@ class MainWindow(QMainWindow):
         # Page stack
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("pagesContainer")
-        self._page_stack.setMinimumHeight(200)  # v7.2.6
+        self._page_stack.setMinimumHeight(s(200))  # v7.2.6
         self._splitter.addWidget(self._page_stack)
 
         # Console log
         self.console = ConsoleLogWidget()
-        self.console.setMinimumHeight(40)  # v7.2.6
+        self.console.setMinimumHeight(s(40))  # v7.2.6
         self._splitter.addWidget(self.console)
 
         self._splitter.setStretchFactor(0, 5)
@@ -372,7 +377,7 @@ class MainWindow(QMainWindow):
         self._context_splitter.setStretchFactor(0, 0)  # context: fixed
         self._context_splitter.setStretchFactor(1, 1)   # content: stretches
         self._context_splitter.setChildrenCollapsible(True)
-        self._context_splitter.setHandleWidth(4)
+        self._context_splitter.setHandleWidth(s(4))
         # Start with context panel hidden
         self.ui_extraLeftBox.hide()
         self._context_panel_width = AppSettings.LEFT_BOX_WIDTH  # remember last width
@@ -384,7 +389,7 @@ class MainWindow(QMainWindow):
         """Create a sidebar navigation button."""
         btn = QPushButton(icon_text)
         btn.setObjectName(obj_name)
-        btn.setMinimumHeight(44)
+        btn.setMinimumHeight(s(44))
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip(label)
         btn.clicked.connect(self._on_menu_click)
@@ -402,7 +407,7 @@ class MainWindow(QMainWindow):
 
         dot = QLabel("●")
         dot.setObjectName("connDotOff")
-        dot.setFixedWidth(14)
+        dot.setFixedWidth(s(14))
         dot.setAlignment(Qt.AlignCenter)
         layout.addWidget(dot)
 
@@ -419,7 +424,7 @@ class MainWindow(QMainWindow):
         self.status_bar = self.statusBar()
         self.status_bar.setObjectName("bottomBar")
 
-        mono = QFont("Consolas", 9)
+        mono = QFont("Consolas", scaled_font_size(9))
 
         self.sb_xy = QLabel("XY: — , — µm")
         self.sb_xy.setFont(mono)

@@ -60,6 +60,7 @@ from SupportClasses.PhysicalModels import (
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.scaling import s, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ class InkEditorDialog(QDialog):
     def __init__(self, ink: InkSpec | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Ink" if ink else "Add Ink")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(s(400))
         self._build_ui(ink)
 
     def _build_ui(self, ink: InkSpec | None):
@@ -132,7 +133,7 @@ class InkEditorDialog(QDialog):
         color_row = QHBoxLayout()
         self._ink_color = ink.color if ink else "#a6e3a1"
         self.color_btn = QPushButton()
-        self.color_btn.setFixedSize(28, 28)
+        self.color_btn.setFixedSize(s(28), s(28))
         self.color_btn.setStyleSheet(
             f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: 4px;")
         self.color_btn.clicked.connect(self._pick_ink_color)
@@ -182,7 +183,7 @@ class RosetteEditorDialog(QDialog):
     def __init__(self, rosette: RosetteInsert | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Rosette" if rosette else "Add Rosette")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(s(400))
         self._build_ui(rosette)
 
     def _build_ui(self, rosette: RosetteInsert | None):
@@ -306,7 +307,7 @@ class PumpChannelWidget(QGroupBox):
         # Row 1: Ink(s) — multi-select checklist
         layout.addWidget(QLabel("Inks:"), 1, 0, Qt.AlignmentFlag.AlignTop)
         self.ink_list = QListWidget()
-        self.ink_list.setMaximumHeight(70)
+        self.ink_list.setMaximumHeight(s(70))
         self.ink_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.ink_list.itemChanged.connect(self._on_change)
         layout.addWidget(self.ink_list, 1, 1, 1, 2)
@@ -527,13 +528,13 @@ class HardwareSetupPage(QWidget):
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("My Experiment Setup")
-        self.name_edit.setMinimumWidth(350)
+        self.name_edit.setMinimumWidth(s(350))
         self.name_edit.textChanged.connect(self._on_config_changed)
         name_lay.addRow("Name:", self.name_edit)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes...")
-        self.notes_edit.setMinimumWidth(350)
+        self.notes_edit.setMinimumWidth(s(350))
         self.notes_edit.textChanged.connect(self._on_config_changed)
         name_lay.addRow("Notes:", self.notes_edit)
 
@@ -573,7 +574,7 @@ class HardwareSetupPage(QWidget):
             QAbstractItemView.SingleSelection)
         self.ink_table.setEditTriggers(
             QAbstractItemView.NoEditTriggers)
-        self.ink_table.setMaximumHeight(160)
+        self.ink_table.setMaximumHeight(s(160))
         ink_lay.addWidget(self.ink_table)
 
         ink_btns = QHBoxLayout()
@@ -697,7 +698,7 @@ class HardwareSetupPage(QWidget):
             QAbstractItemView.SingleSelection)
         self.rosette_table.setEditTriggers(
             QAbstractItemView.NoEditTriggers)
-        self.rosette_table.setMaximumHeight(140)
+        self.rosette_table.setMaximumHeight(s(140))
         ros_lay.addWidget(self.rosette_table)
 
         ros_btns = QHBoxLayout()
@@ -782,7 +783,7 @@ class HardwareSetupPage(QWidget):
         # Detect row
         detect_row = QHBoxLayout()
         self._btn_detect_live_cams = QPushButton("Detect Cameras")
-        self._btn_detect_live_cams.setMinimumWidth(130)
+        self._btn_detect_live_cams.setMinimumWidth(s(130))
         self._btn_detect_live_cams.setToolTip(
             "Scan for available cameras (OpenCV, ToupCam, Simulated)")
         self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
@@ -813,7 +814,7 @@ class HardwareSetupPage(QWidget):
             rl.addWidget(QLabel(f"<b>Cam {i+1}</b>"), 0, 0)
             src = QComboBox()
             src.addItem("— None —", None)
-            src.setMinimumWidth(120)
+            src.setMinimumWidth(s(120))
             rl.addWidget(src, 0, 1, 1, 2)
             self._live_cam_source_combos.append(src)
 
@@ -847,7 +848,7 @@ class HardwareSetupPage(QWidget):
         self._btn_calibrate_umpx.setToolTip(
             "Measure actual µm/px by moving the stage a known distance "
             "and correlating pixel displacement")
-        self._btn_calibrate_umpx.setMinimumWidth(140)
+        self._btn_calibrate_umpx.setMinimumWidth(s(140))
         self._btn_calibrate_umpx.clicked.connect(self._on_calibrate_umpx)
         cal_row.addWidget(self._btn_calibrate_umpx)
         cal_row.addStretch()
@@ -863,7 +864,7 @@ class HardwareSetupPage(QWidget):
         self.validity_label = QLabel("⚠ Setup incomplete")
         self.validity_label.setStyleSheet(
             f"color: {COLORS.get('yellow', '#f9e2af')};")
-        self.validity_label.setFont(QFont("", 10, QFont.Bold))
+        self.validity_label.setFont(QFont("", scaled_font_size(10), QFont.Bold))
         self.validity_label.setWordWrap(True)
         status_lay.addWidget(self.validity_label)
 
@@ -1156,7 +1157,7 @@ class HardwareSetupPage(QWidget):
                 label = QLabel("Bore →")
             else:
                 label = QLabel(f"Channel {ch_idx + 1} →")
-            label.setMinimumWidth(80)
+            label.setMinimumWidth(s(80))
             row_layout.addWidget(label)
 
             combo = QComboBox()
@@ -1720,7 +1721,7 @@ class HardwareSetupPage(QWidget):
 
         self._config_list = QListWidget()
         self._config_list.setAlternatingRowColors(True)
-        self._config_list.setMaximumHeight(260)
+        self._config_list.setMaximumHeight(s(260))
         self._config_list.itemDoubleClicked.connect(
             self._on_config_list_double_click)
         self._config_list.currentItemChanged.connect(
@@ -1737,19 +1738,19 @@ class HardwareSetupPage(QWidget):
         # Buttons row
         btn_row = QHBoxLayout()
         btn_load = QPushButton("Load")
-        btn_load.setMaximumHeight(26)
+        btn_load.setMaximumHeight(s(26))
         btn_load.clicked.connect(self._on_config_list_load)
         btn_row.addWidget(btn_load)
 
         btn_del = QPushButton("Delete")
-        btn_del.setMaximumHeight(26)
+        btn_del.setMaximumHeight(s(26))
         btn_del.setObjectName("dangerBtn")
         btn_del.clicked.connect(self._on_config_list_delete)
         btn_row.addWidget(btn_del)
 
         btn_refresh = QPushButton("🔄")
-        btn_refresh.setMaximumHeight(26)
-        btn_refresh.setMaximumWidth(32)
+        btn_refresh.setMaximumHeight(s(26))
+        btn_refresh.setMaximumWidth(s(32))
         btn_refresh.setToolTip("Refresh config file list")
         btn_refresh.clicked.connect(self._scan_config_directory)
         btn_row.addWidget(btn_refresh)

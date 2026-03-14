@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 
+from gui.scaling import s, scaled_font_size
+
 logger = logging.getLogger(__name__)
 
 # Try to import OpenCV
@@ -231,13 +233,13 @@ class CameraWidget(QWidget):
 
             header.addWidget(QLabel("Src:"))
             self.camera_combo = QComboBox()
-            self.camera_combo.setMinimumWidth(100)
-            self.camera_combo.setMaximumWidth(180)
+            self.camera_combo.setMinimumWidth(s(100))
+            self.camera_combo.setMaximumWidth(s(180))
             self._populate_cameras()
             header.addWidget(self.camera_combo)
 
             self.btn_start = QPushButton("▶ Start")
-            self.btn_start.setMinimumWidth(64)
+            self.btn_start.setMinimumWidth(s(64))
             self.btn_start.setToolTip("Start / Stop camera")
             self.btn_start.clicked.connect(self.toggle)
             header.addWidget(self.btn_start)
@@ -249,14 +251,14 @@ class CameraWidget(QWidget):
             header.addWidget(self.chk_crosshair)
 
             btn_snap = QPushButton("📷 Snap")
-            btn_snap.setMinimumWidth(56)
+            btn_snap.setMinimumWidth(s(56))
             btn_snap.setToolTip("Save snapshot to file")
             btn_snap.clicked.connect(self.take_snapshot)
             header.addWidget(btn_snap)
 
             # v7.3.2: Per-camera settings toggle
             self._btn_settings = QPushButton("⚙ Settings")
-            self._btn_settings.setMinimumWidth(72)
+            self._btn_settings.setMinimumWidth(s(72))
             self._btn_settings.setToolTip("Brightness, gamma, FPS")
             self._btn_settings.setCheckable(True)
             self._btn_settings.toggled.connect(self._toggle_settings_panel)
@@ -282,7 +284,7 @@ class CameraWidget(QWidget):
             self._sld_brightness.valueChanged.connect(self._on_brightness_slider)
             bri_row.addWidget(self._sld_brightness)
             self._lbl_brightness = QLabel("0")
-            self._lbl_brightness.setMinimumWidth(28)
+            self._lbl_brightness.setMinimumWidth(s(28))
             bri_row.addWidget(self._lbl_brightness)
             sp_layout.addLayout(bri_row)
 
@@ -295,7 +297,7 @@ class CameraWidget(QWidget):
             self._sld_gamma.valueChanged.connect(self._on_gamma_slider)
             gam_row.addWidget(self._sld_gamma)
             self._lbl_gamma = QLabel("1.00")
-            self._lbl_gamma.setMinimumWidth(28)
+            self._lbl_gamma.setMinimumWidth(s(28))
             gam_row.addWidget(self._lbl_gamma)
             sp_layout.addLayout(gam_row)
 
@@ -322,9 +324,9 @@ class CameraWidget(QWidget):
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._compact:
-            self.video_label.setMinimumSize(200, 150)
+            self.video_label.setMinimumSize(s(200), s(150))
         else:
-            self.video_label.setMinimumSize(320, 240)
+            self.video_label.setMinimumSize(s(320), s(240))
         self.video_label.setStyleSheet(
             "background-color: #181825; border: 1px solid #45475a;"
         )

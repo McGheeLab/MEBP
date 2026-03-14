@@ -28,6 +28,7 @@ from PySide6.QtGui import QFont, QKeyEvent
 
 from SupportClasses.StageController import StageController
 from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.scaling import s as _sc, scaled_font_size
 
 # v7.3.1: Optional well plate navigator
 try:
@@ -219,7 +220,7 @@ class JogControlPage(QWidget):
         btn_goto.setStyleSheet(
             f"background-color: {COLORS['blue']}; color: {COLORS['crust']}; "
             f"font-weight: bold; padding: 4px 12px;")
-        btn_goto.setMaximumHeight(28)
+        btn_goto.setMaximumHeight(_sc(28))
         btn_goto.clicked.connect(self._absolute_goto)
         layout.addWidget(btn_goto)
 
@@ -276,7 +277,7 @@ class JogControlPage(QWidget):
             pos_layout.addWidget(lbl, 0, col)
             val = QLabel("—")
             val.setObjectName("positionValue")
-            val.setFont(QFont("Consolas", 11))
+            val.setFont(QFont("Consolas", scaled_font_size(11)))
             val.setAlignment(Qt.AlignmentFlag.AlignCenter)
             setattr(self, attr, val)
             pos_layout.addWidget(val, 1, col)
@@ -290,28 +291,28 @@ class JogControlPage(QWidget):
         xy_grid.setSpacing(4)
 
         btn_up = QPushButton("▲")
-        btn_up.setMinimumSize(50, 40)
+        btn_up.setMinimumSize(_sc(50), _sc(40))
         btn_up.clicked.connect(partial(self._jog_xy, 0, -1))
         xy_grid.addWidget(btn_up, 0, 1)
 
         btn_left = QPushButton("◀")
-        btn_left.setMinimumSize(50, 40)
+        btn_left.setMinimumSize(_sc(50), _sc(40))
         btn_left.clicked.connect(partial(self._jog_xy, -1, 0))
         xy_grid.addWidget(btn_left, 1, 0)
 
         btn_home = QPushButton("⌂")
-        btn_home.setMinimumSize(50, 40)
+        btn_home.setMinimumSize(_sc(50), _sc(40))
         btn_home.setToolTip("Move to zero reference")
         btn_home.clicked.connect(self._jog_xy_home)
         xy_grid.addWidget(btn_home, 1, 1)
 
         btn_right = QPushButton("▶")
-        btn_right.setMinimumSize(50, 40)
+        btn_right.setMinimumSize(_sc(50), _sc(40))
         btn_right.clicked.connect(partial(self._jog_xy, 1, 0))
         xy_grid.addWidget(btn_right, 1, 2)
 
         btn_down = QPushButton("▼")
-        btn_down.setMinimumSize(50, 40)
+        btn_down.setMinimumSize(_sc(50), _sc(40))
         btn_down.clicked.connect(partial(self._jog_xy, 0, 1))
         xy_grid.addWidget(btn_down, 2, 1)
 
@@ -384,7 +385,7 @@ class JogControlPage(QWidget):
             nav_label.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
             nav_layout.addWidget(nav_label)
             self._well_nav = WellPlateNavigator(parent=self)
-            self._well_nav.setMinimumHeight(120)
+            self._well_nav.setMinimumHeight(_sc(120))
             self._well_nav.well_clicked.connect(self._on_well_nav_click)
             nav_layout.addWidget(self._well_nav, stretch=1)
             self._well_nav_status = QLabel("")
@@ -929,7 +930,7 @@ class JogControlPage(QWidget):
         layout.setSpacing(4)
 
         lbl = QLabel(label_text)
-        lbl.setMinimumWidth(24)
+        lbl.setMinimumWidth(_sc(24))
         layout.addWidget(lbl)
 
         slider = QSlider(Qt.Orientation.Horizontal)

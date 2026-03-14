@@ -73,7 +73,7 @@ Layout matches the coding plan Tab 3 wireframe:
         plan_scroll = QScrollArea()
         plan_scroll.setWidget(self._plan_display)
         plan_scroll.setWidgetResizable(True)
-        plan_scroll.setMaximumHeight(180)
+        plan_scroll.setMaximumHeight(s(180))
         plan_layout.addWidget(plan_scroll)
 
         # Plan summary
@@ -119,7 +119,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPointF, QTimer
 from PySide6.QtGui import QColor, QCursor
 
-from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
+from gui.styles import COLORS
+from gui.scaling import s, scaled_font_size, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
 # MiniProjectionView removed in v7.2.4 (XY-only layout)
 
@@ -352,8 +353,8 @@ class WellSetupTab(QWidget):
         for role, label, color in role_defs:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedHeight(28)
-            btn.setMinimumWidth(62)
+            btn.setFixedHeight(s(28))
+            btn.setMinimumWidth(s(62))
             btn.setStyleSheet(
                 f"QPushButton {{background:#1e1e2e; border:2px solid #45475a;"
                 f" border-radius:4px; color:#cdd6f4; font-size:11px;}}"
@@ -371,7 +372,7 @@ class WellSetupTab(QWidget):
 
         # Clear / Empty button
         btn_clear = QPushButton("✕ Clear")
-        btn_clear.setFixedHeight(28)
+        btn_clear.setFixedHeight(s(28))
         btn_clear.setObjectName("dangerBtn")
         btn_clear.setToolTip("Reset selected wells to Empty")
         btn_clear.clicked.connect(self._on_clear_role)
@@ -388,7 +389,7 @@ class WellSetupTab(QWidget):
         of_layout.setSpacing(0)
 
         self._role_options_stack = QStackedWidget()
-        self._role_options_stack.setFixedHeight(52)
+        self._role_options_stack.setFixedHeight(s(52))
 
         # Page 0: Placeholder
         ph = QWidget()
@@ -432,7 +433,7 @@ class WellSetupTab(QWidget):
 
         self.print_combo = QComboBox()
         self.print_combo.addItem("(no prints available)", None)
-        self.print_combo.setMinimumWidth(200)
+        self.print_combo.setMinimumWidth(s(200))
         layout.addWidget(self.print_combo, stretch=1)
 
         btn_assign = QPushButton("Assign to Wells")
@@ -453,7 +454,7 @@ class WellSetupTab(QWidget):
 
         self.ink_combo = QComboBox()
         self.ink_combo.addItem("(none)", None)
-        self.ink_combo.setMinimumWidth(160)
+        self.ink_combo.setMinimumWidth(s(160))
         layout.addWidget(self.ink_combo, stretch=1)
 
         btn_assign = QPushButton("Assign to Wells")
@@ -491,7 +492,7 @@ class WellSetupTab(QWidget):
         self._max_ink_spin.setValue(100.0)
         self._max_ink_spin.setSuffix(" uL")
         self._max_ink_spin.setDecimals(1)
-        self._max_ink_spin.setMaximumWidth(110)
+        self._max_ink_spin.setMaximumWidth(s(110))
         pref_row.addWidget(self._max_ink_spin)
 
         self._wash_check   = QCheckBox("Wash")

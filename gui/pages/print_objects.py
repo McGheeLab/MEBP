@@ -48,6 +48,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon
 
 from gui.styles import COLORS
+from gui.scaling import s as _sc, scaled_font_size
 
 # v7.2.4: XY-only well preview with zoom/pan/bounds (S4.2)
 try:
@@ -507,7 +508,7 @@ class PrintObjectsTab(QWidget):
         bar_layout.addWidget(QLabel("Name:"))
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("Enter print name...")
-        self._name_edit.setMaximumWidth(200)
+        self._name_edit.setMaximumWidth(_sc(200))
         self._name_edit.editingFinished.connect(self._on_name_changed)
         bar_layout.addWidget(self._name_edit)
 
@@ -516,7 +517,7 @@ class PrintObjectsTab(QWidget):
         # Load dropdown
         bar_layout.addWidget(QLabel("Saved:"))
         self._file_combo = QComboBox()
-        self._file_combo.setMinimumWidth(150)
+        self._file_combo.setMinimumWidth(_sc(150))
         self._file_combo.currentTextChanged.connect(self._on_file_selected)
         bar_layout.addWidget(self._file_combo)
 
@@ -657,7 +658,7 @@ class PrintObjectsTab(QWidget):
         ink_row.addWidget(self._ink_combo)
 
         self._ink_color_swatch = QLabel()
-        self._ink_color_swatch.setFixedSize(24, 24)
+        self._ink_color_swatch.setFixedSize(_sc(24), _sc(24))
         self._current_color = DEFAULT_COLORS[0]
         self._ink_color_swatch.setStyleSheet(
             f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
@@ -683,7 +684,7 @@ class PrintObjectsTab(QWidget):
         self._fill_pattern_combo.addItem("Meander", "meander")
         self._fill_pattern_combo.addItem("Spiral", "spiral")
         self._fill_pattern_combo.setVisible(False)
-        self._fill_pattern_combo.setMaximumWidth(100)
+        self._fill_pattern_combo.setMaximumWidth(_sc(100))
         self._fill_pattern_combo.currentIndexChanged.connect(self._schedule_preview)
         fill_row.addWidget(self._fill_pattern_combo)
         fill_row.addStretch()
@@ -699,7 +700,7 @@ class PrintObjectsTab(QWidget):
             spin.setSingleStep(0.1)
             spin.setDecimals(2)
             spin.setSuffix(" mm")
-            spin.setMaximumWidth(90)
+            spin.setMaximumWidth(_sc(90))
             spin.valueChanged.connect(self._schedule_preview)
             pos_row.addWidget(QLabel(label))
             pos_row.addWidget(spin)
@@ -876,7 +877,7 @@ class PrintObjectsTab(QWidget):
             if isinstance(default, str):
                 # Text field (e.g., ring_counts as comma-separated)
                 edit = QLineEdit(default)
-                edit.setMaximumWidth(120)
+                edit.setMaximumWidth(_sc(120))
                 form.addRow(f"{pname.replace('_', ' ').title()}:", edit)
                 widgets[pname] = edit
             else:
@@ -940,7 +941,7 @@ class PrintObjectsTab(QWidget):
         layout = parent_layout
 
         self._objects_list = QListWidget()
-        self._objects_list.setMaximumHeight(200)
+        self._objects_list.setMaximumHeight(_sc(200))
         self._objects_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._objects_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self._objects_list.currentRowChanged.connect(self._on_object_selected)
@@ -958,14 +959,14 @@ class PrintObjectsTab(QWidget):
         ]:
             btn = QPushButton(label)
             btn.setToolTip(tip)
-            btn.setFixedHeight(24)
-            btn.setMaximumWidth(50)
+            btn.setFixedHeight(_sc(24))
+            btn.setMaximumWidth(_sc(50))
             btn.clicked.connect(slot)
             btn_row.addWidget(btn)
 
         self._btn_remove_from_well = QPushButton("Remove from Well")
         self._btn_remove_from_well.setToolTip("Remove selected object from the well preview")
-        self._btn_remove_from_well.setFixedHeight(24)
+        self._btn_remove_from_well.setFixedHeight(_sc(24))
         self._btn_remove_from_well.setEnabled(False)
         self._btn_remove_from_well.clicked.connect(self._remove_from_well)
         btn_row.addWidget(self._btn_remove_from_well)
@@ -988,7 +989,7 @@ class PrintObjectsTab(QWidget):
         parent_layout.addWidget(stg_lbl)
 
         self._prints_staging_list = QListWidget()
-        self._prints_staging_list.setMaximumHeight(80)
+        self._prints_staging_list.setMaximumHeight(_sc(80))
         self._prints_staging_list.setStyleSheet(f"""
             QListWidget {{ background: {COLORS['surface0']}; color: {COLORS['text']};
                 border: 1px solid {COLORS['surface1']}; border-radius: 4px; font-size: 10px; }}
@@ -996,9 +997,9 @@ class PrintObjectsTab(QWidget):
         parent_layout.addWidget(self._prints_staging_list)
 
         btns = QHBoxLayout()
-        b1 = QPushButton("+ Add Current"); b1.setFixedHeight(24); b1.clicked.connect(self._staging_add_current); btns.addWidget(b1)
-        b2 = QPushButton("- Remove"); b2.setFixedHeight(24); b2.clicked.connect(self._staging_remove_selected); btns.addWidget(b2)
-        self._btn_send_to_prints = QPushButton("\U0001f4cb Send"); self._btn_send_to_prints.setFixedHeight(24)
+        b1 = QPushButton("+ Add Current"); b1.setFixedHeight(_sc(24)); b1.clicked.connect(self._staging_add_current); btns.addWidget(b1)
+        b2 = QPushButton("- Remove"); b2.setFixedHeight(_sc(24)); b2.clicked.connect(self._staging_remove_selected); btns.addWidget(b2)
+        self._btn_send_to_prints = QPushButton("\U0001f4cb Send"); self._btn_send_to_prints.setFixedHeight(_sc(24))
         self._btn_send_to_prints.setStyleSheet(f"QPushButton {{ background: {COLORS.get('mauve','#cba6f7')}; color: {COLORS.get('base','#1e1e2e')}; font-weight: bold; border-radius: 4px; font-size: 10px; }}")
         self._btn_send_to_prints.clicked.connect(self._send_staged_prints); btns.addWidget(self._btn_send_to_prints)
         btns.addStretch()
@@ -2452,7 +2453,7 @@ class PrintObjectsTab(QWidget):
         file_group = QGroupBox("Print Files")
         file_layout = QVBoxLayout(file_group)
         self._ctx_file_list = QListWidget()
-        self._ctx_file_list.setMaximumHeight(150)
+        self._ctx_file_list.setMaximumHeight(_sc(150))
         self._ctx_file_list.itemDoubleClicked.connect(
             lambda item: self._load_print_file(item.text()))
         file_layout.addWidget(self._ctx_file_list)

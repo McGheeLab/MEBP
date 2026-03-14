@@ -30,6 +30,8 @@ from PySide6.QtWidgets import QWidget, QToolTip
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent
 
+from gui.scaling import s, scaled_font_size
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,7 @@ class WellPlateNavigator(QWidget):
         self._hover_well: str | None = None
         self._well_positions: dict[str, tuple[float, float]] | None = None  # well → (x_um, y_um)
 
-        self.setMinimumSize(160, 100)
+        self.setMinimumSize(s(160), s(100))
         self.setMouseTracking(True)
         self.setToolTip("Click a well to fast-travel")
 
@@ -207,7 +209,7 @@ class WellPlateNavigator(QWidget):
         r = layout["radius"]
 
         # Row labels
-        label_font = QFont("Consolas", max(7, int(layout["cell"] * 0.35)))
+        label_font = QFont("Consolas", scaled_font_size(max(7, int(layout["cell"] * 0.35))))
         p.setFont(label_font)
         p.setPen(self._CLR_LABEL)
         for row in range(layout["rows"]):

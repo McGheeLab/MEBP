@@ -31,6 +31,7 @@ from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtGui import QColor
 
 from gui.styles import COLORS
+from gui.scaling import s, scaled_font_size
 from SupportClasses.PickAndPlaceManager import (
     OperationQueue, PickPlaceExecutor, PickPlaceOperation,
     OperationStatus,
@@ -146,7 +147,7 @@ class PPExecutionPage(QWidget):
         self._progress_bar.setMinimum(0)
         self._progress_bar.setMaximum(100)
         self._progress_bar.setValue(0)
-        self._progress_bar.setMaximumHeight(20)
+        self._progress_bar.setMaximumHeight(s(20))
         prog_row.addWidget(self._progress_bar, 1)
 
         self._lbl_progress = QLabel("0 / 0")
@@ -164,7 +165,7 @@ class PPExecutionPage(QWidget):
         self._lbl_dwell = QLabel("")
         self._lbl_dwell.setStyleSheet(f"color: {COLORS['yellow']};")
         self._dwell_bar = QProgressBar()
-        self._dwell_bar.setMaximumHeight(14)
+        self._dwell_bar.setMaximumHeight(s(14))
         self._dwell_row.addWidget(self._lbl_dwell)
         self._dwell_row.addWidget(self._dwell_bar, 1)
         self._dwell_widget = QWidget()

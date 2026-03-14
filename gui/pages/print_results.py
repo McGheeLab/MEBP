@@ -46,6 +46,7 @@ from PySide6.QtGui import (
 )
 
 from gui.styles import COLORS
+from gui.scaling import s as _sc, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class PathComparisonWidget(QWidget):
         self._drag_start = QPointF()
         self._drag_pan_start = (0.0, 0.0)
 
-        self.setMinimumSize(300, 250)
+        self.setMinimumSize(_sc(300), _sc(250))
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet(f"background-color: {COLORS['crust']};")
@@ -245,7 +246,7 @@ class PathComparisonWidget(QWidget):
 
         if not self._display_samples:
             painter.setPen(QColor(COLORS["overlay0"]))
-            painter.setFont(QFont("Segoe UI", 11))
+            painter.setFont(QFont("Segoe UI", scaled_font_size(11)))
             painter.drawText(self.rect(), Qt.AlignCenter,
                              "No recording loaded\nSelect a recording from the context panel")
             painter.end()
@@ -393,7 +394,7 @@ class PathComparisonWidget(QWidget):
 
     def _draw_legend(self, painter: QPainter):
         """Draw a small legend in top-right corner."""
-        painter.setFont(QFont("Segoe UI", 8))
+        painter.setFont(QFont("Segoe UI", scaled_font_size(8)))
         x = self.width() - 155
         y = 10
 
@@ -427,7 +428,7 @@ class PathComparisonWidget(QWidget):
         h_label, v_label = axes.get(self._projection, ("H", "V"))
 
         painter.setPen(QColor(COLORS["subtext0"]))
-        painter.setFont(QFont("Segoe UI", 9))
+        painter.setFont(QFont("Segoe UI", scaled_font_size(9)))
         # H axis label (bottom center)
         painter.drawText(self.width() // 2 - 20, self.height() - 5, h_label)
         # V axis label (left, rotated)
@@ -488,7 +489,7 @@ class ErrorTimeSeriesWidget(QWidget):
         self._max_time = 1.0
         self._max_error_um = 100.0
 
-        self.setMinimumSize(300, 120)
+        self.setMinimumSize(_sc(300), _sc(120))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet(f"background-color: {COLORS['crust']};")
 
@@ -516,7 +517,7 @@ class ErrorTimeSeriesWidget(QWidget):
 
         if not self._display_samples:
             painter.setPen(QColor(COLORS["overlay0"]))
-            painter.setFont(QFont("Segoe UI", 10))
+            painter.setFont(QFont("Segoe UI", scaled_font_size(10)))
             painter.drawText(self.rect(), Qt.AlignCenter, "No data")
             painter.end()
             return
@@ -582,7 +583,7 @@ class ErrorTimeSeriesWidget(QWidget):
 
         # Labels
         painter.setPen(QColor(COLORS["subtext0"]))
-        painter.setFont(QFont("Segoe UI", 8))
+        painter.setFont(QFont("Segoe UI", scaled_font_size(8)))
         painter.drawText(margin_l - 45, margin_t + 4, f"{self._max_error_um:.0f}µm")
         painter.drawText(margin_l - 25, margin_t + plot_h + 4, "0")
         painter.drawText(margin_l, margin_t + plot_h + 15, "0s")
@@ -590,7 +591,7 @@ class ErrorTimeSeriesWidget(QWidget):
                          f"{self._max_time:.1f}s")
 
         # Legend
-        painter.setFont(QFont("Segoe UI", 8))
+        painter.setFont(QFont("Segoe UI", scaled_font_size(8)))
         lx = margin_l + 10
         ly = margin_t + 5
         painter.setPen(QPen(ERROR_COLOR_GOOD, 2))
@@ -695,7 +696,7 @@ class PlaybackController(QWidget):
         self._time_label = QLabel("0.0s / 0.0s")
         self._time_label.setStyleSheet(
             f"color: {COLORS['text']}; font-size: 10px; font-family: monospace;")
-        self._time_label.setMinimumWidth(100)
+        self._time_label.setMinimumWidth(_sc(100))
         layout.addWidget(self._time_label)
 
     def set_data(self, samples: list[dict]):
@@ -872,7 +873,7 @@ class StatisticsPanel(QWidget):
             QAbstractItemView.SelectionBehavior.SelectRows)
         self._seg_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._seg_table.setMaximumHeight(150)
+        self._seg_table.setMaximumHeight(_sc(150))
         self._seg_table.setStyleSheet(
             f"QTableWidget {{ background: {COLORS['surface0']}; "
             f"color: {COLORS['text']}; gridline-color: {COLORS['surface1']}; "
@@ -1121,7 +1122,7 @@ class PrintResultsPage(QWidget):
 
         # ── Playback controller bar ───────────────────────────────
         self._playback = PlaybackController()
-        self._playback.setMaximumHeight(50)
+        self._playback.setMaximumHeight(_sc(50))
         self._playback.setStyleSheet(
             f"background-color: {COLORS['surface0']}; border-radius: 4px;")
         outer.addWidget(self._playback)
@@ -1151,7 +1152,7 @@ class PrintResultsPage(QWidget):
         layout.addWidget(lbl_rec)
 
         self._ctx_recording_list = QListWidget()
-        self._ctx_recording_list.setMaximumHeight(180)
+        self._ctx_recording_list.setMaximumHeight(_sc(180))
         self._ctx_recording_list.setStyleSheet(
             f"QListWidget {{ background: {COLORS['surface0']}; "
             f"color: {COLORS['text']}; border-radius: 4px; font-size: 10px; }}"

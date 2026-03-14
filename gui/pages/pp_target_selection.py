@@ -39,6 +39,7 @@ from PySide6.QtGui import (
 import numpy as np
 
 from gui.styles import COLORS
+from gui.scaling import s, scaled_font_size
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.target_overlay_camera_view import TargetOverlayCameraView
 from SupportClasses.ImageStitcher import StitchedImage, generate_scan_pattern
@@ -71,7 +72,7 @@ class StitchedImageView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.setMinimumSize(400, 300)
+        self.setMinimumSize(s(400), s(300))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # Image data
@@ -285,7 +286,7 @@ class StitchedImageView(QWidget):
         # "No image" label
         if img is None:
             painter.setPen(QColor(COLORS["overlay0"]))
-            painter.setFont(QFont("Segoe UI", 12))
+            painter.setFont(QFont("Segoe UI", scaled_font_size(12)))
             painter.drawText(self.rect(), Qt.AlignCenter,
                              "No image — capture frames to build composite")
 
@@ -343,7 +344,7 @@ class StitchedImageView(QWidget):
 
             # ID label
             painter.setPen(QPen(color, 1))
-            painter.setFont(QFont("Consolas", 8))
+            painter.setFont(QFont("Consolas", scaled_font_size(8)))
             painter.drawText(int(wx + r_px + 3), int(wy - 2), target.target_id)
 
     def _draw_crosshair(self, painter: QPainter):
@@ -548,8 +549,8 @@ class PPTargetSelectionPage(QWidget):
         self._lbl_count.setStyleSheet(f"color: {COLORS['subtext0']};")
         right_layout.addWidget(self._lbl_count)
 
-        right_panel.setMinimumWidth(200)
-        right_panel.setMaximumWidth(300)
+        right_panel.setMinimumWidth(s(200))
+        right_panel.setMaximumWidth(s(300))
         splitter.addWidget(right_panel)
 
         splitter.setStretchFactor(0, 3)
@@ -591,7 +592,7 @@ class PPTargetSelectionPage(QWidget):
         # Well selector for auto-scan
         scan_layout.addWidget(QLabel("Well:"))
         self._well_combo = QComboBox()
-        self._well_combo.setMinimumWidth(80)
+        self._well_combo.setMinimumWidth(s(80))
         self._well_combo.setPlaceholderText("Select well")
         scan_layout.addWidget(self._well_combo)
 
@@ -603,7 +604,7 @@ class PPTargetSelectionPage(QWidget):
 
         # Progress bar (hidden until scanning)
         self._scan_progress = QProgressBar()
-        self._scan_progress.setMaximumHeight(16)
+        self._scan_progress.setMaximumHeight(s(16))
         self._scan_progress.setVisible(False)
         scan_layout.addWidget(self._scan_progress)
 

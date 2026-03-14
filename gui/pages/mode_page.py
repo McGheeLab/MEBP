@@ -25,23 +25,24 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 
 from gui.styles import COLORS
+from gui.scaling import s, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
 # Right sidebar dimensions
-_SIDEBAR_WIDTH = 48
-_BUTTON_SIZE = 40
-_BUTTON_SPACING = 4
+_SIDEBAR_WIDTH = s(48)
+_BUTTON_SIZE = s(40)
+_BUTTON_SPACING = s(4)
 
 
 def _make_sub_icon(text: str, size: int = 24, color: str = COLORS["subtext0"]) -> QIcon:
     """Create a QIcon from a text character for the sub-page button."""
-    pixmap = QPixmap(size, size)
+    pixmap = QPixmap(s(size), s(size))
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(QColor(color))
-    painter.setFont(QFont("Segoe UI Emoji", int(size * 0.55)))
+    painter.setFont(QFont("Segoe UI Emoji", scaled_font_size(int(size * 0.55))))
     painter.drawText(pixmap.rect(), Qt.AlignCenter, text)
     painter.end()
     return QIcon(pixmap)
@@ -122,7 +123,7 @@ class ModePage(QWidget):
         btn.setFixedSize(_BUTTON_SIZE, _BUTTON_SIZE)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip(title)
-        btn.setFont(QFont("Segoe UI Emoji", 14))
+        btn.setFont(QFont("Segoe UI Emoji", scaled_font_size(14)))
         btn.setObjectName(f"modeSubBtn_{index}")
 
         # Style

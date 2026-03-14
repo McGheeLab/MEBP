@@ -19,8 +19,19 @@ import signal
 import sys
 import time
 
-# PyDracula HiDPI fix — must be set before QApplication
-os.environ["QT_FONT_DPI"] = "96"
+# ── HiDPI support ───────────────────────────────────────────────────
+# Let Qt6 handle DPI scaling natively instead of locking to 96 DPI.
+# The gui/scaling.py module detects actual DPI and scales hardcoded
+# pixel dimensions accordingly.  Override with MEBP_UI_SCALE=1.5 etc.
+os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+
+# ── PyInstaller frozen-app support ──────────────────────────────────
+# When running as a bundled executable, change the working directory to
+# the bundle's internal directory so that all relative paths
+# (config/, settings.json, print_records/, etc.) resolve correctly.
+if getattr(sys, "frozen", False):
+    _bundle_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    os.chdir(_bundle_dir)
 
 from SupportClasses.StageController import StageController
 from SupportClasses.Settings import Settings
@@ -203,4 +214,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required for PyInstaller on macOS/Windows when using multiprocessing
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

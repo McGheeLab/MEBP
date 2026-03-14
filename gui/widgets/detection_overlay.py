@@ -25,6 +25,8 @@ from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt, QRectF, QPointF, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QPainterPath
 
+from gui.scaling import s, scaled_font_size
+
 logger = logging.getLogger(__name__)
 
 # Try to import detection result types for type hints
@@ -95,8 +97,8 @@ class DetectionOverlay(QWidget):
         self._adjustable_radius: float = 0.0
 
         # Font
-        self._font = QFont("monospace", 9)
-        self._font_small = QFont("monospace", 8)
+        self._font = QFont("monospace", scaled_font_size(9))
+        self._font_small = QFont("monospace", scaled_font_size(8))
 
     # ── Public API ─────────────────────────────────────────────
 

@@ -38,6 +38,7 @@ from SupportClasses.PrintManager import (
 )
 from SupportClasses.PhysicalModels import WorkspaceConfig
 from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.scaling import s as _sc, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig
@@ -476,7 +477,7 @@ class PrintSetupPage(QWidget):
         ]:
             row = QHBoxLayout()
             lbl = QLabel(label_text)
-            lbl.setFixedWidth(80)
+            lbl.setFixedWidth(_sc(80))
             row.addWidget(lbl)
             val = QLabel("—")
             val.setStyleSheet(dim_style)
@@ -557,7 +558,7 @@ class PrintSetupPage(QWidget):
         for pid in ["P1", "P2", "P3"]:
             row = QHBoxLayout()
             lbl = QLabel(f"{pid}:")
-            lbl.setFixedWidth(24)
+            lbl.setFixedWidth(_sc(24))
             lbl.setStyleSheet(
                 f"font-weight: bold; color: {COLORS.get('blue', '#89b4fa')};")
             row.addWidget(lbl)
@@ -568,7 +569,7 @@ class PrintSetupPage(QWidget):
             ret_spin.setValue(0.5)
             ret_spin.setSuffix(" uL")
             ret_spin.setDecimals(2)
-            ret_spin.setMaximumWidth(90)
+            ret_spin.setMaximumWidth(_sc(90))
             row.addWidget(ret_spin)
             self._retract_spins[pid] = ret_spin
 
@@ -578,7 +579,7 @@ class PrintSetupPage(QWidget):
             prime_spin.setValue(0.5)
             prime_spin.setSuffix(" uL")
             prime_spin.setDecimals(2)
-            prime_spin.setMaximumWidth(90)
+            prime_spin.setMaximumWidth(_sc(90))
             row.addWidget(prime_spin)
             self._prime_spins[pid] = prime_spin
 
@@ -641,7 +642,7 @@ class PrintSetupPage(QWidget):
             spin.setDecimals(0)
             spin.setValue(default)
             spin.setToolTip(f"{tip} volume")
-            spin.setMaximumWidth(85)
+            spin.setMaximumWidth(_sc(85))
             vol_form.addWidget(QLabel(f"{tip}:"))
             vol_form.addWidget(spin)
         swap_lay.addLayout(vol_form)
@@ -844,11 +845,11 @@ class PrintSetupPage(QWidget):
 
         export_row = QHBoxLayout()
         btn_export = QPushButton("Export G-code")
-        btn_export.setMaximumHeight(28)
+        btn_export.setMaximumHeight(_sc(28))
         btn_export.clicked.connect(self._export_gcode)
         export_row.addWidget(btn_export)
         btn_save = QPushButton("Save JSON")
-        btn_save.setMaximumHeight(28)
+        btn_save.setMaximumHeight(_sc(28))
         btn_save.clicked.connect(self._save_job)
         export_row.addWidget(btn_save)
         export_row.addStretch()

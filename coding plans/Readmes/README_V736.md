@@ -2,7 +2,7 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.3.6** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.3.4** | Python 3.10+ | PySide6 (Qt 6)
 
 ---
 
@@ -12,19 +12,17 @@ A desktop application for controlling laboratory-scale bioprinting hardware. MEB
 - **Parametric object designer** — 1D (point), 2D (line, circle, square, triangle, spiral, ellipse), and 3D (sphere, cube, cylinder, ellipsoid) with shell/solid and fill pattern options
 - **Image-based toolpaths** — Import TIFF stacks, image sequences, or single images to generate raster toolpaths with per-pump intensity mapping
 - **Well plate support** — Standard 6, 12, 24, 48, 96, and 384-well plates with per-well object assignment
-- **Real-time jogging** — Xbox controller support for manual stage positioning with configurable button mapping, well plate navigator for one-click fast-travel to any well
+- **Real-time jogging** — Xbox controller support for manual stage positioning with configurable button mapping, well plate navigator for one-click fast-travel to any well; trigger creep fixed (platform-based normalization + heartbeat suppression); debug mode toggle for verbose diagnostics
 - **Well plate calibration** — SVD Procrustes similarity-transform registration from 2+ manually-taught well positions; calibrated positions persist across restarts and sync to the jog page navigator automatically
 - **Z-plane calibration** — 3-point teach + least-squares plane fit for automatic tilt compensation
-- **Camera alignment** — ToupTek or USB camera integration for visual plate registration; per-camera objective selector (1x-100x) with theoretical and empirically-measured um/px display; click-to-move on live camera feed
-- **Objective calibration** — Per-camera, per-objective um/px calibration stored in `config/hardware/objectives.json`; empirical stage-motion calibration via `PixelCalibrationDialog`
+- **Camera alignment** — ToupTek or USB camera integration for visual plate registration; per-camera objective selector (1×–100×) with theoretical and empirically-measured µm/px display; click-to-move on live camera feed (click a point to centre it under the needle)
+- **Objective calibration** — Per-camera, per-objective µm/px calibration stored in `config/hardware/objectives.json`; empirical stage-motion calibration via `PixelCalibrationDialog`
 - **Pick & Place mode** — Config-first workflow with live camera target overlays, auto-queue building, and execution monitoring
-- **DPI-aware GUI** — Scales correctly on 1080p, 1440p, 4K, Retina, and ultrawide displays; all dimensions parameterized via `gui/scaling.py`
-- **Hardware simulation** — Physics-based XY and Z/pump simulators with state persistence for offline development and testing
+- **Hardware simulation** — Physics-based XY and Z/pump simulators for offline development and testing
 - **Print monitoring** — Real-time XY path visualization, Z cross-section view, and per-pump volume tracking
 - **Post-print analysis** — Planned vs. actual path comparison, error time series, and statistics
 - **Crash recovery** — Print state persisted to disk for resumption after unexpected interruption
 - **Persistent print files** — Save, load, and manage print designs with schema migration across versions
-- **Standalone executable** — PyInstaller packaging for distribution without Python environment
 
 ---
 
@@ -34,8 +32,8 @@ A desktop application for controlling laboratory-scale bioprinting hardware. MEB
 |-----------|-----------------|
 | XY Stage | Prior ProScan II, ProScan III (RS-232, 38400 baud) |
 | Z/Pump Board | Marlin-compatible 3D printer board (RS-232, 115200 baud, G-code) |
-| Syringes | Hamilton (25-1000 uL catalog included) |
-| Needles | Standard hypodermic 16G-32G |
+| Syringes | Hamilton (25–1000 µL catalog included) |
+| Needles | Standard hypodermic 16G–32G |
 | Controller | Xbox (USB/Bluetooth, via pygame) |
 | Camera | ToupTek (DLL), OpenCV-compatible USB cameras |
 
@@ -110,22 +108,6 @@ python main.py --headless --real-xy --real-zp
 
 Xbox controller jogging without the GUI — useful for manual positioning.
 
-### Standalone Executable
-
-Build a standalone executable (no Python required to run):
-
-```bash
-python build_exe.py --clean
-```
-
-Run the built executable:
-
-```bash
-./dist/MEBP/MEBP                                          # macOS/Linux
-dist\MEBP\MEBP.exe                                        # Windows
-./dist/MEBP/MEBP --simulate-xy --simulate-zp --headless   # headless mode
-```
-
 ### All Options
 
 ```
@@ -139,21 +121,6 @@ python main.py [OPTIONS]
   --settings FILE    Path to settings JSON file (default: settings.json)
   --verbose, -v      Enable debug logging
 ```
-
----
-
-## DPI Scaling
-
-The GUI automatically detects screen DPI and scales all elements proportionally. On standard 96-DPI screens, the UI renders at its baseline size. On high-DPI screens (1440p, 4K, Retina), all buttons, fonts, panels, and spacing scale up.
-
-To manually override the scale factor:
-
-```bash
-MEBP_UI_SCALE=1.5 python main.py    # Force 150% scaling (simulates 4K on 1080p)
-MEBP_UI_SCALE=2.0 python main.py    # Force 200% scaling
-```
-
-The scale factor floor is 1.0 — the UI never shrinks below its 96-DPI design size.
 
 ---
 
@@ -193,8 +160,8 @@ Align your well plate and set up the camera:
 - Auto Z-bottom calibration via focus sweep
 
 **Camera settings:**
-- Per-camera objective selector (1x-100x) with live um/px readout
-- Run **Calibrate um/px** to measure empirically via stage-motion correlation
+- Per-camera objective selector (1×–100×) with live µm/px readout
+- Run **Calibrate µm/px** to measure empirically via stage-motion correlation
 - Calibrated values saved to `config/hardware/objectives.json`
 
 **Z-plane:**
@@ -233,12 +200,10 @@ Post-print analysis:
 ```
 MEBP/
 ├── main.py                    # Application entry point
-├── build_exe.py               # PyInstaller build script
-├── MEBP.spec                  # PyInstaller spec file
 ├── settings.json              # Persistent configuration
 ├── SupportClasses/            # Backend (hardware, geometry, printing)
 │   ├── StageController.py     # Hardware orchestrator
-│   ├── HardwareConfig.py      # Central uL<->mm configuration
+│   ├── HardwareConfig.py      # Central µL↔mm configuration
 │   ├── GeometryEngine.py      # Parametric trajectory generation
 │   ├── PrintManager.py        # Print execution engine
 │   ├── PrintPlanOfAction.py   # Plan generation + PrintExecutionConfig
@@ -246,16 +211,14 @@ MEBP/
 │   └── ...
 ├── gui/                       # Frontend (PySide6)
 │   ├── app.py                 # Main window
-│   ├── scaling.py             # DPI-aware scaling utility
-│   ├── styles.py              # Catppuccin Mocha theme (parameterized)
-│   ├── pages/                 # Application pages (7 main + sub-pages)
-│   └── widgets/               # Custom Qt widgets
+│   ├── pages/                 # Application pages (8)
+│   └── widgets/               # Custom Qt widgets (9)
 ├── config/                    # JSON configuration files
 │   ├── controllers/           # Stage protocol definitions
 │   ├── hardware/              # Needle/syringe/ink catalogs + objectives.json
 │   └── prints/                # Saved print designs
 ├── tests/                     # Test suite
-└── coding plans/              # Architecture docs, update plans, archived READMEs
+└── patches/                   # Version upgrade patches
 ```
 
 ---
@@ -271,7 +234,6 @@ Application settings are stored in `settings.json` and auto-saved on exit. Key s
 - `safety_limits` — Software endstops and max rates
 - `hardware_config` — Full hardware configuration
 - `calibration` — Taught points and Z-plane coefficients
-- `zp_stage` — Z/pump feedrates and EEPROM save settings
 
 ### Controller Protocols
 
@@ -301,18 +263,9 @@ python -m unittest tests/test_v726_print_execution.py
 
 The physics-based simulators (`XYStageSimulator`, `ZPStageSimulator`) provide deterministic testing without hardware. All tests can run in simulation mode.
 
-### Building the Executable
-
-```bash
-python build_exe.py --clean          # Clean build
-python build_exe.py --debug          # Debug build (console visible)
-```
-
-The executable is output to `dist/MEBP/`. Bundle size is approximately 470 MB (large transitive dependencies like TensorFlow and PyTorch are excluded).
-
 ### Architecture Documentation
 
-See `coding plans/Architectures/ARCHITECTURE_V736.md` for comprehensive architecture reference.
+See `coding plans/Architectures/ARCHITECTURE_V729.md` for comprehensive architecture reference (covers through v7.3.4).
 
 ---
 
