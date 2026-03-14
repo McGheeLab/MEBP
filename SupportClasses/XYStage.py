@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import SupportClasses.XYDebugLogger as _dbg
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -500,9 +502,13 @@ class XYStageManager:
             with self._serial_lock:
                 self._send_protocol_command("position_query", fallback_cmd="P")
                 response = _read_response_cr(self.spo, timeout=0.5)
-            return self._parse_position_response(response)
+            result = self._parse_position_response(response)
+            _dbg.log("POLL", raw_rx=repr(response),
+                     pos_x=result[0], pos_y=result[1], pos_z=result[2])
+            return result
         except Exception as e:
             logger.debug(f"XY position query error: {e}")
+            _dbg.log("QUERY_ERR", note=str(e))
             return (None, None, None)
 
 
@@ -525,14 +531,35 @@ class XYStageManager:
 
     def move_stage_at_velocity(self, vx: float, vy: float) -> None:
         """Set XY velocity (continuous jog mode).
-        v7.2.8s2: serial lock prevents collision with position polling.
+        v7.3.4: consume 'R' ack under serial lock — proscan_ii.json confirms
+        VS responds with R, same as GR/G. Without this, every velocity command
+        leaves an unread R\\r in the RX buffer; PositionPoller then reads those
+        accumulated R bytes instead of actual position responses, causing
+        progressively worsening position display lag during Xbox jogging.
         """
-        with self._serial_lock:
+        if self.simulate:
             self._send_protocol_command(
                 "set_velocity",
                 fallback_cmd=f"VS,{vx},{vy}",
                 vx=vx, vy=vy,
             )
+        elif self.spo is not None:
+            if self._protocol:
+                cmd = self._protocol.format_command("set_velocity", vx=vx, vy=vy)
+            else:
+                cmd = f"VS,{vx},{vy}"
+            if cmd:
+                if self._protocol:
+                    encoded = cmd.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{cmd}\r\n".encode("ascii")
+                try:
+                    with self._serial_lock:
+                        self.spo.write(encoded)
+                        _read_response_cr(self.spo, timeout=0.05)
+                except Exception as e:
+                    logger.debug(f"XY move_stage_at_velocity: {e}")
+        _dbg.log("MOVE_VEL", vx=f"{vx:.1f}", vy=f"{vy:.1f}")
 
     def move_stage_to_position(self, x: float, y: float, fast: bool = False) -> None:
         """Move to absolute position (x, y) in stage coordinates.
@@ -566,12 +593,35 @@ class XYStageManager:
         logger.debug(f"XY absolute move: ({x:.0f}, {y:.0f}) fast={fast}")
 
     def move_stage_relative(self, dx: float, dy: float) -> None:
-        """Move by relative offset (dx, dy)."""
-        self._send_protocol_command(
-            "move_relative",
-            fallback_cmd=f"GR {round(dx)},{round(dy)}",
-            dx=round(dx), dy=round(dy),
-        )
+        """Move by relative offset (dx, dy).
+        v7.3.4: consume 'R' ack under serial lock — same as move_stage_to_position.
+        Without this the ack lingers in the serial buffer and the PositionPoller
+        reads 'R' instead of the actual position on its next query.
+        """
+        if self.simulate:
+            self._send_protocol_command(
+                "move_relative",
+                fallback_cmd=f"GR {round(dx)},{round(dy)}",
+                dx=round(dx), dy=round(dy),
+            )
+        elif self.spo is not None:
+            if self._protocol:
+                cmd = self._protocol.format_command(
+                    "move_relative", dx=round(dx), dy=round(dy))
+            else:
+                cmd = f"GR {round(dx)},{round(dy)}"
+            if cmd:
+                if self._protocol:
+                    encoded = cmd.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{cmd}\r\n".encode("ascii")
+                try:
+                    with self._serial_lock:
+                        self.spo.write(encoded)
+                        _read_response_cr(self.spo, timeout=0.05)
+                except Exception as e:
+                    logger.debug(f"XY move_stage_relative: {e}")
+        _dbg.log("MOVE_REL", sent_dx=f"{dx:.1f}", sent_dy=f"{dy:.1f}")
         logger.debug(f"XY relative move: ({dx:.0f}, {dy:.0f})")
 
     def set_home(self) -> None:

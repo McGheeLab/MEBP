@@ -805,7 +805,7 @@ class SettingsPage(QWidget):
 
         grid.addWidget(QLabel("Position Poll Interval:"), row, 0)
         self.spin_poll_interval = QSpinBox()
-        self.spin_poll_interval.setRange(100, 2000)
+        self.spin_poll_interval.setRange(50, 2000)
         self.spin_poll_interval.setSuffix(" ms")
         self.spin_poll_interval.setSingleStep(50)
         grid.addWidget(self.spin_poll_interval, row, 1)
@@ -876,6 +876,45 @@ class SettingsPage(QWidget):
         grid.addWidget(self.xbox_cal_label, row, 0, 1, 3)
         row += 1
 
+        # v7.3.4: Per-axis deadzone thresholds
+        from PySide6.QtWidgets import QDoubleSpinBox as _DSB
+        grid.addWidget(QLabel("Stick Deadzone:"), row, 0)
+        self.xbox_stick_dz_spin = _DSB()
+        self.xbox_stick_dz_spin.setRange(0, 95)
+        self.xbox_stick_dz_spin.setDecimals(1)
+        self.xbox_stick_dz_spin.setSuffix(" %")
+        self.xbox_stick_dz_spin.setValue(20.0)
+        self.xbox_stick_dz_spin.setToolTip(
+            "Deadzone for left and right sticks (axes 0–3).\n"
+            "Input below this % of full deflection is ignored.")
+        self.xbox_stick_dz_spin.setMaximumWidth(90)
+        grid.addWidget(self.xbox_stick_dz_spin, row, 1)
+        row += 1
+
+        grid.addWidget(QLabel("Trigger Deadzone:"), row, 0)
+        self.xbox_trigger_dz_spin = _DSB()
+        self.xbox_trigger_dz_spin.setRange(0, 95)
+        self.xbox_trigger_dz_spin.setDecimals(1)
+        self.xbox_trigger_dz_spin.setSuffix(" %")
+        self.xbox_trigger_dz_spin.setValue(5.0)
+        self.xbox_trigger_dz_spin.setToolTip(
+            "Deadzone for left and right triggers (axes 4–5).\n"
+            "Input below this % of full deflection is ignored.\n"
+            "Keep low — triggers often rest at a non-zero value.")
+        self.xbox_trigger_dz_spin.setMaximumWidth(90)
+        grid.addWidget(self.xbox_trigger_dz_spin, row, 1)
+        row += 1
+
+        # v7.3.4: Debug mode
+        from PySide6.QtWidgets import QCheckBox as _QCB
+        self.chk_xbox_debug = _QCB("Debug Mode")
+        self.chk_xbox_debug.setToolTip(
+            "Log trigger values, axis dispatches, and pump velocity changes.\n"
+            "Reconnect the controller after toggling to apply.")
+        self.chk_xbox_debug.setStyleSheet(f"color: {COLORS['subtext0']};")
+        grid.addWidget(self.chk_xbox_debug, row, 0, 1, 3)
+        row += 1
+
         layout.addLayout(grid)
         self._load_xbox_cal_label()
         parent_layout.addWidget(card)
@@ -932,6 +971,12 @@ class SettingsPage(QWidget):
         self.chk_verbose = QCheckBox("Verbose (Debug) Logging")
         layout.addWidget(self.chk_verbose)
 
+        self.chk_debug_xy = QCheckBox("XY Position Debug Log (CSV)")
+        self.chk_debug_xy.setToolTip(
+            "Record raw serial position data and jog commands to xy_debug_*.csv in the project folder.\n"
+            "Takes effect on next application startup.")
+        layout.addWidget(self.chk_debug_xy)
+
         parent_layout.addWidget(card)
 
     # ════════════════════════════════════════════════════════════════
@@ -976,10 +1021,22 @@ class SettingsPage(QWidget):
         mapping = self.settings.get(
             "xbox.mapping_file", "current_button_mapping.json")
         self.xbox_mapping_label.setText(mapping)
+        # v7.3.4: Deadzone spinboxes
+        if hasattr(self, 'xbox_stick_dz_spin'):
+            self.xbox_stick_dz_spin.setValue(
+                self.settings.get("xbox.deadzones.sticks", 0.20) * 100)
+        if hasattr(self, 'xbox_trigger_dz_spin'):
+            self.xbox_trigger_dz_spin.setValue(
+                self.settings.get("xbox.deadzones.triggers", 0.05) * 100)
+        if hasattr(self, 'chk_xbox_debug'):
+            self.chk_xbox_debug.setChecked(
+                bool(self.settings.get("xbox.debug_mode", False)))
 
         # Logging
         self.chk_verbose.setChecked(
             self.settings.get("logging.verbose", False))
+        self.chk_debug_xy.setChecked(
+            self.settings.get("logging.debug_xy", False))
 
         # v7.3.2: Axis flip
         saved_flips = self.settings.get_section("axis_flip") or {}
@@ -1048,10 +1105,11 @@ class SettingsPage(QWidget):
 
         self.settings.set_section("safety_limits", sl.to_dict())
 
-        # Polling → apply immediately
+        # Polling → apply immediately (GUI timer reads setting on next tick)
         poll_ms = self.spin_poll_interval.value()
         self.controller._pos_poller.poll_interval = poll_ms / 1000.0
         self.settings.set("polling.position_interval_ms", poll_ms)
+        self.controller._watchdog.check_interval = self.spin_watchdog.value()
         self.settings.set(
             "polling.watchdog_interval_s", self.spin_watchdog.value())
 
@@ -1064,12 +1122,25 @@ class SettingsPage(QWidget):
         # Xbox
         self.settings.set(
             "xbox.mapping_file", self.xbox_mapping_label.text())
+        # v7.3.4: Deadzone thresholds (stored as 0–1 fractions)
+        if hasattr(self, 'xbox_stick_dz_spin'):
+            self.settings.set(
+                "xbox.deadzones.sticks",
+                round(self.xbox_stick_dz_spin.value() / 100.0, 4))
+        if hasattr(self, 'xbox_trigger_dz_spin'):
+            self.settings.set(
+                "xbox.deadzones.triggers",
+                round(self.xbox_trigger_dz_spin.value() / 100.0, 4))
+        if hasattr(self, 'chk_xbox_debug'):
+            self.settings.set("xbox.debug_mode", self.chk_xbox_debug.isChecked())
 
         # Logging → apply immediately
         verbose = self.chk_verbose.isChecked()
         self.settings.set("logging.verbose", verbose)
         log_level = logging.DEBUG if verbose else logging.INFO
         logging.getLogger().setLevel(log_level)
+
+        self.settings.set("logging.debug_xy", self.chk_debug_xy.isChecked())
 
         # v7.3.2: Axis flip → controller + settings
         flip_dict = {axis: chk.isChecked()

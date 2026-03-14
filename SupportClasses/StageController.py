@@ -28,6 +28,7 @@ from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
 from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.HardwareConfig import HardwareConfig
 from SupportClasses.PositionLogger import PositionLogger
+import SupportClasses.XYDebugLogger as _dbg
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,11 @@ class XboxQueuePoller:
     events to the Processor command bus.
     """
 
-    def __init__(self, queue: Queue, processor: Processor):
+    def __init__(self, queue: Queue, processor: Processor,
+                 debug_mode: bool = False):
         self.queue = queue
         self.processor = processor
+        self.debug_mode = debug_mode
         self._running = False
         self._thread: threading.Thread | None = None
         # v7.2.6: S4-D status handler — track controller state from worker
@@ -81,13 +84,23 @@ class XboxQueuePoller:
                         logger.info(f"[Xbox] Status: {self._xbox_status}")
                 elif "debug" in msg:
                     text = msg["debug"]
-                    if "connect" in text.lower() or "found" in text.lower():
+                    # Always show connection events; show diagnostic messages
+                    # only when debug mode is enabled.
+                    if ("connect" in text.lower() or "found" in text.lower()
+                            or self.debug_mode):
                         logger.info(f"[Xbox] {text}")
                 elif "button" in msg:
                     self.processor.add_command(msg["command"], button=msg["button"])
                 elif "axis" in msg:
+                    avg = msg["average"]
+                    cmd = msg["command"]
+                    # Log pump axis commands only in debug mode
+                    if self.debug_mode and "p" in cmd.lower() and "velocity" in cmd.lower():
+                        logger.info(
+                            f"[Xbox→Proc] {cmd}  axis={msg['axis']}  avg={avg}"
+                        )
                     self.processor.add_command(
-                        msg["command"], axis=msg["axis"], average=msg["average"]
+                        cmd, axis=msg["axis"], average=avg
                     )
                 elif "dpad" in msg:
                     self.processor.add_command(msg["command"], direction=msg["dpad"])
@@ -293,7 +306,13 @@ class ZPJogHandler:
         vel = self._pump_vel_mm_s(raw, pump_id)
         vel = self._clamp_pump_flow(vel, pump_id)
         with self._lock:
+            prev_vel = getattr(self, vel_attr, 0.0)
             setattr(self, vel_attr, vel)
+        # v7.3.4: Pump velocity trace — debug level so it only appears when
+        # the app log level is set to DEBUG (or Xbox debug mode is on).
+        logger.debug(
+            f"[ZPJog] {pump_id} vel: {prev_vel:.4f} → {vel:.4f}  (raw={raw:.4f})"
+        )
 
     def _handle_p1_vel(self, *args, **kwargs):
         self._handle_pump_vel("P1", "vel_p1", *args, **kwargs)
@@ -496,6 +515,13 @@ class XYJogHandler:
                 logger.debug(f"[XY] Jog start: x={vx:.1f} y={vy:.1f}")
             elif not is_moving and self._was_moving:
                 logger.debug("[XY] Jog stop")
+                # Send explicit zero-velocity so the ProScan stops immediately.
+                # The stage uses continuous velocity mode and will keep moving
+                # until a zero command is received.
+                try:
+                    self.stage.move_stage_at_velocity(0, 0)
+                except Exception as e:
+                    logger.warning(f"[XY] Stop command failed: {e}")
             self._was_moving = is_moving
 
             if not is_moving:
@@ -551,9 +577,19 @@ class PositionPoller:
         self._lock = threading.Lock()
         self._xy_pos: tuple = (None, None, None)
         self._zp_pos: tuple = (None, None, None, None)
+        self._suspended = False  # v7.3.4: pause polling during programmatic moves
 
         # v7.2.7: init _hardware_config
         self._hardware_config = None
+
+    def suspend(self) -> None:
+        """Pause hardware queries (e.g., during safe_travel_to) to prevent
+        serial races between the poll thread and caller-side waits."""
+        self._suspended = True
+
+    def resume(self) -> None:
+        """Resume normal polling after a programmatic move completes."""
+        self._suspended = False
 
     def set_stages(
         self,
@@ -592,22 +628,31 @@ class PositionPoller:
 
     def _poll_loop(self) -> None:
         while self._running:
+            if self._suspended:
+                time.sleep(0.05)
+                continue
+
             with self._lock:
                 xy, zp = self._xy_stage, self._zp_stage
 
             if xy is not None:
                 try:
                     pos = xy.get_current_position()
-                    with self._lock:
-                        self._xy_pos = pos
+                    if pos[0] is not None:
+                        with self._lock:
+                            self._xy_pos = pos
+                        if _dbg.is_enabled() and getattr(xy, 'simulate', False):
+                            _dbg.log("POLL", pos_x=pos[0], pos_y=pos[1], pos_z=pos[2],
+                                     note="simulated")
                 except Exception as e:
                     logger.debug(f"XY poll error: {e}")
 
             if zp is not None:
                 try:
                     pos = zp.get_current_position()
-                    with self._lock:
-                        self._zp_pos = pos
+                    if pos[0] is not None:
+                        with self._lock:
+                            self._zp_pos = pos
                 except Exception as e:
                     logger.debug(f"ZP poll error: {e}")
 
@@ -631,6 +676,8 @@ class StageController:
         simulate_xy: bool = True,
         simulate_zp: bool = True,
         controller_json: str | None = None,
+        poll_interval: float = 0.3,
+        watchdog_interval: float = 2.0,
     ):
         self.simulate_xy = simulate_xy
         self.simulate_zp = simulate_zp
@@ -668,11 +715,11 @@ class StageController:
         self.position_logger = PositionLogger()
 
         # Watchdog for real hardware disconnects
-        self._watchdog = ConnectionWatchdog(check_interval=3.0)
+        self._watchdog = ConnectionWatchdog(check_interval=watchdog_interval)
         self._watchdog.start()
 
-        # Background position cache
-        self._pos_poller = PositionPoller(poll_interval=0.3)  # v7.2.8: poll interval restored  # v7.2.6: poll interval 1.0s
+        # Background position cache — interval from settings (default 0.3s)
+        self._pos_poller = PositionPoller(poll_interval=poll_interval)
         self._pos_poller.start()
 
         # Disconnect callback (GUI can set this)
@@ -845,8 +892,11 @@ class StageController:
     def connect_xbox(self, mapping_file: str = "current_button_mapping.json",
                      use_thread: bool = False,
                      reconnect_timeout: float = 30.0,
-                     stick_offsets: dict | None = None) -> None:
-        """Connect Xbox controller. v7.2.7: thread fallback, v7.3.2: stick offsets
+                     stick_offsets: dict | None = None,
+                     axis_deadzones: dict | None = None,
+                     debug_mode: bool = False) -> None:
+        """Connect Xbox controller. v7.2.7: thread fallback, v7.3.2: stick offsets,
+        v7.3.4: axis_deadzones, debug_mode.
 
         Args:
             mapping_file: Path to button mapping JSON.
@@ -855,6 +905,8 @@ class StageController:
                         invisible to spawned subprocesses.
             reconnect_timeout: Seconds to attempt reconnection after loss.
             stick_offsets: Per-axis center offsets from calibration (v7.3.2).
+            axis_deadzones: Per-axis deadzone thresholds, keys are int axis
+                            indices, values 0–1 (v7.3.4).
         """
         if self.xbox_process and self.xbox_process.is_alive():
             logger.warning("Xbox already connected")
@@ -880,10 +932,17 @@ class StageController:
         if stick_offsets:
             _so = {int(k): v for k, v in stick_offsets.items()}
 
+        # v7.3.4: Convert axis_deadzones keys to int for multiprocessing
+        _adz = None
+        if axis_deadzones:
+            _adz = {int(k): float(v) for k, v in axis_deadzones.items()}
+
         _worker_kwargs = {
             "mapping_file": self._mapping_file,
             "reconnect_timeout": reconnect_timeout,
             "stick_offsets": _so,
+            "axis_deadzones": _adz,
+            "debug_mode": debug_mode,
         }
 
         if use_thread:
@@ -908,7 +967,9 @@ class StageController:
             self.xbox_process.start()
             logger.info(f"Xbox worker started (PROCESS mode, mapping: {self._mapping_file})")
 
-        self.xbox_poller = XboxQueuePoller(self.xbox_queue, self.processor)
+        self.xbox_poller = XboxQueuePoller(
+            self.xbox_queue, self.processor, debug_mode=debug_mode
+        )
         self.xbox_poller.start()
         self.xbox_poller._xbox_status = "waiting"  # v7.2.7: force initial status
 
@@ -931,6 +992,18 @@ class StageController:
             pass
         self._xbox_thread = None
         self.xbox_queue = None
+        # v7.3.4: Zero all jog velocities on disconnect so a stranded velocity
+        # from an in-flight command can't persist and drive the stage.
+        if self.zp_jog:
+            with self.zp_jog._lock:
+                self.zp_jog.vel_z = 0.0
+                self.zp_jog.vel_p1 = 0.0
+                self.zp_jog.vel_p2 = 0.0
+                self.zp_jog.vel_p3 = 0.0
+        if self.xy_jog:
+            with self.xy_jog._lock:
+                self.xy_jog.vel_x = 0.0
+                self.xy_jog.vel_y = 0.0
         logger.info("Xbox controller disconnected")
 
 
@@ -1293,20 +1366,32 @@ class StageController:
         if not self.xy_stage:
             return
 
+        req_dx, req_dy = dx_um, dy_um  # preserve original request for debug log
+        cached_pos = self.get_xy_position(cached=True)
+
         # Safety: project cached position + delta, clamp if needed
         # Note: safety limits and positions are all in the same units (microns)
         if self.safety_limits.enabled:
-            pos = self.get_xy_position(cached=True)
-            if pos[0] is not None:
+            if cached_pos[0] is not None:
                 zero_x = self.zero_position["x"]
                 zero_y = self.zero_position["y"]
-                cur_zr_x = pos[0] - zero_x
-                cur_zr_y = pos[1] - zero_y
+                cur_zr_x = cached_pos[0] - zero_x
+                cur_zr_y = cached_pos[1] - zero_y
                 new_zr_x = cur_zr_x + dx_um
                 new_zr_y = cur_zr_y + dy_um
                 clamped_x, clamped_y = self.safety_limits.clamp_xy(new_zr_x, new_zr_y)
                 dx_um = clamped_x - cur_zr_x
                 dy_um = clamped_y - cur_zr_y
+
+        clamped = (dx_um != req_dx or dy_um != req_dy)
+        _dbg.log(
+            "JOG_CMD",
+            cmd_dx=f"{req_dx:.1f}", cmd_dy=f"{req_dy:.1f}",
+            sent_dx=f"{dx_um:.1f}", sent_dy=f"{dy_um:.1f}",
+            cached_x=f"{cached_pos[0]:.1f}" if cached_pos[0] is not None else "",
+            cached_y=f"{cached_pos[1]:.1f}" if cached_pos[1] is not None else "",
+            note="safety clamped" if clamped else "",
+        )
 
         logger.debug(f"move_xy_relative_um: sending dx={dx_um:.1f} dy={dy_um:.1f} µm")
         self.xy_stage.move_stage_relative(dx_um, dy_um)
@@ -1385,43 +1470,62 @@ class StageController:
         """
         ok = True
 
-        # Step 1: Raise Z to safe height and WAIT for arrival
-        if self.is_zp_connected:
-            self.move_z_absolute(safe_z_mm, from_zero_ref=True)
-            if not self.wait_for_z_arrival(safe_z_mm, tolerance_mm=0.1,
-                                           timeout_s=z_timeout_s):
-                logger.warning("safe_travel_to: Z retract timed out — "
-                               "proceeding with XY move anyway")
-                ok = False
-
-        # Step 2: Fast XY travel and WAIT for arrival
-        if self.is_xy_connected:
-            if hasattr(self, 'xy_stage') and self.xy_stage:
-                if hasattr(self.xy_stage, 'set_speed_mm_s'):
-                    self.xy_stage.set_speed_mm_s(fast_xy_speed_mm_s)
+        # Suspend the position poller for the entire sequence to prevent
+        # serial races between the poller thread and our M400 / M114 waits.
+        self._pos_poller.suspend()
+        try:
+            # Step 1: Raise Z to safe height and WAIT for physical completion
+            if self.is_zp_connected:
+                self.move_z_absolute(safe_z_mm, from_zero_ref=True)
+                if hasattr(self.zp_stage, 'flush_moves'):
+                    # M400: Marlin only responds 'ok' after all moves are done
+                    if not self.zp_stage.flush_moves(timeout_s=z_timeout_s):
+                        logger.warning("safe_travel_to: Z retract timed out (M400) — "
+                                       "proceeding with XY move anyway")
+                        ok = False
                 else:
-                    self.xy_stage.set_velocity(100)
-            self.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
+                    if not self.wait_for_z_arrival(safe_z_mm, tolerance_mm=0.1,
+                                                   timeout_s=z_timeout_s):
+                        logger.warning("safe_travel_to: Z retract timed out — "
+                                       "proceeding with XY move anyway")
+                        ok = False
 
-            # Convert raw stage coords to zero-ref mm (matching get_xy_position_mm)
-            zero_x = self.zero_position.get("x", 0)
-            zero_y = self.zero_position.get("y", 0)
-            target_x_mm = (target_x_um - zero_x) / 1000.0
-            target_y_mm = (target_y_um - zero_y) / 1000.0
-            if not self.wait_for_xy_arrival(target_x_mm, target_y_mm,
-                                            tolerance_mm=0.5,
-                                            timeout_s=xy_timeout_s):
-                logger.warning("safe_travel_to: XY arrival timed out — "
-                               "proceeding with Z descent anyway")
-                ok = False
+            # Step 2: Fast XY travel and WAIT for arrival
+            if self.is_xy_connected:
+                if hasattr(self, 'xy_stage') and self.xy_stage:
+                    if hasattr(self.xy_stage, 'set_speed_mm_s'):
+                        self.xy_stage.set_speed_mm_s(fast_xy_speed_mm_s)
+                    else:
+                        self.xy_stage.set_velocity(100)
+                self.move_xy_absolute(target_x_um, target_y_um, from_zero_ref=False)
 
-        # Step 3: Lower Z to target and WAIT for arrival
-        if self.is_zp_connected and target_z_mm is not None:
-            self.move_z_absolute(target_z_mm, from_zero_ref=True)
-            if not self.wait_for_z_arrival(target_z_mm, tolerance_mm=0.1,
-                                           timeout_s=z_timeout_s):
-                logger.warning("safe_travel_to: Z descent timed out")
-                ok = False
+                # Convert raw stage coords to zero-ref mm (matching get_xy_position_mm)
+                zero_x = self.zero_position.get("x", 0)
+                zero_y = self.zero_position.get("y", 0)
+                target_x_mm = (target_x_um - zero_x) / 1000.0
+                target_y_mm = (target_y_um - zero_y) / 1000.0
+                if not self.wait_for_xy_arrival(target_x_mm, target_y_mm,
+                                                tolerance_mm=0.5,
+                                                timeout_s=xy_timeout_s):
+                    logger.warning("safe_travel_to: XY arrival timed out — "
+                                   "proceeding with Z descent anyway")
+                    ok = False
+
+            # Step 3: Lower Z to target and WAIT for physical completion
+            if self.is_zp_connected and target_z_mm is not None:
+                self.move_z_absolute(target_z_mm, from_zero_ref=True)
+                if hasattr(self.zp_stage, 'flush_moves'):
+                    if not self.zp_stage.flush_moves(timeout_s=z_timeout_s):
+                        logger.warning("safe_travel_to: Z descent timed out (M400)")
+                        ok = False
+                else:
+                    if not self.wait_for_z_arrival(target_z_mm, tolerance_mm=0.1,
+                                                   timeout_s=z_timeout_s):
+                        logger.warning("safe_travel_to: Z descent timed out")
+                        ok = False
+
+        finally:
+            self._pos_poller.resume()
 
         logger.info(f"Safe travel to ({target_x_um:.0f}, {target_y_um:.0f}) µm, "
                     f"safe_z={safe_z_mm:.2f} mm, ok={ok}")

@@ -1,7 +1,7 @@
-# MEBP v7.2.9 — Architecture Reference
+# MEBP v7.3.4 — Architecture Reference
 
 **Multi-Extrusion Bioprinting Platform**
-**Version 7.2.9 | March 2026**
+**Version 7.3.4 | March 2026**
 
 ---
 
@@ -58,6 +58,7 @@ MEBP/
 │   ├── hardware/
 │   │   ├── needles.json                 # Needle gauge catalog (16G–32G)
 │   │   ├── syringes.json                # Hamilton syringe catalog (25–1000 µL)
+│   │   ├── objectives.json              # Per-camera objective µm/px calibrations  ← v7.3.4
 │   │   └── Standard Bioprinting Setup.json  # Example HardwareConfig
 │   └── prints/                          # Persistent print file storage
 │       ├── PIAR.json                    # Saved print designs
@@ -96,7 +97,9 @@ MEBP/
 │   ├── auto_layout.py                   # Ring/grid/hex layout generators
 │   ├── VisionDetector.py                # Well/needle detection, focus scoring  ← v7.3.0
 │   ├── SimulatedCamera.py               # Synthetic microscope with DOF model   ← v7.3.0
-│   └── MosaicBuilder.py                 # Affine calibration (Procrustes SVD)   ← v7.3.1
+│   ├── MosaicBuilder.py                 # Affine calibration (Procrustes SVD)   ← v7.3.1
+│   ├── MosaicCalibrator.py              # Manual SVD Procrustes point-set reg.  ← v7.3.4
+│   └── ObjectiveCalibration.py          # Per-camera objective µm/px store      ← v7.3.4
 │
 ├── gui/                                 # Frontend — PySide6 / Qt 6
 │   ├── __init__.py
@@ -271,8 +274,8 @@ MainWindow (app.py)
 ├── QStackedWidget (page router)
 │   ├── Page 0: HardwareSetupPage      — needle, pumps, inks, ink swap strategy
 │   ├── Page 1: DashboardPage           — connection status, position readouts
-│   ├── Page 2: JogControlPage          — manual jogging, Xbox mapping
-│   ├── Page 3: CalibrationPage         — 3-well auto-cal, auto Z-bottom, validation
+│   ├── Page 2: JogControlPage          — manual jogging, Xbox mapping, well plate navigator
+│   ├── Page 3: CalibrationPage         — 3-well auto-cal, manual SVD training, auto Z-bottom, objective µm/px, click-to-move  ← v7.3.4
 │   ├── Page 4: PrintSetupPage          — 4-tab print designer  ← v7.2.9
 │   │   ├── Tab 1: WorkspaceTab         — read-only hardware summary
 │   │   ├── Tab 2: PrintObjectsTab      — CAD-like object editor
@@ -298,9 +301,13 @@ The central hardware abstraction that manages all physical devices:
 - **Connection management**: `connect_xy_stage()`, `connect_zp_stage()`, `connect_xbox()`
 - **Position queries**: `get_xy_position()`, `get_z_position()` (cached via PositionPoller)
 - **Motion**: `move_xy_absolute()`, `move_xy_relative()`, `move_z_relative()`, `move_pump_uL()`
-- **Xbox integration**: `XboxQueuePoller` dispatches controller events to `XYJogHandler`/`ZPJogHandler`
+- **Xbox integration**: `XboxQueuePoller` dispatches controller events to `XYJogHandler`/`ZPJogHandler`; `debug_mode` flag gates verbose trigger/dispatch/velocity logs
 - **Xbox status**: `is_xbox_connected` property checks poller status (thread mode on macOS)
 - **Properties**: `is_xy_connected`, `is_zp_connected`, `is_xbox_connected`, `current_position`
+- **Safe travel**: `safe_travel_to(x_um, y_um, safe_z_mm)` — suspends `PositionPoller`, sends Z move + `flush_moves` (M400), fast XY + `wait_for_xy_arrival`, optional Z descend + `flush_moves`, resumes poller. Guarantees physical Z completion before XY starts.
+- **PositionPoller**: `suspend()`/`resume()` methods pause background hardware polling to prevent serial races during programmatic moves. `_suspended` flag checked at top of `_poll_loop`.
+
+**Critical serial protocol note (v7.3.4):** The ProScan II/III stage responds with `R\r` to *every* command — including position queries (`P`), relative moves (`GR`), absolute moves (`G`), and velocity commands (`VS`). Every command that writes to the serial port **must** consume this `R\r` ack under `_serial_lock` (write + read atomically). Failure to read the ack causes byte accumulation in the RX buffer; the `PositionPoller` then reads stale `R` bytes instead of position responses, causing progressively worsening display lag. This was the root cause of the v7.3.4 XY lag bug fixed in `XYStage.move_stage_at_velocity()`.
 
 ### 5.2 HardwareConfig.py — Central Configuration
 
@@ -347,7 +354,7 @@ Converts image stacks into raster toolpaths for image-based printing.
 - Output: Nx7 array `[x, y, z, p1, p2, p3, t]` (mm/s units)
 - CSV export via `save_csv()`
 
-### 5.9 Vision & Calibration System (v7.3.0 / v7.3.1)
+### 5.9 Vision & Calibration System (v7.3.0 / v7.3.1 / v7.3.4)
 
 ```
 VisionDetector.py
@@ -367,10 +374,23 @@ SimulatedCamera.py
 └── set_stage_position(x, y, z_mm) — updates camera viewpoint
 
 MosaicBuilder.py
-├── AffineCalibration (Procrustes SVD similarity transform)
+├── AffineCalibration (Procrustes SVD similarity transform)  ← auto-scan path
 │   ├── correct_positions(predicted) → calibrated dict
-│   └── rotation_deg, scale, translation, rms_residual
+│   ├── rotation_deg, scale, translation_um, center_um, rms_residual
+│   └── is_identity — True if transform is essentially a no-op
 └── Frame collection + composite stitching (legacy mosaic support)
+
+MosaicCalibrator.py  ← v7.3.4: manual teaching path
+├── add_point(pred_x, pred_y, meas_x, meas_y) — accumulate matched pairs
+├── solve() — SVD Procrustes fit; requires ≥2 pairs; unique for 2-pt case
+├── correct_positions(predicted_dict) → corrected dict
+└── rms_error_um — RMS residual in µm after solve
+
+ObjectiveCalibration.py  ← v7.3.4
+├── ObjectiveCalibrationStore — load/save objectives.json
+│   ├── get_calibration(camera_model, objective_name) → µm/px or None
+│   └── set_calibration(camera_model, objective_name, um_per_px)
+└── get_store() — lazy singleton accessor
 
 Detection Pipeline (GUI)
 ├── DetectionWorker (QThread, pull-based frame consumer)
@@ -378,6 +398,39 @@ Detection Pipeline (GUI)
 │   └── Emits: detection_result, focus_updated signals
 └── DetectionOverlay (QPainter overlay with aspect-ratio-aware mapping)
 ```
+
+#### Well Plate Calibration Data Flow (v7.3.4)
+
+```
+CalibrationPage
+├── _predicted_positions  ← plate.get_all_positions_from_a1(taught_a1)
+├── _calibrated_positions ← AffineCalibration.correct_positions(_predicted_positions)
+│                           (set by auto-scan OR manual MosaicCalibrator training)
+├── _three_well_calibration: AffineCalibration  ← persisted to settings.calibration.mosaic_affine
+├── calibration_data_changed: Signal
+└── get_calibration_data() → (plate, positions, safe_z)
+                                      │
+                        Signal connection + immediate push
+                        (app.py wires after load_startup_plate)
+                                      │
+JogControlPage
+├── _well_positions: dict (calibrated or approximate)
+├── _safe_z: float
+├── set_calibration_data(plate, positions, safe_z)
+└── _well_nav: WellPlateNavigator
+    ├── Calibrated positions  → green wells
+    ├── Approximate positions → yellow wells
+    ├── Current position      → blue highlight
+    └── well_clicked.emit(well_name) → controller.safe_travel_to(x, y, safe_z)
+
+Persistence:
+  On training:   _save_calibration() → settings.calibration.mosaic_affine (auto-saved)
+  On startup:    _load_calibration() → AffineCalibration → _calibrated_positions
+                 app.py: load_startup_plate() then immediate set_calibration_data() push
+```
+
+**Coordinate systems:**
+- All `_predicted_positions` and `_calibrated_positions` are in **absolute stage µm** (origin at stage mechanical limit). Zero-reference (`controller.zero_position`) is applied only when displaying values to the user. Calibrated positions remain valid even if the zero reference changes.
 
 ### 5.3 GeometryEngine.py — Parametric Object Generation
 
@@ -451,7 +504,7 @@ Robust serial communication layer:
 - `G1 E5 F10` → extrude 5mm at 10mm/min (pump)
 - `M114` → report current position
 - `G28 Z` → home Z axis
-- `M400` → wait for moves to complete
+- `M400` → wait for all moves to complete (**used by `ZPStage.flush_moves()`** — the reliable Z-arrival signal in `safe_travel_to`; only returns `ok` after physical completion, not just planner acceptance)
 
 ### 6.3 Xbox Controller (pygame via multiprocessing)
 
@@ -461,6 +514,9 @@ Robust serial communication layer:
 - `XboxQueuePoller` (thread in main process) dispatches events to `Processor` command bus
 - Button mapping loaded from `current_button_mapping.json` (hot-reloadable)
 - macOS: Uses thread mode (no subprocess) due to macOS Bluetooth restrictions
+- **Trigger normalization (v7.3.4)**: Windows/Linux XInput triggers rest at `-1.0`; hardcoded offset `{4: -1.0, 5: -1.0}` normalizes to `0..1`. macOS triggers already `0..1`.
+- **Heartbeat suppression (v7.3.4)**: `pygame.joystick.quit()/init()` every 3s causes triggers to transiently report `0.0`. `_accum_suppress_until` timestamp blocks axis accumulation for `avg_interval + 0.15s` after each reinit.
+- **Debug mode (v7.3.4)**: `debug_mode` flag passed from Settings → Dashboard → `connect_xbox()` → subprocess kwargs. Gates: startup trigger diagnostic, periodic TRIG DIAG every 2s, per-dispatch log.
 
 ---
 
@@ -737,9 +793,9 @@ Auto-saved on application exit via `Settings.save()`.
 
 | Component | Threading Model | Safety Mechanism |
 |-----------|----------------|-----------------|
-| StageController | Main thread + PositionPoller thread | Processor command bus (FIFO queue) |
+| StageController | Main thread + PositionPoller thread | Processor command bus (FIFO queue); PositionPoller suspended during `safe_travel_to` to prevent serial races |
 | XboxController | Separate Process (multiprocessing) | Queue-based event passing |
-| XboxQueuePoller | Daemon thread in main process | Dispatches to Processor |
+| XboxQueuePoller | Daemon thread in main process | Dispatches to Processor; zeros jog velocities on disconnect |
 | PrintManager | Daemon thread for execution | Qt Signals (QueuedConnection) for GUI updates |
 | SerialUtils | Called from various threads | `retry_serial` decorator, `ConnectionWatchdog` |
 | GUI | Main thread only (Qt requirement) | Signal/slot for cross-thread updates |
@@ -780,6 +836,7 @@ Auto-saved on application exit via `Settings.save()`.
 | v7.3.1 | Calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (removed manual Teach A1/Corner), per-well 50% overlap scanning, jog page well plate navigator, MosaicBuilder affine engine, 110 tests total |
 | v7.3.2 | QoL upgrades: camera config persistence, jog page startup well plate, axis flip checkboxes (Z + pumps), custom jog step sizes + absolute goto, calibration page restructure (steps to main, configurable cameras, deprecate needle zero), print monitor camera overlay, settings page manual zero calibration, Xbox stick zero calibration, safe travel Z-wait standardization |
 | v7.3.3 | Mode-based navigation restructure (ModePage base class, right-side icon sub-nav), Printing mode container (wraps print setup/monitor/results/helpers), Pick & Place mode (PickAndPlaceManager backend, ImageStitcher, target selection with camera overlays, operation queue auto-building, execution monitoring), CameraManager shared across pages, TargetOverlayCameraView (live feed target overlays), PPOperationSetupPage (config-first workflow), camera µm/px empirical calibration (stage-move phase correlation dialog), relaxed needle detection with interactive edge refinement + accept/reject UI, needle-based µm/px calibration bridge |
+| v7.3.4 | **Bug fixes:** XY progressive lag during Xbox jogging (ProScan R-ack accumulation in VS command), XY stage does not stop when joystick returns to deadzone (VS 0,0 not sent on stop), well plate calibration not persistent (MosaicCalibrator.py created, save/load race fixed), per-tick setStyleSheet overhead (state-change guards), MosaicCalibrator module missing. **New features:** Per-camera objective selector with theoretical + empirical µm/px (ObjectiveCalibration.py + objectives.json), Xbox trigger creep fix (platform-based rest values + `_accum_suppress_until` heartbeat suppression + velocity zeroing on disconnect), Xbox debug mode (settings toggle propagated to subprocess; gates TRIG DIAG / dispatch / velocity logs), calibration page click-to-move (Click→Move toggle + `_on_feed_clicked` handler via `CameraFeedView.clicked`), safe navigation Z-wait reliability (`ZPStage.flush_moves` M400, `PositionPoller.suspend/resume`, `safe_travel_to` uses M400 instead of M114 polling) |
 
 ---
 

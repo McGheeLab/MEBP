@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.3** — Microscope-Enabled Bioprinting Platform
+**V7.3.4** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.3`
+Branch: `Version-7.3.4`
 
 ---
 
@@ -77,6 +77,7 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v733_to_v734_UPDATE.md` | v7.3.4 Objective-based µm/px calibration (per-camera selector, objectives.json, ObjectiveCalibration.py), MosaicCalibrator.py (manual SVD training persistence fix), XY lag fix (ProScan R-ack), XY stop fix (VS 0,0 on jog stop), CSS overhead fix, Xbox trigger creep fix (platform normalization + heartbeat suppression + velocity zeroing), Xbox debug mode (settings toggle → subprocess), calibration click-to-move (Click→Move toggle + CameraFeedView.clicked), safe navigation Z-wait fix (ZPStage.flush_moves M400 + PositionPoller.suspend/resume) |
 | `MEBP_v732_to_v733_UPDATE.md` | v7.3.3 Mode-based navigation + Pick & Place: ModePage base class with right-side icon nav, Printing mode (wraps print sub-pages), Pick & Place mode (config-first workflow, live camera target overlays, auto-queue building, execution monitoring), CameraManager shared feeds, camera µm/px empirical calibration (stage-move phase correlation), relaxed needle detection with interactive edge refinement + accept/reject UI, needle-based µm/px bridge |
 | `MEBP_v731_to_v732_UPDATE.md` | v7.3.2 QoL upgrades: camera config persistence, jog page startup well plate, axis flip checkboxes, custom step sizes + absolute goto, calibration page restructure (steps to main, configurable cameras, deprecate needle zero), print monitor camera overlay |
 | `MEBP_v730_to_v731_UPDATE.md` | v7.3.1 calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (no manual teach steps), per-well 50% overlap scanning, jog page well plate navigator, 110 tests |

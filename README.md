@@ -2,7 +2,7 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.2.9** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.3.4** | Python 3.10+ | PySide6 (Qt 6)
 
 ---
 
@@ -12,9 +12,12 @@ A desktop application for controlling laboratory-scale bioprinting hardware. MEB
 - **Parametric object designer** — 1D (point), 2D (line, circle, square, triangle, spiral, ellipse), and 3D (sphere, cube, cylinder, ellipsoid) with shell/solid and fill pattern options
 - **Image-based toolpaths** — Import TIFF stacks, image sequences, or single images to generate raster toolpaths with per-pump intensity mapping
 - **Well plate support** — Standard 6, 12, 24, 48, 96, and 384-well plates with per-well object assignment
-- **Real-time jogging** — Xbox controller support for manual stage positioning with configurable button mapping
+- **Real-time jogging** — Xbox controller support for manual stage positioning with configurable button mapping, well plate navigator for one-click fast-travel to any well; trigger creep fixed (platform-based normalization + heartbeat suppression); debug mode toggle for verbose diagnostics
+- **Well plate calibration** — SVD Procrustes similarity-transform registration from 2+ manually-taught well positions; calibrated positions persist across restarts and sync to the jog page navigator automatically
 - **Z-plane calibration** — 3-point teach + least-squares plane fit for automatic tilt compensation
-- **Camera alignment** — ToupTek or USB camera integration for visual plate registration
+- **Camera alignment** — ToupTek or USB camera integration for visual plate registration; per-camera objective selector (1×–100×) with theoretical and empirically-measured µm/px display; click-to-move on live camera feed (click a point to centre it under the needle)
+- **Objective calibration** — Per-camera, per-objective µm/px calibration stored in `config/hardware/objectives.json`; empirical stage-motion calibration via `PixelCalibrationDialog`
+- **Pick & Place mode** — Config-first workflow with live camera target overlays, auto-queue building, and execution monitoring
 - **Hardware simulation** — Physics-based XY and Z/pump simulators for offline development and testing
 - **Print monitoring** — Real-time XY path visualization, Z cross-section view, and per-pump volume tracking
 - **Post-print analysis** — Planned vs. actual path comparison, error time series, and statistics
@@ -145,11 +148,24 @@ Move stages manually using on-screen buttons or Xbox controller. Configure jog s
 
 ### 4. Calibration (Page 3)
 
-Align your well plate using 3-point teach:
-1. Jog to well A1, teach position
-2. Jog to opposite corner, teach position
-3. Jog to third point, teach position
-4. System fits a Z-plane for automatic tilt compensation
+Align your well plate and set up the camera:
+
+**Manual XY training:**
+1. Jog to any 2+ wells, teach each position
+2. Press **Train** — SVD Procrustes fit corrects all predicted well positions
+3. Calibrated positions are auto-saved and pushed to the Jog page navigator
+
+**Auto-calibration (camera required):**
+- 3-well auto-scan with Procrustes SVD fit
+- Auto Z-bottom calibration via focus sweep
+
+**Camera settings:**
+- Per-camera objective selector (1×–100×) with live µm/px readout
+- Run **Calibrate µm/px** to measure empirically via stage-motion correlation
+- Calibrated values saved to `config/hardware/objectives.json`
+
+**Z-plane:**
+- 3-point teach + least-squares plane fit for automatic tilt compensation
 
 ### 5. Print Setup (Page 4)
 
@@ -199,7 +215,7 @@ MEBP/
 │   └── widgets/               # Custom Qt widgets (9)
 ├── config/                    # JSON configuration files
 │   ├── controllers/           # Stage protocol definitions
-│   ├── hardware/              # Needle/syringe/ink catalogs
+│   ├── hardware/              # Needle/syringe/ink catalogs + objectives.json
 │   └── prints/                # Saved print designs
 ├── tests/                     # Test suite
 └── patches/                   # Version upgrade patches
@@ -249,7 +265,7 @@ The physics-based simulators (`XYStageSimulator`, `ZPStageSimulator`) provide de
 
 ### Architecture Documentation
 
-See `coding plans/Architectures/ARCHITECTURE_V729.md` for comprehensive architecture reference.
+See `coding plans/Architectures/ARCHITECTURE_V729.md` for comprehensive architecture reference (covers through v7.3.4).
 
 ---
 

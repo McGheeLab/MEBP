@@ -123,6 +123,8 @@ def main():
                         help="Force ZP stage simulation")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument("--debug-xy", action="store_true",
+                        help="Record raw XY serial data + jog commands to a CSV file")
     parser.add_argument("--settings", default="settings.json",
                         help="Path to settings file (default: settings.json)")
     args = parser.parse_args()
@@ -132,6 +134,10 @@ def main():
 
     verbose = args.verbose or settings.get("logging.verbose", False)
     setup_logging(verbose)
+
+    if getattr(args, "debug_xy", False) or settings.get("logging.debug_xy", False):
+        from SupportClasses.XYDebugLogger import enable as _enable_xy_debug
+        _enable_xy_debug()
 
     # v7.2.8s2: default simulate False — real hardware is the default
     simulate_xy = settings.get("simulation.simulate_xy", False)
@@ -150,10 +156,15 @@ def main():
     # v7.2.8: Pass controller_json from settings for hardware auto-detect
     controller_json = settings.get("controller.controller_json", "auto")
 
+    poll_interval_s = settings.get("polling.position_interval_ms", 300) / 1000.0
+    watchdog_interval_s = settings.get("polling.watchdog_interval_s", 2.0)
+
     controller = StageController(
         simulate_xy=simulate_xy,
         simulate_zp=simulate_zp,
         controller_json=controller_json,
+        poll_interval=poll_interval_s,
+        watchdog_interval=watchdog_interval_s,
     )
 
     saved_zero = settings.get_section("zero_position")

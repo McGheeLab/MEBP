@@ -110,20 +110,29 @@ def xbox_polling_worker(
     deadzone: float = 0.2,
     reconnect_timeout: float = 30.0,
     stick_offsets: dict | None = None,
+    axis_deadzones: dict | None = None,
+    debug_mode: bool = False,
 ) -> None:
     """
     Main polling loop — runs in a separate process.
     v7.2.6: S4 resilient worker — retry loop on startup, crash recovery,
     periodic heartbeat. Worker never exits; reconnects automatically.
     v7.3.2: stick_offsets — per-axis center offsets to subtract before deadzone.
+    v7.3.4: axis_deadzones — per-axis deadzone thresholds (0–1). Keys are
+            axis indices. Falls back to ``deadzone`` for unmapped axes.
+            Sticks are axes 0–3; triggers are axes 4–5.
 
     Args:
         out_queue:          Multiprocessing queue for outbound messages.
         mapping_file:       Path to the button mapping JSON file.
         avg_interval:       Seconds between averaged axis updates.
-        deadzone:           Axis deadzone threshold (0–1).
+        deadzone:           Fallback deadzone threshold (0–1) for axes not in
+                            axis_deadzones.
         reconnect_timeout:  Seconds to attempt reconnection before giving up.
         stick_offsets:      Dict mapping axis index → center offset (v7.3.2).
+        axis_deadzones:     Dict mapping axis index → deadzone threshold (v7.3.4).
+                            e.g. {0: 0.15, 1: 0.15, 2: 0.15, 3: 0.15,
+                                  4: 0.05, 5: 0.05}
     """
     # v7.2.7: SDL Bluetooth hints
     import os as _os
@@ -205,6 +214,7 @@ def xbox_polling_worker(
     last_heartbeat   = time.time()
     last_hat = (0, 0)
     _btn_debounce = {}  # v7.2.7: button debounce: last-fire time per button
+    _accum_suppress_until = 0.0  # v7.3.4: suppress axis accumulation after heartbeat reinit
     last_sent: dict = {}
 
     axis_groups = [
@@ -216,22 +226,61 @@ def xbox_polling_worker(
 
 
     # v7.2.7: trigger normalization
-    # Windows Xbox triggers rest at -1.0; macOS at 0.0.
-    # Read initial trigger values to use as zero-offset.
+    # Windows Xbox triggers (XInput) rest at -1.0 and travel to +1.0.
+    # macOS triggers rest at 0.0 and travel to +1.0 — no normalization needed.
+    # v7.3.4: Use platform-based normalization instead of sampling.
+    # Sampling is unreliable at startup due to Bluetooth settle latency —
+    # early reads often return 0.0 before the driver delivers the true -1.0,
+    # causing a partial/wrong offset that lets the rest value pass the deadzone.
+    if _is_macos:
+        _trigger_offsets = {}  # macOS: already 0..1, no normalization needed
+    else:
+        # Windows (and Linux XInput): triggers always rest at -1.0
+        _trigger_offsets = {ti: -1.0 for ti in [4, 5] if ti < num_axes}
+
+    # v7.3.4: Diagnostic — report actual trigger rest values so we can
+    # confirm whether the -1.0 assumption holds on this controller/driver.
     pygame.event.pump()
-    _trigger_offsets = {}
+    time.sleep(0.2)  # brief settle
+    pygame.event.pump()
+    _diag_vals = {}
     for _ti in [4, 5]:
         if _ti < num_axes:
-            _tval = joystick.get_axis(_ti)
-            # If rest value is < -0.5, this is Windows-style (-1 to +1)
-            _trigger_offsets[_ti] = _tval if _tval < -0.1 else 0.0
+            _diag_vals[_ti] = round(joystick.get_axis(_ti), 4)
+    if debug_mode:
+        out_queue.put({"debug":
+            f"Trigger rest values (raw, at-rest, BEFORE normalization): {_diag_vals} | "
+            f"offsets applied: {_trigger_offsets} | platform: {'macOS' if _is_macos else 'Windows/Linux'}"
+        })
 
     # ── Main Loop ─────────────────────────────────────────────────
+    _last_trigger_diag = time.time()  # v7.3.4: periodic trigger diagnostics
+
     while True:
         current_time = time.time()
 
         try:
             pygame.event.pump()
+
+            # v7.3.4: Periodic trigger diagnostic (debug mode only).
+            if debug_mode and current_time - _last_trigger_diag >= 2.0:
+                _per_axis_dz_diag = axis_deadzones or {}
+                _trig_report = []
+                for _ti in [4, 5]:
+                    if _ti < num_axes:
+                        _raw = joystick.get_axis(_ti)
+                        _norm = _raw
+                        if _ti in _trigger_offsets and _trigger_offsets[_ti] < -0.1:
+                            _off = _trigger_offsets[_ti]
+                            _norm = (_raw - _off) / (1.0 - _off)
+                        _dz = _per_axis_dz_diag.get(_ti, deadzone)
+                        _passes = abs(_norm) > _dz
+                        _trig_report.append(
+                            f"ax{_ti}: raw={_raw:.3f} norm={_norm:.3f} "
+                            f"dz={_dz:.2f} passes={_passes}"
+                        )
+                out_queue.put({"debug": "TRIG DIAG | " + " | ".join(_trig_report)})
+                _last_trigger_diag = current_time
 
             # Hot-reload mapping every 5 seconds
             if current_time - last_mapping_time >= 5:
@@ -249,6 +298,17 @@ def xbox_polling_worker(
                 joystick.init()
                 out_queue.put({"status": "alive"})
                 last_heartbeat = current_time
+                # v7.3.4: Suppress accumulation after reinit.
+                # pygame.joystick.quit/init causes triggers to transiently
+                # report 0.0. With offset=-1.0 applied, 0.0 normalises to 0.5
+                # and passes the deadzone. We flush the accumulator AND block
+                # axis accumulation for a full window + buffer so every transient
+                # read in this iteration AND the settling period is discarded.
+                for _a in range(num_axes):
+                    axis_accum[_a] = 0.0
+                    axis_count[_a] = 0
+                last_axis_time = current_time
+                _accum_suppress_until = current_time + avg_interval + 0.15
 
             # ── Button Presses (debounced) ─────────────────
             for i in range(joystick.get_numbuttons()):
@@ -263,16 +323,26 @@ def xbox_polling_worker(
                         _btn_debounce[i] = current_time
 
             # ── Axis Accumulation ──────────────────────────────────
+            # v7.3.4: Skip accumulation during heartbeat-reinit settle window.
+            if current_time < _accum_suppress_until:
+                time.sleep(0.02)
+                continue
             _stick_off = stick_offsets or {}
+            _per_axis_dz = axis_deadzones or {}
             for i in range(num_axes):
                 raw = joystick.get_axis(i)
                 # Normalize triggers: subtract rest offset, remap to 0..1
-                if i in _trigger_offsets and _trigger_offsets[i] < -0.5:
-                    raw = (raw - _trigger_offsets[i]) / 2.0  # -1..+1 → 0..+1
+                # v7.3.4: threshold consistent with detection (< -0.1);
+                # span = 1 - offset maps any rest position correctly to 0..1.
+                if i in _trigger_offsets and _trigger_offsets[i] < -0.1:
+                    _off = _trigger_offsets[i]
+                    raw = (raw - _off) / (1.0 - _off)  # rest→0, full-press→1
                 # v7.3.2: Subtract stick center offset
                 if i in _stick_off:
                     raw -= _stick_off[i]
-                if abs(raw) > deadzone:
+                # v7.3.4: Per-axis deadzone (falls back to global deadzone)
+                _dz = _per_axis_dz.get(i, deadzone)
+                if abs(raw) > _dz:
                     axis_accum[i] += raw
                     axis_count[i] += 1
 
@@ -300,12 +370,22 @@ def xbox_polling_worker(
                         # v7.2.7: LT retract: LT (axis 4) = retract (negative)
                         if a == 4:
                             avg_val = -avg_val
+                        # v7.3.4: Output-level deadzone — clamp averaged trigger
+                        # to zero if it doesn't clear the per-axis threshold.
+                        _out_dz = _per_axis_dz.get(a, deadzone)
+                        if abs(avg_val) <= _out_dz:
+                            avg_val = 0.0
 
                     zero_value = (0.0, 0.0) if group["type"] == "axis" else 0.0
                     prev = last_sent.get(group["name"], zero_value)
 
                     # Only send if changed or non-zero
                     if avg_val != zero_value or prev != zero_value:
+                        # v7.3.4: Log every dispatch so we can trace the source
+                        if debug_mode and avg_val != zero_value:
+                            out_queue.put({"debug":
+                                f"DISPATCH axis={group['name']} avg={avg_val} cmd={cmd}"
+                            })
                         out_queue.put({
                             "axis":    group["name"],
                             "average": avg_val,

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QFrame, QSizePolicy, QScrollArea,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 
 from SupportClasses.StageController import StageController
@@ -28,6 +28,22 @@ except ImportError:
     HardwareConfig = None
 
 logger = logging.getLogger(__name__)
+
+
+class _ConnectWorker(QThread):
+    """Run a blocking stage-connect call off the main thread."""
+    finished = Signal(bool, str)  # (success, error_message)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            self._fn()
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 class DashboardPage(QWidget):
@@ -100,9 +116,10 @@ class DashboardPage(QWidget):
 
             layout.addLayout(row)
 
-            # Store status references
+            # Store status and button references
             attr_prefix = name.split()[0].lower()
             setattr(self, f'ctx_dot_{attr_prefix}', self._ctx_status)
+            setattr(self, f'_btn_connect_{attr_prefix}', btn_conn)
 
         # ── Xbox Mapping Editor ──────────────────────────────────
         btn_xbox_edit = QPushButton("Xbox Mapping Editor...")
@@ -405,13 +422,16 @@ class DashboardPage(QWidget):
             uy = xy[1] - ctrl.zero_position["y"]
             self.lbl_x.setText(f"{ux:,.1f}")
             self.lbl_y.setText(f"{uy:,.1f}")
-            self.lbl_xy_status.setText("Connected")
-            self.lbl_xy_status.setStyleSheet(f"color: {COLORS['green']};")
         else:
             self.lbl_x.setText("—")
             self.lbl_y.setText("—")
-            conn = "Connected" if ctrl.is_xy_connected else "Disconnected"
-            color = COLORS['green'] if ctrl.is_xy_connected else COLORS['red']
+
+        # XY status label — only re-style on connection state change
+        _xy_conn = ctrl.is_xy_connected
+        if getattr(self, '_last_xy_conn', None) != _xy_conn:
+            self._last_xy_conn = _xy_conn
+            conn = "Connected" if _xy_conn else "Disconnected"
+            color = COLORS['green'] if _xy_conn else COLORS['red']
             self.lbl_xy_status.setText(conn)
             self.lbl_xy_status.setStyleSheet(f"color: {color};")
 
@@ -437,13 +457,16 @@ class DashboardPage(QWidget):
                     lbl.setText(f"{rel_mm:.2f}")
                 else:
                     lbl.setText("—")
-            self.lbl_zp_status.setText("Connected")
-            self.lbl_zp_status.setStyleSheet(f"color: {COLORS['green']};")
         else:
             for lbl in [self.lbl_z, self.lbl_p1, self.lbl_p2, self.lbl_p3]:
                 lbl.setText("—")
-            conn = "Connected" if ctrl.is_zp_connected else "Disconnected"
-            color = COLORS['green'] if ctrl.is_zp_connected else COLORS['red']
+
+        # ZP status label — only re-style on connection state change
+        _zp_conn = ctrl.is_zp_connected
+        if getattr(self, '_last_zp_conn', None) != _zp_conn:
+            self._last_zp_conn = _zp_conn
+            conn = "Connected" if _zp_conn else "Disconnected"
+            color = COLORS['green'] if _zp_conn else COLORS['red']
             self.lbl_zp_status.setText(conn)
             self.lbl_zp_status.setStyleSheet(f"color: {color};")
 
@@ -459,35 +482,38 @@ class DashboardPage(QWidget):
         for key, lbl in self.zero_labels.items():
             lbl.setText(f"{ctrl.zero_position.get(key, 0):.1f}")
 
-        # Safety limits
+        # Safety limits — only re-style and rebuild text on state change
         sl = ctrl.safety_limits
-        if sl.enabled:
-            self.lbl_safety_status.setText("🛡️ Enabled")
-            self.lbl_safety_status.setStyleSheet(
-                f"color: {COLORS['green']}; font-weight: bold;")
-            # v7.2.6: Show per-pump limits
-            pump_parts = []
-            for pid, pmin, pmax in [
-                ('P1', sl.p1_min, sl.p1_max),
-                ('P2', sl.p2_min, sl.p2_max),
-                ('P3', sl.p3_min, sl.p3_max),
-            ]:
-                pump_parts.append(f'{pid}:[{pmin:.1f}..{pmax:.1f}]')
-            all_same = (sl.p1_min == sl.p2_min == sl.p3_min
-                        and sl.p1_max == sl.p2_max == sl.p3_max)
-            pump_str = (f'P:[{sl.p1_min:.1f}..{sl.p1_max:.1f}]'
-                        if all_same else '  '.join(pump_parts))
-            self.lbl_safety_info.setText(
-                f"XY: [{sl.xy_min_x:.0f}..{sl.xy_max_x:.0f}] × "
-                f"[{sl.xy_min_y:.0f}..{sl.xy_max_y:.0f}]  "
-                f"Z: [{sl.z_min:.1f}..{sl.z_max:.1f}]  "
-                f"{pump_str}"
-            )
-        else:
-            self.lbl_safety_status.setText("⚠ Disabled")
-            self.lbl_safety_status.setStyleSheet(
-                f"color: {COLORS['red']}; font-weight: bold;")
-            self.lbl_safety_info.setText("Software endstops are OFF — be careful!")
+        _safety_on = sl.enabled
+        if getattr(self, '_last_safety_on', None) != _safety_on:
+            self._last_safety_on = _safety_on
+            if _safety_on:
+                self.lbl_safety_status.setText("🛡️ Enabled")
+                self.lbl_safety_status.setStyleSheet(
+                    f"color: {COLORS['green']}; font-weight: bold;")
+                # v7.2.6: Show per-pump limits
+                pump_parts = []
+                for pid, pmin, pmax in [
+                    ('P1', sl.p1_min, sl.p1_max),
+                    ('P2', sl.p2_min, sl.p2_max),
+                    ('P3', sl.p3_min, sl.p3_max),
+                ]:
+                    pump_parts.append(f'{pid}:[{pmin:.1f}..{pmax:.1f}]')
+                all_same = (sl.p1_min == sl.p2_min == sl.p3_min
+                            and sl.p1_max == sl.p2_max == sl.p3_max)
+                pump_str = (f'P:[{sl.p1_min:.1f}..{sl.p1_max:.1f}]'
+                            if all_same else '  '.join(pump_parts))
+                self.lbl_safety_info.setText(
+                    f"XY: [{sl.xy_min_x:.0f}..{sl.xy_max_x:.0f}] × "
+                    f"[{sl.xy_min_y:.0f}..{sl.xy_max_y:.0f}]  "
+                    f"Z: [{sl.z_min:.1f}..{sl.z_max:.1f}]  "
+                    f"{pump_str}"
+                )
+            else:
+                self.lbl_safety_status.setText("⚠ Disabled")
+                self.lbl_safety_status.setStyleSheet(
+                    f"color: {COLORS['red']}; font-weight: bold;")
+                self.lbl_safety_info.setText("Software endstops are OFF — be careful!")
 
         # Print history
         if self.print_history:
@@ -499,12 +525,10 @@ class DashboardPage(QWidget):
             )
 
     def _update_conn_status(self, name: str, state: str):
-        """Update context panel connection dot.
-
-        Args:
-            name:  Device key ("xy", "zp", "xbox").
-            state: "on" (green), "warn" (yellow), or "off" (red).
-        """
+        """Update context panel connection dot — only re-styles on state change."""
+        if getattr(self, f'_ctx_conn_state_{name}', None) == state:
+            return
+        setattr(self, f'_ctx_conn_state_{name}', state)
         dot = getattr(self, f'ctx_dot_{name}', None)
         if dot:
             _names = {"on": "connDotOn", "warn": "connDotWarn", "off": "connDotOff"}
@@ -515,32 +539,47 @@ class DashboardPage(QWidget):
 
 
     def _connect_xy(self):
-        try:
-            self.controller.connect_xy()
-        except Exception as e:
-            logger.error(f"XY connect failed: {e}")
-        self.on_status_update()  # v7.2.7: disconnect refresh
+        btn = getattr(self, '_btn_connect_xy', None)
+        self._run_connect(self.controller.connect_xy, btn, "XY")
 
     def _disconnect_xy(self):
         try:
             self.controller.disconnect_xy()
         except Exception as e:
             logger.error(f"XY disconnect failed: {e}")
-        self.on_status_update()  # v7.2.7: disconnect refresh
+        self.on_status_update()
 
     def _connect_zp(self):
-        try:
-            self.controller.connect_zp()
-        except Exception as e:
-            logger.error(f"ZP connect failed: {e}")
-        self.on_status_update()  # v7.2.7: disconnect refresh
+        btn = getattr(self, '_btn_connect_zp', None)
+        self._run_connect(self.controller.connect_zp, btn, "ZP")
 
     def _disconnect_zp(self):
         try:
             self.controller.disconnect_zp()
         except Exception as e:
             logger.error(f"ZP disconnect failed: {e}")
-        self.on_status_update()  # v7.2.7: disconnect refresh
+        self.on_status_update()
+
+    def _run_connect(self, fn, btn, label):
+        """Spawn a worker thread for a blocking connect call."""
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("Connecting…")
+        worker = _ConnectWorker(fn)
+        worker.finished.connect(
+            lambda ok, err, b=btn, lbl=label: self._on_connect_done(b, lbl, ok, err))
+        worker.finished.connect(worker.deleteLater)
+        # Keep a reference so the thread isn't garbage-collected
+        setattr(self, f'_worker_{label.lower()}', worker)
+        worker.start()
+
+    def _on_connect_done(self, btn, label, ok, err):
+        if btn is not None:
+            btn.setText("Connect")
+            btn.setEnabled(True)
+        if not ok:
+            logger.error(f"{label} connect failed: {err}")
+        self.on_status_update()
 
     def _connect_xbox(self):
         """Connect Xbox controller. v7.2.7: thread mode option"""
@@ -556,10 +595,20 @@ class DashboardPage(QWidget):
             stick_offsets = self.settings.get_section("xbox_stick_offsets")
             if stick_offsets:
                 stick_offsets = {int(k): v for k, v in stick_offsets.items()}
+            # v7.3.4: Build per-axis deadzone dict from saved stick/trigger values
+            stick_dz = self.settings.get("xbox.deadzones.sticks", 0.20)
+            trigger_dz = self.settings.get("xbox.deadzones.triggers", 0.05)
+            axis_deadzones = {
+                0: stick_dz, 1: stick_dz, 2: stick_dz, 3: stick_dz,
+                4: trigger_dz, 5: trigger_dz,
+            }
+            debug_mode = bool(self.settings.get("xbox.debug_mode", False))
             self.controller.connect_xbox(
                 mapping_file=mapping, use_thread=use_thread,
                 reconnect_timeout=timeout,
                 stick_offsets=stick_offsets or None,
+                axis_deadzones=axis_deadzones,
+                debug_mode=debug_mode,
             )
         except Exception as e:
             logger.error(f"Xbox connect failed: {e}")

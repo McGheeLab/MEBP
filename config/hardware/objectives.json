@@ -1,0 +1,63 @@
+{
+  "version": "1.0",
+  "objectives": [
+    {
+      "name": "1x",
+      "nominal_magnification": 1.0
+    },
+    {
+      "name": "2x",
+      "nominal_magnification": 2.0
+    },
+    {
+      "name": "4x",
+      "nominal_magnification": 4.0
+    },
+    {
+      "name": "10x",
+      "nominal_magnification": 10.0
+    },
+    {
+      "name": "20x",
+      "nominal_magnification": 20.0
+    },
+    {
+      "name": "40x",
+      "nominal_magnification": 40.0
+    },
+    {
+      "name": "100x",
+      "nominal_magnification": 100.0
+    }
+  ],
+  "camera_objective_calibrations": {
+    "BUC3D-1000C": {
+      "2x": {
+        "measured_um_per_px": 3.11919,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      },
+      "4x": {
+        "measured_um_per_px": 1.547113,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      },
+      "10x": {
+        "measured_um_per_px": 0.624919,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      }
+    }
+  },
+  "description": "Standard microscope objectives and per-camera empirical \u00b5m/px calibrations.",
+  "notes": "Calibrations are keyed by camera model name then objective name. measured_um_per_px is the empirically measured scale via stage-motion phase correlation. resolution records the active frame size at calibration time."
+}

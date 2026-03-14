@@ -584,17 +584,20 @@ class MainWindow(QMainWindow):
         if hasattr(helpers, 'print_file_created'):
             helpers.print_file_created.connect(self._on_helper_print_created)
 
-        # v7.3.1: Wire calibration data → jog page (well positions, safe_z)
         cal_page = pages[3]   # CalibrationPage
         jog_page = pages[2]   # JogControlPage
+
+        # v7.3.2: Load approximate well plate first (geometry-predicted baseline)
+        if hasattr(jog_page, 'load_startup_plate'):
+            jog_page.load_startup_plate(self.settings)
+
+        # v7.3.1: Wire calibration data → jog page (well positions, safe_z)
+        # v7.3.4: Also push immediately — _load_calibration fires before this signal is wired
         if hasattr(cal_page, 'calibration_data_changed') and hasattr(jog_page, 'set_calibration_data'):
             cal_page.calibration_data_changed.connect(
                 lambda: jog_page.set_calibration_data(*cal_page.get_calibration_data())
             )
-
-        # v7.3.2: Load approximate well plate on startup (geometry-predicted)
-        if hasattr(jog_page, 'load_startup_plate'):
-            jog_page.load_startup_plate(self.settings)
+            jog_page.set_calibration_data(*cal_page.get_calibration_data())
 
         # v7.3.3: CameraManager is shared — no need to manually wire cameras
 
@@ -1299,11 +1302,25 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def _setup_timers(self):
-        """Start the position/status polling timer."""
-        self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self._update_status)
-        interval = self.settings.get("polling.position_interval_ms", 300)
-        self.update_timer.start(interval)
+        """Start the position/status polling timer using single-shot reschedule.
+
+        Single-shot prevents Qt from queuing up back-to-back timer callbacks
+        when _update_status() occasionally runs over the interval — the next
+        tick is only scheduled after the current one fully completes.
+        """
+        self._tick()
+
+    def _tick(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        try:
+            self._update_status()
+        finally:
+            elapsed_ms = (_time.monotonic() - _t0) * 1000
+            if elapsed_ms > 20:
+                logger.debug(f"[Tick] _update_status took {elapsed_ms:.1f}ms")
+            interval = self.settings.get("polling.position_interval_ms", 300)
+            QTimer.singleShot(interval, self._tick)
 
     def _update_status(self):
         """Update connection dots, position readouts, and page callbacks."""
@@ -1386,14 +1403,17 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Safety status
+        # Safety status — only re-style when state changes
         sl = self.controller.safety_limits
-        if sl.enabled:
-            self.sb_safety.setText("🛡️ ON")
-            self.sb_safety.setStyleSheet(f"color: {COLORS['green']};")
-        else:
-            self.sb_safety.setText("🛡️ OFF")
-            self.sb_safety.setStyleSheet(f"color: {COLORS['yellow']};")
+        _safety_on = sl.enabled
+        if getattr(self, "_safety_state", None) != _safety_on:
+            self._safety_state = _safety_on
+            if _safety_on:
+                self.sb_safety.setText("🛡️ ON")
+                self.sb_safety.setStyleSheet(f"color: {COLORS['green']};")
+            else:
+                self.sb_safety.setText("🛡️ OFF")
+                self.sb_safety.setStyleSheet(f"color: {COLORS['yellow']};")
 
         # Position log count
         if hasattr(self.controller, 'position_logger'):
@@ -1406,12 +1426,15 @@ class MainWindow(QMainWindow):
             page.on_status_update()
 
     def _update_conn_dot(self, name: str, state: str):
-        """Update a connection status dot.
+        """Update a connection status dot — only re-styles when state changes.
 
-        Args:
-            name:  Device key ("xy", "zp", "xbox").
-            state: "on" (green), "warn" (yellow), or "off" (red).
+        unpolish()/polish() re-evaluate the entire Qt stylesheet; calling them
+        every tick even when nothing changed caused severe per-tick overhead.
         """
+        if getattr(self, f"_conn_state_{name}", None) == state:
+            return
+        setattr(self, f"_conn_state_{name}", state)
+
         dot = getattr(self, f"_dot_{name}", None)
         lbl = getattr(self, f"_lbl_{name}", None)
         if dot is None:

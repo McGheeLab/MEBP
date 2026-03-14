@@ -660,16 +660,27 @@ class CameraWidget(QWidget):
         this forces a new read() call. Essential after stage movement to ensure
         the frame content matches the current stage position.
 
+        Supports OpenCV, ToupCam, and SimulatedCamera backends.
+
         Returns:
             np.ndarray (BGR, uint8) or None
         """
-        if not self._capture or not self._capture.isOpened():
-            return None
-        # Use read_fresh() if available (SimulatedCamera) for uncached position
-        if hasattr(self._capture, 'read_fresh'):
-            ret, frame = self._capture.read_fresh()
+        backend = getattr(self, '_backend_type', 'opencv')
+
+        if backend == 'toupcam':
+            tc = getattr(self, '_toupcam', None)
+            if tc is None or not tc.isOpened():
+                return None
+            ret, frame = tc.read()
         else:
-            ret, frame = self._capture.read()
+            if not self._capture or not self._capture.isOpened():
+                return None
+            # Use read_fresh() if available (SimulatedCamera) for uncached position
+            if hasattr(self._capture, 'read_fresh'):
+                ret, frame = self._capture.read_fresh()
+            else:
+                ret, frame = self._capture.read()
+
         if ret and frame is not None:
             return frame.copy()
         return None

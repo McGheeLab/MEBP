@@ -277,6 +277,41 @@ class ZPStageManager:
         self._parse_position(response)
         return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
 
+    def flush_moves(self, timeout_s: float = 15.0) -> bool:
+        """Block until Marlin confirms all queued moves are physically complete.
+
+        Sends M400 (Wait for Moves to Finish). Marlin only responds with 'ok'
+        after every buffered move has executed. This is more reliable than
+        polling M114, which may return commanded (planned) position rather than
+        the actual stepper position during motion.
+
+        Should be called with the PositionPoller suspended to avoid racing on
+        the serial port for the 'ok' response.
+
+        Returns:
+            True  — Marlin confirmed completion within timeout.
+            False — Timed out (caller should log a warning and decide how to proceed).
+        """
+        if self.serial is None or self.simulate:
+            return True  # Simulated or disconnected — treat as immediate success
+
+        self.send_data("M400")
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            with self._serial_lock:
+                try:
+                    line = self.serial.readline().decode("utf-8", errors="replace").strip()
+                except Exception as e:
+                    logger.warning(f"flush_moves read error: {e}")
+                    return False
+            if line == "ok":
+                return True
+            # Discard other lines (position data, temperature reports, etc.)
+
+        logger.warning(f"flush_moves: M400 timed out after {timeout_s:.1f}s")
+        return False
+
     def _parse_position(self, response: str) -> None:
         """Parse M114 response and update cached positions."""
         for line in response.split("\n"):

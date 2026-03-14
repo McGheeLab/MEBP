@@ -40,6 +40,23 @@ except ImportError:
     HardwareConfig = None
     CameraConfig = None
 
+# v7.3.4: Objective calibration persistence
+try:
+    from SupportClasses.ObjectiveCalibration import get_store as _get_obj_store
+    OBJECTIVE_CAL_AVAILABLE = True
+except ImportError:
+    OBJECTIVE_CAL_AVAILABLE = False
+    def _get_obj_store():
+        return None
+
+# v7.3.4: Empirical µm/px calibration dialog
+try:
+    from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
+    PIXEL_CAL_DIALOG_AVAILABLE = True
+except ImportError:
+    PIXEL_CAL_DIALOG_AVAILABLE = False
+    PixelCalibrationDialog = None
+
 logger = logging.getLogger(__name__)
 
 # Optional camera support
@@ -700,6 +717,31 @@ class CalibrationPage(QWidget):
             if hasattr(self, 'ctx_lbl_needle_info'):
                 self.ctx_lbl_needle_info.setText(needle_text)
 
+        # v7.3.4: Sync objective selector and µm/px display for all camera slots
+        # Use the objective stored in camera_config if available
+        cam_cfg = getattr(config, 'camera_config', None)
+        obj_combos = getattr(self, '_ctx_cam_obj_combos', [])
+        if cam_cfg is not None and obj_combos:
+            # Map nominal magnification back to objective name
+            nom_mag = getattr(cam_cfg, 'objective_magnification', None)
+            if nom_mag is not None and OBJECTIVE_CAL_AVAILABLE:
+                store = _get_obj_store()
+                matched_name = None
+                if store:
+                    for obj in store.objectives:
+                        if abs(obj["nominal_magnification"] - nom_mag) < 0.01:
+                            matched_name = obj["name"]
+                            break
+                if matched_name:
+                    for combo in obj_combos:
+                        idx_in_combo = combo.findText(matched_name)
+                        if idx_in_combo >= 0:
+                            combo.blockSignals(True)
+                            combo.setCurrentIndex(idx_in_combo)
+                            combo.blockSignals(False)
+        for cam_idx in range(len(obj_combos)):
+            self._ctx_update_um_px_display(cam_idx)
+
 
 
     # ════════════════════════════════════════════════════════════════
@@ -749,7 +791,7 @@ class CalibrationPage(QWidget):
         refresh_row.addStretch()
         cam_lay.addLayout(refresh_row)
 
-        # Row 2: Tile arrangement
+        # Row 2: Tile arrangement + click-to-move toggle
         opts_row = QHBoxLayout()
         opts_row.addWidget(QLabel("Layout:"))
         self._cam_tile_combo = QComboBox()
@@ -761,6 +803,15 @@ class CalibrationPage(QWidget):
         self._cam_tile_combo.currentIndexChanged.connect(self._on_tile_changed)
         opts_row.addWidget(self._cam_tile_combo)
         opts_row.addStretch()
+        self._btn_click_to_move = QPushButton("Click→Move: OFF")
+        self._btn_click_to_move.setCheckable(True)
+        self._btn_click_to_move.setChecked(False)
+        self._btn_click_to_move.setMaximumWidth(130)
+        self._btn_click_to_move.setToolTip(
+            "Click on the camera feed to move the XY stage so that\n"
+            "the clicked point is centred under the camera.")
+        self._btn_click_to_move.toggled.connect(self._on_click_to_move_toggled)
+        opts_row.addWidget(self._btn_click_to_move)
         cam_lay.addLayout(opts_row)
 
         # Per-camera control rows
@@ -769,6 +820,11 @@ class CalibrationPage(QWidget):
         self._ctx_cam_start_btns: list[QPushButton] = []
         self._ctx_cam_settings_panels: list[QFrame] = []
         self._ctx_cam_checkboxes: list[QCheckBox] = []
+        # v7.3.4: Per-camera µm/px calibration widgets
+        self._ctx_cam_obj_combos: list[QComboBox] = []
+        self._ctx_cam_theo_labels: list[QLabel] = []
+        self._ctx_cam_cal_labels: list[QLabel] = []
+        self._ctx_cam_fov_labels: list[QLabel] = []
         for i in range(MAX_CAMERAS):
             row_frame = QFrame()
             row_frame.setStyleSheet(
@@ -855,6 +911,70 @@ class CalibrationPage(QWidget):
             fps_row.addWidget(spn_fps)
             fps_row.addStretch()
             sp_lay.addLayout(fps_row)
+
+            # v7.3.4: Objective & µm/px calibration section
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet(f"color: {COLORS['surface1']}; margin: 2px 0;")
+            sp_lay.addWidget(sep)
+
+            obj_hdr = QLabel("Objective & Scale")
+            obj_hdr.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-weight: bold; font-size: 8pt;")
+            sp_lay.addWidget(obj_hdr)
+
+            obj_row = QHBoxLayout()
+            obj_row.addWidget(QLabel("Obj:"))
+            obj_combo = QComboBox()
+            obj_combo.setMinimumWidth(70)
+            obj_combo.setToolTip("Select the installed objective lens")
+            # Populate with standard objectives (or whatever the store has)
+            if OBJECTIVE_CAL_AVAILABLE:
+                store = _get_obj_store()
+                for name in store.objective_names():
+                    obj_combo.addItem(name)
+            else:
+                for name in ["1x", "2x", "4x", "10x", "20x", "40x", "100x"]:
+                    obj_combo.addItem(name)
+            obj_combo.currentIndexChanged.connect(
+                lambda _idx, cam=i: self._ctx_on_objective_changed(cam))
+            obj_row.addWidget(obj_combo, stretch=1)
+            sp_lay.addLayout(obj_row)
+            self._ctx_cam_obj_combos.append(obj_combo)
+
+            theo_lbl = QLabel("Theoretical: —")
+            theo_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 8pt;")
+            theo_lbl.setWordWrap(True)
+            sp_lay.addWidget(theo_lbl)
+            self._ctx_cam_theo_labels.append(theo_lbl)
+
+            cal_lbl = QLabel("Calibrated: —")
+            cal_lbl.setStyleSheet(
+                f"color: {COLORS['overlay0']}; font-size: 8pt;")
+            cal_lbl.setWordWrap(True)
+            sp_lay.addWidget(cal_lbl)
+            self._ctx_cam_cal_labels.append(cal_lbl)
+
+            fov_lbl = QLabel("FOV: —")
+            fov_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: 8pt;")
+            fov_lbl.setWordWrap(True)
+            sp_lay.addWidget(fov_lbl)
+            self._ctx_cam_fov_labels.append(fov_lbl)
+
+            btn_cal_umpx = QPushButton("Calibrate µm/px")
+            btn_cal_umpx.setToolTip(
+                "Empirically measure µm/px via stage motion + phase correlation")
+            btn_cal_umpx.setStyleSheet(
+                f"QPushButton {{ background-color: {COLORS['surface1']}; "
+                f"color: {COLORS['text']}; padding: 3px 8px; "
+                f"border-radius: 3px; font-size: 8pt; }}"
+                f"QPushButton:hover {{ background-color: {COLORS['blue']}; "
+                f"color: {COLORS['base']}; }}")
+            btn_cal_umpx.clicked.connect(
+                lambda checked=False, cam=i: self._ctx_calibrate_um_per_px(cam))
+            sp_lay.addWidget(btn_cal_umpx)
 
             row_lay.addWidget(settings_panel)
             self._ctx_cam_settings_panels.append(settings_panel)
@@ -1024,6 +1144,39 @@ class CalibrationPage(QWidget):
         prefix = "▸" if visible else "▾"
         toggle.setText(f"{prefix} Camera Controls")
 
+    def _on_click_to_move_toggled(self, checked: bool):
+        """Toggle click-to-move mode on/off."""
+        self._click_to_move_enabled = checked
+        btn = getattr(self, '_btn_click_to_move', None)
+        if btn:
+            btn.setText("Click→Move: ON" if checked else "Click→Move: OFF")
+            btn.setStyleSheet(
+                f"background-color: {COLORS.get('green', '#a6e3a1')}; color: #1e1e2e;"
+                if checked else ""
+            )
+
+    def _on_feed_clicked(self, cam_idx: int, px_x: float, px_y: float):
+        """Move XY stage so the clicked image point centres under the camera."""
+        if not getattr(self, '_click_to_move_enabled', False):
+            return
+        if not self.controller or not self.controller.xy_stage:
+            return
+        mgr = getattr(self, '_camera_manager', None)
+        if mgr is None:
+            return
+        feed_views = getattr(self, '_cam_feed_views', [])
+        if cam_idx >= len(feed_views):
+            return
+        img_w, img_h = feed_views[cam_idx].image_size
+        if img_w == 0 or img_h == 0:
+            return
+        dx_um, dy_um = mgr.pixel_to_stage_offset(cam_idx, px_x, px_y, img_w, img_h)
+        logger.debug(
+            f"[CalibPage] click-to-move cam={cam_idx} px=({px_x:.1f},{px_y:.1f}) "
+            f"→ dx={dx_um:.1f} dy={dy_um:.1f} µm"
+        )
+        self.controller.move_xy_relative_um(dx_um, dy_um)
+
     def _refresh_source_combos(self):
         """v7.3.3: Refresh source combos from CameraManager (no detection)."""
         mgr = self._camera_manager
@@ -1117,6 +1270,228 @@ class CalibrationPage(QWidget):
                 cam._timer.setInterval(int(1000 / max(1, value)))
 
     # ════════════════════════════════════════════════════════════════
+    #  v7.3.4: OBJECTIVE & µm/px CALIBRATION HELPERS
+    # ════════════════════════════════════════════════════════════════
+
+    def _get_camera_spec_for_idx(self, idx: int):
+        """Return CameraSpec from hardware config for a camera slot, or None.
+
+        Currently all camera slots share the same hardware config camera_spec
+        (multi-camera configs are a future enhancement).
+        """
+        hw = getattr(self, '_hardware_config', None)
+        if hw is None:
+            return None
+        cam_cfg = getattr(hw, 'camera_config', None)
+        if cam_cfg is None:
+            return None
+        return getattr(cam_cfg, 'camera_spec', None)
+
+    def _get_camera_model_for_idx(self, idx: int) -> str:
+        """Return a camera model name string suitable as an objectives.json key.
+
+        Tries to extract the model ID from the camera spec name
+        (e.g. "Bestscope BUC3D-1000C (ToupTek...)" → "BUC3D-1000C").
+        Falls back to "unknown" when no spec is available.
+        """
+        spec = self._get_camera_spec_for_idx(idx)
+        if spec is None:
+            return "unknown"
+        # Prefer the first parenthetical token or the first word-run with digits
+        name: str = spec.name
+        # e.g. "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)"
+        # Extract the second word if the first looks like a brand
+        parts = name.split()
+        for part in parts:
+            if any(ch.isdigit() for ch in part):
+                return part.rstrip("()")
+        return parts[0] if parts else "unknown"
+
+    def _ctx_on_objective_changed(self, idx: int) -> None:
+        """Called when the objective combo selection changes."""
+        self._ctx_update_um_px_display(idx)
+
+    def _ctx_update_um_px_display(self, idx: int) -> None:
+        """Recompute and refresh the µm/px labels for camera slot idx.
+
+        Reads:
+          - The selected objective name from the combo
+          - The camera spec from the hardware config (sensor_pixel_size_um,
+            max_resolution, active_resolution)
+          - Any stored calibration from ObjectiveCalibrationStore
+
+        Writes:
+          - Theoretical label (from sensor spec + nominal magnification)
+          - Calibrated label (from objectives.json, green if available)
+          - FOV label
+          - Propagates the best available value to CameraManager
+        """
+        obj_combos = getattr(self, '_ctx_cam_obj_combos', [])
+        theo_labels = getattr(self, '_ctx_cam_theo_labels', [])
+        cal_labels = getattr(self, '_ctx_cam_cal_labels', [])
+        fov_labels = getattr(self, '_ctx_cam_fov_labels', [])
+
+        if idx >= len(obj_combos):
+            return
+
+        obj_name = obj_combos[idx].currentText() if obj_combos[idx].count() else ""
+        spec = self._get_camera_spec_for_idx(idx)
+        hw = getattr(self, '_hardware_config', None)
+        cam_cfg = getattr(hw, 'camera_config', None) if hw else None
+
+        # Theoretical µm/px
+        theoretical_um_per_px: float | None = None
+        if spec is not None and OBJECTIVE_CAL_AVAILABLE:
+            store = _get_obj_store()
+            nom_mag = store.nominal_magnification(obj_name) if store else None
+            if nom_mag and nom_mag > 0:
+                active_res = (
+                    cam_cfg.active_resolution if cam_cfg else (916, 686)
+                )
+                effective_px = spec.effective_pixel_size_um(active_res)
+                theoretical_um_per_px = effective_px / nom_mag
+        elif spec is not None:
+            # Fallback: try to get magnification from hardware config
+            nom_mag = (
+                cam_cfg.objective_magnification if cam_cfg else 1.0
+            )
+            if nom_mag and nom_mag > 0:
+                active_res = (
+                    cam_cfg.active_resolution if cam_cfg else (916, 686)
+                )
+                effective_px = spec.effective_pixel_size_um(active_res)
+                theoretical_um_per_px = effective_px / nom_mag
+
+        if idx < len(theo_labels):
+            if theoretical_um_per_px is not None:
+                theo_labels[idx].setText(
+                    f"Theoretical: {theoretical_um_per_px:.3f} µm/px")
+            else:
+                theo_labels[idx].setText("Theoretical: — (no camera spec)")
+
+        # Calibrated µm/px from objectives.json
+        calibrated_um_per_px: float | None = None
+        if OBJECTIVE_CAL_AVAILABLE and obj_name:
+            store = _get_obj_store()
+            camera_model = self._get_camera_model_for_idx(idx)
+            cal = store.get_calibration(camera_model, obj_name) if store else None
+            if cal:
+                calibrated_um_per_px = cal.get("measured_um_per_px")
+                cal_date = cal.get("date", "")
+                cal_res = cal.get("resolution", [])
+                if idx < len(cal_labels):
+                    cal_labels[idx].setText(
+                        f"Calibrated: {calibrated_um_per_px:.3f} µm/px"
+                        f"{' (' + str(cal_res[0]) + 'x' + str(cal_res[1]) + ')' if cal_res else ''}"
+                        f"{' [' + cal_date + ']' if cal_date else ''}")
+                    cal_labels[idx].setStyleSheet(
+                        f"color: {COLORS['green']}; font-size: 8pt;")
+            else:
+                if idx < len(cal_labels):
+                    cal_labels[idx].setText("Calibrated: — (not yet calibrated)")
+                    cal_labels[idx].setStyleSheet(
+                        f"color: {COLORS['overlay0']}; font-size: 8pt;")
+
+        # Active µm/px: prefer calibrated over theoretical
+        active_um_per_px = calibrated_um_per_px or theoretical_um_per_px
+
+        # FOV label
+        if idx < len(fov_labels):
+            if active_um_per_px and cam_cfg:
+                w, h = cam_cfg.active_resolution
+                fov_w = w * active_um_per_px / 1000.0  # mm
+                fov_h = h * active_um_per_px / 1000.0
+                fov_labels[idx].setText(
+                    f"FOV: {fov_w:.2f} × {fov_h:.2f} mm")
+            else:
+                fov_labels[idx].setText("FOV: —")
+
+        # Push to CameraManager
+        mgr = getattr(self, '_camera_manager', None)
+        if mgr is not None and active_um_per_px is not None:
+            mgr.set_um_per_px(idx, active_um_per_px)
+            logger.debug(
+                f"Camera {idx}: applied {active_um_per_px:.4f} µm/px "
+                f"(obj={obj_name}, calibrated={calibrated_um_per_px is not None})")
+
+        # Also update hardware config objective magnification if we have a
+        # nominal mag for the selected objective
+        if cam_cfg is not None and OBJECTIVE_CAL_AVAILABLE and obj_name:
+            store = _get_obj_store()
+            nom_mag = store.nominal_magnification(obj_name) if store else None
+            if nom_mag is not None:
+                cam_cfg.objective_magnification = nom_mag
+
+    def _ctx_calibrate_um_per_px(self, idx: int) -> None:
+        """Open the empirical µm/px calibration dialog for camera slot idx.
+
+        On accept:
+          - Saves the measured value to objectives.json keyed by camera model
+            and currently selected objective name.
+          - Writes the value into hardware_config.camera_config for immediate
+            downstream use (clears override when switching objectives; see
+            _ctx_update_um_px_display).
+          - Refreshes the µm/px display labels.
+          - Emits um_per_px_calibrated to update the hardware setup page.
+        """
+        if not PIXEL_CAL_DIALOG_AVAILABLE or PixelCalibrationDialog is None:
+            QMessageBox.warning(self, "Unavailable",
+                                "Pixel calibration dialog is not available.")
+            return
+
+        mgr = getattr(self, '_camera_manager', None)
+        if mgr is None or not mgr.is_running(idx):
+            QMessageBox.warning(self, "Camera Required",
+                                "Start Camera %d before calibrating." % (idx + 1))
+            return
+
+        if self.controller is None:
+            QMessageBox.warning(self, "Stage Required",
+                                "Stage controller must be connected for calibration.")
+            return
+
+        dlg = PixelCalibrationDialog(mgr, self.controller, cam_idx=idx,
+                                     parent=self)
+        if not dlg.exec():
+            return
+
+        measured = dlg.result_um_per_px
+        if measured is None:
+            return
+
+        # Persist to objectives.json
+        if OBJECTIVE_CAL_AVAILABLE:
+            store = _get_obj_store()
+            obj_combos = getattr(self, '_ctx_cam_obj_combos', [])
+            obj_name = (obj_combos[idx].currentText()
+                        if idx < len(obj_combos) and obj_combos[idx].count()
+                        else "unknown")
+            camera_model = self._get_camera_model_for_idx(idx)
+            hw = getattr(self, '_hardware_config', None)
+            cam_cfg = getattr(hw, 'camera_config', None) if hw else None
+            active_res = (
+                cam_cfg.active_resolution if cam_cfg else (916, 686)
+            )
+            if store is not None:
+                store.set_calibration(camera_model, obj_name,
+                                      measured, active_res)
+
+        # Write into hardware config for immediate use by downstream code
+        hw = getattr(self, '_hardware_config', None)
+        if hw is not None:
+            cam_cfg = getattr(hw, 'camera_config', None)
+            if cam_cfg is not None:
+                cam_cfg.micron_per_pixel_override = measured
+
+        # Refresh labels and push to CameraManager
+        self._ctx_update_um_px_display(idx)
+
+        # Emit so hardware setup page can also update its readout
+        self.um_per_px_calibrated.emit(idx, measured)
+        logger.info(
+            f"Camera {idx}: calibration accepted — {measured:.4f} µm/px")
+
+    # ════════════════════════════════════════════════════════════════
     #  MAIN CONTENT UI  (position readout + camera feeds)
     # ════════════════════════════════════════════════════════════════
 
@@ -1172,6 +1547,7 @@ class CalibrationPage(QWidget):
 
             # Create feed views — lightweight displays subscribed to CameraWidgets
             self._cam_feed_views: list[CameraFeedView] = []
+            self._click_to_move_enabled = False
             for i in range(MAX_CAMERAS):
                 fv = CameraFeedView(
                     camera_manager=self._camera_manager,
@@ -1179,6 +1555,10 @@ class CalibrationPage(QWidget):
                     show_crosshair=True,
                     label=f"Camera {i + 1}",
                     parent=self,
+                )
+                # Connect click signal for click-to-move
+                fv.clicked.connect(
+                    lambda px, py, idx=i: self._on_feed_clicked(idx, px, py)
                 )
                 self._cam_feed_views.append(fv)
 
@@ -1200,6 +1580,7 @@ class CalibrationPage(QWidget):
         else:
             self._cam_feed_views = []
             self._cam_placeholders = []
+            self._click_to_move_enabled = False
             no_cam = QLabel(
                 "Camera unavailable\n"
                 "Install: pip install opencv-python"
@@ -1795,9 +2176,7 @@ class CalibrationPage(QWidget):
             self.lbl_z.setText(f"{zp[0] - ctrl.zero_position.get('Z', 0):.2f}")
 
             # v7.2.7: feed needle to plate view
-            if hasattr(self, '_cal_plate_view') and self._taught_a1 is not None:
-                zero_x = ctrl.zero_position.get('x', 0)
-                zero_y = ctrl.zero_position.get('y', 0)
+            if hasattr(self, '_cal_plate_view') and self._taught_a1 is not None and xy[0] is not None:
                 nx_mm = (xy[0] - self._taught_a1[0]) / 1000.0
                 ny_mm = (xy[1] - self._taught_a1[1]) / 1000.0
                 self._cal_plate_view.set_needle_xy(nx_mm, ny_mm)
@@ -3298,6 +3677,21 @@ class CalibrationPage(QWidget):
             mcal.solve()
             self._calibrated_positions = mcal.correct_positions(
                 self._predicted_positions)
+            # v7.3.4: Convert to AffineCalibration so _save_calibration persists it
+            try:
+                import numpy as _np
+                from SupportClasses.MosaicBuilder import AffineCalibration
+                _R = mcal._R
+                self._three_well_calibration = AffineCalibration(
+                    rotation_deg=float(_np.degrees(_np.arctan2(_R[1, 0], _R[0, 0]))),
+                    scale=mcal._scale,
+                    translation_um=(mcal._tx, mcal._ty),
+                    center_um=(0.0, 0.0),
+                    num_points=mcal.n_points,
+                    residual_um=mcal.rms_error_um,
+                )
+            except Exception:
+                pass
             if hasattr(self, '_cal_plate_view'):
                 self._cal_plate_view.set_calibrated_positions(
                     self._calibrated_positions)
@@ -3310,6 +3704,7 @@ class CalibrationPage(QWidget):
                 self._gen_status.setStyleSheet(
                     f"color: {COLORS['green']}; font-size: 9pt;")
             logger.info(f"Manual XY fit: {n_cal} wells from {n} taught points")
+            self._save_calibration()  # v7.3.4: auto-persist calibrated positions
         except (ImportError, Exception) as e:
             # Fallback: 2-point scale+rotation via legacy method
             if "A1" in self._xy_teach_points:
