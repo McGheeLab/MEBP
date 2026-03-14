@@ -32,7 +32,7 @@ MEBP is a Python/PySide6 desktop application for controlling laboratory bioprint
 | `config/` | Hardware configs, controller protocols, print files |
 | `coding plans/` | Architecture docs, update plans, readmes |
 | `tests/` | Test suite |
-| `patches/` | Version upgrade patches |
+| `patches/` | Legacy version upgrade patches (deprecated — content migrated to update plans) |
 
 ### Core Design Principles
 
@@ -77,18 +77,22 @@ Each update plan is a **living document** that must include:
 
 | File | Scope |
 |------|-------|
-| `MEBP_v734_to_v735_UPDATE.md` | v7.3.5 Critical fixes: safe Z flush_moves() stale "ok" drain (serial buffer race), click-to-move QLabel event filter, XY unit fix (renamed microsteps_per_micron → xy_position_scale, 10→1), ZP stage settings card (feedrates + EEPROM save), watchdog periodic M500, simulation state persistence (ZP EEPROM + XY position to JSON) |
-| `MEBP_v733_to_v734_UPDATE.md` | v7.3.4 Objective-based µm/px calibration (per-camera selector, objectives.json, ObjectiveCalibration.py), MosaicCalibrator.py (manual SVD training persistence fix), XY lag fix (ProScan R-ack), XY stop fix (VS 0,0 on jog stop), CSS overhead fix, Xbox trigger creep fix (platform normalization + heartbeat suppression + velocity zeroing), Xbox debug mode (settings toggle → subprocess), calibration click-to-move (Click→Move toggle + CameraFeedView.clicked), safe navigation Z-wait fix (ZPStage.flush_moves M400 + PositionPoller.suspend/resume) |
-| `MEBP_v732_to_v733_UPDATE.md` | v7.3.3 Mode-based navigation + Pick & Place: ModePage base class with right-side icon nav, Printing mode (wraps print sub-pages), Pick & Place mode (config-first workflow, live camera target overlays, auto-queue building, execution monitoring), CameraManager shared feeds, camera µm/px empirical calibration (stage-move phase correlation), relaxed needle detection with interactive edge refinement + accept/reject UI, needle-based µm/px bridge |
-| `MEBP_v731_to_v732_UPDATE.md` | v7.3.2 QoL upgrades: camera config persistence, jog page startup well plate, axis flip checkboxes, custom step sizes + absolute goto, calibration page restructure (steps to main, configurable cameras, deprecate needle zero), print monitor camera overlay |
-| `MEBP_v730_to_v731_UPDATE.md` | v7.3.1 calibration overhaul: geometry-predicted wells, 3-well auto-calibration (Procrustes SVD), auto Z-bottom calibration (focus-sweep), simplified wizard (no manual teach steps), per-well 50% overlap scanning, jog page well plate navigator, 110 tests |
-| `MEBP_v730_AUTOCALIBRATION_UPDATE.md` | v7.3.0 autocalibration: well/needle detection, focus assist, simulated camera, detection overlay, parallel vision (7 phases complete) |
-| `MEBP_v729_to_v730_UPDATE.md` | Plan of Action redesign, PrintExecutionConfig, Finalize tab, new step types |
-| `MEBP_v728_to_v729_UPDATE.md` | Object consolidation, multi-ink, ink swap strategy, triangle fill |
-| `V726_PRINT_RESTORATION_PLAN.md` | Print execution restoration (7 critical fixes) |
-| `MEBP_v725_UPDATE_PLAN.md` | v7.2.5 multi-pump UI |
-| `MEBP_v724_UPDATE_PLAN.md` | v7.2.4 pump channel mapping |
-| `V723_UPGRADE_PLAN.md` | v7.2.3 hardware setup page |
+| `MEBP_v734_to_v735_UPDATE.md` | v7.3.5 Critical fixes: safe Z flush_moves() stale "ok" drain, click-to-move QLabel event filter, XY unit rename (microsteps_per_micron → xy_position_scale, 10→1), ZP stage settings card, watchdog M500, simulation state persistence |
+| `MEBP_v733_to_v734_UPDATE.md` | v7.3.4 Objective-based µm/px calibration, MosaicCalibrator.py, XY lag fix (R-ack), XY stop fix, CSS overhead fix, Xbox trigger creep + debug mode, calibration click-to-move, safe navigation Z-wait fix |
+| `MEBP_v732_to_v733_UPDATE.md` | v7.3.3 Mode-based navigation + Pick & Place, CameraManager shared feeds, µm/px empirical calibration, relaxed needle detection |
+| `MEBP_v731_to_v732_UPDATE.md` | v7.3.2 QoL: camera config persistence, jog well plate, axis flip, custom steps, calibration restructure, print monitor camera overlay |
+| `MEBP_v730_to_v731_UPDATE.md` | v7.3.1 Calibration overhaul: geometry-predicted wells, 3-well SVD auto-calibration, auto Z-bottom, simplified wizard, 110 tests |
+| `MEBP_v730_AUTOCALIBRATION_UPDATE.md` | v7.3.0 Autocalibration: well/needle detection, focus assist, simulated camera, detection overlay, 7 phases |
+| `MEBP_v729_to_v730_UPDATE.md` | v7.2.9→v7.3.0 Plan of Action redesign, PrintExecutionConfig, Finalize tab, new step types |
+| `MEBP_v728_to_v729_UPDATE.md` | v7.2.8→v7.2.9 Object consolidation, multi-ink, ink swap strategy, triangle fill |
+| `MEBP_v727_to_v728_UPDATE.md` | v7.2.8 Hardware comms: XY auto-detection, ProScan CR terminator, atomic position reads, Xbox status fix, simulation defaults |
+| `MEBP_v726_to_v727_UPDATE.md` | v7.2.7 Calibration workflow, Xbox Bluetooth cross-platform, Helper Functions page, print speed propagation, position display fixes |
+| `MEBP_v725_to_v726_UPDATE.md` | v7.2.6 Print execution restoration: 7 critical pipeline breaks, 8 secondary fixes, print monitor redesign, ToupCam integration |
+| `MEBP_v724_to_v725_UPDATE.md` | v7.2.5 Config load fix, XY µm-direct, pump µL jog, well setup redesign, print file list, Print Results page |
+| `MEBP_v723_to_v724_UPDATE.md` | v7.2.4 Config propagation audit, jog step verification, pump-ink-needle mapping, zoomable preview + OOB detection, plan validation |
+| `MEBP_v72_to_v723_UPDATE.md` | v7.2.3 UI/workflow overhaul: HW Setup auto-load, read-only workspace, execution→monitor, file-centric print objects |
+| `MEBP_v712_to_v72_UPDATE.md` | v7.2.0 Hardware Setup page, HardwareConfig model, µL-native pumps, PyDracula GUI migration, Catppuccin theme |
+| `MEBP_v71_to_v712_UPDATE.md` | v7.1.2 Bug fixes: XY jog accuracy, simulator performance, protocol loading, position rounding |
 
 ---
 
