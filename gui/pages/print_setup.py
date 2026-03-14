@@ -38,7 +38,7 @@ from SupportClasses.PrintManager import (
 )
 from SupportClasses.PhysicalModels import WorkspaceConfig
 from gui.styles import COLORS, SECTION_TITLE_STYLE
-from gui.scaling import s as _sc, scaled_font_size
+from gui.scaling import s as _sc, sf as _sf, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig
@@ -204,11 +204,11 @@ class PrintSetupPage(QWidget):
             QTabBar::tab {{
                 background: {COLORS['surface0']};
                 color: {COLORS['subtext0']};
-                padding: 8px 16px;
-                margin-right: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                font-weight: bold;
+                padding: {_sc(8)}px {_sc(16)}px;
+                margin-right: {_sc(2)}px;
+                border-top-left-radius: {_sc(6)}px;
+                border-top-right-radius: {_sc(6)}px;
+                font: bold {_sf(10)}pt "Segoe UI", "Apple Color Emoji", sans-serif;
             }}
             QTabBar::tab:selected {{
                 background: {COLORS['surface1']};

@@ -119,8 +119,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPointF, QTimer
 from PySide6.QtGui import QColor, QCursor
 
-from gui.styles import COLORS
-from gui.scaling import s, scaled_font_size, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
+from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
+from gui.scaling import s, scaled_font_size
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
 # MiniProjectionView removed in v7.2.4 (XY-only layout)
 

@@ -19,13 +19,12 @@ import logging
 
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QStackedWidget,
-    QPushButton, QFrame, QSizePolicy,
+    QPushButton, QFrame,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
 
 from gui.styles import COLORS
-from gui.scaling import s, scaled_font_size
+from gui.scaling import s, sf
 
 logger = logging.getLogger(__name__)
 
@@ -33,19 +32,6 @@ logger = logging.getLogger(__name__)
 _SIDEBAR_WIDTH = s(48)
 _BUTTON_SIZE = s(40)
 _BUTTON_SPACING = s(4)
-
-
-def _make_sub_icon(text: str, size: int = 24, color: str = COLORS["subtext0"]) -> QIcon:
-    """Create a QIcon from a text character for the sub-page button."""
-    pixmap = QPixmap(s(size), s(size))
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(QColor(color))
-    painter.setFont(QFont("Segoe UI Emoji", scaled_font_size(int(size * 0.55))))
-    painter.drawText(pixmap.rect(), Qt.AlignCenter, text)
-    painter.end()
-    return QIcon(pixmap)
 
 
 class ModePage(QWidget):
@@ -93,7 +79,7 @@ class ModePage(QWidget):
 
         self._sidebar_layout = QVBoxLayout(self._sidebar)
         self._sidebar_layout.setSpacing(_BUTTON_SPACING)
-        self._sidebar_layout.setContentsMargins(4, 8, 4, 8)
+        self._sidebar_layout.setContentsMargins(s(4), s(8), s(4), s(8))
         self._sidebar_layout.setAlignment(Qt.AlignTop)
 
         self._main_layout.addWidget(self._sidebar)
@@ -123,7 +109,6 @@ class ModePage(QWidget):
         btn.setFixedSize(_BUTTON_SIZE, _BUTTON_SIZE)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setToolTip(title)
-        btn.setFont(QFont("Segoe UI Emoji", scaled_font_size(14)))
         btn.setObjectName(f"modeSubBtn_{index}")
 
         # Style
@@ -203,16 +188,24 @@ class ModePage(QWidget):
 
     # ── Button styling ───────────────────────────────────────────
 
+    _EMOJI_FONT = (
+        f'"Segoe UI Emoji", "Apple Color Emoji", '
+        f'"Noto Color Emoji", sans-serif'
+    )
+
     def _apply_button_style(self, btn: QPushButton, active: bool):
         """Apply active/inactive style to a sub-page button."""
+        font_css = (
+            f"font: {sf(14)}pt {self._EMOJI_FONT};"
+        )
         if active:
             btn.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {COLORS['surface0']};
-                    border: 2px solid {COLORS['mauve']};
-                    border-radius: 6px;
+                    border: {s(2)}px solid {COLORS['mauve']};
+                    border-radius: {s(6)}px;
                     color: {COLORS['text']};
-                    font-size: 16px;
+                    {font_css}
                 }}
                 QPushButton:hover {{
                     background-color: {COLORS['surface1']};
@@ -223,9 +216,9 @@ class ModePage(QWidget):
                 QPushButton {{
                     background-color: {COLORS['mantle']};
                     border: 1px solid {COLORS['surface1']};
-                    border-radius: 6px;
+                    border-radius: {s(6)}px;
                     color: {COLORS['subtext0']};
-                    font-size: 16px;
+                    {font_css}
                 }}
                 QPushButton:hover {{
                     background-color: {COLORS['surface0']};

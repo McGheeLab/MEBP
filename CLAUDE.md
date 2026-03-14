@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.6** — Microscope-Enabled Bioprinting Platform
+**V7.3.7** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.6`
+Branch: `Version-7.3.7`
 
 ---
 
@@ -12,7 +12,7 @@ Branch: `Version-7.3.6`
 
 **Before making ANY code changes, read the architecture document for this version:**
 
-`coding plans/Architectures/ARCHITECTURE_V736.md`
+`coding plans/Architectures/ARCHITECTURE_V737.md`
 
 This document contains the full system architecture, module responsibilities, data flow diagrams, communication protocols, and key algorithms. Understanding this is mandatory before modifying any code.
 
@@ -107,7 +107,7 @@ Ensure the update plan in `coding plans/Update plans/` is finalized:
 ### 4. Push
 
 - Commit all changes
-- Push to the version branch (e.g., `Version-7.3.6`)
+- Push to the version branch (e.g., `Version-7.3.7`)
 
 ---
 
@@ -115,6 +115,7 @@ Ensure the update plan in `coding plans/Update plans/` is finalized:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v736_to_v737_UPDATE.md` | v7.3.7 Fix startup ImportError, DPI-scale mode page sidebar button icons + emoji font-family fallbacks, DPI-scale print setup tab bar |
 | `MEBP_v735_to_v736_UPDATE.md` | v7.3.6 DPI-aware GUI scaling (gui/scaling.py, build_theme(k), all pages/widgets scaled), PyInstaller executable packaging (MEBP.spec, build_exe.py), .gitignore |
 | `MEBP_v734_to_v735_UPDATE.md` | v7.3.5 Critical fixes: safe Z flush_moves() stale "ok" drain, click-to-move QLabel event filter, XY unit rename (microsteps_per_micron → xy_position_scale, 10→1), ZP stage settings card, watchdog M500, simulation state persistence |
 | `MEBP_v733_to_v734_UPDATE.md` | v7.3.4 Objective-based µm/px calibration, MosaicCalibrator.py, XY lag fix (R-ack), XY stop fix, CSS overhead fix, Xbox trigger creep + debug mode, calibration click-to-move, safe navigation Z-wait fix |
