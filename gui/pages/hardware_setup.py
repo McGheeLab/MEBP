@@ -929,6 +929,11 @@ class HardwareSetupPage(ModePage):
             self._sub_layouts[key].addStretch()
 
         # Register sub-pages with ModePage in user-facing order.
+        # v7.4.1: Device (Stage) is FIRST because it's the one-time
+        # initial setup of the physical machine. Everything below
+        # configures the experiment.
+        self.add_sub_page("⚙️", "Device",
+                          self._sub_scrolls["stage"])
         self.add_sub_page("🧾", "Identity",
                           self._sub_scrolls["identity"])
         self.add_sub_page("🔬", "Plate",
@@ -941,8 +946,6 @@ class HardwareSetupPage(ModePage):
                           self._sub_scrolls["rosette"])
         self.add_sub_page("📷", "Cameras",
                           self._sub_scrolls["cameras"])
-        self.add_sub_page("⚙️", "Stage",
-                          self._sub_scrolls["stage"])
 
     # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
     def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
@@ -973,11 +976,14 @@ class HardwareSetupPage(ModePage):
     # ════════════════════════════════════════════════════════════════
 
     def get_sub_page_title(self) -> str:
-        """Override ModePage to return descriptive sub-page name."""
-        labels = ["Hardware: Identity", "Hardware: Plate",
+        """Override ModePage to return descriptive sub-page name.
+
+        v7.4.1: Device sub-page first (initial setup), then experiment
+        sub-pages.
+        """
+        labels = ["Hardware: Device", "Hardware: Identity", "Hardware: Plate",
                   "Hardware: Pumps & Inks", "Hardware: Needle",
-                  "Hardware: Rosette", "Hardware: Cameras",
-                  "Hardware: Stage"]
+                  "Hardware: Rosette", "Hardware: Cameras"]
         idx = self.get_active_index()
         return labels[idx] if 0 <= idx < len(labels) else "Hardware Setup"
 

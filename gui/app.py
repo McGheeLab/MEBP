@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.4.0-c")
+        self.setWindowTitle("MEBP Bioprinter — v7.4.1")
         self.setMinimumSize(s(1100), s(700))
         self.resize(s(1400), s(850))
 
@@ -144,7 +144,7 @@ class MainWindow(QMainWindow):
         # after the window is shown so it appears on top).
         QTimer.singleShot(0, self._maybe_show_onboarding)
 
-        logger.info("MainWindow initialized (v7.4.0-c)")
+        logger.info("MainWindow initialized (v7.4.1)")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.0-c: ONBOARDING WIZARD TRIGGER
@@ -181,9 +181,10 @@ class MainWindow(QMainWindow):
             target = getattr(self.sender(), 'get_deep_link_target', lambda: None)()
             if target is not None:
                 self._navigate_to(target)
-                # HW page is a ModePage — switch to Pumps & Inks (sub-page idx 2)
+                # v7.4.1: Sub-page order reshuffled. New order:
+                #   0=Device 1=Identity 2=Plate 3=Pumps & Inks 4=Needle ...
                 if hasattr(hw_page, 'switch_to'):
-                    hw_page.switch_to(2)
+                    hw_page.switch_to(3)
             logger.info("Onboarding config applied")
         except Exception as e:
             logger.error(f"Failed to apply onboarding config: {e}")

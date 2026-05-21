@@ -164,6 +164,13 @@ DEFAULTS: dict[str, Any] = {
     # so it only runs once per settings.json file. See _run_migrations().
     "migrations": {
         "v7_4_0_b": False,
+        "v7_4_1_default_device": False,
+    },
+    # v7.4.1: Device profile (initial device setup — safety, feedrates,
+    # axis flips). The active profile name is tracked here so we can
+    # restore the selection in the Stage sub-page UI on each launch.
+    "device_profile": {
+        "active": None,
     },
 }
 
@@ -223,6 +230,44 @@ class Settings:
             self.set("migrations.v7_4_0_b", True)
             self.save()
             logger.info("v7.4.0-b migration complete; .bak-v7.3 written")
+
+        # v7.4.1: If no device profile has been selected yet, auto-load
+        # the bundled Standard.json so users have a sensible safety
+        # envelope from the very first launch.
+        if not self.get("migrations.v7_4_1_default_device", False):
+            self._apply_default_device_profile()
+            self.set("migrations.v7_4_1_default_device", True)
+            self.save()
+            logger.info("v7.4.1 default device profile applied")
+
+    def _apply_default_device_profile(self) -> None:
+        """v7.4.1: Apply Standard.json device profile on first launch.
+
+        Only runs if no active profile is currently set — won't clobber
+        a user who already picked a profile manually.
+        """
+        if self.get("device_profile.active"):
+            return  # Already configured
+        try:
+            # Lazy import to avoid GUI dependency in headless contexts
+            from pathlib import Path
+            standard_path = (
+                Path(__file__).resolve().parent.parent
+                / "config" / "hardware" / "devices" / "Standard.json"
+            )
+            if not standard_path.exists():
+                logger.debug(
+                    "Standard device profile not found; skipping default")
+                return
+            data = json.loads(standard_path.read_text())
+            for section in ("safety_limits", "zp_stage", "axis_flip"):
+                if section in data and isinstance(data[section], dict):
+                    self.set_section(section, data[section])
+            self.set("device_profile.active",
+                     data.get("profile_name", "Standard"))
+            logger.info("Applied default device profile: Standard")
+        except Exception as e:
+            logger.warning(f"Failed to apply default device profile: {e}")
 
     def _backup_v73(self) -> None:
         """Write a one-time backup of the current settings.json file.

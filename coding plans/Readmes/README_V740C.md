@@ -2,16 +2,17 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.4.1** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.4.0-c** | Python 3.10+ | PySide6 (Qt 6)
 
-> **v7.4.1** introduces **device profiles** — reusable per-machine settings
-> bundles (safety envelope, motor feedrates, axis direction) that travel
-> across any experiment-level HardwareConfig. Two bundled profiles ship in
-> `config/hardware/devices/`: Standard and Conservative. The Stage sub-page
-> is now the first sub-page in Hardware Setup and hosts the profile
-> picker. First launch auto-applies the Standard profile.
-> See [`coding plans/Update plans/MEBP_v740c_to_v741_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v740c_to_v741_UPDATE.md)
-> and [`coding plans/Architectures/ARCHITECTURE_V741.md`](coding%20plans/Architectures/ARCHITECTURE_V741.md).
+> **v7.4.0-c** is the final sub-version of the UX-focused v7.4.0 release.
+> First-time users now see a 5-step OnboardingWizard before the main
+> window appears. A top-bar Help toggle reveals inline guidance on every
+> registered form field. A global InvalidationBanner surfaces when
+> hardware config changes affect downstream pages.
+> See [`coding plans/Update plans/MEBP_v740b_to_v740c_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v740b_to_v740c_UPDATE.md)
+> for what's new in this sub-version, and
+> [`coding plans/Architectures/ARCHITECTURE_V740C.md`](coding%20plans/Architectures/ARCHITECTURE_V740C.md)
+> for the architecture delta.
 
 ---
 
@@ -325,7 +326,6 @@ See `coding plans/Architectures/ARCHITECTURE_V737.md` for the comprehensive arch
 - `coding plans/Architectures/ARCHITECTURE_V740A.md` — foundation (components, transitions, calibration auto-save)
 - `coding plans/Architectures/ARCHITECTURE_V740B.md` — workflow restructure (HW Setup sub-pages, Settings slim, migrations)
 - `coding plans/Architectures/ARCHITECTURE_V740C.md` — onboarding (wizard, help mode, invalidation banner)
-- `coding plans/Architectures/ARCHITECTURE_V741.md` — device profiles (per-machine reusable settings)
 
 ---
 
