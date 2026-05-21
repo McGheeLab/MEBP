@@ -140,7 +140,11 @@ class StageHardwarePanel(QWidget):
         # are now legacy and only kept around as fallbacks.
         outer.addWidget(self._build_setup_jog_safety_group())
         outer.addWidget(self._build_zp_feedrates_group())
-        outer.addWidget(self._build_axis_flip_group())
+        # v7.4.2 hotfix: Axis Direction Flips section removed — direction
+        # inversion now lives exclusively in steps_per_mm sign (see the
+        # Stepper Calibration "Invert Axis Direction" button). axis_flip
+        # is force-zeroed on every Apply to keep the two mechanisms from
+        # ever fighting each other.
 
         # Apply / Reset buttons
         btn_row = QHBoxLayout()
@@ -320,6 +324,21 @@ class StageHardwarePanel(QWidget):
         self.chk_zp_autosave.setChecked(False)
         outer.addWidget(self.chk_zp_autosave)
 
+        # v7.4.2 hotfix: per-section Save — pushes derived absolute
+        # mm/min to settings + sends M203 to Marlin (max feedrate)
+        # and updates the controller's retract/insert feedrates.
+        save_row = QHBoxLayout()
+        btn_save_feedrates = QPushButton("💾 Save Feedrates")
+        btn_save_feedrates.setObjectName("successBtn")
+        btn_save_feedrates.setToolTip(
+            "Compute absolute mm/min from the percentages, persist to "
+            "settings, send M203 to Marlin for the max feedrate, and "
+            "update the controller's retract/insert/jog feedrates.")
+        btn_save_feedrates.clicked.connect(self._apply_zp_feedrates)
+        save_row.addWidget(btn_save_feedrates)
+        save_row.addStretch()
+        outer.addLayout(save_row)
+
         # Initial derived display
         self._refresh_zp_feedrate_derived()
 
@@ -435,8 +454,51 @@ class StageHardwarePanel(QWidget):
         self._jog_array.home_requested.connect(self._force_refresh_positions)
         jog_lay.addWidget(self._jog_array)
 
-        # Manual refresh + status alongside the jog pad
+        # v7.4.2 hotfix: live position readout panel alongside the
+        # jog pad — gives the same at-a-glance position display the
+        # standalone Jog Control page has.
         side = QVBoxLayout()
+        pos_title = QLabel("Live Position")
+        pos_title.setStyleSheet(
+            f"color: {COLORS['blue']}; font-weight: 600; "
+            f"font-size: {sf(10)}pt;")
+        side.addWidget(pos_title)
+
+        pos_frame = QFrame()
+        pos_frame.setStyleSheet(
+            f"background: {COLORS['mantle']}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)}; padding: {sp(4)};")
+        pos_grid = QGridLayout(pos_frame)
+        pos_grid.setSpacing(s(4))
+        pos_grid.setContentsMargins(s(6), s(4), s(6), s(4))
+
+        self.lbl_jog_pos: dict[str, QLabel] = {}
+        for r, (axis, unit) in enumerate([
+            ("X", "µm"), ("Y", "µm"), ("Z", "mm"),
+            ("P1", "mm"), ("P2", "mm"), ("P3", "mm"),
+        ]):
+            ax_lbl = QLabel(f"<b>{axis}</b>")
+            ax_lbl.setStyleSheet(
+                f"color: {COLORS['text']}; font-size: {sf(9.5)}pt;")
+            pos_grid.addWidget(ax_lbl, r, 0)
+
+            val = QLabel("—")
+            val.setStyleSheet(
+                f"color: {COLORS['text']}; font-family: monospace; "
+                f"font-size: {sf(10)}pt;")
+            val.setMinimumWidth(s(80))
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            pos_grid.addWidget(val, r, 1)
+            self.lbl_jog_pos[axis] = val
+
+            unit_lbl = QLabel(f"({unit})")
+            unit_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            pos_grid.addWidget(unit_lbl, r, 2)
+
+        side.addWidget(pos_frame)
+
         self.btn_refresh_positions = QPushButton("↻ Refresh Positions")
         self.btn_refresh_positions.setToolTip(
             "Force a fresh position read from each connected stage.")
@@ -488,13 +550,31 @@ class StageHardwarePanel(QWidget):
                 decimals=3))
 
         outer.addWidget(limits_grp)
+
+        # v7.4.2 hotfix: per-section Save button — pushes safety_limits
+        # to settings + the live controller in one click.
+        save_row = QHBoxLayout()
+        btn_save_safety = QPushButton("💾 Save Safety Limits && Zero")
+        btn_save_safety.setObjectName("successBtn")
+        btn_save_safety.setToolTip(
+            "Persist safety_limits + zero positions to settings and "
+            "push them to the live StageController.")
+        btn_save_safety.clicked.connect(self._apply_safety_and_zero)
+        save_row.addWidget(btn_save_safety)
+        save_row.addStretch()
+        outer.addLayout(save_row)
+
         return grp
 
     def _build_axis_limit_row(self, axis: str, unit: str,
                               default_min: float, default_max: float,
                               min_attr, max_attr,
                               decimals: int = 1) -> QFrame:
-        """Build one axis row: position readout | Set Min | min spin | Set Max | max spin."""
+        """Build one axis row: position readout | Set Zero | Set Min | min spin | Set Max | max spin.
+
+        v7.4.2 hotfix: Set Zero button added — stamps the current
+        controller position as the new zero reference for this axis.
+        """
         frame = QFrame()
         frame.setStyleSheet(
             f"QFrame {{ background: {COLORS['surface0']}; "
@@ -517,6 +597,15 @@ class StageHardwarePanel(QWidget):
         self.lbl_axis_pos[axis] = pos_lbl
 
         h.addWidget(QLabel(f"({unit})"))
+
+        # v7.4.2 hotfix: Set Zero button
+        btn_zero = QPushButton("⊙ Set Zero")
+        btn_zero.setToolTip(
+            f"Stamp the current {axis} position as the new zero reference "
+            f"and persist it to the device settings.")
+        btn_zero.setMaximumHeight(s(26))
+        btn_zero.clicked.connect(lambda _c=False, a=axis: self._set_zero_axis(a))
+        h.addWidget(btn_zero)
 
         def _spin() -> QDoubleSpinBox:
             sp_w = QDoubleSpinBox()
@@ -595,30 +684,11 @@ class StageHardwarePanel(QWidget):
             logger.warning(f"jog {pump} {distance} failed: {e}")
         self._refresh_jog_positions()
 
-    def _build_axis_flip_group(self) -> QGroupBox:
-        grp = QGroupBox("Axis Direction Flips")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        lay = QVBoxLayout(grp)
+    # v7.4.2 hotfix: _build_axis_flip_group removed.
+    # Direction is now exclusively controlled by the sign of
+    # ``steps_per_mm`` (see Stepper Calibration → Invert Axis Direction).
+    # Keeping the two mechanisms in sync was a source of confusion.
 
-        info = QLabel(
-            "Flip the positive direction for an axis if your machine moves "
-            "the opposite way of expected. Per-machine setting."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        lay.addWidget(info)
-
-        row = QHBoxLayout()
-        self.chk_flip_z = QCheckBox("Flip Z")
-        self.chk_flip_p1 = QCheckBox("Flip P1")
-        self.chk_flip_p2 = QCheckBox("Flip P2")
-        self.chk_flip_p3 = QCheckBox("Flip P3")
-        for chk in (self.chk_flip_z, self.chk_flip_p1, self.chk_flip_p2, self.chk_flip_p3):
-            row.addWidget(chk)
-        row.addStretch()
-        lay.addLayout(row)
-
-        return grp
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.2: Connect Hardware
@@ -746,6 +816,21 @@ class StageHardwarePanel(QWidget):
             grid.addWidget(cmb, r, 2)
             self.cmb_axis_map[logical] = cmb
         lay.addLayout(grid)
+
+        # v7.4.2 hotfix: per-section Save button + status
+        save_row = QHBoxLayout()
+        btn_save = QPushButton("💾 Save Axis Mapping")
+        btn_save.setObjectName("successBtn")
+        btn_save.setToolTip(
+            "Push the mapping to the live ZP stage (if connected) and "
+            "persist to settings + the current device profile.")
+        btn_save.clicked.connect(self._apply_axis_mapping)
+        save_row.addWidget(btn_save)
+        self.lbl_axis_map_status = QLabel("")
+        self.lbl_axis_map_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        save_row.addWidget(self.lbl_axis_map_status, 1)
+        lay.addLayout(save_row)
 
         return grp
 
@@ -888,6 +973,23 @@ class StageHardwarePanel(QWidget):
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         self.lbl_cal_status.setWordWrap(True)
         outer.addWidget(self.lbl_cal_status)
+
+        # v7.4.2 hotfix: per-section Save button. The individual buttons
+        # (Calculate & Send M92, Invert Axis Direction, Record as Max)
+        # already persist on click — this button is a "save everything in
+        # this section now" convenience + a confirmation that values are
+        # synced to Marlin.
+        save_row = QHBoxLayout()
+        btn_save_cal = QPushButton("💾 Save Calibration")
+        btn_save_cal.setObjectName("successBtn")
+        btn_save_cal.setToolTip(
+            "Re-send the current steps_per_mm to Marlin (M92) and "
+            "persist steps_per_mm + per_axis_max_feedrate to "
+            "settings and the active device profile.")
+        btn_save_cal.clicked.connect(self._apply_steps_cal)
+        save_row.addWidget(btn_save_cal)
+        save_row.addStretch()
+        outer.addLayout(save_row)
 
         return grp
 
@@ -1045,18 +1147,7 @@ class StageHardwarePanel(QWidget):
         except Exception as e:
             self.lbl_jog_status.setText(f"Read failed: {e}")
             return
-        # Drive the same label-update path the polling tick uses
-        if xy:
-            if xy[0] is not None and "X" in self.lbl_axis_pos:
-                self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
-            if xy[1] is not None and "Y" in self.lbl_axis_pos:
-                self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
-        if zp:
-            if zp[0] is not None and "Z" in self.lbl_axis_pos:
-                self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
-            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
-                if i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
-                    self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+        self._update_position_displays(xy, zp)
         connected = []
         if ctrl.is_xy_connected:
             connected.append("XY")
@@ -1069,6 +1160,34 @@ class StageHardwarePanel(QWidget):
             self.lbl_jog_status.setText(
                 "No stages connected — connect XY/ZP above first.")
 
+    def _update_position_displays(self, xy, zp) -> None:
+        """v7.4.2 hotfix: update BOTH the per-axis limit-row labels
+        (lbl_axis_pos) AND the new live-position panel (lbl_jog_pos)
+        beside the jog pad."""
+        def _set(d, key, val):
+            if val is None or not hasattr(self, d) or key not in getattr(self, d):
+                return
+            getattr(self, d)[key].setText(val)
+        if xy:
+            if xy[0] is not None:
+                txt = f"{xy[0]:,.1f}"
+                _set("lbl_axis_pos", "X", txt)
+                _set("lbl_jog_pos", "X", txt)
+            if xy[1] is not None:
+                txt = f"{xy[1]:,.1f}"
+                _set("lbl_axis_pos", "Y", txt)
+                _set("lbl_jog_pos", "Y", txt)
+        if zp:
+            if zp[0] is not None:
+                txt = f"{zp[0]:.3f}"
+                _set("lbl_axis_pos", "Z", txt)
+                _set("lbl_jog_pos", "Z", txt)
+            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
+                if i < len(zp) and zp[i] is not None:
+                    txt = f"{zp[i]:.3f}"
+                    _set("lbl_axis_pos", pid, txt)
+                    _set("lbl_jog_pos", pid, txt)
+
     # v7.4.2 hotfix: _build_jog_row, _jog, and _JOG_STEPS removed.
     # Per-axis jog UI is now driven by the embedded JogButtonArray
     # via _on_jog_array_xy / _on_jog_array_z / _on_jog_array_pump
@@ -1076,7 +1195,11 @@ class StageHardwarePanel(QWidget):
     # bypass_safety=True.
 
     def _refresh_jog_positions(self) -> None:
-        """Update the per-axis position readouts. Called by jog + a 500ms tick."""
+        """Update the per-axis position readouts. Called by jog + a 500ms tick.
+
+        v7.4.2 hotfix: routes through _update_position_displays so both
+        the limit-row labels and the new live-position panel update.
+        """
         ctrl = self._controller
         if ctrl is None or not hasattr(self, 'lbl_axis_pos'):
             return
@@ -1085,15 +1208,54 @@ class StageHardwarePanel(QWidget):
             zp = ctrl.get_zp_position(cached=True)
         except Exception:
             return
-        if xy and xy[0] is not None and "X" in self.lbl_axis_pos:
-            self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
-        if xy and xy[1] is not None and "Y" in self.lbl_axis_pos:
-            self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
-        if zp and zp[0] is not None and "Z" in self.lbl_axis_pos:
-            self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
-        for i, pid in enumerate(["P1", "P2", "P3"], start=1):
-            if zp and i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
-                self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+        self._update_position_displays(xy, zp)
+
+    # v7.4.2 hotfix: per-axis Set Zero — stamps current controller
+    # position as the new zero reference for the chosen axis and
+    # persists to settings.json (zero_position section).
+    _ZERO_KEY = {
+        "X": "x", "Y": "y", "Z": "Z",
+        "P1": "P1", "P2": "P2", "P3": "P3",
+    }
+
+    def _set_zero_axis(self, axis: str) -> None:
+        ctrl = self._controller
+        if ctrl is None:
+            self.lbl_jog_status.setText("No controller available.")
+            return
+        try:
+            xy = ctrl.get_xy_position(cached=False)
+            zp = ctrl.get_zp_position(cached=False)
+        except Exception as e:
+            self.lbl_jog_status.setText(f"Read failed: {e}")
+            return
+        raw: float | None = None
+        if axis == "X" and xy and xy[0] is not None:
+            raw = float(xy[0])
+        elif axis == "Y" and xy and xy[1] is not None:
+            raw = float(xy[1])
+        elif axis == "Z" and zp and zp[0] is not None:
+            raw = float(zp[0])
+        elif axis in ("P1", "P2", "P3"):
+            idx = {"P1": 1, "P2": 2, "P3": 3}[axis]
+            if zp and idx < len(zp) and zp[idx] is not None:
+                raw = float(zp[idx])
+        if raw is None:
+            self.lbl_jog_status.setText(
+                f"Cannot zero {axis}: no fresh position available "
+                f"(is the stage connected?).")
+            return
+        key = self._ZERO_KEY[axis]
+        ctrl.zero_position[key] = raw
+        if self._settings is not None:
+            self._settings.set_section("zero_position", ctrl.zero_position)
+            self._settings.save()
+        self._update_position_displays(xy, zp)
+        unit = "µm" if axis in ("X", "Y") else "mm"
+        self.lbl_jog_status.setText(
+            f"Zeroed {axis} at raw {raw:.3f} {unit}. New zero saved "
+            f"to settings.json (zero_position.{key}).")
+        logger.info(f"Set {axis} zero: raw={raw:.3f} {unit}")
 
     def _record_limit(self, axis: str, which: str) -> None:
         """Copy current position into the matching safety spinbox.
@@ -1136,17 +1298,7 @@ class StageHardwarePanel(QWidget):
                 recorded_val = float(zp[idx] - zero.get(axis, 0))
                 target_dict[axis].setValue(recorded_val)
         # Update visible position labels with the fresh read
-        if xy:
-            if xy[0] is not None and "X" in self.lbl_axis_pos:
-                self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
-            if xy[1] is not None and "Y" in self.lbl_axis_pos:
-                self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
-        if zp:
-            if zp[0] is not None and "Z" in self.lbl_axis_pos:
-                self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
-            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
-                if i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
-                    self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+        self._update_position_displays(xy, zp)
         if recorded_val is not None and hasattr(self, 'lbl_jog_status'):
             unit = "µm" if axis in ("X", "Y") else "mm"
             self.lbl_jog_status.setText(
@@ -1217,10 +1369,8 @@ class StageHardwarePanel(QWidget):
         self.chk_zp_autosave.setChecked(bool(s.get("zp_stage.auto_save_position", False)))
 
         # Axis flips
-        self.chk_flip_z.setChecked(bool(s.get("axis_flip.z", False)))
-        self.chk_flip_p1.setChecked(bool(s.get("axis_flip.p1", False)))
-        self.chk_flip_p2.setChecked(bool(s.get("axis_flip.p2", False)))
-        self.chk_flip_p3.setChecked(bool(s.get("axis_flip.p3", False)))
+        # v7.4.2 hotfix: axis_flip UI removed; widgets no longer exist.
+        # Force-zero any stale axis_flip values on next Apply.
 
         # v7.4.1: Restore active profile selection
         active = s.get("device_profile.active", "")
@@ -1254,6 +1404,155 @@ class StageHardwarePanel(QWidget):
             self._refresh_max_feedrate_grid()
         if hasattr(self, 'spin_cal_feedrate') and hasattr(self, 'cmb_cal_axis'):
             self._on_cal_axis_changed(0)
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2 hotfix: per-section focused apply methods
+    # ════════════════════════════════════════════════════════════════
+    #
+    # Each writes to BOTH the live StageController (so the change
+    # takes effect immediately) AND settings.json (so it survives a
+    # relaunch). The master ``_apply`` below still saves everything in
+    # one click for users who prefer it.
+
+    def _apply_axis_mapping(self) -> None:
+        """Save the axis-mapping section: combos → settings + zp_stage."""
+        if self._settings is None:
+            return
+        new_map = {logical: cmb.currentData()
+                   for logical, cmb in self.cmb_axis_map.items()
+                   if cmb.currentData()}
+        self._settings.set("device_profile.axis_map", new_map)
+        self._settings.save()
+        if (self._controller is not None
+                and self._controller.zp_stage is not None):
+            self._controller.zp_stage.set_axis_map(new_map)
+        elif self._controller is not None:
+            self._controller.apply_device_settings(axis_map=new_map)
+        if hasattr(self, 'lbl_axis_map_status'):
+            self.lbl_axis_map_status.setText(
+                f"Saved: {new_map}")
+        logger.info(f"Axis mapping saved: {new_map}")
+
+    def _apply_steps_cal(self) -> None:
+        """Save the stepper-calibration section: re-send M92 + persist."""
+        if self._settings is None:
+            return
+        if self._controller is not None and self._controller.zp_stage is not None:
+            steps = dict(self._controller.zp_stage.steps_per_mm)
+            self._settings.set("device_profile.steps_per_mm", steps)
+            # Re-send M92 so Marlin matches our stored steps/mm
+            self._controller.zp_stage.set_steps_per_mm(steps, persist=True)
+        self._settings.save()
+        self._refresh_steps_grid()
+        self._refresh_max_feedrate_grid()
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                "Calibration saved: steps_per_mm + per_axis_max_feedrate "
+                "persisted; M92 sent to Marlin.")
+        logger.info("Stepper calibration saved")
+
+    def _apply_safety_and_zero(self) -> None:
+        """Save safety_limits + zero positions: settings + controller.
+
+        Includes the master safety toggle, all min/max spinboxes, global
+        feedrate caps, and the per-axis zero references (already in
+        controller.zero_position via the Set Zero buttons; this just
+        re-persists the snapshot).
+        """
+        s = self._settings
+        if s is None:
+            return
+        s.set("safety_limits.enabled", self.chk_safety_enabled.isChecked())
+        s.set("safety_limits.xy_min_x", self.spin_xy_min_x.value())
+        s.set("safety_limits.xy_max_x", self.spin_xy_max_x.value())
+        s.set("safety_limits.xy_min_y", self.spin_xy_min_y.value())
+        s.set("safety_limits.xy_max_y", self.spin_xy_max_y.value())
+        s.set("safety_limits.z_min", self.spin_z_min.value())
+        s.set("safety_limits.z_max", self.spin_z_max.value())
+        for pid in ("P1", "P2", "P3"):
+            s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
+            s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
+        s.set("safety_limits.max_xy_speed", self.spin_max_xy_speed.value())
+        s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
+        s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
+        # Mirror into live controller.safety_limits if available
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "safety_limits"):
+            sl = ctrl.safety_limits
+            sl.enabled = self.chk_safety_enabled.isChecked()
+            sl.xy_min_x = self.spin_xy_min_x.value()
+            sl.xy_max_x = self.spin_xy_max_x.value()
+            sl.xy_min_y = self.spin_xy_min_y.value()
+            sl.xy_max_y = self.spin_xy_max_y.value()
+            sl.z_min = self.spin_z_min.value()
+            sl.z_max = self.spin_z_max.value()
+            for pid in ("P1", "P2", "P3"):
+                pid_l = pid.lower()
+                if hasattr(sl, f"{pid_l}_min"):
+                    setattr(sl, f"{pid_l}_min", self.spin_p_mins[pid].value())
+                    setattr(sl, f"{pid_l}_max", self.spin_p_maxs[pid].value())
+            sl.max_xy_speed = self.spin_max_xy_speed.value()
+            sl.max_z_feedrate = self.spin_max_z_feed.value()
+            sl.max_pump_feedrate = self.spin_max_pump_feed.value()
+            # Persist current zero_position snapshot too
+            s.set_section("zero_position", ctrl.zero_position)
+        s.save()
+        if hasattr(self, 'lbl_jog_status'):
+            self.lbl_jog_status.setText(
+                "Safety limits + zero positions saved to settings and "
+                "applied to the live controller.")
+        logger.info("Safety limits + zero saved")
+
+    def _apply_zp_feedrates(self) -> None:
+        """Save ZP feedrates: compute absolute mm/min from percentages,
+        send M203 to Marlin, update controller retract/insert feedrates."""
+        s = self._settings
+        if s is None:
+            return
+        z_max = self._z_max_feedrate_mm_min()
+        max_pct = self.spin_zp_max_pct.value()
+        ret_pct = self.spin_zp_retract_pct.value()
+        ins_pct = self.spin_zp_insert_pct.value()
+        jog_pct = self.spin_zp_jog_pct.value()
+        max_mm = max_pct / 100.0 * z_max
+        ret_mm = ret_pct / 100.0 * z_max
+        ins_mm = ins_pct / 100.0 * z_max
+        jog_mm = jog_pct / 100.0 * z_max
+        s.set("zp_stage.max_feedrate_pct", max_pct)
+        s.set("zp_stage.retract_feedrate_pct", ret_pct)
+        s.set("zp_stage.insert_feedrate_pct", ins_pct)
+        s.set("zp_stage.jog_feedrate_pct", jog_pct)
+        s.set("zp_stage.max_feedrate", max_mm)
+        s.set("zp_stage.retract_feedrate", ret_mm)
+        s.set("zp_stage.insert_feedrate", ins_mm)
+        s.set("zp_stage.jog_feedrate", jog_mm)
+        s.set("zp_stage.auto_save_position", self.chk_zp_autosave.isChecked())
+        # Push to the live controller / ZP stage
+        ctrl = self._controller
+        if ctrl is not None:
+            try:
+                if ctrl.zp_stage is not None and hasattr(
+                        ctrl.zp_stage, 'set_max_feedrate'):
+                    ctrl.zp_stage.set_max_feedrate(max_mm)  # sends M203
+                    ctrl.zp_stage.feedrate = jog_mm
+                if hasattr(ctrl, '_zp_retract_feedrate'):
+                    ctrl._zp_retract_feedrate = ret_mm
+                if hasattr(ctrl, '_zp_insert_feedrate'):
+                    ctrl._zp_insert_feedrate = ins_mm
+                if hasattr(ctrl, '_zp_auto_save_position'):
+                    ctrl._zp_auto_save_position = self.chk_zp_autosave.isChecked()
+            except Exception as e:
+                logger.warning(f"ZP feedrate push to controller failed: {e}")
+        s.save()
+        if hasattr(self, 'lbl_jog_status'):
+            self.lbl_jog_status.setText(
+                f"ZP feedrates saved: max {max_mm:.0f}, retract {ret_mm:.0f}, "
+                f"insert {ins_mm:.0f}, jog {jog_mm:.0f} mm/min "
+                f"(M203 sent to Marlin)")
+        logger.info(
+            f"ZP feedrates saved (mm/min): "
+            f"max={max_mm:.0f}, retract={ret_mm:.0f}, "
+            f"insert={ins_mm:.0f}, jog={jog_mm:.0f}")
 
     def _apply(self):
         """v7.4.1: Write current widget values to Settings using canonical
@@ -1294,10 +1593,18 @@ class StageHardwarePanel(QWidget):
         s.set("zp_stage.jog_feedrate",     jog_pct / 100.0 * z_max)
         s.set("zp_stage.auto_save_position", self.chk_zp_autosave.isChecked())
 
-        s.set("axis_flip.z", self.chk_flip_z.isChecked())
-        s.set("axis_flip.p1", self.chk_flip_p1.isChecked())
-        s.set("axis_flip.p2", self.chk_flip_p2.isChecked())
-        s.set("axis_flip.p3", self.chk_flip_p3.isChecked())
+        # v7.4.2 hotfix: axis_flip UI removed; force-zero any stale
+        # flags so direction is exclusively controlled by steps_per_mm sign.
+        s.set("axis_flip.z", False)
+        s.set("axis_flip.p1", False)
+        s.set("axis_flip.p2", False)
+        s.set("axis_flip.p3", False)
+        if self._controller is not None and hasattr(self._controller, 'set_axis_flips'):
+            try:
+                self._controller.set_axis_flips({
+                    "z": False, "p1": False, "p2": False, "p3": False})
+            except Exception:
+                pass
 
         # v7.4.2: Axis mapping — collect from combos
         if hasattr(self, 'cmb_axis_map'):
@@ -1339,10 +1646,7 @@ class StageHardwarePanel(QWidget):
         self.spin_zp_jog_pct.setValue(40.0)
         self._refresh_zp_feedrate_derived()
         self.chk_zp_autosave.setChecked(False)
-        self.chk_flip_z.setChecked(False)
-        self.chk_flip_p1.setChecked(False)
-        self.chk_flip_p2.setChecked(False)
-        self.chk_flip_p3.setChecked(False)
+        # v7.4.2 hotfix: axis_flip UI removed
 
     # ── v7.4.1: Device profile actions ───────────────────────────
 
