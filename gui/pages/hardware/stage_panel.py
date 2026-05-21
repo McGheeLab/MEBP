@@ -34,6 +34,7 @@ from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.hardware.device_profile import (
     DeviceProfile, list_profiles, delete_profile, DEVICES_DIR,
 )
+from gui.widgets.jog_button_array import JogButtonArray
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +135,10 @@ class StageHardwarePanel(QWidget):
         outer.addWidget(self._build_axis_mapping_group())
         outer.addWidget(self._build_steps_cal_group())
 
-        outer.addWidget(self._build_safety_group())
-        # v7.4.2: Per-axis Jog + Record Min/Max for limits discovery
-        outer.addWidget(self._build_jog_limits_group())
+        # v7.4.2 hotfix: Safety + per-axis jog + full jog pad combined
+        # into one workspace. _build_safety_group + _build_jog_limits_group
+        # are now legacy and only kept around as fallbacks.
+        outer.addWidget(self._build_setup_jog_safety_group())
         outer.addWidget(self._build_zp_feedrates_group())
         outer.addWidget(self._build_axis_flip_group())
 
@@ -215,86 +217,14 @@ class StageHardwarePanel(QWidget):
 
         return grp
 
-    def _build_safety_group(self) -> QGroupBox:
-        """v7.4.1: Uses canonical SafetyLimits field names (xy_min_x etc.)."""
-        grp = QGroupBox("Safety Limits")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        form = QGridLayout(grp)
-        form.setSpacing(s(6))
+    # v7.4.2 hotfix: _build_safety_group removed.
+    # Its widgets (chk_safety_enabled, spin_xy_min_x, spin_xy_max_x,
+    # spin_xy_min_y, spin_xy_max_y, spin_z_min, spin_z_max,
+    # spin_p_mins, spin_p_maxs, spin_max_xy_speed, spin_max_z_feed,
+    # spin_max_pump_feed) are now built inside
+    # _build_setup_jog_safety_group with the same attribute names so
+    # _load_from_settings + _apply continue to work unchanged.
 
-        def _spin(default: float, unit: str, decimals: int = 1,
-                  lo: float = -1e6, hi: float = 1e6) -> QDoubleSpinBox:
-            sp_w = QDoubleSpinBox()
-            sp_w.setRange(lo, hi)
-            sp_w.setDecimals(decimals)
-            sp_w.setSuffix(f" {unit}")
-            sp_w.setValue(default)
-            sp_w.setMinimumWidth(s(120))
-            return sp_w
-
-        row = 0
-        form.addWidget(QLabel("Enable safety limits:"), row, 0)
-        self.chk_safety_enabled = QCheckBox()
-        self.chk_safety_enabled.setChecked(True)
-        form.addWidget(self.chk_safety_enabled, row, 1)
-
-        # XY — separate X and Y bounds (match SafetyLimits.xy_{min,max}_{x,y})
-        row += 1
-        form.addWidget(QLabel("XY X min (µm):"), row, 0)
-        self.spin_xy_min_x = _spin(-130000.0, "µm")
-        form.addWidget(self.spin_xy_min_x, row, 1)
-        form.addWidget(QLabel("XY X max (µm):"), row, 2)
-        self.spin_xy_max_x = _spin(130000.0, "µm")
-        form.addWidget(self.spin_xy_max_x, row, 3)
-
-        row += 1
-        form.addWidget(QLabel("XY Y min (µm):"), row, 0)
-        self.spin_xy_min_y = _spin(-85000.0, "µm")
-        form.addWidget(self.spin_xy_min_y, row, 1)
-        form.addWidget(QLabel("XY Y max (µm):"), row, 2)
-        self.spin_xy_max_y = _spin(85000.0, "µm")
-        form.addWidget(self.spin_xy_max_y, row, 3)
-
-        row += 1
-        form.addWidget(QLabel("Z min (mm):"), row, 0)
-        self.spin_z_min = _spin(-10.0, "mm", decimals=3)
-        form.addWidget(self.spin_z_min, row, 1)
-        form.addWidget(QLabel("Z max (mm):"), row, 2)
-        self.spin_z_max = _spin(50.0, "mm", decimals=3)
-        form.addWidget(self.spin_z_max, row, 3)
-
-        # Per-pump limits (P1/P2/P3 — match SafetyLimits.{p1,p2,p3}_{min,max})
-        self.spin_p_mins: dict[str, QDoubleSpinBox] = {}
-        self.spin_p_maxs: dict[str, QDoubleSpinBox] = {}
-        for pid, default_lo, default_hi in [
-            ("P1", -50.0, 50.0),
-            ("P2", -50.0, 50.0),
-            ("P3", -50.0, 50.0),
-        ]:
-            row += 1
-            form.addWidget(QLabel(f"{pid} min (mm):"), row, 0)
-            sp_min = _spin(default_lo, "mm", decimals=3)
-            form.addWidget(sp_min, row, 1)
-            form.addWidget(QLabel(f"{pid} max (mm):"), row, 2)
-            sp_max = _spin(default_hi, "mm", decimals=3)
-            form.addWidget(sp_max, row, 3)
-            self.spin_p_mins[pid] = sp_min
-            self.spin_p_maxs[pid] = sp_max
-
-        row += 1
-        form.addWidget(QLabel("Max XY speed (µm/s):"), row, 0)
-        self.spin_max_xy_speed = _spin(10000.0, "µm/s")
-        form.addWidget(self.spin_max_xy_speed, row, 1)
-        form.addWidget(QLabel("Max Z feedrate (mm/min):"), row, 2)
-        self.spin_max_z_feed = _spin(500.0, "mm/min")
-        form.addWidget(self.spin_max_z_feed, row, 3)
-
-        row += 1
-        form.addWidget(QLabel("Max pump feedrate (mm/min):"), row, 0)
-        self.spin_max_pump_feed = _spin(200.0, "mm/min")
-        form.addWidget(self.spin_max_pump_feed, row, 1)
-
-        return grp
 
     def _build_zp_feedrates_group(self) -> QGroupBox:
         """v7.4.2 hotfix: ZP feedrates are now PERCENTAGES of Z's
@@ -424,6 +354,246 @@ class StageHardwarePanel(QWidget):
         ]:
             actual = (spin.value() / 100.0) * z_max
             lbl.setText(f"= {actual:.0f} mm/min  (of Z max {z_max:.0f})")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2 hotfix: combined Jog & Safety Limits workspace
+    # ════════════════════════════════════════════════════════════════
+    #
+    # The old "Safety Limits" group and the old "Per-Axis Jog + Record
+    # Limits" group fused into one. The full jog pad from
+    # JogButtonArray (XY pad + Z buttons + pumps + step selectors) is
+    # embedded here so the user can run the whole find-the-mechanical-
+    # envelope workflow on one screen.
+
+    def _build_setup_jog_safety_group(self) -> QGroupBox:
+        grp = QGroupBox("Jog && Safety Limits")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        # ── Bypass-mode banner ─────────────────────────────────
+        bypass_banner = QLabel(
+            "⚠ <b>Setup-mode jog.</b> The jog pad below bypasses "
+            "soft-limit clamping and the pump-enabled check so you "
+            "can move freely to discover the mechanical envelope. "
+            "Use <i>Set as Min / Set as Max</i> next to each axis "
+            "row to record the current position into the safety "
+            "limits — then click Apply Settings at the bottom to "
+            "persist."
+        )
+        bypass_banner.setWordWrap(True)
+        bypass_banner.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: {sf(9)}pt; "
+            f"padding: {sp(4)} {sp(8)};"
+            f"border-left: 2px solid {COLORS['yellow']};"
+            f"background: rgba(249, 226, 175, 18);"
+        )
+        outer.addWidget(bypass_banner)
+
+        # ── Master safety toggle + global feedrate caps ────────
+        top_row = QHBoxLayout()
+        self.chk_safety_enabled = QCheckBox("Enable safety limits")
+        self.chk_safety_enabled.setChecked(True)
+        self.chk_safety_enabled.setToolTip(
+            "Master switch for the recorded soft-limit envelope. "
+            "When off, no clamping is applied anywhere in the app. "
+            "(The jog pad below ignores this either way.)")
+        top_row.addWidget(self.chk_safety_enabled)
+        top_row.addStretch(1)
+        outer.addLayout(top_row)
+
+        caps_grp = QGroupBox("Global Feedrate Caps")
+        caps_grp.setStyleSheet(SECTION_TITLE_STYLE)
+        caps_form = QFormLayout(caps_grp)
+
+        def _cap_spin(default: float, unit: str, dec: int = 1) -> QDoubleSpinBox:
+            sp_w = QDoubleSpinBox()
+            sp_w.setRange(0.1, 1e6)
+            sp_w.setDecimals(dec)
+            sp_w.setSuffix(f" {unit}")
+            sp_w.setValue(default)
+            sp_w.setMinimumWidth(s(140))
+            return sp_w
+
+        self.spin_max_xy_speed = _cap_spin(10000.0, "µm/s")
+        caps_form.addRow("Max XY speed:", self.spin_max_xy_speed)
+        self.spin_max_z_feed = _cap_spin(500.0, "mm/min")
+        caps_form.addRow("Max Z feedrate:", self.spin_max_z_feed)
+        self.spin_max_pump_feed = _cap_spin(200.0, "mm/min")
+        caps_form.addRow("Max pump feedrate:", self.spin_max_pump_feed)
+        outer.addWidget(caps_grp)
+
+        # ── Full jog pad embed ──────────────────────────────────
+        jog_grp = QGroupBox("Full Jog Pad (setup-mode, safety bypassed)")
+        jog_grp.setStyleSheet(SECTION_TITLE_STYLE)
+        jog_lay = QHBoxLayout(jog_grp)
+        jog_lay.setSpacing(s(12))
+
+        self._jog_array = JogButtonArray(compact=False, show_pumps=True)
+        self._jog_array.jog_xy_requested.connect(self._on_jog_array_xy)
+        self._jog_array.jog_z_requested.connect(self._on_jog_array_z)
+        self._jog_array.jog_pump_requested.connect(self._on_jog_array_pump)
+        self._jog_array.home_requested.connect(self._force_refresh_positions)
+        jog_lay.addWidget(self._jog_array)
+
+        # Manual refresh + status alongside the jog pad
+        side = QVBoxLayout()
+        self.btn_refresh_positions = QPushButton("↻ Refresh Positions")
+        self.btn_refresh_positions.setToolTip(
+            "Force a fresh position read from each connected stage.")
+        self.btn_refresh_positions.clicked.connect(self._force_refresh_positions)
+        side.addWidget(self.btn_refresh_positions)
+
+        self.lbl_jog_status = QLabel("")
+        self.lbl_jog_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_jog_status.setWordWrap(True)
+        side.addWidget(self.lbl_jog_status, 1)
+        jog_lay.addLayout(side, 1)
+
+        outer.addWidget(jog_grp)
+
+        # ── Per-axis position + record + min/max spinboxes ─────
+        limits_grp = QGroupBox(
+            "Per-axis position && safety limits "
+            "(jog to extremes → click Set Min/Max)")
+        limits_grp.setStyleSheet(SECTION_TITLE_STYLE)
+        limits_outer = QVBoxLayout(limits_grp)
+
+        self.lbl_axis_pos: dict[str, QLabel] = {}
+        self.spin_p_mins: dict[str, QDoubleSpinBox] = {}
+        self.spin_p_maxs: dict[str, QDoubleSpinBox] = {}
+
+        # X axis row
+        limits_outer.addWidget(self._build_axis_limit_row(
+            "X", "µm", -130000.0, 130000.0,
+            min_attr="spin_xy_min_x", max_attr="spin_xy_max_x",
+            decimals=0))
+        # Y axis row
+        limits_outer.addWidget(self._build_axis_limit_row(
+            "Y", "µm", -85000.0, 85000.0,
+            min_attr="spin_xy_min_y", max_attr="spin_xy_max_y",
+            decimals=0))
+        # Z axis row
+        limits_outer.addWidget(self._build_axis_limit_row(
+            "Z", "mm", -10.0, 50.0,
+            min_attr="spin_z_min", max_attr="spin_z_max",
+            decimals=3))
+        # Pump rows
+        for pid, lo, hi in [("P1", -50.0, 50.0), ("P2", -50.0, 50.0),
+                            ("P3", -50.0, 50.0)]:
+            limits_outer.addWidget(self._build_axis_limit_row(
+                pid, "mm", lo, hi,
+                min_attr=("spin_p_mins", pid),
+                max_attr=("spin_p_maxs", pid),
+                decimals=3))
+
+        outer.addWidget(limits_grp)
+        return grp
+
+    def _build_axis_limit_row(self, axis: str, unit: str,
+                              default_min: float, default_max: float,
+                              min_attr, max_attr,
+                              decimals: int = 1) -> QFrame:
+        """Build one axis row: position readout | Set Min | min spin | Set Max | max spin."""
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: {COLORS['surface0']}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)}; padding: {sp(4)}; }}")
+        h = QHBoxLayout(frame)
+        h.setSpacing(s(6))
+        h.setContentsMargins(s(6), s(4), s(6), s(4))
+
+        lbl_axis = QLabel(f"<b>{axis}</b>")
+        lbl_axis.setMinimumWidth(s(28))
+        h.addWidget(lbl_axis)
+
+        pos_lbl = QLabel("—")
+        pos_lbl.setStyleSheet(
+            f"color: {COLORS['text']}; font-family: monospace; "
+            f"min-width: {sp(90)};")
+        pos_lbl.setMinimumWidth(s(90))
+        h.addWidget(pos_lbl)
+        self.lbl_axis_pos[axis] = pos_lbl
+
+        h.addWidget(QLabel(f"({unit})"))
+
+        def _spin() -> QDoubleSpinBox:
+            sp_w = QDoubleSpinBox()
+            sp_w.setRange(-1e6, 1e6)
+            sp_w.setDecimals(decimals)
+            sp_w.setSuffix(f" {unit}")
+            sp_w.setMinimumWidth(s(110))
+            return sp_w
+
+        # MIN side
+        btn_min = QPushButton("⤓ Set Min")
+        btn_min.setToolTip(f"Stamp the current {axis} position into the min spinbox")
+        btn_min.setMaximumHeight(s(26))
+        btn_min.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "min"))
+        h.addWidget(btn_min)
+        spin_min = _spin()
+        spin_min.setValue(default_min)
+        h.addWidget(spin_min)
+
+        # MAX side
+        btn_max = QPushButton("⤒ Set Max")
+        btn_max.setToolTip(f"Stamp the current {axis} position into the max spinbox")
+        btn_max.setMaximumHeight(s(26))
+        btn_max.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "max"))
+        h.addWidget(btn_max)
+        spin_max = _spin()
+        spin_max.setValue(default_max)
+        h.addWidget(spin_max)
+
+        h.addStretch(1)
+
+        # Store spin widgets at the canonical attribute path so _load_from_settings
+        # and _apply (which use names like self.spin_xy_min_x or
+        # self.spin_p_mins["P1"]) keep working unchanged.
+        if isinstance(min_attr, tuple):
+            container_name, key = min_attr
+            getattr(self, container_name)[key] = spin_min
+        else:
+            setattr(self, min_attr, spin_min)
+        if isinstance(max_attr, tuple):
+            container_name, key = max_attr
+            getattr(self, container_name)[key] = spin_max
+        else:
+            setattr(self, max_attr, spin_max)
+        return frame
+
+    # JogButtonArray signal adapters — pass through to the same
+    # bypass-safety move methods used by the per-axis jog buttons.
+
+    def _on_jog_array_xy(self, dx_um: float, dy_um: float) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.move_xy_relative_um(
+                dx_um, dy_um, bypass_safety=True)
+        except Exception as e:
+            logger.warning(f"jog XY {(dx_um, dy_um)} failed: {e}")
+        self._refresh_jog_positions()
+
+    def _on_jog_array_z(self, dz_mm: float) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.move_z_relative(dz_mm, bypass_safety=True)
+        except Exception as e:
+            logger.warning(f"jog Z {dz_mm} failed: {e}")
+        self._refresh_jog_positions()
+
+    def _on_jog_array_pump(self, pump: str, distance: float) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.move_pump_relative(
+                pump, distance, bypass_safety=True)
+        except Exception as e:
+            logger.warning(f"jog {pump} {distance} failed: {e}")
+        self._refresh_jog_positions()
 
     def _build_axis_flip_group(self) -> QGroupBox:
         grp = QGroupBox("Axis Direction Flips")
@@ -857,71 +1027,11 @@ class StageHardwarePanel(QWidget):
             lbl.setText(f"{ax}: {val}")
 
     # ════════════════════════════════════════════════════════════════
-    #  v7.4.2: Per-axis Stage Jog + Record Min/Max
+    #  v7.4.2 hotfix: Per-axis jog + record (now uses JogButtonArray)
     # ════════════════════════════════════════════════════════════════
 
-    # Step sizes per axis: (fine, medium, coarse). XY in µm, Z/P in mm.
-    _JOG_STEPS = {
-        "X":  (10.0,    100.0,   1000.0),   # µm
-        "Y":  (10.0,    100.0,   1000.0),   # µm
-        "Z":  (0.01,    0.1,     1.0),       # mm
-        "P1": (0.01,    0.1,     1.0),       # mm
-        "P2": (0.01,    0.1,     1.0),       # mm
-        "P3": (0.01,    0.1,     1.0),       # mm
-    }
-
-    def _build_jog_limits_group(self) -> QGroupBox:
-        grp = QGroupBox("Per-Axis Jog && Record Limits")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        outer = QVBoxLayout(grp)
-
-        info = QLabel(
-            "Jog each axis to its mechanical extremes. Click "
-            "<b>Set as Min</b> / <b>Set as Max</b> to record the current "
-            "position into the Safety Limits above. XY in µm; Z and pumps in mm."
-        )
-        info.setWordWrap(True)
-        info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        outer.addWidget(info)
-
-        # v7.4.2 hotfix banner: explain the safety bypass scoped to this group
-        bypass_banner = QLabel(
-            "⚠ <b>Setup-mode jog.</b> These buttons bypass soft-limit "
-            "clamping and the pump-enabled check so you can move freely "
-            "to find the mechanical envelope. The normal Jog Control "
-            "page still respects all safety limits."
-        )
-        bypass_banner.setWordWrap(True)
-        bypass_banner.setStyleSheet(
-            f"color: {COLORS['yellow']}; font-size: {sf(9)}pt; "
-            f"padding: {sp(4)} {sp(8)};"
-            f"border-left: 2px solid {COLORS['yellow']};"
-            f"background: rgba(249, 226, 175, 18);"
-        )
-        outer.addWidget(bypass_banner)
-
-        # v7.4.2 hotfix: manual Refresh Positions button + status label
-        ctrl_row = QHBoxLayout()
-        self.btn_refresh_positions = QPushButton("↻ Refresh Positions")
-        self.btn_refresh_positions.setToolTip(
-            "Force a fresh position read from each connected stage. "
-            "Useful if the cached display looks stale.")
-        self.btn_refresh_positions.clicked.connect(self._force_refresh_positions)
-        ctrl_row.addWidget(self.btn_refresh_positions)
-
-        self.lbl_jog_status = QLabel("")
-        self.lbl_jog_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        self.lbl_jog_status.setWordWrap(True)
-        ctrl_row.addWidget(self.lbl_jog_status, 1)
-        outer.addLayout(ctrl_row)
-
-        self.lbl_axis_pos: dict[str, QLabel] = {}
-        for axis in ("X", "Y", "Z", "P1", "P2", "P3"):
-            outer.addWidget(self._build_jog_row(axis))
-
-        return grp
+    # v7.4.2 hotfix: _build_jog_limits_group removed.
+    # Its content is merged into _build_setup_jog_safety_group above.
 
     def _force_refresh_positions(self) -> None:
         """v7.4.2 hotfix: button-driven fresh read of every connected stage."""
@@ -959,95 +1069,11 @@ class StageHardwarePanel(QWidget):
             self.lbl_jog_status.setText(
                 "No stages connected — connect XY/ZP above first.")
 
-    def _build_jog_row(self, axis: str) -> QFrame:
-        """Build one row of jog controls + record buttons for a single axis."""
-        frame = QFrame()
-        frame.setStyleSheet(
-            f"QFrame {{ background: {COLORS['surface0']}; "
-            f"border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: {sp(4)}; padding: {sp(4)}; }}")
-        h = QHBoxLayout(frame)
-        h.setSpacing(s(4))
-        h.setContentsMargins(s(6), s(4), s(6), s(4))
-
-        unit = "µm" if axis in ("X", "Y") else "mm"
-
-        # Axis label
-        lbl_axis = QLabel(f"<b>{axis}</b>")
-        lbl_axis.setMinimumWidth(s(28))
-        h.addWidget(lbl_axis)
-
-        # Position readout
-        pos_lbl = QLabel("—")
-        pos_lbl.setStyleSheet(
-            f"color: {COLORS['text']}; font-family: monospace; "
-            f"min-width: {sp(80)};")
-        pos_lbl.setMinimumWidth(s(80))
-        h.addWidget(pos_lbl)
-        self.lbl_axis_pos[axis] = pos_lbl
-
-        # Jog buttons: -coarse -med -fine + fine +med +coarse
-        fine, med, coarse = self._JOG_STEPS[axis]
-        for step, label, color_hint in [
-            (-coarse, f"-{coarse:g}",  "red"),
-            (-med,    f"-{med:g}",     "peach"),
-            (-fine,   f"-{fine:g}",    "subtext0"),
-            ( fine,   f"+{fine:g}",    "subtext0"),
-            ( med,    f"+{med:g}",     "peach"),
-            ( coarse, f"+{coarse:g}",  "green"),
-        ]:
-            btn = QPushButton(label)
-            btn.setMaximumWidth(s(64))
-            btn.setStyleSheet(
-                f"color: {COLORS[color_hint]}; font-family: monospace;")
-            btn.clicked.connect(
-                lambda _checked=False, a=axis, d=step: self._jog(a, d))
-            h.addWidget(btn)
-
-        h.addWidget(QLabel(f"({unit})"))
-        h.addStretch(1)
-
-        # Record buttons
-        btn_min = QPushButton("Set as Min")
-        btn_min.setMaximumHeight(s(24))
-        btn_min.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "min"))
-        h.addWidget(btn_min)
-
-        btn_max = QPushButton("Set as Max")
-        btn_max.setMaximumHeight(s(24))
-        btn_max.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "max"))
-        h.addWidget(btn_max)
-
-        return frame
-
-    def _jog(self, axis: str, distance: float) -> None:
-        """Device sub-page jog.
-
-        v7.4.2 hotfix: passes ``bypass_safety=True`` so soft limits and
-        the is_pump_enabled gate are bypassed for jog buttons originating
-        from this page. The Device sub-page is the *initial* machine
-        setup — you can't discover the mechanical extremes if soft
-        limits stop you, and you can't jog pumps to find their range
-        if HardwareConfig hasn't been set up yet.
-        """
-        if self._controller is None:
-            return
-        try:
-            if axis in ("X", "Y"):
-                dx = distance if axis == "X" else 0.0
-                dy = distance if axis == "Y" else 0.0
-                self._controller.move_xy_relative_um(
-                    dx, dy, bypass_safety=True)
-            elif axis == "Z":
-                self._controller.move_z_relative(
-                    distance, bypass_safety=True)
-            else:
-                self._controller.move_pump_relative(
-                    axis, distance, bypass_safety=True)
-        except Exception as e:
-            logger.warning(f"Jog {axis} {distance} failed: {e}")
-        # Refresh shown positions soon — controller updates them async
-        self._refresh_jog_positions()
+    # v7.4.2 hotfix: _build_jog_row, _jog, and _JOG_STEPS removed.
+    # Per-axis jog UI is now driven by the embedded JogButtonArray
+    # via _on_jog_array_xy / _on_jog_array_z / _on_jog_array_pump
+    # which still call StageController move methods with
+    # bypass_safety=True.
 
     def _refresh_jog_positions(self) -> None:
         """Update the per-axis position readouts. Called by jog + a 500ms tick."""
