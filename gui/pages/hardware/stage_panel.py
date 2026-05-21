@@ -424,6 +424,14 @@ class StageHardwarePanel(QWidget):
             ok = bool(self._controller.is_zp_connected)
             self.badge_zp.set_status("ok" if ok else "err",
                                      "Connected" if ok else "Failed")
+            # v7.4.2 hotfix: cache the connected port so next launch
+            # can skip the rediscovery scan
+            if ok and self._settings is not None:
+                port = self._controller.zp_connected_port
+                if port:
+                    self._settings.set("zp_stage.last_port", port)
+                    self._settings.save()
+                    logger.info(f"ZP last_port cached: {port}")
         except Exception as e:
             self.badge_zp.set_status("err", f"Error: {e}")
 

@@ -714,6 +714,11 @@ class StageController:
         # v7.4.2: Device settings cached until ZP stage connects
         self._pending_axis_map: dict | None = None
         self._pending_steps_per_mm: dict | None = None
+        # v7.4.2 hotfix: last-known-good ZP serial port. Tried first on
+        # connect_stages() so we skip the rediscovery scan. Set by
+        # the caller from settings (zp_stage.last_port) and re-saved
+        # whenever the ZP stage reports its connected_port.
+        self._preferred_zp_port: str | None = None
 
         # Zero reference (set during calibration)
         self.zero_position: dict[str, float] = {
@@ -804,8 +809,13 @@ class StageController:
 
         if zp and self.zp_stage is None:
             # v7.2.8: ZP connection error handling
+            # v7.4.2 hotfix: pass preferred_port so the rediscovery scan
+            # can short-circuit to the last-known-good port.
             try:
-                self.zp_stage = ZPStageManager(simulate=self.simulate_zp)
+                self.zp_stage = ZPStageManager(
+                    simulate=self.simulate_zp,
+                    preferred_port=self._preferred_zp_port,
+                )
             except (ConnectionError, ImportError, OSError) as e:
                 logger.error(f"ZP stage connection failed: {e}")
                 self.zp_stage = None
@@ -863,6 +873,20 @@ class StageController:
             logger.debug(f"ZP position save failed: {e}")
 
     # ── Convenience connection methods (used by Dashboard) ────────
+
+    def set_preferred_zp_port(self, port: str | None) -> None:
+        """v7.4.2 hotfix: cache the last-known-good ZP serial port so
+        the next connect_stages() can try it first instead of
+        scanning every tty."""
+        self._preferred_zp_port = port
+
+    @property
+    def zp_connected_port(self) -> str | None:
+        """v7.4.2 hotfix: serial device the live ZP stage opened.
+        None if not connected or running in simulation."""
+        if self.zp_stage and not self.simulate_zp:
+            return getattr(self.zp_stage, "connected_port", None)
+        return None
 
     def apply_device_settings(self, axis_map: dict | None = None,
                               steps_per_mm: dict | None = None,

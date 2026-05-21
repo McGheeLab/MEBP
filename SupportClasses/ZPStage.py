@@ -94,6 +94,7 @@ class ZPStageManager:
         default_feedrate: float = DEFAULT_FEEDRATE,
         steps_per_mm: int | dict[str, int] = DEFAULT_STEPS_PER_MM,
         axis_map: dict[str, str] | None = None,
+        preferred_port: str | None = None,
     ):
         # v7.2.6: lock before init
         self._serial_lock = threading.RLock()  # v7.2.6: ZP serial lock
@@ -101,6 +102,11 @@ class ZPStageManager:
         # v7.2.6: ZP serial lock — thread-safe serial access
         self.baudrate = baudrate
         self.feedrate = default_feedrate
+        # v7.4.2 hotfix: cached preferred port from last successful
+        # connect — tried first to skip the rediscovery scan.
+        self.preferred_port = preferred_port
+        # Set after a successful connect so the caller can persist it.
+        self.connected_port: str | None = None
         # v7.4.2: per-axis steps_per_mm + configurable axis map
         if isinstance(steps_per_mm, dict):
             self.steps_per_mm = dict(steps_per_mm)
@@ -152,39 +158,199 @@ class ZPStageManager:
             pass
 
     # ── Serial Initialisation ─────────────────────────────────────
+    #
+    # v7.4.2 hotfix: speed up + correct connect path.
+    #
+    # Before: every port was probed twice — once at hardcoded 115200
+    # to look for "FIRMWARE_NAME", then closed and reopened at
+    # self.baudrate (38400) for the real session. Each open triggers
+    # an Arduino-class DTR reset (Marlin board reboots ~2s), so the
+    # naive loop took ~5-10s on a typical Mac with 3-4 random tty
+    # ports (Bluetooth, debug-console, etc.).
+    #
+    # After:
+    #   1. Rank candidate ports — hwid/description hints first
+    #      (MARLIN, STM32, ATMEGA, VID:PID hints), then known-good
+    #      naming patterns (usbmodem, usbserial, COM), then skip
+    #      obvious junk (Bluetooth-*, debug-console, headphones).
+    #   2. Try the previously-good port first (preferred_port).
+    #   3. Single open per port at self.baudrate — if Marlin
+    #      responds to M115, that same handle is the session.
+    #   4. Drain Marlin's boot banner before checking the M115
+    #      response, so a "start"/"echo:..." line doesn't look
+    #      like a failed probe.
 
-    def _initialise_serial(self) -> Optional[serial.Serial]:
-        """Find and open a 3D printer board."""
+    # Platform-agnostic skip patterns. Lowercase substring match
+    # against port.device.
+    _SKIP_DEVICE_PATTERNS = (
+        "bluetooth", "debug-console", "qc35", "headphone", "speaker",
+        "incoming-port", "wireless",
+    )
+    # Lowercase substring match against port.device. Bumps score.
+    _LIKELY_DEVICE_PATTERNS = (
+        "usbmodem", "usbserial", "ttyusb", "ttyacm",
+    )
+    # Substring match (case-insensitive) against port.hwid + description.
+    # Strong Marlin signal.
+    _MARLIN_HWID_HINTS = (
+        "MARLIN", "STM32", "ATMEGA", "ARDUINO",
+        # Common Marlin board VID:PID — extend as needed
+        "0483:5740",   # STM32 CDC
+        "1A86:7523",   # CH340G (common Marlin clone boards)
+        "0403:6001",   # FT232 (FTDI) — common adapter
+        "10C4:EA60",   # CP210x — Prusa/etc.
+        "2341:",       # Arduino VID
+    )
+
+    def _initialise_serial(self) -> Optional["serial.Serial"]:
+        """Find and open the Marlin board (v7.4.2 hotfix: ranked + cached)."""
         if serial is None:
             raise ImportError("pyserial is required for hardware mode")
 
-        ports = self._get_available_ports()
-        for port_device in ports:
-            if self._is_marlin_printer(port_device):
-                logger.info(f"3D printer board found on {port_device}")
-                try:
-                    ser = serial.Serial(port_device, baudrate=self.baudrate, timeout=1)
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                    return ser
-                except serial.SerialException as e:
-                    logger.error(f"Failed to open {port_device}: {e}")
+        try:
+            port_infos = list(serial.tools.list_ports.comports())
+        except Exception as e:
+            logger.error(f"Error listing COM ports: {e}")
+            return None
 
-        logger.warning("No 3D printer board found")
+        ranked = self._rank_ports(port_infos, preferred=self.preferred_port)
+        if not ranked:
+            logger.warning("No serial ports detected")
+            return None
+
+        logger.info(
+            "ZP probe order: " +
+            ", ".join(f"{p.device}({p.description or 'n/a'})" for p in ranked))
+
+        for port_info in ranked:
+            device = port_info.device
+            device_lc = (device or "").lower()
+            if any(s in device_lc for s in self._SKIP_DEVICE_PATTERNS):
+                logger.debug(f"Skipping non-candidate port {device}")
+                continue
+
+            ser = self._try_open_marlin(device)
+            if ser is not None:
+                logger.info(f"Marlin board connected on {device}")
+                self.connected_port = device
+                return ser
+
+        logger.warning("No Marlin board found on any candidate port")
         return None
+
+    @classmethod
+    def _rank_ports(cls, port_infos, preferred: str | None = None):
+        """Sort serial ports by Marlin-likeness, preferred port first.
+
+        Ranking signals (higher = tried earlier):
+          * preferred (last-known-good) port → 10000
+          * description/hwid contains a Marlin/STM32/Arduino hint → +500
+          * device name matches usbmodem/usbserial/ttyACM* → +100
+          * device name matches a known-junk pattern → -1000 (de-facto skipped)
+        """
+        def score(p) -> int:
+            device = (p.device or "").lower()
+            hwid = (p.hwid or "").upper()
+            desc = (p.description or "").upper()
+            s = 0
+            if preferred and p.device == preferred:
+                s += 10000
+            for hint in cls._MARLIN_HWID_HINTS:
+                if hint.upper() in hwid or hint.upper() in desc:
+                    s += 500
+                    break
+            for pat in cls._LIKELY_DEVICE_PATTERNS:
+                if pat in device:
+                    s += 100
+                    break
+            for skip in cls._SKIP_DEVICE_PATTERNS:
+                if skip in device:
+                    s -= 1000
+                    break
+            return s
+        return sorted(port_infos, key=score, reverse=True)
 
     @staticmethod
     def _get_available_ports() -> list[str]:
-        """List available serial port device names."""
+        """List available serial port device names. v7.2 compat shim."""
         try:
             return [p.device for p in serial.tools.list_ports.comports()]
         except Exception as e:
             logger.error(f"Error listing COM ports: {e}")
             return []
 
+    def _try_open_marlin(self, port: str,
+                         probe_timeout: float = 2.0
+                         ) -> Optional["serial.Serial"]:
+        """Open ``port`` at self.baudrate, send M115, return the handle
+        if Marlin responds with a FIRMWARE_NAME line.
+
+        Single open — the same handle becomes the session if Marlin
+        is found. No close-reopen → only one Arduino DTR reset.
+        """
+        try:
+            ser = serial.Serial(port, self.baudrate, timeout=probe_timeout)
+        except (serial.SerialException, OSError) as e:
+            logger.debug(f"open {port} failed: {e}")
+            return None
+        try:
+            # Brief settle — gives boards that DTR-reset on open a moment
+            # to wake up enough to accept bytes. Bigger waits don't help
+            # because Marlin's M115 response is what we actually look for.
+            time.sleep(0.1)
+            # Drain anything in the input buffer (the "start" banner,
+            # bootloader chatter, etc.) so it doesn't precede our M115 reply.
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            ser.write(b"\nM115\n")
+            ser.flush()
+            # Marlin's M115 response is multiline and terminates with "ok".
+            # Read up to a few KB or until we see FIRMWARE_NAME / ok.
+            deadline = time.monotonic() + probe_timeout
+            accumulated = ""
+            while time.monotonic() < deadline:
+                chunk = ser.read(512)
+                if chunk:
+                    try:
+                        accumulated += chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        accumulated += str(chunk)
+                if "FIRMWARE_NAME" in accumulated:
+                    logger.debug(f"{port} → Marlin OK: {accumulated[:80]!r}")
+                    try:
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    return ser
+                if "ok" in accumulated.lower() and len(accumulated) > 80:
+                    # End-of-response without FIRMWARE_NAME → not Marlin
+                    break
+                if not chunk:
+                    # Nothing came back — brief pause before next loop
+                    time.sleep(0.05)
+            logger.debug(
+                f"{port} not Marlin (response: {accumulated[:80]!r})")
+            ser.close()
+            return None
+        except Exception as e:
+            logger.debug(f"probe {port} failed: {e}")
+            try:
+                ser.close()
+            except Exception:
+                pass
+            return None
+
     @staticmethod
     def _is_marlin_printer(port: str) -> bool:
-        """Probe a port for Marlin firmware via M115."""
+        """v7.2 compat shim. Kept so existing callers still link.
+
+        v7.4.2 hotfix: ZPStageManager itself no longer goes through
+        this method — see ``_try_open_marlin`` which uses
+        ``self.baudrate`` consistently instead of the legacy
+        hardcoded 115200.
+        """
         try:
             with serial.Serial(port, 115200, timeout=1) as ser:
                 ser.write(b"\nM115\n")

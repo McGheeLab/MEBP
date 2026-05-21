@@ -57,6 +57,12 @@ def run_headless(controller: StageController, settings: Settings):
     print("=" * 50)
 
     controller.connect_stages()
+    # v7.4.2 hotfix: persist last-known-good ZP port so next launch
+    # short-circuits the rediscovery scan
+    zp_port = controller.zp_connected_port
+    if zp_port:
+        settings.set("zp_stage.last_port", zp_port)
+        settings.save()
     # v7.3.2: Load stick calibration offsets for headless mode
     _stick_offsets = settings.get_section("xbox_stick_offsets")
     if _stick_offsets:
@@ -181,6 +187,12 @@ def main():
     saved_zero = settings.get_section("zero_position")
     if saved_zero:
         controller.zero_position.update(saved_zero)
+
+    # v7.4.2 hotfix: cache last-known-good ZP serial port so the
+    # rediscovery scan can short-circuit on first connect_stages().
+    saved_zp_port = settings.get("zp_stage.last_port")
+    if saved_zp_port:
+        controller.set_preferred_zp_port(saved_zp_port)
 
     # v7.3.2: Load axis flip settings
     saved_flips = settings.get_section("axis_flip")
