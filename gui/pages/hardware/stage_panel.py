@@ -297,36 +297,133 @@ class StageHardwarePanel(QWidget):
         return grp
 
     def _build_zp_feedrates_group(self) -> QGroupBox:
-        grp = QGroupBox("ZP Stage Feedrates")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        form = QFormLayout(grp)
+        """v7.4.2 hotfix: ZP feedrates are now PERCENTAGES of Z's
+        per-axis max (from Stepper Calibration → Record as Max).
 
-        def _spin(default: float, unit: str = "mm/min") -> QDoubleSpinBox:
+        The backend still reads ``zp_stage.max_feedrate`` etc. as
+        absolute mm/min — we save both the percentage (for next
+        launch's UI) and the computed absolute (for the rest of the
+        app). Live "= NNN mm/min" labels show the derived value
+        next to each spin so the user sees what's actually being
+        sent to Marlin.
+        """
+        grp = QGroupBox("ZP Stage Feedrates (% of Z max)")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "Each feedrate below is a percentage of the <b>Z-axis</b> "
+            "maximum feedrate that you discovered via "
+            "<i>Stepper Calibration → Record as Max</i>. Adjust the "
+            "Z max there first; the absolute mm/min sent to Marlin is "
+            "shown live next to each spin."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        outer.addWidget(info)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(s(10))
+
+        def _pct_spin(default: float) -> QDoubleSpinBox:
             sp_w = QDoubleSpinBox()
-            sp_w.setRange(0.1, 100000.0)
-            sp_w.setDecimals(1)
-            sp_w.setSuffix(f" {unit}")
+            sp_w.setRange(0.0, 100.0)
+            sp_w.setDecimals(0)
+            sp_w.setSingleStep(5.0)
+            sp_w.setSuffix(" %")
             sp_w.setValue(default)
-            sp_w.setMinimumWidth(s(160))
+            sp_w.setMinimumWidth(s(110))
             return sp_w
 
-        self.spin_zp_max_feed = _spin(3000.0)
-        form.addRow("Max feedrate:", self.spin_zp_max_feed)
+        def _row(label: str, spin: QDoubleSpinBox, derived_lbl: QLabel) -> QWidget:
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(s(8))
+            h.addWidget(spin)
+            h.addWidget(derived_lbl, 1)
+            return w
 
-        self.spin_zp_retract_feed = _spin(1500.0)
-        form.addRow("Retract feedrate:", self.spin_zp_retract_feed)
+        derived_style = (
+            f"color: {COLORS['text']}; font-family: monospace; "
+            f"padding: {sp(2)} {sp(6)}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)};"
+        )
 
-        self.spin_zp_insert_feed = _spin(600.0)
-        form.addRow("Insert feedrate:", self.spin_zp_insert_feed)
+        self.spin_zp_max_pct = _pct_spin(100.0)
+        self.lbl_zp_max_derived = QLabel("= — mm/min")
+        self.lbl_zp_max_derived.setStyleSheet(derived_style)
+        self.spin_zp_max_pct.valueChanged.connect(
+            self._refresh_zp_feedrate_derived)
+        form.addRow("Max:",
+                    _row("Max", self.spin_zp_max_pct, self.lbl_zp_max_derived))
 
-        self.spin_zp_jog_feed = _spin(900.0)
-        form.addRow("Jog feedrate:", self.spin_zp_jog_feed)
+        self.spin_zp_retract_pct = _pct_spin(50.0)
+        self.lbl_zp_retract_derived = QLabel("= — mm/min")
+        self.lbl_zp_retract_derived.setStyleSheet(derived_style)
+        self.spin_zp_retract_pct.valueChanged.connect(
+            self._refresh_zp_feedrate_derived)
+        form.addRow("Retract:",
+                    _row("Retract", self.spin_zp_retract_pct, self.lbl_zp_retract_derived))
+
+        self.spin_zp_insert_pct = _pct_spin(20.0)
+        self.lbl_zp_insert_derived = QLabel("= — mm/min")
+        self.lbl_zp_insert_derived.setStyleSheet(derived_style)
+        self.spin_zp_insert_pct.valueChanged.connect(
+            self._refresh_zp_feedrate_derived)
+        form.addRow("Insert:",
+                    _row("Insert", self.spin_zp_insert_pct, self.lbl_zp_insert_derived))
+
+        self.spin_zp_jog_pct = _pct_spin(40.0)
+        self.lbl_zp_jog_derived = QLabel("= — mm/min")
+        self.lbl_zp_jog_derived.setStyleSheet(derived_style)
+        self.spin_zp_jog_pct.valueChanged.connect(
+            self._refresh_zp_feedrate_derived)
+        form.addRow("Jog:",
+                    _row("Jog", self.spin_zp_jog_pct, self.lbl_zp_jog_derived))
+
+        outer.addLayout(form)
 
         self.chk_zp_autosave = QCheckBox("Auto-save position to EEPROM")
         self.chk_zp_autosave.setChecked(False)
-        form.addRow("", self.chk_zp_autosave)
+        outer.addWidget(self.chk_zp_autosave)
+
+        # Initial derived display
+        self._refresh_zp_feedrate_derived()
 
         return grp
+
+    def _z_max_feedrate_mm_min(self) -> float:
+        """v7.4.2 hotfix: resolve Z's per-axis max for the percentage math.
+
+        Falls back to a sensible default if no calibration value is
+        available yet.
+        """
+        if self._settings is not None:
+            per_axis = self._settings.get("device_profile.per_axis_max_feedrate") or {}
+            v = per_axis.get("Z")
+            if v:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return 500.0  # Standard.json default
+
+    def _refresh_zp_feedrate_derived(self, *_args) -> None:
+        """Update the live '= NNN mm/min' labels next to each percentage spin."""
+        if not hasattr(self, 'lbl_zp_max_derived'):
+            return
+        z_max = self._z_max_feedrate_mm_min()
+        for spin, lbl in [
+            (self.spin_zp_max_pct,     self.lbl_zp_max_derived),
+            (self.spin_zp_retract_pct, self.lbl_zp_retract_derived),
+            (self.spin_zp_insert_pct,  self.lbl_zp_insert_derived),
+            (self.spin_zp_jog_pct,     self.lbl_zp_jog_derived),
+        ]:
+            actual = (spin.value() / 100.0) * z_max
+            lbl.setText(f"= {actual:.0f} mm/min  (of Z max {z_max:.0f})")
 
     def _build_axis_flip_group(self) -> QGroupBox:
         grp = QGroupBox("Axis Direction Flips")
@@ -804,11 +901,63 @@ class StageHardwarePanel(QWidget):
         )
         outer.addWidget(bypass_banner)
 
+        # v7.4.2 hotfix: manual Refresh Positions button + status label
+        ctrl_row = QHBoxLayout()
+        self.btn_refresh_positions = QPushButton("↻ Refresh Positions")
+        self.btn_refresh_positions.setToolTip(
+            "Force a fresh position read from each connected stage. "
+            "Useful if the cached display looks stale.")
+        self.btn_refresh_positions.clicked.connect(self._force_refresh_positions)
+        ctrl_row.addWidget(self.btn_refresh_positions)
+
+        self.lbl_jog_status = QLabel("")
+        self.lbl_jog_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_jog_status.setWordWrap(True)
+        ctrl_row.addWidget(self.lbl_jog_status, 1)
+        outer.addLayout(ctrl_row)
+
         self.lbl_axis_pos: dict[str, QLabel] = {}
         for axis in ("X", "Y", "Z", "P1", "P2", "P3"):
             outer.addWidget(self._build_jog_row(axis))
 
         return grp
+
+    def _force_refresh_positions(self) -> None:
+        """v7.4.2 hotfix: button-driven fresh read of every connected stage."""
+        ctrl = self._controller
+        if ctrl is None:
+            self.lbl_jog_status.setText("No controller available.")
+            return
+        try:
+            xy = ctrl.get_xy_position(cached=False)
+            zp = ctrl.get_zp_position(cached=False)
+        except Exception as e:
+            self.lbl_jog_status.setText(f"Read failed: {e}")
+            return
+        # Drive the same label-update path the polling tick uses
+        if xy:
+            if xy[0] is not None and "X" in self.lbl_axis_pos:
+                self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
+            if xy[1] is not None and "Y" in self.lbl_axis_pos:
+                self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
+        if zp:
+            if zp[0] is not None and "Z" in self.lbl_axis_pos:
+                self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
+            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
+                if i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
+                    self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+        connected = []
+        if ctrl.is_xy_connected:
+            connected.append("XY")
+        if ctrl.is_zp_connected:
+            connected.append("ZP")
+        if connected:
+            self.lbl_jog_status.setText(
+                f"Position read OK ({', '.join(connected)} connected).")
+        else:
+            self.lbl_jog_status.setText(
+                "No stages connected — connect XY/ZP above first.")
 
     def _build_jog_row(self, axis: str) -> QFrame:
         """Build one row of jog controls + record buttons for a single axis."""
@@ -921,30 +1070,62 @@ class StageHardwarePanel(QWidget):
                 self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
 
     def _record_limit(self, axis: str, which: str) -> None:
-        """Copy current position into the matching safety spinbox."""
+        """Copy current position into the matching safety spinbox.
+
+        v7.4.2 hotfix: uses ``cached=False`` so the position read comes
+        straight from the controller at the moment of the click — the
+        cached position can lag the jog by hundreds of ms otherwise.
+        Also refreshes the visible position labels so the user sees
+        what was just recorded.
+        """
         ctrl = self._controller
         if ctrl is None:
+            self.lbl_cal_status.setText("No controller available.") \
+                if hasattr(self, 'lbl_cal_status') else None
             return
         try:
-            xy = ctrl.get_xy_position(cached=True)
-            zp = ctrl.get_zp_position(cached=True)
-        except Exception:
+            xy = ctrl.get_xy_position(cached=False)
+            zp = ctrl.get_zp_position(cached=False)
+        except Exception as e:
+            logger.warning(f"record_limit fresh read failed: {e}")
             return
         zero = ctrl.zero_position
+        recorded_val: float | None = None
         if axis == "X" and xy and xy[0] is not None:
             target_spin = self.spin_xy_min_x if which == "min" else self.spin_xy_max_x
-            target_spin.setValue(float(xy[0] - zero.get("x", 0)))
+            recorded_val = float(xy[0] - zero.get("x", 0))
+            target_spin.setValue(recorded_val)
         elif axis == "Y" and xy and xy[1] is not None:
             target_spin = self.spin_xy_min_y if which == "min" else self.spin_xy_max_y
-            target_spin.setValue(float(xy[1] - zero.get("y", 0)))
+            recorded_val = float(xy[1] - zero.get("y", 0))
+            target_spin.setValue(recorded_val)
         elif axis == "Z" and zp and zp[0] is not None:
             target_spin = self.spin_z_min if which == "min" else self.spin_z_max
-            target_spin.setValue(float(zp[0] - zero.get("Z", 0)))
+            recorded_val = float(zp[0] - zero.get("Z", 0))
+            target_spin.setValue(recorded_val)
         elif axis in ("P1", "P2", "P3"):
             idx = {"P1": 1, "P2": 2, "P3": 3}[axis]
             if zp and idx < len(zp) and zp[idx] is not None:
                 target_dict = self.spin_p_mins if which == "min" else self.spin_p_maxs
-                target_dict[axis].setValue(float(zp[idx] - zero.get(axis, 0)))
+                recorded_val = float(zp[idx] - zero.get(axis, 0))
+                target_dict[axis].setValue(recorded_val)
+        # Update visible position labels with the fresh read
+        if xy:
+            if xy[0] is not None and "X" in self.lbl_axis_pos:
+                self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
+            if xy[1] is not None and "Y" in self.lbl_axis_pos:
+                self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
+        if zp:
+            if zp[0] is not None and "Z" in self.lbl_axis_pos:
+                self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
+            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
+                if i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
+                    self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+        if recorded_val is not None and hasattr(self, 'lbl_jog_status'):
+            unit = "µm" if axis in ("X", "Y") else "mm"
+            self.lbl_jog_status.setText(
+                f"Recorded {axis} {which}: {recorded_val:.3f} {unit} "
+                f"(remember to click Apply Settings to persist)")
 
     # ── Settings I/O ─────────────────────────────────────────────
 
@@ -972,10 +1153,41 @@ class StageHardwarePanel(QWidget):
         self.spin_max_pump_feed.setValue(float(s.get("safety_limits.max_pump_feedrate", 200.0)))
 
         # ZP feedrates
-        self.spin_zp_max_feed.setValue(float(s.get("zp_stage.max_feedrate", 3000.0)))
-        self.spin_zp_retract_feed.setValue(float(s.get("zp_stage.retract_feedrate", 1500.0)))
-        self.spin_zp_insert_feed.setValue(float(s.get("zp_stage.insert_feedrate", 600.0)))
-        self.spin_zp_jog_feed.setValue(float(s.get("zp_stage.jog_feedrate", 900.0)))
+        # v7.4.2 hotfix: ZP feedrates are now percentages of Z max
+        # (the user-facing UI value). The backend keys
+        # ``zp_stage.max_feedrate`` etc. are derived absolute mm/min
+        # for code paths that still consume them.
+        #
+        # Back-compat: if the user has old absolute mm/min values from
+        # a previous version but no percentage stored yet, derive the
+        # initial percentage from absolute / Z_max so their settings
+        # don't get nuked back to defaults.
+        z_max_load = self._z_max_feedrate_mm_min()
+
+        def _load_pct(pct_key: str, abs_key: str, default_pct: float) -> float:
+            v = s.get(pct_key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+            abs_v = s.get(abs_key)
+            if abs_v is not None and z_max_load > 0:
+                try:
+                    return max(0.0, min(100.0, float(abs_v) / z_max_load * 100.0))
+                except (TypeError, ValueError):
+                    pass
+            return default_pct
+
+        self.spin_zp_max_pct.setValue(_load_pct(
+            "zp_stage.max_feedrate_pct", "zp_stage.max_feedrate", 100.0))
+        self.spin_zp_retract_pct.setValue(_load_pct(
+            "zp_stage.retract_feedrate_pct", "zp_stage.retract_feedrate", 50.0))
+        self.spin_zp_insert_pct.setValue(_load_pct(
+            "zp_stage.insert_feedrate_pct", "zp_stage.insert_feedrate", 20.0))
+        self.spin_zp_jog_pct.setValue(_load_pct(
+            "zp_stage.jog_feedrate_pct", "zp_stage.jog_feedrate", 40.0))
+        self._refresh_zp_feedrate_derived()
         self.chk_zp_autosave.setChecked(bool(s.get("zp_stage.auto_save_position", False)))
 
         # Axis flips
@@ -1038,10 +1250,22 @@ class StageHardwarePanel(QWidget):
         s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
         s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
 
-        s.set("zp_stage.max_feedrate", self.spin_zp_max_feed.value())
-        s.set("zp_stage.retract_feedrate", self.spin_zp_retract_feed.value())
-        s.set("zp_stage.insert_feedrate", self.spin_zp_insert_feed.value())
-        s.set("zp_stage.jog_feedrate", self.spin_zp_jog_feed.value())
+        # v7.4.2 hotfix: ZP feedrates are stored as both percentages
+        # (UI re-load) and absolute mm/min (consumed by StageController
+        # etc.). Absolute = pct * Z_max_feedrate / 100.
+        z_max = self._z_max_feedrate_mm_min()
+        max_pct = self.spin_zp_max_pct.value()
+        ret_pct = self.spin_zp_retract_pct.value()
+        ins_pct = self.spin_zp_insert_pct.value()
+        jog_pct = self.spin_zp_jog_pct.value()
+        s.set("zp_stage.max_feedrate_pct",     max_pct)
+        s.set("zp_stage.retract_feedrate_pct", ret_pct)
+        s.set("zp_stage.insert_feedrate_pct",  ins_pct)
+        s.set("zp_stage.jog_feedrate_pct",     jog_pct)
+        s.set("zp_stage.max_feedrate",     max_pct / 100.0 * z_max)
+        s.set("zp_stage.retract_feedrate", ret_pct / 100.0 * z_max)
+        s.set("zp_stage.insert_feedrate",  ins_pct / 100.0 * z_max)
+        s.set("zp_stage.jog_feedrate",     jog_pct / 100.0 * z_max)
         s.set("zp_stage.auto_save_position", self.chk_zp_autosave.isChecked())
 
         s.set("axis_flip.z", self.chk_flip_z.isChecked())
@@ -1082,10 +1306,12 @@ class StageHardwarePanel(QWidget):
         self.spin_max_xy_speed.setValue(10000.0)
         self.spin_max_z_feed.setValue(500.0)
         self.spin_max_pump_feed.setValue(200.0)
-        self.spin_zp_max_feed.setValue(3000.0)
-        self.spin_zp_retract_feed.setValue(1500.0)
-        self.spin_zp_insert_feed.setValue(600.0)
-        self.spin_zp_jog_feed.setValue(900.0)
+        # v7.4.2 hotfix: ZP feedrates are now percentages of Z max
+        self.spin_zp_max_pct.setValue(100.0)
+        self.spin_zp_retract_pct.setValue(50.0)
+        self.spin_zp_insert_pct.setValue(20.0)
+        self.spin_zp_jog_pct.setValue(40.0)
+        self._refresh_zp_feedrate_derived()
         self.chk_zp_autosave.setChecked(False)
         self.chk_flip_z.setChecked(False)
         self.chk_flip_p1.setChecked(False)
