@@ -60,7 +60,7 @@ from SupportClasses.PhysicalModels import (
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
-from gui.scaling import s, scaled_font_size
+from gui.scaling import s, sf, sp, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class InkEditorDialog(QDialog):
         self.color_btn = QPushButton()
         self.color_btn.setFixedSize(s(28), s(28))
         self.color_btn.setStyleSheet(
-            f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: 4px;")
+            f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: {sp(4)};")
         self.color_btn.clicked.connect(self._pick_ink_color)
         color_row.addWidget(self.color_btn)
         self.color_label = QLabel(self._ink_color)
@@ -155,7 +155,7 @@ class InkEditorDialog(QDialog):
         if color.isValid():
             self._ink_color = color.name()
             self.color_btn.setStyleSheet(
-                f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: 4px;")
+                f"background: {self._ink_color}; border: 1px solid #585b70; border-radius: {sp(4)};")
             self.color_label.setText(self._ink_color)
 
     def get_ink(self) -> InkSpec | None:
@@ -280,10 +280,10 @@ class PumpChannelWidget(QGroupBox):
             QGroupBox {{
                 font-weight: bold; color: {COLORS.get('blue', '#89b4fa')};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 6px; padding-top: 14px;
+                border-radius: {sp(4)}; margin-top: {sp(6)}; padding-top: {sp(14)};
             }}
             QGroupBox::title {{
-                subcontrol-origin: margin; left: 8px; padding: 0 4px;
+                subcontrol-origin: margin; left: {sp(8)}; padding: 0 {sp(4)};
             }}
         """)
         layout = QGridLayout(self)
@@ -608,7 +608,7 @@ class HardwareSetupPage(QWidget):
         self.pump_ink_summary = QLabel("")
         self.pump_ink_summary.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; "
-            f"font-size: 9pt; padding: 4px 8px;")
+            f"font-size: {sf(9)}pt; padding: {sp(4)} {sp(8)};")
         self.pump_ink_summary.setWordWrap(True)
         pump_lay.addWidget(self.pump_ink_summary)
 
@@ -674,7 +674,7 @@ class HardwareSetupPage(QWidget):
         # Validation indicator
         self.channel_map_status = QLabel("")
         self.channel_map_status.setStyleSheet(
-            f"font-size: 9pt; padding: 2px 4px;")
+            f"font-size: {sf(9)}pt; padding: {sp(2)} {sp(4)};")
         self._channel_map_layout.addWidget(self.channel_map_status)
 
         self._content_layout.addWidget(self.channel_map_group)
@@ -806,7 +806,7 @@ class HardwareSetupPage(QWidget):
             row = QFrame()
             row.setStyleSheet(
                 f"QFrame {{ border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-                f"border-radius: 4px; padding: 2px; }}")
+                f"border-radius: {sp(4)}; padding: {sp(2)}; }}")
             rl = QGridLayout(row)
             rl.setContentsMargins(6, 4, 6, 4)
             rl.setSpacing(4)

@@ -69,7 +69,7 @@ Layout matches the coding plan Tab 3 wireframe:
         self._plan_display = QLabel("No plan generated yet")
         self._plan_display.setWordWrap(True)
         self._plan_display.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: 10px; padding: 4px;")
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; padding: {sp(4)};")
         plan_scroll = QScrollArea()
         plan_scroll.setWidget(self._plan_display)
         plan_scroll.setWidgetResizable(True)
@@ -120,7 +120,7 @@ from PySide6.QtCore import Qt, Signal, QPointF, QTimer
 from PySide6.QtGui import QColor, QCursor
 
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
-from gui.scaling import s, scaled_font_size
+from gui.scaling import s, sf, sp, scaled_font_size
 from gui.widgets.well_plate_view import WellPlateView, WellRoleLegend
 # MiniProjectionView removed in v7.2.4 (XY-only layout)
 
@@ -277,7 +277,7 @@ class WellSetupTab(QWidget):
         # Status label (save/load / warnings)
         self.plane_info_label = QLabel("")
         self.plane_info_label.setStyleSheet(
-            "color: #a6adc8; font-size: 11px; padding: 2px 4px;")
+            f"color: {COLORS['subtext0']}; font-size: {sf(9.5)}pt; padding: {sp(2)} {sp(4)};")
         main.addWidget(self.plane_info_label)
 
         # ── Top area: plate + summary ─────────────────────────────
@@ -356,10 +356,10 @@ class WellSetupTab(QWidget):
             btn.setFixedHeight(s(28))
             btn.setMinimumWidth(s(62))
             btn.setStyleSheet(
-                f"QPushButton {{background:#1e1e2e; border:2px solid #45475a;"
-                f" border-radius:4px; color:#cdd6f4; font-size:11px;}}"
+                f"QPushButton {{background:{COLORS['base']}; border:2px solid {COLORS['surface1']};"
+                f" border-radius:{sp(4)}; color:{COLORS['text']}; font-size:{sf(9.5)}pt;}}"
                 f"QPushButton:checked {{border-color:{color}; color:{color};"
-                f" background:#252536;}}"
+                f" background:{COLORS['menu_hover']};}}"
                 f"QPushButton:hover {{border-color:{color}; color:{color};}}"
             )
             btn.clicked.connect(
@@ -517,7 +517,7 @@ class WellSetupTab(QWidget):
 
         self._plan_label = QLabel("")
         self._plan_label.setStyleSheet(
-            "color:#a6adc8; font-size:11px; padding:2px;")
+            f"color:{COLORS['subtext0']}; font-size:{sf(9.5)}pt; padding:{sp(2)};")
         self._plan_label.setWordWrap(True)
         plan_layout.addWidget(self._plan_label)
 

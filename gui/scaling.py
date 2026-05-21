@@ -93,3 +93,14 @@ def scaled_font_size(pt: int) -> int:
         QFont("Segoe UI", scaled_font_size(12))
     """
     return round(pt * scale_factor())
+
+
+def sp(px: int | float) -> str:
+    """Scale a pixel dimension and format as a QSS string.
+
+    Shorthand for f"{s(px)}px" — for use inside QSS templates::
+
+        f"padding: {sp(4)} {sp(8)};"
+        f"border-radius: {sp(6)};"
+    """
+    return f"{s(px)}px"

@@ -35,7 +35,7 @@ from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 
 try:
     from gui.styles import COLORS
-    from gui.scaling import s as _sc, scaled_font_size
+    from gui.scaling import s as _sc, sf as _sf, sp as _sp, scaled_font_size
 except ImportError:
     COLORS = {
         "base": "#1e1e2e", "text": "#cdd6f4", "surface0": "#313244",
@@ -293,7 +293,7 @@ class HelperFunctionsPage(QWidget):
             frame.setStyleSheet(
                 f"QFrame {{ background: {COLORS.get('surface0', '#313244')}; "
                 f"border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-                f"border-radius: 4px; }}"
+                f"border-radius: {_sp(4)}; }}"
             )
             frame.setMinimumSize(_sc(120), _sc(120))
             frame.setMaximumSize(_sc(200), _sc(200))
@@ -328,14 +328,14 @@ class HelperFunctionsPage(QWidget):
         group.setStyleSheet(
             f"QGroupBox {{ color: {COLORS.get('text', '#cdd6f4')}; font-weight: bold; "
             f"border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-            f"border-radius: 4px; margin-top: 6px; padding-top: 14px; }}"
+            f"border-radius: {_sp(4)}; margin-top: {_sp(6)}; padding-top: {_sp(14)}; }}"
         )
         layout = QVBoxLayout(group)
 
         self._input_tabs = QTabWidget()
         self._input_tabs.setStyleSheet(
             f"QTabBar::tab {{ color: {COLORS.get('text', '#cdd6f4')}; "
-            f"padding: 4px 10px; }} "
+            f"padding: {_sp(4)} {_sp(10)}; }} "
             f"QTabBar::tab:selected {{ background: {COLORS.get('surface0', '#313244')}; }}"
         )
 
@@ -440,7 +440,7 @@ class HelperFunctionsPage(QWidget):
         group.setStyleSheet(
             f"QGroupBox {{ color: {COLORS.get('text', '#cdd6f4')}; font-weight: bold; "
             f"border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-            f"border-radius: 4px; margin-top: 6px; padding-top: 14px; }}"
+            f"border-radius: {_sp(4)}; margin-top: {_sp(6)}; padding-top: {_sp(14)}; }}"
         )
         grid = QGridLayout(group)
         grid.setSpacing(6)
@@ -507,7 +507,7 @@ class HelperFunctionsPage(QWidget):
         group.setStyleSheet(
             f"QGroupBox {{ color: {COLORS.get('text', '#cdd6f4')}; font-weight: bold; "
             f"border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-            f"border-radius: 4px; margin-top: 6px; padding-top: 14px; }}"
+            f"border-radius: {_sp(4)}; margin-top: {_sp(6)}; padding-top: {_sp(14)}; }}"
         )
         layout = QVBoxLayout(group)
         layout.setSpacing(6)
@@ -517,7 +517,7 @@ class HelperFunctionsPage(QWidget):
         btn_gen.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('blue', '#89b4fa')}; "
             f"color: {COLORS.get('base', '#1e1e2e')}; font-weight: bold; "
-            f"border-radius: 4px; padding: 6px; }}"
+            f"border-radius: {_sp(4)}; padding: {_sp(6)}; }}"
         )
         btn_gen.clicked.connect(self._generate)
         layout.addWidget(btn_gen)
@@ -530,7 +530,7 @@ class HelperFunctionsPage(QWidget):
         btn_print.setStyleSheet(
             f"QPushButton {{ background: {COLORS.get('green', '#a6e3a1')}; "
             f"color: {COLORS.get('base', '#1e1e2e')}; font-weight: bold; "
-            f"border-radius: 4px; padding: 4px; }}"
+            f"border-radius: {_sp(4)}; padding: {_sp(4)}; }}"
         )
         btn_print.clicked.connect(self._load_as_print_object)
         row.addWidget(btn_print)

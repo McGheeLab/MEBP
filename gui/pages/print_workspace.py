@@ -47,6 +47,7 @@ from SupportClasses.PhysicalModels import (
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
+from gui.scaling import s as _sc, sf as _sf, sp as _sp
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig
@@ -110,8 +111,8 @@ class HardwareSummaryWidget(QWidget):
             QPushButton {{
                 background: {COLORS.get('blue', '#89b4fa')};
                 color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 6px 14px;
-                border-radius: 4px;
+                font-weight: bold; padding: {_sp(6)} {_sp(14)};
+                border-radius: {_sp(4)};
             }}
             QPushButton:hover {{
                 background: {COLORS.get('sapphire', '#74c7ec')};
@@ -201,20 +202,20 @@ class HardwareSummaryWidget(QWidget):
         group = QGroupBox(title)
         group.setStyleSheet(f"""
             QGroupBox {{
-                font-weight: bold; font-size: 12px;
+                font-weight: bold; font-size: {_sf(11)}pt;
                 color: {COLORS.get('text', '#cdd6f4')};
                 background: {COLORS.get('base', '#1e1e2e')};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+                border-radius: {_sp(4)}; margin-top: {_sp(10)}; padding-top: {_sp(24)};
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 0px; right: 0px; top: 0px;
-                padding: 6px 10px;
+                padding: {_sp(6)} {_sp(10)};
                 background: {COLORS.get('surface1', '#45475a')};
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                border-top-left-radius: {_sp(4)};
+                border-top-right-radius: {_sp(4)};
             }}
         """)
         layout = QVBoxLayout(group)
@@ -534,7 +535,7 @@ class WorkspaceTab(QWidget):
             QGroupBox {{
                 font-weight: bold; color: {COLORS['text']};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 6px; padding-top: 14px;
+                border-radius: {_sp(4)}; margin-top: {_sp(6)}; padding-top: {_sp(14)};
             }}
         """)
         save_lay = QVBoxLayout(save_group)

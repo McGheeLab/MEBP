@@ -2,13 +2,7 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.4.0-a** | Python 3.10+ | PySide6 (Qt 6)
-
-> **v7.4.0-a** is the foundation sub-version of a larger UX-focused v7.4.0 release.
-> See [`coding plans/Update plans/MEBP_v737_to_v740a_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v737_to_v740a_UPDATE.md)
-> for what's new in this sub-version, and
-> [`coding plans/Architectures/ARCHITECTURE_V740A.md`](coding%20plans/Architectures/ARCHITECTURE_V740A.md)
-> for the architecture delta.
+**Version 7.3.7** | Python 3.10+ | PySide6 (Qt 6)
 
 ---
 
@@ -318,7 +312,7 @@ The executable is output to `dist/MEBP/`. Bundle size is approximately 470 MB (l
 
 ### Architecture Documentation
 
-See `coding plans/Architectures/ARCHITECTURE_V737.md` for the comprehensive architecture reference, and `coding plans/Architectures/ARCHITECTURE_V740A.md` for the v7.4.0-a delta.
+See `coding plans/Architectures/ARCHITECTURE_V737.md` for comprehensive architecture reference.
 
 ---
 

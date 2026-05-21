@@ -28,7 +28,7 @@ from PySide6.QtGui import QFont, QKeyEvent
 
 from SupportClasses.StageController import StageController
 from gui.styles import COLORS, SECTION_TITLE_STYLE
-from gui.scaling import s as _sc, scaled_font_size
+from gui.scaling import s as _sc, sf as _sf, sp as _sp, scaled_font_size
 
 # v7.3.1: Optional well plate navigator
 try:
@@ -219,7 +219,7 @@ class JogControlPage(QWidget):
         btn_goto = QPushButton("Go To")
         btn_goto.setStyleSheet(
             f"background-color: {COLORS['blue']}; color: {COLORS['crust']}; "
-            f"font-weight: bold; padding: 4px 12px;")
+            f"font-weight: bold; padding: {_sp(4)} {_sp(12)};")
         btn_goto.setMaximumHeight(_sc(28))
         btn_goto.clicked.connect(self._absolute_goto)
         layout.addWidget(btn_goto)
@@ -368,7 +368,7 @@ class JogControlPage(QWidget):
         btn_estop = QPushButton("⚠ STOP")
         btn_estop.setStyleSheet(
             f"background-color: {COLORS['red']}; color: {COLORS['crust']}; "
-            f"font-weight: bold; padding: 6px 16px;")
+            f"font-weight: bold; padding: {_sp(6)} {_sp(16)};")
         btn_estop.clicked.connect(self._emergency_stop)
         actions_layout.addWidget(btn_estop)
 

@@ -38,7 +38,7 @@ from SupportClasses.PrintManager import (
 )
 from SupportClasses.PhysicalModels import WorkspaceConfig
 from gui.styles import COLORS, SECTION_TITLE_STYLE
-from gui.scaling import s as _sc, sf as _sf, scaled_font_size
+from gui.scaling import s as _sc, sf as _sf, sp as _sp, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig
@@ -290,28 +290,28 @@ class PrintSetupPage(QWidget):
 
         grp_style = f"""
             QGroupBox {{
-                font-weight: bold; font-size: 12px;
+                font-weight: bold; font-size: {_sf(11)}pt;
                 color: {COLORS.get('text', '#cdd6f4')};
                 background: {COLORS.get('base', '#1e1e2e')};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+                border-radius: {_sp(4)}; margin-top: {_sp(10)}; padding-top: {_sp(24)};
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 0px; right: 0px; top: 0px;
-                padding: 6px 10px;
+                padding: {_sp(6)} {_sp(10)};
                 background: {COLORS.get('surface1', '#45475a')};
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                border-top-left-radius: {_sp(4)};
+                border-top-right-radius: {_sp(4)};
             }}
         """
 
         title = QLabel("Display Options")
         title.setStyleSheet(
-            f"font-weight: bold; font-size: 13px; "
+            f"font-weight: bold; font-size: {_sf(12)}pt; "
             f"color: {COLORS.get('peach', '#fab387')}; "
-            f"padding: 4px 0px;")
+            f"padding: {_sp(4)} 0px;")
         layout.addWidget(title)
 
         # ── Well Plate Display ────────────────────────────────────
@@ -391,23 +391,23 @@ class PrintSetupPage(QWidget):
 
         grp_style = f"""
             QGroupBox {{
-                font-weight: bold; font-size: 12px;
+                font-weight: bold; font-size: {_sf(11)}pt;
                 color: {COLORS.get('text', '#cdd6f4')};
                 background: {COLORS.get('base', '#1e1e2e')};
                 border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: 4px; margin-top: 10px; padding-top: 24px;
+                border-radius: {_sp(4)}; margin-top: {_sp(10)}; padding-top: {_sp(24)};
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 0px; right: 0px; top: 0px;
-                padding: 6px 10px;
+                padding: {_sp(6)} {_sp(10)};
                 background: {COLORS.get('surface1', '#45475a')};
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                border-top-left-radius: {_sp(4)};
+                border-top-right-radius: {_sp(4)};
             }}
         """
-        dim_style = f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 10px;"
+        dim_style = f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {_sf(9)}pt;"
 
         # ── Two-column layout ─────────────────────────────────────
         columns = QHBoxLayout()
@@ -423,9 +423,9 @@ class PrintSetupPage(QWidget):
 
         left_title = QLabel("Print Parameters")
         left_title.setStyleSheet(
-            f"font-weight: bold; font-size: 13px; "
+            f"font-weight: bold; font-size: {_sf(12)}pt; "
             f"color: {COLORS.get('blue', '#89b4fa')}; "
-            f"padding: 2px 0px;")
+            f"padding: {_sp(2)} 0px;")
         left_col.addWidget(left_title)
 
         # ── Extrusion ─────────────────────────────────────────────
@@ -594,9 +594,9 @@ class PrintSetupPage(QWidget):
 
         right_title = QLabel("Plan of Action")
         right_title.setStyleSheet(
-            f"font-weight: bold; font-size: 13px; "
+            f"font-weight: bold; font-size: {_sf(12)}pt; "
             f"color: {COLORS.get('peach', '#fab387')}; "
-            f"padding: 2px 0px;")
+            f"padding: {_sp(2)} 0px;")
         right_col.addWidget(right_title)
 
         # ── Ink Swap Strategy ─────────────────────────────────────
@@ -799,8 +799,8 @@ class PrintSetupPage(QWidget):
             QPushButton {{
                 background: {COLORS.get('blue', '#89b4fa')};
                 color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 10px 20px;
-                border-radius: 4px; font-size: 13px;
+                font-weight: bold; padding: {_sp(10)} {_sp(20)};
+                border-radius: {_sp(4)}; font-size: {_sf(12)}pt;
             }}
             QPushButton:hover {{
                 background: {COLORS.get('sapphire', '#74c7ec')};
@@ -815,8 +815,8 @@ class PrintSetupPage(QWidget):
             QPushButton {{
                 background: {COLORS.get('green', '#a6e3a1')};
                 color: {COLORS.get('base', '#1e1e2e')};
-                font-weight: bold; padding: 10px 20px;
-                border-radius: 4px; font-size: 13px;
+                font-weight: bold; padding: {_sp(10)} {_sp(20)};
+                border-radius: {_sp(4)}; font-size: {_sf(12)}pt;
             }}
             QPushButton:hover {{
                 background: {COLORS.get('teal', '#94e2d5')};

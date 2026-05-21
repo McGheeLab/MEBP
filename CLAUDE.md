@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.3.7** — Microscope-Enabled Bioprinting Platform
+**V7.4.0-a** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.3.7`
+Branch: `Version-7.4.0-a` (foundation sub-version of the v7.4.0 UX-focused release)
 
 ---
 
@@ -12,7 +12,7 @@ Branch: `Version-7.3.7`
 
 **Before making ANY code changes, read the architecture document for this version:**
 
-`coding plans/Architectures/ARCHITECTURE_V737.md`
+`coding plans/Architectures/ARCHITECTURE_V740A.md` (delta against `ARCHITECTURE_V737.md`)
 
 This document contains the full system architecture, module responsibilities, data flow diagrams, communication protocols, and key algorithms. Understanding this is mandatory before modifying any code.
 
@@ -115,6 +115,7 @@ Ensure the update plan in `coding plans/Update plans/` is finalized:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v737_to_v740a_UPDATE.md` | v7.4.0-a UX foundation: calibration auto-save bug fix (debounced QTimer in `_emit_calibration_data_changed`), new component library (`gui/widgets/components.py`: Card/StatusBadge/SectionHeader/FormRow/WizardStep/LoadingBanner), page transitions (`gui/widgets/page_transition.py::fade_swap`), `sp(px)` QSS-string helper, padding sweep across primary-workflow pages |
 | `MEBP_v736_to_v737_UPDATE.md` | v7.3.7 Fix startup ImportError, DPI-scale mode page sidebar button icons + emoji font-family fallbacks, DPI-scale print setup tab bar |
 | `MEBP_v735_to_v736_UPDATE.md` | v7.3.6 DPI-aware GUI scaling (gui/scaling.py, build_theme(k), all pages/widgets scaled), PyInstaller executable packaging (MEBP.spec, build_exe.py), .gitignore |
 | `MEBP_v734_to_v735_UPDATE.md` | v7.3.5 Critical fixes: safe Z flush_moves() stale "ok" drain, click-to-move QLabel event filter, XY unit rename (microsteps_per_micron → xy_position_scale, 10→1), ZP stage settings card, watchdog M500, simulation state persistence |

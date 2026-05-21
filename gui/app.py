@@ -58,6 +58,8 @@ from gui.pages.settings_page import SettingsPage
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
 from gui.widgets.camera_manager import CameraManager       # v7.3.3
+from gui.widgets.components import LoadingBanner            # v7.4.0-a
+from gui.widgets.page_transition import fade_swap           # v7.4.0-a
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,7 @@ class MainWindow(QMainWindow):
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.3.3")
+        self.setWindowTitle("MEBP Bioprinter — v7.4.0-a")
         self.setMinimumSize(s(1100), s(700))
         self.resize(s(1400), s(850))
 
@@ -123,7 +125,7 @@ class MainWindow(QMainWindow):
         # Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized (v7.3.3)")
+        logger.info("MainWindow initialized (v7.4.0-a)")
 
     # ════════════════════════════════════════════════════════════════
     #  XY POSITION SCALE PROPERTY
@@ -345,6 +347,10 @@ class MainWindow(QMainWindow):
         top_bar_layout.addWidget(conn_frame)
 
         content_layout.addWidget(top_bar)
+
+        # v7.4.0-a: Global loading banner — show_loading(msg) / hide_loading()
+        self._loading_banner = LoadingBanner()
+        content_layout.addWidget(self._loading_banner)
 
         # Content splitter (pages + console)
         self._splitter = QSplitter(Qt.Vertical)
@@ -1208,7 +1214,8 @@ class MainWindow(QMainWindow):
             return
 
         self._current_page_index = index
-        self._page_stack.setCurrentIndex(index)
+        # v7.4.0-a: Smooth fade for page swaps (skipped for camera-bearing pages)
+        fade_swap(self._page_stack, index)
 
         page = self._page_widgets[index]
 
@@ -1292,6 +1299,20 @@ class MainWindow(QMainWindow):
         (e.g., PrintSetupPage.navigate_to_page).
         """
         self._navigate_to(index)
+
+    # ────────────────────────────────────────────────────────────────
+    #  v7.4.0-a: Loading banner
+    # ────────────────────────────────────────────────────────────────
+
+    def show_loading(self, message: str):
+        """Show the global loading banner with the given message."""
+        if hasattr(self, '_loading_banner'):
+            self._loading_banner.show_for(message)
+
+    def hide_loading(self):
+        """Hide the global loading banner."""
+        if hasattr(self, '_loading_banner'):
+            self._loading_banner.hide()
 
     # ════════════════════════════════════════════════════════════════
     #  TIMERS & STATUS UPDATES

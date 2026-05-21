@@ -40,7 +40,7 @@ from gui.unit_helpers import (
     DEFAULT_XY_POSITION_SCALE,
 )
 from gui.widgets.jog_button_array import JogButtonArray
-from gui.scaling import s, scaled_font_size
+from gui.scaling import s, sf, sp, scaled_font_size
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +203,7 @@ class SettingsPage(QWidget):
         # Position readout
         pos_frame = QFrame()
         pos_frame.setStyleSheet(
-            f"background: {COLORS['mantle']}; border-radius: 4px; padding: 4px;")
+            f"background: {COLORS['mantle']}; border-radius: {sp(4)}; padding: {sp(4)};")
         pos_grid = QGridLayout(pos_frame)
         pos_grid.setSpacing(2)
         pos_grid.setContentsMargins(4, 4, 4, 4)
@@ -740,7 +740,7 @@ class SettingsPage(QWidget):
         self.lbl_safety_um = QLabel("")
         self.lbl_safety_um.setWordWrap(True)
         self.lbl_safety_um.setStyleSheet(
-            f"color: {COLORS['overlay0']}; font-size: 9pt; padding: 2px;")
+            f"color: {COLORS['overlay0']}; font-size: {sf(9)}pt; padding: {sp(2)};")
         layout.addWidget(self.lbl_safety_um)
 
         grid = QGridLayout()

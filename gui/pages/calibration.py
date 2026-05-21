@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QFrame, QSizePolicy, QMessageBox, QCheckBox,
     QScrollArea,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor
@@ -33,7 +33,7 @@ from SupportClasses.StageController import StageController
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
-from gui.scaling import s, scaled_font_size
+from gui.scaling import s, sf, sp, scaled_font_size
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig
@@ -650,6 +650,15 @@ class CalibrationPage(QWidget):
 
         if not hasattr(self, '_corner_well'): self._corner_well = 'H12'
 
+        # v7.4.0-a: Debounced auto-save. _emit_calibration_data_changed fires
+        # from many places (safe Z teach, top Z teach, 3-point teach, mosaic
+        # tick). Writing settings.json on each emit would thrash disk during
+        # mosaic scans, so coalesce into a single write 500 ms after the last
+        # change.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(500)
+        self._autosave_timer.timeout.connect(self._save_calibration)
 
         self._setup_ui()
 
@@ -665,8 +674,15 @@ class CalibrationPage(QWidget):
         return self._plate, positions, getattr(self, '_safe_z', None)
 
     def _emit_calibration_data_changed(self):
-        """v7.3.1: Notify listeners that calibration data has changed."""
+        """v7.3.1: Notify listeners that calibration data has changed.
+
+        v7.4.0-a: Also schedule a debounced auto-save to settings.json so
+        users never lose taught Safe Z / Top Z / 3-point positions just
+        because they forgot to click the manual Save button.
+        """
         self.calibration_data_changed.emit()
+        if self.settings is not None and hasattr(self, '_autosave_timer'):
+            self._autosave_timer.start()
 
     def set_xy_position_scale(self, value: float):
         """Update the XY position scale factor."""
@@ -765,8 +781,8 @@ class CalibrationPage(QWidget):
         self._ctx_cam_toggle.setObjectName("flatBtn")
         self._ctx_cam_toggle.setStyleSheet(
             f"text-align: left; font-weight: 600; color: {COLORS['blue']}; "
-            f"padding: 6px 0px 2px 0px; border: none; background: transparent;"
-            f"border-bottom: 1px solid {COLORS['surface1']}; margin-bottom: 4px;")
+            f"padding: {sp(6)} 0px {sp(2)} 0px; border: none; background: transparent;"
+            f"border-bottom: 1px solid {COLORS['surface1']}; margin-bottom: {sp(4)};")
         self._ctx_cam_toggle.setCursor(Qt.PointingHandCursor)
         self._ctx_cam_toggle.clicked.connect(self._toggle_cam_section)
         cam_header_row.addWidget(self._ctx_cam_toggle, stretch=1)
@@ -830,7 +846,7 @@ class CalibrationPage(QWidget):
             row_frame = QFrame()
             row_frame.setStyleSheet(
                 f"QFrame {{ border: 1px solid {COLORS['surface1']}; "
-                f"border-radius: 4px; padding: 2px; }}")
+                f"border-radius: {sp(4)}; padding: {sp(2)}; }}")
             row_lay = QVBoxLayout(row_frame)
             row_lay.setContentsMargins(4, 3, 4, 3)
             row_lay.setSpacing(2)
@@ -969,8 +985,8 @@ class CalibrationPage(QWidget):
                 "Empirically measure µm/px via stage motion + phase correlation")
             btn_cal_umpx.setStyleSheet(
                 f"QPushButton {{ background-color: {COLORS['surface1']}; "
-                f"color: {COLORS['text']}; padding: 3px 8px; "
-                f"border-radius: 3px; font-size: 8pt; }}"
+                f"color: {COLORS['text']}; padding: {sp(3)} {sp(8)}; "
+                f"border-radius: {sp(3)}; font-size: {sf(8)}pt; }}"
                 f"QPushButton:hover {{ background-color: {COLORS['blue']}; "
                 f"color: {COLORS['base']}; }}")
             btn_cal_umpx.clicked.connect(
@@ -1638,9 +1654,9 @@ class CalibrationPage(QWidget):
         from PySide6.QtWidgets import QGroupBox
         grp = QGroupBox("Plate Position View")
         grp.setStyleSheet(
-            "QGroupBox { color: #cdd6f4; font-weight: bold; "
-            "border: 1px solid #45475a; border-radius: 4px; "
-            "margin-top: 6px; padding-top: 12px; }")
+            f"QGroupBox {{ color: {COLORS['text']}; font-weight: bold; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: {sp(4)}; "
+            f"margin-top: {sp(6)}; padding-top: {sp(12)}; }}")
         grp_layout = QHBoxLayout(grp)
         grp_layout.setSpacing(4)
         grp_layout.setContentsMargins(4, 4, 4, 4)
