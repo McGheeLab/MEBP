@@ -2,14 +2,12 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.4.0-b** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.4.0-a** | Python 3.10+ | PySide6 (Qt 6)
 
-> **v7.4.0-b** is the workflow-restructure sub-version of the UX-focused v7.4.0 release.
-> Hardware Setup is now a mode page with 7 sub-pages (Identity, Plate, Pumps & Inks,
-> Needle, Rosette, Cameras, Stage). Settings is slimmed to user/system preferences.
-> See [`coding plans/Update plans/MEBP_v740a_to_v740b_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v740a_to_v740b_UPDATE.md)
+> **v7.4.0-a** is the foundation sub-version of a larger UX-focused v7.4.0 release.
+> See [`coding plans/Update plans/MEBP_v737_to_v740a_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v737_to_v740a_UPDATE.md)
 > for what's new in this sub-version, and
-> [`coding plans/Architectures/ARCHITECTURE_V740B.md`](coding%20plans/Architectures/ARCHITECTURE_V740B.md)
+> [`coding plans/Architectures/ARCHITECTURE_V740A.md`](coding%20plans/Architectures/ARCHITECTURE_V740A.md)
 > for the architecture delta.
 
 ---
@@ -320,9 +318,7 @@ The executable is output to `dist/MEBP/`. Bundle size is approximately 470 MB (l
 
 ### Architecture Documentation
 
-See `coding plans/Architectures/ARCHITECTURE_V737.md` for the comprehensive architecture reference, then the v7.4.0 deltas:
-- `coding plans/Architectures/ARCHITECTURE_V740A.md` — foundation (components, transitions, calibration auto-save)
-- `coding plans/Architectures/ARCHITECTURE_V740B.md` — workflow restructure (HW Setup sub-pages, Settings slim, migrations)
+See `coding plans/Architectures/ARCHITECTURE_V737.md` for the comprehensive architecture reference, and `coding plans/Architectures/ARCHITECTURE_V740A.md` for the v7.4.0-a delta.
 
 ---
 

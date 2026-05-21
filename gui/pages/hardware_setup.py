@@ -61,6 +61,7 @@ from SupportClasses.PhysicalModels import (
 from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
+from gui.pages.mode_page import ModePage  # v7.4.0-b
 
 logger = logging.getLogger(__name__)
 
@@ -459,11 +460,15 @@ class PumpChannelWidget(QGroupBox):
 # Hardware Setup Page (v7.2.4)
 # ═══════════════════════════════════════════════════════════════════
 
-class HardwareSetupPage(QWidget):
+class HardwareSetupPage(ModePage):
     """
     Hardware Setup — the gating page that must be completed before
     any other page can operate.
 
+    v7.4.0-b: Restructured as a ModePage with 7 sub-pages
+        (Identity, Plate, Pumps & Inks, Needle, Rosette, Cameras, Stage)
+        for navigability. Existing widgets/signals/handlers preserved;
+        only the layout changes.
     v7.2.4: Reordered sections, added rosette library, fixed config restore.
     v7.2.4 Session 3: Pump-ink exclusivity, needle channel mapping.
     """
@@ -473,6 +478,11 @@ class HardwareSetupPage(QWidget):
     # Signals
     config_changed = Signal(object)       # Emits HardwareConfig
     config_validated = Signal(bool)       # Emits validity state
+
+    # v7.4.0-b: Settings reference used by the Stage sub-page (safety limits,
+    # ZP feedrates, axis flips). Set via set_settings() from MainWindow.
+    _settings = None
+    _controller = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -493,6 +503,12 @@ class HardwareSetupPage(QWidget):
 
         self._setup_ui()
 
+    def set_settings(self, settings):
+        """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets."""
+        self._settings = settings
+        if hasattr(self, '_stage_panel'):
+            self._stage_panel.set_settings(settings)
+
     def get_page_title(self) -> str:
         return "Hardware Setup"
 
@@ -505,21 +521,40 @@ class HardwareSetupPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
-        """Build the main page layout with v7.2.4 section ordering."""
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        """v7.4.0-b: Build 7 sub-pages partitioning the hardware config UI.
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        Existing section-building code is preserved; each section is added
+        to the appropriate sub-page's layout instead of one long scroll.
+        After all sections are built, sub-pages are registered with
+        ModePage via add_sub_page().
+        """
         _bg = COLORS['base']
-        scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
 
-        scroll_content = QWidget()
-        scroll_content.setStyleSheet(f"background-color: {_bg};")
-        self._content_layout = QVBoxLayout(scroll_content)
-        self._content_layout.setSpacing(12)
-        self._content_layout.setContentsMargins(12, 12, 12, 12)
+        # Create per-sub-page scaffolds (scroll, content widget, layout)
+        self._sub_layouts: dict[str, QVBoxLayout] = {}
+        self._sub_scrolls: dict[str, QScrollArea] = {}
+        for key in ("identity", "plate", "pumps_inks", "needle",
+                    "rosette", "cameras"):
+            scroll, lay = self._make_subpage_scaffold(_bg)
+            self._sub_scrolls[key] = scroll
+            self._sub_layouts[key] = lay
+
+        # Stage sub-page is custom (StageHardwarePanel) — defined separately
+        from gui.pages.hardware.stage_panel import StageHardwarePanel
+        self._stage_panel = StageHardwarePanel(self)
+        stage_scroll = QScrollArea()
+        stage_scroll.setWidgetResizable(True)
+        stage_scroll.setFrameShape(QFrame.NoFrame)
+        stage_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {_bg}; border: none; }}")
+        stage_scroll.setWidget(self._stage_panel)
+        self._sub_scrolls["stage"] = stage_scroll
+
+        # Backward-compat alias: existing code still references
+        # self._content_layout in a few spots — make it point at the
+        # identity sub-page so any orphaned addWidget calls land somewhere
+        # visible rather than crashing.
+        self._content_layout = self._sub_layouts["identity"]
 
         # ── Section 1: Setup Name & Notes ─────────────────────────
         name_group = QGroupBox("Setup Name && Notes")
@@ -556,7 +591,7 @@ class HardwareSetupPage(QWidget):
         plate_lay.addWidget(self.plate_combo)
         plate_lay.addStretch()
 
-        self._content_layout.addWidget(plate_group)
+        self._sub_layouts["plate"].addWidget(plate_group)
 
         # ── Section 3: Ink Library ────────────────────────────────
         ink_group = QGroupBox("Ink Library")
@@ -590,7 +625,7 @@ class HardwareSetupPage(QWidget):
         ink_btns.addStretch()
         ink_lay.addLayout(ink_btns)
 
-        self._content_layout.addWidget(ink_group)
+        self._sub_layouts["pumps_inks"].addWidget(ink_group)
 
         # ── Section 4: Pump Channels (v7.2.4: with exclusive inks) ─
         pump_group = QGroupBox("Pump Channels")
@@ -612,7 +647,7 @@ class HardwareSetupPage(QWidget):
         self.pump_ink_summary.setWordWrap(True)
         pump_lay.addWidget(self.pump_ink_summary)
 
-        self._content_layout.addWidget(pump_group)
+        self._sub_layouts["pumps_inks"].addWidget(pump_group)
 
         # v7.2.9: Ink Swap Strategy UI moved to Print Setup → Plan of Action
 
@@ -649,7 +684,7 @@ class HardwareSetupPage(QWidget):
             f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
         needle_lay.addWidget(self.needle_info_label, 2, 0, 1, 4)
 
-        self._content_layout.addWidget(needle_group)
+        self._sub_layouts["needle"].addWidget(needle_group)
 
         # ── Section 6: Needle Channel → Pump Mapping (v7.2.4: NEW) ─
         self.channel_map_group = QGroupBox("Needle Channel Assignment")
@@ -677,7 +712,7 @@ class HardwareSetupPage(QWidget):
             f"font-size: {sf(9)}pt; padding: {sp(2)} {sp(4)};")
         self._channel_map_layout.addWidget(self.channel_map_status)
 
-        self._content_layout.addWidget(self.channel_map_group)
+        self._sub_layouts["needle"].addWidget(self.channel_map_group)
 
         # Build initial channel rows
         self._rebuild_channel_map_rows()
@@ -714,7 +749,7 @@ class HardwareSetupPage(QWidget):
         ros_btns.addStretch()
         ros_lay.addLayout(ros_btns)
 
-        self._content_layout.addWidget(ros_group)
+        self._sub_layouts["rosette"].addWidget(ros_group)
 
         # ── Section 8: Camera Configuration (v7.3.0) ─────────────
         cam_group = QGroupBox("Camera Configuration")
@@ -773,7 +808,7 @@ class HardwareSetupPage(QWidget):
             f"color: {COLORS.get('subtext0', '#a6adc8')};")
         cam_lay.addWidget(self.cam_fov_label, 5, 1, 1, 2)
 
-        self._content_layout.addWidget(cam_group)
+        self._sub_layouts["cameras"].addWidget(cam_group)
 
         # ── Section 8b: Live Camera Sources (v7.3.3) ─────────────
         live_cam_group = QGroupBox("Live Camera Sources")
@@ -854,7 +889,7 @@ class HardwareSetupPage(QWidget):
         cal_row.addStretch()
         live_cam_lay.addLayout(cal_row)
 
-        self._content_layout.addWidget(live_cam_group)
+        self._sub_layouts["cameras"].addWidget(live_cam_group)
 
         # ── Section 9: Setup Status ───────────────────────────────
         status_group = QGroupBox("Setup Status")
@@ -887,10 +922,42 @@ class HardwareSetupPage(QWidget):
 
         self._content_layout.addWidget(actions_group)
 
-        # ── Finalize scroll area ──────────────────────────────────
-        self._content_layout.addStretch()
-        scroll.setWidget(scroll_content)
-        outer.addWidget(scroll)
+        # ── Finalize sub-pages (v7.4.0-b) ─────────────────────────
+        # Add stretch to each sub-page layout so groups stack at the top.
+        for key in ("identity", "plate", "pumps_inks", "needle",
+                    "rosette", "cameras"):
+            self._sub_layouts[key].addStretch()
+
+        # Register sub-pages with ModePage in user-facing order.
+        self.add_sub_page("🧾", "Identity",
+                          self._sub_scrolls["identity"])
+        self.add_sub_page("🔬", "Plate",
+                          self._sub_scrolls["plate"])
+        self.add_sub_page("💧", "Pumps & Inks",
+                          self._sub_scrolls["pumps_inks"])
+        self.add_sub_page("🪡", "Needle",
+                          self._sub_scrolls["needle"])
+        self.add_sub_page("🌸", "Rosette",
+                          self._sub_scrolls["rosette"])
+        self.add_sub_page("📷", "Cameras",
+                          self._sub_scrolls["cameras"])
+        self.add_sub_page("⚙️", "Stage",
+                          self._sub_scrolls["stage"])
+
+    # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
+    def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {bg}; border: none; }}")
+        content = QWidget()
+        content.setStyleSheet(f"background-color: {bg};")
+        layout = QVBoxLayout(content)
+        layout.setSpacing(s(12))
+        layout.setContentsMargins(s(12), s(12), s(12), s(12))
+        scroll.setWidget(content)
+        return scroll, layout
 
     # ════════════════════════════════════════════════════════════════
     #  SHARED STYLES
@@ -900,6 +967,19 @@ class HardwareSetupPage(QWidget):
     def _group_style() -> str:
         """v7.2.4: Delegates to centralized SECTION_TITLE_STYLE."""
         return SECTION_TITLE_STYLE
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.0-b: SUB-PAGE TITLE FOR MODE PAGE
+    # ════════════════════════════════════════════════════════════════
+
+    def get_sub_page_title(self) -> str:
+        """Override ModePage to return descriptive sub-page name."""
+        labels = ["Hardware: Identity", "Hardware: Plate",
+                  "Hardware: Pumps & Inks", "Hardware: Needle",
+                  "Hardware: Rosette", "Hardware: Cameras",
+                  "Hardware: Stage"]
+        idx = self.get_active_index()
+        return labels[idx] if 0 <= idx < len(labels) else "Hardware Setup"
 
     # ════════════════════════════════════════════════════════════════
     #  NEEDLE CHANGE HANDLER
@@ -1002,8 +1082,13 @@ class HardwareSetupPage(QWidget):
         self._camera_manager = manager
 
     def set_controller(self, controller):
-        """v7.3.3: Receive StageController for pixel calibration."""
+        """v7.3.3: Receive StageController for pixel calibration.
+
+        v7.4.0-b: Also propagates to the Stage sub-page panel.
+        """
         self._controller = controller
+        if hasattr(self, '_stage_panel'):
+            self._stage_panel.set_controller(controller)
 
     def set_calibrated_um_per_px(self, cam_idx: int, value: float):
         """v7.3.3: Set calibrated µm/px from external source (e.g., needle-based)."""

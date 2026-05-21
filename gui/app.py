@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QStackedWidget, QScrollArea, QSizePolicy,
     QSplitter,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor, QKeyEvent
 
 from SupportClasses.StageController import StageController
@@ -84,6 +84,12 @@ def _make_text_icon(text: str, size: int = 0, color: str = "#a6adc8") -> QIcon:
 class MainWindow(QMainWindow):
     """MEBP main application window with PyDracula-style sidebar navigation."""
 
+    # v7.4.0-b: Emitted when hardware config changes in a way that affects
+    # downstream derived data on other pages (plate format, pumps, inks,
+    # needle). Pages can subscribe and either auto-refresh or surface an
+    # InvalidationBanner.
+    hw_config_invalidated = Signal(dict)
+
     def __init__(self, controller: StageController, settings: Settings,
                  print_history: PrintHistory | None = None,
                  recorder: PrintRecorder | None = None):
@@ -107,7 +113,7 @@ class MainWindow(QMainWindow):
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.4.0-a")
+        self.setWindowTitle("MEBP Bioprinter — v7.4.0-b")
         self.setMinimumSize(s(1100), s(700))
         self.resize(s(1400), s(850))
 
@@ -125,7 +131,7 @@ class MainWindow(QMainWindow):
         # Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized (v7.4.0-a)")
+        logger.info("MainWindow initialized (v7.4.0-b)")
 
     # ════════════════════════════════════════════════════════════════
     #  XY POSITION SCALE PROPERTY
@@ -511,6 +517,7 @@ class MainWindow(QMainWindow):
         hw_page = pages[0]
         hw_page.set_camera_manager(self._camera_manager)  # v7.3.3
         hw_page.set_controller(self.controller)  # v7.3.3: for pixel calibration
+        hw_page.set_settings(self.settings)       # v7.4.0-b: for Stage sub-page
         hw_page.config_changed.connect(self._on_hardware_config_changed)
         hw_page.config_validated.connect(self._on_hardware_validated)
 
@@ -1095,17 +1102,40 @@ class MainWindow(QMainWindow):
     # ════════════════════════════════════════════════════════════════
 
     def _on_hardware_config_changed(self, config: HardwareConfig):
-        """Called when hardware setup changes. Propagates to all pages."""
+        """Called when hardware setup changes. Propagates to all pages.
+
+        v7.4.0-b: Also emits hw_config_invalidated so downstream pages
+        (Print Setup, Calibration) can surface a refresh banner.
+        """
         if self._propagating_config:
             return  # Guard against re-entrant calls
         self._propagating_config = True
         try:
+            prev = self._hardware_config
             self._hardware_config = config
             self._propagate_hardware_config(config)
             self._save_hardware_config(config)
             logger.info(f"Hardware config updated: {config}")
+            # v7.4.0-b: Notify pages that derived data may be stale.
+            self._emit_invalidation(prev, config)
         finally:
             self._propagating_config = False
+
+    def _emit_invalidation(self, prev, current):
+        """v7.4.0-b: Emit hw_config_invalidated with what changed.
+
+        Payload is a dict of changed keys; subscribers can decide how
+        much UI to invalidate based on which keys changed.
+        """
+        changed = {}
+        if prev is None or getattr(prev, 'plate_format', None) != \
+                getattr(current, 'plate_format', None):
+            changed["plate_format"] = getattr(current, 'plate_format', None)
+        if prev is None or getattr(prev, 'pumps', None) != \
+                getattr(current, 'pumps', None):
+            changed["pumps"] = True
+        if changed:
+            self.hw_config_invalidated.emit(changed)
 
     def _on_hardware_validated(self, is_valid: bool):
         """Called when hardware setup validity changes. Gates other pages."""

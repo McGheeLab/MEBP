@@ -282,14 +282,24 @@ class SettingsPage(QWidget):
 
         # Sync context labels from current main content state
         self._update_context_sim_labels()
-        self.ctx_safety_chk.setChecked(self.chk_safety_enabled.isChecked())
+        # v7.4.0-b: chk_safety_enabled moved to HW Setup → Stage
+        if hasattr(self, 'chk_safety_enabled'):
+            self.ctx_safety_chk.setChecked(self.chk_safety_enabled.isChecked())
         self.ctx_port_label.setText(self.port_list_label.text())
 
         return ctx
 
     def _ctx_safety_toggled(self, checked):
-        """Quick toggle from context panel — sync to main content."""
-        self.chk_safety_enabled.setChecked(checked)
+        """Quick toggle from context panel — sync to main content.
+
+        v7.4.0-b: chk_safety_enabled moved to HW Setup → Stage. If it's
+        absent, still update the context indicator + write directly to
+        Settings so users get fast safety toggling from the context panel.
+        """
+        if hasattr(self, 'chk_safety_enabled'):
+            self.chk_safety_enabled.setChecked(checked)
+        else:
+            self.settings.set("safety_limits.enabled", checked)
         if checked:
             self.ctx_safety_status.setText("Enabled")
             self.ctx_safety_status.setStyleSheet(
@@ -381,12 +391,13 @@ class SettingsPage(QWidget):
 
         self._build_connection_card(layout)
         self._build_controller_card(layout)
-        self._build_zp_stage_card(layout)
-        self._build_safety_card(layout)
         self._build_polling_card(layout)
         self._build_xbox_card(layout)
-        self._build_axis_flip_card(layout)
         self._build_logging_card(layout)
+        # v7.4.0-b: ZP feedrates, safety limits, and axis flips moved to
+        # Hardware Setup → Stage sub-page. Build a "moved" notice banner
+        # to point users at the new home.
+        self._build_moved_notice_card(layout)
 
         # Apply / Reset buttons (also in main content for convenience)
         btn_row = QHBoxLayout()
@@ -409,6 +420,39 @@ class SettingsPage(QWidget):
         outer.addWidget(scroll)
 
     # ── Connection Card ───────────────────────────────────────────
+
+    def _build_moved_notice_card(self, parent_layout):
+        """v7.4.0-b: Notice card pointing to relocated controls."""
+        card = QFrame()
+        card.setObjectName("cardFrame")
+        card.setStyleSheet(
+            f"QFrame#cardFrame {{"
+            f"  background-color: {COLORS['surface0']};"
+            f"  border: 1px solid {COLORS['mauve']};"
+            f"  border-radius: {sp(8)};"
+            f"  padding: {sp(12)};"
+            f"}}"
+        )
+        lay = QVBoxLayout(card)
+        lay.setSpacing(s(6))
+
+        title = QLabel("Moved in v7.4.0-b")
+        title.setStyleSheet(
+            f"color: {COLORS['mauve']}; font-weight: 600; font-size: {sf(10)}pt;")
+        lay.addWidget(title)
+
+        body = QLabel(
+            "Safety limits, ZP stage feedrates, axis direction flips, "
+            "and the zero-calibration jog have moved from this page to "
+            "<b>Hardware Setup → Stage</b>. The Settings page is now "
+            "strictly user/system preferences."
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet(
+            f"color: {COLORS['text']}; font-size: {sf(9.5)}pt;")
+        lay.addWidget(body)
+
+        parent_layout.addWidget(card)
 
     def _build_connection_card(self, parent_layout):
         card = QFrame()
@@ -1080,46 +1124,54 @@ class SettingsPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _load_from_controller(self):
-        """Populate UI from controller + settings."""
+        """Populate UI from controller + settings.
+
+        v7.4.0-b: ZP feedrates, safety limits, and axis flips moved to
+        Hardware Setup → Stage. The widgets here are guarded with
+        hasattr() checks so this method works whether or not those
+        cards were built (they are not built post-v7.4.0-b).
+        """
         sl = self.controller.safety_limits
 
         # Connection
         self.chk_sim_xy.setChecked(self.controller.simulate_xy)
         self.chk_sim_zp.setChecked(self.controller.simulate_zp)
 
-        # v7.3.5: ZP Stage settings
-        from SupportClasses.ZPStage import ZPStageManager
-        default_fr = ZPStageManager.DEFAULT_FEEDRATE
-        self.spin_zp_max_feedrate.setValue(
-            self.settings.get("zp_stage.max_feedrate", default_fr))
-        self.spin_zp_retract_feedrate.setValue(
-            self.settings.get("zp_stage.retract_feedrate", default_fr))
-        self.spin_zp_insert_feedrate.setValue(
-            self.settings.get("zp_stage.insert_feedrate", default_fr / 2))
-        self.spin_zp_jog_feedrate.setValue(
-            self.settings.get("zp_stage.jog_feedrate", default_fr))
-        self.chk_zp_position_save.setChecked(
-            bool(self.settings.get("zp_stage.auto_save_position", False)))
+        # v7.3.5: ZP Stage settings (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, 'spin_zp_max_feedrate'):
+            from SupportClasses.ZPStage import ZPStageManager
+            default_fr = ZPStageManager.DEFAULT_FEEDRATE
+            self.spin_zp_max_feedrate.setValue(
+                self.settings.get("zp_stage.max_feedrate", default_fr))
+            self.spin_zp_retract_feedrate.setValue(
+                self.settings.get("zp_stage.retract_feedrate", default_fr))
+            self.spin_zp_insert_feedrate.setValue(
+                self.settings.get("zp_stage.insert_feedrate", default_fr / 2))
+            self.spin_zp_jog_feedrate.setValue(
+                self.settings.get("zp_stage.jog_feedrate", default_fr))
+            self.chk_zp_position_save.setChecked(
+                bool(self.settings.get("zp_stage.auto_save_position", False)))
 
-        # Safety limits
-        self.chk_safety_enabled.setChecked(sl.enabled)
-        self.spin_xy_min_x.setValue(sl.xy_min_x)
-        self.spin_xy_max_x.setValue(sl.xy_max_x)
-        self.spin_xy_min_y.setValue(sl.xy_min_y)
-        self.spin_xy_max_y.setValue(sl.xy_max_y)
-        self.spin_z_min.setValue(sl.z_min)
-        self.spin_z_max.setValue(sl.z_max)
-        # v7.2.6: Load per-pump limits
-        for pid, attr_min, attr_max in [
-            ('P1', 'p1_min', 'p1_max'),
-            ('P2', 'p2_min', 'p2_max'),
-            ('P3', 'p3_min', 'p3_max'),
-        ]:
-            if pid in self._pump_min_spins:
-                self._pump_min_spins[pid].setValue(getattr(sl, attr_min))
-                self._pump_max_spins[pid].setValue(getattr(sl, attr_max))
-        self.spin_max_z_feed.setValue(sl.max_z_feedrate)
-        self.spin_max_p_feed.setValue(sl.max_pump_feedrate)
+        # Safety limits (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, 'chk_safety_enabled'):
+            self.chk_safety_enabled.setChecked(sl.enabled)
+            self.spin_xy_min_x.setValue(sl.xy_min_x)
+            self.spin_xy_max_x.setValue(sl.xy_max_x)
+            self.spin_xy_min_y.setValue(sl.xy_min_y)
+            self.spin_xy_max_y.setValue(sl.xy_max_y)
+            self.spin_z_min.setValue(sl.z_min)
+            self.spin_z_max.setValue(sl.z_max)
+            # v7.2.6: Load per-pump limits
+            for pid, attr_min, attr_max in [
+                ('P1', 'p1_min', 'p1_max'),
+                ('P2', 'p2_min', 'p2_max'),
+                ('P3', 'p3_min', 'p3_max'),
+            ]:
+                if pid in self._pump_min_spins:
+                    self._pump_min_spins[pid].setValue(getattr(sl, attr_min))
+                    self._pump_max_spins[pid].setValue(getattr(sl, attr_max))
+            self.spin_max_z_feed.setValue(sl.max_z_feedrate)
+            self.spin_max_p_feed.setValue(sl.max_pump_feedrate)
 
         # Polling
         poll_ms = self.settings.get("polling.position_interval_ms", 300)
@@ -1148,10 +1200,11 @@ class SettingsPage(QWidget):
         self.chk_debug_xy.setChecked(
             self.settings.get("logging.debug_xy", False))
 
-        # v7.3.2: Axis flip
-        saved_flips = self.settings.get_section("axis_flip") or {}
-        for axis, chk in self._flip_checks.items():
-            chk.setChecked(bool(saved_flips.get(axis, False)))
+        # v7.3.2: Axis flip (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, '_flip_checks'):
+            saved_flips = self.settings.get_section("axis_flip") or {}
+            for axis, chk in self._flip_checks.items():
+                chk.setChecked(bool(saved_flips.get(axis, False)))
 
         # Unit conversion factor
         um_val = self.settings.get("stage.xy_position_scale",
@@ -1190,55 +1243,61 @@ class SettingsPage(QWidget):
             )
 
     def _apply_settings(self):
-        """Apply UI values to controller and persist."""
+        """Apply UI values to controller and persist.
+
+        v7.4.0-b: ZP feedrates, safety limits, and axis flips moved to
+        Hardware Setup → Stage. Those branches are guarded so this
+        works whether or not the legacy widgets were built.
+        """
         sl = self.controller.safety_limits
 
-        # Safety limits → controller
-        sl.enabled = self.chk_safety_enabled.isChecked()
-        sl.xy_min_x = self.spin_xy_min_x.value()
-        sl.xy_max_x = self.spin_xy_max_x.value()
-        sl.xy_min_y = self.spin_xy_min_y.value()
-        sl.xy_max_y = self.spin_xy_max_y.value()
-        sl.z_min = self.spin_z_min.value()
-        sl.z_max = self.spin_z_max.value()
-        # v7.2.6: Apply per-pump limits
-        for pid, attr_min, attr_max in [
-            ('P1', 'p1_min', 'p1_max'),
-            ('P2', 'p2_min', 'p2_max'),
-            ('P3', 'p3_min', 'p3_max'),
-        ]:
-            if pid in self._pump_min_spins:
-                setattr(sl, attr_min, self._pump_min_spins[pid].value())
-                setattr(sl, attr_max, self._pump_max_spins[pid].value())
-        sl.max_z_feedrate = self.spin_max_z_feed.value()
-        sl.max_pump_feedrate = self.spin_max_p_feed.value()
+        # Safety limits → controller (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, 'chk_safety_enabled'):
+            sl.enabled = self.chk_safety_enabled.isChecked()
+            sl.xy_min_x = self.spin_xy_min_x.value()
+            sl.xy_max_x = self.spin_xy_max_x.value()
+            sl.xy_min_y = self.spin_xy_min_y.value()
+            sl.xy_max_y = self.spin_xy_max_y.value()
+            sl.z_min = self.spin_z_min.value()
+            sl.z_max = self.spin_z_max.value()
+            # v7.2.6: Apply per-pump limits
+            for pid, attr_min, attr_max in [
+                ('P1', 'p1_min', 'p1_max'),
+                ('P2', 'p2_min', 'p2_max'),
+                ('P3', 'p3_min', 'p3_max'),
+            ]:
+                if pid in self._pump_min_spins:
+                    setattr(sl, attr_min, self._pump_min_spins[pid].value())
+                    setattr(sl, attr_max, self._pump_max_spins[pid].value())
+            sl.max_z_feedrate = self.spin_max_z_feed.value()
+            sl.max_pump_feedrate = self.spin_max_p_feed.value()
+            self.settings.set_section("safety_limits", sl.to_dict())
 
-        self.settings.set_section("safety_limits", sl.to_dict())
+        # v7.3.5: ZP Stage settings (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, 'spin_zp_max_feedrate'):
+            zp_max_fr = self.spin_zp_max_feedrate.value()
+            zp_retract_fr = self.spin_zp_retract_feedrate.value()
+            zp_insert_fr = self.spin_zp_insert_feedrate.value()
+            zp_jog_fr = self.spin_zp_jog_feedrate.value()
+            zp_auto_save = self.chk_zp_position_save.isChecked()
 
-        # v7.3.5: ZP Stage settings → apply to hardware + persist
-        zp_max_fr = self.spin_zp_max_feedrate.value()
-        zp_retract_fr = self.spin_zp_retract_feedrate.value()
-        zp_insert_fr = self.spin_zp_insert_feedrate.value()
-        zp_jog_fr = self.spin_zp_jog_feedrate.value()
-        zp_auto_save = self.chk_zp_position_save.isChecked()
+            self.settings.set("zp_stage.max_feedrate", zp_max_fr)
+            self.settings.set("zp_stage.retract_feedrate", zp_retract_fr)
+            self.settings.set("zp_stage.insert_feedrate", zp_insert_fr)
+            self.settings.set("zp_stage.jog_feedrate", zp_jog_fr)
+            self.settings.set("zp_stage.auto_save_position", zp_auto_save)
 
-        self.settings.set("zp_stage.max_feedrate", zp_max_fr)
-        self.settings.set("zp_stage.retract_feedrate", zp_retract_fr)
-        self.settings.set("zp_stage.insert_feedrate", zp_insert_fr)
-        self.settings.set("zp_stage.jog_feedrate", zp_jog_fr)
-        self.settings.set("zp_stage.auto_save_position", zp_auto_save)
+            # Apply max feedrate to hardware (M203)
+            if self.controller.is_zp_connected and self.controller.zp_stage:
+                self.controller.zp_stage.set_max_feedrate(zp_max_fr)
+                self.controller.zp_stage.feedrate = zp_jog_fr
 
-        # Apply max feedrate to hardware (M203)
-        if self.controller.is_zp_connected and self.controller.zp_stage:
-            self.controller.zp_stage.set_max_feedrate(zp_max_fr)
-            self.controller.zp_stage.feedrate = zp_jog_fr
+            # Store retract/insert feedrates on controller for safe_travel_to
+            self.controller._zp_retract_feedrate = zp_retract_fr
+            self.controller._zp_insert_feedrate = zp_insert_fr
 
-        # Store retract/insert feedrates on controller for safe_travel_to
-        self.controller._zp_retract_feedrate = zp_retract_fr
-        self.controller._zp_insert_feedrate = zp_insert_fr
-
-        # Enable/disable periodic position save
-        self.controller._zp_auto_save_position = zp_auto_save
+            # Enable/disable periodic position save
+            self.controller._zp_auto_save_position = zp_auto_save
 
         # Polling → apply immediately (GUI timer reads setting on next tick)
         poll_ms = self.spin_poll_interval.value()
@@ -1277,11 +1336,12 @@ class SettingsPage(QWidget):
 
         self.settings.set("logging.debug_xy", self.chk_debug_xy.isChecked())
 
-        # v7.3.2: Axis flip → controller + settings
-        flip_dict = {axis: chk.isChecked()
-                     for axis, chk in self._flip_checks.items()}
-        self.controller.set_axis_flips(flip_dict)
-        self.settings.set_section("axis_flip", flip_dict)
+        # v7.3.2: Axis flip (moved to HW Setup → Stage in v7.4.0-b)
+        if hasattr(self, '_flip_checks'):
+            flip_dict = {axis: chk.isChecked()
+                         for axis, chk in self._flip_checks.items()}
+            self.controller.set_axis_flips(flip_dict)
+            self.settings.set_section("axis_flip", flip_dict)
 
         # P8.23: Controller protocol selection
         ctrl_data = self.combo_controller.currentData()

@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.4.0-a** — Microscope-Enabled Bioprinting Platform
+**V7.4.0-b** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.4.0-a` (foundation sub-version of the v7.4.0 UX-focused release)
+Branch: `Version-7.4.0-b` (workflow-restructure sub-version of the v7.4.0 UX-focused release)
 
 ---
 
@@ -12,7 +12,7 @@ Branch: `Version-7.4.0-a` (foundation sub-version of the v7.4.0 UX-focused relea
 
 **Before making ANY code changes, read the architecture document for this version:**
 
-`coding plans/Architectures/ARCHITECTURE_V740A.md` (delta against `ARCHITECTURE_V737.md`)
+`coding plans/Architectures/ARCHITECTURE_V740B.md` (delta against `ARCHITECTURE_V740A.md` and `ARCHITECTURE_V737.md`)
 
 This document contains the full system architecture, module responsibilities, data flow diagrams, communication protocols, and key algorithms. Understanding this is mandatory before modifying any code.
 
@@ -115,6 +115,7 @@ Ensure the update plan in `coding plans/Update plans/` is finalized:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v740a_to_v740b_UPDATE.md` | v7.4.0-b workflow restructure: Hardware Setup decomposed into a ModePage with 7 sub-pages (Identity/Plate/Pumps & Inks/Needle/Rosette/Cameras/Stage); new `StageHardwarePanel` (`gui/pages/hardware/stage_panel.py`) hosts safety/feedrate/axis-flip widgets relocated from Settings; SettingsPage slimmed to preferences-only with hasattr guards; settings.json migration writes one-time `.bak-v7.3` snapshot; `MainWindow.hw_config_invalidated` signal + `InvalidationBanner` widget |
 | `MEBP_v737_to_v740a_UPDATE.md` | v7.4.0-a UX foundation: calibration auto-save bug fix (debounced QTimer in `_emit_calibration_data_changed`), new component library (`gui/widgets/components.py`: Card/StatusBadge/SectionHeader/FormRow/WizardStep/LoadingBanner), page transitions (`gui/widgets/page_transition.py::fade_swap`), `sp(px)` QSS-string helper, padding sweep across primary-workflow pages |
 | `MEBP_v736_to_v737_UPDATE.md` | v7.3.7 Fix startup ImportError, DPI-scale mode page sidebar button icons + emoji font-family fallbacks, DPI-scale print setup tab bar |
 | `MEBP_v735_to_v736_UPDATE.md` | v7.3.6 DPI-aware GUI scaling (gui/scaling.py, build_theme(k), all pages/widgets scaled), PyInstaller executable packaging (MEBP.spec, build_exe.py), .gitignore |

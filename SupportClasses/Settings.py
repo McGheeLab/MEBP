@@ -160,6 +160,11 @@ DEFAULTS: dict[str, Any] = {
         "last_config_file": None,           # Path to last loaded hardware config JSON
         "auto_load": True,                  # Auto-load last config on startup
     },
+    # v7.4.0-b: Migration tracking. Each one-shot migration sets a flag here
+    # so it only runs once per settings.json file. See _run_migrations().
+    "migrations": {
+        "v7_4_0_b": False,
+    },
 }
 
 
@@ -177,7 +182,13 @@ class Settings:
     # ── Load / Save ───────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load from file, falling back to defaults for missing keys."""
+        """Load from file, falling back to defaults for missing keys.
+
+        v7.4.0-b: After loading, runs one-shot migrations (see
+        :meth:`_run_migrations`). The first such migration writes a
+        ``settings.json.bak-v7.3`` backup so users can roll back if
+        anything goes wrong.
+        """
         if not self.filepath.exists():
             logger.info(f"No settings file at {self.filepath} — using defaults")
             return
@@ -186,10 +197,48 @@ class Settings:
                 saved = json.load(f)
             self._merge(self._data, saved)
             logger.info(f"Settings loaded from {self.filepath}")
+            self._run_migrations()
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupt settings file ({e}) — using defaults")
         except Exception as e:
             logger.warning(f"Failed to load settings: {e} — using defaults")
+
+    # ── Migrations (v7.4.0-b) ─────────────────────────────────────
+
+    def _run_migrations(self) -> None:
+        """Run one-shot data migrations idempotently.
+
+        Each migration:
+          * checks its flag under ``migrations.<name>``
+          * if unset, performs its work and sets the flag
+          * the next ``save()`` persists the flag so it never re-runs
+
+        v7.4.0-b: Writes a single ``.bak-v7.3`` snapshot of the loaded
+        settings before the new layout is allowed to overwrite it.
+        Future v7.4.0-c migrations (e.g., moving keys into the
+        hardware_config namespace) can be added here.
+        """
+        if not self.get("migrations.v7_4_0_b", False):
+            self._backup_v73()
+            self.set("migrations.v7_4_0_b", True)
+            self.save()
+            logger.info("v7.4.0-b migration complete; .bak-v7.3 written")
+
+    def _backup_v73(self) -> None:
+        """Write a one-time backup of the current settings.json file.
+
+        Skips if the backup already exists.
+        """
+        backup = self.filepath.with_suffix(self.filepath.suffix + ".bak-v7.3")
+        if backup.exists():
+            logger.debug(f"v7.3 backup already present at {backup} — skipping")
+            return
+        try:
+            with open(self.filepath) as src, open(backup, "w") as dst:
+                dst.write(src.read())
+            logger.info(f"v7.3 settings backup written to {backup}")
+        except Exception as e:
+            logger.warning(f"Failed to write v7.3 backup: {e}")
 
     def save(self) -> None:
         """Persist current settings to file."""
