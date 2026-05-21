@@ -54,6 +54,12 @@ class StageHardwarePanel(QWidget):
         super().__init__(parent)
         self._settings = None
         self._controller = None
+        # v7.4.1 hotfix: explicit background so the panel doesn't fall
+        # through to Qt's default light grey. Scoped to this widget via
+        # objectName so children keep their own QSS rules.
+        self.setObjectName("stageHardwarePanel")
+        self.setStyleSheet(
+            f"#stageHardwarePanel {{ background-color: {COLORS['base']}; }}")
         self._setup_ui()
 
     # ── Public injection points ──────────────────────────────────
