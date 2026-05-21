@@ -1428,7 +1428,8 @@ class StageController:
                      f"µm (raw: dx={dx:.2f} dy={dy:.2f})")
         self.xy_stage.move_stage_relative(dx, dy)
 
-    def move_xy_relative_um(self, dx_um: float, dy_um: float) -> None:
+    def move_xy_relative_um(self, dx_um: float, dy_um: float,
+                            bypass_safety: bool = False) -> None:
         """
         Move XY stage by a relative offset in MICRONS.
 
@@ -1437,6 +1438,11 @@ class StageController:
         any microstep conversion.
 
         Safety limits are projected from cached position.
+
+        v7.4.2: ``bypass_safety=True`` skips the soft-limit clamp.
+        Used by the Hardware Setup → Device sub-page jog buttons so
+        users can move freely to discover mechanical extremes when
+        setting up a new machine.
         """
         if not self.xy_stage:
             return
@@ -1446,7 +1452,7 @@ class StageController:
 
         # Safety: project cached position + delta, clamp if needed
         # Note: safety limits and positions are all in the same units (microns)
-        if self.safety_limits.enabled:
+        if self.safety_limits.enabled and not bypass_safety:
             if cached_pos[0] is not None:
                 zero_x = self.zero_position["x"]
                 zero_y = self.zero_position["y"]
@@ -1496,14 +1502,19 @@ class StageController:
             {_axis_letter(self.zp_stage, "Z"): position}, fast,
             feedrate_mm_min=feedrate_mm_min)
 
-    def move_z_relative(self, distance: float, feedrate: float | None = None) -> None:
-        """Move Z by relative distance. v7.3.2: applies axis flip."""
+    def move_z_relative(self, distance: float, feedrate: float | None = None,
+                        bypass_safety: bool = False) -> None:
+        """Move Z by relative distance. v7.3.2: applies axis flip.
+
+        v7.4.2: ``bypass_safety=True`` skips the soft-limit clamp.
+        Used by the Hardware Setup → Device sub-page jog buttons.
+        """
         if not self.zp_stage:
             return
         distance = distance * self._flip_sign("Z")
-        if feedrate and self.safety_limits.enabled:
+        if feedrate and self.safety_limits.enabled and not bypass_safety:
             feedrate = self.safety_limits.clamp_z_feedrate(feedrate)
-        if self.safety_limits.enabled:
+        if self.safety_limits.enabled and not bypass_safety:
             try:
                 pos = self.get_zp_position(cached=True)
                 if pos[0] is not None:
@@ -1633,18 +1644,25 @@ class StageController:
         return pump_cfg.is_configured
 
     def move_pump_relative(
-        self, pump: str, distance: float, feedrate: float | None = None
+        self, pump: str, distance: float, feedrate: float | None = None,
+        bypass_safety: bool = False,
     ) -> None:
-        """Move a pump (P1/P2/P3) by relative distance. v7.3.2: applies axis flip."""
+        """Move a pump (P1/P2/P3) by relative distance. v7.3.2: applies axis flip.
+
+        v7.4.2: ``bypass_safety=True`` skips both the soft-limit clamp
+        AND the ``is_pump_enabled`` check. Used by the Hardware Setup
+        → Device sub-page jog buttons so users can jog pumps to find
+        their mechanical limits before HardwareConfig is set up.
+        """
         if not self.zp_stage:
             return
-        if not self.is_pump_enabled(pump):
+        if not bypass_safety and not self.is_pump_enabled(pump):
             logger.warning(f"Pump {pump} is disabled — move blocked")
             return
         distance = distance * self._flip_sign(pump)
-        if feedrate and self.safety_limits.enabled:
+        if feedrate and self.safety_limits.enabled and not bypass_safety:
             feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
-        if self.safety_limits.enabled:
+        if self.safety_limits.enabled and not bypass_safety:
             try:
                 pos = self.get_zp_position(cached=True)
                 if pos[0] is not None:

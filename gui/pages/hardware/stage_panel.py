@@ -639,6 +639,22 @@ class StageHardwarePanel(QWidget):
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         outer.addWidget(info)
 
+        # v7.4.2 hotfix banner: explain the safety bypass scoped to this group
+        bypass_banner = QLabel(
+            "⚠ <b>Setup-mode jog.</b> These buttons bypass soft-limit "
+            "clamping and the pump-enabled check so you can move freely "
+            "to find the mechanical envelope. The normal Jog Control "
+            "page still respects all safety limits."
+        )
+        bypass_banner.setWordWrap(True)
+        bypass_banner.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: {sf(9)}pt; "
+            f"padding: {sp(4)} {sp(8)};"
+            f"border-left: 2px solid {COLORS['yellow']};"
+            f"background: rgba(249, 226, 175, 18);"
+        )
+        outer.addWidget(bypass_banner)
+
         self.lbl_axis_pos: dict[str, QLabel] = {}
         for axis in ("X", "Y", "Z", "P1", "P2", "P3"):
             outer.addWidget(self._build_jog_row(axis))
@@ -707,17 +723,29 @@ class StageHardwarePanel(QWidget):
         return frame
 
     def _jog(self, axis: str, distance: float) -> None:
+        """Device sub-page jog.
+
+        v7.4.2 hotfix: passes ``bypass_safety=True`` so soft limits and
+        the is_pump_enabled gate are bypassed for jog buttons originating
+        from this page. The Device sub-page is the *initial* machine
+        setup — you can't discover the mechanical extremes if soft
+        limits stop you, and you can't jog pumps to find their range
+        if HardwareConfig hasn't been set up yet.
+        """
         if self._controller is None:
             return
         try:
             if axis in ("X", "Y"):
                 dx = distance if axis == "X" else 0.0
                 dy = distance if axis == "Y" else 0.0
-                self._controller.move_xy_relative_um(dx, dy)
+                self._controller.move_xy_relative_um(
+                    dx, dy, bypass_safety=True)
             elif axis == "Z":
-                self._controller.move_z_relative(distance)
+                self._controller.move_z_relative(
+                    distance, bypass_safety=True)
             else:
-                self._controller.move_pump_relative(axis, distance)
+                self._controller.move_pump_relative(
+                    axis, distance, bypass_safety=True)
         except Exception as e:
             logger.warning(f"Jog {axis} {distance} failed: {e}")
         # Refresh shown positions soon — controller updates them async
