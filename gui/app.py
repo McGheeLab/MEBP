@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.4.1")
+        self.setWindowTitle("MEBP Bioprinter — v7.4.2")
         self.setMinimumSize(s(1100), s(700))
         self.resize(s(1400), s(850))
 
@@ -144,7 +144,7 @@ class MainWindow(QMainWindow):
         # after the window is shown so it appears on top).
         QTimer.singleShot(0, self._maybe_show_onboarding)
 
-        logger.info("MainWindow initialized (v7.4.1)")
+        logger.info("MainWindow initialized (v7.4.2)")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.0-c: ONBOARDING WIZARD TRIGGER
@@ -593,6 +593,18 @@ class MainWindow(QMainWindow):
         hw_page.set_settings(self.settings)       # v7.4.0-b: for Stage sub-page
         hw_page.config_changed.connect(self._on_hardware_config_changed)
         hw_page.config_validated.connect(self._on_hardware_validated)
+
+        # v7.4.2: Push saved axis_map + steps_per_mm into the controller so
+        # they're ready when the ZP stage connects (or pushed live now if
+        # it's already connected).
+        try:
+            self.controller.apply_device_settings(
+                axis_map=self.settings.get("device_profile.axis_map") or None,
+                steps_per_mm=self.settings.get("device_profile.steps_per_mm") or None,
+                persist_steps=False,  # Don't re-send M92 on startup
+            )
+        except Exception as e:
+            logger.warning(f"v7.4.2 apply_device_settings failed: {e}")
 
         # Restore saved config to Hardware Setup page
         if self._hardware_config:

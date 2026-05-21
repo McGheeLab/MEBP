@@ -2,9 +2,9 @@
 
 ## Current Version
 
-**V7.4.1** — Microscope-Enabled Bioprinting Platform
+**V7.4.2** — Microscope-Enabled Bioprinting Platform
 
-Branch: `Version-7.4.1` (device profiles: per-machine reusable settings bundles)
+Branch: `Version-7.4.2` (initial device setup workspace on Device sub-page)
 
 ---
 
@@ -12,7 +12,7 @@ Branch: `Version-7.4.1` (device profiles: per-machine reusable settings bundles)
 
 **Before making ANY code changes, read the architecture document for this version:**
 
-`coding plans/Architectures/ARCHITECTURE_V741.md` (delta against `ARCHITECTURE_V740C.md`; through it the earlier v7.4.0 deltas and `ARCHITECTURE_V737.md`)
+`coding plans/Architectures/ARCHITECTURE_V742.md` (delta against `ARCHITECTURE_V741.md`; through it the earlier v7.4.x deltas and `ARCHITECTURE_V737.md`)
 
 This document contains the full system architecture, module responsibilities, data flow diagrams, communication protocols, and key algorithms. Understanding this is mandatory before modifying any code.
 
@@ -115,6 +115,7 @@ Ensure the update plan in `coding plans/Update plans/` is finalized:
 
 | File | Scope |
 |------|-------|
+| `MEBP_v741_to_v742_UPDATE.md` | v7.4.2 initial device setup: Device sub-page gains 4 new groups (Connect Hardware, Per-axis Jog + Record Min/Max, Axis Mapping, Stepper Calibration); `ZPStageManager.axis_map` and `steps_per_mm` become instance-level configurable (per-machine); `StageController._axis_letter()` helper + `apply_device_settings()` cache + push; `PrintManager` + `VelocityExecutor` updated to honor custom axis_map; DeviceProfile carries axis_map + steps_per_mm |
 | `MEBP_v740c_to_v741_UPDATE.md` | v7.4.1 device profiles: new `config/hardware/devices/` directory with `Standard.json` + `Conservative.json` bundled profiles; `DeviceProfile` dataclass + helpers (`gui/pages/hardware/device_profile.py`); Stage sub-page gets Device Profile group (combo + Load/Save/Save As/Delete); Stage promoted to first HW sub-page; v7.4.0-b safety_limits field-name regression fixed (xy_min_um → xy_min_x); first-launch migration auto-applies Standard profile |
 | `MEBP_v740b_to_v740c_UPDATE.md` | v7.4.0-c onboarding + help + invalidation: new `gui/onboarding/` package (`OnboardingWizard` 5-step modal with non-blocking Test Connection via QThread, `prefab_inks.json` starter library, `help_texts.py` catalog); `HelpToggle` button in top bar drives global `MainWindow.help_mode_changed` signal + `register_form_row()` registry; global `InvalidationBanner` mounted above page stack with auto-show on `hw_config_invalidated`; first-run trigger detects unconfigured needle gauge and runs wizard before user can interact with main window |
 | `MEBP_v740a_to_v740b_UPDATE.md` | v7.4.0-b workflow restructure: Hardware Setup decomposed into a ModePage with 7 sub-pages (Identity/Plate/Pumps & Inks/Needle/Rosette/Cameras/Stage); new `StageHardwarePanel` (`gui/pages/hardware/stage_panel.py`) hosts safety/feedrate/axis-flip widgets relocated from Settings; SettingsPage slimmed to preferences-only with hasattr guards; settings.json migration writes one-time `.bak-v7.3` snapshot; `MainWindow.hw_config_invalidated` signal + `InvalidationBanner` widget |

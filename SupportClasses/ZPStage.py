@@ -33,6 +33,11 @@ from SupportClasses.ZPStageSimulator import ZPStageSimulator
 # ═══════════════════════════════════════════════════════════════════
 # Logical → Printer Axis Mapping
 # ═══════════════════════════════════════════════════════════════════
+#
+# v7.4.2: AXIS_MAP and steps_per_mm are now instance-level — each
+# ZPStageManager can carry its own per-machine mapping. The module-
+# level constants below are kept as defaults for backwards compatibility
+# and as the canonical starting point for new device profiles.
 
 AXIS_MAP: dict[str, str] = {
     "Z": "X",    # Vertical needle → printer X
@@ -53,11 +58,25 @@ class ZPStageManager:
         baudrate:        Serial baud rate for real hardware.
         default_feedrate: Default movement feedrate (mm/min).
         steps_per_mm:    Steps-per-mm for the stepper calibration.
+                         v7.4.2: accepts int (back-compat — applied to
+                         every logical axis) or dict[str, int] keyed by
+                         logical axis (Z, P1, P2, P3). Sign indicates
+                         direction; negative inverts.
+        axis_map:        v7.4.2: dict mapping logical axes (Z, P1, P2,
+                         P3) to physical Marlin axes (X, Y, Z, E).
+                         Defaults to the module-level AXIS_MAP.
     """
 
     DEFAULT_BAUDRATE = 38400
     DEFAULT_FEEDRATE = 200      # mm/min
     DEFAULT_STEPS_PER_MM = 5069
+
+    # v7.4.2: Per-axis default. Note P2 inverts direction (negative) —
+    # matches the original hard-coded `Z-{spm}.00` in the M92 command
+    # for the original single-machine config.
+    DEFAULT_STEPS_PER_MM_DICT = {
+        "Z": 5069, "P1": 5069, "P2": -5069, "P3": 5069,
+    }
 
     # Position pattern for M114 response parsing
     _M114_PATTERN = re.compile(
@@ -73,7 +92,8 @@ class ZPStageManager:
         simulate: bool = False,
         baudrate: int = DEFAULT_BAUDRATE,
         default_feedrate: float = DEFAULT_FEEDRATE,
-        steps_per_mm: int = DEFAULT_STEPS_PER_MM,
+        steps_per_mm: int | dict[str, int] = DEFAULT_STEPS_PER_MM,
+        axis_map: dict[str, str] | None = None,
     ):
         # v7.2.6: lock before init
         self._serial_lock = threading.RLock()  # v7.2.6: ZP serial lock
@@ -81,7 +101,17 @@ class ZPStageManager:
         # v7.2.6: ZP serial lock — thread-safe serial access
         self.baudrate = baudrate
         self.feedrate = default_feedrate
-        self.steps_per_mm = steps_per_mm
+        # v7.4.2: per-axis steps_per_mm + configurable axis map
+        if isinstance(steps_per_mm, dict):
+            self.steps_per_mm = dict(steps_per_mm)
+        else:
+            # Back-compat: int collapses to dict; preserve P2's
+            # legacy negative sign so existing call sites continue to work.
+            self.steps_per_mm = dict(self.DEFAULT_STEPS_PER_MM_DICT)
+            for k in self.steps_per_mm:
+                sign = -1 if self.steps_per_mm[k] < 0 else 1
+                self.steps_per_mm[k] = sign * abs(int(steps_per_mm))
+        self.axis_map = dict(axis_map) if axis_map else dict(AXIS_MAP)
 
         # Cached position values (updated on get_current_position)
         self.x_pos: float = 0.0
@@ -167,20 +197,64 @@ class ZPStageManager:
     # ── Printer Setup ─────────────────────────────────────────────
 
     def _setup_printer(self) -> None:
-        """Configure the printer for bioprinting operation."""
-        spm = self.steps_per_mm
+        """Configure the printer for bioprinting operation.
+
+        v7.4.2: M92 is now built per-logical-axis from
+        ``self.steps_per_mm`` and routed to physical axes via
+        ``self.axis_map``. Sign of each value is preserved (negative
+        = direction-inverted).
+        """
         commands = [
             "M302 S0",                          # Allow cold extrusion
             "M83",                               # Extruder relative mode
             "G91",                               # Relative positioning
             f"M203 E{self.feedrate} Y{self.feedrate} X{self.feedrate} Z{self.feedrate}",
-            f"M92 X{spm}.00 Y{spm}.00 Z-{spm}.00 E{spm}.00",
+            self._build_m92_command(),
             f"G0 F{self.feedrate}",              # Set initial feedrate
             "M220 S100",                         # Speed factor 100%
         ]
         for cmd in commands:
             self.send_data(cmd)
-        logger.info(f"ZP stage configured (feedrate={self.feedrate}, steps/mm={spm})")
+        logger.info(
+            f"ZP stage configured (feedrate={self.feedrate}, "
+            f"steps={self.steps_per_mm}, axis_map={self.axis_map})")
+
+    def _build_m92_command(self) -> str:
+        """v7.4.2: Build M92 G-code from current steps_per_mm + axis_map.
+
+        Returns e.g. ``"M92 X5069.00 Y5069.00 Z-5069.00 E5069.00"``.
+        """
+        parts = ["M92"]
+        for logical, physical in self.axis_map.items():
+            steps = self.steps_per_mm.get(logical, self.DEFAULT_STEPS_PER_MM)
+            parts.append(f"{physical}{steps:.2f}")
+        return " ".join(parts)
+
+    def set_axis_map(self, axis_map: dict[str, str]) -> None:
+        """v7.4.2: Update the logical→physical axis mapping.
+
+        Does NOT re-send M92 — caller should call
+        :meth:`set_steps_per_mm(..., persist=True)` afterward if the
+        mapping has changed and Marlin needs to be reprogrammed.
+        """
+        self.axis_map = dict(axis_map)
+        logger.info(f"ZP axis_map updated: {self.axis_map}")
+
+    def set_steps_per_mm(self, steps: dict[str, int],
+                         persist: bool = True) -> None:
+        """v7.4.2: Update per-axis steps_per_mm and optionally send M92.
+
+        Args:
+            steps:   dict keyed by logical axis (Z, P1, P2, P3).
+            persist: If True (default), send M92 to Marlin so the new
+                     calibration takes effect immediately. If False,
+                     just updates local state.
+        """
+        self.steps_per_mm = dict(steps)
+        if persist:
+            cmd = self._build_m92_command()
+            self.send_data(cmd)
+            logger.info(f"ZP M92 sent: {cmd}")
 
     # ── Communication ─────────────────────────────────────────────
 

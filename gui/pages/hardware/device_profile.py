@@ -40,6 +40,10 @@ class DeviceProfile:
     Round-trips to JSON in ``config/hardware/devices/<profile_name>.json``.
     Active profile name is persisted via ``settings.set("device_profile.active", ...)``
     so the same profile re-loads across launches.
+
+    v7.4.2: Carries ``axis_map`` (logical→physical axis mapping) and
+    per-axis ``steps_per_mm`` (stepper calibration). These define how
+    MEBP G-code translates to Marlin axes for a specific machine.
     """
 
     profile_name: str = "Untitled Device"
@@ -47,21 +51,28 @@ class DeviceProfile:
     safety_limits: dict = field(default_factory=dict)
     zp_stage: dict = field(default_factory=dict)
     axis_flip: dict = field(default_factory=dict)
+    # v7.4.2: per-machine wiring of logical axes (Z, P1, P2, P3) to
+    # physical Marlin axes (X, Y, Z, E), plus per-axis stepper calibration.
+    axis_map: dict = field(default_factory=dict)
+    steps_per_mm: dict = field(default_factory=dict)
 
     # ── JSON I/O ─────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
         return {
-            "_format_version": "v7.4.1",
+            "_format_version": "v7.4.2",
             "_description": (
                 "Device profile — physical-machine settings (safety envelope, "
-                "motor feedrates, axis direction). Edit on Hardware Setup → Stage."
+                "motor feedrates, axis direction, axis mapping, stepper "
+                "calibration). Edit on Hardware Setup → Device."
             ),
             "profile_name": self.profile_name,
             "notes": self.notes,
             "safety_limits": self.safety_limits,
             "zp_stage": self.zp_stage,
             "axis_flip": self.axis_flip,
+            "axis_map": self.axis_map,
+            "steps_per_mm": self.steps_per_mm,
         }
 
     @classmethod
@@ -72,6 +83,8 @@ class DeviceProfile:
             safety_limits=data.get("safety_limits", {}) or {},
             zp_stage=data.get("zp_stage", {}) or {},
             axis_flip=data.get("axis_flip", {}) or {},
+            axis_map=data.get("axis_map", {}) or {},
+            steps_per_mm=data.get("steps_per_mm", {}) or {},
         )
 
     def save(self, path: Path | None = None) -> Path:
@@ -103,14 +116,18 @@ class DeviceProfile:
             safety_limits=settings.get_section("safety_limits") or {},
             zp_stage=settings.get_section("zp_stage") or {},
             axis_flip=settings.get_section("axis_flip") or {},
+            axis_map=settings.get("device_profile.axis_map") or {},
+            steps_per_mm=settings.get("device_profile.steps_per_mm") or {},
         )
 
     def apply_to_settings(self, settings) -> None:
         """Copy this profile's values into the live Settings instance.
 
         Writes to the same top-level keys the rest of the app reads
-        (``safety_limits.*``, ``zp_stage.*``, ``axis_flip.*``). Caller
-        is responsible for triggering any UI refresh + ``settings.save()``.
+        (``safety_limits.*``, ``zp_stage.*``, ``axis_flip.*``,
+        ``device_profile.axis_map``, ``device_profile.steps_per_mm``).
+        Caller is responsible for triggering any UI refresh +
+        ``settings.save()``.
         """
         if self.safety_limits:
             settings.set_section("safety_limits", self.safety_limits)
@@ -118,6 +135,10 @@ class DeviceProfile:
             settings.set_section("zp_stage", self.zp_stage)
         if self.axis_flip:
             settings.set_section("axis_flip", self.axis_flip)
+        if self.axis_map:
+            settings.set("device_profile.axis_map", self.axis_map)
+        if self.steps_per_mm:
+            settings.set("device_profile.steps_per_mm", self.steps_per_mm)
 
 
 # ── Module-level helpers ─────────────────────────────────────────

@@ -23,6 +23,15 @@ from typing import Callable, Optional
 from SupportClasses.Processor import Processor
 from SupportClasses.XYStage import XYStageManager
 from SupportClasses.ZPStage import ZPStageManager, AXIS_MAP
+
+
+def _axis_letter(zp_stage, logical: str) -> str | None:
+    """v7.4.2: Resolve a logical axis (Z/P1/P2/P3) to its physical Marlin
+    letter (X/Y/Z/E) using the live ZPStageManager's mapping when
+    available, falling back to the module-level default."""
+    if zp_stage is not None and hasattr(zp_stage, 'axis_map'):
+        return zp_stage.axis_map.get(logical, AXIS_MAP.get(logical))
+    return AXIS_MAP.get(logical)
 from SupportClasses.XboxController import xbox_polling_worker, calibrate_sticks
 from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
 from SupportClasses.SafetyLimits import SafetyLimits
@@ -702,6 +711,10 @@ class StageController:
         self.xbox_process: Process | None = None
         self.xbox_poller: XboxQueuePoller | None = None
 
+        # v7.4.2: Device settings cached until ZP stage connects
+        self._pending_axis_map: dict | None = None
+        self._pending_steps_per_mm: dict | None = None
+
         # Zero reference (set during calibration)
         self.zero_position: dict[str, float] = {
             "x": 0.0, "y": 0.0, "f": 0.0,
@@ -820,6 +833,14 @@ class StageController:
                 self._watchdog.add_periodic(self._periodic_zp_position_save)
             logger.info("ZP stage connected")
 
+            # v7.4.2: Apply any pending device settings (axis_map, steps_per_mm)
+            # that were set before the ZP stage was online.
+            if self._pending_axis_map is not None:
+                self.zp_stage.set_axis_map(self._pending_axis_map)
+            if self._pending_steps_per_mm is not None:
+                self.zp_stage.set_steps_per_mm(
+                    self._pending_steps_per_mm, persist=True)
+
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
 
     def _periodic_zp_position_save(self) -> None:
@@ -842,6 +863,34 @@ class StageController:
             logger.debug(f"ZP position save failed: {e}")
 
     # ── Convenience connection methods (used by Dashboard) ────────
+
+    def apply_device_settings(self, axis_map: dict | None = None,
+                              steps_per_mm: dict | None = None,
+                              persist_steps: bool = False) -> None:
+        """v7.4.2: Push device-level settings into a connected ZP stage.
+
+        Called by MainWindow after construction (or when the user clicks
+        Apply on the Device sub-page). If the ZP stage is not yet
+        connected, the values are stored on the controller for use when
+        it eventually connects.
+
+        Args:
+            axis_map: Logical→physical axis mapping. None to skip.
+            steps_per_mm: Per-logical-axis stepper calibration. None to skip.
+            persist_steps: If True and zp_stage is connected, send M92
+                so the new calibration takes effect on Marlin.
+        """
+        # Cache for next connect
+        if axis_map is not None:
+            self._pending_axis_map = dict(axis_map)
+        if steps_per_mm is not None:
+            self._pending_steps_per_mm = dict(steps_per_mm)
+        # Push live if connected
+        if self.zp_stage is not None:
+            if axis_map is not None:
+                self.zp_stage.set_axis_map(axis_map)
+            if steps_per_mm is not None:
+                self.zp_stage.set_steps_per_mm(steps_per_mm, persist=persist_steps)
 
     def connect_xy(self) -> None:
         """Connect only the XY stage."""
@@ -1444,7 +1493,7 @@ class StageController:
         if from_zero_ref:
             position += self.zero_position["Z"]
         self.zp_stage.move_absolute(
-            {AXIS_MAP["Z"]: position}, fast,
+            {_axis_letter(self.zp_stage, "Z"): position}, fast,
             feedrate_mm_min=feedrate_mm_min)
 
     def move_z_relative(self, distance: float, feedrate: float | None = None) -> None:
@@ -1463,7 +1512,8 @@ class StageController:
                     distance = (clamped + self.zero_position["Z"]) - pos[0]
             except Exception:
                 pass
-        self.zp_stage.move_relative({AXIS_MAP["Z"]: distance}, feedrate)
+        self.zp_stage.move_relative(
+            {_axis_letter(self.zp_stage, "Z"): distance}, feedrate)
 
     def safe_travel_to(
         self,
@@ -1605,7 +1655,7 @@ class StageController:
                     distance = (clamped + zero_ref) - cur
             except Exception:
                 pass
-        mapped = AXIS_MAP.get(pump)
+        mapped = _axis_letter(self.zp_stage, pump)
         if mapped:
             self.zp_stage.move_relative({mapped: distance}, feedrate)
 

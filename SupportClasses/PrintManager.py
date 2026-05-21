@@ -775,9 +775,10 @@ class TrajectoryExecutor:
 
             # Pumps (move to absolute plunger position)
             if ctrl.is_zp_connected and ctrl.zp_stage:
-                from SupportClasses.ZPStage import AXIS_MAP
+                # v7.4.2: honor configurable per-machine axis_map
+                _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP)
                 for pump_id, wp_val in [("P1", wp.p1), ("P2", wp.p2), ("P3", wp.p3)]:
-                    mapped = AXIS_MAP.get(pump_id)
+                    mapped = _axis_map.get(pump_id, AXIS_MAP.get(pump_id))
                     if mapped and wp_val != 0.0:
                         ctrl.zp_stage.move_absolute(
                             {mapped: wp_val + ctrl.zero_position.get(pump_id, 0)},
@@ -2415,7 +2416,10 @@ class PrintManager:
                 if volume_uL > 0.001 and hasattr(ctrl, 'move_pump_uL'):
                     ctrl.move_pump_uL(pump, volume_uL, flow_rate_uL_s)
                 elif volume_uL > 0.001:
-                    mapped = AXIS_MAP.get(pump)
+                    # v7.4.2: honor configurable per-machine axis_map
+                    _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                        if ctrl.zp_stage else AXIS_MAP
+                    mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
                     if mapped and ctrl.zp_stage:
                         ctrl.zp_stage.move_relative(
                             {mapped: volume_uL * 0.3},
@@ -2425,7 +2429,10 @@ class PrintManager:
                 # Legacy: extrude proportional to segment length (dimensionless ratio)
                 extrude_amount = seg_length * flow_rate
                 if extrude_amount > 0.0001:
-                    mapped = AXIS_MAP.get(pump)
+                    # v7.4.2: honor configurable per-machine axis_map
+                    _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                        if ctrl.zp_stage else AXIS_MAP
+                    mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
                     if mapped and ctrl.zp_stage:
                         ctrl.zp_stage.move_relative(
                             {mapped: extrude_amount},

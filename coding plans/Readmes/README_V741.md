@@ -2,17 +2,16 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.4.2** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.4.1** | Python 3.10+ | PySide6 (Qt 6)
 
-> **v7.4.2** turns the Device sub-page into a complete initial-machine-setup
-> workspace: Connect Hardware buttons with live status, per-axis Jog +
-> Record Min/Max buttons that populate the Safety Limits, configurable
-> Axis Mapping (logical Z/P1/P2/P3 → physical Marlin X/Y/Z/E), and
-> per-axis Stepper Calibration (commanded vs. measured → send M92). The
-> custom mapping is honored end-to-end — manual jog, print execution,
-> and the velocity controller all consult the configured axis_map.
-> See [`coding plans/Update plans/MEBP_v741_to_v742_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v741_to_v742_UPDATE.md)
-> and [`coding plans/Architectures/ARCHITECTURE_V742.md`](coding%20plans/Architectures/ARCHITECTURE_V742.md).
+> **v7.4.1** introduces **device profiles** — reusable per-machine settings
+> bundles (safety envelope, motor feedrates, axis direction) that travel
+> across any experiment-level HardwareConfig. Two bundled profiles ship in
+> `config/hardware/devices/`: Standard and Conservative. The Stage sub-page
+> is now the first sub-page in Hardware Setup and hosts the profile
+> picker. First launch auto-applies the Standard profile.
+> See [`coding plans/Update plans/MEBP_v740c_to_v741_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v740c_to_v741_UPDATE.md)
+> and [`coding plans/Architectures/ARCHITECTURE_V741.md`](coding%20plans/Architectures/ARCHITECTURE_V741.md).
 
 ---
 
@@ -327,7 +326,6 @@ See `coding plans/Architectures/ARCHITECTURE_V737.md` for the comprehensive arch
 - `coding plans/Architectures/ARCHITECTURE_V740B.md` — workflow restructure (HW Setup sub-pages, Settings slim, migrations)
 - `coding plans/Architectures/ARCHITECTURE_V740C.md` — onboarding (wizard, help mode, invalidation banner)
 - `coding plans/Architectures/ARCHITECTURE_V741.md` — device profiles (per-machine reusable settings)
-- `coding plans/Architectures/ARCHITECTURE_V742.md` — initial device setup workspace (connect, jog/limits, axis mapping, stepper cal)
 
 ---
 

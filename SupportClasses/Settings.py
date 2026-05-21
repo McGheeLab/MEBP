@@ -169,8 +169,24 @@ DEFAULTS: dict[str, Any] = {
     # v7.4.1: Device profile (initial device setup — safety, feedrates,
     # axis flips). The active profile name is tracked here so we can
     # restore the selection in the Stage sub-page UI on each launch.
+    #
+    # v7.4.2: axis_map and steps_per_mm added. axis_map maps logical
+    # axes (Z, P1, P2, P3) to physical Marlin axes (X, Y, Z, E).
+    # steps_per_mm is per-LOGICAL-axis (sign indicates direction).
     "device_profile": {
         "active": None,
+        "axis_map": {
+            "Z": "X",   # vertical needle  → Marlin X
+            "P1": "Y",  # syringe pump 1   → Marlin Y
+            "P2": "Z",  # syringe pump 2   → Marlin Z
+            "P3": "E",  # syringe pump 3   → Marlin E
+        },
+        "steps_per_mm": {
+            "Z": 5069,
+            "P1": 5069,
+            "P2": -5069,   # negative = inverted direction (legacy default)
+            "P3": 5069,
+        },
     },
 }
 

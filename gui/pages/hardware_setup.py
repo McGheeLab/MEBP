@@ -1792,8 +1792,16 @@ class HardwareSetupPage(ModePage):
             self.set_config(config)
 
     def on_status_update(self):
-        """Called by MainWindow timer. No periodic refresh needed for this page."""
-        pass
+        """Called by MainWindow timer.
+
+        v7.4.2: Forward to Stage panel so connection badges + per-axis
+        jog readouts refresh while the user is on the Device sub-page.
+        """
+        if hasattr(self, '_stage_panel'):
+            try:
+                self._stage_panel.on_status_update()
+            except Exception:
+                pass
 
     def get_context_widget(self) -> QWidget | None:
         """v7.2.4: Context panel with saved config file browser."""

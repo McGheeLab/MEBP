@@ -71,8 +71,37 @@ class StageHardwarePanel(QWidget):
             self._load_from_settings()
 
     def set_controller(self, controller):
-        """Inject StageController for the zero-calibration jog row."""
+        """Inject StageController for the zero-calibration jog row.
+
+        v7.4.2: Also drives the Connect Hardware status badges and the
+        per-axis Jog + Record Limits group.
+        """
         self._controller = controller
+        # Initial badge sync once a controller is available
+        if hasattr(self, 'badge_xy'):
+            self._sync_connection_badges()
+
+    def on_status_update(self):
+        """v7.4.2: Periodic tick from MainWindow.
+
+        Refreshes the per-axis position readouts and connection status
+        badges. Cheap — uses cached positions.
+        """
+        if not hasattr(self, 'lbl_axis_pos'):
+            return
+        self._refresh_jog_positions()
+        self._sync_connection_badges()
+
+    def _sync_connection_badges(self):
+        """v7.4.2: Reflect controller's live connection state in badges."""
+        if self._controller is None or not hasattr(self, 'badge_xy'):
+            return
+        xy_ok = bool(getattr(self._controller, 'is_xy_connected', False))
+        zp_ok = bool(getattr(self._controller, 'is_zp_connected', False))
+        self.badge_xy.set_status("ok" if xy_ok else "pending",
+                                 "Connected" if xy_ok else "Not connected")
+        self.badge_zp.set_status("ok" if zp_ok else "pending",
+                                 "Connected" if zp_ok else "Not connected")
 
     # ── UI ───────────────────────────────────────────────────────
 
@@ -100,7 +129,14 @@ class StageHardwarePanel(QWidget):
         # a profile populates all the groups below
         outer.addWidget(self._build_device_profile_group())
 
+        # v7.4.2: Connect Hardware + Axis Mapping + Steps Calibration
+        outer.addWidget(self._build_connect_group())
+        outer.addWidget(self._build_axis_mapping_group())
+        outer.addWidget(self._build_steps_cal_group())
+
         outer.addWidget(self._build_safety_group())
+        # v7.4.2: Per-axis Jog + Record Min/Max for limits discovery
+        outer.addWidget(self._build_jog_limits_group())
         outer.addWidget(self._build_zp_feedrates_group())
         outer.addWidget(self._build_axis_flip_group())
 
@@ -317,6 +353,422 @@ class StageHardwarePanel(QWidget):
 
         return grp
 
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2: Connect Hardware
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_connect_group(self) -> QGroupBox:
+        """Connect XY / ZP / Xbox with live status badges."""
+        from gui.widgets.components import StatusBadge
+
+        grp = QGroupBox("Connect Hardware")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        grid = QGridLayout(grp)
+        grid.setSpacing(s(6))
+
+        row = 0
+        grid.addWidget(QLabel("XY stage:"), row, 0)
+        self.btn_connect_xy = QPushButton("Connect")
+        self.btn_connect_xy.setObjectName("accentBtn")
+        self.btn_connect_xy.clicked.connect(self._connect_xy)
+        grid.addWidget(self.btn_connect_xy, row, 1)
+        self.btn_disconnect_xy = QPushButton("Disconnect")
+        self.btn_disconnect_xy.setObjectName("dangerBtn")
+        self.btn_disconnect_xy.clicked.connect(self._disconnect_xy)
+        grid.addWidget(self.btn_disconnect_xy, row, 2)
+        self.badge_xy = StatusBadge("Not connected", "pending")
+        grid.addWidget(self.badge_xy, row, 3)
+
+        row += 1
+        grid.addWidget(QLabel("Z + Pumps:"), row, 0)
+        self.btn_connect_zp = QPushButton("Connect")
+        self.btn_connect_zp.setObjectName("accentBtn")
+        self.btn_connect_zp.clicked.connect(self._connect_zp)
+        grid.addWidget(self.btn_connect_zp, row, 1)
+        self.btn_disconnect_zp = QPushButton("Disconnect")
+        self.btn_disconnect_zp.setObjectName("dangerBtn")
+        self.btn_disconnect_zp.clicked.connect(self._disconnect_zp)
+        grid.addWidget(self.btn_disconnect_zp, row, 2)
+        self.badge_zp = StatusBadge("Not connected", "pending")
+        grid.addWidget(self.badge_zp, row, 3)
+
+        return grp
+
+    def _connect_xy(self):
+        if self._controller is None:
+            return
+        self.badge_xy.set_status("info", "Connecting…")
+        try:
+            self._controller.connect_xy()
+            ok = bool(self._controller.is_xy_connected)
+            self.badge_xy.set_status("ok" if ok else "err",
+                                     "Connected" if ok else "Failed")
+        except Exception as e:
+            self.badge_xy.set_status("err", f"Error: {e}")
+
+    def _disconnect_xy(self):
+        if self._controller is None:
+            return
+        try:
+            self._controller.disconnect_xy()
+        except Exception as e:
+            logger.warning(f"disconnect_xy failed: {e}")
+        self.badge_xy.set_status("pending", "Not connected")
+
+    def _connect_zp(self):
+        if self._controller is None:
+            return
+        self.badge_zp.set_status("info", "Connecting…")
+        try:
+            self._controller.connect_zp()
+            ok = bool(self._controller.is_zp_connected)
+            self.badge_zp.set_status("ok" if ok else "err",
+                                     "Connected" if ok else "Failed")
+        except Exception as e:
+            self.badge_zp.set_status("err", f"Error: {e}")
+
+    def _disconnect_zp(self):
+        if self._controller is None:
+            return
+        try:
+            self._controller.disconnect_zp()
+        except Exception as e:
+            logger.warning(f"disconnect_zp failed: {e}")
+        self.badge_zp.set_status("pending", "Not connected")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2: Axis Mapping (logical → physical Marlin axis)
+    # ════════════════════════════════════════════════════════════════
+
+    _PHYSICAL_LETTERS = ["X", "Y", "Z", "E"]
+    _LOGICAL_AXES = ["Z", "P1", "P2", "P3"]
+
+    def _build_axis_mapping_group(self) -> QGroupBox:
+        grp = QGroupBox("Axis Mapping (logical → Marlin)")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        lay = QVBoxLayout(grp)
+
+        info = QLabel(
+            "Which physical Marlin axis drives each logical axis on "
+            "your machine. Defaults: Z→X, P1→Y, P2→Z, P3→E. Change "
+            "these to match how your steppers are wired."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        lay.addWidget(info)
+
+        self.cmb_axis_map: dict[str, QComboBox] = {}
+        grid = QGridLayout()
+        grid.setSpacing(s(6))
+        for r, logical in enumerate(self._LOGICAL_AXES):
+            grid.addWidget(QLabel(f"{logical}:"), r, 0)
+            grid.addWidget(QLabel("→"), r, 1)
+            cmb = QComboBox()
+            for letter in self._PHYSICAL_LETTERS:
+                cmb.addItem(f"{letter}  (Marlin {letter})", letter)
+            cmb.setMinimumWidth(s(160))
+            grid.addWidget(cmb, r, 2)
+            self.cmb_axis_map[logical] = cmb
+        lay.addLayout(grid)
+
+        return grp
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2: Steps-per-mm Calibration
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_steps_cal_group(self) -> QGroupBox:
+        grp = QGroupBox("Stepper Calibration (steps per mm)")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "<b>How to calibrate:</b> Pick an axis. Click <i>Command Move</i> "
+            "to send a known-distance move. Measure the actual physical "
+            "movement and enter it. Click <i>Calculate & Send M92</i> — "
+            "the new steps/mm is sent to Marlin and saved to this device "
+            "profile. Negative values invert direction."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        outer.addWidget(info)
+
+        # Current per-axis steps/mm grid (read-only display)
+        self.lbl_steps_grid: dict[str, QLabel] = {}
+        steps_row = QHBoxLayout()
+        for ax in self._LOGICAL_AXES:
+            cell = QLabel(f"{ax}: —")
+            cell.setStyleSheet(
+                f"color: {COLORS['text']}; font-family: monospace; "
+                f"padding: {sp(2)} {sp(8)}; "
+                f"border: 1px solid {COLORS['surface1']}; "
+                f"border-radius: {sp(4)};")
+            steps_row.addWidget(cell)
+            self.lbl_steps_grid[ax] = cell
+        steps_row.addStretch()
+        outer.addLayout(steps_row)
+
+        # Workflow row
+        wf = QHBoxLayout()
+        wf.addWidget(QLabel("Axis:"))
+        self.cmb_cal_axis = QComboBox()
+        for ax in self._LOGICAL_AXES:
+            self.cmb_cal_axis.addItem(ax, ax)
+        wf.addWidget(self.cmb_cal_axis)
+
+        wf.addWidget(QLabel("Commanded:"))
+        self.spin_cal_commanded = QDoubleSpinBox()
+        self.spin_cal_commanded.setRange(0.001, 100.0)
+        self.spin_cal_commanded.setDecimals(3)
+        self.spin_cal_commanded.setValue(1.0)
+        self.spin_cal_commanded.setSuffix(" mm")
+        wf.addWidget(self.spin_cal_commanded)
+
+        self.btn_cal_move = QPushButton("Command Move")
+        self.btn_cal_move.clicked.connect(self._cal_command_move)
+        wf.addWidget(self.btn_cal_move)
+
+        wf.addWidget(QLabel("Measured:"))
+        self.spin_cal_measured = QDoubleSpinBox()
+        self.spin_cal_measured.setRange(0.001, 100.0)
+        self.spin_cal_measured.setDecimals(3)
+        self.spin_cal_measured.setValue(1.0)
+        self.spin_cal_measured.setSuffix(" mm")
+        wf.addWidget(self.spin_cal_measured)
+
+        self.btn_cal_apply = QPushButton("Calculate && Send M92")
+        self.btn_cal_apply.setObjectName("accentBtn")
+        self.btn_cal_apply.clicked.connect(self._cal_apply)
+        wf.addWidget(self.btn_cal_apply)
+
+        wf.addStretch()
+        outer.addLayout(wf)
+
+        self.lbl_cal_status = QLabel("")
+        self.lbl_cal_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_cal_status.setWordWrap(True)
+        outer.addWidget(self.lbl_cal_status)
+
+        return grp
+
+    def _cal_command_move(self):
+        """Send a known-distance relative move on the selected logical axis."""
+        if self._controller is None or not self._controller.is_zp_connected:
+            self.lbl_cal_status.setText("ZP stage not connected.")
+            return
+        axis = self.cmb_cal_axis.currentData()
+        distance = self.spin_cal_commanded.value()
+        try:
+            if axis == "Z":
+                self._controller.move_z_relative(distance)
+            else:
+                self._controller.move_pump_relative(axis, distance)
+            self.lbl_cal_status.setText(
+                f"Sent {distance} mm move on {axis}. Measure actual "
+                f"physical movement, then enter it on the right.")
+        except Exception as e:
+            self.lbl_cal_status.setText(f"Move failed: {e}")
+
+    def _cal_apply(self):
+        """Compute new steps/mm = current * (commanded / measured); send M92."""
+        if self._controller is None or self._controller.zp_stage is None:
+            self.lbl_cal_status.setText("ZP stage not connected.")
+            return
+        axis = self.cmb_cal_axis.currentData()
+        commanded = self.spin_cal_commanded.value()
+        measured = self.spin_cal_measured.value()
+        if measured <= 0:
+            self.lbl_cal_status.setText("Measured distance must be > 0.")
+            return
+        current = self._controller.zp_stage.steps_per_mm.get(axis, 5069)
+        # Preserve sign of current calibration
+        sign = -1 if current < 0 else 1
+        new_abs = int(round(abs(current) * (commanded / measured)))
+        new_value = sign * new_abs
+        new_steps = dict(self._controller.zp_stage.steps_per_mm)
+        new_steps[axis] = new_value
+        self._controller.zp_stage.set_steps_per_mm(new_steps, persist=True)
+        # Persist into settings + the live UI display
+        if self._settings is not None:
+            self._settings.set("device_profile.steps_per_mm", new_steps)
+            self._settings.save()
+        self._refresh_steps_grid()
+        self.lbl_cal_status.setText(
+            f"{axis}: {current} → {new_value} steps/mm "
+            f"(commanded {commanded} / measured {measured}). M92 sent.")
+
+    def _refresh_steps_grid(self):
+        if self._controller and self._controller.zp_stage:
+            steps = self._controller.zp_stage.steps_per_mm
+        else:
+            steps = (self._settings.get("device_profile.steps_per_mm")
+                     if self._settings else {}) or {}
+        for ax, lbl in self.lbl_steps_grid.items():
+            val = steps.get(ax, "—")
+            lbl.setText(f"{ax}: {val}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.2: Per-axis Stage Jog + Record Min/Max
+    # ════════════════════════════════════════════════════════════════
+
+    # Step sizes per axis: (fine, medium, coarse). XY in µm, Z/P in mm.
+    _JOG_STEPS = {
+        "X":  (10.0,    100.0,   1000.0),   # µm
+        "Y":  (10.0,    100.0,   1000.0),   # µm
+        "Z":  (0.01,    0.1,     1.0),       # mm
+        "P1": (0.01,    0.1,     1.0),       # mm
+        "P2": (0.01,    0.1,     1.0),       # mm
+        "P3": (0.01,    0.1,     1.0),       # mm
+    }
+
+    def _build_jog_limits_group(self) -> QGroupBox:
+        grp = QGroupBox("Per-Axis Jog && Record Limits")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "Jog each axis to its mechanical extremes. Click "
+            "<b>Set as Min</b> / <b>Set as Max</b> to record the current "
+            "position into the Safety Limits above. XY in µm; Z and pumps in mm."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        outer.addWidget(info)
+
+        self.lbl_axis_pos: dict[str, QLabel] = {}
+        for axis in ("X", "Y", "Z", "P1", "P2", "P3"):
+            outer.addWidget(self._build_jog_row(axis))
+
+        return grp
+
+    def _build_jog_row(self, axis: str) -> QFrame:
+        """Build one row of jog controls + record buttons for a single axis."""
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: {COLORS['surface0']}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)}; padding: {sp(4)}; }}")
+        h = QHBoxLayout(frame)
+        h.setSpacing(s(4))
+        h.setContentsMargins(s(6), s(4), s(6), s(4))
+
+        unit = "µm" if axis in ("X", "Y") else "mm"
+
+        # Axis label
+        lbl_axis = QLabel(f"<b>{axis}</b>")
+        lbl_axis.setMinimumWidth(s(28))
+        h.addWidget(lbl_axis)
+
+        # Position readout
+        pos_lbl = QLabel("—")
+        pos_lbl.setStyleSheet(
+            f"color: {COLORS['text']}; font-family: monospace; "
+            f"min-width: {sp(80)};")
+        pos_lbl.setMinimumWidth(s(80))
+        h.addWidget(pos_lbl)
+        self.lbl_axis_pos[axis] = pos_lbl
+
+        # Jog buttons: -coarse -med -fine + fine +med +coarse
+        fine, med, coarse = self._JOG_STEPS[axis]
+        for step, label, color_hint in [
+            (-coarse, f"-{coarse:g}",  "red"),
+            (-med,    f"-{med:g}",     "peach"),
+            (-fine,   f"-{fine:g}",    "subtext0"),
+            ( fine,   f"+{fine:g}",    "subtext0"),
+            ( med,    f"+{med:g}",     "peach"),
+            ( coarse, f"+{coarse:g}",  "green"),
+        ]:
+            btn = QPushButton(label)
+            btn.setMaximumWidth(s(64))
+            btn.setStyleSheet(
+                f"color: {COLORS[color_hint]}; font-family: monospace;")
+            btn.clicked.connect(
+                lambda _checked=False, a=axis, d=step: self._jog(a, d))
+            h.addWidget(btn)
+
+        h.addWidget(QLabel(f"({unit})"))
+        h.addStretch(1)
+
+        # Record buttons
+        btn_min = QPushButton("Set as Min")
+        btn_min.setMaximumHeight(s(24))
+        btn_min.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "min"))
+        h.addWidget(btn_min)
+
+        btn_max = QPushButton("Set as Max")
+        btn_max.setMaximumHeight(s(24))
+        btn_max.clicked.connect(lambda _c=False, a=axis: self._record_limit(a, "max"))
+        h.addWidget(btn_max)
+
+        return frame
+
+    def _jog(self, axis: str, distance: float) -> None:
+        if self._controller is None:
+            return
+        try:
+            if axis in ("X", "Y"):
+                dx = distance if axis == "X" else 0.0
+                dy = distance if axis == "Y" else 0.0
+                self._controller.move_xy_relative_um(dx, dy)
+            elif axis == "Z":
+                self._controller.move_z_relative(distance)
+            else:
+                self._controller.move_pump_relative(axis, distance)
+        except Exception as e:
+            logger.warning(f"Jog {axis} {distance} failed: {e}")
+        # Refresh shown positions soon — controller updates them async
+        self._refresh_jog_positions()
+
+    def _refresh_jog_positions(self) -> None:
+        """Update the per-axis position readouts. Called by jog + a 500ms tick."""
+        ctrl = self._controller
+        if ctrl is None or not hasattr(self, 'lbl_axis_pos'):
+            return
+        try:
+            xy = ctrl.get_xy_position(cached=True)
+            zp = ctrl.get_zp_position(cached=True)
+        except Exception:
+            return
+        if xy and xy[0] is not None and "X" in self.lbl_axis_pos:
+            self.lbl_axis_pos["X"].setText(f"{xy[0]:,.1f}")
+        if xy and xy[1] is not None and "Y" in self.lbl_axis_pos:
+            self.lbl_axis_pos["Y"].setText(f"{xy[1]:,.1f}")
+        if zp and zp[0] is not None and "Z" in self.lbl_axis_pos:
+            self.lbl_axis_pos["Z"].setText(f"{zp[0]:.3f}")
+        for i, pid in enumerate(["P1", "P2", "P3"], start=1):
+            if zp and i < len(zp) and zp[i] is not None and pid in self.lbl_axis_pos:
+                self.lbl_axis_pos[pid].setText(f"{zp[i]:.3f}")
+
+    def _record_limit(self, axis: str, which: str) -> None:
+        """Copy current position into the matching safety spinbox."""
+        ctrl = self._controller
+        if ctrl is None:
+            return
+        try:
+            xy = ctrl.get_xy_position(cached=True)
+            zp = ctrl.get_zp_position(cached=True)
+        except Exception:
+            return
+        zero = ctrl.zero_position
+        if axis == "X" and xy and xy[0] is not None:
+            target_spin = self.spin_xy_min_x if which == "min" else self.spin_xy_max_x
+            target_spin.setValue(float(xy[0] - zero.get("x", 0)))
+        elif axis == "Y" and xy and xy[1] is not None:
+            target_spin = self.spin_xy_min_y if which == "min" else self.spin_xy_max_y
+            target_spin.setValue(float(xy[1] - zero.get("y", 0)))
+        elif axis == "Z" and zp and zp[0] is not None:
+            target_spin = self.spin_z_min if which == "min" else self.spin_z_max
+            target_spin.setValue(float(zp[0] - zero.get("Z", 0)))
+        elif axis in ("P1", "P2", "P3"):
+            idx = {"P1": 1, "P2": 2, "P3": 3}[axis]
+            if zp and idx < len(zp) and zp[idx] is not None:
+                target_dict = self.spin_p_mins if which == "min" else self.spin_p_maxs
+                target_dict[axis].setValue(float(zp[idx] - zero.get(axis, 0)))
+
     # ── Settings I/O ─────────────────────────────────────────────
 
     def _load_from_settings(self):
@@ -365,6 +817,22 @@ class StageHardwarePanel(QWidget):
                 self.cmb_profile.blockSignals(False)
                 self.lbl_profile_status.setText(f"Active profile: {active}")
 
+        # v7.4.2: Axis mapping
+        if hasattr(self, 'cmb_axis_map'):
+            axis_map = s.get("device_profile.axis_map") or {}
+            for logical, cmb in self.cmb_axis_map.items():
+                physical = axis_map.get(logical, "")
+                if physical:
+                    idx = cmb.findData(physical)
+                    if idx >= 0:
+                        cmb.blockSignals(True)
+                        cmb.setCurrentIndex(idx)
+                        cmb.blockSignals(False)
+
+        # v7.4.2: Steps per mm grid display
+        if hasattr(self, 'lbl_steps_grid'):
+            self._refresh_steps_grid()
+
     def _apply(self):
         """v7.4.1: Write current widget values to Settings using canonical
         SafetyLimits field names."""
@@ -396,6 +864,20 @@ class StageHardwarePanel(QWidget):
         s.set("axis_flip.p1", self.chk_flip_p1.isChecked())
         s.set("axis_flip.p2", self.chk_flip_p2.isChecked())
         s.set("axis_flip.p3", self.chk_flip_p3.isChecked())
+
+        # v7.4.2: Axis mapping — collect from combos
+        if hasattr(self, 'cmb_axis_map'):
+            new_map = {logical: cmb.currentData()
+                       for logical, cmb in self.cmb_axis_map.items()
+                       if cmb.currentData()}
+            s.set("device_profile.axis_map", new_map)
+            # Push live if the controller has a zp_stage
+            if (self._controller is not None
+                    and self._controller.zp_stage is not None):
+                self._controller.zp_stage.set_axis_map(new_map)
+            elif self._controller is not None:
+                # Cache for next connect
+                self._controller.apply_device_settings(axis_map=new_map)
 
         s.save()
         self.settings_applied.emit()

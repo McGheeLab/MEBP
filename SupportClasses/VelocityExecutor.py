@@ -310,6 +310,9 @@ class VelocityExecutor:
         """Send pump position commands."""
         from SupportClasses.ZPStage import AXIS_MAP
         zero = getattr(ctrl, 'zero_position', {})
+        # v7.4.2: honor configurable per-machine axis_map
+        _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+            if ctrl.zp_stage else AXIS_MAP
 
         for pump_id, col in [("P1", COL_P1), ("P2", COL_P2), ("P3", COL_P3)]:
             target = self._interpolate_axis(elapsed, col)
@@ -318,7 +321,7 @@ class VelocityExecutor:
             if target == self._last_pumps_sent.get(pump_id):
                 continue
 
-            mapped = AXIS_MAP.get(pump_id)
+            mapped = _axis_map.get(pump_id, AXIS_MAP.get(pump_id))
             if mapped and ctrl.zp_stage:
                 try:
                     abs_pos = target + zero.get(pump_id, 0)
@@ -400,9 +403,12 @@ class VelocityExecutor:
                     ctrl.move_z_absolute(wp.z, from_zero_ref=True)
                     # Pumps
                     from SupportClasses.ZPStage import AXIS_MAP
+                    # v7.4.2: honor configurable per-machine axis_map
+                    _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                        if ctrl.zp_stage else AXIS_MAP
                     zero = getattr(ctrl, 'zero_position', {})
                     for pid, val in [("P1", wp.p1), ("P2", wp.p2), ("P3", wp.p3)]:
-                        mapped = AXIS_MAP.get(pid)
+                        mapped = _axis_map.get(pid, AXIS_MAP.get(pid))
                         if mapped and ctrl.zp_stage and val != 0.0:
                             ctrl.zp_stage.move_absolute(
                                 {mapped: val + zero.get(pid, 0)}, fast=False)

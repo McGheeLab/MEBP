@@ -1,8 +1,8 @@
 {
-  "_format_version": "v7.4.1",
-  "_description": "Device profile — physical-machine settings (safety envelope, motor feedrates, axis direction). Edit on Hardware Setup → Stage. Reusable across any experiment-level HardwareConfig.",
+  "_format_version": "v7.4.2",
+  "_description": "Device profile — physical-machine settings (safety envelope, motor feedrates, axis direction, axis mapping, stepper calibration). Edit on Hardware Setup → Device. Reusable across any experiment-level HardwareConfig.",
   "profile_name": "Standard",
-  "notes": "Reasonable defaults for a typical Prior ProScan + Marlin bioprinter. Generous safety envelope; medium feedrates.",
+  "notes": "Reasonable defaults for a typical Prior ProScan + Marlin bioprinter. Generous safety envelope; medium feedrates. Axis map: Z=X, P1=Y, P2=Z (inverted), P3=E.",
   "safety_limits": {
     "enabled": true,
     "xy_min_x": -130000.0,
@@ -33,5 +33,17 @@
     "p1": false,
     "p2": false,
     "p3": false
+  },
+  "axis_map": {
+    "Z": "X",
+    "P1": "Y",
+    "P2": "Z",
+    "P3": "E"
+  },
+  "steps_per_mm": {
+    "Z": 5069,
+    "P1": 5069,
+    "P2": -5069,
+    "P3": 5069
   }
 }
