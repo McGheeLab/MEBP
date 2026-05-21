@@ -90,6 +90,11 @@ class MainWindow(QMainWindow):
     # InvalidationBanner.
     hw_config_invalidated = Signal(dict)
 
+    # v7.4.0-c: Emitted when the global Help toggle flips. FormRow widgets
+    # registered via register_form_row() listen and reveal/hide their
+    # inline help text.
+    help_mode_changed = Signal(bool)
+
     def __init__(self, controller: StageController, settings: Settings,
                  print_history: PrintHistory | None = None,
                  recorder: PrintRecorder | None = None):
@@ -100,6 +105,10 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.print_history = print_history
         self.recorder = recorder
+
+        # v7.4.0-c: Help-mode state + FormRow registry
+        self._help_mode: bool = False
+        self._registered_form_rows: list = []
 
         # Menu button references
         self._menu_buttons: list[QPushButton] = []
@@ -113,7 +122,7 @@ class MainWindow(QMainWindow):
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
 
-        self.setWindowTitle("MEBP Bioprinter — v7.4.0-b")
+        self.setWindowTitle("MEBP Bioprinter — v7.4.0-c")
         self.setMinimumSize(s(1100), s(700))
         self.resize(s(1400), s(850))
 
@@ -131,7 +140,53 @@ class MainWindow(QMainWindow):
         # Start on Hardware Setup page
         self._navigate_to(0)
 
-        logger.info("MainWindow initialized (v7.4.0-b)")
+        # v7.4.0-c: Schedule onboarding wizard if first-run (defer until
+        # after the window is shown so it appears on top).
+        QTimer.singleShot(0, self._maybe_show_onboarding)
+
+        logger.info("MainWindow initialized (v7.4.0-c)")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.0-c: ONBOARDING WIZARD TRIGGER
+    # ════════════════════════════════════════════════════════════════
+
+    def _maybe_show_onboarding(self):
+        """Show OnboardingWizard if first-run detected.
+
+        Trigger: no needle gauge saved AND no last hardware config file
+        path saved. Skips silently otherwise.
+        """
+        try:
+            from gui.onboarding.wizard import (
+                OnboardingWizard, should_show_onboarding,
+            )
+        except Exception as e:
+            logger.warning(f"Onboarding import failed: {e}")
+            return
+
+        if not should_show_onboarding(self.settings):
+            return
+
+        logger.info("First-run detected — launching OnboardingWizard")
+        wizard = OnboardingWizard(self.controller, self.settings, parent=self)
+        wizard.completed.connect(self._on_onboarding_completed)
+        wizard.exec()
+
+    def _on_onboarding_completed(self, config):
+        """Apply the config produced by the onboarding wizard."""
+        try:
+            hw_page = self._page_widgets[0]
+            hw_page.set_config(config)
+            # If user opted into the deep-link, switch to HW Setup → Pumps & Inks
+            target = getattr(self.sender(), 'get_deep_link_target', lambda: None)()
+            if target is not None:
+                self._navigate_to(target)
+                # HW page is a ModePage — switch to Pumps & Inks (sub-page idx 2)
+                if hasattr(hw_page, 'switch_to'):
+                    hw_page.switch_to(2)
+            logger.info("Onboarding config applied")
+        except Exception as e:
+            logger.error(f"Failed to apply onboarding config: {e}")
 
     # ════════════════════════════════════════════════════════════════
     #  XY POSITION SCALE PROPERTY
@@ -341,6 +396,12 @@ class MainWindow(QMainWindow):
         top_bar_layout.addWidget(title_frame)
         top_bar_layout.addStretch()
 
+        # v7.4.0-c: Help toggle — reveals inline FormRow help text
+        from gui.widgets.help_toggle import HelpToggle
+        self._help_toggle = HelpToggle()
+        self._help_toggle.toggled.connect(self._on_help_toggled)
+        top_bar_layout.addWidget(self._help_toggle)
+
         # Connection dots
         conn_frame = QFrame()
         conn_frame.setObjectName("connStatusFrame")
@@ -357,6 +418,17 @@ class MainWindow(QMainWindow):
         # v7.4.0-a: Global loading banner — show_loading(msg) / hide_loading()
         self._loading_banner = LoadingBanner()
         content_layout.addWidget(self._loading_banner)
+
+        # v7.4.0-c: Global invalidation banner shown when hardware config
+        # changes invalidate derived data on other pages. Click Refresh →
+        # re-propagate config so pages re-read their inputs.
+        from gui.widgets.invalidation_banner import InvalidationBanner
+        self._invalidation_banner = InvalidationBanner(
+            message="Hardware changed — refresh pages to re-apply.",
+            on_refresh=self._on_invalidation_refresh,
+        )
+        self._invalidation_banner.hide()
+        content_layout.addWidget(self._invalidation_banner)
 
         # Content splitter (pages + console)
         self._splitter = QSplitter(Qt.Vertical)
@@ -1126,6 +1198,9 @@ class MainWindow(QMainWindow):
 
         Payload is a dict of changed keys; subscribers can decide how
         much UI to invalidate based on which keys changed.
+
+        v7.4.0-c: Also surfaces the global InvalidationBanner so users
+        see something has changed even if no specific page subscribed.
         """
         changed = {}
         if prev is None or getattr(prev, 'plate_format', None) != \
@@ -1136,6 +1211,35 @@ class MainWindow(QMainWindow):
             changed["pumps"] = True
         if changed:
             self.hw_config_invalidated.emit(changed)
+            self._show_invalidation_banner(changed)
+
+    def _show_invalidation_banner(self, changed: dict):
+        """v7.4.0-c: Surface the global invalidation banner."""
+        if not hasattr(self, '_invalidation_banner'):
+            return
+        # Don't show the banner while we're on the Hardware Setup page —
+        # the user is actively editing config, no need to nag them.
+        if self._current_page_index == 0:
+            return
+        parts = []
+        if "plate_format" in changed:
+            parts.append("plate format")
+        if "pumps" in changed:
+            parts.append("pumps")
+        if parts:
+            self._invalidation_banner.set_message(
+                f"Hardware changed ({', '.join(parts)}) — refresh pages to re-apply.")
+        self._invalidation_banner.show()
+
+    def _on_invalidation_refresh(self):
+        """v7.4.0-c: User clicked Refresh on invalidation banner.
+
+        Re-propagates the current hardware config to every page so they
+        re-read their inputs.
+        """
+        if self._hardware_config is not None:
+            self._propagate_hardware_config(self._hardware_config)
+        logger.info("Hardware config re-propagated via invalidation refresh")
 
     def _on_hardware_validated(self, is_valid: bool):
         """Called when hardware setup validity changes. Gates other pages."""
@@ -1343,6 +1447,38 @@ class MainWindow(QMainWindow):
         """Hide the global loading banner."""
         if hasattr(self, '_loading_banner'):
             self._loading_banner.hide()
+
+    # ────────────────────────────────────────────────────────────────
+    #  v7.4.0-c: Help mode + FormRow registry
+    # ────────────────────────────────────────────────────────────────
+
+    def _on_help_toggled(self, on: bool):
+        """Top-bar Help toggle clicked. Propagate to registered FormRows."""
+        self._help_mode = on
+        for row in list(self._registered_form_rows):
+            try:
+                row.set_help_visible(on)
+            except Exception as e:
+                logger.debug(f"FormRow.set_help_visible failed: {e}")
+        self.help_mode_changed.emit(on)
+
+    def register_form_row(self, row):
+        """Register a FormRow so the top-bar Help toggle controls it.
+
+        Pages call this for each FormRow they construct; the toggle is
+        applied immediately so newly-registered rows match current state.
+        """
+        if row not in self._registered_form_rows:
+            self._registered_form_rows.append(row)
+        # Apply current state immediately
+        try:
+            row.set_help_visible(self._help_mode)
+        except Exception:
+            pass
+
+    @property
+    def help_mode(self) -> bool:
+        return self._help_mode
 
     # ════════════════════════════════════════════════════════════════
     #  TIMERS & STATUS UPDATES

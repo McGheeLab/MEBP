@@ -1,0 +1,50 @@
+{
+  "_description": "Starter ink library loaded by OnboardingWizard if user has no inks (v7.4.0-c). Five common bioprinting materials with reasonable defaults — users can edit/delete after first run.",
+  "inks": {
+    "PBS": {
+      "name": "PBS",
+      "ink_type": "buffer",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.01,
+      "color": "#89b4fa"
+    },
+    "Alginate 2%": {
+      "name": "Alginate 2%",
+      "ink_type": "hydrogel",
+      "viscosity_cP": 250.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.02,
+      "color": "#a6e3a1"
+    },
+    "GelMA": {
+      "name": "GelMA",
+      "ink_type": "hydrogel",
+      "viscosity_cP": 500.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.05,
+      "color": "#f9e2af"
+    },
+    "Water": {
+      "name": "Water",
+      "ink_type": "buffer",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.00,
+      "color": "#94e2d5"
+    },
+    "Cell Media": {
+      "name": "Cell Media",
+      "ink_type": "media",
+      "viscosity_cP": 1.1,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.01,
+      "color": "#f5c2e7"
+    }
+  }
+}
