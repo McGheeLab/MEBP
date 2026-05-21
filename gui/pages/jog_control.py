@@ -225,7 +225,11 @@ class JogControlPage(QWidget):
         layout.addWidget(btn_goto)
 
         # ── Speed Multipliers ────────────────────────────────────
-        speed_label = QLabel("Speed (Xbox Jog)")
+        # v7.4.2 hotfix: this slider now drives BOTH the Xbox continuous
+        # jog loop AND the button-click jog feedrate. Before the fix the
+        # slider only affected Xbox jog; button clicks always used
+        # ZPStageManager's default 200 mm/min regardless.
+        speed_label = QLabel("Speed")
         speed_label.setObjectName("contextSectionLabel")
         layout.addWidget(speed_label)
 
@@ -640,7 +644,9 @@ class JogControlPage(QWidget):
 
     def _jog_z(self, direction: int):
         if self.controller.is_zp_connected:
-            self.controller.move_z_relative(direction * self._get_z_step())
+            feedrate = self._z_feedrate_mm_min()
+            self.controller.move_z_relative(
+                direction * self._get_z_step(), feedrate=feedrate)
 
     def _jog_pump(self, pump: str, direction: int):
         """Jog pump — convert µL step to mm if HW config available."""
@@ -650,18 +656,60 @@ class JogControlPage(QWidget):
             logger.warning(f"{pump} is disabled — enable it in Hardware Setup to jog")
             return
         step_val = self._get_p_step()
+        feedrate = self._pump_feedrate_mm_min(pump)
         if self._hardware_config:
             pump_cfg = self._hardware_config.pumps.get(pump)
             if pump_cfg and pump_cfg.is_configured:
                 try:
                     step_mm = self._hardware_config.uL_to_mm(pump, step_val)
-                    self.controller.move_pump_relative(pump, direction * step_mm)
-                    logger.debug(f"Pump {pump}: {step_val} µL = {step_mm:.4f} mm")
+                    self.controller.move_pump_relative(
+                        pump, direction * step_mm, feedrate=feedrate)
+                    logger.debug(
+                        f"Pump {pump}: {step_val} µL = {step_mm:.4f} mm "
+                        f"@ {feedrate:.1f} mm/min")
                     return
                 except (ValueError, AttributeError) as e:
                     logger.warning(f"µL→mm conversion failed for {pump}: {e}")
         # Fallback: use raw value as mm
-        self.controller.move_pump_relative(pump, direction * step_val)
+        self.controller.move_pump_relative(
+            pump, direction * step_val, feedrate=feedrate)
+
+    # ── v7.4.2 hotfix: derive feedrate from the speed slider ────
+
+    def _z_feedrate_mm_min(self) -> float | None:
+        """Compute Z button-jog feedrate (mm/min) from the speed slider.
+
+        The slider stores its current value on ``controller.zp_jog.z_speed``
+        as mm/s. Marlin's G-code feedrate is mm/min, so we multiply by 60.
+        Returns None if no zp_jog handler is available — in that case
+        ZPStageManager falls back to its default feedrate.
+        """
+        jog = getattr(self.controller, 'zp_jog', None)
+        if jog is None:
+            return None
+        return max(float(jog.z_speed) * 60.0, 1.0)
+
+    def _pump_feedrate_mm_min(self, pump: str) -> float | None:
+        """Compute pump button-jog feedrate (mm/min) from the speed slider.
+
+        zp_jog.p_speed is µL/s when HardwareConfig has the pump's syringe
+        configured, otherwise raw mm/s. Convert to mm/s via syringe
+        geometry, then × 60 for mm/min. Returns None if no zp_jog.
+        """
+        jog = getattr(self.controller, 'zp_jog', None)
+        if jog is None:
+            return None
+        rate = abs(float(jog.p_speed))
+        if self._hardware_config:
+            pump_cfg = self._hardware_config.pumps.get(pump)
+            if pump_cfg and pump_cfg.is_configured:
+                try:
+                    vel_mm_s = pump_cfg.uL_to_mm(rate)
+                    return max(vel_mm_s * 60.0, 1.0)
+                except (ValueError, AttributeError):
+                    pass
+        # Fallback: p_speed already in mm/s
+        return max(rate * 60.0, 1.0)
 
     def _set_zero(self):
         self.controller._calibrate_zero()
