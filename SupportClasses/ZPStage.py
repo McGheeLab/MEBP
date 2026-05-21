@@ -118,6 +118,12 @@ class ZPStageManager:
                 sign = -1 if self.steps_per_mm[k] < 0 else 1
                 self.steps_per_mm[k] = sign * abs(int(steps_per_mm))
         self.axis_map = dict(axis_map) if axis_map else dict(AXIS_MAP)
+        # v7.4.2 hotfix: per-logical-axis max accel (M201). Defaults
+        # are sensible Marlin defaults; callers can override via
+        # set_axis_accelerations().
+        self.max_accel: dict[str, float] = {
+            "Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0,
+        }
 
         # Cached position values (updated on get_current_position)
         self.x_pos: float = 0.0
@@ -421,6 +427,119 @@ class ZPStageManager:
             cmd = self._build_m92_command()
             self.send_data(cmd)
             logger.info(f"ZP M92 sent: {cmd}")
+
+    def set_zero(self, logical_axis: str) -> bool:
+        """v7.4.2 hotfix: zero the Marlin physical axis mapped to
+        ``logical_axis`` by sending a G92.
+
+        Returns True if the command was queued, False if the logical
+        axis isn't mapped. After this call, the next M114 query for
+        that axis returns 0.
+        """
+        physical = self.axis_map.get(logical_axis)
+        if not physical:
+            logger.warning(
+                f"set_zero({logical_axis}): no mapping in axis_map={self.axis_map}")
+            return False
+        self.send_data(f"G92 {physical}0")
+        logger.info(f"ZP G92 {physical}0 sent (logical {logical_axis})")
+        return True
+
+    def set_axis_accelerations(self, accels: dict[str, float],
+                               persist: bool = True) -> None:
+        """v7.4.2 hotfix: set per-logical-axis maximum acceleration via M201.
+
+        ``accels`` keys are logical axes (Z, P1, P2, P3). The M201
+        command is built from the current axis_map (each logical axis
+        is routed to its physical Marlin letter).
+
+        Marlin's M201 expects mm/s²; the command applies to G0/G1
+        moves until overridden.
+        """
+        self.max_accel = dict(accels)
+        if persist:
+            parts = ["M201"]
+            for logical, accel in accels.items():
+                physical = self.axis_map.get(logical)
+                if physical:
+                    parts.append(f"{physical}{float(accel):.2f}")
+            cmd = " ".join(parts)
+            self.send_data(cmd)
+            logger.info(f"ZP {cmd} sent")
+
+    def query_settings(self, timeout: float = 2.0) -> dict:
+        """v7.4.2 hotfix: send M503 and parse Marlin's echoed settings.
+
+        Returns a permissive dict with whatever was successfully parsed.
+        Example::
+
+            {
+                "steps_per_mm": {"X": 5069.0, "Y": 5069.0, "Z": 5070.0, "E": 5069.0},
+                "max_feedrate": {"X": 3000.0, "Y": 3000.0, "Z": 600.0, "E": 200.0},
+                "max_accel":    {"X": 1000.0, "Y": 1000.0, "Z": 100.0, "E": 1000.0},
+            }
+
+        Per-build Marlin output varies; the parser is best-effort —
+        unparseable lines are silently ignored.
+        """
+        result = {"steps_per_mm": {}, "max_feedrate": {}, "max_accel": {}}
+        if self.serial is None:
+            return result
+        try:
+            with self._serial_lock:
+                try:
+                    self.serial.reset_input_buffer()
+                except Exception:
+                    pass
+                self.serial.write(b"M503\n")
+                self.serial.flush()
+            deadline = time.monotonic() + timeout
+            accumulated = ""
+            while time.monotonic() < deadline:
+                with self._serial_lock:
+                    try:
+                        chunk = self.serial.read(1024)
+                    except Exception:
+                        break
+                if chunk:
+                    try:
+                        accumulated += chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        accumulated += str(chunk)
+                # Stop early if we've seen a long enough echo
+                if "ok" in accumulated.lower() and len(accumulated) > 200:
+                    break
+                if not chunk:
+                    time.sleep(0.05)
+            self._parse_m503(accumulated, result)
+        except Exception as e:
+            logger.warning(f"query_settings failed: {e}")
+        return result
+
+    _M503_FIELD_RE = re.compile(
+        r"\b(?P<letter>[XYZE])(?P<value>[+-]?\d+\.?\d*)")
+
+    def _parse_m503(self, text: str, result: dict) -> None:
+        """Parse M503 echo into result dict. Permissive; ignores noise."""
+        for line in text.splitlines():
+            up = line.strip().upper()
+            # Marlin typically prefixes echoes with "echo:" or "echo: "
+            up = up.replace("ECHO:", "").strip()
+            if up.startswith("M92"):
+                bucket = "steps_per_mm"
+            elif up.startswith("M203"):
+                bucket = "max_feedrate"
+            elif up.startswith("M201"):
+                bucket = "max_accel"
+            else:
+                continue
+            for m in self._M503_FIELD_RE.finditer(up[3:]):
+                letter = m.group("letter")
+                try:
+                    val = float(m.group("value"))
+                except ValueError:
+                    continue
+                result[bucket][letter] = val
 
     # ── Communication ─────────────────────────────────────────────
 

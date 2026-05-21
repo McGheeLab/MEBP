@@ -22,6 +22,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,13 @@ class DeviceProfile:
     # feedrate experimentation. Reference value only — global safety
     # clamping still uses safety_limits.max_z_feedrate / max_pump_feedrate.
     per_axis_max_feedrate: dict = field(default_factory=dict)
+    # v7.4.2 hotfix: per-logical-axis max acceleration (mm/s²) sent
+    # to Marlin via M201; XY stage motion calibration (velocity %,
+    # acceleration 1–100 SAS, optional jerk 1–100 SCS).
+    per_axis_max_accel: dict = field(default_factory=dict)
+    xy_velocity_pct: Optional[int] = None
+    xy_acceleration: Optional[int] = None
+    xy_jerk: Optional[int] = None
 
     # ── JSON I/O ─────────────────────────────────────────────────
 
@@ -78,6 +86,10 @@ class DeviceProfile:
             "axis_map": self.axis_map,
             "steps_per_mm": self.steps_per_mm,
             "per_axis_max_feedrate": self.per_axis_max_feedrate,
+            "per_axis_max_accel": self.per_axis_max_accel,
+            "xy_velocity_pct": self.xy_velocity_pct,
+            "xy_acceleration": self.xy_acceleration,
+            "xy_jerk": self.xy_jerk,
         }
 
     @classmethod
@@ -91,6 +103,10 @@ class DeviceProfile:
             axis_map=data.get("axis_map", {}) or {},
             steps_per_mm=data.get("steps_per_mm", {}) or {},
             per_axis_max_feedrate=data.get("per_axis_max_feedrate", {}) or {},
+            per_axis_max_accel=data.get("per_axis_max_accel", {}) or {},
+            xy_velocity_pct=data.get("xy_velocity_pct"),
+            xy_acceleration=data.get("xy_acceleration"),
+            xy_jerk=data.get("xy_jerk"),
         )
 
     def save(self, path: Path | None = None) -> Path:
@@ -126,6 +142,11 @@ class DeviceProfile:
             steps_per_mm=settings.get("device_profile.steps_per_mm") or {},
             per_axis_max_feedrate=settings.get(
                 "device_profile.per_axis_max_feedrate") or {},
+            per_axis_max_accel=settings.get(
+                "device_profile.per_axis_max_accel") or {},
+            xy_velocity_pct=settings.get("device_profile.xy_velocity_pct"),
+            xy_acceleration=settings.get("device_profile.xy_acceleration"),
+            xy_jerk=settings.get("device_profile.xy_jerk"),
         )
 
     def apply_to_settings(self, settings) -> None:
@@ -150,6 +171,15 @@ class DeviceProfile:
         if self.per_axis_max_feedrate:
             settings.set("device_profile.per_axis_max_feedrate",
                          self.per_axis_max_feedrate)
+        if self.per_axis_max_accel:
+            settings.set("device_profile.per_axis_max_accel",
+                         self.per_axis_max_accel)
+        if self.xy_velocity_pct is not None:
+            settings.set("device_profile.xy_velocity_pct", self.xy_velocity_pct)
+        if self.xy_acceleration is not None:
+            settings.set("device_profile.xy_acceleration", self.xy_acceleration)
+        if self.xy_jerk is not None:
+            settings.set("device_profile.xy_jerk", self.xy_jerk)
 
 
 # ── Module-level helpers ─────────────────────────────────────────

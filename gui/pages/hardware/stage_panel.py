@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QDoubleSpinBox, QCheckBox, QPushButton, QFrame,
     QSizePolicy, QComboBox, QInputDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
@@ -35,6 +35,7 @@ from gui.pages.hardware.device_profile import (
     DeviceProfile, list_profiles, delete_profile, DEVICES_DIR,
 )
 from gui.widgets.jog_button_array import JogButtonArray
+from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +131,11 @@ class StageHardwarePanel(QWidget):
         # a profile populates all the groups below
         outer.addWidget(self._build_device_profile_group())
 
-        # v7.4.2: Connect Hardware + Axis Mapping + Steps Calibration
+        # v7.4.2: Connect Hardware + Axis Mapping
         outer.addWidget(self._build_connect_group())
         outer.addWidget(self._build_axis_mapping_group())
+        # v7.4.2 hotfix: motion calibration split into per-stage sections
+        outer.addWidget(self._build_xy_cal_group())
         outer.addWidget(self._build_steps_cal_group())
 
         # v7.4.2 hotfix: Safety + per-axis jog + full jog pad combined
@@ -420,9 +423,15 @@ class StageHardwarePanel(QWidget):
         top_row.addStretch(1)
         outer.addLayout(top_row)
 
-        caps_grp = QGroupBox("Global Feedrate Caps")
-        caps_grp.setStyleSheet(SECTION_TITLE_STYLE)
-        caps_form = QFormLayout(caps_grp)
+        # v7.4.2 hotfix: Global Feedrate Caps group REMOVED from this
+        # section per user direction — per-axis max feedrates already
+        # live in ZP Stage Calibration via device_profile.per_axis_max_feedrate;
+        # XY max speed moves to the new XY Stage Calibration section.
+        # The spin widgets themselves still exist as headless objects
+        # so _load_from_settings + _apply_safety_and_zero keep working
+        # without rewriting their bodies. spin_max_xy_speed is reparented
+        # into the XY Calibration section below; the Z/pump caps remain
+        # as silent shadows of safety_limits.* until removed in v7.4.3.
 
         def _cap_spin(default: float, unit: str, dec: int = 1) -> QDoubleSpinBox:
             sp_w = QDoubleSpinBox()
@@ -434,12 +443,8 @@ class StageHardwarePanel(QWidget):
             return sp_w
 
         self.spin_max_xy_speed = _cap_spin(10000.0, "µm/s")
-        caps_form.addRow("Max XY speed:", self.spin_max_xy_speed)
         self.spin_max_z_feed = _cap_spin(500.0, "mm/min")
-        caps_form.addRow("Max Z feedrate:", self.spin_max_z_feed)
         self.spin_max_pump_feed = _cap_spin(200.0, "mm/min")
-        caps_form.addRow("Max pump feedrate:", self.spin_max_pump_feed)
-        outer.addWidget(caps_grp)
 
         # ── Full jog pad embed ──────────────────────────────────
         jog_grp = QGroupBox("Full Jog Pad (setup-mode, safety bypassed)")
@@ -769,6 +774,14 @@ class StageHardwarePanel(QWidget):
                     self._settings.set("zp_stage.last_port", port)
                     self._settings.save()
                     logger.info(f"ZP last_port cached: {port}")
+            # v7.4.2 hotfix: auto-trigger alignment check ~1s after
+            # connect succeeds so the user sees mismatches without
+            # having to click the button. Debounced via QTimer so
+            # Marlin has time to finish booting + responding to the
+            # _setup_printer M-codes.
+            if ok:
+                QTimer.singleShot(
+                    1000, lambda: self._check_marlin_alignment(quiet=False))
         except Exception as e:
             self.badge_zp.set_status("err", f"Error: {e}")
 
@@ -835,11 +848,218 @@ class StageHardwarePanel(QWidget):
         return grp
 
     # ════════════════════════════════════════════════════════════════
+    #  v7.4.2 hotfix: XY Stage Calibration
+    # ════════════════════════════════════════════════════════════════
+    #
+    # New section that separates XY motion calibration from the ZP
+    # stage's stepper calibration. ProScan exposes set_max_speed
+    # (SMS), set_acceleration (SAS), and optionally set_jerk (SCS)
+    # — wrap them as user-visible spinboxes here. The units-
+    # verification workflow is REPORT-ONLY: ProScan natively works
+    # in µm at 1:1, so a discrepancy between commanded and measured
+    # indicates a mechanical issue (belt slip, encoder mis-cal),
+    # not a software setting.
+
+    def _build_xy_cal_group(self) -> QGroupBox:
+        grp = QGroupBox("XY Stage Calibration")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "Configure XY motion characteristics (ProScan). Velocity "
+            "and acceleration are stored in the device profile and "
+            "pushed to the controller on Save. The Units verification "
+            "test (below) is report-only — ProScan moves natively in "
+            "µm at 1:1, so a discrepancy means a mechanical issue, "
+            "not a software fix."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        outer.addWidget(info)
+
+        # ── Velocity / acceleration / jerk ─────────────────────
+        form = QFormLayout()
+        form.setHorizontalSpacing(s(10))
+
+        self.spin_xy_velocity = QDoubleSpinBox()
+        self.spin_xy_velocity.setRange(1, 100)
+        self.spin_xy_velocity.setDecimals(0)
+        self.spin_xy_velocity.setSuffix(" %")
+        self.spin_xy_velocity.setValue(100)
+        self.spin_xy_velocity.setMinimumWidth(s(120))
+        self.spin_xy_velocity.setToolTip(
+            "ProScan SMS — max velocity as a percentage of the "
+            "controller's hardware ceiling. Default 100%.")
+        form.addRow("Velocity (% max):", self.spin_xy_velocity)
+
+        self.spin_xy_acceleration = QDoubleSpinBox()
+        self.spin_xy_acceleration.setRange(1, 100)
+        self.spin_xy_acceleration.setDecimals(0)
+        self.spin_xy_acceleration.setValue(50)
+        self.spin_xy_acceleration.setMinimumWidth(s(120))
+        self.spin_xy_acceleration.setToolTip(
+            "ProScan SAS — acceleration as a percentage. Default 50.")
+        form.addRow("Acceleration:", self.spin_xy_acceleration)
+
+        self.spin_xy_jerk = QDoubleSpinBox()
+        self.spin_xy_jerk.setRange(0, 100)
+        self.spin_xy_jerk.setDecimals(0)
+        self.spin_xy_jerk.setValue(0)
+        self.spin_xy_jerk.setMinimumWidth(s(120))
+        self.spin_xy_jerk.setToolTip(
+            "ProScan SCS — jerk. Optional; silently ignored if the "
+            "controller protocol doesn't declare set_jerk. 0 = leave "
+            "controller default.")
+        form.addRow("Jerk (optional):", self.spin_xy_jerk)
+
+        outer.addLayout(form)
+
+        # ── Units verification workflow ────────────────────────
+        verify_grp = QGroupBox("Units verification (report only)")
+        verify_grp.setStyleSheet(SECTION_TITLE_STYLE)
+        v_outer = QVBoxLayout(verify_grp)
+        v_info = QLabel(
+            "Pick an axis, command a distance, measure the actual "
+            "displacement with a caliper, and enter the result. The "
+            "comparison is shown below; no value is auto-corrected."
+        )
+        v_info.setWordWrap(True)
+        v_info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        v_outer.addWidget(v_info)
+
+        v_row = QHBoxLayout()
+        v_row.addWidget(QLabel("Axis:"))
+        self.cmb_xy_verify_axis = QComboBox()
+        self.cmb_xy_verify_axis.addItem("X", "X")
+        self.cmb_xy_verify_axis.addItem("Y", "Y")
+        v_row.addWidget(self.cmb_xy_verify_axis)
+
+        v_row.addWidget(QLabel("Distance:"))
+        self.spin_xy_verify_commanded = QDoubleSpinBox()
+        self.spin_xy_verify_commanded.setRange(1, 100000)
+        self.spin_xy_verify_commanded.setDecimals(0)
+        self.spin_xy_verify_commanded.setValue(1000)
+        self.spin_xy_verify_commanded.setSuffix(" µm")
+        v_row.addWidget(self.spin_xy_verify_commanded)
+
+        btn_xy_move = QPushButton("Move")
+        btn_xy_move.setToolTip("Send a relative move in the chosen direction.")
+        btn_xy_move.clicked.connect(self._xy_verify_command_move)
+        v_row.addWidget(btn_xy_move)
+
+        v_row.addWidget(QLabel("Measured:"))
+        self.spin_xy_verify_measured = QDoubleSpinBox()
+        self.spin_xy_verify_measured.setRange(0, 100000)
+        self.spin_xy_verify_measured.setDecimals(0)
+        self.spin_xy_verify_measured.setValue(1000)
+        self.spin_xy_verify_measured.setSuffix(" µm")
+        v_row.addWidget(self.spin_xy_verify_measured)
+
+        btn_xy_report = QPushButton("Compare")
+        btn_xy_report.setToolTip("Show deviation between commanded and measured.")
+        btn_xy_report.clicked.connect(self._xy_verify_report)
+        v_row.addWidget(btn_xy_report)
+        v_row.addStretch()
+        v_outer.addLayout(v_row)
+
+        self.lbl_xy_verify_result = QLabel("")
+        self.lbl_xy_verify_result.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_xy_verify_result.setWordWrap(True)
+        v_outer.addWidget(self.lbl_xy_verify_result)
+        outer.addWidget(verify_grp)
+
+        # ── Save XY Calibration button ─────────────────────────
+        save_row = QHBoxLayout()
+        btn_save_xy = QPushButton("💾 Save XY Calibration")
+        btn_save_xy.setObjectName("successBtn")
+        btn_save_xy.setToolTip(
+            "Send velocity/acceleration/jerk to ProScan and persist "
+            "to settings + device profile.")
+        btn_save_xy.clicked.connect(self._apply_xy_calibration)
+        save_row.addWidget(btn_save_xy)
+        self.lbl_xy_cal_status = QLabel("")
+        self.lbl_xy_cal_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        save_row.addWidget(self.lbl_xy_cal_status, 1)
+        outer.addLayout(save_row)
+        return grp
+
+    def _xy_verify_command_move(self) -> None:
+        ctrl = self._controller
+        if ctrl is None or not ctrl.is_xy_connected:
+            self.lbl_xy_verify_result.setText("XY stage not connected.")
+            return
+        axis = self.cmb_xy_verify_axis.currentData()
+        dist = float(self.spin_xy_verify_commanded.value())
+        try:
+            dx = dist if axis == "X" else 0.0
+            dy = dist if axis == "Y" else 0.0
+            ctrl.move_xy_relative_um(dx, dy, bypass_safety=True)
+            self.lbl_xy_verify_result.setText(
+                f"Sent {dist:.0f} µm move on {axis}. Measure with a "
+                f"caliper, enter measured, then click Compare.")
+        except Exception as e:
+            self.lbl_xy_verify_result.setText(f"Move failed: {e}")
+
+    def _xy_verify_report(self) -> None:
+        commanded = float(self.spin_xy_verify_commanded.value())
+        measured = float(self.spin_xy_verify_measured.value())
+        if measured <= 0:
+            self.lbl_xy_verify_result.setText("Measured must be > 0.")
+            return
+        dev_pct = (measured - commanded) / commanded * 100.0
+        verdict = ("OK — within 1%" if abs(dev_pct) < 1.0
+                   else "INVESTIGATE — likely mechanical issue")
+        self.lbl_xy_verify_result.setText(
+            f"Commanded {commanded:.0f} µm | Measured {measured:.0f} µm | "
+            f"Deviation {dev_pct:+.1f}% — {verdict}")
+
+    def _apply_xy_calibration(self) -> None:
+        s = self._settings
+        if s is None:
+            return
+        vel = int(self.spin_xy_velocity.value())
+        acc = int(self.spin_xy_acceleration.value())
+        jerk = int(self.spin_xy_jerk.value()) if self.spin_xy_jerk.value() > 0 else None
+        s.set("device_profile.xy_velocity_pct", vel)
+        s.set("device_profile.xy_acceleration", acc)
+        s.set("device_profile.xy_jerk", jerk)
+        # Push to the controller if the XY stage is live
+        ctrl = self._controller
+        if ctrl is not None and ctrl.xy_stage is not None:
+            try:
+                ctrl.xy_stage.set_velocity(vel)
+            except Exception as e:
+                logger.warning(f"XY set_velocity failed: {e}")
+            try:
+                ctrl.xy_stage.set_acceleration(acc)
+            except Exception as e:
+                logger.warning(f"XY set_acceleration failed: {e}")
+            if jerk is not None:
+                try:
+                    ctrl.xy_stage.set_jerk(jerk)
+                except Exception as e:
+                    logger.warning(f"XY set_jerk failed: {e}")
+        s.save()
+        self.lbl_xy_cal_status.setText(
+            f"Saved: velocity {vel}%, acceleration {acc}"
+            + (f", jerk {jerk}" if jerk is not None else "")
+            + " — sent to ProScan and persisted.")
+        logger.info(f"XY calibration saved: vel={vel}, acc={acc}, jerk={jerk}")
+
+    # ════════════════════════════════════════════════════════════════
     #  v7.4.2: Steps-per-mm Calibration
     # ════════════════════════════════════════════════════════════════
 
     def _build_steps_cal_group(self) -> QGroupBox:
-        grp = QGroupBox("Stepper Calibration && Feedrate Test")
+        # v7.4.2 hotfix: renamed section title and added per-axis
+        # acceleration spinboxes. The "Stepper Calibration & Feedrate
+        # Test" name became "ZP Stage Calibration" to match the new
+        # XY Stage Calibration section.
+        grp = QGroupBox("ZP Stage Calibration (steps, feedrate, acceleration)")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         outer = QVBoxLayout(grp)
 
@@ -852,12 +1072,30 @@ class StageHardwarePanel(QWidget):
             "Negative steps/mm invert the axis direction permanently.<br>"
             "<b>To find the max feedrate:</b> raise the feedrate, send "
             "test moves, and watch for missed steps or motor stall. When "
-            "you find a safe ceiling, click <i>Record as Max</i>."
+            "you find a safe ceiling, click <i>Record as Max</i>.<br>"
+            "<b>Acceleration:</b> set per-axis max acceleration (mm/s²) — "
+            "sent to Marlin as M201 on Save Calibration."
         )
         info.setWordWrap(True)
         info.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         outer.addWidget(info)
+
+        # v7.4.2 hotfix: red-state-capable label style. Stage panel
+        # uses these for alignment-check mismatch highlighting.
+        self._cell_style_ok = (
+            f"color: {COLORS['text']}; font-family: monospace; "
+            f"padding: {sp(2)} {sp(8)}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)};"
+        )
+        self._cell_style_mismatch = (
+            f"color: {COLORS['red']}; font-family: monospace; "
+            f"padding: {sp(2)} {sp(8)}; "
+            f"border: 1px solid {COLORS['red']}; "
+            f"border-radius: {sp(4)};"
+            f"background-color: rgba(243, 139, 168, 28);"
+        )
 
         # Current per-axis steps/mm grid (read-only display)
         steps_row = QHBoxLayout()
@@ -865,11 +1103,7 @@ class StageHardwarePanel(QWidget):
         self.lbl_steps_grid: dict[str, QLabel] = {}
         for ax in self._LOGICAL_AXES:
             cell = QLabel(f"{ax}: —")
-            cell.setStyleSheet(
-                f"color: {COLORS['text']}; font-family: monospace; "
-                f"padding: {sp(2)} {sp(8)}; "
-                f"border: 1px solid {COLORS['surface1']}; "
-                f"border-radius: {sp(4)};")
+            cell.setStyleSheet(self._cell_style_ok)
             steps_row.addWidget(cell)
             self.lbl_steps_grid[ax] = cell
         steps_row.addStretch()
@@ -881,15 +1115,31 @@ class StageHardwarePanel(QWidget):
         self.lbl_feedrate_grid: dict[str, QLabel] = {}
         for ax in self._LOGICAL_AXES:
             cell = QLabel(f"{ax}: —")
-            cell.setStyleSheet(
-                f"color: {COLORS['text']}; font-family: monospace; "
-                f"padding: {sp(2)} {sp(8)}; "
-                f"border: 1px solid {COLORS['surface1']}; "
-                f"border-radius: {sp(4)};")
+            cell.setStyleSheet(self._cell_style_ok)
             feed_row.addWidget(cell)
             self.lbl_feedrate_grid[ax] = cell
         feed_row.addStretch()
         outer.addLayout(feed_row)
+
+        # v7.4.2 hotfix: Per-axis max acceleration (M201)
+        accel_row = QHBoxLayout()
+        accel_row.addWidget(QLabel("max accel (mm/s²):"))
+        self.spin_axis_accel: dict[str, QDoubleSpinBox] = {}
+        default_accel = {"Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0}
+        for ax in self._LOGICAL_AXES:
+            cell = QLabel(f"{ax}:")
+            cell.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            accel_row.addWidget(cell)
+            sp_w = QDoubleSpinBox()
+            sp_w.setRange(1.0, 100000.0)
+            sp_w.setDecimals(0)
+            sp_w.setSingleStep(50.0)
+            sp_w.setValue(default_accel.get(ax, 1000.0))
+            sp_w.setMinimumWidth(s(80))
+            accel_row.addWidget(sp_w)
+            self.spin_axis_accel[ax] = sp_w
+        accel_row.addStretch()
+        outer.addLayout(accel_row)
 
         # Workflow row — axis, distance, feedrate, +/- move buttons
         wf = QHBoxLayout()
@@ -983,12 +1233,25 @@ class StageHardwarePanel(QWidget):
         btn_save_cal = QPushButton("💾 Save Calibration")
         btn_save_cal.setObjectName("successBtn")
         btn_save_cal.setToolTip(
-            "Re-send the current steps_per_mm to Marlin (M92) and "
-            "persist steps_per_mm + per_axis_max_feedrate to "
-            "settings and the active device profile.")
+            "Re-send steps_per_mm (M92), per-axis max acceleration "
+            "(M201), and per_axis_max_feedrate to Marlin / device "
+            "profile and persist to settings.")
         btn_save_cal.clicked.connect(self._apply_steps_cal)
         save_row.addWidget(btn_save_cal)
-        save_row.addStretch()
+
+        # v7.4.2 hotfix: alignment check button + result label
+        self.btn_check_alignment = QPushButton("🔍 Check alignment")
+        self.btn_check_alignment.setToolTip(
+            "Query Marlin (M503) and compare its reported steps/mm "
+            "and max feedrate against this device profile. Axes that "
+            "disagree turn red so you know which to re-save.")
+        self.btn_check_alignment.clicked.connect(self._check_marlin_alignment)
+        save_row.addWidget(self.btn_check_alignment)
+
+        self.lbl_alignment_status = QLabel("")
+        self.lbl_alignment_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        save_row.addWidget(self.lbl_alignment_status, 1)
         outer.addLayout(save_row)
 
         return grp
@@ -1160,10 +1423,38 @@ class StageHardwarePanel(QWidget):
             self.lbl_jog_status.setText(
                 "No stages connected — connect XY/ZP above first.")
 
+    # v7.4.2 hotfix: single source of truth for translating between
+    # logical axis names (Z, P1, P2, P3) and the Marlin (X, Y, Z, E)
+    # tuple that ``get_zp_position`` returns.
+    _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
+
+    def _logical_zp_value(self, zp, logical: str) -> float | None:
+        """Read the ``zp`` tuple at the index for ``logical`` axis.
+
+        ``zp`` is the tuple returned by ``StageController.get_zp_position``
+        — always physical-axis order (Marlin X, Y, Z, E). The mapping
+        from logical → physical comes from the live
+        ``controller.zp_stage.axis_map``, falling back to the module
+        default when no zp_stage exists.
+        """
+        axis_map = (self._controller.zp_stage.axis_map
+                    if self._controller and self._controller.zp_stage
+                    else _DEFAULT_AXIS_MAP)
+        physical = axis_map.get(logical)
+        idx = self._PHYSICAL_TO_INDEX.get(physical)
+        if idx is None or zp is None or idx >= len(zp):
+            return None
+        v = zp[idx]
+        return float(v) if v is not None else None
+
     def _update_position_displays(self, xy, zp) -> None:
         """v7.4.2 hotfix: update BOTH the per-axis limit-row labels
-        (lbl_axis_pos) AND the new live-position panel (lbl_jog_pos)
-        beside the jog pad."""
+        (lbl_axis_pos) AND the live-position panel (lbl_jog_pos).
+
+        Routes every ZP axis through the live ``axis_map`` so the
+        display reflects whatever physical Marlin axis is currently
+        mapped to each logical Z/P1/P2/P3.
+        """
         def _set(d, key, val):
             if val is None or not hasattr(self, d) or key not in getattr(self, d):
                 return
@@ -1178,15 +1469,13 @@ class StageHardwarePanel(QWidget):
                 _set("lbl_axis_pos", "Y", txt)
                 _set("lbl_jog_pos", "Y", txt)
         if zp:
-            if zp[0] is not None:
-                txt = f"{zp[0]:.3f}"
-                _set("lbl_axis_pos", "Z", txt)
-                _set("lbl_jog_pos", "Z", txt)
-            for i, pid in enumerate(["P1", "P2", "P3"], start=1):
-                if i < len(zp) and zp[i] is not None:
-                    txt = f"{zp[i]:.3f}"
-                    _set("lbl_axis_pos", pid, txt)
-                    _set("lbl_jog_pos", pid, txt)
+            for logical in ("Z", "P1", "P2", "P3"):
+                v = self._logical_zp_value(zp, logical)
+                if v is None:
+                    continue
+                txt = f"{v:.3f}"
+                _set("lbl_axis_pos", logical, txt)
+                _set("lbl_jog_pos", logical, txt)
 
     # v7.4.2 hotfix: _build_jog_row, _jog, and _JOG_STEPS removed.
     # Per-axis jog UI is now driven by the embedded JogButtonArray
@@ -1219,43 +1508,41 @@ class StageHardwarePanel(QWidget):
     }
 
     def _set_zero_axis(self, axis: str) -> None:
+        """v7.4.2 hotfix: zero the axis on hardware (G92 for ZP,
+        ProScan set_home for XY) via ``StageController.zero_axis``,
+        then snapshot ``zero_position`` to settings.json and force a
+        fresh display refresh — so the live readout actually shows 0
+        immediately after the click.
+        """
         ctrl = self._controller
         if ctrl is None:
             self.lbl_jog_status.setText("No controller available.")
             return
-        try:
-            xy = ctrl.get_xy_position(cached=False)
-            zp = ctrl.get_zp_position(cached=False)
-        except Exception as e:
-            self.lbl_jog_status.setText(f"Read failed: {e}")
+        result = ctrl.zero_axis(axis)
+        if not result.get("ok"):
+            err = result.get("error", "unknown")
+            self.lbl_jog_status.setText(f"Zero {axis} failed: {err}")
             return
-        raw: float | None = None
-        if axis == "X" and xy and xy[0] is not None:
-            raw = float(xy[0])
-        elif axis == "Y" and xy and xy[1] is not None:
-            raw = float(xy[1])
-        elif axis == "Z" and zp and zp[0] is not None:
-            raw = float(zp[0])
-        elif axis in ("P1", "P2", "P3"):
-            idx = {"P1": 1, "P2": 2, "P3": 3}[axis]
-            if zp and idx < len(zp) and zp[idx] is not None:
-                raw = float(zp[idx])
-        if raw is None:
-            self.lbl_jog_status.setText(
-                f"Cannot zero {axis}: no fresh position available "
-                f"(is the stage connected?).")
-            return
-        key = self._ZERO_KEY[axis]
-        ctrl.zero_position[key] = raw
         if self._settings is not None:
             self._settings.set_section("zero_position", ctrl.zero_position)
             self._settings.save()
-        self._update_position_displays(xy, zp)
+        try:
+            xy = ctrl.get_xy_position(cached=False)
+            zp = ctrl.get_zp_position(cached=False)
+            self._update_position_displays(xy, zp)
+        except Exception as e:
+            logger.warning(f"post-zero refresh failed: {e}")
+        previous = result.get("previous_raw")
         unit = "µm" if axis in ("X", "Y") else "mm"
-        self.lbl_jog_status.setText(
-            f"Zeroed {axis} at raw {raw:.3f} {unit}. New zero saved "
-            f"to settings.json (zero_position.{key}).")
-        logger.info(f"Set {axis} zero: raw={raw:.3f} {unit}")
+        if previous is not None:
+            self.lbl_jog_status.setText(
+                f"Zeroed {axis} on hardware (was {previous:.3f} {unit}). "
+                f"Marlin/ProScan position counter reset to 0 and "
+                f"zero_position saved to settings.")
+        else:
+            self.lbl_jog_status.setText(
+                f"Zeroed {axis} on hardware. zero_position saved.")
+        logger.info(f"Set {axis} zero on hardware (was {previous})")
 
     def _record_limit(self, axis: str, which: str) -> None:
         """Copy current position into the matching safety spinbox.
@@ -1287,15 +1574,19 @@ class StageHardwarePanel(QWidget):
             target_spin = self.spin_xy_min_y if which == "min" else self.spin_xy_max_y
             recorded_val = float(xy[1] - zero.get("y", 0))
             target_spin.setValue(recorded_val)
-        elif axis == "Z" and zp and zp[0] is not None:
-            target_spin = self.spin_z_min if which == "min" else self.spin_z_max
-            recorded_val = float(zp[0] - zero.get("Z", 0))
-            target_spin.setValue(recorded_val)
+        elif axis == "Z":
+            # v7.4.2 hotfix: route via the live axis_map so Z reads
+            # from whatever physical Marlin axis is configured.
+            v = self._logical_zp_value(zp, "Z")
+            if v is not None:
+                target_spin = self.spin_z_min if which == "min" else self.spin_z_max
+                recorded_val = float(v - zero.get("Z", 0))
+                target_spin.setValue(recorded_val)
         elif axis in ("P1", "P2", "P3"):
-            idx = {"P1": 1, "P2": 2, "P3": 3}[axis]
-            if zp and idx < len(zp) and zp[idx] is not None:
+            v = self._logical_zp_value(zp, axis)
+            if v is not None:
                 target_dict = self.spin_p_mins if which == "min" else self.spin_p_maxs
-                recorded_val = float(zp[idx] - zero.get(axis, 0))
+                recorded_val = float(v - zero.get(axis, 0))
                 target_dict[axis].setValue(recorded_val)
         # Update visible position labels with the fresh read
         self._update_position_displays(xy, zp)
@@ -1405,6 +1696,21 @@ class StageHardwarePanel(QWidget):
         if hasattr(self, 'spin_cal_feedrate') and hasattr(self, 'cmb_cal_axis'):
             self._on_cal_axis_changed(0)
 
+        # v7.4.2 hotfix: ZP per-axis acceleration + XY motion cal
+        if hasattr(self, 'spin_axis_accel'):
+            saved_accel = s.get("device_profile.per_axis_max_accel") or {}
+            defaults = {"Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0}
+            for ax, sp_w in self.spin_axis_accel.items():
+                v = saved_accel.get(ax, defaults.get(ax, 1000.0))
+                sp_w.setValue(float(v))
+        if hasattr(self, 'spin_xy_velocity'):
+            self.spin_xy_velocity.setValue(
+                float(s.get("device_profile.xy_velocity_pct") or 100))
+            self.spin_xy_acceleration.setValue(
+                float(s.get("device_profile.xy_acceleration") or 50))
+            saved_jerk = s.get("device_profile.xy_jerk")
+            self.spin_xy_jerk.setValue(float(saved_jerk) if saved_jerk else 0)
+
     # ════════════════════════════════════════════════════════════════
     #  v7.4.2 hotfix: per-section focused apply methods
     # ════════════════════════════════════════════════════════════════
@@ -1434,7 +1740,7 @@ class StageHardwarePanel(QWidget):
         logger.info(f"Axis mapping saved: {new_map}")
 
     def _apply_steps_cal(self) -> None:
-        """Save the stepper-calibration section: re-send M92 + persist."""
+        """Save the ZP calibration section: M92 + M201 + persist."""
         if self._settings is None:
             return
         if self._controller is not None and self._controller.zp_stage is not None:
@@ -1442,14 +1748,120 @@ class StageHardwarePanel(QWidget):
             self._settings.set("device_profile.steps_per_mm", steps)
             # Re-send M92 so Marlin matches our stored steps/mm
             self._controller.zp_stage.set_steps_per_mm(steps, persist=True)
+            # v7.4.2 hotfix: also send per-axis acceleration via M201
+            if hasattr(self, 'spin_axis_accel'):
+                accels = {ax: sp_w.value()
+                          for ax, sp_w in self.spin_axis_accel.items()}
+                self._settings.set("device_profile.per_axis_max_accel", accels)
+                try:
+                    self._controller.zp_stage.set_axis_accelerations(
+                        accels, persist=True)
+                except Exception as e:
+                    logger.warning(f"M201 send failed: {e}")
+        else:
+            # Persist UI values even if controller isn't connected yet
+            if hasattr(self, 'spin_axis_accel'):
+                accels = {ax: sp_w.value()
+                          for ax, sp_w in self.spin_axis_accel.items()}
+                self._settings.set("device_profile.per_axis_max_accel", accels)
         self._settings.save()
         self._refresh_steps_grid()
         self._refresh_max_feedrate_grid()
+        # v7.4.2 hotfix: re-check alignment after a save
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
         if hasattr(self, 'lbl_cal_status'):
             self.lbl_cal_status.setText(
-                "Calibration saved: steps_per_mm + per_axis_max_feedrate "
-                "persisted; M92 sent to Marlin.")
-        logger.info("Stepper calibration saved")
+                "ZP calibration saved: steps_per_mm, per_axis_max_feedrate, "
+                "and per_axis_max_accel persisted; M92 + M201 sent to Marlin.")
+        logger.info("ZP calibration saved (steps + accel)")
+
+    def _check_marlin_alignment(self, quiet: bool = False) -> None:
+        """v7.4.2 hotfix: query Marlin via M503 and compare its reported
+        steps_per_mm + max_feedrate to this device's settings.
+
+        Cells in the steps_per_mm + max_feedrate display grids turn
+        red when Marlin's value differs from the software value by
+        more than a small epsilon (1e-3). Tooltip on each mismatched
+        cell shows the diff.
+        """
+        if (self._controller is None or self._controller.zp_stage is None
+                or self._controller.simulate_zp):
+            if not quiet and hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "Connect ZP (real hardware) to run alignment check.")
+            return
+        try:
+            reported = self._controller.zp_stage.query_settings()
+        except Exception as e:
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(f"M503 query failed: {e}")
+            return
+        sw_steps = (self._controller.zp_stage.steps_per_mm
+                    if self._controller.zp_stage else {})
+        sw_max_feed = (self._settings.get("device_profile.per_axis_max_feedrate")
+                       if self._settings else {}) or {}
+        axis_map = self._controller.zp_stage.axis_map
+        mismatches: list[str] = []
+        # Compare steps/mm per logical axis
+        for logical, physical in axis_map.items():
+            cell = self.lbl_steps_grid.get(logical) \
+                if hasattr(self, 'lbl_steps_grid') else None
+            if cell is None:
+                continue
+            sw_v = sw_steps.get(logical)
+            hw_v = reported.get("steps_per_mm", {}).get(physical)
+            if hw_v is None or sw_v is None:
+                cell.setStyleSheet(self._cell_style_ok)
+                cell.setToolTip(
+                    f"Could not read Marlin {physical} steps/mm — alignment unknown.")
+                continue
+            if abs(float(sw_v) - float(hw_v)) > 1e-3:
+                cell.setStyleSheet(self._cell_style_mismatch)
+                cell.setToolTip(
+                    f"Mismatch: Marlin {physical}={hw_v:.2f}, "
+                    f"software {logical}={sw_v:.2f}. Click "
+                    f"Save Calibration to push software → Marlin, "
+                    f"or edit the software side.")
+                mismatches.append(f"{logical} steps/mm")
+            else:
+                cell.setStyleSheet(self._cell_style_ok)
+                cell.setToolTip("Aligned with Marlin.")
+        # Compare max feedrate per logical axis
+        for logical, physical in axis_map.items():
+            cell = self.lbl_feedrate_grid.get(logical) \
+                if hasattr(self, 'lbl_feedrate_grid') else None
+            if cell is None:
+                continue
+            sw_v = sw_max_feed.get(logical)
+            hw_v = reported.get("max_feedrate", {}).get(physical)
+            if hw_v is None or sw_v is None:
+                cell.setStyleSheet(self._cell_style_ok)
+                cell.setToolTip(
+                    f"Could not read Marlin {physical} max feedrate — alignment unknown.")
+                continue
+            if abs(float(sw_v) - float(hw_v)) > 1.0:  # 1 mm/min tolerance
+                cell.setStyleSheet(self._cell_style_mismatch)
+                cell.setToolTip(
+                    f"Mismatch: Marlin {physical} max feedrate={hw_v:.0f}, "
+                    f"software {logical}={sw_v:.0f}. Click Save Calibration "
+                    f"to push software → Marlin.")
+                mismatches.append(f"{logical} max feedrate")
+            else:
+                cell.setStyleSheet(self._cell_style_ok)
+                cell.setToolTip("Aligned with Marlin.")
+        if hasattr(self, 'lbl_alignment_status'):
+            if mismatches:
+                self.lbl_alignment_status.setText(
+                    f"⚠ Out of sync: {', '.join(mismatches)}. See red cells.")
+                self.lbl_alignment_status.setStyleSheet(
+                    f"color: {COLORS['red']}; font-size: {sf(9)}pt;")
+            else:
+                self.lbl_alignment_status.setText("✓ Marlin matches software.")
+                self.lbl_alignment_status.setStyleSheet(
+                    f"color: {COLORS['green']}; font-size: {sf(9)}pt;")
 
     def _apply_safety_and_zero(self) -> None:
         """Save safety_limits + zero positions: settings + controller.

@@ -197,6 +197,22 @@ DEFAULTS: dict[str, Any] = {
             "P2": 200,
             "P3": 200,
         },
+        # v7.4.2 hotfix: per-axis max acceleration (mm/s²) — sent to
+        # Marlin via M201 on Save Calibration.
+        "per_axis_max_accel": {
+            "Z": 100.0,
+            "P1": 1000.0,
+            "P2": 1000.0,
+            "P3": 1000.0,
+        },
+        # v7.4.2 hotfix: XY stage motion calibration (ProScan).
+        # Velocity is percent-of-max (1–100, ProScan SMS command);
+        # acceleration is 1–100 (SAS command); jerk is optional
+        # (SCS command, only emitted if the controller protocol
+        # declares it).
+        "xy_velocity_pct": 100,
+        "xy_acceleration": 50,
+        "xy_jerk": None,
     },
 }
 

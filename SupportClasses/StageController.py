@@ -1372,6 +1372,70 @@ class StageController:
                 metadata={"pump": pump, "new_zero": pos[idx]},
             )
 
+    def zero_axis(self, axis: str) -> dict:
+        """v7.4.2 hotfix: zero the specified logical axis on hardware.
+
+        - For ``"X"`` / ``"Y"``: invoke ProScan ``set_home``, which
+          zeros the controller's internal position counter for that
+          axis (the protocol's ``Z`` command). Updates
+          ``self.zero_position["x"]`` / ``["y"]`` to 0.
+        - For ``"Z"`` / ``"P1"`` / ``"P2"`` / ``"P3"``: send Marlin
+          ``G92 <physical>0`` (the physical axis comes from
+          ``zp_stage.axis_map``). Marlin now reports the current
+          physical position as 0. Updates ``self.zero_position[axis]``
+          to 0.
+
+        Returns a dict like ``{"ok": True, "axis": "Z", "previous_raw": 3.45}``
+        so the caller can show the user what was zeroed. ``previous_raw``
+        is whatever the controller reported just before the zero.
+        """
+        previous_raw: float | None = None
+        if axis in ("X", "Y"):
+            if self.xy_stage is None:
+                return {"ok": False, "axis": axis, "error": "XY stage not connected"}
+            try:
+                pos = self.xy_stage.get_current_position()
+                previous_raw = float(pos[0]) if axis == "X" and pos[0] is not None \
+                    else (float(pos[1]) if axis == "Y" and pos[1] is not None else None)
+                # ProScan set_home is whole-stage (XY); we still call it
+                # because there's no per-axis equivalent for ProScan II.
+                if hasattr(self.xy_stage, "set_home"):
+                    self.xy_stage.set_home()
+                key = axis.lower()
+                self.zero_position[key] = 0.0
+                # ProScan's set_home zeros BOTH X and Y; keep the dict consistent.
+                self.zero_position["x"] = 0.0
+                self.zero_position["y"] = 0.0
+                logger.info(f"XY hardware zeroed (axis {axis} requested); previous raw {axis} = {previous_raw}")
+            except Exception as e:
+                logger.warning(f"XY zero failed: {e}")
+                return {"ok": False, "axis": axis, "error": str(e)}
+            return {"ok": True, "axis": axis, "previous_raw": previous_raw}
+
+        if axis in ("Z", "P1", "P2", "P3"):
+            if self.zp_stage is None:
+                return {"ok": False, "axis": axis, "error": "ZP stage not connected"}
+            try:
+                pos = self.zp_stage.get_current_position()
+                # Marlin axis index lookup via axis_map → physical letter → index
+                idx_lookup = {"X": 0, "Y": 1, "Z": 2, "E": 3}
+                physical = self.zp_stage.axis_map.get(axis)
+                idx = idx_lookup.get(physical) if physical else None
+                if idx is not None and idx < len(pos) and pos[idx] is not None:
+                    previous_raw = float(pos[idx])
+                ok = self.zp_stage.set_zero(axis)
+                if not ok:
+                    return {"ok": False, "axis": axis,
+                            "error": f"axis_map has no entry for {axis}"}
+                self.zero_position[axis] = 0.0
+                logger.info(f"ZP {axis} zeroed via G92; previous raw = {previous_raw}")
+            except Exception as e:
+                logger.warning(f"ZP zero failed: {e}")
+                return {"ok": False, "axis": axis, "error": str(e)}
+            return {"ok": True, "axis": axis, "previous_raw": previous_raw}
+
+        return {"ok": False, "axis": axis, "error": f"unknown axis: {axis}"}
+
     def reset_z_zero(self) -> None:
         """
         v7.2.6: Reset zero reference for Z axis only.
