@@ -55,6 +55,10 @@ class DeviceProfile:
     # physical Marlin axes (X, Y, Z, E), plus per-axis stepper calibration.
     axis_map: dict = field(default_factory=dict)
     steps_per_mm: dict = field(default_factory=dict)
+    # v7.4.2: per-axis max feedrate discovered via Stepper Calibration
+    # feedrate experimentation. Reference value only — global safety
+    # clamping still uses safety_limits.max_z_feedrate / max_pump_feedrate.
+    per_axis_max_feedrate: dict = field(default_factory=dict)
 
     # ── JSON I/O ─────────────────────────────────────────────────
 
@@ -73,6 +77,7 @@ class DeviceProfile:
             "axis_flip": self.axis_flip,
             "axis_map": self.axis_map,
             "steps_per_mm": self.steps_per_mm,
+            "per_axis_max_feedrate": self.per_axis_max_feedrate,
         }
 
     @classmethod
@@ -85,6 +90,7 @@ class DeviceProfile:
             axis_flip=data.get("axis_flip", {}) or {},
             axis_map=data.get("axis_map", {}) or {},
             steps_per_mm=data.get("steps_per_mm", {}) or {},
+            per_axis_max_feedrate=data.get("per_axis_max_feedrate", {}) or {},
         )
 
     def save(self, path: Path | None = None) -> Path:
@@ -118,6 +124,8 @@ class DeviceProfile:
             axis_flip=settings.get_section("axis_flip") or {},
             axis_map=settings.get("device_profile.axis_map") or {},
             steps_per_mm=settings.get("device_profile.steps_per_mm") or {},
+            per_axis_max_feedrate=settings.get(
+                "device_profile.per_axis_max_feedrate") or {},
         )
 
     def apply_to_settings(self, settings) -> None:
@@ -139,6 +147,9 @@ class DeviceProfile:
             settings.set("device_profile.axis_map", self.axis_map)
         if self.steps_per_mm:
             settings.set("device_profile.steps_per_mm", self.steps_per_mm)
+        if self.per_axis_max_feedrate:
+            settings.set("device_profile.per_axis_max_feedrate",
+                         self.per_axis_max_feedrate)
 
 
 # ── Module-level helpers ─────────────────────────────────────────

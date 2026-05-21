@@ -479,16 +479,20 @@ class StageHardwarePanel(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _build_steps_cal_group(self) -> QGroupBox:
-        grp = QGroupBox("Stepper Calibration (steps per mm)")
+        grp = QGroupBox("Stepper Calibration && Feedrate Test")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         outer = QVBoxLayout(grp)
 
         info = QLabel(
-            "<b>How to calibrate:</b> Pick an axis. Click <i>Command Move</i> "
-            "to send a known-distance move. Measure the actual physical "
-            "movement and enter it. Click <i>Calculate & Send M92</i> — "
-            "the new steps/mm is sent to Marlin and saved to this device "
-            "profile. Negative values invert direction."
+            "<b>How to calibrate:</b> Pick an axis. Use <i>Move +</i> or "
+            "<i>Move −</i> to send a known-distance move at the chosen "
+            "feedrate. Measure the actual physical movement and enter it. "
+            "Click <i>Calculate & Send M92</i> — the new steps/mm is sent "
+            "to Marlin and saved to this device profile. "
+            "Negative steps/mm invert the axis direction permanently.<br>"
+            "<b>To find the max feedrate:</b> raise the feedrate, send "
+            "test moves, and watch for missed steps or motor stall. When "
+            "you find a safe ceiling, click <i>Record as Max</i>."
         )
         info.setWordWrap(True)
         info.setStyleSheet(
@@ -496,8 +500,9 @@ class StageHardwarePanel(QWidget):
         outer.addWidget(info)
 
         # Current per-axis steps/mm grid (read-only display)
-        self.lbl_steps_grid: dict[str, QLabel] = {}
         steps_row = QHBoxLayout()
+        steps_row.addWidget(QLabel("steps/mm:"))
+        self.lbl_steps_grid: dict[str, QLabel] = {}
         for ax in self._LOGICAL_AXES:
             cell = QLabel(f"{ax}: —")
             cell.setStyleSheet(
@@ -510,15 +515,33 @@ class StageHardwarePanel(QWidget):
         steps_row.addStretch()
         outer.addLayout(steps_row)
 
-        # Workflow row
+        # v7.4.2: Per-axis max feedrate grid (read-only display)
+        feed_row = QHBoxLayout()
+        feed_row.addWidget(QLabel("max F (mm/min):"))
+        self.lbl_feedrate_grid: dict[str, QLabel] = {}
+        for ax in self._LOGICAL_AXES:
+            cell = QLabel(f"{ax}: —")
+            cell.setStyleSheet(
+                f"color: {COLORS['text']}; font-family: monospace; "
+                f"padding: {sp(2)} {sp(8)}; "
+                f"border: 1px solid {COLORS['surface1']}; "
+                f"border-radius: {sp(4)};")
+            feed_row.addWidget(cell)
+            self.lbl_feedrate_grid[ax] = cell
+        feed_row.addStretch()
+        outer.addLayout(feed_row)
+
+        # Workflow row — axis, distance, feedrate, +/- move buttons
         wf = QHBoxLayout()
         wf.addWidget(QLabel("Axis:"))
         self.cmb_cal_axis = QComboBox()
         for ax in self._LOGICAL_AXES:
             self.cmb_cal_axis.addItem(ax, ax)
+        self.cmb_cal_axis.currentIndexChanged.connect(
+            self._on_cal_axis_changed)
         wf.addWidget(self.cmb_cal_axis)
 
-        wf.addWidget(QLabel("Commanded:"))
+        wf.addWidget(QLabel("Distance:"))
         self.spin_cal_commanded = QDoubleSpinBox()
         self.spin_cal_commanded.setRange(0.001, 100.0)
         self.spin_cal_commanded.setDecimals(3)
@@ -526,25 +549,64 @@ class StageHardwarePanel(QWidget):
         self.spin_cal_commanded.setSuffix(" mm")
         wf.addWidget(self.spin_cal_commanded)
 
-        self.btn_cal_move = QPushButton("Command Move")
-        self.btn_cal_move.clicked.connect(self._cal_command_move)
-        wf.addWidget(self.btn_cal_move)
+        wf.addWidget(QLabel("Feedrate:"))
+        self.spin_cal_feedrate = QDoubleSpinBox()
+        self.spin_cal_feedrate.setRange(1.0, 100000.0)
+        self.spin_cal_feedrate.setDecimals(0)
+        self.spin_cal_feedrate.setSingleStep(50.0)
+        self.spin_cal_feedrate.setValue(600.0)
+        self.spin_cal_feedrate.setSuffix(" mm/min")
+        wf.addWidget(self.spin_cal_feedrate)
 
-        wf.addWidget(QLabel("Measured:"))
+        # +/- move buttons — flip direction without changing distance
+        self.btn_cal_move_fwd = QPushButton("Move +")
+        self.btn_cal_move_fwd.setToolTip("Send the distance in the positive direction")
+        self.btn_cal_move_fwd.clicked.connect(
+            lambda: self._cal_command_move(direction=1))
+        wf.addWidget(self.btn_cal_move_fwd)
+
+        self.btn_cal_move_rev = QPushButton("Move −")
+        self.btn_cal_move_rev.setToolTip("Send the distance in the negative direction")
+        self.btn_cal_move_rev.clicked.connect(
+            lambda: self._cal_command_move(direction=-1))
+        wf.addWidget(self.btn_cal_move_rev)
+
+        wf.addStretch()
+        outer.addLayout(wf)
+
+        # Measure + apply + record-as-max row
+        mr = QHBoxLayout()
+        mr.addWidget(QLabel("Measured:"))
         self.spin_cal_measured = QDoubleSpinBox()
         self.spin_cal_measured.setRange(0.001, 100.0)
         self.spin_cal_measured.setDecimals(3)
         self.spin_cal_measured.setValue(1.0)
         self.spin_cal_measured.setSuffix(" mm")
-        wf.addWidget(self.spin_cal_measured)
+        mr.addWidget(self.spin_cal_measured)
 
         self.btn_cal_apply = QPushButton("Calculate && Send M92")
         self.btn_cal_apply.setObjectName("accentBtn")
         self.btn_cal_apply.clicked.connect(self._cal_apply)
-        wf.addWidget(self.btn_cal_apply)
+        mr.addWidget(self.btn_cal_apply)
 
-        wf.addStretch()
-        outer.addLayout(wf)
+        self.btn_cal_flip_axis = QPushButton("Invert Axis Direction")
+        self.btn_cal_flip_axis.setToolTip(
+            "Negate the saved steps/mm for the selected axis — flips "
+            "which way 'positive' moves on Marlin without changing "
+            "step count magnitude.")
+        self.btn_cal_flip_axis.clicked.connect(self._cal_flip_axis)
+        mr.addWidget(self.btn_cal_flip_axis)
+
+        self.btn_cal_record_max = QPushButton("Record as Max")
+        self.btn_cal_record_max.setToolTip(
+            "Save the current feedrate as the experimentally-discovered "
+            "max for the selected axis. Stored in the device profile "
+            "as device_profile.per_axis_max_feedrate.")
+        self.btn_cal_record_max.clicked.connect(self._cal_record_max_feedrate)
+        mr.addWidget(self.btn_cal_record_max)
+
+        mr.addStretch()
+        outer.addLayout(mr)
 
         self.lbl_cal_status = QLabel("")
         self.lbl_cal_status.setStyleSheet(
@@ -554,21 +616,48 @@ class StageHardwarePanel(QWidget):
 
         return grp
 
-    def _cal_command_move(self):
-        """Send a known-distance relative move on the selected logical axis."""
+    def _on_cal_axis_changed(self, _idx: int) -> None:
+        """When the cal axis changes, populate the feedrate spin with
+        the recorded max for that axis (if any)."""
+        if self._settings is None or not hasattr(self, 'spin_cal_feedrate'):
+            return
+        axis = self.cmb_cal_axis.currentData()
+        per_axis = self._settings.get("device_profile.per_axis_max_feedrate") or {}
+        recorded = per_axis.get(axis)
+        if recorded is not None:
+            self.spin_cal_feedrate.blockSignals(True)
+            self.spin_cal_feedrate.setValue(float(recorded))
+            self.spin_cal_feedrate.blockSignals(False)
+
+    def _cal_command_move(self, direction: int = 1):
+        """Send a known-distance relative move on the selected logical axis.
+
+        v7.4.2: direction (+1 / -1) flips the sign; feedrate is taken from
+        the spin box so users can experiment with finding the max feedrate
+        for each axis. The move uses ``bypass_safety=True`` because the
+        calibration workflow is initial setup — soft limits would defeat
+        the point of trying to find the mechanical / motor envelope.
+        """
         if self._controller is None or not self._controller.is_zp_connected:
             self.lbl_cal_status.setText("ZP stage not connected.")
             return
         axis = self.cmb_cal_axis.currentData()
-        distance = self.spin_cal_commanded.value()
+        magnitude = self.spin_cal_commanded.value()
+        feedrate = self.spin_cal_feedrate.value()
+        distance = magnitude * (1 if direction >= 0 else -1)
         try:
             if axis == "Z":
-                self._controller.move_z_relative(distance)
+                self._controller.move_z_relative(
+                    distance, feedrate=feedrate, bypass_safety=True)
             else:
-                self._controller.move_pump_relative(axis, distance)
+                self._controller.move_pump_relative(
+                    axis, distance, feedrate=feedrate, bypass_safety=True)
+            dir_label = "forward" if direction >= 0 else "reverse"
             self.lbl_cal_status.setText(
-                f"Sent {distance} mm move on {axis}. Measure actual "
-                f"physical movement, then enter it on the right.")
+                f"Sent {dir_label} {magnitude} mm move on {axis} at "
+                f"{feedrate:.0f} mm/min. Measure the actual physical "
+                f"movement, then enter it on the right. If the motor "
+                f"stalled or skipped steps, lower the feedrate and try again.")
         except Exception as e:
             self.lbl_cal_status.setText(f"Move failed: {e}")
 
@@ -599,6 +688,58 @@ class StageHardwarePanel(QWidget):
         self.lbl_cal_status.setText(
             f"{axis}: {current} → {new_value} steps/mm "
             f"(commanded {commanded} / measured {measured}). M92 sent.")
+
+    def _cal_flip_axis(self):
+        """v7.4.2: Negate the saved steps/mm for the selected axis.
+
+        Inverts the physical direction of the axis without changing
+        the magnitude. Updates Marlin via M92 and saves to the device
+        profile.
+        """
+        if self._controller is None or self._controller.zp_stage is None:
+            self.lbl_cal_status.setText("ZP stage not connected.")
+            return
+        axis = self.cmb_cal_axis.currentData()
+        current = self._controller.zp_stage.steps_per_mm.get(axis, 5069)
+        new_steps = dict(self._controller.zp_stage.steps_per_mm)
+        new_steps[axis] = -current
+        self._controller.zp_stage.set_steps_per_mm(new_steps, persist=True)
+        if self._settings is not None:
+            self._settings.set("device_profile.steps_per_mm", new_steps)
+            self._settings.save()
+        self._refresh_steps_grid()
+        self.lbl_cal_status.setText(
+            f"{axis} direction inverted: {current} → {-current} steps/mm. "
+            f"M92 sent.")
+
+    def _cal_record_max_feedrate(self):
+        """v7.4.2: Save current feedrate as the experimentally-found
+        max for the selected axis. Stored in device_profile.per_axis_max_feedrate."""
+        if self._settings is None:
+            self.lbl_cal_status.setText("Settings not available.")
+            return
+        axis = self.cmb_cal_axis.currentData()
+        feedrate = self.spin_cal_feedrate.value()
+        per_axis = dict(
+            self._settings.get("device_profile.per_axis_max_feedrate") or {})
+        per_axis[axis] = feedrate
+        self._settings.set("device_profile.per_axis_max_feedrate", per_axis)
+        self._settings.save()
+        self._refresh_max_feedrate_grid()
+        self.lbl_cal_status.setText(
+            f"Recorded {axis} max feedrate: {feedrate:.0f} mm/min. "
+            f"You can copy this into the global Safety Limits "
+            f"max_z_feedrate / max_pump_feedrate when you're confident.")
+
+    def _refresh_max_feedrate_grid(self):
+        """Refresh the per-axis max feedrate display row."""
+        if not hasattr(self, 'lbl_feedrate_grid'):
+            return
+        per_axis = (self._settings.get("device_profile.per_axis_max_feedrate")
+                    if self._settings else {}) or {}
+        for ax, lbl in self.lbl_feedrate_grid.items():
+            val = per_axis.get(ax, "—")
+            lbl.setText(f"{ax}: {val}")
 
     def _refresh_steps_grid(self):
         if self._controller and self._controller.zp_stage:
@@ -860,6 +1001,13 @@ class StageHardwarePanel(QWidget):
         # v7.4.2: Steps per mm grid display
         if hasattr(self, 'lbl_steps_grid'):
             self._refresh_steps_grid()
+
+        # v7.4.2: Max-feedrate-per-axis grid + seed the feedrate spin
+        # from the recorded value for the currently-selected cal axis
+        if hasattr(self, 'lbl_feedrate_grid'):
+            self._refresh_max_feedrate_grid()
+        if hasattr(self, 'spin_cal_feedrate') and hasattr(self, 'cmb_cal_axis'):
+            self._on_cal_axis_changed(0)
 
     def _apply(self):
         """v7.4.1: Write current widget values to Settings using canonical

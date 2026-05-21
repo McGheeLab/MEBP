@@ -187,6 +187,16 @@ DEFAULTS: dict[str, Any] = {
             "P2": -5069,   # negative = inverted direction (legacy default)
             "P3": 5069,
         },
+        # v7.4.2: per-axis max feedrate (mm/min) discovered via the
+        # Stepper Calibration feedrate-test workflow. Recorded here
+        # for reference; the user later copies values into the global
+        # safety_limits.max_z_feedrate / max_pump_feedrate as desired.
+        "per_axis_max_feedrate": {
+            "Z": 500,
+            "P1": 200,
+            "P2": 200,
+            "P3": 200,
+        },
     },
 }
 

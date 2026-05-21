@@ -1,13 +1,12 @@
 {
   "_format_version": "v7.4.2",
-  "_description": "Device profile — physical-machine settings (safety envelope, motor feedrates, axis direction, axis mapping, stepper calibration). Edit on Hardware Setup → Device. Reusable across any experiment-level HardwareConfig.",
+  "_description": "Device profile \u2014 physical-machine settings (safety envelope, motor feedrates, axis direction, axis mapping, stepper calibration). Edit on Hardware Setup \u2192 Device.",
   "profile_name": "Conservative",
-  "notes": "Tighter safety envelope and slower feedrates. Recommended for new lab members, brittle samples, or unfamiliar geometries.",
+  "notes": "",
   "safety_limits": {
-    "enabled": true,
     "xy_min_x": -100000.0,
-    "xy_max_x": 100000.0,
     "xy_min_y": -70000.0,
+    "xy_max_x": 100000.0,
     "xy_max_y": 70000.0,
     "z_min": -5.0,
     "z_max": 30.0,
@@ -19,7 +18,8 @@
     "p3_max": 30.0,
     "max_xy_speed": 5000.0,
     "max_z_feedrate": 200.0,
-    "max_pump_feedrate": 100.0
+    "max_pump_feedrate": 100.0,
+    "enabled": true
   },
   "zp_stage": {
     "max_feedrate": 1500.0,
@@ -35,15 +35,21 @@
     "p3": false
   },
   "axis_map": {
-    "Z": "X",
-    "P1": "Y",
-    "P2": "Z",
+    "Z": "Z",
+    "P1": "X",
+    "P2": "Y",
     "P3": "E"
   },
   "steps_per_mm": {
-    "Z": 5069,
-    "P1": 5069,
-    "P2": -5069,
+    "Z": 5280,
+    "P1": 10138,
+    "P2": -563,
     "P3": 5069
+  },
+  "per_axis_max_feedrate": {
+    "Z": 200,
+    "P1": 100,
+    "P2": 100,
+    "P3": 100
   }
 }
