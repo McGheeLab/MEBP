@@ -40,6 +40,31 @@ from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 logger = logging.getLogger(__name__)
 
 
+class _ClickableLabel(QLabel):
+    """v7.4.2 hotfix: QLabel that emits ``clicked`` on left-mouse release.
+
+    Used for the read-only display cells in ZP Stage Calibration
+    (steps/mm and max feedrate grids) so the user can click any cell
+    to open an edit popup instead of having to run the full
+    Move + Measured + Calculate workflow.
+
+    Hover gets a brighter border + pointer cursor so users discover
+    the cells are interactive without needing a separate help string.
+    """
+
+    clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to edit")
+
+    def mouseReleaseEvent(self, ev):  # noqa: N802 — Qt naming
+        if ev.button() == Qt.LeftButton and self.rect().contains(ev.pos()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(ev)
+
+
 class StageHardwarePanel(QWidget):
     """v7.4.0-b: Stage hardware configuration sub-page.
 
@@ -1097,25 +1122,33 @@ class StageHardwarePanel(QWidget):
             f"background-color: rgba(243, 139, 168, 28);"
         )
 
-        # Current per-axis steps/mm grid (read-only display)
+        # v7.4.2 hotfix: per-axis steps/mm cells are clickable —
+        # click to open an edit popup (in addition to the existing
+        # Calculate & Send M92 workflow below).
         steps_row = QHBoxLayout()
         steps_row.addWidget(QLabel("steps/mm:"))
-        self.lbl_steps_grid: dict[str, QLabel] = {}
+        self.lbl_steps_grid: dict[str, _ClickableLabel] = {}
         for ax in self._LOGICAL_AXES:
-            cell = QLabel(f"{ax}: —")
+            cell = _ClickableLabel(f"{ax}: —")
             cell.setStyleSheet(self._cell_style_ok)
+            cell.setToolTip(f"Click to edit {ax} steps/mm directly")
+            cell.clicked.connect(
+                lambda a=ax: self._edit_steps_per_mm_popup(a))
             steps_row.addWidget(cell)
             self.lbl_steps_grid[ax] = cell
         steps_row.addStretch()
         outer.addLayout(steps_row)
 
-        # v7.4.2: Per-axis max feedrate grid (read-only display)
+        # v7.4.2: Per-axis max feedrate grid — also clickable.
         feed_row = QHBoxLayout()
         feed_row.addWidget(QLabel("max F (mm/min):"))
-        self.lbl_feedrate_grid: dict[str, QLabel] = {}
+        self.lbl_feedrate_grid: dict[str, _ClickableLabel] = {}
         for ax in self._LOGICAL_AXES:
-            cell = QLabel(f"{ax}: —")
+            cell = _ClickableLabel(f"{ax}: —")
             cell.setStyleSheet(self._cell_style_ok)
+            cell.setToolTip(f"Click to edit {ax} max feedrate directly")
+            cell.clicked.connect(
+                lambda a=ax: self._edit_max_feedrate_popup(a))
             feed_row.addWidget(cell)
             self.lbl_feedrate_grid[ax] = cell
         feed_row.addStretch()
@@ -1370,6 +1403,81 @@ class StageHardwarePanel(QWidget):
             f"Recorded {axis} max feedrate: {feedrate:.0f} mm/min. "
             f"You can copy this into the global Safety Limits "
             f"max_z_feedrate / max_pump_feedrate when you're confident.")
+
+    def _edit_steps_per_mm_popup(self, axis: str) -> None:
+        """v7.4.2 hotfix: click-to-edit popup for a steps/mm cell.
+
+        Pops a QInputDialog with the current value; on accept,
+        updates the controller's per-axis dict, sends M92 immediately,
+        persists to settings, and refreshes the display grid.
+        """
+        if self._controller is None or self._controller.zp_stage is None:
+            QMessageBox.information(
+                self, "Edit steps/mm",
+                "ZP stage not connected. Connect first, then edit.")
+            return
+        current = float(self._controller.zp_stage.steps_per_mm.get(axis, 5069))
+        new_val, ok = QInputDialog.getDouble(
+            self,
+            f"Edit steps/mm — {axis}",
+            f"Enter steps/mm for {axis} (negative inverts direction):",
+            value=current, minValue=-1e6, maxValue=1e6, decimals=2,
+        )
+        if not ok:
+            return
+        new_steps = dict(self._controller.zp_stage.steps_per_mm)
+        new_steps[axis] = float(new_val)
+        self._controller.zp_stage.set_steps_per_mm(new_steps, persist=True)
+        if self._settings is not None:
+            self._settings.set("device_profile.steps_per_mm", new_steps)
+            self._settings.save()
+        self._refresh_steps_grid()
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                f"{axis} steps/mm: {current:.2f} → {new_val:.2f}. "
+                f"M92 sent and persisted.")
+        # Re-check alignment after a direct edit
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
+
+    def _edit_max_feedrate_popup(self, axis: str) -> None:
+        """v7.4.2 hotfix: click-to-edit popup for a max feedrate cell.
+
+        Updates ``device_profile.per_axis_max_feedrate`` and refreshes
+        the display. Does NOT send M203 automatically — the canonical
+        path is to adjust the percentage in ZP Feedrates and click
+        Save Feedrates, since M203 takes a single value per Marlin
+        physical axis (not per logical axis). This popup edits the
+        reference ceiling that the percentage spinboxes derive from.
+        """
+        per_axis = ((self._settings.get("device_profile.per_axis_max_feedrate")
+                     if self._settings else {}) or {}).copy()
+        current = float(per_axis.get(axis, 500))
+        new_val, ok = QInputDialog.getDouble(
+            self,
+            f"Edit max feedrate — {axis}",
+            f"Enter max feedrate (mm/min) for {axis}:\n"
+            f"This is the experimentally-discovered ceiling; ZP "
+            f"Feedrates derives absolute mm/min as a % of this.",
+            value=current, minValue=1.0, maxValue=100000.0, decimals=0,
+        )
+        if not ok:
+            return
+        per_axis[axis] = float(new_val)
+        if self._settings is not None:
+            self._settings.set("device_profile.per_axis_max_feedrate", per_axis)
+            self._settings.save()
+        self._refresh_max_feedrate_grid()
+        # The ZP Feedrates derived-mm/min display uses Z max — if Z
+        # changed, refresh the derived labels.
+        if axis == "Z" and hasattr(self, '_refresh_zp_feedrate_derived'):
+            self._refresh_zp_feedrate_derived()
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                f"{axis} max feedrate: {current:.0f} → {new_val:.0f} mm/min. "
+                f"Saved to device profile.")
 
     def _refresh_max_feedrate_grid(self):
         """Refresh the per-axis max feedrate display row."""
