@@ -129,6 +129,22 @@ class StageHardwarePanel(QWidget):
                                  "Connected" if xy_ok else "Not connected")
         self.badge_zp.set_status("ok" if zp_ok else "pending",
                                  "Connected" if zp_ok else "Not connected")
+        # Xbox is tri-state (waiting / connected / reconnecting).
+        if hasattr(self, 'badge_xbox'):
+            xbox_st = getattr(self._controller, "xbox_status", None)
+            if callable(xbox_st):
+                try:
+                    xbox_st = xbox_st()
+                except Exception:
+                    xbox_st = "disconnected"
+            if xbox_st in ("connected", "alive"):
+                self.badge_xbox.set_status("ok", "Connected")
+            elif xbox_st == "reconnecting":
+                self.badge_xbox.set_status("warn", "Reconnecting…")
+            elif xbox_st == "waiting":
+                self.badge_xbox.set_status("info", "Searching…")
+            else:
+                self.badge_xbox.set_status("pending", "Not connected")
 
     # ── UI ───────────────────────────────────────────────────────
 
@@ -811,6 +827,25 @@ class StageHardwarePanel(QWidget):
         self.badge_zp = StatusBadge("Not connected", "pending")
         grid.addWidget(self.badge_zp, row, 3)
 
+        # v7.4.2: Xbox controller — moved here from the (now-removed)
+        # Dashboard page. Reads optional connect parameters from settings.
+        row += 1
+        grid.addWidget(_stage_label("Xbox"), row, 0)
+        self.btn_connect_xbox = QPushButton("🎮  Connect")
+        self.btn_connect_xbox.setObjectName("successBtn")
+        self.btn_connect_xbox.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_xbox.setToolTip(
+            "Connect an Xbox controller for continuous jogging.")
+        self.btn_connect_xbox.clicked.connect(self._connect_xbox)
+        grid.addWidget(self.btn_connect_xbox, row, 1)
+        self.btn_disconnect_xbox = QPushButton("Disconnect")
+        self.btn_disconnect_xbox.setObjectName("dangerBtn")
+        self.btn_disconnect_xbox.setCursor(Qt.PointingHandCursor)
+        self.btn_disconnect_xbox.clicked.connect(self._disconnect_xbox)
+        grid.addWidget(self.btn_disconnect_xbox, row, 2)
+        self.badge_xbox = StatusBadge("Not connected", "pending")
+        grid.addWidget(self.badge_xbox, row, 3)
+
         return grp
 
     def _connect_xy(self):
@@ -870,6 +905,66 @@ class StageHardwarePanel(QWidget):
         except Exception as e:
             logger.warning(f"disconnect_zp failed: {e}")
         self.badge_zp.set_status("pending", "Not connected")
+
+    # ── Xbox (moved from the deprecated Dashboard page) ──────────
+
+    def _connect_xbox(self):
+        """v7.4.2: Connect Xbox controller using saved settings.
+
+        Mirrors the parameters DashboardPage used: mapping file, thread
+        mode (macOS), reconnect timeout, stick offsets, per-axis
+        deadzones, debug mode. Anything missing falls back to sensible
+        defaults.
+        """
+        ctrl = self._controller
+        if ctrl is None:
+            return
+        self.badge_xbox.set_status("info", "Connecting…")
+        try:
+            import platform
+            use_thread = platform.system() == "Darwin"
+            mapping = getattr(
+                ctrl, "_mapping_file", "current_button_mapping.json")
+            s_obj = self._settings
+            if s_obj is not None:
+                timeout = s_obj.get("xbox.reconnect_timeout_s", 30)
+                stick_offsets = s_obj.get_section("xbox_stick_offsets") or {}
+                if stick_offsets:
+                    stick_offsets = {int(k): v for k, v in stick_offsets.items()}
+                stick_dz = s_obj.get("xbox.deadzones.sticks", 0.20)
+                trigger_dz = s_obj.get("xbox.deadzones.triggers", 0.05)
+                debug_mode = bool(s_obj.get("xbox.debug_mode", False))
+            else:
+                timeout = 30
+                stick_offsets = {}
+                stick_dz = 0.20
+                trigger_dz = 0.05
+                debug_mode = False
+            axis_deadzones = {
+                0: stick_dz, 1: stick_dz, 2: stick_dz, 3: stick_dz,
+                4: trigger_dz, 5: trigger_dz,
+            }
+            ctrl.connect_xbox(
+                mapping_file=mapping,
+                use_thread=use_thread,
+                reconnect_timeout=timeout,
+                stick_offsets=stick_offsets or None,
+                axis_deadzones=axis_deadzones,
+                debug_mode=debug_mode,
+            )
+            self.badge_xbox.set_status("ok", "Connected")
+        except Exception as e:
+            logger.warning(f"Xbox connect failed: {e}")
+            self.badge_xbox.set_status("err", f"Error: {e}")
+
+    def _disconnect_xbox(self):
+        if self._controller is None:
+            return
+        try:
+            self._controller.disconnect_xbox()
+        except Exception as e:
+            logger.warning(f"disconnect_xbox failed: {e}")
+        self.badge_xbox.set_status("pending", "Not connected")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.2: Axis Mapping (logical → physical Marlin axis)

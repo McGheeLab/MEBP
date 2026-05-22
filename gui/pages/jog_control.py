@@ -252,9 +252,62 @@ class JogControlPage(QWidget):
             "P:", self.lbl_p_speed, 1, 500, 50, self._on_p_speed,
             store_as="_sld_p_speed"))
 
+        # ── Position Log (moved from the deprecated Dashboard) ──
+        log_label = QLabel("Position Log")
+        log_label.setObjectName("contextSectionLabel")
+        layout.addWidget(log_label)
+
+        self._lbl_log_count = QLabel("Entries: 0")
+        self._lbl_log_count.setObjectName("contextLabel")
+        layout.addWidget(self._lbl_log_count)
+
+        log_btns = QHBoxLayout()
+        log_btns.setSpacing(_sc(6))
+        btn_export_csv = QPushButton("Export CSV")
+        btn_export_csv.setCursor(Qt.PointingHandCursor)
+        btn_export_csv.clicked.connect(self._export_log_csv)
+        log_btns.addWidget(btn_export_csv)
+
+        btn_export_json = QPushButton("Export JSON")
+        btn_export_json.setCursor(Qt.PointingHandCursor)
+        btn_export_json.clicked.connect(self._export_log_json)
+        log_btns.addWidget(btn_export_json)
+        layout.addLayout(log_btns)
+
+        # ── Xbox Mapping Editor (moved from the deprecated Dashboard) ──
+        btn_xbox_edit = QPushButton("🎮  Xbox Mapping Editor…")
+        btn_xbox_edit.setObjectName("accentBtn")
+        btn_xbox_edit.setCursor(Qt.PointingHandCursor)
+        btn_xbox_edit.setToolTip(
+            "Edit which Xbox buttons trigger which actions.")
+        btn_xbox_edit.clicked.connect(self._open_xbox_editor)
+        layout.addWidget(btn_xbox_edit)
+
         layout.addStretch()
         self._context_widget = ctx
         return ctx
+
+    # ── Position log + Xbox editor (moved from Dashboard) ────────
+
+    def _export_log_csv(self):
+        if hasattr(self.controller, 'position_logger'):
+            path = self.controller.position_logger.export_csv()
+            if path:
+                logger.info(f"Position log exported to {path}")
+
+    def _export_log_json(self):
+        if hasattr(self.controller, 'position_logger'):
+            path = self.controller.position_logger.export_json()
+            if path:
+                logger.info(f"Position log exported to {path}")
+
+    def _open_xbox_editor(self):
+        """v7.4.2: opens the Xbox button-mapping editor dialog."""
+        from gui.widgets.xbox_mapping_editor import XboxMappingEditor
+        mapping_path = getattr(
+            self.controller, "_mapping_file", "current_button_mapping.json")
+        editor = XboxMappingEditor(mapping_file=mapping_path, parent=self)
+        editor.exec()
 
     # ════════════════════════════════════════════════════════════════
     #  UI SETUP
@@ -477,6 +530,15 @@ class JogControlPage(QWidget):
     def on_status_update(self):
         """Called by MainWindow timer (~300 ms)."""
         ctrl = self.controller
+
+        # v7.4.2: refresh position-log count in context panel
+        # (moved from the deprecated Dashboard).
+        if hasattr(self, '_lbl_log_count'):
+            try:
+                count = ctrl.position_logger.count
+                self._lbl_log_count.setText(f"Entries: {count}")
+            except Exception:
+                pass
 
         # XY position — v7.2.5: controller reports in microns directly
         xy = ctrl.get_xy_position(cached=True)

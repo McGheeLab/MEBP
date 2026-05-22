@@ -6,8 +6,9 @@ v7.3.3 changes:
       with right-side sub-page icon columns
     - Printing mode wraps: Print Setup, Monitor, Results, Helpers
     - Pick & Place mode: Target Selection, Operation Queue, Execution
-    - Page indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibration,
-      4=Printing(mode), 5=PickPlace(mode), 6=Settings
+    - v7.4.2 page indices: 0=Hardware, 1=Jog, 2=Calibration,
+      3=Printing(mode), 4=PickPlace(mode), 5=Settings
+      (Dashboard removed; readouts merged into Jog + Hardware Setup)
 
 v7.2.3 changes:
     - Hardware Setup page added as page 0 (🔧)
@@ -49,7 +50,7 @@ from gui.unit_helpers import (
     DEFAULT_XY_POSITION_SCALE,
 )
 from gui.pages.hardware_setup import HardwareSetupPage
-from gui.pages.dashboard import DashboardPage
+# v7.4.2: DashboardPage removed; its readouts merged into Jog + Hardware Setup
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
 from gui.pages.printing_mode import PrintingModePage      # v7.3.3
@@ -295,9 +296,10 @@ class MainWindow(QMainWindow):
 
         # Page buttons — Hardware Setup is first
         # v7.3.3: Printing + Pick & Place are mode pages (sub-pages inside)
+        # v7.4.2: Dashboard removed; its readouts moved into Jog and
+        # Hardware Setup → Device.
         menu_items = [
             ("btn_hardware",   "🔧", "Hardware Setup"),
-            ("btn_dashboard",  "📊", "Dashboard"),
             ("btn_jog",        "🕹️", "Jog Control"),
             ("btn_calibrate",  "📐", "Calibration"),
             ("btn_printing",   "🖨️", "Printing"),            # mode page
@@ -551,14 +553,14 @@ class MainWindow(QMainWindow):
         """
         Instantiate all page widgets.
 
-        v7.3.3 page indices:
+        v7.4.2 page indices (Dashboard removed; readouts merged into
+        Jog + Hardware Setup):
             0: Hardware Setup (always enabled)
-            1: Dashboard
-            2: Jog Control
-            3: Calibration
-            4: Printing (mode — sub-pages: Setup, Monitor, Results, Helpers)
-            5: Pick & Place (mode — sub-pages: Targets, Queue, Execution)
-            6: Settings (always enabled)
+            1: Jog Control
+            2: Calibration
+            3: Printing (mode — sub-pages: Setup, Monitor, Results, Helpers)
+            4: Pick & Place (mode — sub-pages: Targets, Queue, Execution)
+            5: Settings (always enabled)
 
         v7.2.3: Also wires the job pipeline (Setup → Monitor)
         and execution control signals (Monitor → PrintManager).
@@ -577,13 +579,12 @@ class MainWindow(QMainWindow):
 
         pages = [
             HardwareSetupPage(),                                          # 0
-            DashboardPage(self.controller, self.print_history, settings=self.settings),  # 1
-            JogControlPage(self.controller),                              # 2
+            JogControlPage(self.controller),                              # 1
             CalibrationPage(self.controller, settings=self.settings,
-                           camera_manager=self._camera_manager),          # 3
-            self._printing_mode,                                          # 4  v7.3.3 mode
-            self._pick_place_mode,                                        # 5  v7.3.3 mode
-            SettingsPage(self.controller, self.settings),                 # 6
+                           camera_manager=self._camera_manager),          # 2
+            self._printing_mode,                                          # 3  v7.3.3 mode
+            self._pick_place_mode,                                        # 4  v7.3.3 mode
+            SettingsPage(self.controller, self.settings),                 # 5
         ]
 
         # Wire Hardware Setup signals
@@ -856,8 +857,9 @@ class MainWindow(QMainWindow):
             monitor_page.receive_job(job)
 
         # v7.3.3: Switch to Printing mode page + Monitor sub-page
+        # v7.4.2: was index 4 with Dashboard; now index 3.
         self._printing_mode.switch_to_monitor()
-        self._switch_page(4)  # Printing mode is page 4
+        self._switch_page(3)
     def _setup_monitor_visualization(self, setup_page, monitor_page, job):
         """v7.2.6: Feed plate/trajectory/syringe data to monitor widgets."""
         try:
@@ -1181,8 +1183,9 @@ class MainWindow(QMainWindow):
             elif hasattr(tab, '_emit_prints_changed'):
                 tab._emit_prints_changed()
         # Switch to Printing mode, Setup sub-page
+        # v7.4.2: was index 4 with Dashboard; now index 3.
         self._printing_mode.switch_to_setup()
-        self._navigate_to(4)
+        self._navigate_to(3)
 
 
     # ════════════════════════════════════════════════════════════════
@@ -1292,8 +1295,8 @@ class MainWindow(QMainWindow):
     def _update_page_gating(self, hardware_valid: bool):
         """Enable/disable navigation buttons for pages requiring hardware setup.
 
-        v7.3.3 indices: 0=Hardware, 1=Dashboard, 2=Jog, 3=Calibrate,
-                        4=Printing(mode), 5=PickPlace(mode), 6=Settings
+        v7.4.2 indices: 0=Hardware, 1=Jog, 2=Calibrate, 3=Printing(mode),
+                        4=PickPlace(mode), 5=Settings
         """
         for i, btn in enumerate(self._menu_buttons):
             if i == 0:
@@ -1341,15 +1344,14 @@ class MainWindow(QMainWindow):
         if not btn:
             return
 
-        # v7.3.3: Updated indices for mode-based navigation
+        # v7.4.2: Dashboard removed; indices renumbered.
         btn_map = {
             "btn_hardware":  0,
-            "btn_dashboard": 1,
-            "btn_jog":       2,
-            "btn_calibrate": 3,
-            "btn_printing":  4,   # v7.3.3 mode page
-            "btn_pickplace": 5,   # v7.3.3 mode page
-            "btn_settings":  6,
+            "btn_jog":       1,
+            "btn_calibrate": 2,
+            "btn_printing":  3,   # mode page
+            "btn_pickplace": 4,   # mode page
+            "btn_settings":  5,
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
@@ -1374,9 +1376,9 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            titles = ["Hardware Setup", "Dashboard", "Jog Control",
-                      "Calibration", "Printing", "Pick & Place",
-                      "Settings"]
+            # v7.4.2: Dashboard removed from indices.
+            titles = ["Hardware Setup", "Jog Control", "Calibration",
+                      "Printing", "Pick & Place", "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
@@ -1386,9 +1388,8 @@ class MainWindow(QMainWindow):
             self._update_mode_context(index, page)
         else:
             self._context_stack.setCurrentIndex(index)
-            context_titles = ["Hardware", "Dashboard", "Jog Settings",
-                              "Calibration", "Printing", "Pick & Place",
-                              "Settings"]
+            context_titles = ["Hardware", "Jog Settings", "Calibration",
+                              "Printing", "Pick & Place", "Settings"]
             self._context_title.setText(
                 context_titles[index] if index < len(context_titles) else "Settings"
             )
