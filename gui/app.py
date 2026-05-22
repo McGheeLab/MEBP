@@ -1476,8 +1476,40 @@ class MainWindow(QMainWindow):
                 getattr(page, "get_right_context_title", lambda: "")()
                 or "")
             self.ui_extraRightBox.show()
+            # The splitter's stretch factor for the right pane is 0,
+            # which means it keeps whatever its current width is —
+            # since it was hidden at startup, that width is 0 even
+            # after .show(). Explicitly allocate ~420 px on first
+            # reveal; subsequent shows preserve whatever the user
+            # last dragged it to.
+            self._allocate_right_context_width()
         else:
             self.ui_extraRightBox.hide()
+
+    def _allocate_right_context_width(self) -> None:
+        """v7.4.2: give the right context pane a real pixel width.
+
+        Splitter's stretch factor on slot 2 is 0, so without an
+        explicit ``setSizes`` the pane never gets any pixels even
+        after ``.show()``. Default to ~420 px the first time it
+        appears; if it's already > 50 px we trust the user's
+        previous drag and leave it alone.
+        """
+        try:
+            splitter = self._context_splitter
+            sizes = splitter.sizes()
+            if len(sizes) != 3:
+                return
+            target = s(420)
+            if sizes[2] >= s(80):
+                return  # already visible at a reasonable width
+            total = sum(sizes) or splitter.width()
+            left_w = sizes[0]
+            right_w = min(target, max(s(280), total // 4))
+            content_w = max(s(300), total - left_w - right_w)
+            splitter.setSizes([left_w, content_w, right_w])
+        except Exception as e:
+            logger.debug(f"_allocate_right_context_width failed: {e}")
 
     def _on_mode_sub_page_changed(self, mode_page_index: int):
         """v7.3.3: When a mode page switches sub-pages, update context panel."""
