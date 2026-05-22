@@ -490,15 +490,22 @@ class JogControlPage(QWidget):
             self.lbl_y.setText("—")
 
         # ZP position
+        # v7.4.2 hotfix: read via logical axis (Z/P1/P2/P3) so the
+        # displayed value matches the user's axis_map, not the legacy
+        # physical-tuple order.
         zp = ctrl.get_zp_position(cached=True)
-        if zp[0] is not None:
-            self.lbl_z.setText(f"{zp[0] - ctrl.zero_position['Z']:.2f}")
-            # v7.2.5: Display pump positions in µL if HW config available
+        z_val = ctrl.zp_logical_value(zp, "Z")
+        if z_val is not None:
+            self.lbl_z.setText(f"{z_val - ctrl.zero_position['Z']:.2f}")
             for pidx, pid in enumerate(["P1", "P2", "P3"], start=1):
                 lbl = getattr(self, f"lbl_p{pidx}", None)
                 if lbl is None:
                     continue
-                pos_mm = zp[pidx] - ctrl.zero_position[pid]
+                p_val = ctrl.zp_logical_value(zp, pid)
+                if p_val is None:
+                    lbl.setText("—")
+                    continue
+                pos_mm = p_val - ctrl.zero_position[pid]
                 if (self._hardware_config and
                         pid in self._hardware_config.configured_pump_ids):
                     try:

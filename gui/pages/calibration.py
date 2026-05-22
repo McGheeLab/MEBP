@@ -2189,8 +2189,10 @@ class CalibrationPage(QWidget):
             self.lbl_y.setText("—")
 
         zp = ctrl.get_zp_position(cached=True)
-        if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
-            self.lbl_z.setText(f"{zp[0] - ctrl.zero_position.get('Z', 0):.2f}")
+        # v7.4.2 hotfix: read Z via logical axis (honours axis_map).
+        z_val = ctrl.zp_logical_value(zp, "Z")
+        if z_val is not None:
+            self.lbl_z.setText(f"{z_val - ctrl.zero_position.get('Z', 0):.2f}")
 
             # v7.2.7: feed needle to plate view
             if hasattr(self, '_cal_plate_view') and self._taught_a1 is not None and xy[0] is not None:
@@ -3475,9 +3477,11 @@ class CalibrationPage(QWidget):
         if not well_name:
             return
         zp = self.controller.get_zp_position(cached=False)
-        if zp is None or zp[0] is None:
+        # v7.4.2 hotfix: read Z via logical axis.
+        z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if z_val is None:
             return
-        z_offset = zp[0] - self.controller.zero_position.get("Z", 0)
+        z_offset = z_val - self.controller.zero_position.get("Z", 0)
         self._z_teach_points[well_name] = z_offset
 
         # Also store as taught_a1_z / taught_corner_z / taught_third_z for legacy compat
@@ -3788,9 +3792,11 @@ class CalibrationPage(QWidget):
     def _set_safe_z(self):
         """v7.2.7: Record current Z as safe travel height."""
         zp = self.controller.get_zp_position(cached=False)
-        if zp is None or zp[0] is None:
+        # v7.4.2 hotfix: read Z via logical axis.
+        z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if z_val is None:
             return
-        self._safe_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        self._safe_z = z_val - self.controller.zero_position.get("Z", 0)
         if hasattr(self, 'lbl_safe_z'):
             self.lbl_safe_z.setText(f"Safe Z: {self._safe_z:.2f} mm")
             self.lbl_safe_z.setStyleSheet(f"color: {COLORS['green']};")
@@ -3800,9 +3806,11 @@ class CalibrationPage(QWidget):
     def _set_top_z(self):
         """v7.2.7: Record current Z as plate top surface."""
         zp = self.controller.get_zp_position(cached=False)
-        if zp is None or zp[0] is None:
+        # v7.4.2 hotfix: read Z via logical axis.
+        z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if z_val is None:
             return
-        self._top_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        self._top_z = z_val - self.controller.zero_position.get("Z", 0)
         if hasattr(self, 'lbl_top_z'):
             self.lbl_top_z.setText(f"Top Z: {self._top_z:.2f} mm")
             self.lbl_top_z.setStyleSheet(f"color: {COLORS['green']};")
@@ -3817,8 +3825,10 @@ class CalibrationPage(QWidget):
         self._taught_a1 = (xy[0], xy[1])
         ax = xy[0] - self.controller.zero_position["x"]
         ay = xy[1] - self.controller.zero_position["y"]
-        if zp is not None and zp[0] is not None:
-            self._taught_a1_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        # v7.4.2 hotfix: route Z read through axis_map.
+        a1_z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if a1_z_val is not None:
+            self._taught_a1_z = a1_z_val - self.controller.zero_position.get("Z", 0)
         z_str = f"  Z: {self._taught_a1_z:.2f} mm" if self._taught_a1_z is not None else ""
         if hasattr(self, 'lbl_a1'):
             self.lbl_a1.setText(f"({ax:,.1f}, {ay:,.1f}) µm{z_str}")
@@ -3858,8 +3868,10 @@ class CalibrationPage(QWidget):
         self._taught_corner = (xy[0], xy[1])
         cx = xy[0] - self.controller.zero_position["x"]
         cy = xy[1] - self.controller.zero_position["y"]
-        if zp is not None and zp[0] is not None:
-            self._taught_corner_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        # v7.4.2 hotfix: route Z read through axis_map.
+        corner_z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if corner_z_val is not None:
+            self._taught_corner_z = corner_z_val - self.controller.zero_position.get("Z", 0)
         z_str = f"  Z: {self._taught_corner_z:.2f} mm" if self._taught_corner_z is not None else ""
         if hasattr(self, 'lbl_corner'):
             self.lbl_corner.setText(f"({cx:,.1f}, {cy:,.1f}) µm{z_str}")

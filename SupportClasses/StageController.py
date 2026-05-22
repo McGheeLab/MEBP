@@ -32,6 +32,25 @@ def _axis_letter(zp_stage, logical: str) -> str | None:
     if zp_stage is not None and hasattr(zp_stage, 'axis_map'):
         return zp_stage.axis_map.get(logical, AXIS_MAP.get(logical))
     return AXIS_MAP.get(logical)
+
+
+# v7.4.2 hotfix: physical Marlin letter → index into the ZP position
+# tuple returned by ZPStageManager.get_current_position(), which is
+# always (x, y, z, e) in Marlin's physical axis order.
+_PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
+
+
+def _axis_index(zp_stage, logical: str) -> int | None:
+    """v7.4.2 hotfix: index into a ZP position tuple for a logical axis.
+
+    Equivalent of ``_axis_letter`` for *consumers* of M114 readouts —
+    routes ``logical`` through the live axis_map and converts the
+    resulting physical Marlin letter (X/Y/Z/E) into its tuple index.
+    """
+    letter = _axis_letter(zp_stage, logical)
+    if letter is None:
+        return None
+    return _PHYSICAL_TO_INDEX.get(letter)
 from SupportClasses.XboxController import xbox_polling_worker, calibrate_sticks
 from SupportClasses.SerialUtils import ConnectionWatchdog, check_port_health
 from SupportClasses.SafetyLimits import SafetyLimits
@@ -1260,7 +1279,14 @@ class StageController:
         return False
 
     def get_zp_position(self, cached: bool = True) -> tuple:
-        """Get ZP position. cached=True returns polled value (non-blocking)."""
+        """Get ZP position. cached=True returns polled value (non-blocking).
+
+        Returns a 4-tuple in *physical* Marlin axis order: ``(X, Y, Z, E)``.
+        Consumers wanting logical (Z, P1, P2, P3) values should use
+        :meth:`get_zp_position_logical` or :meth:`zp_logical_value`,
+        which respect the live ``axis_map`` and stay correct under
+        non-default per-machine wiring.
+        """
         if cached:
             return self._pos_poller.zp_position
         if self.zp_stage:
@@ -1269,6 +1295,29 @@ class StageController:
             except Exception as e:
                 logger.debug(f"ZP direct query error: {e}")
         return (None, None, None, None)
+
+    def zp_logical_value(self, pos: tuple, logical: str) -> float | None:
+        """v7.4.2 hotfix: pluck a logical-axis value from a ZP tuple.
+
+        ``pos`` is the 4-tuple from :meth:`get_zp_position` in physical
+        Marlin order. ``logical`` is one of ``Z, P1, P2, P3``. Returns
+        ``None`` if the logical axis is unmapped or the slot is empty.
+        """
+        idx = _axis_index(self.zp_stage, logical)
+        if idx is None or pos is None or idx >= len(pos):
+            return None
+        return pos[idx]
+
+    def get_zp_position_logical(self, cached: bool = True) -> dict:
+        """v7.4.2 hotfix: return ZP position keyed by logical axis.
+
+        Convenience for GUI / executors that don't want to deal with
+        the physical tuple. Returns ``{"Z": val, "P1": val, "P2": val,
+        "P3": val}`` with ``None`` for unmapped or unread slots.
+        """
+        pos = self.get_zp_position(cached=cached)
+        return {logical: self.zp_logical_value(pos, logical)
+                for logical in ("Z", "P1", "P2", "P3")}
 
     def get_speed_info(self) -> dict:
         """Return current jog speeds as numeric values.
@@ -1380,8 +1429,11 @@ class StageController:
             logger.warning(f"Cannot reset {pump} zero — ZP stage not connected")
             return
 
-        idx = {"P1": 1, "P2": 2, "P3": 3}[pump]
-        if idx < len(pos) and pos[idx] is not None:
+        # v7.4.2 hotfix: route through axis_map so we read the right
+        # tuple slot under non-default mappings (e.g. P1→X under
+        # Conservative profile).
+        idx = _axis_index(self.zp_stage, pump)
+        if idx is not None and idx < len(pos) and pos[idx] is not None:
             self.zero_position[pump] = pos[idx]
             logger.info(f"{pump} zero set to {pos[idx]:.3f} mm (absolute)")
 
@@ -1774,11 +1826,15 @@ class StageController:
             try:
                 pos = self.get_zp_position(cached=True)
                 if pos[0] is not None:
-                    idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
-                    cur = pos[idx]
-                    zero_ref = self.zero_position.get(pump, 0)
-                    clamped = self.safety_limits.clamp_pump(cur + distance - zero_ref, pump)
-                    distance = (clamped + zero_ref) - cur
+                    # v7.4.2 hotfix: index through live axis_map so the
+                    # safety clamp reads the correct physical motor.
+                    idx = _axis_index(self.zp_stage, pump)
+                    if idx is not None and idx < len(pos):
+                        cur = pos[idx]
+                        zero_ref = self.zero_position.get(pump, 0)
+                        clamped = self.safety_limits.clamp_pump(
+                            cur + distance - zero_ref, pump)
+                        distance = (clamped + zero_ref) - cur
             except Exception:
                 pass
         mapped = _axis_letter(self.zp_stage, pump)
@@ -1997,8 +2053,9 @@ class StageController:
         if pos is None or pos[0] is None:
             return None
 
-        idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
-        if idx >= len(pos):
+        # v7.4.2 hotfix: respect live axis_map.
+        idx = _axis_index(self.zp_stage, pump)
+        if idx is None or idx >= len(pos):
             return None
 
         pos_mm = pos[idx]

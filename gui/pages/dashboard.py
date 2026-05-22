@@ -438,12 +438,13 @@ class DashboardPage(QWidget):
             self.lbl_xy_status.setStyleSheet(f"color: {color};")
 
         # ZP position — Z in mm, pumps in µL (v7.2) or mm (fallback)
+        # v7.4.2 hotfix: read by logical axis to honour the live axis_map.
         zp = ctrl.get_zp_position(cached=True)
-        if zp[0] is not None:
-            self.lbl_z.setText(f"{zp[0] - ctrl.zero_position['Z']:.2f}")
+        z_val = ctrl.zp_logical_value(zp, "Z")
+        if z_val is not None:
+            self.lbl_z.setText(f"{z_val - ctrl.zero_position['Z']:.2f}")
             for pid, lbl in [("P1", self.lbl_p1), ("P2", self.lbl_p2), ("P3", self.lbl_p3)]:
-                idx = {"P1": 1, "P2": 2, "P3": 3}[pid]
-                pos_mm = zp[idx] if idx < len(zp) else None
+                pos_mm = ctrl.zp_logical_value(zp, pid)
                 zero_ref = ctrl.zero_position.get(pid, 0)
                 if pos_mm is not None:
                     rel_mm = pos_mm - zero_ref

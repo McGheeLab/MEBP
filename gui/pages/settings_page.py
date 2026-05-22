@@ -89,12 +89,16 @@ class SettingsPage(QWidget):
                 self._ctx_pos_labels["X"].setText(f"{rel_x:,.1f}")
                 self._ctx_pos_labels["Y"].setText(f"{rel_y:,.1f}")
 
-            if zp[0] is not None:
-                rel_z = zp[0] - zero.get("Z", 0)
+            # v7.4.2 hotfix: read by logical axis so non-default
+            # axis_maps show the right values.
+            z_val = ctrl.zp_logical_value(zp, "Z") if ctrl else None
+            if z_val is not None:
+                rel_z = z_val - zero.get("Z", 0)
                 self._ctx_pos_labels["Z"].setText(f"{rel_z:.3f}")
-                for i, pid in enumerate(["P1", "P2", "P3"], start=1):
-                    if i < len(zp) and zp[i] is not None:
-                        rel_p = zp[i] - zero.get(pid, 0)
+                for pid in ("P1", "P2", "P3"):
+                    p_val = ctrl.zp_logical_value(zp, pid)
+                    if p_val is not None:
+                        rel_p = p_val - zero.get(pid, 0)
                         self._ctx_pos_labels[pid].setText(f"{rel_p:.3f}")
         except Exception:
             pass
@@ -1494,10 +1498,11 @@ class SettingsPage(QWidget):
         """v7.2.6: Set pump limit from the current position."""
         pos = self.controller.get_zp_position(cached=True)
         if pos[0] is not None:
-            idx = {"P1": 1, "P2": 2, "P3": 3}.get(pump, 1)
-            if idx < len(pos) and pos[idx] is not None:
+            # v7.4.2 hotfix: route through axis_map.
+            pump_val = self.controller.zp_logical_value(pos, pump)
+            if pump_val is not None:
                 zero_ref = self.controller.zero_position.get(pump, 0)
-                rel_mm = pos[idx] - zero_ref
+                rel_mm = pump_val - zero_ref
                 if as_max:
                     self._pump_max_spins[pump].setValue(rel_mm)
                 else:

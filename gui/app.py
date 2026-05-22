@@ -1564,12 +1564,15 @@ class MainWindow(QMainWindow):
                 self.sb_xy.setText("XY: — , — µm")
 
             # Z in mm, Pumps in µL when syringe configured else mm
-            if zp[0] is not None:
+            # v7.4.2 hotfix: route ZP reads through logical axis so the
+            # status bar matches the user's axis_map.
+            z_val = self.controller.zp_logical_value(zp, "Z")
+            if z_val is not None:
                 zz = self.controller.zero_position.get("Z", 0)
-                self.sb_z.setText(f"Z: {zp[0] - zz:.2f}")
+                self.sb_z.setText(f"Z: {z_val - zz:.2f}")
 
                 for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
-                    pos_mm = zp[idx] if idx < len(zp) else None
+                    pos_mm = self.controller.zp_logical_value(zp, pid)
                     lbl = getattr(self, f"sb_p{idx}", None)
                     if lbl is None:
                         continue
