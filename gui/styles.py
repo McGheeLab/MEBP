@@ -94,33 +94,40 @@ def _f(val: float, k: float) -> float:
 # Use these instead of per-page _group_style() methods for consistency.
 
 def build_section_title_style(k: float = 1.0) -> str:
-    # v7.4.2 polish: roomier padding, softer borders, sub-pixel-clean title
-    # baseline. Title sits on the top-left edge as a "pill" cut into the
-    # frame, with a subtle accent dot to anchor the eye.
+    # v7.4.2 polish: frosted-glass card.
+    # Qt stylesheets can't blur the backdrop the way CSS backdrop-filter
+    # can, but a slight vertical gradient over the page bg + a soft
+    # subtext-colored border approximates the look well enough that the
+    # eye reads "elevated translucent panel" instead of "flat block".
+    # Title pill sits on the top-left edge in the accent blue.
     return f"""
     QGroupBox {{
         font-size: {_f(10.5, k)}pt;
         font-weight: 500;
         color: {COLORS['text']};
-        background-color: {COLORS['surface0']};
-        border: 1px solid {COLORS['surface1']};
-        border-radius: {_p(10, k)}px;
-        margin-top: {_p(16, k)}px;
-        padding: {_p(22, k)}px {_p(18, k)}px {_p(16, k)}px {_p(18, k)}px;
+        background-color: qlineargradient(
+            x1: 0, y1: 0, x2: 0, y2: 1,
+            stop: 0 rgba(69, 71, 90, 110),
+            stop: 1 rgba(49, 50, 68, 140)
+        );
+        border: 1px solid rgba(166, 173, 200, 35);
+        border-radius: {_p(12, k)}px;
+        margin-top: {_p(18, k)}px;
+        padding: {_p(24, k)}px {_p(20, k)}px {_p(18, k)}px {_p(20, k)}px;
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
         subcontrol-position: top left;
-        left: {_p(14, k)}px;
-        top: {_p(2, k)}px;
-        padding: {_p(3, k)}px {_p(10, k)}px;
-        background-color: {COLORS['base']};
-        border: 1px solid {COLORS['surface1']};
-        border-radius: {_p(6, k)}px;
+        left: {_p(16, k)}px;
+        top: {_p(1, k)}px;
+        padding: {_p(4, k)}px {_p(12, k)}px;
+        background-color: rgba(30, 30, 46, 240);
+        border: 1px solid rgba(137, 180, 250, 110);
+        border-radius: {_p(8, k)}px;
         color: {COLORS['blue']};
         font-size: {_f(9.5, k)}pt;
-        font-weight: 600;
-        letter-spacing: 0.3px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
     }}
 """
 
@@ -199,7 +206,11 @@ def build_theme(k: float = 1.0) -> str:
 
 QWidget {{
     color: #cdd6f4;
-    font: {_f(10, k)}pt "Segoe UI", "Ubuntu", sans-serif;
+    /* v7.4.2 polish: macOS native first, then high-quality fallbacks.
+       Slight bump to 10.5pt for the body baseline so labels in cards
+       are comfortably readable without forcing a higher app scale. */
+    font: {_f(10.5, k)}pt -apple-system, "SF Pro Text", "Inter",
+          "Segoe UI", "Ubuntu", sans-serif;
 }}
 
 QToolTip {{

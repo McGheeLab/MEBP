@@ -279,49 +279,66 @@ class PumpChannelWidget(QGroupBox):
     def _build_ui(self):
         # v7.4.2 polish: inherit the central section title style so pump
         # channel sub-cards visually match the rest of the hardware page.
+        # Aligned label/input grid — column 0 is the row label (fixed
+        # width so all rows line up), column 1 is the input.
         self.setStyleSheet(SECTION_TITLE_STYLE)
         layout = QGridLayout(self)
-        layout.setContentsMargins(s(8), s(8), s(8), s(8))
-        layout.setHorizontalSpacing(s(10))
-        layout.setVerticalSpacing(s(8))
+        layout.setContentsMargins(s(10), s(10), s(10), s(10))
+        layout.setHorizontalSpacing(s(12))
+        layout.setVerticalSpacing(s(10))
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 1)
 
-        # Row 0: Enable + Syringe
-        self.enable_check = QCheckBox("Enable")
+        def _row_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLORS['text']}; font-weight: 500;")
+            lbl.setMinimumWidth(s(80))
+            return lbl
+
+        # Row 0: Enable toggle (spans both columns, sits flush left)
+        self.enable_check = QCheckBox("Enable this pump")
         self.enable_check.setChecked(False)
+        self.enable_check.setStyleSheet(
+            f"color: {COLORS['text']}; font-weight: 500;")
         self.enable_check.toggled.connect(self._on_enable_changed)
-        layout.addWidget(self.enable_check, 0, 0)
+        layout.addWidget(self.enable_check, 0, 0, 1, 2)
 
-        layout.addWidget(QLabel("Syringe:"), 0, 1)
+        # Row 1: Syringe
+        layout.addWidget(_row_label("Syringe"), 1, 0)
         self.syringe_combo = QComboBox()
         self.syringe_combo.addItem("— None —", None)
         for vol in sorted(self.syringe_catalog.keys()):
             self.syringe_combo.addItem(f"{vol} µL", vol)
         self.syringe_combo.currentIndexChanged.connect(self._on_change)
-        layout.addWidget(self.syringe_combo, 0, 2)
+        layout.addWidget(self.syringe_combo, 1, 1)
 
-        # Row 1: Ink(s) — multi-select checklist
-        layout.addWidget(QLabel("Inks:"), 1, 0, Qt.AlignmentFlag.AlignTop)
-        self.ink_list = QListWidget()
-        self.ink_list.setMaximumHeight(s(70))
-        self.ink_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.ink_list.itemChanged.connect(self._on_change)
-        layout.addWidget(self.ink_list, 1, 1, 1, 2)
-
-        # Backward-compat shim: ink_combo property for code that still references it
-        self.ink_combo = None  # Removed — use ink_list
-
-        layout.addWidget(QLabel("Mode:"), 2, 0)
+        # Row 2: Mode
+        layout.addWidget(_row_label("Mode"), 2, 0)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Incremental", "incremental")
         self.mode_combo.addItem("Continuous", "continuous")
         self.mode_combo.currentIndexChanged.connect(self._on_change)
-        layout.addWidget(self.mode_combo, 2, 1, 1, 2)
+        layout.addWidget(self.mode_combo, 2, 1)
 
-        # Row 3: Info line
+        # Row 3: Inks — multi-select checklist (taller, so label aligns top)
+        layout.addWidget(
+            _row_label("Inks"), 3, 0, Qt.AlignmentFlag.AlignTop)
+        self.ink_list = QListWidget()
+        self.ink_list.setMaximumHeight(s(80))
+        self.ink_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.ink_list.itemChanged.connect(self._on_change)
+        layout.addWidget(self.ink_list, 3, 1)
+
+        # Backward-compat shim
+        self.ink_combo = None
+
+        # Row 4: Info line (spans both columns)
         self.info_label = QLabel("")
         self.info_label.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
-        layout.addWidget(self.info_label, 3, 0, 1, 3)
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label, 4, 0, 1, 2)
 
         self._update_controls()
 

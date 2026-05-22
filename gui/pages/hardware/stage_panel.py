@@ -1193,138 +1193,152 @@ class StageHardwarePanel(QWidget):
             f"background-color: rgba(243, 139, 168, 28);"
         )
 
-        # v7.4.2 hotfix: per-axis steps/mm cells are clickable —
-        # click to open an edit popup (in addition to the existing
-        # Calculate & Send M92 workflow below).
-        steps_row = QHBoxLayout()
-        steps_row.setSpacing(s(8))
-        steps_row.addWidget(QLabel("steps/mm"))
+        # v7.4.2 polish: single aligned grid for all per-axis values.
+        # Rows = parameter, columns = logical axis. Cells line up so
+        # the eye can scan steps/feedrate/accel across Z/P1/P2/P3 at a
+        # glance instead of chasing labels of varying width.
+        values_grid = QGridLayout()
+        values_grid.setHorizontalSpacing(s(12))
+        values_grid.setVerticalSpacing(s(8))
+        values_grid.setColumnStretch(0, 0)  # row label
+        for c in range(1, 1 + len(self._LOGICAL_AXES)):
+            values_grid.setColumnStretch(c, 1)
+
+        # Column headers (axis names) in row 0
+        for col, ax in enumerate(self._LOGICAL_AXES, start=1):
+            head = QLabel(ax)
+            head.setAlignment(Qt.AlignCenter)
+            head.setStyleSheet(
+                f"color: {COLORS['blue']}; font-weight: 700; "
+                f"font-family: monospace; font-size: {sf(10)}pt; "
+                f"letter-spacing: 0.4px;")
+            values_grid.addWidget(head, 0, col)
+
+        def _row_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLORS['text']}; font-weight: 500; "
+                f"font-size: {sf(10)}pt;")
+            lbl.setMinimumWidth(s(160))
+            return lbl
+
+        # Row 1: steps/mm (clickable cells)
+        values_grid.addWidget(_row_label("steps/mm"), 1, 0)
         self.lbl_steps_grid: dict[str, _ClickableLabel] = {}
-        for ax in self._LOGICAL_AXES:
-            cell = _ClickableLabel(f"{ax}: —")
+        for col, ax in enumerate(self._LOGICAL_AXES, start=1):
+            cell = _ClickableLabel("—")
+            cell.setAlignment(Qt.AlignCenter)
             cell.setStyleSheet(self._cell_style_ok)
             cell.setToolTip(f"Click to edit {ax} steps/mm directly")
             cell.clicked.connect(
                 lambda a=ax: self._edit_steps_per_mm_popup(a))
-            steps_row.addWidget(cell)
+            values_grid.addWidget(cell, 1, col)
             self.lbl_steps_grid[ax] = cell
-        steps_row.addStretch()
-        outer.addLayout(steps_row)
 
-        # v7.4.2: Per-axis max feedrate grid — also clickable.
-        feed_row = QHBoxLayout()
-        feed_row.setSpacing(s(8))
-        feed_row.addWidget(QLabel("max F (mm/min)"))
+        # Row 2: max feedrate (clickable cells)
+        values_grid.addWidget(_row_label("max feedrate (mm/min)"), 2, 0)
         self.lbl_feedrate_grid: dict[str, _ClickableLabel] = {}
-        for ax in self._LOGICAL_AXES:
-            cell = _ClickableLabel(f"{ax}: —")
+        for col, ax in enumerate(self._LOGICAL_AXES, start=1):
+            cell = _ClickableLabel("—")
+            cell.setAlignment(Qt.AlignCenter)
             cell.setStyleSheet(self._cell_style_ok)
             cell.setToolTip(f"Click to edit {ax} max feedrate directly")
             cell.clicked.connect(
                 lambda a=ax: self._edit_max_feedrate_popup(a))
-            feed_row.addWidget(cell)
+            values_grid.addWidget(cell, 2, col)
             self.lbl_feedrate_grid[ax] = cell
-        feed_row.addStretch()
-        outer.addLayout(feed_row)
 
-        # v7.4.2 hotfix: Per-axis max acceleration (M201)
-        accel_row = QHBoxLayout()
-        accel_row.setSpacing(s(8))
-        accel_row.addWidget(QLabel("max accel (mm/s²)"))
+        # Row 3: max acceleration (editable spinboxes — same column width)
+        values_grid.addWidget(_row_label("max accel (mm/s²)"), 3, 0)
         self.spin_axis_accel: dict[str, QDoubleSpinBox] = {}
         default_accel = {"Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0}
-        for ax in self._LOGICAL_AXES:
-            cell = QLabel(f"{ax}")
-            cell.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
-                f"padding-left: {sp(6)};")
-            accel_row.addWidget(cell)
+        for col, ax in enumerate(self._LOGICAL_AXES, start=1):
             sp_w = QDoubleSpinBox()
             sp_w.setRange(1.0, 100000.0)
             sp_w.setDecimals(0)
             sp_w.setSingleStep(50.0)
             sp_w.setValue(default_accel.get(ax, 1000.0))
-            sp_w.setMinimumWidth(s(80))
-            accel_row.addWidget(sp_w)
+            sp_w.setAlignment(Qt.AlignCenter)
+            values_grid.addWidget(sp_w, 3, col)
             self.spin_axis_accel[ax] = sp_w
-        accel_row.addStretch()
-        outer.addLayout(accel_row)
+
+        outer.addLayout(values_grid)
 
         # v7.4.2 polish: heading for the interactive calibration workflow
         outer.addWidget(sub_heading("Calibrate / Test"))
 
-        # Workflow row — axis, distance, feedrate, +/- move buttons
-        wf = QHBoxLayout()
-        wf.setSpacing(s(8))
-        wf.addWidget(QLabel("Axis:"))
+        # v7.4.2 polish: aligned form grid — labels in col 0, inputs in
+        # col 1, action buttons in col 2 (spanning is OK). Every input
+        # shares a column width so the eye lines up.
+        form = QGridLayout()
+        form.setHorizontalSpacing(s(12))
+        form.setVerticalSpacing(s(8))
+        form.setColumnStretch(0, 0)
+        form.setColumnStretch(1, 0)
+        form.setColumnStretch(2, 1)  # button area soaks remaining space
+
+        def _form_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLORS['text']}; font-weight: 500; "
+                f"font-size: {sf(10)}pt;")
+            lbl.setMinimumWidth(s(110))
+            return lbl
+
+        # Row 0: Axis picker
+        form.addWidget(_form_label("Axis"), 0, 0)
         self.cmb_cal_axis = QComboBox()
         for ax in self._LOGICAL_AXES:
             self.cmb_cal_axis.addItem(ax, ax)
+        self.cmb_cal_axis.setMinimumWidth(s(160))
         self.cmb_cal_axis.currentIndexChanged.connect(
             self._on_cal_axis_changed)
-        wf.addWidget(self.cmb_cal_axis)
+        form.addWidget(self.cmb_cal_axis, 0, 1)
 
-        wf.addWidget(QLabel("Distance:"))
+        # Row 1: Distance + Move +/- buttons (compact button group on right)
+        form.addWidget(_form_label("Commanded distance"), 1, 0)
         self.spin_cal_commanded = QDoubleSpinBox()
         self.spin_cal_commanded.setRange(0.001, 100.0)
         self.spin_cal_commanded.setDecimals(3)
         self.spin_cal_commanded.setValue(1.0)
         self.spin_cal_commanded.setSuffix(" mm")
-        wf.addWidget(self.spin_cal_commanded)
+        self.spin_cal_commanded.setMinimumWidth(s(160))
+        form.addWidget(self.spin_cal_commanded, 1, 1)
 
-        wf.addWidget(QLabel("Feedrate:"))
+        move_btns = QHBoxLayout()
+        move_btns.setSpacing(s(6))
+        move_btns.setContentsMargins(0, 0, 0, 0)
+        self.btn_cal_move_fwd = QPushButton("Move +")
+        self.btn_cal_move_fwd.setCursor(Qt.PointingHandCursor)
+        self.btn_cal_move_fwd.setToolTip(
+            "Send the distance in the positive direction")
+        self.btn_cal_move_fwd.clicked.connect(
+            lambda: self._cal_command_move(direction=1))
+        move_btns.addWidget(self.btn_cal_move_fwd)
+        self.btn_cal_move_rev = QPushButton("Move −")
+        self.btn_cal_move_rev.setCursor(Qt.PointingHandCursor)
+        self.btn_cal_move_rev.setToolTip(
+            "Send the distance in the negative direction")
+        self.btn_cal_move_rev.clicked.connect(
+            lambda: self._cal_command_move(direction=-1))
+        move_btns.addWidget(self.btn_cal_move_rev)
+        move_btns.addStretch()
+        form.addLayout(move_btns, 1, 2)
+
+        # Row 2: Feedrate + Record-as-Max
+        form.addWidget(_form_label("Feedrate"), 2, 0)
         self.spin_cal_feedrate = QDoubleSpinBox()
         self.spin_cal_feedrate.setRange(1.0, 100000.0)
         self.spin_cal_feedrate.setDecimals(0)
         self.spin_cal_feedrate.setSingleStep(50.0)
         self.spin_cal_feedrate.setValue(600.0)
         self.spin_cal_feedrate.setSuffix(" mm/min")
-        wf.addWidget(self.spin_cal_feedrate)
+        self.spin_cal_feedrate.setMinimumWidth(s(160))
+        form.addWidget(self.spin_cal_feedrate, 2, 1)
 
-        # +/- move buttons — flip direction without changing distance
-        self.btn_cal_move_fwd = QPushButton("Move +")
-        self.btn_cal_move_fwd.setCursor(Qt.PointingHandCursor)
-        self.btn_cal_move_fwd.setToolTip("Send the distance in the positive direction")
-        self.btn_cal_move_fwd.clicked.connect(
-            lambda: self._cal_command_move(direction=1))
-        wf.addWidget(self.btn_cal_move_fwd)
-
-        self.btn_cal_move_rev = QPushButton("Move −")
-        self.btn_cal_move_rev.setCursor(Qt.PointingHandCursor)
-        self.btn_cal_move_rev.setToolTip("Send the distance in the negative direction")
-        self.btn_cal_move_rev.clicked.connect(
-            lambda: self._cal_command_move(direction=-1))
-        wf.addWidget(self.btn_cal_move_rev)
-
-        wf.addStretch()
-        outer.addLayout(wf)
-
-        # Measure + apply + record-as-max row
-        mr = QHBoxLayout()
-        mr.setSpacing(s(8))
-        mr.addWidget(QLabel("Measured:"))
-        self.spin_cal_measured = QDoubleSpinBox()
-        self.spin_cal_measured.setRange(0.001, 100.0)
-        self.spin_cal_measured.setDecimals(3)
-        self.spin_cal_measured.setValue(1.0)
-        self.spin_cal_measured.setSuffix(" mm")
-        mr.addWidget(self.spin_cal_measured)
-
-        self.btn_cal_apply = QPushButton("Calculate && Send M92")
-        self.btn_cal_apply.setObjectName("accentBtn")
-        self.btn_cal_apply.setCursor(Qt.PointingHandCursor)
-        self.btn_cal_apply.clicked.connect(self._cal_apply)
-        mr.addWidget(self.btn_cal_apply)
-
-        self.btn_cal_flip_axis = QPushButton("Invert Axis Direction")
-        self.btn_cal_flip_axis.setCursor(Qt.PointingHandCursor)
-        self.btn_cal_flip_axis.setToolTip(
-            "Negate the saved steps/mm for the selected axis — flips "
-            "which way 'positive' moves on Marlin without changing "
-            "step count magnitude.")
-        self.btn_cal_flip_axis.clicked.connect(self._cal_flip_axis)
-        mr.addWidget(self.btn_cal_flip_axis)
-
+        feed_btns = QHBoxLayout()
+        feed_btns.setSpacing(s(6))
+        feed_btns.setContentsMargins(0, 0, 0, 0)
         self.btn_cal_record_max = QPushButton("Record as Max")
         self.btn_cal_record_max.setCursor(Qt.PointingHandCursor)
         self.btn_cal_record_max.setToolTip(
@@ -1332,10 +1346,41 @@ class StageHardwarePanel(QWidget):
             "max for the selected axis. Stored in the device profile "
             "as device_profile.per_axis_max_feedrate.")
         self.btn_cal_record_max.clicked.connect(self._cal_record_max_feedrate)
-        mr.addWidget(self.btn_cal_record_max)
+        feed_btns.addWidget(self.btn_cal_record_max)
+        feed_btns.addStretch()
+        form.addLayout(feed_btns, 2, 2)
 
-        mr.addStretch()
-        outer.addLayout(mr)
+        # Row 3: Measured + Calculate & Invert
+        form.addWidget(_form_label("Measured distance"), 3, 0)
+        self.spin_cal_measured = QDoubleSpinBox()
+        self.spin_cal_measured.setRange(0.001, 100.0)
+        self.spin_cal_measured.setDecimals(3)
+        self.spin_cal_measured.setValue(1.0)
+        self.spin_cal_measured.setSuffix(" mm")
+        self.spin_cal_measured.setMinimumWidth(s(160))
+        form.addWidget(self.spin_cal_measured, 3, 1)
+
+        apply_btns = QHBoxLayout()
+        apply_btns.setSpacing(s(6))
+        apply_btns.setContentsMargins(0, 0, 0, 0)
+        self.btn_cal_apply = QPushButton("Calculate && Send M92")
+        self.btn_cal_apply.setObjectName("accentBtn")
+        self.btn_cal_apply.setCursor(Qt.PointingHandCursor)
+        self.btn_cal_apply.clicked.connect(self._cal_apply)
+        apply_btns.addWidget(self.btn_cal_apply)
+
+        self.btn_cal_flip_axis = QPushButton("Invert Direction")
+        self.btn_cal_flip_axis.setCursor(Qt.PointingHandCursor)
+        self.btn_cal_flip_axis.setToolTip(
+            "Negate the saved steps/mm for the selected axis — flips "
+            "which way 'positive' moves on Marlin without changing "
+            "step count magnitude.")
+        self.btn_cal_flip_axis.clicked.connect(self._cal_flip_axis)
+        apply_btns.addWidget(self.btn_cal_flip_axis)
+        apply_btns.addStretch()
+        form.addLayout(apply_btns, 3, 2)
+
+        outer.addLayout(form)
 
         self.lbl_cal_status = QLabel("")
         self.lbl_cal_status.setStyleSheet(
@@ -1592,14 +1637,19 @@ class StageHardwarePanel(QWidget):
                 f"{suffix}")
 
     def _refresh_max_feedrate_grid(self):
-        """Refresh the per-axis max feedrate display row."""
+        """Refresh the per-axis max feedrate display row.
+
+        v7.4.2 polish: cells now sit in a column-aligned grid under
+        axis headers, so each cell displays only the value (the row
+        label sits in column 0, the axis header in row 0).
+        """
         if not hasattr(self, 'lbl_feedrate_grid'):
             return
         per_axis = (self._settings.get("device_profile.per_axis_max_feedrate")
                     if self._settings else {}) or {}
         for ax, lbl in self.lbl_feedrate_grid.items():
             val = per_axis.get(ax, "—")
-            lbl.setText(f"{ax}: {val}")
+            lbl.setText(str(val) if val != "—" else "—")
 
     def _refresh_steps_grid(self):
         if self._controller and self._controller.zp_stage:
@@ -1609,7 +1659,7 @@ class StageHardwarePanel(QWidget):
                      if self._settings else {}) or {}
         for ax, lbl in self.lbl_steps_grid.items():
             val = steps.get(ax, "—")
-            lbl.setText(f"{ax}: {val}")
+            lbl.setText(str(val) if val != "—" else "—")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.2 hotfix: Per-axis jog + record (now uses JogButtonArray)
