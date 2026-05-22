@@ -181,16 +181,13 @@ class StageHardwarePanel(QWidget):
         # a profile populates all the groups below
         outer.addWidget(self._build_device_profile_group())
 
-        # v7.4.2: Connect Hardware + Axis Mapping
-        outer.addWidget(self._build_connect_group())
+        # v7.4.2: Connect Hardware + Full Jog Pad + Live Position were
+        # moved to the persistent HardwareControlPanel on the left edge
+        # of Hardware Setup (always visible across sub-pages). The Device
+        # sub-page now only carries the *configuration* sections.
         outer.addWidget(self._build_axis_mapping_group())
-        # v7.4.2 hotfix: motion calibration split into per-stage sections
         outer.addWidget(self._build_xy_cal_group())
         outer.addWidget(self._build_steps_cal_group())
-
-        # v7.4.2 hotfix: Safety + per-axis jog + full jog pad combined
-        # into one workspace. _build_safety_group + _build_jog_limits_group
-        # are now legacy and only kept around as fallbacks.
         outer.addWidget(self._build_setup_jog_safety_group())
         outer.addWidget(self._build_zp_feedrates_group())
         # v7.4.2 hotfix: Axis Direction Flips section removed — direction
@@ -524,78 +521,23 @@ class StageHardwarePanel(QWidget):
         self.spin_max_z_feed = _cap_spin(500.0, "mm/min")
         self.spin_max_pump_feed = _cap_spin(200.0, "mm/min")
 
-        # ── Full jog pad embed ──────────────────────────────────
-        jog_grp = QGroupBox("Full Jog Pad (setup-mode, safety bypassed)")
-        jog_grp.setStyleSheet(SECTION_TITLE_STYLE)
-        jog_lay = QHBoxLayout(jog_grp)
-        jog_lay.setSpacing(s(12))
-
-        self._jog_array = JogButtonArray(compact=False, show_pumps=True)
-        self._jog_array.jog_xy_requested.connect(self._on_jog_array_xy)
-        self._jog_array.jog_z_requested.connect(self._on_jog_array_z)
-        self._jog_array.jog_pump_requested.connect(self._on_jog_array_pump)
-        self._jog_array.home_requested.connect(self._force_refresh_positions)
-        jog_lay.addWidget(self._jog_array)
-
-        # v7.4.2 hotfix: live position readout panel alongside the
-        # jog pad — gives the same at-a-glance position display the
-        # standalone Jog Control page has.
-        side = QVBoxLayout()
-        pos_title = QLabel("Live Position")
-        pos_title.setStyleSheet(
-            f"color: {COLORS['blue']}; font-weight: 600; "
-            f"")
-        side.addWidget(pos_title)
-
-        pos_frame = QFrame()
-        pos_frame.setStyleSheet(
-            f"background: {COLORS['mantle']}; "
-            f"border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: {sp(4)}; padding: {sp(4)};")
-        pos_grid = QGridLayout(pos_frame)
-        pos_grid.setSpacing(s(4))
-        pos_grid.setContentsMargins(s(6), s(4), s(6), s(4))
-
+        # v7.4.2: the Full Jog Pad + Live Position panel that used to
+        # sit here have moved to the persistent HardwareControlPanel on
+        # the left edge of Hardware Setup. They were embedded only on
+        # the Device sub-page; now they're visible across all sub-pages.
+        #
+        # Headless placeholders below keep _update_position_displays /
+        # _force_refresh_positions / _set_zero_axis happy without
+        # rewriting their bodies — they reference lbl_jog_pos +
+        # lbl_jog_status + btn_refresh_positions.
         self.lbl_jog_pos: dict[str, QLabel] = {}
-        for r, (axis, unit) in enumerate([
-            ("X", "µm"), ("Y", "µm"), ("Z", "mm"),
-            ("P1", "mm"), ("P2", "mm"), ("P3", "mm"),
-        ]):
-            ax_lbl = QLabel(f"<b>{axis}</b>")
-            ax_lbl.setStyleSheet(
-                f"color: {COLORS['text']}; ")
-            pos_grid.addWidget(ax_lbl, r, 0)
-
-            val = QLabel("—")
-            val.setStyleSheet(
-                f"color: {COLORS['text']}; font-family: monospace; "
-                f"")
-            val.setMinimumWidth(s(80))
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            pos_grid.addWidget(val, r, 1)
-            self.lbl_jog_pos[axis] = val
-
-            unit_lbl = QLabel(f"({unit})")
-            unit_lbl.setStyleSheet(
-                f"color: {COLORS['subtext0']}; ")
-            pos_grid.addWidget(unit_lbl, r, 2)
-
-        side.addWidget(pos_frame)
-
-        self.btn_refresh_positions = QPushButton("↻ Refresh Positions")
-        self.btn_refresh_positions.setToolTip(
-            "Force a fresh position read from each connected stage.")
-        self.btn_refresh_positions.clicked.connect(self._force_refresh_positions)
-        side.addWidget(self.btn_refresh_positions)
-
+        for axis in ("X", "Y", "Z", "P1", "P2", "P3"):
+            self.lbl_jog_pos[axis] = QLabel("—")
+            self.lbl_jog_pos[axis].setVisible(False)
+        self.btn_refresh_positions = QPushButton()
+        self.btn_refresh_positions.setVisible(False)
         self.lbl_jog_status = QLabel("")
-        self.lbl_jog_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; ")
-        self.lbl_jog_status.setWordWrap(True)
-        side.addWidget(self.lbl_jog_status, 1)
-        jog_lay.addLayout(side, 1)
-
-        outer.addWidget(jog_grp)
+        self.lbl_jog_status.setVisible(False)
 
         # ── Per-axis position + record + min/max spinboxes ─────
         limits_grp = QGroupBox(
@@ -1838,6 +1780,10 @@ class StageHardwarePanel(QWidget):
         Routes every ZP axis through the live ``axis_map`` so the
         display reflects whatever physical Marlin axis is currently
         mapped to each logical Z/P1/P2/P3.
+
+        v7.4.2: Also nudges the persistent HardwareControlPanel's
+        position labels so the left-side live display stays in sync
+        when a Set Zero / Set Min / Set Max click forces a fresh read.
         """
         def _set(d, key, val):
             if val is None or not hasattr(self, d) or key not in getattr(self, d):
@@ -1860,6 +1806,17 @@ class StageHardwarePanel(QWidget):
                 txt = f"{v:.3f}"
                 _set("lbl_axis_pos", logical, txt)
                 _set("lbl_jog_pos", logical, txt)
+        # v7.4.2: nudge the persistent left-side control panel too.
+        page = self.parent()
+        ctrl_panel = None
+        while page is not None and ctrl_panel is None:
+            ctrl_panel = getattr(page, "_control_panel", None)
+            page = page.parent() if hasattr(page, "parent") else None
+        if ctrl_panel is not None:
+            try:
+                ctrl_panel._update_position_displays(xy, zp)
+            except Exception:
+                pass
 
     # v7.4.2 hotfix: _build_jog_row, _jog, and _JOG_STEPS removed.
     # Per-axis jog UI is now driven by the embedded JogButtonArray

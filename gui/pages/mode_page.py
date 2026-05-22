@@ -55,10 +55,16 @@ class ModePage(QWidget):
         self._active_index: int = 0
         self._context_widgets: list[QWidget | None] = []
 
-        # Main layout: [content stack] + [right sidebar]
+        # Main layout: [optional left panel] + [content stack] + [right sidebar]
         self._main_layout = QHBoxLayout(self)
         self._main_layout.setSpacing(0)
         self._main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # v7.4.2: Optional persistent left panel — subclasses use
+        # add_left_panel() to attach a widget here. Used by Hardware
+        # Setup to host the Connect / Jog / Live Position controls so
+        # they stay visible regardless of which sub-page is active.
+        self._left_panel: QWidget | None = None
 
         # Sub-page content stack
         self._sub_stack = QStackedWidget()
@@ -83,6 +89,28 @@ class ModePage(QWidget):
         self._sidebar_layout.setAlignment(Qt.AlignTop)
 
         self._main_layout.addWidget(self._sidebar)
+
+    # ── Left panel ───────────────────────────────────────────────
+
+    def add_left_panel(self, panel: QWidget, width: int = 320) -> None:
+        """v7.4.2: Insert a persistent left panel visible across all sub-pages.
+
+        Hardware Setup uses this for the always-on Connect Hardware +
+        Jog Pad + Live Position controls so the user can move the
+        stages while editing config on any sub-page.
+
+        Args:
+            panel: Widget to insert at the left edge of the page.
+            width: Fixed width in scaled px (default 320).
+        """
+        if self._left_panel is not None:
+            logger.warning("ModePage already has a left panel — replacing it")
+            self._main_layout.removeWidget(self._left_panel)
+            self._left_panel.deleteLater()
+        panel.setFixedWidth(s(width))
+        # Insert at index 0 so it sits before the sub-page stack.
+        self._main_layout.insertWidget(0, panel)
+        self._left_panel = panel
 
     # ── Sub-page management ──────────────────────────────────────
 

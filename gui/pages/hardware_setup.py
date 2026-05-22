@@ -514,11 +514,20 @@ class HardwareSetupPage(ModePage):
 
         self._setup_ui()
 
+        # v7.4.2: Persistent left-side control panel — Connect + Jog +
+        # Live Position. Stays visible across all 7 sub-pages so the
+        # user can move stages while editing any config section.
+        from gui.pages.hardware.control_panel import HardwareControlPanel
+        self._control_panel = HardwareControlPanel()
+        self.add_left_panel(self._control_panel, width=360)
+
     def set_settings(self, settings):
         """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets."""
         self._settings = settings
         if hasattr(self, '_stage_panel'):
             self._stage_panel.set_settings(settings)
+        if hasattr(self, '_control_panel'):
+            self._control_panel.set_settings(settings)
 
     def get_page_title(self) -> str:
         return "Hardware Setup"
@@ -1144,10 +1153,13 @@ class HardwareSetupPage(ModePage):
         """v7.3.3: Receive StageController for pixel calibration.
 
         v7.4.0-b: Also propagates to the Stage sub-page panel.
+        v7.4.2: Also propagates to the persistent left-side control panel.
         """
         self._controller = controller
         if hasattr(self, '_stage_panel'):
             self._stage_panel.set_controller(controller)
+        if hasattr(self, '_control_panel'):
+            self._control_panel.set_controller(controller)
 
     def set_calibrated_um_per_px(self, cam_idx: int, value: float):
         """v7.3.3: Set calibrated µm/px from external source (e.g., needle-based)."""
@@ -1845,11 +1857,13 @@ class HardwareSetupPage(ModePage):
             self.set_config(config)
 
     def on_status_update(self):
-        """Called by MainWindow timer.
-
-        v7.4.2: Forward to Stage panel so connection badges + per-axis
-        jog readouts refresh while the user is on the Device sub-page.
-        """
+        """v7.4.2: Tick the persistent control panel + forward to the
+        Stage sub-page so its per-axis position cells refresh too."""
+        if hasattr(self, '_control_panel'):
+            try:
+                self._control_panel.on_status_update()
+            except Exception:
+                pass
         if hasattr(self, '_stage_panel'):
             try:
                 self._stage_panel.on_status_update()
