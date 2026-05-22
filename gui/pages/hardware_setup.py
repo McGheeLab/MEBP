@@ -514,12 +514,14 @@ class HardwareSetupPage(ModePage):
 
         self._setup_ui()
 
-        # v7.4.2: Persistent left-side control panel — Connect + Jog +
-        # Live Position. Stays visible across all 7 sub-pages so the
-        # user can move stages while editing any config section.
+        # v7.4.2: Persistent control panel — Connect + Jog + Live Position.
+        # Lives in the existing per-page left context panel
+        # (returned from ``get_context_widget``) so it replaces the old
+        # "Saved Configurations" browser that used to live there.
+        # Always visible across all 7 sub-pages because the context
+        # panel doesn't swap when the sub-page changes.
         from gui.pages.hardware.control_panel import HardwareControlPanel
         self._control_panel = HardwareControlPanel()
-        self.add_left_panel(self._control_panel, width=360)
 
     def set_settings(self, settings):
         """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets."""
@@ -1871,77 +1873,16 @@ class HardwareSetupPage(ModePage):
                 pass
 
     def get_context_widget(self) -> QWidget | None:
-        """v7.2.4: Context panel with saved config file browser."""
-        if self._context_widget is not None:
-            return self._context_widget
+        """v7.4.2: Return the HardwareControlPanel as the context widget.
 
-        ctx = QWidget()
-        layout = QVBoxLayout(ctx)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
-
-        # ── Saved Configurations ────────────────────────────
-        configs_label = QLabel("Saved Configurations")
-        configs_label.setObjectName("contextSectionLabel")
-        layout.addWidget(configs_label)
-
-        self._config_list = QListWidget()
-        self._config_list.setAlternatingRowColors(True)
-        self._config_list.setMaximumHeight(s(260))
-        self._config_list.itemDoubleClicked.connect(
-            self._on_config_list_double_click)
-        self._config_list.currentItemChanged.connect(
-            self._on_config_list_selection)
-        layout.addWidget(self._config_list)
-
-        # Active config indicator
-        self._lbl_active_config = QLabel("Active: (unsaved)")
-        self._lbl_active_config.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
-            f"font-style: italic;")
-        layout.addWidget(self._lbl_active_config)
-
-        # Buttons row
-        btn_row = QHBoxLayout()
-        btn_load = QPushButton("Load")
-        btn_load.setMaximumHeight(s(26))
-        btn_load.clicked.connect(self._on_config_list_load)
-        btn_row.addWidget(btn_load)
-
-        btn_del = QPushButton("Delete")
-        btn_del.setMaximumHeight(s(26))
-        btn_del.setObjectName("dangerBtn")
-        btn_del.clicked.connect(self._on_config_list_delete)
-        btn_row.addWidget(btn_del)
-
-        btn_refresh = QPushButton("🔄")
-        btn_refresh.setMaximumHeight(s(26))
-        btn_refresh.setMaximumWidth(s(32))
-        btn_refresh.setToolTip("Refresh config file list")
-        btn_refresh.clicked.connect(self._scan_config_directory)
-        btn_row.addWidget(btn_refresh)
-        layout.addLayout(btn_row)
-
-        # ── Validity Status ─────────────────────────────────
-        status_label = QLabel("Setup Status")
-        status_label.setObjectName("contextSectionLabel")
-        layout.addWidget(status_label)
-
-        self._ctx_validity_label = QLabel("⚠ Setup incomplete")
-        self._ctx_validity_label.setStyleSheet(
-            f"color: {COLORS.get('yellow', '#f9e2af')}; ")
-        self._ctx_validity_label.setWordWrap(True)
-        layout.addWidget(self._ctx_validity_label)
-
-        layout.addStretch()
-
-        self._context_widget = ctx
-
-        # Sync validity label now that _ctx_validity_label exists
-        self._sync_validity_display()  # v7.3.1: sync on first show
-
-        # Initial scan
-        self._scan_config_directory()
+        Previously this returned a "Saved Configurations" file browser.
+        Per user request, that browser is gone — config save/load lives
+        on the Identity sub-page's Actions row, and the device profile
+        picker lives on the Device sub-page. The context panel now
+        hosts the always-on Connect / Jog / Live Position controls so
+        the user can drive the stages from any Hardware Setup sub-page.
+        """
+        return self._control_panel
 
         return ctx
 
