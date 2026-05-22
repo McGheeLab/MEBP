@@ -525,10 +525,16 @@ class HardwareSetupPage(ModePage):
         self._control_panel = HardwareControlPanel()
 
     def set_settings(self, settings):
-        """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets."""
+        """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets.
+
+        v7.4.2: Also propagates to the Xbox sub-page and the persistent
+        left-side control panel.
+        """
         self._settings = settings
         if hasattr(self, '_stage_panel'):
             self._stage_panel.set_settings(settings)
+        if hasattr(self, '_xbox_panel'):
+            self._xbox_panel.set_settings(settings)
         if hasattr(self, '_control_panel'):
             self._control_panel.set_settings(settings)
 
@@ -572,6 +578,17 @@ class HardwareSetupPage(ModePage):
             f"QScrollArea {{ background-color: {_bg}; border: none; }}")
         stage_scroll.setWidget(self._stage_panel)
         self._sub_scrolls["stage"] = stage_scroll
+
+        # v7.4.2: dedicated Xbox controller sub-page.
+        from gui.pages.hardware.xbox_panel import XboxHardwarePanel
+        self._xbox_panel = XboxHardwarePanel(self)
+        xbox_scroll = QScrollArea()
+        xbox_scroll.setWidgetResizable(True)
+        xbox_scroll.setFrameShape(QFrame.NoFrame)
+        xbox_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {_bg}; border: none; }}")
+        xbox_scroll.setWidget(self._xbox_panel)
+        self._sub_scrolls["xbox"] = xbox_scroll
 
         # Backward-compat alias: existing code still references
         # self._content_layout in a few spots — make it point at the
@@ -1045,6 +1062,8 @@ class HardwareSetupPage(ModePage):
                           self._sub_scrolls["rosette"])
         self.add_sub_page("📷", "Cameras",
                           self._sub_scrolls["cameras"])
+        self.add_sub_page("🎮", "Xbox Controller",
+                          self._sub_scrolls["xbox"])
 
     # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
     def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
@@ -1197,6 +1216,8 @@ class HardwareSetupPage(ModePage):
         self._controller = controller
         if hasattr(self, '_stage_panel'):
             self._stage_panel.set_controller(controller)
+        if hasattr(self, '_xbox_panel'):
+            self._xbox_panel.set_controller(controller)
         if hasattr(self, '_control_panel'):
             self._control_panel.set_controller(controller)
 

@@ -81,6 +81,13 @@ class XboxQueuePoller:
         # v7.2.6: S4-D status handler — track controller state from worker
         self._xbox_status: str = "disconnected"
         self._last_heartbeat_time: float = time.time()
+        # v7.4.2: live input monitor state. Updated as worker events
+        # come in so a GUI poll-driven visualiser can render the
+        # current stick / trigger positions + the most recent button
+        # press without subscribing to the Processor's command bus.
+        self.last_axis: dict[int, float] = {}    # axis index → normalized [-1, 1]
+        self.last_button: tuple[int, float] | None = None  # (button_id, ts)
+        self.last_dpad: tuple[int, float] | None = None    # (direction, ts)
 
 
     def start(self) -> None:
@@ -118,10 +125,21 @@ class XboxQueuePoller:
                             or self.debug_mode):
                         logger.info(f"[Xbox] {text}")
                 elif "button" in msg:
+                    # v7.4.2: cache last button for the live monitor.
+                    try:
+                        self.last_button = (int(msg["button"]), time.time())
+                    except Exception:
+                        pass
                     self.processor.add_command(msg["command"], button=msg["button"])
                 elif "axis" in msg:
                     avg = msg["average"]
                     cmd = msg["command"]
+                    # v7.4.2: cache the latest per-axis value for the
+                    # live monitor.
+                    try:
+                        self.last_axis[int(msg["axis"])] = float(avg)
+                    except Exception:
+                        pass
                     # Log pump axis commands only in debug mode
                     if self.debug_mode and "p" in cmd.lower() and "velocity" in cmd.lower():
                         logger.info(
@@ -131,6 +149,10 @@ class XboxQueuePoller:
                         cmd, axis=msg["axis"], average=avg
                     )
                 elif "dpad" in msg:
+                    try:
+                        self.last_dpad = (int(msg["dpad"]), time.time())
+                    except Exception:
+                        pass
                     self.processor.add_command(msg["command"], direction=msg["dpad"])
 
             # Heartbeat staleness: worker sends every 3s, stale after 10s
