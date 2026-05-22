@@ -1160,7 +1160,9 @@ class PrintResultsPage(QWidget):
         self._ctx_recording_list.itemClicked.connect(self._on_recording_clicked)
         layout.addWidget(self._ctx_recording_list)
 
-        btn_load = QPushButton("📂 Load Selected")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_load = _icon_button("Load Selected", "folder-open",
+                                color=COLORS['crust'])
         btn_load.setStyleSheet(
             f"QPushButton {{ background: {COLORS['green']}; "
             f"color: {COLORS['crust']}; font-weight: bold; "
@@ -1168,7 +1170,7 @@ class PrintResultsPage(QWidget):
         btn_load.clicked.connect(self._load_selected_recording)
         layout.addWidget(btn_load)
 
-        btn_refresh = QPushButton("🔄 Refresh List")
+        btn_refresh = _icon_button("Refresh List", "refresh")
         btn_refresh.setStyleSheet(
             f"QPushButton {{ background: {COLORS['surface0']}; "
             f"color: {COLORS['text']}; border-radius: 4px; padding: 4px; }}")

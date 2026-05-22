@@ -370,11 +370,12 @@ class WellSetupTab(QWidget):
 
         bar_layout.addStretch()
 
-        # Clear / Empty button
-        btn_clear = QPushButton("✕ Clear")
+        # Clear / Empty button — v7.4.2: solid icon, not emoji
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_clear = _icon_button(
+            "Clear", "x", object_name="dangerBtn",
+            tooltip="Reset selected wells to Empty")
         btn_clear.setFixedHeight(s(28))
-        btn_clear.setObjectName("dangerBtn")
-        btn_clear.setToolTip("Reset selected wells to Empty")
         btn_clear.clicked.connect(self._on_clear_role)
         bar_layout.addWidget(btn_clear)
 

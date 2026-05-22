@@ -62,6 +62,7 @@ from SupportClasses.WellPlate import PLATE_DEFINITIONS
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
+from gui.widgets.icons import icon, icon_button
 
 logger = logging.getLogger(__name__)
 
@@ -603,10 +604,10 @@ class HardwareSetupPage(ModePage):
         self.name_edit.editTextChanged.connect(self._on_config_changed)
         name_row.addWidget(self.name_edit, 1)
 
-        self._btn_refresh_setups = QPushButton("🔄")
-        self._btn_refresh_setups.setFixedWidth(s(32))
-        self._btn_refresh_setups.setToolTip(
-            "Re-scan saved hardware configurations")
+        self._btn_refresh_setups = icon_button(
+            "", "refresh",
+            tooltip="Re-scan saved hardware configurations")
+        self._btn_refresh_setups.setFixedWidth(s(36))
         self._btn_refresh_setups.clicked.connect(
             self._refresh_setup_name_combo)
         name_row.addWidget(self._btn_refresh_setups)
@@ -664,18 +665,13 @@ class HardwareSetupPage(ModePage):
         # secondary, destructive in red.
         ink_btns = QHBoxLayout()
         ink_btns.setSpacing(s(8))
-        btn_add_ink = QPushButton("➕  Add Ink")
-        btn_add_ink.setObjectName("accentBtn")
-        btn_add_ink.setCursor(Qt.PointingHandCursor)
+        btn_add_ink = icon_button("Add Ink", "plus", object_name="accentBtn")
         btn_add_ink.clicked.connect(self._add_ink)
         ink_btns.addWidget(btn_add_ink)
-        btn_edit_ink = QPushButton("Edit")
-        btn_edit_ink.setCursor(Qt.PointingHandCursor)
+        btn_edit_ink = icon_button("Edit", "pencil")
         btn_edit_ink.clicked.connect(self._edit_ink)
         ink_btns.addWidget(btn_edit_ink)
-        btn_del_ink = QPushButton("Remove")
-        btn_del_ink.setObjectName("dangerBtn")
-        btn_del_ink.setCursor(Qt.PointingHandCursor)
+        btn_del_ink = icon_button("Remove", "trash", object_name="dangerBtn")
         btn_del_ink.clicked.connect(self._remove_ink)
         ink_btns.addWidget(btn_del_ink)
         ink_btns.addStretch()
@@ -798,18 +794,13 @@ class HardwareSetupPage(ModePage):
         # v7.4.2 polish: action row — primary add, secondary edit, danger remove.
         ros_btns = QHBoxLayout()
         ros_btns.setSpacing(s(8))
-        btn_add_ros = QPushButton("➕  Add Rosette")
-        btn_add_ros.setObjectName("accentBtn")
-        btn_add_ros.setCursor(Qt.PointingHandCursor)
+        btn_add_ros = icon_button("Add Rosette", "plus", object_name="accentBtn")
         btn_add_ros.clicked.connect(self._add_rosette)
         ros_btns.addWidget(btn_add_ros)
-        btn_edit_ros = QPushButton("Edit")
-        btn_edit_ros.setCursor(Qt.PointingHandCursor)
+        btn_edit_ros = icon_button("Edit", "pencil")
         btn_edit_ros.clicked.connect(self._edit_rosette)
         ros_btns.addWidget(btn_edit_ros)
-        btn_del_ros = QPushButton("Remove")
-        btn_del_ros.setObjectName("dangerBtn")
-        btn_del_ros.setCursor(Qt.PointingHandCursor)
+        btn_del_ros = icon_button("Remove", "trash", object_name="dangerBtn")
         btn_del_ros.clicked.connect(self._remove_rosette)
         ros_btns.addWidget(btn_del_ros)
         ros_btns.addStretch()
@@ -887,12 +878,10 @@ class HardwareSetupPage(ModePage):
         # v7.4.2 polish: detect row — primary "Detect" button + muted count.
         detect_row = QHBoxLayout()
         detect_row.setSpacing(s(8))
-        self._btn_detect_live_cams = QPushButton("🔍  Detect Cameras")
-        self._btn_detect_live_cams.setObjectName("accentBtn")
-        self._btn_detect_live_cams.setCursor(Qt.PointingHandCursor)
-        self._btn_detect_live_cams.setMinimumWidth(s(140))
-        self._btn_detect_live_cams.setToolTip(
-            "Scan for available cameras (OpenCV, ToupCam, Simulated)")
+        self._btn_detect_live_cams = icon_button(
+            "Detect Cameras", "search", object_name="accentBtn",
+            tooltip="Scan for available cameras (OpenCV, ToupCam, Simulated)")
+        self._btn_detect_live_cams.setMinimumWidth(s(160))
         self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
         detect_row.addWidget(self._btn_detect_live_cams)
         self._lbl_live_cam_count = QLabel("0 found")
@@ -960,12 +949,11 @@ class HardwareSetupPage(ModePage):
         # Calibrate µm/px button (v7.3.3)
         cal_row = QHBoxLayout()
         cal_row.setSpacing(s(8))
-        self._btn_calibrate_umpx = QPushButton("📐  Calibrate µm/px")
-        self._btn_calibrate_umpx.setCursor(Qt.PointingHandCursor)
-        self._btn_calibrate_umpx.setToolTip(
-            "Measure actual µm/px by moving the stage a known distance "
-            "and correlating pixel displacement")
-        self._btn_calibrate_umpx.setMinimumWidth(s(150))
+        self._btn_calibrate_umpx = icon_button(
+            "Calibrate µm/px", "ruler",
+            tooltip=("Measure actual µm/px by moving the stage a known "
+                     "distance and correlating pixel displacement"))
+        self._btn_calibrate_umpx.setMinimumWidth(s(170))
         self._btn_calibrate_umpx.clicked.connect(self._on_calibrate_umpx)
         cal_row.addStretch()
         cal_row.addWidget(self._btn_calibrate_umpx)
@@ -994,17 +982,16 @@ class HardwareSetupPage(ModePage):
         actions_lay = QHBoxLayout(actions_group)
         actions_lay.setSpacing(s(8))
 
-        btn_save = QPushButton("💾  Save Config")
-        btn_save.setObjectName("accentBtn")
-        btn_save.setCursor(Qt.PointingHandCursor)
-        btn_save.setToolTip("Save the current hardware configuration to disk.")
+        btn_save = icon_button(
+            "Save Config", "save", object_name="accentBtn",
+            tooltip="Save the current hardware configuration to disk.")
         btn_save.clicked.connect(self._save_config)
         actions_lay.addStretch()
         actions_lay.addWidget(btn_save)
 
-        btn_load = QPushButton("📂  Load Config")
-        btn_load.setCursor(Qt.PointingHandCursor)
-        btn_load.setToolTip("Load a previously saved hardware configuration.")
+        btn_load = icon_button(
+            "Load Config", "folder-open",
+            tooltip="Load a previously saved hardware configuration.")
         btn_load.clicked.connect(self._load_config)
         actions_lay.addWidget(btn_load)
 

@@ -34,6 +34,7 @@ from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.hardware.device_profile import (
     DeviceProfile, list_profiles, delete_profile, DEVICES_DIR,
 )
+from gui.widgets.icons import icon, icon_button, set_button_icon
 from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 
@@ -208,12 +209,11 @@ class StageHardwarePanel(QWidget):
             "Discard all unsaved edits and reload the saved device profile.")
         self.btn_reset.clicked.connect(self._reset_defaults)
         btn_row.addWidget(self.btn_reset)
-        self.btn_apply = QPushButton("💾  Apply Settings")
-        self.btn_apply.setObjectName("accentBtn")
-        self.btn_apply.setCursor(Qt.PointingHandCursor)
-        self.btn_apply.setToolTip(
-            "Apply every section in one click. Per-section buttons do the "
-            "same thing scoped to that section.")
+        self.btn_apply = icon_button(
+            "Apply Settings", "save", object_name="accentBtn",
+            tooltip=(
+                "Apply every section in one click. Per-section buttons "
+                "do the same thing scoped to that section."))
         self.btn_apply.clicked.connect(self._apply)
         btn_row.addWidget(self.btn_apply)
         outer.addLayout(btn_row)
@@ -240,10 +240,9 @@ class StageHardwarePanel(QWidget):
         self.cmb_profile.currentIndexChanged.connect(self._on_profile_picked)
         row.addWidget(self.cmb_profile, 1)
 
-        self.btn_refresh_profiles = QPushButton("🔄")
+        self.btn_refresh_profiles = icon_button(
+            "", "refresh", tooltip="Refresh profile list")
         self.btn_refresh_profiles.setFixedWidth(s(36))
-        self.btn_refresh_profiles.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh_profiles.setToolTip("Refresh profile list")
         self.btn_refresh_profiles.clicked.connect(self._refresh_profile_list)
         row.addWidget(self.btn_refresh_profiles)
         lay.addLayout(row)
@@ -252,18 +251,15 @@ class StageHardwarePanel(QWidget):
         # Delete on the right (semantic grouping).
         action_row = QHBoxLayout()
         action_row.setSpacing(s(8))
-        self.btn_load_profile = QPushButton("📂  Load")
-        self.btn_load_profile.setCursor(Qt.PointingHandCursor)
-        self.btn_load_profile.setToolTip(
-            "Apply the selected profile to every section below.")
+        self.btn_load_profile = icon_button(
+            "Load", "folder-open",
+            tooltip="Apply the selected profile to every section below.")
         self.btn_load_profile.clicked.connect(self._load_selected_profile)
         action_row.addWidget(self.btn_load_profile)
 
-        self.btn_save_profile = QPushButton("💾  Save")
-        self.btn_save_profile.setObjectName("accentBtn")
-        self.btn_save_profile.setCursor(Qt.PointingHandCursor)
-        self.btn_save_profile.setToolTip(
-            "Save current settings back to the selected profile")
+        self.btn_save_profile = icon_button(
+            "Save", "save", object_name="accentBtn",
+            tooltip="Save current settings back to the selected profile")
         self.btn_save_profile.clicked.connect(self._save_to_selected_profile)
         action_row.addWidget(self.btn_save_profile)
 
@@ -406,12 +402,12 @@ class StageHardwarePanel(QWidget):
         # mm/min to settings + sends M203 to Marlin (max feedrate)
         # and updates the controller's retract/insert feedrates.
         save_row = QHBoxLayout()
-        btn_save_feedrates = QPushButton("💾 Save Feedrates")
-        btn_save_feedrates.setObjectName("successBtn")
-        btn_save_feedrates.setToolTip(
-            "Compute absolute mm/min from the percentages, persist to "
-            "settings, send M203 to Marlin for the max feedrate, and "
-            "update the controller's retract/insert/jog feedrates.")
+        btn_save_feedrates = icon_button(
+            "Save Feedrates", "save", object_name="successBtn",
+            tooltip=(
+                "Compute absolute mm/min from the percentages, persist to "
+                "settings, send M203 to Marlin for the max feedrate, and "
+                "update the controller's retract/insert/jog feedrates."))
         btn_save_feedrates.clicked.connect(self._apply_zp_feedrates)
         save_row.addWidget(btn_save_feedrates)
         save_row.addStretch()
@@ -579,11 +575,10 @@ class StageHardwarePanel(QWidget):
         # v7.4.2 hotfix: per-section Save button — pushes safety_limits
         # to settings + the live controller in one click.
         save_row = QHBoxLayout()
-        btn_save_safety = QPushButton("💾 Save Safety Limits && Zero")
-        btn_save_safety.setObjectName("successBtn")
-        btn_save_safety.setToolTip(
-            "Persist safety_limits + zero positions to settings and "
-            "push them to the live StageController.")
+        btn_save_safety = icon_button(
+            "Save Safety Limits && Zero", "save", object_name="successBtn",
+            tooltip=("Persist safety_limits + zero positions to settings "
+                     "and push them to the live StageController."))
         btn_save_safety.clicked.connect(self._apply_safety_and_zero)
         save_row.addWidget(btn_save_safety)
         save_row.addStretch()
@@ -964,12 +959,11 @@ class StageHardwarePanel(QWidget):
             f"color: {COLORS['subtext0']}; ")
         self.lbl_axis_map_status.setWordWrap(True)
         save_row.addWidget(self.lbl_axis_map_status, 1)
-        btn_save = QPushButton("💾  Save Mapping")
-        btn_save.setObjectName("accentBtn")
-        btn_save.setCursor(Qt.PointingHandCursor)
-        btn_save.setToolTip(
-            "Push the mapping to the live ZP stage (if connected) and "
-            "persist to settings + the current device profile.")
+        btn_save = icon_button(
+            "Save Mapping", "save", object_name="accentBtn",
+            tooltip=(
+                "Push the mapping to the live ZP stage (if connected) and "
+                "persist to settings + the current device profile."))
         btn_save.clicked.connect(self._apply_axis_mapping)
         save_row.addWidget(btn_save)
         lay.addLayout(save_row)
@@ -1102,11 +1096,10 @@ class StageHardwarePanel(QWidget):
 
         # ── Save XY Calibration button ─────────────────────────
         save_row = QHBoxLayout()
-        btn_save_xy = QPushButton("💾 Save XY Calibration")
-        btn_save_xy.setObjectName("successBtn")
-        btn_save_xy.setToolTip(
-            "Send velocity/acceleration/jerk to ProScan and persist "
-            "to settings + device profile.")
+        btn_save_xy = icon_button(
+            "Save XY Calibration", "save", object_name="successBtn",
+            tooltip=("Send velocity/acceleration/jerk to ProScan and "
+                     "persist to settings + device profile."))
         btn_save_xy.clicked.connect(self._apply_xy_calibration)
         save_row.addWidget(btn_save_xy)
         self.lbl_xy_cal_status = QLabel("")
@@ -1451,22 +1444,20 @@ class StageHardwarePanel(QWidget):
         self.lbl_alignment_status.setWordWrap(True)
         save_row.addWidget(self.lbl_alignment_status, 1)
 
-        self.btn_check_alignment = QPushButton("🔍  Check alignment")
-        self.btn_check_alignment.setCursor(Qt.PointingHandCursor)
-        self.btn_check_alignment.setToolTip(
-            "Query Marlin (M503) and compare its reported steps/mm "
-            "and max feedrate against this device profile. Axes that "
-            "disagree turn red so you know which to re-save.")
+        self.btn_check_alignment = icon_button(
+            "Check alignment", "search",
+            tooltip=(
+                "Query Marlin (M503) and compare its reported steps/mm "
+                "and max feedrate against this device profile. Axes "
+                "that disagree turn red so you know which to re-save."))
         self.btn_check_alignment.clicked.connect(self._check_marlin_alignment)
         save_row.addWidget(self.btn_check_alignment)
 
-        btn_save_cal = QPushButton("💾  Save Calibration")
-        btn_save_cal.setObjectName("accentBtn")
-        btn_save_cal.setCursor(Qt.PointingHandCursor)
-        btn_save_cal.setToolTip(
-            "Re-send steps_per_mm (M92), per-axis max acceleration "
-            "(M201), and per_axis_max_feedrate to Marlin / device "
-            "profile and persist to settings.")
+        btn_save_cal = icon_button(
+            "Save Calibration", "save", object_name="accentBtn",
+            tooltip=("Re-send steps_per_mm (M92), per-axis max acceleration "
+                     "(M201), and per_axis_max_feedrate to Marlin / device "
+                     "profile and persist to settings."))
         btn_save_cal.clicked.connect(self._apply_steps_cal)
         save_row.addWidget(btn_save_cal)
 

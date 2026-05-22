@@ -275,11 +275,10 @@ class JogControlPage(QWidget):
         layout.addLayout(log_btns)
 
         # ── Xbox Mapping Editor (moved from the deprecated Dashboard) ──
-        btn_xbox_edit = QPushButton("🎮  Xbox Mapping Editor…")
-        btn_xbox_edit.setObjectName("accentBtn")
-        btn_xbox_edit.setCursor(Qt.PointingHandCursor)
-        btn_xbox_edit.setToolTip(
-            "Edit which Xbox buttons trigger which actions.")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_xbox_edit = _icon_button(
+            "Xbox Mapping Editor…", "gamepad", object_name="accentBtn",
+            tooltip="Edit which Xbox buttons trigger which actions.")
         btn_xbox_edit.clicked.connect(self._open_xbox_editor)
         layout.addWidget(btn_xbox_edit)
 
@@ -422,7 +421,11 @@ class JogControlPage(QWidget):
         btn_goto_zero.clicked.connect(self._goto_zero)
         actions_layout.addWidget(btn_goto_zero)
 
-        btn_estop = QPushButton("⚠ STOP")
+        # v7.4.2: solid-icon stop button (red, with stop glyph).
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_estop = _icon_button(
+            "STOP", "stop", object_name="dangerBtn",
+            color=COLORS['crust'])
         btn_estop.setStyleSheet(
             f"background-color: {COLORS['red']}; color: {COLORS['crust']}; "
             f"font-weight: bold; padding: {_sp(6)} {_sp(16)};")

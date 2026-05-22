@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from gui.scaling import s, sp, scaled_font_size as sf
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.widgets.components import StatusBadge
+from gui.widgets.icons import icon, icon_button
 from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 
@@ -126,6 +127,14 @@ class HardwareControlPanel(QWidget):
             lbl.setStyleSheet(f"font-weight: 600; color: {COLORS['text']};")
             return lbl
 
+        def _connect_btn(text: str, icon_name: str) -> QPushButton:
+            return icon_button(text, icon_name, object_name="successBtn")
+
+        def _disconnect_btn(tooltip: str) -> QPushButton:
+            b = icon_button("", "x", object_name="dangerBtn", tooltip=tooltip)
+            b.setFixedWidth(s(36))
+            return b
+
         # XY row
         row = 0
         grid.addWidget(_name("XY stage"), row, 0)
@@ -134,16 +143,10 @@ class HardwareControlPanel(QWidget):
         btns = QHBoxLayout()
         btns.setSpacing(s(6))
         btns.setContentsMargins(0, 0, 0, 0)
-        self.btn_connect_xy = QPushButton("🔌 Connect")
-        self.btn_connect_xy.setObjectName("successBtn")
-        self.btn_connect_xy.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_xy = _connect_btn("Connect", "plug")
         self.btn_connect_xy.clicked.connect(self._connect_xy)
         btns.addWidget(self.btn_connect_xy)
-        self.btn_disconnect_xy = QPushButton("✕")
-        self.btn_disconnect_xy.setObjectName("dangerBtn")
-        self.btn_disconnect_xy.setCursor(Qt.PointingHandCursor)
-        self.btn_disconnect_xy.setToolTip("Disconnect")
-        self.btn_disconnect_xy.setFixedWidth(s(36))
+        self.btn_disconnect_xy = _disconnect_btn("Disconnect XY")
         self.btn_disconnect_xy.clicked.connect(self._disconnect_xy)
         btns.addWidget(self.btn_disconnect_xy)
         grid.addLayout(btns, row, 2)
@@ -156,16 +159,10 @@ class HardwareControlPanel(QWidget):
         btns = QHBoxLayout()
         btns.setSpacing(s(6))
         btns.setContentsMargins(0, 0, 0, 0)
-        self.btn_connect_zp = QPushButton("🔌 Connect")
-        self.btn_connect_zp.setObjectName("successBtn")
-        self.btn_connect_zp.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_zp = _connect_btn("Connect", "plug")
         self.btn_connect_zp.clicked.connect(self._connect_zp)
         btns.addWidget(self.btn_connect_zp)
-        self.btn_disconnect_zp = QPushButton("✕")
-        self.btn_disconnect_zp.setObjectName("dangerBtn")
-        self.btn_disconnect_zp.setCursor(Qt.PointingHandCursor)
-        self.btn_disconnect_zp.setToolTip("Disconnect")
-        self.btn_disconnect_zp.setFixedWidth(s(36))
+        self.btn_disconnect_zp = _disconnect_btn("Disconnect ZP")
         self.btn_disconnect_zp.clicked.connect(self._disconnect_zp)
         btns.addWidget(self.btn_disconnect_zp)
         grid.addLayout(btns, row, 2)
@@ -178,16 +175,10 @@ class HardwareControlPanel(QWidget):
         btns = QHBoxLayout()
         btns.setSpacing(s(6))
         btns.setContentsMargins(0, 0, 0, 0)
-        self.btn_connect_xbox = QPushButton("🎮 Connect")
-        self.btn_connect_xbox.setObjectName("successBtn")
-        self.btn_connect_xbox.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_xbox = _connect_btn("Connect", "gamepad")
         self.btn_connect_xbox.clicked.connect(self._connect_xbox)
         btns.addWidget(self.btn_connect_xbox)
-        self.btn_disconnect_xbox = QPushButton("✕")
-        self.btn_disconnect_xbox.setObjectName("dangerBtn")
-        self.btn_disconnect_xbox.setCursor(Qt.PointingHandCursor)
-        self.btn_disconnect_xbox.setToolTip("Disconnect")
-        self.btn_disconnect_xbox.setFixedWidth(s(36))
+        self.btn_disconnect_xbox = _disconnect_btn("Disconnect Xbox")
         self.btn_disconnect_xbox.clicked.connect(self._disconnect_xbox)
         btns.addWidget(self.btn_disconnect_xbox)
         grid.addLayout(btns, row, 2)
@@ -210,10 +201,9 @@ class HardwareControlPanel(QWidget):
         self._jog_array.home_requested.connect(self._force_refresh_positions)
         lay.addWidget(self._jog_array)
 
-        self.btn_refresh = QPushButton("↻ Refresh Positions")
-        self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.setToolTip(
-            "Force a fresh position read from each connected stage.")
+        self.btn_refresh = icon_button(
+            "Refresh Positions", "refresh",
+            tooltip="Force a fresh position read from each connected stage.")
         self.btn_refresh.clicked.connect(self._force_refresh_positions)
         lay.addWidget(self.btn_refresh)
 

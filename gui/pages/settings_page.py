@@ -181,7 +181,8 @@ class SettingsPage(QWidget):
         self.ctx_port_label.setWordWrap(True)
         lay.addWidget(self.ctx_port_label)
 
-        btn_refresh = QPushButton("🔄 Refresh Ports")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_refresh = _icon_button("Refresh Ports", "refresh")
         btn_refresh.setMaximumHeight(s(26))
         btn_refresh.clicked.connect(self._refresh_ports)
         lay.addWidget(btn_refresh)
@@ -264,7 +265,8 @@ class SettingsPage(QWidget):
         act_lbl.setObjectName("contextSectionLabel")
         lay.addWidget(act_lbl)
 
-        btn_apply = QPushButton("✓ Apply Settings")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_apply = _icon_button("Apply Settings", "check", object_name="accentBtn")
         btn_apply.setObjectName("successBtn")
         btn_apply.setMaximumHeight(s(28))
         btn_apply.clicked.connect(self._apply_settings)
@@ -406,7 +408,8 @@ class SettingsPage(QWidget):
         # Apply / Reset buttons (also in main content for convenience)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
-        btn_apply = QPushButton("✓ Apply Settings")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_apply = _icon_button("Apply Settings", "check", object_name="accentBtn")
         btn_apply.setObjectName("successBtn")
         btn_apply.clicked.connect(self._apply_settings)
         btn_row.addWidget(btn_apply)
@@ -504,7 +507,8 @@ class SettingsPage(QWidget):
         grid.addWidget(self.port_list_label, row, 1)
         row += 1
 
-        btn_refresh = QPushButton("🔄 Refresh Ports")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_refresh = _icon_button("Refresh Ports", "refresh")
         btn_refresh.clicked.connect(self._refresh_ports)
         grid.addWidget(btn_refresh, row, 1)
         row += 1
@@ -540,7 +544,8 @@ class SettingsPage(QWidget):
 
         # Auto-detect button
         btn_row = QHBoxLayout()
-        btn_auto = QPushButton("🔍 Auto-Detect")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_auto = _icon_button("Auto-Detect", "search")
         btn_auto.setToolTip("Scan all ports for a matching controller")
         btn_auto.clicked.connect(self._auto_detect_controller)
         btn_row.addWidget(btn_auto)

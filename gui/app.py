@@ -349,10 +349,10 @@ class MainWindow(QMainWindow):
         extra_top_layout.addWidget(self._context_title)
         extra_top_layout.addStretch()
 
-        btn_close_context = QPushButton("✕")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_close_context = _icon_button("", "x", tooltip="Hide context panel")
         btn_close_context.setObjectName("extraCloseColumnBtn")
         btn_close_context.setFixedSize(s(28), s(28))
-        btn_close_context.setCursor(Qt.PointingHandCursor)
         btn_close_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
         extra_top_layout.addWidget(btn_close_context)
 

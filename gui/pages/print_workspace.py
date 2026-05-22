@@ -540,11 +540,12 @@ class WorkspaceTab(QWidget):
         """)
         save_lay = QVBoxLayout(save_group)
 
-        btn_save = QPushButton("💾 Export Workspace")
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_save = _icon_button("Export Workspace", "save")
         btn_save.clicked.connect(self._export_workspace)
         save_lay.addWidget(btn_save)
 
-        btn_load = QPushButton("📂 Import Workspace")
+        btn_load = _icon_button("Import Workspace", "folder-open")
         btn_load.clicked.connect(self._import_workspace)
         save_lay.addWidget(btn_load)
 
