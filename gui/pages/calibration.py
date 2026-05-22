@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QComboBox, QDoubleSpinBox,
     QFrame, QSizePolicy, QMessageBox, QCheckBox,
-    QScrollArea,
+    QScrollArea, QTabWidget,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont
@@ -584,6 +584,15 @@ class CalibrationPage(QWidget):
         else:
             self._cameras: list = []
         self._context_widget = None
+        # v7.4.2: right-side context panel holds the Camera / Needle /
+        # Plate tabs that used to live in the left context. Built
+        # lazily by ``get_right_context_widget``.
+        self._right_context_widget = None
+        # The original ``get_context_widget`` body now becomes the
+        # widget mounted into the right tabbed panel; this flag lets
+        # us reroute the addWidget calls inside the existing helpers
+        # so we don't have to refactor every callsite.
+        self._building_right_context = False
 
         # v7.1.1: Microsteps-to-microns conversion factor
         self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
@@ -765,15 +774,130 @@ class CalibrationPage(QWidget):
     #  CONTEXT PANEL  (Plate Config + Plate View + Wizard Steps)
     # ════════════════════════════════════════════════════════════════
 
-    def get_context_widget(self) -> QWidget:
-        """Build the context panel: camera controls + plate config + wizard."""
-        if self._context_widget is not None:
-            return self._context_widget
+    # v7.4.2: ``get_context_widget`` now returns a soft-limit jog panel
+    # (no Connect Hardware) so the user can drive the stages while
+    # calibrating. The original camera/plate/wizard content moved to
+    # the right context panel, exposed via ``get_right_context_widget``.
 
-        ctx = QWidget()
-        layout = QVBoxLayout(ctx)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(5)
+    def get_context_widget(self) -> QWidget:
+        """Left context panel — jog stages with safety limits ON.
+
+        Same look/feel as Hardware Setup's left panel but with the
+        Connect Hardware section hidden (connect happens on Hardware
+        Setup) and ``bypass_safety=False`` so jogs respect the
+        recorded soft-limit envelope.
+        """
+        if not hasattr(self, "_jog_left_panel") or self._jog_left_panel is None:
+            from gui.pages.hardware.control_panel import HardwareControlPanel
+            panel = HardwareControlPanel(
+                show_connect=False, bypass_safety=False)
+            ctrl = getattr(self, "controller", None)
+            if ctrl is not None:
+                panel.set_controller(ctrl)
+            self._jog_left_panel = panel
+        return self._jog_left_panel
+
+    def get_right_context_title(self) -> str:
+        return "Calibration"
+
+    def get_right_context_widget(self) -> QWidget:
+        """Right context panel — tabbed Camera / Needle / Plate views."""
+        if self._right_context_widget is not None:
+            return self._right_context_widget
+        tabs = QTabWidget()
+        tabs.setObjectName("calibrationRightTabs")
+
+        # Tab 1: Camera Setup
+        cam_tab = QWidget()
+        cam_lay = QVBoxLayout(cam_tab)
+        cam_lay.setContentsMargins(s(10), s(10), s(10), s(10))
+        cam_lay.setSpacing(s(6))
+        # Build the camera container into the cam tab. We reuse the
+        # same builders as the legacy context — they're stateful (they
+        # populate self._ctx_cam_* lists) so they need to run once.
+        self._build_camera_tab_content(cam_lay)
+        cam_lay.addStretch(1)
+        tabs.addTab(cam_tab, "Camera Setup")
+
+        # Tab 2: Needle Calibration
+        needle_tab = QWidget()
+        needle_lay = QVBoxLayout(needle_tab)
+        needle_lay.setContentsMargins(s(10), s(10), s(10), s(10))
+        needle_lay.setSpacing(s(6))
+        self._build_needle_tab_content(needle_lay)
+        needle_lay.addStretch(1)
+        tabs.addTab(needle_tab, "Needle Calibration")
+
+        # Tab 3: Plate Calibration
+        plate_tab = QWidget()
+        plate_lay = QVBoxLayout(plate_tab)
+        plate_lay.setContentsMargins(s(10), s(10), s(10), s(10))
+        plate_lay.setSpacing(s(6))
+        self._build_plate_tab_content(plate_lay)
+        plate_lay.addStretch(1)
+        tabs.addTab(plate_tab, "Plate Calibration")
+
+        self._right_context_widget = tabs
+        # Trigger initial calibration load now that all per-tab
+        # widgets exist (the legacy build did this at the end of
+        # the function).
+        try:
+            self._load_calibration()
+        except Exception as e:
+            logger.debug(f"Initial calibration load skipped: {e}")
+        return tabs
+
+    # ── Right-context tab builders (v7.4.2) ──────────────────────
+    #
+    # Each builder writes widgets into the passed-in layout. They
+    # exist as wrappers around the original inline build code so we
+    # don't have to refactor every reference to the camera /
+    # wizard / plate-view widgets that the page already uses.
+
+    def _build_camera_tab_content(self, layout: "QVBoxLayout") -> None:
+        """Camera controls — sources, layout, per-camera rows, objective
+        & µm/px settings. Sourced from the original get_context_widget."""
+        self._build_camera_container_into(layout)
+
+    def _build_needle_tab_content(self, layout: "QVBoxLayout") -> None:
+        """Needle Z setup + Z-bottom Auto-Cal + Manual Teaching.
+
+        v7.4.2 first cut: the entire calibration wizard lives here
+        because Safe Z / Top Z / Z-Bottom are needle-Z positioning.
+        Plate-detection steps (auto-cal 3-well) bleed into here too —
+        a future pass can split them out.
+        """
+        self._build_wizard_steps(layout)
+
+    def _build_plate_tab_content(self, layout: "QVBoxLayout") -> None:
+        """Plate format combo + plate position view."""
+        plate_label = QLabel("Plate Configuration")
+        plate_label.setObjectName("contextSectionLabel")
+        layout.addWidget(plate_label)
+        plate_row = QHBoxLayout()
+        plate_row.addWidget(QLabel("Format:"))
+        self.ctx_plate_combo = QComboBox()
+        for fmt in sorted(PLATE_DEFINITIONS.keys()):
+            self.ctx_plate_combo.addItem(f"{fmt}-well", fmt)
+        self.ctx_plate_combo.setCurrentIndex(4)  # 96-well default
+        self.ctx_plate_combo.currentIndexChanged.connect(self._on_plate_changed)
+        plate_row.addWidget(self.ctx_plate_combo, stretch=1)
+        layout.addLayout(plate_row)
+        self._build_cal_views(layout)
+
+    def _build_camera_container_into(self, layout: "QVBoxLayout") -> None:
+        """Full camera-controls block. Body extracted from the original
+        get_context_widget body — all per-camera state lives on self
+        so this can only safely run once."""
+        # The original implementation in the v7.4.1 file is below;
+        # we call it to populate the camera widgets.
+        self._build_legacy_camera_section(layout)
+
+    # Legacy build retained for back-compat — invoked by the camera
+    # tab builder above.
+
+    def _build_legacy_camera_section(self, layout) -> None:
+        """Original camera-controls build, now scoped to a passed-in layout."""
 
         # ── Camera Controls (collapsible) ────────────────────────
         cam_header_row = QHBoxLayout()
@@ -1001,35 +1125,9 @@ class CalibrationPage(QWidget):
 
         layout.addWidget(self._ctx_cam_container)
 
-        # ── Plate Configuration ──────────────────────────────────
-        plate_label = QLabel("Plate Configuration")
-        plate_label.setObjectName("contextSectionLabel")
-        layout.addWidget(plate_label)
-
-        plate_row = QHBoxLayout()
-        plate_row.addWidget(QLabel("Format:"))
-        self.ctx_plate_combo = QComboBox()
-        for fmt in sorted(PLATE_DEFINITIONS.keys()):
-            self.ctx_plate_combo.addItem(f"{fmt}-well", fmt)
-        self.ctx_plate_combo.setCurrentIndex(4)  # 96-well default
-        self.ctx_plate_combo.currentIndexChanged.connect(self._on_plate_changed)
-        plate_row.addWidget(self.ctx_plate_combo, stretch=1)
-        layout.addLayout(plate_row)
-
-        # v7.3.2: Plate position view in context panel
-        self._build_cal_views(layout)
-
-        # v7.3.2: Calibration wizard steps in context panel
-        self._build_wizard_steps(layout)
-
-        layout.addStretch()
-
-        self._context_widget = ctx
-
-        # Now that all widgets exist, load any saved calibration
-        self._load_calibration()
-
-        return ctx
+        # v7.4.2: Plate config + plate views + wizard moved to other
+        # tabs — see _build_needle_tab_content and _build_plate_tab_content.
+        # No return — this helper writes into the passed-in layout.
 
     def _get_max_slots(self) -> int:
         """Return max display slots for the current tile mode."""

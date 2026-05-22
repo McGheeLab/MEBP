@@ -111,11 +111,19 @@ class PositionBar(QWidget):
 
 
 class HardwareControlPanel(QWidget):
-    """Always-on Connect + Jog + Live Position panel for Hardware Setup."""
+    """Always-on Connect + Jog + Live Position panel.
+
+    v7.4.2: configurable via kwargs so the same widget can serve both
+    Hardware Setup (default: connect visible, soft limits bypassed for
+    setup-mode jogs) and Calibration (connect hidden, soft limits
+    enforced so jogs respect the recorded envelope).
+    """
 
     _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, *,
+                 show_connect: bool = True,
+                 bypass_safety: bool = True):
         super().__init__(parent)
         self.setObjectName("hardwareControlPanel")
         self.setStyleSheet(
@@ -126,6 +134,8 @@ class HardwareControlPanel(QWidget):
         )
         self._controller = None
         self._settings = None
+        self._show_connect = show_connect
+        self._bypass_safety = bypass_safety
         self._build_ui()
 
     # ── Public API ──────────────────────────────────────────────
@@ -179,7 +189,8 @@ class HardwareControlPanel(QWidget):
         layout.setContentsMargins(s(14), s(14), s(14), s(14))
         scroll.setWidget(content)
 
-        layout.addWidget(self._build_connect_group())
+        if self._show_connect:
+            layout.addWidget(self._build_connect_group())
         layout.addWidget(self._build_jog_group())
         layout.addWidget(self._build_position_group())
         layout.addStretch(1)
@@ -273,16 +284,20 @@ class HardwareControlPanel(QWidget):
         lay.setSpacing(s(8))
         lay.setContentsMargins(s(8), s(8), s(8), s(8))
 
-        # v7.4.2: prominent warning that the jog controls bypass
-        # the recorded safety envelope. Yellow tinted card with the
-        # alert icon — hard to miss.
+        # v7.4.2: variant-aware banner. Setup-mode (bypass_safety=True)
+        # gets the yellow "limits OFF" warning. Safety-on mode gets a
+        # quieter green banner confirming jogs are clamped.
         warn = QFrame()
         warn.setObjectName("jogSafetyWarn")
+        accent = (COLORS.get("yellow", "#f9e2af") if self._bypass_safety
+                  else COLORS.get("green", "#a6e3a1"))
+        bg_rgba = ("rgba(249, 226, 175, 28)" if self._bypass_safety
+                   else "rgba(166, 227, 161, 24)")
         warn.setStyleSheet(
             f"#jogSafetyWarn {{"
-            f"  background-color: rgba(249, 226, 175, 28);"
-            f"  border: 1px solid {COLORS.get('yellow', '#f9e2af')};"
-            f"  border-left: 3px solid {COLORS.get('yellow', '#f9e2af')};"
+            f"  background-color: {bg_rgba};"
+            f"  border: 1px solid {accent};"
+            f"  border-left: 3px solid {accent};"
             f"  border-radius: {sp(6)};"
             f"  padding: {sp(8)} {sp(10)};"
             f"}}"
@@ -291,19 +306,27 @@ class HardwareControlPanel(QWidget):
         warn_lay.setSpacing(s(8))
         warn_lay.setContentsMargins(0, 0, 0, 0)
         warn_icon = QLabel()
+        icon_name = "alert" if self._bypass_safety else "check-circle"
         warn_icon.setPixmap(
-            icon("alert", color=COLORS.get("yellow", "#f9e2af"),
-                 px=s(20)).pixmap(s(20), s(20)))
+            icon(icon_name, color=accent, px=s(20)).pixmap(s(20), s(20)))
         warn_icon.setFixedSize(s(20), s(20))
         warn_lay.addWidget(warn_icon, 0, Qt.AlignTop)
-        warn_text = QLabel(
-            "<b>Safety limits are OFF in this section.</b><br>"
-            "Soft-limit clamping and the pump-enabled check are "
-            "bypassed so you can drive each stage to its mechanical "
-            "extremes. Watch the Live Position bars below — markers "
-            "turn red when they cross the recorded envelope.")
+        if self._bypass_safety:
+            text = (
+                "<b>Safety limits are OFF in this section.</b><br>"
+                "Soft-limit clamping and the pump-enabled check are "
+                "bypassed so you can drive each stage to its mechanical "
+                "extremes. Watch the Live Position bars below — markers "
+                "turn red when they cross the recorded envelope.")
+        else:
+            text = (
+                "<b>Safety limits are enforced.</b> Jogs respect the "
+                "recorded soft-limit envelope and the pump-enabled "
+                "check. Position bars highlight in red if the stage "
+                "approaches a limit.")
+        warn_text = QLabel(text)
         warn_text.setWordWrap(True)
-        warn_text.setStyleSheet(f"color: {COLORS.get('yellow', '#f9e2af')};")
+        warn_text.setStyleSheet(f"color: {accent};")
         warn_lay.addWidget(warn_text, 1)
         lay.addWidget(warn)
 
@@ -594,6 +617,10 @@ class HardwareControlPanel(QWidget):
     def _sync_badges(self) -> None:
         if self._controller is None:
             return
+        # v7.4.2: panel may be configured without the Connect group
+        # (calibration variant) — bail if the badge widgets don't exist.
+        if not hasattr(self, 'badge_xy'):
+            return
         xy_ok = bool(getattr(self._controller, 'is_xy_connected', False))
         zp_ok = bool(getattr(self._controller, 'is_zp_connected', False))
         self.badge_xy.set_status("ok" if xy_ok else "pending",
@@ -623,9 +650,10 @@ class HardwareControlPanel(QWidget):
         # v7.4.2: ensure the latest speed is on ProScan before the move
         # (the user may have edited the spinbox without pressing Tab).
         self._apply_xy_speed(self.spin_xy_speed.value())
+        bypass = self._bypass_safety
         try:
             self._controller.move_xy_relative_um(
-                dx_um, dy_um, bypass_safety=True)
+                dx_um, dy_um, bypass_safety=bypass)
         except Exception as e:
             logger.warning(f"jog XY ({dx_um}, {dy_um}) failed: {e}")
         self._force_refresh_positions()
@@ -634,12 +662,12 @@ class HardwareControlPanel(QWidget):
         if self._controller is None:
             return
         feed = float(self.spin_z_speed.value())
+        bypass = self._bypass_safety
         try:
             self._controller.move_z_relative(
-                dz_mm, feedrate=feed, bypass_safety=True)
+                dz_mm, feedrate=feed, bypass_safety=bypass)
         except TypeError:
-            # Older controller signature without feedrate kwarg
-            self._controller.move_z_relative(dz_mm, bypass_safety=True)
+            self._controller.move_z_relative(dz_mm, bypass_safety=bypass)
         except Exception as e:
             logger.warning(f"jog Z {dz_mm} failed: {e}")
         self._force_refresh_positions()
@@ -648,12 +676,13 @@ class HardwareControlPanel(QWidget):
         if self._controller is None:
             return
         feed = float(self.spin_p_speed.value())
+        bypass = self._bypass_safety
         try:
             self._controller.move_pump_relative(
-                pump, distance, feedrate=feed, bypass_safety=True)
+                pump, distance, feedrate=feed, bypass_safety=bypass)
         except TypeError:
             self._controller.move_pump_relative(
-                pump, distance, bypass_safety=True)
+                pump, distance, bypass_safety=bypass)
         except Exception as e:
             logger.warning(f"jog {pump} {distance} failed: {e}")
         self._force_refresh_positions()

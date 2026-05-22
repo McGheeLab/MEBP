@@ -362,6 +362,36 @@ class MainWindow(QMainWindow):
         self._context_stack.setObjectName("extraContent")
         extra_layout.addWidget(self._context_stack)
 
+        # ── Right context panel (v7.4.2) ─────────────────────────
+        # A mirror of the left context panel anchored on the right
+        # edge. Pages opt in by implementing ``get_right_context_widget``.
+        # If a page returns None, the right panel hides.
+        self.ui_extraRightBox = QFrame()
+        self.ui_extraRightBox.setObjectName("extraRightBox")
+        self.ui_extraRightBox.setFrameShape(QFrame.NoFrame)
+        self.ui_extraRightBox.setStyleSheet(
+            f"#extraRightBox {{ background-color: {COLORS['mantle']}; "
+            f"border-left: 1px solid {COLORS['surface1']}; }}"
+        )
+        right_layout = QVBoxLayout(self.ui_extraRightBox)
+        right_layout.setSpacing(0)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_top = QFrame()
+        right_top.setMinimumHeight(s(40))
+        right_top.setMaximumHeight(s(40))
+        right_top_layout = QHBoxLayout(right_top)
+        right_top_layout.setContentsMargins(s(10), 0, s(6), 0)
+        self._right_context_title = QLabel("")
+        self._right_context_title.setObjectName("extraLabel")
+        right_top_layout.addWidget(self._right_context_title)
+        right_top_layout.addStretch()
+        right_layout.addWidget(right_top)
+
+        self._right_context_stack = QStackedWidget()
+        right_layout.addWidget(self._right_context_stack)
+        self.ui_extraRightBox.hide()  # hidden until a page opts in
+
         # ── Content Area ─────────────────────────────────────────
         content_frame = QFrame()
         content_frame.setObjectName("contentBox")
@@ -461,12 +491,15 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._splitter)
 
         # v7.3.2: Horizontal splitter for resizable context panel + content
+        # v7.4.2: third pane on the right for pages that need it (Calibration).
         self._context_splitter = QSplitter(Qt.Horizontal)
         self._context_splitter.setObjectName("contextSplitter")
         self._context_splitter.addWidget(self.ui_extraLeftBox)
         self._context_splitter.addWidget(content_frame)
-        self._context_splitter.setStretchFactor(0, 0)  # context: fixed
+        self._context_splitter.addWidget(self.ui_extraRightBox)
+        self._context_splitter.setStretchFactor(0, 0)  # left context: fixed
         self._context_splitter.setStretchFactor(1, 1)   # content: stretches
+        self._context_splitter.setStretchFactor(2, 0)  # right context: fixed
         self._context_splitter.setChildrenCollapsible(True)
         self._context_splitter.setHandleWidth(s(4))
         # Start with context panel hidden
@@ -657,6 +690,22 @@ class MainWindow(QMainWindow):
                 else:
                     placeholder = QWidget()
                     self._context_stack.addWidget(placeholder)
+
+            # v7.4.2: parallel right-context panel. Pages opt in by
+            # implementing get_right_context_widget; everyone else
+            # gets a placeholder so stack indices line up with page
+            # indices.
+            right_ctx = None
+            if hasattr(page, 'get_right_context_widget'):
+                right_ctx = page.get_right_context_widget()
+            if right_ctx is not None:
+                rscroll = QScrollArea()
+                rscroll.setObjectName("rightContextScrollArea")
+                rscroll.setWidgetResizable(True)
+                rscroll.setWidget(right_ctx)
+                self._right_context_stack.addWidget(rscroll)
+            else:
+                self._right_context_stack.addWidget(QWidget())
 
             # Propagate XY position scale
             if hasattr(page, 'set_xy_position_scale'):
@@ -1414,6 +1463,21 @@ class MainWindow(QMainWindow):
         else:
             if self.ui_extraLeftBox.isVisible():
                 UIFunctions.toggleLeftBox(self)
+
+        # v7.4.2: same dance for the right context panel.
+        right_ctx = None
+        if hasattr(page, 'get_right_context_widget'):
+            right_ctx = page.get_right_context_widget()
+        if right_ctx is not None:
+            # Stack index follows page index (placeholder QWidgets were
+            # added for pages without a right context).
+            self._right_context_stack.setCurrentIndex(index)
+            self._right_context_title.setText(
+                getattr(page, "get_right_context_title", lambda: "")()
+                or "")
+            self.ui_extraRightBox.show()
+        else:
+            self.ui_extraRightBox.hide()
 
     def _on_mode_sub_page_changed(self, mode_page_index: int):
         """v7.3.3: When a mode page switches sub-pages, update context panel."""
