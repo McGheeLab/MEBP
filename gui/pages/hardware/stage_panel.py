@@ -1231,6 +1231,8 @@ class StageHardwarePanel(QWidget):
                 except Exception as e:
                     logger.warning(f"XY set_jerk failed: {e}")
         s.save()
+        # v7.4.2: also persist to the active profile JSON.
+        self._persist_active_profile()
         self.lbl_xy_cal_status.setText(
             f"Saved: velocity {vel}%, acceleration {acc}"
             + (f", jerk {jerk}" if jerk is not None else "")
@@ -1598,6 +1600,8 @@ class StageHardwarePanel(QWidget):
         if self._settings is not None:
             self._settings.set("device_profile.steps_per_mm", new_steps)
             self._settings.save()
+            # v7.4.2: also persist to the active profile JSON.
+            self._persist_active_profile()
         self._refresh_steps_grid()
         self.lbl_cal_status.setText(
             f"{axis}: {current} → {new_value} steps/mm "
@@ -1621,6 +1625,8 @@ class StageHardwarePanel(QWidget):
         if self._settings is not None:
             self._settings.set("device_profile.steps_per_mm", new_steps)
             self._settings.save()
+            # v7.4.2: also persist to the active profile JSON.
+            self._persist_active_profile()
         self._refresh_steps_grid()
         self.lbl_cal_status.setText(
             f"{axis} direction inverted: {current} → {-current} steps/mm. "
@@ -1639,6 +1645,8 @@ class StageHardwarePanel(QWidget):
         per_axis[axis] = feedrate
         self._settings.set("device_profile.per_axis_max_feedrate", per_axis)
         self._settings.save()
+        # v7.4.2: also persist to the active profile JSON.
+        self._persist_active_profile()
         self._refresh_max_feedrate_grid()
         self.lbl_cal_status.setText(
             f"Recorded {axis} max feedrate: {feedrate:.0f} mm/min. "
@@ -1672,6 +1680,9 @@ class StageHardwarePanel(QWidget):
         if self._settings is not None:
             self._settings.set("device_profile.steps_per_mm", new_steps)
             self._settings.save()
+            # v7.4.2: also persist to the active profile JSON so the
+            # edit survives a profile switch round-trip.
+            self._persist_active_profile()
         self._refresh_steps_grid()
         if hasattr(self, 'lbl_cal_status'):
             self.lbl_cal_status.setText(
@@ -1708,6 +1719,9 @@ class StageHardwarePanel(QWidget):
         if self._settings is not None:
             self._settings.set("device_profile.per_axis_max_feedrate", per_axis)
             self._settings.save()
+            # v7.4.2: also persist to the active profile JSON so the
+            # edit survives a profile switch round-trip.
+            self._persist_active_profile()
         # v7.4.2 hotfix: push M203 immediately so Marlin agrees and the
         # alignment cell goes green without requiring a Save Calibration.
         pushed = False
@@ -2099,6 +2113,9 @@ class StageHardwarePanel(QWidget):
                    if cmb.currentData()}
         self._settings.set("device_profile.axis_map", new_map)
         self._settings.save()
+        # v7.4.2: also persist to the active profile JSON so the change
+        # survives a profile switch round-trip.
+        self._persist_active_profile()
         if (self._controller is not None
                 and self._controller.zp_stage is not None):
             self._controller.zp_stage.set_axis_map(new_map)
@@ -2147,6 +2164,9 @@ class StageHardwarePanel(QWidget):
                           for ax, sp_w in self.spin_axis_accel.items()}
                 self._settings.set("device_profile.per_axis_max_accel", accels)
         self._settings.save()
+        # v7.4.2: also persist to the active profile JSON so the change
+        # survives a profile switch round-trip.
+        self._persist_active_profile()
         self._refresh_steps_grid()
         self._refresh_max_feedrate_grid()
         # v7.4.2 hotfix: re-check alignment after a save
@@ -2292,6 +2312,8 @@ class StageHardwarePanel(QWidget):
             # Persist current zero_position snapshot too
             s.set_section("zero_position", ctrl.zero_position)
         s.save()
+        # v7.4.2: also persist to the active profile JSON.
+        self._persist_active_profile()
         if hasattr(self, 'lbl_jog_status'):
             self.lbl_jog_status.setText(
                 "Safety limits + zero positions saved to settings and "
@@ -2349,6 +2371,8 @@ class StageHardwarePanel(QWidget):
             except Exception as e:
                 logger.warning(f"ZP feedrate push to controller failed: {e}")
         s.save()
+        # v7.4.2: also persist to the active profile JSON.
+        self._persist_active_profile()
         # v7.4.2 hotfix: re-check alignment after pushing M203
         try:
             self._check_marlin_alignment(quiet=True)
@@ -2431,6 +2455,9 @@ class StageHardwarePanel(QWidget):
                 self._controller.apply_device_settings(axis_map=new_map)
 
         s.save()
+        # v7.4.2: also persist to the active profile JSON so the change
+        # survives a profile switch round-trip.
+        self._persist_active_profile()
         self.settings_applied.emit()
         logger.info("Stage hardware settings applied")
 
@@ -2508,6 +2535,34 @@ class StageHardwarePanel(QWidget):
             f"Loaded profile: {profile.profile_name}")
         self.settings_applied.emit()
         logger.info(f"Loaded device profile: {profile.profile_name}")
+
+    def _persist_active_profile(self) -> bool:
+        """v7.4.2: Snapshot current settings into the active profile JSON
+        on disk so the calibration survives a profile switch round-trip.
+
+        Without this, popup edits + per-section Save buttons only updated
+        settings.json — the on-disk profile file was stale, so switching
+        profiles and switching back lost the user's edits.
+
+        Returns True on success, False if no active profile is set or the
+        write failed (silently — caller already showed the section's
+        own status message).
+        """
+        from pathlib import Path
+        if self._settings is None:
+            return False
+        active = self._settings.get("device_profile.active") or ""
+        if not active or active not in self._profile_paths:
+            return False
+        try:
+            profile = DeviceProfile.from_settings(self._settings, name=active)
+            profile.save(Path(self._profile_paths[active]))
+            logger.info(
+                f"Active device profile auto-saved to disk: {active}")
+            return True
+        except Exception as e:
+            logger.warning(f"Active profile auto-save failed: {e}")
+            return False
 
     def _save_to_selected_profile(self):
         """Overwrite the selected profile with current widget values."""
