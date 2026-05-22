@@ -138,7 +138,8 @@ class StageHardwarePanel(QWidget):
         outer.setSpacing(s(18))
         outer.setContentsMargins(s(20), s(20), s(20), s(20))
 
-        # Banner: explains what's here and where it came from
+        # v7.4.2 polish: banner uses the frosted-glass panel style with
+        # a mauve accent stripe, matching the look of every other card.
         banner = QLabel(
             "<b>Initial device setup.</b> Safety envelope, motor "
             "feedrates, and axis direction describe the physical "
@@ -147,12 +148,16 @@ class StageHardwarePanel(QWidget):
         )
         banner.setWordWrap(True)
         banner.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9.5)}pt; "
-            f"padding: {sp(10)} {sp(14)};"
-            f"background-color: {COLORS['surface0']};"
-            f"border: 1px solid {COLORS['surface1']};"
+            f"color: {COLORS['subtext0']};"
+            f"padding: {sp(12)} {sp(16)};"
+            f"background-color: qlineargradient("
+            f"  x1: 0, y1: 0, x2: 0, y2: 1,"
+            f"  stop: 0 rgba(205, 214, 244, 14),"
+            f"  stop: 1 rgba(203, 166, 247, 14)"
+            f");"
+            f"border: 1px solid rgba(166, 173, 200, 32);"
             f"border-left: 3px solid {COLORS['mauve']};"
-            f"border-radius: {sp(6)};"
+            f"border-radius: {sp(10)};"
         )
         outer.addWidget(banner)
 
@@ -271,7 +276,7 @@ class StageHardwarePanel(QWidget):
         self.lbl_profile_status = QLabel(
             f"Profiles directory: {DEVICES_DIR}")
         self.lbl_profile_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
+            f"color: {COLORS['subtext0']}; "
             f"padding-top: {sp(4)};")
         self.lbl_profile_status.setWordWrap(True)
         lay.addWidget(self.lbl_profile_status)
@@ -314,7 +319,7 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         outer.addWidget(info)
 
         form = QFormLayout()
@@ -461,7 +466,7 @@ class StageHardwarePanel(QWidget):
         )
         bypass_banner.setWordWrap(True)
         bypass_banner.setStyleSheet(
-            f"color: {COLORS['yellow']}; font-size: {sf(9)}pt; "
+            f"color: {COLORS['yellow']}; "
             f"padding: {sp(4)} {sp(8)};"
             f"border-left: 2px solid {COLORS['yellow']};"
             f"background: rgba(249, 226, 175, 18);"
@@ -523,7 +528,7 @@ class StageHardwarePanel(QWidget):
         pos_title = QLabel("Live Position")
         pos_title.setStyleSheet(
             f"color: {COLORS['blue']}; font-weight: 600; "
-            f"font-size: {sf(10)}pt;")
+            f"")
         side.addWidget(pos_title)
 
         pos_frame = QFrame()
@@ -542,13 +547,13 @@ class StageHardwarePanel(QWidget):
         ]):
             ax_lbl = QLabel(f"<b>{axis}</b>")
             ax_lbl.setStyleSheet(
-                f"color: {COLORS['text']}; font-size: {sf(9.5)}pt;")
+                f"color: {COLORS['text']}; ")
             pos_grid.addWidget(ax_lbl, r, 0)
 
             val = QLabel("—")
             val.setStyleSheet(
                 f"color: {COLORS['text']}; font-family: monospace; "
-                f"font-size: {sf(10)}pt;")
+                f"")
             val.setMinimumWidth(s(80))
             val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             pos_grid.addWidget(val, r, 1)
@@ -556,7 +561,7 @@ class StageHardwarePanel(QWidget):
 
             unit_lbl = QLabel(f"({unit})")
             unit_lbl.setStyleSheet(
-                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+                f"color: {COLORS['subtext0']}; ")
             pos_grid.addWidget(unit_lbl, r, 2)
 
         side.addWidget(pos_frame)
@@ -569,7 +574,7 @@ class StageHardwarePanel(QWidget):
 
         self.lbl_jog_status = QLabel("")
         self.lbl_jog_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         self.lbl_jog_status.setWordWrap(True)
         side.addWidget(self.lbl_jog_status, 1)
         jog_lay.addLayout(side, 1)
@@ -886,7 +891,7 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+            f"color: {COLORS['subtext0']}; "
             f"padding-bottom: {sp(4)};")
         lay.addWidget(info)
 
@@ -919,7 +924,7 @@ class StageHardwarePanel(QWidget):
         save_row.setSpacing(s(8))
         self.lbl_axis_map_status = QLabel("")
         self.lbl_axis_map_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         self.lbl_axis_map_status.setWordWrap(True)
         save_row.addWidget(self.lbl_axis_map_status, 1)
         btn_save = QPushButton("💾  Save Mapping")
@@ -962,7 +967,7 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         outer.addWidget(info)
 
         # ── Velocity / acceleration / jerk ─────────────────────
@@ -1013,7 +1018,7 @@ class StageHardwarePanel(QWidget):
         )
         v_info.setWordWrap(True)
         v_info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         v_outer.addWidget(v_info)
 
         v_row = QHBoxLayout()
@@ -1053,7 +1058,7 @@ class StageHardwarePanel(QWidget):
 
         self.lbl_xy_verify_result = QLabel("")
         self.lbl_xy_verify_result.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         self.lbl_xy_verify_result.setWordWrap(True)
         v_outer.addWidget(self.lbl_xy_verify_result)
         outer.addWidget(verify_grp)
@@ -1069,7 +1074,7 @@ class StageHardwarePanel(QWidget):
         save_row.addWidget(btn_save_xy)
         self.lbl_xy_cal_status = QLabel("")
         self.lbl_xy_cal_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         save_row.addWidget(self.lbl_xy_cal_status, 1)
         outer.addLayout(save_row)
         return grp
@@ -1170,7 +1175,7 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+            f"color: {COLORS['subtext0']}; "
             f"padding-bottom: {sp(4)};")
         outer.addWidget(info)
 
@@ -1210,7 +1215,7 @@ class StageHardwarePanel(QWidget):
             head.setAlignment(Qt.AlignCenter)
             head.setStyleSheet(
                 f"color: {COLORS['blue']}; font-weight: 700; "
-                f"font-family: monospace; font-size: {sf(10)}pt; "
+                f"font-family: monospace; "
                 f"letter-spacing: 0.4px;")
             values_grid.addWidget(head, 0, col)
 
@@ -1218,7 +1223,7 @@ class StageHardwarePanel(QWidget):
             lbl = QLabel(text)
             lbl.setStyleSheet(
                 f"color: {COLORS['text']}; font-weight: 500; "
-                f"font-size: {sf(10)}pt;")
+                f"")
             lbl.setMinimumWidth(s(160))
             return lbl
 
@@ -1281,7 +1286,7 @@ class StageHardwarePanel(QWidget):
             lbl = QLabel(text)
             lbl.setStyleSheet(
                 f"color: {COLORS['text']}; font-weight: 500; "
-                f"font-size: {sf(10)}pt;")
+                f"")
             lbl.setMinimumWidth(s(110))
             return lbl
 
@@ -1384,7 +1389,7 @@ class StageHardwarePanel(QWidget):
 
         self.lbl_cal_status = QLabel("")
         self.lbl_cal_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         self.lbl_cal_status.setWordWrap(True)
         outer.addWidget(self.lbl_cal_status)
 
@@ -1403,7 +1408,7 @@ class StageHardwarePanel(QWidget):
         save_row.setSpacing(s(8))
         self.lbl_alignment_status = QLabel("")
         self.lbl_alignment_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; ")
         self.lbl_alignment_status.setWordWrap(True)
         save_row.addWidget(self.lbl_alignment_status, 1)
 
@@ -2140,11 +2145,11 @@ class StageHardwarePanel(QWidget):
                 self.lbl_alignment_status.setText(
                     f"⚠ Out of sync: {', '.join(mismatches)}. See red cells.")
                 self.lbl_alignment_status.setStyleSheet(
-                    f"color: {COLORS['red']}; font-size: {sf(9)}pt;")
+                    f"color: {COLORS['red']}; ")
             else:
                 self.lbl_alignment_status.setText("✓ Marlin matches software.")
                 self.lbl_alignment_status.setStyleSheet(
-                    f"color: {COLORS['green']}; font-size: {sf(9)}pt;")
+                    f"color: {COLORS['green']}; ")
 
     def _apply_safety_and_zero(self) -> None:
         """Save safety_limits + zero positions: settings + controller.

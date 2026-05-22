@@ -94,23 +94,24 @@ def _f(val: float, k: float) -> float:
 # Use these instead of per-page _group_style() methods for consistency.
 
 def build_section_title_style(k: float = 1.0) -> str:
-    # v7.4.2 polish: frosted-glass card.
+    # v7.4.2 polish: mostly-transparent frosted-glass card.
     # Qt stylesheets can't blur the backdrop the way CSS backdrop-filter
-    # can, but a slight vertical gradient over the page bg + a soft
-    # subtext-colored border approximates the look well enough that the
-    # eye reads "elevated translucent panel" instead of "flat block".
-    # Title pill sits on the top-left edge in the accent blue.
+    # can, but a faint vertical gradient over the page bg + a hairline
+    # subtext-ghost border reads as an elevated translucent panel.
+    # Alpha is intentionally low (~25-30%) so the page bg shows through.
+    # All body text (labels, buttons, inputs, status) inherits the
+    # 10.5pt baseline from gui/styles.py::QWidget — sections do not set
+    # their own body font-size, only the title pill is differentiated.
     return f"""
     QGroupBox {{
-        font-size: {_f(10.5, k)}pt;
         font-weight: 500;
         color: {COLORS['text']};
         background-color: qlineargradient(
             x1: 0, y1: 0, x2: 0, y2: 1,
-            stop: 0 rgba(69, 71, 90, 110),
-            stop: 1 rgba(49, 50, 68, 140)
+            stop: 0 rgba(205, 214, 244, 14),
+            stop: 1 rgba(137, 180, 250, 10)
         );
-        border: 1px solid rgba(166, 173, 200, 35);
+        border: 1px solid rgba(166, 173, 200, 32);
         border-radius: {_p(12, k)}px;
         margin-top: {_p(18, k)}px;
         padding: {_p(24, k)}px {_p(20, k)}px {_p(18, k)}px {_p(20, k)}px;
@@ -121,7 +122,7 @@ def build_section_title_style(k: float = 1.0) -> str:
         left: {_p(16, k)}px;
         top: {_p(1, k)}px;
         padding: {_p(4, k)}px {_p(12, k)}px;
-        background-color: rgba(30, 30, 46, 240);
+        background-color: rgba(30, 30, 46, 230);
         border: 1px solid rgba(137, 180, 250, 110);
         border-radius: {_p(8, k)}px;
         color: {COLORS['blue']};
@@ -159,6 +160,28 @@ def build_card_frame_style(k: float = 1.0) -> str:
         border: 1px solid {COLORS['surface1']};
         border-radius: {_p(8, k)}px;
         padding: {_p(12, k)}px;
+    }}
+"""
+
+
+def build_glass_panel_style(object_name: str = "glassPanel",
+                            k: float = 1.0) -> str:
+    """v7.4.2 polish: mostly-transparent frosted-glass panel for
+    secondary cards (no title) inside a primary section.
+
+    Use for QFrame sub-cards (cam mini-cards, the banner, units-
+    verification block) so every elevated surface in the hardware
+    pages reads the same translucent way.
+    """
+    return f"""
+    QFrame#{object_name} {{
+        background-color: qlineargradient(
+            x1: 0, y1: 0, x2: 0, y2: 1,
+            stop: 0 rgba(205, 214, 244, 14),
+            stop: 1 rgba(137, 180, 250, 10)
+        );
+        border: 1px solid rgba(166, 173, 200, 32);
+        border-radius: {_p(10, k)}px;
     }}
 """
 

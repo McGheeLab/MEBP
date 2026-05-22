@@ -336,7 +336,7 @@ class PumpChannelWidget(QGroupBox):
         # Row 4: Info line (spans both columns)
         self.info_label = QLabel("")
         self.info_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         self.info_label.setWordWrap(True)
         layout.addWidget(self.info_label, 4, 0, 1, 2)
 
@@ -662,7 +662,7 @@ class HardwareSetupPage(ModePage):
         self.pump_ink_summary = QLabel("")
         self.pump_ink_summary.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; "
-            f"font-size: {sf(9)}pt; padding: {sp(4)} {sp(8)};")
+            f"padding: {sp(4)} {sp(8)};")
         self.pump_ink_summary.setWordWrap(True)
         pump_lay.addWidget(self.pump_ink_summary)
 
@@ -703,7 +703,7 @@ class HardwareSetupPage(ModePage):
 
         self.needle_info_label = QLabel("Select a needle gauge above")
         self.needle_info_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         needle_lay.addWidget(self.needle_info_label, 2, 0, 1, 4)
 
         self._sub_layouts["needle"].addWidget(needle_group)
@@ -717,7 +717,7 @@ class HardwareSetupPage(ModePage):
         self.channel_map_info = QLabel(
             "Each needle channel must be assigned to a unique enabled pump.")
         self.channel_map_info.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         self.channel_map_info.setWordWrap(True)
         self._channel_map_layout.addWidget(self.channel_map_info)
 
@@ -731,7 +731,7 @@ class HardwareSetupPage(ModePage):
         # Validation indicator
         self.channel_map_status = QLabel("")
         self.channel_map_status.setStyleSheet(
-            f"font-size: {sf(9)}pt; padding: {sp(2)} {sp(4)};")
+            f"padding: {sp(2)} {sp(4)};")
         self._channel_map_layout.addWidget(self.channel_map_status)
 
         self._sub_layouts["needle"].addWidget(self.channel_map_group)
@@ -860,7 +860,7 @@ class HardwareSetupPage(ModePage):
         detect_row.addWidget(self._btn_detect_live_cams)
         self._lbl_live_cam_count = QLabel("0 found")
         self._lbl_live_cam_count.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         detect_row.addWidget(self._lbl_live_cam_count)
         detect_row.addStretch()
         live_cam_lay.addLayout(detect_row)
@@ -872,27 +872,23 @@ class HardwareSetupPage(ModePage):
         self._live_cam_umpx_spins: list[QDoubleSpinBox] = []
         self._live_cam_mag_combos: list[QComboBox] = []
 
-        # v7.4.2 polish: per-camera mini-card matches the surface0
-        # background with a soft border, plus roomy spacing.
+        # v7.4.2 polish: per-camera mini-card uses the shared frosted-
+        # glass panel style so secondary cards match the primary
+        # section's translucent look.
+        from gui.styles import build_glass_panel_style
+        glass_style = build_glass_panel_style("camMiniCard")
         max_cams = 3  # will be updated from camera_manager if set
         for i in range(max_cams):
             row = QFrame()
             row.setObjectName("camMiniCard")
-            row.setStyleSheet(
-                f"QFrame#camMiniCard {{"
-                f"  background-color: {COLORS.get('surface0', '#313244')};"
-                f"  border: 1px solid {COLORS.get('surface1', '#45475a')};"
-                f"  border-radius: {sp(6)};"
-                f"}}"
-            )
+            row.setStyleSheet(glass_style)
             rl = QGridLayout(row)
             rl.setContentsMargins(s(12), s(10), s(12), s(10))
             rl.setHorizontalSpacing(s(10))
             rl.setVerticalSpacing(s(8))
 
             cam_label = QLabel(f"<b>Cam {i+1}</b>")
-            cam_label.setStyleSheet(
-                f"color: {COLORS['blue']}; font-size: {sf(10)}pt;")
+            cam_label.setStyleSheet(f"color: {COLORS['blue']};")
             rl.addWidget(cam_label, 0, 0)
             src = QComboBox()
             src.addItem("— None —", None)
@@ -1371,16 +1367,16 @@ class HardwareSetupPage(ModePage):
         elif has_duplicate:
             self.channel_map_status.setText("⚠ Duplicate pump assignment")
             self.channel_map_status.setStyleSheet(
-                f"color: {COLORS.get('red', '#f38ba8')}; font-size: 9pt;")
+                f"color: {COLORS.get('red', '#f38ba8')}; ")
         elif not all_assigned:
             self.channel_map_status.setText(
                 f"⚠ {num_channels - len(assigned_pumps)} channel(s) unassigned")
             self.channel_map_status.setStyleSheet(
-                f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 9pt;")
+                f"color: {COLORS.get('yellow', '#f9e2af')}; ")
         else:
             self.channel_map_status.setText("✓ All channels assigned")
             self.channel_map_status.setStyleSheet(
-                f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 9pt;")
+                f"color: {COLORS.get('green', '#a6e3a1')}; ")
 
     def _get_enabled_pump_ids(self) -> list[str]:
         """Get list of currently enabled pump IDs from widgets."""
@@ -1417,7 +1413,7 @@ class HardwareSetupPage(ModePage):
             ctx_text = "✓ Setup complete" if valid else (
                 f"⚠ {issues[0]}" if issues else "⚠ Setup incomplete")
             ctx_lbl.setText(ctx_text)
-            ctx_lbl.setStyleSheet(f"color: {color}; font-size: 9pt;")
+            ctx_lbl.setStyleSheet(f"color: {color}; ")
 
     def _on_config_changed(self):
         """Called whenever any config widget changes."""
@@ -1888,7 +1884,7 @@ class HardwareSetupPage(ModePage):
         self._lbl_active_config = QLabel("Active: (unsaved)")
         self._lbl_active_config.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; "
-            f"font-size: 9pt; font-style: italic;")
+            f"font-style: italic;")
         layout.addWidget(self._lbl_active_config)
 
         # Buttons row
@@ -1919,7 +1915,7 @@ class HardwareSetupPage(ModePage):
 
         self._ctx_validity_label = QLabel("⚠ Setup incomplete")
         self._ctx_validity_label.setStyleSheet(
-            f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 9pt;")
+            f"color: {COLORS.get('yellow', '#f9e2af')}; ")
         self._ctx_validity_label.setWordWrap(True)
         layout.addWidget(self._ctx_validity_label)
 
