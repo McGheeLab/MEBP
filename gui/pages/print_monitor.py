@@ -1288,7 +1288,9 @@ class PrintMonitorPage(QWidget):
             zero = getattr(ctrl, 'zero_position', {})
             px = (xy[0] - zero.get('x', 0)) / 1000.0
             py = (xy[1] - zero.get('y', 0)) / 1000.0
-            pz = (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0.0
+            # v7.4.2 hotfix: route Z read through axis_map.
+            z_val = ctrl.zp_logical_value(zp, "Z") if zp else None
+            pz = (z_val - zero.get('Z', 0)) if z_val is not None else 0.0
 
             # Update all views (set_needle_position appends to trail)
             self.plate_view.set_needle_position(px, py)

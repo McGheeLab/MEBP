@@ -2105,7 +2105,12 @@ class CalibrationPage(QWidget):
         except Exception:
             return
         try:
-            z_mm = float(zp.get("Z", 0) or 0) if isinstance(zp, dict)                    else (float(zp[0]) if zp and len(zp) >= 1 else 0.0)
+            if isinstance(zp, dict):
+                z_mm = float(zp.get("Z", 0) or 0)
+            else:
+                # v7.4.2 hotfix: tuple form — route through axis_map.
+                z_val = ctrl.zp_logical_value(zp, "Z") if zp else None
+                z_mm = float(z_val) if z_val is not None else 0.0
         except Exception:
             z_mm = 0.0
 
@@ -3910,8 +3915,10 @@ class CalibrationPage(QWidget):
         self._taught_third = (xy[0], xy[1])
         tx = xy[0] - self.controller.zero_position["x"]
         ty = xy[1] - self.controller.zero_position["y"]
-        if zp is not None and zp[0] is not None:
-            self._taught_third_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        # v7.4.2 hotfix: route Z read through axis_map.
+        third_z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if third_z_val is not None:
+            self._taught_third_z = third_z_val - self.controller.zero_position.get("Z", 0)
         well_name = self._third_well or "3rd"
         z_str = f"  Z: {self._taught_third_z:.2f} mm" if self._taught_third_z is not None else ""
         if hasattr(self, 'lbl_third'):
@@ -4067,10 +4074,10 @@ class CalibrationPage(QWidget):
         self.lbl_a1.setStyleSheet(f"color: {COLORS['green']};")
 
         # Store Z if available
-
-        if zp is not None and zp[0] is not None:
-
-            self._taught_a1_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        # v7.4.2 hotfix: route Z read through axis_map.
+        a1_z_alt = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if a1_z_alt is not None:
+            self._taught_a1_z = a1_z_alt - self.controller.zero_position.get("Z", 0)
 
         logger.info(f"Taught A1: {self._taught_a1}")
         # v7.3.1: Compute geometry-predicted positions for all wells
@@ -4129,9 +4136,10 @@ class CalibrationPage(QWidget):
 
         # Store Z if available
 
-        if zp is not None and zp[0] is not None:
-
-            self._taught_corner_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        # v7.4.2 hotfix: route Z read through axis_map.
+        corner_z_alt = self.controller.zp_logical_value(zp, "Z") if zp else None
+        if corner_z_alt is not None:
+            self._taught_corner_z = corner_z_alt - self.controller.zero_position.get("Z", 0)
 
         logger.info(f"Taught corner: {self._taught_corner}")
 
@@ -5257,10 +5265,12 @@ class CalibrationPage(QWidget):
             overlay.set_focus_result(result)
 
         # Track best focus Z
+        # v7.4.2 hotfix: route Z read through axis_map.
         zp = self.controller.get_zp_position(cached=True)
+        z_val = self.controller.zp_logical_value(zp, "Z") if zp else None
         current_z = None
-        if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
-            current_z = zp[0] - self.controller.zero_position.get("Z", 0)
+        if z_val is not None:
+            current_z = z_val - self.controller.zero_position.get("Z", 0)
 
         if result.normalized_score > self._best_focus_score:
             self._best_focus_score = result.normalized_score

@@ -791,10 +791,13 @@ class TrajectoryExecutor:
                 actual_zp = ctrl.get_zp_position(cached=True)
                 ax = actual_xy[0] if actual_xy[0] is not None else 0.0
                 ay = actual_xy[1] if actual_xy[1] is not None else 0.0
-                az = actual_zp[0] if actual_zp[0] is not None else 0.0
-                ap1 = actual_zp[1] if actual_zp[1] is not None else 0.0
-                ap2 = actual_zp[2] if actual_zp[2] is not None else 0.0
-                ap3 = actual_zp[3] if actual_zp[3] is not None else 0.0
+                # v7.4.2 hotfix: pluck each logical axis via axis_map so
+                # the CSV columns are in (Z, P1, P2, P3) order regardless
+                # of how Marlin's physical tuple is wired.
+                az = ctrl.zp_logical_value(actual_zp, "Z") or 0.0
+                ap1 = ctrl.zp_logical_value(actual_zp, "P1") or 0.0
+                ap2 = ctrl.zp_logical_value(actual_zp, "P2") or 0.0
+                ap3 = ctrl.zp_logical_value(actual_zp, "P3") or 0.0
 
                 # Convert actual XY from stage coords to zero-ref coords
                 ax -= ctrl.zero_position.get("x", 0)

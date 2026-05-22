@@ -277,11 +277,15 @@ class SimulatedCamera:
             pass
         try:
             zp = self._controller.get_zp_position(cached=cached)
-            if isinstance(zp, (list, tuple)) and len(zp) >= 1 and zp[0] is not None:
+            # v7.4.2 hotfix: route Z through axis_map.
+            z_val = (self._controller.zp_logical_value(zp, "Z")
+                     if hasattr(self._controller, 'zp_logical_value')
+                     else (zp[0] if isinstance(zp, (list, tuple)) and len(zp) >= 1 else None))
+            if z_val is not None:
                 zero_z = 0.0
                 if hasattr(self._controller, 'zero_position'):
                     zero_z = self._controller.zero_position.get("Z", 0.0)
-                self._z_mm = float(zp[0]) - zero_z
+                self._z_mm = float(z_val) - zero_z
         except Exception:
             pass
 

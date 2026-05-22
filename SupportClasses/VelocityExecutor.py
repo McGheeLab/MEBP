@@ -195,8 +195,10 @@ class VelocityExecutor:
                             measured_y = (xy[1] - zero.get('y', 0)) / 1000.0
                             last_position_time = t_now
 
-                        if zp and zp[0] is not None:
-                            measured_z = zp[0] - zero.get('Z', 0)
+                        # v7.4.2 hotfix: route Z read through axis_map.
+                        z_val = ctrl.zp_logical_value(zp, "Z") if zp else None
+                        if z_val is not None:
+                            measured_z = z_val - zero.get('Z', 0)
                 except Exception as e:
                     logger.debug(f"Position read error: {e}")
 
@@ -350,11 +352,18 @@ class VelocityExecutor:
         actual_xy = (mx or 0, my or 0)
         try:
             zp = ctrl.get_zp_position(cached=True)
+            # v7.4.2 hotfix: route each logical axis through axis_map so
+            # the recorded actual_zp matches the logical (Z, P1, P2, P3)
+            # ordering of the planned waypoints — independent of the
+            # physical-tuple order Marlin happens to emit.
+            def _logical(ax: str, key: str) -> float:
+                v = ctrl.zp_logical_value(zp, ax) if zp else None
+                return (v - zero.get(key, 0)) if v is not None else 0
             actual_zp = (
-                (zp[0] - zero.get('Z', 0)) if zp and zp[0] is not None else 0,
-                (zp[1] - zero.get('P1', 0)) if zp and len(zp) > 1 and zp[1] is not None else 0,
-                (zp[2] - zero.get('P2', 0)) if zp and len(zp) > 2 and zp[2] is not None else 0,
-                (zp[3] - zero.get('P3', 0)) if zp and len(zp) > 3 and zp[3] is not None else 0,
+                _logical("Z", "Z"),
+                _logical("P1", "P1"),
+                _logical("P2", "P2"),
+                _logical("P3", "P3"),
             )
         except Exception:
             actual_zp = (0, 0, 0, 0)
