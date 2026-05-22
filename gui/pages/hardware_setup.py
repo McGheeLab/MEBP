@@ -579,21 +579,47 @@ class HardwareSetupPage(ModePage):
         self._content_layout = self._sub_layouts["identity"]
 
         # ── Section 1: Setup Name & Notes ─────────────────────────
+        # v7.4.2: name_edit is now an editable QComboBox listing every
+        # saved hardware config in ``config/hardware/`` so the user can
+        # pick a previously-saved accessory setup (plate / pumps / inks
+        # / needle / rosette / cameras) without leaving the page. Free-
+        # typing a new name is still allowed; it becomes a new save on
+        # Apply / Save Config.
         name_group = QGroupBox("Setup Name && Notes")
         name_group.setStyleSheet(self._group_style())
         name_lay = QFormLayout(name_group)
+        name_lay.setHorizontalSpacing(s(10))
+        name_lay.setVerticalSpacing(s(10))
 
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("My Experiment Setup")
-        self.name_edit.setMinimumWidth(s(350))
-        self.name_edit.textChanged.connect(self._on_config_changed)
-        name_lay.addRow("Name:", self.name_edit)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(s(6))
+        self.name_edit = QComboBox()
+        self.name_edit.setEditable(True)
+        self.name_edit.setInsertPolicy(QComboBox.NoInsert)
+        self.name_edit.lineEdit().setPlaceholderText(
+            "Pick a saved setup or type a new name")
+        self.name_edit.setMinimumWidth(s(320))
+        self.name_edit.activated.connect(self._on_setup_name_picked)
+        self.name_edit.editTextChanged.connect(self._on_config_changed)
+        name_row.addWidget(self.name_edit, 1)
+
+        self._btn_refresh_setups = QPushButton("🔄")
+        self._btn_refresh_setups.setFixedWidth(s(32))
+        self._btn_refresh_setups.setToolTip(
+            "Re-scan saved hardware configurations")
+        self._btn_refresh_setups.clicked.connect(
+            self._refresh_setup_name_combo)
+        name_row.addWidget(self._btn_refresh_setups)
+        name_lay.addRow("Name:", name_row)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes...")
         self.notes_edit.setMinimumWidth(s(350))
         self.notes_edit.textChanged.connect(self._on_config_changed)
         name_lay.addRow("Notes:", self.notes_edit)
+
+        # Populate the combo with whatever's already on disk.
+        self._refresh_setup_name_combo()
 
         self._content_layout.addWidget(name_group)
 
@@ -1444,8 +1470,9 @@ class HardwareSetupPage(ModePage):
 
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
-        # Name & notes
-        self._config.config_name = self.name_edit.text().strip() or "Untitled Setup"
+        # Name & notes — name_edit is an editable QComboBox (v7.4.2)
+        self._config.config_name = (
+            self.name_edit.currentText().strip() or "Untitled Setup")
         self._config.notes = self.notes_edit.text().strip()
 
         # Well plate
@@ -1643,6 +1670,9 @@ class HardwareSetupPage(ModePage):
                     self, "Saved", f"Configuration saved to:\n{path}")
                 # v7.2.4: Refresh the config file browser
                 self._scan_config_directory()
+                # v7.4.2: Refresh the Setup Name combo so the new file
+                # appears as a pickable option immediately.
+                self._refresh_setup_name_combo()
             except Exception as e:
                 QMessageBox.critical(
                     self, "Error", f"Failed to save:\n{e}")
@@ -1688,8 +1718,9 @@ class HardwareSetupPage(ModePage):
         logger.info("Applying config to UI...")
 
         # ── 1. Name & Notes ──────────────────────────────────────
+        # v7.4.2: name_edit is now an editable QComboBox.
         self.name_edit.blockSignals(True)
-        self.name_edit.setText(self._config.config_name)
+        self.name_edit.setEditText(self._config.config_name)
         self.name_edit.blockSignals(False)
 
         self.notes_edit.blockSignals(True)
@@ -1889,6 +1920,89 @@ class HardwareSetupPage(ModePage):
     # ════════════════════════════════════════════════════════════════
     #  CONFIG FILE BROWSER (v7.2.4)
     # ════════════════════════════════════════════════════════════════
+
+    # ── v7.4.2: Setup-name combo (replaces the old context-panel browser) ─
+
+    def _refresh_setup_name_combo(self) -> None:
+        """Re-scan ``config/hardware/`` and populate the Setup Name combo.
+
+        Items map to file paths via ``self._setup_file_paths``. Only
+        files that look like saved HardwareConfig JSONs are listed —
+        a file is considered a config if it has a ``config_name`` key
+        OR a ``pumps`` / ``plate_format`` key. This filters out the
+        catalog files (cameras.json, needles.json, objectives.json,
+        syringes.json) that share the directory.
+
+        The currently-typed name is preserved so a partially-entered
+        new name doesn't get wiped by the rescan.
+        """
+        if not hasattr(self, 'name_edit'):
+            return
+        import json
+        self._setup_file_paths: dict[str, "Path"] = {}
+        current_text = self.name_edit.currentText()
+        self.name_edit.blockSignals(True)
+        self.name_edit.clear()
+        config_dir = CONFIG_HARDWARE_DIR
+        if config_dir.is_dir():
+            for jf in sorted(config_dir.glob("*.json")):
+                try:
+                    with open(jf, "r") as f:
+                        data = json.load(f)
+                except Exception as e:
+                    logger.debug(f"Skipping malformed config {jf.name}: {e}")
+                    continue
+                # Only HardwareConfig saves — filter catalogs by shape.
+                if not isinstance(data, dict):
+                    continue
+                cfg_name = data.get("config_name")
+                looks_like_config = (
+                    cfg_name is not None
+                    or "pumps" in data
+                    or "plate_format" in data
+                    or "needle_gauge" in data
+                )
+                if not looks_like_config:
+                    continue
+                display = cfg_name or jf.stem
+                # Always disambiguate by appending the filename when it
+                # differs from the config_name (two files with the same
+                # name, or a renamed file with stale internal name).
+                if cfg_name and cfg_name != jf.stem:
+                    display = f"{cfg_name}  —  {jf.stem}"
+                # Final dedup safety net in case two files share both
+                # name AND filename (shouldn't happen on a sane fs).
+                base_display = display
+                suffix = 2
+                while display in self._setup_file_paths:
+                    display = f"{base_display} #{suffix}"
+                    suffix += 1
+                self.name_edit.addItem(display)
+                self._setup_file_paths[display] = jf
+        # Restore typed text so a new name being typed isn't blown away.
+        self.name_edit.setEditText(current_text)
+        self.name_edit.blockSignals(False)
+
+    def _on_setup_name_picked(self, idx: int) -> None:
+        """User picked an existing saved setup from the combo → load it.
+
+        Triggered by ``QComboBox.activated`` only — so this fires on
+        user clicks / Enter, not on free-typing (``editTextChanged``).
+        """
+        if idx < 0:
+            return
+        display = self.name_edit.itemText(idx)
+        path = getattr(self, "_setup_file_paths", {}).get(display)
+        if path is None or not path.exists():
+            return
+        try:
+            self._config = HardwareConfig.load(str(path))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Load Setup", f"Failed to load {path.name}:\n{e}")
+            return
+        self._apply_config_to_ui()
+        logger.info(f"Loaded hardware setup from combo: {path.name}")
 
     def _scan_config_directory(self):
         """Scan config/hardware/ for saved .json config files."""
