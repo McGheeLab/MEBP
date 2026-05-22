@@ -444,11 +444,15 @@ class MainWindow(QMainWindow):
         self._splitter.addWidget(self._page_stack)
 
         # Console log
+        # v7.4.2: bump minimum height so the terminal pane is comfortably
+        # tall by default (the previous 40px floor let it collapse to a
+        # one-line strip). Splitter stretch ratio drops from 5:1 to 3:1
+        # so it gets ~25% of the vertical space initially.
         self.console = ConsoleLogWidget()
-        self.console.setMinimumHeight(s(40))  # v7.2.6
+        self.console.setMinimumHeight(s(180))
         self._splitter.addWidget(self.console)
 
-        self._splitter.setStretchFactor(0, 5)
+        self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
 
         # v7.2.6: Prevent splitter collapse crash

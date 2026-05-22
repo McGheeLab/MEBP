@@ -580,47 +580,71 @@ class HardwareSetupPage(ModePage):
         self._content_layout = self._sub_layouts["identity"]
 
         # ── Section 1: Setup Name & Notes ─────────────────────────
-        # v7.4.2: name_edit is now an editable QComboBox listing every
-        # saved hardware config in ``config/hardware/`` so the user can
-        # pick a previously-saved accessory setup (plate / pumps / inks
-        # / needle / rosette / cameras) without leaving the page. Free-
-        # typing a new name is still allowed; it becomes a new save on
-        # Apply / Save Config.
+        # v7.4.2: per-user feedback — a free-text Name + Notes pair
+        # PLUS a scrollable list of every saved hardware config in
+        # ``config/hardware/``. Click an entry then Load to apply that
+        # accessory setup (plate / pumps / inks / needle / rosette /
+        # cameras). The Name field stays free-text; it becomes the
+        # filename on the next save.
         name_group = QGroupBox("Setup Name && Notes")
         name_group.setStyleSheet(self._group_style())
-        name_lay = QFormLayout(name_group)
-        name_lay.setHorizontalSpacing(s(10))
-        name_lay.setVerticalSpacing(s(10))
+        name_outer = QVBoxLayout(name_group)
+        name_outer.setSpacing(s(10))
 
-        name_row = QHBoxLayout()
-        name_row.setSpacing(s(6))
-        self.name_edit = QComboBox()
-        self.name_edit.setEditable(True)
-        self.name_edit.setInsertPolicy(QComboBox.NoInsert)
-        self.name_edit.lineEdit().setPlaceholderText(
-            "Pick a saved setup or type a new name")
-        self.name_edit.setMinimumWidth(s(320))
-        self.name_edit.activated.connect(self._on_setup_name_picked)
-        self.name_edit.editTextChanged.connect(self._on_config_changed)
-        name_row.addWidget(self.name_edit, 1)
-
-        self._btn_refresh_setups = icon_button(
-            "", "refresh",
-            tooltip="Re-scan saved hardware configurations")
-        self._btn_refresh_setups.setFixedWidth(s(36))
-        self._btn_refresh_setups.clicked.connect(
-            self._refresh_setup_name_combo)
-        name_row.addWidget(self._btn_refresh_setups)
-        name_lay.addRow("Name:", name_row)
+        form = QFormLayout()
+        form.setHorizontalSpacing(s(10))
+        form.setVerticalSpacing(s(10))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("My Experiment Setup")
+        self.name_edit.setMinimumWidth(s(350))
+        self.name_edit.textChanged.connect(self._on_config_changed)
+        form.addRow("Name:", self.name_edit)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText("Optional notes...")
         self.notes_edit.setMinimumWidth(s(350))
         self.notes_edit.textChanged.connect(self._on_config_changed)
-        name_lay.addRow("Notes:", self.notes_edit)
+        form.addRow("Notes:", self.notes_edit)
+        name_outer.addLayout(form)
 
-        # Populate the combo with whatever's already on disk.
-        self._refresh_setup_name_combo()
+        # Scrollable list of saved setups
+        saved_label = QLabel("Saved setups")
+        saved_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-weight: 600; "
+            f"padding-top: {sp(6)};")
+        name_outer.addWidget(saved_label)
+
+        self._setup_list = QListWidget()
+        self._setup_list.setAlternatingRowColors(True)
+        self._setup_list.setMinimumHeight(s(140))
+        self._setup_list.setMaximumHeight(s(220))
+        self._setup_list.itemDoubleClicked.connect(
+            lambda _item: self._load_selected_setup())
+        name_outer.addWidget(self._setup_list)
+
+        setup_btn_row = QHBoxLayout()
+        setup_btn_row.setSpacing(s(8))
+        self._btn_load_setup = icon_button(
+            "Load Setup", "folder-open", object_name="accentBtn",
+            tooltip="Apply the selected saved setup to every section below.")
+        self._btn_load_setup.clicked.connect(self._load_selected_setup)
+        setup_btn_row.addWidget(self._btn_load_setup)
+        self._btn_refresh_setups = icon_button(
+            "", "refresh",
+            tooltip="Re-scan saved hardware configurations")
+        self._btn_refresh_setups.setFixedWidth(s(36))
+        self._btn_refresh_setups.clicked.connect(
+            self._refresh_setup_list)
+        setup_btn_row.addWidget(self._btn_refresh_setups)
+        setup_btn_row.addStretch(1)
+        self._lbl_setup_status = QLabel("")
+        self._lbl_setup_status.setStyleSheet(
+            f"color: {COLORS['subtext0']};")
+        setup_btn_row.addWidget(self._lbl_setup_status, 2)
+        name_outer.addLayout(setup_btn_row)
+
+        # Populate
+        self._refresh_setup_list()
 
         self._content_layout.addWidget(name_group)
 
@@ -1457,9 +1481,9 @@ class HardwareSetupPage(ModePage):
 
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
-        # Name & notes — name_edit is an editable QComboBox (v7.4.2)
+        # Name & notes — name_edit is a plain QLineEdit (v7.4.2 rev2).
         self._config.config_name = (
-            self.name_edit.currentText().strip() or "Untitled Setup")
+            self.name_edit.text().strip() or "Untitled Setup")
         self._config.notes = self.notes_edit.text().strip()
 
         # Well plate
@@ -1705,9 +1729,10 @@ class HardwareSetupPage(ModePage):
         logger.info("Applying config to UI...")
 
         # ── 1. Name & Notes ──────────────────────────────────────
-        # v7.4.2: name_edit is now an editable QComboBox.
+        # v7.4.2 rev2: name_edit is a QLineEdit again; the picker
+        # lives below as a scrollable list with a Load button.
         self.name_edit.blockSignals(True)
-        self.name_edit.setEditText(self._config.config_name)
+        self.name_edit.setText(self._config.config_name)
         self.name_edit.blockSignals(False)
 
         self.notes_edit.blockSignals(True)
@@ -1908,28 +1933,29 @@ class HardwareSetupPage(ModePage):
     #  CONFIG FILE BROWSER (v7.2.4)
     # ════════════════════════════════════════════════════════════════
 
-    # ── v7.4.2: Setup-name combo (replaces the old context-panel browser) ─
+    # ── v7.4.2: Setup list (replaces the older combo picker) ─
 
-    def _refresh_setup_name_combo(self) -> None:
-        """Re-scan ``config/hardware/`` and populate the Setup Name combo.
+    def _refresh_setup_list(self) -> None:
+        """Re-scan ``config/hardware/`` and populate the Saved Setups list.
 
         Items map to file paths via ``self._setup_file_paths``. Only
         files that look like saved HardwareConfig JSONs are listed —
         a file is considered a config if it has a ``config_name`` key
-        OR a ``pumps`` / ``plate_format`` key. This filters out the
-        catalog files (cameras.json, needles.json, objectives.json,
-        syringes.json) that share the directory.
+        OR a ``pumps`` / ``plate_format`` / ``needle_gauge`` key. This
+        filters out the catalog files (cameras.json, needles.json,
+        objectives.json, syringes.json) that share the directory.
 
-        The currently-typed name is preserved so a partially-entered
-        new name doesn't get wiped by the rescan.
+        The current selection is preserved across refresh when possible.
         """
-        if not hasattr(self, 'name_edit'):
+        if not hasattr(self, '_setup_list'):
             return
         import json
         self._setup_file_paths: dict[str, "Path"] = {}
-        current_text = self.name_edit.currentText()
-        self.name_edit.blockSignals(True)
-        self.name_edit.clear()
+        previous = None
+        current = self._setup_list.currentItem()
+        if current is not None:
+            previous = current.text()
+        self._setup_list.clear()
         config_dir = CONFIG_HARDWARE_DIR
         if config_dir.is_dir():
             for jf in sorted(config_dir.glob("*.json")):
@@ -1939,7 +1965,6 @@ class HardwareSetupPage(ModePage):
                 except Exception as e:
                     logger.debug(f"Skipping malformed config {jf.name}: {e}")
                     continue
-                # Only HardwareConfig saves — filter catalogs by shape.
                 if not isinstance(data, dict):
                     continue
                 cfg_name = data.get("config_name")
@@ -1952,35 +1977,42 @@ class HardwareSetupPage(ModePage):
                 if not looks_like_config:
                     continue
                 display = cfg_name or jf.stem
-                # Always disambiguate by appending the filename when it
-                # differs from the config_name (two files with the same
-                # name, or a renamed file with stale internal name).
                 if cfg_name and cfg_name != jf.stem:
                     display = f"{cfg_name}  —  {jf.stem}"
-                # Final dedup safety net in case two files share both
-                # name AND filename (shouldn't happen on a sane fs).
                 base_display = display
                 suffix = 2
                 while display in self._setup_file_paths:
                     display = f"{base_display} #{suffix}"
                     suffix += 1
-                self.name_edit.addItem(display)
+                self._setup_list.addItem(display)
                 self._setup_file_paths[display] = jf
-        # Restore typed text so a new name being typed isn't blown away.
-        self.name_edit.setEditText(current_text)
-        self.name_edit.blockSignals(False)
+        # Restore prior selection
+        if previous:
+            for i in range(self._setup_list.count()):
+                item = self._setup_list.item(i)
+                if item.text() == previous:
+                    self._setup_list.setCurrentRow(i)
+                    break
+        if hasattr(self, '_lbl_setup_status'):
+            n = self._setup_list.count()
+            self._lbl_setup_status.setText(
+                f"{n} saved setup{'s' if n != 1 else ''} on disk.")
 
-    def _on_setup_name_picked(self, idx: int) -> None:
-        """User picked an existing saved setup from the combo → load it.
-
-        Triggered by ``QComboBox.activated`` only — so this fires on
-        user clicks / Enter, not on free-typing (``editTextChanged``).
-        """
-        if idx < 0:
+    def _load_selected_setup(self) -> None:
+        """Apply the currently-selected setup from the list."""
+        if not hasattr(self, '_setup_list'):
             return
-        display = self.name_edit.itemText(idx)
-        path = getattr(self, "_setup_file_paths", {}).get(display)
+        item = self._setup_list.currentItem()
+        if item is None:
+            if hasattr(self, '_lbl_setup_status'):
+                self._lbl_setup_status.setText(
+                    "Pick a setup from the list above first.")
+            return
+        path = getattr(self, "_setup_file_paths", {}).get(item.text())
         if path is None or not path.exists():
+            if hasattr(self, '_lbl_setup_status'):
+                self._lbl_setup_status.setText(
+                    f"File missing: {item.text()}")
             return
         try:
             self._config = HardwareConfig.load(str(path))
@@ -1989,7 +2021,13 @@ class HardwareSetupPage(ModePage):
                 self, "Load Setup", f"Failed to load {path.name}:\n{e}")
             return
         self._apply_config_to_ui()
-        logger.info(f"Loaded hardware setup from combo: {path.name}")
+        if hasattr(self, '_lbl_setup_status'):
+            self._lbl_setup_status.setText(f"Loaded: {path.name}")
+        logger.info(f"Loaded hardware setup from list: {path.name}")
+
+    # Back-compat shim: a few callers still invoke the old name.
+    def _refresh_setup_name_combo(self) -> None:
+        self._refresh_setup_list()
 
     def _scan_config_directory(self):
         """Scan config/hardware/ for saved .json config files."""
