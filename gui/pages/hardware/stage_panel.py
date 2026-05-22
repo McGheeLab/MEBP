@@ -133,9 +133,10 @@ class StageHardwarePanel(QWidget):
     # ── UI ───────────────────────────────────────────────────────
 
     def _setup_ui(self):
+        # v7.4.2 polish: roomier spacing + margins so cards breathe.
         outer = QVBoxLayout(self)
-        outer.setSpacing(s(12))
-        outer.setContentsMargins(s(12), s(12), s(12), s(12))
+        outer.setSpacing(s(18))
+        outer.setContentsMargins(s(20), s(20), s(20), s(20))
 
         # Banner: explains what's here and where it came from
         banner = QLabel(
@@ -147,8 +148,11 @@ class StageHardwarePanel(QWidget):
         banner.setWordWrap(True)
         banner.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9.5)}pt; "
-            f"padding: {sp(6)} {sp(10)};"
-            f"border-left: 2px solid {COLORS['mauve']};"
+            f"padding: {sp(10)} {sp(14)};"
+            f"background-color: {COLORS['surface0']};"
+            f"border: 1px solid {COLORS['surface1']};"
+            f"border-left: 3px solid {COLORS['mauve']};"
+            f"border-radius: {sp(6)};"
         )
         outer.addWidget(banner)
 
@@ -174,18 +178,26 @@ class StageHardwarePanel(QWidget):
         # is force-zeroed on every Apply to keep the two mechanisms from
         # ever fighting each other.
 
-        # Apply / Reset buttons
+        # v7.4.2 polish: Apply / Reset bottom action row — right-aligned,
+        # primary apply, danger reset.
         btn_row = QHBoxLayout()
-        self.btn_apply = QPushButton("Apply Settings")
-        self.btn_apply.setObjectName("accentBtn")
-        self.btn_apply.clicked.connect(self._apply)
-        btn_row.addWidget(self.btn_apply)
-
+        btn_row.setSpacing(s(8))
+        btn_row.addStretch()
         self.btn_reset = QPushButton("Reset to Defaults")
         self.btn_reset.setObjectName("dangerBtn")
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setToolTip(
+            "Discard all unsaved edits and reload the saved device profile.")
         self.btn_reset.clicked.connect(self._reset_defaults)
         btn_row.addWidget(self.btn_reset)
-        btn_row.addStretch()
+        self.btn_apply = QPushButton("💾  Apply Settings")
+        self.btn_apply.setObjectName("accentBtn")
+        self.btn_apply.setCursor(Qt.PointingHandCursor)
+        self.btn_apply.setToolTip(
+            "Apply every section in one click. Per-section buttons do the "
+            "same thing scoped to that section.")
+        self.btn_apply.clicked.connect(self._apply)
+        btn_row.addWidget(self.btn_apply)
         outer.addLayout(btn_row)
 
         outer.addStretch()
@@ -196,51 +208,71 @@ class StageHardwarePanel(QWidget):
         grp = QGroupBox("Device Profile")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         lay = QVBoxLayout(grp)
+        # v7.4.2 polish: roomy rhythm inside the section.
+        lay.setSpacing(s(10))
 
-        # Row 1: profile picker + active label
+        # Row 1: profile picker + refresh icon
         row = QHBoxLayout()
-        row.addWidget(QLabel("Profile:"))
+        row.setSpacing(s(8))
+        lbl_profile = QLabel("Profile")
+        lbl_profile.setStyleSheet(f"font-weight: 600; color: {COLORS['text']};")
+        row.addWidget(lbl_profile)
         self.cmb_profile = QComboBox()
-        self.cmb_profile.setMinimumWidth(s(220))
+        self.cmb_profile.setMinimumWidth(s(240))
         self.cmb_profile.currentIndexChanged.connect(self._on_profile_picked)
         row.addWidget(self.cmb_profile, 1)
 
         self.btn_refresh_profiles = QPushButton("🔄")
-        self.btn_refresh_profiles.setFixedWidth(s(32))
+        self.btn_refresh_profiles.setFixedWidth(s(36))
+        self.btn_refresh_profiles.setCursor(Qt.PointingHandCursor)
         self.btn_refresh_profiles.setToolTip("Refresh profile list")
         self.btn_refresh_profiles.clicked.connect(self._refresh_profile_list)
         row.addWidget(self.btn_refresh_profiles)
         lay.addLayout(row)
 
-        # Row 2: action buttons
+        # Row 2: action buttons — Load left, Save / Save As primary,
+        # Delete on the right (semantic grouping).
         action_row = QHBoxLayout()
-        self.btn_load_profile = QPushButton("Load")
+        action_row.setSpacing(s(8))
+        self.btn_load_profile = QPushButton("📂  Load")
+        self.btn_load_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_load_profile.setToolTip(
+            "Apply the selected profile to every section below.")
         self.btn_load_profile.clicked.connect(self._load_selected_profile)
         action_row.addWidget(self.btn_load_profile)
 
-        self.btn_save_profile = QPushButton("Save")
+        self.btn_save_profile = QPushButton("💾  Save")
+        self.btn_save_profile.setObjectName("accentBtn")
+        self.btn_save_profile.setCursor(Qt.PointingHandCursor)
         self.btn_save_profile.setToolTip(
             "Save current settings back to the selected profile")
         self.btn_save_profile.clicked.connect(self._save_to_selected_profile)
         action_row.addWidget(self.btn_save_profile)
 
         self.btn_save_as_profile = QPushButton("Save As…")
-        self.btn_save_as_profile.setObjectName("accentBtn")
+        self.btn_save_as_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_save_as_profile.setToolTip(
+            "Save current settings as a new device profile.")
         self.btn_save_as_profile.clicked.connect(self._save_as_new_profile)
         action_row.addWidget(self.btn_save_as_profile)
 
+        action_row.addStretch()
+
         self.btn_delete_profile = QPushButton("Delete")
         self.btn_delete_profile.setObjectName("dangerBtn")
+        self.btn_delete_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_delete_profile.setToolTip(
+            "Delete the selected profile from disk.")
         self.btn_delete_profile.clicked.connect(self._delete_selected_profile)
         action_row.addWidget(self.btn_delete_profile)
-        action_row.addStretch()
         lay.addLayout(action_row)
 
-        # Status label
+        # Status / footer
         self.lbl_profile_status = QLabel(
             f"Profiles directory: {DEVICES_DIR}")
         self.lbl_profile_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
+            f"padding-top: {sp(4)};")
         self.lbl_profile_status.setWordWrap(True)
         lay.addWidget(self.lbl_profile_status)
 
@@ -731,29 +763,44 @@ class StageHardwarePanel(QWidget):
         grp = QGroupBox("Connect Hardware")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         grid = QGridLayout(grp)
-        grid.setSpacing(s(6))
+        # v7.4.2 polish: roomier grid + each row reads cleanly.
+        grid.setHorizontalSpacing(s(10))
+        grid.setVerticalSpacing(s(10))
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 0)
+        grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 1)
+
+        def _stage_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"font-weight: 600; color: {COLORS['text']};")
+            return lbl
 
         row = 0
-        grid.addWidget(QLabel("XY stage:"), row, 0)
-        self.btn_connect_xy = QPushButton("Connect")
-        self.btn_connect_xy.setObjectName("accentBtn")
+        grid.addWidget(_stage_label("XY stage"), row, 0)
+        self.btn_connect_xy = QPushButton("🔌  Connect")
+        self.btn_connect_xy.setObjectName("successBtn")
+        self.btn_connect_xy.setCursor(Qt.PointingHandCursor)
         self.btn_connect_xy.clicked.connect(self._connect_xy)
         grid.addWidget(self.btn_connect_xy, row, 1)
         self.btn_disconnect_xy = QPushButton("Disconnect")
         self.btn_disconnect_xy.setObjectName("dangerBtn")
+        self.btn_disconnect_xy.setCursor(Qt.PointingHandCursor)
         self.btn_disconnect_xy.clicked.connect(self._disconnect_xy)
         grid.addWidget(self.btn_disconnect_xy, row, 2)
         self.badge_xy = StatusBadge("Not connected", "pending")
         grid.addWidget(self.badge_xy, row, 3)
 
         row += 1
-        grid.addWidget(QLabel("Z + Pumps:"), row, 0)
-        self.btn_connect_zp = QPushButton("Connect")
-        self.btn_connect_zp.setObjectName("accentBtn")
+        grid.addWidget(_stage_label("Z + Pumps"), row, 0)
+        self.btn_connect_zp = QPushButton("🔌  Connect")
+        self.btn_connect_zp.setObjectName("successBtn")
+        self.btn_connect_zp.setCursor(Qt.PointingHandCursor)
         self.btn_connect_zp.clicked.connect(self._connect_zp)
         grid.addWidget(self.btn_connect_zp, row, 1)
         self.btn_disconnect_zp = QPushButton("Disconnect")
         self.btn_disconnect_zp.setObjectName("dangerBtn")
+        self.btn_disconnect_zp.setCursor(Qt.PointingHandCursor)
         self.btn_disconnect_zp.clicked.connect(self._disconnect_zp)
         grid.addWidget(self.btn_disconnect_zp, row, 2)
         self.badge_zp = StatusBadge("Not connected", "pending")
@@ -827,9 +874,10 @@ class StageHardwarePanel(QWidget):
     _LOGICAL_AXES = ["Z", "P1", "P2", "P3"]
 
     def _build_axis_mapping_group(self) -> QGroupBox:
-        grp = QGroupBox("Axis Mapping (logical → Marlin)")
+        grp = QGroupBox("Axis Mapping")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         lay = QVBoxLayout(grp)
+        lay.setSpacing(s(10))
 
         info = QLabel(
             "Which physical Marlin axis drives each logical axis on "
@@ -838,36 +886,50 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+            f"padding-bottom: {sp(4)};")
         lay.addWidget(info)
 
+        # v7.4.2 polish: tidy column-aligned grid.
         self.cmb_axis_map: dict[str, QComboBox] = {}
         grid = QGridLayout()
-        grid.setSpacing(s(6))
+        grid.setHorizontalSpacing(s(10))
+        grid.setVerticalSpacing(s(8))
+        grid.setColumnStretch(3, 1)
         for r, logical in enumerate(self._LOGICAL_AXES):
-            grid.addWidget(QLabel(f"{logical}:"), r, 0)
-            grid.addWidget(QLabel("→"), r, 1)
+            lbl = QLabel(logical)
+            lbl.setStyleSheet(
+                f"font-weight: 600; color: {COLORS['text']};"
+                f"font-family: monospace;")
+            lbl.setMinimumWidth(s(28))
+            grid.addWidget(lbl, r, 0)
+            arrow = QLabel("→")
+            arrow.setStyleSheet(f"color: {COLORS['subtext0']};")
+            grid.addWidget(arrow, r, 1)
             cmb = QComboBox()
             for letter in self._PHYSICAL_LETTERS:
                 cmb.addItem(f"{letter}  (Marlin {letter})", letter)
-            cmb.setMinimumWidth(s(160))
+            cmb.setMinimumWidth(s(170))
             grid.addWidget(cmb, r, 2)
             self.cmb_axis_map[logical] = cmb
         lay.addLayout(grid)
 
-        # v7.4.2 hotfix: per-section Save button + status
+        # v7.4.2 polish: status takes the stretch, save right-aligned.
         save_row = QHBoxLayout()
-        btn_save = QPushButton("💾 Save Axis Mapping")
-        btn_save.setObjectName("successBtn")
+        save_row.setSpacing(s(8))
+        self.lbl_axis_map_status = QLabel("")
+        self.lbl_axis_map_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_axis_map_status.setWordWrap(True)
+        save_row.addWidget(self.lbl_axis_map_status, 1)
+        btn_save = QPushButton("💾  Save Mapping")
+        btn_save.setObjectName("accentBtn")
+        btn_save.setCursor(Qt.PointingHandCursor)
         btn_save.setToolTip(
             "Push the mapping to the live ZP stage (if connected) and "
             "persist to settings + the current device profile.")
         btn_save.clicked.connect(self._apply_axis_mapping)
         save_row.addWidget(btn_save)
-        self.lbl_axis_map_status = QLabel("")
-        self.lbl_axis_map_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        save_row.addWidget(self.lbl_axis_map_status, 1)
         lay.addLayout(save_row)
 
         return grp
@@ -1084,9 +1146,14 @@ class StageHardwarePanel(QWidget):
         # acceleration spinboxes. The "Stepper Calibration & Feedrate
         # Test" name became "ZP Stage Calibration" to match the new
         # XY Stage Calibration section.
-        grp = QGroupBox("ZP Stage Calibration (steps, feedrate, acceleration)")
+        # v7.4.2 polish: short title; in-section sub-headings carry the
+        # hierarchy.
+        from gui.pages.hardware._polish import sub_heading, divider
+
+        grp = QGroupBox("ZP Stage Calibration")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         outer = QVBoxLayout(grp)
+        outer.setSpacing(s(10))
 
         info = QLabel(
             "<b>How to calibrate:</b> Pick an axis. Use <i>Move +</i> or "
@@ -1103,8 +1170,12 @@ class StageHardwarePanel(QWidget):
         )
         info.setWordWrap(True)
         info.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+            f"padding-bottom: {sp(4)};")
         outer.addWidget(info)
+
+        # v7.4.2 polish: heading anchors the "live values" block
+        outer.addWidget(sub_heading("Current Values"))
 
         # v7.4.2 hotfix: red-state-capable label style. Stage panel
         # uses these for alignment-check mismatch highlighting.
@@ -1126,7 +1197,8 @@ class StageHardwarePanel(QWidget):
         # click to open an edit popup (in addition to the existing
         # Calculate & Send M92 workflow below).
         steps_row = QHBoxLayout()
-        steps_row.addWidget(QLabel("steps/mm:"))
+        steps_row.setSpacing(s(8))
+        steps_row.addWidget(QLabel("steps/mm"))
         self.lbl_steps_grid: dict[str, _ClickableLabel] = {}
         for ax in self._LOGICAL_AXES:
             cell = _ClickableLabel(f"{ax}: —")
@@ -1141,7 +1213,8 @@ class StageHardwarePanel(QWidget):
 
         # v7.4.2: Per-axis max feedrate grid — also clickable.
         feed_row = QHBoxLayout()
-        feed_row.addWidget(QLabel("max F (mm/min):"))
+        feed_row.setSpacing(s(8))
+        feed_row.addWidget(QLabel("max F (mm/min)"))
         self.lbl_feedrate_grid: dict[str, _ClickableLabel] = {}
         for ax in self._LOGICAL_AXES:
             cell = _ClickableLabel(f"{ax}: —")
@@ -1156,12 +1229,15 @@ class StageHardwarePanel(QWidget):
 
         # v7.4.2 hotfix: Per-axis max acceleration (M201)
         accel_row = QHBoxLayout()
-        accel_row.addWidget(QLabel("max accel (mm/s²):"))
+        accel_row.setSpacing(s(8))
+        accel_row.addWidget(QLabel("max accel (mm/s²)"))
         self.spin_axis_accel: dict[str, QDoubleSpinBox] = {}
         default_accel = {"Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0}
         for ax in self._LOGICAL_AXES:
-            cell = QLabel(f"{ax}:")
-            cell.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            cell = QLabel(f"{ax}")
+            cell.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+                f"padding-left: {sp(6)};")
             accel_row.addWidget(cell)
             sp_w = QDoubleSpinBox()
             sp_w.setRange(1.0, 100000.0)
@@ -1174,8 +1250,12 @@ class StageHardwarePanel(QWidget):
         accel_row.addStretch()
         outer.addLayout(accel_row)
 
+        # v7.4.2 polish: heading for the interactive calibration workflow
+        outer.addWidget(sub_heading("Calibrate / Test"))
+
         # Workflow row — axis, distance, feedrate, +/- move buttons
         wf = QHBoxLayout()
+        wf.setSpacing(s(8))
         wf.addWidget(QLabel("Axis:"))
         self.cmb_cal_axis = QComboBox()
         for ax in self._LOGICAL_AXES:
@@ -1203,12 +1283,14 @@ class StageHardwarePanel(QWidget):
 
         # +/- move buttons — flip direction without changing distance
         self.btn_cal_move_fwd = QPushButton("Move +")
+        self.btn_cal_move_fwd.setCursor(Qt.PointingHandCursor)
         self.btn_cal_move_fwd.setToolTip("Send the distance in the positive direction")
         self.btn_cal_move_fwd.clicked.connect(
             lambda: self._cal_command_move(direction=1))
         wf.addWidget(self.btn_cal_move_fwd)
 
         self.btn_cal_move_rev = QPushButton("Move −")
+        self.btn_cal_move_rev.setCursor(Qt.PointingHandCursor)
         self.btn_cal_move_rev.setToolTip("Send the distance in the negative direction")
         self.btn_cal_move_rev.clicked.connect(
             lambda: self._cal_command_move(direction=-1))
@@ -1219,6 +1301,7 @@ class StageHardwarePanel(QWidget):
 
         # Measure + apply + record-as-max row
         mr = QHBoxLayout()
+        mr.setSpacing(s(8))
         mr.addWidget(QLabel("Measured:"))
         self.spin_cal_measured = QDoubleSpinBox()
         self.spin_cal_measured.setRange(0.001, 100.0)
@@ -1229,10 +1312,12 @@ class StageHardwarePanel(QWidget):
 
         self.btn_cal_apply = QPushButton("Calculate && Send M92")
         self.btn_cal_apply.setObjectName("accentBtn")
+        self.btn_cal_apply.setCursor(Qt.PointingHandCursor)
         self.btn_cal_apply.clicked.connect(self._cal_apply)
         mr.addWidget(self.btn_cal_apply)
 
         self.btn_cal_flip_axis = QPushButton("Invert Axis Direction")
+        self.btn_cal_flip_axis.setCursor(Qt.PointingHandCursor)
         self.btn_cal_flip_axis.setToolTip(
             "Negate the saved steps/mm for the selected axis — flips "
             "which way 'positive' moves on Marlin without changing "
@@ -1241,6 +1326,7 @@ class StageHardwarePanel(QWidget):
         mr.addWidget(self.btn_cal_flip_axis)
 
         self.btn_cal_record_max = QPushButton("Record as Max")
+        self.btn_cal_record_max.setCursor(Qt.PointingHandCursor)
         self.btn_cal_record_max.setToolTip(
             "Save the current feedrate as the experimentally-discovered "
             "max for the selected axis. Stored in the device profile "
@@ -1257,23 +1343,27 @@ class StageHardwarePanel(QWidget):
         self.lbl_cal_status.setWordWrap(True)
         outer.addWidget(self.lbl_cal_status)
 
+        # v7.4.2 polish: visual divider before the save row so the
+        # save/alignment block reads as a footer, not just another row.
+        outer.addWidget(divider())
+
         # v7.4.2 hotfix: per-section Save button. The individual buttons
         # (Calculate & Send M92, Invert Axis Direction, Record as Max)
         # already persist on click — this button is a "save everything in
         # this section now" convenience + a confirmation that values are
         # synced to Marlin.
+        # v7.4.2 polish: status label takes the stretch, buttons sit
+        # right-aligned where the eye expects "save / commit" actions.
         save_row = QHBoxLayout()
-        btn_save_cal = QPushButton("💾 Save Calibration")
-        btn_save_cal.setObjectName("successBtn")
-        btn_save_cal.setToolTip(
-            "Re-send steps_per_mm (M92), per-axis max acceleration "
-            "(M201), and per_axis_max_feedrate to Marlin / device "
-            "profile and persist to settings.")
-        btn_save_cal.clicked.connect(self._apply_steps_cal)
-        save_row.addWidget(btn_save_cal)
+        save_row.setSpacing(s(8))
+        self.lbl_alignment_status = QLabel("")
+        self.lbl_alignment_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self.lbl_alignment_status.setWordWrap(True)
+        save_row.addWidget(self.lbl_alignment_status, 1)
 
-        # v7.4.2 hotfix: alignment check button + result label
-        self.btn_check_alignment = QPushButton("🔍 Check alignment")
+        self.btn_check_alignment = QPushButton("🔍  Check alignment")
+        self.btn_check_alignment.setCursor(Qt.PointingHandCursor)
         self.btn_check_alignment.setToolTip(
             "Query Marlin (M503) and compare its reported steps/mm "
             "and max feedrate against this device profile. Axes that "
@@ -1281,10 +1371,16 @@ class StageHardwarePanel(QWidget):
         self.btn_check_alignment.clicked.connect(self._check_marlin_alignment)
         save_row.addWidget(self.btn_check_alignment)
 
-        self.lbl_alignment_status = QLabel("")
-        self.lbl_alignment_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        save_row.addWidget(self.lbl_alignment_status, 1)
+        btn_save_cal = QPushButton("💾  Save Calibration")
+        btn_save_cal.setObjectName("accentBtn")
+        btn_save_cal.setCursor(Qt.PointingHandCursor)
+        btn_save_cal.setToolTip(
+            "Re-send steps_per_mm (M92), per-axis max acceleration "
+            "(M201), and per_axis_max_feedrate to Marlin / device "
+            "profile and persist to settings.")
+        btn_save_cal.clicked.connect(self._apply_steps_cal)
+        save_row.addWidget(btn_save_cal)
+
         outer.addLayout(save_row)
 
         return grp

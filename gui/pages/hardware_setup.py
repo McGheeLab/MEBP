@@ -277,19 +277,13 @@ class PumpChannelWidget(QGroupBox):
         self._build_ui()
 
     def _build_ui(self):
-        self.setStyleSheet(f"""
-            QGroupBox {{
-                font-weight: bold; color: {COLORS.get('blue', '#89b4fa')};
-                border: 1px solid {COLORS.get('surface1', '#45475a')};
-                border-radius: {sp(4)}; margin-top: {sp(6)}; padding-top: {sp(14)};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin; left: {sp(8)}; padding: 0 {sp(4)};
-            }}
-        """)
+        # v7.4.2 polish: inherit the central section title style so pump
+        # channel sub-cards visually match the rest of the hardware page.
+        self.setStyleSheet(SECTION_TITLE_STYLE)
         layout = QGridLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(s(8), s(8), s(8), s(8))
+        layout.setHorizontalSpacing(s(10))
+        layout.setVerticalSpacing(s(8))
 
         # Row 0: Enable + Syringe
         self.enable_check = QCheckBox("Enable")
@@ -326,7 +320,7 @@ class PumpChannelWidget(QGroupBox):
         # Row 3: Info line
         self.info_label = QLabel("")
         self.info_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
         layout.addWidget(self.info_label, 3, 0, 1, 3)
 
         self._update_controls()
@@ -612,14 +606,22 @@ class HardwareSetupPage(ModePage):
         self.ink_table.setMaximumHeight(s(160))
         ink_lay.addWidget(self.ink_table)
 
+        # v7.4.2 polish: action row — primary add on the left, edit/remove
+        # secondary, destructive in red.
         ink_btns = QHBoxLayout()
-        btn_add_ink = QPushButton("+ Add Ink")
+        ink_btns.setSpacing(s(8))
+        btn_add_ink = QPushButton("➕  Add Ink")
+        btn_add_ink.setObjectName("accentBtn")
+        btn_add_ink.setCursor(Qt.PointingHandCursor)
         btn_add_ink.clicked.connect(self._add_ink)
         ink_btns.addWidget(btn_add_ink)
         btn_edit_ink = QPushButton("Edit")
+        btn_edit_ink.setCursor(Qt.PointingHandCursor)
         btn_edit_ink.clicked.connect(self._edit_ink)
         ink_btns.addWidget(btn_edit_ink)
         btn_del_ink = QPushButton("Remove")
+        btn_del_ink.setObjectName("dangerBtn")
+        btn_del_ink.setCursor(Qt.PointingHandCursor)
         btn_del_ink.clicked.connect(self._remove_ink)
         ink_btns.addWidget(btn_del_ink)
         ink_btns.addStretch()
@@ -655,6 +657,9 @@ class HardwareSetupPage(ModePage):
         needle_group = QGroupBox("Needle Configuration")
         needle_group.setStyleSheet(self._group_style())
         needle_lay = QGridLayout(needle_group)
+        # v7.4.2 polish: roomier grid spacing.
+        needle_lay.setHorizontalSpacing(s(12))
+        needle_lay.setVerticalSpacing(s(10))
 
         needle_lay.addWidget(QLabel("Gauge:"), 0, 0)
         self.gauge_combo = QComboBox()
@@ -681,7 +686,7 @@ class HardwareSetupPage(ModePage):
 
         self.needle_info_label = QLabel("Select a needle gauge above")
         self.needle_info_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
         needle_lay.addWidget(self.needle_info_label, 2, 0, 1, 4)
 
         self._sub_layouts["needle"].addWidget(needle_group)
@@ -695,7 +700,7 @@ class HardwareSetupPage(ModePage):
         self.channel_map_info = QLabel(
             "Each needle channel must be assigned to a unique enabled pump.")
         self.channel_map_info.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
         self.channel_map_info.setWordWrap(True)
         self._channel_map_layout.addWidget(self.channel_map_info)
 
@@ -736,14 +741,21 @@ class HardwareSetupPage(ModePage):
         self.rosette_table.setMaximumHeight(s(140))
         ros_lay.addWidget(self.rosette_table)
 
+        # v7.4.2 polish: action row — primary add, secondary edit, danger remove.
         ros_btns = QHBoxLayout()
-        btn_add_ros = QPushButton("+ Add Rosette")
+        ros_btns.setSpacing(s(8))
+        btn_add_ros = QPushButton("➕  Add Rosette")
+        btn_add_ros.setObjectName("accentBtn")
+        btn_add_ros.setCursor(Qt.PointingHandCursor)
         btn_add_ros.clicked.connect(self._add_rosette)
         ros_btns.addWidget(btn_add_ros)
         btn_edit_ros = QPushButton("Edit")
+        btn_edit_ros.setCursor(Qt.PointingHandCursor)
         btn_edit_ros.clicked.connect(self._edit_rosette)
         ros_btns.addWidget(btn_edit_ros)
         btn_del_ros = QPushButton("Remove")
+        btn_del_ros.setObjectName("dangerBtn")
+        btn_del_ros.setCursor(Qt.PointingHandCursor)
         btn_del_ros.clicked.connect(self._remove_rosette)
         ros_btns.addWidget(btn_del_ros)
         ros_btns.addStretch()
@@ -755,6 +767,9 @@ class HardwareSetupPage(ModePage):
         cam_group = QGroupBox("Camera Configuration")
         cam_group.setStyleSheet(self._group_style())
         cam_lay = QGridLayout(cam_group)
+        # v7.4.2 polish: roomier grid spacing.
+        cam_lay.setHorizontalSpacing(s(12))
+        cam_lay.setVerticalSpacing(s(10))
 
         # Row 0: Camera selection
         cam_lay.addWidget(QLabel("Camera:"), 0, 0)
@@ -815,38 +830,53 @@ class HardwareSetupPage(ModePage):
         live_cam_group.setStyleSheet(self._group_style())
         live_cam_lay = QVBoxLayout(live_cam_group)
 
-        # Detect row
+        # v7.4.2 polish: detect row — primary "Detect" button + muted count.
         detect_row = QHBoxLayout()
-        self._btn_detect_live_cams = QPushButton("Detect Cameras")
-        self._btn_detect_live_cams.setMinimumWidth(s(130))
+        detect_row.setSpacing(s(8))
+        self._btn_detect_live_cams = QPushButton("🔍  Detect Cameras")
+        self._btn_detect_live_cams.setObjectName("accentBtn")
+        self._btn_detect_live_cams.setCursor(Qt.PointingHandCursor)
+        self._btn_detect_live_cams.setMinimumWidth(s(140))
         self._btn_detect_live_cams.setToolTip(
             "Scan for available cameras (OpenCV, ToupCam, Simulated)")
         self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
         detect_row.addWidget(self._btn_detect_live_cams)
         self._lbl_live_cam_count = QLabel("0 found")
         self._lbl_live_cam_count.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: 9pt;")
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; font-size: {sf(9)}pt;")
         detect_row.addWidget(self._lbl_live_cam_count)
         detect_row.addStretch()
         live_cam_lay.addLayout(detect_row)
 
         # Per-camera rows (created dynamically, up to max_cameras from manager)
         self._live_cam_rows_container = QVBoxLayout()
+        self._live_cam_rows_container.setSpacing(s(10))
         self._live_cam_source_combos: list[QComboBox] = []
         self._live_cam_umpx_spins: list[QDoubleSpinBox] = []
         self._live_cam_mag_combos: list[QComboBox] = []
 
+        # v7.4.2 polish: per-camera mini-card matches the surface0
+        # background with a soft border, plus roomy spacing.
         max_cams = 3  # will be updated from camera_manager if set
         for i in range(max_cams):
             row = QFrame()
+            row.setObjectName("camMiniCard")
             row.setStyleSheet(
-                f"QFrame {{ border: 1px solid {COLORS.get('surface1', '#45475a')}; "
-                f"border-radius: {sp(4)}; padding: {sp(2)}; }}")
+                f"QFrame#camMiniCard {{"
+                f"  background-color: {COLORS.get('surface0', '#313244')};"
+                f"  border: 1px solid {COLORS.get('surface1', '#45475a')};"
+                f"  border-radius: {sp(6)};"
+                f"}}"
+            )
             rl = QGridLayout(row)
-            rl.setContentsMargins(6, 4, 6, 4)
-            rl.setSpacing(4)
+            rl.setContentsMargins(s(12), s(10), s(12), s(10))
+            rl.setHorizontalSpacing(s(10))
+            rl.setVerticalSpacing(s(8))
 
-            rl.addWidget(QLabel(f"<b>Cam {i+1}</b>"), 0, 0)
+            cam_label = QLabel(f"<b>Cam {i+1}</b>")
+            cam_label.setStyleSheet(
+                f"color: {COLORS['blue']}; font-size: {sf(10)}pt;")
+            rl.addWidget(cam_label, 0, 0)
             src = QComboBox()
             src.addItem("— None —", None)
             src.setMinimumWidth(s(120))
@@ -879,14 +909,16 @@ class HardwareSetupPage(ModePage):
 
         # Calibrate µm/px button (v7.3.3)
         cal_row = QHBoxLayout()
-        self._btn_calibrate_umpx = QPushButton("Calibrate µm/px")
+        cal_row.setSpacing(s(8))
+        self._btn_calibrate_umpx = QPushButton("📐  Calibrate µm/px")
+        self._btn_calibrate_umpx.setCursor(Qt.PointingHandCursor)
         self._btn_calibrate_umpx.setToolTip(
             "Measure actual µm/px by moving the stage a known distance "
             "and correlating pixel displacement")
-        self._btn_calibrate_umpx.setMinimumWidth(s(140))
+        self._btn_calibrate_umpx.setMinimumWidth(s(150))
         self._btn_calibrate_umpx.clicked.connect(self._on_calibrate_umpx)
-        cal_row.addWidget(self._btn_calibrate_umpx)
         cal_row.addStretch()
+        cal_row.addWidget(self._btn_calibrate_umpx)
         live_cam_lay.addLayout(cal_row)
 
         self._sub_layouts["cameras"].addWidget(live_cam_group)
@@ -906,19 +938,25 @@ class HardwareSetupPage(ModePage):
         self._content_layout.addWidget(status_group)
 
         # ── Section 9: Actions ────────────────────────────────────
+        # v7.4.2 polish: primary save button + secondary load.
         actions_group = QGroupBox("Actions")
         actions_group.setStyleSheet(self._group_style())
         actions_lay = QHBoxLayout(actions_group)
+        actions_lay.setSpacing(s(8))
 
-        btn_save = QPushButton("Save Config")
+        btn_save = QPushButton("💾  Save Config")
+        btn_save.setObjectName("accentBtn")
+        btn_save.setCursor(Qt.PointingHandCursor)
+        btn_save.setToolTip("Save the current hardware configuration to disk.")
         btn_save.clicked.connect(self._save_config)
+        actions_lay.addStretch()
         actions_lay.addWidget(btn_save)
 
-        btn_load = QPushButton("Load Config")
+        btn_load = QPushButton("📂  Load Config")
+        btn_load.setCursor(Qt.PointingHandCursor)
+        btn_load.setToolTip("Load a previously saved hardware configuration.")
         btn_load.clicked.connect(self._load_config)
         actions_lay.addWidget(btn_load)
-
-        actions_lay.addStretch()
 
         self._content_layout.addWidget(actions_group)
 
@@ -949,6 +987,8 @@ class HardwareSetupPage(ModePage):
 
     # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
     def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
+        # v7.4.2 polish: generous margins + section spacing so cards
+        # breathe instead of crowding each other.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -957,8 +997,8 @@ class HardwareSetupPage(ModePage):
         content = QWidget()
         content.setStyleSheet(f"background-color: {bg};")
         layout = QVBoxLayout(content)
-        layout.setSpacing(s(12))
-        layout.setContentsMargins(s(12), s(12), s(12), s(12))
+        layout.setSpacing(s(18))
+        layout.setContentsMargins(s(20), s(20), s(20), s(20))
         scroll.setWidget(content)
         return scroll, layout
 

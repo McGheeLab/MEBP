@@ -94,27 +94,33 @@ def _f(val: float, k: float) -> float:
 # Use these instead of per-page _group_style() methods for consistency.
 
 def build_section_title_style(k: float = 1.0) -> str:
+    # v7.4.2 polish: roomier padding, softer borders, sub-pixel-clean title
+    # baseline. Title sits on the top-left edge as a "pill" cut into the
+    # frame, with a subtle accent dot to anchor the eye.
     return f"""
     QGroupBox {{
-        font-size: {_f(11, k)}pt;
-        font-weight: 600;
+        font-size: {_f(10.5, k)}pt;
+        font-weight: 500;
         color: {COLORS['text']};
+        background-color: {COLORS['surface0']};
         border: 1px solid {COLORS['surface1']};
-        border-radius: {_p(8, k)}px;
-        margin-top: {_p(14, k)}px;
-        padding: {_p(16, k)}px {_p(12, k)}px {_p(10, k)}px {_p(12, k)}px;
+        border-radius: {_p(10, k)}px;
+        margin-top: {_p(16, k)}px;
+        padding: {_p(22, k)}px {_p(18, k)}px {_p(16, k)}px {_p(18, k)}px;
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
         subcontrol-position: top left;
-        left: {_p(12, k)}px;
-        top: 0px;
-        padding: {_p(2, k)}px {_p(8, k)}px;
+        left: {_p(14, k)}px;
+        top: {_p(2, k)}px;
+        padding: {_p(3, k)}px {_p(10, k)}px;
         background-color: {COLORS['base']};
-        border-radius: {_p(4, k)}px;
+        border: 1px solid {COLORS['surface1']};
+        border-radius: {_p(6, k)}px;
         color: {COLORS['blue']};
-        font-size: {_f(10, k)}pt;
+        font-size: {_f(9.5, k)}pt;
         font-weight: 600;
+        letter-spacing: 0.3px;
     }}
 """
 
