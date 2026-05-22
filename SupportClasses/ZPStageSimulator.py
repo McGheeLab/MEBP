@@ -193,6 +193,26 @@ class ZPStageSimulator:
         except queue.Empty:
             return b""
 
+    def read(self, size: int = 1) -> bytes:
+        """v7.4.2 hotfix: drain up to ``size`` bytes from queued responses.
+
+        Pulls whole queued lines (separated by ``\\n``) and returns at
+        most ``size`` bytes of the joined buffer. Returns ``b""`` if no
+        responses are pending so callers behave like a non-blocking
+        pyserial read with a zero timeout.
+
+        Required for parity with real serial in :meth:`ZPStageManager.
+        query_settings`, which reads via ``serial.read(1024)``.
+        """
+        buf = bytearray()
+        while not self._response_queue.empty() and len(buf) < size:
+            try:
+                line = self._response_queue.get_nowait()
+            except queue.Empty:
+                break
+            buf.extend((line + "\n").encode("utf-8"))
+        return bytes(buf[:size])
+
     def reset_input_buffer(self) -> None:
         """Clear any pending responses."""
         while not self._response_queue.empty():

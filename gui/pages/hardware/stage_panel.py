@@ -1445,12 +1445,10 @@ class StageHardwarePanel(QWidget):
     def _edit_max_feedrate_popup(self, axis: str) -> None:
         """v7.4.2 hotfix: click-to-edit popup for a max feedrate cell.
 
-        Updates ``device_profile.per_axis_max_feedrate`` and refreshes
-        the display. Does NOT send M203 automatically — the canonical
-        path is to adjust the percentage in ZP Feedrates and click
-        Save Feedrates, since M203 takes a single value per Marlin
-        physical axis (not per logical axis). This popup edits the
-        reference ceiling that the percentage spinboxes derive from.
+        Updates ``device_profile.per_axis_max_feedrate``, pushes the
+        full per-axis dict to Marlin via M203 (using axis_map to route
+        each logical axis to its physical letter), and re-runs the
+        alignment check so the red cell turns green.
         """
         per_axis = ((self._settings.get("device_profile.per_axis_max_feedrate")
                      if self._settings else {}) or {}).copy()
@@ -1469,15 +1467,33 @@ class StageHardwarePanel(QWidget):
         if self._settings is not None:
             self._settings.set("device_profile.per_axis_max_feedrate", per_axis)
             self._settings.save()
+        # v7.4.2 hotfix: push M203 immediately so Marlin agrees and the
+        # alignment cell goes green without requiring a Save Calibration.
+        pushed = False
+        ctrl = self._controller
+        if ctrl is not None and ctrl.zp_stage is not None:
+            try:
+                ctrl.zp_stage.set_per_axis_max_feedrate(per_axis, persist=True)
+                pushed = True
+            except Exception as e:
+                logger.warning(f"set_per_axis_max_feedrate (popup) failed: {e}")
+        elif ctrl is not None:
+            ctrl.apply_device_settings(per_axis_max_feedrate=per_axis)
         self._refresh_max_feedrate_grid()
         # The ZP Feedrates derived-mm/min display uses Z max — if Z
         # changed, refresh the derived labels.
         if axis == "Z" and hasattr(self, '_refresh_zp_feedrate_derived'):
             self._refresh_zp_feedrate_derived()
+        # Re-check alignment so the cell colour reflects the new state.
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
         if hasattr(self, 'lbl_cal_status'):
+            suffix = " (M203 sent to Marlin)" if pushed else ""
             self.lbl_cal_status.setText(
-                f"{axis} max feedrate: {current:.0f} → {new_val:.0f} mm/min. "
-                f"Saved to device profile.")
+                f"{axis} max feedrate: {current:.0f} → {new_val:.0f} mm/min."
+                f"{suffix}")
 
     def _refresh_max_feedrate_grid(self):
         """Refresh the per-axis max feedrate display row."""
@@ -1848,14 +1864,26 @@ class StageHardwarePanel(QWidget):
         logger.info(f"Axis mapping saved: {new_map}")
 
     def _apply_steps_cal(self) -> None:
-        """Save the ZP calibration section: M92 + M201 + persist."""
+        """Save the ZP calibration section: M92 + M203 + M201 + persist."""
         if self._settings is None:
             return
+        # Read the current per-axis feedrate ceilings out of settings so
+        # Save Calibration also re-aligns Marlin's M203 with software.
+        per_axis_feed = ((self._settings.get(
+            "device_profile.per_axis_max_feedrate")) or {})
         if self._controller is not None and self._controller.zp_stage is not None:
             steps = dict(self._controller.zp_stage.steps_per_mm)
             self._settings.set("device_profile.steps_per_mm", steps)
             # Re-send M92 so Marlin matches our stored steps/mm
             self._controller.zp_stage.set_steps_per_mm(steps, persist=True)
+            # v7.4.2 hotfix: push per-axis M203 so Marlin matches the
+            # per_axis_max_feedrate ceilings stored on the device profile.
+            if per_axis_feed:
+                try:
+                    self._controller.zp_stage.set_per_axis_max_feedrate(
+                        per_axis_feed, persist=True)
+                except Exception as e:
+                    logger.warning(f"M203 send failed: {e}")
             # v7.4.2 hotfix: also send per-axis acceleration via M201
             if hasattr(self, 'spin_axis_accel'):
                 accels = {ax: sp_w.value()
@@ -1883,8 +1911,9 @@ class StageHardwarePanel(QWidget):
         if hasattr(self, 'lbl_cal_status'):
             self.lbl_cal_status.setText(
                 "ZP calibration saved: steps_per_mm, per_axis_max_feedrate, "
-                "and per_axis_max_accel persisted; M92 + M201 sent to Marlin.")
-        logger.info("ZP calibration saved (steps + accel)")
+                "and per_axis_max_accel persisted; M92 + M203 + M201 sent "
+                "to Marlin.")
+        logger.info("ZP calibration saved (steps + feedrate + accel)")
 
     def _check_marlin_alignment(self, quiet: bool = False) -> None:
         """v7.4.2 hotfix: query Marlin via M503 and compare its reported
@@ -2049,11 +2078,21 @@ class StageHardwarePanel(QWidget):
         s.set("zp_stage.auto_save_position", self.chk_zp_autosave.isChecked())
         # Push to the live controller / ZP stage
         ctrl = self._controller
+        # v7.4.2 hotfix: send per-axis M203 from the per_axis_max_feedrate
+        # ceilings instead of broadcasting the Z-derived max_mm. The
+        # percentage workflow controls travel/retract/insert/jog speeds;
+        # the M203 ceiling is the per-axis raw value the user dialled in
+        # via Stepper Calibration / popup edits.
+        per_axis_feed = (s.get("device_profile.per_axis_max_feedrate") or {})
         if ctrl is not None:
             try:
-                if ctrl.zp_stage is not None and hasattr(
-                        ctrl.zp_stage, 'set_max_feedrate'):
-                    ctrl.zp_stage.set_max_feedrate(max_mm)  # sends M203
+                if ctrl.zp_stage is not None:
+                    if per_axis_feed and hasattr(
+                            ctrl.zp_stage, 'set_per_axis_max_feedrate'):
+                        ctrl.zp_stage.set_per_axis_max_feedrate(
+                            per_axis_feed, persist=True)
+                    elif hasattr(ctrl.zp_stage, 'set_max_feedrate'):
+                        ctrl.zp_stage.set_max_feedrate(max_mm)
                     ctrl.zp_stage.feedrate = jog_mm
                 if hasattr(ctrl, '_zp_retract_feedrate'):
                     ctrl._zp_retract_feedrate = ret_mm
@@ -2064,11 +2103,16 @@ class StageHardwarePanel(QWidget):
             except Exception as e:
                 logger.warning(f"ZP feedrate push to controller failed: {e}")
         s.save()
+        # v7.4.2 hotfix: re-check alignment after pushing M203
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
         if hasattr(self, 'lbl_jog_status'):
             self.lbl_jog_status.setText(
                 f"ZP feedrates saved: max {max_mm:.0f}, retract {ret_mm:.0f}, "
                 f"insert {ins_mm:.0f}, jog {jog_mm:.0f} mm/min "
-                f"(M203 sent to Marlin)")
+                f"(per-axis M203 sent to Marlin)")
         logger.info(
             f"ZP feedrates saved (mm/min): "
             f"max={max_mm:.0f}, retract={ret_mm:.0f}, "

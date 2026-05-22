@@ -124,6 +124,14 @@ class ZPStageManager:
         self.max_accel: dict[str, float] = {
             "Z": 100.0, "P1": 1000.0, "P2": 1000.0, "P3": 1000.0,
         }
+        # v7.4.2 hotfix: per-logical-axis max feedrate (M203). Starts
+        # as broadcast of default_feedrate; overridden by callers via
+        # set_per_axis_max_feedrate(). Used at _setup_printer so M203
+        # matches the software per-axis ceilings from connect-time.
+        self.per_axis_max_feedrate: dict[str, float] = {
+            "Z": default_feedrate, "P1": default_feedrate,
+            "P2": default_feedrate, "P3": default_feedrate,
+        }
 
         # Cached position values (updated on get_current_position)
         self.x_pos: float = 0.0
@@ -380,7 +388,7 @@ class ZPStageManager:
             "M302 S0",                          # Allow cold extrusion
             "M83",                               # Extruder relative mode
             "G91",                               # Relative positioning
-            f"M203 E{self.feedrate} Y{self.feedrate} X{self.feedrate} Z{self.feedrate}",
+            self._build_m203_command(),
             self._build_m92_command(),
             f"G0 F{self.feedrate}",              # Set initial feedrate
             "M220 S100",                         # Speed factor 100%
@@ -444,6 +452,41 @@ class ZPStageManager:
         self.send_data(f"G92 {physical}0")
         logger.info(f"ZP G92 {physical}0 sent (logical {logical_axis})")
         return True
+
+    def _build_m203_command(self) -> str:
+        """v7.4.2 hotfix: Build M203 G-code from per_axis_max_feedrate +
+        axis_map. Returns e.g. ``"M203 X3000.00 Y3000.00 Z600.00 E200.00"``.
+
+        Falls back to broadcasting ``self.feedrate`` to every mapped
+        physical axis if per_axis_max_feedrate is empty.
+        """
+        parts = ["M203"]
+        if self.per_axis_max_feedrate:
+            for logical, physical in self.axis_map.items():
+                feed = self.per_axis_max_feedrate.get(logical, self.feedrate)
+                parts.append(f"{physical}{float(feed):.2f}")
+        else:
+            for physical in self.axis_map.values():
+                parts.append(f"{physical}{float(self.feedrate):.2f}")
+        return " ".join(parts)
+
+    def set_per_axis_max_feedrate(self, feedrates: dict[str, float],
+                                  persist: bool = True) -> None:
+        """v7.4.2 hotfix: set per-logical-axis maximum feedrate via M203.
+
+        ``feedrates`` keys are logical axes (Z, P1, P2, P3). The M203
+        command is built from the current axis_map so each logical axis
+        is routed to its physical Marlin letter.
+
+        This is the per-axis replacement for :meth:`set_max_feedrate`,
+        which sent the same value to every Marlin axis and so could
+        never match a per-axis software ceiling.
+        """
+        self.per_axis_max_feedrate = dict(feedrates)
+        if persist:
+            cmd = self._build_m203_command()
+            self.send_data(cmd)
+            logger.info(f"ZP {cmd} sent")
 
     def set_axis_accelerations(self, accels: dict[str, float],
                                persist: bool = True) -> None:
@@ -707,10 +750,15 @@ class ZPStageManager:
     # ── Settings ──────────────────────────────────────────────────
 
     def set_max_feedrate(self, feedrate: float) -> None:
-        """Set maximum feedrate for all axes."""
+        """Set maximum feedrate. Broadcasts ``feedrate`` to every logical
+        axis (Z, P1, P2, P3). Prefer :meth:`set_per_axis_max_feedrate`
+        for the per-axis case.
+        """
         self.feedrate = feedrate
-        self.send_data(f"M203 E{feedrate} Y{feedrate} X{feedrate} Z{feedrate}")
-        logger.debug(f"ZP max feedrate set to {feedrate} mm/min")
+        broadcast = {logical: float(feedrate)
+                     for logical in (self.axis_map or AXIS_MAP).keys()}
+        self.set_per_axis_max_feedrate(broadcast, persist=True)
+        logger.debug(f"ZP max feedrate broadcast to {feedrate} mm/min")
 
     def set_absolute_mode(self) -> None:
         """Switch to absolute positioning."""

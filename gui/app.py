@@ -594,14 +594,17 @@ class MainWindow(QMainWindow):
         hw_page.config_changed.connect(self._on_hardware_config_changed)
         hw_page.config_validated.connect(self._on_hardware_validated)
 
-        # v7.4.2: Push saved axis_map + steps_per_mm into the controller so
-        # they're ready when the ZP stage connects (or pushed live now if
-        # it's already connected).
+        # v7.4.2: Push saved axis_map + steps_per_mm + per_axis_max_feedrate
+        # into the controller so they're ready when the ZP stage connects
+        # (or pushed live now if it's already connected).
         try:
             self.controller.apply_device_settings(
                 axis_map=self.settings.get("device_profile.axis_map") or None,
                 steps_per_mm=self.settings.get("device_profile.steps_per_mm") or None,
-                persist_steps=False,  # Don't re-send M92 on startup
+                per_axis_max_feedrate=self.settings.get(
+                    "device_profile.per_axis_max_feedrate") or None,
+                persist_steps=False,    # Don't re-send M92 on startup
+                persist_feedrate=False,  # _setup_printer handles initial M203
             )
         except Exception as e:
             logger.warning(f"v7.4.2 apply_device_settings failed: {e}")

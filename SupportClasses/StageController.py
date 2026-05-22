@@ -714,6 +714,10 @@ class StageController:
         # v7.4.2: Device settings cached until ZP stage connects
         self._pending_axis_map: dict | None = None
         self._pending_steps_per_mm: dict | None = None
+        # v7.4.2 hotfix: per-axis M203 ceilings (logical → mm/min).
+        # Pushed to Marlin once the ZP stage connects so software and
+        # firmware start in sync.
+        self._pending_per_axis_max_feedrate: dict | None = None
         # v7.4.2 hotfix: last-known-good ZP serial port. Tried first on
         # connect_stages() so we skip the rediscovery scan. Set by
         # the caller from settings (zp_stage.last_port) and re-saved
@@ -850,6 +854,11 @@ class StageController:
             if self._pending_steps_per_mm is not None:
                 self.zp_stage.set_steps_per_mm(
                     self._pending_steps_per_mm, persist=True)
+            # v7.4.2 hotfix: push per-axis M203 ceilings so Marlin agrees
+            # with the software's per_axis_max_feedrate from connect-time.
+            if self._pending_per_axis_max_feedrate is not None:
+                self.zp_stage.set_per_axis_max_feedrate(
+                    self._pending_per_axis_max_feedrate, persist=True)
 
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
 
@@ -890,7 +899,9 @@ class StageController:
 
     def apply_device_settings(self, axis_map: dict | None = None,
                               steps_per_mm: dict | None = None,
-                              persist_steps: bool = False) -> None:
+                              per_axis_max_feedrate: dict | None = None,
+                              persist_steps: bool = False,
+                              persist_feedrate: bool = False) -> None:
         """v7.4.2: Push device-level settings into a connected ZP stage.
 
         Called by MainWindow after construction (or when the user clicks
@@ -901,20 +912,29 @@ class StageController:
         Args:
             axis_map: Logical→physical axis mapping. None to skip.
             steps_per_mm: Per-logical-axis stepper calibration. None to skip.
+            per_axis_max_feedrate: Per-logical-axis max feedrate ceiling
+                (mm/min). None to skip.
             persist_steps: If True and zp_stage is connected, send M92
                 so the new calibration takes effect on Marlin.
+            persist_feedrate: If True and zp_stage is connected, send M203
+                so the new per-axis feedrate ceilings take effect on Marlin.
         """
         # Cache for next connect
         if axis_map is not None:
             self._pending_axis_map = dict(axis_map)
         if steps_per_mm is not None:
             self._pending_steps_per_mm = dict(steps_per_mm)
+        if per_axis_max_feedrate is not None:
+            self._pending_per_axis_max_feedrate = dict(per_axis_max_feedrate)
         # Push live if connected
         if self.zp_stage is not None:
             if axis_map is not None:
                 self.zp_stage.set_axis_map(axis_map)
             if steps_per_mm is not None:
                 self.zp_stage.set_steps_per_mm(steps_per_mm, persist=persist_steps)
+            if per_axis_max_feedrate is not None:
+                self.zp_stage.set_per_axis_max_feedrate(
+                    per_axis_max_feedrate, persist=persist_feedrate)
 
     def connect_xy(self) -> None:
         """Connect only the XY stage."""
