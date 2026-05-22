@@ -208,11 +208,16 @@ class JogButtonArray(QWidget):
 
     @property
     def pump_step(self) -> float:
-        return float(self._p_step.current())
+        """Currently selected pump step in mm (the StageController's
+        native pump unit). User-facing magnitudes are µm; convert here.
+        """
+        return float(self._p_step.current()) / 1000.0
 
     def set_pump_step_mode(self, use_uL: bool) -> None:
-        """Compatibility shim — preset magnitudes don't change because
-        the order-of-magnitude buttons cover both µL and mm ranges."""
+        """v7.4.2: kept as a no-op for back-compat — the pump step is
+        always emitted in mm now, regardless of whether downstream code
+        wanted µL or mm before.
+        """
         self._pump_step_is_uL = use_uL
 
     # ── UI ─────────────────────────────────────────────────────
@@ -234,8 +239,11 @@ class JogButtonArray(QWidget):
         steps_box.addLayout(xy_row)
         steps_box.addLayout(z_row)
         if self._show_pumps:
+            # v7.4.2: pump steps are in µm (linear motion) instead of
+            # µL — µL depends on syringe geometry and the user may
+            # not have configured the pump yet at this point.
             p_row, self._p_step = _build_step_row(
-                "P", "µL", _MAGNITUDES, 10.0, on_change=None)
+                "P", "µm", _MAGNITUDES, 100.0, on_change=None)
             steps_box.addLayout(p_row)
 
         layout.addLayout(steps_box)

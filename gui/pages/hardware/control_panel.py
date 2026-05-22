@@ -267,11 +267,45 @@ class HardwareControlPanel(QWidget):
     # ── Jog group ───────────────────────────────────────────────
 
     def _build_jog_group(self) -> QGroupBox:
-        grp = QGroupBox("Jog Stages (setup-mode, safety bypassed)")
+        grp = QGroupBox("Jog Stages")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         lay = QVBoxLayout(grp)
         lay.setSpacing(s(8))
         lay.setContentsMargins(s(8), s(8), s(8), s(8))
+
+        # v7.4.2: prominent warning that the jog controls bypass
+        # the recorded safety envelope. Yellow tinted card with the
+        # alert icon — hard to miss.
+        warn = QFrame()
+        warn.setObjectName("jogSafetyWarn")
+        warn.setStyleSheet(
+            f"#jogSafetyWarn {{"
+            f"  background-color: rgba(249, 226, 175, 28);"
+            f"  border: 1px solid {COLORS.get('yellow', '#f9e2af')};"
+            f"  border-left: 3px solid {COLORS.get('yellow', '#f9e2af')};"
+            f"  border-radius: {sp(6)};"
+            f"  padding: {sp(8)} {sp(10)};"
+            f"}}"
+        )
+        warn_lay = QHBoxLayout(warn)
+        warn_lay.setSpacing(s(8))
+        warn_lay.setContentsMargins(0, 0, 0, 0)
+        warn_icon = QLabel()
+        warn_icon.setPixmap(
+            icon("alert", color=COLORS.get("yellow", "#f9e2af"),
+                 px=s(20)).pixmap(s(20), s(20)))
+        warn_icon.setFixedSize(s(20), s(20))
+        warn_lay.addWidget(warn_icon, 0, Qt.AlignTop)
+        warn_text = QLabel(
+            "<b>Safety limits are OFF in this section.</b><br>"
+            "Soft-limit clamping and the pump-enabled check are "
+            "bypassed so you can drive each stage to its mechanical "
+            "extremes. Watch the Live Position bars below — markers "
+            "turn red when they cross the recorded envelope.")
+        warn_text.setWordWrap(True)
+        warn_text.setStyleSheet(f"color: {COLORS.get('yellow', '#f9e2af')};")
+        warn_lay.addWidget(warn_text, 1)
+        lay.addWidget(warn)
 
         self._jog_array = JogButtonArray(compact=True, show_pumps=True)
         self._jog_array.jog_xy_requested.connect(self._on_jog_xy)
@@ -280,6 +314,12 @@ class HardwareControlPanel(QWidget):
         self._jog_array.home_requested.connect(self._force_refresh_positions)
         lay.addWidget(self._jog_array)
 
+        # v7.4.2: per-axis jog speeds. Values flow through the
+        # ``_on_jog_*`` handlers — XY uses ProScan SMS via
+        # xy_stage.set_velocity (µm/s); Z and pumps pass feedrate
+        # (mm/min) to move_z_relative / move_pump_relative.
+        lay.addWidget(self._build_speed_controls())
+
         self.btn_refresh = icon_button(
             "Refresh Positions", "refresh",
             tooltip="Force a fresh position read from each connected stage.")
@@ -287,6 +327,84 @@ class HardwareControlPanel(QWidget):
         lay.addWidget(self.btn_refresh)
 
         return grp
+
+    # ── Speed controls ─────────────────────────────────────────
+
+    def _build_speed_controls(self) -> QWidget:
+        wrap = QFrame()
+        wrap.setStyleSheet(
+            f"background-color: rgba(255,255,255,8);"
+            f"border-radius: {sp(6)}; padding: {sp(2)};"
+        )
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(s(8), s(6), s(8), s(6))
+        outer.setSpacing(s(4))
+
+        heading = QLabel("Speeds")
+        heading.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-weight: 600; "
+            f"letter-spacing: 0.4px;")
+        outer.addWidget(heading)
+
+        # XY speed — µm/s (ProScan native)
+        self.spin_xy_speed = self._speed_spin(10000, suffix=" µm/s",
+                                              default=2000, step=100)
+        outer.addLayout(self._labeled(
+            "XY", self.spin_xy_speed,
+            tooltip="ProScan max velocity in µm/s. Applied via SMS on each jog."))
+        # Z speed — mm/min feedrate
+        self.spin_z_speed = self._speed_spin(3000, suffix=" mm/min",
+                                             default=600, step=50)
+        outer.addLayout(self._labeled(
+            "Z", self.spin_z_speed,
+            tooltip="Z move feedrate in mm/min."))
+        # Pump speed — mm/min feedrate
+        self.spin_p_speed = self._speed_spin(3000, suffix=" mm/min",
+                                             default=200, step=50)
+        outer.addLayout(self._labeled(
+            "P", self.spin_p_speed,
+            tooltip="Pump move feedrate in mm/min."))
+
+        # Push the XY speed to the controller whenever it changes so
+        # the next ProScan move uses the new SMS value.
+        self.spin_xy_speed.valueChanged.connect(self._apply_xy_speed)
+        return wrap
+
+    def _labeled(self, name: str, widget, tooltip: str = "") -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(s(6))
+        row.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(name)
+        lbl.setStyleSheet(
+            f"color: {COLORS['text']}; font-weight: 500;")
+        lbl.setMinimumWidth(s(22))
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        if tooltip:
+            widget.setToolTip(tooltip)
+            lbl.setToolTip(tooltip)
+        return row
+
+    def _speed_spin(self, maximum: float, suffix: str, default: float,
+                    step: float) -> "QDoubleSpinBox":
+        from PySide6.QtWidgets import QDoubleSpinBox
+        sp_w = QDoubleSpinBox()
+        sp_w.setRange(1, maximum)
+        sp_w.setDecimals(0)
+        sp_w.setSingleStep(step)
+        sp_w.setValue(default)
+        sp_w.setSuffix(suffix)
+        return sp_w
+
+    def _apply_xy_speed(self, value: float) -> None:
+        """Push XY speed to ProScan via set_velocity (µm/s)."""
+        ctrl = self._controller
+        if ctrl is None or ctrl.xy_stage is None:
+            return
+        try:
+            ctrl.xy_stage.set_velocity(int(value))
+        except Exception as e:
+            logger.debug(f"set_velocity({value}) failed: {e}")
 
     # ── Live position group ─────────────────────────────────────
 
@@ -502,6 +620,9 @@ class HardwareControlPanel(QWidget):
     def _on_jog_xy(self, dx_um: float, dy_um: float) -> None:
         if self._controller is None:
             return
+        # v7.4.2: ensure the latest speed is on ProScan before the move
+        # (the user may have edited the spinbox without pressing Tab).
+        self._apply_xy_speed(self.spin_xy_speed.value())
         try:
             self._controller.move_xy_relative_um(
                 dx_um, dy_um, bypass_safety=True)
@@ -512,7 +633,12 @@ class HardwareControlPanel(QWidget):
     def _on_jog_z(self, dz_mm: float) -> None:
         if self._controller is None:
             return
+        feed = float(self.spin_z_speed.value())
         try:
+            self._controller.move_z_relative(
+                dz_mm, feedrate=feed, bypass_safety=True)
+        except TypeError:
+            # Older controller signature without feedrate kwarg
             self._controller.move_z_relative(dz_mm, bypass_safety=True)
         except Exception as e:
             logger.warning(f"jog Z {dz_mm} failed: {e}")
@@ -521,7 +647,11 @@ class HardwareControlPanel(QWidget):
     def _on_jog_pump(self, pump: str, distance: float) -> None:
         if self._controller is None:
             return
+        feed = float(self.spin_p_speed.value())
         try:
+            self._controller.move_pump_relative(
+                pump, distance, feedrate=feed, bypass_safety=True)
+        except TypeError:
             self._controller.move_pump_relative(
                 pump, distance, bypass_safety=True)
         except Exception as e:
