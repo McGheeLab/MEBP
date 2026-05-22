@@ -46,10 +46,10 @@ class PickPlaceModePage(ModePage):
             controller, settings, camera_manager=camera_manager)
         self._execution_page = PPExecutionPage(controller)
 
-        # Register sub-pages with right sidebar icons
-        self.add_sub_page("⚙️", "Operation Setup", self._setup_page)
-        self.add_sub_page("🎯", "Target Selection", self._target_page)
-        self.add_sub_page("▶️", "Execution", self._execution_page)
+        # v7.4.2: solid-white SVG icons via the factory.
+        self.add_sub_page("settings", "Operation Setup",  self._setup_page)
+        self.add_sub_page("target",   "Target Selection", self._target_page)
+        self.add_sub_page("play",     "Execution",        self._execution_page)
 
         # Wire inter-page data flow
         # Setup → Target Selection + Execution (operation config)

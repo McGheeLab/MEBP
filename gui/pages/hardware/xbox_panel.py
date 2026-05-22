@@ -187,7 +187,15 @@ class XboxHardwarePanel(QWidget):
         super().__init__(parent)
         self._controller = None
         self._settings = None
-        self._mapping_dialog = None
+        # v7.4.2: panel paints the page background colour explicitly so
+        # it doesn't inherit Qt's native white from the parent scroll
+        # area.
+        self.setAutoFillBackground(True)
+        self.setObjectName("xboxHardwarePanel")
+        self.setStyleSheet(
+            f"#xboxHardwarePanel {{ background-color: {COLORS['base']}; }}"
+        )
+        self._mapping_widget = None
         self._build_ui()
 
         # 20 Hz live-monitor refresh
@@ -414,33 +422,32 @@ class XboxHardwarePanel(QWidget):
 
         return grp
 
-    # ── Mapping group ──────────────────────────────────────────
+    # ── Mapping group (inline editor, no popup) ────────────────
 
     def _build_mapping_group(self) -> QGroupBox:
+        from gui.widgets.xbox_mapping_editor import XboxMappingEditorWidget
         grp = QGroupBox("Button Mapping")
         grp.setStyleSheet(SECTION_TITLE_STYLE)
         lay = QVBoxLayout(grp)
         lay.setSpacing(s(10))
 
         info = QLabel(
-            "The button-action map decides what each physical "
-            "button does when pressed. Open the editor to remap, "
-            "test, and save."
+            "Map physical Xbox inputs to stage commands. Changes save "
+            "to ``current_button_mapping.json`` and hot-reload — no "
+            "need to reconnect the controller."
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {COLORS['subtext0']};")
         lay.addWidget(info)
 
-        row = QHBoxLayout()
-        row.setSpacing(s(10))
-        self.btn_edit_mapping = icon_button(
-            "Edit Mapping…", "pencil", object_name="accentBtn",
-            tooltip="Open the Xbox button → action editor.")
-        self.btn_edit_mapping.clicked.connect(self._open_mapping_editor)
-        row.addWidget(self.btn_edit_mapping)
-        row.addStretch(1)
-        lay.addLayout(row)
-
+        mapping_path = (
+            getattr(self._controller, "_mapping_file",
+                    "current_button_mapping.json")
+            if self._controller is not None
+            else "current_button_mapping.json")
+        self._mapping_widget = XboxMappingEditorWidget(
+            mapping_file=mapping_path, parent=self)
+        lay.addWidget(self._mapping_widget)
         return grp
 
     # ── Helpers ────────────────────────────────────────────────
@@ -655,12 +662,4 @@ class XboxHardwarePanel(QWidget):
             logger.warning(f"Failed to clear stick offsets: {e}")
         self._refresh_offsets_label()
 
-    def _open_mapping_editor(self) -> None:
-        from gui.widgets.xbox_mapping_editor import XboxMappingEditor
-        mapping_path = (
-            getattr(self._controller, "_mapping_file",
-                    "current_button_mapping.json")
-            if self._controller is not None
-            else "current_button_mapping.json")
-        editor = XboxMappingEditor(mapping_file=mapping_path, parent=self)
-        editor.exec()
+    # v7.4.2: _open_mapping_editor removed — editor lives inline now.

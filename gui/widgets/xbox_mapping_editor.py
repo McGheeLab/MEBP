@@ -66,10 +66,260 @@ DPAD_LABELS = {
 }
 
 
+class XboxMappingEditorWidget(QWidget):
+    """v7.4.2: QWidget variant of the mapping editor so it can be
+    embedded inline in a page (instead of opening as a dialog).
+
+    Same load / save / reset / import / export behavior as the dialog
+    — minus the modal Cancel/OK pair. Save persists immediately on
+    click and emits no signals (the controller hot-reloads the file).
+    """
+
+    def __init__(self, mapping_file: str = "current_button_mapping.json",
+                 parent=None):
+        super().__init__(parent)
+        self.mapping_file = mapping_file
+        self.mapping = _load_mapping_from_file(self.mapping_file)
+        self._setup_ui()
+        self._populate_tables()
+
+    # ── UI ──────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        info = QLabel(
+            "Map Xbox controller inputs to stage commands. "
+            "Changes are saved to the mapping file and hot-reloaded "
+            "by the controller."
+        )
+        info.setStyleSheet("color: #a6adc8;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        tabs = QTabWidget()
+        # Buttons tab
+        btn_tab = QWidget(); btn_lay = QVBoxLayout(btn_tab)
+        btn_lay.setContentsMargins(0, 0, 0, 0)
+        self.btn_table = QTableWidget()
+        self.btn_table.setColumnCount(3)
+        self.btn_table.setHorizontalHeaderLabels(["#", "Input", "Command"])
+        self.btn_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self.btn_table.setColumnWidth(0, 30)
+        self.btn_table.setColumnWidth(1, 160)
+        self.btn_table.verticalHeader().setVisible(False)
+        btn_lay.addWidget(self.btn_table)
+        tabs.addTab(btn_tab, "Buttons")
+        # Axes tab
+        axis_tab = QWidget(); axis_lay = QVBoxLayout(axis_tab)
+        axis_lay.setContentsMargins(0, 0, 0, 0)
+        self.axis_table = QTableWidget()
+        self.axis_table.setColumnCount(3)
+        self.axis_table.setHorizontalHeaderLabels(["Group", "Input", "Command"])
+        self.axis_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self.axis_table.setColumnWidth(0, 50)
+        self.axis_table.setColumnWidth(1, 160)
+        self.axis_table.verticalHeader().setVisible(False)
+        axis_lay.addWidget(self.axis_table)
+        tabs.addTab(axis_tab, "Axes")
+        # D-Pad tab
+        dpad_tab = QWidget(); dpad_lay = QVBoxLayout(dpad_tab)
+        dpad_lay.setContentsMargins(0, 0, 0, 0)
+        self.dpad_table = QTableWidget()
+        self.dpad_table.setColumnCount(3)
+        self.dpad_table.setHorizontalHeaderLabels(
+            ["Direction", "Label", "Command"])
+        self.dpad_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self.dpad_table.setColumnWidth(0, 60)
+        self.dpad_table.setColumnWidth(1, 120)
+        self.dpad_table.verticalHeader().setVisible(False)
+        dpad_lay.addWidget(self.dpad_table)
+        tabs.addTab(dpad_tab, "D-Pad")
+        layout.addWidget(tabs, 1)
+
+        # Action row (no Cancel/OK — inline widget saves in place)
+        row = QHBoxLayout()
+        from gui.widgets.icons import icon_button as _icon_button
+        btn_reset = _icon_button("Reset to Defaults", "refresh")
+        btn_reset.clicked.connect(self._reset_defaults)
+        row.addWidget(btn_reset)
+        row.addStretch(1)
+        btn_export = _icon_button("Export…", "save")
+        btn_export.clicked.connect(self._export_mapping)
+        row.addWidget(btn_export)
+        btn_import = _icon_button("Import…", "folder-open")
+        btn_import.clicked.connect(self._import_mapping)
+        row.addWidget(btn_import)
+        btn_save = _icon_button("Save Mapping", "save", object_name="accentBtn")
+        btn_save.clicked.connect(self._save_mapping)
+        row.addWidget(btn_save)
+        layout.addLayout(row)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet("color: #a6adc8;")
+        layout.addWidget(self.lbl_status)
+
+    # ── Reused helpers (mirrors of the dialog implementation) ──
+
+    def _make_command_combo(self, current_value: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItems(AVAILABLE_COMMANDS)
+        idx = combo.findText(current_value)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        elif current_value:
+            combo.addItem(current_value)
+            combo.setCurrentIndex(combo.count() - 1)
+        return combo
+
+    def _populate_tables(self):
+        buttons = self.mapping.get("buttons", {})
+        axes = self.mapping.get("axes", {})
+        dpad = self.mapping.get("dpad", {})
+        all_buttons = sorted(
+            set(list(buttons.keys()) + list(BUTTON_LABELS.keys())),
+            key=lambda x: int(x))
+        self.btn_table.setRowCount(len(all_buttons))
+        self._btn_combos = {}
+        for row, btn_id in enumerate(all_buttons):
+            id_item = QTableWidgetItem(btn_id)
+            id_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.btn_table.setItem(row, 0, id_item)
+            label_item = QTableWidgetItem(
+                BUTTON_LABELS.get(btn_id, f"Button {btn_id}"))
+            label_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.btn_table.setItem(row, 1, label_item)
+            combo = self._make_command_combo(buttons.get(btn_id, "None"))
+            self.btn_table.setCellWidget(row, 2, combo)
+            self._btn_combos[btn_id] = combo
+        self.axis_table.setRowCount(len(AXIS_LABELS))
+        self._axis_combos = {}
+        for row, axis_id in enumerate(AXIS_LABELS):
+            id_item = QTableWidgetItem(axis_id)
+            id_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.axis_table.setItem(row, 0, id_item)
+            label_item = QTableWidgetItem(AXIS_LABELS[axis_id])
+            label_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.axis_table.setItem(row, 1, label_item)
+            combo = self._make_command_combo(axes.get(axis_id, "None"))
+            self.axis_table.setCellWidget(row, 2, combo)
+            self._axis_combos[axis_id] = combo
+        self.dpad_table.setRowCount(len(DPAD_LABELS))
+        self._dpad_combos = {}
+        for row, direction in enumerate(DPAD_LABELS):
+            dir_item = QTableWidgetItem(direction)
+            dir_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.dpad_table.setItem(row, 0, dir_item)
+            label_item = QTableWidgetItem(DPAD_LABELS[direction])
+            label_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.dpad_table.setItem(row, 1, label_item)
+            combo = self._make_command_combo(dpad.get(direction, "None"))
+            self.dpad_table.setCellWidget(row, 2, combo)
+            self._dpad_combos[direction] = combo
+
+    def _collect_mapping(self) -> dict:
+        return {
+            "buttons": {k: c.currentText() for k, c in self._btn_combos.items()},
+            "axes":    {k: c.currentText() for k, c in self._axis_combos.items()},
+            "dpad":    {k: c.currentText() for k, c in self._dpad_combos.items()},
+        }
+
+    def _save_mapping(self):
+        mapping = self._collect_mapping()
+        try:
+            with open(self.mapping_file, "w") as f:
+                json.dump(mapping, f, indent=4)
+            self.lbl_status.setText(f"Saved: {self.mapping_file}")
+            logger.info(f"Mapping saved to {self.mapping_file}")
+        except Exception as e:
+            self.lbl_status.setText(f"Save failed: {e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save: {e}")
+
+    def _reset_defaults(self):
+        self.mapping = _DEFAULT_MAPPING.copy()
+        self._populate_tables()
+        self.lbl_status.setText("Reset to defaults (not yet saved).")
+
+    def _export_mapping(self):
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Mapping", "", "JSON (*.json);;All (*)")
+        if filepath:
+            mapping = self._collect_mapping()
+            with open(filepath, "w") as f:
+                json.dump(mapping, f, indent=4)
+            self.lbl_status.setText(f"Exported: {filepath}")
+
+    def _import_mapping(self):
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Import Mapping", "", "JSON (*.json);;All (*)")
+        if filepath:
+            try:
+                with open(filepath, "r") as f:
+                    self.mapping = json.load(f)
+                self._populate_tables()
+                self.lbl_status.setText(
+                    f"Imported {filepath} — click Save to persist.")
+            except Exception as e:
+                self.lbl_status.setText(f"Import failed: {e}")
+                QMessageBox.critical(self, "Import Error", f"Failed: {e}")
+
+
+_DEFAULT_MAPPING = {
+    "buttons": {
+        "0": "zero_needle_pos",
+        "1": "None", "2": "None", "3": "None",
+        "4": "increment_zspeed_down",
+        "5": "increment_zspeed_up",
+        "6": "increment_pspeed_down",
+        "7": "increment_pspeed_up",
+        "8": "increment_xyspeed_down",
+        "9": "increment_xyspeed_up",
+        "10": "None", "11": "None",
+    },
+    "axes": {
+        "0-1": "move_stage_at_velocity",
+        "2-3": "move_z_at_velocity",
+        "4": "move_p3_at_velocity",
+        "5": "move_p3_at_velocity",
+    },
+    "dpad": {
+        "up": "increment_zspeed_up",
+        "down": "increment_zspeed_down",
+        "left": "increment_pspeed_down",
+        "right": "increment_pspeed_up",
+    },
+}
+
+
+def _load_mapping_from_file(mapping_file: str) -> dict:
+    """v7.4.2: shared mapping-load helper (used by widget + dialog)."""
+    path = Path(mapping_file)
+    if not path.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(_DEFAULT_MAPPING, f, indent=4)
+            logger.info(f"Created default mapping file: {path}")
+        except Exception as e:
+            logger.warning(f"Could not create default mapping: {e}")
+        return _DEFAULT_MAPPING.copy()
+    try:
+        with open(mapping_file, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load mapping: {e}")
+        return {"buttons": {}, "axes": {}, "dpad": {}}
+
+
 class XboxMappingEditor(QDialog):
     """
     Dialog for editing Xbox controller button/axis/dpad mappings.
-    
+
     Loads from and saves to a JSON mapping file.
     """
 

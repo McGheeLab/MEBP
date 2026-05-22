@@ -44,11 +44,11 @@ class PrintingModePage(ModePage):
         self._results_page = PrintResultsPage(controller, settings)
         self._helpers_page = HelperFunctionsPage()
 
-        # Register sub-pages with right sidebar icons
-        self.add_sub_page("🖨️", "Print Setup", self._setup_page)
-        self.add_sub_page("📈", "Print Monitor", self._monitor_page)
-        self.add_sub_page("📋", "Print Results", self._results_page)
-        self.add_sub_page("🧰", "Helper Functions", self._helpers_page)
+        # v7.4.2: solid-white SVG icons via the factory.
+        self.add_sub_page("printer",   "Print Setup",      self._setup_page)
+        self.add_sub_page("chart",     "Print Monitor",    self._monitor_page)
+        self.add_sub_page("clipboard", "Print Results",    self._results_page)
+        self.add_sub_page("wrench",    "Helper Functions", self._helpers_page)
 
         logger.info("PrintingModePage initialized with 4 sub-pages")
 

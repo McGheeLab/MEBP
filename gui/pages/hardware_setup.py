@@ -1048,22 +1048,16 @@ class HardwareSetupPage(ModePage):
         # v7.4.1: Device (Stage) is FIRST because it's the one-time
         # initial setup of the physical machine. Everything below
         # configures the experiment.
-        self.add_sub_page("⚙️", "Device",
-                          self._sub_scrolls["stage"])
-        self.add_sub_page("🧾", "Identity",
-                          self._sub_scrolls["identity"])
-        self.add_sub_page("🔬", "Plate",
-                          self._sub_scrolls["plate"])
-        self.add_sub_page("💧", "Pumps & Inks",
-                          self._sub_scrolls["pumps_inks"])
-        self.add_sub_page("🪡", "Needle",
-                          self._sub_scrolls["needle"])
-        self.add_sub_page("🌸", "Rosette",
-                          self._sub_scrolls["rosette"])
-        self.add_sub_page("📷", "Cameras",
-                          self._sub_scrolls["cameras"])
-        self.add_sub_page("🎮", "Xbox Controller",
-                          self._sub_scrolls["xbox"])
+        # v7.4.2: pass icon-factory names instead of emoji so the tab
+        # bar renders crisp solid-white SVG icons.
+        self.add_sub_page("settings",  "Device",          self._sub_scrolls["stage"])
+        self.add_sub_page("file-text", "Identity",        self._sub_scrolls["identity"])
+        self.add_sub_page("microscope","Plate",           self._sub_scrolls["plate"])
+        self.add_sub_page("droplet",   "Pumps & Inks",    self._sub_scrolls["pumps_inks"])
+        self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
+        self.add_sub_page("flower",    "Rosette",         self._sub_scrolls["rosette"])
+        self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
+        self.add_sub_page("gamepad",   "Xbox Controller", self._sub_scrolls["xbox"])
 
     # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
     def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
