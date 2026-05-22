@@ -2267,6 +2267,21 @@ class StageHardwarePanel(QWidget):
                 "Safety limits + zero positions saved to settings and "
                 "applied to the live controller.")
         logger.info("Safety limits + zero saved")
+        # v7.4.2: nudge the persistent left-panel position bars so the
+        # slider extents track the user's new envelope.
+        self._notify_control_panel_safety_changed()
+
+    def _notify_control_panel_safety_changed(self) -> None:
+        page = self.parent()
+        while page is not None and not hasattr(page, "_control_panel"):
+            page = page.parent() if hasattr(page, "parent") else None
+        if page is not None:
+            panel = getattr(page, "_control_panel", None)
+            if panel is not None and hasattr(panel, "refresh_safety_limits"):
+                try:
+                    panel.refresh_safety_limits()
+                except Exception:
+                    pass
 
     def _apply_zp_feedrates(self) -> None:
         """Save ZP feedrates: compute absolute mm/min from percentages,

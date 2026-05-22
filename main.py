@@ -102,6 +102,15 @@ def run_gui(controller: StageController, settings: Settings):
     app = QApplication(sys.argv)
     app.setApplicationName("MEBP Bioprinter")
     app.setOrganizationName("Lab")
+    # v7.4.2: force the Fusion widget style across platforms so our QSS
+    # (notably QComboBox dropdown menus) actually paints. macOS' default
+    # native style ignores stylesheet rules on the popup view, which
+    # leaves combo dropdowns rendering as light system menus over our
+    # dark theme.
+    from PySide6.QtWidgets import QStyleFactory
+    fusion = QStyleFactory.create("Fusion")
+    if fusion is not None:
+        app.setStyle(fusion)
 
     from SupportClasses.PrintRecorder import PrintRecorder
     recorder = PrintRecorder()

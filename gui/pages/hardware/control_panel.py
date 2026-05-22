@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from gui.scaling import s, sp, scaled_font_size as sf
@@ -38,6 +38,76 @@ from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 
 logger = logging.getLogger(__name__)
+
+
+class PositionBar(QWidget):
+    """v7.4.2: Slim horizontal slider showing where an axis sits between
+    its safety-limit min and max.
+
+    Renders a track (rounded rect) with a marker line at the current
+    value. ``set_range(min, max)`` defines the extents; ``set_value(v)``
+    moves the marker. If no value is set yet, only the track is drawn.
+
+    Range comes from ``safety_limits.*`` on the active Settings; the
+    parent ``HardwareControlPanel`` calls ``set_range`` after settings
+    arrive and re-calls it when the user edits limits and saves.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._min = 0.0
+        self._max = 100.0
+        self._value: float | None = None
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(s(10))
+        self.setMinimumWidth(s(60))
+
+    def set_range(self, lo: float, hi: float) -> None:
+        if hi <= lo:
+            hi = lo + 1.0
+        self._min, self._max = float(lo), float(hi)
+        self.update()
+
+    def set_value(self, value: float | None) -> None:
+        self._value = float(value) if value is not None else None
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        radius = h / 2.0
+        # Track
+        track_color = QColor(COLORS.get("surface1", "#45475a"))
+        p.setPen(Qt.NoPen)
+        p.setBrush(track_color)
+        p.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
+        # Marker (current position)
+        if self._value is None:
+            return
+        span = self._max - self._min
+        if span <= 0:
+            return
+        clamped = max(self._min, min(self._max, self._value))
+        frac = (clamped - self._min) / span
+        x = frac * (w - h) + radius  # leave room for the dot at edges
+        # Fill from left edge to marker — visual cue for "how far in".
+        fill_color = QColor(COLORS.get("mauve", "#cba6f7"))
+        fill_color.setAlpha(80)
+        p.setBrush(fill_color)
+        p.drawRoundedRect(QRectF(0, 0, x + radius, h), radius, radius)
+        # Marker dot
+        dot_color = QColor(COLORS.get("mauve", "#cba6f7"))
+        p.setBrush(dot_color)
+        dot_r = h * 0.7
+        p.drawEllipse(QRectF(x - dot_r / 2, (h - dot_r) / 2, dot_r, dot_r))
+        # If the value is outside the recorded envelope, paint a red
+        # ring around the dot — alerts the user to a clamp / overrun.
+        if self._value < self._min or self._value > self._max:
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(COLORS.get("red", "#f38ba8")), 1.5))
+            p.drawEllipse(QRectF(x - dot_r / 2 - 1, (h - dot_r) / 2 - 1,
+                                  dot_r + 2, dot_r + 2))
 
 
 class HardwareControlPanel(QWidget):
@@ -67,6 +137,15 @@ class HardwareControlPanel(QWidget):
 
     def set_settings(self, settings) -> None:
         self._settings = settings
+        # v7.4.2: pull safety-limit ranges into the position bars so the
+        # slider extents reflect the user's recorded envelope.
+        self._refresh_bar_ranges()
+
+    def refresh_safety_limits(self) -> None:
+        """v7.4.2: External hook — call after the user saves new safety
+        limits in the Device sub-page so the bar extents update live.
+        """
+        self._refresh_bar_ranges()
 
     def on_status_update(self) -> None:
         """Refresh position labels + status badges. Called by MainWindow tick."""
@@ -217,32 +296,82 @@ class HardwareControlPanel(QWidget):
         lay = QVBoxLayout(grp)
         lay.setContentsMargins(s(8), s(8), s(8), s(8))
 
+        # v7.4.2: per-axis row = label + slider bar (extents from safety
+        # limits) + numeric value + unit. The bar visualises how close
+        # the stage is to its recorded min/max envelope.
         grid = QGridLayout()
         grid.setHorizontalSpacing(s(8))
-        grid.setVerticalSpacing(s(4))
+        grid.setVerticalSpacing(s(6))
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 0)
+        grid.setColumnStretch(3, 0)
 
         self.lbl_pos: dict[str, QLabel] = {}
+        self.bar_pos: dict[str, PositionBar] = {}
         for r, (axis, unit) in enumerate([
             ("X", "µm"), ("Y", "µm"), ("Z", "mm"),
             ("P1", "mm"), ("P2", "mm"), ("P3", "mm"),
         ]):
             ax_lbl = QLabel(f"<b>{axis}</b>")
             ax_lbl.setStyleSheet(f"color: {COLORS['text']};")
+            ax_lbl.setMinimumWidth(s(22))
             grid.addWidget(ax_lbl, r, 0)
+            bar = PositionBar()
+            grid.addWidget(bar, r, 1)
+            self.bar_pos[axis] = bar
             val = QLabel("—")
-            val.setStyleSheet(f"color: {COLORS['text']}; font-family: monospace;")
+            val.setStyleSheet(
+                f"color: {COLORS['text']}; font-family: monospace;")
             val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            grid.addWidget(val, r, 1)
-            unit_lbl = QLabel(f"({unit})")
+            val.setMinimumWidth(s(70))
+            grid.addWidget(val, r, 2)
+            unit_lbl = QLabel(unit)
             unit_lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
-            grid.addWidget(unit_lbl, r, 2)
+            grid.addWidget(unit_lbl, r, 3)
             self.lbl_pos[axis] = val
         lay.addLayout(grid)
 
         return grp
+
+    # ── Safety-limit range loader ───────────────────────────────
+
+    def _refresh_bar_ranges(self) -> None:
+        """v7.4.2: pull min/max from settings.safety_limits and apply to
+        each PositionBar so the slider extents reflect the user's
+        recorded envelope. Called on set_settings + on the first
+        on_status_update tick after a controller arrives.
+        """
+        if not hasattr(self, 'bar_pos'):
+            return
+        s_obj = self._settings
+        if s_obj is None:
+            return
+        try:
+            ranges = {
+                "X":  (s_obj.get("safety_limits.xy_min_x", -130000.0),
+                       s_obj.get("safety_limits.xy_max_x", 130000.0)),
+                "Y":  (s_obj.get("safety_limits.xy_min_y",  -85000.0),
+                       s_obj.get("safety_limits.xy_max_y",   85000.0)),
+                "Z":  (s_obj.get("safety_limits.z_min",      -10.0),
+                       s_obj.get("safety_limits.z_max",       50.0)),
+                "P1": (s_obj.get("safety_limits.p1_min",     -50.0),
+                       s_obj.get("safety_limits.p1_max",      50.0)),
+                "P2": (s_obj.get("safety_limits.p2_min",     -50.0),
+                       s_obj.get("safety_limits.p2_max",      50.0)),
+                "P3": (s_obj.get("safety_limits.p3_min",     -50.0),
+                       s_obj.get("safety_limits.p3_max",      50.0)),
+            }
+        except Exception as e:
+            logger.debug(f"_refresh_bar_ranges failed: {e}")
+            return
+        for axis, (lo, hi) in ranges.items():
+            bar = self.bar_pos.get(axis)
+            if bar is not None:
+                try:
+                    bar.set_range(float(lo), float(hi))
+                except Exception:
+                    pass
 
     # ── Connect handlers ────────────────────────────────────────
 
@@ -428,17 +557,15 @@ class HardwareControlPanel(QWidget):
         return float(v) if v is not None else None
 
     def _update_position_displays(self, xy, zp) -> None:
+        def _set(axis: str, value: float | None, fmt: str) -> None:
+            self.lbl_pos[axis].setText(fmt.format(value) if value is not None else "—")
+            bar = self.bar_pos.get(axis) if hasattr(self, 'bar_pos') else None
+            if bar is not None:
+                bar.set_value(value)
         if xy and len(xy) >= 2:
-            if xy[0] is not None:
-                self.lbl_pos["X"].setText(f"{xy[0]:,.1f}")
-            else:
-                self.lbl_pos["X"].setText("—")
-            if xy[1] is not None:
-                self.lbl_pos["Y"].setText(f"{xy[1]:,.1f}")
-            else:
-                self.lbl_pos["Y"].setText("—")
+            _set("X", xy[0] if xy[0] is not None else None, "{:,.1f}")
+            _set("Y", xy[1] if xy[1] is not None else None, "{:,.1f}")
         if zp:
             for logical in ("Z", "P1", "P2", "P3"):
                 v = self._logical_zp_value(zp, logical)
-                self.lbl_pos[logical].setText(
-                    f"{v:.3f}" if v is not None else "—")
+                _set(logical, v, "{:.3f}")
