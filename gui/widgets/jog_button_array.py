@@ -282,25 +282,31 @@ class JogButtonArray(QWidget):
         layout.addLayout(controls)
 
         # ── Pump columns (P1▲/▼, P2▲/▼, P3▲/▼) — each pump stacked ─
+        # v7.4.2: pump buttons live in a wider, centered grid so each
+        # column is a clearly clickable target on a wide context pane.
         if self._show_pumps:
+            pump_btn_w = max(btn_size, _sc(56))
             pump_row = QHBoxLayout()
-            pump_row.setSpacing(_sc(6))
+            pump_row.setSpacing(_sc(10))
+            pump_row.addStretch(1)  # center horizontally
             self._pump_buttons = {}
             for pump_id in ("P1", "P2", "P3"):
                 col = QVBoxLayout()
-                col.setSpacing(_sc(3))
+                col.setSpacing(_sc(4))
                 col.setContentsMargins(0, 0, 0, 0)
                 btn_ext = self._dir_btn(f"{pump_id} ▲", btn_size)
+                btn_ext.setFixedWidth(pump_btn_w)
                 btn_ext.setToolTip(f"Extend {pump_id}")
                 btn_ext.clicked.connect(partial(self._on_pump, pump_id, 1))
                 col.addWidget(btn_ext)
                 btn_ret = self._dir_btn(f"{pump_id} ▼", btn_size)
+                btn_ret.setFixedWidth(pump_btn_w)
                 btn_ret.setToolTip(f"Retract {pump_id}")
                 btn_ret.clicked.connect(partial(self._on_pump, pump_id, -1))
                 col.addWidget(btn_ret)
                 pump_row.addLayout(col)
                 self._pump_buttons[pump_id] = (btn_ext, btn_ret)
-            pump_row.addStretch(1)
+            pump_row.addStretch(1)  # center horizontally
             layout.addLayout(pump_row)
 
     def _dir_btn(self, text: str, btn_size: int) -> QPushButton:

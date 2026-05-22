@@ -27,7 +27,7 @@ class AppSettings:
     """Global UI settings — tweak these to customize the shell."""
     ENABLE_CUSTOM_TITLE_BAR = False      # Use native title bar (safer cross-platform)
     MENU_WIDTH = 200                     # Expanded left menu width (base px, scaled at runtime)
-    LEFT_BOX_WIDTH = 400                 # Extra-left context panel width (base px, scaled at runtime). v7.4.2: widened to fit the Hardware Setup connect/jog/live-position panel.
+    LEFT_BOX_WIDTH = 540                 # Extra-left context panel width (base px, scaled at runtime). v7.4.2: 400 was still too narrow for the Hardware Setup connect/jog/live-position panel; bumped to 540.
     TIME_ANIMATION = 300                 # Animation duration (ms)
 
     # Dynamic style fragments
