@@ -34,7 +34,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "7.2.3"
+SCHEMA_VERSION = "7.5.0"
 DEFAULT_PRINTS_DIR = "config/prints"
 
 
@@ -198,11 +198,19 @@ def validate_print_file(data: dict) -> tuple[bool, list[str]]:
 
 def migrate_print_file(data: dict) -> dict:
     """
-    Forward-migrate a print file to schema v7.2.3.
+    Forward-migrate a print file to the current schema (v7.5.0).
 
     Handles:
-        - v7.1 → v7.2: Adds layout_presets if missing
-        - v7.2 → v7.2.3: Updates schema_version
+        - v7.1 → v7.2:   Adds layout_presets if missing
+        - v7.2 → v7.2.3: Updates schema_version, ensures collections key
+        - v7.2.3 → v7.5.0:
+            * Tags each object with ``source`` ("csv" if object_type ==
+              "csv_import", else "parametric").
+            * Strips the persisted ``trajectory`` array from parametric
+              objects — they regenerate via GeometryEngine at load.
+            * If an embedded execution_config is present, maps the
+              deprecated use_waste/wash/buffer flags into ink_swap.*
+              and renames max_ink_volume_uL → pump_volume_overrides_uL.
     """
     version = data.get("schema_version", data.get("version", "7.1"))
     migrated = copy.deepcopy(data)
@@ -233,6 +241,39 @@ def migrate_print_file(data: dict) -> dict:
         logger.info(f"Migrating print file from {version} to 7.2.3")
         migrated.setdefault("layout_presets", {})
         migrated.setdefault("collections", {})
+        migrated["schema_version"] = "7.2.3"
+        version = "7.2.3"
+
+    # v7.2.3 → v7.5.0
+    if version < "7.5.0":
+        logger.info(f"Migrating print file from {version} to 7.5.0")
+        objects = migrated.get("objects")
+        if isinstance(objects, dict):
+            for obj_name, obj_data in objects.items():
+                if not isinstance(obj_data, dict):
+                    continue
+                is_csv = (obj_data.get("object_type") == "csv_import"
+                          or obj_data.get("source") == "csv")
+                obj_data["source"] = "csv" if is_csv else "parametric"
+                # Drop persisted trajectory for parametric — it will be
+                # regenerated from object_type + params on load.
+                if not is_csv:
+                    obj_data.pop("trajectory", None)
+        # If the file carries an embedded execution_config (newer
+        # sessions), rationalize the deprecated flags.
+        ec = migrated.get("execution_config")
+        if isinstance(ec, dict):
+            ink_swap = ec.setdefault("ink_swap", {})
+            if "use_waste" in ec:
+                ink_swap.setdefault("waste", ec.pop("use_waste"))
+            if "use_wash" in ec:
+                v = ec.pop("use_wash")
+                ink_swap.setdefault("wash_pre", v)
+                ink_swap.setdefault("wash_post", v)
+            if "use_buffer" in ec:
+                ink_swap.setdefault("buffer", ec.pop("use_buffer"))
+            if "max_ink_volume_uL" in ec and "pump_volume_overrides_uL" not in ec:
+                ec["pump_volume_overrides_uL"] = ec.pop("max_ink_volume_uL")
         migrated["schema_version"] = SCHEMA_VERSION
 
     # Remove legacy keys
@@ -240,6 +281,25 @@ def migrate_print_file(data: dict) -> dict:
         migrated.pop(key, None)
 
     return migrated
+
+
+def write_migration_backup(path: Path, original_data: dict) -> Path | None:
+    """
+    Write a one-time ``.bak-v7.2.3`` snapshot next to ``path`` containing
+    the pre-migration JSON. Returns the backup path, or None if the
+    backup already exists (so we never overwrite an existing snapshot).
+    """
+    backup = path.with_suffix(path.suffix + ".bak-v7.2.3")
+    if backup.exists():
+        return None
+    try:
+        with open(backup, "w") as f:
+            json.dump(original_data, f, indent=2)
+        logger.info(f"Wrote pre-v7.5.0 migration snapshot: {backup}")
+        return backup
+    except OSError as e:
+        logger.warning(f"Failed to write migration backup at {backup}: {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -402,6 +462,12 @@ class PrintFileManager:
             with open(target_path) as f:
                 raw = json.load(f)
 
+            pre_migration_version = raw.get("schema_version", "7.1")
+            pre_migration_snapshot = (
+                copy.deepcopy(raw) if pre_migration_version < SCHEMA_VERSION
+                else None
+            )
+
             # Validate
             valid, errors = validate_print_file(raw)
             if not valid:
@@ -413,9 +479,12 @@ class PrintFileManager:
                     return None
 
             # Migrate if needed
-            sv = raw.get("schema_version", "7.1")
-            if sv != SCHEMA_VERSION:
+            if pre_migration_version != SCHEMA_VERSION:
                 raw = migrate_print_file(raw)
+                # Persist a one-time pre-migration backup so a user can
+                # roll back if anything regenerated unexpectedly.
+                if pre_migration_snapshot is not None:
+                    write_migration_backup(target_path, pre_migration_snapshot)
 
             self.current = PrintFileData.from_dict(raw)
             self.current_path = target_path
@@ -607,3 +676,97 @@ class PrintFileManager:
     def get_object_names(self) -> list[str]:
         """List object names in current file."""
         return list(self.current.objects.keys()) if self.current else []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Trajectory → custom print object  (v7.5.x — Print Builder)
+# ═══════════════════════════════════════════════════════════════════
+
+def save_trajectory_as_print_object(
+    trajectory,
+    base_name: str = "PrintBuilder",
+    description: str = "",
+    color: str = "#89b4fa",
+    author: str = "Print Builder",
+    source: str = "PrintBuilder",
+    object_name: str = "Sketch_1",
+    prints_dir: str = DEFAULT_PRINTS_DIR,
+    extra_params: dict | None = None,
+) -> str:
+    """Bake an Nx7 trajectory into a ``csv_import`` print file.
+
+    Writes ``{prints_dir}/{name}.csv`` (header ``x,y,z,p1,p2,p3,t``) and a
+    matching ``{name}.json`` print file whose single object has
+    ``object_type="csv_import"`` pointing at the CSV. The name is auto-
+    incremented from ``base_name`` so existing files are never clobbered.
+
+    This is the shared contract used by both the Print Builder Sketch page
+    and the Image Import (Helper Functions) page so the resulting object
+    shows up in Print Setup's custom-prints area. Returns the file name
+    (no extension) for emitting via ``print_file_created``.
+    """
+    import csv as _csv
+    import numpy as _np
+
+    arr = _np.asarray(trajectory, dtype=_np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 7:
+        raise ValueError(
+            f"trajectory must be an Nx7 array, got shape {arr.shape}")
+    arr = arr[:, :7]
+    if len(arr) < 2:
+        raise ValueError("trajectory must have at least 2 waypoints")
+
+    out_dir = Path(prints_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base = _sanitize_filename(base_name)
+    counter = 1
+    while (out_dir / f"{base}_{counter}.csv").exists() \
+            or (out_dir / f"{base}_{counter}.json").exists():
+        counter += 1
+    name = f"{base}_{counter}"
+    csv_path = out_dir / f"{name}.csv"
+    json_path = out_dir / f"{name}.json"
+
+    # ── CSV ──
+    with open(csv_path, "w", newline="") as f:
+        writer = _csv.writer(f)
+        writer.writerow(["x", "y", "z", "p1", "p2", "p3", "t"])
+        for row in arr:
+            writer.writerow([f"{v:.6f}" for v in row])
+
+    # ── Print file JSON (csv_import object) ──
+    params = {"csv_path": str(csv_path), "source": source,
+              "num_waypoints": int(len(arr))}
+    if extra_params:
+        params.update(extra_params)
+
+    now = datetime.now(timezone.utc).isoformat()
+    print_data = {
+        "schema_version": SCHEMA_VERSION,
+        "metadata": {
+            "name": name,
+            "description": description or f"{author}: {name}",
+            "created": now,
+            "modified": now,
+            "author": author,
+        },
+        "objects": {
+            object_name: {
+                "object_type": "csv_import",
+                "params": params,
+                "position": [0.0, 0.0, 0.0],
+                "color": color,
+                "ink": "",
+                "in_well": True,
+            },
+        },
+        "collections": {},
+        "layout_presets": {},
+    }
+    with open(json_path, "w") as f:
+        json.dump(print_data, f, indent=2)
+
+    logger.info(f"save_trajectory_as_print_object → {name} "
+                f"({len(arr)} waypoints)")
+    return name

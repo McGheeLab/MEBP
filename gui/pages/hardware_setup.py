@@ -53,7 +53,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QStandardItem
 
-from SupportClasses.HardwareConfig import HardwareConfig, PumpChannelConfig, CameraConfig
+from SupportClasses.HardwareConfig import (
+    HardwareConfig, PumpChannelConfig, CameraConfig, CameraRole,
+)
 from SupportClasses.PhysicalModels import (
     NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert, CameraSpec,
     load_needle_catalog, load_syringe_catalog, load_camera_catalog,
@@ -63,6 +65,7 @@ from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
 from gui.widgets.icons import icon, icon_button
+from gui.widgets.components import StatusBadge  # v7.4.x rev3 polish
 
 logger = logging.getLogger(__name__)
 
@@ -515,6 +518,11 @@ class HardwareSetupPage(ModePage):
 
         self._setup_ui()
 
+        # v7.4.x rev3: seed the role-derived visuals so the page shows
+        # its disabled / "Not assigned" state on first display rather
+        # than waiting for the first config-apply.
+        self._refresh_role_derived_displays()
+
         # v7.4.2: Persistent control panel — Connect + Jog + Live Position.
         # Lives in the existing per-page left context panel
         # (returned from ``get_context_widget``) so it replaces the old
@@ -665,23 +673,39 @@ class HardwareSetupPage(ModePage):
 
         self._content_layout.addWidget(name_group)
 
-        # ── Section 2: Well Plate Format (v7.2.4: MOVED UP) ──────
-        plate_group = QGroupBox("Well Plate Format")
-        plate_group.setStyleSheet(self._group_style())
-        plate_lay = QHBoxLayout(plate_group)
+        # ── Section 2: Well Plate Designer (v7.4.5) ──────────────
+        # Inline parametric well-plate sketcher replaces the old format
+        # combo. Bundled standards still appear in the picker; users
+        # can drop a Grid / Single-Well and impose constraints (Lock,
+        # Distance, Coincident, Concentric, Equal-Ø, etc.) — and save
+        # custom plates under config/hardware/plates/user/.
+        #
+        # Backward-compat shim: a hidden QComboBox mirrors the picker so
+        # external code that still calls self.plate_combo.currentData()
+        # or .findData() keeps working until the migration finishes.
+        from gui.pages.hardware.plate_designer import PlateDesignerWidget
+        self._plate_designer = PlateDesignerWidget(self, mode="plate")
+        self._plate_designer.plate_changed.connect(
+            lambda _key: self._on_config_changed())
+        self._sub_layouts["plate"].addWidget(self._plate_designer)
 
-        plate_lay.addWidget(QLabel("Format:"))
+        # v7.4.8: the Rosette sub-page hosts a rosette-mode designer that
+        # mirrors the plate layout; double-clicking a well drills into its
+        # rosette. It shares the plate design object with the Plate page
+        # (synced on sub-page switch — see _on_hw_sub_page_changed).
+        self._rosette_designer = PlateDesignerWidget(self, mode="rosette")
+        self._rosette_designer.save_requested.connect(
+            self._on_rosette_save_requested)
+        self._rosette_designer.design_edited.connect(
+            self._on_rosette_design_edited)
+
         self.plate_combo = QComboBox()
+        self.plate_combo.hide()
         for fmt in sorted(PLATE_DEFINITIONS.keys()):
             pdef = PLATE_DEFINITIONS[fmt]
             rows = pdef.get("rows", "?")
             cols = pdef.get("cols", "?")
             self.plate_combo.addItem(f"{fmt}-well ({rows}×{cols})", fmt)
-        self.plate_combo.currentIndexChanged.connect(self._on_config_changed)
-        plate_lay.addWidget(self.plate_combo)
-        plate_lay.addStretch()
-
-        self._sub_layouts["plate"].addWidget(plate_group)
 
         # ── Section 3: Ink Library ────────────────────────────────
         ink_group = QGroupBox("Ink Library")
@@ -813,7 +837,12 @@ class HardwareSetupPage(ModePage):
         # Build initial channel rows
         self._rebuild_channel_map_rows()
 
-        # ── Section 7: Rosette Library ────────────────────────────
+        # ── Section 7a: Rosette Designer (v7.4.8) ─────────────────
+        # Primary content of the Rosette sub-page: the plate layout with
+        # double-click-to-drill-into-a-well rosette design.
+        self._sub_layouts["rosette"].addWidget(self._rosette_designer, 1)
+
+        # ── Section 7b: Rosette Library (legacy RosetteInsert presets) ─
         ros_group = QGroupBox("Rosette Library")
         ros_group.setStyleSheet(self._group_style())
         ros_lay = QVBoxLayout(ros_group)
@@ -849,50 +878,194 @@ class HardwareSetupPage(ModePage):
 
         self._sub_layouts["rosette"].addWidget(ros_group)
 
-        # ── Section 8: Camera Configuration (v7.3.0) ─────────────
-        cam_group = QGroupBox("Camera Configuration")
-        cam_group.setStyleSheet(self._group_style())
-        cam_lay = QGridLayout(cam_group)
-        # v7.4.2 polish: roomier grid spacing.
-        cam_lay.setHorizontalSpacing(s(12))
-        cam_lay.setVerticalSpacing(s(10))
+        # ── Section 0: Camera Detection & Assignment (v7.4.x rev3) ──
+        # Top-of-page block. Detect row stays single-line; per-slot
+        # rows are compact cards with a Cam-N pill, source picker,
+        # role picker, and a colored role badge that lights up as
+        # soon as the user picks a non-Unassigned role.
+        assign_group = QGroupBox("Camera Detection & Assignment")
+        assign_group.setStyleSheet(self._group_style())
+        assign_lay = QVBoxLayout(assign_group)
+        assign_lay.setContentsMargins(s(14), s(20), s(14), s(14))
+        assign_lay.setSpacing(s(12))
 
-        # Row 0: Camera selection
-        cam_lay.addWidget(QLabel("Camera:"), 0, 0)
+        intro = QLabel(
+            "Discover live camera sources, assign each slot a source, "
+            "and tag it with its workflow role. Roles drive the rest of "
+            "the page below."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {scaled_font_size(9)}pt;"
+        )
+        assign_lay.addWidget(intro)
+
+        detect_row = QHBoxLayout()
+        detect_row.setSpacing(s(10))
+        self._btn_detect_live_cams = icon_button(
+            "Detect Cameras", "search", object_name="accentBtn",
+            tooltip="Scan for available cameras (OpenCV, ToupCam, Simulated)")
+        self._btn_detect_live_cams.setMinimumWidth(s(170))
+        self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
+        detect_row.addWidget(self._btn_detect_live_cams)
+        self._lbl_live_cam_count = StatusBadge("0 sources found", variant="pending")
+        detect_row.addWidget(self._lbl_live_cam_count)
+        detect_row.addStretch()
+        assign_lay.addLayout(detect_row)
+
+        self._live_cam_rows_container = QVBoxLayout()
+        self._live_cam_rows_container.setSpacing(s(8))
+        self._live_cam_source_combos: list[QComboBox] = []
+        self._live_cam_role_combos: list[QComboBox] = []
+        self._live_cam_role_badges: list[StatusBadge] = []
+
+        from gui.styles import build_glass_panel_style
+        assign_glass = build_glass_panel_style("camMiniCard")
+        max_cams = 3  # CameraManager default; updated via set_camera_manager.
+        for i in range(max_cams):
+            row = QFrame()
+            row.setObjectName("camMiniCard")
+            row.setStyleSheet(assign_glass)
+            rl = QGridLayout(row)
+            rl.setContentsMargins(s(14), s(12), s(14), s(12))
+            rl.setHorizontalSpacing(s(12))
+            rl.setVerticalSpacing(s(8))
+            rl.setColumnStretch(0, 0)
+            rl.setColumnStretch(1, 0)
+            rl.setColumnStretch(2, 1)
+            rl.setColumnStretch(3, 0)
+
+            # Cam N pill (uses the accent color so it reads as a chip).
+            cam_pill = QLabel(f"Cam {i + 1}")
+            cam_pill.setAlignment(Qt.AlignCenter)
+            cam_pill.setMinimumWidth(s(54))
+            cam_pill.setStyleSheet(
+                f"QLabel {{"
+                f"  background-color: rgba(137, 180, 250, 30);"
+                f"  color: {COLORS['blue']};"
+                f"  border: 1px solid {COLORS['blue']};"
+                f"  border-radius: {sp(10)};"
+                f"  padding: {sp(2)} {sp(10)};"
+                f"  font-size: {sf(10)}pt;"
+                f"  font-weight: 700;"
+                f"}}"
+            )
+            rl.addWidget(cam_pill, 0, 0, 2, 1, Qt.AlignVCenter)
+
+            rl.addWidget(self._field_label("Source"), 0, 1)
+            src = QComboBox()
+            src.addItem("— None —", None)
+            src.setMinimumWidth(s(220))
+            rl.addWidget(src, 0, 2)
+            self._live_cam_source_combos.append(src)
+
+            # Role badge — lives in column 3 and tracks the combo's
+            # current selection. Empty/Unassigned variant by default.
+            role_badge = StatusBadge("Unassigned", variant="pending")
+            rl.addWidget(role_badge, 0, 3, 2, 1, Qt.AlignVCenter)
+            self._live_cam_role_badges.append(role_badge)
+
+            rl.addWidget(self._field_label("Role"), 1, 1)
+            role_combo = QComboBox()
+            role_combo.addItem("Unassigned", CameraRole.UNASSIGNED)
+            role_combo.addItem("Microscope", CameraRole.MICROSCOPE)
+            role_combo.addItem("Needle X-view", CameraRole.NEEDLE_X)
+            role_combo.addItem("Needle Y-view", CameraRole.NEEDLE_Y)
+            role_combo.addItem("Plate (overhead)", CameraRole.PLATE)
+            role_combo.setToolTip(
+                "Workflow role for this camera slot. All non-Unassigned "
+                "roles are singletons — assigning one here automatically "
+                "clears it from any other slot."
+            )
+            role_combo.currentIndexChanged.connect(
+                lambda idx_combo, cam_i=i: self._on_live_cam_role_changed(cam_i)
+            )
+            rl.addWidget(role_combo, 1, 2)
+            self._live_cam_role_combos.append(role_combo)
+
+            self._live_cam_rows_container.addWidget(row)
+
+        assign_lay.addLayout(self._live_cam_rows_container)
+        self._sub_layouts["cameras"].addWidget(assign_group)
+
+        # ── Section A: Microscope Camera Setup (v7.4.x) ──────────
+        # Houses the camera specification (model, resolution, computed/
+        # override scale, FOV). The slot designated MICROSCOPE in the
+        # Detection & Assignment section above is the camera this
+        # section describes. The objective the user has installed
+        # lives in Section C (Objective Calibration Setup) and drives
+        # the effective magnification used for
+        # `computed_micron_per_pixel`.
+        cam_group = QGroupBox("Microscope Camera Setup")
+        cam_group.setStyleSheet(self._group_style())
+        cam_outer = QVBoxLayout(cam_group)
+        cam_outer.setContentsMargins(s(14), s(20), s(14), s(14))
+        cam_outer.setSpacing(s(12))
+
+        # Header strip: "Assigned camera" + status badge.
+        mic_header = QHBoxLayout()
+        mic_header.setSpacing(s(10))
+        mic_header.addWidget(QLabel("Assigned camera:"))
+        self._microscope_status = StatusBadge("Not assigned", variant="pending")
+        self._microscope_status.setToolTip(
+            "Set the microscope camera by picking the MICROSCOPE role "
+            "in the Camera Detection & Assignment section at the top."
+        )
+        mic_header.addWidget(self._microscope_status)
+        mic_header.addStretch()
+        cam_outer.addLayout(mic_header)
+
+        # Spec frame: everything below is the camera's spec + calibration
+        # configuration. Wrapped in its own QFrame so we can disable the
+        # whole block in one call when no microscope is assigned.
+        self._microscope_spec_frame = QFrame()
+        self._microscope_spec_frame.setObjectName("camMiniCard")
+        from gui.styles import build_glass_panel_style
+        self._microscope_spec_frame.setStyleSheet(
+            build_glass_panel_style("camMiniCard")
+        )
+        spec_form = QFormLayout(self._microscope_spec_frame)
+        spec_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        spec_form.setContentsMargins(s(14), s(12), s(14), s(12))
+        spec_form.setHorizontalSpacing(s(14))
+        spec_form.setVerticalSpacing(s(10))
+
         self.camera_combo = QComboBox()
         self.camera_combo.addItem("None", None)
         for name, spec in self._camera_catalog.items():
             self.camera_combo.addItem(name, name)
         self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
-        cam_lay.addWidget(self.camera_combo, 0, 1, 1, 2)
+        spec_form.addRow(self._field_label("Camera spec"), self.camera_combo)
 
-        # Row 1: Resolution
-        cam_lay.addWidget(QLabel("Resolution:"), 1, 0)
         self.cam_resolution_combo = QComboBox()
         self.cam_resolution_combo.currentIndexChanged.connect(self._on_camera_changed)
-        cam_lay.addWidget(self.cam_resolution_combo, 1, 1, 1, 2)
+        spec_form.addRow(self._field_label("Resolution"), self.cam_resolution_combo)
 
-        # Row 2: Objective selection (Nikon Ti2-U)
-        cam_lay.addWidget(QLabel("Objective:"), 2, 0)
         self.cam_objective_combo = QComboBox()
-        # Nikon Ti2-U standard objectives
-        for mag in NIKON_TI2U_OBJECTIVES:
-            self.cam_objective_combo.addItem(f"{mag}×", mag)
-        self.cam_objective_combo.currentIndexChanged.connect(self._on_camera_changed)
-        cam_lay.addWidget(self.cam_objective_combo, 2, 1, 1, 2)
+        self.cam_objective_combo.setEditable(False)
+        self.cam_objective_combo.setToolTip(
+            "Set this in the Objective Calibration Setup section below "
+            "via the 'Currently installed' combo."
+        )
+        self.cam_objective_combo.setEnabled(False)
+        spec_form.addRow(
+            self._field_label("Installed objective"), self.cam_objective_combo
+        )
 
-        # Row 3: Computed pixel scale (read-only)
-        cam_lay.addWidget(QLabel("Pixel Scale:"), 3, 0)
         self.cam_scale_label = QLabel("—")
         self.cam_scale_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')};")
-        cam_lay.addWidget(self.cam_scale_label, 3, 1, 1, 2)
+            f"color: {COLORS.get('text', '#cdd6f4')}; font-weight: 600;"
+        )
+        self.cam_scale_label.setWordWrap(True)
+        spec_form.addRow(self._field_label("Pixel scale"), self.cam_scale_label)
 
-        # Row 4: Override checkbox + custom scale
+        # Override checkbox + custom scale on the same row.
+        override_row = QHBoxLayout()
+        override_row.setSpacing(s(8))
         self.cam_override_check = QCheckBox("Use custom scale")
         self.cam_override_check.toggled.connect(self._on_camera_override_toggled)
-        cam_lay.addWidget(self.cam_override_check, 4, 0, 1, 2)
-
+        override_row.addWidget(self.cam_override_check)
         self.cam_override_spin = QDoubleSpinBox()
         self.cam_override_spin.setRange(0.01, 1000.0)
         self.cam_override_spin.setDecimals(2)
@@ -900,107 +1073,147 @@ class HardwareSetupPage(ModePage):
         self.cam_override_spin.setValue(1.67)
         self.cam_override_spin.setEnabled(False)
         self.cam_override_spin.valueChanged.connect(self._on_config_changed)
-        cam_lay.addWidget(self.cam_override_spin, 4, 2)
+        override_row.addWidget(self.cam_override_spin)
+        override_row.addStretch(1)
+        override_holder = QWidget()
+        override_holder.setLayout(override_row)
+        spec_form.addRow(self._field_label("Override"), override_holder)
 
-        # Row 5: FOV info (read-only)
-        cam_lay.addWidget(QLabel("Camera FOV:"), 5, 0)
         self.cam_fov_label = QLabel("—")
         self.cam_fov_label.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')};")
-        cam_lay.addWidget(self.cam_fov_label, 5, 1, 1, 2)
+            f"color: {COLORS.get('subtext0', '#a6adc8')};"
+        )
+        spec_form.addRow(self._field_label("Field of view"), self.cam_fov_label)
 
+        cam_outer.addWidget(self._microscope_spec_frame)
         self._sub_layouts["cameras"].addWidget(cam_group)
 
-        # ── Section 8b: Live Camera Sources (v7.3.3) ─────────────
-        live_cam_group = QGroupBox("Live Camera Sources")
+        # ── Section B: Needle Cameras Setup (v7.4.x rev3) ───────
+        # Exactly two needle cameras, side-by-side. Each card binds
+        # to a fixed role; assignment + calibration are independent.
+        live_cam_group = QGroupBox("Needle Cameras Setup")
         live_cam_group.setStyleSheet(self._group_style())
         live_cam_lay = QVBoxLayout(live_cam_group)
+        live_cam_lay.setContentsMargins(s(14), s(20), s(14), s(14))
+        live_cam_lay.setSpacing(s(10))
 
-        # v7.4.2 polish: detect row — primary "Detect" button + muted count.
-        detect_row = QHBoxLayout()
-        detect_row.setSpacing(s(8))
-        self._btn_detect_live_cams = icon_button(
-            "Detect Cameras", "search", object_name="accentBtn",
-            tooltip="Scan for available cameras (OpenCV, ToupCam, Simulated)")
-        self._btn_detect_live_cams.setMinimumWidth(s(160))
-        self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
-        detect_row.addWidget(self._btn_detect_live_cams)
-        self._lbl_live_cam_count = QLabel("0 found")
-        self._lbl_live_cam_count.setStyleSheet(
-            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
-        detect_row.addWidget(self._lbl_live_cam_count)
-        detect_row.addStretch()
-        live_cam_lay.addLayout(detect_row)
+        needle_intro = QLabel(
+            "Two side cameras look down the X and Y axes. Assign each a "
+            "camera in the section above; then run an independent stage-"
+            "motion µm/px calibration for each."
+        )
+        needle_intro.setWordWrap(True)
+        needle_intro.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {scaled_font_size(9)}pt;"
+        )
+        live_cam_lay.addWidget(needle_intro)
 
-        # Per-camera rows (created dynamically, up to max_cameras from manager)
-        self._live_cam_rows_container = QVBoxLayout()
-        self._live_cam_rows_container.setSpacing(s(10))
-        self._live_cam_source_combos: list[QComboBox] = []
-        self._live_cam_umpx_spins: list[QDoubleSpinBox] = []
-        self._live_cam_mag_combos: list[QComboBox] = []
-
-        # v7.4.2 polish: per-camera mini-card uses the shared frosted-
-        # glass panel style so secondary cards match the primary
-        # section's translucent look.
+        # Two cards side-by-side.
         from gui.styles import build_glass_panel_style
         glass_style = build_glass_panel_style("camMiniCard")
-        max_cams = 3  # will be updated from camera_manager if set
-        for i in range(max_cams):
-            row = QFrame()
-            row.setObjectName("camMiniCard")
-            row.setStyleSheet(glass_style)
-            rl = QGridLayout(row)
-            rl.setContentsMargins(s(12), s(10), s(12), s(10))
-            rl.setHorizontalSpacing(s(10))
-            rl.setVerticalSpacing(s(8))
+        needle_row = QHBoxLayout()
+        needle_row.setSpacing(s(12))
+        self._needle_cards: dict[CameraRole, dict[str, QWidget]] = {}
+        for role, title, axis_color in (
+            (CameraRole.NEEDLE_X, "Needle X-view", COLORS.get("peach", "#fab387")),
+            (CameraRole.NEEDLE_Y, "Needle Y-view", COLORS.get("sky", "#89dceb")),
+        ):
+            card = QFrame()
+            card.setObjectName("camMiniCard")
+            card.setStyleSheet(glass_style)
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(s(14), s(12), s(14), s(12))
+            inner.setSpacing(s(10))
 
-            cam_label = QLabel(f"<b>Cam {i+1}</b>")
-            cam_label.setStyleSheet(f"color: {COLORS['blue']};")
-            rl.addWidget(cam_label, 0, 0)
-            src = QComboBox()
-            src.addItem("— None —", None)
-            src.setMinimumWidth(s(120))
-            rl.addWidget(src, 0, 1, 1, 2)
-            self._live_cam_source_combos.append(src)
+            # Header: colored title + status badge on the right.
+            head = QHBoxLayout()
+            head.setSpacing(s(8))
+            title_lbl = QLabel(title)
+            title_lbl.setStyleSheet(
+                f"color: {axis_color}; font-weight: 700; "
+                f"font-size: {scaled_font_size(11)}pt;"
+            )
+            head.addWidget(title_lbl)
+            head.addStretch(1)
+            status = StatusBadge("Not assigned", variant="pending")
+            head.addWidget(status)
+            inner.addLayout(head)
 
-            rl.addWidget(QLabel("µm/px:"), 1, 0)
-            umpx = QDoubleSpinBox()
-            umpx.setRange(0.01, 1000.0)
-            umpx.setDecimals(3)
-            umpx.setSuffix(" µm/px")
-            umpx.setValue(1.67)
-            umpx.valueChanged.connect(
-                lambda v, idx=i: self._on_live_cam_umpx_changed(idx, v))
-            rl.addWidget(umpx, 1, 1, 1, 2)
-            self._live_cam_umpx_spins.append(umpx)
+            # Info form: current µm/px.
+            info = QFormLayout()
+            info.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            info.setHorizontalSpacing(s(12))
+            info.setVerticalSpacing(s(6))
+            info.setContentsMargins(0, 0, 0, 0)
+            umpx = QLabel("—")
+            umpx.setStyleSheet(
+                f"color: {COLORS.get('text', '#cdd6f4')}; "
+                f"font-weight: 700; font-size: {scaled_font_size(11)}pt;"
+            )
+            info.addRow(self._field_label("Current µm/px"), umpx)
+            inner.addLayout(info)
 
-            rl.addWidget(QLabel("Mag:"), 2, 0)
-            mag_combo = QComboBox()
-            for m in NIKON_TI2U_OBJECTIVES:
-                mag_combo.addItem(f"{m}×", m)
-            mag_combo.currentIndexChanged.connect(
-                lambda idx_combo, cam_i=i: self._on_live_cam_mag_changed(cam_i))
-            rl.addWidget(mag_combo, 2, 1, 1, 2)
-            self._live_cam_mag_combos.append(mag_combo)
+            # Action: calibrate button (full-width).
+            cal_btn = icon_button(
+                "Calibrate µm/px…", "ruler",
+                object_name="accentBtn",
+                tooltip=(
+                    "Stage-motion calibration: move the stage a known "
+                    "distance and correlate pixel displacement to "
+                    "compute µm/px for this needle camera."
+                ),
+            )
+            cal_btn.setEnabled(False)
+            cal_btn.clicked.connect(
+                lambda _checked=False, r=role: self._on_calibrate_needle(r)
+            )
+            inner.addWidget(cal_btn)
 
-            self._live_cam_rows_container.addWidget(row)
+            # Empty-state hint (only visible when not assigned).
+            hint = QLabel("↑ Assign a camera with this role above")
+            hint.setAlignment(Qt.AlignCenter)
+            hint.setStyleSheet(
+                f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+                f"font-style: italic; "
+                f"font-size: {scaled_font_size(8)}pt;"
+            )
+            inner.addWidget(hint)
 
-        live_cam_lay.addLayout(self._live_cam_rows_container)
+            needle_row.addWidget(card, stretch=1)
+            self._needle_cards[role] = {
+                "card": card,
+                "status": status,
+                "umpx": umpx,
+                "calibrate": cal_btn,
+                "hint": hint,
+            }
 
-        # Calibrate µm/px button (v7.3.3)
-        cal_row = QHBoxLayout()
-        cal_row.setSpacing(s(8))
-        self._btn_calibrate_umpx = icon_button(
-            "Calibrate µm/px", "ruler",
-            tooltip=("Measure actual µm/px by moving the stage a known "
-                     "distance and correlating pixel displacement"))
-        self._btn_calibrate_umpx.setMinimumWidth(s(170))
-        self._btn_calibrate_umpx.clicked.connect(self._on_calibrate_umpx)
-        cal_row.addStretch()
-        cal_row.addWidget(self._btn_calibrate_umpx)
-        live_cam_lay.addLayout(cal_row)
-
+        live_cam_lay.addLayout(needle_row)
         self._sub_layouts["cameras"].addWidget(live_cam_group)
+
+        # ── Section 8c: Microscope Objective Calibration (v7.4.x) ──
+        from gui.pages.hardware.objective_calibration_card import (
+            ObjectiveCalibrationCard,
+        )
+        self._objective_cal_card = ObjectiveCalibrationCard(
+            getattr(self, "_camera_manager", None),
+            lambda: self._config,
+            parent=self,
+        )
+        self._objective_cal_card.calibration_changed.connect(
+            self._on_config_changed
+        )
+        self._objective_cal_card.calibration_changed.connect(
+            self._refresh_installed_objective_combo
+        )
+        self._objective_cal_card.calibration_changed.connect(
+            self._update_camera_info_labels
+        )
+        self._objective_cal_card.um_per_px_committed.connect(
+            self.set_calibrated_um_per_px
+        )
+        self._sub_layouts["cameras"].addWidget(self._objective_cal_card)
 
         # ── Section 9: Setup Status ───────────────────────────────
         status_group = QGroupBox("Setup Status")
@@ -1052,12 +1265,18 @@ class HardwareSetupPage(ModePage):
         # bar renders crisp solid-white SVG icons.
         self.add_sub_page("settings",  "Device",          self._sub_scrolls["stage"])
         self.add_sub_page("file-text", "Identity",        self._sub_scrolls["identity"])
+        self._plate_sub_index = len(self._sub_pages)
         self.add_sub_page("microscope","Plate",           self._sub_scrolls["plate"])
         self.add_sub_page("droplet",   "Pumps & Inks",    self._sub_scrolls["pumps_inks"])
         self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
+        self._rosette_sub_index = len(self._sub_pages)
         self.add_sub_page("flower",    "Rosette",         self._sub_scrolls["rosette"])
         self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
         self.add_sub_page("gamepad",   "Xbox Controller", self._sub_scrolls["xbox"])
+
+        # v7.4.8: sync the rosette designer to the plate layout when the
+        # Rosette sub-page is shown, and refresh the plate when returning.
+        self.sub_page_changed.connect(self._on_hw_sub_page_changed)
 
     # v7.4.0-b: Helper to build a per-sub-page scroll + content layout
     def _make_subpage_scaffold(self, bg: str) -> tuple[QScrollArea, QVBoxLayout]:
@@ -1076,6 +1295,44 @@ class HardwareSetupPage(ModePage):
         scroll.setWidget(content)
         return scroll, layout
 
+    # ── v7.4.8: Plate ↔ Rosette designer sync ────────────────────
+
+    def _on_hw_sub_page_changed(self, index: int) -> None:
+        """Keep the rosette designer mirroring the plate layout.
+
+        On showing the Rosette sub-page, adopt the Plate page's current
+        design (shared object) so the rosette designer starts from the
+        same plate. On returning to the Plate sub-page, re-render so any
+        rosettes added on the Rosette page show their badges.
+        """
+        if not hasattr(self, "_rosette_designer"):
+            return
+        if index == getattr(self, "_rosette_sub_index", -1):
+            self._rosette_designer.adopt_design(
+                self._plate_designer.current_design(),
+                key=self._plate_designer.current_plate_key())
+        elif index == getattr(self, "_plate_sub_index", -1):
+            self._plate_designer.refresh()
+
+    def _on_rosette_design_edited(self) -> None:
+        """A rosette edit mutates the shared plate design → mark dirty so
+        the user knows to save (Save works on either sub-page)."""
+        self._plate_designer._dirty = True
+        self._plate_designer._update_dirty_label()
+        self._on_config_changed()
+
+    def _on_rosette_save_requested(self) -> None:
+        """Rosette page 'Save plate' → save the shared plate via the Plate
+        page (forks standards to a custom name), then clear the rosette
+        page's unsaved flag + re-sync its key."""
+        self._plate_designer._on_save()
+        # Mirror the (possibly new) key + cleared dirty state onto the
+        # rosette designer so its header stops showing "unsaved".
+        self._rosette_designer._current_key = (
+            self._plate_designer.current_plate_key())
+        self._rosette_designer._dirty = False
+        self._rosette_designer._update_dirty_label()
+
     # ════════════════════════════════════════════════════════════════
     #  SHARED STYLES
     # ════════════════════════════════════════════════════════════════
@@ -1084,6 +1341,31 @@ class HardwareSetupPage(ModePage):
     def _group_style() -> str:
         """v7.2.4: Delegates to centralized SECTION_TITLE_STYLE."""
         return SECTION_TITLE_STYLE
+
+    # ── v7.4.x rev3 polish helpers ────────────────────────────────
+
+    @staticmethod
+    def _field_label(text: str) -> QLabel:
+        """Compact label for form-style rows on the Cameras sub-page."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {scaled_font_size(9)}pt; letter-spacing: 0.4px;"
+        )
+        return lbl
+
+    @staticmethod
+    def _role_badge_props(role) -> tuple[str, str]:
+        """Map a CameraRole to a (label, StatusBadge variant) pair."""
+        if role == CameraRole.MICROSCOPE:
+            return ("Microscope", "info")
+        if role == CameraRole.NEEDLE_X:
+            return ("Needle X", "warn")
+        if role == CameraRole.NEEDLE_Y:
+            return ("Needle Y", "warn")
+        if role == CameraRole.PLATE:
+            return ("Plate", "ok")
+        return ("Unassigned", "pending")
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.0-b: SUB-PAGE TITLE FOR MODE PAGE
@@ -1195,11 +1477,87 @@ class HardwareSetupPage(ModePage):
         self._update_camera_info_labels()
         self._on_config_changed()
 
+    # ── Microscope camera slot (v7.4.x) ───────────────────────────
+
+    def _refresh_installed_objective_combo(self):
+        """Sync the read-only 'Installed objective' display to the
+        user's objectives library + the card's current selection."""
+        from SupportClasses.ObjectiveCalibration import get_store
+        store = get_store()
+        current = getattr(
+            self._config.camera_config, "current_objective_name", None
+        )
+        self.cam_objective_combo.blockSignals(True)
+        self.cam_objective_combo.clear()
+        if not store.objective_names():
+            self.cam_objective_combo.addItem("(no objectives defined)", None)
+            self.cam_objective_combo.setCurrentIndex(0)
+        else:
+            for name in store.objective_names():
+                nominal = store.nominal_magnification(name) or 0.0
+                self.cam_objective_combo.addItem(f"{name} ({nominal:g}×)", name)
+            target = self.cam_objective_combo.findData(current)
+            if target >= 0:
+                self.cam_objective_combo.setCurrentIndex(target)
+            else:
+                self.cam_objective_combo.setCurrentIndex(0)
+        self.cam_objective_combo.blockSignals(False)
+
+    def _refresh_role_derived_displays(self):
+        """Refresh every visual element that mirrors role assignments.
+
+        Run after any role-combo change so the Section 0 role badges,
+        the Microscope Camera Setup readout, and the Needle Cameras
+        Setup cards all reflect reality.
+        """
+        # Section 0 — per-slot role badges.
+        for i, badge in enumerate(getattr(self, "_live_cam_role_badges", [])):
+            role = (
+                self._config.camera_roles[i]
+                if i < len(self._config.camera_roles)
+                else CameraRole.UNASSIGNED
+            )
+            label, variant = self._role_badge_props(role)
+            badge.set_status(variant, label)
+
+        # Section A — microscope assignment status badge.
+        mic_idx = self._config.camera_for_role(CameraRole.MICROSCOPE)
+        if hasattr(self, "_microscope_status"):
+            if mic_idx is None:
+                self._microscope_status.set_status("pending", "Not assigned")
+            else:
+                self._microscope_status.set_status("info", f"Cam {mic_idx + 1}")
+        # Section A — dim the spec controls when nothing is assigned.
+        if hasattr(self, "_microscope_spec_frame"):
+            self._microscope_spec_frame.setEnabled(mic_idx is not None)
+
+        # Section B — per-needle assignment + current µm/px + button.
+        mgr = getattr(self, "_camera_manager", None)
+        for role, widgets in getattr(self, "_needle_cards", {}).items():
+            slot = self._config.camera_for_role(role)
+            if slot is None:
+                widgets["status"].set_status("pending", "Not assigned")
+                widgets["umpx"].setText("—")
+                widgets["calibrate"].setEnabled(False)
+                widgets["hint"].setVisible(True)
+            else:
+                widgets["status"].set_status("ok", f"Cam {slot + 1}")
+                if mgr is not None:
+                    try:
+                        umpx = mgr.get_um_per_px(slot)
+                        widgets["umpx"].setText(f"{umpx:.4f} µm/px")
+                    except Exception:
+                        widgets["umpx"].setText("—")
+                widgets["calibrate"].setEnabled(True)
+                widgets["hint"].setVisible(False)
+
     # ── Live Camera Sources (v7.3.3) ─────────────────────────────
 
     def set_camera_manager(self, manager):
         """v7.3.3: Receive shared CameraManager for live camera detection."""
         self._camera_manager = manager
+        if hasattr(self, "_objective_cal_card"):
+            self._objective_cal_card.set_camera_manager(manager)
 
     def set_controller(self, controller):
         """v7.3.3: Receive StageController for pixel calibration.
@@ -1216,47 +1574,79 @@ class HardwareSetupPage(ModePage):
             self._control_panel.set_controller(controller)
 
     def set_calibrated_um_per_px(self, cam_idx: int, value: float):
-        """v7.3.3: Set calibrated µm/px from external source (e.g., needle-based)."""
-        if 0 <= cam_idx < len(self._live_cam_umpx_spins):
-            self._live_cam_umpx_spins[cam_idx].setValue(value)
-            logger.info(f"Camera {cam_idx + 1} µm/px set to {value:.4f} "
-                        f"from external calibration")
+        """v7.3.3/v7.4.x: Apply a calibrated µm/px from any source.
 
-    def _on_calibrate_umpx(self):
-        """Launch pixel calibration dialog for the first running camera."""
+        Writes through to `CameraManager.set_um_per_px` (the canonical
+        live value) and refreshes the role-derived displays so the
+        needle card's readout tracks the change. The microscope's
+        µm/px is sourced from `ObjectiveCalibrationStore` instead and
+        does not flow through here.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is not None:
+            try:
+                mgr.set_um_per_px(cam_idx, value)
+            except Exception as exc:
+                logger.debug(f"set_um_per_px({cam_idx}, {value}) — {exc}")
+        if hasattr(self, "_needle_cards"):
+            self._refresh_role_derived_displays()
+        logger.info(
+            f"Camera {cam_idx + 1} µm/px set to {value:.4f} from external "
+            "calibration"
+        )
+
+    def _on_calibrate_needle(self, role: CameraRole):
+        """Launch the stage-motion µm/px calibration for a needle camera.
+
+        The slot is resolved from the active role assignment so the
+        Needle X and Needle Y buttons each target their own camera
+        independently.
+        """
         from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
         from PySide6.QtWidgets import QDialog, QMessageBox
 
-        mgr = getattr(self, '_camera_manager', None)
-        ctrl = getattr(self, '_controller', None)
-
+        mgr = getattr(self, "_camera_manager", None)
+        ctrl = getattr(self, "_controller", None)
         if mgr is None:
-            QMessageBox.warning(self, "Cannot Calibrate",
-                                "Camera manager not available.")
+            QMessageBox.warning(
+                self, "Cannot Calibrate", "Camera manager not available."
+            )
             return
         if ctrl is None:
-            QMessageBox.warning(self, "Cannot Calibrate",
-                                "Stage controller not connected.")
+            QMessageBox.warning(
+                self, "Cannot Calibrate", "Stage controller not connected."
+            )
             return
 
-        # Find first running camera
-        cam_idx = None
-        for i, cam in enumerate(mgr.cameras):
-            if getattr(cam, '_running', False):
-                cam_idx = i
-                break
+        cam_idx = self._config.camera_for_role(role)
         if cam_idx is None:
-            QMessageBox.warning(self, "Cannot Calibrate",
-                                "Start a camera first, then retry.")
+            QMessageBox.warning(
+                self, "Cannot Calibrate",
+                f"No camera is assigned the {role.value} role. Set the "
+                "role in the Camera Detection & Assignment section.",
+            )
+            return
+        try:
+            cam = mgr.cameras[cam_idx]
+        except (AttributeError, IndexError):
+            return
+        if not getattr(cam, "_running", False):
+            QMessageBox.warning(
+                self, "Cannot Calibrate",
+                f"Start Cam {cam_idx + 1} (the {role.value} camera) "
+                "before launching the calibration.",
+            )
             return
 
         dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             result = dlg.result_um_per_px
-            if result is not None and cam_idx < len(self._live_cam_umpx_spins):
-                self._live_cam_umpx_spins[cam_idx].setValue(result)
-                logger.info(f"Pixel calibration applied: camera {cam_idx + 1} "
-                            f"= {result:.4f} µm/px")
+            if result is not None:
+                self.set_calibrated_um_per_px(cam_idx, result)
+                logger.info(
+                    f"Needle calibration applied: Cam {cam_idx + 1} "
+                    f"({role.value}) = {result:.4f} µm/px"
+                )
 
     def _on_detect_live_cameras(self):
         """Detect live cameras via CameraManager and populate source combos."""
@@ -1272,7 +1662,12 @@ class HardwareSetupPage(ModePage):
         sources = mgr.available_sources
         num = len(sources)
 
-        self._lbl_live_cam_count.setText(f"{num} found")
+        if num == 0:
+            self._lbl_live_cam_count.set_status("warn", "No sources found")
+        elif num == 1:
+            self._lbl_live_cam_count.set_status("ok", "1 source found")
+        else:
+            self._lbl_live_cam_count.set_status("ok", f"{num} sources found")
 
         # Populate each per-camera source combo
         for combo in self._live_cam_source_combos:
@@ -1292,25 +1687,59 @@ class HardwareSetupPage(ModePage):
         self._btn_detect_live_cams.setEnabled(True)
         logger.info(f"Hardware Setup: detected {num} live camera sources")
 
-    def _on_live_cam_umpx_changed(self, cam_idx: int, value: float):
-        """Update CameraManager's µm/px for a specific camera."""
-        mgr = getattr(self, '_camera_manager', None)
-        if mgr:
-            mgr.set_um_per_px(cam_idx, value)
+    def _on_live_cam_role_changed(self, cam_idx: int):
+        """v7.4.x: Persist the workflow role assigned to this camera.
 
-    def _on_live_cam_mag_changed(self, cam_idx: int):
-        """Update CameraManager's magnification for a specific camera."""
-        mgr = getattr(self, '_camera_manager', None)
-        combo = self._live_cam_mag_combos[cam_idx]
-        mag = combo.currentData() or 2.0
-        if mgr:
-            mgr.set_magnification(cam_idx, mag)
+        Writes through to `self._config.camera_roles[cam_idx]` (with
+        singleton enforcement clearing the role from any other slot),
+        then refreshes every section that mirrors role state and
+        fires the standard config-changed pipeline.
+        """
+        if cam_idx >= len(self._live_cam_role_combos):
+            return
+        combo = self._live_cam_role_combos[cam_idx]
+        role = combo.currentData() or CameraRole.UNASSIGNED
+        try:
+            self._config.set_camera_role(cam_idx, role)
+        except Exception as e:
+            logger.warning(f"set_camera_role({cam_idx}, {role}) failed: {e}")
+        # Singleton enforcement may have cleared another slot — rehydrate
+        # every role combo from the (now-canonical) config state.
+        for i, other in enumerate(self._live_cam_role_combos):
+            target = self._config.camera_roles[i] if i < len(
+                self._config.camera_roles) else CameraRole.UNASSIGNED
+            tidx = other.findData(target)
+            if tidx >= 0 and other.currentIndex() != tidx:
+                other.blockSignals(True)
+                other.setCurrentIndex(tidx)
+                other.blockSignals(False)
+
+        # Skip the rebuild + label refresh churn while a saved config
+        # is being applied to the UI; the role list is already correct.
+        if not getattr(self, '_restoring', False):
+            self._refresh_role_derived_displays()
+            if hasattr(self, "_objective_cal_card"):
+                self._objective_cal_card.apply_config(self._config)
+            self._on_config_changed()
 
     def _update_camera_info_labels(self):
         """Update computed pixel scale and FOV labels."""
         cam_name = self.camera_combo.currentData()
         spec = self._camera_catalog.get(cam_name) if cam_name else None
-        mag = self.cam_objective_combo.currentData() or 2.0
+        # v7.4.x: the installed objective (chosen by the user in
+        # Section C) drives the spec-computed µm/px. Falls back to the
+        # CameraConfig field for legacy configs without a selection.
+        from SupportClasses.ObjectiveCalibration import get_store
+        store = get_store()
+        current_obj = getattr(
+            self._config.camera_config, "current_objective_name", None
+        )
+        nominal = store.nominal_magnification(current_obj) if current_obj else None
+        mag = (
+            nominal
+            if nominal is not None
+            else (self._config.camera_config.objective_magnification or 2.0)
+        )
 
         res_data = self.cam_resolution_combo.currentData()
         active_res = tuple(res_data) if res_data else (916, 686)
@@ -1501,8 +1930,20 @@ class HardwareSetupPage(ModePage):
             self.name_edit.text().strip() or "Untitled Setup")
         self._config.notes = self.notes_edit.text().strip()
 
-        # Well plate
-        self._config.plate_format = self.plate_combo.currentData() or 24
+        # Well plate (v7.4.5: designer widget owns both fields)
+        if hasattr(self, "_plate_designer"):
+            self._config.plate_format = (
+                self._plate_designer.current_plate_format())
+            self._config.plate_name = (
+                self._plate_designer.current_plate_name())
+            # Keep the shim combo in sync for legacy readers.
+            idx = self.plate_combo.findData(self._config.plate_format)
+            if idx >= 0:
+                self.plate_combo.blockSignals(True)
+                self.plate_combo.setCurrentIndex(idx)
+                self.plate_combo.blockSignals(False)
+        else:
+            self._config.plate_format = self.plate_combo.currentData() or 24
 
         # Needle
         gauge = self.gauge_combo.currentData()
@@ -1548,13 +1989,40 @@ class HardwareSetupPage(ModePage):
         active_res = tuple(res_data) if res_data else (916, 686)
         override = (self.cam_override_spin.value()
                      if self.cam_override_check.isChecked() else None)
+        # v7.4.x: preserve the per-machine objective selection through
+        # the rebuild (the Objective Calibration card writes it).
+        prev_cam_cfg = self._config.camera_config
+        current_objective = getattr(prev_cam_cfg, "current_objective_name", None)
+        # Derive nominal magnification from the user's objectives
+        # library (no prepopulated combo). Fall back to the previous
+        # value when the user hasn't picked an objective yet.
+        from SupportClasses.ObjectiveCalibration import get_store
+        _store = get_store()
+        nominal = (
+            _store.nominal_magnification(current_objective)
+            if current_objective else None
+        )
+        objective_mag = (
+            nominal
+            if nominal is not None
+            else (prev_cam_cfg.objective_magnification or 2.0)
+        )
         self._config.camera_config = CameraConfig(
             camera_spec=cam_spec,
-            objective_magnification=self.cam_objective_combo.currentData() or 2.0,
+            objective_magnification=objective_mag,
             active_resolution=active_res,
             micron_per_pixel_override=override,
-            camera_to_needle_offset_um=self._config.camera_config.camera_to_needle_offset_um,
+            camera_to_needle_offset_um=prev_cam_cfg.camera_to_needle_offset_um,
+            current_objective_name=current_objective,
         )
+
+        # v7.4.x rev2: Per-camera workflow roles. All roles (incl.
+        # MICROSCOPE) are now selectable via the per-slot combo in
+        # the Camera Detection & Assignment section, so we can rewrite
+        # them all from combo state without any preservation logic.
+        for i, combo in enumerate(self._live_cam_role_combos):
+            role = combo.currentData() or CameraRole.UNASSIGNED
+            self._config.set_camera_role(i, role)
 
     # ════════════════════════════════════════════════════════════════
     #  INK LIBRARY CRUD
@@ -1755,13 +2223,18 @@ class HardwareSetupPage(ModePage):
         self.notes_edit.blockSignals(False)
         logger.debug(f"  Name: {self._config.config_name}")
 
-        # ── 2. Plate Format ──────────────────────────────────────
+        # ── 2. Plate Format / Custom Plate (v7.4.5) ──────────────
+        # active_plate_key returns plate_name (str) when set, else
+        # plate_format (int). Designer handles both.
+        active_key = self._config.active_plate_key
+        if hasattr(self, "_plate_designer"):
+            self._plate_designer.load_plate(active_key)
         self.plate_combo.blockSignals(True)
         pidx = self.plate_combo.findData(self._config.plate_format)
         if pidx >= 0:
             self.plate_combo.setCurrentIndex(pidx)
         self.plate_combo.blockSignals(False)
-        logger.debug(f"  Plate format: {self._config.plate_format}")
+        logger.debug(f"  Plate: {active_key}")
 
         # ── 3. Ink Library (MUST come before pumps) ──────────────
         self._refresh_ink_table()
@@ -1870,11 +2343,16 @@ class HardwareSetupPage(ModePage):
             self.camera_combo.setCurrentIndex(0)  # "None"
         self.camera_combo.blockSignals(False)
 
-        self.cam_objective_combo.blockSignals(True)
-        oidx = self.cam_objective_combo.findData(cam_cfg.objective_magnification)
-        if oidx >= 0:
-            self.cam_objective_combo.setCurrentIndex(oidx)
-        self.cam_objective_combo.blockSignals(False)
+        # v7.4.x: Installed objective is a read-only mirror of the
+        # Objective Calibration Setup card. Populate from the user's
+        # objectives library (custom, no prepopulated list).
+        self._refresh_installed_objective_combo()
+
+        # v7.4.x rev2: microscope-slot is now expressed via the role
+        # combo in the Detection & Assignment section. The dedicated
+        # combo is gone; the read-only readout is updated by
+        # `_refresh_role_derived_displays` further down in this method
+        # (called from the role-combo restore block).
 
         self.cam_override_check.blockSignals(True)
         has_override = cam_cfg.micron_per_pixel_override is not None
@@ -1891,6 +2369,27 @@ class HardwareSetupPage(ModePage):
             f"  Camera: {cam_cfg.camera_spec.name if cam_cfg.camera_spec else 'None'}, "
             f"mag={cam_cfg.objective_magnification}×, "
             f"scale={cam_cfg.micron_per_pixel}")
+
+        # v7.4.x rev2: Per-camera workflow roles. Role combos now own
+        # all five role values including MICROSCOPE.
+        for i, combo in enumerate(self._live_cam_role_combos):
+            if i >= len(self._config.camera_roles):
+                continue
+            role = self._config.camera_roles[i]
+            ridx = combo.findData(role)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(ridx if ridx >= 0 else 0)
+            combo.blockSignals(False)
+        logger.debug(f"  Camera roles: {self._config.camera_roles}")
+
+        # v7.4.x rev2: Refresh the section labels and per-needle cards
+        # that mirror the role assignments.
+        self._refresh_role_derived_displays()
+
+        # v7.4.x: Objective Calibration card — refresh microscope
+        # assignment, current-objective combo, and status table.
+        if hasattr(self, "_objective_cal_card"):
+            self._objective_cal_card.apply_config(self._config)
 
         # ── 9. Emit signals ──────────────────────────────────────
         self._restoring = False

@@ -57,14 +57,29 @@ class ConsoleLogWidget(QWidget):
 
     MAX_LINES = 5000
 
-    def __init__(self, parent=None):
+    # v7.4.2: signal emitted when collapse/expand toggled so the parent
+    # splitter can relax its minimum-height constraint to let the widget
+    # shrink down to the toolbar height.
+    collapse_toggled = Signal(bool)  # True when collapsed
+
+    def __init__(self, parent=None, start_collapsed: bool = False):
         super().__init__(parent)
         self._auto_scroll = True
         self._line_count = 0
+        self._collapsed = False
         self._bridge = _LogSignalBridge()
         self._bridge.log_received.connect(self._append)
 
         self._setup_ui()
+
+        if start_collapsed:
+            # Apply collapsed visual state up-front without emitting the
+            # signal — the host hasn't connected slots yet, and the
+            # splitter is responsible for picking a sensible initial size.
+            self._collapsed = True
+            self._text.setVisible(False)
+            self._btn_collapse.setText("▲ Terminal")
+            self._btn_collapse.setToolTip("Expand the terminal")
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -77,6 +92,14 @@ class ConsoleLogWidget(QWidget):
         # Toolbar
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
+
+        # v7.4.2: collapse/expand toggle — first control so it's easy to
+        # spot when the terminal is hogging vertical space.
+        self._btn_collapse = QPushButton("▼ Terminal")
+        self._btn_collapse.setFixedWidth(110)
+        self._btn_collapse.setToolTip("Collapse / expand the terminal")
+        self._btn_collapse.clicked.connect(self._toggle_collapsed)
+        toolbar.addWidget(self._btn_collapse)
 
         btn_clear = QPushButton("Clear")
         btn_clear.setFixedWidth(60)
@@ -145,6 +168,28 @@ class ConsoleLogWidget(QWidget):
     def _toggle_scroll(self):
         self._auto_scroll = not self._auto_scroll
         self._btn_scroll.setText(f"Auto-scroll: {'ON' if self._auto_scroll else 'OFF'}")
+
+    # v7.4.2: collapse/expand control. Hides the text area and shrinks the
+    # widget down to the toolbar so it occupies minimal space. Emits
+    # ``collapse_toggled`` so the host splitter can relax/restore its
+    # minimum-height constraint (otherwise the splitter floor keeps the
+    # console at ~180 px even with the text area hidden).
+    def set_collapsed(self, collapsed: bool):
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        self._text.setVisible(not collapsed)
+        self._btn_collapse.setText("▲ Terminal" if collapsed else "▼ Terminal")
+        self._btn_collapse.setToolTip(
+            "Expand the terminal" if collapsed else "Collapse the terminal"
+        )
+        self.collapse_toggled.emit(collapsed)
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def _toggle_collapsed(self):
+        self.set_collapsed(not self._collapsed)
 
 
 # ── Qt log handler ────────────────────────────────────────────────

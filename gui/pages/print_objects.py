@@ -101,6 +101,7 @@ try:
     from gui.widgets.projection_canvas import (
         ProjectionCanvas, ObjectPath, InteractiveProjectionCanvas,
         PlacedObject, create_interactive_well_preview,
+        create_horizontal_well_preview,
     )
     HAS_PROJECTION_CANVAS = True
 except ImportError:
@@ -406,84 +407,34 @@ class PrintObjectsTab(QWidget):
         # ── Print File Bar (always visible, pinned top) ──────────
         self._build_file_bar(outer)
 
-        # ── Two-column layout: left (builders) | right (preview + list) ──
-        columns = QSplitter(Qt.Orientation.Horizontal)
-        columns.setChildrenCollapsible(False)
-        columns.setStyleSheet(f"QSplitter {{ background: {_bg}; }}")
+        # v7.5.3: body is the projection trio with the file bar kept
+        # on top. Designer, Ink & Material, Auto-Layout, and CSV
+        # Import are built as detached panels that the wizard's
+        # context pane reparents into its Tools section.
+        body_inner = QWidget()
+        body_inner.setStyleSheet(f"background: {_bg};")
+        preview_lay = QVBoxLayout(body_inner)
+        preview_lay.setContentsMargins(4, 4, 4, 4)
+        preview_lay.setSpacing(4)
+        self._build_preview_section(preview_lay)
+        outer.addWidget(body_inner, 1)
 
-        # ── LEFT: Scrollable builder sections ────────────────────
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setStyleSheet(f"QScrollArea {{ background: {_bg}; border: none; }}")
-
-        left_content = QWidget()
-        left_content.setStyleSheet(f"background: {_bg};")
-        left_lay = QVBoxLayout(left_content)
-        left_lay.setContentsMargins(4, 4, 4, 4)
-        left_lay.setSpacing(4)
-
-        _, designer_lay = self._make_collapsible_group(
-            "Object Designer", left_lay, expanded=True)
-        self._build_designer_section(designer_lay)
-
-        _, auto_lay = self._make_collapsible_group(
-            "Auto-Layout", left_lay, expanded=False)
-        self._build_auto_layout_section(auto_lay)
-
-        _, csv_lay = self._make_collapsible_group(
-            "CSV Import", left_lay, expanded=False)
-        self._build_csv_import_section(csv_lay)
-
-        left_lay.addStretch()
-        left_scroll.setWidget(left_content)
-        columns.addWidget(left_scroll)
-
-        # ── RIGHT: Preview (fixed) + Objects/Summary (scrollable) ─
-        right = QWidget()
-        right.setStyleSheet(f"background: {_bg};")
-        right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(4, 4, 4, 4)
-        right_lay.setSpacing(4)
-
-        # Preview — always visible, not collapsible
-        self._build_preview_section(right_lay)
-
-        # Objects + Summary in a scroll area below preview
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        right_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        right_scroll.setStyleSheet(f"QScrollArea {{ background: {_bg}; border: none; }}")
-
-        right_scroll_content = QWidget()
-        right_scroll_content.setStyleSheet(f"background: {_bg};")
-        right_scroll_lay = QVBoxLayout(right_scroll_content)
-        right_scroll_lay.setContentsMargins(0, 0, 0, 0)
-        right_scroll_lay.setSpacing(4)
-
-        _, objects_lay = self._make_collapsible_group(
-            "Objects in This Print", right_scroll_lay, expanded=True)
-        self._build_objects_list_section(objects_lay)
-
-        _, summary_lay = self._make_collapsible_group(
-            "Summary & Staging", right_scroll_lay, expanded=True)
-        self._build_summary_section(summary_lay)
-
-        right_scroll_lay.addStretch()
-        right_scroll.setWidget(right_scroll_content)
-        right_lay.addWidget(right_scroll)
-
-        columns.addWidget(right)
-
-        # Left gets less space, right (preview) gets more
-        columns.setStretchFactor(0, 2)
-        columns.setStretchFactor(1, 3)
-
-        outer.addWidget(columns)
+        # ── Detached panels for the wizard sidebar / context ─────
+        # All built as standalone widgets that the wizard reparents.
+        # ``objects_panel`` (v7.5.1): wizard right sidebar (Objects
+        #     in This Print + Summary).
+        # ``auto_layout_panel`` (v7.5.2): wizard left context Tools.
+        # ``designer_panel`` (v7.5.3): wizard left context Tools —
+        #     Object Designer (type list + params + Add button).
+        # ``ink_material_panel`` (v7.5.3): wizard left context Tools
+        #     — Ink + Filled + Position cluster.
+        # v7.5.6: CSV Import is no longer a standalone panel — it's a
+        # custom-object type at the top of the designer's type list.
+        self._csv_chosen_path: str | None = None
+        self.objects_panel = self._build_objects_panel()
+        self.designer_panel = self._build_designer_panel()
+        self.ink_material_panel = self._build_ink_material_panel()
+        self.auto_layout_panel = self._build_auto_layout_panel()
 
     # ── File Bar ──────────────────────────────────────────────────
 
@@ -646,68 +597,9 @@ class PrintObjectsTab(QWidget):
 
         layout.addWidget(self._param_stack)
 
-        # Common fields: ink, position
-        common = QFormLayout()
-        common.setSpacing(4)
-
-        # Ink selector + read-only color swatch
-        ink_row = QHBoxLayout()
-        self._ink_combo = QComboBox()
-        self._ink_combo.addItem("(no inks defined)", "")
-        self._ink_combo.currentIndexChanged.connect(self._on_ink_combo_changed)
-        ink_row.addWidget(self._ink_combo)
-
-        self._ink_color_swatch = QLabel()
-        self._ink_color_swatch.setFixedSize(_sc(24), _sc(24))
-        self._current_color = DEFAULT_COLORS[0]
-        self._ink_color_swatch.setStyleSheet(
-            f"background: {self._current_color}; border: 1px solid {COLORS['surface1']}; "
-            f"border-radius: 4px;")
-        self._ink_color_swatch.setToolTip("Ink color (set in Hardware Setup)")
-        ink_row.addWidget(self._ink_color_swatch)
-        ink_row.addStretch()
-        common.addRow("Ink:", ink_row)
-
-        # Filled checkbox + fill pattern combo
-        fill_row = QHBoxLayout()
-        self._filled_check = QCheckBox("Filled / Solid")
-        self._filled_check.setToolTip(
-            "2D: fill interior with pattern\n"
-            "3D: solid fill instead of shell")
-        self._filled_check.stateChanged.connect(self._on_filled_toggled)
-        fill_row.addWidget(self._filled_check)
-
-        self._fill_pattern_label = QLabel("Pattern:")
-        self._fill_pattern_label.setVisible(False)
-        fill_row.addWidget(self._fill_pattern_label)
-        self._fill_pattern_combo = QComboBox()
-        self._fill_pattern_combo.addItem("Meander", "meander")
-        self._fill_pattern_combo.addItem("Spiral", "spiral")
-        self._fill_pattern_combo.setVisible(False)
-        self._fill_pattern_combo.setMaximumWidth(_sc(100))
-        self._fill_pattern_combo.currentIndexChanged.connect(self._schedule_preview)
-        fill_row.addWidget(self._fill_pattern_combo)
-        fill_row.addStretch()
-        common.addRow("Fill:", fill_row)
-
-        # Position
-        pos_row = QHBoxLayout()
-        self._pos_x = QDoubleSpinBox()
-        self._pos_y = QDoubleSpinBox()
-        self._pos_z = QDoubleSpinBox()
-        for spin, label in [(self._pos_x, "X"), (self._pos_y, "Y"), (self._pos_z, "Z")]:
-            spin.setRange(-50.0, 50.0)
-            spin.setSingleStep(0.1)
-            spin.setDecimals(2)
-            spin.setSuffix(" mm")
-            spin.setMaximumWidth(_sc(90))
-            spin.valueChanged.connect(self._schedule_preview)
-            pos_row.addWidget(QLabel(label))
-            pos_row.addWidget(spin)
-        pos_row.addStretch()
-        common.addRow("Position:", pos_row)
-
-        layout.addLayout(common)
+        # v7.5.1: ink / filled / position widgets moved to
+        # _build_ink_material_section() so they live in a separate
+        # fixed-height card and don't reflow the page on toggle.
 
         # Add/Update Object button
         btn_row = QHBoxLayout()
@@ -740,6 +632,286 @@ class PrintObjectsTab(QWidget):
         self._edit_indicator.setVisible(False)
         layout.addWidget(self._edit_indicator)
 
+    # ── Ink & Material (v7.5.1) ───────────────────────────────────
+
+    def _build_ink_material_section(self, parent_layout):
+        """Ink selector + filled/pattern + outer-ring volume + position.
+
+        Lives in a separate card from the Object Designer so toggling
+        Filled never reflows the page.
+        """
+        form = QFormLayout()
+        form.setSpacing(4)
+
+        # ── Ink selector + read-only color swatch ─────────────────
+        ink_row = QHBoxLayout()
+        self._ink_combo = QComboBox()
+        self._ink_combo.addItem("(no inks defined)", "")
+        self._ink_combo.currentIndexChanged.connect(self._on_ink_combo_changed)
+        ink_row.addWidget(self._ink_combo)
+
+        self._ink_color_swatch = QLabel()
+        self._ink_color_swatch.setFixedSize(_sc(24), _sc(24))
+        self._current_color = DEFAULT_COLORS[0]
+        self._ink_color_swatch.setStyleSheet(
+            f"background: {self._current_color}; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+        self._ink_color_swatch.setToolTip("Ink color (set in Hardware Setup)")
+        ink_row.addWidget(self._ink_color_swatch)
+        ink_row.addStretch()
+        form.addRow("Ink:", ink_row)
+
+        # ── Filled checkbox + fill pattern combo ─────────────────
+        fill_row = QHBoxLayout()
+        self._filled_check = QCheckBox("Filled / Solid")
+        self._filled_check.setToolTip(
+            "2D: fill interior with pattern (and outline pass).\n"
+            "3D: solid fill instead of shell.")
+        self._filled_check.stateChanged.connect(self._on_filled_toggled)
+        fill_row.addWidget(self._filled_check)
+
+        self._fill_pattern_label = QLabel("Pattern:")
+        self._fill_pattern_label.setVisible(False)
+        fill_row.addWidget(self._fill_pattern_label)
+        self._fill_pattern_combo = QComboBox()
+        self._fill_pattern_combo.addItem("Meander", "meander")
+        self._fill_pattern_combo.addItem("Spiral", "spiral")
+        self._fill_pattern_combo.setVisible(False)
+        self._fill_pattern_combo.setMaximumWidth(_sc(100))
+        self._fill_pattern_combo.currentIndexChanged.connect(
+            self._schedule_preview)
+        fill_row.addWidget(self._fill_pattern_combo)
+        fill_row.addStretch()
+        form.addRow("Fill:", fill_row)
+
+        # ── v7.5.1: outer-ring volume (extra ink on the outline) ──
+        outer_row = QHBoxLayout()
+        self._outer_ring_uL = QDoubleSpinBox()
+        self._outer_ring_uL.setRange(0.0, 100.0)
+        self._outer_ring_uL.setDecimals(2)
+        self._outer_ring_uL.setSingleStep(0.05)
+        self._outer_ring_uL.setSuffix(" µL")
+        self._outer_ring_uL.setMaximumWidth(_sc(120))
+        self._outer_ring_uL.setToolTip(
+            "Volume of ink deposited along the outline pass that\n"
+            "wraps a filled 2D shape. 0 = use natural extrusion rate.")
+        self._outer_ring_uL.valueChanged.connect(self._schedule_preview)
+        outer_row.addWidget(self._outer_ring_uL)
+        outer_row.addStretch()
+        self._outer_ring_label = QLabel("Outer-ring uL:")
+        form.addRow(self._outer_ring_label, outer_row)
+        # Same visibility rules as fill_pattern
+        self._outer_ring_uL.setVisible(False)
+        self._outer_ring_label.setVisible(False)
+
+        # ── Position ──────────────────────────────────────────────
+        # Compact X/Y/Z row: no " mm" suffix (the label says mm) and
+        # narrow spinboxes so all three fit the Tools column width.
+        pos_row = QHBoxLayout()
+        pos_row.setSpacing(_sc(2))
+        self._pos_x = QDoubleSpinBox()
+        self._pos_y = QDoubleSpinBox()
+        self._pos_z = QDoubleSpinBox()
+        for spin, label in [
+            (self._pos_x, "X"), (self._pos_y, "Y"), (self._pos_z, "Z"),
+        ]:
+            spin.setRange(-50.0, 50.0)
+            spin.setSingleStep(0.1)
+            spin.setDecimals(2)
+            spin.setMinimumWidth(0)
+            spin.setMaximumWidth(_sc(62))
+            spin.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Fixed)
+            spin.valueChanged.connect(self._schedule_preview)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
+            pos_row.addWidget(lbl)
+            pos_row.addWidget(spin, 1)
+        form.addRow("Position (mm):", pos_row)
+
+        parent_layout.addLayout(form)
+
+    # ── Detached panels: Designer / Ink / CSV (v7.5.3) ───────────
+
+    def _build_designer_panel(self) -> QWidget:
+        """Object Designer (type list + param stack + Add button) as
+        a standalone widget for the wizard's left context Tools."""
+        host = QWidget()
+        host.setObjectName("printDesignerPanel")
+        host.setStyleSheet(
+            f"#printDesignerPanel {{ background: {COLORS['base']}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        _, designer_lay = self._make_collapsible_group(
+            "Object Designer", lay, expanded=True)
+        self._build_designer_section(designer_lay)
+        lay.addStretch()
+        return host
+
+    def _build_ink_material_panel(self) -> QWidget:
+        """Ink & Material (ink combo + filled + outer ring + position)
+        as a standalone widget for the wizard's left context Tools."""
+        host = QWidget()
+        host.setObjectName("printInkMaterialPanel")
+        host.setStyleSheet(
+            f"#printInkMaterialPanel {{ background: {COLORS['base']}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        _, ink_lay = self._make_collapsible_group(
+            "Ink && Material", lay, expanded=True)
+        self._build_ink_material_section(ink_lay)
+        lay.addStretch()
+        return host
+
+    def _build_csv_import_panel(self) -> QWidget:
+        """CSV Import as a standalone widget for the wizard's left
+        context Tools."""
+        host = QWidget()
+        host.setObjectName("printCsvImportPanel")
+        host.setStyleSheet(
+            f"#printCsvImportPanel {{ background: {COLORS['base']}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        _, csv_lay = self._make_collapsible_group(
+            "CSV Import", lay, expanded=False)
+        self._build_csv_import_section(csv_lay)
+        lay.addStretch()
+        return host
+
+    # ── Detached Auto-Layout panel (v7.5.2) ──────────────────────
+
+    def _build_auto_layout_panel(self) -> QWidget:
+        """Build the Auto-Layout group as a standalone widget that the
+        wizard's left context pane reparents into its Step 1 tools
+        page. The widget isn't part of *this* tab's body layout."""
+        host = QWidget()
+        host.setObjectName("printAutoLayoutPanel")
+        host.setStyleSheet(
+            f"#printAutoLayoutPanel {{ background: {COLORS['base']}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        _, auto_lay = self._make_collapsible_group(
+            "Auto-Layout", lay, expanded=True)
+        self._build_auto_layout_section(auto_lay)
+        lay.addStretch()
+        return host
+
+    # ── Detached Objects + Summary panel (v7.5.1) ────────────────
+
+    def _build_objects_panel(self) -> QWidget:
+        """Build the right-sidebar panel: Print List + Objects in This
+        Print + Summary, stacked top-to-bottom as a standalone widget
+        the wizard reparents into its right sidebar.
+
+        Print List (v7.5.3): catalog view of the session's print
+        objects + collections — fed by the wizard's PrintObjectsModel
+        via :meth:`set_print_list_model`."""
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem
+        host = QWidget()
+        host.setObjectName("printObjectsListPanel")
+        host.setStyleSheet(
+            f"#printObjectsListPanel {{ background: {COLORS['base']}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+
+        # ── Print List ────────────────────────────────────────────
+        _, list_lay = self._make_collapsible_group(
+            "Print List", lay, expanded=True)
+        self._print_list_count_label = QLabel("0 objects")
+        self._print_list_count_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 10px;")
+        list_lay.addWidget(self._print_list_count_label)
+        self._print_list_list = QListWidget()
+        self._print_list_list.setMaximumHeight(_sc(140))
+        self._print_list_list.setStyleSheet(
+            f"QListWidget {{"
+            f"  background: {COLORS['mantle']};"
+            f"  color: {COLORS['text']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"  border-radius: 4px;"
+            f"}}"
+            f"QListWidget::item {{ padding: 2px 6px; }}"
+            f"QListWidget::item:selected {{"
+            f"  background: {COLORS['surface1']};"
+            f"  color: {COLORS['text']};"
+            f"}}"
+        )
+        list_lay.addWidget(self._print_list_list)
+        self._print_list_coll_label = QLabel("Collections")
+        self._print_list_coll_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 10px; "
+            f"font-weight: 700; padding-top: 4px;")
+        list_lay.addWidget(self._print_list_coll_label)
+        self._print_list_coll_list = QListWidget()
+        self._print_list_coll_list.setMaximumHeight(_sc(80))
+        self._print_list_coll_list.setStyleSheet(
+            self._print_list_list.styleSheet())
+        list_lay.addWidget(self._print_list_coll_list)
+
+        # ── Objects in This Print ─────────────────────────────────
+        _, objects_lay = self._make_collapsible_group(
+            "Objects in This Print", lay, expanded=True)
+        self._build_objects_list_section(objects_lay)
+
+        # ── Summary & Staging ─────────────────────────────────────
+        _, summary_lay = self._make_collapsible_group(
+            "Summary && Staging", lay, expanded=True)
+        self._build_summary_section(summary_lay)
+
+        lay.addStretch()
+        return host
+
+    def set_print_list_model(self, model) -> None:
+        """v7.5.3: bind the right-pane Print List section to a
+        PrintObjectsModel so it reflects the session's objects +
+        collections in real time."""
+        if not hasattr(self, "_print_list_list"):
+            return
+        self._print_list_model = model
+        model.changed.connect(self._refresh_print_list_section)
+        self._refresh_print_list_section()
+
+    def _refresh_print_list_section(self) -> None:
+        from PySide6.QtWidgets import QListWidgetItem
+        model = getattr(self, "_print_list_model", None)
+        if model is None or not hasattr(self, "_print_list_list"):
+            return
+        self._print_list_list.clear()
+        for obj in model.objects():
+            name = obj.get("name", "?")
+            otype = obj.get("object_type", "")
+            ink = obj.get("ink")
+            if not ink and isinstance(obj.get("ink_assignments"), dict):
+                ink = next(iter(obj["ink_assignments"].values()), "")
+            label = name
+            if otype:
+                label = f"{label}   ·   {otype}"
+            if ink:
+                label = f"{label}   ·   {ink}"
+            self._print_list_list.addItem(QListWidgetItem(label))
+        n = self._print_list_list.count()
+        self._print_list_count_label.setText(
+            "No objects defined yet." if n == 0
+            else f"{n} object{'' if n == 1 else 's'}"
+        )
+        self._print_list_coll_list.clear()
+        for coll in model.collections():
+            cname = coll.get("name", "?")
+            count = len(coll.get("objects", []))
+            self._print_list_coll_list.addItem(
+                f"{cname}   ·   {count} object{'' if count == 1 else 's'}"
+            )
+
     def _build_param_page(self, obj_type: str) -> tuple[QWidget, dict]:
         """Build a parameter form for one object type. Returns (widget, {name: spinbox})."""
         page = QWidget()
@@ -748,9 +920,30 @@ class PrintObjectsTab(QWidget):
         widgets = {}
 
         if obj_type == "csv_import":
-            lbl = QLabel("No parameters — use CSV Import section below")
-            lbl.setStyleSheet(f"color: {COLORS['overlay0']}; font-style: italic;")
-            form.addRow(lbl)
+            # v7.5.6: CSV import is a custom-object type. The file
+            # picker lives right here in the designer; clicking
+            # "+ Add Object" imports the chosen file as a custom
+            # object.
+            choose_btn = QPushButton("Choose CSV File…")
+            choose_btn.setStyleSheet(
+                f"background: {COLORS['surface1']}; "
+                f"padding: 6px 12px; border-radius: 4px;")
+            choose_btn.clicked.connect(self._choose_csv_file)
+            form.addRow(choose_btn)
+
+            self._csv_chosen_label = QLabel("No file chosen")
+            self._csv_chosen_label.setStyleSheet(
+                f"color: {COLORS['overlay0']}; font-size: 10px; "
+                f"font-style: italic;")
+            self._csv_chosen_label.setWordWrap(True)
+            form.addRow(self._csv_chosen_label)
+
+            hint = QLabel("Imports an XYZ(P/T) trajectory as a custom object. "
+                          "Then click + Add Object.")
+            hint.setStyleSheet(
+                f"color: {COLORS['overlay0']}; font-size: 9px;")
+            hint.setWordWrap(True)
+            form.addRow(hint)
             return page, widgets
 
         defaults = _get_type_params(obj_type)
@@ -785,6 +978,12 @@ class PrintObjectsTab(QWidget):
                 spin.setValue(float(default_val))
 
             spin.valueChanged.connect(self._schedule_preview)
+            # v7.6.0: allow spinboxes to shrink so the param form fits
+            # the (sometimes-narrow) left-context column width.
+            spin.setMinimumWidth(0)
+            spin.setMaximumWidth(_sc(130))
+            spin.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Fixed)
 
             # Pretty label
             label = param_name.replace("_", " ").title()
@@ -919,7 +1118,8 @@ class PrintObjectsTab(QWidget):
 
     def _build_preview_section(self, parent_layout):
         if HAS_PROJECTION_CANVAS:
-            self._preview = create_interactive_well_preview()
+            # v7.5.1: horizontal trio (XY|XZ|YZ) with pan+zoom locked.
+            self._preview = create_horizontal_well_preview()
             self._preview.set_library_resolver(self._resolve_library_object)
             if hasattr(self._preview, 'object_placed'):
                 self._preview.object_placed.connect(self._on_object_repositioned)
@@ -948,8 +1148,11 @@ class PrintObjectsTab(QWidget):
         self._objects_list.model().rowsMoved.connect(self._on_objects_reordered)
         layout.addWidget(self._objects_list)
 
-        # Action buttons
+        # Action buttons — compact row of 5 (Edit/Dup/▲/▼/✕). Each
+        # button shares the row width equally so they never overflow
+        # the narrow "This Print" pane.
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(_sc(2))
         for label, slot, tip in [
             ("Edit", self._edit_selected, "Load into designer for editing"),
             ("Dup", self._duplicate_selected, "Duplicate with offset"),
@@ -960,18 +1163,22 @@ class PrintObjectsTab(QWidget):
             btn = QPushButton(label)
             btn.setToolTip(tip)
             btn.setFixedHeight(_sc(24))
-            btn.setMaximumWidth(_sc(50))
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                              QSizePolicy.Policy.Fixed)
+            btn.setMinimumWidth(0)
             btn.clicked.connect(slot)
             btn_row.addWidget(btn)
+        layout.addLayout(btn_row)
 
+        # "Remove from Well" on its own full-width row so it never
+        # pushes the compact row out of the pane.
         self._btn_remove_from_well = QPushButton("Remove from Well")
-        self._btn_remove_from_well.setToolTip("Remove selected object from the well preview")
+        self._btn_remove_from_well.setToolTip(
+            "Remove selected object from the well preview")
         self._btn_remove_from_well.setFixedHeight(_sc(24))
         self._btn_remove_from_well.setEnabled(False)
         self._btn_remove_from_well.clicked.connect(self._remove_from_well)
-        btn_row.addWidget(self._btn_remove_from_well)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+        layout.addWidget(self._btn_remove_from_well)
 
     # ── Summary Section (S4B.11) ──────────────────────────────────
 
@@ -1227,17 +1434,32 @@ class PrintObjectsTab(QWidget):
     # Types where the filled checkbox row is hidden
     _NO_FILL_TYPES = {"point", "line", "spiral", "csv_import"}
 
+    # Object types that get the v7.5.1 outer-ring outline pass when
+    # filled — currently only 2D fillable shapes.
+    _OUTER_RING_TYPES = {"circle", "square", "triangle", "ellipse"}
+
     def _sync_filled_checkbox(self, obj_type: str):
-        """Show/hide the filled checkbox + fill-pattern combo based on object type."""
+        """Show/hide the filled checkbox + fill-pattern combo +
+        outer-ring spinbox based on object type."""
         if not hasattr(self, '_filled_check'):
             return
         hide = obj_type in self._NO_FILL_TYPES
         self._filled_check.setVisible(not hide)
+        is_filled = self._filled_check.isChecked()
         # Show fill-pattern combo only when filled is checked and visible
         if hasattr(self, '_fill_pattern_combo'):
-            show_pattern = not hide and self._filled_check.isChecked()
+            show_pattern = not hide and is_filled
             self._fill_pattern_combo.setVisible(show_pattern)
             self._fill_pattern_label.setVisible(show_pattern)
+        # v7.5.1: outer-ring volume shows only for 2D filled shapes.
+        if hasattr(self, '_outer_ring_uL'):
+            show_outer = (
+                not hide
+                and is_filled
+                and obj_type in self._OUTER_RING_TYPES
+            )
+            self._outer_ring_uL.setVisible(show_outer)
+            self._outer_ring_label.setVisible(show_outer)
 
     @staticmethod
     def _categorize_object_types() -> list[tuple[str, list]]:
@@ -1260,14 +1482,15 @@ class PrintObjectsTab(QWidget):
                 cats_other.append(entry)
 
         result = []
+        # v7.5.6: Import (CSV custom objects) first, per user request.
+        if cats_other:
+            result.append(("Import", cats_other))
         if cats_1d:
             result.append(("1D Objects", cats_1d))
         if cats_2d:
             result.append(("2D Objects", cats_2d))
         if cats_3d:
             result.append(("3D Objects", cats_3d))
-        if cats_other:
-            result.append(("Import", cats_other))
         return result
 
     def _get_current_params(self) -> dict:
@@ -1295,6 +1518,10 @@ class PrintObjectsTab(QWidget):
             params["filled"] = self._filled_check.isChecked()
         if hasattr(self, '_fill_pattern_combo') and self._filled_check.isChecked():
             params["fill_pattern"] = self._fill_pattern_combo.currentData() or "meander"
+        # v7.5.1: outer-ring outline volume for 2D filled shapes.
+        if (hasattr(self, '_outer_ring_uL')
+                and self._outer_ring_uL.isVisible()):
+            params["outer_ring_volume_uL"] = float(self._outer_ring_uL.value())
         return params
 
     def _set_params_from_dict(self, obj_type: str, params: dict):
@@ -1326,6 +1553,12 @@ class PrintObjectsTab(QWidget):
                 self._fill_pattern_combo.blockSignals(True)
                 self._fill_pattern_combo.setCurrentIndex(idx)
                 self._fill_pattern_combo.blockSignals(False)
+        # v7.5.1: outer-ring outline volume
+        if hasattr(self, '_outer_ring_uL'):
+            self._outer_ring_uL.blockSignals(True)
+            self._outer_ring_uL.setValue(
+                float(params.get("outer_ring_volume_uL", 0.0)))
+            self._outer_ring_uL.blockSignals(False)
         self._sync_filled_checkbox(obj_type)
 
     def _on_filled_toggled(self, _state):
@@ -1675,6 +1908,10 @@ class PrintObjectsTab(QWidget):
                 "num_layers": 1,
                 "layer_height": 0.2,
                 "auto_layout": True,
+                # v7.5.1: without this, _refresh_preview_all() filters
+                # auto-layout entries out (it requires in_well=True)
+                # and the user sees no objects appear after Apply.
+                "in_well": True,
             }
             self._objects.append(entry)
 
@@ -1701,11 +1938,26 @@ class PrintObjectsTab(QWidget):
     #  CSV IMPORT (S4B.10)
     # ══════════════════════════════════════════════════════════════
 
-    def _import_csv(self):
-        """Import trajectory from CSV file."""
+    def _choose_csv_file(self):
+        """v7.5.6: pick a CSV file in the Object Designer. The file is
+        imported as a custom object when the user clicks + Add Object."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import CSV Trajectory", "",
+            self, "Choose CSV Trajectory", "",
             "CSV Files (*.csv *.txt);;All Files (*)")
+        if not path:
+            return
+        self._csv_chosen_path = path
+        if hasattr(self, "_csv_chosen_label"):
+            self._csv_chosen_label.setText(f"✓ {Path(path).name}")
+
+    def _import_csv(self):
+        """Import the chosen CSV trajectory as a custom object. If no
+        file was chosen via the designer, prompt for one."""
+        path = getattr(self, "_csv_chosen_path", None)
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Import CSV Trajectory", "",
+                "CSV Files (*.csv *.txt);;All Files (*)")
         if not path:
             return
 
@@ -1718,7 +1970,6 @@ class PrintObjectsTab(QWidget):
                     reader = csv.reader(f)
                     next(reader, None)  # skip header
                     data = [list(map(float, row)) for row in reader if row]
-                data = data  # keep as list
 
             name, ok = QInputDialog.getText(
                 self, "Name CSV Import", "Object name:",
@@ -1742,11 +1993,16 @@ class PrintObjectsTab(QWidget):
             self._refresh_preview_all()
             self._update_summary()
             self._trigger_auto_save()
-            self._csv_info.setText(f"✅ Imported {Path(path).name}")
+            self._emit_prints_changed()
+            # Reset the chosen-file state for the next import.
+            self._csv_chosen_path = None
+            if hasattr(self, "_csv_chosen_label"):
+                self._csv_chosen_label.setText("No file chosen")
 
         except Exception as e:
             QMessageBox.warning(self, "CSV Import Failed", str(e))
-            self._csv_info.setText(f"⚠ Import failed: {e}")
+            if hasattr(self, "_csv_chosen_label"):
+                self._csv_chosen_label.setText(f"⚠ Import failed: {e}")
 
     # ══════════════════════════════════════════════════════════════
     #  PREVIEW AND TRAJECTORY
@@ -1807,6 +2063,7 @@ class PrintObjectsTab(QWidget):
         filled = params.get("filled", False)
         effective_type = _3D_TYPE_MAP.get((obj_type, filled), obj_type)
 
+        is_csv = (obj_type == "csv_import")
         obj = PrintObject(
             name=name,
             object_type=effective_type,
@@ -1814,10 +2071,11 @@ class PrintObjectsTab(QWidget):
             position=position,
             ink_assignments={pump_id: "ink"},
             color=color,
+            source=("csv" if is_csv else "parametric"),
         )
 
         # CSV import: use pre-loaded trajectory directly (skip GeometryEngine)
-        if obj_type == "csv_import":
+        if is_csv:
             csv_data = params.get("_csv_data")
             if csv_data is None and "source_file" in params:
                 try:
@@ -2042,10 +2300,14 @@ class PrintObjectsTab(QWidget):
         logger.debug(f"PrintObjects: refreshed ink options from config")
 
     def _update_well_diameter(self):
-        """Set well boundary circle on preview from workspace/HW config."""
+        """Set well boundary + depth on preview from workspace/HW config."""
         diam = self._get_well_diameter_mm()
         if hasattr(self._preview, 'set_well_diameter'):
             self._preview.set_well_diameter(diam)
+        # v7.6.0: well depth drives the XZ/YZ well-height outline.
+        depth = self._get_well_depth_mm()
+        if hasattr(self._preview, 'set_well_depth'):
+            self._preview.set_well_depth(depth)
 
     # ── Out-of-Bounds Detection (v7.2.4 S4.9-S4.11) ─────────────
 
@@ -2157,6 +2419,23 @@ class PrintObjectsTab(QWidget):
             except (ImportError, AttributeError):
                 pass
         return 6.0  # Default 96-well plate
+
+    def _get_well_depth_mm(self) -> float:
+        """v7.6.0: well depth from HW config or workspace plate format."""
+        for src_attr in ("_hw_config", "_workspace"):
+            src = getattr(self, src_attr, None)
+            if not src:
+                continue
+            try:
+                fmt = src.plate_format
+                from SupportClasses.WellPlate import PLATE_DEFINITIONS
+                plate_def = PLATE_DEFINITIONS.get(fmt, {})
+                depth = plate_def.get("well_depth_mm", 0.0)
+                if depth:
+                    return float(depth)
+            except (ImportError, AttributeError):
+                pass
+        return 10.67  # Default 96-well depth
 
     def _resolve_library_object(self, library_key, x_mm, y_mm):
         """Resolve a library key to a PlacedObject (for drag-drop compat)."""
@@ -2422,6 +2701,7 @@ class PrintObjectsTab(QWidget):
                 position=entry.get("position", (0, 0, 0)),
                 ink_assignments={self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))): entry.get("ink", "ink")},
                 color=entry.get("color", DEFAULT_COLORS[0]),
+                source=("csv" if entry["object_type"] == "csv_import" else "parametric"),
             )
             coll.add_object(obj)
 

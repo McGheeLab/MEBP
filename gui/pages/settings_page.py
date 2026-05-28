@@ -153,6 +153,9 @@ class SettingsPage(QWidget):
         lay.addWidget(self.ctx_safety_status)
 
         # ── Simulation Mode ──────────────────────────────────────
+        # v7.4.2: each stage is connected via Hardware Setup → Device →
+        # Connect Hardware (Connect = real, Simulate = simulator). The
+        # labels here just mirror the live mode for convenience.
         sim_lbl = QLabel("Simulation Mode")
         sim_lbl.setObjectName("contextSectionLabel")
         lay.addWidget(sim_lbl)
@@ -165,9 +168,9 @@ class SettingsPage(QWidget):
         self.ctx_sim_zp_lbl.setObjectName("contextLabel")
         lay.addWidget(self.ctx_sim_zp_lbl)
 
-        note = QLabel("⚠ Changes require restart")
+        note = QLabel("Set per-device on Hardware Setup → Device")
         note.setStyleSheet(
-            f"color: {COLORS['yellow']}; font-size: 9pt;")
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
         note.setWordWrap(True)
         lay.addWidget(note)
 
@@ -367,19 +370,38 @@ class SettingsPage(QWidget):
             self.ctx_status_label.setStyleSheet(f"color: {COLORS['green']};")
 
     def _update_context_sim_labels(self):
-        """Refresh simulation status labels in context panel."""
+        """Refresh simulation status labels in the context panel.
+
+        v7.4.2: reads the live mode straight from the controller — there
+        is no per-stage checkbox here any more. The labels show "—" when
+        the stage is not connected, "Hardware" when a real stage is
+        attached, or "Simulated" when the simulator is running.
+        """
         if self._context_widget is None:
             return
-        xy_sim = self.chk_sim_xy.isChecked()
-        zp_sim = self.chk_sim_zp.isChecked()
-        self.ctx_sim_xy_lbl.setText(
-            f"XY: {'Simulated' if xy_sim else 'Hardware'}")
-        self.ctx_sim_xy_lbl.setStyleSheet(
-            f"color: {COLORS['yellow'] if xy_sim else COLORS['green']};")
-        self.ctx_sim_zp_lbl.setText(
-            f"ZP: {'Simulated' if zp_sim else 'Hardware'}")
-        self.ctx_sim_zp_lbl.setStyleSheet(
-            f"color: {COLORS['yellow'] if zp_sim else COLORS['green']};")
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return
+        xy_connected = bool(getattr(ctrl, "is_xy_connected", False))
+        zp_connected = bool(getattr(ctrl, "is_zp_connected", False))
+        xy_sim = bool(getattr(ctrl, "simulate_xy", False)) and xy_connected
+        zp_sim = bool(getattr(ctrl, "simulate_zp", False)) and zp_connected
+        if not xy_connected:
+            self.ctx_sim_xy_lbl.setText("XY: —")
+            self.ctx_sim_xy_lbl.setStyleSheet(f"color: {COLORS['overlay0']};")
+        else:
+            self.ctx_sim_xy_lbl.setText(
+                f"XY: {'Simulated' if xy_sim else 'Hardware'}")
+            self.ctx_sim_xy_lbl.setStyleSheet(
+                f"color: {COLORS['yellow'] if xy_sim else COLORS['green']};")
+        if not zp_connected:
+            self.ctx_sim_zp_lbl.setText("ZP: —")
+            self.ctx_sim_zp_lbl.setStyleSheet(f"color: {COLORS['overlay0']};")
+        else:
+            self.ctx_sim_zp_lbl.setText(
+                f"ZP: {'Simulated' if zp_sim else 'Hardware'}")
+            self.ctx_sim_zp_lbl.setStyleSheet(
+                f"color: {COLORS['yellow'] if zp_sim else COLORS['green']};")
 
     # ════════════════════════════════════════════════════════════════
     #  MAIN CONTENT — Card-based settings sections
@@ -478,24 +500,16 @@ class SettingsPage(QWidget):
         grid.setSpacing(4)
         row = 0
 
-        # Simulation mode
-        grid.addWidget(QLabel("Simulation Mode:"), row, 0)
-        sim_row = QHBoxLayout()
-        self.chk_sim_xy = QCheckBox("Simulate XY")
-        self.chk_sim_xy.toggled.connect(
-            lambda: self._update_context_sim_labels())
-        self.chk_sim_zp = QCheckBox("Simulate ZP")
-        self.chk_sim_zp.toggled.connect(
-            lambda: self._update_context_sim_labels())
-        sim_row.addWidget(self.chk_sim_xy)
-        sim_row.addWidget(self.chk_sim_zp)
-        grid.addLayout(sim_row, row, 1)
-        row += 1
-
-        restart_label = QLabel("⚠ Simulation changes require restart")
-        restart_label.setStyleSheet(
-            f"color: {COLORS['yellow']}; font-size: 10pt;")
-        grid.addWidget(restart_label, row, 0, 1, 2)
+        # v7.4.2: simulation toggles moved to the per-stage Simulate
+        # buttons on Hardware Setup → Device → Connect Hardware.
+        sim_hint = QLabel(
+            "Open Hardware Setup → Device to choose Connect (real) or "
+            "Simulate per stage. The current mode is shown to the right."
+        )
+        sim_hint.setWordWrap(True)
+        sim_hint.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: 9pt;")
+        grid.addWidget(sim_hint, row, 0, 1, 2)
         row += 1
 
         # Serial ports
@@ -1142,9 +1156,8 @@ class SettingsPage(QWidget):
         """
         sl = self.controller.safety_limits
 
-        # Connection
-        self.chk_sim_xy.setChecked(self.controller.simulate_xy)
-        self.chk_sim_zp.setChecked(self.controller.simulate_zp)
+        # v7.4.2: simulation toggles live on Hardware Setup → Device.
+        # The context-panel mirror picks up the current mode below.
 
         # v7.3.5: ZP Stage settings (moved to HW Setup → Stage in v7.4.0-b)
         if hasattr(self, 'spin_zp_max_feedrate'):
@@ -1316,11 +1329,8 @@ class SettingsPage(QWidget):
         self.settings.set(
             "polling.watchdog_interval_s", self.spin_watchdog.value())
 
-        # Simulation flags → save only (need restart)
-        self.settings.set(
-            "simulation.simulate_xy", self.chk_sim_xy.isChecked())
-        self.settings.set(
-            "simulation.simulate_zp", self.chk_sim_zp.isChecked())
+        # v7.4.2: simulate flags no longer persisted — simulation is a
+        # per-connect choice on Hardware Setup → Device.
 
         # Xbox
         self.settings.set(

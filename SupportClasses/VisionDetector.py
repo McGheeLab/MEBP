@@ -1152,3 +1152,319 @@ def measure_pixel_displacement(
     confidence = float(max(0.0, min(response, 1.0)))
 
     return (float(dx), float(dy), confidence)
+
+
+# ---------------------------------------------------------------------------
+# v7.4.4: Two-Camera Needle Aligner (user-click driven)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TwoCameraEdgePicks:
+    """The four edge clicks gathered during the Needle Location workflow."""
+    x_view_left_px: float | None = None
+    x_view_right_px: float | None = None
+    y_view_left_px: float | None = None
+    y_view_right_px: float | None = None
+
+    def x_view_complete(self) -> bool:
+        return (self.x_view_left_px is not None
+                and self.x_view_right_px is not None)
+
+    def y_view_complete(self) -> bool:
+        return (self.y_view_left_px is not None
+                and self.y_view_right_px is not None)
+
+    def complete(self) -> bool:
+        return self.x_view_complete() and self.y_view_complete()
+
+
+class TwoCameraNeedleAligner:
+    """Compute the stage offset that recenters the needle in two cameras.
+
+    Mounting assumption: two side cameras mounted orthogonally to the
+    workspace.
+
+      * `NEEDLE_X` looks down the **X** axis. Its image columns map to
+        stage Y; rows map to stage Z.
+      * `NEEDLE_Y` looks down the **Y** axis. Its image columns map to
+        stage X; rows map to stage Z.
+
+    The user clicks the left and right visible edges of the needle in
+    each camera. The midpoint of those two clicks is the needle's
+    pixel-center along the column axis. The pixel offset from the
+    frame's column center, scaled by that camera's µm/pixel, gives the
+    stage offset needed to bring the needle to the optical center.
+
+    Sign conventions follow the existing project convention: positive
+    pixel offset (center is right of frame center) → positive stage
+    offset along the mapped axis. Callers can pass per-axis sign flips
+    via `x_sign` / `y_sign` when the physical mounting reverses one
+    axis.
+    """
+
+    def __init__(
+        self,
+        um_per_px_x_view: float,
+        um_per_px_y_view: float,
+        frame_width_x_view: int,
+        frame_width_y_view: int,
+        x_sign: float = 1.0,
+        y_sign: float = 1.0,
+    ) -> None:
+        if um_per_px_x_view <= 0 or um_per_px_y_view <= 0:
+            raise ValueError("um_per_px must be positive for both cameras")
+        if frame_width_x_view <= 0 or frame_width_y_view <= 0:
+            raise ValueError("frame widths must be positive")
+        self.um_per_px_x_view = float(um_per_px_x_view)
+        self.um_per_px_y_view = float(um_per_px_y_view)
+        self.frame_width_x_view = int(frame_width_x_view)
+        self.frame_width_y_view = int(frame_width_y_view)
+        self.x_sign = float(x_sign)
+        self.y_sign = float(y_sign)
+
+    @staticmethod
+    def _midpoint(a: float, b: float) -> float:
+        return (a + b) / 2.0
+
+    def offset_from_edge_clicks(
+        self, picks: TwoCameraEdgePicks
+    ) -> tuple[float, float]:
+        """Return `(dx_um, dy_um)` — the stage move that recenters the
+        needle in both views.
+
+        Raises ``ValueError`` if any pick is missing.
+        """
+        if not picks.complete():
+            raise ValueError(
+                "All four edge picks must be supplied "
+                "(x_view left+right and y_view left+right)"
+            )
+
+        # X-view: columns → stage Y
+        x_view_center_col = self._midpoint(
+            picks.x_view_left_px, picks.x_view_right_px
+        )
+        x_view_offset_px = x_view_center_col - (self.frame_width_x_view / 2.0)
+        dy_um = self.y_sign * x_view_offset_px * self.um_per_px_x_view
+
+        # Y-view: columns → stage X
+        y_view_center_col = self._midpoint(
+            picks.y_view_left_px, picks.y_view_right_px
+        )
+        y_view_offset_px = y_view_center_col - (self.frame_width_y_view / 2.0)
+        dx_um = self.x_sign * y_view_offset_px * self.um_per_px_y_view
+
+        return (float(dx_um), float(dy_um))
+
+
+# ---------------------------------------------------------------------------
+# v7.4.4: Edge-Fit Well Locator (known-radius partial-arc fit)
+# ---------------------------------------------------------------------------
+
+class EdgeFitWellLocator:
+    """Locate a well center by fitting a circle of *known* radius to its
+    visible edge — works whether the well fills the frame or only a
+    partial arc is visible (objective dependent: 2× / 4× / 10×).
+
+    The Plate Location workflow drives the stage to the user-clicked
+    target well and uses this fitter to refine the well's actual centre
+    against the predicted centre. The radius is locked to the plate's
+    known well diameter, which is far more robust than free-radius
+    Hough fits when only a fraction of the rim is visible.
+    """
+
+    def __init__(self, canny_low: int = 50, canny_high: int = 150) -> None:
+        self.canny_low = int(canny_low)
+        self.canny_high = int(canny_high)
+
+    @staticmethod
+    def _to_gray(frame: np.ndarray) -> np.ndarray:
+        if frame.ndim == 3:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return frame
+
+    def fit_partial_arc(
+        self,
+        frame: np.ndarray,
+        expected_radius_px: float,
+        um_per_px: float,
+        tolerance_pct: float = 0.10,
+        min_edge_pixels: int = 30,
+    ) -> Optional[DetectionResult]:
+        """Fit a circle of *known* radius to the well's visible edge.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            Single camera frame (BGR or grayscale).
+        expected_radius_px : float
+            The well's known radius in pixels (= half the plate-spec
+            well diameter, converted via ``um_per_px``).
+        um_per_px : float
+            For optional µm conversion of the result; not used in the
+            fit itself.
+        tolerance_pct : float
+            Allowed deviation of the fitted radius from
+            ``expected_radius_px`` (0.10 = ±10 %). A fit outside this
+            band is rejected.
+        min_edge_pixels : int
+            Sanity threshold; fewer detected edge pixels → return None.
+        """
+        if expected_radius_px <= 0 or um_per_px <= 0:
+            return None
+        gray = self._to_gray(frame)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, self.canny_low, self.canny_high)
+        ys, xs = np.nonzero(edges)
+        if xs.size < min_edge_pixels:
+            return None
+
+        # Algebraic least-squares circle fit (Kåsa). Even with the
+        # radius free, this is numerically robust for arcs >~45°. We
+        # then validate the fitted radius against the known value.
+        x = xs.astype(np.float64)
+        y = ys.astype(np.float64)
+        A = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+        b = x * x + y * y
+        try:
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        cx_fit, cy_fit, c = float(sol[0]), float(sol[1]), float(sol[2])
+        r_squared = c + cx_fit * cx_fit + cy_fit * cy_fit
+        if r_squared <= 0:
+            return None
+        r_fit = math.sqrt(r_squared)
+
+        # Radius-band guard rejects bogus fits to background clutter.
+        lo = expected_radius_px * (1.0 - tolerance_pct)
+        hi = expected_radius_px * (1.0 + tolerance_pct)
+        if not (lo <= r_fit <= hi):
+            return None
+
+        # Confidence = inverse residual normalized by radius. Closer
+        # to 1.0 means the edge pixels lie tightly on the fitted
+        # circle.
+        residuals = np.abs(np.hypot(x - cx_fit, y - cy_fit) - r_fit)
+        rms = float(np.sqrt(np.mean(residuals * residuals)))
+        confidence = float(np.clip(1.0 - rms / max(r_fit, 1.0), 0.0, 1.0))
+
+        # Snap the radius to the known value for downstream use; the
+        # fitted radius only existed to validate the candidate.
+        return DetectionResult(
+            center_px=(cx_fit, cy_fit),
+            radius_px=float(expected_radius_px),
+            confidence=confidence,
+            center_um=(cx_fit * um_per_px, cy_fit * um_per_px),
+            radius_um=expected_radius_px * um_per_px,
+            method="edge_fit_partial_arc",
+        )
+
+
+# ---------------------------------------------------------------------------
+# v7.4.6: Adaptive well-fit strategy + rim-point sampling
+# ---------------------------------------------------------------------------
+
+# Thresholds for picking a circle-fit strategy from the FOV ratio, defined
+# as well_diameter_um / min(fov_w_um, fov_h_um) — i.e. how many fields of
+# view the well spans. Tunable.
+WELL_FIT_FULL_CIRCLE_MAX_RATIO = 0.85   # whole well comfortably fits in view
+WELL_FIT_PARTIAL_ARC_MAX_RATIO = 3.0    # arc still curves enough for a
+                                        # known-radius single-frame fit
+
+
+def select_well_fit_strategy(
+    well_diameter_um: float,
+    fov_w_um: float,
+    fov_h_um: float,
+) -> str:
+    """Pick the circle-fit strategy from well size vs. camera field of view.
+
+    Returns one of:
+
+    * ``"full_circle"`` — the whole well fits in one frame; detect the
+      full circle directly (Hough / contour).
+    * ``"partial_arc"`` — only an arc is visible, but it curves enough to
+      pin the center via a known-radius fit on a single frame.
+    * ``"multi_edge"`` — the well is so much larger than the FOV that the
+      visible rim is nearly flat; the caller must sample several rim
+      points and fit a circle through them.
+    """
+    fov_min = min(fov_w_um, fov_h_um)
+    if fov_min <= 0 or well_diameter_um <= 0:
+        return "partial_arc"
+    ratio = well_diameter_um / fov_min
+    if ratio <= WELL_FIT_FULL_CIRCLE_MAX_RATIO:
+        return "full_circle"
+    if ratio <= WELL_FIT_PARTIAL_ARC_MAX_RATIO:
+        return "partial_arc"
+    return "multi_edge"
+
+
+def fit_circle_to_points(points) -> "tuple[float, float, float] | None":
+    """Kåsa algebraic circle fit through ≥3 points.
+
+    ``points`` is an Nx2 array-like of (x, y). With exactly three
+    non-collinear points this is the exact circumcircle. Returns
+    ``(cx, cy, radius)`` or None (too few points / collinear).
+    """
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] < 3 or arr.shape[1] != 2:
+        return None
+    # Reject (near-)collinear point sets: Kåsa still returns a finite
+    # bogus circle for points on a line, so guard explicitly via the
+    # smaller eigenvalue of the centered covariance.
+    centered = arr - arr.mean(axis=0)
+    evals = np.linalg.eigvalsh(centered.T @ centered)
+    if evals[0] <= 1e-6 * max(float(evals[1]), 1e-9):
+        return None
+    return NeedleDetector._fit_circle_kasa(arr)
+
+
+def detect_rim_point_near_center(
+    frame: np.ndarray,
+    canny_low: int = 50,
+    canny_high: int = 150,
+    search_frac: float = 0.30,
+    min_edge_pixels: int = 5,
+) -> "tuple[float, float, float] | None":
+    """Find the well-rim crossing nearest the frame center.
+
+    Used by the multi-edge strategy: the stage is aimed at a predicted
+    rim point, so the true rim crosses near the frame center. Canny-detect
+    edges, restrict to a central window (reject far clutter), take the
+    edge pixel nearest the center, and average its immediate neighbors for
+    sub-pixel stability.
+
+    Returns ``(px, py, confidence)`` in pixel coordinates, or None.
+    """
+    if frame is None:
+        return None
+    gray = frame
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, int(canny_low), int(canny_high))
+    ys, xs = np.nonzero(edges)
+    if xs.size < min_edge_pixels:
+        return None
+    h, w = gray.shape[:2]
+    fcx, fcy = w / 2.0, h / 2.0
+    xs = xs.astype(np.float64)
+    ys = ys.astype(np.float64)
+    win_x = w * search_frac
+    win_y = h * search_frac
+    mask = (np.abs(xs - fcx) < win_x) & (np.abs(ys - fcy) < win_y)
+    if int(mask.sum()) >= min_edge_pixels:
+        sx, sy = xs[mask], ys[mask]
+    else:
+        sx, sy = xs, ys
+    d2 = (sx - fcx) ** 2 + (sy - fcy) ** 2
+    k = int(np.argmin(d2))
+    px0, py0 = sx[k], sy[k]
+    cluster_r = 0.05 * min(w, h)
+    near = ((sx - px0) ** 2 + (sy - py0) ** 2) < (cluster_r * cluster_r)
+    px = float(np.mean(sx[near]))
+    py = float(np.mean(sy[near]))
+    confidence = float(np.clip(int(near.sum()) / 20.0, 0.0, 1.0))
+    return (px, py, confidence)

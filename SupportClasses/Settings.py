@@ -41,10 +41,10 @@ DEFAULTS: dict[str, Any] = {
         "active_tab": 0,
         "splitter_sizes": [500, 150],
     },
-    "simulation": {
-        "simulate_xy": False,  # v7.2.8s2: default simulate False (lab instrument)
-        "simulate_zp": False,
-    },
+    # v7.4.2: ``simulation`` removed from defaults — XY/ZP simulation is
+    # now decided per-connect via Connect / Simulate buttons on Hardware
+    # Setup → Device. Existing keys in user settings.json are left alone
+    # (no migration), they're simply ignored.
     "speeds": {
         "xy": 250.0,
         "z": 1.0,

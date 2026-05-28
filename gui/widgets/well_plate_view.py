@@ -329,17 +329,30 @@ class WellPlateView(QGraphicsView):
         if not wells:
             return
 
-        radius_mm = self._plate.well_diameter / 2.0
+        # v7.4.8: custom plates have per-well diameters (well_diameter is
+        # 0.0). Use a representative radius for the border/header layout and
+        # render each well at its own size below.
+        if self._plate.well_diameter > 0:
+            radius_mm = self._plate.well_diameter / 2.0
+        else:
+            radius_mm = max((w.diameter for w in wells), default=6.0) / 2.0
         radius_scene = radius_mm * SCALE_FACTOR
 
+        # Standard grids draw A/B/C + 1/2/3 headers; custom plates (no
+        # uniform spacing) skip them — the labels would overlap at origin.
+        draw_headers = (self._plate.well_spacing_x > 0
+                        and self._plate.well_spacing_y > 0)
+
         # Draw plate outline (light border rectangle)
+        min_x = min(w.x for w in wells) * SCALE_FACTOR
+        min_y = min(w.y for w in wells) * SCALE_FACTOR
         max_x = max(w.x for w in wells) * SCALE_FACTOR
         max_y = max(w.y for w in wells) * SCALE_FACTOR
         plate_rect = QRectF(
-            -radius_scene - PLATE_PADDING,
-            -radius_scene - PLATE_PADDING,
-            max_x + 2 * radius_scene + 2 * PLATE_PADDING,
-            max_y + 2 * radius_scene + 2 * PLATE_PADDING,
+            min_x - radius_scene - PLATE_PADDING,
+            min_y - radius_scene - PLATE_PADDING,
+            (max_x - min_x) + 2 * radius_scene + 2 * PLATE_PADDING,
+            (max_y - min_y) + 2 * radius_scene + 2 * PLATE_PADDING,
         )
         plate_border = self._scene.addRect(
             plate_rect,
@@ -350,7 +363,7 @@ class WellPlateView(QGraphicsView):
 
         # Draw row headers (A, B, C, …)
         header_font = QFont("Segoe UI", HEADER_FONT_SIZE)
-        for r in range(self._plate.rows):
+        for r in range(self._plate.rows if draw_headers else 0):
             label_text = ROW_LABELS[r] if r < len(ROW_LABELS) else str(r)
             y_pos = r * self._plate.well_spacing_y * SCALE_FACTOR
             text = self._scene.addText(label_text, header_font)
@@ -377,7 +390,7 @@ class WellPlateView(QGraphicsView):
             zone.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
         # Draw column headers (1, 2, 3, …)
-        for c in range(self._plate.cols):
+        for c in range(self._plate.cols if draw_headers else 0):
             label_text = str(c + 1)
             x_pos = c * self._plate.well_spacing_x * SCALE_FACTOR
             text = self._scene.addText(label_text, header_font)
@@ -403,9 +416,12 @@ class WellPlateView(QGraphicsView):
             zone.setAcceptHoverEvents(True)
             zone.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
-        # Draw wells
+        # Draw wells — each at its own diameter (v7.4.8: custom plates /
+        # flattened rosette sub-wells have mixed sizes).
         for well in wells:
-            item = WellGraphicsItem(well, radius_scene)
+            well_r = ((well.diameter / 2.0) * SCALE_FACTOR
+                      if well.diameter > 0 else radius_scene)
+            item = WellGraphicsItem(well, well_r)
             item.setZValue(1)
             self._scene.addItem(item)
             self._well_items[well.name] = item

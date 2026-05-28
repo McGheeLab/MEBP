@@ -260,21 +260,32 @@ class HardwareSummaryWidget(QWidget):
         else:
             self._needle_label.setText("Not selected")
 
-        # Plate
-        fmt = config.plate_format
-        pdef = PLATE_DEFINITIONS.get(fmt)
-        if pdef:
-            rows = pdef.rows if hasattr(pdef, 'rows') else pdef.get('rows', '?')
-            cols = pdef.cols if hasattr(pdef, 'cols') else pdef.get('cols', '?')
-            well_d = (pdef.well_diameter if hasattr(pdef, 'well_diameter')
-                      else pdef.get('well_diameter', '?'))
-            spacing = (pdef.well_spacing_x if hasattr(pdef, 'well_spacing_x')
-                       else pdef.get('well_spacing_x', '?'))
+        # Plate (v7.4.5: custom plates via active_plate_key)
+        from SupportClasses.WellPlate import WellPlate
+        key = getattr(config, "active_plate_key",
+                      getattr(config, "plate_format", 24))
+        try:
+            plate = WellPlate.load(key)
+        except Exception:
+            plate = None
+        if plate is None:
+            self._plate_label.setText(f"{key}")
+        elif plate.is_custom:
+            wells = plate.get_all_wells()
+            diam_min = min((w.diameter for w in wells), default=0.0)
+            diam_max = max((w.diameter for w in wells), default=0.0)
+            diam_str = (f"{diam_min:.2f} mm"
+                        if abs(diam_max - diam_min) < 1e-6
+                        else f"{diam_min:.2f}–{diam_max:.2f} mm")
             self._plate_label.setText(
-                f"{fmt}-well  ({rows} × {cols})  —  "
-                f"Ø {well_d} mm, Spacing: {spacing} mm")
+                f"{plate.format[7:]} (custom)  "
+                f"({plate.rows} × {plate.cols}, {len(wells)} wells)  —  "
+                f"Ø {diam_str}")
         else:
-            self._plate_label.setText(f"{fmt}-well")
+            fmt = plate.format
+            self._plate_label.setText(
+                f"{fmt}-well  ({plate.rows} × {plate.cols})  —  "
+                f"Ø {plate.well_diameter} mm, Spacing: {plate.well_spacing_x} mm")
 
         # Pumps
         for pid in ["P1", "P2", "P3"]:
@@ -454,8 +465,11 @@ class WorkspaceTab(QWidget):
         # Needle (direct copy)
         ws.needle = hw_config.needle
 
-        # Plate format
+        # Plate (v7.4.5: copy both fields so active_plate_key resolves to
+        # a custom plate when one is configured, falling back to the int
+        # standard otherwise).
         ws.plate_format = hw_config.plate_format
+        ws.plate_name = getattr(hw_config, "plate_name", "") or ""
 
         # Ink library (direct copy)
         ws.ink_library = dict(hw_config.ink_library)

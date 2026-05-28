@@ -1,0 +1,875 @@
+"""
+XZSideView — polished side-view visualization (X horizontal, Z vertical).
+
+A clean side-on rendering of the needle hovering over the plate. The
+needle is drawn at scale — its length and outer diameter come from the
+configured needle spec — so the operator can see the relationship
+between current Z and the plate at a glance.
+
+Layers (back → front)
+---------------------
+  1. Soft inset plot surface (mantle, rounded, hairline border)
+  2. Plate block at Z = 0 (crust, with brighter top edge for the
+     plate-surface line)
+  3. Well cavity beneath the needle when one is configured
+  4. Safe-Z indicator line + badge
+  5. Needle: tapered body + triangle tip + soft halo
+  6. Right-side annotation card (label / value rows, divider lines)
+  7. Bottom readout band (X and Z in mm)
+
+Public API
+----------
+    set_safety_limits(limits)
+    set_needle(outer_diameter_um, length_mm)
+    set_safe_z(safe_z_mm)
+    set_position(x_um, z_mm)         # either can be None
+    set_well_under_needle(diameter_mm, depth_mm)   # both None to clear
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF, QWheelEvent
+from PySide6.QtWidgets import (
+    QPushButton, QScrollBar, QSizePolicy, QWidget,
+)
+
+from gui.scaling import s, scaled_font_size, sf, sp
+from gui.styles import COLORS
+
+_NEEDLE_MIN_PX_WIDE = 4.0
+
+
+def _qc(name: str, alpha: int | None = None) -> QColor:
+    c = QColor(COLORS[name])
+    if alpha is not None:
+        c.setAlpha(alpha)
+    return c
+
+
+class XZSideView(QWidget):
+    """Side-view canvas: X horizontal, Z vertical, needle drawn to scale."""
+
+    # Fired when the user clicks one of the captured-Z badges.
+    # The argument is the target Z in mm (zero-referenced).
+    go_to_z_requested = Signal(float)
+
+    # Ordered list of Z-reference keys → (short label, accent color key)
+    # Each labelled Z value the page sets via set_z_references gets a
+    # thin dashed line at that Z + a clickable badge on the right edge.
+    _Z_REF_META: list[tuple[str, str, str]] = [
+        # (key, label, color key from gui.styles.COLORS)
+        ("replace_z",      "Replace",     "peach"),
+        ("max_z",          "Max",         "red"),
+        ("fast_move_z",    "Safe",        "green"),
+        ("plate_top_z",    "Plate ↑",     "blue"),
+        ("plate_bottom_z", "Plate ↓",     "mauve"),
+    ]
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setMinimumSize(s(180), s(220))
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+        self._safety_limits = None
+        self._needle_od_um: float = 410.0
+        self._needle_length_mm: float = 12.7
+        self._safe_z_mm: float | None = None
+        self._x_um: float | None = None
+        self._z_mm: float | None = None
+        self._well_diameter_mm: float | None = None
+        self._well_depth_mm: float | None = None
+
+        # Z-reference values (keyed by the same labels as the
+        # calibration page's get_z_references()). Each non-None entry
+        # renders as a dashed horizontal line + clickable badge.
+        self._z_refs: dict[str, float | None] = {
+            "replace_z": None, "max_z": None,
+            "fast_move_z": None, "plate_top_z": None,
+            "plate_bottom_z": None,
+        }
+        # Hit rects for the badges (populated in paint).
+        self._z_ref_hit_rects: dict[str, tuple[QRectF, float]] = {}
+
+        # Z-axis zoom — 1.0 means show the full safety range.
+        # Larger values zoom in around `_z_zoom_center_mm` (or current
+        # cursor Z if the wheel was used).
+        self._z_zoom: float = 1.0
+        self._z_zoom_center_mm: float | None = None
+        # Hit rect for the reset-zoom badge (computed in paint)
+        self._reset_zoom_rect: QRectF | None = None
+
+        # ── Z-zoom controls ────────────────────────────────────
+        # Buttons + vertical scrollbar live as child widgets of the
+        # canvas. Positioned in resizeEvent. The mouse-wheel handler
+        # still works in parallel.
+        self._scrollbar_updating = False
+        self._btn_zoom_in = QPushButton("+", self)
+        self._btn_zoom_in.setObjectName("xzZoomBtn")
+        self._btn_zoom_in.setCursor(Qt.PointingHandCursor)
+        self._btn_zoom_in.setToolTip("Zoom in (Z axis)")
+        self._btn_zoom_in.clicked.connect(self._on_zoom_in)
+
+        self._btn_zoom_out = QPushButton("−", self)
+        self._btn_zoom_out.setObjectName("xzZoomBtn")
+        self._btn_zoom_out.setCursor(Qt.PointingHandCursor)
+        self._btn_zoom_out.setToolTip("Zoom out (Z axis)")
+        self._btn_zoom_out.clicked.connect(self._on_zoom_out)
+
+        self._scrollbar = QScrollBar(Qt.Orientation.Vertical, self)
+        self._scrollbar.setObjectName("xzZoomScroll")
+        self._scrollbar.setToolTip(
+            "Scroll the visible Z range (only while zoomed in)")
+        self._scrollbar.valueChanged.connect(
+            self._on_scrollbar_changed)
+
+        self._style_zoom_widgets()
+        self._sync_scrollbar()
+
+    # ── Public API ─────────────────────────────────────────────────
+
+    def set_safety_limits(self, limits) -> None:
+        self._safety_limits = limits
+        self.update()
+
+    def set_needle(self, outer_diameter_um: float | None = None,
+                   length_mm: float | None = None) -> None:
+        if outer_diameter_um is not None and outer_diameter_um > 0:
+            self._needle_od_um = float(outer_diameter_um)
+        if length_mm is not None and length_mm > 0:
+            self._needle_length_mm = float(length_mm)
+        self.update()
+
+    def set_safe_z(self, safe_z_mm: float | None) -> None:
+        """Legacy hook — mirrors into the ``fast_move_z`` slot of the
+        full Z-references dict so all consumers stay in sync.
+        """
+        value = float(safe_z_mm) if safe_z_mm is not None else None
+        self._safe_z_mm = value
+        self._z_refs["fast_move_z"] = value
+        self.update()
+
+    def set_z_references(self, refs: dict) -> None:
+        """Receive captured Z heights from the Calibration page.
+
+        Keys (all mm, zero-referenced; missing = ``None``):
+            ``replace_z`` · ``max_z`` · ``fast_move_z`` ·
+            ``plate_top_z`` · ``plate_bottom_z``
+
+        Each non-None entry draws a thin dashed line on the side view
+        plus a small clickable badge on the right edge. Clicking the
+        badge emits :sig:`go_to_z_requested(z_mm)`.
+        """
+        if not refs:
+            return
+        for key in self._z_refs:
+            if key in refs:
+                value = refs[key]
+                self._z_refs[key] = (
+                    float(value) if value is not None else None)
+        # Keep the legacy safe-Z mirror in sync
+        if "fast_move_z" in refs and refs["fast_move_z"] is not None:
+            self._safe_z_mm = float(refs["fast_move_z"])
+        elif "fast_move_z" in refs and refs["fast_move_z"] is None:
+            self._safe_z_mm = None
+        self.update()
+
+    def set_position(self, x_um: float | None, z_mm: float | None) -> None:
+        self._x_um = float(x_um) if x_um is not None else None
+        self._z_mm = float(z_mm) if z_mm is not None else None
+        self.update()
+
+    def set_well_under_needle(
+        self,
+        well_diameter_mm: float | None,
+        well_depth_mm: float | None,
+    ) -> None:
+        self._well_diameter_mm = (
+            float(well_diameter_mm) if well_diameter_mm else None)
+        self._well_depth_mm = (
+            float(well_depth_mm) if well_depth_mm else None)
+        self.update()
+
+    # ── Coordinate scales ──────────────────────────────────────────
+
+    def _zoom_strip_width(self) -> int:
+        return s(20)
+
+    def _content_rect(self) -> QRectF:
+        """Plot area, with chrome reserved for the zoom strip on the
+        right and a two-line readout band along the bottom.
+        """
+        m = s(8)
+        strip_w = self._zoom_strip_width()
+        readout_band = s(38)
+        return QRectF(
+            m,
+            m,
+            max(1, self.width() - 2 * m - strip_w - s(4)),
+            max(1, self.height() - 2 * m - readout_band),
+        )
+
+    def _x_bounds_um(self) -> tuple[float, float] | None:
+        if self._safety_limits is None:
+            return None
+        return (float(self._safety_limits.xy_min_x),
+                float(self._safety_limits.xy_max_x))
+
+    def _z_bounds_mm(self) -> tuple[float, float] | None:
+        """Visible Z bounds, accounting for the user's zoom level."""
+        if self._safety_limits is None:
+            return None
+        base_min = float(self._safety_limits.z_min)
+        base_max = float(self._safety_limits.z_max)
+        if self._z_zoom <= 1.0:
+            return (base_min, base_max)
+        base_range = base_max - base_min
+        view_range = base_range / self._z_zoom
+        center = self._z_zoom_center_mm
+        if center is None:
+            # Default zoom focus: the plate surface (Z = 0).
+            center = 0.0
+        half = view_range / 2.0
+        z_min = center - half
+        z_max = center + half
+        # Pin to the safety bounds — don't show Z outside the envelope.
+        if z_min < base_min:
+            z_max = min(base_max, z_max + (base_min - z_min))
+            z_min = base_min
+        if z_max > base_max:
+            z_min = max(base_min, z_min - (z_max - base_max))
+            z_max = base_max
+        return (z_min, z_max)
+
+    def _x_to_px(self, x_um: float) -> float:
+        bounds = self._x_bounds_um()
+        rect = self._content_rect()
+        if bounds is None:
+            return rect.center().x()
+        x_min, x_max = bounds
+        span = max(1.0, x_max - x_min)
+        frac = (x_um - x_min) / span
+        return rect.left() + frac * rect.width()
+
+    def _z_to_px(self, z_mm: float) -> float:
+        bounds = self._z_bounds_mm()
+        rect = self._content_rect()
+        if bounds is None:
+            return rect.center().y()
+        z_min, z_max = bounds
+        span = max(0.1, z_max - z_min)
+        frac = (z_max - z_mm) / span
+        return rect.top() + frac * rect.height()
+
+    def _x_um_per_px(self) -> float:
+        bounds = self._x_bounds_um()
+        rect = self._content_rect()
+        if bounds is None or rect.width() <= 0:
+            return 1.0
+        return (bounds[1] - bounds[0]) / rect.width()
+
+    # ── Painting ───────────────────────────────────────────────────
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        p.fillRect(self.rect(), _qc('base'))
+
+        if self._safety_limits is None:
+            self._paint_placeholder(p)
+            p.end()
+            return
+
+        rect = self._content_rect()
+
+        # Plot area: subtle inset surface
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(_qc('mantle')))
+        p.drawRoundedRect(rect, s(8), s(8))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_qc('surface1'), 1.0))
+        p.drawRoundedRect(rect, s(8), s(8))
+
+        self._paint_plate_and_well(p, rect)
+        self._paint_z_references(p, rect)
+        self._paint_needle(p, rect)
+        self._paint_readout(p, rect)
+        self._paint_zoom_badge(p, rect)
+
+        p.end()
+
+    def _paint_placeholder(self, p: QPainter) -> None:
+        p.setPen(QPen(_qc('overlay0')))
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(10))
+        p.setFont(font)
+        p.drawText(self.rect(),
+                   Qt.AlignmentFlag.AlignCenter,
+                   "Waiting for hardware…")
+
+    def _paint_plate_and_well(self, p: QPainter, rect: QRectF) -> None:
+        z0_y = self._z_to_px(0.0)
+
+        # Plate block: from Z=0 down to the bottom of the plot, filled
+        # with crust + a brighter top "surface" stripe.
+        if z0_y < rect.bottom():
+            plate_rect = QRectF(
+                rect.left() + 1, z0_y,
+                rect.width() - 2, rect.bottom() - z0_y - 1)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(_qc('crust')))
+            p.drawRect(plate_rect)
+            # Subtle horizontal lines for "material" texture
+            line_pen = QPen(_qc('surface0', 80), 1.0)
+            p.setPen(line_pen)
+            step = s(8)
+            y = plate_rect.top() + step
+            while y < plate_rect.bottom():
+                p.drawLine(QPointF(plate_rect.left(), y),
+                           QPointF(plate_rect.right(), y))
+                y += step
+
+            # Bright surface line
+            p.setPen(QPen(_qc('text'), 1.4))
+            p.drawLine(QPointF(rect.left() + 1, z0_y),
+                       QPointF(rect.right() - 1, z0_y))
+
+            # Plate-surface label badge
+            self._draw_pill(
+                p,
+                QPointF(rect.left() + s(8), z0_y - s(10)),
+                "plate surface",
+                _qc('subtext0'),
+                _qc('crust', 200),
+            )
+
+        # Well cavity beneath the needle, when applicable
+        if (self._well_diameter_mm and self._well_depth_mm
+                and self._x_um is not None):
+            half_w_um = (self._well_diameter_mm / 2.0) * 1000.0
+            x_left = self._x_to_px(self._x_um - half_w_um)
+            x_right = self._x_to_px(self._x_um + half_w_um)
+            z_top = self._z_to_px(0.0)
+            z_bot = self._z_to_px(-self._well_depth_mm)
+            well = QRectF(
+                QPointF(min(x_left, x_right), z_top),
+                QPointF(max(x_left, x_right), z_bot),
+            ).normalized()
+            # Fill (transparent darker)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(_qc('base', 230)))
+            p.drawRoundedRect(well, s(3), s(3))
+            # Edge
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_qc('blue'), 1.2))
+            p.drawRoundedRect(well, s(3), s(3))
+            # Dashed bottom line for "well bottom"
+            pen = QPen(_qc('blue', 200), 1.2, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(QPointF(well.left() + s(2), well.bottom()),
+                       QPointF(well.right() - s(2), well.bottom()))
+
+    def _paint_z_references(self, p: QPainter, rect: QRectF) -> None:
+        """Draw a dashed line + clickable badge for each set Z reference.
+
+        Badges are right-anchored inside the plot rect and remember
+        their hit rectangle so :meth:`mousePressEvent` can route clicks
+        to :sig:`go_to_z_requested`.
+        """
+        self._z_ref_hit_rects.clear()
+
+        # Pre-compute badge sizing once per paint (consistent across
+        # rows).
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(8))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        pad_x = s(8)
+        pad_y = s(3)
+        badge_h = metrics.height() + pad_y * 2
+
+        # Track previously-drawn badge centres so adjacent labels nudge
+        # to avoid stacking on top of each other.
+        placed: list[float] = []
+
+        for key, label, color_key in self._Z_REF_META:
+            value = self._z_refs.get(key)
+            if value is None:
+                continue
+            z_y = self._z_to_px(value)
+            # Skip if the line is outside the visible (zoomed) plot
+            if z_y < rect.top() - 1 or z_y > rect.bottom() + 1:
+                continue
+
+            accent = _qc(color_key)
+            # Subtle accent-tinted dashed line
+            line_pen = QPen(QColor(accent), 1.0, Qt.PenStyle.DashLine)
+            p.setPen(line_pen)
+            p.drawLine(QPointF(rect.left() + s(4), z_y),
+                       QPointF(rect.right() - s(4), z_y))
+
+            # Badge text: short label + value
+            text = f"{label} · {value:.2f} mm"
+            text_w = metrics.horizontalAdvance(text)
+            badge_w = text_w + pad_x * 2
+            badge_x = rect.right() - badge_w - s(2)
+
+            # Nudge the badge vertically if it would collide with one
+            # we just drew above. Keeps overlapping labels readable
+            # without overpainting.
+            badge_cy = z_y
+            for prev_cy in placed:
+                if abs(badge_cy - prev_cy) < badge_h + s(2):
+                    if badge_cy >= prev_cy:
+                        badge_cy = prev_cy + badge_h + s(2)
+                    else:
+                        badge_cy = prev_cy - badge_h - s(2)
+            # Clamp inside plot
+            badge_cy = max(rect.top() + badge_h / 2,
+                           min(rect.bottom() - badge_h / 2, badge_cy))
+            placed.append(badge_cy)
+
+            badge_rect = QRectF(
+                badge_x, badge_cy - badge_h / 2, badge_w, badge_h)
+            self._z_ref_hit_rects[key] = (badge_rect, value)
+
+            # Leader line from the badge back to its Z line (when
+            # nudged away from the row)
+            if abs(badge_cy - z_y) > 1:
+                leader_pen = QPen(accent, 1.0, Qt.PenStyle.DotLine)
+                p.setPen(leader_pen)
+                p.drawLine(QPointF(badge_rect.left() - s(2), badge_cy),
+                           QPointF(badge_rect.left() - s(8), z_y))
+
+            # Pill background + border
+            p.setPen(QPen(accent, 1.0))
+            p.setBrush(QBrush(_qc('crust', 230)))
+            p.drawRoundedRect(badge_rect, badge_h / 2, badge_h / 2)
+            # Label
+            p.setPen(QPen(accent))
+            p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_needle(self, p: QPainter, rect: QRectF) -> None:
+        """Render the current Z as a red horizontal line spanning the plot.
+
+        A small inward-pointing triangle on each side marks the line as
+        the current Z; a tiny tick at the needle's X position shows
+        where the tip is in X. This replaces the previous tapered
+        needle drawing — much cleaner and easier to read against the
+        plate.
+        """
+        if self._z_mm is None:
+            return
+
+        z_y = self._z_to_px(self._z_mm)
+        if z_y < rect.top() or z_y > rect.bottom():
+            return
+
+        # Red horizontal line spanning the plot area
+        pen = QPen(_qc('red'), 1.8)
+        p.setPen(pen)
+        p.drawLine(QPointF(rect.left() + s(2), z_y),
+                   QPointF(rect.right() - s(2), z_y))
+
+        # Inward arrow caps so the line reads as "current Z"
+        cap_h = s(4)
+        cap_w = s(6)
+        p.setBrush(QBrush(_qc('red')))
+        p.setPen(Qt.PenStyle.NoPen)
+        left_cap = QPolygonF([
+            QPointF(rect.left() + s(2), z_y - cap_h),
+            QPointF(rect.left() + s(2) + cap_w, z_y),
+            QPointF(rect.left() + s(2), z_y + cap_h),
+        ])
+        right_cap = QPolygonF([
+            QPointF(rect.right() - s(2), z_y - cap_h),
+            QPointF(rect.right() - s(2) - cap_w, z_y),
+            QPointF(rect.right() - s(2), z_y + cap_h),
+        ])
+        p.drawPolygon(left_cap)
+        p.drawPolygon(right_cap)
+
+        # Tip indicator: small square at the X position
+        if self._x_um is not None:
+            tip_x = self._x_to_px(self._x_um)
+            if rect.left() < tip_x < rect.right():
+                marker = s(5)
+                p.setBrush(QBrush(_qc('red')))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRect(QRectF(tip_x - marker / 2,
+                                  z_y - marker / 2,
+                                  marker, marker))
+
+    # ── Bottom readout (two lines: primary X/Z + secondary Δ info) ──
+
+    def _paint_readout(self, p: QPainter, rect: QRectF) -> None:
+        band_top = rect.bottom() + s(4)
+        # Primary line — large X / Z
+        line1 = QRectF(rect.left(), band_top, rect.width(), s(18))
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(10))
+        font.setBold(True)
+        p.setFont(font)
+        if self._x_um is None or self._z_mm is None:
+            text = "X: —   Z: —"
+        else:
+            text = (f"X: {self._x_um / 1000.0:+.3f} mm    "
+                    f"Z: {self._z_mm:+.3f} mm")
+        p.setPen(QPen(_qc('text')))
+        p.drawText(
+            line1,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            text,
+        )
+
+        # Secondary line — subtle Δ info + Safe Z
+        line2 = QRectF(rect.left(), band_top + s(18),
+                       rect.width(), s(16))
+        parts: list[tuple[str, QColor]] = []
+        if self._z_mm is not None:
+            color = (_qc('green') if self._z_mm > 0
+                     else (_qc('red') if self._z_mm < 0 else _qc('subtext0')))
+            parts.append((f"Δ plate {self._z_mm:+.2f} mm", color))
+        if self._safe_z_mm is not None:
+            parts.append((f"safe Z {self._safe_z_mm:.2f} mm", _qc('green')))
+        if (self._well_depth_mm is not None
+                and self._z_mm is not None):
+            depth_remaining = self._z_mm - (-self._well_depth_mm)
+            parts.append(
+                (f"Δ well {depth_remaining:+.2f} mm", _qc('blue')))
+
+        if parts:
+            font.setPointSizeF(scaled_font_size(8))
+            font.setBold(False)
+            p.setFont(font)
+            metrics = p.fontMetrics()
+            sep = "  ·  "
+            sep_w = metrics.horizontalAdvance(sep)
+            x = line2.left()
+            sep_color = _qc('surface2')
+            for i, (text, color) in enumerate(parts):
+                tw = metrics.horizontalAdvance(text)
+                if i > 0:
+                    p.setPen(QPen(sep_color))
+                    p.drawText(
+                        QRectF(x, line2.top(), sep_w, line2.height()),
+                        int(Qt.AlignmentFlag.AlignLeft
+                            | Qt.AlignmentFlag.AlignVCenter),
+                        sep,
+                    )
+                    x += sep_w
+                p.setPen(QPen(color))
+                p.drawText(
+                    QRectF(x, line2.top(), tw + s(4), line2.height()),
+                    int(Qt.AlignmentFlag.AlignLeft
+                        | Qt.AlignmentFlag.AlignVCenter),
+                    text,
+                )
+                x += tw
+
+    # ── Zoom widget styling + sync ────────────────────────────────
+
+    def _style_zoom_widgets(self) -> None:
+        btn_style = (
+            f"QPushButton#xzZoomBtn {{"
+            f"  background-color: {COLORS['surface0']};"
+            f"  color: {COLORS['text']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"  border-radius: {sp(4)};"
+            f"  font-weight: 700;"
+            f"  font-size: {sf(11)}pt;"
+            f"  min-height: 0px;"
+            f"  padding: 0px;"
+            f"}}"
+            f"QPushButton#xzZoomBtn:hover {{"
+            f"  background-color: {COLORS['surface1']};"
+            f"  border-color: {COLORS['mauve']};"
+            f"  color: {COLORS['mauve']};"
+            f"}}"
+            f"QPushButton#xzZoomBtn:pressed {{"
+            f"  background-color: {COLORS['mauve']};"
+            f"  color: {COLORS['crust']};"
+            f"}}"
+            f"QPushButton#xzZoomBtn:disabled {{"
+            f"  color: {COLORS['overlay0']};"
+            f"  border-color: {COLORS['surface0']};"
+            f"  background-color: {COLORS['mantle']};"
+            f"}}"
+        )
+        self._btn_zoom_in.setStyleSheet(btn_style)
+        self._btn_zoom_out.setStyleSheet(btn_style)
+        self._scrollbar.setStyleSheet(
+            f"QScrollBar#xzZoomScroll:vertical {{"
+            f"  background-color: {COLORS['mantle']};"
+            f"  border: 1px solid {COLORS['surface0']};"
+            f"  border-radius: {sp(3)};"
+            f"  width: {s(12)}px;"
+            f"  margin: 0;"
+            f"}}"
+            f"QScrollBar#xzZoomScroll::handle:vertical {{"
+            f"  background-color: {COLORS['mauve']};"
+            f"  border-radius: {sp(3)};"
+            f"  min-height: {s(18)}px;"
+            f"}}"
+            f"QScrollBar#xzZoomScroll::handle:vertical:hover {{"
+            f"  background-color: {COLORS['pink']};"
+            f"}}"
+            f"QScrollBar#xzZoomScroll::add-line:vertical,"
+            f"QScrollBar#xzZoomScroll::sub-line:vertical {{"
+            f"  height: 0; width: 0;"
+            f"  background: transparent;"
+            f"}}"
+            f"QScrollBar#xzZoomScroll::add-page:vertical,"
+            f"QScrollBar#xzZoomScroll::sub-page:vertical {{"
+            f"  background: transparent;"
+            f"}}"
+            f"QScrollBar#xzZoomScroll:disabled {{"
+            f"  background-color: {COLORS['mantle']};"
+            f"}}"
+            f"QScrollBar#xzZoomScroll::handle:vertical:disabled {{"
+            f"  background-color: {COLORS['surface1']};"
+            f"}}"
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_zoom_widgets()
+
+    def _position_zoom_widgets(self) -> None:
+        rect = self._content_rect()
+        strip_w = self._zoom_strip_width()
+        btn_size = s(18)
+        scroll_w = s(12)
+
+        strip_x = int(rect.right()) + s(4)
+        # Buttons centered in the strip horizontally
+        btn_x = strip_x + (strip_w - btn_size) // 2
+        scroll_x = strip_x + (strip_w - scroll_w) // 2
+
+        self._btn_zoom_in.setGeometry(
+            btn_x, int(rect.top()), btn_size, btn_size)
+        self._btn_zoom_out.setGeometry(
+            btn_x, int(rect.bottom()) - btn_size,
+            btn_size, btn_size)
+        self._scrollbar.setGeometry(
+            scroll_x,
+            int(rect.top()) + btn_size + s(3),
+            scroll_w,
+            max(s(20),
+                int(rect.height()) - 2 * (btn_size + s(3))))
+
+    def _on_zoom_in(self) -> None:
+        if self._safety_limits is None:
+            return
+        if self._z_zoom_center_mm is None:
+            # Default zoom focus is the plate surface
+            self._z_zoom_center_mm = 0.0
+        new_zoom = min(self._z_zoom * 1.5, 30.0)
+        self._z_zoom = new_zoom
+        self._sync_scrollbar()
+        self.update()
+
+    def _on_zoom_out(self) -> None:
+        new_zoom = max(self._z_zoom / 1.5, 1.0)
+        self._z_zoom = new_zoom
+        if new_zoom <= 1.0:
+            self._z_zoom = 1.0
+            self._z_zoom_center_mm = None
+        self._sync_scrollbar()
+        self.update()
+
+    def _on_scrollbar_changed(self, sb_value: int) -> None:
+        if self._scrollbar_updating or self._safety_limits is None:
+            return
+        if self._z_zoom <= 1.0:
+            return
+        z_min = float(self._safety_limits.z_min)
+        z_max = float(self._safety_limits.z_max)
+        total = z_max - z_min
+        view_range = total / self._z_zoom
+        half = view_range / 2.0
+        center_min = z_min + half
+        center_max = z_max - half
+        if center_max <= center_min:
+            return
+        # Scrollbar units = 0.01 mm. value 0 → top (center_max).
+        center = center_max - sb_value / 100.0
+        self._z_zoom_center_mm = max(center_min, min(center_max, center))
+        self.update()
+
+    def _sync_scrollbar(self) -> None:
+        """Push current zoom state into the scrollbar + button enabled
+        flags. Set ``_scrollbar_updating`` while we mutate it so the
+        ``valueChanged`` callback short-circuits."""
+        self._scrollbar_updating = True
+        try:
+            if (self._safety_limits is None
+                    or self._z_zoom <= 1.0):
+                self._scrollbar.setEnabled(False)
+                self._scrollbar.setRange(0, 0)
+                self._scrollbar.setValue(0)
+            else:
+                z_min = float(self._safety_limits.z_min)
+                z_max = float(self._safety_limits.z_max)
+                total = z_max - z_min
+                view_range = total / self._z_zoom
+                half = view_range / 2.0
+                center_min = z_min + half
+                center_max = z_max - half
+                if center_max <= center_min:
+                    self._scrollbar.setEnabled(False)
+                    self._scrollbar.setRange(0, 0)
+                    self._scrollbar.setValue(0)
+                else:
+                    sb_max = max(1, int((center_max - center_min) * 100))
+                    self._scrollbar.setEnabled(True)
+                    self._scrollbar.setRange(0, sb_max)
+                    self._scrollbar.setPageStep(
+                        max(1, int(view_range * 100)))
+                    self._scrollbar.setSingleStep(
+                        max(1, int(view_range * 10)))
+                    center = (self._z_zoom_center_mm
+                              if self._z_zoom_center_mm is not None
+                              else 0.0)
+                    center = max(center_min, min(center_max, center))
+                    self._scrollbar.setValue(
+                        int((center_max - center) * 100))
+        finally:
+            self._scrollbar_updating = False
+        # Button enabled states
+        self._btn_zoom_in.setEnabled(self._z_zoom < 30.0)
+        self._btn_zoom_out.setEnabled(self._z_zoom > 1.0)
+
+    # ── Zoom badge ─────────────────────────────────────────────────
+
+    def _paint_zoom_badge(self, p: QPainter, rect: QRectF) -> None:
+        """A small badge in the top-left showing the current Z zoom.
+
+        When zoomed in, clicking the badge resets to 1×. The text reads
+        `1×` at default zoom and `4.2×` etc. when zoomed.
+        """
+        text = (f"Z · {self._z_zoom:g}×" if self._z_zoom <= 1.0
+                else f"Z · {self._z_zoom:.1f}×  (click to reset)")
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(8))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        text_w = metrics.horizontalAdvance(text)
+        pad_x = s(8)
+        pad_y = s(3)
+        badge_w = text_w + pad_x * 2
+        badge_h = metrics.height() + pad_y * 2
+        badge_rect = QRectF(rect.left() + s(8), rect.top() + s(8),
+                            badge_w, badge_h)
+        self._reset_zoom_rect = badge_rect
+
+        if self._z_zoom <= 1.0:
+            text_color = _qc('subtext0')
+            border_color = _qc('surface2')
+        else:
+            text_color = _qc('mauve')
+            border_color = _qc('mauve')
+        p.setPen(QPen(border_color, 1.0))
+        p.setBrush(QBrush(_qc('crust', 200)))
+        p.drawRoundedRect(badge_rect, badge_h / 2, badge_h / 2)
+        p.setPen(QPen(text_color))
+        p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    # ── Mouse / wheel handling ─────────────────────────────────────
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Scroll wheel zooms the Z axis around the cursor."""
+        if self._safety_limits is None:
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        rect = self._content_rect()
+        # Only zoom when the cursor is inside the plot area
+        pos = event.position()
+        if not rect.contains(pos):
+            return
+        # Cursor Z (in mm) given current zoom — use it as the new center
+        bounds = self._z_bounds_mm()
+        if bounds is None:
+            return
+        z_min, z_max = bounds
+        frac = (pos.y() - rect.top()) / max(1.0, rect.height())
+        cursor_z = z_max - frac * (z_max - z_min)
+        # Step the zoom factor
+        if delta > 0:
+            new_zoom = min(self._z_zoom * 1.4, 30.0)
+        else:
+            new_zoom = max(self._z_zoom / 1.4, 1.0)
+        self._z_zoom = new_zoom
+        self._z_zoom_center_mm = cursor_z
+        if self._z_zoom <= 1.0:
+            self._z_zoom = 1.0
+            self._z_zoom_center_mm = None
+        self._sync_scrollbar()
+        self.update()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        # Use a pointing-hand cursor over the clickable badges
+        pos = event.position()
+        over_clickable = False
+        if (self._reset_zoom_rect is not None
+                and self._reset_zoom_rect.contains(pos)
+                and self._z_zoom > 1.0):
+            over_clickable = True
+        else:
+            for rect, _ in self._z_ref_hit_rects.values():
+                if rect.contains(pos):
+                    over_clickable = True
+                    break
+        self.setCursor(Qt.PointingHandCursor if over_clickable
+                       else Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        pos = event.position()
+        # Click the zoom badge to reset
+        if (self._reset_zoom_rect is not None
+                and self._reset_zoom_rect.contains(pos)):
+            if self._z_zoom > 1.0:
+                self._z_zoom = 1.0
+                self._z_zoom_center_mm = None
+                self._sync_scrollbar()
+                self.update()
+                event.accept()
+                return
+        # Click one of the Z-reference badges to jump there
+        for key, (rect, z_value) in self._z_ref_hit_rects.items():
+            if rect.contains(pos):
+                self.go_to_z_requested.emit(float(z_value))
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    # ── Pill helper ───────────────────────────────────────────────
+
+    def _draw_pill(self, p: QPainter, top_left: QPointF, text: str,
+                   text_color: QColor, bg_color: QColor) -> None:
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(8))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        text_w = metrics.horizontalAdvance(text)
+        pad_x = s(6)
+        pad_y = s(2)
+        pill_w = text_w + pad_x * 2
+        pill_h = metrics.height() + pad_y * 2
+        rect = QRectF(top_left.x(), top_left.y(), pill_w, pill_h)
+        p.setPen(QPen(text_color, 1.0))
+        p.setBrush(QBrush(bg_color))
+        p.drawRoundedRect(rect, pill_h / 2, pill_h / 2)
+        p.setPen(QPen(text_color))
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)

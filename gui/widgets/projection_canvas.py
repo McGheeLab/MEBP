@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QWidget, QGraphicsView, QGraphicsScene,
     QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy,
     QGraphicsPathItem, QGraphicsRectItem, QGraphicsItem,
-    QMenu,
+    QMenu, QPushButton, QLabel,
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QMimeData
 from PySide6.QtGui import (
@@ -55,6 +55,7 @@ from PySide6.QtGui import (
 )
 
 from gui.styles import COLORS
+from gui.scaling import s as _s, scaled_font_size as _sf
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ def _nice_step(range_mm: float) -> float:
 
 class ProjectionPane(QGraphicsView):
     """
-    A single 2D projection pane (XY, ZY, or XZ).
+    A single 2D projection pane (XY, ZY, XZ, or YZ).
 
     Supports two rendering modes:
 
@@ -187,13 +188,17 @@ class ProjectionPane(QGraphicsView):
 
     Axes:
         XY: h=x, v=y  (top-down)
-        ZY: h=z, v=y  (side view)
+        ZY: h=z, v=y  (side view, Z horizontal)
         XZ: h=x, v=z  (front view)
+        YZ: h=y, v=z  (side view, Y horizontal) — added in v7.5.1
 
     Double-click to promote this view to primary position.
     """
 
-    promote_requested = Signal(str)  # emits mode name ("XY"/"ZY"/"XZ")
+    promote_requested = Signal(str)  # emits mode name ("XY"/"ZY"/"XZ"/"YZ")
+    # v7.5.1: emitted when wheel-zoom changes the transform; canvases
+    # in row layout broadcast the factor to peer panes for locked zoom.
+    zoom_changed = Signal(float)
 
     def __init__(
         self,
@@ -215,6 +220,7 @@ class ProjectionPane(QGraphicsView):
         self._needle_pos: tuple[float, float] | None = None
         self._tracking_error_mm: float = 0.0
         self._well_diameter_mm: float = 0.0
+        self._well_depth_mm: float = 0.0  # v7.6.0: for XZ/YZ outline
 
         # Multi-object colored paths
         self._object_paths: list[ObjectPath] = []
@@ -235,9 +241,20 @@ class ProjectionPane(QGraphicsView):
             QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
         # Default size policy (overridden by canvas layout)
-        self._apply_position_sizing(
-            "primary" if mode == "XY" else
-            "side_right" if mode == "ZY" else "side_bottom")
+        if mode == "XY":
+            initial_position = "primary"
+        elif mode == "ZY":
+            initial_position = "side_right"
+        elif mode == "YZ":
+            # Row-layout default; same constraints as side_right
+            initial_position = "side_right"
+        else:  # XZ
+            initial_position = "side_bottom"
+        self._apply_position_sizing(initial_position)
+
+        # v7.5.1: external-pan suppression flag so canvas-driven
+        # scrollbar sync doesn't recurse back into the peer panes.
+        self._suppress_pan_signal = False
 
     # ── Position sizing (called by canvas when swapping views) ────
 
@@ -265,6 +282,11 @@ class ProjectionPane(QGraphicsView):
 
     def set_well_diameter(self, diameter_mm: float) -> None:
         self._well_diameter_mm = diameter_mm
+
+    def set_well_depth(self, depth_mm: float) -> None:
+        """v7.6.0: well depth (mm) so the Z-axis views (XZ, YZ) can
+        draw the well-height outline with the floor at the bottom."""
+        self._well_depth_mm = depth_mm
 
     def add_completed_point(self, x: float, y: float, z: float) -> None:
         h, v = self._project(x, y, z)
@@ -337,15 +359,21 @@ class ProjectionPane(QGraphicsView):
                 return (x, y)
             elif self._mode == "ZY":
                 return (z * Z_AMPLIFY, y)
-            else:
+            elif self._mode == "YZ":
+                return (y, z * Z_AMPLIFY)
+            else:  # XZ
                 return (x, z * Z_AMPLIFY)
         else:
             if self._mode == "XY":
                 return (x, y)
             elif self._mode == "ZY":
                 return (z, y)
-            else:
-                return (x, z)
+            elif self._mode == "YZ":
+                # v7.6.0: Z runs upward — floor (z=0) at the bottom, well
+                # top above. Scene-y grows downward, so negate z.
+                return (y, -z)
+            else:  # XZ
+                return (x, -z)
 
     def _scene_coord(self, h: float, v: float) -> tuple[float, float]:
         return (h * self._scale, v * self._scale)
@@ -359,6 +387,8 @@ class ProjectionPane(QGraphicsView):
             return ("X", "Y")
         elif self._mode == "ZY":
             return ("Z", "Y")
+        elif self._mode == "YZ":
+            return ("Y", "Z")
         return ("X", "Z")
 
     def _axis_scales(self) -> tuple[float, float]:
@@ -367,6 +397,8 @@ class ProjectionPane(QGraphicsView):
         if self._scale_mode == "plate":
             if self._mode == "ZY":
                 return (s * Z_AMPLIFY, s)
+            elif self._mode == "YZ":
+                return (s, s * Z_AMPLIFY)
             elif self._mode == "XZ":
                 return (s, s * Z_AMPLIFY)
         return (s, s)
@@ -394,7 +426,39 @@ class ProjectionPane(QGraphicsView):
         br = self._scene.itemsBoundingRect()
         label.setPos(br.left(), br.top() - 16)
 
-        # Fit view
+        # Fit view (stable region — see _fit_view)
+        self._fit_view()
+
+    def _fit_rect(self) -> QRectF | None:
+        """Scene-coord rectangle the view should frame.
+
+        For well-scale views this is the fixed well/ruler extent — NOT
+        the item bounding rect — so dragging an object never rescales
+        the view (which made objects accelerate away and feel jumpy).
+        Plate-scale views keep the legacy item-bounds behaviour.
+        """
+        if self._scale_mode != "well":
+            return None
+        h_min, h_max, v_min, v_max = self._ruler_extent_mm()
+        if (h_max - h_min) < 0.01 and (v_max - v_min) < 0.01:
+            return None
+        h_fac, v_fac = self._axis_scales()
+        margin = 0.12 * max(h_max - h_min, v_max - v_min)
+        return QRectF(
+            (h_min - margin) * h_fac,
+            (v_min - margin) * v_fac,
+            (h_max - h_min + 2 * margin) * h_fac,
+            (v_max - v_min + 2 * margin) * v_fac,
+        )
+
+    def _fit_view(self) -> None:
+        fit = self._fit_rect()
+        if fit is not None and not fit.isEmpty():
+            # Pin the scene rect so dragged items stay bounded + the
+            # zoom is constant regardless of object position.
+            self._scene.setSceneRect(fit)
+            self.fitInView(fit, Qt.AspectRatioMode.KeepAspectRatio)
+            return
         rect = self._scene.itemsBoundingRect().adjusted(-15, -15, 15, 15)
         if not rect.isEmpty():
             self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
@@ -450,10 +514,23 @@ class ProjectionPane(QGraphicsView):
             h += step
 
         # Left (vertical axis)
+        z_view = self._is_well_height_view()
         v = math.ceil(v_min / step) * step
         while v <= v_max + step * 0.01:
-            if abs(v) > step * 0.01:
-                sy = v * v_fac
+            sy = v * v_fac
+            if z_view:
+                # Vertical scene-y is negated z; show the Z *height*
+                # (0 = floor at the bottom, increasing upward). Skip any
+                # below-floor ticks.
+                z_val = -v
+                if z_val >= -step * 0.01:
+                    fmt = f"{z_val:.1f}" if use_decimal else f"{z_val:.0f}"
+                    txt = self._scene.addText(fmt, font)
+                    txt.setDefaultTextColor(lc)
+                    tb = txt.boundingRect()
+                    txt.setPos(h_min * h_fac - tb.width() - 3,
+                               sy - tb.height() / 2)
+            elif abs(v) > step * 0.01:
                 fmt = f"{v:.1f}" if use_decimal else f"{v:.0f}"
                 txt = self._scene.addText(fmt, font)
                 txt.setDefaultTextColor(lc)
@@ -471,6 +548,11 @@ class ProjectionPane(QGraphicsView):
         av.setDefaultTextColor(lc)
         av.setPos(h_min * h_fac - 18, v_min * v_fac - 16)
 
+    def _is_well_height_view(self) -> bool:
+        """True for the side/front well-scale projections whose vertical
+        axis is Z (drawn 0 = floor at the bottom, up to the well top)."""
+        return self._scale_mode == "well" and self._mode in ("XZ", "YZ")
+
     def _ruler_extent_mm(self) -> tuple[float, float, float, float]:
         """(h_min, h_max, v_min, v_max) in mm for ruler drawing."""
         if self._scale_mode == "well":
@@ -478,6 +560,14 @@ class ProjectionPane(QGraphicsView):
                  if self._well_diameter_mm > 0
                  else DEFAULT_WELL_EXTENT)
             ext = r * 1.3
+            if self._is_well_height_view():
+                # Vertical = Z height. Scene-y is negated z, so the
+                # floor (z=0) sits at scene-y 0 (bottom) and the well
+                # top at scene-y -depth (above). Range bottom→top:
+                # a touch below the floor up past the rim.
+                depth = (self._well_depth_mm
+                         if self._well_depth_mm > 0 else DEFAULT_WELL_EXTENT)
+                return (-ext, ext, -depth * 1.12, depth * 0.08)
             return (-ext, ext, -ext, ext)
 
         if not self._well_markers:
@@ -508,8 +598,29 @@ class ProjectionPane(QGraphicsView):
             r = self._well_diameter_mm / 2 * s
             pen = QPen(QColor(WELL_BOUNDARY_COLOR), 1.5, Qt.PenStyle.DotLine)
             if self._mode == "XY":
+                # Top-down: well circle.
                 self._scene.addEllipse(-r, -r, 2 * r, 2 * r, pen)
+            elif self._mode in ("XZ", "YZ") and self._well_depth_mm > 0:
+                # v7.6.0: side/front views show the well *height*. The Z
+                # axis runs upward — floor (z=0) at scene-y 0 (bottom),
+                # rim (z=+depth) at scene-y -depth (top). Solid floor +
+                # rim lines, dotted side walls, faint fill.
+                depth = self._well_depth_mm * s
+                fill = QColor(WELL_BOUNDARY_COLOR)
+                fill.setAlpha(24)
+                self._scene.addRect(-r, -depth, 2 * r, depth,
+                                    QPen(Qt.PenStyle.NoPen), QBrush(fill))
+                # Dotted side walls
+                self._scene.addLine(-r, -depth, -r, 0, pen)
+                self._scene.addLine(r, -depth, r, 0, pen)
+                # Rim (top, z=depth) — dotted
+                self._scene.addLine(-r, -depth, r, -depth, pen)
+                # Floor (bottom, z=0) — solid, emphasized
+                floor_pen = QPen(QColor(WELL_BOUNDARY_COLOR), 2.0,
+                                 Qt.PenStyle.SolidLine)
+                self._scene.addLine(-r, 0, r, 0, floor_pen)
             else:
+                # ZY or no depth available: just the rim line.
                 self._scene.addLine(-r, 0, r, 0, pen)
 
         # Multi-object colored paths
@@ -611,13 +722,31 @@ class ProjectionPane(QGraphicsView):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        rect = self._scene.itemsBoundingRect().adjusted(-15, -15, 15, 15)
-        if not rect.isEmpty():
-            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_view()
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.promote_requested.emit(self._mode)
         super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        # v7.5.1: wheel zooms (and the row-canvas broadcasts the factor
+        # so all three projection panes stay locked at the same scale).
+        # Without this override Qt's default wheelEvent scrolls, which
+        # collides with the canvas-level scrollbar sync.
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        zoom_in = delta > 0
+        factor = 1.15 if zoom_in else 1.0 / 1.15
+        self.scale(factor, factor)
+        self.zoom_changed.emit(factor)
+        event.accept()
+
+    def apply_external_zoom(self, factor: float) -> None:
+        """Apply a zoom factor without re-broadcasting (peer panes
+        receive this from the canvas during row-layout sync)."""
+        self.scale(factor, factor)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -633,9 +762,13 @@ _SIDE_ORDER = {
 
 class ProjectionCanvas(QWidget):
     """
-    L-shaped triple-projection widget.
+    Triple-projection widget. Supports two layout modes:
 
-    Double-click any side pane to promote it to the primary position.
+    * ``"L"`` (default) — XY primary top-left, ZY tall right, XZ wide
+      bottom. Double-click a side pane to promote it.
+    * ``"row"`` (v7.5.1) — XY, XZ, YZ side-by-side at equal stretch.
+      Pan and zoom are **synchronized** across panes along their
+      shared axes so the trio reads as a single coupled view.
     """
 
     primary_view_changed = Signal(str)
@@ -645,17 +778,28 @@ class ProjectionCanvas(QWidget):
         scale_mode: str = "well",
         panes: dict[str, ProjectionPane] | None = None,
         parent: QWidget | None = None,
+        layout_mode: str = "L",
     ):
         super().__init__(parent)
         self._scale_mode = scale_mode
+        self._layout_mode = layout_mode
         self._primary_mode = "XY"
+        self._syncing_view = False  # recursion guard for pan/zoom sync
 
         if panes is None:
-            self._panes: dict[str, ProjectionPane] = {
-                "XY": ProjectionPane("XY", scale_mode),
-                "ZY": ProjectionPane("ZY", scale_mode),
-                "XZ": ProjectionPane("XZ", scale_mode),
-            }
+            if layout_mode == "row":
+                # Horizontal trio: XY | XZ | YZ
+                self._panes: dict[str, ProjectionPane] = {
+                    "XY": ProjectionPane("XY", scale_mode),
+                    "XZ": ProjectionPane("XZ", scale_mode),
+                    "YZ": ProjectionPane("YZ", scale_mode),
+                }
+            else:
+                self._panes = {
+                    "XY": ProjectionPane("XY", scale_mode),
+                    "ZY": ProjectionPane("ZY", scale_mode),
+                    "XZ": ProjectionPane("XZ", scale_mode),
+                }
         else:
             self._panes = panes
 
@@ -663,14 +807,40 @@ class ProjectionCanvas(QWidget):
             pane.promote_requested.connect(self.set_primary_view)
 
         self.xy_view = self._panes["XY"]
-        self.zy_view = self._panes["ZY"]
-        self.xz_view = self._panes["XZ"]
+        # Side-pane convenience handles — keep both keys around even
+        # when the layout doesn't actually use one, for code that
+        # introspects ``self.zy_view`` / ``self.xz_view``.
+        self.zy_view = self._panes.get("ZY")
+        self.xz_view = self._panes.get("XZ")
+        self.yz_view = self._panes.get("YZ")
         self._views = list(self._panes.values())
+
+        # Row-mode view-visibility state (toggled via the top button bar).
+        self._row_modes = ("XY", "XZ", "YZ")
+        self._visible_modes = list(self._row_modes)
+        self._view_toggle_btns: dict[str, QPushButton] = {}
 
         self._main_layout = QVBoxLayout(self)
         self._main_layout.setContentsMargins(0, 0, 0, 0)
         self._main_layout.setSpacing(2)
+
+        # v7.6.0: a row of XY / XZ / YZ toggle chips above the panes lets
+        # the user pick which projections are shown; the chosen views
+        # share the full width evenly.
+        if layout_mode == "row":
+            self._main_layout.addWidget(self._build_view_toggle_bar())
+
+        # Panes live in a dedicated host so the toggle bar persists
+        # across ``_rebuild_layout`` (which wipes & recreates the host).
+        self._panes_host = QWidget(self)
+        self._host_layout = QVBoxLayout(self._panes_host)
+        self._host_layout.setContentsMargins(0, 0, 0, 0)
+        self._host_layout.setSpacing(2)
+        self._main_layout.addWidget(self._panes_host, 1)
+
         self._rebuild_layout()
+        if layout_mode == "row":
+            self._wire_row_sync()
 
     # ── View swapping ─────────────────────────────────────────────
 
@@ -682,19 +852,45 @@ class ProjectionCanvas(QWidget):
         self.primary_view_changed.emit(mode)
 
     def _rebuild_layout(self) -> None:
+        host_layout = getattr(self, "_host_layout", self._main_layout)
+
         # Detach panes
         for pane in self._panes.values():
             pane.setParent(None)
 
-        # Remove old widgets from layout
-        while self._main_layout.count():
-            item = self._main_layout.takeAt(0)
+        # Remove old widgets from the panes host layout
+        while host_layout.count():
+            item = host_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.setParent(None)
                 w.deleteLater()
 
-        # Roles
+        if self._layout_mode == "row":
+            # v7.5.1: equal-width horizontal row of panes. v7.6.0: only
+            # the toggled-on views are shown; they share the full width.
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(2)
+            for mode in self._row_modes:
+                if mode not in self._visible_modes:
+                    continue
+                pane = self._panes.get(mode)
+                if pane is None:
+                    continue
+                pane._apply_position_sizing("primary")
+                # Equal stretch so all shown views share width evenly.
+                row.addWidget(pane, 1)
+            container = QWidget(self)
+            container.setLayout(row)
+            host_layout.addWidget(container, stretch=1)
+            for mode, pane in self._panes.items():
+                pane.setVisible(mode in self._visible_modes)
+                if mode in self._visible_modes:
+                    pane.refresh()
+            return
+
+        # ── L-shaped layout (legacy default) ──────────────────────
         primary = self._panes[self._primary_mode]
         sr_mode, sb_mode = _SIDE_ORDER[self._primary_mode]
         side_r = self._panes[sr_mode]
@@ -710,11 +906,164 @@ class ProjectionCanvas(QWidget):
         top.setStretchFactor(0, 4)
         top.setStretchFactor(1, 1)
 
-        self._main_layout.addWidget(top, stretch=3)
-        self._main_layout.addWidget(side_b, stretch=1)
+        host_layout.addWidget(top, stretch=3)
+        host_layout.addWidget(side_b, stretch=1)
 
         for pane in self._panes.values():
             pane.refresh()
+
+    # ── View-visibility toggle bar (v7.6.0) ───────────────────────
+
+    def _build_view_toggle_bar(self) -> QWidget:
+        """A compact row of XY / XZ / YZ toggle chips. The chosen views
+        share the full canvas width; deselecting all is disallowed."""
+        bar = QWidget(self)
+        bar.setObjectName("projViewToggleBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(_s(6), _s(4), _s(6), _s(4))
+        lay.setSpacing(_s(6))
+
+        caption = QLabel("Views:")
+        caption.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {_sf(9.5)}pt;")
+        lay.addWidget(caption)
+
+        for mode in self._row_modes:
+            btn = QPushButton(mode)
+            btn.setCheckable(True)
+            btn.setChecked(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(_s(24))
+            btn.setMinimumWidth(_s(44))
+            btn.setStyleSheet(self._toggle_chip_style())
+            btn.clicked.connect(
+                lambda _checked, m=mode: self._on_view_toggled(m))
+            lay.addWidget(btn)
+            self._view_toggle_btns[mode] = btn
+
+        lay.addStretch(1)
+        return bar
+
+    @staticmethod
+    def _toggle_chip_style() -> str:
+        return (
+            f"QPushButton {{"
+            f"  background: {COLORS['surface0']};"
+            f"  color: {COLORS['subtext0']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"  border-radius: {_s(6)}px;"
+            f"  padding: {_s(2)}px {_s(10)}px;"
+            f"  font-weight: 700; font-size: {_sf(9.5)}pt;"
+            f"}}"
+            f"QPushButton:hover {{ border-color: {COLORS['mauve']}; }}"
+            f"QPushButton:checked {{"
+            f"  background: {COLORS['mauve']};"
+            f"  color: {COLORS['base']};"
+            f"  border-color: {COLORS['mauve']};"
+            f"}}"
+        )
+
+    def _on_view_toggled(self, mode: str) -> None:
+        visible = [m for m in self._row_modes
+                   if self._view_toggle_btns[m].isChecked()]
+        if not visible:
+            # Never allow zero panes — re-check the one just turned off.
+            self._view_toggle_btns[mode].setChecked(True)
+            return
+        self._visible_modes = visible
+        self._rebuild_layout()
+
+    def set_visible_views(self, modes: list[str]) -> None:
+        """Programmatically set which row-mode views are shown."""
+        modes = [m for m in self._row_modes if m in modes]
+        if not modes:
+            return
+        self._visible_modes = modes
+        for m, btn in self._view_toggle_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(m in modes)
+            btn.blockSignals(False)
+        self._rebuild_layout()
+
+    # ── Row-layout view sync (v7.5.1) ─────────────────────────────
+
+    def _wire_row_sync(self) -> None:
+        """Lock pan + zoom across the XY/XZ/YZ panes along their
+        shared axes.
+
+        Shared-axis map (row layout):
+            XY h (X)  ↔  XZ h (X)
+            XY v (Y)  ↔  YZ h (Y)
+            XZ v (Z)  ↔  YZ v (Z)
+        """
+        xy = self._panes.get("XY")
+        xz = self._panes.get("XZ")
+        yz = self._panes.get("YZ")
+        if xy is None or xz is None or yz is None:
+            return
+
+        # Zoom — every pane broadcasts the factor, peers apply it.
+        for src in (xy, xz, yz):
+            src.zoom_changed.connect(
+                lambda factor, origin=src: self._broadcast_zoom(origin, factor)
+            )
+
+        # Pan — wire scrollbars per shared axis.
+        # XY h ↔ XZ h (both X)
+        xy.horizontalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(xy, xz, "h", "h", v))
+        xz.horizontalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(xz, xy, "h", "h", v))
+        # XY v ↔ YZ h (XY's Y is YZ's horizontal)
+        xy.verticalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(xy, yz, "v", "h", v))
+        yz.horizontalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(yz, xy, "h", "v", v))
+        # XZ v ↔ YZ v (both Z)
+        xz.verticalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(xz, yz, "v", "v", v))
+        yz.verticalScrollBar().valueChanged.connect(
+            lambda v: self._sync_scroll(yz, xz, "v", "v", v))
+
+    def _broadcast_zoom(self, origin: ProjectionPane, factor: float) -> None:
+        if self._syncing_view:
+            return
+        self._syncing_view = True
+        try:
+            for pane in self._panes.values():
+                if pane is origin:
+                    continue
+                pane.apply_external_zoom(factor)
+        finally:
+            self._syncing_view = False
+
+    def _sync_scroll(
+        self,
+        src: ProjectionPane,
+        dst: ProjectionPane,
+        src_axis: str,
+        dst_axis: str,
+        value: int,
+    ) -> None:
+        if self._syncing_view:
+            return
+        self._syncing_view = True
+        try:
+            # Translate src scrollbar value → equivalent dst scrollbar
+            # value. The two panes typically have the same scene scale
+            # at the same zoom (we broadcast zoom uniformly), so the
+            # scrollbar ranges should match; if not, scale by ratio.
+            src_bar = (src.horizontalScrollBar() if src_axis == "h"
+                       else src.verticalScrollBar())
+            dst_bar = (dst.horizontalScrollBar() if dst_axis == "h"
+                       else dst.verticalScrollBar())
+            src_range = max(1, src_bar.maximum() - src_bar.minimum())
+            dst_range = max(1, dst_bar.maximum() - dst_bar.minimum())
+            rel = (value - src_bar.minimum()) / src_range
+            dst_value = dst_bar.minimum() + int(round(rel * dst_range))
+            dst_bar.setValue(dst_value)
+        finally:
+            self._syncing_view = False
 
     # ══════════════════════════════════════════════════════════════
     #  WELL-SCALE API
@@ -723,6 +1072,14 @@ class ProjectionCanvas(QWidget):
     def set_well_diameter(self, diameter_mm: float) -> None:
         for v in self._views:
             v.set_well_diameter(diameter_mm)
+
+    def set_well_depth(self, depth_mm: float) -> None:
+        """v7.6.0: broadcast well depth to all panes (XZ/YZ use it
+        to draw the well-height outline)."""
+        for v in self._views:
+            v.set_well_depth(depth_mm)
+        for v in self._views:
+            v.refresh()
 
     def add_completed_point(self, x: float, y: float, z: float) -> None:
         for v in self._views:
@@ -852,37 +1209,50 @@ class MiniProjectionView(ProjectionPane):
 
 def _project_point(pt: tuple[float, float, float],
                    mode: str) -> tuple[float, float]:
-    """Project a 3D point onto the two axes of *mode*."""
+    """Project a 3D point onto the two axes of *mode*.
+
+    v7.6.0: in XZ/YZ the vertical scene axis is Z drawn *upward* (floor
+    z=0 at the bottom), so z is negated to match Qt's downward scene-y —
+    consistent with ``ProjectionPane._project``."""
     x, y, z = pt
     if mode == "XY":
         return (x, y)
     elif mode == "ZY":
         return (z, y)
-    return (x, z)  # XZ
+    elif mode == "YZ":
+        return (y, -z)
+    return (x, -z)  # XZ
 
 
 def _offset_h_v(placed: PlacedObject,
                 mode: str) -> tuple[float, float]:
-    """Return (h_mm, v_mm) offset for *mode*."""
+    """Return (h_mm, v_mm) scene offset for *mode* (z negated in XZ/YZ
+    so +z renders upward — see ``_project_point``)."""
     if mode == "XY":
         return (placed.x_offset, placed.y_offset)
     elif mode == "ZY":
         return (placed.z_offset, placed.y_offset)
-    return (placed.x_offset, placed.z_offset)  # XZ
+    elif mode == "YZ":
+        return (placed.y_offset, -placed.z_offset)
+    return (placed.x_offset, -placed.z_offset)  # XZ
 
 
 def _write_offset_h_v(placed: PlacedObject,
                       mode: str, h_mm: float, v_mm: float) -> None:
-    """Write (h_mm, v_mm) back onto the right PlacedObject fields."""
+    """Write a (h_mm, v_mm) scene offset back onto the right PlacedObject
+    fields (z negated in XZ/YZ to undo the upward-Z scene mapping)."""
     if mode == "XY":
         placed.x_offset = h_mm
         placed.y_offset = v_mm
     elif mode == "ZY":
         placed.z_offset = h_mm
         placed.y_offset = v_mm
+    elif mode == "YZ":
+        placed.y_offset = h_mm
+        placed.z_offset = -v_mm
     else:  # XZ
         placed.x_offset = h_mm
-        placed.z_offset = v_mm
+        placed.z_offset = -v_mm
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -978,6 +1348,19 @@ class DraggableObjectItem(QGraphicsPathItem):
     # ── Drag feedback ─────────────────────────────────────────────
 
     def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            # Clamp the proposed scene position to the pane's scene rect
+            # so the object can't be flung off into empty space (where it
+            # becomes hard to retrieve). value is the candidate QPointF.
+            scene = self.scene()
+            if scene is not None:
+                sr = scene.sceneRect()
+                if sr.isValid() and not sr.isEmpty():
+                    x = min(max(value.x(), sr.left()), sr.right())
+                    y = min(max(value.y(), sr.top()), sr.bottom())
+                    if x != value.x() or y != value.y():
+                        return QPointF(x, y)
+            return value
         if (change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged
                 and not self._suppress_sync):
             h_mm = value.x() / self._scale
@@ -1152,13 +1535,27 @@ class InteractiveProjectionCanvas(ProjectionCanvas):
     object_moved = Signal(str, float, float)
     object_removed = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None):
-        panes = {
-            "XY": InteractiveProjectionPane("XY"),
-            "ZY": InteractiveProjectionPane("ZY"),
-            "XZ": InteractiveProjectionPane("XZ"),
-        }
-        super().__init__(scale_mode="well", panes=panes, parent=parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        layout_mode: str = "L",
+    ):
+        if layout_mode == "row":
+            panes = {
+                "XY": InteractiveProjectionPane("XY"),
+                "XZ": InteractiveProjectionPane("XZ"),
+                "YZ": InteractiveProjectionPane("YZ"),
+            }
+        else:
+            panes = {
+                "XY": InteractiveProjectionPane("XY"),
+                "ZY": InteractiveProjectionPane("ZY"),
+                "XZ": InteractiveProjectionPane("XZ"),
+            }
+        super().__init__(
+            scale_mode="well", panes=panes, parent=parent,
+            layout_mode=layout_mode,
+        )
 
         # Canonical placed-object list
         self._placed_objects: list[PlacedObject] = []
@@ -1192,6 +1589,8 @@ class InteractiveProjectionCanvas(ProjectionCanvas):
             x_mm, y_mm = h_mm, v_mm
         elif source_mode == "ZY":
             x_mm, y_mm = 0.0, v_mm
+        elif source_mode == "YZ":     # v7.5.1: h=Y, v=Z
+            x_mm, y_mm = 0.0, h_mm
         else:  # XZ
             x_mm, y_mm = h_mm, 0.0
 
@@ -1199,9 +1598,11 @@ class InteractiveProjectionCanvas(ProjectionCanvas):
         if placed is None:
             return
 
-        # If dropped into ZY, the h component is z_offset
+        # If dropped into a side view, the orthogonal axis becomes Z
         if source_mode == "ZY":
             placed.z_offset = h_mm
+        elif source_mode == "YZ":     # v7.5.1
+            placed.z_offset = v_mm
         elif source_mode == "XZ":
             placed.z_offset = v_mm
 
@@ -1259,5 +1660,13 @@ class InteractiveProjectionCanvas(ProjectionCanvas):
 
 
 def create_interactive_well_preview() -> InteractiveProjectionCanvas:
-    """Create an interactive well-scale canvas for object arrangement."""
+    """Create an interactive well-scale canvas for object arrangement
+    in the legacy L-shaped layout."""
     return InteractiveProjectionCanvas()
+
+
+def create_horizontal_well_preview() -> InteractiveProjectionCanvas:
+    """v7.5.1: Create an interactive well-scale canvas with the three
+    projections in a horizontal row (XY | XZ | YZ), pan + zoom locked
+    across panes."""
+    return InteractiveProjectionCanvas(layout_mode="row")

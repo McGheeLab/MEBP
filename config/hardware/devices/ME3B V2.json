@@ -1,7 +1,7 @@
 {
   "_format_version": "v7.4.2",
   "_description": "Device profile \u2014 physical-machine settings (safety envelope, motor feedrates, axis direction, axis mapping, stepper calibration). Edit on Hardware Setup \u2192 Device.",
-  "profile_name": "Conservative",
+  "profile_name": "ME3B V2",
   "notes": "",
   "safety_limits": {
     "xy_min_x": -100000.0,
@@ -22,11 +22,15 @@
     "enabled": true
   },
   "zp_stage": {
-    "max_feedrate": 1500.0,
-    "retract_feedrate": 800.0,
-    "insert_feedrate": 300.0,
-    "jog_feedrate": 400.0,
-    "auto_save_position": true
+    "max_feedrate": 200.0,
+    "retract_feedrate": 200.0,
+    "insert_feedrate": 200.0,
+    "jog_feedrate": 200.0,
+    "auto_save_position": true,
+    "max_feedrate_pct": 100.0,
+    "retract_feedrate_pct": 50.0,
+    "insert_feedrate_pct": 20.0,
+    "jog_feedrate_pct": 40.0
   },
   "axis_flip": {
     "z": false,
@@ -42,21 +46,21 @@
   },
   "steps_per_mm": {
     "Z": 5280,
-    "P1": 10138,
-    "P2": -563,
-    "P3": 5069
+    "P1": 10120,
+    "P2": -10120,
+    "P3": 5280
   },
   "per_axis_max_feedrate": {
-    "Z": 200,
-    "P1": 100,
-    "P2": 100,
-    "P3": 100
+    "Z": 500,
+    "P1": 200,
+    "P2": 200,
+    "P3": 200
   },
   "per_axis_max_accel": {
-    "Z": 50.0,
-    "P1": 500.0,
-    "P2": 500.0,
-    "P3": 500.0
+    "Z": 1000.0,
+    "P1": 1000.0,
+    "P2": 1000.0,
+    "P3": 1000.0
   },
   "xy_velocity_pct": 60,
   "xy_acceleration": 30,

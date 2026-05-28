@@ -2,10 +2,6 @@
   "version": "1.0",
   "objectives": [
     {
-      "name": "1x",
-      "nominal_magnification": 1.0
-    },
-    {
       "name": "2x",
       "nominal_magnification": 2.0
     },
@@ -20,14 +16,6 @@
     {
       "name": "20x",
       "nominal_magnification": 20.0
-    },
-    {
-      "name": "40x",
-      "nominal_magnification": 40.0
-    },
-    {
-      "name": "100x",
-      "nominal_magnification": 100.0
     }
   ],
   "camera_objective_calibrations": {

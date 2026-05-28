@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QComboBox, QDoubleSpinBox,
     QFrame, QSizePolicy, QMessageBox, QCheckBox,
-    QScrollArea, QTabWidget,
+    QScrollArea, QTabWidget, QSplitter, QListWidget, QListWidgetItem,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont
@@ -36,10 +36,28 @@ from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
 from gui.scaling import s, sf, sp, scaled_font_size
 
 try:
-    from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig
+    from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig, CameraRole
 except ImportError:
     HardwareConfig = None
     CameraConfig = None
+    CameraRole = None
+
+# v7.4.4: Two-camera needle aligner + edge-fit well locator
+try:
+    from SupportClasses.VisionDetector import (
+        TwoCameraNeedleAligner, TwoCameraEdgePicks, EdgeFitWellLocator,
+        select_well_fit_strategy, detect_rim_point_near_center,
+        fit_circle_to_points,
+    )
+    NEEDLE_LOCATION_AVAILABLE = True
+except ImportError:
+    NEEDLE_LOCATION_AVAILABLE = False
+    TwoCameraNeedleAligner = None
+    TwoCameraEdgePicks = None
+    EdgeFitWellLocator = None
+    select_well_fit_strategy = None
+    detect_rim_point_near_center = None
+    fit_circle_to_points = None
 
 # v7.3.4: Objective calibration persistence
 try:
@@ -651,7 +669,11 @@ class CalibrationPage(QWidget):
 
                   '_taught_third','_taught_third_z','_third_well',
 
-                  '_z_plane_result']:
+                  '_z_plane_result',
+
+                  # v7.4.4: new Z reference heights for the Needle
+                  # Offset Calibration tab.
+                  '_replace_z','_max_z','_plate_bottom_z']:
 
             if not hasattr(self, _a): setattr(self, _a, None)
 
@@ -682,6 +704,78 @@ class CalibrationPage(QWidget):
         positions = self._calibrated_positions or self._predicted_positions
         return self._plate, positions, getattr(self, '_safe_z', None)
 
+    def _wells_in_zero_ref(self) -> dict:
+        """v7.4.4: stage-µm well positions converted to zero-ref µm for
+        ``JogWorkspaceView``. Falls back to plate-geometry-only
+        predictions when no calibration has happened yet."""
+        positions = self._calibrated_positions or self._predicted_positions
+        if not positions:
+            # Geometry-only: centre the plate on the controller zero.
+            if self._plate is None or self.controller is None:
+                return {}
+            zero = self.controller.zero_position
+            cx = float(zero.get("x", 0.0))
+            cy = float(zero.get("y", 0.0))
+            try:
+                approx = self._plate.get_all_positions_from_plate_center(cx, cy)
+            except Exception:
+                return {}
+            return {
+                name: (wx - cx, wy - cy)
+                for name, (wx, wy) in approx.items()
+            }
+        if self.controller is None:
+            return {}
+        zero = self.controller.zero_position
+        zx = float(zero.get("x", 0.0))
+        zy = float(zero.get("y", 0.0))
+        return {
+            name: (wx - zx, wy - zy)
+            for name, (wx, wy) in positions.items()
+        }
+
+    def get_z_references(self) -> dict:
+        """v7.4.4: Return the five captured Z reference heights for
+        consumers outside the calibration page.
+
+        Keys (all values are mm, zero-referenced; missing = ``None``):
+
+        * ``replace_z``       — needle-swap clearance (highest)
+        * ``max_z``           — soft-limit ceiling
+        * ``fast_move_z``     — fast XY travel height (legacy ``safe_z``)
+        * ``plate_top_z``     — plate's top surface (legacy ``top_z``)
+        * ``plate_bottom_z``  — well floor (lowest)
+        """
+        return {
+            "replace_z":      getattr(self, "_replace_z", None),
+            "max_z":          getattr(self, "_max_z", None),
+            "fast_move_z":    getattr(self, "_safe_z", None),
+            "plate_top_z":    getattr(self, "_top_z", None),
+            "plate_bottom_z": getattr(self, "_plate_bottom_z", None),
+        }
+
+    def _refresh_ploc_view(self) -> None:
+        """v7.4.4: push the latest plate + well positions into the
+        shared XY workspace view on the Plate Location tab. No-op
+        when the view hasn't been built yet."""
+        view = getattr(self, "_ploc_plate_view", None)
+        if view is None:
+            return
+        if self._plate is not None and hasattr(view, "set_plate"):
+            view.set_plate(self._plate)
+        if hasattr(view, "set_well_positions"):
+            kind = "calibrated" if self._calibrated_positions else "approximate"
+            view.set_well_positions(self._wells_in_zero_ref(), kind)
+        if hasattr(view, "set_safety_limits"):
+            sl = getattr(self.controller, "safety_limits", None) if self.controller else None
+            if sl is not None:
+                view.set_safety_limits(sl)
+        hw = getattr(self, "_hardware_config", None)
+        needle = getattr(hw, "needle", None) if hw is not None else None
+        od = getattr(needle, "od_um", None) if needle is not None else None
+        if od and hasattr(view, "set_needle"):
+            view.set_needle(float(od))
+
     def _emit_calibration_data_changed(self):
         """v7.3.1: Notify listeners that calibration data has changed.
 
@@ -689,9 +783,26 @@ class CalibrationPage(QWidget):
         users never lose taught Safe Z / Top Z / 3-point positions just
         because they forgot to click the manual Save button.
         """
+        self._refresh_ploc_view()
         self.calibration_data_changed.emit()
         if self.settings is not None and hasattr(self, '_autosave_timer'):
             self._autosave_timer.start()
+        # v7.4.3: keep the reusable jog context panel's Hardware Info /
+        # Safe Z line in sync whenever calibration changes.
+        panel = getattr(self, "_jog_left_panel", None)
+        if panel is not None:
+            try:
+                panel.set_calibration_data(*self.get_calibration_data())
+            except Exception:
+                pass
+            # v7.4.4: also push the full Z reference set so the
+            # Hardware Info card reflects Replace / Max / Plate Top /
+            # Plate Bottom Z, not just Fast Move Z.
+            if hasattr(panel, "set_z_references"):
+                try:
+                    panel.set_z_references(self.get_z_references())
+                except Exception:
+                    pass
 
     def set_xy_position_scale(self, value: float):
         """Update the XY position scale factor."""
@@ -708,32 +819,71 @@ class CalibrationPage(QWidget):
         if config is None:
             return
 
-        # Auto-select plate format in context panel combo
-        if hasattr(config, 'plate_format') and config.plate_format:
-            fmt = config.plate_format
-            # Sync main plate_combo (if page has one)
-            if hasattr(self, 'plate_combo'):
+        # v7.4.5: use active_plate_key (str for custom, int for standard).
+        key = getattr(config, 'active_plate_key', None)
+        if key is None:
+            # Older configs without the new field — fall back to plate_format.
+            key = getattr(config, 'plate_format', None)
+        if key:
+            # Sync main plate_combo (only resolves for integer standards)
+            if hasattr(self, 'plate_combo') and isinstance(key, int):
                 for i in range(self.plate_combo.count()):
-                    if self.plate_combo.itemData(i) == fmt:
+                    if self.plate_combo.itemData(i) == key:
                         self.plate_combo.setCurrentIndex(i)
                         break
-            # Sync context panel plate combo
-            if hasattr(self, 'ctx_plate_combo'):
+            # Sync context panel plate combo (same, only for standards)
+            if hasattr(self, 'ctx_plate_combo') and isinstance(key, int):
                 for i in range(self.ctx_plate_combo.count()):
-                    if self.ctx_plate_combo.itemData(i) == fmt:
+                    if self.ctx_plate_combo.itemData(i) == key:
                         if self.ctx_plate_combo.currentIndex() != i:
                             self.ctx_plate_combo.setCurrentIndex(i)
                         break
-            # Rebuild the plate model directly so calibration always matches HW config
-            self._plate = WellPlate.from_format(fmt)
-            defn = PLATE_DEFINITIONS[fmt]
-            rows, cols = defn["rows"], defn["cols"]
+            # Rebuild the plate model via the new polymorphic loader.
+            try:
+                self._plate = WellPlate.load(key)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load plate '{key}': {e}; "
+                    f"falling back to 24-well")
+                self._plate = WellPlate.from_format(24)
+            rows, cols = self._plate.rows, self._plate.cols
             self._corner_well = f"{chr(ord('A') + rows - 1)}{cols}"
             if hasattr(self, 'val_well_combo'):
                 wells = self._plate.well_names
                 self.val_well_combo.clear()
                 self.val_well_combo.addItems(wells)
-            logger.info(f"Calibration: plate format synced to {fmt}-well from HardwareConfig")
+            # v7.4.4: build a geometry-only predicted-positions map
+            # centered on the controller zero so the workspace view
+            # (and the Jog page, via set_calibration_data) immediately
+            # shows the correct number of wells in roughly the right
+            # spot even before any real calibration has happened. The
+            # calibration flow will replace these with the
+            # affine-fitted positions later.
+            #
+            # If saved calibrated positions exist but belong to a
+            # different plate format (user switched 96 → 24 in
+            # Hardware Setup, for example), they are stale and must
+            # be cleared so they don't bleed into the new workspace.
+            new_well_names = set(self._plate.well_names)
+            if self._calibrated_positions:
+                cal_names = set(self._calibrated_positions.keys())
+                if not cal_names.issubset(new_well_names) or not new_well_names.issubset(cal_names):
+                    logger.info(
+                        "Clearing calibrated positions — they belong to a "
+                        "different plate format than the current hardware "
+                        f"config ({len(cal_names)} wells vs {len(new_well_names)})."
+                    )
+                    self._calibrated_positions = None
+            if self.controller is not None:
+                try:
+                    zero = self.controller.zero_position
+                    cx = float(zero.get("x", 0.0))
+                    cy = float(zero.get("y", 0.0))
+                    self._predicted_positions = (
+                        self._plate.get_all_positions_from_plate_center(cx, cy))
+                except Exception as e:
+                    logger.debug(f"geometry-only well prediction skipped: {e}")
+            logger.info(f"Calibration: plate synced to {key} from HardwareConfig")
 
         # Show needle info in calibration context panel
         if hasattr(config, 'needle') and config.needle:
@@ -768,6 +918,38 @@ class CalibrationPage(QWidget):
         for cam_idx in range(len(obj_combos)):
             self._ctx_update_um_px_display(cam_idx)
 
+        # v7.4.4: refresh the Needle Location tab — the new role
+        # assignments may have changed which cameras to mount.
+        if hasattr(self, '_needle_loc_cam_slots'):
+            try:
+                self._needle_loc_refresh_cameras()
+            except Exception as e:
+                logger.debug(f"_needle_loc_refresh_cameras skipped: {e}")
+
+        # v7.4.4: keep the shared XY workspace view in sync with the
+        # latest plate / needle / safety envelope.
+        try:
+            self._refresh_ploc_view()
+        except Exception:
+            pass
+
+        # v7.4.3: forward into the reusable standard jog context panel
+        panel = getattr(self, "_jog_left_panel", None)
+        if panel is not None:
+            try:
+                panel.set_hardware_config(config)
+            except Exception:
+                pass
+
+        # v7.4.4: a fresh plate (or just-rebuilt predicted positions)
+        # must be broadcast via ``calibration_data_changed`` so the Jog
+        # page swaps out the stale ``load_startup_plate`` wells. Without
+        # this emit, switching plate formats in Hardware Setup left the
+        # workspace canvas showing the old (or settings-default) plate.
+        try:
+            self._emit_calibration_data_changed()
+        except Exception as e:
+            logger.debug(f"calibration_data_changed emit skipped: {e}")
 
 
     # ════════════════════════════════════════════════════════════════
@@ -780,72 +962,1463 @@ class CalibrationPage(QWidget):
     # the right context panel, exposed via ``get_right_context_widget``.
 
     def get_context_widget(self) -> QWidget:
-        """Left context panel — jog stages with safety limits ON.
+        """Left context panel — the project's standard reusable jog panel.
 
-        Same look/feel as Hardware Setup's left panel but with the
-        Connect Hardware section hidden (connect happens on Hardware
-        Setup) and ``bypass_safety=False`` so jogs respect the
-        recorded soft-limit envelope.
+        v7.4.3: switched from a bare ``HardwareControlPanel`` to
+        :class:`StandardJogContextPanel`, which keeps the same jog UI
+        (safety limits engaged) and adds the Quick Actions, Absolute
+        Go To, and Hardware Info sections. The same panel is reused on
+        the Jog page so users learn one jog UI.
         """
         if not hasattr(self, "_jog_left_panel") or self._jog_left_panel is None:
-            from gui.pages.hardware.control_panel import HardwareControlPanel
-            panel = HardwareControlPanel(
-                show_connect=False, bypass_safety=False)
+            from gui.widgets.standard_jog_context import StandardJogContextPanel
             ctrl = getattr(self, "controller", None)
-            if ctrl is not None:
-                panel.set_controller(ctrl)
+            settings = getattr(self, "settings", None)
+            panel = StandardJogContextPanel(
+                controller=ctrl,
+                settings=settings,
+                show_connect=False,
+                bypass_safety=False,
+            )
+            # Push any hardware config or calibration data that already
+            # arrived before the panel was instantiated.
+            hw = getattr(self, "_hardware_config", None)
+            if hw is not None:
+                panel.set_hardware_config(hw)
+            try:
+                panel.set_calibration_data(*self.get_calibration_data())
+            except Exception:
+                pass
+            # v7.4.4: push the full Z reference set on first build.
+            if hasattr(panel, "set_z_references"):
+                try:
+                    panel.set_z_references(self.get_z_references())
+                except Exception:
+                    pass
             self._jog_left_panel = panel
         return self._jog_left_panel
 
     def get_right_context_title(self) -> str:
-        return "Calibration"
+        return ""
 
-    def get_right_context_widget(self) -> QWidget:
-        """Right context panel — tabbed Camera / Needle / Plate views."""
-        if self._right_context_widget is not None:
-            return self._right_context_widget
-        tabs = QTabWidget()
-        tabs.setObjectName("calibrationRightTabs")
+    def get_right_context_widget(self) -> QWidget | None:
+        """v7.4.4: right context retired. The four workflow tabs
+        (Needle Location / Z-Offset / Plate Location / Custom) live in
+        the main page area now, so returning None tells app.py not to
+        mount a right column for this page."""
+        return None
 
-        # Tab 1: Camera Setup
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.4: Custom (freeform) tab — wraps the v7.4.2 sub-tabs so
+    #  nothing the user could do before disappears.
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_custom_tab(self) -> QWidget:
+        """Build the Custom tab: the live multi-camera grid plus the
+        v7.4.2 Camera Setup / Full Wizard / Plate Calibration sections
+        nested as sub-tabs so power users keep full access while the
+        new workflow tabs handle the common jobs."""
+        outer = QWidget()
+        outer_lay = QVBoxLayout(outer)
+        outer_lay.setContentsMargins(s(6), s(6), s(6), s(6))
+        outer_lay.setSpacing(s(6))
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(s(4))
+
+        # Left side: the legacy multi-camera grid (relocated from the
+        # main page area). The grid widget was built in _setup_ui but
+        # left parentless — adopting it here gives the Custom tab the
+        # live view today's users expect.
+        cam_card = QFrame()
+        cam_card.setObjectName("cardFrame")
+        cam_lay = QVBoxLayout(cam_card)
+        cam_lay.setContentsMargins(s(4), s(4), s(4), s(4))
+        cam_lay.setSpacing(s(2))
+        if hasattr(self, '_cam_grid_widget'):
+            cam_lay.addWidget(self._cam_grid_widget, stretch=1)
+        splitter.addWidget(cam_card)
+
+        # Right side: control sub-tabs (Camera Setup / Full Wizard /
+        # Plate Calibration). These are the v7.4.2 builders, which
+        # are stateful and run once.
+        sub_tabs = QTabWidget()
+        sub_tabs.setObjectName("calibrationCustomSubTabs")
+
         cam_tab = QWidget()
-        cam_lay = QVBoxLayout(cam_tab)
-        cam_lay.setContentsMargins(s(10), s(10), s(10), s(10))
-        cam_lay.setSpacing(s(6))
-        # Build the camera container into the cam tab. We reuse the
-        # same builders as the legacy context — they're stateful (they
-        # populate self._ctx_cam_* lists) so they need to run once.
-        self._build_camera_tab_content(cam_lay)
-        cam_lay.addStretch(1)
-        tabs.addTab(cam_tab, "Camera Setup")
+        cam_tab_lay = QVBoxLayout(cam_tab)
+        cam_tab_lay.setContentsMargins(s(10), s(10), s(10), s(10))
+        cam_tab_lay.setSpacing(s(6))
+        self._build_camera_tab_content(cam_tab_lay)
+        cam_tab_lay.addStretch(1)
+        sub_tabs.addTab(cam_tab, "Camera Setup")
 
-        # Tab 2: Needle Calibration
         needle_tab = QWidget()
         needle_lay = QVBoxLayout(needle_tab)
         needle_lay.setContentsMargins(s(10), s(10), s(10), s(10))
         needle_lay.setSpacing(s(6))
         self._build_needle_tab_content(needle_lay)
         needle_lay.addStretch(1)
-        tabs.addTab(needle_tab, "Needle Calibration")
+        sub_tabs.addTab(needle_tab, "Full Wizard")
 
-        # Tab 3: Plate Calibration
         plate_tab = QWidget()
         plate_lay = QVBoxLayout(plate_tab)
         plate_lay.setContentsMargins(s(10), s(10), s(10), s(10))
         plate_lay.setSpacing(s(6))
         self._build_plate_tab_content(plate_lay)
         plate_lay.addStretch(1)
-        tabs.addTab(plate_tab, "Plate Calibration")
+        sub_tabs.addTab(plate_tab, "Plate Calibration")
 
-        self._right_context_widget = tabs
-        # Trigger initial calibration load now that all per-tab
-        # widgets exist (the legacy build did this at the end of
-        # the function).
+        splitter.addWidget(sub_tabs)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer_lay.addWidget(splitter, stretch=1)
+        return outer
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.4: Needle Location tab — dual-camera edge-click workflow
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_needle_location_tab(self) -> QWidget:
+        """Workflow tab: pick needle edges in two side cameras, then
+        recenter so the needle sits at the optical center of both.
+
+        Saves the resulting stage position as ``needle_origin_um`` —
+        the workspace reference that travels across plate loadouts.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(s(8), s(8), s(8), s(8))
+        outer.setSpacing(s(6))
+
+        # Persistent edge-pick state for this tab.
+        if NEEDLE_LOCATION_AVAILABLE:
+            self._needle_loc_picks = TwoCameraEdgePicks()
+        else:
+            self._needle_loc_picks = None
+        # 0 = waiting for x_left, 1 = x_right, 2 = y_left, 3 = y_right, 4 = ready
+        self._needle_loc_step = 0
+        self._needle_loc_views: list = []  # [x_view, y_view]
+
+        # ── Status banner ────────────────────────────────────────
+        self._needle_loc_banner = QLabel()
+        self._needle_loc_banner.setWordWrap(True)
+        self._needle_loc_banner.setStyleSheet(
+            f"background-color: {COLORS['surface0']}; "
+            f"color: {COLORS['text']}; padding: {sp(8)}; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+        outer.addWidget(self._needle_loc_banner)
+
+        # ── Splitter: cameras (top) / wizard steps (bottom) ──────
+        splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(s(4))
+
+        # Camera tiles row (a horizontal splitter inside the vertical one).
+        cam_row_wrap = QWidget()
+        cam_row = QHBoxLayout(cam_row_wrap)
+        cam_row.setContentsMargins(0, 0, 0, 0)
+        cam_row.setSpacing(s(6))
+        cam_splitter = QSplitter(Qt.Horizontal)
+        cam_splitter.setChildrenCollapsible(False)
+        cam_splitter.setHandleWidth(s(4))
+        # Two slots — they get filled by _needle_loc_refresh_cameras() once
+        # the user assigns roles in Hardware Setup → Cameras.
+        self._needle_loc_cam_slots = [QWidget(), QWidget()]
+        for i, slot in enumerate(self._needle_loc_cam_slots):
+            lay = QVBoxLayout(slot)
+            lay.setContentsMargins(0, 0, 0, 0)
+            label = QLabel(
+                f"<b>{'X-view' if i == 0 else 'Y-view'}</b>"
+            )
+            label.setStyleSheet(f"color: {COLORS['blue']};")
+            lay.addWidget(label)
+            placeholder = QLabel(
+                "No camera assigned.\n"
+                "Set role in Hardware Setup → Cameras."
+            )
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet(
+                f"background-color: #181825; "
+                f"color: {COLORS['subtext0']}; "
+                f"border: 1px solid {COLORS['surface1']}; "
+                f"min-height: {sp(180)}; padding: {sp(12)};")
+            lay.addWidget(placeholder, stretch=1)
+            slot.setProperty("_placeholder", placeholder)
+            slot.setProperty("_feed_view", None)
+            cam_splitter.addWidget(slot)
+        cam_row.addWidget(cam_splitter, stretch=1)
+        splitter.addWidget(cam_row_wrap)
+
+        # Wizard panel.
+        wiz_panel = QWidget()
+        wiz_lay = QVBoxLayout(wiz_panel)
+        wiz_lay.setContentsMargins(s(4), s(4), s(4), s(4))
+        wiz_lay.setSpacing(s(6))
+
+        self._needle_loc_step_label = QLabel()
+        self._needle_loc_step_label.setStyleSheet(
+            f"font-weight: 600; color: {COLORS['text']};")
+        wiz_lay.addWidget(self._needle_loc_step_label)
+
+        # Pick status table — four rows.
+        self._needle_loc_pick_labels: dict[str, QLabel] = {}
+        pick_grid = QGridLayout()
+        pick_grid.setHorizontalSpacing(s(8))
+        pick_grid.setVerticalSpacing(s(4))
+        for row, (key, label) in enumerate([
+            ("x_left", "X-view left edge:"),
+            ("x_right", "X-view right edge:"),
+            ("y_left", "Y-view left edge:"),
+            ("y_right", "Y-view right edge:"),
+        ]):
+            pick_grid.addWidget(QLabel(label), row, 0)
+            v = QLabel("—")
+            v.setStyleSheet(f"color: {COLORS['subtext0']};")
+            self._needle_loc_pick_labels[key] = v
+            pick_grid.addWidget(v, row, 1)
+        wiz_lay.addLayout(pick_grid)
+
+        # Computed offset preview.
+        self._needle_loc_offset_label = QLabel("Offset preview: —")
+        self._needle_loc_offset_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-style: italic;")
+        wiz_lay.addWidget(self._needle_loc_offset_label)
+
+        # Action buttons.
+        action_row = QHBoxLayout()
+        self._needle_loc_btn_reset = QPushButton("Reset picks")
+        self._needle_loc_btn_reset.clicked.connect(self._needle_loc_reset)
+        action_row.addWidget(self._needle_loc_btn_reset)
+        action_row.addStretch()
+        self._needle_loc_btn_center = QPushButton("Center & Save needle origin")
+        self._needle_loc_btn_center.setObjectName("accentBtn")
+        self._needle_loc_btn_center.setEnabled(False)
+        self._needle_loc_btn_center.clicked.connect(
+            self._needle_loc_center_and_save)
+        action_row.addWidget(self._needle_loc_btn_center)
+        wiz_lay.addLayout(action_row)
+
+        # Last saved origin.
+        self._needle_loc_origin_label = QLabel("needle_origin_um: not set")
+        self._needle_loc_origin_label.setStyleSheet(
+            f"color: {COLORS['subtext0']}; padding-top: {sp(6)};")
+        wiz_lay.addWidget(self._needle_loc_origin_label)
+
+        splitter.addWidget(wiz_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, stretch=1)
+
+        # Initial UI state.
+        self._needle_loc_refresh_cameras()
+        self._needle_loc_update_ui()
+        return page
+
+    def _needle_loc_refresh_cameras(self) -> None:
+        """Mount the cameras for NEEDLE_X / NEEDLE_Y roles into the
+        Needle Location tab slots, or show the placeholder if a role
+        is missing."""
+        if CameraRole is None or not hasattr(self, '_needle_loc_cam_slots'):
+            return
+        hw = getattr(self, '_hardware_config', None)
+        roles_ok = True
+        for slot_idx, role in enumerate(
+            [CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y]
+        ):
+            slot = self._needle_loc_cam_slots[slot_idx]
+            placeholder = slot.property("_placeholder")
+            old_feed = slot.property("_feed_view")
+            cam_idx = hw.camera_for_role(role) if hw is not None else None
+            if cam_idx is None or self._camera_manager is None:
+                roles_ok = False
+                if old_feed is not None:
+                    old_feed.setVisible(False)
+                if placeholder is not None:
+                    placeholder.setVisible(True)
+                continue
+            # Build (or rebind) a fresh CameraFeedView.
+            if old_feed is not None:
+                try:
+                    old_feed.set_camera(cam_idx)
+                    old_feed.setVisible(True)
+                    if placeholder is not None:
+                        placeholder.setVisible(False)
+                    continue
+                except Exception:
+                    pass
+            try:
+                from gui.widgets.camera_feed_view import CameraFeedView
+                fv = CameraFeedView(
+                    camera_manager=self._camera_manager,
+                    cam_idx=cam_idx,
+                    show_crosshair=True,
+                    label=f"Camera {cam_idx + 1}",
+                    parent=slot,
+                )
+                fv.clicked.connect(
+                    lambda px, py, role_=role: self._needle_loc_on_click(role_, px, py)
+                )
+                slot.layout().addWidget(fv, stretch=1)
+                slot.setProperty("_feed_view", fv)
+                if placeholder is not None:
+                    placeholder.setVisible(False)
+            except Exception as e:
+                logger.warning(f"NeedleLocation: failed to mount cam {cam_idx}: {e}")
+                roles_ok = False
+        if not roles_ok:
+            self._needle_loc_banner.setText(
+                "Assign Needle X-view and Needle Y-view roles to two "
+                "live cameras in Hardware Setup → Cameras to enable "
+                "this workflow."
+            )
+            self._needle_loc_banner.setStyleSheet(
+                f"background-color: {COLORS['surface0']}; "
+                f"color: {COLORS['yellow']}; padding: {sp(8)}; "
+                f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+        else:
+            self._needle_loc_banner.setText(
+                "Step 1 of 4: bring the needle into both camera views using "
+                "the jog controls on the left. Then click the needle's left "
+                "and right edges in the X-view, then the Y-view."
+            )
+            self._needle_loc_banner.setStyleSheet(
+                f"background-color: {COLORS['surface0']}; "
+                f"color: {COLORS['text']}; padding: {sp(8)}; "
+                f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+
+    def _needle_loc_on_click(
+        self, role: "CameraRole", px: float, py: float
+    ) -> None:
+        """Route a camera-feed click into the current edge-pick step."""
+        if self._needle_loc_picks is None:
+            return
+        step = self._needle_loc_step
+        if role == CameraRole.NEEDLE_X:
+            if step == 0:
+                self._needle_loc_picks.x_view_left_px = px
+                self._needle_loc_step = 1
+            elif step == 1:
+                self._needle_loc_picks.x_view_right_px = px
+                self._needle_loc_step = 2
+        elif role == CameraRole.NEEDLE_Y:
+            if step == 2:
+                self._needle_loc_picks.y_view_left_px = px
+                self._needle_loc_step = 3
+            elif step == 3:
+                self._needle_loc_picks.y_view_right_px = px
+                self._needle_loc_step = 4
+        self._needle_loc_update_ui()
+
+    def _needle_loc_reset(self) -> None:
+        if self._needle_loc_picks is None:
+            return
+        self._needle_loc_picks = TwoCameraEdgePicks()
+        self._needle_loc_step = 0
+        self._needle_loc_update_ui()
+
+    def _needle_loc_update_ui(self) -> None:
+        if self._needle_loc_picks is None:
+            return
+        picks = self._needle_loc_picks
+        labels = self._needle_loc_pick_labels
+
+        def _fmt(v):
+            return f"{v:.1f} px" if v is not None else "—"
+
+        labels["x_left"].setText(_fmt(picks.x_view_left_px))
+        labels["x_right"].setText(_fmt(picks.x_view_right_px))
+        labels["y_left"].setText(_fmt(picks.y_view_left_px))
+        labels["y_right"].setText(_fmt(picks.y_view_right_px))
+
+        step_texts = [
+            "Click LEFT edge of needle in X-view",
+            "Click RIGHT edge of needle in X-view",
+            "Click LEFT edge of needle in Y-view",
+            "Click RIGHT edge of needle in Y-view",
+            "All edges picked — review then click Center & Save",
+        ]
+        self._needle_loc_step_label.setText(
+            f"Step {min(self._needle_loc_step + 1, 4)} / 4: "
+            f"{step_texts[self._needle_loc_step]}"
+        )
+
+        # Preview offset if everything is picked and we have µm/px.
+        ready = picks.complete()
+        self._needle_loc_btn_center.setEnabled(ready)
+        if ready:
+            try:
+                dx, dy = self._needle_loc_compute_offset_um()
+                self._needle_loc_offset_label.setText(
+                    f"Offset preview: ΔX = {dx:+.1f} µm, ΔY = {dy:+.1f} µm"
+                )
+            except Exception as e:
+                self._needle_loc_offset_label.setText(
+                    f"Offset preview: cannot compute ({e})"
+                )
+        else:
+            self._needle_loc_offset_label.setText("Offset preview: —")
+
+    def _needle_loc_camera_info(
+        self, role: "CameraRole"
+    ) -> tuple[float, int] | None:
+        """Return (um_per_px, frame_width_px) for the camera with `role`,
+        or None if unresolvable."""
+        if CameraRole is None or self._camera_manager is None:
+            return None
+        hw = getattr(self, '_hardware_config', None)
+        if hw is None:
+            return None
+        cam_idx = hw.camera_for_role(role)
+        if cam_idx is None:
+            return None
         try:
-            self._load_calibration()
+            cam = self._camera_manager.cameras[cam_idx]
+        except (AttributeError, IndexError):
+            return None
+        um_per_px = float(getattr(cam, "_um_per_px", 0.0) or 0.0)
+        # Best-effort frame width: prefer last captured frame size.
+        frame = None
+        try:
+            frame = cam.get_current_frame()
+        except Exception:
+            frame = None
+        if frame is not None and frame.ndim >= 2:
+            frame_w = int(frame.shape[1])
+        else:
+            frame_w = 0
+        if um_per_px <= 0 or frame_w <= 0:
+            return None
+        return um_per_px, frame_w
+
+    def _needle_loc_compute_offset_um(self) -> tuple[float, float]:
+        """Run the two-camera aligner; raises ValueError if not ready."""
+        if not NEEDLE_LOCATION_AVAILABLE or self._needle_loc_picks is None:
+            raise ValueError("NeedleLocation: aligner unavailable")
+        x_info = self._needle_loc_camera_info(CameraRole.NEEDLE_X)
+        y_info = self._needle_loc_camera_info(CameraRole.NEEDLE_Y)
+        if x_info is None or y_info is None:
+            raise ValueError("camera µm/px or frame size not available")
+        aligner = TwoCameraNeedleAligner(
+            um_per_px_x_view=x_info[0],
+            um_per_px_y_view=y_info[0],
+            frame_width_x_view=x_info[1],
+            frame_width_y_view=y_info[1],
+        )
+        return aligner.offset_from_edge_clicks(self._needle_loc_picks)
+
+    def _needle_loc_center_and_save(self) -> None:
+        """Drive the stage to recenter the needle, then save
+        ``needle_origin_um`` as the current stage position."""
+        if not NEEDLE_LOCATION_AVAILABLE:
+            return
+        try:
+            dx_um, dy_um = self._needle_loc_compute_offset_um()
         except Exception as e:
-            logger.debug(f"Initial calibration load skipped: {e}")
-        return tabs
+            QMessageBox.warning(
+                self, "Needle Location",
+                f"Cannot compute offset: {e}")
+            return
+
+        if self.controller is None:
+            QMessageBox.warning(
+                self, "Needle Location",
+                "Stage controller not connected.")
+            return
+
+        try:
+            self.controller.move_xy_relative_um(dx_um, dy_um)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Needle Location",
+                f"Move failed: {e}")
+            return
+
+        # Capture the post-move stage XY as the needle origin.
+        try:
+            xy = self.controller.get_xy_position(cached=False)
+        except Exception:
+            xy = (None, None)
+        if xy and xy[0] is not None:
+            zero = self.controller.zero_position
+            origin_x_um = stage_to_um(xy[0] - zero.get("x", 0))
+            origin_y_um = stage_to_um(xy[1] - zero.get("y", 0))
+            self._needle_origin_um = (origin_x_um, origin_y_um)
+            self._needle_loc_origin_label.setText(
+                f"needle_origin_um: ({origin_x_um:.1f}, {origin_y_um:.1f}) µm"
+            )
+            self._needle_loc_origin_label.setStyleSheet(
+                f"color: {COLORS['green']}; padding-top: {sp(6)};")
+            try:
+                self._emit_calibration_data_changed()
+            except Exception:
+                pass
+
+        # Reset for the next iteration.
+        self._needle_loc_reset()
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.4: Needle Offset Calibration tab — rehouses Z handlers
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_z_offset_tab(self) -> QWidget:
+        """Workflow tab: capture Safe Z + Top Z and run the focus-peak
+        Z-bottom auto-cal. Wires the existing v7.4.2 handlers so the
+        math is unchanged — only the host is."""
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(s(10), s(10), s(10), s(10))
+        outer.setSpacing(s(8))
+
+        intro = QLabel(
+            "Needle offset calibration anchors the needle's vertical "
+            "travel. Capture Safe Z (travel height), Top Z (plate "
+            "surface), then run the focus-based Z-bottom search to "
+            "find each well's bottom."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {COLORS['subtext0']};")
+        outer.addWidget(intro)
+
+        # ── Reference Z heights (top → bottom) ───────────────────
+        # v7.4.4: five Z reference heights captured by "set current Z"
+        # buttons, ordered from highest (Replace) to lowest (Plate
+        # Bottom). Each button captures the current Z relative to the
+        # stage zero; the label updates with the saved value.
+        z_group = QGroupBox("Reference Z heights (top → bottom)")
+        z_grid = QGridLayout(z_group)
+        z_grid.setHorizontalSpacing(s(8))
+        z_grid.setVerticalSpacing(s(6))
+
+        z_rows = [
+            # (button_label, tooltip, handler, label_attr, label_prefix)
+            ("Set Replace Z",
+             "Needle-swap clearance — highest safe Z when changing "
+             "the needle. Set with stage at the position you use "
+             "for replacing the needle.",
+             self._zoff_set_replace_z, "_zoff_lbl_replace_z", "Replace Z"),
+            ("Set Max Z",
+             "Soft-limit ceiling — the highest Z the stage may "
+             "travel to during normal motion.",
+             self._zoff_set_max_z, "_zoff_lbl_max_z", "Max Z"),
+            ("Set Fast Move Z",
+             "Travel height for fast XY moves between wells "
+             "(retract before XY, return below afterward).",
+             self._zoff_set_safe_z, "_zoff_lbl_safe_z", "Fast Move Z"),
+            ("Set Plate Top Z",
+             "Plate's top surface — first contact with the plate "
+             "from above.",
+             self._zoff_set_top_z, "_zoff_lbl_top_z", "Plate Top Z"),
+            ("Set Plate Bottom Z",
+             "Well floor — needle just touching the bottom of a "
+             "calibrated well.",
+             self._zoff_set_plate_bottom_z, "_zoff_lbl_plate_bottom_z",
+             "Plate Bottom Z"),
+        ]
+        for row, (btn_label, tooltip, handler, lbl_attr, prefix) in enumerate(z_rows):
+            btn = QPushButton(btn_label)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(handler)
+            z_grid.addWidget(btn, row, 0)
+            lbl = QLabel(f"{prefix}: —")
+            lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
+            z_grid.addWidget(lbl, row, 1)
+            setattr(self, lbl_attr, lbl)
+
+        outer.addWidget(z_group)
+
+        # ── Quick actions powered by the captured heights ────────
+        actions_group = QGroupBox("Quick actions")
+        actions_lay = QHBoxLayout(actions_group)
+        actions_lay.setSpacing(s(8))
+        btn_goto_replace = QPushButton("Go to Replace Z")
+        btn_goto_replace.setToolTip(
+            "Retract Z to the captured Replace Z (needle-swap height). "
+            "XY stays put.")
+        btn_goto_replace.clicked.connect(self._zoff_goto_replace_z)
+        actions_lay.addWidget(btn_goto_replace)
+        actions_lay.addStretch()
+        outer.addWidget(actions_group)
+
+        # ── Z-bottom auto-calibration ────────────────────────────
+        z_auto_group = QGroupBox("Z-bottom auto-calibration")
+        z_auto_lay = QVBoxLayout(z_auto_group)
+        z_auto_info = QLabel(
+            "Visits three calibrated wells and walks Z toward the "
+            "well bottom by maximizing focus. Requires a finished "
+            "Plate Location (XY map) first."
+        )
+        z_auto_info.setWordWrap(True)
+        z_auto_info.setStyleSheet(f"color: {COLORS['subtext0']};")
+        z_auto_lay.addWidget(z_auto_info)
+        z_auto_btn_row = QHBoxLayout()
+        btn_run_z = QPushButton("Run Z-Bottom Auto-Cal")
+        btn_run_z.setObjectName("accentBtn")
+        btn_run_z.clicked.connect(self._start_auto_z_cal)
+        z_auto_btn_row.addWidget(btn_run_z)
+        z_auto_btn_row.addStretch()
+        z_auto_lay.addLayout(z_auto_btn_row)
+        outer.addWidget(z_auto_group)
+
+        # ── Pointer to power-user features ───────────────────────
+        manual_note = QLabel(
+            "For per-well manual Z teach, edge-finding, and Z-plane "
+            "tilt fit, open <b>Custom → Full Wizard</b>."
+        )
+        manual_note.setWordWrap(True)
+        manual_note.setStyleSheet(
+            f"color: {COLORS['subtext0']}; padding: {sp(6)}; "
+            f"background-color: {COLORS['surface0']}; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+        outer.addWidget(manual_note)
+
+        outer.addStretch(1)
+        return page
+
+    # ── v7.4.4: Z reference setters ──────────────────────────────
+    #
+    # The existing wizard uses ``_safe_z`` (Fast Move Z) and ``_top_z``
+    # (Plate Top Z) — those internals stay so the rest of the pipeline
+    # (safe-travel logic, soft limits, etc.) keeps working. The three
+    # new heights (Replace Z, Max Z, Plate Bottom Z) get fresh
+    # attributes plus a shared capture helper.
+
+    def _zoff_capture_current_z(self) -> float | None:
+        """Read the current stage Z (mm, zero-referenced) or None."""
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return None
+        zp = ctrl.get_zp_position(cached=False)
+        z_val = ctrl.zp_logical_value(zp, "Z") if zp else None
+        if z_val is None:
+            return None
+        return z_val - ctrl.zero_position.get("Z", 0)
+
+    def _zoff_set_safe_z(self) -> None:
+        """Fast Move Z setter — delegates to the legacy ``_set_safe_z``
+        so soft-limit / safe-travel callers keep using ``self._safe_z``.
+        """
+        self._set_safe_z()
+        if getattr(self, '_safe_z', None) is not None:
+            self._zoff_lbl_safe_z.setText(
+                f"Fast Move Z: {self._safe_z:.2f} mm")
+            self._zoff_lbl_safe_z.setStyleSheet(f"color: {COLORS['green']};")
+
+    def _zoff_set_top_z(self) -> None:
+        """Plate Top Z setter — delegates to legacy ``_set_top_z``."""
+        self._set_top_z()
+        if getattr(self, '_top_z', None) is not None:
+            self._zoff_lbl_top_z.setText(
+                f"Plate Top Z: {self._top_z:.2f} mm")
+            self._zoff_lbl_top_z.setStyleSheet(f"color: {COLORS['green']};")
+
+    def _zoff_set_replace_z(self) -> None:
+        """Replace Z setter — needle-swap clearance height."""
+        z = self._zoff_capture_current_z()
+        if z is None:
+            return
+        self._replace_z = z
+        self._zoff_lbl_replace_z.setText(f"Replace Z: {z:.2f} mm")
+        self._zoff_lbl_replace_z.setStyleSheet(f"color: {COLORS['green']};")
+        logger.info(f"Replace Z set: {z:.2f} mm")
+        self._emit_calibration_data_changed()
+
+    def _zoff_set_max_z(self) -> None:
+        """Max Z setter — pushes into ``controller.safety_limits.z_max``
+        so the soft-limit envelope enforces the ceiling immediately."""
+        z = self._zoff_capture_current_z()
+        if z is None:
+            return
+        self._max_z = z
+        self._zoff_lbl_max_z.setText(f"Max Z: {z:.2f} mm")
+        self._zoff_lbl_max_z.setStyleSheet(f"color: {COLORS['green']};")
+        # Update the live safety envelope.
+        sl = getattr(self.controller, "safety_limits", None) if self.controller else None
+        if sl is not None:
+            try:
+                sl.set_z_from_current(z, as_max=True)
+            except Exception as e:
+                logger.warning(f"safety_limits.set_z_from_current(max) failed: {e}")
+        logger.info(f"Max Z set: {z:.2f} mm")
+        self._emit_calibration_data_changed()
+
+    def _zoff_set_plate_bottom_z(self) -> None:
+        """Plate Bottom Z setter — pushes into
+        ``controller.safety_limits.z_min`` so the lower envelope stops
+        the stage from crashing into the well floor."""
+        z = self._zoff_capture_current_z()
+        if z is None:
+            return
+        self._plate_bottom_z = z
+        self._zoff_lbl_plate_bottom_z.setText(f"Plate Bottom Z: {z:.2f} mm")
+        self._zoff_lbl_plate_bottom_z.setStyleSheet(
+            f"color: {COLORS['green']};")
+        sl = getattr(self.controller, "safety_limits", None) if self.controller else None
+        if sl is not None:
+            try:
+                sl.set_z_from_current(z, as_max=False)
+            except Exception as e:
+                logger.warning(f"safety_limits.set_z_from_current(min) failed: {e}")
+        logger.info(f"Plate Bottom Z set: {z:.2f} mm")
+        self._emit_calibration_data_changed()
+
+    def _zoff_goto_replace_z(self) -> None:
+        """Drive Z to the captured Replace Z for needle swapping.
+
+        Disabled when Replace Z hasn't been set yet. Uses an absolute
+        Z move; XY stays put.
+        """
+        if self.controller is None:
+            return
+        z = getattr(self, "_replace_z", None)
+        if z is None:
+            QMessageBox.information(
+                self, "Replace Z",
+                "Replace Z has not been captured yet. Jog Z to the "
+                "needle-swap height and press 'Set Replace Z' first.")
+            return
+        try:
+            self.controller.move_z_absolute(z, from_zero_ref=True)
+            logger.info(f"Moved to Replace Z: {z:.2f} mm")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Replace Z",
+                f"Move to Replace Z failed: {e}")
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.4.4: Plate Location tab — click-snap N-well XY map workflow
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_plate_location_tab(self) -> QWidget:
+        """Workflow tab: user clicks N>3 wells on the plate view, the
+        system visits each and fits the known-radius well edge to
+        refine the XY affine map."""
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(s(8), s(8), s(8), s(8))
+        outer.setSpacing(s(6))
+
+        # ── Status banner ────────────────────────────────────────
+        self._ploc_banner = QLabel(
+            "Use the Free/Snap toggle (top-left of the plate view) to "
+            "choose how clicks enqueue targets. Snap = click wells "
+            "(auto edge-fit on Run). Free = click anywhere to drop a "
+            "freeform point (Run drives there, you manually center, "
+            "then Confirm). Mix both, then Run. This builds the XY map "
+            "only — Z calibration lives in the Needle Offset tab."
+        )
+        self._ploc_banner.setWordWrap(True)
+        self._ploc_banner.setStyleSheet(
+            f"background-color: {COLORS['surface0']}; "
+            f"color: {COLORS['text']}; padding: {sp(8)}; "
+            f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
+        outer.addWidget(self._ploc_banner)
+
+        # ── Horizontal splitter: plate view on left, queue on right
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(s(4))
+
+        # v7.4.4: use the same top-down XY canvas the Jog page uses
+        # (``JogWorkspaceView``) instead of the bespoke legacy
+        # ``_CalibrationPlateView``. The two pages now show identical
+        # workspace visualizations — safety envelope, plate outline,
+        # wells colored by calibrated/approximate status, needle at
+        # scale, breadcrumbs, click-to-snap.
+        from gui.widgets.jog_workspace_view import JogWorkspaceView
+        self._ploc_plate_view = JogWorkspaceView(parent=page)
+        sl = getattr(self.controller, "safety_limits", None) if self.controller else None
+        if sl is not None:
+            self._ploc_plate_view.set_safety_limits(sl)
+        # Needle outer diameter (drawn to scale) from the hardware config.
+        hw = getattr(self, "_hardware_config", None)
+        needle = getattr(hw, "needle", None) if hw is not None else None
+        od = getattr(needle, "od_um", None) if needle is not None else None
+        if od:
+            self._ploc_plate_view.set_needle(float(od))
+        # v7.4.6: the Plate Location workflow now accepts BOTH well
+        # snapping (Snap mode) and arbitrary freeform points (Free
+        # mode), toggled via the built-in Free/Snap control on the
+        # canvas. Start in Snap so existing muscle memory is unchanged.
+        self._ploc_plate_view.set_target_mode("snap")
+        if self._plate is not None:
+            self._ploc_plate_view.set_plate(self._plate)
+            self._ploc_plate_view.set_well_positions(
+                self._wells_in_zero_ref(), "approximate")
+        self._ploc_plate_view.well_clicked.connect(self._ploc_on_well_clicked)
+        # Free-mode clicks emit position_clicked with zero-ref µm. (Snap
+        # mode emits it too, alongside well_clicked — the handler guards
+        # on the active mode so wells aren't double-enqueued.)
+        self._ploc_plate_view.position_clicked.connect(
+            self._ploc_on_position_clicked)
+        splitter.addWidget(self._ploc_plate_view)
+
+        # Queue + controls panel.
+        ctrl_panel = QWidget()
+        ctrl_lay = QVBoxLayout(ctrl_panel)
+        ctrl_lay.setContentsMargins(s(6), s(6), s(6), s(6))
+        ctrl_lay.setSpacing(s(6))
+
+        ctrl_lay.addWidget(QLabel("Target queue:"))
+        self._ploc_queue_list = QListWidget()
+        self._ploc_queue_list.setSelectionMode(
+            QListWidget.SelectionMode.SingleSelection)
+        ctrl_lay.addWidget(self._ploc_queue_list, stretch=1)
+
+        btn_row = QHBoxLayout()
+        self._ploc_btn_clear = QPushButton("Clear queue")
+        self._ploc_btn_clear.clicked.connect(self._ploc_clear_queue)
+        btn_row.addWidget(self._ploc_btn_clear)
+        btn_row.addStretch()
+        self._ploc_btn_run = QPushButton("Run")
+        self._ploc_btn_run.setObjectName("accentBtn")
+        self._ploc_btn_run.setEnabled(False)
+        self._ploc_btn_run.clicked.connect(self._ploc_run_queue)
+        btn_row.addWidget(self._ploc_btn_run)
+        ctrl_lay.addLayout(btn_row)
+
+        # v7.4.6: confirm-mode controls — shown only while Run is paused
+        # at a freeform point waiting for the user to manually center.
+        self._ploc_confirm_label = QLabel("")
+        self._ploc_confirm_label.setWordWrap(True)
+        self._ploc_confirm_label.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-size: 9pt;")
+        self._ploc_confirm_label.setVisible(False)
+        ctrl_lay.addWidget(self._ploc_confirm_label)
+
+        confirm_row = QHBoxLayout()
+        self._ploc_btn_confirm = QPushButton("Confirm position")
+        self._ploc_btn_confirm.setObjectName("successBtn")
+        self._ploc_btn_confirm.clicked.connect(self._ploc_confirm)
+        confirm_row.addWidget(self._ploc_btn_confirm)
+        self._ploc_btn_skip = QPushButton("Skip")
+        self._ploc_btn_skip.clicked.connect(self._ploc_skip)
+        confirm_row.addWidget(self._ploc_btn_skip)
+        self._ploc_btn_cancel = QPushButton("Cancel run")
+        self._ploc_btn_cancel.clicked.connect(self._ploc_cancel_run)
+        confirm_row.addWidget(self._ploc_btn_cancel)
+        self._ploc_confirm_row = confirm_row
+        for _b in (self._ploc_btn_confirm, self._ploc_btn_skip,
+                   self._ploc_btn_cancel):
+            _b.setVisible(False)
+        ctrl_lay.addLayout(confirm_row)
+
+        self._ploc_status = QLabel("Queue: 0 wells, 0 freeform")
+        self._ploc_status.setStyleSheet(f"color: {COLORS['subtext0']};")
+        ctrl_lay.addWidget(self._ploc_status)
+
+        splitter.addWidget(ctrl_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, stretch=1)
+
+        # Track queue + fits.
+        #
+        # v7.4.6: the queue is now heterogeneous. Each entry is either:
+        #   • a ``str`` well name (Snap mode)                       — or —
+        #   • a dict ``{"kind": "free", "x", "y", "status"}`` for a
+        #     freeform point. ``x``/``y`` are zero-ref µm (the same
+        #     frame the canvas emits). ``status`` ∈ queued/taught/skipped.
+        self._ploc_queue: list = []
+        self._ploc_fits: dict[str, tuple[float, float]] = {}
+        # Freeform manual-teach pairs accumulated during a Run, as
+        # ((src_x_stage, src_y_stage), (meas_x_stage, meas_y_stage)) in
+        # absolute stage µm. Consumed by ``_manual_fit_xy`` then cleared.
+        self._free_teach_pairs: list = []
+        # Run state machine.
+        self._ploc_running: bool = False
+        self._ploc_steps: list = []
+        self._ploc_run_idx: int = 0
+        self._ploc_well_results: dict[str, tuple[float, float]] = {}
+        # Pause state — when a step needs user interaction. ``kind`` is
+        # "freeform" (one Confirm) or "well_3pt" (collect 3 rim points).
+        self._ploc_pause_kind: str | None = None
+        self._ploc_manual_well: str | None = None
+        self._ploc_manual_points: list = []
+        # Cached per-run well-fit resources (set up in _ploc_run_queue).
+        self._ploc_plate_cam = None
+        self._ploc_um_per_px: float = 0.0
+        self._ploc_expected_radius_px: float = 0.0
+        self._ploc_locator = None
+        return page
+
+    # ── Adaptive well auto-cal tuning (v7.4.6) ───────────────────────
+    # Minimum detection confidence to accept a single-frame fit.
+    _PLOC_MIN_CONF = 0.20
+    # Rim points sampled per well in the multi-edge strategy.
+    _PLOC_RIM_SAMPLES = 8
+    # Stage settle time (s) between rim-sample moves.
+    _PLOC_SETTLE_S = 0.15
+    # Reject a multi-edge / 3-point fit whose radius deviates this much
+    # from the plate's known well radius (fractional).
+    _PLOC_RADIUS_TOL = 0.50
+
+    def _ploc_on_well_clicked(self, well_name: str) -> None:
+        if not well_name:
+            return
+        if self._ploc_running:
+            return
+        # Toggle: clicking an already-queued well removes it.
+        if well_name in self._ploc_queue:
+            self._ploc_queue.remove(well_name)
+        else:
+            self._ploc_queue.append(well_name)
+        self._ploc_refresh_queue_view()
+
+    # ── Freeform (arbitrary XY) targets — v7.4.6 ─────────────────────
+
+    # Click within this radius (zero-ref µm) of an existing freeform
+    # point removes it instead of adding a new one (mirrors well toggle).
+    _PLOC_FREE_REMOVE_RADIUS_UM = 500.0
+
+    def _ploc_on_position_clicked(self, x_zr: float, y_zr: float) -> None:
+        """Handle a freeform click on the plate view.
+
+        Snap mode emits ``position_clicked`` too (next to
+        ``well_clicked``); we only act in Free mode so wells are not
+        double-enqueued.
+        """
+        if self._ploc_running:
+            return
+        try:
+            mode = self._ploc_plate_view.target_mode()
+        except Exception:
+            mode = "snap"
+        if mode != "free":
+            return
+        # Toggle-remove if the click lands near an existing freeform pt.
+        near = self._ploc_find_free_near(x_zr, y_zr)
+        if near is not None:
+            self._ploc_queue.remove(near)
+        else:
+            self._ploc_queue.append({
+                "kind": "free",
+                "x": float(x_zr),
+                "y": float(y_zr),
+                "status": "queued",
+            })
+        self._ploc_refresh_queue_view()
+
+    def _ploc_find_free_near(self, x_zr: float, y_zr: float):
+        """Return the nearest queued freeform entry within the remove
+        radius of (x_zr, y_zr) zero-ref µm, or None."""
+        best = None
+        best_d2 = self._PLOC_FREE_REMOVE_RADIUS_UM ** 2
+        for entry in self._ploc_queue:
+            if not isinstance(entry, dict) or entry.get("kind") != "free":
+                continue
+            dx = entry["x"] - x_zr
+            dy = entry["y"] - y_zr
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = entry
+        return best
+
+    def _ploc_clear_queue(self) -> None:
+        if self._ploc_running:
+            return
+        self._ploc_queue = []
+        self._ploc_fits = {}
+        self._free_teach_pairs = []
+        self._ploc_refresh_queue_view()
+
+    def _ploc_refresh_queue_view(self) -> None:
+        self._ploc_queue_list.clear()
+        n_wells = 0
+        n_free = 0
+        for entry in self._ploc_queue:
+            if isinstance(entry, str):
+                n_wells += 1
+                status = "fitted" if entry in self._ploc_fits else "queued"
+                label = f"{entry}  —  {status}"
+            else:
+                n_free += 1
+                status = entry.get("status", "queued")
+                label = (f"⌖ ({entry['x']:+.0f}, {entry['y']:+.0f}) µm"
+                         f"  —  {status}")
+            self._ploc_queue_list.addItem(QListWidgetItem(label))
+        self._ploc_status.setText(
+            f"Queue: {n_wells} wells, {n_free} freeform")
+        # Enable Run with any target queued; the fit step reports if
+        # there are too few points to solve the affine.
+        self._ploc_btn_run.setEnabled(
+            (n_wells + n_free) >= 1 and not self._ploc_running)
+
+    def _ploc_run_queue(self) -> None:
+        """Start the queue run.
+
+        Wells are auto edge-fit (needs the Plate camera). Freeform
+        points pause the run so the user can manually center on the
+        target before confirming (v7.4.6). Camera resources are only
+        required when the queue contains at least one well.
+        """
+        if self._ploc_running:
+            return
+        if self.controller is None:
+            QMessageBox.warning(
+                self, "Plate Location", "Stage controller required.")
+            return
+        if self._plate is None:
+            QMessageBox.warning(
+                self, "Plate Location", "No plate format selected.")
+            return
+
+        n_wells = sum(1 for e in self._ploc_queue if isinstance(e, str))
+        # Only validate / cache the camera path when wells are queued.
+        if n_wells > 0:
+            if not NEEDLE_LOCATION_AVAILABLE:
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    "Vision helpers not available — install opencv-python.")
+                return
+            if self._camera_manager is None:
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    "Camera manager required to edge-fit wells.")
+                return
+            hw = getattr(self, '_hardware_config', None)
+            plate_cam_idx = (
+                hw.camera_for_role(CameraRole.PLATE) if hw is not None else None
+            )
+            if plate_cam_idx is None:
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    "Assign a camera the Plate role in Hardware Setup → Cameras.")
+                return
+            try:
+                plate_cam = self._camera_manager.cameras[plate_cam_idx]
+            except (AttributeError, IndexError):
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    f"Camera index {plate_cam_idx} not available.")
+                return
+            um_per_px = float(getattr(plate_cam, "_um_per_px", 0.0) or 0.0)
+            if um_per_px <= 0:
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    "Plate camera µm/pixel not calibrated. "
+                    "Calibrate in Hardware Setup → Cameras.")
+                return
+            self._ploc_plate_cam = plate_cam
+            self._ploc_um_per_px = um_per_px
+            well_radius_um = (self._plate.well_diameter_mm * 1000.0) / 2.0
+            self._ploc_expected_radius_px = well_radius_um / um_per_px
+            self._ploc_locator = EdgeFitWellLocator()
+
+        # Initialise the run state machine and kick it off.
+        self._ploc_running = True
+        self._ploc_steps = list(self._ploc_queue)
+        self._ploc_run_idx = 0
+        self._ploc_well_results = {}
+        self._free_teach_pairs = []
+        self._ploc_pause_kind = None
+        self._ploc_manual_well = None
+        self._ploc_manual_points = []
+        for e in self._ploc_queue:
+            if isinstance(e, dict):
+                e["status"] = "queued"
+        self._ploc_btn_run.setEnabled(False)
+        self._ploc_btn_clear.setEnabled(False)
+        self._ploc_advance()
+
+    # ── Well auto-calibration (v7.4.6 adaptive circle fitting) ───────
+
+    def _ploc_capture(self):
+        """Grab a fresh frame from the cached plate camera, or None."""
+        cam = self._ploc_plate_cam
+        if cam is None:
+            return None
+        try:
+            return cam.capture_fresh_frame()
+        except Exception:
+            try:
+                return cam.get_current_frame()
+            except Exception:
+                return None
+
+    def _ploc_auto_fit_well(self, well_name: str):
+        """Auto-calibrate one well's center, picking the circle-fit
+        strategy from well size vs. camera FOV.
+
+        Returns the measured center in absolute stage µm, or None when
+        the arc can't be found automatically (→ manual 3-point fallback).
+        """
+        wells_by_name = {w.name: w for w in self._plate.get_all_wells()}
+        if well_name not in wells_by_name:
+            return None
+        try:
+            cx_pred, cy_pred = self._predict_well_xy(well_name)
+        except Exception as e:
+            logger.warning(f"PlateLocation: predict for {well_name} failed: {e}")
+            return None
+        # Centered observation frame + FOV.
+        try:
+            self.controller.move_xy_absolute_um(cx_pred, cy_pred)
+        except Exception as e:
+            logger.warning(f"PlateLocation: move to {well_name} failed: {e}")
+            return None
+        frame = self._ploc_capture()
+        if frame is None:
+            return None
+        um = self._ploc_um_per_px
+        fh, fw = frame.shape[0], frame.shape[1]
+        d_um = float(self._plate.well_diameter_mm) * 1000.0
+        strategy = select_well_fit_strategy(d_um, fw * um, fh * um)
+        logger.info(
+            f"PlateLocation: {well_name} strategy={strategy} "
+            f"(well Ø{d_um:.0f}µm vs FOV {fw*um:.0f}×{fh*um:.0f}µm)")
+        if strategy in ("full_circle", "partial_arc"):
+            return self._ploc_single_frame_fit(
+                frame, strategy, cx_pred, cy_pred)
+        # multi_edge: sample several rim points and fit a circle.
+        return self._ploc_multi_edge_fit(cx_pred, cy_pred, d_um / 2.0)
+
+    def _ploc_single_frame_fit(self, frame, strategy, cx_pred, cy_pred):
+        """Detect the well center in a single centered frame.
+
+        ``full_circle`` → Hough/contour, falling back to a known-radius
+        arc fit; ``partial_arc`` → known-radius arc fit, falling back to
+        Hough/contour. Returns stage-µm center or None.
+        """
+        um = self._ploc_um_per_px
+        r_px = self._ploc_expected_radius_px
+
+        def _hough():
+            try:
+                from SupportClasses.VisionDetector import WellDetector
+                return WellDetector.detect_well_with_fallback(
+                    frame, expected_diameter_px=2.0 * r_px, tolerance=0.3)
+            except Exception as e:
+                logger.warning(f"PlateLocation: full-circle detect failed: {e}")
+                return None
+
+        def _arc():
+            return self._ploc_locator.fit_partial_arc(
+                frame, expected_radius_px=r_px, um_per_px=um)
+
+        result = _hough() if strategy == "full_circle" else _arc()
+        if result is None or result.confidence < self._PLOC_MIN_CONF:
+            alt = _arc() if strategy == "full_circle" else _hough()
+            if alt is not None and (
+                result is None or alt.confidence > result.confidence
+            ):
+                result = alt
+        if result is None or result.confidence < self._PLOC_MIN_CONF:
+            return None
+        fw = frame.shape[1]
+        fh = frame.shape[0]
+        off_x = (result.center_px[0] - fw / 2.0) * um
+        off_y = (result.center_px[1] - fh / 2.0) * um
+        return (cx_pred + off_x, cy_pred + off_y)
+
+    def _ploc_multi_edge_fit(self, cx_pred, cy_pred, r_um):
+        """Drive to ``_PLOC_RIM_SAMPLES`` predicted rim points, detect the
+        local edge at each, and fit a circle through the collected rim
+        points. Returns stage-µm center or None (→ manual fallback)."""
+        import math
+        import time
+        um = self._ploc_um_per_px
+        n = max(3, int(self._PLOC_RIM_SAMPLES))
+        pts: list[tuple[float, float]] = []
+        for i in range(n):
+            th = 2.0 * math.pi * i / n
+            ax = cx_pred + r_um * math.cos(th)
+            ay = cy_pred + r_um * math.sin(th)
+            try:
+                self.controller.move_xy_absolute_um(ax, ay)
+            except Exception as e:
+                logger.warning(f"PlateLocation: rim move failed: {e}")
+                continue
+            time.sleep(self._PLOC_SETTLE_S)
+            frame = self._ploc_capture()
+            if frame is None:
+                continue
+            rp = detect_rim_point_near_center(frame)
+            if rp is None:
+                continue
+            px, py, _conf = rp
+            fw = frame.shape[1]
+            fh = frame.shape[0]
+            off_x = (px - fw / 2.0) * um
+            off_y = (py - fh / 2.0) * um
+            pts.append((ax + off_x, ay + off_y))
+        if len(pts) < 3:
+            logger.info(
+                f"PlateLocation: multi-edge found only {len(pts)} rim "
+                "points — falling back to manual.")
+            return None
+        fit = fit_circle_to_points(pts)
+        if fit is None:
+            return None
+        cx, cy, r = fit
+        if r_um > 0 and abs(r - r_um) / r_um > self._PLOC_RADIUS_TOL:
+            logger.warning(
+                f"PlateLocation: multi-edge radius {r:.0f}µm vs expected "
+                f"{r_um:.0f}µm — rejecting fit.")
+            return None
+        return (cx, cy)
+
+    def _ploc_advance(self) -> None:
+        """Process queue steps until one needs user interaction (freeform
+        centering, or a manual 3-point well fit), or the queue is done."""
+        steps = self._ploc_steps
+        total = len(steps)
+        while self._ploc_run_idx < total:
+            step = steps[self._ploc_run_idx]
+            if isinstance(step, str):
+                center = self._ploc_auto_fit_well(step)
+                if center is not None:
+                    self._ploc_well_results[step] = center
+                    self._ploc_run_idx += 1
+                    continue
+                # Arc not found → pause for a manual 3-point fit.
+                self._ploc_begin_well_manual(step)
+                return
+            # Freeform point: drive there, then pause for centering.
+            x_zr = step["x"]
+            y_zr = step["y"]
+            zero = self.controller.zero_position
+            sx = x_zr + zero.get("x", 0)
+            sy = y_zr + zero.get("y", 0)
+            try:
+                self.controller.move_xy_absolute_um(sx, sy)
+            except Exception as e:
+                logger.warning(f"PlateLocation: move to freeform failed: {e}")
+            self._ploc_pause_kind = "freeform"
+            self._ploc_enter_confirm_mode(self._ploc_run_idx, total, x_zr, y_zr)
+            return
+        self._ploc_finish_run()
+
+    def _ploc_enter_confirm_mode(
+        self, idx: int, total: int, x_zr: float, y_zr: float
+    ) -> None:
+        self._ploc_confirm_label.setText(
+            f"Step {idx + 1}/{total}: moved to freeform "
+            f"({x_zr:+.0f}, {y_zr:+.0f}) µm. Jog to center the target "
+            "in the plate camera, then Confirm (or Skip)."
+        )
+        self._ploc_confirm_label.setVisible(True)
+        for b in (self._ploc_btn_confirm, self._ploc_btn_skip,
+                  self._ploc_btn_cancel):
+            b.setVisible(True)
+
+    def _ploc_exit_confirm_mode(self) -> None:
+        self._ploc_confirm_label.setVisible(False)
+        for b in (self._ploc_btn_confirm, self._ploc_btn_skip,
+                  self._ploc_btn_cancel):
+            b.setVisible(False)
+
+    def _ploc_begin_well_manual(self, well_name: str) -> None:
+        """Enter manual 3-point mode for `well_name` after auto-fit
+        failed. Nudges the stage to a predicted rim point so the rim is
+        in view, then waits for three Confirms."""
+        self._ploc_pause_kind = "well_3pt"
+        self._ploc_manual_well = well_name
+        self._ploc_manual_points = []
+        try:
+            cx, cy = self._predict_well_xy(well_name)
+            r_um = float(self._plate.well_diameter_mm) * 1000.0 / 2.0
+            self.controller.move_xy_absolute_um(cx + r_um, cy)
+        except Exception as e:
+            logger.warning(f"PlateLocation: manual-start move failed: {e}")
+        self._ploc_update_manual_prompt(0)
+        self._ploc_confirm_label.setVisible(True)
+        for b in (self._ploc_btn_confirm, self._ploc_btn_skip,
+                  self._ploc_btn_cancel):
+            b.setVisible(True)
+
+    def _ploc_update_manual_prompt(self, got: int) -> None:
+        self._ploc_confirm_label.setText(
+            f"Auto-fit failed for {self._ploc_manual_well}. Jog to a "
+            f"point on the well rim and Confirm — collected {got}/3. "
+            "Pick 3 well-separated points around the circle (Skip to "
+            "leave this well uncalibrated)."
+        )
+
+    def _ploc_confirm(self) -> None:
+        """Confirm the current manual position. Dispatches on pause kind:
+        freeform records one teach pair; well_3pt collects rim points and
+        fits a circle once three are gathered."""
+        if not self._ploc_running:
+            return
+        xy = self.controller.get_xy_position(cached=False)
+        if xy is None or xy[0] is None:
+            QMessageBox.warning(
+                self, "Plate Location",
+                "Could not read current stage position.")
+            return
+        pos = (float(xy[0]), float(xy[1]))
+        kind = self._ploc_pause_kind
+
+        if kind == "freeform":
+            step = self._ploc_steps[self._ploc_run_idx]
+            zero = self.controller.zero_position
+            # Pair the clicked (predicted) location with the confirmed
+            # (measured) one, both in absolute stage µm.
+            src = (step["x"] + zero.get("x", 0), step["y"] + zero.get("y", 0))
+            self._free_teach_pairs.append((src, pos))
+            step["status"] = "taught"
+            self._ploc_run_idx += 1
+            self._ploc_pause_kind = None
+            self._ploc_exit_confirm_mode()
+            self._ploc_refresh_queue_view()
+            self._ploc_advance()
+            return
+
+        if kind == "well_3pt":
+            self._ploc_manual_points.append(pos)
+            got = len(self._ploc_manual_points)
+            if got < 3:
+                self._ploc_update_manual_prompt(got)
+                return
+            well = self._ploc_manual_well
+            fit = fit_circle_to_points(self._ploc_manual_points)
+            r_exp = float(self._plate.well_diameter_mm) * 1000.0 / 2.0
+            ok = fit is not None
+            if ok and r_exp > 0:
+                ok = abs(fit[2] - r_exp) / r_exp <= self._PLOC_RADIUS_TOL
+            if ok:
+                cx, cy, r = fit
+                self._ploc_well_results[well] = (cx, cy)
+                logger.info(
+                    f"PlateLocation: 3-point fit {well} → "
+                    f"({cx:.1f}, {cy:.1f}) µm, r={r:.1f} µm")
+            else:
+                QMessageBox.warning(
+                    self, "Plate Location",
+                    f"3-point fit for {well} was rejected (points "
+                    "collinear or radius implausible). Well left "
+                    "uncalibrated.")
+                logger.warning(
+                    f"PlateLocation: 3-point fit rejected for {well} "
+                    f"(fit={fit}, expected r={r_exp:.0f}µm).")
+            self._ploc_manual_points = []
+            self._ploc_manual_well = None
+            self._ploc_pause_kind = None
+            self._ploc_run_idx += 1
+            self._ploc_exit_confirm_mode()
+            self._ploc_refresh_queue_view()
+            self._ploc_advance()
+
+    def _ploc_skip(self) -> None:
+        """Skip the current paused step (freeform point, or a well's
+        manual fit) and advance."""
+        if not self._ploc_running:
+            return
+        step = self._ploc_steps[self._ploc_run_idx]
+        if self._ploc_pause_kind == "freeform" and isinstance(step, dict):
+            step["status"] = "skipped"
+        self._ploc_manual_points = []
+        self._ploc_manual_well = None
+        self._ploc_pause_kind = None
+        self._ploc_run_idx += 1
+        self._ploc_exit_confirm_mode()
+        self._ploc_refresh_queue_view()
+        self._ploc_advance()
+
+    def _ploc_cancel_run(self) -> None:
+        """Abort an in-progress run, discarding its results."""
+        if not self._ploc_running:
+            return
+        self._ploc_running = False
+        self._ploc_steps = []
+        self._ploc_run_idx = 0
+        self._ploc_well_results = {}
+        self._free_teach_pairs = []
+        self._ploc_pause_kind = None
+        self._ploc_manual_well = None
+        self._ploc_manual_points = []
+        self._ploc_exit_confirm_mode()
+        self._ploc_btn_clear.setEnabled(True)
+        self._ploc_refresh_queue_view()
+        self._ploc_status.setText("Run cancelled.")
+
+    def _ploc_finish_run(self) -> None:
+        """Feed all collected points (well fits + freeform teach pairs)
+        into the affine and refresh the UI."""
+        self._ploc_running = False
+        self._ploc_fits = dict(self._ploc_well_results)
+        n_taught = sum(
+            1 for e in self._ploc_queue
+            if isinstance(e, dict) and e.get("status") == "taught")
+        n_skipped = sum(
+            1 for e in self._ploc_queue
+            if isinstance(e, dict) and e.get("status") == "skipped")
+        self._ploc_exit_confirm_mode()
+        self._ploc_btn_clear.setEnabled(True)
+        self._ploc_refresh_queue_view()
+        # _ploc_feed_affine invokes _manual_fit_xy, which also consumes
+        # self._free_teach_pairs (the freeform manual-teach pairs).
+        try:
+            self._ploc_feed_affine(self._ploc_well_results)
+        except Exception as e:
+            logger.warning(f"PlateLocation: affine fit failed: {e}")
+        # Freeform pairs are now folded into the saved affine; clear so a
+        # later manual-tab refit doesn't double-count stale points.
+        self._free_teach_pairs = []
+        self._ploc_status.setText(
+            f"Done — {len(self._ploc_well_results)} wells fitted, "
+            f"{n_taught} freeform taught, {n_skipped} skipped."
+        )
+
+    def _predict_well_xy(self, well_name: str) -> tuple[float, float]:
+        """Best-effort predicted stage XY (µm) for `well_name`.
+
+        Falls back to plate-geometry-only prediction if the existing
+        affine fit hasn't been computed yet. Returns absolute stage
+        µm so the caller can pass it straight to
+        ``move_xy_absolute_um``.
+        """
+        zero = self.controller.zero_position
+        # Try the existing predicted-wells dict if the affine was
+        # already fitted.
+        predicted = getattr(self, '_predicted_wells', None)
+        if predicted and well_name in predicted:
+            px_um, py_um = predicted[well_name]
+            return (zero.get("x", 0) + px_um, zero.get("y", 0) + py_um)
+        # Fallback: A1-relative geometry.
+        wells_by_name = {w.name: w for w in self._plate.get_all_wells()}
+        a1 = wells_by_name["A1"]
+        target = wells_by_name[well_name]
+        dx_um = (target.x_mm - a1.x_mm) * 1000.0
+        dy_um = (target.y_mm - a1.y_mm) * 1000.0
+        # If A1 has been taught, anchor at that stage position.
+        if getattr(self, '_taught_a1', None):
+            ax, ay = self._taught_a1
+            return (ax + dx_um, ay + dy_um)
+        # Last resort: anchor at stage zero.
+        return (zero.get("x", 0) + dx_um, zero.get("y", 0) + dy_um)
+
+    def _ploc_feed_affine(
+        self, results: dict[str, tuple[float, float]]
+    ) -> None:
+        """Push the fitted well centers into the affine fitter.
+
+        ``results`` maps well name → measured center in absolute stage
+        µm. These are written into ``_xy_teach_points`` (the store
+        ``_manual_fit_xy`` actually pairs against the geometry-predicted
+        positions) plus the legacy A1/corner/third trackers, then the
+        fit is recomputed. ``_manual_fit_xy`` additionally folds in any
+        freeform pairs accumulated in ``_free_teach_pairs``.
+        """
+        for name, (sx, sy) in results.items():
+            # _manual_fit_xy and the manual-teach tab both key on
+            # absolute stage µm — store the measured centers directly.
+            self._xy_teach_points[name] = (sx, sy)
+            if name == "A1":
+                self._taught_a1 = (sx, sy)
+            elif getattr(self, '_corner_well', None) == name:
+                self._taught_corner = (sx, sy)
+            elif self._taught_third is None:
+                self._third_well = name
+                self._taught_third = (sx, sy)
+        try:
+            self._manual_fit_xy()
+            self._emit_calibration_data_changed()
+        except Exception as e:
+            logger.warning(f"PlateLocation: _manual_fit_xy failed: {e}")
 
     # ── Right-context tab builders (v7.4.2) ──────────────────────
     #
@@ -1611,31 +3184,34 @@ class CalibrationPage(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _setup_ui(self):
+        """v7.4.4: Calibration page IS the workflow tab widget.
+
+        The right context column was removed — every control needed
+        for a workflow lives inside that workflow's tab. The page
+        layout is just a compact stage-position strip across the top
+        plus the four workflow tabs filling the remaining space:
+
+          1. **Needle Location** — dual-camera edge-click recenter
+          2. **Z-Offset Calibration** — Safe Z / Top Z / Z-Bottom auto
+          3. **Plate Location** — click-snap N-well XY-map workflow
+          4. **Custom** — legacy camera grid + full wizard + plate cal
+        """
         _bg = COLORS['base']
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet(f"QScrollArea {{ background-color: {_bg}; border: none; }}")
-        outer.addWidget(scroll)
-
-        container = QWidget()
-        container.setStyleSheet(f"background-color: {_bg};")
-        layout = QVBoxLayout(container)
-        layout.setSpacing(8)
-        layout.setContentsMargins(12, 8, 12, 8)
-        scroll.setWidget(container)
+        outer.setContentsMargins(s(8), s(6), s(8), s(6))
+        outer.setSpacing(s(6))
 
         mono = QFont("Consolas", scaled_font_size(12))
 
-        # ── Position Readout (compact) ────────────────────────────
+        # ── Compact position readout strip ────────────────────────
         pos_card = QFrame()
         pos_card.setObjectName("cardFrame")
         pos_layout = QHBoxLayout(pos_card)
-        pos_layout.setSpacing(16)
-        for name, attr in [("X (µm):", "lbl_x"), ("Y (µm):", "lbl_y"), ("Z (mm):", "lbl_z")]:
+        pos_layout.setContentsMargins(s(10), s(4), s(10), s(4))
+        pos_layout.setSpacing(s(12))
+        for name, attr in [("X (µm):", "lbl_x"),
+                           ("Y (µm):", "lbl_y"),
+                           ("Z (mm):", "lbl_z")]:
             pos_layout.addWidget(QLabel(name))
             lbl = QLabel("—")
             lbl.setFont(mono)
@@ -1643,15 +3219,12 @@ class CalibrationPage(QWidget):
             pos_layout.addWidget(lbl)
             setattr(self, attr, lbl)
         pos_layout.addStretch()
-        layout.addWidget(pos_card)
+        outer.addWidget(pos_card)
 
-        # ── Camera Feeds (grid layout, controls in context panel) ───
-        cam_card = QFrame()
-        cam_card.setObjectName("cardFrame")
-        cam_card_layout = QVBoxLayout(cam_card)
-        cam_card_layout.setSpacing(0)
-        cam_card_layout.setContentsMargins(4, 4, 4, 4)
-
+        # ── Build the legacy camera grid widget (parent=None for now)
+        # so the Custom tab can adopt it once it's constructed. The
+        # grid + relayout machinery is unchanged from v7.4.2; only
+        # its parent owner moves.
         self._cam_grid_widget = QWidget()
         self._cam_grid_layout = QGridLayout(self._cam_grid_widget)
         self._cam_grid_layout.setSpacing(4)
@@ -1660,7 +3233,6 @@ class CalibrationPage(QWidget):
         if self._camera_manager and self._camera_manager.is_available:
             from gui.widgets.camera_feed_view import CameraFeedView
 
-            # Create feed views — lightweight displays subscribed to CameraWidgets
             self._cam_feed_views: list[CameraFeedView] = []
             self._click_to_move_enabled = False
             for i in range(MAX_CAMERAS):
@@ -1671,13 +3243,11 @@ class CalibrationPage(QWidget):
                     label=f"Camera {i + 1}",
                     parent=self,
                 )
-                # Connect click signal for click-to-move
                 fv.clicked.connect(
                     lambda px, py, idx=i: self._on_feed_clicked(idx, px, py)
                 )
                 self._cam_feed_views.append(fv)
 
-            # Placeholder labels for empty slots (square mode)
             self._cam_placeholders: list[QLabel] = []
             for i in range(MAX_CAMERAS):
                 ph = QLabel(f"Camera {i + 1}")
@@ -1689,7 +3259,6 @@ class CalibrationPage(QWidget):
                 ph.setMinimumSize(s(200), s(150))
                 self._cam_placeholders.append(ph)
 
-            # Initial layout: single camera, first checked
             self._cam_tile_mode = "single"
             self._relayout_cameras()
         else:
@@ -1704,8 +3273,29 @@ class CalibrationPage(QWidget):
             no_cam.setStyleSheet(f"color: {COLORS['overlay0']};")
             self._cam_grid_layout.addWidget(no_cam, 0, 0)
 
-        cam_card_layout.addWidget(self._cam_grid_widget, stretch=1)
-        layout.addWidget(cam_card, stretch=1)
+        # ── Workflow tabs ────────────────────────────────────────
+        self._workflow_tabs = QTabWidget()
+        self._workflow_tabs.setObjectName("calibrationWorkflowTabs")
+        self._workflow_tabs.addTab(
+            self._build_needle_location_tab(), "Needle Location")
+        self._workflow_tabs.addTab(
+            self._build_plate_location_tab(), "Plate Location")
+        self._workflow_tabs.addTab(
+            self._build_z_offset_tab(), "Needle Offset Calibration")
+        self._workflow_tabs.addTab(
+            self._build_custom_tab(), "Custom")
+        outer.addWidget(self._workflow_tabs, stretch=1)
+
+        # The right-context entry point still exists on this class
+        # for back-compat with app.py's hasattr check, but it now
+        # returns None so no right column is shown.
+        self._right_context_widget = None
+
+        # Trigger the initial calibration restore.
+        try:
+            self._load_calibration()
+        except Exception as e:
+            logger.debug(f"Initial calibration load skipped: {e}")
 
     # ════════════════════════════════════════════════════════════════
     #  STATUS UPDATE
@@ -2276,6 +3866,13 @@ class CalibrationPage(QWidget):
         """Called periodically by the main window."""
         # v7.3.0: Keep simulated cameras synced
         self._configure_simulated_cameras()
+        # v7.4.3: forward the tick to the reusable jog context panel
+        panel = getattr(self, "_jog_left_panel", None)
+        if panel is not None:
+            try:
+                panel.on_status_update()
+            except Exception:
+                pass
 
         ctrl = self.controller
 
@@ -2287,9 +3884,23 @@ class CalibrationPage(QWidget):
             uy = xy[1] - ctrl.zero_position["y"]
             self.lbl_x.setText(f"{ux:,.1f}")
             self.lbl_y.setText(f"{uy:,.1f}")
+            # v7.4.4: feed the shared XY workspace view so the needle
+            # tracks live (same canvas the Jog page uses).
+            ploc = getattr(self, "_ploc_plate_view", None)
+            if ploc is not None and hasattr(ploc, "set_position"):
+                try:
+                    ploc.set_position(ux, uy)
+                except Exception:
+                    pass
         else:
             self.lbl_x.setText("—")
             self.lbl_y.setText("—")
+            ploc = getattr(self, "_ploc_plate_view", None)
+            if ploc is not None and hasattr(ploc, "set_position"):
+                try:
+                    ploc.set_position(None, None)
+                except Exception:
+                    pass
 
         zp = ctrl.get_zp_position(cached=True)
         # v7.4.2 hotfix: read Z via logical axis (honours axis_map).
@@ -3735,7 +5346,11 @@ class CalibrationPage(QWidget):
         With 2 points: computes scale + rotation (legacy alignment).
         With 3+ points: uses Procrustes SVD if available, else scale+rotation from first 2.
         """
-        n = len(self._xy_teach_points)
+        # v7.4.6: freeform manual-teach pairs (Plate Location tab) count
+        # as taught points too — each is an (predicted, measured) stage-µm
+        # pair injected straight into the Procrustes fit below.
+        free_pairs = list(getattr(self, '_free_teach_pairs', []))
+        n = len(self._xy_teach_points) + len(free_pairs)
         if n == 0:
             if hasattr(self, '_gen_status'):
                 self._gen_status.setText("Need at least 1 taught XY point.")
@@ -3783,12 +5398,17 @@ class CalibrationPage(QWidget):
                 px, py = self._predicted_positions[name]
                 pred_pts.append((px, py))
                 meas_pts.append((mx, my))
+        # v7.4.6: freeform pairs carry their own (predicted, measured)
+        # stage-\u00b5m coordinates \u2014 no well-name lookup needed.
+        for (sx, sy), (tx, ty) in free_pairs:
+            pred_pts.append((sx, sy))
+            meas_pts.append((tx, ty))
 
         if len(pred_pts) < 2:
             if hasattr(self, '_gen_status'):
                 self._gen_status.setText(
-                    f"Need \u22652 matched wells (have {len(pred_pts)}). "
-                    "Ensure taught wells exist in plate format.")
+                    f"Need \u22652 matched points (have {len(pred_pts)}). "
+                    "Add more wells or freeform points.")
                 self._gen_status.setStyleSheet(f"color: {COLORS['red']}; font-size: 9pt;")
             return
 
@@ -4409,6 +6029,10 @@ class CalibrationPage(QWidget):
             "taught_third_z": getattr(self, '_taught_third_z', None),
             "third_well": getattr(self, '_third_well', None),
             "corner_well": getattr(self, '_corner_well', "H12"),
+            # v7.4.4 additions — Needle Offset Calibration heights.
+            "replace_z": getattr(self, '_replace_z', None),
+            "max_z": getattr(self, '_max_z', None),
+            "plate_bottom_z": getattr(self, '_plate_bottom_z', None),
         }
         # v7.3.1: Save 3-well affine calibration
         three_well_cal = getattr(self, '_three_well_calibration', None)
@@ -4499,12 +6123,50 @@ class CalibrationPage(QWidget):
             if self._safe_z is not None and hasattr(self, 'lbl_safe_z'):
                 self.lbl_safe_z.setText(f"Safe Z: {self._safe_z:.2f} mm")
                 self.lbl_safe_z.setStyleSheet(f"color: {COLORS['green']};")
+            # v7.4.4: mirror onto the Needle Offset tab label.
+            if self._safe_z is not None and hasattr(self, '_zoff_lbl_safe_z'):
+                self._zoff_lbl_safe_z.setText(
+                    f"Fast Move Z: {self._safe_z:.2f} mm")
+                self._zoff_lbl_safe_z.setStyleSheet(
+                    f"color: {COLORS['green']};")
 
         if hasattr(self, '_top_z'):
             self._top_z = cal.get("top_z")
             if self._top_z is not None and hasattr(self, 'lbl_top_z'):
                 self.lbl_top_z.setText(f"Top Z: {self._top_z:.2f} mm")
                 self.lbl_top_z.setStyleSheet(f"color: {COLORS['green']};")
+            if self._top_z is not None and hasattr(self, '_zoff_lbl_top_z'):
+                self._zoff_lbl_top_z.setText(
+                    f"Plate Top Z: {self._top_z:.2f} mm")
+                self._zoff_lbl_top_z.setStyleSheet(
+                    f"color: {COLORS['green']};")
+
+        # v7.4.4: new Z reference heights.
+        for key, attr, lbl_attr, prefix in [
+            ("replace_z", "_replace_z", "_zoff_lbl_replace_z", "Replace Z"),
+            ("max_z", "_max_z", "_zoff_lbl_max_z", "Max Z"),
+            ("plate_bottom_z", "_plate_bottom_z",
+             "_zoff_lbl_plate_bottom_z", "Plate Bottom Z"),
+        ]:
+            val = cal.get(key)
+            setattr(self, attr, val)
+            lbl = getattr(self, lbl_attr, None)
+            if val is not None and lbl is not None:
+                lbl.setText(f"{prefix}: {val:.2f} mm")
+                lbl.setStyleSheet(f"color: {COLORS['green']};")
+
+        # v7.4.4: restore the live safety envelope from the calibrated
+        # Max Z / Plate Bottom Z so the soft limits are enforced
+        # immediately on startup (not just after a manual re-capture).
+        sl = getattr(self.controller, "safety_limits", None) if self.controller else None
+        if sl is not None:
+            try:
+                if self._max_z is not None:
+                    sl.set_z_from_current(self._max_z, as_max=True)
+                if self._plate_bottom_z is not None:
+                    sl.set_z_from_current(self._plate_bottom_z, as_max=False)
+            except Exception as e:
+                logger.warning(f"Restoring Z safety envelope failed: {e}")
 
         self._taught_a1_z = cal.get("taught_a1_z")
         self._taught_corner_z = cal.get("taught_corner_z")

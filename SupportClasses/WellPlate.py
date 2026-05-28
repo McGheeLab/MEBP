@@ -1,9 +1,12 @@
 """
 Well Plate Geometry — Standard ANSI/SLAS well plate definitions and path generators.
 
-Provides coordinate geometry for 6, 12, 24, 48, 96, and 384-well plates.
-All coordinates are relative to the A1 well centre, which aligns
-with the zero reference position set during calibration.
+Provides coordinate geometry for 6, 12, 24, 48, 96, and 384-well plates,
+plus user-designed custom plates with arbitrary per-well position and diameter.
+
+All standard-format coordinates are relative to the A1 well centre, which aligns
+with the zero reference position set during calibration. Custom plates
+likewise place their first/anchor well at the workspace origin.
 
 Path generators produce lists of (x, y) waypoints for common fill
 patterns: line, meander, spiral, grid, and concentric rings.
@@ -14,9 +17,17 @@ v7.1 additions:
 - rosette_insert field on WellInfo for attached geometry (P8.12)
 - 384-well plate definition (P8.13)
 
+v7.4.5 additions:
+- `format: int | str` — custom plates use `"custom:<name>"`
+- `from_wells(name, wells, **meta)` factory for arbitrary per-well plates
+- `load(name_or_format)` polymorphic factory: int → standard, str → user JSON
+- `__post_init__` guarded so explicit `_wells` skip grid auto-fill
+
 Usage::
 
-    plate = WellPlate.from_format(96)
+    plate = WellPlate.from_format(96)              # legacy, unchanged
+    plate = WellPlate.load(96)                     # equivalent
+    plate = WellPlate.load("my-coverslip-array")   # user-saved custom plate
     x, y = plate.get_well_position("B3")
     wells = plate.get_all_wells()
     path = generate_meander_path(5.0, 5.0, 0.5)
@@ -24,12 +35,21 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# v7.4.5: User-saved custom plate designs live here as JSON.
+# Standards are still computed in-code from `PLATE_DEFINITIONS`.
+USER_PLATES_DIR = (
+    Path(__file__).resolve().parent.parent / "config" / "hardware" / "plates" / "user"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -119,7 +139,16 @@ class WellInfo:
 
     # v7.1 additions (P8.11, P8.12)
     bottom_z_offset: float = 0.0    # Z offset from plane fit (mm), 0 = on reference plane
-    rosette_insert: Any = None      # Attached RosetteInsert geometry (or None)
+    rosette_insert: Any = None      # Attached RosetteInsert geometry (or None) — legacy
+
+    # v7.4.8 — insert/tube geometry (rosette sub-wells flatten into these).
+    # Larger Z = higher / further from the plate (matches calibration safe_z).
+    rim_height_mm: float = 0.0      # height the well/tube top sits ABOVE the
+                                    # plate top surface (clearance); 0 = flush
+    ink_z_mm: float | None = None   # prescribed ink-dispense Z relative to the
+                                    # plate top; None = use the global print Z
+    is_subwell: bool = False        # True = flattened rosette sub-well
+    parent_well: str | None = None  # parent well name (e.g. "A1") for subwells
 
 
 @dataclass
@@ -129,8 +158,15 @@ class WellPlate:
 
     All coordinates are relative to A1 centre (0, 0).
     The stage controller's zero_position maps A1 to the physical origin.
+
+    Standard formats (6/12/24/48/96/384) have uniform per-well diameters and
+    a regular grid. v7.4.5 generalizes the dataclass to also hold custom
+    plates where each well has its own position and diameter; in that case
+    `format` is a string `"custom:<name>"`, `well_spacing_x/y` and
+    `well_diameter` are 0.0 ("varies — read per-well from WellInfo"), and
+    `rows` / `cols` are advisory (max row/col + 1).
     """
-    format: int
+    format: int | str
     rows: int
     cols: int
     well_spacing_x: float
@@ -143,7 +179,13 @@ class WellPlate:
     _wells: dict[str, WellInfo] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
-        """Compute well coordinates."""
+        """Compute well coordinates for standard-format grids.
+
+        v7.4.5: skip auto-fill if `_wells` was already supplied (custom plates
+        constructed via `from_wells()`).
+        """
+        if self._wells:
+            return
         self._wells = {}
         for r in range(self.rows):
             for c in range(self.cols):
@@ -172,6 +214,97 @@ class WellPlate:
                 f"Choose from {sorted(PLATE_DEFINITIONS)}"
             )
         return cls(format=well_count, **PLATE_DEFINITIONS[well_count])
+
+    @classmethod
+    def from_wells(
+        cls,
+        name: str,
+        wells: list[WellInfo],
+        well_depth_mm: float = 10.67,
+        a1_offset_x: float = 0.0,
+        a1_offset_y: float = 0.0,
+        description: str = "",
+    ) -> WellPlate:
+        """
+        Construct a custom plate from an explicit list of `WellInfo`.
+
+        Skips the grid auto-fill in `__post_init__`. `rows` / `cols` are
+        derived as `max(row)+1` / `max(col)+1` for backward compat with
+        callers that index by row/col; spacings and the plate-level
+        diameter are 0.0 ("varies — see WellInfo per well").
+
+        Args:
+            name: Human-readable plate name; stored in `format` as
+                  `"custom:<name>"` to distinguish from standard formats.
+            wells: All wells on the plate. Each must have its name, row,
+                   col, x, y, and diameter set.
+            well_depth_mm: Plate-level default well depth (mm).
+            a1_offset_x / a1_offset_y: Offset (mm) from the plate's
+                top-left corner to the A1 (or first/anchor) well centre,
+                used by `get_a1_from_plate_center()` for ANSI/SLAS-style
+                positioning.
+            description: Optional human-readable description.
+        """
+        if not wells:
+            raise ValueError("from_wells: at least one WellInfo required")
+
+        max_row = max(w.row for w in wells)
+        max_col = max(w.col for w in wells)
+
+        plate = cls(
+            format=f"custom:{name}",
+            rows=max_row + 1,
+            cols=max_col + 1,
+            well_spacing_x=0.0,
+            well_spacing_y=0.0,
+            well_diameter=0.0,
+            well_depth_mm=well_depth_mm,
+            a1_offset_x=a1_offset_x,
+            a1_offset_y=a1_offset_y,
+            description=description,
+            # Key by UPPER-cased name so case-insensitive lookups
+            # (get_well_info/get_well_position uppercase the query) resolve
+            # sub-wells like "A1.a" (display name preserved on WellInfo).
+            _wells={w.name.upper(): w for w in wells},
+        )
+        return plate
+
+    @classmethod
+    def load(cls, name_or_format: int | str) -> WellPlate:
+        """
+        Polymorphic loader. v7.4.5.
+
+        - `int` → standard format (delegates to `from_format`).
+        - `str` matching a standard format (e.g. "96") → `from_format(int)`.
+        - `str` like ``"custom:<name>"`` (the WellPlate.format encoding) →
+          strips the prefix and resolves to the user file.
+        - Any other `str` → looks for `config/hardware/plates/user/<name>.json`
+          and deserializes it as a `PlateDesign`, then `compile()`s to a
+          `WellPlate`.
+        """
+        # Accept stringified ints transparently
+        if isinstance(name_or_format, str) and name_or_format.isdigit():
+            return cls.from_format(int(name_or_format))
+        if isinstance(name_or_format, int):
+            return cls.from_format(name_or_format)
+
+        # Strip the "custom:" tag the dataclass uses internally so users
+        # can round-trip `WellPlate.load(plate.format)`.
+        name = name_or_format
+        if name.startswith("custom:"):
+            name = name[7:]
+
+        path = USER_PLATES_DIR / f"{name}.json"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No plate named '{name}' under {USER_PLATES_DIR}"
+            )
+        # Import locally to avoid a circular import: PlateDesign imports WellPlate.
+        from SupportClasses.PlateDesign import PlateDesign
+        with open(path) as f:
+            data = json.load(f)
+        design = PlateDesign.from_dict(data)
+        return design.compile()
 
     # ── Lookups ───────────────────────────────────────────────────
 
@@ -292,19 +425,62 @@ class WellPlate:
         return [w.name for w in self.get_all_wells()]
 
     @property
+    def is_custom(self) -> bool:
+        """v7.4.5: True iff this plate was built from a custom design."""
+        return isinstance(self.format, str) and self.format.startswith("custom:")
+
+    @property
     def plate_width(self) -> float:
         """Total width in mm (X direction)."""
-        return (self.cols - 1) * self.well_spacing_x
+        if self.well_spacing_x > 0:
+            return (self.cols - 1) * self.well_spacing_x
+        # Custom plate: derive from actual well extents.
+        wells = self._wells.values()
+        if not wells:
+            return 0.0
+        return max(w.x for w in wells) - min(w.x for w in wells)
 
     @property
     def plate_height(self) -> float:
         """Total height in mm (Y direction)."""
-        return (self.rows - 1) * self.well_spacing_y
+        if self.well_spacing_y > 0:
+            return (self.rows - 1) * self.well_spacing_y
+        wells = self._wells.values()
+        if not wells:
+            return 0.0
+        return max(w.y for w in wells) - min(w.y for w in wells)
+
+    @property
+    def max_rim_height_mm(self) -> float:
+        """v7.4.8: tallest insert rim above the plate top across all wells.
+
+        Drives the plate-wide travel-Z clearance floor so the needle
+        clears the highest tube/insert when moving across the plate.
+        Returns 0.0 for plates with no tall inserts.
+        """
+        return max((w.rim_height_mm for w in self._wells.values()), default=0.0)
+
+    def _max_well_radius_mm(self) -> float:
+        """v7.4.5: largest well radius on the plate (for custom plates)."""
+        if self.well_diameter > 0:
+            return self.well_diameter / 2.0
+        wells = list(self._wells.values())
+        if not wells:
+            return 0.0
+        return max(w.diameter for w in wells) / 2.0
 
     def get_bounding_box(self) -> tuple[float, float, float, float]:
         """Plate bounding box relative to A1: (min_x, min_y, max_x, max_y)."""
-        r = self.well_diameter / 2
-        return (-r, -r, self.plate_width + r, self.plate_height + r)
+        r = self._max_well_radius_mm()
+        if self.well_spacing_x > 0 and self.well_spacing_y > 0:
+            return (-r, -r, self.plate_width + r, self.plate_height + r)
+        # Custom plate: walk wells.
+        wells = list(self._wells.values())
+        if not wells:
+            return (-r, -r, r, r)
+        xs = [w.x for w in wells]
+        ys = [w.y for w in wells]
+        return (min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r)
 
     # ── v7.3.1: Geometry-predicted positions ───────────────────────
 
@@ -399,13 +575,14 @@ class WellPlate:
         Returns:
             (min_x_um, min_y_um, max_x_um, max_y_um)
         """
-        r_um = self.well_diameter * 1000.0 / 2.0
+        r_um = self._max_well_radius_mm() * 1000.0
 
-        # Plate-relative bounding box (from A1)
-        min_x = a1_x_um - r_um
-        min_y = a1_y_um - r_um
-        max_x = a1_x_um + (self.cols - 1) * self.well_spacing_x * 1000.0 + r_um
-        max_y = a1_y_um + (self.rows - 1) * self.well_spacing_y * 1000.0 + r_um
+        # Use plate bounding box (handles both standard and custom plates).
+        bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y = self.get_bounding_box()
+        min_x = a1_x_um + bbox_min_x * 1000.0
+        min_y = a1_y_um + bbox_min_y * 1000.0
+        max_x = a1_x_um + bbox_max_x * 1000.0
+        max_y = a1_y_um + bbox_max_y * 1000.0
 
         # Clamp to stage travel limits (stage range: 0 to travel_mm * 1000)
         max_travel_x = STAGE_TRAVEL_X_MM * 1000.0
@@ -434,7 +611,7 @@ class WellPlate:
         Returns:
             (min_x_um, min_y_um, max_x_um, max_y_um)
         """
-        half_span = self.well_diameter * 1000.0 * margin_factor / 2.0
+        half_span = self._max_well_radius_mm() * 1000.0 * margin_factor
         min_x = max(well_x_um - half_span, 0.0)
         min_y = max(well_y_um - half_span, 0.0)
         max_x = min(well_x_um + half_span, STAGE_TRAVEL_X_MM * 1000.0)

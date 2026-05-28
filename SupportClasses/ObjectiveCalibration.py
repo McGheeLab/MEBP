@@ -49,16 +49,13 @@ logger = logging.getLogger(__name__)
 # Default path relative to working directory (project root)
 _DEFAULT_PATH = Path("config/hardware/objectives.json")
 
-# Standard microscope objectives included on first-time creation
-STANDARD_OBJECTIVES: list[dict] = [
-    {"name": "1x",   "nominal_magnification": 1.0},
-    {"name": "2x",   "nominal_magnification": 2.0},
-    {"name": "4x",   "nominal_magnification": 4.0},
-    {"name": "10x",  "nominal_magnification": 10.0},
-    {"name": "20x",  "nominal_magnification": 20.0},
-    {"name": "40x",  "nominal_magnification": 40.0},
-    {"name": "100x", "nominal_magnification": 100.0},
-]
+# v7.4.x: Objectives are user-defined — no prepopulated list. Users
+# create entries via the Objective Calibration Setup card with their
+# own names and nominal magnifications. Existing objectives.json
+# files (e.g. carried over from a previous version that auto-populated
+# 1x/2x/.../100x) keep their data on load; only first-time installs
+# start with an empty list.
+STANDARD_OBJECTIVES: list[dict] = []
 
 
 class ObjectiveCalibrationStore:
@@ -119,6 +116,51 @@ class ObjectiveCalibrationStore:
             if obj["name"] == objective_name:
                 return float(obj["nominal_magnification"])
         return None
+
+    # ── Objective library CRUD (v7.4.x) ────────────────────────────
+
+    def add_objective(self, name: str, nominal_magnification: float) -> bool:
+        """Add a user-defined objective. Returns True on success.
+
+        Duplicate names are rejected (case-sensitive). Persists immediately.
+        """
+        name = (name or "").strip()
+        if not name:
+            return False
+        objectives = list(self._data.get("objectives", []))
+        for obj in objectives:
+            if obj.get("name") == name:
+                return False  # duplicate
+        objectives.append({
+            "name": name,
+            "nominal_magnification": float(nominal_magnification),
+        })
+        self._data["objectives"] = objectives
+        self.save()
+        logger.info(
+            f"Objective added: {name} @ nominal {nominal_magnification:g}×"
+        )
+        return True
+
+    def remove_objective(self, name: str) -> bool:
+        """Remove a user-defined objective (and its calibration entries).
+
+        Returns True if the objective existed and was removed. Persists.
+        """
+        objectives = list(self._data.get("objectives", []))
+        remaining = [o for o in objectives if o.get("name") != name]
+        if len(remaining) == len(objectives):
+            return False  # not found
+        self._data["objectives"] = remaining
+        # Also strip any calibration entries keyed by this objective name
+        # so the store stays internally consistent.
+        for cam, cals in self._data.get(
+            "camera_objective_calibrations", {}
+        ).items():
+            cals.pop(name, None)
+        self.save()
+        logger.info(f"Objective removed: {name}")
+        return True
 
     # ── Calibration read / write ───────────────────────────────────
 

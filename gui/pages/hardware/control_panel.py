@@ -26,13 +26,13 @@ import logging
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from gui.scaling import s, sp, scaled_font_size as sf
-from gui.styles import COLORS, SECTION_TITLE_STYLE
-from gui.widgets.components import StatusBadge
+from gui.styles import COLORS
+from gui.widgets.components import Card, StatusBadge
 from gui.widgets.icons import icon, icon_button
 from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
@@ -123,7 +123,24 @@ class HardwareControlPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None, *,
                  show_connect: bool = True,
-                 bypass_safety: bool = True):
+                 bypass_safety: bool = True,
+                 embedded: bool = False):
+        """Build the control panel.
+
+        Args:
+            show_connect: Show the Connect Hardware section (default True).
+                          Hide on pages where connection happens elsewhere.
+            bypass_safety: Set True for Hardware Setup's mechanical-envelope
+                           workflow; False on Calibration / Jog where soft
+                           limits should clamp every move.
+            embedded: When False (default) the panel owns a QScrollArea
+                      around its content. Set True when embedding inside
+                      a parent that already scrolls — the parent then sees
+                      the panel's natural size, and the inner sections
+                      don't have to share that scroll with neighbours.
+                      v7.4.3: required by StandardJogContextPanel so the
+                      outer context-pane scroll handles everything.
+        """
         super().__init__(parent)
         self.setObjectName("hardwareControlPanel")
         self.setStyleSheet(
@@ -136,6 +153,7 @@ class HardwareControlPanel(QWidget):
         self._settings = None
         self._show_connect = show_connect
         self._bypass_safety = bypass_safety
+        self._embedded = embedded
         self._build_ui()
 
     # ── Public API ──────────────────────────────────────────────
@@ -172,28 +190,37 @@ class HardwareControlPanel(QWidget):
     # ── UI ──────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet(
-            f"QScrollArea {{ background-color: transparent; border: none; }}")
+        # v7.4.3: when embedded, skip our own QScrollArea so the parent
+        # context pane provides one outer scroll. Nested scrolls were
+        # squeezing the jog buttons in the calibration / jog left panel.
+        if self._embedded:
+            layout = QVBoxLayout(self)
+            layout.setSpacing(s(14))
+            layout.setContentsMargins(s(14), s(14), s(14), s(14))
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setStyleSheet(
+                f"QScrollArea {{ background-color: transparent; border: none; }}")
 
-        wrap = QVBoxLayout(self)
-        wrap.setContentsMargins(0, 0, 0, 0)
-        wrap.addWidget(scroll)
+            wrap = QVBoxLayout(self)
+            wrap.setContentsMargins(0, 0, 0, 0)
+            wrap.addWidget(scroll)
 
-        content = QWidget()
-        content.setStyleSheet("background-color: transparent;")
-        layout = QVBoxLayout(content)
-        layout.setSpacing(s(14))
-        layout.setContentsMargins(s(14), s(14), s(14), s(14))
-        scroll.setWidget(content)
+            content = QWidget()
+            content.setStyleSheet("background-color: transparent;")
+            layout = QVBoxLayout(content)
+            layout.setSpacing(s(14))
+            layout.setContentsMargins(s(14), s(14), s(14), s(14))
+            scroll.setWidget(content)
 
         if self._show_connect:
             layout.addWidget(self._build_connect_group())
         layout.addWidget(self._build_jog_group())
         layout.addWidget(self._build_position_group())
-        layout.addStretch(1)
+        if not self._embedded:
+            layout.addStretch(1)
 
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet(f"color: {COLORS['subtext0']};")
@@ -202,10 +229,11 @@ class HardwareControlPanel(QWidget):
 
     # ── Connect group ───────────────────────────────────────────
 
-    def _build_connect_group(self) -> QGroupBox:
-        grp = QGroupBox("Connect Hardware")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        grid = QGridLayout(grp)
+    def _build_connect_group(self) -> QWidget:
+        # v7.4.3: Card-with-collapsible replaces QGroupBox so the whole
+        # context pane can be one scrolling list of foldable sections.
+        card = Card("Connect Hardware", collapsible=True)
+        grid = QGridLayout()
         grid.setHorizontalSpacing(s(8))
         grid.setVerticalSpacing(s(10))
         grid.setColumnStretch(0, 0)
@@ -219,6 +247,15 @@ class HardwareControlPanel(QWidget):
 
         def _connect_btn(text: str, icon_name: str) -> QPushButton:
             return icon_button(text, icon_name, object_name="successBtn")
+
+        def _simulate_btn(tooltip: str) -> QPushButton:
+            # v7.4.2: per-stage Simulate button — opens the built-in
+            # simulator instead of real hardware. Mirrors the Connect
+            # button's visual weight but uses the accent color so the
+            # two paths are easy to tell apart at a glance.
+            b = icon_button("Simulate", "flask", object_name="accentBtn",
+                            tooltip=tooltip)
+            return b
 
         def _disconnect_btn(tooltip: str) -> QPushButton:
             b = icon_button("", "x", object_name="dangerBtn", tooltip=tooltip)
@@ -234,8 +271,14 @@ class HardwareControlPanel(QWidget):
         btns.setSpacing(s(6))
         btns.setContentsMargins(0, 0, 0, 0)
         self.btn_connect_xy = _connect_btn("Connect", "plug")
+        self.btn_connect_xy.setToolTip(
+            "Open the real XY stage over serial.")
         self.btn_connect_xy.clicked.connect(self._connect_xy)
         btns.addWidget(self.btn_connect_xy)
+        self.btn_simulate_xy = _simulate_btn(
+            "Use the XY stage simulator instead of real hardware.")
+        self.btn_simulate_xy.clicked.connect(self._simulate_xy)
+        btns.addWidget(self.btn_simulate_xy)
         self.btn_disconnect_xy = _disconnect_btn("Disconnect XY")
         self.btn_disconnect_xy.clicked.connect(self._disconnect_xy)
         btns.addWidget(self.btn_disconnect_xy)
@@ -250,8 +293,14 @@ class HardwareControlPanel(QWidget):
         btns.setSpacing(s(6))
         btns.setContentsMargins(0, 0, 0, 0)
         self.btn_connect_zp = _connect_btn("Connect", "plug")
+        self.btn_connect_zp.setToolTip(
+            "Open the real Marlin Z + pumps controller over serial.")
         self.btn_connect_zp.clicked.connect(self._connect_zp)
         btns.addWidget(self.btn_connect_zp)
+        self.btn_simulate_zp = _simulate_btn(
+            "Use the Z + pumps simulator instead of real hardware.")
+        self.btn_simulate_zp.clicked.connect(self._simulate_zp)
+        btns.addWidget(self.btn_simulate_zp)
         self.btn_disconnect_zp = _disconnect_btn("Disconnect ZP")
         self.btn_disconnect_zp.clicked.connect(self._disconnect_zp)
         btns.addWidget(self.btn_disconnect_zp)
@@ -273,16 +322,15 @@ class HardwareControlPanel(QWidget):
         btns.addWidget(self.btn_disconnect_xbox)
         grid.addLayout(btns, row, 2)
 
-        return grp
+        card.add_layout(grid)
+        return card
 
     # ── Jog group ───────────────────────────────────────────────
 
-    def _build_jog_group(self) -> QGroupBox:
-        grp = QGroupBox("Jog Stages")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        lay = QVBoxLayout(grp)
+    def _build_jog_group(self) -> QWidget:
+        card = Card("Jog Stages", collapsible=True)
+        lay = card.body_layout()
         lay.setSpacing(s(8))
-        lay.setContentsMargins(s(8), s(8), s(8), s(8))
 
         # v7.4.2: variant-aware banner. Setup-mode (bypass_safety=True)
         # gets the yellow "limits OFF" warning. Safety-on mode gets a
@@ -349,7 +397,7 @@ class HardwareControlPanel(QWidget):
         self.btn_refresh.clicked.connect(self._force_refresh_positions)
         lay.addWidget(self.btn_refresh)
 
-        return grp
+        return card
 
     # ── Speed controls ─────────────────────────────────────────
 
@@ -431,11 +479,9 @@ class HardwareControlPanel(QWidget):
 
     # ── Live position group ─────────────────────────────────────
 
-    def _build_position_group(self) -> QGroupBox:
-        grp = QGroupBox("Live Position")
-        grp.setStyleSheet(SECTION_TITLE_STYLE)
-        lay = QVBoxLayout(grp)
-        lay.setContentsMargins(s(8), s(8), s(8), s(8))
+    def _build_position_group(self) -> QWidget:
+        card = Card("Live Position", collapsible=True)
+        lay = card.body_layout()
 
         # v7.4.2: per-axis row = label + slider bar (extents from safety
         # limits) + numeric value + unit. The bar visualises how close
@@ -473,7 +519,7 @@ class HardwareControlPanel(QWidget):
             self.lbl_pos[axis] = val
         lay.addLayout(grid)
 
-        return grp
+        return card
 
     # ── Safety-limit range loader ───────────────────────────────
 
@@ -517,14 +563,33 @@ class HardwareControlPanel(QWidget):
     # ── Connect handlers ────────────────────────────────────────
 
     def _connect_xy(self) -> None:
+        """v7.4.2: open the real XY hardware."""
+        self._open_xy(simulate=False)
+
+    def _simulate_xy(self) -> None:
+        """v7.4.2: open the XY simulator (no hardware required)."""
+        self._open_xy(simulate=True)
+
+    def _open_xy(self, *, simulate: bool) -> None:
         if self._controller is None:
             return
-        self.badge_xy.set_status("info", "Connecting…")
+        # If a stage is already attached, tear it down first so we can
+        # switch between real / simulator without leaving a stale handle.
+        if self._controller.is_xy_connected:
+            try:
+                self._controller.disconnect_xy()
+            except Exception as e:
+                logger.warning(f"disconnect_xy before reopen failed: {e}")
+        self.badge_xy.set_status(
+            "info", "Starting simulator…" if simulate else "Connecting…")
         try:
-            self._controller.connect_xy()
+            self._controller.connect_xy(simulate=simulate)
             ok = bool(self._controller.is_xy_connected)
-            self.badge_xy.set_status("ok" if ok else "err",
-                                     "Connected" if ok else "Failed")
+            if ok:
+                self.badge_xy.set_status(
+                    "ok", "Simulated" if simulate else "Connected")
+            else:
+                self.badge_xy.set_status("err", "Failed")
         except Exception as e:
             self.badge_xy.set_status("err", f"Error: {e}")
 
@@ -538,15 +603,33 @@ class HardwareControlPanel(QWidget):
         self.badge_xy.set_status("pending", "Not connected")
 
     def _connect_zp(self) -> None:
+        """v7.4.2: open the real ZP hardware."""
+        self._open_zp(simulate=False)
+
+    def _simulate_zp(self) -> None:
+        """v7.4.2: open the ZP simulator (no hardware required)."""
+        self._open_zp(simulate=True)
+
+    def _open_zp(self, *, simulate: bool) -> None:
         if self._controller is None:
             return
-        self.badge_zp.set_status("info", "Connecting…")
+        if self._controller.is_zp_connected:
+            try:
+                self._controller.disconnect_zp()
+            except Exception as e:
+                logger.warning(f"disconnect_zp before reopen failed: {e}")
+        self.badge_zp.set_status(
+            "info", "Starting simulator…" if simulate else "Connecting…")
         try:
-            self._controller.connect_zp()
+            self._controller.connect_zp(simulate=simulate)
             ok = bool(self._controller.is_zp_connected)
-            self.badge_zp.set_status("ok" if ok else "err",
-                                     "Connected" if ok else "Failed")
-            if ok and self._settings is not None:
+            if ok:
+                self.badge_zp.set_status(
+                    "ok", "Simulated" if simulate else "Connected")
+            else:
+                self.badge_zp.set_status("err", "Failed")
+            # Cache the connected serial port — only meaningful for real HW.
+            if ok and not simulate and self._settings is not None:
                 port = self._controller.zp_connected_port
                 if port:
                     self._settings.set("zp_stage.last_port", port)
@@ -623,10 +706,20 @@ class HardwareControlPanel(QWidget):
             return
         xy_ok = bool(getattr(self._controller, 'is_xy_connected', False))
         zp_ok = bool(getattr(self._controller, 'is_zp_connected', False))
-        self.badge_xy.set_status("ok" if xy_ok else "pending",
-                                 "Connected" if xy_ok else "Not connected")
-        self.badge_zp.set_status("ok" if zp_ok else "pending",
-                                 "Connected" if zp_ok else "Not connected")
+        # v7.4.2: distinguish a real-hardware connection from a simulator
+        # so the operator sees at a glance which one is driving the stage.
+        xy_sim = bool(getattr(self._controller, 'simulate_xy', False)) and xy_ok
+        zp_sim = bool(getattr(self._controller, 'simulate_zp', False)) and zp_ok
+        if not xy_ok:
+            self.badge_xy.set_status("pending", "Not connected")
+        else:
+            self.badge_xy.set_status(
+                "ok", "Simulated" if xy_sim else "Connected")
+        if not zp_ok:
+            self.badge_zp.set_status("pending", "Not connected")
+        else:
+            self.badge_zp.set_status(
+                "ok", "Simulated" if zp_sim else "Connected")
         xbox_st = getattr(self._controller, "xbox_status", None)
         if callable(xbox_st):
             try:

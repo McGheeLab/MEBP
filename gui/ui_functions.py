@@ -131,11 +131,20 @@ class UIFunctions:
             window._context_panel_width = box.width() or s(AppSettings.LEFT_BOX_WIDTH)
             box.hide()
         else:
-            # Opening — restore saved width
-            target = getattr(window, '_context_panel_width', s(AppSettings.LEFT_BOX_WIDTH))
+            # Opening — restore the remembered width. MainWindow owns the
+            # sizing logic (drag bounds + clamp) so the splitter behaves the
+            # same whether the panel is opened by button, page-switch, or the
+            # first-show event.
             box.show()
-            total = splitter.width()
-            splitter.setSizes([target, total - target])
+            if hasattr(window, '_apply_saved_context_width'):
+                window._apply_saved_context_width()
+            else:
+                # Fallback for any window without the helper.
+                saved = getattr(window, '_context_panel_width',
+                                s(AppSettings.LEFT_BOX_WIDTH))
+                total = splitter.width()
+                target = max(box.minimumWidth() or s(340), saved)
+                splitter.setSizes([target, max(0, total - target)])
 
     # ── Menu Selection Styling ───────────────────────────────────
 

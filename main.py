@@ -5,11 +5,20 @@ Supports two modes:
   --headless : Xbox controller only (no GUI)
   (default)  : Full PyDracula-style GUI application
 
+GUI mode: stages start disconnected. Click Connect (real hardware) or
+Simulate (built-in simulator) per stage on Hardware Setup → Device →
+Connect Hardware. There is no longer a single global "simulation" flag
+in settings.json — the choice is made per-connection at runtime.
+
+Headless mode: stages are connected once at startup. The defaults are
+real hardware for both axes. Use ``--simulate-xy`` / ``--simulate-zp``
+to spin up simulators instead (handy when no hardware is attached).
+
 Usage:
-  python main.py                         # GUI mode, simulation
-  python main.py --headless              # Headless with simulation
-  python main.py --real-xy --real-zp     # Real hardware
-  python main.py --headless --real-xy    # Headless, real XY, simulated ZP
+  python main.py                         # GUI mode, nothing connected yet
+  python main.py --headless              # Headless, real XY + real ZP
+  python main.py --headless --simulate-xy --simulate-zp   # Headless, simulators
+  python main.py --headless --simulate-zp                  # Real XY, sim ZP
 """
 
 import argparse
@@ -138,15 +147,20 @@ def main():
     parser = argparse.ArgumentParser(description="MEBP Bioprinter Application")
     parser.add_argument("--headless", action="store_true",
                         help="Run without GUI (Xbox controller only)")
+    # v7.4.2: GUI mode no longer auto-connects — Connect / Simulate
+    # buttons on Hardware Setup → Device drive per-stage selection.
+    # In headless mode the default is real hardware on both axes; pass
+    # --simulate-xy / --simulate-zp to swap in the built-in simulators.
     parser.add_argument("--real-xy", action="store_true",
-                        help="Use real XY stage hardware (default: simulate)")
+                        help="(Headless) Force real XY stage. Default is real "
+                             "hardware, so this is only needed alongside the "
+                             "deprecated --simulate-xy to win the override.")
     parser.add_argument("--real-zp", action="store_true",
-                        help="Use real ZP stage hardware")
-    # v7.2.8s2: default simulate False — add explicit simulate flags
+                        help="(Headless) Force real ZP stage. See --real-xy.")
     parser.add_argument("--simulate-xy", action="store_true",
-                        help="Force XY stage simulation")
+                        help="(Headless) Open the XY simulator instead of real hardware.")
     parser.add_argument("--simulate-zp", action="store_true",
-                        help="Force ZP stage simulation")
+                        help="(Headless) Open the ZP simulator instead of real hardware.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
     parser.add_argument("--debug-xy", action="store_true",
@@ -165,19 +179,16 @@ def main():
         from SupportClasses.XYDebugLogger import enable as _enable_xy_debug
         _enable_xy_debug()
 
-    # v7.2.8s2: default simulate False — real hardware is the default
-    simulate_xy = settings.get("simulation.simulate_xy", False)
-    simulate_zp = settings.get("simulation.simulate_zp", False)
-
-    # CLI overrides
+    # v7.4.2: simulation is no longer a persisted setting. Real hardware
+    # is the default; CLI flags swap in the simulator per axis (mainly
+    # useful in headless mode, since GUI mode chooses per-connect from
+    # the Device sub-page). --real-* wins when both flags are passed.
+    simulate_xy = bool(getattr(args, "simulate_xy", False))
+    simulate_zp = bool(getattr(args, "simulate_zp", False))
     if args.real_xy:
         simulate_xy = False
     if args.real_zp:
         simulate_zp = False
-    if getattr(args, "simulate_xy", False):
-        simulate_xy = True
-    if getattr(args, "simulate_zp", False):
-        simulate_zp = True
 
     # v7.2.8: Pass controller_json from settings for hardware auto-detect
     controller_json = settings.get("controller.controller_json", "auto")

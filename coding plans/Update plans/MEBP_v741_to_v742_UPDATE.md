@@ -72,3 +72,26 @@ Branch: `Version-7.4.2` (branched from `Version-7.4.1`).
 - **Three preset step sizes, not configurable spinbox.** Per the user's choice: Fine / Med / Coarse for each axis. XY: 10µm / 100µm / 1000µm. Z/P: 0.01mm / 0.1mm / 1mm. Discoverable and fast for the common record-limits workflow; if more granular control is needed, the existing Jog Control page still has the configurable-step path.
 - **Calibration formula.** `new_steps = current_steps × (commanded / measured)`. Preserves the sign of the current calibration so direction inversion isn't accidentally clobbered.
 - **Record Min/Max writes to safety spinboxes, not directly to settings.** The user can still adjust the value before clicking Apply Settings — useful if you want to round a jog-recorded number to a clean limit (e.g. 129843 → 130000).
+
+## Addendum — Per-Stage Simulate Buttons (v7.4.2 hotfix)
+
+### Objective
+Make XY/ZP simulation a per-connect choice driven from the Connect Hardware group, instead of a global boolean that lived in `settings.json` and required an app restart to toggle. Connect = real hardware only; Simulate = built-in simulator. Either button rebinds the stage at runtime.
+
+### Files Modified
+
+| File | Rationale |
+|------|-----------|
+| `SupportClasses/StageController.py` | `simulate_xy` / `simulate_zp` change from instance flags to read-only properties that report the live stage's mode (or the constructor default when nothing is connected). `connect_stages` / `connect_xy` / `connect_zp` gain a `simulate` kwarg. Init args renamed in spirit (now `_default_simulate_xy`/`_zp`) so headless callers without an explicit `simulate=` argument keep working. |
+| `gui/pages/hardware/stage_panel.py` | Connect Hardware group gains a `🧪 Simulate` button per stage next to `🔌 Connect`. New `_simulate_xy` / `_simulate_zp` / `_open_xy` / `_open_zp` slots tear down whatever is currently bound and reopen in the chosen mode. `_sync_connection_badges` distinguishes "Connected" from "Simulated". |
+| `gui/pages/settings_page.py` | Removed `Simulate XY` / `Simulate ZP` checkboxes from the Connection card (and load/save logic). Context-panel labels now read live mode from `controller.simulate_xy/_zp` and show "—" until a stage is connected. |
+| `gui/onboarding/wizard.py` | Stages step replaces single Test button + checkbox with Connect / Simulate buttons per stage. `_ConnectProbeWorker` accepts a `simulate` kwarg. Removed `_stages_next` simulate-flag persistence. Summary step now reports live mode instead of "takes effect on next launch". |
+| `main.py` | Stop reading `simulation.simulate_xy/zp` from settings.json. CLI flags still drive headless defaults. Docstring + argparse help updated. |
+| `SupportClasses/Settings.py` | `simulation` block removed from DEFAULTS. Old user keys ignored (no migration needed). |
+| `settings.json` | Stripped the `simulation` block from the committed default file. |
+
+### Issues & Decisions
+- **Why a property, not a setter.** `controller.simulate_xy` and `simulate_zp` are widely read across the codebase to gate behavior (e.g. EEPROM `M500` saves, alignment checks, status text). Making them read-only properties backed by `xy_stage.simulate` / `zp_stage.simulate` keeps every caller correct without touching them.
+- **Open-while-open is a re-open.** Clicking Simulate while a real stage is connected (or vice versa) calls `disconnect_xy`/`disconnect_zp` first, then reopens in the new mode. No app restart required.
+- **CLI flags survive.** `--simulate-xy` / `--simulate-zp` (and `--real-xy` / `--real-zp`) still work in headless mode — they set the constructor default, which is what `connect_stages()` with no `simulate=` kwarg falls back to. The GUI path never uses the constructor default because every connect button passes an explicit flag.
+- **No migration of user settings.** Old `simulation.simulate_xy` / `simulation.simulate_zp` keys are simply ignored on next launch — they're not load-bearing anywhere else, so we don't burn a migration step on them.

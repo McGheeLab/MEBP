@@ -289,13 +289,14 @@ class PrintTrajectoryPlanner:
             self._fluid_balance[pump_id] -= abs(pump_delta)
 
 
-    def _travel_to_well(self, wx: float, wy: float, settings, well=""):
+    def _travel_to_well(self, wx: float, wy: float, settings, well="",
+                        print_z: float | None = None):
         """4-phase smart Z approach. # v7.2.6-auto-B1
 
         Phase 1: Fast Z up to safe_z (travel_z_height) if not already there.
         Phase 2: Fast XY to destination at service_xy_speed_mm_s.
         Phase 3: Fast Z down to (top_z + 0.5mm buffer) — above well opening.
-        Phase 4: Slow Z entry to print_z_height — controlled needle insertion.
+        Phase 4: Slow Z entry to print_z (per-well, v7.4.8) — controlled insertion.
 
         Falls back to single-phase if top_z_height == 0 (calibration not done).
         """
@@ -305,6 +306,7 @@ class PrintTrajectoryPlanner:
         fast_z   = getattr(settings, 'fast_z_feedrate_mm_min', settings.z_feedrate)
         entry_z  = getattr(settings, 'entry_z_feedrate_mm_min', settings.z_feedrate)
         svc_xy   = getattr(settings, 'service_xy_speed_mm_s', 10.0) * 60.0  # → mm/min
+        target   = print_z if print_z is not None else settings.print_z_height
 
         # Phase 1: raise to safe_z at fast speed
         if self._z < safe_z - 0.01:
@@ -320,10 +322,10 @@ class PrintTrajectoryPlanner:
             if self._z > approach_z + 0.01:
                 self._move_z(approach_z, fast_z, segment="travel", well=well)
             # Phase 4: slow Z entry to print height
-            self._move_z(settings.print_z_height, entry_z, segment="travel", well=well)
+            self._move_z(target, entry_z, segment="travel", well=well)
         else:
             # Fallback: single-phase lower (no calibration)
-            self._move_z(settings.print_z_height, settings.z_feedrate,
+            self._move_z(target, settings.z_feedrate,
                          segment="travel", well=well)
 
         # Dwell after arrival
@@ -331,17 +333,17 @@ class PrintTrajectoryPlanner:
             self._dwell(settings.dwell_after_move, well=well)
 
 
-    def _lower_to_print(self, settings, well=""):
+    def _lower_to_print(self, settings, well="", print_z: float | None = None):
         """Lower Z to print height. 2-phase if calibration available. # v7.2.6-auto-B2
 
         Phase 1: Fast Z to (top_z + 0.5mm) if not already below that.
-        Phase 2: Slow entry to print_z_height.
+        Phase 2: Slow entry to print_z (per-well, v7.4.8).
         Falls back to single-phase (z_feedrate) if top_z_height == 0.
         """
         top_z   = getattr(settings, 'top_z_height', 0.0)
         fast_z  = getattr(settings, 'fast_z_feedrate_mm_min', settings.z_feedrate)
         entry_z = getattr(settings, 'entry_z_feedrate_mm_min', settings.z_feedrate)
-        target  = settings.print_z_height
+        target  = print_z if print_z is not None else settings.print_z_height
 
         if self._z <= target + 0.001:
             return  # Already at or below print height
@@ -509,6 +511,23 @@ class PrintTrajectoryPlanner:
         self._do_print_wells(plate, well_names, pump_id, path_points,
                              flow_rate, settings)
 
+    def _well_print_z(self, plate, well_name, settings) -> float:
+        """v7.4.8: effective dispense Z for a well.
+
+        If the well (e.g. a flattened rosette sub-well A1.a) prescribes an
+        ``ink_z_mm`` (relative to the plate top), use ``top_z + ink_z_mm``;
+        otherwise fall back to the global ``settings.print_z_height``.
+        Larger Z = higher / further from plate.
+        """
+        try:
+            info = plate.get_well_info(well_name)
+            if getattr(info, "ink_z_mm", None) is not None:
+                top_z = getattr(settings, "top_z_height", 0.0)
+                return top_z + info.ink_z_mm
+        except Exception:
+            pass
+        return settings.print_z_height
+
     def _do_print_wells(self, plate, well_names, pump_id, path_points,
                         flow_rate, settings):
         """Print a list of wells: for each → travel, lower, prime, print, retract, raise."""
@@ -521,11 +540,15 @@ class PrintTrajectoryPlanner:
 
             self._next_segment()
 
+            # v7.4.8: per-well dispense Z (rosette sub-wells / tubes).
+            print_z = self._well_print_z(plate, well_name, settings)
+
             # Travel to well
-            self._travel_to_well(wx, wy, settings, well=well_name)
+            self._travel_to_well(wx, wy, settings, well=well_name,
+                                 print_z=print_z)
 
             # Lower to print
-            self._lower_to_print(settings, well=well_name)
+            self._lower_to_print(settings, well=well_name, print_z=print_z)
 
             # Prime
             prime_mm = settings.get_retract_amount(pump_id) if hasattr(settings, 'get_retract_amount') else 0

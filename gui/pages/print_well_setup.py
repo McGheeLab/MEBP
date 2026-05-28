@@ -145,6 +145,21 @@ from SupportClasses.PrintPlanOfAction import (
 logger = logging.getLogger(__name__)
 
 
+def _same_plate_key(a, b) -> bool:
+    """Compare two plate keys, treating int 96 and 'custom:foo' vs 'foo' equivalently.
+
+    v7.4.5 helper. Inputs may be:
+      - int (standard format like 6/12/96/...)
+      - str (custom plate name like 'my-plate' or its WellPlate.format
+        encoding 'custom:my-plate')
+    """
+    if a == b:
+        return True
+    a_s = a[7:] if isinstance(a, str) and a.startswith("custom:") else a
+    b_s = b[7:] if isinstance(b, str) and b.startswith("custom:") else b
+    return a_s == b_s
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Well Setup Tab (Tab 3)
 # ═══════════════════════════════════════════════════════════════════
@@ -190,8 +205,10 @@ class WellSetupTab(QWidget):
         self._settings   = settings
         self._workspace  = workspace or WorkspaceConfig()
 
-        # Model
-        self._model = WellSetupModel(self._workspace.plate_format)
+        # Model (v7.4.5: use active_plate_key so custom plates pass through)
+        plate_key = getattr(self._workspace, "active_plate_key",
+                            self._workspace.plate_format)
+        self._model = WellSetupModel(plate_key)
 
         # State
         self._available_prints: list = []
@@ -232,8 +249,9 @@ class WellSetupTab(QWidget):
     def set_workspace(self, workspace) -> None:
         """Update workspace / plate format."""
         self._workspace = workspace
-        if workspace.plate_format != self._model.plate_format:
-            self._model.set_plate_format(workspace.plate_format)
+        new_key = getattr(workspace, "active_plate_key", workspace.plate_format)
+        if not _same_plate_key(new_key, self._model.plate_format):
+            self._model.set_plate_format(new_key)
             self._refresh_plate()
 
     def set_available_prints(self, names: list) -> None:
@@ -250,9 +268,11 @@ class WellSetupTab(QWidget):
         if hasattr(self, "_model") and self._model:
             current_fmt = getattr(self._model, "plate_format",
                                   getattr(self._model, "_plate_format", None))
-            if config.plate_format != current_fmt:
+            # v7.4.5: use active_plate_key so custom plates pass through.
+            new_key = getattr(config, "active_plate_key", config.plate_format)
+            if not _same_plate_key(new_key, current_fmt):
                 try:
-                    self._model.set_plate_format(config.plate_format)
+                    self._model.set_plate_format(new_key)
                     self._refresh_plate()
                 except Exception as exc:
                     logger.error(f"Plate format sync failed: {exc}")
@@ -269,7 +289,15 @@ class WellSetupTab(QWidget):
     # ── UI Build ──────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        """Build the complete well setup layout."""
+        """Build the well setup layout.
+
+        v7.6.0: the body keeps only the canonical view (status line +
+        plate + assignment summary). The role bar, role options, and
+        save/load/auto-assign actions are built as DETACHED panels
+        (``role_bar_panel`` / ``role_options_panel`` /
+        ``well_actions_panel``) that the wizard reparents into the
+        Step 2 left-context Tools.
+        """
         main = QVBoxLayout(self)
         main.setContentsMargins(4, 4, 4, 4)
         main.setSpacing(4)
@@ -280,17 +308,35 @@ class WellSetupTab(QWidget):
             f"color: {COLORS['subtext0']}; font-size: {sf(9.5)}pt; padding: {sp(2)} {sp(4)};")
         main.addWidget(self.plane_info_label)
 
-        # ── Top area: plate + summary ─────────────────────────────
+        # ── Body: plate + summary (canonical view, stays here) ────
         self._build_plate_area(main)
 
-        # ── Role bar ──────────────────────────────────────────────
-        self._build_role_bar(main)
+        # ── Detached tool panels (reparented into Step 2 Tools) ───
+        self.role_bar_panel = self._make_tool_panel(
+            "Assign Role", self._build_role_bar)
+        self.role_options_panel = self._make_tool_panel(
+            "Role Options", self._build_role_options)
+        self.well_actions_panel = self._make_tool_panel(
+            "Setup", self._build_bottom_buttons)
 
-        # ── Role-specific options ─────────────────────────────────
-        self._build_role_options(main)
-
-        # ── Bottom buttons ────────────────────────────────────────
-        self._build_bottom_buttons(main)
+    def _make_tool_panel(self, title: str, build_fn) -> QWidget:
+        """Wrap one of the existing `_build_*` section builders into a
+        standalone titled QWidget for the wizard's Step 2 Tools."""
+        host = QWidget()
+        host.setStyleSheet(f"background: {COLORS['base']};")
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(s(4), s(4), s(4), s(4))
+        lay.setSpacing(s(4))
+        hdr = QLabel(title)
+        hdr.setStyleSheet(
+            f"color: {COLORS['text']}; font-weight: 700; "
+            f"font-size: {sf(10.5)}pt; "
+            f"background: {COLORS['surface0']}; "
+            f"padding: {sp(4)} {sp(8)}; border-radius: 4px;")
+        lay.addWidget(hdr)
+        build_fn(lay)
+        lay.addStretch()
+        return host
 
     def _build_plate_area(self, parent_layout) -> None:
         """Splitter: WellPlateView (left) + Assignment Summary Table (right)."""
@@ -324,6 +370,36 @@ class WellSetupTab(QWidget):
             QAbstractItemView.SelectionMode.NoSelection)
         self._summary_table.setAlternatingRowColors(True)
         self._summary_table.verticalHeader().setVisible(False)
+        # Catppuccin styling — without this, setAlternatingRowColors
+        # falls back to the QPalette AlternateBase which Qt defaults
+        # to system white, producing a glaring white background.
+        self._summary_table.setStyleSheet(
+            f"QTableWidget {{"
+            f"  background: {COLORS['base']};"
+            f"  alternate-background-color: {COLORS['surface0']};"
+            f"  color: {COLORS['text']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"  gridline-color: {COLORS['surface1']};"
+            f"  font-size: {sf(10)}pt;"
+            f"}}"
+            f"QTableWidget::item {{ padding: {sp(4)} {sp(6)}; }}"
+            f"QHeaderView::section {{"
+            f"  background: {COLORS['mantle']};"
+            f"  color: {COLORS['subtext0']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"  padding: {sp(4)} {sp(8)};"
+            f"  font-weight: 600;"
+            f"}}"
+            f"QTableCornerButton::section {{"
+            f"  background: {COLORS['mantle']};"
+            f"  border: 1px solid {COLORS['surface1']};"
+            f"}}"
+        )
+        # Viewport background — the QAbstractScrollArea viewport ignores
+        # the QTableWidget stylesheet's background-color rule.
+        self._summary_table.viewport().setStyleSheet(
+            f"background: {COLORS['base']};"
+        )
         tc_layout.addWidget(self._summary_table)
 
         splitter.addWidget(table_container)
@@ -332,10 +408,12 @@ class WellSetupTab(QWidget):
         parent_layout.addWidget(splitter, stretch=3)
 
     def _build_role_bar(self, parent_layout) -> None:
-        """Row of checkable role buttons."""
+        """v7.6.0: checkable role buttons in a 2-column grid so they
+        fit the narrow left-context Tools column without overflow."""
+        from PySide6.QtWidgets import QGridLayout
         bar_frame = QFrame()
         bar_frame.setObjectName("cardFrame")
-        bar_layout = QHBoxLayout(bar_frame)
+        bar_layout = QVBoxLayout(bar_frame)
         bar_layout.setContentsMargins(6, 4, 6, 4)
         bar_layout.setSpacing(4)
 
@@ -350,11 +428,15 @@ class WellSetupTab(QWidget):
             (WellRole.SORTED_CELLS, "Sorted",  "#fab387"),
         ]
 
-        for role, label, color in role_defs:
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        for i, (role, label, color) in enumerate(role_defs):
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setFixedHeight(s(28))
-            btn.setMinimumWidth(s(62))
+            btn.setMinimumWidth(0)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                              QSizePolicy.Policy.Fixed)
             btn.setStyleSheet(
                 f"QPushButton {{background:{COLORS['base']}; border:2px solid {COLORS['surface1']};"
                 f" border-radius:{sp(4)}; color:{COLORS['text']}; font-size:{sf(9.5)}pt;}}"
@@ -366,11 +448,10 @@ class WellSetupTab(QWidget):
                 lambda _checked, r=role: self._on_role_btn_clicked(r)
             )
             self._role_btns[role] = btn
-            bar_layout.addWidget(btn)
+            grid.addWidget(btn, i // 2, i % 2)
+        bar_layout.addLayout(grid)
 
-        bar_layout.addStretch()
-
-        # Clear / Empty button — v7.4.2: solid icon, not emoji
+        # Clear / Empty button — full-width row.
         from gui.widgets.icons import icon_button as _icon_button
         btn_clear = _icon_button(
             "Clear", "x", object_name="dangerBtn",
@@ -525,27 +606,29 @@ class WellSetupTab(QWidget):
         parent_layout.addWidget(plan_group)
 
     def _build_bottom_buttons(self, parent_layout) -> None:
-        """Save / Load / Auto-assign row."""
+        """v7.6.0: Save / Load on one shared row + Auto-Assign full
+        width below, so they fit the narrow left-context column."""
         row = QHBoxLayout()
         row.setSpacing(6)
 
         btn_save = QPushButton("Save Setup")
         btn_save.clicked.connect(self._save_layout)
+        btn_save.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Fixed)
         row.addWidget(btn_save)
 
         btn_load = QPushButton("Load Setup")
         btn_load.clicked.connect(self._load_layout)
+        btn_load.setSizePolicy(QSizePolicy.Policy.Expanding,
+                               QSizePolicy.Policy.Fixed)
         row.addWidget(btn_load)
+        parent_layout.addLayout(row)
 
-        row.addStretch()
-
-        # Auto-assign menu
+        # Auto-assign menu — full-width row.
         btn_auto = QPushButton("Auto-Assign ▾")
         btn_auto.setObjectName("accentBtn")
         btn_auto.clicked.connect(self._show_auto_assign_menu)
-        row.addWidget(btn_auto)
-
-        parent_layout.addLayout(row)
+        parent_layout.addWidget(btn_auto)
 
     def _show_auto_assign_menu(self) -> None:
         """Quick auto-assign patterns."""

@@ -40,6 +40,7 @@ try:
         FocusTracker,
         WellDetector,
         NeedleDetector,
+        EdgeFitWellLocator,
     )
     VISION_AVAILABLE = True
 except ImportError:
@@ -54,6 +55,7 @@ class DetectionMode(Enum):
     NEEDLE_DETECT = auto()   # Detect needle tip (dark circle)
     NEEDLE_DETECT_RELAXED = auto()  # v7.3.3: Relaxed needle detection (wide tolerance)
     FOCUS_ASSIST = auto()    # Compute focus quality score
+    WELL_EDGE_FIT = auto()   # v7.4.4: Known-radius partial-arc fit (Plate Location workflow)
 
 
 class DetectionWorker(QThread):
@@ -100,6 +102,12 @@ class DetectionWorker(QThread):
         self._well_tolerance: float = 0.3
         self._well_param1: float = 100.0
         self._well_param2: float = 30.0
+
+        # v7.4.4: Edge-fit (known-radius partial-arc) tuning + state
+        self._edge_fit_radius_px: float = 0.0
+        self._edge_fit_um_per_px: float = 0.0
+        self._edge_fit_tolerance_pct: float = 0.10
+        self._edge_fit_locator = EdgeFitWellLocator() if VISION_AVAILABLE else None
 
         # Needle tuning parameters
         self._needle_tolerance: float = 0.4
@@ -181,6 +189,22 @@ class DetectionWorker(QThread):
         self._needle_tolerance = tolerance
         self._needle_min_circularity = min_circularity
 
+    def set_edge_fit_params(
+        self,
+        expected_radius_px: float,
+        um_per_px: float,
+        tolerance_pct: float = 0.10,
+    ) -> None:
+        """v7.4.4: Set known-radius edge-fit parameters for WELL_EDGE_FIT mode.
+
+        Called by the Plate Location workflow before driving to each
+        target well. The radius is the plate's known well-radius in
+        pixels (= half the spec diameter / um_per_px).
+        """
+        self._edge_fit_radius_px = float(expected_radius_px)
+        self._edge_fit_um_per_px = float(um_per_px)
+        self._edge_fit_tolerance_pct = float(tolerance_pct)
+
     # ── Thread Lifecycle ───────────────────────────────────────
 
     def stop_detection(self) -> None:
@@ -221,6 +245,8 @@ class DetectionWorker(QThread):
                     self._detect_needle_relaxed(frame)
                 elif self._mode == DetectionMode.FOCUS_ASSIST:
                     self._compute_focus(frame)
+                elif self._mode == DetectionMode.WELL_EDGE_FIT:
+                    self._fit_well_edge(frame)
             except Exception as e:
                 logger.warning(f"DetectionWorker error: {e}")
 
@@ -301,3 +327,22 @@ class DetectionWorker(QThread):
             result = raw
 
         self.focus_updated.emit(result)
+
+    def _fit_well_edge(self, frame) -> None:
+        """v7.4.4: Known-radius partial-arc fit, emit via well_detected."""
+        if (self._edge_fit_locator is None
+                or self._edge_fit_radius_px <= 0
+                or self._edge_fit_um_per_px <= 0):
+            return
+
+        result = self._edge_fit_locator.fit_partial_arc(
+            frame,
+            expected_radius_px=self._edge_fit_radius_px,
+            um_per_px=self._edge_fit_um_per_px,
+            tolerance_pct=self._edge_fit_tolerance_pct,
+        )
+
+        if result is not None:
+            self.well_detected.emit(result)
+        else:
+            self.detection_cleared.emit()

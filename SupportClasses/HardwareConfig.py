@@ -74,6 +74,47 @@ from SupportClasses.PrintPlanOfAction import InkSwapStrategy  # noqa: F401
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Camera Roles (v7.4.4)
+# ═══════════════════════════════════════════════════════════════════
+
+class CameraRole(str, Enum):
+    """Workflow role assigned to a live camera.
+
+    The Calibration page resolves which `CameraManager.cameras[i]` to
+    mount on each workflow tab by looking up the index that has the
+    expected role. Two side-mounted needle cameras (X-view and Y-view)
+    plus a single overhead plate camera covers the v7.4.4 workflows;
+    MICROSCOPE (v7.4.x) tags the camera that sits behind an objective
+    lens and supports per-objective µm/px calibration.
+
+    All non-UNASSIGNED roles are enforced as singletons by
+    `HardwareConfig.set_camera_role()` — assigning a role to a new slot
+    clears it from any other slot.
+    """
+    UNASSIGNED = "unassigned"
+    NEEDLE_X = "needle_x"     # Side cam looking down the X axis (sees Y/Z)
+    NEEDLE_Y = "needle_y"     # Side cam looking down the Y axis (sees X/Z)
+    PLATE = "plate"           # Overhead cam over the well plate
+    MICROSCOPE = "microscope" # Behind an objective lens; per-objective µm/px
+
+
+# v7.4.x: roles that may only be held by a single camera slot at a time.
+SINGLETON_CAMERA_ROLES: frozenset[CameraRole] = frozenset({
+    CameraRole.NEEDLE_X,
+    CameraRole.NEEDLE_Y,
+    CameraRole.PLATE,
+    CameraRole.MICROSCOPE,
+})
+
+
+# Maximum live cameras tracked simultaneously by CameraManager (v7.3.3).
+# Kept in sync with the `max_cams = 3` constant used by the Hardware
+# Setup mini-cards. Bumping this means bumping the default
+# `camera_roles` list length below.
+MAX_LIVE_CAMERAS = 3
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Camera Configuration (v7.3.0)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -91,6 +132,10 @@ class CameraConfig:
     active_resolution: tuple[int, int] = (916, 686)
     micron_per_pixel_override: float | None = None
     camera_to_needle_offset_um: tuple[float, float] = (0.0, 0.0)
+    # v7.4.x: which objective is currently mounted on the microscope camera.
+    # Used by `ObjectiveCalibrationCard` to look up the per-objective µm/px
+    # stored in objectives.json. None = no objective selected yet.
+    current_objective_name: str | None = None
 
     @property
     def computed_micron_per_pixel(self) -> float | None:
@@ -139,6 +184,7 @@ class CameraConfig:
             "active_resolution": list(self.active_resolution),
             "micron_per_pixel_override": self.micron_per_pixel_override,
             "camera_to_needle_offset_um": list(self.camera_to_needle_offset_um),
+            "current_objective_name": self.current_objective_name,
         }
 
     @classmethod
@@ -152,6 +198,7 @@ class CameraConfig:
             camera_to_needle_offset_um=tuple(
                 data.get("camera_to_needle_offset_um", [0.0, 0.0])
             ),
+            current_objective_name=data.get("current_objective_name"),
         )
 
 
@@ -317,7 +364,14 @@ class HardwareConfig:
     })
 
     # ── Well plate ────────────────────────────────────────────────
-    plate_format: int = 24  # 6, 12, 24, 48, 96, 384
+    plate_format: int = 24  # 6, 12, 24, 48, 96, 384 — legacy field, still
+                            # honored when `plate_name` is empty.
+
+    # ── v7.4.5: Custom parametric plates ──────────────────────────
+    # When non-empty, takes precedence over `plate_format`. Resolved via
+    # `WellPlate.load(cfg.active_plate_key)` to pick up either a standard
+    # (int) or a user-saved design (file under config/hardware/plates/user/).
+    plate_name: str = ""
 
     # ── Ink library (persisted across sessions) ───────────────────
     ink_library: dict[str, InkSpec] = field(default_factory=dict)
@@ -339,6 +393,14 @@ class HardwareConfig:
 
     # ── v7.3.0: Camera configuration for autocalibration ──────────
     camera_config: CameraConfig = field(default_factory=CameraConfig)
+
+    # ── v7.4.4: Per-camera workflow roles ─────────────────────────
+    # One entry per CameraManager slot (MAX_LIVE_CAMERAS). The
+    # Calibration page workflow tabs resolve which physical camera to
+    # mount by looking up the index with the matching role.
+    camera_roles: list[CameraRole] = field(
+        default_factory=lambda: [CameraRole.UNASSIGNED] * MAX_LIVE_CAMERAS
+    )
 
     # ── Metadata ──────────────────────────────────────────────────
     config_name: str = "Untitled Setup"
@@ -390,6 +452,18 @@ class HardwareConfig:
         """List of pump IDs that are enabled (have syringes)."""
         return [pid for pid, p in self.pumps.items() if p.enabled and p.is_configured]
 
+    # ── v7.4.5: Active plate key (custom name OR standard int) ───
+    @property
+    def active_plate_key(self) -> int | str:
+        """The key to pass to `WellPlate.load()` for this config.
+
+        Returns `plate_name` (str) when a custom plate is active, otherwise
+        falls back to the legacy `plate_format` (int). Centralizes the
+        precedence rule so downstream callers stop reaching into both
+        fields.
+        """
+        return self.plate_name if self.plate_name else self.plate_format
+
     # ══════════════════════════════════════════════════════════════
     #  VALIDATION (v7.2.4 enhanced — S3.3)
     # ══════════════════════════════════════════════════════════════
@@ -416,8 +490,15 @@ class HardwareConfig:
             if pcfg.enabled and pcfg.syringe and not pcfg.has_ink:
                 issues.append(f"{pid} is enabled but has no ink assigned")
 
-        # Plate format
-        if self.plate_format not in PLATE_DEFINITIONS:
+        # Plate format / custom plate name (v7.4.5)
+        if self.plate_name:
+            # Custom plate — file must exist under user plates dir.
+            from SupportClasses.WellPlate import USER_PLATES_DIR
+            if not (USER_PLATES_DIR / f"{self.plate_name}.json").exists():
+                issues.append(
+                    f"Custom plate '{self.plate_name}' not found in "
+                    f"{USER_PLATES_DIR}")
+        elif self.plate_format not in PLATE_DEFINITIONS:
             issues.append(f"Invalid plate format: {self.plate_format}")
 
         # Needle channel-pump mapping
@@ -558,6 +639,41 @@ class HardwareConfig:
         """Clear all channel-pump assignments."""
         self.needle_channel_pump_map.clear()
 
+    # ── v7.4.4: Camera role lookup ────────────────────────────────
+
+    def camera_for_role(self, role: CameraRole) -> int | None:
+        """First camera index whose `camera_roles[i]` matches `role`.
+
+        Returns None if no camera has that role assigned. Used by the
+        Calibration page workflow tabs to resolve which physical
+        `CameraManager.cameras[i]` to mount.
+        """
+        for idx, r in enumerate(self.camera_roles):
+            if r == role:
+                return idx
+        return None
+
+    def set_camera_role(self, cam_idx: int, role: CameraRole) -> None:
+        """Assign `role` to the camera at `cam_idx`.
+
+        Out-of-range indices are ignored. The list is fixed-length
+        (`MAX_LIVE_CAMERAS`); migrate/pad through `from_dict`.
+
+        v7.4.x: roles in `SINGLETON_CAMERA_ROLES` are enforced as
+        unique — assigning one to a new slot clears it from any other
+        slot that holds it. UNASSIGNED is always allowed on multiple
+        slots simultaneously. Legacy duplicates already in a loaded
+        config are not retroactively normalized; cleanup only happens
+        on user-driven role mutations.
+        """
+        if not (0 <= cam_idx < len(self.camera_roles)):
+            return
+        if role in SINGLETON_CAMERA_ROLES:
+            for i, existing in enumerate(self.camera_roles):
+                if i != cam_idx and existing == role:
+                    self.camera_roles[i] = CameraRole.UNASSIGNED
+        self.camera_roles[cam_idx] = role
+
     def auto_assign_channels(self):
         """
         Auto-assign channels to enabled pumps in order.
@@ -630,6 +746,7 @@ class HardwareConfig:
             "needle": self.needle.to_dict() if self.needle else None,
             "pumps": {pid: p.to_dict() for pid, p in self.pumps.items()},
             "plate_format": self.plate_format,
+            "plate_name": self.plate_name,  # v7.4.5
             "ink_library": {name: ink.to_dict() for name, ink in self.ink_library.items()},
             "rosette_library": {
                 name: r.to_dict() for name, r in self.rosette_library.items()
@@ -643,6 +760,13 @@ class HardwareConfig:
             "ink_swap_strategy": self.ink_swap_strategy.to_dict(),
             # v7.3.0: Camera config for autocalibration
             "camera_config": self.camera_config.to_dict(),
+            # v7.4.4: Per-camera workflow roles (length = MAX_LIVE_CAMERAS).
+            # Tolerate raw strings sneaking into the list via legacy
+            # in-memory state — coerce each entry to its string value.
+            "camera_roles": [
+                (r.value if isinstance(r, CameraRole) else str(r))
+                for r in self.camera_roles
+            ],
         }
 
     @classmethod
@@ -663,6 +787,8 @@ class HardwareConfig:
 
         # Plate format
         config.plate_format = data.get("plate_format", 24)
+        # v7.4.5: custom plate name (takes precedence when non-empty)
+        config.plate_name = data.get("plate_name", "") or ""
 
         # Ink library
         for name, ink_data in data.get("ink_library", {}).items():
@@ -690,6 +816,20 @@ class HardwareConfig:
         # v7.3.0: Camera config
         if "camera_config" in data:
             config.camera_config = CameraConfig.from_dict(data["camera_config"])
+
+        # v7.4.4: Per-camera workflow roles. Missing field migrates to
+        # all-UNASSIGNED; shorter lists are zero-padded; unknown values
+        # fall back to UNASSIGNED rather than erroring out.
+        raw_roles = data.get("camera_roles") or []
+        roles: list[CameraRole] = []
+        for entry in raw_roles[:MAX_LIVE_CAMERAS]:
+            try:
+                roles.append(CameraRole(entry))
+            except ValueError:
+                roles.append(CameraRole.UNASSIGNED)
+        while len(roles) < MAX_LIVE_CAMERAS:
+            roles.append(CameraRole.UNASSIGNED)
+        config.camera_roles = roles
 
         return config
 

@@ -354,10 +354,11 @@ class PrintExecutionConfig:
         default_factory=lambda: InkGatherConfig(
             ink_name="default", max_pickup_uL=0.0, extra_percent=10.0))
 
-    # ── Service Sequence Toggles (per-run) ────────────────────────
-    use_waste: bool = True
-    use_wash: bool = True
-    use_buffer: bool = True
+    # ── Service Sequence ──────────────────────────────────────────
+    # Canonical source is ink_swap (.waste / .wash_pre / .wash_post /
+    # .buffer / .ink_load / .wash_final). The legacy use_waste /
+    # use_wash / use_buffer flags are surfaced as @property shims so
+    # older callers continue to work; they read/write through ink_swap.
     wash_cycles: int = 3
 
     # ── Speeds ────────────────────────────────────────────────────
@@ -366,8 +367,45 @@ class PrintExecutionConfig:
     dispense_speed_uL_s: float = 2.0
     wash_time_per_cycle_s: float = 5.0
 
-    # ── Ink Volume Limits (per-pump syringe overrides) ────────────
-    max_ink_volume_uL: dict[str, float] = field(default_factory=dict)
+    # ── Per-Pump Volume Overrides ─────────────────────────────────
+    # Empty dict means "use HardwareConfig syringe capacities". Renamed
+    # from max_ink_volume_uL in v7.5.0; the old name still works via an
+    # alias property below.
+    pump_volume_overrides_uL: dict[str, float] = field(default_factory=dict)
+
+    # ── Legacy Aliases (deprecated, removed in v7.6.0) ────────────
+    @property
+    def max_ink_volume_uL(self) -> dict[str, float]:
+        return self.pump_volume_overrides_uL
+
+    @max_ink_volume_uL.setter
+    def max_ink_volume_uL(self, value: dict[str, float]) -> None:
+        self.pump_volume_overrides_uL = value
+
+    @property
+    def use_waste(self) -> bool:
+        return self.ink_swap.waste
+
+    @use_waste.setter
+    def use_waste(self, value: bool) -> None:
+        self.ink_swap.waste = bool(value)
+
+    @property
+    def use_wash(self) -> bool:
+        return self.ink_swap.wash_pre or self.ink_swap.wash_post
+
+    @use_wash.setter
+    def use_wash(self, value: bool) -> None:
+        self.ink_swap.wash_pre = bool(value)
+        self.ink_swap.wash_post = bool(value)
+
+    @property
+    def use_buffer(self) -> bool:
+        return self.ink_swap.buffer
+
+    @use_buffer.setter
+    def use_buffer(self, value: bool) -> None:
+        self.ink_swap.buffer = bool(value)
 
     def get_ink_gather(self, ink_name: str) -> InkGatherConfig:
         """Get the gather config for a specific ink, falling back to default."""
@@ -383,15 +421,12 @@ class PrintExecutionConfig:
                 k: v.to_dict() for k, v in self.ink_gather_configs.items()
             },
             "default_gather_config": self.default_gather_config.to_dict(),
-            "use_waste": self.use_waste,
-            "use_wash": self.use_wash,
-            "use_buffer": self.use_buffer,
             "wash_cycles": self.wash_cycles,
             "travel_speed_mm_s": self.travel_speed_mm_s,
             "aspirate_speed_uL_s": self.aspirate_speed_uL_s,
             "dispense_speed_uL_s": self.dispense_speed_uL_s,
             "wash_time_per_cycle_s": self.wash_time_per_cycle_s,
-            "max_ink_volume_uL": dict(self.max_ink_volume_uL),
+            "pump_volume_overrides_uL": dict(self.pump_volume_overrides_uL),
         }
 
     @classmethod
@@ -399,6 +434,16 @@ class PrintExecutionConfig:
         cfg = cls()
         if "ink_swap" in data:
             cfg.ink_swap = InkSwapStrategy.from_dict(data["ink_swap"])
+        else:
+            # Legacy save (pre v7.5.0): rehydrate ink_swap toggles from
+            # the old top-level use_waste / use_wash / use_buffer flags
+            # via the property shims.
+            if "use_waste" in data:
+                cfg.use_waste = data["use_waste"]
+            if "use_wash" in data:
+                cfg.use_wash = data["use_wash"]
+            if "use_buffer" in data:
+                cfg.use_buffer = data["use_buffer"]
         if "z_travel" in data:
             cfg.z_travel = ZTravelConfig.from_dict(data["z_travel"])
         if "xy_travel" in data:
@@ -413,15 +458,17 @@ class PrintExecutionConfig:
         if "default_gather_config" in data:
             cfg.default_gather_config = InkGatherConfig.from_dict(
                 data["default_gather_config"])
-        cfg.use_waste = data.get("use_waste", True)
-        cfg.use_wash = data.get("use_wash", True)
-        cfg.use_buffer = data.get("use_buffer", True)
         cfg.wash_cycles = data.get("wash_cycles", 3)
         cfg.travel_speed_mm_s = data.get("travel_speed_mm_s", 10.0)
         cfg.aspirate_speed_uL_s = data.get("aspirate_speed_uL_s", 1.0)
         cfg.dispense_speed_uL_s = data.get("dispense_speed_uL_s", 2.0)
         cfg.wash_time_per_cycle_s = data.get("wash_time_per_cycle_s", 5.0)
-        cfg.max_ink_volume_uL = data.get("max_ink_volume_uL", {})
+        # Accept either the new key (pump_volume_overrides_uL) or the
+        # legacy max_ink_volume_uL key.
+        cfg.pump_volume_overrides_uL = (
+            data.get("pump_volume_overrides_uL")
+            or data.get("max_ink_volume_uL", {})
+        )
         return cfg
 
     @classmethod
@@ -439,7 +486,7 @@ class PrintExecutionConfig:
         cfg.aspirate_speed_uL_s = getattr(prefs, 'aspirate_speed_uL_s', 1.0)
         cfg.dispense_speed_uL_s = getattr(prefs, 'dispense_speed_uL_s', 2.0)
         cfg.wash_time_per_cycle_s = getattr(prefs, 'wash_time_per_cycle_s', 5.0)
-        cfg.max_ink_volume_uL = dict(getattr(prefs, 'max_ink_volume_uL', {}))
+        cfg.pump_volume_overrides_uL = dict(getattr(prefs, 'max_ink_volume_uL', {}))
         return cfg
 
 
@@ -702,8 +749,8 @@ class PrintPlanOfAction:
         # Determine max per run (applying per-ink gather configs)
         max_per_run = {}
         for pump_id, (ink_name, total_needed) in pump_ink_needs.items():
-            if pump_id in cfg.max_ink_volume_uL:
-                max_per_run[pump_id] = cfg.max_ink_volume_uL[pump_id]
+            if pump_id in cfg.pump_volume_overrides_uL:
+                max_per_run[pump_id] = cfg.pump_volume_overrides_uL[pump_id]
             else:
                 pcfg = hw_config.pumps.get(pump_id)
                 if pcfg and pcfg.syringe:

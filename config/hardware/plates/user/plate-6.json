@@ -1,0 +1,433 @@
+{
+  "schema_version": "1.0",
+  "name": "plate-6",
+  "description": "6-well plate",
+  "units": "mm",
+  "outline": {
+    "kind": "rect",
+    "width": 127.76,
+    "height": 85.48,
+    "radius": 0.0,
+    "polygon": [],
+    "origin_point": 1
+  },
+  "entities": {
+    "1": {
+      "type": "Point",
+      "id": 1,
+      "construction": false,
+      "fixed": true,
+      "x": 0.0,
+      "y": 0.0
+    },
+    "2": {
+      "type": "Group",
+      "id": 2,
+      "construction": false,
+      "fixed": false,
+      "name": "grid-6",
+      "members": [
+        4,
+        6,
+        8,
+        10,
+        12,
+        14
+      ],
+      "pattern_kind": "grid",
+      "params": {
+        "rows": 2,
+        "cols": 3,
+        "spacing_x": 39.12,
+        "spacing_y": 39.12,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "diameter": 34.8
+      }
+    },
+    "3": {
+      "type": "Point",
+      "id": 3,
+      "construction": false,
+      "fixed": false,
+      "x": 0.0,
+      "y": 0.0
+    },
+    "4": {
+      "type": "Well",
+      "id": 4,
+      "construction": false,
+      "fixed": false,
+      "name": "A1",
+      "center": 3,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": {
+        "schema_version": "1.0",
+        "name": "A1-rosette",
+        "description": "",
+        "units": "mm",
+        "outline": {
+          "kind": "circle",
+          "width": 34.8,
+          "height": 34.8,
+          "radius": 17.4,
+          "polygon": [],
+          "origin_point": 1
+        },
+        "entities": {
+          "1": {
+            "type": "Point",
+            "id": 1,
+            "construction": false,
+            "fixed": true,
+            "x": 0.0,
+            "y": 0.0
+          },
+          "2": {
+            "type": "Group",
+            "id": 2,
+            "construction": false,
+            "fixed": false,
+            "name": "ring-1",
+            "members": [
+              16,
+              18,
+              20,
+              22,
+              24,
+              26
+            ],
+            "pattern_kind": "circle",
+            "params": {
+              "count": 6,
+              "center_x": 0.0,
+              "center_y": 0.0,
+              "radius": 10.031,
+              "diameter": 6.0,
+              "start_angle_deg": 0.0,
+              "center_well": false
+            }
+          },
+          "15": {
+            "type": "Point",
+            "id": 15,
+            "construction": false,
+            "fixed": false,
+            "x": 10.031,
+            "y": 0.0
+          },
+          "16": {
+            "type": "Well",
+            "id": 16,
+            "construction": false,
+            "fixed": false,
+            "name": "a",
+            "center": 15,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          },
+          "17": {
+            "type": "Point",
+            "id": 17,
+            "construction": false,
+            "fixed": false,
+            "x": 5.015500000000001,
+            "y": 8.687100825361703
+          },
+          "18": {
+            "type": "Well",
+            "id": 18,
+            "construction": false,
+            "fixed": false,
+            "name": "b",
+            "center": 17,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          },
+          "19": {
+            "type": "Point",
+            "id": 19,
+            "construction": false,
+            "fixed": false,
+            "x": -5.0154999999999985,
+            "y": 8.687100825361705
+          },
+          "20": {
+            "type": "Well",
+            "id": 20,
+            "construction": false,
+            "fixed": false,
+            "name": "c",
+            "center": 19,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          },
+          "21": {
+            "type": "Point",
+            "id": 21,
+            "construction": false,
+            "fixed": false,
+            "x": -10.031,
+            "y": 1.22844320422471e-15
+          },
+          "22": {
+            "type": "Well",
+            "id": 22,
+            "construction": false,
+            "fixed": false,
+            "name": "d",
+            "center": 21,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          },
+          "23": {
+            "type": "Point",
+            "id": 23,
+            "construction": false,
+            "fixed": false,
+            "x": -5.015500000000005,
+            "y": -8.687100825361702
+          },
+          "24": {
+            "type": "Well",
+            "id": 24,
+            "construction": false,
+            "fixed": false,
+            "name": "e",
+            "center": 23,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          },
+          "25": {
+            "type": "Point",
+            "id": 25,
+            "construction": false,
+            "fixed": false,
+            "x": 5.015500000000001,
+            "y": -8.687100825361703
+          },
+          "26": {
+            "type": "Well",
+            "id": 26,
+            "construction": false,
+            "fixed": false,
+            "name": "f",
+            "center": 25,
+            "diameter": 6.0,
+            "well_depth_mm": 10.67,
+            "bottom_z_offset": 0.0,
+            "group": 2,
+            "naming_scheme": "MANUAL",
+            "rosette_design": null,
+            "rosette_rotation_deg": 0.0,
+            "rim_height_mm": 0.0,
+            "ink_z_mm": null
+          }
+        },
+        "constraints": [
+          {
+            "id": 1,
+            "kind": "ground",
+            "refs": [
+              1
+            ],
+            "value": null,
+            "weight": 1.0,
+            "snapshot": null,
+            "mode": "center"
+          }
+        ],
+        "a1_offset_x": 14.38,
+        "a1_offset_y": 11.24,
+        "well_depth_default_mm": 10.67,
+        "_next_entity_id": 27,
+        "_next_constraint_id": 2
+      },
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    },
+    "5": {
+      "type": "Point",
+      "id": 5,
+      "construction": false,
+      "fixed": false,
+      "x": 39.12,
+      "y": 0.0
+    },
+    "6": {
+      "type": "Well",
+      "id": 6,
+      "construction": false,
+      "fixed": false,
+      "name": "A2",
+      "center": 5,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    },
+    "7": {
+      "type": "Point",
+      "id": 7,
+      "construction": false,
+      "fixed": false,
+      "x": 78.24,
+      "y": 0.0
+    },
+    "8": {
+      "type": "Well",
+      "id": 8,
+      "construction": false,
+      "fixed": false,
+      "name": "A3",
+      "center": 7,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    },
+    "9": {
+      "type": "Point",
+      "id": 9,
+      "construction": false,
+      "fixed": false,
+      "x": 0.0,
+      "y": 39.12
+    },
+    "10": {
+      "type": "Well",
+      "id": 10,
+      "construction": false,
+      "fixed": false,
+      "name": "B1",
+      "center": 9,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    },
+    "11": {
+      "type": "Point",
+      "id": 11,
+      "construction": false,
+      "fixed": false,
+      "x": 39.12,
+      "y": 39.12
+    },
+    "12": {
+      "type": "Well",
+      "id": 12,
+      "construction": false,
+      "fixed": false,
+      "name": "B2",
+      "center": 11,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    },
+    "13": {
+      "type": "Point",
+      "id": 13,
+      "construction": false,
+      "fixed": false,
+      "x": 78.24,
+      "y": 39.12
+    },
+    "14": {
+      "type": "Well",
+      "id": 14,
+      "construction": false,
+      "fixed": false,
+      "name": "B3",
+      "center": 13,
+      "diameter": 34.8,
+      "well_depth_mm": 17.4,
+      "bottom_z_offset": 0.0,
+      "group": 2,
+      "naming_scheme": "ANSI",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 0.0,
+      "ink_z_mm": null
+    }
+  },
+  "constraints": [
+    {
+      "id": 1,
+      "kind": "ground",
+      "refs": [
+        1
+      ],
+      "value": null,
+      "weight": 1.0,
+      "snapshot": null,
+      "mode": "center"
+    }
+  ],
+  "a1_offset_x": 24.76,
+  "a1_offset_y": 23.16,
+  "well_depth_default_mm": 17.4,
+  "_next_entity_id": 15,
+  "_next_constraint_id": 2
+}

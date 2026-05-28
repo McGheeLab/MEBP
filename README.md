@@ -2,17 +2,24 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.4.2** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.5.0** | Python 3.10+ | PySide6 (Qt 6)
 
-> **v7.4.2** turns the Device sub-page into a complete initial-machine-setup
-> workspace: Connect Hardware buttons with live status, per-axis Jog +
-> Record Min/Max buttons that populate the Safety Limits, configurable
-> Axis Mapping (logical Z/P1/P2/P3 → physical Marlin X/Y/Z/E), and
-> per-axis Stepper Calibration (commanded vs. measured → send M92). The
-> custom mapping is honored end-to-end — manual jog, print execution,
-> and the velocity controller all consult the configured axis_map.
-> See [`coding plans/Update plans/MEBP_v741_to_v742_UPDATE.md`](coding%20plans/Update%20plans/MEBP_v741_to_v742_UPDATE.md)
-> and [`coding plans/Architectures/ARCHITECTURE_V742.md`](coding%20plans/Architectures/ARCHITECTURE_V742.md).
+> **v7.5.0** introduces the **Print Builder** mode page — a dedicated home for
+> *authoring* print trajectories, inserted in the sidebar before *Printing*.
+> Its flagship **Sketch** tool lets you draw a print directly from vector
+> primitives (line / rect / circle / ellipse / polygon) with paint-bucket fill
+> of enclosed regions, multi-layer Z-stacks, object/border snapping, and a
+> per-shape printed bead width — all driven by the active needle's diameter.
+> The compiled toolpath renders as the **main view** (colored by pump,
+> dashed-grey travel); your shapes are a slim editable overlay on top. A
+> dashed **standard well** outline is drawn at the origin for scale. Output
+> bakes through the existing `csv_import` contract so it shows up in Print
+> Setup's custom-prints area alongside the legacy image-stack importer
+> (relocated as the *Image Import* sub-page). Bundles the staged v7.4.3–v7.4.8
+> increments — see
+> [`coding plans/Update plans/MEBP_v75x_PRINT_BUILDER.md`](coding%20plans/Update%20plans/MEBP_v75x_PRINT_BUILDER.md)
+> and
+> [`coding plans/Architectures/ARCHITECTURE_V750.md`](coding%20plans/Architectures/ARCHITECTURE_V750.md).
 
 ---
 
@@ -253,13 +260,14 @@ MEBP/
 │   ├── PrintManager.py        # Print execution engine
 │   ├── PrintPlanOfAction.py   # Plan generation + PrintExecutionConfig
 │   ├── ImagePathPlanner.py    # Image-to-toolpath raster generator
+│   ├── SketchTrajectory.py    # v7.5.0 Print Builder Sketch model + compiler + paint-bucket
 │   └── ...
 ├── gui/                       # Frontend (PySide6)
-│   ├── app.py                 # Main window
+│   ├── app.py                 # Main window (7 main pages: HW · Cal · Jog · Print Builder · Printing · Workflows · Settings)
 │   ├── scaling.py             # DPI-aware scaling utility
 │   ├── styles.py              # Catppuccin Mocha theme (parameterized)
-│   ├── pages/                 # Application pages (7 main + sub-pages)
-│   └── widgets/               # Custom Qt widgets
+│   ├── pages/                 # Application pages (incl. print_builder.py + print_builder_sketch.py)
+│   └── widgets/               # Custom Qt widgets (incl. sketch_canvas.py)
 ├── config/                    # JSON configuration files
 │   ├── controllers/           # Stage protocol definitions
 │   ├── hardware/              # Needle/syringe/ink catalogs + objectives.json

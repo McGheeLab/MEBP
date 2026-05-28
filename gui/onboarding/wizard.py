@@ -64,28 +64,40 @@ class _ConnectProbeWorker(QObject):
     blocking ``StageController.connect_xy`` / ``connect_zp`` paths
     because the controller handles its own error cases gracefully —
     we just need to keep the UI responsive while the probe runs.
+
+    v7.4.2: ``simulate`` selects between real hardware and the
+    simulator at probe time so the wizard's Test buttons match the
+    Device sub-page's Connect / Simulate split.
     """
 
     finished = Signal(str, bool, str)
 
-    def __init__(self, controller, axis: str):
+    def __init__(self, controller, axis: str, simulate: bool = False):
         super().__init__()
         self._controller = controller
         self._axis = axis  # "XY" or "ZP"
+        self._simulate = bool(simulate)
 
     def run(self):
         axis = self._axis
+        mode_lbl = "simulator" if self._simulate else "hardware"
         try:
             if axis == "XY":
-                self._controller.connect_xy()
+                self._controller.connect_xy(simulate=self._simulate)
                 ok = self._controller.is_xy_connected
             else:
-                self._controller.connect_zp()
+                self._controller.connect_zp(simulate=self._simulate)
                 ok = self._controller.is_zp_connected
-            msg = f"{axis} connected" if ok else f"{axis} not detected"
+            if ok:
+                msg = (f"{axis} simulator running"
+                       if self._simulate else f"{axis} connected")
+            else:
+                msg = (f"{axis} simulator failed"
+                       if self._simulate else f"{axis} not detected")
             self.finished.emit(axis, ok, msg)
         except Exception as e:
-            logger.warning(f"Test-connection probe ({axis}) failed: {e}")
+            logger.warning(
+                f"Test-connection probe ({axis}, {mode_lbl}) failed: {e}")
             self.finished.emit(axis, False, f"{axis} error: {e}")
 
 
@@ -203,57 +215,64 @@ class OnboardingWizard(QDialog):
         b_lay.setSpacing(s(12))
 
         intro = QLabel(
-            "Choose whether to connect real hardware or run in simulation. "
-            "Simulation is fully featured and recommended for first-time setup."
+            "Verify your stages now, or skip and decide later. Each "
+            "stage has two probes: <b>Connect</b> opens the real "
+            "hardware over serial, and <b>Simulate</b> spins up the "
+            "built-in simulator (great if no hardware is attached yet)."
         )
         intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
         intro.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(10)}pt;")
         b_lay.addWidget(intro)
 
-        # Simulation toggles
-        sim_card = Card("Simulation mode")
-        self._chk_sim_xy = QCheckBox("Simulate XY stage")
-        self._chk_sim_xy.setChecked(self._controller.simulate_xy)
-        sim_card.add_widget(self._chk_sim_xy)
-
-        self._chk_sim_zp = QCheckBox("Simulate Z and pump axes")
-        self._chk_sim_zp.setChecked(self._controller.simulate_zp)
-        sim_card.add_widget(self._chk_sim_zp)
-
-        sim_note = QLabel(
-            "Simulation flags take effect on next launch. The Test "
-            "buttons below use the current mode."
-        )
-        sim_note.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        sim_note.setWordWrap(True)
-        sim_card.add_widget(sim_note)
-        b_lay.addWidget(sim_card)
-
-        # Test connection card
+        # Probe card — Connect / Simulate per axis
         probe_card = Card("Test connection")
 
         xy_row = QHBoxLayout()
-        self._btn_test_xy = QPushButton("Test XY")
-        self._btn_test_xy.setObjectName("accentBtn")
-        self._btn_test_xy.clicked.connect(lambda: self._start_probe("XY"))
+        xy_row.addWidget(QLabel("XY stage"))
+        self._btn_test_xy = QPushButton("Connect")
+        self._btn_test_xy.setObjectName("successBtn")
+        self._btn_test_xy.clicked.connect(
+            lambda: self._start_probe("XY", simulate=False))
         xy_row.addWidget(self._btn_test_xy)
+        self._btn_sim_xy = QPushButton("Simulate")
+        self._btn_sim_xy.setObjectName("accentBtn")
+        self._btn_sim_xy.clicked.connect(
+            lambda: self._start_probe("XY", simulate=True))
+        xy_row.addWidget(self._btn_sim_xy)
         self._badge_xy = StatusBadge("Not tested", "pending")
         xy_row.addWidget(self._badge_xy)
         xy_row.addStretch(1)
         probe_card.add_layout(xy_row)
 
         zp_row = QHBoxLayout()
-        self._btn_test_zp = QPushButton("Test ZP")
-        self._btn_test_zp.setObjectName("accentBtn")
-        self._btn_test_zp.clicked.connect(lambda: self._start_probe("ZP"))
+        zp_row.addWidget(QLabel("Z + Pumps"))
+        self._btn_test_zp = QPushButton("Connect")
+        self._btn_test_zp.setObjectName("successBtn")
+        self._btn_test_zp.clicked.connect(
+            lambda: self._start_probe("ZP", simulate=False))
         zp_row.addWidget(self._btn_test_zp)
+        self._btn_sim_zp = QPushButton("Simulate")
+        self._btn_sim_zp.setObjectName("accentBtn")
+        self._btn_sim_zp.clicked.connect(
+            lambda: self._start_probe("ZP", simulate=True))
+        zp_row.addWidget(self._btn_sim_zp)
         self._badge_zp = StatusBadge("Not tested", "pending")
         zp_row.addWidget(self._badge_zp)
         zp_row.addStretch(1)
         probe_card.add_layout(zp_row)
 
         b_lay.addWidget(probe_card)
+
+        sim_note = QLabel(
+            "You can change Connect / Simulate any time later from "
+            "Hardware Setup → Device → Connect Hardware."
+        )
+        sim_note.setWordWrap(True)
+        sim_note.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: {sf(9)}pt;")
+        b_lay.addWidget(sim_note)
+
         b_lay.addStretch(1)
 
         step = WizardStep(2, self._TOTAL_STEPS, "Stages", body)
@@ -262,19 +281,22 @@ class OnboardingWizard(QDialog):
         self._stack.addWidget(step)
 
     def _stages_next(self):
-        # Persist simulation flags now (require restart to take effect)
-        self._settings.set("simulation.simulate_xy", self._chk_sim_xy.isChecked())
-        self._settings.set("simulation.simulate_zp", self._chk_sim_zp.isChecked())
+        # v7.4.2: simulation flags are no longer persisted from the wizard —
+        # the Connect / Simulate buttons on the Device sub-page own that
+        # decision per-connect.
         self._stack.setCurrentIndex(2)
 
-    def _start_probe(self, axis: str):
+    def _start_probe(self, axis: str, simulate: bool = False):
         badge = self._badge_xy if axis == "XY" else self._badge_zp
-        btn = self._btn_test_xy if axis == "XY" else self._btn_test_zp
-        badge.set_status("info", f"Probing {axis}…")
-        btn.setEnabled(False)
+        real_btn = self._btn_test_xy if axis == "XY" else self._btn_test_zp
+        sim_btn = self._btn_sim_xy if axis == "XY" else self._btn_sim_zp
+        label = "simulator" if simulate else "hardware"
+        badge.set_status("info", f"Probing {axis} {label}…")
+        real_btn.setEnabled(False)
+        sim_btn.setEnabled(False)
 
         thread = QThread(self)
-        worker = _ConnectProbeWorker(self._controller, axis)
+        worker = _ConnectProbeWorker(self._controller, axis, simulate=simulate)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_probe_finished)
@@ -286,9 +308,11 @@ class OnboardingWizard(QDialog):
 
     def _on_probe_finished(self, axis: str, ok: bool, message: str):
         badge = self._badge_xy if axis == "XY" else self._badge_zp
-        btn = self._btn_test_xy if axis == "XY" else self._btn_test_zp
+        real_btn = self._btn_test_xy if axis == "XY" else self._btn_test_zp
+        sim_btn = self._btn_sim_xy if axis == "XY" else self._btn_sim_zp
         badge.set_status("ok" if ok else "err", message)
-        btn.setEnabled(True)
+        real_btn.setEnabled(True)
+        sim_btn.setEnabled(True)
 
     # ── Step 3: Plate & Needle ───────────────────────────────────
 
@@ -439,12 +463,21 @@ class OnboardingWizard(QDialog):
         prefab_count = self._count_prefab_inks() if getattr(
             self, '_chk_load_prefabs', None) and \
             self._chk_load_prefabs.isChecked() else 0
+        # v7.4.2: simulation is no longer a persisted setting; the live
+        # mode of each stage is whatever was probed last (or whatever the
+        # user opens on Hardware Setup → Device next).
+        ctrl = self._controller
+        xy_mode = "—"
+        if getattr(ctrl, "is_xy_connected", False):
+            xy_mode = "simulator" if ctrl.simulate_xy else "hardware"
+        zp_mode = "—"
+        if getattr(ctrl, "is_zp_connected", False):
+            zp_mode = "simulator" if ctrl.simulate_zp else "hardware"
         self._summary_label.setText(
             f"<p>You're all set! Here's what will be saved:</p>"
             f"<ul>"
-            f"<li><b>Simulation:</b> XY={'on' if self._chk_sim_xy.isChecked() else 'off'}, "
-            f"ZP={'on' if self._chk_sim_zp.isChecked() else 'off'} "
-            f"(takes effect on next launch)</li>"
+            f"<li><b>Stage mode (current):</b> XY={xy_mode}, ZP={zp_mode} "
+            f"— switch any time from Hardware Setup → Device.</li>"
             f"<li><b>Plate:</b> {plate}-well</li>"
             f"<li><b>Needle gauge:</b> {needle_str}</li>"
             f"<li><b>Starter inks:</b> {prefab_count}</li>"

@@ -121,15 +121,28 @@ class StageHardwarePanel(QWidget):
         self._sync_connection_badges()
 
     def _sync_connection_badges(self):
-        """v7.4.2: Reflect controller's live connection state in badges."""
+        """v7.4.2: Reflect controller's live connection state in badges.
+
+        Distinguishes "Connected" (real hardware) from "Simulated" so the
+        operator can see at a glance whether the stage they're driving is
+        physical or virtual.
+        """
         if self._controller is None or not hasattr(self, 'badge_xy'):
             return
         xy_ok = bool(getattr(self._controller, 'is_xy_connected', False))
         zp_ok = bool(getattr(self._controller, 'is_zp_connected', False))
-        self.badge_xy.set_status("ok" if xy_ok else "pending",
-                                 "Connected" if xy_ok else "Not connected")
-        self.badge_zp.set_status("ok" if zp_ok else "pending",
-                                 "Connected" if zp_ok else "Not connected")
+        xy_sim = bool(getattr(self._controller, 'simulate_xy', False)) and xy_ok
+        zp_sim = bool(getattr(self._controller, 'simulate_zp', False)) and zp_ok
+        if not xy_ok:
+            self.badge_xy.set_status("pending", "Not connected")
+        else:
+            self.badge_xy.set_status(
+                "ok", "Simulated" if xy_sim else "Connected")
+        if not zp_ok:
+            self.badge_zp.set_status("pending", "Not connected")
+        else:
+            self.badge_zp.set_status(
+                "ok", "Simulated" if zp_sim else "Connected")
         # Xbox is tri-state (waiting / connected / reconnecting).
         if hasattr(self, 'badge_xbox'):
             xbox_st = getattr(self._controller, "xbox_status", None)
@@ -715,7 +728,12 @@ class StageHardwarePanel(QWidget):
     # ════════════════════════════════════════════════════════════════
 
     def _build_connect_group(self) -> QGroupBox:
-        """Connect XY / ZP / Xbox with live status badges."""
+        """Connect XY / ZP / Xbox with live status badges.
+
+        v7.4.2 update: each stage row has separate ``Connect`` (real
+        hardware) and ``Simulate`` buttons. The Simulate button opens a
+        software simulator for that one device — no app restart needed.
+        """
         from gui.widgets.components import StatusBadge
 
         grp = QGroupBox("Connect Hardware")
@@ -727,7 +745,8 @@ class StageHardwarePanel(QWidget):
         grid.setColumnStretch(0, 0)
         grid.setColumnStretch(1, 0)
         grid.setColumnStretch(2, 0)
-        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(3, 0)
+        grid.setColumnStretch(4, 1)
 
         def _stage_label(text: str) -> QLabel:
             lbl = QLabel(text)
@@ -739,33 +758,52 @@ class StageHardwarePanel(QWidget):
         self.btn_connect_xy = QPushButton("🔌  Connect")
         self.btn_connect_xy.setObjectName("successBtn")
         self.btn_connect_xy.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_xy.setToolTip(
+            "Open the real Prior ProScan XY stage over serial.")
         self.btn_connect_xy.clicked.connect(self._connect_xy)
         grid.addWidget(self.btn_connect_xy, row, 1)
+        self.btn_simulate_xy = QPushButton("🧪  Simulate")
+        self.btn_simulate_xy.setObjectName("accentBtn")
+        self.btn_simulate_xy.setCursor(Qt.PointingHandCursor)
+        self.btn_simulate_xy.setToolTip(
+            "Use the XY stage simulator instead of real hardware.")
+        self.btn_simulate_xy.clicked.connect(self._simulate_xy)
+        grid.addWidget(self.btn_simulate_xy, row, 2)
         self.btn_disconnect_xy = QPushButton("Disconnect")
         self.btn_disconnect_xy.setObjectName("dangerBtn")
         self.btn_disconnect_xy.setCursor(Qt.PointingHandCursor)
         self.btn_disconnect_xy.clicked.connect(self._disconnect_xy)
-        grid.addWidget(self.btn_disconnect_xy, row, 2)
+        grid.addWidget(self.btn_disconnect_xy, row, 3)
         self.badge_xy = StatusBadge("Not connected", "pending")
-        grid.addWidget(self.badge_xy, row, 3)
+        grid.addWidget(self.badge_xy, row, 4)
 
         row += 1
         grid.addWidget(_stage_label("Z + Pumps"), row, 0)
         self.btn_connect_zp = QPushButton("🔌  Connect")
         self.btn_connect_zp.setObjectName("successBtn")
         self.btn_connect_zp.setCursor(Qt.PointingHandCursor)
+        self.btn_connect_zp.setToolTip(
+            "Open the real Marlin Z + pumps controller over serial.")
         self.btn_connect_zp.clicked.connect(self._connect_zp)
         grid.addWidget(self.btn_connect_zp, row, 1)
+        self.btn_simulate_zp = QPushButton("🧪  Simulate")
+        self.btn_simulate_zp.setObjectName("accentBtn")
+        self.btn_simulate_zp.setCursor(Qt.PointingHandCursor)
+        self.btn_simulate_zp.setToolTip(
+            "Use the Z + pumps simulator instead of real hardware.")
+        self.btn_simulate_zp.clicked.connect(self._simulate_zp)
+        grid.addWidget(self.btn_simulate_zp, row, 2)
         self.btn_disconnect_zp = QPushButton("Disconnect")
         self.btn_disconnect_zp.setObjectName("dangerBtn")
         self.btn_disconnect_zp.setCursor(Qt.PointingHandCursor)
         self.btn_disconnect_zp.clicked.connect(self._disconnect_zp)
-        grid.addWidget(self.btn_disconnect_zp, row, 2)
+        grid.addWidget(self.btn_disconnect_zp, row, 3)
         self.badge_zp = StatusBadge("Not connected", "pending")
-        grid.addWidget(self.badge_zp, row, 3)
+        grid.addWidget(self.badge_zp, row, 4)
 
         # v7.4.2: Xbox controller — moved here from the (now-removed)
         # Dashboard page. Reads optional connect parameters from settings.
+        # Xbox has no simulator, so its row spans the Simulate column.
         row += 1
         grid.addWidget(_stage_label("Xbox"), row, 0)
         self.btn_connect_xbox = QPushButton("🎮  Connect")
@@ -774,26 +812,45 @@ class StageHardwarePanel(QWidget):
         self.btn_connect_xbox.setToolTip(
             "Connect an Xbox controller for continuous jogging.")
         self.btn_connect_xbox.clicked.connect(self._connect_xbox)
-        grid.addWidget(self.btn_connect_xbox, row, 1)
+        grid.addWidget(self.btn_connect_xbox, row, 1, 1, 2)
         self.btn_disconnect_xbox = QPushButton("Disconnect")
         self.btn_disconnect_xbox.setObjectName("dangerBtn")
         self.btn_disconnect_xbox.setCursor(Qt.PointingHandCursor)
         self.btn_disconnect_xbox.clicked.connect(self._disconnect_xbox)
-        grid.addWidget(self.btn_disconnect_xbox, row, 2)
+        grid.addWidget(self.btn_disconnect_xbox, row, 3)
         self.badge_xbox = StatusBadge("Not connected", "pending")
-        grid.addWidget(self.badge_xbox, row, 3)
+        grid.addWidget(self.badge_xbox, row, 4)
 
         return grp
 
     def _connect_xy(self):
+        """v7.4.2: open the real XY hardware."""
+        self._open_xy(simulate=False)
+
+    def _simulate_xy(self):
+        """v7.4.2: open the XY simulator (no hardware required)."""
+        self._open_xy(simulate=True)
+
+    def _open_xy(self, *, simulate: bool):
         if self._controller is None:
             return
-        self.badge_xy.set_status("info", "Connecting…")
+        if self._controller.is_xy_connected:
+            # Tear down whatever is currently attached so we can switch
+            # modes without leaving a stale stage object behind.
+            try:
+                self._controller.disconnect_xy()
+            except Exception as e:
+                logger.warning(f"disconnect_xy before reopen failed: {e}")
+        mode_text = "Starting simulator…" if simulate else "Connecting…"
+        self.badge_xy.set_status("info", mode_text)
         try:
-            self._controller.connect_xy()
+            self._controller.connect_xy(simulate=simulate)
             ok = bool(self._controller.is_xy_connected)
-            self.badge_xy.set_status("ok" if ok else "err",
-                                     "Connected" if ok else "Failed")
+            if ok:
+                self.badge_xy.set_status(
+                    "ok", "Simulated" if simulate else "Connected")
+            else:
+                self.badge_xy.set_status("err", "Failed")
         except Exception as e:
             self.badge_xy.set_status("err", f"Error: {e}")
 
@@ -807,17 +864,34 @@ class StageHardwarePanel(QWidget):
         self.badge_xy.set_status("pending", "Not connected")
 
     def _connect_zp(self):
+        """v7.4.2: open the real ZP hardware."""
+        self._open_zp(simulate=False)
+
+    def _simulate_zp(self):
+        """v7.4.2: open the ZP simulator (no hardware required)."""
+        self._open_zp(simulate=True)
+
+    def _open_zp(self, *, simulate: bool):
         if self._controller is None:
             return
-        self.badge_zp.set_status("info", "Connecting…")
+        if self._controller.is_zp_connected:
+            try:
+                self._controller.disconnect_zp()
+            except Exception as e:
+                logger.warning(f"disconnect_zp before reopen failed: {e}")
+        mode_text = "Starting simulator…" if simulate else "Connecting…"
+        self.badge_zp.set_status("info", mode_text)
         try:
-            self._controller.connect_zp()
+            self._controller.connect_zp(simulate=simulate)
             ok = bool(self._controller.is_zp_connected)
-            self.badge_zp.set_status("ok" if ok else "err",
-                                     "Connected" if ok else "Failed")
+            if ok:
+                self.badge_zp.set_status(
+                    "ok", "Simulated" if simulate else "Connected")
+            else:
+                self.badge_zp.set_status("err", "Failed")
             # v7.4.2 hotfix: cache the connected port so next launch
-            # can skip the rediscovery scan
-            if ok and self._settings is not None:
+            # can skip the rediscovery scan. Only meaningful for real HW.
+            if ok and not simulate and self._settings is not None:
                 port = self._controller.zp_connected_port
                 if port:
                     self._settings.set("zp_stage.last_port", port)
@@ -827,8 +901,9 @@ class StageHardwarePanel(QWidget):
             # connect succeeds so the user sees mismatches without
             # having to click the button. Debounced via QTimer so
             # Marlin has time to finish booting + responding to the
-            # _setup_printer M-codes.
-            if ok:
+            # _setup_printer M-codes. Simulator has nothing to align
+            # against, so skip in that mode.
+            if ok and not simulate:
                 QTimer.singleShot(
                     1000, lambda: self._check_marlin_alignment(quiet=False))
         except Exception as e:

@@ -376,6 +376,10 @@ class PrintSetupPage(QWidget):
         import math
 
         wrapper = QWidget()
+        # v7.6.0: expand to fill the full height of the left-context
+        # Tools column (the form carries its own inner scroll area, so
+        # the column should not leave empty space beneath it).
+        wrapper.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -432,7 +436,8 @@ class PrintSetupPage(QWidget):
         ext_grp = QGroupBox("Extrusion")
         ext_grp.setStyleSheet(grp_style)
         ext_lay = QVBoxLayout(ext_grp)
-        ext_lay.setSpacing(4)
+        ext_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        ext_lay.setSpacing(_sc(7))
 
         vf_row = QHBoxLayout()
         vf_row.addWidget(QLabel("Fill:"))
@@ -464,7 +469,8 @@ class PrintSetupPage(QWidget):
         calc_grp = QGroupBox("Calculated")
         calc_grp.setStyleSheet(grp_style)
         calc_lay = QVBoxLayout(calc_grp)
-        calc_lay.setSpacing(2)
+        calc_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        calc_lay.setSpacing(_sc(4))
 
         self._calc_labels = {}
         for key, label_text in [
@@ -491,7 +497,8 @@ class PrintSetupPage(QWidget):
         layer_grp = QGroupBox("Layers")
         layer_grp.setStyleSheet(grp_style)
         layer_lay = QVBoxLayout(layer_grp)
-        layer_lay.setSpacing(4)
+        layer_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        layer_lay.setSpacing(_sc(7))
 
         ly_row = QHBoxLayout()
         ly_row.addWidget(QLabel("Count:"))
@@ -520,7 +527,8 @@ class PrintSetupPage(QWidget):
         adv_grp.setCheckable(True)
         adv_grp.setChecked(False)
         adv_lay = QVBoxLayout(adv_grp)
-        adv_lay.setSpacing(4)
+        adv_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        adv_lay.setSpacing(_sc(6))
 
         zf_row = QHBoxLayout()
         zf_row.addWidget(QLabel("Z Feed:"))
@@ -586,7 +594,8 @@ class PrintSetupPage(QWidget):
             adv_lay.addLayout(row)
 
         left_col.addWidget(adv_grp)
-        left_col.addStretch()
+        # v7.6.0: no stretch here — Plan of Action stacks directly
+        # beneath Print Parameters in the single-column layout.
 
         # ══════════════════════════════════════════════════════════
         #  RIGHT COLUMN: Plan of Action
@@ -608,7 +617,8 @@ class PrintSetupPage(QWidget):
             "When a pump switches between inks, these steps run.\n"
             "Sequence: waste > wash > buffer > wash > ink load > wash")
         swap_lay = QVBoxLayout(swap_grp)
-        swap_lay.setSpacing(2)
+        swap_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        swap_lay.setSpacing(_sc(7))
 
         self._swap_checks = {}
         swap_steps = [
@@ -625,26 +635,45 @@ class PrintSetupPage(QWidget):
             swap_lay.addWidget(cb)
             self._swap_checks[key] = cb
 
-        vol_form = QHBoxLayout()
-        vol_form.setSpacing(4)
+        # v7.6.0: per-step volumes in a 2-column grid below a small
+        # caption. Right-aligned labels + expanding spinboxes keep the
+        # pairs evenly spaced (not crowded) in the narrow column.
+        from PySide6.QtWidgets import QGridLayout
+        vol_caption = QLabel("Volumes (µL)")
+        vol_caption.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {_sf(9)}pt; padding-top: {_sp(4)}px;")
+        swap_lay.addWidget(vol_caption)
+
+        vol_form = QGridLayout()
+        vol_form.setHorizontalSpacing(_sc(10))
+        vol_form.setVerticalSpacing(_sc(6))
         self._swap_waste_vol = QDoubleSpinBox()
         self._swap_wash_vol = QDoubleSpinBox()
         self._swap_buffer_vol = QDoubleSpinBox()
         self._swap_ink_load_vol = QDoubleSpinBox()
-        for spin, tip, default in [
+        for i, (spin, tip, default) in enumerate([
             (self._swap_waste_vol, "Waste", 50.0),
             (self._swap_wash_vol, "Wash", 100.0),
-            (self._swap_buffer_vol, "Buff", 100.0),
+            (self._swap_buffer_vol, "Buffer", 100.0),
             (self._swap_ink_load_vol, "Ink", 50.0),
-        ]:
+        ]):
             spin.setRange(0, 5000)
-            spin.setSuffix(" uL")
+            spin.setSuffix(" µL")
             spin.setDecimals(0)
             spin.setValue(default)
             spin.setToolTip(f"{tip} volume")
-            spin.setMaximumWidth(_sc(85))
-            vol_form.addWidget(QLabel(f"{tip}:"))
-            vol_form.addWidget(spin)
+            spin.setMinimumWidth(0)
+            spin.setMaximumWidth(_sc(96))
+            spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            r, c = i // 2, (i % 2) * 2
+            lbl = QLabel(f"{tip}:")
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')};")
+            vol_form.addWidget(lbl, r, c)
+            vol_form.addWidget(spin, r, c + 1)
+        vol_form.setColumnStretch(1, 1)
+        vol_form.setColumnStretch(3, 1)
         swap_lay.addLayout(vol_form)
 
         right_col.addWidget(swap_grp)
@@ -653,7 +682,8 @@ class PrintSetupPage(QWidget):
         gather_grp = QGroupBox("Ink Gathering")
         gather_grp.setStyleSheet(grp_style)
         gather_lay = QVBoxLayout(gather_grp)
-        gather_lay.setSpacing(4)
+        gather_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        gather_lay.setSpacing(_sc(7))
 
         extra_row = QHBoxLayout()
         extra_row.addWidget(QLabel("Extra:"))
@@ -686,7 +716,8 @@ class PrintSetupPage(QWidget):
         z_grp = QGroupBox("Z Travel")
         z_grp.setStyleSheet(grp_style)
         z_lay = QVBoxLayout(z_grp)
-        z_lay.setSpacing(2)
+        z_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        z_lay.setSpacing(_sc(7))
 
         self._z_wait_confirm_cb = QCheckBox("Wait for Z position confirm")
         self._z_wait_confirm_cb.setChecked(True)
@@ -734,7 +765,8 @@ class PrintSetupPage(QWidget):
         xy_grp = QGroupBox("XY Travel")
         xy_grp.setStyleSheet(grp_style)
         xy_lay = QVBoxLayout(xy_grp)
-        xy_lay.setSpacing(2)
+        xy_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        xy_lay.setSpacing(_sc(7))
 
         self._xy_fast_cb = QCheckBox("Fast XY travel between wells")
         self._xy_fast_cb.setChecked(True)
@@ -761,7 +793,8 @@ class PrintSetupPage(QWidget):
         clean_grp.setCheckable(True)
         clean_grp.setChecked(True)
         clean_lay = QVBoxLayout(clean_grp)
-        clean_lay.setSpacing(2)
+        clean_lay.setContentsMargins(_sc(10), _sc(6), _sc(10), _sc(10))
+        clean_lay.setSpacing(_sc(7))
         self._cleanup_grp = clean_grp
 
         self._cleanup_waste_cb = QCheckBox("Waste (eject remaining)")
@@ -779,9 +812,12 @@ class PrintSetupPage(QWidget):
         right_col.addWidget(clean_grp)
         right_col.addStretch()
 
-        columns.addLayout(left_col, stretch=1)
-        columns.addLayout(right_col, stretch=1)
-        outer.addLayout(columns)
+        # v7.6.0: single-column layout — Print Parameters stacked
+        # above Plan of Action — so the whole form fits the narrow
+        # left-context Tools column without horizontal overflow.
+        # (``columns`` QHBoxLayout is left unused.)
+        outer.addLayout(left_col)
+        outer.addLayout(right_col)
 
         # ══════════════════════════════════════════════════════════
         #  Bottom: Validate, Generate & Send
@@ -791,8 +827,10 @@ class PrintSetupPage(QWidget):
         sep.setStyleSheet(f"color: {COLORS.get('surface1', '#45475a')};")
         outer.addWidget(sep)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
+        # v7.6.0: stack the two primary actions vertically (full
+        # width) so they fit the narrow left-context column.
+        btn_row = QVBoxLayout()
+        btn_row.setSpacing(6)
 
         self.btn_generate_print = QPushButton("Validate & Generate Print")
         self.btn_generate_print.setStyleSheet(f"""
@@ -846,13 +884,14 @@ class PrintSetupPage(QWidget):
         export_row = QHBoxLayout()
         btn_export = QPushButton("Export G-code")
         btn_export.setMaximumHeight(_sc(28))
+        btn_export.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_export.clicked.connect(self._export_gcode)
         export_row.addWidget(btn_export)
         btn_save = QPushButton("Save JSON")
         btn_save.setMaximumHeight(_sc(28))
+        btn_save.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_save.clicked.connect(self._save_job)
         export_row.addWidget(btn_save)
-        export_row.addStretch()
         outer.addLayout(export_row)
 
         scroll.setWidget(content)
@@ -934,12 +973,22 @@ class PrintSetupPage(QWidget):
                     _p = _p.parent() if hasattr(_p, 'parent') else None
             if _app_settings:
                 cal = _app_settings.get_section('calibration') or {}
+                # Fast Move Z (legacy "safe_z") → fast XY travel height.
                 safe_z = cal.get('safe_z')
-                top_z = cal.get('top_z')
                 if safe_z is not None and safe_z > 0:
                     s.travel_z_height = float(safe_z)
+                # Plate Top Z (legacy "top_z") → top of well opening.
+                top_z = cal.get('top_z')
                 if top_z is not None and top_z >= 0:
                     s.top_z_height = float(top_z)
+                # v7.4.4: pass through the new Z reference heights so
+                # downstream consumers (safety, trajectory clamping,
+                # GCode comments) can pick them up via hasattr-guarded
+                # reads.
+                for key in ("replace_z", "max_z", "plate_bottom_z"):
+                    val = cal.get(key)
+                    if val is not None:
+                        setattr(s, key, float(val))
         except Exception:
             pass
 

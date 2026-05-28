@@ -732,51 +732,26 @@ class HelperFunctionsPage(QWidget):
             QMessageBox.warning(self, "No Toolpath", "Generate a toolpath first.")
             return
         try:
-            import json
-            from datetime import datetime, timezone
-
-            prints_dir = Path("config/prints")
-            prints_dir.mkdir(parents=True, exist_ok=True)
-
-            base = "ImageToolpath"
-            counter = 1
-            while (prints_dir / f"{base}_{counter}.csv").exists():
-                counter += 1
-            name = f"{base}_{counter}"
-            csv_path = prints_dir / f"{name}.csv"
-            self._planner.save_csv(str(csv_path))
+            # v7.5.x: bake via the shared csv_import helper (same path the
+            # Print Builder Sketch page uses).
+            from SupportClasses.PrintFileManager import (
+                save_trajectory_as_print_object)
 
             summary = self._planner.get_summary()
-            print_data = {
-                "schema_version": "7.2.3",
-                "metadata": {
-                    "name": name,
-                    "description": (
-                        f"Image toolpath: {summary['num_waypoints']} wpts, "
-                        f"{summary['num_layers']} layers, "
-                        f"{summary['image_width_mm']:.2f}x"
-                        f"{summary['image_height_mm']:.2f} mm"
-                    ),
-                    "created": datetime.now(timezone.utc).isoformat(),
-                    "modified": datetime.now(timezone.utc).isoformat(),
-                    "author": "Helper Functions",
-                },
-                "objects": {
-                    "ImagePath_1": {
-                        "object_type": "csv_import",
-                        "params": {"csv_path": str(csv_path), "source": "ImagePathPlanner",
-                                   "num_waypoints": summary["num_waypoints"],
-                                   "num_layers": summary["num_layers"]},
-                        "position": [0.0, 0.0, 0.0], "color": "#a6e3a1",
-                        "ink": "", "in_well": True,
-                    },
-                },
-                "collections": {}, "layout_presets": {},
-            }
-            json_path = prints_dir / f"{name}.json"
-            with open(json_path, "w") as f:
-                json.dump(print_data, f, indent=2)
-
+            name = save_trajectory_as_print_object(
+                self._planner.trajectory,
+                base_name="ImageToolpath",
+                description=(
+                    f"Image toolpath: {summary['num_waypoints']} wpts, "
+                    f"{summary['num_layers']} layers, "
+                    f"{summary['image_width_mm']:.2f}x"
+                    f"{summary['image_height_mm']:.2f} mm"),
+                color="#a6e3a1",
+                author="Helper Functions",
+                source="ImagePathPlanner",
+                object_name="ImagePath_1",
+                extra_params={"num_layers": summary["num_layers"]},
+            )
             self._status_label.setText(f"Created: {name}")
             self._status_label.setStyleSheet(
                 f"color: {COLORS.get('green', '#a6e3a1')}; font-size: 11px;")

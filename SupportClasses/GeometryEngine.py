@@ -103,6 +103,12 @@ class PrintObject:
     ink_assignments: dict[str, str] = field(default_factory=dict)  # {"P1": "ink_name"}
     color: str = "#a6e3a1"                  # Display color (hex)
 
+    # v7.5.0: discriminator for how this object was created. Parametric
+    # objects regenerate their trajectory from object_type + params at
+    # load time; csv-sourced objects have no generator, so the trajectory
+    # is persisted in print files / sessions.
+    source: str = "parametric"              # "parametric" | "csv"
+
     # Generated trajectory — set by generate_object_trajectory()
     trajectory: np.ndarray | None = None    # Nx7: [x, y, z, p1, p2, p3, t]
 
@@ -140,12 +146,16 @@ class PrintObject:
             "position": list(self.position),
             "ink_assignments": dict(self.ink_assignments),
             "color": self.color,
+            "source": self.source,
             "total_length_mm": self.total_length_mm,
             "total_volume_uL": self.total_volume_uL,
             "total_time_s": self.total_time_s,
             "num_layers": self.num_layers,
         }
-        if self.has_trajectory:
+        # Persist the trajectory only when it cannot be regenerated from
+        # object_type + params (i.e. csv-sourced). Parametric objects
+        # regenerate at load via generate_object_trajectory().
+        if self.has_trajectory and self.source == "csv":
             d["trajectory"] = self.trajectory.tolist()
         return d
 
@@ -159,6 +169,7 @@ class PrintObject:
             position=tuple(data.get("position", (0, 0, 0))),
             ink_assignments=data.get("ink_assignments", {}),
             color=data.get("color", "#a6e3a1"),
+            source=data.get("source", "parametric"),
             total_length_mm=data.get("total_length_mm", 0.0),
             total_volume_uL=data.get("total_volume_uL", 0.0),
             total_time_s=data.get("total_time_s", 0.0),
@@ -728,36 +739,60 @@ def generate_object_trajectory(
         obj.num_layers = 1
 
     elif otype == ObjectType.CIRCLE.value:
+        radius = p.get("radius", 1.0)
+        num_points = p.get("num_points", 64)
+        outer_uL = float(p.get("outer_ring_volume_uL", 0.0))
         if p.get("filled", False):
-            pts = generate_circular_meander_fill(
-                ox, oy, p.get("radius", 1.0), spacing)
+            fill_pts = generate_circular_meander_fill(ox, oy, radius, spacing)
+            outline_pts = generate_circle(ox, oy, radius, num_points)
+            traj = _gen_2d_fill_then_outline(
+                fill_pts, outline_pts, oz, print_speed_mm_s,
+                layer_height_mm, needle, syringe, pump_col,
+                outer_ring_volume_uL=outer_uL,
+            )
         else:
-            pts = generate_circle(ox, oy, p.get("radius", 1.0), p.get("num_points", 64))
-        traj = _gen_2d_trajectory(
-            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
-        )
+            traj = _gen_2d_trajectory(
+                generate_circle(ox, oy, radius, num_points),
+                oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            )
         obj.num_layers = 1
 
     elif otype == ObjectType.SQUARE.value:
         side = p.get("side", 2.0)
+        points_per_side = p.get("points_per_side", 20)
+        outer_uL = float(p.get("outer_ring_volume_uL", 0.0))
         if p.get("filled", False):
-            pts = generate_meander_fill(ox, oy, side, side, spacing)
+            fill_pts = generate_meander_fill(ox, oy, side, side, spacing)
+            outline_pts = generate_square(ox, oy, side, points_per_side)
+            traj = _gen_2d_fill_then_outline(
+                fill_pts, outline_pts, oz, print_speed_mm_s,
+                layer_height_mm, needle, syringe, pump_col,
+                outer_ring_volume_uL=outer_uL,
+            )
         else:
-            pts = generate_square(ox, oy, side, p.get("points_per_side", 20))
-        traj = _gen_2d_trajectory(
-            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
-        )
+            traj = _gen_2d_trajectory(
+                generate_square(ox, oy, side, points_per_side),
+                oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            )
         obj.num_layers = 1
 
     elif otype == ObjectType.TRIANGLE.value:
+        side = p.get("side", 2.0)
+        points_per_side = p.get("points_per_side", 20)
+        outer_uL = float(p.get("outer_ring_volume_uL", 0.0))
         if p.get("filled", False):
-            pts = generate_triangular_meander_fill(
-                ox, oy, p.get("side", 2.0), spacing)
+            fill_pts = generate_triangular_meander_fill(ox, oy, side, spacing)
+            outline_pts = generate_triangle(ox, oy, side, points_per_side)
+            traj = _gen_2d_fill_then_outline(
+                fill_pts, outline_pts, oz, print_speed_mm_s,
+                layer_height_mm, needle, syringe, pump_col,
+                outer_ring_volume_uL=outer_uL,
+            )
         else:
-            pts = generate_triangle(ox, oy, p.get("side", 2.0), p.get("points_per_side", 20))
-        traj = _gen_2d_trajectory(
-            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
-        )
+            traj = _gen_2d_trajectory(
+                generate_triangle(ox, oy, side, points_per_side),
+                oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            )
         obj.num_layers = 1
 
     elif otype == ObjectType.SPIRAL.value:
@@ -769,15 +804,23 @@ def generate_object_trajectory(
         obj.num_layers = 1
 
     elif otype == ObjectType.ELLIPSE.value:
+        a = p.get("a", 2.0)
+        b = p.get("b", 1.0)
+        num_points = p.get("num_points", 64)
+        outer_uL = float(p.get("outer_ring_volume_uL", 0.0))
         if p.get("filled", False):
-            pts = generate_elliptical_meander_fill(
-                ox, oy, p.get("a", 2.0), p.get("b", 1.0), spacing)
+            fill_pts = generate_elliptical_meander_fill(ox, oy, a, b, spacing)
+            outline_pts = generate_ellipse(ox, oy, a, b, num_points)
+            traj = _gen_2d_fill_then_outline(
+                fill_pts, outline_pts, oz, print_speed_mm_s,
+                layer_height_mm, needle, syringe, pump_col,
+                outer_ring_volume_uL=outer_uL,
+            )
         else:
-            pts = generate_ellipse(ox, oy, p.get("a", 2.0), p.get("b", 1.0),
-                                  p.get("num_points", 64))
-        traj = _gen_2d_trajectory(
-            pts, oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
-        )
+            traj = _gen_2d_trajectory(
+                generate_ellipse(ox, oy, a, b, num_points),
+                oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            )
         obj.num_layers = 1
 
     # ----- 3D Shell Objects -----
@@ -884,6 +927,81 @@ def _gen_2d_trajectory(
     if syringe is not None:
         pump_pos = compute_pump_positions(dists, needle, syringe, layer_h)
     return _build_trajectory(xy_points, z, times, pump_col, pump_pos)
+
+
+def _gen_2d_fill_then_outline(
+    fill_pts: np.ndarray,
+    outline_pts: np.ndarray,
+    z: float,
+    speed: float,
+    layer_h: float,
+    needle: NeedleSpec,
+    syringe: SyringeSpec | None,
+    pump_col: int,
+    outer_ring_volume_uL: float = 0.0,
+) -> np.ndarray:
+    """
+    Build a combined trajectory: raster fill, then perimeter outline.
+
+    The outline pass is appended after the fill with a small time gap
+    so the trajectory planner inserts a travel/lift transition between
+    them. When ``outer_ring_volume_uL > 0``, the outline's pump deltas
+    are scaled to deposit exactly that volume regardless of the
+    natural flow-physics extrusion.
+    """
+    # If no outline points were supplied, behave like a plain fill
+    if outline_pts is None or len(outline_pts) == 0:
+        return _gen_2d_trajectory(
+            fill_pts, z, speed, layer_h, needle, syringe, pump_col,
+        )
+    if fill_pts is None or len(fill_pts) == 0:
+        return _gen_2d_trajectory(
+            outline_pts, z, speed, layer_h, needle, syringe, pump_col,
+        )
+
+    # Fill segment — built with the standard time parameterization
+    fill_times, fill_dists = _time_parameterize(fill_pts, z, speed)
+    fill_pump = np.zeros(len(fill_pts))
+    if syringe is not None:
+        fill_pump = compute_pump_positions(
+            fill_dists, needle, syringe, layer_h)
+    fill_traj = _build_trajectory(
+        fill_pts, z, fill_times, pump_col, fill_pump,
+    )
+
+    # Outline segment — start time + pump offset where fill left off,
+    # plus a small gap so the planner can insert a travel move.
+    t_offset = float(fill_times[-1]) + 0.1 if len(fill_times) else 0.0
+    p_offset = float(fill_pump[-1]) if len(fill_pump) else 0.0
+
+    out_times, out_dists = _time_parameterize(
+        outline_pts, z, speed, t_start=t_offset)
+    out_pump_deltas = np.zeros(len(outline_pts))
+    if syringe is not None:
+        # Natural extrusion the flow physics would compute for the
+        # outline at the current speed / layer height / needle
+        natural = compute_pump_positions(
+            out_dists, needle, syringe, layer_h)
+        out_pump_deltas = natural - natural[0]
+        if outer_ring_volume_uL and outer_ring_volume_uL > 0:
+            # Scale deltas to hit the requested outer-ring volume
+            natural_uL = float(natural[-1] - natural[0]) * syringe.uL_per_mm
+            if natural_uL > 1e-6:
+                scale = outer_ring_volume_uL / natural_uL
+                out_pump_deltas = out_pump_deltas * scale
+            elif syringe.uL_per_mm > 1e-6 and out_dists[-1] > 1e-6:
+                # No natural extrusion (e.g. layer_h=0) — distribute
+                # the target volume linearly along the perimeter.
+                mm_per_uL = 1.0 / syringe.uL_per_mm
+                target_mm = outer_ring_volume_uL * mm_per_uL
+                out_pump_deltas = (out_dists / out_dists[-1]) * target_mm
+
+    out_pump = p_offset + out_pump_deltas
+    outline_traj = _build_trajectory(
+        outline_pts, z, out_times, pump_col, out_pump,
+    )
+
+    return np.vstack([fill_traj, outline_traj])
 
 
 def _gen_multilayer(

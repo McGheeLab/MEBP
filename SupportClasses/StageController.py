@@ -723,14 +723,21 @@ class StageController:
 
     def __init__(
         self,
-        simulate_xy: bool = True,
-        simulate_zp: bool = True,
+        simulate_xy: bool = False,
+        simulate_zp: bool = False,
         controller_json: str | None = None,
         poll_interval: float = 0.3,
         watchdog_interval: float = 2.0,
     ):
-        self.simulate_xy = simulate_xy
-        self.simulate_zp = simulate_zp
+        # v7.4.2: per-device simulation is decided at connect time
+        # (Connect = real hardware, Simulate = simulator). The init
+        # kwargs are kept as fallback defaults for callers — notably
+        # ``--simulate-xy`` / ``--simulate-zp`` in headless mode — that
+        # invoke ``connect_stages()`` without an explicit ``simulate``
+        # argument. ``self.simulate_xy`` / ``self.simulate_zp`` are now
+        # read-only properties that reflect the live stage's mode.
+        self._default_simulate_xy = bool(simulate_xy)
+        self._default_simulate_zp = bool(simulate_zp)
 
         # v7.1 P8.27: Controller JSON path (passed through to XYStageManager)
         # "auto" = auto-detect, None = default ProScan III, or explicit path
@@ -799,6 +806,10 @@ class StageController:
         # v7.3.5: Configurable ZP feedrates (mm/min), set from Settings page
         self._zp_retract_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE
         self._zp_insert_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE / 2
+        # v7.4.8: minimum safe travel Z (zero-referenced mm) that clears the
+        # tallest plate insert/tube. None = no floor. Set from the active
+        # plate's max_rim_height + calibration top Z.
+        self._min_travel_z_mm: float | None = None
         # v7.3.5: Periodic position save to Marlin EEPROM (M500)
         self._zp_auto_save_position: bool = False
 
@@ -814,18 +825,32 @@ class StageController:
         msg = kwargs.get("message", "") or (args[0] if args else "")
         logger.info(f"[Debug] {msg}")
 
-    def connect_stages(self, xy: bool = True, zp: bool = True) -> None:
+    def connect_stages(
+        self,
+        xy: bool = True,
+        zp: bool = True,
+        simulate_xy: bool | None = None,
+        simulate_zp: bool | None = None,
+    ) -> None:
         """Initialise and connect stages.
 
         Args:
             xy: If True, connect the XY stage (default True).
             zp: If True, connect the ZP stage (default True).
+            simulate_xy: If True, the XY stage opens a simulator; if False,
+                real hardware. ``None`` falls back to the ``__init__`` default
+                (used by headless / CLI callers). Real hardware is now the
+                default — the GUI passes an explicit flag from the Connect /
+                Simulate buttons on the Hardware Setup → Device sub-page.
+            simulate_zp: Same as ``simulate_xy`` but for the ZP stage.
         """
+        sim_xy = self._default_simulate_xy if simulate_xy is None else bool(simulate_xy)
+        sim_zp = self._default_simulate_zp if simulate_zp is None else bool(simulate_zp)
         if xy and self.xy_stage is None:
             # v7.2.8: connection error handling
             try:
                 self.xy_stage = XYStageManager(
-                    simulate=self.simulate_xy,
+                    simulate=sim_xy,
                     controller_json=self.controller_json,
                 )
             except (ConnectionError, ImportError, OSError) as e:
@@ -844,13 +869,13 @@ class StageController:
                 get_xy_position=lambda: self._pos_poller.xy_position,
             )
             self.xy_jog.start()
-            if not self.simulate_xy:
+            if not sim_xy:
                 self._watchdog.watch(
                     "XY",
                     lambda: getattr(self.xy_stage, "spo", None),
                     lambda: self._handle_disconnect("XY"),
                 )
-            logger.info("XY stage connected")
+            logger.info(f"XY stage connected ({'SIM' if sim_xy else 'REAL'})")
 
         if zp and self.zp_stage is None:
             # v7.2.8: ZP connection error handling
@@ -858,7 +883,7 @@ class StageController:
             # can short-circuit to the last-known-good port.
             try:
                 self.zp_stage = ZPStageManager(
-                    simulate=self.simulate_zp,
+                    simulate=sim_zp,
                     preferred_port=self._preferred_zp_port,
                 )
             except (ConnectionError, ImportError, OSError) as e:
@@ -878,7 +903,7 @@ class StageController:
                 zero_position=self.zero_position,
             )
             self.zp_jog.start()
-            if not self.simulate_zp:
+            if not sim_zp:
                 self._watchdog.watch(
                     "ZP",
                     lambda: getattr(self.zp_stage, "serial", None),
@@ -886,7 +911,7 @@ class StageController:
                 )
                 # v7.3.5: Register periodic position save (M500)
                 self._watchdog.add_periodic(self._periodic_zp_position_save)
-            logger.info("ZP stage connected")
+            logger.info(f"ZP stage connected ({'SIM' if sim_zp else 'REAL'})")
 
             # v7.4.2: Apply any pending device settings (axis_map, steps_per_mm)
             # that were set before the ZP stage was online.
@@ -938,6 +963,18 @@ class StageController:
             return getattr(self.zp_stage, "connected_port", None)
         return None
 
+    def set_min_travel_z(self, z_mm: float | None) -> None:
+        """v7.4.8: set the plate-wide travel-Z clearance floor (zero-ref mm).
+
+        When set, every `safe_travel_to` retract is raised to at least this
+        height so the needle clears the tallest insert/tube. Pass None to
+        clear the floor (plate has no tall inserts).
+        """
+        self._min_travel_z_mm = z_mm
+        if z_mm is not None:
+            logger.info(f"StageController: min travel Z floor = {z_mm:.2f} mm "
+                        f"(clears plate inserts)")
+
     def apply_device_settings(self, axis_map: dict | None = None,
                               steps_per_mm: dict | None = None,
                               per_axis_max_feedrate: dict | None = None,
@@ -977,13 +1014,24 @@ class StageController:
                 self.zp_stage.set_per_axis_max_feedrate(
                     per_axis_max_feedrate, persist=persist_feedrate)
 
-    def connect_xy(self) -> None:
-        """Connect only the XY stage."""
-        self.connect_stages(xy=True, zp=False)
+    def connect_xy(self, simulate: bool | None = None) -> None:
+        """Connect only the XY stage.
 
-    def connect_zp(self) -> None:
-        """Connect only the ZP stage."""
-        self.connect_stages(xy=False, zp=True)
+        Args:
+            simulate: If True, opens a simulator instead of real hardware.
+                ``None`` falls back to the ``__init__`` default (real
+                hardware unless ``--simulate-xy`` was passed). The Hardware
+                Setup → Device page passes ``False`` from "Connect" and
+                ``True`` from "Simulate".
+        """
+        self.connect_stages(xy=True, zp=False, simulate_xy=simulate)
+
+    def connect_zp(self, simulate: bool | None = None) -> None:
+        """Connect only the ZP stage.
+
+        See :meth:`connect_xy` for the meaning of ``simulate``.
+        """
+        self.connect_stages(xy=False, zp=True, simulate_zp=simulate)
 
     def disconnect_xy(self) -> None:
         """Disconnect only the XY stage."""
@@ -1359,6 +1407,30 @@ class StageController:
     @property
     def is_zp_connected(self) -> bool:
         return self.zp_stage is not None
+
+    @property
+    def simulate_xy(self) -> bool:
+        """v7.4.2: True iff the currently-connected XY stage is a simulator.
+
+        Replaces the previous static instance flag — simulation is now
+        decided per-connection from the UI ("Simulate" button vs.
+        "Connect"). When no stage is connected, falls back to the
+        constructor default (controlled by ``--simulate-xy`` in headless
+        mode).
+        """
+        if self.xy_stage is not None:
+            return bool(getattr(self.xy_stage, "simulate", False))
+        return self._default_simulate_xy
+
+    @property
+    def simulate_zp(self) -> bool:
+        """v7.4.2: True iff the currently-connected ZP stage is a simulator.
+
+        See :attr:`simulate_xy` for the rationale.
+        """
+        if self.zp_stage is not None:
+            return bool(getattr(self.zp_stage, "simulate", False))
+        return self._default_simulate_zp
 
     # ── Calibration ───────────────────────────────────────────────
 
@@ -1743,6 +1815,16 @@ class StageController:
             True if all moves completed successfully, False if any timed out.
         """
         ok = True
+
+        # v7.4.8: floor the retract height so the needle clears the
+        # tallest insert/tube on the plate (set via set_min_travel_z()).
+        # Both values are zero-referenced mm; larger Z = higher.
+        min_travel_z = getattr(self, "_min_travel_z_mm", None)
+        if min_travel_z is not None and min_travel_z > safe_z_mm:
+            logger.info(
+                f"safe_travel_to: raising safe Z {safe_z_mm:.2f} → "
+                f"{min_travel_z:.2f} mm to clear plate inserts")
+            safe_z_mm = min_travel_z
 
         # Suspend the position poller for the entire sequence to prevent
         # serial races between the poller thread and our M400 / M114 waits.

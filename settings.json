@@ -1,23 +1,19 @@
 {
   "window": {
-    "x": 164,
-    "y": 122,
-    "width": 1400,
+    "x": -899,
+    "y": -977,
+    "width": 1559,
     "height": 850,
-    "active_tab": 3,
+    "active_tab": 4,
     "splitter_sizes": [
-      706,
-      0
+      500,
+      150
     ]
   },
-  "simulation": {
-    "simulate_xy": true,
-    "simulate_zp": true
-  },
   "speeds": {
-    "xy": 0,
-    "z": 0,
-    "p": 0
+    "xy": 250.0,
+    "z": 1.0,
+    "p": 0.5
   },
   "zero_position": {
     "x": 0.0,
@@ -43,85 +39,54 @@
   },
   "xbox": {
     "mapping_file": "current_button_mapping.json",
-    "reconnect_timeout_s": 30,
     "deadzones": {
-      "sticks": 0.2,
-      "triggers": 0.11
-    },
-    "debug_mode": false
+      "sticks": 0.09
+    }
   },
   "logging": {
-    "verbose": false,
-    "debug_xy": false
+    "verbose": false
   },
   "safety_limits": {
-    "xy_min_x": 0.0,
-    "xy_min_y": 0.0,
-    "xy_max_x": 111817.0,
-    "xy_max_y": 73286.0,
-    "z_min": -50.0,
+    "xy_min_x": -130000.0,
+    "xy_min_y": -85000.0,
+    "xy_max_x": 130000.0,
+    "xy_max_y": 85000.0,
+    "z_min": -10.0,
     "z_max": 50.0,
     "p1_min": -50.0,
     "p1_max": 50.0,
     "p2_min": -50.0,
     "p2_max": 50.0,
-    "p3_min": -51.0,
+    "p3_min": -50.0,
     "p3_max": 50.0,
     "max_xy_speed": 10000.0,
     "max_z_feedrate": 500.0,
     "max_pump_feedrate": 200.0,
-    "enabled": true,
-    "max_flow_rate_p1_uL_s": 8.0,
-    "max_flow_rate_p2_uL_s": 1.5,
-    "max_flow_rate_p3_uL_s": 0.0
+    "enabled": true
   },
   "polling": {
-    "position_interval_ms": 50,
-    "watchdog_interval_s": 2.0
+    "position_interval_ms": 300,
+    "watchdog_interval_s": 3.0
   },
   "calibration": {
-    "plate_format": 24,
-    "taught_a1": [
-      45290.5,
-      33869.0
-    ],
+    "plate_format": "custom:plate-12",
+    "taught_a1": null,
     "taught_corner": null,
-    "corner_well": "D6",
-    "offset_x": 0,
-    "offset_y": 0,
+    "offset_x": 0.0,
+    "offset_y": 0.0,
     "rotation": 0.0,
     "scale": 1.0,
-    "alignment_valid": false,
-    "safe_z": 16.06,
-    "top_z": 11.4,
-    "taught_a1_z": 9.0,
-    "taught_corner_z": 4.4999,
-    "taught_third": [
-      -49059.0,
-      28945.0
-    ],
-    "taught_third_z": -19.02,
-    "third_well": "A6",
-    "mosaic_affine": {
-      "rotation_deg": -179.98158475180406,
-      "scale": 0.9994922796041877,
-      "translation_um": [
-        90547.12255440415,
-        67735.3515492228
-      ],
-      "center_um": [
-        0.0,
-        0.0
-      ],
-      "num_points": 2,
-      "residual_um": 7.275957614183426e-12
-    },
-    "z_plane": {
-      "a": -0.04663523316062176,
-      "b": 3.4542314335177505e-06,
-      "c": 8.999999999999998,
-      "r_squared": 1.0
-    }
+    "safe_z": null,
+    "top_z": null,
+    "taught_a1_z": null,
+    "taught_corner_z": null,
+    "taught_third": null,
+    "taught_third_z": null,
+    "third_well": null,
+    "corner_well": "C4",
+    "replace_z": null,
+    "max_z": null,
+    "plate_bottom_z": null
   },
   "controller": {
     "controller_json": null,
@@ -129,8 +94,8 @@
     "controllers_dir": "config/controllers"
   },
   "workspace": {
-    "needle_gauge": null,
-    "plate_format": 24,
+    "needle_gauge": 27,
+    "plate_format": 6,
     "pump_loadouts": {
       "P1": {
         "syringe_volume_uL": null,
@@ -184,7 +149,7 @@
       "id_um": 210,
       "wall_um": 102,
       "length_inches": 2.0,
-      "num_channels": 1,
+      "num_channels": 2,
       "channel_pump_map": {
         "1": "P1"
       }
@@ -199,7 +164,26 @@
           "barrel_id_mm": 3.256,
           "part_number": "1725"
         },
-        "inks": [],
+        "inks": [
+          {
+            "name": "MSC Cells",
+            "ink_type": "cells",
+            "viscosity_cP": 1.2,
+            "granule_diameter_um": 0.0,
+            "cell_diameter_um": 20.0,
+            "density_g_mL": 1.0,
+            "color": "#89b4fa"
+          },
+          {
+            "name": "DPBS",
+            "ink_type": "buffer",
+            "viscosity_cP": 1.0,
+            "granule_diameter_um": 0.0,
+            "cell_diameter_um": 0.0,
+            "density_g_mL": 1.0,
+            "color": "#e959ed"
+          }
+        ],
         "printing_mode": "incremental",
         "fluid_column": {
           "oil_volume_uL": 0.0,
@@ -207,7 +191,7 @@
           "ink_volume_uL": 0.0,
           "dead_volume_uL": 2.0
         },
-        "enabled": false
+        "enabled": true
       },
       "P2": {
         "pump_id": "P2",
@@ -254,6 +238,7 @@
       }
     },
     "plate_format": 24,
+    "plate_name": "plate-12",
     "ink_library": {
       "Hydrogel A": {
         "name": "Hydrogel A",
@@ -295,7 +280,8 @@
     "rosette_library": {},
     "buffer_ink_name": "DPBS",
     "needle_channel_pump_map": {
-      "0": "P2"
+      "0": "P1",
+      "1": "P2"
     },
     "ink_swap_strategy": {
       "waste": true,
@@ -313,32 +299,54 @@
       "camera_spec": null,
       "objective_magnification": 2.0,
       "active_resolution": [
-        916,
-        686
+        1832,
+        1374
       ],
-      "micron_per_pixel_override": 3.12,
+      "micron_per_pixel_override": null,
       "camera_to_needle_offset_um": [
         0.0,
         0.0
-      ]
-    }
+      ],
+      "current_objective_name": null
+    },
+    "camera_roles": [
+      "microscope",
+      "needle_x",
+      "needle_y"
+    ]
   },
-  "ui": {
-    "scale": 2.0
+  "migrations": {
+    "v7_4_0_b": true,
+    "v7_4_1_default_device": true
   },
-  "execution": {
-    "mode": "discrete"
-  },
-  "xbox_stick_offsets": {
-    "0": 0.0,
-    "1": 0.0,
-    "2": 0.0,
-    "3": 0.0
-  },
-  "axis_flip": {
-    "Z": false,
-    "P1": false,
-    "P2": false,
-    "P3": false
+  "device_profile": {
+    "active": null,
+    "axis_map": {
+      "Z": "X",
+      "P1": "Y",
+      "P2": "Z",
+      "P3": "E"
+    },
+    "steps_per_mm": {
+      "Z": 5069,
+      "P1": 5069,
+      "P2": -5069,
+      "P3": 5069
+    },
+    "per_axis_max_feedrate": {
+      "Z": 500,
+      "P1": 200,
+      "P2": 200,
+      "P3": 200
+    },
+    "per_axis_max_accel": {
+      "Z": 100.0,
+      "P1": 1000.0,
+      "P2": 1000.0,
+      "P3": 1000.0
+    },
+    "xy_velocity_pct": 100,
+    "xy_acceleration": 50,
+    "xy_jerk": null
   }
 }

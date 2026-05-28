@@ -829,7 +829,10 @@ class WorkspaceConfig:
         "P2": PumpLoadout(pump_id="P2"),
         "P3": PumpLoadout(pump_id="P3"),
     })
-    plate_format: int = 24                  # 6, 12, 24, 48, 96
+    plate_format: int = 24                  # 6, 12, 24, 48, 96 (legacy)
+    # v7.4.5: custom-plate name when set; takes precedence over plate_format
+    # via `active_plate_key`.
+    plate_name: str = ""
     rosette_library: dict[str, RosetteInsert] = field(default_factory=dict)
     ink_library: dict[str, InkSpec] = field(default_factory=dict)
     buffer_ink: InkSpec | None = None       # The buffer material (e.g. DPBS)
@@ -846,6 +849,11 @@ class WorkspaceConfig:
         "retract_speed_uL_s": 2.0,
         "prime_speed_uL_s": 1.0,
     })
+
+    @property
+    def active_plate_key(self) -> int | str:
+        """v7.4.5: returns plate_name (str) when set, else plate_format (int)."""
+        return self.plate_name if self.plate_name else self.plate_format
 
     def get_pump(self, pump_id: str) -> PumpLoadout | None:
         """Get pump loadout by ID."""
@@ -874,7 +882,9 @@ class WorkspaceConfig:
             issues.append("No needle selected")
         if not any(p.syringe for p in self.pumps.values()):
             issues.append("No syringes configured — attach at least one syringe")
-        if self.plate_format not in (6, 12, 24, 48, 96, 384):
+        # v7.4.5: a non-empty plate_name overrides plate_format; both
+        # branches are valid (load() resolves the right plate).
+        if not self.plate_name and self.plate_format not in (6, 12, 24, 48, 96, 384):
             issues.append(f"Unknown plate format: {self.plate_format}")
         return issues
 
@@ -883,6 +893,7 @@ class WorkspaceConfig:
             "needle": self.needle.to_dict() if self.needle else None,
             "pumps": {k: v.to_dict() for k, v in self.pumps.items()},
             "plate_format": self.plate_format,
+            "plate_name": self.plate_name,                          # v7.4.5
             "rosette_library": {k: v.to_dict() for k, v in self.rosette_library.items()},
             "ink_library": {k: v.to_dict() for k, v in self.ink_library.items()},
             "buffer_ink": self.buffer_ink.to_dict() if self.buffer_ink else None,
@@ -900,6 +911,7 @@ class WorkspaceConfig:
             ws.pumps = {k: PumpLoadout.from_dict(v) for k, v in data["pumps"].items()}
         # Plate format
         ws.plate_format = data.get("plate_format", 24)
+        ws.plate_name = data.get("plate_name", "") or ""              # v7.4.5
         # Rosette library
         if data.get("rosette_library"):
             ws.rosette_library = {

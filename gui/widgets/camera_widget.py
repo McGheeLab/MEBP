@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QGroupBox, QFileDialog, QSlider,
     QFrame, QSizePolicy, QSpinBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QObject
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 
 from gui.scaling import s, scaled_font_size
@@ -177,6 +177,12 @@ class CameraWidget(QWidget):
 
     frame_captured = Signal(object)  # QImage
 
+    # v7.4.4: Edge-pick mode (Needle Location workflow). Emits the
+    # frame-pixel coordinate (cx_px, cy_px) of each user click while
+    # edge-pick mode is enabled. The caller decides whether the click
+    # is "left edge" or "right edge".
+    pixel_clicked = Signal(float, float)
+
     def __init__(
         self,
         camera_label: str = "Camera",
@@ -207,6 +213,9 @@ class CameraWidget(QWidget):
         # v7.3.0: Thread-safe frame buffer for detection workers
         self._current_frame = None        # Latest BGR numpy array (or None)
         self._frame_lock = threading.Lock()
+
+        # v7.4.4: Edge-pick mode (Needle Location workflow)
+        self._edge_pick_mode = False
 
         self._setup_ui(show_controls)
 
@@ -333,6 +342,12 @@ class CameraWidget(QWidget):
         self.video_label.setText(f"{self._camera_label} — stopped")
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.video_label, stretch=1)
+
+        # v7.4.4: Install event filter so we can intercept clicks on the
+        # video label when edge-pick mode is active. Stays installed
+        # regardless of mode — the filter early-outs when the mode is
+        # off, so this has no effect outside the workflow.
+        self.video_label.installEventFilter(self)
 
         # v7.3.0: Detection overlay (transparent, sits on top of video_label)
         try:
@@ -715,6 +730,69 @@ class CameraWidget(QWidget):
     def detection_overlay(self):
         """Access the detection overlay widget (or None if unavailable)."""
         return getattr(self, '_detection_overlay', None)
+
+    # ── v7.4.4: Edge-Pick Mode (Needle Location workflow) ────────
+
+    def set_edge_pick_mode(self, enabled: bool) -> None:
+        """Enable/disable edge-pick click capture on this widget.
+
+        While enabled, every left-click inside `video_label` is mapped
+        from label-pixel coordinates back to frame-pixel coordinates
+        and emitted via `pixel_clicked(cx_px, cy_px)`. The cursor
+        switches to a crosshair while the mode is active.
+        """
+        if not hasattr(self, 'video_label'):
+            return
+        self._edge_pick_mode = bool(enabled)
+        if self._edge_pick_mode:
+            self.video_label.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.video_label.unsetCursor()
+
+    def is_edge_pick_mode(self) -> bool:
+        return bool(self._edge_pick_mode)
+
+    def _label_to_frame_px(
+        self, label_x: float, label_y: float
+    ) -> tuple[float, float] | None:
+        """Map a click on `video_label` back to original frame pixels.
+
+        Mirrors the KeepAspectRatio + AlignCenter math from
+        `DetectionOverlay._display_transform`. Returns None when there
+        is no current frame or the click falls in the letterbox.
+        """
+        with self._frame_lock:
+            frame = self._current_frame
+        if frame is None or frame.ndim < 2:
+            return None
+        fh, fw = frame.shape[:2]
+        ow, oh = self.video_label.width(), self.video_label.height()
+        if fw <= 0 or fh <= 0 or ow <= 0 or oh <= 0:
+            return None
+        scale = min(ow / fw, oh / fh)
+        if scale <= 0:
+            return None
+        displayed_w = fw * scale
+        displayed_h = fh * scale
+        offset_x = (ow - displayed_w) / 2.0
+        offset_y = (oh - displayed_h) / 2.0
+        fx = (label_x - offset_x) / scale
+        fy = (label_y - offset_y) / scale
+        if fx < 0 or fy < 0 or fx >= fw or fy >= fh:
+            return None
+        return float(fx), float(fy)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (self._edge_pick_mode
+                and obj is getattr(self, 'video_label', None)
+                and event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton):
+            pos = event.position()
+            mapped = self._label_to_frame_px(pos.x(), pos.y())
+            if mapped is not None:
+                self.pixel_clicked.emit(mapped[0], mapped[1])
+            return True  # Consume the click so click-to-move can't also fire
+        return super().eventFilter(obj, event)
 
     # ── Cleanup ───────────────────────────────────────────────────
 

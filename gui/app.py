@@ -6,9 +6,9 @@ v7.3.3 changes:
       with right-side sub-page icon columns
     - Printing mode wraps: Print Setup, Monitor, Results, Helpers
     - Pick & Place mode: Target Selection, Operation Queue, Execution
-    - v7.4.2 page indices: 0=Hardware, 1=Jog, 2=Calibration,
+    - v7.4.3 page indices: 0=Hardware, 1=Calibration, 2=Jog,
       3=Printing(mode), 4=PickPlace(mode), 5=Settings
-      (Dashboard removed; readouts merged into Jog + Hardware Setup)
+      (Calibration moved above Jog — both share StandardJogContextPanel)
 
 v7.2.3 changes:
     - Hardware Setup page added as page 0 (🔧)
@@ -54,7 +54,8 @@ from gui.pages.hardware_setup import HardwareSetupPage
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
 from gui.pages.printing_mode import PrintingModePage      # v7.3.3
-from gui.pages.pick_place_mode import PickPlaceModePage   # v7.3.3
+from gui.pages.print_builder import PrintBuilderPage       # v7.5.x
+from gui.pages.workflows_mode import WorkflowsModePage    # v7.4.3
 from gui.pages.settings_page import SettingsPage
 from gui.widgets.console_log import ConsoleLogWidget
 from gui.widgets.xbox_mapping_editor import XboxMappingEditor
@@ -298,12 +299,17 @@ class MainWindow(QMainWindow):
         # v7.3.3: Printing + Pick & Place are mode pages (sub-pages inside)
         # v7.4.2: Dashboard removed; its readouts moved into Jog and
         # Hardware Setup → Device.
+        # v7.4.3: Calibration moved above Jog Control. The calibration
+        # step naturally precedes everyday driving, and both pages now
+        # share the same StandardJogContextPanel on the left, so the
+        # earlier-in-list ordering reads as the natural workflow.
         menu_items = [
-            ("btn_hardware",   "🔧", "Hardware Setup"),
-            ("btn_jog",        "🕹️", "Jog Control"),
-            ("btn_calibrate",  "📐", "Calibration"),
-            ("btn_printing",   "🖨️", "Printing"),            # mode page
-            ("btn_pickplace",  "🔬", "Pick & Place"),         # mode page
+            ("btn_hardware",     "🔧", "Hardware Setup"),
+            ("btn_calibrate",    "📐", "Calibration"),
+            ("btn_jog",          "🕹️", "Jog Control"),
+            ("btn_printbuilder", "✏️", "Print Builder"),     # mode page (v7.5.x)
+            ("btn_printing",     "🖨️", "Printing"),            # mode page
+            ("btn_workflows",    "🧫", "Workflows"),            # mode page (v7.4.3)
         ]
         for obj_name, icon_text, label_text in menu_items:
             btn = self._make_menu_button(obj_name, icon_text, label_text)
@@ -478,8 +484,15 @@ class MainWindow(QMainWindow):
         # tall by default (the previous 40px floor let it collapse to a
         # one-line strip). Splitter stretch ratio drops from 5:1 to 3:1
         # so it gets ~25% of the vertical space initially.
-        self.console = ConsoleLogWidget()
-        self.console.setMinimumHeight(s(180))
+        # v7.4.2: start with the terminal collapsed — most users only need
+        # it when something goes wrong, and the default print/jog/cal
+        # workflows benefit from the extra vertical real estate.
+        self.console = ConsoleLogWidget(start_collapsed=True)
+        self._console_min_expanded = s(180)
+        # Min height stays at 0 while collapsed so the splitter can shrink
+        # the pane to its toolbar; the collapse handler restores the
+        # comfortable floor on expand.
+        self.console.setMinimumHeight(0)
         self._splitter.addWidget(self.console)
 
         self._splitter.setStretchFactor(0, 3)
@@ -487,6 +500,11 @@ class MainWindow(QMainWindow):
 
         # v7.2.6: Prevent splitter collapse crash
         self._splitter.setChildrenCollapsible(False)
+
+        # v7.4.2: when the user collapses the terminal, drop the splitter
+        # min-height floor so the pane can actually shrink to the toolbar;
+        # restore the comfortable default when re-expanded.
+        self.console.collapse_toggled.connect(self._on_console_collapsed)
 
         content_layout.addWidget(self._splitter)
 
@@ -500,11 +518,39 @@ class MainWindow(QMainWindow):
         self._context_splitter.setStretchFactor(0, 0)  # left context: fixed
         self._context_splitter.setStretchFactor(1, 1)   # content: stretches
         self._context_splitter.setStretchFactor(2, 0)  # right context: fixed
+        # v7.4.x: the left context panel is a *bounded sidebar*, not a free
+        # splitter pane. The three knobs that make dragging behave:
+        #
+        #   • slot 0 non-collapsible + a minimum width  → it can't be dragged
+        #     shut (the old "bugs out and collapses").
+        #   • slot 1 (content) stays collapsible        → on a narrow window
+        #     it can yield width instead of fighting the panel ("bugs out
+        #     when I expand").
+        #   • a *dynamic maximum width* on slot 0 (see _update_context_panel_
+        #     bounds, refreshed on every resize) keeps the panel from growing
+        #     far enough to push content past its collapse threshold — which
+        #     is what produced the "snaps to mid / full open" jump. Qt honors
+        #     maximumWidth during the drag, so the handle smoothly *stops* at
+        #     the bound instead of snapping.
+        #
+        # The right pane (slot 2) is shown/hidden explicitly per page.
         self._context_splitter.setChildrenCollapsible(True)
+        self._context_splitter.setCollapsible(0, False)
+        self.ui_extraLeftBox.setMinimumWidth(s(340))
         self._context_splitter.setHandleWidth(s(4))
+        # Reserve at least this much for the content pane when sizing the
+        # left panel, so content never approaches its collapse threshold.
+        self._content_reserve_px = s(460)
+        # Remember the dragged/restored panel width across hide/show. Track it
+        # live as the user drags so a page-switch (which hides the panel)
+        # preserves whatever they last set.
+        self._context_splitter.splitterMoved.connect(
+            self._on_context_splitter_moved)
         # Start with context panel hidden
         self.ui_extraLeftBox.hide()
-        self._context_panel_width = AppSettings.LEFT_BOX_WIDTH  # remember last width
+        # Remember last width (scaled — LEFT_BOX_WIDTH is a base px value, so
+        # the first open must use the runtime-scaled width, not the raw 540).
+        self._context_panel_width = s(AppSettings.LEFT_BOX_WIDTH)
 
         app_layout.addWidget(self._context_splitter)
 
@@ -590,14 +636,15 @@ class MainWindow(QMainWindow):
         """
         Instantiate all page widgets.
 
-        v7.4.2 page indices (Dashboard removed; readouts merged into
-        Jog + Hardware Setup):
+        v7.5.x page indices (Print Builder inserted before Printing):
             0: Hardware Setup (always enabled)
-            1: Jog Control
-            2: Calibration
-            3: Printing (mode — sub-pages: Setup, Monitor, Results, Helpers)
-            4: Pick & Place (mode — sub-pages: Targets, Queue, Execution)
-            5: Settings (always enabled)
+            1: Calibration
+            2: Jog Control
+            3: Print Builder (mode — sub-pages: Sketch, Image Import,
+               Hardware, Print Settings)
+            4: Printing (mode — sub-pages: Setup, Monitor, Results)
+            5: Workflows (mode)
+            6: Settings (always enabled)
 
         v7.2.3: Also wires the job pipeline (Setup → Monitor)
         and execution control signals (Monitor → PrintManager).
@@ -610,18 +657,23 @@ class MainWindow(QMainWindow):
 
         # v7.3.3: Mode pages wrap sub-pages internally
         self._printing_mode = PrintingModePage(self.controller, self.settings)
-        self._pick_place_mode = PickPlaceModePage(
+        self._print_builder = PrintBuilderPage(self.controller, self.settings)  # v7.5.x
+        self._workflows_mode = WorkflowsModePage(
             self.controller, self.settings,
             camera_manager=self._camera_manager)
 
+        # v7.4.3: Calibration sits between Hardware Setup and Jog Control,
+        # matching the sidebar menu order above. The pages list index is
+        # the menu-button index, so the order here must mirror menu_items.
         pages = [
             HardwareSetupPage(),                                          # 0
-            JogControlPage(self.controller),                              # 1
             CalibrationPage(self.controller, settings=self.settings,
-                           camera_manager=self._camera_manager),          # 2
-            self._printing_mode,                                          # 3  v7.3.3 mode
-            self._pick_place_mode,                                        # 4  v7.3.3 mode
-            SettingsPage(self.controller, self.settings),                 # 5
+                           camera_manager=self._camera_manager),          # 1
+            JogControlPage(self.controller),                              # 2
+            self._print_builder,                                          # 3  v7.5.x mode
+            self._printing_mode,                                          # 4  v7.3.3 mode
+            self._workflows_mode,                                         # 5  v7.4.3 mode
+            SettingsPage(self.controller, self.settings),                 # 6
         ]
 
         # Wire Hardware Setup signals
@@ -673,8 +725,10 @@ class MainWindow(QMainWindow):
 
             # Create context panel
             # v7.3.3: Mode pages manage context dynamically via
-            # _update_mode_context — use placeholder to avoid double-wrap
-            if isinstance(page, ModePage):
+            # _update_mode_context — use placeholder to avoid double-wrap.
+            # v7.4.x: WorkflowsModePage uses the same dynamic context
+            # pattern even though it doesn't subclass ModePage.
+            if isinstance(page, ModePage) or isinstance(page, WorkflowsModePage):
                 placeholder = QWidget()
                 self._context_stack.addWidget(placeholder)
             else:
@@ -712,8 +766,11 @@ class MainWindow(QMainWindow):
                 page.set_xy_position_scale(self._xy_position_scale)
 
         # v7.3.3: Wire mode page sub-page changes → context panel updates
+        # v7.4.x: also wire WorkflowsModePage (not a ModePage subclass) so
+        # the left context panel swaps to the active workflow's
+        # StandardJogContextPanel when the user picks a workflow.
         for i, page in enumerate(self._page_widgets):
-            if isinstance(page, ModePage):
+            if isinstance(page, ModePage) or isinstance(page, WorkflowsModePage):
                 page.sub_page_changed.connect(
                     lambda idx, page_idx=i: self._on_mode_sub_page_changed(page_idx))
 
@@ -730,12 +787,18 @@ class MainWindow(QMainWindow):
         self._wire_job_pipeline()
         self._wire_print_manager_to_monitor()
 
-        # v7.2.7: Wire helper functions signal
-        helpers = self._printing_mode.helpers_page
-        if hasattr(helpers, 'print_file_created'):
-            helpers.print_file_created.connect(self._on_helper_print_created)
+        # v7.2.7 / v7.5.x: Wire the Print Builder's authoring sub-pages
+        # (Image Import + Sketch) — both bake a csv_import object that
+        # should land in Print Setup's custom-prints area.
+        for _author_page in (self._print_builder.image_import_page,
+                             self._print_builder.sketch_page):
+            if hasattr(_author_page, 'print_file_created'):
+                _author_page.print_file_created.connect(
+                    self._on_print_created)
 
-        cal_page = pages[3]   # CalibrationPage
+        # v7.4.3: page order is now (HW=0, Calibration=1, Jog=2,
+        # Printing=3, P&P=4, Settings=5).
+        cal_page = pages[1]   # CalibrationPage
         jog_page = pages[2]   # JogControlPage
 
         # v7.3.2: Load approximate well plate first (geometry-predicted baseline)
@@ -744,11 +807,42 @@ class MainWindow(QMainWindow):
 
         # v7.3.1: Wire calibration data → jog page (well positions, safe_z)
         # v7.3.4: Also push immediately — _load_calibration fires before this signal is wired
+        # v7.4.4: Also push the full Z-reference set so the XZ side
+        # view can render clickable "go to Z" badges for each captured
+        # height (Replace / Max / Safe / Plate ↑ / Plate ↓).
+        def _push_cal_to_jog():
+            try:
+                jog_page.set_calibration_data(*cal_page.get_calibration_data())
+            except Exception as e:
+                logger.debug(f"set_calibration_data on jog page failed: {e}")
+            if (hasattr(jog_page, 'set_z_references')
+                    and hasattr(cal_page, 'get_z_references')):
+                try:
+                    jog_page.set_z_references(cal_page.get_z_references())
+                except Exception as e:
+                    logger.debug(f"set_z_references on jog page failed: {e}")
+            # v7.4.x: also push to the Workflows mode (active workflow
+            # pages need the same plate / safe_z / Z-references so their
+            # embedded XY workspace + XZ side view + StandardJogContextPanel
+            # render identically to the Jog page).
+            wf = getattr(self, "_workflows_mode", None)
+            if wf is not None:
+                try:
+                    if hasattr(wf, "set_calibration_data"):
+                        wf.set_calibration_data(*cal_page.get_calibration_data())
+                    if (hasattr(wf, "set_z_references")
+                            and hasattr(cal_page, "get_z_references")):
+                        wf.set_z_references(cal_page.get_z_references())
+                    if hasattr(wf, "set_settings"):
+                        wf.set_settings(self.settings)
+                except Exception as e:
+                    logger.debug(f"push cal data to workflows mode failed: {e}")
+            # v7.4.8: push the plate-wide insert-clearance floor to the
+            # controller so every safe_travel_to clears the tallest tube.
+            self._update_insert_clearance(cal_page)
         if hasattr(cal_page, 'calibration_data_changed') and hasattr(jog_page, 'set_calibration_data'):
-            cal_page.calibration_data_changed.connect(
-                lambda: jog_page.set_calibration_data(*cal_page.get_calibration_data())
-            )
-            jog_page.set_calibration_data(*cal_page.get_calibration_data())
+            cal_page.calibration_data_changed.connect(_push_cal_to_jog)
+            _push_cal_to_jog()
 
         # v7.3.3: CameraManager is shared — no need to manually wire cameras
 
@@ -1223,27 +1317,59 @@ class MainWindow(QMainWindow):
     #  v7.2.7: HELPER FUNCTIONS INTEGRATION
     # ════════════════════════════════════════════════════════════════
 
-    def _on_helper_print_created(self, filename: str):
-        """Helper Functions page created a print file — notify Print Objects tab.
+    def _on_print_created(self, filename: str):
+        """A Print Builder authoring page (Sketch / Image Import) baked a
+        csv_import print file — load it into Print Setup's object list and
+        jump to the Setup sub-page.
 
-        v7.3.3: Access setup through PrintingModePage, switch to setup sub-page.
+        v7.5.x: sources are Print Builder sub-pages; Printing is now index 4.
         """
         setup_page = self._printing_mode.setup_page
-        if hasattr(setup_page, 'tab_objects'):
-            tab = setup_page.tab_objects
-            if hasattr(tab, '_load_file_by_name'):
-                tab._load_file_by_name(filename)
+        # The wizard PrintSetupPage composes the legacy page internally as
+        # ``_legacy``; the objects tab (PrintObjectsTab) lives on either.
+        tab = getattr(setup_page, 'tab_objects', None)
+        if tab is None:
+            legacy = getattr(setup_page, '_legacy', None)
+            tab = getattr(legacy, 'tab_objects', None)
+        if tab is not None:
+            if hasattr(tab, '_load_print_file'):
+                tab._load_print_file(filename)
             elif hasattr(tab, '_emit_prints_changed'):
                 tab._emit_prints_changed()
-        # Switch to Printing mode, Setup sub-page
-        # v7.4.2: was index 4 with Dashboard; now index 3.
+        # Switch to Printing mode, Setup sub-page (Printing is index 4 in v7.5.x)
         self._printing_mode.switch_to_setup()
-        self._navigate_to(3)
+        self._navigate_to(4)
 
 
     # ════════════════════════════════════════════════════════════════
     #  HARDWARE CONFIG MANAGEMENT
     # ════════════════════════════════════════════════════════════════
+
+    # v7.4.8: extra clearance (mm) added above the tallest insert when
+    # computing the travel-Z floor, so the needle never grazes a tube top.
+    INSERT_CLEARANCE_MARGIN_MM = 3.0
+
+    def _update_insert_clearance(self, cal_page) -> None:
+        """Recompute + push the plate-wide insert clearance floor.
+
+        Floor = plate_top_z + tallest insert rim + margin (zero-ref mm).
+        Pushed to the controller so every `safe_travel_to` retract clears
+        the tallest tube. Cleared (None) when the plate has no inserts.
+        """
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "set_min_travel_z"):
+            return
+        try:
+            plate, _positions, _safe = cal_page.get_calibration_data()
+            top_z = cal_page.get_z_references().get("plate_top_z")
+            max_rim = getattr(plate, "max_rim_height_mm", 0.0) if plate else 0.0
+            if plate is not None and max_rim > 0.0 and top_z is not None:
+                ctrl.set_min_travel_z(
+                    top_z + max_rim + self.INSERT_CLEARANCE_MARGIN_MM)
+            else:
+                ctrl.set_min_travel_z(None)
+        except Exception as e:
+            logger.debug(f"_update_insert_clearance failed: {e}")
 
     def _on_hardware_config_changed(self, config: HardwareConfig):
         """Called when hardware setup changes. Propagates to all pages.
@@ -1313,6 +1439,25 @@ class MainWindow(QMainWindow):
             self._propagate_hardware_config(self._hardware_config)
         logger.info("Hardware config re-propagated via invalidation refresh")
 
+    def _on_console_collapsed(self, collapsed: bool):
+        """v7.4.2: relax/restore the console pane minimum height so the
+        Vertical splitter can actually shrink it to its toolbar when the
+        user collapses the terminal."""
+        if collapsed:
+            self.console.setMinimumHeight(0)
+            sizes = self._splitter.sizes()
+            if len(sizes) == 2:
+                toolbar_h = self.console.sizeHint().height()
+                delta = max(0, sizes[1] - toolbar_h)
+                self._splitter.setSizes([sizes[0] + delta, toolbar_h])
+        else:
+            self.console.setMinimumHeight(self._console_min_expanded)
+            sizes = self._splitter.sizes()
+            if len(sizes) == 2:
+                target = max(self._console_min_expanded, sizes[1])
+                delta = target - sizes[1]
+                self._splitter.setSizes([max(0, sizes[0] - delta), target])
+
     def _on_hardware_validated(self, is_valid: bool):
         """Called when hardware setup validity changes. Gates other pages."""
         self._update_page_gating(is_valid)
@@ -1348,8 +1493,9 @@ class MainWindow(QMainWindow):
     def _update_page_gating(self, hardware_valid: bool):
         """Enable/disable navigation buttons for pages requiring hardware setup.
 
-        v7.4.2 indices: 0=Hardware, 1=Jog, 2=Calibrate, 3=Printing(mode),
-                        4=PickPlace(mode), 5=Settings
+        Index-agnostic: position 0 (Hardware Setup) and the Settings button
+        (matched by objectName) are always enabled; everything else is gated
+        on ``hardware_valid``.
         """
         for i, btn in enumerate(self._menu_buttons):
             if i == 0:
@@ -1397,14 +1543,16 @@ class MainWindow(QMainWindow):
         if not btn:
             return
 
-        # v7.4.2: Dashboard removed; indices renumbered.
+        # v7.4.3: Calibration moved above Jog Control. Index order
+        # must match `menu_items` and the `pages` list in `_create_pages`.
         btn_map = {
-            "btn_hardware":  0,
-            "btn_jog":       1,
-            "btn_calibrate": 2,
-            "btn_printing":  3,   # mode page
-            "btn_pickplace": 4,   # mode page
-            "btn_settings":  5,
+            "btn_hardware":     0,
+            "btn_calibrate":    1,
+            "btn_jog":          2,
+            "btn_printbuilder": 3,   # mode page (v7.5.x)
+            "btn_printing":     4,   # mode page
+            "btn_workflows":    5,   # mode page (v7.4.3)
+            "btn_settings":     6,
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
@@ -1429,9 +1577,9 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            # v7.4.2: Dashboard removed from indices.
-            titles = ["Hardware Setup", "Jog Control", "Calibration",
-                      "Printing", "Pick & Place", "Settings"]
+            # v7.5.x: Print Builder inserted before Printing.
+            titles = ["Hardware Setup", "Calibration", "Jog Control",
+                      "Print Builder", "Printing", "Workflows", "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
@@ -1441,8 +1589,9 @@ class MainWindow(QMainWindow):
             self._update_mode_context(index, page)
         else:
             self._context_stack.setCurrentIndex(index)
-            context_titles = ["Hardware", "Jog Settings", "Calibration",
-                              "Printing", "Pick & Place", "Settings"]
+            context_titles = ["Hardware", "Calibration", "Jog Settings",
+                              "Print Builder", "Printing", "Workflows",
+                              "Settings"]
             self._context_title.setText(
                 context_titles[index] if index < len(context_titles) else "Settings"
             )
@@ -1483,8 +1632,91 @@ class MainWindow(QMainWindow):
             # reveal; subsequent shows preserve whatever the user
             # last dragged it to.
             self._allocate_right_context_width()
+            # A visible right pane eats into the room available to the
+            # left panel — recompute its max drag width.
+            self._update_context_panel_bounds()
         else:
             self.ui_extraRightBox.hide()
+            self._update_context_panel_bounds()
+
+    def resizeEvent(self, event):
+        """Keep the context panel's drag bounds in sync with the window."""
+        super().resizeEvent(event)
+        self._update_context_panel_bounds()
+
+    def showEvent(self, event):
+        """Size the context panel once the window has a real geometry.
+
+        ``_navigate_to(0)`` runs in __init__ (before show), when the
+        splitter width is still 0 — sizing then would pin the panel at its
+        minimum. Defer the first real sizing to here.
+        """
+        super().showEvent(event)
+        if not getattr(self, "_context_sized_once", False):
+            self._context_sized_once = True
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self._apply_saved_context_width)
+
+    def _apply_saved_context_width(self) -> None:
+        """Open the left context panel at its remembered width.
+
+        Refreshes the drag bounds first, then restores the saved width.
+        Qt clamps the panel to its dynamic maximumWidth, so a saved width
+        wider than the window currently allows simply yields the rest to
+        content — no manual squeeze math, no jitter.
+        """
+        sp = getattr(self, "_context_splitter", None)
+        if sp is None:
+            return
+        total = sp.width()
+        if total <= 0 or not self.ui_extraLeftBox.isVisible():
+            return
+        self._update_context_panel_bounds()
+        sizes = sp.sizes()
+        right_w = sizes[2] if len(sizes) == 3 else 0
+        min_left = self.ui_extraLeftBox.minimumWidth() or s(340)
+        saved = getattr(self, "_context_panel_width",
+                        s(AppSettings.LEFT_BOX_WIDTH))
+        target = max(min_left, saved)
+        content_w = max(0, total - target - right_w)
+        sp.setSizes([target, content_w, right_w])
+
+    def _on_context_splitter_moved(self, pos: int, index: int) -> None:
+        """Remember the panel width as the user drags (for hide/show restore).
+
+        This only records the width — it does NOT call setSizes, so it can't
+        fight the live drag. The actual drag bounds are enforced by the
+        panel's dynamic maximumWidth (see _update_context_panel_bounds).
+        """
+        if self.ui_extraLeftBox.isVisible():
+            w = self.ui_extraLeftBox.width()
+            if w > 0:
+                self._context_panel_width = w
+
+    def _update_context_panel_bounds(self) -> None:
+        """Recompute the left context panel's maximum drag width.
+
+        The panel may grow only until the content pane would be squeezed
+        below ``_content_reserve_px`` (accounting for a visible right pane).
+        Capping the *maximum width* lets Qt stop the drag handle at the
+        bound during the drag, so it never reaches the point where the
+        collapsible content pane snaps shut.
+        """
+        sp = getattr(self, "_context_splitter", None)
+        if sp is None:
+            return
+        total = sp.width()
+        if total <= 0:
+            return
+        right_w = 0
+        if self.ui_extraRightBox.isVisible():
+            sizes = sp.sizes()
+            if len(sizes) == 3:
+                right_w = sizes[2]
+        min_left = self.ui_extraLeftBox.minimumWidth() or s(340)
+        reserve = getattr(self, "_content_reserve_px", s(460))
+        max_left = max(min_left, total - right_w - reserve)
+        self.ui_extraLeftBox.setMaximumWidth(max_left)
 
     def _allocate_right_context_width(self) -> None:
         """v7.4.2: give the right context pane a real pixel width.

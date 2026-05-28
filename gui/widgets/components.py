@@ -44,7 +44,20 @@ class Card(QFrame):
     """
 
     def __init__(self, title: str | None = None, collapsible: bool = False,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *,
+                 flush: bool = False):
+        """Build a card.
+
+        Args:
+            title: Optional title shown at the top of the card.
+            collapsible: When True, render a ▾ chevron that folds the
+                          body.
+            flush: When True, the body sits edge-to-edge with the card
+                   frame (no horizontal / bottom padding around it).
+                   The title — if shown — keeps its own internal padding
+                   so it reads correctly. Use for full-bleed
+                   visualisations that want to claim every pixel.
+        """
         super().__init__(parent)
         self.setObjectName("componentCard")
         self.setStyleSheet(
@@ -56,8 +69,12 @@ class Card(QFrame):
         )
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(s(12), s(10), s(12), s(12))
-        outer.setSpacing(s(8))
+        if flush:
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(0)
+        else:
+            outer.setContentsMargins(s(12), s(10), s(12), s(12))
+            outer.setSpacing(s(8))
 
         self._collapsible = collapsible
         self._collapsed = False
@@ -66,7 +83,12 @@ class Card(QFrame):
 
         if title is not None:
             header = QHBoxLayout()
-            header.setContentsMargins(0, 0, 0, 0)
+            if flush:
+                # Re-introduce internal padding for the title only,
+                # since the outer layout no longer provides it.
+                header.setContentsMargins(s(12), s(8), s(12), s(6))
+            else:
+                header.setContentsMargins(0, 0, 0, 0)
             header.setSpacing(s(6))
 
             self._title_label = QLabel(title)

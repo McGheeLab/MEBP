@@ -160,6 +160,16 @@ _BEHAVIOR_DESERIALIZERS: dict[str, type] = {
     "sorted_deposit": SortedCellBehavior,
 }
 
+# Maps WellRole to the single behavior attribute that is meaningful
+# for that role. Roles not listed (PRINT, EMPTY) have no behavior.
+_ROLE_TO_BEHAVIOR_KEY: dict[WellRole, str] = {
+    WellRole.WASH: "wash_behavior",
+    WellRole.WASTE: "waste_behavior",
+    WellRole.BUFFER: "buffer_behavior",
+    WellRole.INK: "ink_pickup",
+    WellRole.SORTED_CELLS: "sorted_deposit",
+}
+
 
 def default_behavior_for_role(role: WellRole):
     """Create default behavior object for a role, or None if role has none."""
@@ -366,16 +376,15 @@ class WellAssignment:
             "manually_taught_z": self.manually_taught_z,
             "color": self.color,
         }
-        # Serialize behaviors (only the active one)
-        for attr, key in [
-            ("wash_behavior", "wash_behavior"),
-            ("waste_behavior", "waste_behavior"),
-            ("buffer_behavior", "buffer_behavior"),
-            ("ink_pickup", "ink_pickup"),
-            ("sorted_deposit", "sorted_deposit"),
-        ]:
-            beh = getattr(self, attr)
-            d[key] = beh.to_dict() if beh else None
+        # Serialize only the behavior relevant to the assigned role.
+        # Older versions persisted all five behavior slots even when most
+        # were nonsensical for the role (e.g. wash_behavior on a PRINT
+        # well). Reading those old saves still works — from_dict ignores
+        # behaviors that don't match the active role.
+        role_key = _ROLE_TO_BEHAVIOR_KEY.get(self.role)
+        if role_key is not None:
+            beh = getattr(self, role_key)
+            d[role_key] = beh.to_dict() if beh else None
         return d
 
     @classmethod
@@ -672,8 +681,9 @@ class WellSetupModel:
     to the print planner when executing a job.
     """
 
-    def __init__(self, plate_format: int = 24):
-        self._plate = WellPlate.from_format(plate_format)
+    def __init__(self, plate_key: int | str = 24):
+        """v7.4.5: accepts an int (standard format) or a str (custom plate name)."""
+        self._plate = WellPlate.load(plate_key)
         self._assignments: dict[str, WellAssignment] = {}
         self._detector = WellBottomDetector(self._plate)
         self._service_sequence = ServiceSequence()
@@ -692,7 +702,8 @@ class WellSetupModel:
         return self._plate
 
     @property
-    def plate_format(self) -> int:
+    def plate_format(self) -> int | str:
+        """v7.4.5: returns the WellPlate.format (int for standards, "custom:<name>" for custom)."""
         return self._plate.format
 
     @property
@@ -713,11 +724,14 @@ class WellSetupModel:
 
     # ── Plate Format ──────────────────────────────────────────────
 
-    def set_plate_format(self, fmt: int) -> None:
+    def set_plate_format(self, key: int | str) -> None:
         """
-        Change plate format. Resets all assignments and teach points.
+        Change plate. Resets all assignments and teach points.
+
+        v7.4.5: `key` may be a standard format int (6/12/24/48/96/384)
+        or a custom plate name (resolves via `WellPlate.load`).
         """
-        self._plate = WellPlate.from_format(fmt)
+        self._plate = WellPlate.load(key)
         self._assignments.clear()
         for well in self._plate.get_all_wells():
             self._assignments[well.name] = WellAssignment(
@@ -725,7 +739,7 @@ class WellSetupModel:
                 color=ROLE_COLORS[WellRole.EMPTY],
             )
         self._detector = WellBottomDetector(self._plate)
-        logger.info(f"Plate changed to {fmt}-well, all assignments reset")
+        logger.info(f"Plate changed to {key}, all assignments reset")
 
     # ── Assignment Operations ─────────────────────────────────────
 
