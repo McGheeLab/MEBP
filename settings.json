@@ -1,10 +1,10 @@
 {
   "window": {
-    "x": -899,
-    "y": -977,
-    "width": 1559,
-    "height": 850,
-    "active_tab": 4,
+    "x": 32,
+    "y": 0,
+    "width": 1985,
+    "height": 1361,
+    "active_tab": 0,
     "splitter_sizes": [
       500,
       150
@@ -350,7 +350,7 @@
     "xy_jerk": null
   },
   "zp_stage": {
-    "last_port": "COM4",
+    "last_port": "COM5",
     "max_feedrate_pct": 80.0,
     "retract_feedrate_pct": 50.0,
     "insert_feedrate_pct": 20.0,
