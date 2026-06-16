@@ -97,6 +97,18 @@ class MainWindow(QMainWindow):
     # inline help text.
     help_mode_changed = Signal(bool)
 
+    # v7.5.x ZP reconnect hotfix: emitted when StageController detects a stage
+    # disconnect (watchdog OR poller-driven liveness). Wired so the backend
+    # can push an immediate status refresh instead of waiting for the next
+    # ~300ms poll tick. Emitted from a worker thread → queued to the GUI
+    # thread, so the slot is the only place that touches widgets.
+    stage_disconnected = Signal(str)
+
+    # v7.5.x: emitted when StageController reports a successful (re)connect.
+    # The ZP edge drives the last-known-position restore prompt. on_connect
+    # may fire on a worker thread (onboarding) → bridged to the GUI thread.
+    stage_connected = Signal(str)
+
     def __init__(self, controller: StageController, settings: Settings,
                  print_history: PrintHistory | None = None,
                  recorder: PrintRecorder | None = None):
@@ -139,6 +151,23 @@ class MainWindow(QMainWindow):
         self._create_pages()
         self._setup_timers()
 
+        # v7.5.x ZP reconnect hotfix: let the backend push disconnects to the
+        # GUI. on_disconnect fires on the watchdog/poller thread, so the
+        # callback only emits a signal; _on_stage_disconnected (GUI thread)
+        # does the actual refresh.
+        self.stage_disconnected.connect(self._on_stage_disconnected)
+        self.controller.on_disconnect = self._emit_stage_disconnected
+
+        # v7.5.x: ZP last-known-position restore. On the first ZP connect
+        # this session, offer to re-stamp the firmware counter with the
+        # position saved at the previous clean shutdown.
+        self._zp_restore_prompted = False
+        # v7.5.x: once-per-session guard for the last-known calibration restore
+        # prompt (needle zero + plate + Z) — see _maybe_prompt_calibration_restore.
+        self._calibration_restore_prompted = False
+        self.stage_connected.connect(self._on_stage_connected)
+        self.controller.on_connect = self._emit_stage_connected
+
         # Start on Hardware Setup page
         self._navigate_to(0)
 
@@ -179,12 +208,13 @@ class MainWindow(QMainWindow):
         try:
             hw_page = self._page_widgets[0]
             hw_page.set_config(config)
-            # If user opted into the deep-link, switch to HW Setup → Pumps & Inks
+            # If user opted into the deep-link, switch to HW Setup → Pump
             target = getattr(self.sender(), 'get_deep_link_target', lambda: None)()
             if target is not None:
                 self._navigate_to(target)
-                # v7.4.1: Sub-page order reshuffled. New order:
-                #   0=Device 1=Identity 2=Plate 3=Pumps & Inks 4=Needle ...
+                # v7.5.x: Pumps & Inks split into separate Pump/Needle/Ink tabs.
+                #   0=Device 1=Identity 2=Plate 3=Pump 4=Needle 5=Ink ...
+                # Land on Pump (3), the first of the material-config tabs.
                 if hasattr(hw_page, 'switch_to'):
                     hw_page.switch_to(3)
             logger.info("Onboarding config applied")
@@ -837,18 +867,54 @@ class MainWindow(QMainWindow):
                         wf.set_settings(self.settings)
                 except Exception as e:
                     logger.debug(f"push cal data to workflows mode failed: {e}")
+            # v7.5.x: push the Z-reference set to the Print Builder so its
+            # Sketch sub-page can express print Z as a height above the
+            # plate bottom.
+            pb_builder = getattr(self, "_print_builder", None)
+            if pb_builder is not None and hasattr(pb_builder, "set_z_references"):
+                try:
+                    if hasattr(cal_page, "get_z_references"):
+                        pb_builder.set_z_references(cal_page.get_z_references())
+                except Exception as e:
+                    logger.debug(f"set_z_references on print builder failed: {e}")
             # v7.4.8: push the plate-wide insert-clearance floor to the
             # controller so every safe_travel_to clears the tallest tube.
             self._update_insert_clearance(cal_page)
+            # v7.5.x: push the plate-bottom Z datum to the controller so every
+            # print clamps against "don't punch through the plate bottom".
+            self._update_print_floor_datum(cal_page)
         if hasattr(cal_page, 'calibration_data_changed') and hasattr(jog_page, 'set_calibration_data'):
             cal_page.calibration_data_changed.connect(_push_cal_to_jog)
             _push_cal_to_jog()
+
+        # v7.5.x: when the user saves new XY safety limits, re-centre the
+        # default (uncalibrated) plate on the new envelope. The Calibration
+        # page is the single source of truth: recenter_default_plate() is
+        # gated (no-op once calibrated) and, when it does re-seed, emits
+        # calibration_data_changed → _push_cal_to_jog, so the Jog page /
+        # Workflows mode update through the normal push path. We deliberately
+        # do NOT poke the Jog page directly — that would be an ungated write
+        # that could clobber calibrated positions on its workspace.
+        hw_page = pages[0]  # HardwareSetupPage
+        if hasattr(hw_page, 'safety_limits_changed') and hasattr(cal_page, 'recenter_default_plate'):
+            def _recenter_plate_in_bounds():
+                try:
+                    cal_page.recenter_default_plate()
+                except Exception as e:
+                    logger.debug(f"recenter_default_plate failed: {e}")
+            hw_page.safety_limits_changed.connect(_recenter_plate_in_bounds)
 
         # v7.3.3: CameraManager is shared — no need to manually wire cameras
 
         # v7.3.3: Wire calibration → hardware page µm/px updates
         if hasattr(cal_page, 'um_per_px_calibrated'):
             cal_page.um_per_px_calibrated.connect(hw_page.set_calibrated_um_per_px)
+
+        # v7.5.x: once the event loop is running (after show()), offer to
+        # restore the last-known-good calibration (needle zero + plate + Z) if
+        # the live calibration came up empty. Deferred so the prompt never
+        # opens mid-construction. See _maybe_prompt_calibration_restore.
+        QTimer.singleShot(450, self._maybe_prompt_calibration_restore)
 
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
@@ -1134,6 +1200,20 @@ class MainWindow(QMainWindow):
                 pm._set_state(PrintState.IDLE)
                 pm._pause_event.set()
 
+                # v7.5.x: machine-readable execution log for this run
+                from SupportClasses.PrintExecutionLogger import (
+                    PrintExecutionLogger)
+                try:
+                    pm.exec_logger = PrintExecutionLogger(
+                        job_name=job.name, mode="hybrid")
+                    pm.exec_logger.start(
+                        pm.controller,
+                        PrintExecutionLogger.manifest_for_job(
+                            job, pm.controller, "hybrid"))
+                except Exception as _lex:
+                    logger.warning(f"Execution log unavailable: {_lex}")
+                    pm.exec_logger = None
+
                 executor = HybridPlanExecutor(
                     controller=pm.controller,
                     plan=plan,
@@ -1143,6 +1223,7 @@ class MainWindow(QMainWindow):
                     settings=job.settings,
                     hw_config=getattr(job, 'hw_config', None),
                     recorder=pm.recorder,
+                    exec_logger=pm.exec_logger,
                 )
 
                 # Estimate total print time
@@ -1175,11 +1256,18 @@ class MainWindow(QMainWindow):
                     except Exception as exc:
                         logger.error(f"Hybrid exec error: {exc}",
                                      exc_info=True)
+                        if pm.exec_logger:
+                            pm.exec_logger.log_error(str(exc), exc)
                         pm._set_state(PrintState.ERROR)
                     finally:
                         if hasattr(pm, '_stop_recorder'):
                             try:
                                 pm._stop_recorder(pm.state.name.lower())
+                            except Exception:
+                                pass
+                        if hasattr(pm, '_end_exec_log'):
+                            try:
+                                pm._end_exec_log()
                             except Exception:
                                 pass
 
@@ -1228,11 +1316,29 @@ class MainWindow(QMainWindow):
                     logger.warning("VelocityExecutor not available, using position mode")
                     exec_mode = "position"
 
+            # v7.5.x: machine-readable execution log for this run
+            from SupportClasses.PrintExecutionLogger import (
+                PrintExecutionLogger)
+            try:
+                pm.exec_logger = PrintExecutionLogger(
+                    job_name=job.name, mode=f"trajectory-{exec_mode}")
+                pm.exec_logger.start(
+                    pm.controller,
+                    PrintExecutionLogger.manifest_for_job(
+                        job, pm.controller, f"trajectory-{exec_mode}"))
+            except Exception as _lex:
+                logger.warning(f"Execution log unavailable: {_lex}")
+                pm.exec_logger = None
+
             if exec_mode == "position":
                 # Use the v7.1 TrajectoryExecutor — simplest, most reliable
                 from SupportClasses.PrintManager import TrajectoryExecutor
-                tex = TrajectoryExecutor(pm.controller, recorder=pm.recorder)
+                tex = TrajectoryExecutor(pm.controller, recorder=pm.recorder,
+                                         exec_logger=pm.exec_logger)
                 logger.info("Using TrajectoryExecutor (position mode)")
+            elif tex is not None and pm.exec_logger is not None \
+                    and hasattr(tex, 'exec_logger'):
+                tex.exec_logger = pm.exec_logger
 
             pm._trajectory_executor = tex
 
@@ -1261,11 +1367,18 @@ class MainWindow(QMainWindow):
                         pm._set_state(PrintState.ABORTED)
                 except Exception as exc:
                     logger.error(f"Trajectory error: {exc}", exc_info=True)
+                    if pm.exec_logger:
+                        pm.exec_logger.log_error(str(exc), exc)
                     pm._set_state(PrintState.ERROR)
                 finally:
                     if hasattr(pm, '_stop_recorder'):
                         try:
                             pm._stop_recorder(pm.state.name.lower())
+                        except Exception:
+                            pass
+                    if hasattr(pm, '_end_exec_log'):
+                        try:
+                            pm._end_exec_log()
                         except Exception:
                             pass
 
@@ -1370,6 +1483,31 @@ class MainWindow(QMainWindow):
                 ctrl.set_min_travel_z(None)
         except Exception as e:
             logger.debug(f"_update_insert_clearance failed: {e}")
+
+    def _update_print_floor_datum(self, cal_page) -> None:
+        """v7.5.x: push the calibrated plate-bottom + plate-top Z to the
+        controller.
+
+        The plate bottom is the print-floor clamp (the needle can never punch
+        through it while printing). The plate top, paired with the bottom, forms
+        the reference vector that derives the print-Z up-direction
+        (``StageController.print_z_dir()``) so print offsets are polarity-correct.
+        Both are cleared (None) when not calibrated.
+        """
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "set_plate_bottom_z"):
+            return
+        try:
+            pb = pt = None
+            if hasattr(cal_page, "get_z_references"):
+                refs = cal_page.get_z_references()
+                pb = refs.get("plate_bottom_z")
+                pt = refs.get("plate_top_z")
+            ctrl.set_plate_bottom_z(pb)
+            if hasattr(ctrl, "set_plate_top_z"):
+                ctrl.set_plate_top_z(pt)
+        except Exception as e:
+            logger.debug(f"_update_print_floor_datum failed: {e}")
 
     def _on_hardware_config_changed(self, config: HardwareConfig):
         """Called when hardware setup changes. Propagates to all pages.
@@ -1840,9 +1978,12 @@ class MainWindow(QMainWindow):
         when _update_status() occasionally runs over the interval — the next
         tick is only scheduled after the current one fully completes.
         """
+        self._closing = False
         self._tick()
 
     def _tick(self):
+        if getattr(self, "_closing", False):
+            return
         import time as _time
         _t0 = _time.monotonic()
         try:
@@ -1851,8 +1992,198 @@ class MainWindow(QMainWindow):
             elapsed_ms = (_time.monotonic() - _t0) * 1000
             if elapsed_ms > 20:
                 logger.debug(f"[Tick] _update_status took {elapsed_ms:.1f}ms")
-            interval = self.settings.get("polling.position_interval_ms", 300)
-            QTimer.singleShot(interval, self._tick)
+            if not getattr(self, "_closing", False):
+                interval = self.settings.get("polling.position_interval_ms", 300)
+                QTimer.singleShot(interval, self._tick)
+
+    def _emit_stage_disconnected(self, stage_name: str) -> None:
+        """v7.5.x: StageController.on_disconnect callback. Runs on the
+        watchdog/poller thread — only emit the signal here; never touch
+        widgets directly (the queued connection hops to the GUI thread)."""
+        try:
+            self.stage_disconnected.emit(str(stage_name))
+        except Exception:
+            pass
+
+    def _on_stage_disconnected(self, stage_name: str) -> None:
+        """v7.5.x: GUI-thread slot — refresh connection state immediately
+        when a stage drops instead of waiting for the next ~300ms poll tick.
+        The hardened is_*_connected properties make this reflect reality."""
+        logger.warning(f"{stage_name} stage disconnected — refreshing status")
+        try:
+            self._update_status()
+        except Exception as e:
+            logger.debug(f"status refresh after disconnect failed: {e}")
+
+    def _emit_stage_connected(self, stage_name: str) -> None:
+        """v7.5.x: StageController.on_connect callback. May run on a worker
+        thread (onboarding) — only emit the signal here; the queued slot
+        hops to the GUI thread before touching widgets."""
+        try:
+            self.stage_connected.emit(str(stage_name))
+        except Exception:
+            pass
+
+    def _on_stage_connected(self, stage_name: str) -> None:
+        """v7.5.x GUI-thread slot for a successful (re)connect."""
+        if stage_name == "ZP":
+            # Defer so the prompt never opens mid-connect-callstack (the
+            # signal is a direct call when connect ran on the GUI thread).
+            QTimer.singleShot(0, self._maybe_prompt_zp_position_restore)
+
+    def _maybe_prompt_zp_position_restore(self) -> None:
+        """v7.5.x: on the first real ZP connect this session, offer to
+        restore the last-known ZP position saved at the previous clean
+        shutdown. Marlin has no absolute encoder and powers up at 0, so
+        the saved snapshot (plus the operator confirming nothing moved by
+        hand) is the only way to recover the prior position. Accepting
+        re-stamps the firmware counter per axis via override_zp_position
+        (G92, no motion)."""
+        if self._zp_restore_prompted:
+            return
+        zp = self.controller.zp_stage
+        if zp is None:
+            return
+        if getattr(zp, "simulate", False):
+            self._zp_restore_prompted = True  # never nag in simulation
+            return
+        snap = self.settings.get_section("zp_last_position")
+        if not snap:
+            return
+        axes = [(ax, snap.get(ax)) for ax in ("Z", "P1", "P2", "P3")
+                if isinstance(snap.get(ax), (int, float))]
+        if not axes:
+            return
+        self._zp_restore_prompted = True
+
+        from PySide6.QtWidgets import QMessageBox
+        ts = snap.get("timestamp", "an earlier session")
+        lines = "\n".join(f"    {ax} = {float(v):.3f} mm" for ax, v in axes)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Restore ZP position?")
+        box.setText(
+            "The ZP stage (Marlin) has no absolute position memory and "
+            "powers up reporting 0.\n\n"
+            f"Last known position, saved {ts}:\n{lines}\n\n"
+            "If the stage has NOT been moved by hand since then, assign "
+            "these as the current position for all ZP axes?")
+        box.setInformativeText(
+            "This re-stamps the firmware position counter (G92) — no motion "
+            "occurs. Choose Skip if unsure; you can set positions manually "
+            "in Hardware Setup → Stage → Override / Sync Axis Position.")
+        assign_btn = box.addButton(
+            "Assign these values", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(assign_btn)
+        box.exec()
+        if box.clickedButton() is not assign_btn:
+            logger.info("ZP position restore skipped by user")
+            return
+        applied = []
+        for ax, v in axes:
+            res = self.controller.override_zp_position(ax, float(v))
+            if res.get("ok"):
+                applied.append(f"{ax}={float(v):.3f}")
+            else:
+                logger.warning(
+                    f"ZP restore {ax} failed: {res.get('error', 'unknown')}")
+        logger.info(f"ZP position restored: {', '.join(applied) or 'none'}")
+        try:
+            self._update_status()
+        except Exception:
+            pass
+
+    def _maybe_prompt_calibration_restore(self) -> None:
+        """v7.5.x: once per session, if the live calibration came up empty but
+        a last-known-good snapshot exists, offer to restore it (needle zero +
+        plate wells/warp + Z plane/heights) as a unit. Mirrors
+        _maybe_prompt_zp_position_restore.
+
+        Only fires when the plate calibration is actually missing, so a healthy
+        restart (calibration auto-loaded fine) is never interrupted. Warns when
+        the hardware fingerprint shows the setup changed since the snapshot was
+        saved (applying it anyway may be inaccurate)."""
+        if self._calibration_restore_prompted:
+            return
+        self._calibration_restore_prompted = True
+        cal_page = self._page_widgets[1] if len(self._page_widgets) > 1 else None
+        if cal_page is None or not hasattr(cal_page, '_has_plate_calibration'):
+            return
+        # Calibration survived this restart → nothing to recover, don't nag.
+        if cal_page._has_plate_calibration():
+            return
+        try:
+            from SupportClasses.CalibrationSnapshotStore import (
+                CalibrationSnapshotStore)
+            store = CalibrationSnapshotStore()
+        except Exception as e:
+            logger.debug(f"calibration snapshot load failed: {e}")
+            return
+        snap = store.load_snapshot()
+        if not snap or not snap.get("calibration"):
+            return
+
+        saved_at = snap.get("saved_at", "an earlier session")
+        diffs = store.fingerprint_diff(
+            snap.get("fingerprint"), store.build_fingerprint(self.settings))
+
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning if diffs
+                    else QMessageBox.Icon.Question)
+        box.setWindowTitle("Restore last calibration?")
+        box.setText(
+            f"A saved calibration from {saved_at} was found, and this session "
+            "has no plate calibration loaded.\n\n"
+            "Restore it (needle zero + plate wells + Z plane / heights)?")
+        info = ("This re-applies the needle zero reference (no motion) and the "
+                "plate / Z calibration. Choose Skip to calibrate fresh.")
+        if diffs:
+            info = ("⚠ The hardware setup looks DIFFERENT from when this "
+                    "calibration was saved:\n    "
+                    + "\n    ".join(diffs)
+                    + "\n\nRestoring may be inaccurate — recalibrate if unsure."
+                    + "\n\n" + info)
+        box.setInformativeText(info)
+        restore_btn = box.addButton(
+            "Restore", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Skip", QMessageBox.ButtonRole.RejectRole)
+        if not diffs:
+            box.setDefaultButton(restore_btn)
+        box.exec()
+        if box.clickedButton() is not restore_btn:
+            logger.info("Calibration restore skipped by user")
+            return
+
+        # Apply needle zero — a software reference only (no motion).
+        zp = snap.get("zero_position") or {}
+        if isinstance(zp, dict) and zp:
+            try:
+                self.controller.zero_position.update(
+                    {k: v for k, v in zp.items()
+                     if isinstance(v, (int, float))})
+                self.settings.set_section(
+                    "zero_position", dict(self.controller.zero_position))
+            except Exception as e:
+                logger.warning(f"Failed to apply restored zero_position: {e}")
+
+        # Restore plate + Z into the live section and reload the page through
+        # its normal load path (recomputes predicted/calibrated positions); the
+        # emit re-pushes to the Jog page / Workflows mode.
+        try:
+            self.settings.set_section("calibration", dict(snap["calibration"]))
+            cal_page._load_calibration()
+            if hasattr(cal_page, '_emit_calibration_data_changed'):
+                cal_page._emit_calibration_data_changed()
+            logger.info(f"Calibration restored from snapshot ({saved_at})")
+        except Exception as e:
+            logger.error(f"Failed to restore calibration snapshot: {e}")
+
+        try:
+            self._update_status()
+        except Exception:
+            pass
 
     def _update_status(self):
         """Update connection dots, position readouts, and page callbacks."""
@@ -2017,6 +2348,50 @@ class MainWindow(QMainWindow):
         self.settings.set("window.active_tab", self._current_page_index)
         if self._hardware_config:
             self._save_hardware_config(self._hardware_config)
+        # v7.5.x: persist the live zero reference on clean shutdown so it
+        # survives restart. The explicit "Set Zero" buttons already save
+        # zero_position on demand, but non-button paths (the Xbox
+        # "zero_needle_pos" → _calibrate_zero, auto-calibration) mutate it
+        # only in RAM. Without this catch-all the reference reverts to the
+        # last button-saved value on restart, and since the ProScan keeps
+        # its absolute position while powered, displayed = raw − zero_position
+        # then reads wrong (the reported XY-restart bug).
+        try:
+            self.settings.set_section(
+                "zero_position", dict(self.controller.zero_position))
+        except Exception as e:
+            logger.warning(f"Failed to persist zero_position on shutdown: {e}")
+        # v7.5.x: snapshot the last-known ZP position (zero-ref mm) + timestamp
+        # so the next startup can offer to restore it (Marlin loses its
+        # position on power cycle). Only overwrite when ZP is connected and we
+        # got a real reading — never clobber a good saved snapshot with a
+        # disconnected-stage blank.
+        try:
+            if self.controller.is_zp_connected:
+                zr = self.controller.get_zp_position_zero_ref(cached=True)
+                if any(v is not None for v in zr.values()):
+                    from datetime import datetime
+                    snap = {ax: (round(float(v), 4) if v is not None else None)
+                            for ax, v in zr.items()}
+                    snap["timestamp"] = datetime.now().isoformat(
+                        timespec="seconds")
+                    self.settings.set_section("zp_last_position", snap)
+        except Exception as e:
+            logger.warning(f"Failed to persist zp_last_position on shutdown: {e}")
+        # v7.5.x: flush a final last-known-good calibration snapshot so an
+        # in-progress teach (not yet written by the 500 ms debounced auto-save)
+        # is captured on clean exit. _save_calibration writes both the live
+        # section and the durable snapshot; the snapshot write is itself gated
+        # on a real plate calibration, so this is a no-op when nothing's taught.
+        try:
+            cal_page = (self._page_widgets[1]
+                        if len(self._page_widgets) > 1 else None)
+            if (cal_page is not None
+                    and getattr(cal_page, '_has_plate_calibration', None)
+                    and cal_page._has_plate_calibration()):
+                cal_page._save_calibration()
+        except Exception as e:
+            logger.debug(f"calibration snapshot flush on shutdown failed: {e}")
         self.settings.save()
 
     # ════════════════════════════════════════════════════════════════
@@ -2025,7 +2400,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean shutdown — stop timers, save settings, stop recording."""
-        self.update_timer.stop()
+        self._closing = True  # stops the self-rescheduling _tick loop
         self.save_settings()
         if self.recorder and self.recorder.is_recording:
             self.recorder.stop_recording()

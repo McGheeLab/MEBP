@@ -1200,6 +1200,18 @@ class TwoCameraNeedleAligner:
     offset along the mapped axis. Callers can pass per-axis sign flips
     via `x_sign` / `y_sign` when the physical mounting reverses one
     axis.
+
+    v7.5.x — rotated mountings: when the cameras are *not* mounted
+    orthogonally to the stage axes (e.g. at 45°), pass each camera's
+    column→stage **direction angle** via ``angle_x_view_deg`` /
+    ``angle_y_view_deg`` — the stage-plane angle (degrees CCW from stage
+    +X) that a positive column offset corresponds to. A positive column
+    offset of ``off`` px means the needle is displaced from the optical
+    axis by ``off × µm/px`` along that direction; the recentering move is
+    the solution of the 2×2 system of both cameras' projections. With the
+    angles left as ``None`` the legacy orthogonal mapping is used
+    (x_view column → stage +Y = 90°, y_view column → stage +X = 0°), so
+    existing behavior is unchanged.
     """
 
     def __init__(
@@ -1210,6 +1222,8 @@ class TwoCameraNeedleAligner:
         frame_width_y_view: int,
         x_sign: float = 1.0,
         y_sign: float = 1.0,
+        angle_x_view_deg: float | None = None,
+        angle_y_view_deg: float | None = None,
     ) -> None:
         if um_per_px_x_view <= 0 or um_per_px_y_view <= 0:
             raise ValueError("um_per_px must be positive for both cameras")
@@ -1221,6 +1235,11 @@ class TwoCameraNeedleAligner:
         self.frame_width_y_view = int(frame_width_y_view)
         self.x_sign = float(x_sign)
         self.y_sign = float(y_sign)
+        # Legacy orthogonal mapping when unset: x_view→+Y (90°), y_view→+X (0°).
+        self.angle_x_view_deg = (
+            90.0 if angle_x_view_deg is None else float(angle_x_view_deg))
+        self.angle_y_view_deg = (
+            0.0 if angle_y_view_deg is None else float(angle_y_view_deg))
 
     @staticmethod
     def _midpoint(a: float, b: float) -> float:
@@ -1232,7 +1251,8 @@ class TwoCameraNeedleAligner:
         """Return `(dx_um, dy_um)` — the stage move that recenters the
         needle in both views.
 
-        Raises ``ValueError`` if any pick is missing.
+        Raises ``ValueError`` if any pick is missing, or if the two camera
+        direction angles are parallel (degenerate, non-invertible).
         """
         if not picks.complete():
             raise ValueError(
@@ -1240,21 +1260,32 @@ class TwoCameraNeedleAligner:
                 "(x_view left+right and y_view left+right)"
             )
 
-        # X-view: columns → stage Y
-        x_view_center_col = self._midpoint(
+        # Signed column offset (px) of the needle center from each frame's
+        # center, → physical displacement (µm) along that camera's direction.
+        x_view_offset_px = self._midpoint(
             picks.x_view_left_px, picks.x_view_right_px
-        )
-        x_view_offset_px = x_view_center_col - (self.frame_width_x_view / 2.0)
-        dy_um = self.y_sign * x_view_offset_px * self.um_per_px_x_view
-
-        # Y-view: columns → stage X
-        y_view_center_col = self._midpoint(
+        ) - (self.frame_width_x_view / 2.0)
+        y_view_offset_px = self._midpoint(
             picks.y_view_left_px, picks.y_view_right_px
-        )
-        y_view_offset_px = y_view_center_col - (self.frame_width_y_view / 2.0)
-        dx_um = self.x_sign * y_view_offset_px * self.um_per_px_y_view
+        ) - (self.frame_width_y_view / 2.0)
+        s1 = x_view_offset_px * self.um_per_px_x_view
+        s2 = y_view_offset_px * self.um_per_px_y_view
 
-        return (float(dx_um), float(dy_um))
+        a1 = math.radians(self.angle_x_view_deg)
+        a2 = math.radians(self.angle_y_view_deg)
+        # U · n = s, where rows of U are the cameras' stage-direction unit
+        # vectors and n is the needle's stage-XY offset from the optical axes.
+        det = math.cos(a1) * math.sin(a2) - math.cos(a2) * math.sin(a1)
+        if abs(det) < 1e-9:
+            raise ValueError(
+                "Camera direction angles are parallel (singular) — "
+                f"x_view={self.angle_x_view_deg:.1f}°, "
+                f"y_view={self.angle_y_view_deg:.1f}°"
+            )
+        # n = U⁻¹ · s   (2×2 closed form)
+        nx = (math.sin(a2) * s1 - math.sin(a1) * s2) / det
+        ny = (-math.cos(a2) * s1 + math.cos(a1) * s2) / det
+        return (float(self.x_sign * nx), float(self.y_sign * ny))
 
 
 # ---------------------------------------------------------------------------

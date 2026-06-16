@@ -312,31 +312,41 @@ class TestEndToEndWorkflow(unittest.TestCase):
             lambda: jog_page.set_calibration_data(*cal_page.get_calibration_data())
         )
 
-        # Set safe Z
+        # Set safe Z. v7.4.2: _set_safe_z reads Z via the logical accessor.
         ctrl.get_zp_position.return_value = (15.0, 0.0, 0.0, 0.0)
+        ctrl.zp_logical_value.return_value = 15.0
         cal_page._set_safe_z()
 
         self.assertAlmostEqual(jog_page._safe_z, 15.0)
 
     def test_jog_page_fast_travel_calls_safe_travel(self):
-        """Clicking a well on jog page calls controller.safe_travel_to()."""
+        """Right-click fast-travel on the jog workspace calls safe_travel_to().
+
+        v7.4.3: fast travel is coordinate-based (a click on the workspace
+        canvas emits zero-ref µm) rather than well-name based.
+        """
         from gui.pages.jog_control import JogControlPage
 
         ctrl = self._make_mock_controller()
+        ctrl.zp_logical_value.return_value = 10.0  # current Z for return move
         jog_page = JogControlPage(ctrl)
 
         plate = WellPlate.from_format(6)
         positions = plate.get_all_positions_from_a1(50000.0, 50000.0)
         jog_page.set_calibration_data(plate, positions, safe_z=15.0)
 
-        # Simulate clicking A1
-        jog_page._on_well_nav_click("A1")
+        # A1 in zero-ref µm (zero_position x/y are 0 here).
+        a1_zr = positions["A1"]
+        jog_page._on_workspace_fast_travel_requested(a1_zr[0], a1_zr[1])
 
-        ctrl.safe_travel_to.assert_called_once_with(
-            positions["A1"][0], positions["A1"][1], 15.0)
+        ctrl.safe_travel_to.assert_called_once()
+        args, kwargs = ctrl.safe_travel_to.call_args
+        self.assertAlmostEqual(args[0], a1_zr[0])      # stage_x (zero=0)
+        self.assertAlmostEqual(args[1], a1_zr[1])      # stage_y
+        self.assertAlmostEqual(kwargs["safe_z_mm"], 15.0)
 
     def test_jog_page_safety_gate_no_safe_z(self):
-        """Without safe_z, fast travel shows warning instead of moving."""
+        """Without safe_z, fast travel shows a warning instead of moving."""
         from gui.pages.jog_control import JogControlPage
 
         ctrl = self._make_mock_controller()
@@ -346,29 +356,27 @@ class TestEndToEndWorkflow(unittest.TestCase):
         positions = plate.get_all_positions_from_a1(50000.0, 50000.0)
         jog_page.set_calibration_data(plate, positions, safe_z=None)
 
-        # Click A1 — should show warning, NOT call safe_travel_to
-        with patch('PySide6.QtWidgets.QMessageBox') as mock_msg:
-            mock_msg.warning = MagicMock()
-            jog_page._on_well_nav_click("A1")
+        # Fast travel without a safe Z — warns, does NOT call safe_travel_to.
+        # Patch the name bound in the jog_control module.
+        with patch('gui.pages.jog_control.QMessageBox') as mock_msg:
+            jog_page._on_workspace_fast_travel_requested(50000.0, 50000.0)
             mock_msg.warning.assert_called_once()
             ctrl.safe_travel_to.assert_not_called()
 
-    def test_jog_page_safety_gate_no_position(self):
-        """Clicking uncalibrated well shows warning."""
+    def test_jog_page_fast_travel_requires_xy_connected(self):
+        """v7.4.3: fast travel is a no-op when the XY stage isn't connected."""
         from gui.pages.jog_control import JogControlPage
 
         ctrl = self._make_mock_controller()
+        ctrl.is_xy_connected = False
         jog_page = JogControlPage(ctrl)
 
-        # Only A1 has a position
-        jog_page.set_calibration_data(
-            WellPlate.from_format(6), {"A1": (50000, 50000)}, safe_z=15.0)
+        plate = WellPlate.from_format(6)
+        positions = plate.get_all_positions_from_a1(50000.0, 50000.0)
+        jog_page.set_calibration_data(plate, positions, safe_z=15.0)
 
-        with patch('PySide6.QtWidgets.QMessageBox') as mock_msg:
-            mock_msg.warning = MagicMock()
-            jog_page._on_well_nav_click("B3")  # Not in positions
-            mock_msg.warning.assert_called_once()
-            ctrl.safe_travel_to.assert_not_called()
+        jog_page._on_workspace_fast_travel_requested(50000.0, 50000.0)
+        ctrl.safe_travel_to.assert_not_called()
 
 
 # ── 7.5: Plate Geometry & Raster Scan ────────────────────────────

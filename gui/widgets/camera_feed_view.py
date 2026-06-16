@@ -59,9 +59,26 @@ class CameraFeedView(QWidget):
         self._last_pixmap: Optional[QPixmap] = None
         self._last_qimage: Optional[QImage] = None  # full-res for re-render on show
         self._last_image_size = (0, 0)  # (w, h) of last received image
+        # v7.5.x: optional displacement-vector overlay drawn from image
+        # center — (dx_px, dy_px, label) in image pixels, or None.
+        self._overlay_vector: Optional[tuple[float, float, str]] = None
 
         self._setup_ui()
         self._connect_camera()
+
+    def set_overlay_vector(self, dx_px: Optional[float], dy_px: Optional[float],
+                           label: str = ""):
+        """Draw (or clear) an arrow from the image center along (dx, dy) px.
+
+        Pass ``None`` for dx/dy to clear. Used by the µm/px calibration
+        dialog to show the phase-correlation displacement it detected.
+        """
+        if dx_px is None or dy_px is None:
+            self._overlay_vector = None
+        else:
+            self._overlay_vector = (float(dx_px), float(dy_px), str(label))
+        if self._last_qimage is not None and self.isVisible():
+            self._render_frame(self._last_qimage)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -148,6 +165,10 @@ class CameraFeedView(QWidget):
         if self._show_crosshair:
             self._draw_crosshair(pixmap)
 
+        # v7.5.x: optional displacement-vector overlay
+        if self._overlay_vector is not None:
+            self._draw_overlay_vector(pixmap)
+
         # Scale to fit display label
         display_size = self._display.size()
         if display_size.width() < 1 or display_size.height() < 1:
@@ -169,6 +190,30 @@ class CameraFeedView(QWidget):
         cy = pixmap.height() // 2
         painter.drawLine(0, cy, pixmap.width(), cy)
         painter.drawLine(cx, 0, cx, pixmap.height())
+        painter.end()
+
+    def _draw_overlay_vector(self, pixmap: QPixmap):
+        """Draw the displacement arrow (image px) from the image center."""
+        import math
+        dx, dy, label = self._overlay_vector
+        cx = pixmap.width() / 2.0
+        cy = pixmap.height() / 2.0
+        ex, ey = cx + dx, cy + dy
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(COLORS.get("green", "#a6e3a1")),
+                   max(2, pixmap.width() // 320))
+        painter.setPen(pen)
+        painter.drawLine(int(cx), int(cy), int(ex), int(ey))
+        # Arrowhead
+        ang = math.atan2(dy, dx)
+        head = max(8.0, pixmap.width() / 60.0)
+        for da in (math.radians(150), math.radians(-150)):
+            hx = ex + head * math.cos(ang + da)
+            hy = ey + head * math.sin(ang + da)
+            painter.drawLine(int(ex), int(ey), int(hx), int(hy))
+        if label:
+            painter.drawText(int(ex) + 6, int(ey) - 6, label)
         painter.end()
 
     # ── Properties ────────────────────────────────────────────────

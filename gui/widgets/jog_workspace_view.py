@@ -78,6 +78,16 @@ class JogWorkspaceView(QWidget):
     # safe-travel-then-restore-Z workflow.
     fast_travel_requested = Signal(float, float)
 
+    # v7.5.x: rotate the top-down rendering 180°. The current Prior II stage
+    # has its origin at the bottom-right with +X/+Y toward the top-left, so an
+    # unflipped canvas (+X→right, +Y→down) draws the plate upside-down relative
+    # to the operator's physical view. Reflecting both axes about the envelope
+    # centre matches the physical orientation. Applied in BOTH the forward and
+    # inverse coordinate maps, so click targeting stays correct. Flip to False
+    # for a stage mounted with the conventional origin/axes. (A future per-
+    # machine setting could drive this; hardcoded for now.)
+    _FLIP_DISPLAY_180 = True
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setMinimumSize(s(280), s(220))
@@ -88,6 +98,10 @@ class JogWorkspaceView(QWidget):
 
         # State
         self._safety_limits = None
+        # v7.5.x: the XY envelope is stored ABSOLUTE stage µm, but this view is
+        # fed zero-referenced needle/well positions. Subtract the current zero
+        # reference from the envelope bounds so both share the zero-ref frame.
+        self._zero_off: tuple[float, float] = (0.0, 0.0)
         self._plate = None
         self._wells_cal: dict[str, tuple[float, float]] = {}
         self._wells_approx: dict[str, tuple[float, float]] = {}
@@ -109,6 +123,15 @@ class JogWorkspaceView(QWidget):
     def set_safety_limits(self, limits) -> None:
         self._safety_limits = limits
         self.update()
+
+    def set_zero_offset(self, zero_x_um: float, zero_y_um: float) -> None:
+        """v7.5.x: current zero reference (absolute stage µm). The absolute XY
+        envelope is shifted by this offset for display so it lines up with the
+        zero-referenced needle/well positions this view is fed."""
+        off = (float(zero_x_um), float(zero_y_um))
+        if off != self._zero_off:
+            self._zero_off = off
+            self.update()
 
     def set_plate(self, plate) -> None:
         self._plate = plate
@@ -169,11 +192,14 @@ class JogWorkspaceView(QWidget):
     def _envelope_bounds(self) -> tuple[float, float, float, float] | None:
         if self._safety_limits is None:
             return None
+        # v7.5.x: envelope bounds are absolute stage µm; subtract the zero
+        # reference so they are in the same zero-ref frame as set_position().
+        zx, zy = self._zero_off
         return (
-            float(self._safety_limits.xy_min_x),
-            float(self._safety_limits.xy_min_y),
-            float(self._safety_limits.xy_max_x),
-            float(self._safety_limits.xy_max_y),
+            float(self._safety_limits.xy_min_x) - zx,
+            float(self._safety_limits.xy_min_y) - zy,
+            float(self._safety_limits.xy_max_x) - zx,
+            float(self._safety_limits.xy_max_y) - zy,
         )
 
     def _content_rect(self) -> QRectF:
@@ -211,19 +237,35 @@ class JogWorkspaceView(QWidget):
         oy = rect.top() + (rect.height() - drawn_h) / 2.0 - y_min * k
         return (k, ox, oy)
 
+    def _apply_display_flip(
+        self, x_um: float, y_um: float
+    ) -> tuple[float, float]:
+        """Reflect a zero-ref µm point about the envelope centre when the
+        display is rotated 180° (see ``_FLIP_DISPLAY_180``). The reflection is
+        its own inverse, so applying it in both the forward (µm→px) and inverse
+        (px→µm) maps rotates the whole render while keeping clicks accurate."""
+        if not self._FLIP_DISPLAY_180:
+            return (x_um, y_um)
+        env = self._envelope_bounds()
+        if env is None:
+            return (x_um, y_um)
+        x_min, y_min, x_max, y_max = env
+        return ((x_min + x_max) - x_um, (y_min + y_max) - y_um)
+
     def _um_to_px(self, x_um: float, y_um: float) -> QPointF:
         sc = self._scale()
         if sc is None:
             return QPointF(0, 0)
         k, ox, oy = sc
-        return QPointF(x_um * k + ox, y_um * k + oy)
+        fx, fy = self._apply_display_flip(x_um, y_um)
+        return QPointF(fx * k + ox, fy * k + oy)
 
     def _px_to_um(self, px_x: float, px_y: float) -> tuple[float, float]:
         sc = self._scale()
         if sc is None:
             return (0.0, 0.0)
         k, ox, oy = sc
-        return ((px_x - ox) / k, (px_y - oy) / k)
+        return self._apply_display_flip((px_x - ox) / k, (px_y - oy) / k)
 
     # ── Snap logic ─────────────────────────────────────────────────
 

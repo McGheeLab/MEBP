@@ -36,6 +36,7 @@ from gui.widgets.components import Card, StatusBadge
 from gui.widgets.icons import icon, icon_button
 from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
+from SupportClasses.StageController import z_raw_to_display
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,10 @@ class HardwareControlPanel(QWidget):
         self._show_connect = show_connect
         self._bypass_safety = bypass_safety
         self._embedded = embedded
+        # v7.5.x: jog speeds default to 1/2 of the calibrated max once
+        # settings arrive. Seed once; preserve a manual edit thereafter.
+        self._speeds_seeded = False
+        self._speed_user_edited = {"xy": False, "z": False, "p": False}
         self._build_ui()
 
     # ── Public API ──────────────────────────────────────────────
@@ -168,6 +173,8 @@ class HardwareControlPanel(QWidget):
         # v7.4.2: pull safety-limit ranges into the position bars so the
         # slider extents reflect the user's recorded envelope.
         self._refresh_bar_ranges()
+        # v7.5.x: seed jog speeds to 1/2 of the calibrated max.
+        self._apply_speed_defaults_from_settings()
 
     def refresh_safety_limits(self) -> None:
         """v7.4.2: External hook — call after the user saves new safety
@@ -439,7 +446,67 @@ class HardwareControlPanel(QWidget):
         # Push the XY speed to the controller whenever it changes so
         # the next ProScan move uses the new SMS value.
         self.spin_xy_speed.valueChanged.connect(self._apply_xy_speed)
+
+        # v7.5.x: track manual edits so the half-of-max seeding never
+        # clobbers a value the user dialed in. editingFinished (not
+        # valueChanged) so programmatic seeding doesn't mark it dirty.
+        self.spin_xy_speed.editingFinished.connect(
+            lambda: self._speed_user_edited.__setitem__("xy", True))
+        self.spin_z_speed.editingFinished.connect(
+            lambda: self._speed_user_edited.__setitem__("z", True))
+        self.spin_p_speed.editingFinished.connect(
+            lambda: self._speed_user_edited.__setitem__("p", True))
         return wrap
+
+    def _apply_speed_defaults_from_settings(self) -> None:
+        """v7.5.x: default each jog speed to HALF of the calibrated max
+        and cap the spinbox at that max.
+
+        Reads the same keys the Stage-calibration page writes:
+          - XY  : ``safety_limits.max_xy_speed``        (µm/s)
+          - Z   : ``device_profile.per_axis_max_feedrate["Z"]`` (mm/min),
+                  falling back to ``safety_limits.max_z_feedrate``
+          - Pump: ``safety_limits.max_pump_feedrate``   (mm/min)
+
+        Seeds once per panel; a manual edit (tracked via editingFinished)
+        is preserved on any later re-injection of settings.
+        """
+        if self._settings is None or not hasattr(self, 'spin_xy_speed'):
+            return
+        if self._speeds_seeded:
+            return
+        s_obj = self._settings
+
+        def _num(val, default):
+            try:
+                v = float(val)
+                return v if v > 0 else float(default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        xy_max = _num(s_obj.get("safety_limits.max_xy_speed", 10000.0), 10000.0)
+        per_axis = s_obj.get("device_profile.per_axis_max_feedrate") or {}
+        z_max = _num(
+            per_axis.get("Z") or s_obj.get("safety_limits.max_z_feedrate", 500.0),
+            500.0)
+        pump_max = _num(
+            s_obj.get("safety_limits.max_pump_feedrate", 200.0), 200.0)
+
+        for spin, axis, cap in (
+            (self.spin_xy_speed, "xy", xy_max),
+            (self.spin_z_speed, "z", z_max),
+            (self.spin_p_speed, "p", pump_max),
+        ):
+            if self._speed_user_edited.get(axis) or cap <= 0:
+                continue
+            spin.blockSignals(True)
+            # Cap the max BEFORE the half-value so it isn't clipped, and
+            # never below the spinbox's own minimum.
+            if cap > spin.minimum():
+                spin.setMaximum(cap)
+            spin.setValue(cap / 2.0)
+            spin.blockSignals(False)
+        self._speeds_seeded = True
 
     def _labeled(self, name: str, widget, tooltip: str = "") -> QHBoxLayout:
         row = QHBoxLayout()
@@ -540,8 +607,12 @@ class HardwareControlPanel(QWidget):
                        s_obj.get("safety_limits.xy_max_x", 130000.0)),
                 "Y":  (s_obj.get("safety_limits.xy_min_y",  -85000.0),
                        s_obj.get("safety_limits.xy_max_y",   85000.0)),
-                "Z":  (s_obj.get("safety_limits.z_min",      -10.0),
-                       s_obj.get("safety_limits.z_max",       50.0)),
+                # v7.5.x: the Z readout is shown as height (up = +), so the
+                # Z bar extents are in the display frame too — convert and
+                # swap (ZDIR=-1 reverses ordering): display-min = -z_max_raw,
+                # display-max = -z_min_raw.
+                "Z":  (z_raw_to_display(s_obj.get("safety_limits.z_max", 50.0)),
+                       z_raw_to_display(s_obj.get("safety_limits.z_min", -10.0))),
                 "P1": (s_obj.get("safety_limits.p1_min",     -50.0),
                        s_obj.get("safety_limits.p1_max",      50.0)),
                 "P2": (s_obj.get("safety_limits.p2_min",     -50.0),
@@ -820,4 +891,7 @@ class HardwareControlPanel(QWidget):
         if zp:
             for logical in ("Z", "P1", "P2", "P3"):
                 v = self._logical_zp_value(zp, logical)
+                # v7.5.x: show Z as height (up = +); pumps unchanged.
+                if logical == "Z" and v is not None:
+                    v = z_raw_to_display(v)
                 _set(logical, v, "{:.3f}")

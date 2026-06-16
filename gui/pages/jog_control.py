@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QMessageBox, QVBoxLayout, QWidget,
 )
 
-from SupportClasses.StageController import StageController
+from SupportClasses.StageController import StageController, ZDIR
 from gui.scaling import s
 from gui.widgets.components import Card
 from gui.widgets.jog_workspace_view import JogWorkspaceView
@@ -167,6 +167,9 @@ class JogControlPage(QWidget):
         top.addWidget(ws_card, stretch=10)
 
         self._xz_view = XZSideView()
+        # v7.5.x: number Z as height (up = +) on this machine; display-only,
+        # the go-to emit stays in the raw zero-ref move frame.
+        self._xz_view.set_z_display_sign(ZDIR)
         self._xz_view.set_safety_limits(self.controller.safety_limits)
         self._xz_view.go_to_z_requested.connect(
             self._on_go_to_z_requested)
@@ -193,6 +196,12 @@ class JogControlPage(QWidget):
         """Called by MainWindow timer (~300 ms)."""
         ctrl = self.controller
         zero = ctrl.zero_position
+
+        # v7.5.x: envelope is absolute stage µm; push the current zero so the
+        # views shift it into the zero-ref frame they draw positions in.
+        self._workspace_view.set_zero_offset(zero["x"], zero["y"])
+        self._xz_view.set_zero_offset_x(zero["x"])
+        self._xz_view.set_zero_offset_z(zero.get("Z", 0.0))
 
         # XY position (stage-frame → zero-ref for the visualizations)
         xy = ctrl.get_xy_position(cached=True)
@@ -357,11 +366,14 @@ class JogControlPage(QWidget):
     def load_startup_plate(self, settings) -> None:
         """Populate the workspace with geometry-predicted (approximate) wells.
 
-        With no real calibration yet, the plate is centred on the
-        controller's zero reference — which means it appears at
-        (0, 0) in zero-ref µm, i.e. dead-centre of the safety envelope
-        on the XY workspace canvas. Once the user calibrates wells the
-        Calibration page pushes their actual positions and this is
+        v7.5.x: with no real calibration yet, the plate is centred on the XY
+        safety-envelope midpoint (absolute stage µm via
+        ``controller.default_plate_center_um()``). After the display path
+        subtracts ``zero_position`` it appears at ``safety_limits.xy_center()``
+        in zero-ref µm — which is (0, 0), i.e. dead-centre of the canvas, ONLY
+        for the symmetric default envelope; for an asymmetric envelope it
+        appears at the envelope midpoint, not (0, 0). Once the user calibrates
+        wells the Calibration page pushes their actual positions and this is
         replaced wholesale.
         """
         try:
@@ -378,10 +390,15 @@ class JogControlPage(QWidget):
         except (ValueError, TypeError):
             plate = WellPlate.from_format(96)
 
-        # Stage-frame coords whose zero-ref representation is (0, 0).
-        zero = self.controller.zero_position
-        center_x = float(zero.get("x", 0.0))
-        center_y = float(zero.get("y", 0.0))
+        # v7.5.x: centre the default plate on the XY safety envelope (absolute
+        # stage µm) so it sits mid-envelope even for an asymmetric envelope;
+        # for the symmetric default this equals zero_position (unchanged).
+        try:
+            center_x, center_y = self.controller.default_plate_center_um()
+        except Exception:
+            zero = self.controller.zero_position
+            center_x = float(zero.get("x", 0.0))
+            center_y = float(zero.get("y", 0.0))
         approx_positions = plate.get_all_positions_from_plate_center(
             center_x, center_y)
 
@@ -393,6 +410,11 @@ class JogControlPage(QWidget):
         if self._context_widget is not None:
             self._context_widget.set_calibration_data(
                 plate, approx_positions, self._safe_z)
+
+    # v7.5.x: the Jog page intentionally has NO recenter_default_plate() —
+    # bounds-change re-centering is owned solely by the Calibration page,
+    # which pushes through calibration_data_changed → _push_cal_to_jog. An
+    # ungated jog-side recenter would overwrite calibrated workspace state.
 
     def _wells_in_zero_ref(self) -> dict[str, tuple[float, float]]:
         if not self._well_positions:
@@ -412,8 +434,18 @@ class JogControlPage(QWidget):
     ) -> None:
         """Click-to-travel from the XY workspace.
 
-        Coordinates are zero-ref µm. Routes through safe_travel_to when
-        current Z is below safe_Z, direct move_xy_absolute otherwise.
+        Coordinates are zero-ref µm. This is a cross-position move to a NEW
+        location, so the needle MUST retract to the safe / "move" Z before XY.
+        When a Safe Z is known we ALWAYS route through ``safe_travel_to``
+        (raise → wait → XY); only when no Safe Z is configured do we prompt and
+        optionally travel without retracting.
+
+        v7.5.x CRITICAL FIX: the old gate skipped the retract when
+        ``current_z >= safe_z`` — polarity-wrong on ME3B V1 (ZDIR=-1, needle
+        descends as raw Z increases), so it skipped the retract exactly when
+        the needle was DOWN. The shortcut is removed; ``safe_travel_to`` is a
+        near-no-op when the needle is already retracted, so always using it is
+        safe.
         """
         if not self.controller.is_xy_connected:
             return
@@ -421,13 +453,6 @@ class JogControlPage(QWidget):
         zero = self.controller.zero_position
         stage_x = x_um_zr + zero["x"]
         stage_y = y_um_zr + zero["y"]
-
-        zp = self.controller.get_zp_position(cached=True)
-        current_z = None
-        if zp[0] is not None:
-            z_raw = self.controller.zp_logical_value(zp, "Z")
-            if z_raw is not None:
-                current_z = z_raw - zero["Z"]
 
         if self._safe_z is None:
             resp = QMessageBox.question(
@@ -439,13 +464,11 @@ class JogControlPage(QWidget):
             )
             if resp != QMessageBox.StandardButton.Yes:
                 return
+            # v7.5.x bugfix: move_xy_absolute(from_zero_ref=True) expects mm
+            # (it multiplies by 1000 internally). The workspace emits zero-ref
+            # µm, so pass mm — previously µm went in as mm → 1000× overshoot.
             self.controller.move_xy_absolute(
-                x_um_zr, y_um_zr, from_zero_ref=True)
-            return
-
-        if current_z is not None and current_z >= self._safe_z - 0.05:
-            self.controller.move_xy_absolute(
-                x_um_zr, y_um_zr, from_zero_ref=True)
+                x_um_zr / 1000.0, y_um_zr / 1000.0, from_zero_ref=True)
             return
 
         self.controller.safe_travel_to(

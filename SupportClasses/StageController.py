@@ -17,7 +17,7 @@ import logging
 import math
 import threading
 import time
-from multiprocessing import Process, Queue
+from multiprocessing import Event as MPEvent, Process, Queue
 from typing import Callable, Optional
 
 from SupportClasses.Processor import Processor
@@ -38,6 +38,75 @@ def _axis_letter(zp_stage, logical: str) -> str | None:
 # tuple returned by ZPStageManager.get_current_position(), which is
 # always (x, y, z, e) in Marlin's physical axis order.
 _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
+
+
+# ── v7.5.x: Z display-numbering sign (ME3B V1) ─────────────────────────
+# On this machine the needle physically DESCENDS as the raw Marlin Z
+# counter INCREASES (steps_per_mm["Z"] = +5255). The app numbers Z by the
+# raw value, so going up the number went negative (top read -60) and the
+# Min/Max envelope recorded inverted (z_min > z_max), collapsing clamp_z
+# to a single point and freezing Z.
+#
+# We number Z as a *height* (up = +) at the human boundary only: every Z
+# value shown to the user on the Jog/Device pages is multiplied by ZDIR;
+# every Z the user types/clicks there is divided by ZDIR before motion.
+# The internal frames (raw Marlin, zero-ref, calibration storage, print,
+# SafetyLimits.z_min/z_max) are UNCHANGED — motion is physically identical.
+# Because ZDIR = -1 reverses ordering, converting between the height limit
+# spinboxes and the raw-stored limits also requires a min/max SWAP.
+ZDIR = -1.0
+
+
+def z_raw_to_display(raw: float) -> float:
+    """Raw Marlin Z (mm) → user-facing height (mm, up = +)."""
+    return ZDIR * raw
+
+
+def z_display_to_raw(disp: float) -> float:
+    """User-facing height (mm, up = +) → raw Marlin Z (mm)."""
+    return disp / ZDIR
+
+
+# ── v7.5.x: plate-bottom Z datum (polarity-general) ────────────────────
+# Print heights are expressed as *height above the plate bottom* (mm, ≥ 0 =
+# above/away from the plate). These convert that to/from the internal
+# zero-ref Z frame using ZDIR, so they are correct on both a conventional
+# machine (ZDIR=+1, up = larger Z) and ME3B V1 (ZDIR=-1, up = smaller Z).
+
+def plate_relative_to_zref(plate_bottom_zref: float, height_above_bottom: float,
+                           zdir: float = ZDIR) -> float:
+    """Height above the plate bottom (mm) → zero-ref Z (mm)."""
+    return plate_bottom_zref + zdir * height_above_bottom
+
+
+def zref_to_plate_relative(plate_bottom_zref: float, z_zref: float,
+                           zdir: float = ZDIR) -> float:
+    """Zero-ref Z (mm) → height above the plate bottom (mm).
+
+    Negative result ⇒ the point is *below* the plate bottom (punch-through).
+    """
+    return zdir * (z_zref - plate_bottom_zref)
+
+
+def derive_z_up_sign(plate_top_zref: float | None,
+                     plate_bottom_zref: float | None,
+                     fallback: float | None = None) -> float:
+    """v7.5.x: which way is *up*, derived from the calibrated reference points.
+
+    The plate top is physically above the plate bottom, so the sign of
+    ``plate_top - plate_bottom`` in the zero-ref frame tells us how zero-ref Z
+    maps to physical height — independent of the machine's raw-Z polarity. This
+    replaces the hard-coded ``ZDIR`` for print-offset math: +1 = "up is larger
+    Z" (conventional), -1 = "up is smaller Z" (ME3B V1, needle descends as raw Z
+    increases). Falls back to ``fallback`` (or the live module ``ZDIR`` when
+    ``fallback is None``) when the two points aren't both calibrated (or are
+    coincident), so behaviour is unchanged until both references are taught.
+    """
+    if plate_top_zref is not None and plate_bottom_zref is not None:
+        d = plate_top_zref - plate_bottom_zref
+        if abs(d) > 1e-6:
+            return 1.0 if d > 0 else -1.0
+    return ZDIR if fallback is None else fallback
 
 
 def _axis_index(zp_stage, logical: str) -> int | None:
@@ -72,22 +141,41 @@ class XboxQueuePoller:
     """
 
     def __init__(self, queue: Queue, processor: Processor,
-                 debug_mode: bool = False):
+                 debug_mode: bool = False,
+                 on_lost: Callable | None = None):
         self.queue = queue
         self.processor = processor
         self.debug_mode = debug_mode
+        # v7.5.x: fired when the controller is lost (worker reports
+        # reconnecting/disconnected, or the heartbeat goes stale).
+        # StageController wires this to zero all jog velocities so a
+        # stranded velocity can't keep driving the stages — reinstates
+        # the v7.3.4-documented behavior that had been lost.
+        self._on_lost = on_lost
         self._running = False
         self._thread: threading.Thread | None = None
         # v7.2.6: S4-D status handler — track controller state from worker
         self._xbox_status: str = "disconnected"
         self._last_heartbeat_time: float = time.time()
-        # v7.4.2: live input monitor state. Updated as worker events
-        # come in so a GUI poll-driven visualiser can render the
-        # current stick / trigger positions + the most recent button
-        # press without subscribing to the Processor's command bus.
-        self.last_axis: dict[int, float] = {}    # axis index → normalized [-1, 1]
+        # v7.4.2: live input monitor state, v7.5.x: fed by the worker's
+        # dedicated "monitor" messages (raw per-axis state) instead of the
+        # dispatch stream — the old cache keyed int(group_name) which raised
+        # on "0-1"/"2-3" and was silently swallowed, so stick values never
+        # updated and Calibrate Sticks always snapshotted zeros.
+        # Sticks (0-3): raw [-1, 1]; triggers (4, 5): pull amount [0, 1].
+        self.last_axis: dict[int, float] = {}
         self.last_button: tuple[int, float] | None = None  # (button_id, ts)
         self.last_dpad: tuple[int, float] | None = None    # (direction, ts)
+
+    def _fire_on_lost(self, reason: str) -> None:
+        """v7.5.x: invoke the controller-lost callback exactly once per event."""
+        if self._on_lost is None:
+            return
+        try:
+            self._on_lost()
+            logger.info(f"[Xbox] Controller lost ({reason}) — jog velocities zeroed")
+        except Exception:
+            logger.exception("[Xbox] on_lost callback failed")
 
 
     def start(self) -> None:
@@ -117,6 +205,22 @@ class XboxQueuePoller:
                     self._xbox_status = msg["status"]
                     if self._xbox_status != _prev:
                         logger.info(f"[Xbox] Status: {self._xbox_status}")
+                        # v7.5.x: zero jog velocities the moment the worker
+                        # reports the controller gone (the worker also sends
+                        # explicit zero dispatches — this is belt-and-braces).
+                        if (self._xbox_status in ("reconnecting", "disconnected")
+                                and _prev in ("connected", "alive")):
+                            self._fire_on_lost(self._xbox_status)
+                elif "monitor" in msg:
+                    # v7.5.x: raw per-axis state for the GUI live monitor.
+                    try:
+                        mon = msg["monitor"]
+                        for k, v in (mon.get("sticks") or {}).items():
+                            self.last_axis[int(k)] = float(v)
+                        for k, v in (mon.get("triggers") or {}).items():
+                            self.last_axis[int(k)] = float(v)
+                    except Exception:
+                        pass
                 elif "debug" in msg:
                     text = msg["debug"]
                     # Always show connection events; show diagnostic messages
@@ -134,12 +238,9 @@ class XboxQueuePoller:
                 elif "axis" in msg:
                     avg = msg["average"]
                     cmd = msg["command"]
-                    # v7.4.2: cache the latest per-axis value for the
-                    # live monitor.
-                    try:
-                        self.last_axis[int(msg["axis"])] = float(avg)
-                    except Exception:
-                        pass
+                    # (v7.5.x: live-monitor caching moved to the dedicated
+                    # "monitor" message — the old int(msg["axis"]) cache
+                    # raised on group names like "0-1" and never worked.)
                     # Log pump axis commands only in debug mode
                     if self.debug_mode and "p" in cmd.lower() and "velocity" in cmd.lower():
                         logger.info(
@@ -160,6 +261,8 @@ class XboxQueuePoller:
                 if time.time() - self._last_heartbeat_time > 10.0:
                     self._xbox_status = "disconnected"
                     logger.warning("[Xbox] Heartbeat stale — marking disconnected")
+                    # v7.5.x: a dead worker can't send zeroes — do it here.
+                    self._fire_on_lost("heartbeat stale")
 
             time.sleep(0.02)
 
@@ -178,12 +281,18 @@ class ZPJogHandler:
         safety_limits: SafetyLimits | None = None,
         get_zp_position: Callable | None = None,
         zero_position: dict | None = None,  # v7.2.6: zero ref for clamping
+        flip_provider: Callable[[str], float] | None = None,  # v7.5.x
     ):
         self.processor = processor
         self.stage = zp_stage
         self.safety_limits = safety_limits
         self._get_zp_position = get_zp_position
         self._zero_position = zero_position or {}  # v7.2.6: zero ref for jog clamping
+        # v7.5.x: per-logical-axis direction flip. Callable(logical) -> ±1.0,
+        # supplied by StageController so the Xbox jog honors the same
+        # axis_flip settings as the GUI jog buttons (move_z_relative /
+        # move_pump_relative both apply _flip_sign). None = no flip (×1.0).
+        self._flip_provider = flip_provider
 
         # Velocity state (updated by command handlers)
         self.vel_z: float = 0.0
@@ -198,6 +307,16 @@ class ZPJogHandler:
         self.p_speed: float = 0.5         # Pump speed: µL/s when hw config, mm/s otherwise
         self.max_speed: float = 1.0
         self._hardware_config = None      # Set via set_hardware_config()
+
+        # v7.5.x: velocity staleness watchdog. The Xbox worker re-sends a
+        # held non-zero velocity every avg_interval (0.1 s); if commands
+        # stop arriving (worker died, queue stalled, controller lost before
+        # a zero-send) the jog loop must not keep applying the last
+        # velocity forever. These *_at_velocity commands have no senders
+        # other than the Xbox pipeline, so the timeout cannot break any
+        # GUI-driven motion.
+        self.stale_timeout: float = 0.5
+        self._last_vel_cmd_time: float = time.time()
 
         self._was_moving = False
         self._running = False
@@ -281,6 +400,20 @@ class ZPJogHandler:
     def _clamp_vel(self, raw: float, multiplier: float) -> float:
         return max(-self.max_speed, min(self.max_speed, raw * multiplier))
 
+    def _flip_sign(self, logical: str) -> float:
+        """v7.5.x: direction-flip sign for a logical axis (Z/P1/P2/P3).
+
+        Mirrors StageController._flip_sign so the Xbox jog inverts the same
+        axes the GUI jog buttons do. Returns 1.0 when no provider is set or
+        the axis isn't flipped.
+        """
+        if self._flip_provider is None:
+            return 1.0
+        try:
+            return float(self._flip_provider(logical))
+        except Exception:
+            return 1.0
+
     def _pump_vel_mm_s(self, raw: float, pump_id: str) -> float:
         """Convert raw Xbox axis to pump velocity in mm/s.
 
@@ -315,6 +448,7 @@ class ZPJogHandler:
         raw = self._extract_velocity(*args, **kwargs)
         with self._lock:
             self.vel_z = self._clamp_vel(raw, self.z_speed)
+            self._last_vel_cmd_time = time.time()  # v7.5.x: watchdog feed
 
     def _clamp_pump_flow(self, vel, pump_id):
         """Clamp pump velocity (mm/s) to max safe flow rate."""
@@ -358,6 +492,7 @@ class ZPJogHandler:
         with self._lock:
             prev_vel = getattr(self, vel_attr, 0.0)
             setattr(self, vel_attr, vel)
+            self._last_vel_cmd_time = time.time()  # v7.5.x: watchdog feed
         # v7.3.4: Pump velocity trace — debug level so it only appears when
         # the app log level is set to DEBUG (or Xbox debug mode is on).
         logger.debug(
@@ -396,8 +531,18 @@ class ZPJogHandler:
         while self._running:
             with self._lock:
                 vz, vp1, vp2, vp3 = self.vel_z, self.vel_p1, self.vel_p2, self.vel_p3
+                last_cmd = self._last_vel_cmd_time
 
             is_moving = any(abs(v) > 0.001 for v in (vz, vp1, vp2, vp3))
+
+            # v7.5.x: staleness watchdog — the worker re-sends held values
+            # every 0.1 s, so a non-zero velocity with no command for
+            # stale_timeout means the pipeline died mid-hold. Stop.
+            if is_moving and (time.time() - last_cmd) > self.stale_timeout:
+                logger.warning("[ZP] Velocity commands stale — zeroing jog")
+                with self._lock:
+                    self.vel_z = self.vel_p1 = self.vel_p2 = self.vel_p3 = 0.0
+                continue
 
             if is_moving and not self._was_moving:
                 logger.debug(f"[ZP] Jog start: z={vz:.2f} p1={vp1:.2f}")
@@ -409,29 +554,47 @@ class ZPJogHandler:
                 time.sleep(0.01)
                 continue
 
-            dz = -vz * self.segment_time
-            dp1 = vp1 * self.segment_time
-            dp2 = vp2 * self.segment_time
-            dp3 = vp3 * self.segment_time
+            # v7.5.x: apply per-axis direction flip before clamping (matches
+            # the GUI jog order in move_z_relative / move_pump_relative). The
+            # leading -vz keeps the "right-stick-up = +Z" convention; the flip
+            # then inverts it (and each pump) when that axis is flip-enabled.
+            dz = -vz * self.segment_time * self._flip_sign("Z")
+            dp1 = vp1 * self.segment_time * self._flip_sign("P1")
+            dp2 = vp2 * self.segment_time * self._flip_sign("P2")
+            dp3 = vp3 * self.segment_time * self._flip_sign("P3")
 
             # Apply safety limits
             if self.safety_limits and self.safety_limits.enabled and self._get_zp_position:
                 try:
                     pos = self._get_zp_position()
                     if pos[0] is not None:
-                        cz, cp1, cp2, cp3 = pos
-                        # v7.2.6: Subtract zero_position before clamping
-                        # clamp_z/clamp_pump expect zero-referenced values
-                        _zp = getattr(self, '_zero_position', {})
-                        z0 = _zp.get('Z', 0.0)
-                        # target_zr = (abs_pos + delta) - zero; clamp; new_delta = clamped_abs - abs_pos
-                        dz = self.safety_limits.clamp_z((cz + dz) - z0) + z0 - cz
-                        p10 = _zp.get('P1', 0.0)
-                        dp1 = self.safety_limits.clamp_pump((cp1 + dp1) - p10, "P1") + p10 - cp1
-                        p20 = _zp.get('P2', 0.0)
-                        dp2 = self.safety_limits.clamp_pump((cp2 + dp2) - p20, "P2") + p20 - cp2
-                        p30 = _zp.get('P3', 0.0)
-                        dp3 = self.safety_limits.clamp_pump((cp3 + dp3) - p30, "P3") + p30 - cp3
+                        # v7.5.x bugfix: resolve each logical axis to its
+                        # physical tuple slot via the live axis_map. The
+                        # old positional unpack (cz,cp1,cp2,cp3 = pos)
+                        # assumed Z,P1,P2,P3 order, so it clamped the wrong
+                        # motor's position on non-default maps (ME3B V1).
+                        # v7.5.x: Z/pump envelope is absolute Marlin raw mm —
+                        # clamp the absolute destination (cur + delta) directly.
+                        # (Was zero-ref: clamp((cur+delta)-zero)+zero-cur, which
+                        # went stale after a Set Z Zero / needle-zero re-anchor
+                        # and wrongly clamped the Xbox jog.)
+                        def _clamp_delta(logical, delta, clamp_fn):
+                            i = _axis_index(self.stage, logical)
+                            if i is None or i >= len(pos) or pos[i] is None:
+                                return delta
+                            cur = pos[i]
+                            return clamp_fn(cur + delta) - cur
+
+                        dz = _clamp_delta("Z", dz, self.safety_limits.clamp_z)
+                        dp1 = _clamp_delta(
+                            "P1", dp1,
+                            lambda v: self.safety_limits.clamp_pump(v, "P1"))
+                        dp2 = _clamp_delta(
+                            "P2", dp2,
+                            lambda v: self.safety_limits.clamp_pump(v, "P2"))
+                        dp3 = _clamp_delta(
+                            "P3", dp3,
+                            lambda v: self.safety_limits.clamp_pump(v, "P3"))
                 except Exception:
                     pass
 
@@ -443,9 +606,16 @@ class ZPJogHandler:
 
             # v7.2.6: ZP jog serial guard — protect against disconnected stage
             try:
-                self.stage.move_relative(
-                    {"X": dz, "Y": dp1, "Z": dp2, "E": dp3}, feedrate
-                )
+                # v7.5.x bugfix: route logical deltas to physical letters
+                # via the live axis_map (was hardcoded X/Y/Z/E = default
+                # map, which drove the wrong motors on ME3B V1).
+                deltas: dict[str, float] = {}
+                for logical, d in (("Z", dz), ("P1", dp1),
+                                   ("P2", dp2), ("P3", dp3)):
+                    letter = _axis_letter(self.stage, logical)
+                    if letter is not None:
+                        deltas[letter] = d
+                self.stage.move_relative(deltas, feedrate)
             except Exception as e:
                 logger.warning(f"[ZP] Jog move failed: {e}")
                 with self._lock:
@@ -482,6 +652,10 @@ class XYJogHandler:
         self.xy_speed: float = 100.0
         self.max_speed: float = 5000.0
         self.update_interval: float = 0.1
+
+        # v7.5.x: velocity staleness watchdog (see ZPJogHandler).
+        self.stale_timeout: float = 0.5
+        self._last_vel_cmd_time: float = time.time()
 
         self._was_moving = False
         self._running = False
@@ -543,6 +717,7 @@ class XYJogHandler:
         with self._lock:
             self.vel_x = max(-self.max_speed, min(self.max_speed, vx * self.xy_speed))
             self.vel_y = max(-self.max_speed, min(self.max_speed, vy * self.xy_speed))
+            self._last_vel_cmd_time = time.time()  # v7.5.x: watchdog feed
 
     def _incr_up(self, *a, **kw):  # v7.2.7: decade speed
         self.xy_speed = min(self.xy_speed * 10, 10000)
@@ -558,8 +733,19 @@ class XYJogHandler:
         while self._running:
             with self._lock:
                 vx, vy = self.vel_x, self.vel_y
+                last_cmd = self._last_vel_cmd_time
 
             is_moving = abs(vx) > 0.001 or abs(vy) > 0.001
+
+            # v7.5.x: staleness watchdog — see ZPJogHandler._jog_loop.
+            # Zeroing here makes the next iteration take the was_moving
+            # transition, which sends the explicit zero-velocity stop the
+            # ProScan needs in continuous velocity mode.
+            if is_moving and (time.time() - last_cmd) > self.stale_timeout:
+                logger.warning("[XY] Velocity commands stale — zeroing jog")
+                with self._lock:
+                    self.vel_x = self.vel_y = 0.0
+                continue
 
             if is_moving and not self._was_moving:
                 logger.debug(f"[XY] Jog start: x={vx:.1f} y={vy:.1f}")
@@ -632,6 +818,18 @@ class PositionPoller:
         # v7.2.7: init _hardware_config
         self._hardware_config = None
 
+        # v7.5.x ZP reconnect hotfix: poller-driven liveness. A real ZP stage
+        # that stops answering position queries for this many consecutive
+        # polls is treated as disconnected (covers board power-off with USB
+        # still attached, which the port-handle watchdog cannot detect).
+        # ``on_zp_lost`` is set by StageController to fire _handle_disconnect.
+        self.on_zp_lost: Callable | None = None
+        self._zp_fail_count = 0
+        # ~2.5 s of consecutive failed ZP position reads before declaring a
+        # disconnect — long enough to ride out a brief board hiccup, short
+        # enough to catch a power-off quickly. Scaled to the poll interval.
+        self._zp_fail_threshold = max(5, int(2.5 / max(poll_interval, 0.05)))
+
     def suspend(self) -> None:
         """Pause hardware queries (e.g., during safe_travel_to) to prevent
         serial races between the poll thread and caller-side waits."""
@@ -653,6 +851,8 @@ class PositionPoller:
                 self._xy_pos = (None, None, None)
             if zp_stage is None:
                 self._zp_pos = (None, None, None, None)
+            # v7.5.x: fresh liveness window for any (re)connect/disconnect.
+            self._zp_fail_count = 0
 
     @property
     def xy_position(self) -> tuple:
@@ -698,13 +898,40 @@ class PositionPoller:
                     logger.debug(f"XY poll error: {e}")
 
             if zp is not None:
+                ok = False
                 try:
                     pos = zp.get_current_position()
-                    if pos[0] is not None:
+                    # get_current_position() returns the cached (possibly
+                    # stale) floats even when the board didn't answer, so
+                    # gate freshness on the explicit read-ok flag rather than
+                    # on pos[0] being non-None.
+                    fresh = getattr(zp, "_last_position_read_ok", True)
+                    if pos[0] is not None and fresh:
                         with self._lock:
                             self._zp_pos = pos
+                        ok = True
                 except Exception as e:
                     logger.debug(f"ZP poll error: {e}")
+                # v7.5.x ZP reconnect hotfix: track consecutive query
+                # failures on real hardware. A board that has been powered
+                # off (USB still attached) keeps its COM port "open" so the
+                # port-handle watchdog never fires — but it stops answering
+                # M114, which we catch here and escalate to a disconnect.
+                if ok:
+                    self._zp_fail_count = 0
+                elif not getattr(zp, "simulate", False):
+                    self._zp_fail_count += 1
+                    if (self._zp_fail_count >= self._zp_fail_threshold
+                            and self.on_zp_lost is not None):
+                        cb = self.on_zp_lost
+                        self._zp_fail_count = 0
+                        logger.warning(
+                            "ZP position queries failing — treating as "
+                            "disconnected (poller-driven liveness)")
+                        try:
+                            cb()
+                        except Exception as e:
+                            logger.error(f"ZP lost callback error: {e}")
 
             time.sleep(self.poll_interval)
 
@@ -758,6 +985,9 @@ class StageController:
         self.xbox_queue: Queue | None = None
         self.xbox_process: Process | None = None
         self.xbox_poller: XboxQueuePoller | None = None
+        # v7.5.x: live tuning channel + clean worker stop
+        self.xbox_ctrl_queue: Queue | None = None
+        self._xbox_stop_event = None
 
         # v7.4.2: Device settings cached until ZP stage connects
         self._pending_axis_map: dict | None = None
@@ -788,12 +1018,27 @@ class StageController:
         self._watchdog = ConnectionWatchdog(check_interval=watchdog_interval)
         self._watchdog.start()
 
+        # v7.5.x ZP reconnect hotfix: serialize disconnect handling — it can
+        # now be triggered from BOTH the watchdog thread (port-handle health)
+        # and the poller thread (position-query liveness), so guard against
+        # two threads tearing the same stage down concurrently.
+        self._disconnect_lock = threading.Lock()
+
         # Background position cache — interval from settings (default 0.3s)
         self._pos_poller = PositionPoller(poll_interval=poll_interval)
+        # v7.5.x: poller-driven liveness — detect a ZP stage that stops
+        # answering position queries (covers board power-off with USB still
+        # attached, which the port-handle watchdog cannot see).
+        self._pos_poller.on_zp_lost = lambda: self._handle_disconnect("ZP")
         self._pos_poller.start()
 
         # Disconnect callback (GUI can set this)
         self.on_disconnect: Callable | None = None
+        # v7.5.x: fired with the stage name ("XY"/"ZP") after a successful
+        # (re)connect. The GUI uses the ZP edge to offer last-known-position
+        # restore (Marlin has no absolute encoder). May fire on a worker
+        # thread (onboarding) — the GUI handler must bridge to its own thread.
+        self.on_connect: Callable | None = None
 
         # v7.2: Hardware configuration (set by GUI when hardware setup completes)
         self._hardware_config: HardwareConfig | None = None
@@ -810,6 +1055,17 @@ class StageController:
         # tallest plate insert/tube. None = no floor. Set from the active
         # plate's max_rim_height + calibration top Z.
         self._min_travel_z_mm: float | None = None
+        # v7.5.x: plate-bottom Z datum (zero-ref mm) + print-time floor.
+        # The needle may never go deeper than the plate bottom while a print
+        # is running. `_print_floor_active` is armed only during print
+        # execution (by PrintManager) so it never blocks calibration / jog.
+        self._plate_bottom_z_zref: float | None = None
+        # v7.5.x: plate-top Z datum (zero-ref mm). With the plate bottom it
+        # forms the reference vector that derives the print-Z up-direction
+        # (see `print_z_dir`), so print offsets are polarity-correct without a
+        # hard-coded ZDIR. None until the plate top is taught in calibration.
+        self._plate_top_z_zref: float | None = None
+        self._print_floor_active: bool = False
         # v7.3.5: Periodic position save to Marlin EEPROM (M500)
         self._zp_auto_save_position: bool = False
 
@@ -846,6 +1102,11 @@ class StageController:
         """
         sim_xy = self._default_simulate_xy if simulate_xy is None else bool(simulate_xy)
         sim_zp = self._default_simulate_zp if simulate_zp is None else bool(simulate_zp)
+        # v7.5.x: track which stage actually came online in THIS call so we
+        # fire on_connect once, only for a real new connection (the
+        # `is None` guards below skip an already-connected stage).
+        xy_just_connected = False
+        zp_just_connected = False
         if xy and self.xy_stage is None:
             # v7.2.8: connection error handling
             try:
@@ -875,6 +1136,7 @@ class StageController:
                     lambda: getattr(self.xy_stage, "spo", None),
                     lambda: self._handle_disconnect("XY"),
                 )
+            xy_just_connected = True
             logger.info(f"XY stage connected ({'SIM' if sim_xy else 'REAL'})")
 
         if zp and self.zp_stage is None:
@@ -892,6 +1154,25 @@ class StageController:
                 if self.on_disconnect:
                     self.on_disconnect("ZP")
                 return
+            # v7.5.x ZP reconnect hotfix: ZPStageManager constructs
+            # successfully even when no Marlin board is acquired
+            # (``_initialise_serial`` returns None instead of raising,
+            # unlike XYStageManager). Treat that as a failed connection so
+            # the badge never shows a false "Connected", the dead object is
+            # released (so a later Connect can retry — the guard above is
+            # ``self.zp_stage is None``), and the GUI is notified.
+            if not sim_zp and getattr(self.zp_stage, "serial", None) is None:
+                logger.error(
+                    "ZP connection failed: no Marlin board acquired "
+                    "(check USB / power / that no other program holds the port)")
+                try:
+                    self.zp_stage.stop()
+                except Exception:
+                    pass
+                self.zp_stage = None
+                if self.on_disconnect:
+                    self.on_disconnect("ZP")
+                return
             # v7.2.6: stop old ZP jog handler
             if self.zp_jog is not None:
                 self.zp_jog.stop()
@@ -901,6 +1182,10 @@ class StageController:
                 safety_limits=self.safety_limits,
                 get_zp_position=lambda: self._pos_poller.zp_position,
                 zero_position=self.zero_position,
+                # v7.5.x: honor the same per-axis direction flips as the GUI
+                # jog buttons. Bound method reads the live _axis_flip dict, so
+                # later set_axis_flip(s) calls take effect without reconnect.
+                flip_provider=self._flip_sign,
             )
             self.zp_jog.start()
             if not sim_zp:
@@ -911,6 +1196,7 @@ class StageController:
                 )
                 # v7.3.5: Register periodic position save (M500)
                 self._watchdog.add_periodic(self._periodic_zp_position_save)
+            zp_just_connected = True
             logger.info(f"ZP stage connected ({'SIM' if sim_zp else 'REAL'})")
 
             # v7.4.2: Apply any pending device settings (axis_map, steps_per_mm)
@@ -927,6 +1213,20 @@ class StageController:
                     self._pending_per_axis_max_feedrate, persist=True)
 
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
+
+        # v7.5.x: notify the GUI of new connections (after set_stages so the
+        # poller already has the stage and the callback can read position).
+        if self.on_connect:
+            if xy_just_connected:
+                try:
+                    self.on_connect("XY")
+                except Exception as e:
+                    logger.debug(f"on_connect(XY) callback error: {e}")
+            if zp_just_connected:
+                try:
+                    self.on_connect("ZP")
+                except Exception as e:
+                    logger.debug(f"on_connect(ZP) callback error: {e}")
 
     def _periodic_zp_position_save(self) -> None:
         """v7.3.5: Called by watchdog — saves ZP position to EEPROM (M500).
@@ -974,6 +1274,107 @@ class StageController:
         if z_mm is not None:
             logger.info(f"StageController: min travel Z floor = {z_mm:.2f} mm "
                         f"(clears plate inserts)")
+
+    # ── v7.5.x: plate-bottom Z datum + print-time "don't punch through" ──
+
+    def set_plate_bottom_z(self, z_zero_ref_mm: float | None) -> None:
+        """Set the calibrated plate-bottom Z (zero-ref mm), or None to clear.
+
+        This is the deepest the needle may go during a print. Pushed from the
+        Calibration page's ``plate_bottom_z`` reference. Setting it does NOT by
+        itself enforce anything — the floor is only applied while a print is
+        running (see :meth:`set_print_floor_active`).
+        """
+        self._plate_bottom_z_zref = (None if z_zero_ref_mm is None
+                                     else float(z_zero_ref_mm))
+        if self._plate_bottom_z_zref is not None:
+            logger.info(f"StageController: plate-bottom Z datum = "
+                        f"{self._plate_bottom_z_zref:.3f} mm (zero-ref)")
+
+    def get_plate_bottom_z(self) -> float | None:
+        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated."""
+        return self._plate_bottom_z_zref
+
+    def set_plate_top_z(self, z_zero_ref_mm: float | None) -> None:
+        """Set the calibrated plate-top Z (zero-ref mm), or None to clear.
+
+        Paired with the plate bottom, this defines the reference vector that
+        tells :meth:`print_z_dir` which way is *up*. Pushed from the Calibration
+        page's ``plate_top_z`` reference. No motion / enforcement on its own.
+        """
+        self._plate_top_z_zref = (None if z_zero_ref_mm is None
+                                  else float(z_zero_ref_mm))
+        if self._plate_top_z_zref is not None:
+            logger.info(f"StageController: plate-top Z datum = "
+                        f"{self._plate_top_z_zref:.3f} mm (zero-ref)")
+
+    def get_plate_top_z(self) -> float | None:
+        """Calibrated plate-top Z (zero-ref mm), or None if uncalibrated."""
+        return getattr(self, "_plate_top_z_zref", None)
+
+    def print_z_dir(self) -> float:
+        """Up-direction sign for print-Z math, derived from the calibrated
+        plate-bottom→plate-top reference vector.
+
+        Returns +1.0 when "up" is a larger zero-ref Z (conventional) and -1.0
+        when "up" is a smaller zero-ref Z (ME3B V1). Falls back to the module
+        ``ZDIR`` when the plate top and bottom aren't both calibrated, so print
+        behaviour is unchanged until both references are taught.
+        """
+        return derive_z_up_sign(getattr(self, "_plate_top_z_zref", None),
+                                getattr(self, "_plate_bottom_z_zref", None))
+
+    def set_print_floor_active(self, active: bool) -> None:
+        """Arm/disarm the plate-bottom floor (armed only during printing)."""
+        self._print_floor_active = bool(active)
+
+    def print_height_to_zref(self, height_above_bottom_mm: float) -> float | None:
+        """Height above the plate bottom (mm) → zero-ref Z, or None if the
+        plate bottom is not yet calibrated."""
+        if self._plate_bottom_z_zref is None:
+            return None
+        return plate_relative_to_zref(self._plate_bottom_z_zref,
+                                      float(height_above_bottom_mm),
+                                      zdir=self.print_z_dir())
+
+    def zref_to_print_height(self, z_zero_ref_mm: float) -> float | None:
+        """Zero-ref Z (mm) → height above the plate bottom (mm), or None."""
+        if self._plate_bottom_z_zref is None:
+            return None
+        return zref_to_plate_relative(self._plate_bottom_z_zref,
+                                      float(z_zero_ref_mm),
+                                      zdir=self.print_z_dir())
+
+    def print_floor_violation(self, z_zero_ref_mm: float) -> bool:
+        """True if a zero-ref Z would put the needle *below* the plate bottom.
+
+        Used for the early warning before a print starts. Returns False when
+        the plate bottom is uncalibrated (nothing to compare against).
+        """
+        if self._plate_bottom_z_zref is None:
+            return False
+        return zref_to_plate_relative(
+            self._plate_bottom_z_zref, float(z_zero_ref_mm),
+            zdir=self.print_z_dir()) < -1e-6
+
+    def _apply_print_floor_raw(self, raw_z: float) -> float:
+        """Clamp a *raw* Marlin Z so the needle never goes deeper than the
+        plate bottom. No-op unless the floor is armed and calibrated.
+
+        Polarity-general: ``up*(raw - plate_bottom_raw) < 0`` means "deeper than
+        the floor" for either Z direction, and we cap at the floor. ``up`` is
+        the reference-vector direction (:meth:`print_z_dir`), falling back to
+        ``ZDIR`` when the plate top isn't taught.
+        """
+        if not self._print_floor_active or self._plate_bottom_z_zref is None:
+            return raw_z
+        pb_raw = self._plate_bottom_z_zref + self.zero_position.get("Z", 0.0)
+        if self.print_z_dir() * (raw_z - pb_raw) < 0:
+            logger.warning(
+                f"Print floor: Z {raw_z:.3f} would punch through the plate "
+                f"bottom ({pb_raw:.3f} mm raw) — clamped to plate bottom")
+            return pb_raw
+        return raw_z
 
     def apply_device_settings(self, axis_map: dict | None = None,
                               steps_per_mm: dict | None = None,
@@ -1033,34 +1434,23 @@ class StageController:
         """
         self.connect_stages(xy=False, zp=True, simulate_zp=simulate)
 
-    def disconnect_xy(self) -> None:
-        """Disconnect only the XY stage."""
-        if self.xy_jog:
-            self.xy_jog.stop()
-            self.xy_jog = None
-        if self.xy_stage:
-            self.xy_stage.stop()
-            self.xy_stage = None
-        self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
-        logger.info("XY stage disconnected")
-
-    def disconnect_zp(self) -> None:
-        """Disconnect only the ZP stage."""
-        if self.zp_jog:
-            self.zp_jog.stop()
-            self.zp_jog = None
-        if self.zp_stage:
-            self.zp_stage.stop()
-            self.zp_stage = None
-        self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
-        logger.info("ZP stage disconnected")
-
     def _handle_disconnect(self, stage_name: str) -> None:
-        logger.error(f"{stage_name} stage disconnected!")
-        if stage_name == "XY":
-            self.disconnect_xy()
-        elif stage_name == "ZP":
-            self.disconnect_zp()
+        # v7.5.x ZP reconnect hotfix: may be called from the watchdog thread
+        # AND the poller thread — serialize and make idempotent so a stage is
+        # only torn down (and the GUI only notified) once per disconnect.
+        with self._disconnect_lock:
+            if stage_name == "XY":
+                if self.xy_stage is None:
+                    return
+                logger.error("XY stage disconnected!")
+                self.disconnect_xy()
+            elif stage_name == "ZP":
+                if self.zp_stage is None:
+                    return
+                logger.error("ZP stage disconnected!")
+                self.disconnect_zp()
+            else:
+                return
         if self.on_disconnect:
             self.on_disconnect(stage_name)
 
@@ -1079,17 +1469,37 @@ class StageController:
         logger.info("XY stage disconnected")
 
     def disconnect_zp(self) -> None:
+        # v7.5.x ZP reconnect hotfix: release EVERY ZP resource in a safe
+        # order so a later Connect can re-acquire the port within the same
+        # process (previously a stale handle / poller reference could keep
+        # the COM port busy until a full app restart).
+        # 1) Stop the poller from touching the ZP serial BEFORE we close it
+        #    (prevents the poll thread racing serial.close()).
+        self._pos_poller.set_stages(self.xy_stage, None)
+        # 2) Detach the watchdog: the port watch AND the periodic M500 save
+        #    (the latter was leaked on every connect — never removed before).
+        self._watchdog.unwatch("ZP")
+        try:
+            self._watchdog.remove_periodic(self._periodic_zp_position_save)
+        except Exception:
+            pass
+        # 3) Stop the jog handler (unregisters its Processor handlers + thread).
         if self.zp_jog:
-            self.zp_jog.stop()
+            try:
+                self.zp_jog.stop()
+            except Exception:
+                pass
             self.zp_jog = None
+        # 4) Close the serial handle and drop the object.
         if self.zp_stage:
             try:
                 self.zp_stage.stop()
             except Exception:
                 pass
             self.zp_stage = None
-        self._pos_poller.set_stages(self.xy_stage, None)
-        self._watchdog.unwatch("ZP")
+        # 5) Forget the last-known-good port so the next scan rediscovers the
+        #    board on whatever COM it re-enumerated to after a power-cycle.
+        self._preferred_zp_port = None
         logger.info("ZP stage disconnected")
 
     def disconnect_stages(self) -> None:
@@ -1135,6 +1545,9 @@ class StageController:
             )
 
         self.xbox_queue = Queue()
+        # v7.5.x: live tuning channel + clean-stop signal for the worker
+        self.xbox_ctrl_queue = Queue()
+        self._xbox_stop_event = MPEvent()
 
         # v7.3.2: Convert stick_offsets keys to int for multiprocessing
         _so = None
@@ -1152,6 +1565,8 @@ class StageController:
             "stick_offsets": _so,
             "axis_deadzones": _adz,
             "debug_mode": debug_mode,
+            "ctrl_queue": self.xbox_ctrl_queue,
+            "stop_event": self._xbox_stop_event,
         }
 
         if use_thread:
@@ -1177,14 +1592,24 @@ class StageController:
             logger.info(f"Xbox worker started (PROCESS mode, mapping: {self._mapping_file})")
 
         self.xbox_poller = XboxQueuePoller(
-            self.xbox_queue, self.processor, debug_mode=debug_mode
+            self.xbox_queue, self.processor, debug_mode=debug_mode,
+            on_lost=self._zero_jog_velocities,  # v7.5.x: stop on loss
         )
         self.xbox_poller.start()
         self.xbox_poller._xbox_status = "waiting"  # v7.2.7: force initial status
 
 
     def disconnect_xbox(self) -> None:
-        """Disconnect Xbox controller. v7.2.7: thread cleanup"""
+        """Disconnect Xbox controller. v7.2.7: thread cleanup,
+        v7.5.x: stop_event lets thread-mode workers exit cleanly too."""
+        # v7.5.x: signal the worker first so it dispatches its final zeroes
+        # and exits its loop (works for both process and thread mode).
+        _ev = getattr(self, "_xbox_stop_event", None)
+        if _ev is not None:
+            try:
+                _ev.set()
+            except Exception:
+                pass
         if self.xbox_poller:
             self.xbox_poller.stop()
             self.xbox_poller = None
@@ -1192,17 +1617,28 @@ class StageController:
             self.xbox_process.terminate()
             self.xbox_process.join(timeout=2.0)
             self.xbox_process = None
-        # v7.2.7: thread mode cleanup
+        # v7.2.7: thread mode cleanup — v7.5.x: the stop_event above makes
+        # the thread-mode worker exit on its next loop iteration.
         _xt = getattr(self, "_xbox_thread", None)
         if _xt and _xt.is_alive():
-            # Thread mode — worker checks queue; we signal via _running
-            # but it's a daemon thread, so it dies when main exits.
-            # We can't cleanly stop it, but we nil the poller so no more dispatch.
-            pass
+            _xt.join(timeout=1.0)
         self._xbox_thread = None
         self.xbox_queue = None
+        self.xbox_ctrl_queue = None
+        self._xbox_stop_event = None
         # v7.3.4: Zero all jog velocities on disconnect so a stranded velocity
         # from an in-flight command can't persist and drive the stage.
+        self._zero_jog_velocities()
+        logger.info("Xbox controller disconnected")
+
+    def _zero_jog_velocities(self) -> None:
+        """v7.5.x: zero every jog-handler velocity (Z, pumps, XY).
+
+        Called on Xbox disconnect, on worker-reported controller loss, and
+        on heartbeat staleness, so a stranded velocity can never keep
+        driving the stages. The XY jog loop sends its explicit zero-velocity
+        stop on the resulting moving→stopped transition.
+        """
         if self.zp_jog:
             with self.zp_jog._lock:
                 self.zp_jog.vel_z = 0.0
@@ -1213,7 +1649,38 @@ class StageController:
             with self.xy_jog._lock:
                 self.xy_jog.vel_x = 0.0
                 self.xy_jog.vel_y = 0.0
-        logger.info("Xbox controller disconnected")
+
+    def update_xbox_tuning(self, stick_offsets: dict | None = None,
+                           axis_deadzones: dict | None = None,
+                           debug_mode: bool | None = None) -> bool:
+        """v7.5.x: push tuning changes to the RUNNING Xbox worker.
+
+        Previously deadzones / stick offsets / debug mode were process
+        arguments, so panel changes only took effect after a full
+        disconnect + reconnect. Returns True if an update was queued.
+        """
+        q = getattr(self, "xbox_ctrl_queue", None)
+        if q is None:
+            return False
+        payload: dict = {}
+        if stick_offsets is not None:
+            payload["stick_offsets"] = {int(k): float(v)
+                                        for k, v in stick_offsets.items()}
+        if axis_deadzones is not None:
+            payload["axis_deadzones"] = {int(k): float(v)
+                                         for k, v in axis_deadzones.items()}
+        if debug_mode is not None:
+            payload["debug_mode"] = bool(debug_mode)
+            if self.xbox_poller is not None:
+                self.xbox_poller.debug_mode = bool(debug_mode)
+        if not payload:
+            return False
+        try:
+            q.put(payload)
+            return True
+        except Exception as e:
+            logger.warning(f"Xbox tuning update failed: {e}")
+            return False
 
 
     def calibrate_xbox_sticks(self, duration: float = 2.0) -> dict:
@@ -1277,6 +1744,21 @@ class StageController:
             return ((pos[0] - zx) / 1000.0, (pos[1] - zy) / 1000.0)
         return (None, None)
 
+    def default_plate_center_um(self) -> tuple[float, float]:
+        """Absolute stage-µm centre of the XY safety envelope.
+
+        The default (uncalibrated) well plate is centred here so it always
+        sits in the middle of the configured travel envelope, regardless of
+        whether the envelope is symmetric.
+
+        v7.5.x: the safety-limit bounds are now **absolute** stage µm, so the
+        envelope midpoint (``safety_limits.xy_center()``) is already in the
+        absolute frame that ``WellPlate.get_all_positions_from_plate_center``
+        expects — no ``zero_position`` offset is added (adding it would place
+        the plate outside the physical box). For the symmetric default
+        envelope (±130000 / ±85000) the midpoint is (0, 0).
+        """
+        return self.safety_limits.xy_center()
 
     def wait_for_xy_arrival(
         self, target_x_mm: float, target_y_mm: float,
@@ -1334,10 +1816,14 @@ class StageController:
         deadline = time.monotonic() + timeout_s
         poll_interval = 0.15
 
+        # v7.5.x bugfix: poll Z via axis_map slot, not pos[0] (which is a
+        # pump under a non-default map). A wrong-axis read here could
+        # falsely confirm Z arrival and let XY move / Z descend early.
+        zi = _axis_index(self.zp_stage, "Z")
         while time.monotonic() < deadline:
             pos = self.get_zp_position(cached=False)
-            if pos[0] is not None:
-                z_mm = (pos[0] - self.zero_position.get("Z", 0))
+            if zi is not None and zi < len(pos) and pos[zi] is not None:
+                z_mm = (pos[zi] - self.zero_position.get("Z", 0))
                 if abs(z_mm - target_z_mm) <= tolerance_mm:
                     return True
             time.sleep(poll_interval)
@@ -1389,6 +1875,39 @@ class StageController:
         return {logical: self.zp_logical_value(pos, logical)
                 for logical in ("Z", "P1", "P2", "P3")}
 
+    def get_zp_position_logical_tuple(self, cached: bool = True) -> tuple:
+        """v7.5.x: ZP position as a logical-ordered tuple ``(Z, P1, P2, P3)``.
+
+        Convenience for :meth:`PositionLogger.record`, whose ``zp_pos``
+        contract is logical order. Resolving each slot through the live
+        ``axis_map`` keeps the diagnostic position log correctly labeled
+        under non-default per-machine wiring (where the raw
+        :meth:`get_zp_position` tuple is physical ``(X, Y, Z, E)`` order).
+        """
+        pos = self.get_zp_position(cached=cached)
+        return tuple(self.zp_logical_value(pos, logical)
+                     for logical in ("Z", "P1", "P2", "P3"))
+
+    def get_zp_position_zero_ref(self, cached: bool = True) -> dict:
+        """v7.5.x: ZP position keyed by logical axis, **zero-referenced** (mm).
+
+        Mirrors the readout frame everywhere in the app:
+        ``displayed = raw − zero_position[axis]``. This is the frame the
+        manual override (:meth:`override_zp_position`) and the saved
+        last-known-position snapshot use, so a value read here can be fed
+        straight back to ``override_zp_position`` to reproduce it.
+
+        Returns ``{"Z":.., "P1":.., "P2":.., "P3":..}`` with ``None`` for
+        unmapped or unread slots.
+        """
+        raw = self.get_zp_position_logical(cached=cached)
+        out: dict[str, float | None] = {}
+        for ax in ("Z", "P1", "P2", "P3"):
+            v = raw.get(ax)
+            out[ax] = None if v is None else (
+                float(v) - float(self.zero_position.get(ax, 0.0)))
+        return out
+
     def get_speed_info(self) -> dict:
         """Return current jog speeds as numeric values.
 
@@ -1406,7 +1925,15 @@ class StageController:
 
     @property
     def is_zp_connected(self) -> bool:
-        return self.zp_stage is not None
+        # v7.5.x ZP reconnect hotfix: a ZPStageManager can exist with a
+        # dead/None serial after a failed (re)connect. Report connected
+        # only when the serial backend is actually live so the badge never
+        # lies. Simulators always have a live backend → short-circuit.
+        if self.zp_stage is None:
+            return False
+        if getattr(self.zp_stage, "simulate", False):
+            return True
+        return getattr(self.zp_stage, "serial", None) is not None
 
     @property
     def simulate_xy(self) -> bool:
@@ -1446,17 +1973,28 @@ class StageController:
         if self.zp_stage:
             pos = self.zp_stage.get_current_position()
             if pos[0] is not None:
-                self.zero_position["Z"] = pos[0]
-                self.zero_position["P1"] = pos[1]
-                self.zero_position["P2"] = pos[2]
-                self.zero_position["P3"] = pos[3]
+                # v7.5.x bugfix: map each logical axis to its physical
+                # tuple slot via axis_map. Hardcoding Z=pos[0]/P1=pos[1]/…
+                # recorded the wrong zero on non-default maps (ME3B V1).
+                for logical in ("Z", "P1", "P2", "P3"):
+                    i = _axis_index(self.zp_stage, logical)
+                    if i is not None and i < len(pos) and pos[i] is not None:
+                        self.zero_position[logical] = pos[i]
 
         logger.info(f"Zero position calibrated: {self.zero_position}")
 
         self.position_logger.record(
             "calibrate_zero",
-            xy_pos=self.get_xy_position(cached=False),
-            zp_pos=self.get_zp_position(cached=False),
+            # v7.5.x: cached reads — this handler runs on the Processor
+            # dispatch thread (Xbox button "zero_needle_pos"); the two
+            # fresh serial reads above are needed for accuracy, but
+            # re-querying both stages again just for the log stalled every
+            # queued velocity command behind ~2 extra serial round-trips
+            # (head-of-line blocking felt as freeze-then-replay).
+            xy_pos=self.get_xy_position(cached=True),
+            # v7.5.x: log in logical (Z,P1,P2,P3) order — PositionLogger's
+            # contract — so the CSV stays correct under non-default axis maps.
+            zp_pos=self.get_zp_position_logical_tuple(cached=True),
             metadata={"zero_position": dict(self.zero_position)},
         )
 
@@ -1534,7 +2072,8 @@ class StageController:
             # Log the event
             self.position_logger.record(
                 f"zero_reset_{pump.lower()}",
-                zp_pos=pos,
+                # v7.5.x: log in logical (Z,P1,P2,P3) order (see helper).
+                zp_pos=self.get_zp_position_logical_tuple(cached=True),
                 metadata={"pump": pump, "new_zero": pos[idx]},
             )
 
@@ -1610,19 +2149,76 @@ class StageController:
         for Z, without affecting XY or pump axes.
         """
         pos = self.get_zp_position(cached=True)
-        if pos[0] is None:
+        # v7.5.x bugfix: resolve Z's slot via axis_map (was pos[0], which
+        # is a pump under a non-default map). Mirrors reset_pump_zero.
+        zi = _axis_index(self.zp_stage, "Z")
+        if zi is None or pos is None or zi >= len(pos) or pos[zi] is None:
             logger.warning("Cannot reset Z zero — ZP stage not connected")
             return
 
-        self.zero_position["Z"] = pos[0]
-        logger.info(f"Z zero set to {pos[0]:.3f} mm (absolute)")
+        self.zero_position["Z"] = pos[zi]
+        logger.info(f"Z zero set to {pos[zi]:.3f} mm (absolute)")
 
         self.position_logger.record(
             "zero_reset_z",
-            zp_pos=pos,
-            metadata={"new_zero": pos[0]},
+            # v7.5.x: log in logical (Z,P1,P2,P3) order (see helper).
+            zp_pos=self.get_zp_position_logical_tuple(cached=True),
+            metadata={"new_zero": pos[zi]},
         )
 
+    def override_zp_position(self, axis: str, value: float) -> dict:
+        """v7.5.x: manually re-sync a ZP axis's firmware position counter.
+
+        The operator declares the axis is physically at ``value`` — in
+        the same zero-referenced mm frame as the position readout and the
+        safety limits. We send a Marlin ``G92`` setting the *physical*
+        counter to ``value + zero_position[axis]`` so the zero-referenced
+        readout becomes ``value`` while the established zero reference is
+        preserved (unlike :meth:`zero_axis`, which forces both the
+        counter and the reference to 0).
+
+        Needed because Marlin has no absolute encoder: after a board
+        power cycle it reports 0 (or a stale value) and a position
+        *refresh* simply re-reads that wrong value. Only the operator
+        knows where the axis actually is — this is the manual recovery
+        path for that case. No motion occurs (G92 only rebases the
+        counter).
+
+        Returns ``{"ok": True, "axis": str, "raw": float,
+        "previous_raw": float|None}`` on success, or
+        ``{"ok": False, "axis": str, "error": str}`` on failure.
+        """
+        if axis not in ("Z", "P1", "P2", "P3"):
+            return {"ok": False, "axis": axis,
+                    "error": f"unsupported axis: {axis} (ZP axes only)"}
+        if self.zp_stage is None:
+            return {"ok": False, "axis": axis,
+                    "error": "ZP stage not connected"}
+        try:
+            prev = self.get_zp_position(cached=False)
+            previous_raw = self.zp_logical_value(prev, axis)
+            zero = float(self.zero_position.get(axis, 0.0))
+            raw = float(value) + zero
+            ok = self.zp_stage.set_position(axis, raw)
+            if not ok:
+                return {"ok": False, "axis": axis,
+                        "error": f"axis_map has no entry for {axis}"}
+            logger.info(
+                f"ZP {axis} position overridden to {value:.4f} "
+                f"(raw G92 {raw:.4f}, zero {zero:.4f}); "
+                f"previous raw = {previous_raw}")
+            self.position_logger.record(
+                f"override_position_{axis.lower()}",
+                # v7.5.x: log in logical (Z,P1,P2,P3) order (see helper).
+                zp_pos=self.get_zp_position_logical_tuple(cached=False),
+                metadata={"axis": axis, "value": value, "raw": raw,
+                          "previous_raw": previous_raw},
+            )
+            return {"ok": True, "axis": axis, "raw": raw,
+                    "previous_raw": previous_raw}
+        except Exception as e:
+            logger.warning(f"ZP {axis} position override failed: {e}")
+            return {"ok": False, "axis": axis, "error": str(e)}
 
     def move_xy_absolute(
         self, x: float, y: float, from_zero_ref: bool = True, fast: bool = False
@@ -1631,26 +2227,50 @@ class StageController:
         """v7.3: Accept mm, convert to µm internally.
 
         When from_zero_ref=True, x/y are in mm (from WellPlate/trajectory).
-        Converts to µm, applies safety limits, adds zero reference (µm),
+        Converts to µm and adds the zero reference to get the absolute stage
+        target, applies safety limits (the XY envelope is absolute stage µm),
         then sends to stage which expects µm (Prior manual page 36).
+
+        v7.5.x: the XY envelope is now absolute, so clamp the absolute target
+        (after adding zero) rather than the zero-referenced value.
         """
         if not self.xy_stage:
             return
 
         if from_zero_ref:
-            # Convert mm → µm, then add zero reference (which is in µm)
-            x_um = x * 1000.0
-            y_um = y * 1000.0
-            if self.safety_limits.enabled:
-                x_um, y_um = self.safety_limits.clamp_xy(x_um, y_um)
-            x_um += self.zero_position["x"]
-            y_um += self.zero_position["y"]
+            # Convert mm → µm, then add zero reference (which is in µm) to
+            # reach the absolute stage frame the envelope is defined in.
+            x_um = x * 1000.0 + self.zero_position["x"]
+            y_um = y * 1000.0 + self.zero_position["y"]
         else:
-            # Legacy: raw values passed directly (assumed µm already)
+            # Legacy: raw values passed directly (assumed absolute µm already)
             x_um = x
             y_um = y
 
+        if self.safety_limits.enabled:
+            x_um, y_um = self.safety_limits.clamp_xy(x_um, y_um)
+
         self.xy_stage.move_stage_to_position(x_um, y_um, fast)
+
+    def move_xy_absolute_um(self, x_um: float, y_um: float,
+                            fast: bool = False) -> None:
+        """Move XY to an ABSOLUTE stage position given in µm.
+
+        Clearly-named entry point for callers that already work in absolute
+        stage µm (e.g. the Calibration page's predicted/observed well centres,
+        which are ``zero_position + offset``). Equivalent to
+        ``move_xy_absolute(x, y, from_zero_ref=False)`` but with safety limits
+        still honored.
+
+        v7.5.x: the XY envelope is now absolute stage µm, so the absolute
+        target is clamped directly (no zero-ref round-trip).
+        """
+        if not self.xy_stage:
+            return
+        if self.safety_limits.enabled:
+            x_um, y_um = self.safety_limits.clamp_xy(x_um, y_um)
+        self.xy_stage.move_stage_to_position(x_um, y_um, fast)
+
     def move_xy_relative(self, dx: float, dy: float) -> None:
         """
         Move XY stage by a relative offset in µm.
@@ -1660,23 +2280,24 @@ class StageController:
 
         Safety limits are projected from cached position (minor boundary
         imprecision is acceptable vs. the gross errors from the old approach).
+
+        v7.5.x: the XY envelope is absolute stage µm, so clamp the absolute
+        destination (cached + delta) directly — no zero-ref round-trip. This
+        keeps small moves valid after a Set Zero re-anchors the plate origin
+        mid-travel (the old zero-ref clamp wrongly rejected negative deltas).
         """
         if not self.xy_stage:
             return
 
-        # Safety: project cached position + delta, clamp if needed
+        # Safety: project cached absolute position + delta, clamp if needed
         if self.safety_limits.enabled:
             pos = self.get_xy_position(cached=True)
             if pos[0] is not None:
-                zero_x = self.zero_position["x"]
-                zero_y = self.zero_position["y"]
-                cur_zr_x = pos[0] - zero_x
-                cur_zr_y = pos[1] - zero_y
-                new_zr_x = cur_zr_x + dx
-                new_zr_y = cur_zr_y + dy
-                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_zr_x, new_zr_y)
-                dx = clamped_x - cur_zr_x
-                dy = clamped_y - cur_zr_y
+                new_x = pos[0] + dx
+                new_y = pos[1] + dy
+                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_x, new_y)
+                dx = clamped_x - pos[0]
+                dy = clamped_y - pos[1]
 
         logger.debug(f"move_xy_relative: sending dx={round(dx)} dy={round(dy)} "
                      f"µm (raw: dx={dx:.2f} dy={dy:.2f})")
@@ -1697,6 +2318,10 @@ class StageController:
         Used by the Hardware Setup → Device sub-page jog buttons so
         users can move freely to discover mechanical extremes when
         setting up a new machine.
+
+        v7.5.x: the XY envelope is absolute stage µm, so clamp the absolute
+        destination (cached + delta) directly — no zero-ref round-trip. Small
+        moves stay valid after a Set Zero re-anchors the plate origin mid-travel.
         """
         if not self.xy_stage:
             return
@@ -1704,19 +2329,15 @@ class StageController:
         req_dx, req_dy = dx_um, dy_um  # preserve original request for debug log
         cached_pos = self.get_xy_position(cached=True)
 
-        # Safety: project cached position + delta, clamp if needed
-        # Note: safety limits and positions are all in the same units (microns)
+        # Safety: project cached absolute position + delta, clamp if needed.
+        # Limits and positions are all absolute stage µm.
         if self.safety_limits.enabled and not bypass_safety:
             if cached_pos[0] is not None:
-                zero_x = self.zero_position["x"]
-                zero_y = self.zero_position["y"]
-                cur_zr_x = cached_pos[0] - zero_x
-                cur_zr_y = cached_pos[1] - zero_y
-                new_zr_x = cur_zr_x + dx_um
-                new_zr_y = cur_zr_y + dy_um
-                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_zr_x, new_zr_y)
-                dx_um = clamped_x - cur_zr_x
-                dy_um = clamped_y - cur_zr_y
+                new_x = cached_pos[0] + dx_um
+                new_y = cached_pos[1] + dy_um
+                clamped_x, clamped_y = self.safety_limits.clamp_xy(new_x, new_y)
+                dx_um = clamped_x - cached_pos[0]
+                dy_um = clamped_y - cached_pos[1]
 
         clamped = (dx_um != req_dx or dy_um != req_dy)
         _dbg.log(
@@ -1747,11 +2368,17 @@ class StageController:
         """
         if not self.zp_stage:
             return
-        if self.safety_limits.enabled and from_zero_ref:
-            z_value = self.safety_limits.clamp_z(z_value)
         position = z_value
         if from_zero_ref:
             position += self.zero_position["Z"]
+        # v7.5.x: the Z envelope is absolute Marlin raw mm. Clamp the
+        # absolute destination (after adding the zero offset) in BOTH the
+        # zero-ref and raw paths — the raw path previously skipped the soft
+        # limit, so this also tightens safety.
+        if self.safety_limits.enabled:
+            position = self.safety_limits.clamp_z(position)
+        # v7.5.x: never punch through the plate bottom during a print.
+        position = self._apply_print_floor_raw(position)
         self.zp_stage.move_absolute(
             {_axis_letter(self.zp_stage, "Z"): position}, fast,
             feedrate_mm_min=feedrate_mm_min)
@@ -1771,14 +2398,125 @@ class StageController:
         if self.safety_limits.enabled and not bypass_safety:
             try:
                 pos = self.get_zp_position(cached=True)
-                if pos[0] is not None:
-                    new_z = pos[0] + distance
-                    clamped = self.safety_limits.clamp_z(new_z - self.zero_position["Z"])
-                    distance = (clamped + self.zero_position["Z"]) - pos[0]
+                # v7.5.x bugfix: resolve Z's tuple slot via the live
+                # axis_map instead of hardcoding pos[0]. The ZP tuple is
+                # physical Marlin order (X,Y,Z,E); on machines whose
+                # axis_map routes Z to a physical axis other than X (e.g.
+                # ME3B V1: Z→Z = index 2, P1→X = index 0), pos[0] is a
+                # PUMP, not Z. Reading it bypassed the Z soft-limit and —
+                # when that pump sat outside the Z envelope — drove Z a
+                # fixed direction regardless of the requested up/down.
+                # Mirrors the move_pump_relative pattern.
+                zi = _axis_index(self.zp_stage, "Z")
+                if zi is not None and zi < len(pos) and pos[zi] is not None:
+                    cur_z = pos[zi]
+                    # v7.5.x: the Z envelope is absolute Marlin raw mm, so
+                    # clamp the absolute destination (cur + delta) directly —
+                    # no zero-ref round-trip. Keeps jog valid after a Set Z
+                    # Zero / needle-zero re-anchors the display zero (the old
+                    # zero-ref clamp went stale and wrongly rejected moves).
+                    clamped = self.safety_limits.clamp_z(cur_z + distance)
+                    # v7.5.x: also hold above the plate bottom during a print.
+                    clamped = self._apply_print_floor_raw(clamped)
+                    distance = clamped - cur_z
             except Exception:
                 pass
         self.zp_stage.move_relative(
             {_axis_letter(self.zp_stage, "Z"): distance}, feedrate)
+
+    # ── v7.5.x: polarity-safe travel-Z retract guarantee ───────────────
+    #
+    # CRITICAL SAFETY: before ANY XY move to a *different* location the needle
+    # must be retracted to the safe / "move" / travel Z height. The two helpers
+    # below make that test/guarantee POLARITY-SAFE (correct for ZDIR=+1 and the
+    # ME3B V1 ZDIR=-1 where the needle descends as raw Z increases) and the
+    # retract NEVER LOWERS the needle — a misconfigured/too-low target degrades
+    # to a no-op instead of crashing the needle into the plate.
+
+    def z_height_of(self, raw_zref_mm: float) -> float:
+        """Zero-ref raw Z (mm) → operator HEIGHT frame (up = +).
+
+        Multiplying by ``ZDIR`` yields a monotonic height where *larger always
+        means the needle is physically higher* (further from the plate),
+        regardless of the machine's raw-Z polarity. Use this for any
+        "is the needle high enough?" comparison instead of comparing raw Z.
+        """
+        return ZDIR * float(raw_zref_mm)
+
+    def default_travel_z(self, reference_z_zero_ref_mm: float,
+                         margin_mm: float = 10.0) -> float:
+        """Fallback travel / "move" Z (zero-ref mm) when no Safe Z is calibrated.
+
+        Returns a height ``margin_mm`` ABOVE ``reference`` in the polarity-safe
+        HEIGHT frame, so the needle is genuinely retracted above the work
+        position regardless of ``ZDIR`` (NOT a raw literal like ``5.0``, which is
+        a *descent* on a ZDIR=-1 machine). The insert-clearance floor and the
+        soft-limit envelope are still applied when this value is fed to a move.
+        """
+        return float(reference_z_zero_ref_mm) + ZDIR * abs(margin_mm)
+
+    def needle_at_or_above(self, current_raw_zref_mm: float,
+                           reference_raw_zref_mm: float,
+                           tol_mm: float = 0.05) -> bool:
+        """True if the needle is at least as HIGH (retracted) as a reference Z.
+
+        Polarity-safe — compares in the height frame so it is correct for both
+        ``ZDIR=+1`` and ``ZDIR=-1``. ``tol_mm`` is a small height slack.
+        """
+        return (self.z_height_of(current_raw_zref_mm)
+                >= self.z_height_of(reference_raw_zref_mm) - abs(tol_mm))
+
+    def ensure_retracted_to(self, safe_z_zero_ref_mm: float,
+                            tol_mm: float = 0.1,
+                            timeout_s: float = 15.0) -> bool:
+        """Guarantee the needle is retracted to >= ``safe_z`` before XY travel.
+
+        Raises the needle (in the HEIGHT frame) to at least ``safe_z``
+        (zero-ref mm) and BLOCKS until Z confirms arrival. It **never lowers**
+        the needle: if the needle is already at/above the target height
+        (polarity-aware), it returns immediately without motion, so a
+        misconfigured/too-low target can never cause a crash-down. Honors the
+        plate-insert clearance floor (:meth:`set_min_travel_z`).
+
+        Returns True if the needle is confirmed at/above the height (or there is
+        no ZP stage), False if the retract move timed out.
+        """
+        if not self.is_zp_connected:
+            return True
+
+        target = float(safe_z_zero_ref_mm)
+        # Floor the retract so the needle clears the tallest insert/tube.
+        # Compare in the height frame (polarity-safe).
+        floor = getattr(self, "_min_travel_z_mm", None)
+        if floor is not None and self.z_height_of(floor) > self.z_height_of(target):
+            target = float(floor)
+
+        # Already at/above the target height? No motion — never descend.
+        zp = self.get_zp_position(cached=False)
+        cur = self.zp_logical_value(zp, "Z")
+        if cur is not None:
+            cur_zref = cur - self.zero_position.get("Z", 0)
+            if self.needle_at_or_above(cur_zref, target, tol_mm=tol_mm):
+                return True
+
+        # Retract up to the target height and wait (M400 + position poll).
+        self._pos_poller.suspend()
+        try:
+            self.move_z_absolute(target, from_zero_ref=True,
+                                 feedrate_mm_min=self._zp_retract_feedrate)
+            if hasattr(self.zp_stage, "flush_moves"):
+                if not self.zp_stage.flush_moves(timeout_s=timeout_s):
+                    logger.error("ensure_retracted_to: Z retract M400 timed out "
+                                 "— needle may not be at travel height")
+                    return False
+            ok = self.wait_for_z_arrival(target, tolerance_mm=tol_mm,
+                                         timeout_s=timeout_s)
+            if not ok:
+                logger.error("ensure_retracted_to: Z retract position "
+                             "verification failed")
+            return ok
+        finally:
+            self._pos_poller.resume()
 
     def safe_travel_to(
         self,
@@ -1818,9 +2556,12 @@ class StageController:
 
         # v7.4.8: floor the retract height so the needle clears the
         # tallest insert/tube on the plate (set via set_min_travel_z()).
-        # Both values are zero-referenced mm; larger Z = higher.
+        # Both values are zero-referenced mm. v7.5.x: compare in the HEIGHT
+        # frame (polarity-safe) so the floor still raises — not lowers — the
+        # needle on ZDIR=-1 machines where larger raw Z = lower needle.
         min_travel_z = getattr(self, "_min_travel_z_mm", None)
-        if min_travel_z is not None and min_travel_z > safe_z_mm:
+        if min_travel_z is not None and \
+                self.z_height_of(min_travel_z) > self.z_height_of(safe_z_mm):
             logger.info(
                 f"safe_travel_to: raising safe Z {safe_z_mm:.2f} → "
                 f"{min_travel_z:.2f} mm to clear plate inserts")
@@ -1935,10 +2676,12 @@ class StageController:
                     idx = _axis_index(self.zp_stage, pump)
                     if idx is not None and idx < len(pos):
                         cur = pos[idx]
-                        zero_ref = self.zero_position.get(pump, 0)
+                        # v7.5.x: pump envelope is absolute Marlin raw mm —
+                        # clamp the absolute destination directly (no zero-ref
+                        # round-trip), so it stays valid after a pump re-zero.
                         clamped = self.safety_limits.clamp_pump(
-                            cur + distance - zero_ref, pump)
-                        distance = (clamped + zero_ref) - cur
+                            cur + distance, pump)
+                        distance = clamped - cur
             except Exception:
                 pass
         mapped = _axis_letter(self.zp_stage, pump)

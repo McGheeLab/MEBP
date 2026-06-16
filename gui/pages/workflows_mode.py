@@ -23,6 +23,7 @@ from gui.pages.workflows._stub_workflow import StubWorkflowPage
 from gui.pages.workflows.spheroid_pickup_workflow import (
     SpheroidPickupWorkflowPage,
 )
+from gui.pages.workflows.quick_print_workflow import QuickPrintWorkflowPage
 
 if TYPE_CHECKING:
     from SupportClasses.StageController import StageController
@@ -77,6 +78,11 @@ class WorkflowsModePage(QWidget):
                     controller=controller,
                     settings=settings,
                     camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "quick_print":
+                page = QuickPrintWorkflowPage(
+                    controller=controller,
+                    settings=settings,
                 )
             else:
                 page = StubWorkflowPage(tile.title)

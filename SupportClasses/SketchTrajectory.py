@@ -104,7 +104,10 @@ class Sketch:
 
     shapes: list[SketchShape] = field(default_factory=list)
 
-    z_start_mm: float = 0.0
+    # v7.5.x: ``z_start_mm`` is the first-layer print height measured UP from
+    # the calibrated plate bottom (mm, ≥ 0), not an absolute Z. The page bakes
+    # it into the internal zero-ref frame when the plate bottom is known.
+    z_start_mm: float = 0.2
     layer_height_mm: float = 0.2
     num_layers: int = 1
 
@@ -134,7 +137,7 @@ class Sketch:
     def from_dict(cls, d: dict) -> "Sketch":
         sk = cls()
         sk.shapes = [SketchShape.from_dict(s) for s in d.get("shapes", [])]
-        sk.z_start_mm = float(d.get("z_start_mm", 0.0))
+        sk.z_start_mm = float(d.get("z_start_mm", 0.2))
         sk.layer_height_mm = float(d.get("layer_height_mm", 0.2))
         sk.num_layers = int(d.get("num_layers", 1))
         sk.print_speed_mm_s = float(d.get("print_speed_mm_s", 5.0))

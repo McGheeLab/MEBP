@@ -72,10 +72,24 @@ class CameraManager(QObject):
         self._max_cameras = max_cameras
         self._cameras: list[CameraWidget] = []
         self._available_sources: list[tuple[str, object]] = []
+        # v7.5.x: cached DirectShow enumeration (name + device path per
+        # index), refreshed on detect_cameras(). Used to resolve a slot's
+        # stable per-device identity for the calibration store.
+        self._ds_cameras: list[dict] = []
 
         # Per-camera calibration data
         self._um_per_px: list[float] = [1.67] * max_cameras
         self._magnification: list[float] = [2.0] * max_cameras
+        # v7.5.x: Track whether each slot's µm/px was *explicitly* set by a
+        # calibration vs. still the 1.67 seed default. Consumers that must
+        # refuse to run on an uncalibrated camera (needle-zero / plate edge
+        # fit) check this instead of `get_um_per_px(...) > 0` — the seed
+        # default is > 0 and would otherwise mask the uncalibrated case.
+        self._um_per_px_set: list[bool] = [False] * max_cameras
+        # v7.5.x: per-slot in-plane rotation (deg) — the stage direction that
+        # maps to the camera's lateral image axis, from the µm/px calibration.
+        # None = not measured (needle aligner falls back to nominal mounting).
+        self._rotation_deg: list[Optional[float]] = [None] * max_cameras
 
         # Create camera widgets (headless — no built-in controls)
         if CAMERA_AVAILABLE and CameraWidget is not None:
@@ -147,9 +161,34 @@ class CameraManager(QObject):
             if hasattr(cam, 'refresh_cameras'):
                 cam.refresh_cameras()
 
+        # v7.5.x: refresh the DirectShow identity map (Windows; [] elsewhere).
+        try:
+            from gui.widgets.camera_identity import enumerate_directshow_cameras
+            self._ds_cameras = enumerate_directshow_cameras()
+        except Exception as exc:
+            logger.debug(f"DirectShow identity enumeration skipped: {exc}")
+            self._ds_cameras = []
+
         n = len(self._available_sources)
         logger.info(f"CameraManager detected {n} sources")
         self.cameras_detected.emit(n)
+
+    def camera_identity(self, cam_idx: int) -> Optional[tuple[str, str]]:
+        """Stable ``(identity_key, friendly_name)`` for a slot's source.
+
+        Resolves the slot's currently-assigned source against the cached
+        DirectShow enumeration. Returns None if the slot has no source.
+        Used to key the per-device µm/px calibration store.
+        """
+        source = self.get_source(cam_idx)
+        if source is None:
+            return None
+        try:
+            from gui.widgets.camera_identity import identity_for_source
+            return identity_for_source(source, self._ds_cameras)
+        except Exception as exc:
+            logger.debug(f"camera_identity({cam_idx}) failed: {exc}")
+            return None
 
     # ── Source assignment ─────────────────────────────────────────
 
@@ -243,9 +282,35 @@ class CameraManager(QObject):
         return 1.67
 
     def set_um_per_px(self, cam_idx: int, value: float):
-        """Set microns per pixel for a camera."""
+        """Set microns per pixel for a camera.
+
+        Marks the slot as explicitly calibrated (see ``is_um_per_px_calibrated``).
+        """
         if 0 <= cam_idx < self._max_cameras:
             self._um_per_px[cam_idx] = value
+            self._um_per_px_set[cam_idx] = True
+
+    def is_um_per_px_calibrated(self, cam_idx: int) -> bool:
+        """True once ``set_um_per_px`` has supplied a real value for the slot.
+
+        Distinguishes a calibrated camera from one still carrying the 1.67
+        seed default, so callers can refuse to run on uncalibrated cameras.
+        """
+        if 0 <= cam_idx < self._max_cameras:
+            return self._um_per_px_set[cam_idx]
+        return False
+
+    def get_rotation_deg(self, cam_idx: int) -> Optional[float]:
+        """In-plane rotation (deg) measured for a slot, or None if unmeasured."""
+        if 0 <= cam_idx < self._max_cameras:
+            return self._rotation_deg[cam_idx]
+        return None
+
+    def set_rotation_deg(self, cam_idx: int, value: Optional[float]):
+        """Set (or clear, with None) the in-plane rotation for a slot."""
+        if 0 <= cam_idx < self._max_cameras:
+            self._rotation_deg[cam_idx] = (
+                None if value is None else float(value))
 
     def get_magnification(self, cam_idx: int) -> float:
         """Get objective magnification for a camera."""

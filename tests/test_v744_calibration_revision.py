@@ -49,34 +49,34 @@ class TestCameraRolePersistence(unittest.TestCase):
         cfg = HardwareConfig()
         cfg.set_camera_role(0, CameraRole.NEEDLE_X)
         cfg.set_camera_role(1, CameraRole.NEEDLE_Y)
-        cfg.set_camera_role(2, CameraRole.PLATE)
+        cfg.set_camera_role(2, CameraRole.MICROSCOPE)
         self.assertEqual(cfg.camera_roles[0], CameraRole.NEEDLE_X)
         self.assertEqual(cfg.camera_roles[1], CameraRole.NEEDLE_Y)
-        self.assertEqual(cfg.camera_roles[2], CameraRole.PLATE)
+        self.assertEqual(cfg.camera_roles[2], CameraRole.MICROSCOPE)
 
     def test_set_camera_role_out_of_range_silently_ignored(self):
         cfg = HardwareConfig()
         # Should not raise.
-        cfg.set_camera_role(99, CameraRole.PLATE)
+        cfg.set_camera_role(99, CameraRole.MICROSCOPE)
         for r in cfg.camera_roles:
             self.assertEqual(r, CameraRole.UNASSIGNED)
 
     def test_camera_for_role_returns_first_match(self):
         cfg = HardwareConfig()
         cfg.set_camera_role(0, CameraRole.NEEDLE_X)
-        cfg.set_camera_role(2, CameraRole.PLATE)
+        cfg.set_camera_role(2, CameraRole.MICROSCOPE)
         self.assertEqual(cfg.camera_for_role(CameraRole.NEEDLE_X), 0)
-        self.assertEqual(cfg.camera_for_role(CameraRole.PLATE), 2)
+        self.assertEqual(cfg.camera_for_role(CameraRole.MICROSCOPE), 2)
         self.assertIsNone(cfg.camera_for_role(CameraRole.NEEDLE_Y))
 
     def test_roundtrip_to_dict_from_dict(self):
         cfg = HardwareConfig()
         cfg.set_camera_role(0, CameraRole.NEEDLE_X)
         cfg.set_camera_role(1, CameraRole.NEEDLE_Y)
-        cfg.set_camera_role(2, CameraRole.PLATE)
+        cfg.set_camera_role(2, CameraRole.MICROSCOPE)
         data = cfg.to_dict()
         self.assertEqual(
-            data["camera_roles"], ["needle_x", "needle_y", "plate"]
+            data["camera_roles"], ["needle_x", "needle_y", "microscope"]
         )
         cfg2 = HardwareConfig.from_dict(data)
         self.assertEqual(cfg2.camera_roles, cfg.camera_roles)
@@ -92,12 +92,24 @@ class TestCameraRolePersistence(unittest.TestCase):
     def test_unknown_role_string_falls_back_to_unassigned(self):
         data = {
             "config_name": "weird",
-            "camera_roles": ["needle_x", "made_up", "plate"],
+            "camera_roles": ["needle_x", "made_up", "microscope"],
         }
         cfg = HardwareConfig.from_dict(data)
         self.assertEqual(cfg.camera_roles[0], CameraRole.NEEDLE_X)
         self.assertEqual(cfg.camera_roles[1], CameraRole.UNASSIGNED)
-        self.assertEqual(cfg.camera_roles[2], CameraRole.PLATE)
+        self.assertEqual(cfg.camera_roles[2], CameraRole.MICROSCOPE)
+
+    def test_legacy_plate_role_migrates_to_microscope(self):
+        # v7.5.x: the PLATE role was removed — the microscope camera views
+        # the plate. A config persisted with the old "plate" string loads
+        # as MICROSCOPE on that slot.
+        data = {
+            "config_name": "legacy-plate",
+            "camera_roles": ["needle_x", "plate"],
+        }
+        cfg = HardwareConfig.from_dict(data)
+        self.assertEqual(cfg.camera_roles[0], CameraRole.NEEDLE_X)
+        self.assertEqual(cfg.camera_roles[1], CameraRole.MICROSCOPE)
 
 
 # ---------------------------------------------------------------------------

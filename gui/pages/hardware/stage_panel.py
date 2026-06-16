@@ -37,6 +37,7 @@ from gui.pages.hardware.device_profile import (
 from gui.widgets.icons import icon, icon_button, set_button_icon
 from gui.widgets.jog_button_array import JogButtonArray
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
+from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,7 @@ class StageHardwarePanel(QWidget):
         outer.addWidget(self._build_xy_cal_group())
         outer.addWidget(self._build_steps_cal_group())
         outer.addWidget(self._build_setup_jog_safety_group())
+        outer.addWidget(self._build_override_position_group())
         outer.addWidget(self._build_zp_feedrates_group())
         # v7.4.2 hotfix: Axis Direction Flips section removed — direction
         # inversion now lives exclusively in steps_per_mm sign (see the
@@ -598,6 +600,136 @@ class StageHardwarePanel(QWidget):
         outer.addLayout(save_row)
 
         return grp
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.5.x: Override / sync axis position (power-cycle recovery)
+    # ════════════════════════════════════════════════════════════════
+    #
+    # Marlin (ZP) has no absolute encoder: after the board loses power it
+    # powers up reporting 0, so the position readout is wrong and a
+    # Refresh just re-reads the wrong value. This card lets the operator
+    # tell the firmware where each ZP axis physically is (sends a G92 to
+    # rebase the counter — no motion). The established zero reference is
+    # preserved, so the value entered is in the same zero-referenced mm
+    # frame as the readout and the safety limits.
+
+    def _build_override_position_group(self) -> QGroupBox:
+        grp = QGroupBox("Override / Sync Axis Position")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "After a ZP-board power cycle, Marlin powers up at <b>0</b> "
+            "(it has no absolute encoder), so the position is wrong and "
+            "<i>Refresh</i> just re-reads the wrong value. Enter where "
+            "each axis physically is and click <b>Set Position</b> — this "
+            "rebases the firmware counter (G92) <b>without moving</b>. "
+            "Values are zero-referenced <b>mm</b> — the same frame as the "
+            "safety limits and the Jog page position (not the raw counter "
+            "shown in the limit rows above)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            f"color: {COLORS['subtext0']}; padding: {sp(2)} {sp(4)};")
+        outer.addWidget(info)
+
+        self.lbl_override_pos: dict[str, QLabel] = {}
+        self.spin_override: dict[str, QDoubleSpinBox] = {}
+
+        for axis in ("Z", "P1", "P2", "P3"):
+            outer.addWidget(self._build_override_row(axis))
+
+        self.lbl_override_status = QLabel("")
+        self.lbl_override_status.setWordWrap(True)
+        self.lbl_override_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; padding: {sp(2)} {sp(4)};")
+        outer.addWidget(self.lbl_override_status)
+
+        return grp
+
+    def _build_override_row(self, axis: str) -> QFrame:
+        """One row: axis | current (zero-ref) readout | new-value spin | Set."""
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: {COLORS['surface0']}; "
+            f"border: 1px solid {COLORS['surface1']}; "
+            f"border-radius: {sp(4)}; padding: {sp(4)}; }}")
+        h = QHBoxLayout(frame)
+        h.setSpacing(s(6))
+        h.setContentsMargins(s(6), s(4), s(6), s(4))
+
+        lbl_axis = QLabel(f"<b>{axis}</b>")
+        lbl_axis.setMinimumWidth(s(28))
+        h.addWidget(lbl_axis)
+
+        h.addWidget(QLabel("now:"))
+        pos_lbl = QLabel("—")
+        pos_lbl.setStyleSheet(
+            f"color: {COLORS['text']}; font-family: monospace; "
+            f"min-width: {sp(90)};")
+        pos_lbl.setMinimumWidth(s(90))
+        h.addWidget(pos_lbl)
+        self.lbl_override_pos[axis] = pos_lbl
+        h.addWidget(QLabel("mm"))
+
+        h.addWidget(QLabel("→ set to:"))
+        spin = QDoubleSpinBox()
+        spin.setRange(-1e6, 1e6)
+        spin.setDecimals(3)
+        spin.setSuffix(" mm")
+        spin.setMinimumWidth(s(110))
+        h.addWidget(spin)
+        self.spin_override[axis] = spin
+
+        btn = QPushButton("⟳ Set Position")
+        btn.setToolTip(
+            f"Tell the firmware that {axis} is physically at the entered "
+            f"value (sends a G92 — no motion). Use after a power cycle to "
+            f"re-sync the position counter.")
+        btn.setMaximumHeight(s(26))
+        btn.clicked.connect(lambda _c=False, a=axis: self._override_axis_position(a))
+        h.addWidget(btn)
+
+        h.addStretch(1)
+        return frame
+
+    def _override_axis_position(self, axis: str) -> None:
+        """v7.5.x: send the entered value to the firmware via G92 so the
+        axis readout matches reality after a power cycle.
+
+        Delegates to ``StageController.override_zp_position`` (which
+        preserves the zero reference and rebases only the firmware
+        counter), then forces a fresh read so the readouts update.
+        """
+        ctrl = self._controller
+        if ctrl is None:
+            self.lbl_override_status.setText("No controller available.")
+            return
+        spin = self.spin_override.get(axis)
+        if spin is None:
+            return
+        value = float(spin.value())
+        result = ctrl.override_zp_position(axis, value)
+        if not result.get("ok"):
+            err = result.get("error", "unknown")
+            self.lbl_override_status.setText(
+                f"⚠ Override {axis} failed: {err}")
+            return
+        try:
+            xy = ctrl.get_xy_position(cached=False)
+            zp = ctrl.get_zp_position(cached=False)
+            self._update_position_displays(xy, zp)
+        except Exception as e:
+            logger.warning(f"post-override refresh failed: {e}")
+        prev = result.get("previous_raw")
+        if prev is not None:
+            self.lbl_override_status.setText(
+                f"✓ Set {axis} position to {value:.3f} mm "
+                f"(firmware counter was {prev:.3f} mm).")
+        else:
+            self.lbl_override_status.setText(
+                f"✓ Set {axis} position to {value:.3f} mm.")
+        logger.info(f"Override {axis} position to {value} (was raw {prev})")
 
     def _build_axis_limit_row(self, axis: str, unit: str,
                               default_min: float, default_max: float,
@@ -1869,9 +2001,19 @@ class StageHardwarePanel(QWidget):
                 v = self._logical_zp_value(zp, logical)
                 if v is None:
                     continue
-                txt = f"{v:.3f}"
+                # v7.5.x: the limit-row + live-position readouts show Z as
+                # height (up = +); pumps unchanged. (The Override card below
+                # stays zero-ref raw — it re-declares the firmware counter.)
+                disp = z_raw_to_display(v) if logical == "Z" else v
+                txt = f"{disp:.3f}"
                 _set("lbl_axis_pos", logical, txt)
                 _set("lbl_jog_pos", logical, txt)
+                # v7.5.x: the Override card shows the zero-referenced
+                # value (the frame the user types into), not the raw
+                # firmware counter shown by the limit-row readout above.
+                if self._controller is not None:
+                    zero = float(self._controller.zero_position.get(logical, 0.0))
+                    _set("lbl_override_pos", logical, f"{v - zero:.3f}")
         # v7.4.2: nudge the persistent left-side control panel too.
         page = self.parent()
         ctrl_panel = None
@@ -1971,15 +2113,17 @@ class StageHardwarePanel(QWidget):
         except Exception as e:
             logger.warning(f"record_limit fresh read failed: {e}")
             return
-        zero = ctrl.zero_position
         recorded_val: float | None = None
+        # v7.5.x: XY *and* the Z/pump envelopes are ABSOLUTE (fixed mechanical
+        # extents, independent of Set Zero), so store the raw absolute reading
+        # for every axis — no `- zero`.
         if axis == "X" and xy and xy[0] is not None:
             target_spin = self.spin_xy_min_x if which == "min" else self.spin_xy_max_x
-            recorded_val = float(xy[0] - zero.get("x", 0))
+            recorded_val = float(xy[0])
             target_spin.setValue(recorded_val)
         elif axis == "Y" and xy and xy[1] is not None:
             target_spin = self.spin_xy_min_y if which == "min" else self.spin_xy_max_y
-            recorded_val = float(xy[1] - zero.get("y", 0))
+            recorded_val = float(xy[1])
             target_spin.setValue(recorded_val)
         elif axis == "Z":
             # v7.4.2 hotfix: route via the live axis_map so Z reads
@@ -1987,13 +2131,17 @@ class StageHardwarePanel(QWidget):
             v = self._logical_zp_value(zp, "Z")
             if v is not None:
                 target_spin = self.spin_z_min if which == "min" else self.spin_z_max
-                recorded_val = float(v - zero.get("Z", 0))
+                # v7.5.x: the Z limit spinboxes are height-frame (up = +).
+                # Convert the raw Marlin reading so "Set Max" at the top
+                # records +60 (not -60). Min/Max never invert: bottom →
+                # spin_z_min (≈0), top → spin_z_max (≈+60).
+                recorded_val = z_raw_to_display(float(v))
                 target_spin.setValue(recorded_val)
         elif axis in ("P1", "P2", "P3"):
             v = self._logical_zp_value(zp, axis)
             if v is not None:
                 target_dict = self.spin_p_mins if which == "min" else self.spin_p_maxs
-                recorded_val = float(v - zero.get(axis, 0))
+                recorded_val = float(v)  # absolute Marlin raw mm
                 target_dict[axis].setValue(recorded_val)
         # Update visible position labels with the fresh read
         self._update_position_displays(xy, zp)
@@ -2017,8 +2165,13 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_max_x.setValue(float(s.get("safety_limits.xy_max_x", 130000.0)))
         self.spin_xy_min_y.setValue(float(s.get("safety_limits.xy_min_y", -85000.0)))
         self.spin_xy_max_y.setValue(float(s.get("safety_limits.xy_max_y", 85000.0)))
-        self.spin_z_min.setValue(float(s.get("safety_limits.z_min", -10.0)))
-        self.spin_z_max.setValue(float(s.get("safety_limits.z_max", 50.0)))
+        # v7.5.x: spinboxes are height-frame (up = +); stored limits are raw
+        # Marlin. ZDIR=-1 reverses ordering, so convert AND swap min/max:
+        # display-min = -z_max_raw, display-max = -z_min_raw.
+        _z_min_raw = float(s.get("safety_limits.z_min", -10.0))
+        _z_max_raw = float(s.get("safety_limits.z_max", 50.0))
+        self.spin_z_min.setValue(z_raw_to_display(_z_max_raw))
+        self.spin_z_max.setValue(z_raw_to_display(_z_min_raw))
         for pid in ("P1", "P2", "P3"):
             self.spin_p_mins[pid].setValue(
                 float(s.get(f"safety_limits.{pid.lower()}_min", -50.0)))
@@ -2305,8 +2458,12 @@ class StageHardwarePanel(QWidget):
         s.set("safety_limits.xy_max_x", self.spin_xy_max_x.value())
         s.set("safety_limits.xy_min_y", self.spin_xy_min_y.value())
         s.set("safety_limits.xy_max_y", self.spin_xy_max_y.value())
-        s.set("safety_limits.z_min", self.spin_z_min.value())
-        s.set("safety_limits.z_max", self.spin_z_max.value())
+        # v7.5.x: spinboxes are height-frame (up = +); store raw Marlin with
+        # the min/max SWAP (ZDIR=-1 reverses ordering). This guarantees
+        # z_min < z_max whenever height-min < height-max → never an inverted
+        # (frozen) envelope.
+        s.set("safety_limits.z_min", z_display_to_raw(self.spin_z_max.value()))
+        s.set("safety_limits.z_max", z_display_to_raw(self.spin_z_min.value()))
         for pid in ("P1", "P2", "P3"):
             s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
             s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
@@ -2322,8 +2479,9 @@ class StageHardwarePanel(QWidget):
             sl.xy_max_x = self.spin_xy_max_x.value()
             sl.xy_min_y = self.spin_xy_min_y.value()
             sl.xy_max_y = self.spin_xy_max_y.value()
-            sl.z_min = self.spin_z_min.value()
-            sl.z_max = self.spin_z_max.value()
+            # v7.5.x: height-frame spinboxes → raw Marlin, swapped (see above).
+            sl.z_min = z_display_to_raw(self.spin_z_max.value())
+            sl.z_max = z_display_to_raw(self.spin_z_min.value())
             for pid in ("P1", "P2", "P3"):
                 pid_l = pid.lower()
                 if hasattr(sl, f"{pid_l}_min"):
@@ -2355,6 +2513,16 @@ class StageHardwarePanel(QWidget):
             if panel is not None and hasattr(panel, "refresh_safety_limits"):
                 try:
                     panel.refresh_safety_limits()
+                except Exception:
+                    pass
+            # v7.5.x: also tell the app the envelope changed so it can
+            # re-centre the default (uncalibrated) plate live. The walk
+            # above already located the HardwareSetupPage, which owns the
+            # safety_limits_changed signal.
+            sig = getattr(page, "safety_limits_changed", None)
+            if sig is not None:
+                try:
+                    sig.emit()
                 except Exception:
                     pass
 
@@ -2438,8 +2606,12 @@ class StageHardwarePanel(QWidget):
         s.set("safety_limits.xy_max_x", self.spin_xy_max_x.value())
         s.set("safety_limits.xy_min_y", self.spin_xy_min_y.value())
         s.set("safety_limits.xy_max_y", self.spin_xy_max_y.value())
-        s.set("safety_limits.z_min", self.spin_z_min.value())
-        s.set("safety_limits.z_max", self.spin_z_max.value())
+        # v7.5.x: spinboxes are height-frame (up = +); store raw Marlin with
+        # the min/max SWAP (ZDIR=-1 reverses ordering). This guarantees
+        # z_min < z_max whenever height-min < height-max → never an inverted
+        # (frozen) envelope.
+        s.set("safety_limits.z_min", z_display_to_raw(self.spin_z_max.value()))
+        s.set("safety_limits.z_max", z_display_to_raw(self.spin_z_min.value()))
         for pid in ("P1", "P2", "P3"):
             s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
             s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
@@ -2506,8 +2678,10 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_max_x.setValue(130000.0)
         self.spin_xy_min_y.setValue(-85000.0)
         self.spin_xy_max_y.setValue(85000.0)
-        self.spin_z_min.setValue(-10.0)
-        self.spin_z_max.setValue(50.0)
+        # v7.5.x: spinboxes are height-frame (up = +); show the raw defaults
+        # (z_min=-10, z_max=50) converted + swapped.
+        self.spin_z_min.setValue(z_raw_to_display(50.0))
+        self.spin_z_max.setValue(z_raw_to_display(-10.0))
         for pid in ("P1", "P2", "P3"):
             self.spin_p_mins[pid].setValue(-50.0)
             self.spin_p_maxs[pid].setValue(50.0)

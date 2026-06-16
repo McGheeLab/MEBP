@@ -1500,14 +1500,19 @@ class SettingsPage(QWidget):
     def _set_z_from_current(self, as_max=True):
         """Set Z limit from the current position."""
         pos = self.controller.get_zp_position(cached=True)
-        if pos[0] is not None:
-            zero_z = pos[0] - self.controller.zero_position["Z"]
+        # v7.5.x bugfix: route through axis_map (was pos[0], which is a
+        # pump under a non-default map). Mirrors _set_pump_from_current.
+        z_val = self.controller.zp_logical_value(pos, "Z")
+        if z_val is not None:
+            # v7.5.x: Z envelope is absolute Marlin raw mm — store the raw
+            # reading (no `- zero`) so it's independent of Set Z Zero.
+            abs_z = float(z_val)
             if as_max:
-                self.spin_z_max.setValue(zero_z)
+                self.spin_z_max.setValue(abs_z)
             else:
-                self.spin_z_min.setValue(zero_z)
+                self.spin_z_min.setValue(abs_z)
             logger.info(
-                f"Z {'max' if as_max else 'min'} set to {zero_z:.2f} mm")
+                f"Z {'max' if as_max else 'min'} set to {abs_z:.2f} mm (absolute)")
 
     def _set_pump_from_current(self, pump: str, as_max: bool = True):
         """v7.2.6: Set pump limit from the current position."""
@@ -1516,15 +1521,16 @@ class SettingsPage(QWidget):
             # v7.4.2 hotfix: route through axis_map.
             pump_val = self.controller.zp_logical_value(pos, pump)
             if pump_val is not None:
-                zero_ref = self.controller.zero_position.get(pump, 0)
-                rel_mm = pump_val - zero_ref
+                # v7.5.x: pump envelope is absolute Marlin raw mm — store the
+                # raw reading (no `- zero`), independent of Set Pump Zero.
+                abs_mm = float(pump_val)
                 if as_max:
-                    self._pump_max_spins[pump].setValue(rel_mm)
+                    self._pump_max_spins[pump].setValue(abs_mm)
                 else:
-                    self._pump_min_spins[pump].setValue(rel_mm)
+                    self._pump_min_spins[pump].setValue(abs_mm)
                 logger.info(
                     f"{pump} {'max' if as_max else 'min'} set to "
-                    f"{rel_mm:.2f} mm (from current)")
+                    f"{abs_mm:.2f} mm (absolute, from current)")
 
     def _reset_pump_zero(self, pump: str):
         """v7.2.6: Reset the zero reference for a single pump."""

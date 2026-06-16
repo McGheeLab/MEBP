@@ -63,8 +63,8 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         workflow_id="quick_print",
         icon="⚡",
         title="Quick Print",
-        description="Single-object print from a quick-setup template.",
-        enabled=False,
+        description="Drop one object in a well and print — no setup.",
+        enabled=True,
     ),
     WorkflowTile(
         workflow_id="immuno",

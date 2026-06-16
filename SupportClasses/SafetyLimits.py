@@ -34,17 +34,23 @@ logger = logging.getLogger(__name__)
 class SafetyLimits:
     """Software endstops for XY, Z, and pump axes."""
 
-    # XY limits (µm, relative to zero reference)
+    # XY limits (µm, ABSOLUTE Prior stage frame — fixed mechanical extents,
+    # unaffected by Set Zero / zero_position; clamps compare the absolute
+    # destination against these bounds).
     xy_min_x: float = -130_000.0
     xy_min_y: float = -85_000.0
     xy_max_x: float = 130_000.0
     xy_max_y: float = 85_000.0
 
-    # Z needle limits (mm, relative to zero reference)
+    # Z needle limits (mm, ABSOLUTE Marlin raw frame — fixed mechanical
+    # extents, unaffected by Set Z Zero / needle-zero calibration; clamps
+    # compare the absolute destination against these bounds. v7.5.x: was
+    # zero-referenced, which went stale whenever calibration re-anchored the
+    # needle zero and wrongly clamped valid jogs).
     z_min: float = -10.0
     z_max: float = 50.0
 
-    # Pump limits (mm, relative to zero reference)
+    # Pump limits (mm, ABSOLUTE Marlin raw frame — see Z note above)
     p1_min: float = -50.0
     p1_max: float = 50.0
     p2_min: float = -50.0
@@ -79,8 +85,24 @@ class SafetyLimits:
             logger.warning(f"XY clamped: ({x:.1f},{y:.1f}) → ({cx:.1f},{cy:.1f})")
         return cx, cy
 
+    def xy_center(self) -> tuple[float, float]:
+        """Midpoint of the XY travel envelope (ABSOLUTE stage µm).
+
+        Used to centre the default (uncalibrated) well plate inside the
+        configured envelope regardless of whether the envelope is symmetric.
+        Since the envelope is now absolute, this is the absolute stage µm at
+        the centre of the physical travel — the plate is seeded here directly
+        (see ``StageController.default_plate_center_um``). For the symmetric
+        default (±130000 / ±85000) this is (0, 0); for an asymmetric envelope
+        (e.g. 0..114332) it is the true centre, not the corner.
+        """
+        return (
+            (self.xy_min_x + self.xy_max_x) / 2.0,
+            (self.xy_min_y + self.xy_max_y) / 2.0,
+        )
+
     def clamp_z(self, z: float) -> float:
-        """Clamp Z position to limits."""
+        """Clamp Z position to limits. v7.5.x: ``z`` is absolute Marlin raw mm."""
         if not self.enabled:
             return z
         cz = max(self.z_min, min(self.z_max, z))
@@ -89,7 +111,7 @@ class SafetyLimits:
         return cz
 
     def clamp_pump(self, position: float, pump: str = "P1") -> float:
-        """Clamp pump position to limits."""
+        """Clamp pump position to limits. v7.5.x: ``position`` is absolute Marlin raw mm."""
         if not self.enabled:
             return position
         p_min, p_max = self._pump_limits(pump)
@@ -215,6 +237,12 @@ class SafetyLimits:
         else:
             self.z_min = z
             logger.info(f"Z min = {z:.3f} mm")
+        if self.z_min > self.z_max:
+            logger.warning(
+                f"Z envelope is INVERTED: z_min={self.z_min:.3f} > "
+                f"z_max={self.z_max:.3f} mm — every Z move will clamp to "
+                f"{self.z_min:.3f}. Re-record so min < max."
+            )
 
     # ── Serialisation ─────────────────────────────────────────────
 

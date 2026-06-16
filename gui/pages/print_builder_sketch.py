@@ -21,7 +21,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QFrame, QToolButton,
     QButtonGroup, QPushButton, QLabel, QCheckBox, QComboBox, QDoubleSpinBox,
-    QSpinBox, QScrollArea, QGroupBox, QSizePolicy, QMessageBox,
+    QSpinBox, QScrollArea, QGroupBox, QSizePolicy, QMessageBox, QLineEdit,
 )
 
 from gui.styles import COLORS, build_section_title_style
@@ -61,6 +61,11 @@ class SketchPage(QWidget):
         self._syringe = None
         self._needle_od_mm = 0.0
         self._building = False
+        # v7.5.x: calibrated plate bottom (zero-ref mm); the Sketch's print
+        # height (``z_start_mm``) is measured up from it, not absolute.
+        self._plate_bottom_z: float | None = None
+        # v7.5.x: user-chosen print name (persists across props rebuilds).
+        self._print_name: str = "Sketch"
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -423,6 +428,13 @@ class SketchPage(QWidget):
         grp = self._group("Print parameters")
         lay = grp.layout()
 
+        # Print name — used to name the baked print object.
+        name_edit = QLineEdit(self._print_name)
+        name_edit.setPlaceholderText("Sketch")
+        name_edit.setToolTip("Name for the print saved to Print Setup.")
+        name_edit.textChanged.connect(self._set_print_name)
+        self._field_row(lay, "Name", name_edit)
+
         if self._needle_od_mm > 0:
             info = QLabel(
                 f"Needle Ø {self._needle_od_mm:.2f} mm — sets bead width "
@@ -432,7 +444,13 @@ class SketchPage(QWidget):
                 f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
             lay.addWidget(info)
 
-        zs = self._dspin(sk.z_start_mm, -50, 200, 0.1)
+        # v7.5.x: print height is measured UP from the calibrated plate bottom
+        # (not an absolute Z). 0 = at the plate bottom; larger = higher.
+        zs = self._dspin(sk.z_start_mm, 0.0, 40.0, 0.1)
+        zs.setToolTip(
+            "Height of the first layer above the calibrated plate bottom.\n"
+            "0 = at the plate bottom; larger = higher. The needle is clamped "
+            "so it can never punch through the plate bottom.")
         lh = self._dspin(sk.layer_height_mm, 0.01, 10, 0.05)
         nl = QSpinBox()
         nl.setRange(1, 999)
@@ -446,11 +464,19 @@ class SketchPage(QWidget):
         sp.valueChanged.connect(lambda v: self._set_sketch("print_speed_mm_s", v))
         ls.valueChanged.connect(lambda v: self._set_sketch("line_spacing_mm", v))
 
-        self._field_row(lay, "Z start", zs)
+        self._field_row(lay, "Print height", zs)
         self._field_row(lay, "Layer h", lh)
         self._field_row(lay, "# Layers", nl)
         self._field_row(lay, "Speed", sp)
         self._field_row(lay, "Raster step", ls)
+        if self._plate_bottom_z is None:
+            warn = QLabel("⚠ Plate bottom not calibrated — height is absolute "
+                          "until you calibrate.")
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                f"color: {COLORS.get('yellow', '#f9e2af')}; "
+                f"font-size: {_sf(8)}pt;")
+            lay.addWidget(warn)
         return grp
 
     # ── Model edits ───────────────────────────────────────────────
@@ -484,6 +510,11 @@ class SketchPage(QWidget):
             return
         setattr(self._canvas.sketch(), attr, value)
         self._schedule_preview()
+
+    def _set_print_name(self, text):
+        if self._building:
+            return
+        self._print_name = text
 
     def _canvas_delete(self):
         self._canvas.delete_selected()
@@ -550,17 +581,45 @@ class SketchPage(QWidget):
             QMessageBox.warning(self, "Empty sketch",
                                 "Draw at least one shape first.")
             return
+
+        base_name = (self._print_name or "").strip() or "Sketch"
+
+        # v7.5.x: the sketch's Z column is a *height above the plate bottom*.
+        # Bake it into the internal zero-ref frame when the plate bottom is
+        # known (so the trajectory is physically correct), and always record
+        # the relative height as metadata so Print Setup prints at the chosen
+        # height above the plate bottom and clamps against punch-through.
+        traj = result.trajectory
+        if self._plate_bottom_z is not None:
+            try:
+                from SupportClasses.StageController import plate_relative_to_zref
+                traj = traj.copy()
+                traj[:, 2] = plate_relative_to_zref(
+                    self._plate_bottom_z, traj[:, 2])
+            except Exception as e:
+                logger.debug(f"sketch Z→zero-ref bake skipped: {e}")
+                traj = result.trajectory
+
+        extra_params = {
+            "z_above_plate_bottom_mm": float(sk.z_start_mm),
+            "z_datum": "plate_bottom",
+            "layer_height_mm": float(sk.layer_height_mm),
+            "num_layers": int(sk.num_layers),
+        }
         try:
             name = save_trajectory_as_print_object(
-                result.trajectory,
-                base_name="Sketch",
-                description=(f"Sketch: {len(sk.shapes)} shape(s), "
+                traj,
+                base_name=base_name,
+                description=(f"{base_name}: {len(sk.shapes)} shape(s), "
                              f"{result.num_layers} layer(s), "
-                             f"{result.total_length_mm:.1f} mm path"),
+                             f"{result.total_length_mm:.1f} mm path · "
+                             f"print height {sk.z_start_mm:.2f} mm above plate "
+                             f"bottom"),
                 color="#cba6f7",
                 author="Print Builder",
                 source="SketchTrajectory",
-                object_name="Sketch_1",
+                object_name=base_name,
+                extra_params=extra_params,
             )
         except Exception as e:
             logger.error(f"send to print setup failed: {e}", exc_info=True)
@@ -572,6 +631,18 @@ class SketchPage(QWidget):
         self.print_file_created.emit(name)
 
     # ── External API ──────────────────────────────────────────────
+
+    def set_z_references(self, refs: dict) -> None:
+        """v7.5.x: receive the calibration Z references; the Sketch only needs
+        ``plate_bottom_z`` (the datum its print height is measured up from)."""
+        if not isinstance(refs, dict):
+            return
+        pb = refs.get("plate_bottom_z")
+        new_pb = None if pb is None else float(pb)
+        if new_pb != self._plate_bottom_z:
+            self._plate_bottom_z = new_pb
+            # Rebuild props so the "not calibrated" hint toggles correctly.
+            self._rebuild_props()
 
     def set_hardware_config(self, config) -> None:
         """Pull needle + syringe (for volume accuracy), base the bead width /

@@ -1,0 +1,33 @@
+{
+  "version": "1.0",
+  "cameras": {
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "um_per_px": 5.944101,
+      "name": "Teslong Camera",
+      "rotation_deg": 45.0,
+      "date": "2026-06-15"
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&b643b4c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "um_per_px": 5.272355,
+      "name": "Teslong Camera",
+      "rotation_deg": -45.0,
+      "date": "2026-06-05"
+    },
+    "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13": {
+      "um_per_px": 3.1041,
+      "name": "ToupCam",
+      "date": "2026-06-15"
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "um_per_px": 5.439254,
+      "name": "Teslong Camera",
+      "rotation_deg": -45.0,
+      "date": "2026-06-15"
+    }
+  },
+  "assignments": {
+    "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "microscope": "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13"
+  }
+}

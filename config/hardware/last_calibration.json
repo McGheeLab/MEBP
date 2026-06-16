@@ -1,0 +1,103 @@
+{
+  "version": "1.0",
+  "saved_at": "2026-06-15T17:55:03",
+  "fingerprint": {
+    "device": "ME3B V1",
+    "axis_map": {
+      "Z": "Z",
+      "P1": "X",
+      "P2": "Y",
+      "P3": "E"
+    },
+    "steps_per_mm": {
+      "Z": 5255.0,
+      "P1": 10120.0,
+      "P2": -10240,
+      "P3": 5069
+    },
+    "plate_format": 24,
+    "needle_gauge": 27
+  },
+  "zero_position": {
+    "x": 0.0,
+    "y": 0.0,
+    "f": 0.0,
+    "Z": 0.0,
+    "P1": 0.0,
+    "P2": 0.0,
+    "P3": 0.0
+  },
+  "calibration": {
+    "plate_format": 24,
+    "taught_a1": null,
+    "taught_corner": [
+      107581.77635703018,
+      67992.06002705019
+    ],
+    "offset_x": 0.0,
+    "offset_y": 0.0,
+    "rotation": 0.0,
+    "scale": 1.0,
+    "safe_z": -37.51,
+    "top_z": -35.92,
+    "taught_a1_z": null,
+    "taught_corner_z": null,
+    "taught_third": [
+      88489.47592598178,
+      67780.71835561092
+    ],
+    "taught_third_z": null,
+    "third_well": "D5",
+    "corner_well": "D6",
+    "replace_z": -39.98,
+    "max_z": -38.36,
+    "plate_bottom_z": -15.97,
+    "mosaic_affine": {
+      "rotation_deg": 1.2153276421572068,
+      "scale": 1.0061589666471766,
+      "translation_um": [
+        4026.3004702726316,
+        -1849.7832302563577
+      ],
+      "center_um": [
+        0.0,
+        0.0
+      ],
+      "num_points": 3,
+      "residual_um": 1.0185760160488099e-07
+    },
+    "plate_warp": {
+      "version": 1,
+      "mode": "affine",
+      "points": [
+        [
+          106836.0,
+          67152.5,
+          107581.77635703018,
+          67992.06002705019
+        ],
+        [
+          87536.0,
+          67152.5,
+          88489.47592598178,
+          67780.71835561092
+        ],
+        [
+          87536.0,
+          47852.5,
+          89101.8779100787,
+          48044.01940834714
+        ]
+      ],
+      "mean_correction_um": 1297.8792150434133,
+      "max_correction_um": 1577.5466120042536,
+      "rms_error_um": 1.0185760160488099e-07
+    },
+    "z_plane": {
+      "a": 0.006839378238342371,
+      "b": -0.02072538860103701,
+      "c": -52.40000000000001,
+      "r_squared": 1.0
+    }
+  }
+}

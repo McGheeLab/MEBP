@@ -3,20 +3,22 @@ objective_calibration_card.py — Hardware Setup → Cameras Section C.
 
 Adds the "Objective Calibration Setup" card to the Cameras sub-page.
 Users define their own microscope objectives (no prepopulated list)
-and run the slide-marking calibration workflow for each. The active
-microscope camera is selected in the Microscope Camera Setup section
-(Section A); this card only reads that assignment from the
-HardwareConfig.
+and measure the real µm/px for each with the stage-motion
+``PixelCalibrationDialog`` — the same workflow the needle cameras use
+(move the stage a known distance, correlate the resulting image
+displacement). The active microscope camera is selected in the
+Microscope Camera Setup section (Section A); this card only reads that
+assignment from the HardwareConfig.
 
 Responsibilities:
 - Add / remove user-defined objectives (persisted via
   ``ObjectiveCalibrationStore``).
 - Track which objective the user has installed under the scope
   (``CameraConfig.current_objective_name``); pushing the stored µm/px
-  into ``CameraManager.set_um_per_px`` on the swap so the live pipeline
+  (and rotation) into ``CameraManager`` on the swap so the live pipeline
   immediately reflects the new objective.
-- Launch the modal ``ObjectiveCalibrationDialog`` for the selected
-  objective.
+- Launch the modal stage-motion ``PixelCalibrationDialog`` for the
+  selected objective and persist its measured µm/px per-objective.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from PySide6.QtGui import QColor
 
 from gui.scaling import s, scaled_font_size
 from gui.styles import COLORS
-from gui.dialogs.objective_calibration_dialog import ObjectiveCalibrationDialog
+from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
 from SupportClasses.HardwareConfig import CameraRole
 from SupportClasses.ObjectiveCalibration import get_store as _get_store
 
@@ -106,10 +108,14 @@ class ObjectiveCalibrationCard(QGroupBox):
         camera_manager,
         config_getter: Callable[[], object],
         parent: Optional[QWidget] = None,
+        controller_getter: Optional[Callable[[], object]] = None,
     ):
         super().__init__("Objective Calibration Setup", parent)
         self._camera_manager = camera_manager
         self._config_getter = config_getter
+        # v7.5.x: resolved lazily — the StageController may arrive after the
+        # card is built. Used to drive the stage-motion µm/px dialog.
+        self._controller_getter = controller_getter or (lambda: None)
         self._store = _get_store()
         self._loading = False
 
@@ -140,7 +146,8 @@ class ObjectiveCalibrationCard(QGroupBox):
         # Intro / context line — always visible.
         intro = QLabel(
             "Define your microscope objectives below, then measure the "
-            "real µm/px for each one with the slide-marking dialog."
+            "real µm/px for each one by moving the stage — the same "
+            "calibration the needle cameras use."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet(
@@ -177,7 +184,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             "No objectives defined yet. Click <b>Add Objective…</b> "
             "below to create your first — each entry is a name plus a "
             "nominal magnification. Real µm/px is captured per-objective "
-            "via the slide-marking dialog."
+            "by moving the stage (same as the needle cameras)."
         )
         self._lbl_empty.setWordWrap(True)
         self._lbl_empty.setStyleSheet(
@@ -362,9 +369,13 @@ class ObjectiveCalibrationCard(QGroupBox):
         if not cal:
             return
         um_per_px = float(cal["measured_um_per_px"])
+        rotation_deg = cal.get("rotation_deg")
         if self._camera_manager is not None:
             try:
                 self._camera_manager.set_um_per_px(cam_idx, um_per_px)
+                if rotation_deg is not None:
+                    self._camera_manager.set_rotation_deg(
+                        cam_idx, float(rotation_deg))
             except Exception as exc:
                 logger.debug(f"ObjectiveCalibrationCard: set_um_per_px — {exc}")
         self.um_per_px_committed.emit(cam_idx, um_per_px)
@@ -540,21 +551,55 @@ class ObjectiveCalibrationCard(QGroupBox):
         objective = self._selected_objective_name() or self._current_objective_name()
         if not objective:
             return
-        config = self._config_getter()
-        dlg = ObjectiveCalibrationDialog(
-            camera_manager=self._camera_manager,
-            hardware_config=config,
-            microscope_cam_idx=cam_idx,
-            camera_name=cam_key,
-            initial_objective=objective,
-            parent=self,
-        )
-        dlg.calibration_committed.connect(self._on_dialog_committed)
-        dlg.exec()
 
-    def _on_dialog_committed(self, objective_name: str, um_per_px: float) -> None:
-        cam_idx = self._microscope_idx()
-        if cam_idx is not None and self._current_objective_name() == objective_name:
+        # v7.5.x: objective µm/px is now measured the same way as the needle
+        # cameras — move the stage a known distance and correlate the image
+        # displacement ("flow") of the plate under the scope. Requires a
+        # running microscope camera and a connected stage controller.
+        controller = self._controller_getter()
+        if controller is None or not getattr(controller, "xy_stage", None):
+            QMessageBox.warning(
+                self, "Calibrate",
+                "Stage controller not connected — objective calibration moves "
+                "the stage to measure µm/px. Connect hardware first.",
+            )
+            return
+        if self._camera_manager is None or not self._camera_manager.is_running(cam_idx):
+            QMessageBox.warning(
+                self, "Calibrate",
+                f"Start the microscope camera (Cam {cam_idx + 1}) before "
+                "calibrating so the dialog can see the live feed.",
+            )
+            return
+
+        dlg = PixelCalibrationDialog(
+            self._camera_manager, controller, cam_idx=cam_idx, parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        um_per_px = dlg.result_um_per_px
+        if um_per_px is None or um_per_px <= 0:
+            return
+        rotation_deg = dlg.result_rotation_deg
+
+        # Persist per-objective (µm/px is objective-specific) and push live.
+        config = self._config_getter()
+        resolution = (
+            tuple(config.camera_config.active_resolution)
+            if config is not None else (0, 0)
+        )
+        self._store.set_calibration(
+            cam_key, objective, um_per_px, resolution, rotation_deg=rotation_deg,
+        )
+        if self._camera_manager is not None:
+            try:
+                self._camera_manager.set_um_per_px(cam_idx, um_per_px)
+                if rotation_deg is not None:
+                    self._camera_manager.set_rotation_deg(cam_idx, rotation_deg)
+            except Exception as exc:
+                logger.debug(f"ObjectiveCalibrationCard: push to manager — {exc}")
+
+        if self._current_objective_name() == objective:
             self.um_per_px_committed.emit(cam_idx, um_per_px)
         self._refresh_table()
         self._refresh_objective_note()

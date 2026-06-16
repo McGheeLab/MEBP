@@ -500,6 +500,17 @@ class XYStageManager:
             return self._parse_position_response(response)
         try:
             with self._serial_lock:
+                # v7.5.0: flush any backlogged/stale RX bytes (orphaned 'R'
+                # acks, older position lines) before querying. All other
+                # senders drain their own ack synchronously under this same
+                # lock, so anything still buffered here is stale by definition.
+                # Without this, the poller drains the backlog one CR-line per
+                # cycle, making the display "slowly count down" to the real
+                # position instead of tracking it.
+                try:
+                    self.spo.reset_input_buffer()
+                except Exception:
+                    pass
                 self._send_protocol_command("position_query", fallback_cmd="P")
                 response = _read_response_cr(self.spo, timeout=0.5)
             result = self._parse_position_response(response)
@@ -625,13 +636,55 @@ class XYStageManager:
         logger.debug(f"XY relative move: ({dx:.0f}, {dy:.0f})")
 
     def set_home(self) -> None:
-        """Set current position as home (0, 0, 0)."""
-        self._send_protocol_command("set_home", fallback_cmd="Z")
+        """Set current position as home (0, 0, 0).
+        v7.5.0: consume the 'R' ack under serial lock — same as the movement
+        commands. Without this the ack lingers in the RX buffer and the
+        PositionPoller reads 'R' instead of the zeroed position on its next
+        query, so the display slowly counts down to 0 instead of snapping.
+        """
+        if self.simulate:
+            self._send_protocol_command("set_home", fallback_cmd="Z")
+        elif self.spo is not None:
+            if self._protocol:
+                cmd = self._protocol.format_command("set_home")
+            else:
+                cmd = "Z"
+            if cmd:
+                if self._protocol:
+                    encoded = cmd.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{cmd}\r\n".encode("ascii")
+                try:
+                    with self._serial_lock:
+                        self.spo.write(encoded)
+                        _read_response_cr(self.spo, timeout=0.05)
+                except Exception as e:
+                    logger.debug(f"XY set_home: {e}")
         logger.info("XY home position set")
 
     def stop_stage(self) -> None:
-        """Send immediate stop command."""
-        self._send_protocol_command("stop", fallback_cmd="I")
+        """Send immediate stop command.
+        v7.5.0: consume the 'R' ack under serial lock — same rationale as
+        set_home; an orphaned ack pollutes the next PositionPoller read.
+        """
+        if self.simulate:
+            self._send_protocol_command("stop", fallback_cmd="I")
+        elif self.spo is not None:
+            if self._protocol:
+                cmd = self._protocol.format_command("stop")
+            else:
+                cmd = "I"
+            if cmd:
+                if self._protocol:
+                    encoded = cmd.encode(self._protocol.encoding) + self._protocol.tx_terminator
+                else:
+                    encoded = f"{cmd}\r\n".encode("ascii")
+                try:
+                    with self._serial_lock:
+                        self.spo.write(encoded)
+                        _read_response_cr(self.spo, timeout=0.05)
+                except Exception as e:
+                    logger.debug(f"XY stop_stage: {e}")
         logger.info("XY stage stopped")
 
     # ── Stage Settings (P8.19, P8.20) ────────────────────────────

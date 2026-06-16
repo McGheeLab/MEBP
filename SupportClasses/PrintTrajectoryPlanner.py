@@ -5,6 +5,17 @@ Converts a PrintPlanOfAction into a continuous time-parameterized trajectory
 of (x, y, z, p1, p2, p3, t) waypoints that the TrajectoryExecutor can
 follow using velocity-based control.
 
+⚠️ v7.5.x KNOWN LIMITATION — Z POLARITY (see CLAUDE.md "Critical Safety Rules"):
+This planner's Z geometry assumes the conventional convention that a LARGER Z is
+physically HIGHER (``approach_z = top_z + 0.5``, ``if self._z < safe_z: raise``,
+layer increments ``self._z + layer_height``, etc.). On machines where the needle
+DESCENDS as raw Z increases (``StageController.ZDIR == -1`` — e.g. ME3B V1) these
+gates invert: the Z-raise-before-travel may be skipped and "above the well" lands
+BELOW it. The retract-before-cross-position-XY guarantee therefore does NOT hold
+for the pure-trajectory print path on a ZDIR=-1 machine. Until this planner gets a
+full polarity pass, prefer the discrete / hybrid-direct print path (DirectCommand
+travel is polarity-agnostic). ``generate()`` logs a warning when ZDIR != 1.
+
 Key features:
   - All movements are time-parameterized — feedrates become durations
   - Trapezoidal velocity profiles for smooth Z acceleration/deceleration
@@ -515,15 +526,22 @@ class PrintTrajectoryPlanner:
         """v7.4.8: effective dispense Z for a well.
 
         If the well (e.g. a flattened rosette sub-well A1.a) prescribes an
-        ``ink_z_mm`` (relative to the plate top), use ``top_z + ink_z_mm``;
-        otherwise fall back to the global ``settings.print_z_height``.
-        Larger Z = higher / further from plate.
+        ``ink_z_mm`` (relative to the plate top), use
+        ``top_z + z_up_sign * ink_z_mm``; otherwise fall back to the global
+        ``settings.print_z_height``.
+
+        v7.5.x: ``ink_z_mm`` keeps its "relative to plate top" meaning but is
+        now applied along the reference-vector up-direction (``z_up_sign`` from
+        ``StageController.print_z_dir()``), so a negative ``ink_z_mm`` means
+        "into the well" on **both** Z polarities (the old ``top_z + ink_z_mm``
+        inverted on ME3B V1, where larger Z is physically *lower*).
         """
         try:
             info = plate.get_well_info(well_name)
             if getattr(info, "ink_z_mm", None) is not None:
                 top_z = getattr(settings, "top_z_height", 0.0)
-                return top_z + info.ink_z_mm
+                z_up = getattr(settings, "z_up_sign", 1.0)
+                return top_z + z_up * info.ink_z_mm
         except Exception:
             pass
         return settings.print_z_height
@@ -657,6 +675,22 @@ class PrintTrajectoryPlanner:
         Returns:
             TrajectoryResult with waypoints and validation status
         """
+        # v7.5.x SAFETY: this planner's Z geometry assumes larger Z = higher.
+        # On a ZDIR=-1 machine (needle descends as raw Z increases) the
+        # raise-before-travel gates invert and "above the well" lands below it,
+        # so the retract-before-cross-position-XY guarantee does NOT hold here.
+        # Warn loudly; the discrete / hybrid-direct path should be used instead.
+        try:
+            from SupportClasses.StageController import ZDIR as _ZDIR
+            if _ZDIR != 1:
+                logger.warning(
+                    "PrintTrajectoryPlanner: ZDIR=%s (needle descends as raw Z "
+                    "increases). This planner's Z model assumes ZDIR=+1 — the "
+                    "trajectory Z-raise-before-travel may be UNSAFE on this "
+                    "machine. Use the discrete/hybrid-direct print path.", _ZDIR)
+        except Exception:
+            pass
+
         # Reset state
         self._waypoints.clear()
         self._t = 0.0

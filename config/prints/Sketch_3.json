@@ -1,0 +1,202 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "Sketch_3",
+    "description": "Sketch: 6 shape(s), 1 layer(s), 28.5 mm path",
+    "created": "2026-06-12T22:22:04.660279+00:00",
+    "modified": "2026-06-12T22:22:04.660279+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "Sketch_1": {
+      "object_type": "csv_import",
+      "params": {
+        "csv_path": "config\\prints\\Sketch_3.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 77
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "auto_layout": false,
+      "in_well": true
+    },
+    "Cylinder_1": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        0.7789002702702712,
+        -4.136791683991684,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": false,
+      "in_well": true
+    },
+    "Cylinder_2": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        3.9895435135135138,
+        -0.10456216216216241,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_3": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        2.5243297297297307,
+        2.777672429190499,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_4": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        -1.6265551351351346,
+        2.7776724291904995,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_5": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        -3.9401248648648655,
+        -0.0522810810810809,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_6": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        -4.205911621621623,
+        -2.516267023785093,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_7": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        5.30953918918919,
+        -2.673110267028336,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Hydrogel A",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Cylinder_8": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        0.46480486486486505,
+        -0.6273729729729731,
+        0.0
+      ],
+      "color": "#89b4fa",
+      "ink": "MSC Cells",
+      "auto_layout": false,
+      "in_well": true
+    },
+    "Cylinder_9": {
+      "object_type": "cylinder",
+      "params": {
+        "radius": 1.0,
+        "height": 2.0,
+        "layer_height": 0.2,
+        "num_points": 64,
+        "filled": false
+      },
+      "position": [
+        -4.255213513513514,
+        -4.391610810810811,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Alginate",
+      "auto_layout": false,
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

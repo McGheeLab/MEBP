@@ -131,11 +131,14 @@ class TriggerBar(QWidget):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
 
     def set_value(self, v: float) -> None:
-        # The Xbox worker reports axis 4 / 5 in [-1, 1]; the resting
-        # state is -1 and a fully-pulled trigger is +1. Map back to
-        # [0, 1] for display.
+        # v7.5.x: the worker's "monitor" messages report triggers as a
+        # normalized pull amount in [0, 1] (rest = 0, fully pulled = 1).
+        # The old code assumed raw [-1, 1] and mapped (v+1)/2, which made
+        # a resting trigger render at 50% — the on-screen half of the
+        # "trigger neutral is not 0" field report. abs() tolerates the
+        # LT-negated dispatch convention if such a value is ever fed.
         try:
-            normalized = (float(v) + 1.0) / 2.0
+            normalized = abs(float(v))
         except Exception:
             normalized = 0.0
         self._value = max(0.0, min(1.0, normalized))
@@ -573,8 +576,9 @@ class XboxHardwarePanel(QWidget):
         ly = last_axis.get(1, 0.0)
         rx = last_axis.get(2, 0.0)
         ry = last_axis.get(3, 0.0)
-        lt = last_axis.get(4, -1.0)
-        rt = last_axis.get(5, -1.0)
+        # v7.5.x: triggers are pull amounts in [0, 1]; rest = 0.
+        lt = last_axis.get(4, 0.0)
+        rt = last_axis.get(5, 0.0)
         self.stick_left.set_value(lx, ly)
         self.stick_right.set_value(rx, ry)
         self.trig_left.set_value(lt)
@@ -608,21 +612,46 @@ class XboxHardwarePanel(QWidget):
         except Exception as e:
             logger.debug(f"Xbox setting save failed for {key}: {e}")
 
+    def _push_live_deadzones(self) -> None:
+        """v7.5.x: apply the current deadzone spinboxes to the RUNNING
+        worker via the ctrl queue (previously they only took effect on
+        the next disconnect + reconnect)."""
+        ctrl = self._controller
+        if ctrl is None or not hasattr(ctrl, "update_xbox_tuning"):
+            return
+        stick_dz = float(self.spin_stick_dz.value())
+        trig_dz = float(self.spin_trigger_dz.value())
+        try:
+            ctrl.update_xbox_tuning(axis_deadzones={
+                0: stick_dz, 1: stick_dz, 2: stick_dz, 3: stick_dz,
+                4: trig_dz, 5: trig_dz,
+            })
+        except Exception as e:
+            logger.debug(f"Live deadzone push failed: {e}")
+
     def _on_stick_dz_changed(self, v: float) -> None:
         self.stick_left.set_deadzone(v)
         self.stick_right.set_deadzone(v)
         self._persist_xbox_setting("xbox.deadzones.sticks", float(v))
+        self._push_live_deadzones()
 
     def _on_trigger_dz_changed(self, v: float) -> None:
         self.trig_left.set_deadzone(v)
         self.trig_right.set_deadzone(v)
         self._persist_xbox_setting("xbox.deadzones.triggers", float(v))
+        self._push_live_deadzones()
 
     def _on_reconnect_timeout_changed(self, v: float) -> None:
         self._persist_xbox_setting("xbox.reconnect_timeout_s", float(v))
 
     def _on_debug_toggled(self, checked: bool) -> None:
         self._persist_xbox_setting("xbox.debug_mode", bool(checked))
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "update_xbox_tuning"):
+            try:
+                ctrl.update_xbox_tuning(debug_mode=bool(checked))
+            except Exception as e:
+                logger.debug(f"Live debug-mode push failed: {e}")
 
     def _on_calibrate_clicked(self) -> None:
         poller = getattr(self._controller, "xbox_poller", None) \
@@ -631,6 +660,10 @@ class XboxHardwarePanel(QWidget):
             return
         last_axis = getattr(poller, "last_axis", {}) or {}
         # Snapshot the four stick axes as the new center offsets.
+        # v7.5.x: last_axis is now fed by the worker's "monitor" messages
+        # with RAW pre-offset stick values, so this snapshot captures true
+        # resting drift (the old dispatch-stream cache never updated for
+        # sticks and this always captured zeros).
         offsets = {
             0: float(last_axis.get(0, 0.0)),
             1: float(last_axis.get(1, 0.0)),
@@ -647,6 +680,13 @@ class XboxHardwarePanel(QWidget):
                 self._settings.save()
             except Exception as e:
                 logger.warning(f"Failed to save stick offsets: {e}")
+        # v7.5.x: apply to the running worker immediately.
+        if self._controller is not None and hasattr(
+                self._controller, "update_xbox_tuning"):
+            try:
+                self._controller.update_xbox_tuning(stick_offsets=offsets)
+            except Exception as e:
+                logger.debug(f"Live offsets push failed: {e}")
         self._refresh_offsets_label()
         logger.info(f"Stick offsets captured: {offsets}")
 
@@ -660,6 +700,14 @@ class XboxHardwarePanel(QWidget):
             self._settings.save()
         except Exception as e:
             logger.warning(f"Failed to clear stick offsets: {e}")
+        # v7.5.x: apply to the running worker immediately.
+        if self._controller is not None and hasattr(
+                self._controller, "update_xbox_tuning"):
+            try:
+                self._controller.update_xbox_tuning(
+                    stick_offsets={k: 0.0 for k in (0, 1, 2, 3)})
+            except Exception as e:
+                logger.debug(f"Live offsets push failed: {e}")
         self._refresh_offsets_label()
 
     # v7.4.2: _open_mapping_editor removed — editor lives inline now.

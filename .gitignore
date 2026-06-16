@@ -23,6 +23,9 @@ config/sim_xy_state.json
 config/sim_zp_state.json
 xy_debug_*.csv
 
+# Print execution logs (keep the schema README, ignore the runs)
+logs/prints/*.jsonl
+
 # IDE
 .vscode/
 .idea/

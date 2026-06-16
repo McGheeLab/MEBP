@@ -76,7 +76,18 @@ def run_headless(controller: StageController, settings: Settings):
     _stick_offsets = settings.get_section("xbox_stick_offsets")
     if _stick_offsets:
         _stick_offsets = {int(k): v for k, v in _stick_offsets.items()}
-    controller.connect_xbox(stick_offsets=_stick_offsets or None)
+    # v7.5.x: build the same per-axis deadzones the GUI connect path uses
+    # (previously headless fell back to the worker's global 0.2 deadzone
+    # for the triggers too, diverging from the GUI's 0.05 default).
+    _stick_dz = float(settings.get("xbox.deadzones.sticks", 0.20))
+    _trig_dz = float(settings.get("xbox.deadzones.triggers", 0.05))
+    controller.connect_xbox(
+        stick_offsets=_stick_offsets or None,
+        axis_deadzones={0: _stick_dz, 1: _stick_dz, 2: _stick_dz,
+                        3: _stick_dz, 4: _trig_dz, 5: _trig_dz},
+        reconnect_timeout=float(settings.get("xbox.reconnect_timeout_s", 30)),
+        debug_mode=bool(settings.get("xbox.debug_mode", False)),
+    )
 
     print("Ready. Press Ctrl+C to exit.\n")
 

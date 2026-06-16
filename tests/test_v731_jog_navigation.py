@@ -187,6 +187,12 @@ class TestSafeTravelTo(unittest.TestCase):
         ctrl.wait_for_z_arrival = MagicMock(return_value=True)
         ctrl.wait_for_xy_arrival = MagicMock(return_value=True)
         ctrl.zero_position = {"x": 0, "y": 0, "f": 0, "Z": 0, "P1": 0, "P2": 0, "P3": 0}
+        # v7.4.x: safe_travel_to suspends the poller and passes per-step
+        # feedrates; supply the attributes it reads.
+        ctrl._pos_poller = MagicMock()
+        ctrl._zp_retract_feedrate = 250.0
+        ctrl._zp_insert_feedrate = 100.0
+        ctrl._min_travel_z_mm = None
         return ctrl
 
     def test_full_sequence(self):
@@ -196,10 +202,12 @@ class TestSafeTravelTo(unittest.TestCase):
 
         calls = ctrl.move_z_absolute.call_args_list
         self.assertEqual(len(calls), 2)
-        # First call: raise to safe Z
-        self.assertEqual(calls[0], call(15.0, from_zero_ref=True))
-        # Second call: lower to target Z
-        self.assertEqual(calls[1], call(5.0, from_zero_ref=True))
+        # First call: raise to safe Z at the retract feedrate
+        self.assertEqual(calls[0], call(
+            15.0, from_zero_ref=True, feedrate_mm_min=ctrl._zp_retract_feedrate))
+        # Second call: lower to target Z at the insert feedrate
+        self.assertEqual(calls[1], call(
+            5.0, from_zero_ref=True, feedrate_mm_min=ctrl._zp_insert_feedrate))
         # XY move
         ctrl.move_xy_absolute.assert_called_once_with(5000.0, 10000.0, from_zero_ref=False)
 
@@ -210,7 +218,8 @@ class TestSafeTravelTo(unittest.TestCase):
 
         calls = ctrl.move_z_absolute.call_args_list
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0], call(15.0, from_zero_ref=True))
+        self.assertEqual(calls[0], call(
+            15.0, from_zero_ref=True, feedrate_mm_min=ctrl._zp_retract_feedrate))
 
     def test_xy_only(self):
         """With no ZP connected, only XY move happens."""
@@ -306,8 +315,10 @@ class TestCalibrationPageDataBridge(unittest.TestCase):
         page = self._make_cal_page()
         received = []
         page.calibration_data_changed.connect(lambda: received.append(True))
-        # Mock controller to return a Z position
+        # Mock controller to return a Z position. v7.4.2: _set_safe_z reads
+        # Z via the logical-axis accessor, so stub it too.
         page.controller.get_zp_position.return_value = (20.0, None, None)
+        page.controller.zp_logical_value.return_value = 20.0
         page._set_safe_z()
         self.assertTrue(len(received) > 0, "calibration_data_changed not emitted on safe_z")
         self.assertIsNotNone(page._safe_z)
@@ -350,9 +361,12 @@ class TestJogPageCalibrationData(unittest.TestCase):
         plate = WellPlate.from_format(6)
         positions = plate.get_all_positions_from_a1(0, 0)
         page.set_calibration_data(plate, positions, 10.0)
-        if page._well_nav is not None:
-            self.assertIs(page._well_nav._plate, plate)
-            self.assertEqual(page._well_nav._calibrated_wells, set(positions.keys()))
+        # v7.4.3: the WellPlateNavigator was replaced by the workspace view.
+        # Calibration data now flows into JogWorkspaceView (plate + the
+        # calibrated wells, converted to zero-ref µm).
+        self.assertIs(page._workspace_view._plate, plate)
+        self.assertEqual(set(page._workspace_view._wells_cal.keys()),
+                         set(positions.keys()))
 
     def test_set_calibration_data_none_values(self):
         page = self._make_jog_page()

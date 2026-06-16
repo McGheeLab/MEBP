@@ -74,6 +74,20 @@ class XZSideView(QWidget):
         self.setMouseTracking(True)
 
         self._safety_limits = None
+        # v7.5.x: XY envelope is absolute stage µm; this view is fed zero-ref
+        # X, so subtract the zero reference from the X bounds for display.
+        self._zero_off_x: float = 0.0
+        # v7.5.x: Z envelope is absolute Marlin raw mm; this view is fed
+        # zero-ref Z, so subtract the zero reference from the Z bounds.
+        self._zero_off_z: float = 0.0
+        # v7.5.x: Z display sign. +1 = the view's native up-positive frame
+        # (unchanged). -1 = number Z as height (up = +) on machines whose raw
+        # Marlin Z increases downward (ME3B V1). Applied ONLY to display:
+        # the safety bounds, the needle/reference pixel mapping, and the
+        # readout text. The go_to_z_requested emit stays in the raw zero-ref
+        # frame (hit rects store the raw value) so the move contract is
+        # unchanged. Pushed in via set_z_display_sign().
+        self._z_disp_sign: float = 1.0
         self._needle_od_um: float = 410.0
         self._needle_length_mm: float = 12.7
         self._safe_z_mm: float | None = None
@@ -133,6 +147,37 @@ class XZSideView(QWidget):
     def set_safety_limits(self, limits) -> None:
         self._safety_limits = limits
         self.update()
+
+    def set_zero_offset_x(self, zero_x_um: float) -> None:
+        """v7.5.x: current X zero reference (absolute stage µm). Shifts the
+        absolute X envelope into the zero-ref frame this view is fed."""
+        off = float(zero_x_um)
+        if off != self._zero_off_x:
+            self._zero_off_x = off
+            self.update()
+
+    def set_zero_offset_z(self, zero_z_mm: float) -> None:
+        """v7.5.x: current Z zero reference (absolute Marlin raw mm). Shifts the
+        absolute Z envelope into the zero-ref frame this view is fed."""
+        off = float(zero_z_mm)
+        if off != self._zero_off_z:
+            self._zero_off_z = off
+            self.update()
+
+    def set_z_display_sign(self, sign: float) -> None:
+        """v7.5.x: set the Z display sign (+1 native, -1 = height/up-positive).
+
+        Display-only: flips the picture orientation, the safety bounds, and
+        the readout text. The ``go_to_z_requested`` emit stays raw zero-ref.
+        """
+        sign = -1.0 if float(sign) < 0 else 1.0
+        if sign != self._z_disp_sign:
+            self._z_disp_sign = sign
+            self.update()
+
+    def _disp(self, z_zero_ref: float) -> float:
+        """Raw zero-ref Z (mm) → this view's display frame (height when -1)."""
+        return self._z_disp_sign * z_zero_ref
 
     def set_needle(self, outer_diameter_um: float | None = None,
                    length_mm: float | None = None) -> None:
@@ -214,15 +259,30 @@ class XZSideView(QWidget):
     def _x_bounds_um(self) -> tuple[float, float] | None:
         if self._safety_limits is None:
             return None
-        return (float(self._safety_limits.xy_min_x),
-                float(self._safety_limits.xy_max_x))
+        # v7.5.x: absolute envelope → zero-ref for display.
+        zx = self._zero_off_x
+        return (float(self._safety_limits.xy_min_x) - zx,
+                float(self._safety_limits.xy_max_x) - zx)
+
+    def _z_safety_bounds(self) -> tuple[float, float] | None:
+        """v7.5.x: the absolute Z envelope shifted into this view's zero-ref
+        frame (subtract the current Z zero reference). Single chokepoint so
+        the scale, scrollbar, and paint all agree."""
+        if self._safety_limits is None:
+            return None
+        off = self._zero_off_z
+        # v7.5.x: into the display frame. ZDIR=-1 reverses ordering, so
+        # convert both ends and re-sort so callers always get (min, max).
+        a = self._disp(float(self._safety_limits.z_min) - off)
+        b = self._disp(float(self._safety_limits.z_max) - off)
+        return (min(a, b), max(a, b))
 
     def _z_bounds_mm(self) -> tuple[float, float] | None:
         """Visible Z bounds, accounting for the user's zoom level."""
-        if self._safety_limits is None:
+        sb = self._z_safety_bounds()
+        if sb is None:
             return None
-        base_min = float(self._safety_limits.z_min)
-        base_max = float(self._safety_limits.z_max)
+        base_min, base_max = sb
         if self._z_zoom <= 1.0:
             return (base_min, base_max)
         base_range = base_max - base_min
@@ -401,7 +461,9 @@ class XZSideView(QWidget):
             value = self._z_refs.get(key)
             if value is None:
                 continue
-            z_y = self._z_to_px(value)
+            # v7.5.x: draw in the display frame; the hit rect below keeps the
+            # raw zero-ref `value` so the go-to emit stays in the move frame.
+            z_y = self._z_to_px(self._disp(value))
             # Skip if the line is outside the visible (zoomed) plot
             if z_y < rect.top() - 1 or z_y > rect.bottom() + 1:
                 continue
@@ -413,8 +475,8 @@ class XZSideView(QWidget):
             p.drawLine(QPointF(rect.left() + s(4), z_y),
                        QPointF(rect.right() - s(4), z_y))
 
-            # Badge text: short label + value
-            text = f"{label} · {value:.2f} mm"
+            # Badge text: short label + value (display frame; up = +)
+            text = f"{label} · {self._disp(value):.2f} mm"
             text_w = metrics.horizontalAdvance(text)
             badge_w = text_w + pad_x * 2
             badge_x = rect.right() - badge_w - s(2)
@@ -466,7 +528,7 @@ class XZSideView(QWidget):
         if self._z_mm is None:
             return
 
-        z_y = self._z_to_px(self._z_mm)
+        z_y = self._z_to_px(self._disp(self._z_mm))
         if z_y < rect.top() or z_y > rect.bottom():
             return
 
@@ -515,11 +577,13 @@ class XZSideView(QWidget):
         font.setPointSizeF(scaled_font_size(10))
         font.setBold(True)
         p.setFont(font)
-        if self._x_um is None or self._z_mm is None:
+        # v7.5.x: readout in the display frame (up = + when sign is -1).
+        disp_z = self._disp(self._z_mm) if self._z_mm is not None else None
+        if self._x_um is None or disp_z is None:
             text = "X: —   Z: —"
         else:
             text = (f"X: {self._x_um / 1000.0:+.3f} mm    "
-                    f"Z: {self._z_mm:+.3f} mm")
+                    f"Z: {disp_z:+.3f} mm")
         p.setPen(QPen(_qc('text')))
         p.drawText(
             line1,
@@ -531,15 +595,18 @@ class XZSideView(QWidget):
         line2 = QRectF(rect.left(), band_top + s(18),
                        rect.width(), s(16))
         parts: list[tuple[str, QColor]] = []
-        if self._z_mm is not None:
-            color = (_qc('green') if self._z_mm > 0
-                     else (_qc('red') if self._z_mm < 0 else _qc('subtext0')))
-            parts.append((f"Δ plate {self._z_mm:+.2f} mm", color))
+        if disp_z is not None:
+            color = (_qc('green') if disp_z > 0
+                     else (_qc('red') if disp_z < 0 else _qc('subtext0')))
+            parts.append((f"Δ plate {disp_z:+.2f} mm", color))
         if self._safe_z_mm is not None:
-            parts.append((f"safe Z {self._safe_z_mm:.2f} mm", _qc('green')))
+            parts.append(
+                (f"safe Z {self._disp(self._safe_z_mm):.2f} mm", _qc('green')))
         if (self._well_depth_mm is not None
-                and self._z_mm is not None):
-            depth_remaining = self._z_mm - (-self._well_depth_mm)
+                and disp_z is not None):
+            # In the display frame the well bottom sits at -well_depth (below
+            # the plate); remaining travel = disp_z - (-well_depth).
+            depth_remaining = disp_z - (-self._well_depth_mm)
             parts.append(
                 (f"Δ well {depth_remaining:+.2f} mm", _qc('blue')))
 
@@ -688,8 +755,10 @@ class XZSideView(QWidget):
             return
         if self._z_zoom <= 1.0:
             return
-        z_min = float(self._safety_limits.z_min)
-        z_max = float(self._safety_limits.z_max)
+        sb = self._z_safety_bounds()
+        if sb is None:
+            return
+        z_min, z_max = sb  # zero-ref frame (matches _z_zoom_center_mm)
         total = z_max - z_min
         view_range = total / self._z_zoom
         half = view_range / 2.0
@@ -714,8 +783,7 @@ class XZSideView(QWidget):
                 self._scrollbar.setRange(0, 0)
                 self._scrollbar.setValue(0)
             else:
-                z_min = float(self._safety_limits.z_min)
-                z_max = float(self._safety_limits.z_max)
+                z_min, z_max = self._z_safety_bounds()  # zero-ref frame
                 total = z_max - z_min
                 view_range = total / self._z_zoom
                 half = view_range / 2.0

@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QDialog, QFormLayout, QDialogButtonBox,
     QCheckBox, QAbstractItemView, QListWidget, QListWidgetItem,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QStandardItem
 
 from SupportClasses.HardwareConfig import (
@@ -493,6 +493,9 @@ class HardwareSetupPage(ModePage):
     # Signals
     config_changed = Signal(object)       # Emits HardwareConfig
     config_validated = Signal(bool)       # Emits validity state
+    # v7.5.x: emitted when the Stage sub-page saves new XY safety limits to
+    # the live controller, so the app can re-centre the default plate.
+    safety_limits_changed = Signal()
 
     # v7.4.0-b: Settings reference used by the Stage sub-page (safety limits,
     # ZP feedrates, axis flips). Set via set_settings() from MainWindow.
@@ -512,6 +515,11 @@ class HardwareSetupPage(ModePage):
         self._config = HardwareConfig()
         self._last_valid = False
         self._restoring = False  # v7.2.6: guard for config restore
+
+        # v7.5.x: one-time auto-detect of cameras on first display so a
+        # remembered camera setup (role→identity assignments + per-camera
+        # µm/px) auto-restores without the user clicking Detect each session.
+        self._auto_detect_done = False
 
         # v7.2.4: Channel mapping widgets (dynamic)
         self._channel_map_widgets: list[tuple[QLabel, QComboBox]] = []
@@ -570,7 +578,7 @@ class HardwareSetupPage(ModePage):
         # Create per-sub-page scaffolds (scroll, content widget, layout)
         self._sub_layouts: dict[str, QVBoxLayout] = {}
         self._sub_scrolls: dict[str, QScrollArea] = {}
-        for key in ("identity", "plate", "pumps_inks", "needle",
+        for key in ("identity", "plate", "pumps_inks", "inks", "needle",
                     "rosette", "cameras"):
             scroll, lay = self._make_subpage_scaffold(_bg)
             self._sub_scrolls[key] = scroll
@@ -742,7 +750,7 @@ class HardwareSetupPage(ModePage):
         ink_btns.addStretch()
         ink_lay.addLayout(ink_btns)
 
-        self._sub_layouts["pumps_inks"].addWidget(ink_group)
+        self._sub_layouts["inks"].addWidget(ink_group)
 
         # ── Section 4: Pump Channels (v7.2.4: with exclusive inks) ─
         pump_group = QGroupBox("Pump Channels")
@@ -919,6 +927,14 @@ class HardwareSetupPage(ModePage):
         self._live_cam_source_combos: list[QComboBox] = []
         self._live_cam_role_combos: list[QComboBox] = []
         self._live_cam_role_badges: list[StatusBadge] = []
+        # v7.5.x: per-slot Start/Stop + collapsible live preview so the user
+        # can power a camera on and verify the feed right on the calibration
+        # page. Previews (CameraFeedView) are created lazily once the shared
+        # CameraManager arrives (see set_camera_manager).
+        self._live_cam_start_btns: list[QPushButton] = []
+        self._live_cam_preview_holders: list[QWidget] = []
+        self._live_cam_previews: list = []
+        self._cam_preview_signals_wired = False
 
         from gui.styles import build_glass_panel_style
         assign_glass = build_glass_panel_style("camMiniCard")
@@ -935,6 +951,7 @@ class HardwareSetupPage(ModePage):
             rl.setColumnStretch(1, 0)
             rl.setColumnStretch(2, 1)
             rl.setColumnStretch(3, 0)
+            rl.setColumnStretch(4, 0)
 
             # Cam N pill (uses the accent color so it reads as a chip).
             cam_pill = QLabel(f"Cam {i + 1}")
@@ -959,6 +976,12 @@ class HardwareSetupPage(ModePage):
             src.setMinimumWidth(s(220))
             rl.addWidget(src, 0, 2)
             self._live_cam_source_combos.append(src)
+            # Applying the chosen source to the shared CameraManager so a
+            # Start below opens *this* slot's selected camera. The combo was
+            # previously display-only (never wired to set_source).
+            src.currentIndexChanged.connect(
+                lambda _idx, cam_i=i: self._on_live_cam_source_changed(cam_i)
+            )
 
             # Role badge — lives in column 3 and tracks the combo's
             # current selection. Empty/Unassigned variant by default.
@@ -972,7 +995,6 @@ class HardwareSetupPage(ModePage):
             role_combo.addItem("Microscope", CameraRole.MICROSCOPE)
             role_combo.addItem("Needle X-view", CameraRole.NEEDLE_X)
             role_combo.addItem("Needle Y-view", CameraRole.NEEDLE_Y)
-            role_combo.addItem("Plate (overhead)", CameraRole.PLATE)
             role_combo.setToolTip(
                 "Workflow role for this camera slot. All non-Unassigned "
                 "roles are singletons — assigning one here automatically "
@@ -983,6 +1005,36 @@ class HardwareSetupPage(ModePage):
             )
             rl.addWidget(role_combo, 1, 2)
             self._live_cam_role_combos.append(role_combo)
+
+            # Start/Stop toggle (col 4) — powers this slot's camera on/off
+            # via the shared CameraManager. Disabled until a source is picked.
+            start_btn = QPushButton("▶ Start")
+            start_btn.setObjectName("accentBtn")
+            start_btn.setEnabled(False)
+            start_btn.setMinimumWidth(s(104))
+            start_btn.setToolTip(
+                "Start/stop this camera so you can verify the live feed below "
+                "and run its calibration."
+            )
+            start_btn.clicked.connect(
+                lambda _checked=False, cam_i=i: self._on_toggle_camera(cam_i)
+            )
+            rl.addWidget(start_btn, 0, 4, 2, 1, Qt.AlignVCenter)
+            self._live_cam_start_btns.append(start_btn)
+
+            # Collapsible live preview (row 2, full width) — hidden until the
+            # camera is running. Filled with a CameraFeedView lazily once the
+            # CameraManager is available (set_camera_manager).
+            preview = QWidget()
+            preview.setVisible(False)
+            pv_lay = QVBoxLayout(preview)
+            pv_lay.setContentsMargins(0, s(8), 0, 0)
+            pv_lay.setSpacing(0)
+            preview.setMinimumHeight(s(170))
+            preview.setMaximumHeight(s(260))
+            rl.addWidget(preview, 2, 0, 1, 5)
+            self._live_cam_preview_holders.append(preview)
+            self._live_cam_previews.append(None)
 
             self._live_cam_rows_container.addWidget(row)
 
@@ -1200,6 +1252,7 @@ class HardwareSetupPage(ModePage):
             getattr(self, "_camera_manager", None),
             lambda: self._config,
             parent=self,
+            controller_getter=lambda: getattr(self, "_controller", None),
         )
         self._objective_cal_card.calibration_changed.connect(
             self._on_config_changed
@@ -1253,7 +1306,7 @@ class HardwareSetupPage(ModePage):
 
         # ── Finalize sub-pages (v7.4.0-b) ─────────────────────────
         # Add stretch to each sub-page layout so groups stack at the top.
-        for key in ("identity", "plate", "pumps_inks", "needle",
+        for key in ("identity", "plate", "pumps_inks", "inks", "needle",
                     "rosette", "cameras"):
             self._sub_layouts[key].addStretch()
 
@@ -1267,8 +1320,9 @@ class HardwareSetupPage(ModePage):
         self.add_sub_page("file-text", "Identity",        self._sub_scrolls["identity"])
         self._plate_sub_index = len(self._sub_pages)
         self.add_sub_page("microscope","Plate",           self._sub_scrolls["plate"])
-        self.add_sub_page("droplet",   "Pumps & Inks",    self._sub_scrolls["pumps_inks"])
+        self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
         self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
+        self.add_sub_page("flask",     "Ink",             self._sub_scrolls["inks"])
         self._rosette_sub_index = len(self._sub_pages)
         self.add_sub_page("flower",    "Rosette",         self._sub_scrolls["rosette"])
         self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
@@ -1363,8 +1417,6 @@ class HardwareSetupPage(ModePage):
             return ("Needle X", "warn")
         if role == CameraRole.NEEDLE_Y:
             return ("Needle Y", "warn")
-        if role == CameraRole.PLATE:
-            return ("Plate", "ok")
         return ("Unassigned", "pending")
 
     # ════════════════════════════════════════════════════════════════
@@ -1378,8 +1430,9 @@ class HardwareSetupPage(ModePage):
         sub-pages.
         """
         labels = ["Hardware: Device", "Hardware: Identity", "Hardware: Plate",
-                  "Hardware: Pumps & Inks", "Hardware: Needle",
-                  "Hardware: Rosette", "Hardware: Cameras"]
+                  "Hardware: Pump", "Hardware: Needle", "Hardware: Ink",
+                  "Hardware: Rosette", "Hardware: Cameras",
+                  "Hardware: Xbox Controller"]
         idx = self.get_active_index()
         return labels[idx] if 0 <= idx < len(labels) else "Hardware Setup"
 
@@ -1544,8 +1597,17 @@ class HardwareSetupPage(ModePage):
                 widgets["status"].set_status("ok", f"Cam {slot + 1}")
                 if mgr is not None:
                     try:
-                        umpx = mgr.get_um_per_px(slot)
-                        widgets["umpx"].setText(f"{umpx:.4f} µm/px")
+                        # v7.5.x: only show a number once the camera has been
+                        # explicitly calibrated — otherwise the 1.67 seed
+                        # default reads as a real (but bogus) calibration.
+                        if mgr.is_um_per_px_calibrated(slot):
+                            umpx = mgr.get_um_per_px(slot)
+                            rot = mgr.get_rotation_deg(slot)
+                            rot_txt = (f"  @ {rot:.0f}°"
+                                       if rot is not None else "")
+                            widgets["umpx"].setText(f"{umpx:.4f} µm/px{rot_txt}")
+                        else:
+                            widgets["umpx"].setText("— (not calibrated)")
                     except Exception:
                         widgets["umpx"].setText("—")
                 widgets["calibrate"].setEnabled(True)
@@ -1558,6 +1620,220 @@ class HardwareSetupPage(ModePage):
         self._camera_manager = manager
         if hasattr(self, "_objective_cal_card"):
             self._objective_cal_card.set_camera_manager(manager)
+        # v7.5.x: wire the per-slot Start/Stop + live preview to the manager.
+        if manager is not None and not self._cam_preview_signals_wired:
+            try:
+                manager.camera_started.connect(
+                    lambda *_: self._refresh_camera_preview_state())
+                manager.camera_stopped.connect(
+                    lambda *_: self._refresh_camera_preview_state())
+                self._cam_preview_signals_wired = True
+            except Exception as exc:
+                logger.debug(f"camera preview signal wiring skipped: {exc}")
+        self._ensure_camera_previews()
+        # Re-activate stored µm/px for any already-assigned slots (no-op
+        # until cameras are detected + a source is assigned).
+        self._restore_all_calibrations()
+        self._refresh_camera_preview_state()
+        # v7.5.x: the manager is now available — schedule the one-time
+        # auto-detect that restores a remembered camera setup. Runs at startup
+        # (manager is wired before the window is shown) so the calibration is
+        # live for every page, not only after the user opens Hardware Setup.
+        # Idempotent with showEvent via the _auto_detect_done guard.
+        self._maybe_auto_detect_cameras()
+
+    def showEvent(self, event):
+        """v7.5.x: on first display, auto-restore a remembered camera setup.
+
+        Hardware Setup is the startup landing page, so this fires at launch
+        (and again the first time the user navigates here if not). It triggers
+        a one-time camera detect → source auto-assign → per-camera µm/px
+        restore, so a previously-calibrated needle setup comes back without
+        the user clicking Detect every session.
+        """
+        super().showEvent(event)
+        self._maybe_auto_detect_cameras()
+
+    def _maybe_auto_detect_cameras(self):
+        """Run camera detection once if a camera setup was remembered.
+
+        Gated on the calibration store having at least one role→identity
+        assignment: only then is there a setup to restore (auto-assign uses
+        those mappings to re-select each slot's source and re-apply its stored
+        µm/px). A first-ever run with nothing remembered still waits for a
+        manual Detect — we don't probe cameras unprompted. Detection is
+        deferred via QTimer so the page paints before the (blocking) probe.
+        """
+        if self._auto_detect_done:
+            return
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            if not get_store().all_assignments():
+                return  # nothing remembered yet — wait for a manual Detect
+        except Exception as exc:
+            logger.debug(f"auto-detect gate check failed: {exc}")
+            return
+        self._auto_detect_done = True  # set before scheduling to avoid re-entry
+        logger.info(
+            "Hardware Setup: remembered camera setup found — auto-detecting "
+            "to restore source assignments + calibrations")
+        QTimer.singleShot(0, self._on_detect_live_cameras)
+
+    # ── Live camera Start/Stop + preview (v7.5.x) ─────────────────
+
+    def _ensure_camera_previews(self):
+        """Lazily create one CameraFeedView per assignment slot.
+
+        Uses CameraFeedView (which subscribes to the camera's frame_captured
+        signal) rather than reparenting the shared CameraWidget, so the same
+        camera can also be previewed elsewhere (e.g. the Calibration page's
+        needle-location feeds) without conflict.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None or not hasattr(self, "_live_cam_preview_holders"):
+            return
+        try:
+            from gui.widgets.camera_feed_view import CameraFeedView
+        except Exception as exc:
+            logger.debug(f"CameraFeedView unavailable — previews disabled: {exc}")
+            return
+        for i, holder in enumerate(self._live_cam_preview_holders):
+            if i < len(self._live_cam_previews) and self._live_cam_previews[i] is not None:
+                continue
+            try:
+                fv = CameraFeedView(
+                    camera_manager=mgr,
+                    cam_idx=i,
+                    show_crosshair=True,
+                    label=f"Cam {i + 1} — live",
+                    parent=holder,
+                )
+                holder.layout().addWidget(fv, stretch=1)
+                self._live_cam_previews[i] = fv
+            except Exception as exc:
+                logger.warning(f"failed to build camera preview {i}: {exc}")
+
+    def _on_live_cam_source_changed(self, cam_idx: int):
+        """Apply the slot's selected source to the CameraManager.
+
+        Restarts the camera if it was already running so the new source
+        takes effect, then refreshes the Start button + preview state.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None or cam_idx >= len(self._live_cam_source_combos):
+            return
+        data = self._live_cam_source_combos[cam_idx].currentData()
+        was_running = mgr.is_running(cam_idx)
+        if was_running:
+            mgr.stop(cam_idx)
+        if data is not None:
+            mgr.set_source(cam_idx, data)
+            # v7.5.x: the slot now points at a known camera — re-apply its
+            # stored µm/px (by device identity) if we have one, and remember
+            # which physical camera plays this slot's role so it auto-restores
+            # on the next detect.
+            self._restore_calibration_for_slot(cam_idx)
+            self._remember_assignment(cam_idx)
+            if hasattr(self, "_needle_cards"):
+                self._refresh_role_derived_displays()
+            if was_running:
+                mgr.start(cam_idx)
+        self._refresh_camera_preview_state()
+
+    def _remember_assignment(self, cam_idx: int):
+        """Persist role→device-identity so the source auto-restores next session."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None or cam_idx >= len(self._config.camera_roles):
+            return
+        role = self._config.camera_roles[cam_idx]
+        role_val = getattr(role, "value", role)
+        if not role_val or role_val == CameraRole.UNASSIGNED.value:
+            return
+        identity = mgr.camera_identity(cam_idx)
+        if identity is None:
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            get_store().set_assignment(role_val, identity[0])
+        except Exception as exc:
+            logger.debug(f"remember assignment failed: {exc}")
+
+    def _auto_assign_sources_from_store(self):
+        """v7.5.x: after detect, re-select each slot's source from the stored
+        role→identity assignment so calibrations auto-load without the user
+        re-picking which camera is needle_x / needle_y each session."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            from gui.widgets.camera_identity import source_for_identity
+            store = get_store()
+        except Exception as exc:
+            logger.debug(f"auto-assign unavailable: {exc}")
+            return
+        ds = getattr(mgr, "_ds_cameras", [])
+        for i, combo in enumerate(getattr(self, "_live_cam_source_combos", [])):
+            if combo.currentData() is not None:
+                continue  # already assigned this session
+            if i >= len(self._config.camera_roles):
+                continue
+            role_val = getattr(self._config.camera_roles[i], "value",
+                               self._config.camera_roles[i])
+            identity = store.get_assignment(role_val)
+            if not identity:
+                continue
+            source = source_for_identity(identity, ds)
+            if source is None:
+                continue  # that camera isn't present this session
+            # NB: QComboBox.findData can't match Python tuples — compare itemData.
+            for j in range(combo.count()):
+                if combo.itemData(j) == source:
+                    combo.setCurrentIndex(j)  # fires _on_live_cam_source_changed
+                    break
+
+    def _on_toggle_camera(self, cam_idx: int):
+        """Start or stop the camera assigned to this slot."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        if mgr.is_running(cam_idx):
+            mgr.stop(cam_idx)
+        else:
+            data = (
+                self._live_cam_source_combos[cam_idx].currentData()
+                if cam_idx < len(self._live_cam_source_combos) else None
+            )
+            if data is None:
+                QMessageBox.information(
+                    self, "Start Camera",
+                    "Pick a source for this slot first, then Start.")
+                return
+            mgr.set_source(cam_idx, data)
+            self._restore_calibration_for_slot(cam_idx)
+            self._remember_assignment(cam_idx)
+            if hasattr(self, "_needle_cards"):
+                self._refresh_role_derived_displays()
+            mgr.start(cam_idx)
+        self._refresh_camera_preview_state()
+
+    def _refresh_camera_preview_state(self):
+        """Sync each slot's Start button label/enabled-state and preview
+        visibility with the live camera state."""
+        mgr = getattr(self, "_camera_manager", None)
+        for i, btn in enumerate(getattr(self, "_live_cam_start_btns", [])):
+            running = mgr.is_running(i) if mgr is not None else False
+            has_source = (
+                self._live_cam_source_combos[i].currentData() is not None
+                if i < len(self._live_cam_source_combos) else False
+            )
+            btn.setEnabled(mgr is not None and (running or has_source))
+            btn.setText("⏹ Stop" if running else "▶ Start")
+            if i < len(self._live_cam_preview_holders):
+                self._live_cam_preview_holders[i].setVisible(running)
 
     def set_controller(self, controller):
         """v7.3.3: Receive StageController for pixel calibration.
@@ -1573,7 +1849,8 @@ class HardwareSetupPage(ModePage):
         if hasattr(self, '_control_panel'):
             self._control_panel.set_controller(controller)
 
-    def set_calibrated_um_per_px(self, cam_idx: int, value: float):
+    def set_calibrated_um_per_px(self, cam_idx: int, value: float,
+                                 rotation_deg: float | None = None):
         """v7.3.3/v7.4.x: Apply a calibrated µm/px from any source.
 
         Writes through to `CameraManager.set_um_per_px` (the canonical
@@ -1581,19 +1858,86 @@ class HardwareSetupPage(ModePage):
         needle card's readout tracks the change. The microscope's
         µm/px is sourced from `ObjectiveCalibrationStore` instead and
         does not flow through here.
+
+        v7.5.x: ``rotation_deg`` (the camera's in-plane lateral stage
+        direction, from the stage-motion calibration) is stored alongside
+        and fed to the needle-centering aligner. None leaves it untouched
+        (e.g. the microscope objective path, which doesn't measure it).
         """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is not None:
             try:
                 mgr.set_um_per_px(cam_idx, value)
+                if rotation_deg is not None:
+                    mgr.set_rotation_deg(cam_idx, rotation_deg)
             except Exception as exc:
                 logger.debug(f"set_um_per_px({cam_idx}, {value}) — {exc}")
+        # v7.5.x: persist keyed by the camera's stable device identity
+        # (name + USB port) in a *per-machine* store — NOT in the hardware
+        # config, which is swappable: loading a saved setup file would replace
+        # the in-memory config and the auto-save would then wipe the
+        # calibration. The store makes the calibration follow the physical
+        # camera/port across setup-file loads and restarts.
+        identity = mgr.camera_identity(cam_idx) if mgr is not None else None
+        if identity is not None:
+            key, name = identity
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_calibration(
+                    key, float(value), rotation_deg=rotation_deg, name=name)
+            except Exception as exc:
+                logger.warning(f"camera calibration store write failed: {exc}")
         if hasattr(self, "_needle_cards"):
             self._refresh_role_derived_displays()
         logger.info(
-            f"Camera {cam_idx + 1} µm/px set to {value:.4f} from external "
-            "calibration"
+            f"Camera {cam_idx + 1} µm/px set to {value:.4f}"
+            f"{f' @ {rotation_deg:.1f}°' if rotation_deg is not None else ''} "
+            f"(identity={identity[0] if identity else '?'})"
         )
+
+    def _restore_calibration_for_slot(self, cam_idx: int) -> bool:
+        """v7.5.x: if the camera now assigned to ``cam_idx`` has a stored
+        µm/px (keyed by its device identity), push it into the live manager
+        and mark the slot calibrated. Returns True if a value was restored."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return False
+        # Only restore for a slot the user has actually assigned a source to.
+        # (After detect, the underlying CameraWidget combos auto-select the
+        # first source, so get_source would otherwise resolve an identity for
+        # every slot before assignment.)
+        if (cam_idx >= len(self._live_cam_source_combos)
+                or self._live_cam_source_combos[cam_idx].currentData() is None):
+            return False
+        identity = mgr.camera_identity(cam_idx)
+        if identity is None:
+            return False
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            entry = get_store().get_calibration(identity[0])
+        except Exception as exc:
+            logger.debug(f"camera calibration store read failed: {exc}")
+            entry = None
+        if not entry or entry.get("um_per_px") is None:
+            return False
+        try:
+            mgr.set_um_per_px(cam_idx, float(entry["um_per_px"]))
+            rot = entry.get("rotation_deg")
+            if rot is not None:
+                mgr.set_rotation_deg(cam_idx, float(rot))
+            return True
+        except Exception as exc:
+            logger.debug(f"restore calibration slot {cam_idx}: {exc}")
+            return False
+
+    def _restore_all_calibrations(self):
+        """Re-apply stored µm/px to every slot whose assigned camera matches
+        a stored identity (called after detect / source assignment)."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        for i in range(len(getattr(self, "_live_cam_source_combos", []))):
+            self._restore_calibration_for_slot(i)
 
     def _on_calibrate_needle(self, role: CameraRole):
         """Launch the stage-motion µm/px calibration for a needle camera.
@@ -1642,7 +1986,10 @@ class HardwareSetupPage(ModePage):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             result = dlg.result_um_per_px
             if result is not None:
-                self.set_calibrated_um_per_px(cam_idx, result)
+                # v7.5.x: also store the measured in-plane rotation (the move
+                # direction that produced clean lateral motion) for the aligner.
+                self.set_calibrated_um_per_px(
+                    cam_idx, result, rotation_deg=dlg.result_rotation_deg)
                 logger.info(
                     f"Needle calibration applied: Cam {cam_idx + 1} "
                     f"({role.value}) = {result:.4f} µm/px"
@@ -1685,6 +2032,15 @@ class HardwareSetupPage(ModePage):
 
         self._btn_detect_live_cams.setText("Detect Cameras")
         self._btn_detect_live_cams.setEnabled(True)
+        # v7.5.x: device identities are known now. First auto-assign each
+        # slot's source from the remembered role→identity map (fires the
+        # source-changed handler, which restores that camera's stored µm/px);
+        # then restore any already-assigned slots + refresh cards/buttons.
+        self._auto_assign_sources_from_store()
+        self._restore_all_calibrations()
+        if hasattr(self, "_needle_cards"):
+            self._refresh_role_derived_displays()
+        self._refresh_camera_preview_state()
         logger.info(f"Hardware Setup: detected {num} live camera sources")
 
     def _on_live_cam_role_changed(self, cam_idx: int):
@@ -1717,6 +2073,11 @@ class HardwareSetupPage(ModePage):
         # Skip the rebuild + label refresh churn while a saved config
         # is being applied to the UI; the role list is already correct.
         if not getattr(self, '_restoring', False):
+            # v7.5.x: a slot that already has a source assigned just gained
+            # (or changed) its role — remember role→identity so the source
+            # auto-restores next session, and restore that camera's stored cal.
+            self._restore_calibration_for_slot(cam_idx)
+            self._remember_assignment(cam_idx)
             self._refresh_role_derived_displays()
             if hasattr(self, "_objective_cal_card"):
                 self._objective_cal_card.apply_config(self._config)
@@ -2381,6 +2742,12 @@ class HardwareSetupPage(ModePage):
             combo.setCurrentIndex(ridx if ridx >= 0 else 0)
             combo.blockSignals(False)
         logger.debug(f"  Camera roles: {self._config.camera_roles}")
+
+        # v7.5.x: re-activate stored µm/px for any already-assigned slots
+        # before the role-derived refresh so the needle cards show the
+        # restored calibration. (Identity-keyed: actual restore happens as
+        # each source is assigned via _on_live_cam_source_changed.)
+        self._restore_all_calibrations()
 
         # v7.4.x rev2: Refresh the section labels and per-needle cards
         # that mirror the role assignments.

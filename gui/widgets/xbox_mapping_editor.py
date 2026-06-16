@@ -7,16 +7,35 @@ dropdown selectors for mapping each input to a command.
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QComboBox, QPushButton, QLabel, QGroupBox, QHeaderView, QTabWidget,
-    QWidget, QMessageBox, QFileDialog,
+    QWidget, QMessageBox, QFileDialog, QCheckBox,
 )
 from PySide6.QtCore import Qt
 
 logger = logging.getLogger(__name__)
+
+
+def _make_invert_cell(checked: bool):
+    """v7.5.x: a centered checkbox cell widget for the Axes 'Invert' column.
+
+    Returns ``(container, checkbox)``. The checkbox drives the per-group
+    ``axes_invert`` flag — a soft, controller-input-side direction flip
+    applied by the Xbox worker (independent of the hardware axis_flip).
+    """
+    container = QWidget()
+    lay = QHBoxLayout(container)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    chk = QCheckBox()
+    chk.setChecked(bool(checked))
+    lay.addWidget(chk)
+    return container, chk
 
 # All available commands that can be mapped
 AVAILABLE_COMMANDS = [
@@ -117,14 +136,23 @@ class XboxMappingEditorWidget(QWidget):
         axis_tab = QWidget(); axis_lay = QVBoxLayout(axis_tab)
         axis_lay.setContentsMargins(0, 0, 0, 0)
         self.axis_table = QTableWidget()
-        self.axis_table.setColumnCount(3)
-        self.axis_table.setHorizontalHeaderLabels(["Group", "Input", "Command"])
+        self.axis_table.setColumnCount(4)
+        self.axis_table.setHorizontalHeaderLabels(
+            ["Group", "Input", "Command", "Invert"])
         self.axis_table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Stretch)
         self.axis_table.setColumnWidth(0, 50)
         self.axis_table.setColumnWidth(1, 160)
+        self.axis_table.setColumnWidth(3, 60)
         self.axis_table.verticalHeader().setVisible(False)
         axis_lay.addWidget(self.axis_table)
+        _hint = QLabel(
+            "Invert flips that controller input's direction (software-only, "
+            "controller-side). It's separate from the hardware Axis Flip on "
+            "Hardware Setup → Device, which inverts the motor for all motion.")
+        _hint.setStyleSheet("color: #a6adc8;")
+        _hint.setWordWrap(True)
+        axis_lay.addWidget(_hint)
         tabs.addTab(axis_tab, "Axes")
         # D-Pad tab
         dpad_tab = QWidget(); dpad_lay = QVBoxLayout(dpad_tab)
@@ -197,8 +225,10 @@ class XboxMappingEditorWidget(QWidget):
             combo = self._make_command_combo(buttons.get(btn_id, "None"))
             self.btn_table.setCellWidget(row, 2, combo)
             self._btn_combos[btn_id] = combo
+        axes_invert = self.mapping.get("axes_invert", {})
         self.axis_table.setRowCount(len(AXIS_LABELS))
         self._axis_combos = {}
+        self._axis_invert_checks = {}
         for row, axis_id in enumerate(AXIS_LABELS):
             id_item = QTableWidgetItem(axis_id)
             id_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -209,6 +239,9 @@ class XboxMappingEditorWidget(QWidget):
             combo = self._make_command_combo(axes.get(axis_id, "None"))
             self.axis_table.setCellWidget(row, 2, combo)
             self._axis_combos[axis_id] = combo
+            cell, chk = _make_invert_cell(axes_invert.get(axis_id, False))
+            self.axis_table.setCellWidget(row, 3, cell)
+            self._axis_invert_checks[axis_id] = chk
         self.dpad_table.setRowCount(len(DPAD_LABELS))
         self._dpad_combos = {}
         for row, direction in enumerate(DPAD_LABELS):
@@ -226,14 +259,16 @@ class XboxMappingEditorWidget(QWidget):
         return {
             "buttons": {k: c.currentText() for k, c in self._btn_combos.items()},
             "axes":    {k: c.currentText() for k, c in self._axis_combos.items()},
+            "axes_invert": {k: c.isChecked()
+                            for k, c in self._axis_invert_checks.items()},
             "dpad":    {k: c.currentText() for k, c in self._dpad_combos.items()},
         }
 
     def _save_mapping(self):
         mapping = self._collect_mapping()
         try:
-            with open(self.mapping_file, "w") as f:
-                json.dump(mapping, f, indent=4)
+            # v7.5.x: atomic write — the worker hot-reloads this file.
+            _atomic_save_mapping(mapping, self.mapping_file)
             self.lbl_status.setText(f"Saved: {self.mapping_file}")
             logger.info(f"Mapping saved to {self.mapping_file}")
         except Exception as e:
@@ -287,6 +322,9 @@ _DEFAULT_MAPPING = {
         "4": "move_p3_at_velocity",
         "5": "move_p3_at_velocity",
     },
+    "axes_invert": {
+        "0-1": False, "2-3": False, "4": False, "5": False,
+    },
     "dpad": {
         "up": "increment_zspeed_up",
         "down": "increment_zspeed_down",
@@ -294,6 +332,29 @@ _DEFAULT_MAPPING = {
         "right": "increment_pspeed_up",
     },
 }
+
+
+def _atomic_save_mapping(mapping: dict, mapping_file: str) -> None:
+    """v7.5.x: write the mapping atomically (temp file + os.replace).
+
+    The Xbox worker hot-reloads this file every 5 s; a plain open(...,'w')
+    truncate-then-write could be read mid-write, and the worker's parse
+    failure used to silently unmap every input. Atomic replace means the
+    worker only ever sees a complete old or complete new file.
+    """
+    path = Path(mapping_file)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent) or ".", suffix=".tmp", prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(mapping, f, indent=4)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _load_mapping_from_file(mapping_file: str) -> dict:
@@ -360,6 +421,9 @@ class XboxMappingEditor(QDialog):
                     "4": "move_p3_at_velocity",
                     "5": "move_p3_at_velocity",
                 },
+                "axes_invert": {
+                    "0-1": False, "2-3": False, "4": False, "5": False,
+                },
                 "dpad": {
                     "up": "increment_zspeed_up",
                     "down": "increment_zspeed_down",
@@ -420,15 +484,24 @@ class XboxMappingEditor(QDialog):
         axis_tab = QWidget()
         axis_layout = QVBoxLayout(axis_tab)
         self.axis_table = QTableWidget()
-        self.axis_table.setColumnCount(3)
-        self.axis_table.setHorizontalHeaderLabels(["Group", "Input", "Command"])
+        self.axis_table.setColumnCount(4)
+        self.axis_table.setHorizontalHeaderLabels(
+            ["Group", "Input", "Command", "Invert"])
         self.axis_table.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.Stretch
         )
         self.axis_table.setColumnWidth(0, 50)
         self.axis_table.setColumnWidth(1, 160)
+        self.axis_table.setColumnWidth(3, 60)
         self.axis_table.verticalHeader().setVisible(False)
         axis_layout.addWidget(self.axis_table)
+        _hint = QLabel(
+            "Invert flips that controller input's direction (software-only, "
+            "controller-side) — separate from the hardware Axis Flip on "
+            "Hardware Setup → Device.")
+        _hint.setStyleSheet("color: #a6adc8; font-size: 9pt;")
+        _hint.setWordWrap(True)
+        axis_layout.addWidget(_hint)
         tabs.addTab(axis_tab, "🕹️ Axes")
 
         # ── D-Pad tab ─────────────────────────────────────────────
@@ -523,9 +596,11 @@ class XboxMappingEditor(QDialog):
             self._btn_combos[btn_id] = combo
 
         # ── Axes ──────────────────────────────────────────────────
+        axes_invert = self.mapping.get("axes_invert", {})
         all_axes = list(AXIS_LABELS.keys())
         self.axis_table.setRowCount(len(all_axes))
         self._axis_combos = {}
+        self._axis_invert_checks = {}
 
         for row, axis_id in enumerate(all_axes):
             id_item = QTableWidgetItem(axis_id)
@@ -541,6 +616,10 @@ class XboxMappingEditor(QDialog):
             combo = self._make_command_combo(current)
             self.axis_table.setCellWidget(row, 2, combo)
             self._axis_combos[axis_id] = combo
+
+            cell, chk = _make_invert_cell(axes_invert.get(axis_id, False))
+            self.axis_table.setCellWidget(row, 3, cell)
+            self._axis_invert_checks[axis_id] = chk
 
         # ── D-Pad ─────────────────────────────────────────────────
         all_dpad = list(DPAD_LABELS.keys())
@@ -572,18 +651,23 @@ class XboxMappingEditor(QDialog):
         for axis_id, combo in self._axis_combos.items():
             axes[axis_id] = combo.currentText()
 
+        axes_invert = {}
+        for axis_id, chk in self._axis_invert_checks.items():
+            axes_invert[axis_id] = chk.isChecked()
+
         dpad = {}
         for direction, combo in self._dpad_combos.items():
             dpad[direction] = combo.currentText()
 
-        return {"buttons": buttons, "axes": axes, "dpad": dpad}
+        return {"buttons": buttons, "axes": axes,
+                "axes_invert": axes_invert, "dpad": dpad}
 
     def _save_mapping(self):
         """Save the current mapping to file."""
         mapping = self._collect_mapping()
         try:
-            with open(self.mapping_file, "w") as f:
-                json.dump(mapping, f, indent=4)
+            # v7.5.x: atomic write — the worker hot-reloads this file.
+            _atomic_save_mapping(mapping, self.mapping_file)
             logger.info(f"Mapping saved to {self.mapping_file}")
             self.accept()
         except Exception as e:
@@ -608,6 +692,9 @@ class XboxMappingEditor(QDialog):
                 "2-3": "move_z_at_velocity",
                 "4": "move_p3_at_velocity",
                 "5": "move_p3_at_velocity",
+            },
+            "axes_invert": {
+                "0-1": False, "2-3": False, "4": False, "5": False,
             },
             "dpad": {
                 "up": "increment_zspeed_up",

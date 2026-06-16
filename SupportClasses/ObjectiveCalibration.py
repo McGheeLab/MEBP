@@ -186,6 +186,7 @@ class ObjectiveCalibrationStore:
         objective_name: str,
         measured_um_per_px: float,
         resolution: tuple[int, int],
+        rotation_deg: Optional[float] = None,
     ) -> None:
         """
         Store an empirically measured µm/px calibration.
@@ -195,14 +196,21 @@ class ObjectiveCalibrationStore:
             objective_name: Objective label (e.g. "4x").
             measured_um_per_px: Measured microns per pixel.
             resolution: Active frame size (width, height) at calibration time.
+            rotation_deg: v7.5.x — in-plane stage direction (deg from +X) that
+                produced the calibration move, as measured by the stage-motion
+                dialog. Lets the live-target picker map clicks → stage offset.
+                ``None`` omits the field (backwards compatible).
         """
         cals = self._data.setdefault("camera_objective_calibrations", {})
         cam_cals = cals.setdefault(camera_name, {})
-        cam_cals[objective_name] = {
+        entry = {
             "measured_um_per_px": round(measured_um_per_px, 6),
             "resolution": list(resolution),
             "date": str(date.today()),
         }
+        if rotation_deg is not None:
+            entry["rotation_deg"] = round(float(rotation_deg), 3)
+        cam_cals[objective_name] = entry
         self.save()
         logger.info(
             f"Objective calibration saved: {camera_name}/{objective_name} "

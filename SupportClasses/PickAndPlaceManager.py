@@ -715,7 +715,11 @@ class PickPlaceExecutor:
                                            timeout_s=self.z_timeout_s)
 
         # 2. Move XY
-        self.controller.move_xy_absolute(target_x_um, target_y_um)
+        # v7.5.x bugfix: target_{x,y}_um are ABSOLUTE stage µm (same frame the
+        # inter-well safe_travel_to uses). move_xy_absolute(from_zero_ref=True)
+        # would treat them as mm (×1000 + zero) → gross mis-placement; use the
+        # µm entry point.
+        self.controller.move_xy_absolute_um(target_x_um, target_y_um)
         self.controller.wait_for_xy_arrival(
             target_x_um / 1000.0, target_y_um / 1000.0,
             timeout_s=self.xy_timeout_s)

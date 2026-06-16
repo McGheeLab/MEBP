@@ -44,6 +44,35 @@
         ],
         "date": "2026-03-13"
       }
+    },
+    "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)": {
+      "4x": {
+        "measured_um_per_px": 1.546395,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-05-29",
+        "rotation_deg": 0.0
+      },
+      "2x": {
+        "measured_um_per_px": 3.1041,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-05-29",
+        "rotation_deg": 0.0
+      },
+      "10x": {
+        "measured_um_per_px": 0.628959,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-05-29",
+        "rotation_deg": 0.0
+      }
     }
   },
   "description": "Standard microscope objectives and per-camera empirical \u00b5m/px calibrations.",

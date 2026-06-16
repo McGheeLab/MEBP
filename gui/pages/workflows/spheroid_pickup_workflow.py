@@ -434,6 +434,13 @@ class SpheroidPickupWorkflowPage(QWidget):
             zero = self._controller.zero_position
         except Exception:
             return
+        # v7.5.x: absolute envelope → push zero so the view draws it zero-ref.
+        if hasattr(self._workspace_view, "set_zero_offset"):
+            self._workspace_view.set_zero_offset(zero["x"], zero["y"])
+        if hasattr(self._xz_view, "set_zero_offset_x"):
+            self._xz_view.set_zero_offset_x(zero["x"])
+        if hasattr(self._xz_view, "set_zero_offset_z"):
+            self._xz_view.set_zero_offset_z(zero.get("Z", 0.0))
         if xy is not None and xy[0] is not None and xy[1] is not None:
             zx_um = float(xy[0]) * 1000.0 - zero["x"]
             zy_um = float(xy[1]) * 1000.0 - zero["y"]
@@ -488,15 +495,17 @@ class SpheroidPickupWorkflowPage(QWidget):
             )
             if resp != QMessageBox.StandardButton.Yes:
                 return
+            # v7.5.x bugfix: move_xy_absolute(from_zero_ref=True) expects mm;
+            # the workspace emits zero-ref µm → convert (was 1000× overshoot).
             self._controller.move_xy_absolute(
-                x_um_zr, y_um_zr, from_zero_ref=True)
+                x_um_zr / 1000.0, y_um_zr / 1000.0, from_zero_ref=True)
             return
 
-        if current_z is not None and current_z >= self._safe_z - 0.05:
-            self._controller.move_xy_absolute(
-                x_um_zr, y_um_zr, from_zero_ref=True)
-            return
-
+        # v7.5.x CRITICAL FIX: cross-position click-to-travel ALWAYS retracts
+        # via safe_travel_to. The old "current_z >= safe_z → skip retract" gate
+        # was polarity-wrong on ME3B V1 (ZDIR=-1) and skipped the retract while
+        # the needle was DOWN. safe_travel_to is a near-no-op when the needle is
+        # already retracted, so always using it is safe.
         self._controller.safe_travel_to(
             stage_x, stage_y, safe_z_mm=self._safe_z, target_z_mm=None)
 

@@ -519,6 +519,27 @@ class PrintSetupPage(QWidget):
         lh_row.addWidget(self.layer_height_spin)
         layer_lay.addLayout(lh_row)
 
+        # v7.5.x: print height is measured up from the calibrated plate
+        # bottom (not an absolute Z), so it is frame-agnostic and can never be
+        # set below the plate. 0 = at the plate bottom; the needle is clamped
+        # so it never goes deeper than the plate bottom.
+        ph_row = QHBoxLayout()
+        _ph_label = QLabel("Print Z (above bottom):")
+        _ph_label.setToolTip(
+            "Print height measured up from the calibrated plate bottom.\n"
+            "0 = at the plate bottom; larger = higher. The needle is clamped "
+            "so it can never punch through the plate bottom.")
+        ph_row.addWidget(_ph_label)
+        self.print_height_spin = QDoubleSpinBox()
+        self.print_height_spin.setRange(0.0, 40.0)
+        self.print_height_spin.setValue(0.2)
+        self.print_height_spin.setSuffix(" mm")
+        self.print_height_spin.setDecimals(2)
+        self.print_height_spin.setSingleStep(0.1)
+        self.print_height_spin.setToolTip(_ph_label.toolTip())
+        ph_row.addWidget(self.print_height_spin)
+        layer_lay.addLayout(ph_row)
+
         left_col.addWidget(layer_grp)
 
         # ── Advanced ──────────────────────────────────────────────
@@ -1043,6 +1064,133 @@ class PrintSetupPage(QWidget):
 
         return (print_speed, flow_rate, max_speed)
 
+    # ════════════════════════════════════════════════════════════════
+    #  v7.5.x: plate-bottom-relative print Z
+    # ════════════════════════════════════════════════════════════════
+
+    def _find_app_settings(self):
+        """Locate the app-level Settings object (walks the parent chain)."""
+        _app_settings = getattr(self, '_app_settings', None)
+        if _app_settings is not None:
+            return _app_settings
+        _p = self.parent() if hasattr(self, 'parent') else None
+        while _p is not None:
+            if hasattr(_p, 'settings') and hasattr(_p.settings, 'get_section'):
+                return _p.settings
+            _p = _p.parent() if hasattr(_p, 'parent') else None
+        return None
+
+    def _calibration_plate_bottom_z(self):
+        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated."""
+        try:
+            app_settings = self._find_app_settings()
+            if app_settings is None:
+                return None
+            cal = app_settings.get_section('calibration') or {}
+            pb = cal.get('plate_bottom_z')
+            return None if pb is None else float(pb)
+        except Exception:
+            return None
+
+    def _print_height_above_bottom(self):
+        """Desired print height above the plate bottom (mm).
+
+        A selected object that carries ``z_above_plate_bottom_mm`` metadata
+        (e.g. a Sketch print) overrides the spin so its authored height is
+        honoured; otherwise the Print-Z spin value is used.
+        """
+        obj_h = self._object_print_height_above_bottom()
+        if obj_h is not None:
+            return obj_h
+        spin = getattr(self, 'print_height_spin', None)
+        return float(spin.value()) if spin is not None else 0.2
+
+    def _object_print_height_above_bottom(self):
+        """Scan selected print objects for a ``z_above_plate_bottom_mm`` param.
+
+        Returns the shallowest (smallest) such height if any object carries it,
+        else None. Shallowest is the safest choice when multiple objects mix.
+        """
+        tab = getattr(self, 'tab_objects', None)
+        if tab is None:
+            return None
+        candidates = []
+
+        def _scan(objs):
+            for obj in objs or []:
+                params = obj.get('params', {}) if isinstance(obj, dict) else {}
+                if isinstance(params, dict) and 'z_above_plate_bottom_mm' in params:
+                    try:
+                        candidates.append(float(params['z_above_plate_bottom_mm']))
+                    except (TypeError, ValueError):
+                        pass
+
+        _scan(getattr(tab, '_objects', None))
+        cf = getattr(tab, '_current_file', None)
+        if cf is not None and getattr(cf, 'objects', None):
+            _scan(list(cf.objects.values()))
+        return min(candidates) if candidates else None
+
+    def _print_z_dir(self) -> float:
+        """v7.5.x: reference-vector print-Z up-direction as a clean float.
+
+        Falls back to the module ``ZDIR`` when the controller can't provide one
+        (older controller / test stub), so callers can always pass a numeric
+        ``zdir``.
+        """
+        from SupportClasses.StageController import ZDIR
+        try:
+            return float(self.controller.print_z_dir())
+        except (TypeError, ValueError, AttributeError):
+            return ZDIR
+
+    def _apply_plate_relative_print_z(self, s) -> None:
+        """Set ``s.print_z_height`` from the plate-bottom datum + the desired
+        height above it. Leaves the default untouched if uncalibrated."""
+        pb = self._calibration_plate_bottom_z()
+        if pb is None:
+            return
+        try:
+            from SupportClasses.StageController import plate_relative_to_zref
+            s.print_z_height = plate_relative_to_zref(
+                pb, self._print_height_above_bottom(),
+                zdir=self._print_z_dir())
+        except Exception as e:
+            logger.debug(f"_apply_plate_relative_print_z failed: {e}")
+
+    def _confirm_print_floor(self, job) -> bool:
+        """Warn if the job's print Z (or its deepest layer) is below the plate
+        bottom. Returns True to proceed, False to cancel."""
+        pb = self._calibration_plate_bottom_z()
+        if pb is None or job is None:
+            return True
+        try:
+            from SupportClasses.StageController import zref_to_plate_relative
+            st = job.settings
+            n = max(1, int(getattr(st, 'num_layers', 1)))
+            lh = float(getattr(st, 'layer_height', 0.0))
+            pz = float(getattr(st, 'print_z_height', 0.0))
+            up = self._print_z_dir()
+            # Check both layer endpoints so the test is correct for either Z
+            # polarity. Layers step by `up*lh` (see build_well_plate_job), so
+            # the deepest point is the base layer; convert both with `up`.
+            heights = [zref_to_plate_relative(pb, pz, zdir=up),
+                       zref_to_plate_relative(pb, pz + up * (n - 1) * lh, zdir=up)]
+            if min(heights) >= -1e-6:
+                return True
+        except Exception:
+            return True
+        from PySide6.QtWidgets import QMessageBox
+        resp = QMessageBox.warning(
+            self, "Below plate bottom",
+            "The configured print height is below the calibrated plate bottom, "
+            "so the needle will be clamped to the plate bottom (it will not "
+            "print deeper, and multi-layer build-up may be capped). Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return resp == QMessageBox.StandardButton.Yes
+
     def _get_settings(self) -> PrintSettings:
         """Build PrintSettings from simplified context panel controls."""
         s = PrintSettings()
@@ -1072,6 +1220,9 @@ class PrintSetupPage(QWidget):
 
         s.num_layers = self.layers_spin.value()
         s.layer_height = self.layer_height_spin.value()
+        # v7.5.x: stamp the reference-vector up-direction so layer build-up and
+        # per-well dispense Z step the correct way on either Z polarity.
+        s.z_up_sign = self._print_z_dir()
         s.travel_z_height = self.travel_z_spin.value()
         s.settle_delay = self.settle_spin.value()
 
@@ -1090,6 +1241,11 @@ class PrintSetupPage(QWidget):
         s.prime_amounts = {
             pid: spin.value() for pid, spin in self._prime_spins.items()
         }
+
+        # v7.5.x: print Z is a height above the calibrated plate bottom (not an
+        # absolute Z), resolved here so both job-build paths (_build_current_job
+        # and the generate path) pick it up.
+        self._apply_plate_relative_print_z(s)
 
         return s
 
@@ -1138,6 +1294,12 @@ class PrintSetupPage(QWidget):
                 self.status_label.setText("\u26a0 No job \u2014 configure wells first")
                 self.status_label.setStyleSheet(
                     f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: 10px;")
+            return
+
+        # v7.5.x: early-warn if the configured print Z (or its deepest layer)
+        # would punch through the plate bottom. The controller hard-clamps
+        # during motion regardless; this just lets the user reconsider first.
+        if not self._confirm_print_floor(job):
             return
 
         # Attach plan of action to job if available

@@ -105,6 +105,19 @@ class _StepGroup:
         f"QLineEdit:focus {{ border-color: {_ACCENT}; }}"
     )
 
+    # Mirrors the :checked preset look so the custom box reads as the
+    # active step size even after it loses keyboard focus.
+    _CUSTOM_ACTIVE_STYLE = (
+        f"QLineEdit {{"
+        f"  background-color: {_ACCENT};"
+        f"  border: 1px solid {_ACCENT};"
+        f"  color: {COLORS.get('base', '#1e1e2e')};"
+        f"  padding: 2px 6px;"
+        f"  border-radius: 4px;"
+        f"  font-weight: 700;"
+        f"}}"
+    )
+
     def __init__(self, magnitudes: tuple[float, ...], default: float,
                  on_change, unit: str):
         self.magnitudes = magnitudes
@@ -138,6 +151,11 @@ class _StepGroup:
             return f"{int(mag)}"
         return f"{mag:g}"
 
+    def _set_custom_active(self, active: bool) -> None:
+        """Toggle the persistent 'active step' highlight on the custom box."""
+        self.custom_edit.setStyleSheet(
+            self._CUSTOM_ACTIVE_STYLE if active else self._CUSTOM_STYLE)
+
     def _pick_preset(self, mag: float, _checked: bool = True) -> None:
         self._value = mag
         # Clear the custom box so the picked value is unambiguous.
@@ -145,11 +163,15 @@ class _StepGroup:
             self.custom_edit.blockSignals(True)
             self.custom_edit.clear()
             self.custom_edit.blockSignals(False)
+        # The preset is now the active step — drop the custom highlight.
+        self._set_custom_active(False)
         if self._on_change:
             self._on_change(mag)
 
     def _on_custom_text(self, text: str) -> None:
         if not text:
+            # Cleared the box — no custom step is active anymore.
+            self._set_custom_active(False)
             return
         try:
             val = float(text)
@@ -158,9 +180,10 @@ class _StepGroup:
         if val <= 0:
             return
         self._value = val
-        # Uncheck all presets — the custom box wins.
+        # Uncheck all presets — the custom box wins, and highlight it.
         for btn in self.buttons:
             btn.setChecked(False)
+        self._set_custom_active(True)
         if self._on_change:
             self._on_change(val)
 

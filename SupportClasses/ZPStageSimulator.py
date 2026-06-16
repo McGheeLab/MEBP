@@ -294,6 +294,8 @@ class ZPStageSimulator:
         with self._lock:
             if cmd.startswith("G0"):
                 return self._cmd_move(cmd)
+            elif cmd.startswith("G92"):
+                return self._cmd_set_position(cmd)
             elif cmd == "G90":
                 self.absolute_mode = True
                 return "ok"
@@ -355,6 +357,32 @@ class ZPStageSimulator:
                 self.target_position[axis] = val
             else:
                 self.target_position[axis] = self.position[axis] + val
+        return "ok"
+
+    def _cmd_set_position(self, cmd: str) -> str:
+        """Handle G92 — rebase the logical position of each named axis
+        without moving (lock must be held).
+
+        Marlin G92 redefines the current coordinate of the listed axes
+        to the given values; the motor does not move. Mirroring it here
+        makes :meth:`ZPStageManager.set_zero` and the manual
+        position-override re-sync visible in the simulated M114 readout
+        (previously G92 fell through to a bare 'ok' and the simulated
+        position never changed).
+        """
+        axes = re.findall(r"([XYZE])([-+]?\d*\.?\d+)", cmd)
+        for axis, value_str in axes:
+            if axis not in self.position:
+                continue
+            try:
+                val = float(value_str)
+            except ValueError:
+                continue
+            self.position[axis] = val
+            self.target_position[axis] = val
+            if axis in self.counts:
+                spm = self.steps_per_mm.get(axis, self._DEFAULT_STEPS_PER_MM)
+                self.counts[axis] = int(round(val * spm))
         return "ok"
 
     def _cmd_report_position(self) -> str:

@@ -203,6 +203,19 @@ class PrintBuilderPage(ModePage):
     def settings_page(self) -> PrintingSettingsPage:
         return self._settings_page
 
+    # ── Calibration fanout ────────────────────────────────────────
+
+    def set_z_references(self, refs: dict) -> None:
+        """v7.5.x: forward the calibration Z-reference set (incl.
+        ``plate_bottom_z``) to any sub-page that wants it (the Sketch page
+        uses it to express print Z as a height above the plate bottom)."""
+        for page in self._sub_pages:
+            if hasattr(page, "set_z_references"):
+                try:
+                    page.set_z_references(refs)
+                except Exception as e:
+                    logger.debug(f"set_z_references on sub-page failed: {e}")
+
     # ── Overrides ─────────────────────────────────────────────────
 
     def get_context_widget(self):

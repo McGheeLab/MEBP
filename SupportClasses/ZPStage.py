@@ -139,6 +139,13 @@ class ZPStageManager:
         self.z_pos: float = 0.0
         self.e_pos: float = 0.0
 
+        # v7.5.x ZP reconnect hotfix: True when the most recent M114 query
+        # parsed a valid position. get_current_position() returns the cached
+        # (possibly stale) floats on a failed read, so callers that need to
+        # know whether the board actually answered (e.g. the PositionPoller's
+        # liveness check) read this flag instead of inspecting the tuple.
+        self._last_position_read_ok: bool = True
+
         # Initialise communication backend
         if simulate:
             self.serial = ZPStageSimulator()
@@ -160,6 +167,23 @@ class ZPStageManager:
             if self.simulate:
                 self.serial.stop()
             else:
+                # v7.5.x close-time reset mitigation (safety): de-assert
+                # DTR/RTS *before* closing so the OS close doesn't pulse the
+                # Marlin RESET line (a reset de-energizes the steppers → the
+                # axes run to their extents). This is the ONLY software lever
+                # for the close-time reset: the open path must keep its reset
+                # (the ME3B V1 board needs it to connect — see
+                # _try_open_marlin), so we can't pin the lines low for the
+                # whole session. Whether this de-assert actually avoids the
+                # reset is board/driver-polarity dependent; if it doesn't, the
+                # reliable cure is the hardware auto-reset disable (cut RST-EN
+                # / 10 µF RESET→GND). Connectivity is unaffected either way —
+                # this runs only at shutdown, after the session is done.
+                try:
+                    self.serial.dtr = False
+                    self.serial.rts = False
+                except Exception:
+                    pass
                 self.serial.close()
         except Exception as e:
             logger.warning(f"Error closing ZP stage: {e}")
@@ -301,11 +325,25 @@ class ZPStageManager:
 
         Single open — the same handle becomes the session if Marlin
         is found. No close-reopen → only one Arduino DTR reset.
+
+        v7.5.x note: an attempt to suppress the open-time DTR/RTS reset
+        (to also kill the close-time reset that slams the axes — see
+        ``stop()``) by opening with the control lines pinned low BROKE
+        connection on the ME3B V1 board — this board needs the DTR reset
+        edge on open to start talking. The open path is therefore left
+        at the default (resetting) behavior. The close-time reset is
+        mitigated only in ``stop()``; the reliable cure is the hardware
+        auto-reset disable (cut RST-EN jumper / 10 µF RESET→GND).
         """
         try:
             ser = serial.Serial(port, self.baudrate, timeout=probe_timeout)
         except (serial.SerialException, OSError) as e:
-            logger.debug(f"open {port} failed: {e}")
+            # v7.5.x ZP reconnect hotfix: INFO (was debug) so a failed
+            # reconnect shows the OS reason in the log. "Access is denied" /
+            # "PermissionError" here means the port is still held open (the
+            # previous handle wasn't released) — the signature of the
+            # "dead until app restart" bug.
+            logger.info(f"ZP probe: open {port} failed: {e}")
             return None
         try:
             # Brief settle — gives boards that DTR-reset on open a moment
@@ -332,7 +370,7 @@ class ZPStageManager:
                     except Exception:
                         accumulated += str(chunk)
                 if "FIRMWARE_NAME" in accumulated:
-                    logger.debug(f"{port} → Marlin OK: {accumulated[:80]!r}")
+                    logger.info(f"ZP probe: {port} answered M115 (Marlin OK)")
                     try:
                         ser.reset_output_buffer()
                     except Exception:
@@ -344,12 +382,17 @@ class ZPStageManager:
                 if not chunk:
                     # Nothing came back — brief pause before next loop
                     time.sleep(0.05)
-            logger.debug(
-                f"{port} not Marlin (response: {accumulated[:80]!r})")
+            # v7.5.x ZP reconnect hotfix: INFO (was debug). An empty response
+            # here means the port opened but nothing answered M115 within the
+            # probe window — e.g. a board still rebooting from the DTR reset
+            # that opening the port triggers, or a non-Marlin port.
+            logger.info(
+                f"ZP probe: {port} did not answer M115 "
+                f"(response: {accumulated[:80]!r})")
             ser.close()
             return None
         except Exception as e:
-            logger.debug(f"probe {port} failed: {e}")
+            logger.info(f"ZP probe: {port} errored during M115 probe: {e}")
             try:
                 ser.close()
             except Exception:
@@ -451,6 +494,34 @@ class ZPStageManager:
             return False
         self.send_data(f"G92 {physical}0")
         logger.info(f"ZP G92 {physical}0 sent (logical {logical_axis})")
+        return True
+
+    def set_position(self, logical_axis: str, value_mm: float) -> bool:
+        """v7.5.x: override the Marlin physical axis mapped to
+        ``logical_axis`` to ``value_mm`` by sending a G92.
+
+        The arbitrary-value generalization of :meth:`set_zero` (which is
+        just ``set_position(axis, 0.0)``). G92 redefines the firmware's
+        current position counter for that axis *without moving* — after
+        this call the next M114 query reports ``value_mm``.
+
+        Used to re-sync the firmware position counter to the real
+        physical position after a board power cycle: Marlin has no
+        absolute encoder and powers up reporting 0, so only the operator
+        can declare where the axis actually is.
+
+        Returns True if the command was queued, False if ``logical_axis``
+        isn't mapped.
+        """
+        physical = self.axis_map.get(logical_axis)
+        if not physical:
+            logger.warning(
+                f"set_position({logical_axis}): no mapping in "
+                f"axis_map={self.axis_map}")
+            return False
+        self.send_data(f"G92 {physical}{value_mm:.4f}")
+        logger.info(
+            f"ZP G92 {physical}{value_mm:.4f} sent (logical {logical_axis})")
         return True
 
     def _build_m203_command(self) -> str:
@@ -631,13 +702,30 @@ class ZPStageManager:
             axes:     Dict of {printer_axis: distance}, e.g. {"X": 1.5, "Y": -0.5}
             feedrate: Optional feedrate override (mm/min).
         """
-        # Filter out zero moves
-        active = {a: d for a, d in axes.items() if abs(d) > 1e-6}
+        # v7.5.x freeze fix: drop SUB-RESOLUTION moves (≥ 1e-4 mm = 0.1 µm).
+        # The old `> 1e-6` gate let through the tiny residual a soft-limit
+        # clamp leaves when an axis is pinned at the limit (clamped_delta =
+        # boundary − current ≈ a few µm of float noise). The continuous jog
+        # loop then emitted one such micro-move *every segment, forever*,
+        # while the stick was held against the limit — a stream of un-acked
+        # commands that freezes the board (→ the poller then drops it). Below
+        # one Marlin step (~0.1 µm) there is nothing real to move, so skip.
+        active = {a: d for a, d in axes.items() if abs(d) >= 1e-4}
         if not active:
             return
 
-        axis_str = " ".join(f"{a}{d}" for a, d in active.items())
+        # v7.5.x freeze fix: fixed-decimal format. Raw f"{d}" emitted
+        # scientific notation for tiny values (e.g. "Z9e-05"), which not all
+        # G-code parsers accept. Matches the print-path convention
+        # (PrintManager uses :.4f / :.5f). 4 dp = 0.1 µm, below any real move.
+        axis_str = " ".join(f"{a}{d:.4f}" for a, d in active.items())
         fr = feedrate if feedrate is not None else self.feedrate
+        # Never emit a non-positive feedrate: Marlin treats "F0" as an
+        # infinite-time move and stalls the planner (another freeze path).
+        try:
+            fr = max(float(fr), 1.0)
+        except (TypeError, ValueError):
+            fr = self.feedrate
         self.send_data(f"G0 F{fr} {axis_str}")
 
     def move_absolute(self, axes: dict[str, float], fast: bool = False,
@@ -657,7 +745,8 @@ class ZPStageManager:
         if not active:
             return
 
-        axis_str = " ".join(f"{a}{p}" for a, p in active.items())
+        # v7.5.x freeze fix: fixed-decimal format (never scientific notation).
+        axis_str = " ".join(f"{a}{p:.4f}" for a, p in active.items())
         feed_str = f" F{feedrate_mm_min:.0f}" if feedrate_mm_min else ""
 
         self.send_data("G90")  # Absolute mode
@@ -743,8 +832,13 @@ class ZPStageManager:
                 self.y_pos = float(match.group(2))
                 self.z_pos = float(match.group(3))
                 self.e_pos = float(match.group(4))
+                self._last_position_read_ok = True  # v7.5.x
                 return
 
+        # v7.5.x: no parseable position in the response — the board did not
+        # answer M114 (dead/powered-off serial). The poller uses this to
+        # escalate to a disconnect (the tuple itself stays at stale floats).
+        self._last_position_read_ok = False
         logger.debug(f"ZP position parse failed: {response[:100]}")
 
     # ── Settings ──────────────────────────────────────────────────

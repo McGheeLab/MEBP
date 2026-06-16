@@ -558,7 +558,11 @@ class ToupCamBackend:
         self._buf_ptr = None
         self._callback_ref = None
         self._frame_ready.clear()
-        logger.info("ToupCam released")
+        # Skip logging if the interpreter is shutting down (e.g. release()
+        # invoked from __del__): the logging machinery may be half-torn-down,
+        # and datetime/strftime in the console handler raises ImportError.
+        if sys.meta_path is not None:
+            logger.info("ToupCam released")
     
     def get_resolution(self) -> tuple[int, int]:
         """Return current (width, height)."""

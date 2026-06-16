@@ -83,9 +83,14 @@ class CameraRole(str, Enum):
     The Calibration page resolves which `CameraManager.cameras[i]` to
     mount on each workflow tab by looking up the index that has the
     expected role. Two side-mounted needle cameras (X-view and Y-view)
-    plus a single overhead plate camera covers the v7.4.4 workflows;
-    MICROSCOPE (v7.4.x) tags the camera that sits behind an objective
-    lens and supports per-objective µm/px calibration.
+    plus the MICROSCOPE camera cover the workflows; MICROSCOPE tags the
+    camera that sits behind an objective lens and looks down at the well
+    plate, and supports per-objective µm/px calibration.
+
+    v7.5.x: the separate ``PLATE`` ("overhead cam over the well plate")
+    role was removed — the microscope camera *is* the camera that views
+    the plate, so MICROSCOPE serves both purposes. Legacy ``"plate"``
+    role strings migrate to MICROSCOPE in ``from_dict``.
 
     All non-UNASSIGNED roles are enforced as singletons by
     `HardwareConfig.set_camera_role()` — assigning a role to a new slot
@@ -94,15 +99,13 @@ class CameraRole(str, Enum):
     UNASSIGNED = "unassigned"
     NEEDLE_X = "needle_x"     # Side cam looking down the X axis (sees Y/Z)
     NEEDLE_Y = "needle_y"     # Side cam looking down the Y axis (sees X/Z)
-    PLATE = "plate"           # Overhead cam over the well plate
-    MICROSCOPE = "microscope" # Behind an objective lens; per-objective µm/px
+    MICROSCOPE = "microscope" # Behind an objective lens, viewing the plate
 
 
 # v7.4.x: roles that may only be held by a single camera slot at a time.
 SINGLETON_CAMERA_ROLES: frozenset[CameraRole] = frozenset({
     CameraRole.NEEDLE_X,
     CameraRole.NEEDLE_Y,
-    CameraRole.PLATE,
     CameraRole.MICROSCOPE,
 })
 
@@ -767,6 +770,10 @@ class HardwareConfig:
                 (r.value if isinstance(r, CameraRole) else str(r))
                 for r in self.camera_roles
             ],
+            # v7.5.x: per-camera µm/px + rotation are NOT stored here — they
+            # live in the per-machine CameraCalibrationStore
+            # (config/hardware/camera_calibrations.json) so loading a saved
+            # hardware-setup file can't wipe them.
         }
 
     @classmethod
@@ -820,9 +827,14 @@ class HardwareConfig:
         # v7.4.4: Per-camera workflow roles. Missing field migrates to
         # all-UNASSIGNED; shorter lists are zero-padded; unknown values
         # fall back to UNASSIGNED rather than erroring out.
+        # v7.5.x: the PLATE role was removed — migrate any legacy "plate"
+        # string to MICROSCOPE (the microscope camera views the plate).
         raw_roles = data.get("camera_roles") or []
         roles: list[CameraRole] = []
         for entry in raw_roles[:MAX_LIVE_CAMERAS]:
+            if entry == "plate":
+                roles.append(CameraRole.MICROSCOPE)
+                continue
             try:
                 roles.append(CameraRole(entry))
             except ValueError:
@@ -830,6 +842,11 @@ class HardwareConfig:
         while len(roles) < MAX_LIVE_CAMERAS:
             roles.append(CameraRole.UNASSIGNED)
         config.camera_roles = roles
+
+        # v7.5.x: per-camera µm/px + rotation are no longer stored in the
+        # hardware config — they live in the per-machine CameraCalibrationStore
+        # so a setup-file load can't wipe them. Any legacy "camera_calibrations"
+        # key in older saved configs is simply ignored.
 
         return config
 

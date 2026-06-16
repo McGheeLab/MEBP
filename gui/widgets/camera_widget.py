@@ -93,10 +93,15 @@ def detect_cameras(max_index: int = 4) -> list[int]:
 
     available = []
     consecutive_fails = 0
+    # v7.5.x: open via DirectShow so OpenCV indices line up with the
+    # DirectShow device enumeration used for per-camera identity
+    # (gui/widgets/camera_identity.py). CAP_DSHOW is a Windows no-op
+    # elsewhere; the constant exists in all OpenCV builds.
+    _dshow = getattr(cv2, "CAP_DSHOW", 700)
     try:
         for idx in range(max_index):
             try:
-                cap = cv2.VideoCapture(idx)
+                cap = cv2.VideoCapture(idx, _dshow)
                 if cap.isOpened():
                     available.append(idx)
                     cap.release()
@@ -381,10 +386,26 @@ class CameraWidget(QWidget):
         if not CAMERA_AVAILABLE:
             return
 
-        # OpenCV cameras
+        # OpenCV cameras — v7.5.x: label with the DirectShow friendly name
+        # + USB port tag (e.g. "Teslong Camera (port 6&29d1719c&2)") so two
+        # identical cameras are distinguishable. Falls back to the index
+        # when no DirectShow info is available.
         if CV2_AVAILABLE:
+            try:
+                from gui.widgets.camera_identity import (
+                    enumerate_directshow_cameras, label_for,
+                )
+                ds_cams = enumerate_directshow_cameras()
+            except Exception:
+                ds_cams = []
             for idx in detect_cameras():
-                self.camera_combo.addItem(f"CV2: Camera {idx}", ("opencv", idx))
+                entry = next(
+                    (c for c in ds_cams if c.get("index") == idx), None)
+                if entry:
+                    text = label_for(entry["name"], entry["device_path"])
+                else:
+                    text = f"Camera {idx}"
+                self.camera_combo.addItem(text, ("opencv", idx))
 
         # ToupCam cameras  (v7.3-camera)
         for tc_dev in detect_toupcam_cameras():
@@ -441,7 +462,10 @@ class CameraWidget(QWidget):
         if not CV2_AVAILABLE or self._running:
             return
 
-        self._capture = cv2.VideoCapture(camera_index)
+        # v7.5.x: match the CAP_DSHOW backend used during detection so the
+        # opened device corresponds to the enumerated identity (see
+        # detect_cameras / camera_identity).
+        self._capture = cv2.VideoCapture(camera_index, getattr(cv2, "CAP_DSHOW", 700))
         if not self._capture.isOpened():
             self.video_label.setText(f"Failed to open camera {camera_index}")
             self._capture = None

@@ -78,6 +78,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from SupportClasses.ZPStage import AXIS_MAP
+from SupportClasses.PrintExecutionLogger import PrintExecutionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,12 @@ class PrintSettings:
     print_z_height: float = 0.1      # Z height for printing (mm above zero)
     layer_height: float = 0.1        # Height increment per layer
     num_layers: int = 1              # Number of layers
+    # v7.5.x: print-Z up-direction (zero-ref frame), stamped from
+    # StageController.print_z_dir() at job-build time. +1 = "up is larger Z"
+    # (conventional); -1 = "up is smaller Z" (ME3B V1, needle descends as raw Z
+    # increases). Layer build-up steps by `z_up_sign * layer_height` so layers
+    # grow UP on either polarity. Default +1 preserves legacy additive behaviour.
+    z_up_sign: float = 1.0
     retract_amount: float = 0.0      # Pump retraction after path segment (legacy single-pump)
     prime_amount: float = 0.0        # Pump prime before path segment (legacy single-pump)
     dwell_after_move: float = 0.0    # Seconds to wait after travel moves
@@ -529,7 +536,11 @@ def build_well_plate_job(
     active_pump = pump
 
     for layer in range(settings.num_layers):
-        z_height = settings.print_z_height + layer * settings.layer_height
+        # v7.5.x: step layers along the reference-vector "up" direction so
+        # build-up grows away from the plate floor on either Z polarity
+        # (legacy additive `+layer*layer_height` drove deeper on ME3B V1).
+        z_up = getattr(settings, "z_up_sign", 1.0)
+        z_height = settings.print_z_height + z_up * layer * settings.layer_height
 
         # Determine pump for this layer
         layer_pump = active_pump
@@ -677,14 +688,16 @@ class TrajectoryExecutor:
     continuous trajectory tracking.
     """
 
-    def __init__(self, controller, recorder=None):
+    def __init__(self, controller, recorder=None, exec_logger=None):
         """
         Args:
             controller: StageController instance
             recorder: Optional PrintRecorder for data logging
+            exec_logger: Optional PrintExecutionLogger (v7.5.x JSONL log)
         """
         self.controller = controller
         self.recorder = recorder
+        self.exec_logger = exec_logger
         self._abort_flag = threading.Event()
 
     def execute(
@@ -714,6 +727,10 @@ class TrajectoryExecutor:
 
         logger.info(f"TrajectoryExecutor: starting {total} waypoints, "
                      f"duration={waypoints[-1].t:.2f}s")
+        lg = self.exec_logger
+        if lg:
+            lg.log("traj_start", n_waypoints=total,
+                   plan_duration_s=round(float(waypoints[-1].t), 3))
 
         # v7.2.7: Set stage speed for trajectory
         try:
@@ -736,6 +753,9 @@ class TrajectoryExecutor:
                     ctrl.xy_stage.set_velocity(_sms_val)
                     _speed_info = f"SMS={_sms_val}"
                 logger.info(f"v7.2.7: Trajectory speed {_max_spd:.1f} mm/s, {_speed_info}")
+                if lg:
+                    lg.log("speed_set", context="trajectory",
+                           mm_s=round(_max_spd * 1.5, 3), info=_speed_info)
         except Exception as _e:
             logger.warning(f"v7.2.7: Could not set trajectory speed: {_e}")
 
@@ -760,6 +780,24 @@ class TrajectoryExecutor:
             t_now = time.monotonic()
             if t_target > t_now:
                 time.sleep(t_target - t_now)
+
+            # v7.5.x exec log: lateness vs plan + sampler lag target.
+            # Logged sparsely (every 25th wp, or any wp >0.25s late) to
+            # keep file size sane on dense trajectories.
+            if lg:
+                late_s = max(0.0, time.monotonic() - t_target)
+                if late_s > 0.25 or i % 25 == 0 or i == total - 1:
+                    lg.log("traj_wp", i=i, t_plan=round(float(wp.t), 3),
+                           late_s=round(late_s, 3),
+                           x_mm=round(float(wp.x), 4),
+                           y_mm=round(float(wp.y), 4),
+                           z_mm=round(float(wp.z), 4))
+                try:
+                    zero = ctrl.zero_position
+                    lg.note_xy_target(wp.x * 1000.0 + zero["x"],
+                                      wp.y * 1000.0 + zero["y"])
+                except Exception:
+                    pass
 
             # Command stage position
             # XY: convert mm to stage units (µsteps) — done by controller
@@ -819,6 +857,10 @@ class TrajectoryExecutor:
                 on_progress(i, total, f"Trajectory {i}/{total}")
 
         logger.info("TrajectoryExecutor: trajectory complete")
+        if lg:
+            lg.log("traj_end",
+                   wall_s=round(time.monotonic() - t_start, 3),
+                   plan_s=round(float(waypoints[-1].t), 3))
         return True
 
     def abort(self):
@@ -842,8 +884,9 @@ class DirectCommandExecutor:
     before proceeding.
     """
 
-    def __init__(self, controller: "StageController"):
+    def __init__(self, controller: "StageController", exec_logger=None):
         self.ctrl = controller
+        self.exec_logger = exec_logger
         self._abort = threading.Event()
 
     def abort(self):
@@ -854,25 +897,46 @@ class DirectCommandExecutor:
         """Move XY to position and wait for arrival."""
         if not self.ctrl.is_xy_connected:
             return True
+        lg = self.exec_logger
+        t0 = time.monotonic()
+        if lg:
+            lg.log("xy_cmd", context="blocking_travel",
+                   **lg.xy_cmd_fields(self.ctrl, x_mm, y_mm))
         self.ctrl.move_xy_absolute(x_mm, y_mm, from_zero_ref=True, fast=False)
-        return self.ctrl.wait_for_xy_arrival(
+        ok = self.ctrl.wait_for_xy_arrival(
             x_mm, y_mm, tolerance_mm=0.5, timeout_s=timeout_s)
+        if lg:
+            lg.log("xy_arrival", ok=bool(ok),
+                   duration_s=round(time.monotonic() - t0, 3),
+                   timeout_s=timeout_s)
+        return ok
 
     def move_z(self, z_mm: float, feedrate_mm_min: float | None = None,
                timeout_s: float = 10.0) -> bool:
         """Move Z to position and wait for arrival."""
         if not self.ctrl.is_zp_connected:
             return True
+        lg = self.exec_logger
+        t0 = time.monotonic()
         self.ctrl.move_z_absolute(z_mm, from_zero_ref=True,
                                   feedrate_mm_min=feedrate_mm_min)
-        return self.ctrl.wait_for_z_arrival(
+        ok = self.ctrl.wait_for_z_arrival(
             z_mm, tolerance_mm=0.1, timeout_s=timeout_s)
+        if lg:
+            lg.log("z_move", context="blocking", z_mm=round(z_mm, 4),
+                   feedrate_mm_min=feedrate_mm_min, ok=bool(ok),
+                   duration_s=round(time.monotonic() - t0, 3))
+        return ok
 
     def move_pump(self, pump_id: str, volume_uL: float,
                   rate_uL_s: float | None = None) -> bool:
         """Move pump and wait estimated duration."""
         if not self.ctrl.is_zp_connected:
             return True
+        if self.exec_logger:
+            self.exec_logger.log("extrude", context="service",
+                                 pump=pump_id, vol_uL=round(volume_uL, 4),
+                                 rate_uL_s=rate_uL_s)
         self.ctrl.move_pump_uL(pump_id, volume_uL, rate_uL_s)
         # Estimate pump move duration and wait
         rate = rate_uL_s or 5.0
@@ -967,7 +1031,7 @@ class HybridPlanExecutor:
     def __init__(self, controller: "StageController",
                  plan, well_model, plate, path_points,
                  settings: PrintSettings, hw_config=None,
-                 recorder=None):
+                 recorder=None, exec_logger=None):
         self.controller = controller
         self.plan = plan
         self.well_model = well_model
@@ -976,6 +1040,7 @@ class HybridPlanExecutor:
         self.settings = settings
         self.hw_config = hw_config
         self.recorder = recorder
+        self.exec_logger = exec_logger
         self._abort_flag = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # not paused initially
@@ -1250,7 +1315,8 @@ class HybridPlanExecutor:
             logger.warning("HybridPlanExecutor: no steps in plan")
             return True
 
-        direct = DirectCommandExecutor(self.controller)
+        direct = DirectCommandExecutor(self.controller,
+                                       exec_logger=self.exec_logger)
         total_steps = len(steps)
 
         logger.info(f"HybridPlanExecutor: starting {total_steps} plan steps")
@@ -1274,6 +1340,10 @@ class HybridPlanExecutor:
             step_name = stype.name if stype else "UNKNOWN"
             logger.info(f"HybridPlanExecutor: step {step_idx+1}/{total_steps}"
                         f" — {step_name}")
+            if self.exec_logger:
+                self.exec_logger.log("plan_step", i=step_idx + 1,
+                                     total=total_steps, type=step_name,
+                                     pump=pump)
             if on_progress:
                 on_progress(step_idx, total_steps,
                             f"Step {step_idx+1}/{total_steps}: {step_name}")
@@ -1304,6 +1374,13 @@ class HybridPlanExecutor:
                 target_wells = getattr(step, 'target_wells', [])
                 if target_wells:
                     try:
+                        # v7.5.x CRITICAL SAFETY: TRAVEL_XY is cross-well travel.
+                        # Retract to the travel Z and WAIT (blocking move_z) before
+                        # the XY move — do not rely solely on a preceding
+                        # MOVE_SAFE_Z plan step (mirrors RETURN_HOME below).
+                        z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
+                        direct.move_z(self.settings.travel_z_height,
+                                      feedrate_mm_min=z_fast)
                         # v7.2.9: Set service speed for XY travel
                         _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
                         if _svc_spd and self.controller.is_xy_connected:
@@ -1412,7 +1489,8 @@ class HybridPlanExecutor:
             logger.warning("PRINT step with no target wells")
             return
 
-        direct = DirectCommandExecutor(self.controller)
+        direct = DirectCommandExecutor(self.controller,
+                                       exec_logger=self.exec_logger)
         safe_z = self.settings.travel_z_height
         print_z = self.settings.print_z_height
         top_z = getattr(self.settings, 'top_z_height', 0.0)
@@ -1487,7 +1565,8 @@ class HybridPlanExecutor:
 
                 # 5. Play back the in-well trajectory
                 tex = TrajectoryExecutor(
-                    self.controller, recorder=self.recorder)
+                    self.controller, recorder=self.recorder,
+                    exec_logger=self.exec_logger)
                 tex.execute(
                     waypoints=result.waypoints,
                     pause_event=pause_event,
@@ -1777,6 +1856,10 @@ class PrintManager:
         # v7.1 P8.4: PrintRecorder (set externally or created on start)
         self.recorder: Optional[object] = None  # PrintRecorder instance
 
+        # v7.5.x: machine-readable JSONL execution log (auto-created on
+        # start() unless one was injected; see PrintExecutionLogger).
+        self.exec_logger: Optional[PrintExecutionLogger] = None
+
         # v7.1 P8.2: TrajectoryExecutor
         self._trajectory_executor: Optional[TrajectoryExecutor] = None
 
@@ -1824,12 +1907,21 @@ class PrintManager:
         self._active_pump = "P1"
         self._start_time = time.time()
 
+        # v7.5.x: arm the plate-bottom floor for the duration of the run so
+        # no Z move (print height, per-object/per-layer offset, …) can punch
+        # through the plate. Disarmed in _execute_loop's finally.
+        self._arm_print_floor(True)
+
         # v7.1 P8.4: Auto-start recording
         self._start_recorder()
 
+        # v7.5.x: open the JSONL execution log for this run
+        self._begin_exec_log(mode="discrete")
+
         # v7.1 P8.2: Create trajectory executor with recorder
         self._trajectory_executor = TrajectoryExecutor(
-            self.controller, recorder=self.recorder
+            self.controller, recorder=self.recorder,
+            exec_logger=self.exec_logger,
         )
 
         # v7.1 P8.6: Create service sequence executor
@@ -1870,6 +1962,12 @@ class PrintManager:
         self._pause_event.set()
         self._current_step = start_step
 
+        # v7.5.x: arm the plate-bottom floor (see start()).
+        self._arm_print_floor(True)
+
+        # v7.5.x: execution log for the resumed run
+        self._begin_exec_log(mode="discrete-resume")
+
         self._thread = threading.Thread(
             target=self._execute_loop,
             kwargs={"start_from": start_step},
@@ -1907,6 +2005,11 @@ class PrintManager:
             return
         self._abort_flag.set()
         self._pause_event.set()  # Unblock if paused
+
+        # v7.5.x exec log: record the abort request + where we were
+        if self.exec_logger:
+            self.exec_logger.log("abort_requested",
+                                 step=self._current_step)
 
         # v7.1: Abort trajectory executor if running
         if self._trajectory_executor:
@@ -1958,7 +2061,7 @@ class PrintManager:
             pos_logger.record(
                 "print_start" if start_from == 0 else "print_resume",
                 xy_pos=self.controller.get_xy_position(cached=False),
-                zp_pos=self.controller.get_zp_position(cached=False),
+                zp_pos=self.controller.get_zp_position_logical_tuple(cached=False),
                 metadata={"job_name": self.job.name, "total_steps": self.job.total_steps,
                           "start_from": start_from},
             )
@@ -1984,14 +2087,26 @@ class PrintManager:
                 label = cmd.label or cmd.type.value
                 self._report_progress(f"[{i + 1}/{self.job.total_steps}] {label}")
 
+                # v7.5.x exec log: command boundary + duration
+                _lg = self.exec_logger
+                if _lg:
+                    _lg.log("command_start", i=i + 1,
+                            total=self.job.total_steps,
+                            type=cmd.type.value, label=label)
+                _cmd_t0 = time.monotonic()
+
                 self._execute_command(cmd)
+
+                if _lg:
+                    _lg.log("command_end", i=i + 1, type=cmd.type.value,
+                            duration_s=round(time.monotonic() - _cmd_t0, 3))
 
                 # Session 4: Log position periodically (every 10 commands)
                 if pos_logger and i % 10 == 0:
                     pos_logger.record(
                         "print_progress",
                         xy_pos=self.controller.get_xy_position(cached=True),
-                        zp_pos=self.controller.get_zp_position(cached=True),
+                        zp_pos=self.controller.get_zp_position_logical_tuple(cached=True),
                         metadata={"step": i + 1, "command": cmd.type.value},
                     )
 
@@ -2013,7 +2128,7 @@ class PrintManager:
                 pos_logger.record(
                     "print_end",
                     xy_pos=self.controller.get_xy_position(cached=False),
-                    zp_pos=self.controller.get_zp_position(cached=False),
+                    zp_pos=self.controller.get_zp_position_logical_tuple(cached=False),
                     metadata={"job_name": self.job.name, "result": "completed"},
                 )
 
@@ -2025,6 +2140,8 @@ class PrintManager:
 
         except Exception as e:
             logger.error(f"Print execution error: {e}", exc_info=True)
+            if self.exec_logger:
+                self.exec_logger.log_error(str(e), e)
             self._set_state(PrintState.ERROR)
             self._report_progress(f"Error: {e}")
 
@@ -2037,7 +2154,7 @@ class PrintManager:
                 pos_logger.record(
                     "print_error",
                     xy_pos=self.controller.get_xy_position(cached=True),
-                    zp_pos=self.controller.get_zp_position(cached=True),
+                    zp_pos=self.controller.get_zp_position_logical_tuple(cached=True),
                     metadata={"job_name": self.job.name, "error": str(e)},
                 )
 
@@ -2046,6 +2163,24 @@ class PrintManager:
 
             # v7.1 P8.4: Auto-stop recording on error
             self._stop_recorder("error")
+
+        finally:
+            # v7.5.x: disarm the plate-bottom floor (covers completion,
+            # error, and the abort early-returns) so it never lingers into
+            # subsequent calibration / jogging.
+            self._arm_print_floor(False)
+            # v7.5.x: always close the execution log (covers the abort
+            # early-returns too; status derives from the final state).
+            self._end_exec_log()
+
+    def _arm_print_floor(self, active: bool) -> None:
+        """v7.5.x: arm/disarm the controller's plate-bottom Z floor."""
+        ctrl = self.controller
+        if ctrl is not None and hasattr(ctrl, "set_print_floor_active"):
+            try:
+                ctrl.set_print_floor_active(active)
+            except Exception as e:
+                logger.debug(f"set_print_floor_active({active}) failed: {e}")
 
     def _record_history(self, state: str, error_message: str = ""):
         """Enhancement 6: Record completed/aborted/error print to history."""
@@ -2078,6 +2213,39 @@ class PrintManager:
         except Exception as e:
             logger.warning(f"Failed to record print history: {e}")
 
+    def _retract_for_travel(self, context: str) -> None:
+        """v7.5.x CRITICAL SAFETY: retract the needle to the travel / "move" Z
+        before a cross-position XY move (``MOVE_XY`` / ``HOME_XY``).
+
+        Travel commands move the stage to a DIFFERENT location, so the needle
+        must be retracted first and Z must be CONFIRMED there before XY starts —
+        independent of any separate ``TRAVEL_UP`` command in the plan
+        (defense-in-depth; fixes the Quick-Print "returned to 0,0 without
+        retracting" failure). Delegates to
+        :meth:`StageController.ensure_retracted_to`, which is polarity-safe
+        (ZDIR=±1) and NEVER lowers the needle, so a misconfigured/too-low
+        travel-Z degrades to a no-op rather than a crash.
+
+        ``PRINT_PATH`` (within-well) moves are intentionally NOT routed through
+        here — Z stays at print height for the print pattern itself.
+        """
+        ctrl = self.controller
+        if not getattr(ctrl, "is_zp_connected", False):
+            return
+        if not hasattr(ctrl, "ensure_retracted_to"):
+            return  # older controller — plan's TRAVEL_UP still applies
+        travel_z = getattr(self.job.settings, "travel_z_height", None)
+        if travel_z is None:
+            return
+        if self.exec_logger:
+            self.exec_logger.log("z_move",
+                                 context=f"retract_for_travel:{context}",
+                                 z_mm=round(float(travel_z), 4))
+        ok = ctrl.ensure_retracted_to(float(travel_z))
+        if not ok:
+            logger.warning("Retract-for-travel (%s): needle not confirmed at "
+                           "travel Z — XY move may be unsafe", context)
+
     def _execute_command(self, cmd: PrintCommand):
         """Execute a single print command."""
         ctrl = self.controller
@@ -2090,6 +2258,11 @@ class PrintManager:
 
         elif cmd.type == CommandType.MOVE_XY:
             x, y = p.get("x", 0), p.get("y", 0)
+            # v7.5.x CRITICAL SAFETY: MOVE_XY is travel to a DIFFERENT location
+            # (well start / pen-up move). Guarantee the needle is retracted to
+            # the travel Z (and confirmed there) BEFORE the XY move — do not
+            # rely solely on a separate preceding TRAVEL_UP. Never descends.
+            self._retract_for_travel("move_xy")
             # v7.2.7: Set travel speed before XY move
             _tspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
@@ -2103,6 +2276,10 @@ class PrintManager:
                         ctrl.xy_stage.set_velocity(max(1, min(100, int(_tspd * 1000 / 50000 * 100))))
                 except Exception:
                     pass
+            if self.exec_logger:
+                self.exec_logger.log(
+                    "xy_cmd", context="travel", speed_mm_s=_tspd,
+                    **self.exec_logger.xy_cmd_fields(ctrl, x, y))
             ctrl.move_xy_absolute(x, y, from_zero_ref=True)
             self._wait_for_xy_settle(x, y, timeout=10.0)
 
@@ -2114,6 +2291,9 @@ class PrintManager:
 
         elif cmd.type == CommandType.MOVE_Z:
             z = p.get("z", 0)
+            if self.exec_logger:
+                self.exec_logger.log("z_move", context="move_z",
+                                     z_mm=round(float(z), 4))
             ctrl.move_z_absolute(z, from_zero_ref=True)
             time.sleep(0.5)
 
@@ -2130,6 +2310,11 @@ class PrintManager:
             if "amount_uL" in p:
                 amount_uL = p["amount_uL"]
                 rate_uL_s = p.get("rate_uL_s", settings.get_pump_rate(pump))
+                if self.exec_logger:
+                    self.exec_logger.log("extrude", context="command",
+                                         pump=pump,
+                                         vol_uL=round(float(amount_uL), 4),
+                                         rate_uL_s=rate_uL_s)
                 if hasattr(ctrl, 'move_pump_uL'):
                     ctrl.move_pump_uL(pump, amount_uL, rate_uL_s)
                 else:
@@ -2159,14 +2344,27 @@ class PrintManager:
                 time.sleep(min(0.1, seconds))
 
         elif cmd.type == CommandType.TRAVEL_UP:
+            if self.exec_logger:
+                self.exec_logger.log(
+                    "z_move", context="travel_up",
+                    z_mm=round(float(settings.travel_z_height), 4))
             ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
             time.sleep(0.5)
 
         elif cmd.type == CommandType.TRAVEL_DOWN:
+            if self.exec_logger:
+                self.exec_logger.log(
+                    "z_move", context="travel_down",
+                    z_mm=round(float(settings.print_z_height), 4))
             ctrl.move_z_absolute(settings.print_z_height, from_zero_ref=True)
             time.sleep(0.3)
 
         elif cmd.type == CommandType.HOME_XY:
+            # v7.5.x CRITICAL SAFETY: HOME_XY returns to the zero reference — a
+            # cross-position travel move. Guarantee the needle is retracted to
+            # the travel Z (and confirmed there) BEFORE moving XY home. Fixes
+            # the Quick-Print "returned to 0,0 without retracting" failure.
+            self._retract_for_travel("home_xy")
             # v7.2.7: Set travel speed before HOME_XY
             _hspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
@@ -2180,6 +2378,10 @@ class PrintManager:
                         ctrl.xy_stage.set_velocity(max(1, min(100, int(_hspd * 1000 / 50000 * 100))))
                 except Exception:
                     pass
+            if self.exec_logger:
+                self.exec_logger.log(
+                    "xy_cmd", context="home", speed_mm_s=_hspd,
+                    **self.exec_logger.xy_cmd_fields(ctrl, 0.0, 0.0))
             ctrl.move_xy_absolute(0, 0, from_zero_ref=True)
             self._wait_for_xy_settle(0, 0, timeout=15.0)
 
@@ -2317,6 +2519,41 @@ class PrintManager:
 
     # ── v7.1: Recording Helpers (P8.4) ───────────────────────────
 
+    # ── v7.5.x: Execution log helpers ─────────────────────────────
+
+    def _begin_exec_log(self, mode: str = "discrete") -> None:
+        """Open a fresh JSONL execution log for this run (never raises).
+
+        If an exec_logger was injected externally and is already active
+        (e.g. app.py opened one for hybrid/trajectory mode), reuse it.
+        """
+        try:
+            if self.exec_logger is not None and self.exec_logger.active:
+                return
+            self.exec_logger = PrintExecutionLogger(
+                job_name=self.job.name if self.job else "print", mode=mode)
+            self.exec_logger.start(
+                self.controller,
+                PrintExecutionLogger.manifest_for_job(
+                    self.job, self.controller, mode))
+        except Exception as e:
+            logger.warning(f"Execution log unavailable: {e}")
+            self.exec_logger = None
+
+    def _end_exec_log(self) -> None:
+        """Close the execution log with a status from the final state."""
+        if self.exec_logger is None:
+            return
+        try:
+            status = {
+                PrintState.COMPLETED: "completed",
+                PrintState.ABORTED: "aborted",
+                PrintState.ERROR: "error",
+            }.get(self.state, self.state.name.lower())
+            self.exec_logger.stop(status)
+        except Exception:
+            pass
+
     def _start_recorder(self) -> None:
         """P8.4: Auto-start recording when print begins."""
         if self.recorder is None:
@@ -2369,6 +2606,9 @@ class PrintManager:
                 pct = max(1, min(100, int(speed_mm_s * 1000 / 50000 * 100)))
                 ctrl.xy_stage.set_velocity(pct)
             logger.info(f"Print speed set: {speed_mm_s:.1f} mm/s")
+            if self.exec_logger:
+                self.exec_logger.log("speed_set", context="print_path",
+                                     mm_s=round(speed_mm_s, 3))
 
 
     def _execute_print_path(self, cmd: PrintCommand):
@@ -2390,14 +2630,36 @@ class PrintManager:
         # v7.2.7: Set stage speed before print path
         self._set_xy_speed_for_print()
 
+        # v7.5.x exec log: path manifest + drift bookkeeping. planned_s
+        # accumulates the loop's own schedule (sleep budget); wall drift
+        # beyond it = serial/computation overhead. The sampler separately
+        # captures the *physical* lag of the stage behind the commands.
+        lg = self.exec_logger
+        _spd = getattr(settings, 'print_speed_mm_s', 0) or \
+            max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+        if lg:
+            lg.log("path_start", n_points=len(points), pump=pump,
+                   flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
+                   speed_mm_s=round(_spd, 3),
+                   **PrintExecutionLogger._path_stats(points))
+        _path_t0 = time.monotonic()
+        _planned_s = 0.0
+
         # Move to start of path
         start_x, start_y = points[0][0], points[0][1]
+        if lg:
+            lg.log("xy_cmd", context="path_start",
+                   **lg.xy_cmd_fields(ctrl, start_x, start_y))
         ctrl.move_xy_absolute(start_x, start_y, from_zero_ref=True)
         self._wait_for_xy_settle(start_x, start_y, timeout=5.0)
 
         # Execute path segments
         for i in range(1, len(points)):
             if self._abort_flag.is_set():
+                if lg:
+                    lg.log("path_end", aborted_at_segment=i,
+                           wall_s=round(time.monotonic() - _path_t0, 3),
+                           planned_s=round(_planned_s, 3))
                 return
 
             x1, y1 = points[i - 1][0], points[i - 1][1]
@@ -2408,14 +2670,18 @@ class PrintManager:
                 continue
 
             # v7.2: Extrude using µL/s flow rate or legacy ratio
+            _seg_vol_uL = 0.0   # v7.5.x exec log: extrusion bookkeeping
+            _seg_vol_dropped = False
             if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0:
                 # Calculate volume from flow rate × segment time
                 # v7.2.7: Use mm/s for extrusion timing
                 _ext_speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
                 if _ext_speed_mm_s <= 0:
                     _ext_speed_mm_s = max(settings.print_feedrate, 1.0) / 60.0
-                seg_time = seg_length / max(_ext_speed_mm_s, 0.01) if xy_speed > 0 else 0
+                seg_time = seg_length / max(_ext_speed_mm_s, 0.01) if _ext_speed_mm_s > 0 else 0
                 volume_uL = flow_rate_uL_s * seg_time
+                _seg_vol_uL = volume_uL
+                _seg_vol_dropped = volume_uL <= 0.001
                 if volume_uL > 0.001 and hasattr(ctrl, 'move_pump_uL'):
                     ctrl.move_pump_uL(pump, volume_uL, flow_rate_uL_s)
                 elif volume_uL > 0.001:
@@ -2443,13 +2709,43 @@ class PrintManager:
                         )
 
             # Move XY
+            _xy_fields = lg.xy_cmd_fields(ctrl, x2, y2) if lg else {}
             ctrl.move_xy_absolute(x2, y2, from_zero_ref=True)
             # v7.2.7: speed_mm_s — use explicit mm/s, fallback to legacy mm/min
             _speed_mm_s = getattr(settings, 'print_speed_mm_s', 0)
             if _speed_mm_s <= 0:
                 _speed_mm_s = max(settings.print_feedrate, 1) / 60.0
             move_time = seg_length / max(_speed_mm_s, 0.01)
-            time.sleep(max(move_time, 0.05))
+            _sleep_s = max(move_time, 0.05)
+            time.sleep(_sleep_s)
+
+            # v7.5.x exec log: one line per segment. drift_s = how far the
+            # loop's wall clock has run ahead of its own sleep schedule
+            # (serial/computation overhead); the physical stage lag shows
+            # up separately in the sampler's 'sample' events as lag_um.
+            if lg:
+                _planned_s += _sleep_s
+                _ev = {"i": i, "n": len(points),
+                       "seg_mm": round(seg_length, 4),
+                       "mv_s": round(move_time, 4),
+                       "slp_s": round(_sleep_s, 4),
+                       "drift_s": round(
+                           (time.monotonic() - _path_t0) - _planned_s, 3)}
+                if _seg_vol_uL:
+                    _ev["vol_uL"] = round(_seg_vol_uL, 5)
+                if _seg_vol_dropped:
+                    _ev["vol_dropped"] = True
+                _ev.update(_xy_fields)
+                lg.log("path_segment", **_ev)
+
+        # v7.5.x exec log: path summary. NOTE — wall_s only measures the
+        # command loop; the stage may still be physically tracing the
+        # path (open-loop pacing). Compare with subsequent 'sample'
+        # events to measure the physical completion time.
+        if lg:
+            lg.log("path_end",
+                   wall_s=round(time.monotonic() - _path_t0, 3),
+                   planned_s=round(_planned_s, 3))
 
     def _wait_for_xy_settle(self, target_x, target_y, timeout=3.0, tolerance=50):
         """
@@ -2467,20 +2763,44 @@ class PrintManager:
         target_x_um = target_x * 1000.0 + ctrl.zero_position.get("x", 0)
         target_y_um = target_y * 1000.0 + ctrl.zero_position.get("y", 0)
 
+        lg = self.exec_logger
+        last_err_um = None
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
             if self._abort_flag.is_set():
+                if lg:
+                    lg.log("settle_wait", ok=False, reason="aborted",
+                           target_x_mm=round(target_x, 4),
+                           target_y_mm=round(target_y, 4),
+                           duration_s=round(time.monotonic() - t0, 3))
                 return
             pos = ctrl.get_xy_position(cached=False)
             if pos[0] is not None:
                 dx = abs(pos[0] - target_x_um)
                 dy = abs(pos[1] - target_y_um)
+                last_err_um = math.hypot(dx, dy)
                 if dx < tolerance and dy < tolerance:
+                    if lg:
+                        lg.log("settle_wait", ok=True,
+                               target_x_mm=round(target_x, 4),
+                               target_y_mm=round(target_y, 4),
+                               duration_s=round(time.monotonic() - t0, 3),
+                               final_err_um=round(last_err_um, 1))
                     return
             time.sleep(0.05)
 
         logger.debug(f"v7.2.7: Settle timeout after {timeout}s "
                      f"(target={target_x:.2f},{target_y:.2f}mm)")
+        # v7.5.x exec log: a settle TIMEOUT silently continues execution —
+        # capture it; this is a prime suspect for desync bugs.
+        if lg:
+            lg.log("settle_wait", ok=False, reason="timeout",
+                   target_x_mm=round(target_x, 4),
+                   target_y_mm=round(target_y, 4),
+                   duration_s=round(time.monotonic() - t0, 3),
+                   timeout_s=timeout,
+                   final_err_um=(round(last_err_um, 1)
+                                 if last_err_um is not None else None))
 
 
 class PrintQueue:

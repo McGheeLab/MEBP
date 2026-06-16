@@ -72,8 +72,8 @@ class TestSingletonEnforcement(unittest.TestCase):
         self.assertEqual(cfg.camera_roles[0], CameraRole.UNASSIGNED)
         self.assertEqual(cfg.camera_roles[2], CameraRole.MICROSCOPE)
 
-    def test_needle_and_plate_roles_are_unique(self):
-        for role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y, CameraRole.PLATE):
+    def test_needle_and_microscope_roles_are_unique(self):
+        for role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y, CameraRole.MICROSCOPE):
             cfg = HardwareConfig()
             cfg.set_camera_role(0, role)
             cfg.set_camera_role(1, role)
@@ -84,17 +84,17 @@ class TestSingletonEnforcement(unittest.TestCase):
     def test_unassigned_does_not_clear_other_slots(self):
         cfg = HardwareConfig()
         cfg.set_camera_role(0, CameraRole.MICROSCOPE)
-        cfg.set_camera_role(1, CameraRole.PLATE)
+        cfg.set_camera_role(1, CameraRole.NEEDLE_X)
         cfg.set_camera_role(2, CameraRole.UNASSIGNED)
         self.assertEqual(cfg.camera_roles[0], CameraRole.MICROSCOPE)
-        self.assertEqual(cfg.camera_roles[1], CameraRole.PLATE)
+        self.assertEqual(cfg.camera_roles[1], CameraRole.NEEDLE_X)
 
     def test_distinct_singleton_roles_can_coexist(self):
         cfg = HardwareConfig()
         cfg.set_camera_role(0, CameraRole.MICROSCOPE)
-        cfg.set_camera_role(1, CameraRole.PLATE)
+        cfg.set_camera_role(1, CameraRole.NEEDLE_X)
         self.assertEqual(cfg.camera_roles[0], CameraRole.MICROSCOPE)
-        self.assertEqual(cfg.camera_roles[1], CameraRole.PLATE)
+        self.assertEqual(cfg.camera_roles[1], CameraRole.NEEDLE_X)
 
     def test_out_of_range_index_is_no_op(self):
         cfg = HardwareConfig()
@@ -160,6 +160,17 @@ class TestObjectiveCalibrationStore(unittest.TestCase):
         self.assertAlmostEqual(cal["measured_um_per_px"], 0.823, places=6)
         self.assertEqual(cal["resolution"], [916, 686])
         self.assertTrue(cal["date"])  # ISO date stamp
+
+    def test_rotation_deg_round_trips_when_supplied(self):
+        # v7.5.x: the stage-motion dialog reports an in-plane rotation; the
+        # store persists it alongside the per-objective µm/px.
+        store = ObjectiveCalibrationStore(self.path)
+        store.set_calibration("CAM-A", "4x", 0.823, (916, 686), rotation_deg=45.0)
+        cal = store.get_calibration("CAM-A", "4x")
+        self.assertAlmostEqual(cal["rotation_deg"], 45.0, places=3)
+        # Omitting it keeps the entry backwards compatible (no key).
+        store.set_calibration("CAM-A", "10x", 0.421, (916, 686))
+        self.assertNotIn("rotation_deg", store.get_calibration("CAM-A", "10x"))
 
     def test_persists_to_disk_and_reloads(self):
         store_a = ObjectiveCalibrationStore(self.path)

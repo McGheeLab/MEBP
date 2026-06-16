@@ -38,6 +38,7 @@ from gui.pages.hardware.control_panel import HardwareControlPanel
 from gui.scaling import s, sf, sp
 from gui.styles import COLORS
 from gui.widgets.components import Card
+from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
 if TYPE_CHECKING:
     from SupportClasses.StageController import StageController
@@ -182,6 +183,9 @@ class StandardJogContextPanel(QWidget):
         self._goto_z.setRange(-100.0, 100.0)
         self._goto_z.setDecimals(3)
         self._goto_z.setSuffix(" mm")
+        self._goto_z.setToolTip(
+            "Target Z height (zero-referenced). Positive = up, matching the "
+            "live Z readout and side view.")
         grid.addWidget(self._goto_z, 2, 1)
 
         card.add_layout(grid)
@@ -209,7 +213,10 @@ class StandardJogContextPanel(QWidget):
             return
         target_x_um_zr = float(self._goto_x.value())
         target_y_um_zr = float(self._goto_y.value())
-        target_z_mm_zr = float(self._goto_z.value())
+        # v7.5.x: the Z box is height-frame (up = +); convert to the raw
+        # zero-ref frame the move methods expect so a positive target moves
+        # UP, not down.
+        target_z_mm_zr = z_display_to_raw(float(self._goto_z.value()))
 
         zero = self._controller.zero_position
         abs_x_um = target_x_um_zr + zero["x"]
@@ -228,8 +235,11 @@ class StandardJogContextPanel(QWidget):
                 if resp != QMessageBox.StandardButton.Yes:
                     return
                 if self._controller.is_xy_connected:
+                    # v7.5.x bugfix: move_xy_absolute(from_zero_ref=True) takes
+                    # mm; the goto X/Y boxes are µm → convert (was 1000× over).
                     self._controller.move_xy_absolute(
-                        target_x_um_zr, target_y_um_zr, from_zero_ref=True)
+                        target_x_um_zr / 1000.0, target_y_um_zr / 1000.0,
+                        from_zero_ref=True)
                 if self._controller.is_zp_connected:
                     self._controller.move_z_absolute(
                         target_z_mm_zr, from_zero_ref=True)
@@ -241,8 +251,10 @@ class StandardJogContextPanel(QWidget):
             )
         else:
             if self._controller.is_xy_connected:
+                # v7.5.x bugfix: µm → mm for move_xy_absolute (see above).
                 self._controller.move_xy_absolute(
-                    target_x_um_zr, target_y_um_zr, from_zero_ref=True)
+                    target_x_um_zr / 1000.0, target_y_um_zr / 1000.0,
+                    from_zero_ref=True)
             if self._controller.is_zp_connected:
                 self._controller.move_z_absolute(
                     target_z_mm_zr, from_zero_ref=True)
@@ -365,4 +377,7 @@ class StandardJogContextPanel(QWidget):
             # Fast-move-z falls back to the legacy attr for back-compat.
             if val is None and key == "fast_move_z":
                 val = self._safe_z
-            lbl.setText(f"{val:.2f} mm" if val is not None else "unset")
+            # v7.5.x: references are stored zero-ref (raw); show as height
+            # (up = +) so they agree with the rest of the jog-page Z readouts.
+            lbl.setText(
+                f"{z_raw_to_display(val):.2f} mm" if val is not None else "unset")

@@ -285,5 +285,14 @@ def main():
     print()
 
 
+# v7.5.x: this is a MANUAL hardware diagnostic (run directly with python),
+# not an automated test — mark every test_* function so pytest doesn't
+# collect them and spin up pygame/controller probing during a suite run.
+for _fn in (test_system_info, test_pygame_import, test_detection_basic,
+            test_detection_with_hints, test_detection_with_event_pump,
+            test_detection_in_subprocess, test_detection_in_thread):
+    _fn.__test__ = False
+
+
 if __name__ == "__main__":
     main()
