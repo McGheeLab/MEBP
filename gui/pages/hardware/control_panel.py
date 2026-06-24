@@ -125,7 +125,8 @@ class HardwareControlPanel(QWidget):
     def __init__(self, parent: QWidget | None = None, *,
                  show_connect: bool = True,
                  bypass_safety: bool = True,
-                 embedded: bool = False):
+                 embedded: bool = False,
+                 pump_action_labels: bool = False):
         """Build the control panel.
 
         Args:
@@ -155,6 +156,9 @@ class HardwareControlPanel(QWidget):
         self._show_connect = show_connect
         self._bypass_safety = bypass_safety
         self._embedded = embedded
+        # v7.5.x: ASPIRATE/DISPENSE pump jog labels (jog side panels) vs the
+        # raw ▲/▼ extend/retract arrows (Hardware Setup page, the default).
+        self._pump_action_labels = pump_action_labels
         # v7.5.x: jog speeds default to 1/2 of the calibrated max once
         # settings arrive. Seed once; preserve a manual edit thereafter.
         self._speeds_seeded = False
@@ -385,7 +389,9 @@ class HardwareControlPanel(QWidget):
         warn_lay.addWidget(warn_text, 1)
         lay.addWidget(warn)
 
-        self._jog_array = JogButtonArray(compact=True, show_pumps=True)
+        self._jog_array = JogButtonArray(
+            compact=True, show_pumps=True,
+            pump_action_labels=self._pump_action_labels)
         self._jog_array.jog_xy_requested.connect(self._on_jog_xy)
         self._jog_array.jog_z_requested.connect(self._on_jog_z)
         self._jog_array.jog_pump_requested.connect(self._on_jog_pump)
@@ -563,6 +569,9 @@ class HardwareControlPanel(QWidget):
 
         self.lbl_pos: dict[str, QLabel] = {}
         self.bar_pos: dict[str, PositionBar] = {}
+        # v7.5.x: per-axis unit labels are kept so the pump readout can flip
+        # "mm" → "µL" once the plunger is calibrated (fill 0=empty → full).
+        self.unit_lbl_pos: dict[str, QLabel] = {}
         for r, (axis, unit) in enumerate([
             ("X", "µm"), ("Y", "µm"), ("Z", "mm"),
             ("P1", "mm"), ("P2", "mm"), ("P3", "mm"),
@@ -584,6 +593,7 @@ class HardwareControlPanel(QWidget):
             unit_lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
             grid.addWidget(unit_lbl, r, 3)
             self.lbl_pos[axis] = val
+            self.unit_lbl_pos[axis] = unit_lbl
         lay.addLayout(grid)
 
         return card
@@ -607,12 +617,13 @@ class HardwareControlPanel(QWidget):
                        s_obj.get("safety_limits.xy_max_x", 130000.0)),
                 "Y":  (s_obj.get("safety_limits.xy_min_y",  -85000.0),
                        s_obj.get("safety_limits.xy_max_y",   85000.0)),
-                # v7.5.x: the Z readout is shown as height (up = +), so the
-                # Z bar extents are in the display frame too — convert and
-                # swap (ZDIR=-1 reverses ordering): display-min = -z_max_raw,
-                # display-max = -z_min_raw.
-                "Z":  (z_raw_to_display(s_obj.get("safety_limits.z_max", 50.0)),
-                       z_raw_to_display(s_obj.get("safety_limits.z_min", -10.0))),
+                # v7.5.x: the Z readout is the unified user frame (0 at the
+                # bottom datum, up = +), so the Z bar extents are too. Convert
+                # both raw bounds and order by value (polarity-general).
+                "Z":  (min(self._z_raw_to_user(s_obj.get("safety_limits.z_min", -10.0)),
+                           self._z_raw_to_user(s_obj.get("safety_limits.z_max", 50.0))),
+                       max(self._z_raw_to_user(s_obj.get("safety_limits.z_min", -10.0)),
+                           self._z_raw_to_user(s_obj.get("safety_limits.z_max", 50.0)))),
                 "P1": (s_obj.get("safety_limits.p1_min",     -50.0),
                        s_obj.get("safety_limits.p1_max",      50.0)),
                 "P2": (s_obj.get("safety_limits.p2_min",     -50.0),
@@ -623,6 +634,18 @@ class HardwareControlPanel(QWidget):
         except Exception as e:
             logger.debug(f"_refresh_bar_ranges failed: {e}")
             return
+        # v7.5.x: a calibrated pump's bar shows the FILL range (0 = empty →
+        # capacity = full), matching the µL readout; uncalibrated pumps keep the
+        # raw-mm envelope above.
+        c = self._controller
+        if c is not None and hasattr(c, "pump_capacity_uL"):
+            for pump in ("P1", "P2", "P3"):
+                try:
+                    cap = c.pump_capacity_uL(pump)
+                except Exception:
+                    cap = None
+                if cap is not None and cap > 0:
+                    ranges[pump] = (0.0, float(cap))
         for axis, (lo, hi) in ranges.items():
             bar = self.bar_pos.get(axis)
             if bar is not None:
@@ -827,11 +850,13 @@ class HardwareControlPanel(QWidget):
             return
         feed = float(self.spin_z_speed.value())
         bypass = self._bypass_safety
+        # v7.5.x: dz_mm is a HEIGHT-frame delta (+ = up); route through
+        # move_z_user_relative so "up" follows the taught z_up_sign.
         try:
-            self._controller.move_z_relative(
+            self._controller.move_z_user_relative(
                 dz_mm, feedrate=feed, bypass_safety=bypass)
         except TypeError:
-            self._controller.move_z_relative(dz_mm, bypass_safety=bypass)
+            self._controller.move_z_user_relative(dz_mm, bypass_safety=bypass)
         except Exception as e:
             logger.warning(f"jog Z {dz_mm} failed: {e}")
         self._force_refresh_positions()
@@ -879,9 +904,38 @@ class HardwareControlPanel(QWidget):
         v = zp[idx]
         return float(v) if v is not None else None
 
+    def _z_raw_to_user(self, raw_mm: float) -> float:
+        """v7.5.x: raw Marlin Z → unified user frame (0 at bottom datum, + up)
+        via the live controller; falls back to the module height helper."""
+        c = self._controller
+        if c is not None and hasattr(c, "raw_to_user_z"):
+            return c.raw_to_user_z(raw_mm)
+        return z_raw_to_display(raw_mm)
+
+    def _pump_raw_to_fill_uL(self, pump: str, raw_mm: float) -> float | None:
+        """v7.5.x: raw Marlin pump position → plunger FILL in µL (0 = empty /
+        fully dispensed → capacity = full / fully aspirated) via the live
+        controller's plunger calibration. None when the pump isn't calibrated
+        (the caller then keeps the raw-mm readout)."""
+        c = self._controller
+        if c is not None and hasattr(c, "raw_to_pump_fill_uL"):
+            try:
+                return c.raw_to_pump_fill_uL(pump, raw_mm)
+            except Exception:
+                return None
+        return None
+
     def _update_position_displays(self, xy, zp) -> None:
-        def _set(axis: str, value: float | None, fmt: str) -> None:
-            self.lbl_pos[axis].setText(fmt.format(value) if value is not None else "—")
+        def _set(axis: str, value: float | None, fmt: str,
+                 unit: str | None = None, tooltip: str | None = None) -> None:
+            lbl = self.lbl_pos[axis]
+            lbl.setText(fmt.format(value) if value is not None else "—")
+            if tooltip is not None:
+                lbl.setToolTip(tooltip)
+            if unit is not None and hasattr(self, "unit_lbl_pos"):
+                u = self.unit_lbl_pos.get(axis)
+                if u is not None:
+                    u.setText(unit)
             bar = self.bar_pos.get(axis) if hasattr(self, 'bar_pos') else None
             if bar is not None:
                 bar.set_value(value)
@@ -891,7 +945,20 @@ class HardwareControlPanel(QWidget):
         if zp:
             for logical in ("Z", "P1", "P2", "P3"):
                 v = self._logical_zp_value(zp, logical)
-                # v7.5.x: show Z as height (up = +); pumps unchanged.
+                # v7.5.x: show Z in the unified user frame (0 at bottom datum,
+                # up = +).
                 if logical == "Z" and v is not None:
-                    v = z_raw_to_display(v)
-                _set(logical, v, "{:.3f}")
+                    v = self._z_raw_to_user(v)
+                    _set(logical, v, "{:.3f}")
+                    continue
+                # v7.5.x: show pumps as a FILL LEVEL in µL (0 = empty/dispensed
+                # → capacity = full/aspirated) once the plunger is calibrated;
+                # keep the raw-mm readout (with the raw value in the tooltip)
+                # for uncalibrated pumps.
+                if v is not None:
+                    fill = self._pump_raw_to_fill_uL(logical, v)
+                    if fill is not None:
+                        _set(logical, fill, "{:.1f}", unit="µL",
+                             tooltip=f"raw {v:.3f} mm")
+                        continue
+                _set(logical, v, "{:.3f}", unit="mm")

@@ -62,6 +62,7 @@ SCALE_FACTOR = 6.0
 WELL_BORDER_WIDTH = 1.5
 WELL_SELECTED_BORDER_WIDTH = 3.0
 WELL_HOVER_BORDER_WIDTH = 2.0
+WELL_TYPE_BORDER_WIDTH = 2.5         # outline width when a type color is set
 SELECTED_BORDER_COLOR = "#cba6f7"    # Mauve (Catppuccin)
 HOVER_BORDER_COLOR = "#89b4fa"       # Blue (Catppuccin)
 EMPTY_WELL_COLOR = "#585b70"
@@ -109,6 +110,7 @@ class WellGraphicsItem(QGraphicsEllipseItem):
         self._selected = False
         self._role = WellRole.EMPTY
         self._color = EMPTY_WELL_COLOR
+        self._border_color: str | None = None   # None → derive from fill
         self._label_text = ""
 
         # Enable hover events
@@ -138,6 +140,7 @@ class WellGraphicsItem(QGraphicsEllipseItem):
         """Update role, color, and label."""
         self._role = role
         self._color = ROLE_COLORS.get(role, EMPTY_WELL_COLOR)
+        self._border_color = None
         self._label_text = label
         self._apply_style()
         self._update_tooltip()
@@ -145,7 +148,29 @@ class WellGraphicsItem(QGraphicsEllipseItem):
     def set_color(self, color: str) -> None:
         """Direct color override."""
         self._color = color
+        self._border_color = None
         self._apply_style()
+
+    def set_appearance(
+        self,
+        fill_color: str,
+        border_color: str | None = None,
+        label: str = "",
+    ) -> None:
+        """Set fill and (optionally) a distinct border color, persisting both.
+
+        Storing the colors on the item is what keeps them surviving a
+        hover-leave: ``hoverLeaveEvent`` repaints via ``_apply_style()``, which
+        reads ``self._color`` / ``self._border_color``. A previous code path
+        set the brush directly and left these stale, so leaving the well wiped
+        the assigned color.
+        """
+        self._color = fill_color
+        self._border_color = border_color
+        self._label_text = label
+        self._apply_style()
+        self.setToolTip(
+            f"{self.well_info.name}: {label}" if label else self.well_info.name)
 
     def _apply_style(self) -> None:
         """Apply current visual state (fill + border)."""
@@ -155,6 +180,8 @@ class WellGraphicsItem(QGraphicsEllipseItem):
 
         if self._selected:
             pen = QPen(QColor(SELECTED_BORDER_COLOR), WELL_SELECTED_BORDER_WIDTH)
+        elif self._border_color:
+            pen = QPen(QColor(self._border_color), WELL_TYPE_BORDER_WIDTH)
         else:
             pen = QPen(QColor(self._color).darker(130), WELL_BORDER_WIDTH)
 
@@ -675,30 +702,28 @@ class WellPlateView(QGraphicsView):
     # ── Resize ────────────────────────────────────────────────────
 
     # ── Role-based well appearance (v7.3.1-rolecolors) ───────────
+    #
+    # NOTE: the canonical role-based bulk update lives in the Public API
+    # section above (``update_all_wells`` → ``item.set_role``). A second,
+    # brush-direct copy used to live here; it left ``WellGraphicsItem._color``
+    # stale so a hover-leave wiped the assigned color, and it was removed.
 
-    def update_all_wells(
+    def update_reagent_appearances(
         self,
         appearances: "dict[str, tuple]",
     ) -> None:
-        """
-        Set fill colour for every well from its role.
+        """Set a distinct fill + border per well (for reagent locations).
 
-        appearances: {well_name: (WellRole, display_label)}
-        Falls back gracefully when ROLE_COLORS is unavailable.
+        appearances: ``{well_name: (fill_hex, border_hex_or_None, label)}``.
+        The fill is the reagent's own color; the border encodes its type.
+        Both are persisted on the item so they survive a hover-leave.
         """
-        try:
-            from SupportClasses.PhysicalModels import ROLE_COLORS
-        except ImportError:
-            ROLE_COLORS = {}
-
-        for name, (role, label) in appearances.items():
+        for name, vals in appearances.items():
             item = self._well_items.get(name)
             if item is None:
                 continue
-            hex_color = ROLE_COLORS.get(role, "#585b70")
-            from PySide6.QtGui import QBrush, QColor
-            item.setBrush(QBrush(QColor(hex_color)))
-            item.setToolTip(f"{name}: {label or role.value if hasattr(role, 'value') else str(role)}")
+            fill_hex, border_hex, label = vals
+            item.set_appearance(fill_hex, border_hex, label)
 
     def set_well_color(self, name: str, hex_color: str) -> None:
         """Set fill colour for a single well (hex string)."""

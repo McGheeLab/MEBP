@@ -60,6 +60,7 @@ _FINGERPRINT_LABELS = {
     "needle_gauge": "needle gauge",
     "axis_map": "axis map",
     "steps_per_mm": "steps/mm",
+    "plate_flip_180": "plate orientation",
 }
 
 
@@ -152,6 +153,9 @@ class CalibrationSnapshotStore:
             "plate_format": g("hardware_config.plate_format",
                               g("calibration.plate_format")),
             "needle_gauge": g("hardware_config.needle.gauge"),
+            # v7.5.x: plate orientation — a change mirrors the well→stage
+            # mapping, so a saved calibration must not be trusted across it.
+            "plate_flip_180": g("device_profile.plate_flip_180"),
         }
 
     @staticmethod

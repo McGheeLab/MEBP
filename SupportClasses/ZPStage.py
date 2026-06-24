@@ -28,6 +28,7 @@ except ImportError:
     logger.warning("pyserial not installed — hardware mode unavailable")
 
 from SupportClasses.ZPStageSimulator import ZPStageSimulator
+from SupportClasses.ZPSerialTrace import tracer as _zp_tracer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -70,6 +71,28 @@ class ZPStageManager:
     DEFAULT_BAUDRATE = 38400
     DEFAULT_FEEDRATE = 200      # mm/min
     DEFAULT_STEPS_PER_MM = 5069
+
+    # v7.5.x (flow-control Phase 1): max seconds to wait for Marlin's 'ok'
+    # acknowledgement of a command. 'ok' normally returns in milliseconds (it
+    # means "accepted into the planner buffer", NOT "motion complete"); the only
+    # slow case is planner-buffer backpressure on a dense burst, which paces us
+    # to the board's capacity — exactly the flow control we want. A 'busy'
+    # keep-alive resets this window, so a genuinely long move keeps the link
+    # alive; only true silence past this budget is treated as a failed command.
+    DEFAULT_OK_TIMEOUT_S = 6.0
+
+    # v7.5.x: once the board has stopped answering (a prior command's 'ok'
+    # already timed out, or the poller's M114 failed), don't keep paying the
+    # full DEFAULT_OK_TIMEOUT_S on EVERY subsequent command — that compounds
+    # into multi-second hangs across a whole print/travel (and starves the XY
+    # position reads via the shared poller). Drop to this short budget until a
+    # command is acked again (which restores the full timeout). Healthy boards
+    # never see this — 'ok' returns in milliseconds.
+    SILENT_OK_TIMEOUT_S = 0.5
+
+    # Lines that mean "Marlin just (re)booted" — seeing one mid-session is a
+    # board reset (position counter lost).
+    _RESET_MARKERS = ("start", "firmware_name", "marlin")
 
     # v7.4.2: Per-axis default. Note P2 inverts direction (negative) —
     # matches the original hard-coded `Z-{spm}.00` in the M92 command
@@ -146,6 +169,22 @@ class ZPStageManager:
         # liveness check) read this flag instead of inspecting the tuple.
         self._last_position_read_ok: bool = True
 
+        # v7.5.x (flow-control Phase 1): set True if a mid-session board RESET
+        # banner ("start" / "Marlin" / "FIRMWARE_NAME") is seen while awaiting
+        # an 'ok'. A reset means Marlin lost its position counter — callers /
+        # the reconnect+restore flow must re-declare position before trusting it.
+        self._board_reset_detected: bool = False
+
+        # v7.5.x flow-control telemetry — the Stress Test workflow reads these
+        # to validate the 'ok' handshake under sustained load (commands issued
+        # vs cleanly acknowledged, plus failures and mid-session resets). Best-
+        # effort counters; snapshot via get_comm_counters(), zero via
+        # reset_comm_counters().
+        self.cmd_count: int = 0       # commands sent expecting an 'ok'
+        self.ok_count: int = 0        # acknowledged with 'ok'
+        self.ok_fail_count: int = 0   # no clean 'ok' (timeout / Error / reset)
+        self.reset_count: int = 0     # mid-session board resets observed
+
         # Initialise communication backend
         if simulate:
             self.serial = ZPStageSimulator()
@@ -179,12 +218,37 @@ class ZPStageManager:
                 # reliable cure is the hardware auto-reset disable (cut RST-EN
                 # / 10 µF RESET→GND). Connectivity is unaffected either way —
                 # this runs only at shutdown, after the session is done.
+                # v7.5.x CRASH FIX: serialize close() against any in-flight
+                # serial I/O under _serial_lock. stop() is called from the
+                # watchdog / poller thread on a mid-print disconnect, while the
+                # retract thread may be BLOCKED inside self.serial.readline()
+                # (flush_moves' M400 wait / the 'ok' handshake) holding the
+                # lock. Calling CloseHandle on a USB-serial port that another
+                # thread is mid-read on is a hard crash on Windows. Acquiring
+                # the lock first makes the close wait for the in-flight read to
+                # finish (each read self-times-out in ~2 s, so the lock frees);
+                # the bounded timeout guarantees shutdown can't deadlock even if
+                # a read is wedged — we then close best-effort regardless. The
+                # timeout MUST exceed the longest continuous lock-hold so we
+                # reliably wait the read out instead of giving up and closing
+                # mid-read: that is flush_moves' M400 wait (up to ~15 s on a
+                # genuinely long move), longer than _read_until_ok's
+                # DEFAULT_OK_TIMEOUT_S. Use 17 s to cover it with margin. (In the
+                # common disconnect case the board is already silent, so both
+                # waits are capped to ~2 s and this never actually blocks long.)
+                lock = getattr(self, "_serial_lock", None)
+                got = (lock.acquire(timeout=17.0)
+                       if lock is not None else False)
                 try:
-                    self.serial.dtr = False
-                    self.serial.rts = False
-                except Exception:
-                    pass
-                self.serial.close()
+                    try:
+                        self.serial.dtr = False
+                        self.serial.rts = False
+                    except Exception:
+                        pass
+                    self.serial.close()
+                finally:
+                    if got and lock is not None:
+                        lock.release()
         except Exception as e:
             logger.warning(f"Error closing ZP stage: {e}")
         logger.info("ZP stage stopped")
@@ -657,28 +721,206 @@ class ZPStageManager:
 
     # ── Communication ─────────────────────────────────────────────
 
-    def send_data(self, data: str) -> None:
-        """Send G-code command to printer.
-        v7.2.6: ZP serial lock protects write+flush.
+    def send_data(self, data: str, wait_ok: bool = True) -> bool:
+        """Send a G-code line to Marlin.
+
+        v7.5.x (flow-control Phase 1): on **real hardware** this now BLOCKS
+        until Marlin acknowledges the command with ``ok`` — the standard
+        request/response handshake every reliable printer host (OctoPrint,
+        Pronterface, …) uses, and the reason Marlin runs print jobs for hours
+        without dropping. Firing commands blind (the old behavior) outran
+        Marlin's small serial/planner buffers under load; the buffer overflowed,
+        bytes were dropped, the board desynced and went silent — which surfaced
+        to us as the mid-print "ZP disconnected". Waiting for ``ok`` means we
+        never send a command Marlin hasn't accepted, and we know immediately if
+        one wasn't accepted.
+
+        ``ok`` means "admitted to the planner buffer", not "move finished" — it
+        returns in milliseconds, so this does not slow motion; it only paces us
+        to the board's buffer when a dense burst would otherwise overflow it.
+        Use :meth:`flush_moves` (M400) to wait for motion completion.
+
+        Args:
+            data:    The G-code line (no trailing newline).
+            wait_ok: When True (default), block for ``ok`` on real hardware.
+                     Pass False for the rare case a caller reads the response
+                     itself.
+
+        Returns:
+            True if Marlin acknowledged (or ``wait_ok=False`` / simulate / the
+            command was written). False on write error, ``ok`` timeout, a
+            Marlin ``Error:`` reply, or a detected board reset. Most callers
+            ignore the return; on failure the poller-liveness flag is also
+            cleared so a silent board escalates to a disconnect.
         """
         if self.serial is None:
             logger.error("ZP serial not initialised -- command ignored")
-            return
-        encoded = data.encode("utf-8") + b"\n"
+            return False
+        # Brief retry window if the port is momentarily not open (reconnect).
         for attempt in range(5):
             if hasattr(self.serial, "is_open") and not self.serial.is_open:
                 if attempt < 4:
-                    import time as _t; _t.sleep(0.01)
+                    time.sleep(0.01)
                     continue
                 logger.error("ZP serial still not open after retries")
-                return
+                return False
             break
+
+        # Simulator: keep the existing fire-and-forget behavior. The simulator
+        # does not model RX-buffer backpressure (it answers every command), so
+        # the synchronous handshake adds nothing there — and the test suite
+        # relies on the non-blocking write semantics.
+        if self.simulate or not wait_ok:
+            with self._serial_lock:
+                try:
+                    self.serial.write(data.encode("utf-8") + b"\n")
+                    self.serial.flush()
+                except Exception as e:
+                    logger.error(f"ZP send_data error: {e}")
+                    return False
+            return True
+
+        # Adaptive timeout: full budget on a healthy board (last command/read
+        # acked), short budget once it's gone silent so we fail fast instead of
+        # paying 6 s on every command and dragging the whole print/travel down.
+        ok_timeout = (self.DEFAULT_OK_TIMEOUT_S
+                      if getattr(self, "_last_position_read_ok", True)
+                      else self.SILENT_OK_TIMEOUT_S)
+        ok, _ = self._txn(data, ok_timeout=ok_timeout, collect=False)
+        # Flow-control telemetry (getattr-safe for __new__-constructed test
+        # stand-ins that bypass __init__).
+        self.cmd_count = getattr(self, "cmd_count", 0) + 1
+        if ok:
+            self.ok_count = getattr(self, "ok_count", 0) + 1
+            # An ack proves the board is alive — restore the full timeout and
+            # feed the liveness flag (the poller reads it too).
+            self._last_position_read_ok = True
+        else:
+            self.ok_fail_count = getattr(self, "ok_fail_count", 0) + 1
+            # A command that never got 'ok' is the earliest signal of a silent
+            # board — surface it to the PositionPoller liveness watchdog (which
+            # reads _last_position_read_ok) so the disconnect is caught fast.
+            self._last_position_read_ok = False
+        return ok
+
+    def get_comm_counters(self) -> dict:
+        """Snapshot the flow-control telemetry counters (see __init__)."""
+        return {
+            "cmd": getattr(self, "cmd_count", 0),
+            "ok": getattr(self, "ok_count", 0),
+            "ok_fail": getattr(self, "ok_fail_count", 0),
+            "reset": getattr(self, "reset_count", 0),
+        }
+
+    def reset_comm_counters(self) -> None:
+        """Zero the flow-control telemetry counters (Stress Test 'start')."""
+        self.cmd_count = self.ok_count = self.ok_fail_count = 0
+        self.reset_count = 0
+        self._board_reset_detected = False
+
+    def _txn(self, line: str, *, ok_timeout: float,
+             collect: bool) -> tuple[bool, str]:
+        """Write one command and synchronously wait for Marlin's ``ok``.
+
+        Real-hardware only (callers short-circuit ``simulate``). The whole
+        write→read-until-``ok`` round trip is serialized under ``_serial_lock``
+        so a concurrent reader (e.g. the position poller) cannot steal the
+        ``ok`` or interleave mid-transaction.
+
+        Returns ``(ok, collected_text)`` — ``collected_text`` holds the non-ok
+        response lines (e.g. an M114 position line) when ``collect=True``.
+        """
+        _t0 = time.monotonic()
         with self._serial_lock:
             try:
-                self.serial.write(encoded)
+                self.serial.write(line.encode("utf-8") + b"\n")
                 self.serial.flush()
             except Exception as e:
-                logger.error(f"ZP send_data error: {e}")
+                logger.error(f"ZP write error ({line!r}): {e}")
+                _zp_tracer().txn(line, outcome="write_error",
+                                 latency_ms=(time.monotonic() - _t0) * 1000.0,
+                                 note=str(e)[:60])
+                return (False, "")
+            _zp_tracer().tx(line)
+            ok, text, stats = self._read_until_ok(ok_timeout, collect)
+        _zp_tracer().txn(line, outcome=stats.get("outcome", "?"),
+                         latency_ms=(time.monotonic() - _t0) * 1000.0,
+                         rx_count=stats.get("rx", 0),
+                         busy_count=stats.get("busy", 0))
+        return (ok, text)
+
+    def _read_until_ok(self, ok_timeout: float,
+                       collect: bool) -> tuple[bool, str, dict]:
+        """Read serial lines until Marlin acknowledges with ``ok``.
+
+        MUST be called holding ``_serial_lock``. Returns
+        ``(ok, text, stats)`` where ``stats`` = ``{outcome, rx, busy}`` for the
+        serial tracer (outcome ∈ ok/timeout/error/reset/read_error).
+
+        Line classification:
+          * ``ok`` / ``ok ...``        → success.
+          * ``error...``               → command rejected; stop, ok=False.
+          * ``busy`` / ``echo:busy``   → host keep-alive: board alive and still
+                                         processing a long move → reset the wait
+                                         window and keep going.
+          * reset banner (see
+            ``_RESET_MARKERS``)        → board RESET mid-session → flag it,
+                                         ok=False (position counter is now lost).
+          * any other non-empty line   → board alive; accumulate (when
+                                         ``collect``) and keep waiting.
+          * silence past the deadline  → board not answering → ok=False.
+        """
+        deadline = time.monotonic() + ok_timeout
+        parts: list[str] = []
+        rx_count = 0
+        busy_count = 0
+        while time.monotonic() < deadline:
+            try:
+                raw = self.serial.readline()
+            except Exception as e:
+                logger.warning(f"ZP read error while awaiting 'ok': {e}")
+                return (False, "\n".join(parts),
+                        {"outcome": "read_error", "rx": rx_count,
+                         "busy": busy_count})
+            if not raw:
+                continue  # readline timed out with no data; re-check deadline
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            rx_count += 1
+            _zp_tracer().rx(line)
+            low = line.lower()
+            if low == "ok" or low.startswith("ok "):
+                return (True, "\n".join(parts),
+                        {"outcome": "ok", "rx": rx_count, "busy": busy_count})
+            if low.startswith("error"):
+                logger.error(f"ZP Marlin reported an error: {line}")
+                return (False, "\n".join(parts),
+                        {"outcome": "error", "rx": rx_count,
+                         "busy": busy_count})
+            if "busy" in low:
+                # Still processing (long move) — board is alive, extend window.
+                busy_count += 1
+                deadline = time.monotonic() + ok_timeout
+                continue
+            if any(m in low for m in self._RESET_MARKERS):
+                logger.error(
+                    f"ZP board RESET detected mid-session: {line!r} — "
+                    f"position counter is lost until re-declared")
+                self._board_reset_detected = True
+                self.reset_count = getattr(self, "reset_count", 0) + 1
+                _zp_tracer().event("board_reset", line=repr(line))
+                return (False, "\n".join(parts),
+                        {"outcome": "reset", "rx": rx_count,
+                         "busy": busy_count})
+            # Some other line (M114 position echo, info) → board is alive.
+            if collect:
+                parts.append(line)
+            # A live line is progress: don't let a chatty-but-slow board be cut
+            # off right at the deadline.
+            deadline = max(deadline, time.monotonic() + 0.5)
+        return (False, "\n".join(parts),
+                {"outcome": "timeout", "rx": rx_count, "busy": busy_count})
 
 
     def receive_data(self) -> str:
@@ -747,7 +989,19 @@ class ZPStageManager:
 
         # v7.5.x freeze fix: fixed-decimal format (never scientific notation).
         axis_str = " ".join(f"{a}{p:.4f}" for a, p in active.items())
-        feed_str = f" F{feedrate_mm_min:.0f}" if feedrate_mm_min else ""
+        # v7.5.x ROOT-CAUSE FIX: ALWAYS emit an explicit F. An absolute move
+        # with no feedrate used to omit F and inherit Marlin's last modal
+        # feedrate — which the slow per-segment pump moves leave at ~F1.8
+        # mm/min, turning the next bare Z move into a ~12-min crawl that hangs
+        # the board (M400 sits "busy" → timeout → Z overheats → USB drop).
+        # Mirror move_relative: fall back to the configured default feedrate,
+        # NEVER to whatever the previous (pump) command happened to set.
+        fr = feedrate_mm_min if feedrate_mm_min else self.feedrate
+        try:
+            fr = max(float(fr), 1.0)
+        except (TypeError, ValueError):
+            fr = self.feedrate
+        feed_str = f" F{fr:.0f}"
 
         self.send_data("G90")  # Absolute mode
         self.send_data(f"G0 {axis_str}{feed_str}")
@@ -763,9 +1017,42 @@ class ZPStageManager:
             (x, y, z, e) — printer axis positions.
             Maps to (Z-needle, P1, P2, P3) via AXIS_MAP.
         """
-        self.send_data("M114")
-        response = self.receive_data()
-        self._parse_position(response)
+        if self.serial is None:
+            self._last_position_read_ok = False
+            return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
+
+        if self.simulate:
+            # Simulator path unchanged: the sim answers M114 via its response
+            # queue (no synchronous 'ok' handshake) — bounded drain + parse.
+            self.send_data("M114")
+            deadline = time.monotonic() + 0.25
+            response = ""
+            while True:
+                chunk = self.receive_data()
+                if chunk:
+                    response = f"{response}\n{chunk}" if response else chunk
+                    self._parse_position(response)
+                    if self._last_position_read_ok:
+                        break
+                if time.monotonic() >= deadline:
+                    if not response:
+                        self._parse_position(response)
+                    break
+            return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
+
+        # Real hardware: a single synchronous M114 transaction — write, then
+        # read until 'ok', parsing the position line along the way. Consuming
+        # the 'ok' leaves the RX buffer clean for the next command, so the old
+        # stale-ack drain (needed only because we used to fire commands without
+        # reading their 'ok') is no longer required. ok_timeout is kept short:
+        # M114 answers immediately, and the poller calls this every ~0.3 s.
+        ok, text = self._txn("M114", ok_timeout=0.5, collect=True)
+        if text:
+            self._parse_position(text)  # sets _last_position_read_ok
+        else:
+            # No reply at all (or only 'ok' with no position) → failed read so
+            # the poller-liveness watchdog still sees a silent board.
+            self._last_position_read_ok = False
         return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
 
     def flush_moves(self, timeout_s: float = 15.0) -> bool:
@@ -776,14 +1063,19 @@ class ZPStageManager:
         polling M114, which may return commanded (planned) position rather than
         the actual stepper position during motion.
 
-        Should be called with the PositionPoller suspended to avoid racing on
-        the serial port for the 'ok' response.
+        v7.5.x CRITICAL: the ENTIRE write→read-until-'ok' round trip is held
+        under ``_serial_lock`` (atomic), exactly like the synchronous command
+        handshake. Previously the lock was released between each ``readline()``,
+        so a *concurrent* ZP reader — a straggler poller M114 (``suspend()`` only
+        sets a flag; a poll already in flight does one more read), the Xbox jog
+        handler, etc. — could slip in and CONSUME the M400 'ok'. flush_moves then
+        waited out the full timeout for an 'ok' that was already eaten and
+        reported a bogus "M400 timed out → ZP disconnected", even on a
+        zero-distance move with a perfectly alive board. Holding the lock makes
+        any other reader WAIT until M400 completes, so the 'ok' can't be stolen.
 
-        v7.3.5 BF-1: Drains the serial RX buffer before sending M400. Prior
-        G-code commands (G90, G0, G91 from move_absolute) generate "ok"
-        responses that send_data() never reads. Without draining, readline()
-        would return a stale "ok" and falsely indicate M400 completion while
-        the Z axis is still moving — causing XY to start prematurely.
+        v7.3.5 BF-1: Drains the serial RX buffer before sending M400 so a stale
+        "ok" can't be mistaken for the M400 completion.
 
         Returns:
             True  — Marlin confirmed completion within timeout.
@@ -792,31 +1084,66 @@ class ZPStageManager:
         if self.serial is None or self.simulate:
             return True  # Simulated or disconnected — treat as immediate success
 
-        # Drain stale "ok" responses and send M400 in a single locked section
-        # to prevent any new stale data from arriving between drain and send.
+        # v7.5.x: if the board has already gone silent, don't wait the full
+        # 15 s for an M400 'ok' that will never come — cap it so the
+        # end-of-print / safe-travel retract fails fast instead of hanging.
+        if not getattr(self, "_last_position_read_ok", True):
+            timeout_s = min(timeout_s, 2.0)
+
+        _t0 = time.monotonic()
+        deadline = _t0 + timeout_s
+        rx_count = 0
+        busy_count = 0
+        # Atomic: drain → write M400 → read until 'ok', all under one lock hold
+        # so no other thread can interleave a read and steal the 'ok'.
         with self._serial_lock:
             try:
                 self.serial.reset_input_buffer()
                 self.serial.write(b"M400\n")
                 self.serial.flush()
+                _zp_tracer().tx("M400")
             except Exception as e:
                 logger.warning(f"flush_moves send error: {e}")
+                _zp_tracer().txn("M400", outcome="write_error",
+                                 latency_ms=(time.monotonic() - _t0) * 1000.0,
+                                 note=str(e)[:60])
                 return False
-
-        deadline = time.monotonic() + timeout_s
-
-        while time.monotonic() < deadline:
-            with self._serial_lock:
+            while time.monotonic() < deadline:
                 try:
-                    line = self.serial.readline().decode("utf-8", errors="replace").strip()
+                    line = self.serial.readline().decode(
+                        "utf-8", errors="replace").strip()
                 except Exception as e:
                     logger.warning(f"flush_moves read error: {e}")
+                    _zp_tracer().txn(
+                        "M400", outcome="read_error", rx_count=rx_count,
+                        busy_count=busy_count,
+                        latency_ms=(time.monotonic() - _t0) * 1000.0)
                     return False
-            if line == "ok":
-                return True
-            # Discard other lines (position data, temperature reports, etc.)
+                if not line:
+                    continue
+                rx_count += 1
+                _zp_tracer().rx(line)
+                if line == "ok" or line.lower().startswith("ok "):
+                    _zp_tracer().txn(
+                        "M400", outcome="ok", rx_count=rx_count,
+                        busy_count=busy_count,
+                        latency_ms=(time.monotonic() - _t0) * 1000.0)
+                    return True
+                if "busy" in line.lower():
+                    busy_count += 1
+                # Discard other lines (position echo, busy keep-alive, etc.).
 
-        logger.warning(f"flush_moves: M400 timed out after {timeout_s:.1f}s")
+        # The rx_count distinguishes a SILENT board (rx=0 → no bytes at all,
+        # genuinely not answering) from a STOLEN 'ok' / slow move (rx>0 → bytes
+        # came back but no 'ok' for us) — the single most useful flush_moves
+        # diagnostic, now captured.
+        logger.warning(
+            f"flush_moves: M400 timed out after {timeout_s:.1f}s "
+            f"(rx_lines={rx_count}, busy={busy_count})")
+        _zp_tracer().txn("M400", outcome="timeout", rx_count=rx_count,
+                         busy_count=busy_count,
+                         latency_ms=(time.monotonic() - _t0) * 1000.0,
+                         note=("SILENT" if rx_count == 0 else "no-ok"))
         return False
 
     def _parse_position(self, response: str) -> None:

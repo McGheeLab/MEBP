@@ -23,7 +23,20 @@ from gui.pages.workflows._stub_workflow import StubWorkflowPage
 from gui.pages.workflows.spheroid_pickup_workflow import (
     SpheroidPickupWorkflowPage,
 )
+from gui.pages.workflows.cell_targeting_workflow import (
+    CellTargetingWorkflowPage,
+)
+from gui.pages.workflows.cell_labeling_workflow import (
+    CellLabelingWorkflowPage,
+)
 from gui.pages.workflows.quick_print_workflow import QuickPrintWorkflowPage
+from gui.pages.workflows.fluorescence_mosaic_workflow import (
+    FluorescenceMosaicWorkflowPage,
+)
+from gui.pages.workflows.stress_test_workflow import StressTestWorkflowPage
+from gui.pages.workflows.timing_calibration_workflow import (
+    TimingCalibrationWorkflowPage,
+)
 
 if TYPE_CHECKING:
     from SupportClasses.StageController import StageController
@@ -79,10 +92,41 @@ class WorkflowsModePage(QWidget):
                     settings=settings,
                     camera_manager=camera_manager,
                 )
+            elif tile.workflow_id == "cell_targeting":
+                page = CellTargetingWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "cell_labeling":
+                page = CellLabelingWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
             elif tile.workflow_id == "quick_print":
                 page = QuickPrintWorkflowPage(
                     controller=controller,
                     settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "fluorescence_mosaic":
+                page = FluorescenceMosaicWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "stress_test":
+                page = StressTestWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "timing_calibration":
+                page = TimingCalibrationWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
                 )
             else:
                 page = StubWorkflowPage(tile.title)

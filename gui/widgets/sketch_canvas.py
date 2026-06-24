@@ -81,9 +81,11 @@ class SketchCanvas(QWidget):
         self._active_pump = 0              # pump for new shapes/fills
         self._default_line_width = 0.4     # bead width for new shapes (needle Ø)
         self._ref_well_d = 0.0             # reference standard-well Ø (mm); 0=off
+        self._safe_well_d = 0.0            # needle-safe inner boundary Ø (mm); 0=off
         # Compiled toolpath shown as the main raster view. Each run is
         # (pump_index | -1 for travel, [(x,y) world mm, ...]).
         self._tp_runs: list[tuple[int, list[tuple[float, float]]]] = []
+        self._show_thickness = False       # draw print runs at the bead width
 
         # Interaction state
         self._mode = None                  # 'draw' | 'move' | 'resize' | 'pan' | 'poly'
@@ -158,6 +160,20 @@ class SketchCanvas(QWidget):
     def set_reference_well(self, diameter_mm: float):
         """Draw a dashed standard-well outline (Ø mm) at the origin; 0 = off."""
         self._ref_well_d = max(0.0, float(diameter_mm or 0.0))
+        self.update()
+
+    def set_safe_boundary(self, diameter_mm: float):
+        """Draw a dashed inner 'needle-safe' boundary (Ø mm) at the origin —
+        the well edge inset by the needle radius, so the needle wall never
+        contacts the well wall when printing. 0 = off."""
+        self._safe_well_d = max(0.0, float(diameter_mm or 0.0))
+        self.update()
+
+    def set_show_thickness(self, on: bool):
+        """When on, render print runs at the deposited bead width (the fill
+        pitch ``line_spacing_mm``, ≈ the needle Ø) instead of a thin line, so
+        the user sees how thick the printed lines will be."""
+        self._show_thickness = bool(on)
         self.update()
 
     def set_toolpath(self, trajectory, pump_states):
@@ -381,6 +397,7 @@ class SketchCanvas(QWidget):
         self._draw_grid(p)
         self._draw_axes(p)
         self._draw_reference_well(p)
+        self._draw_safe_boundary(p)
         self._draw_toolpath(p)             # the raster (what prints)
 
         for i, sh in enumerate(self._sketch.shapes):
@@ -437,21 +454,45 @@ class SketchCanvas(QWidget):
         p.drawEllipse(c, r, r)
         p.setPen(QColor(COLORS.get("mauve", "#cba6f7")))
         p.drawText(int(c.x() - r), int(c.y() - r) - s(4),
-                   f"standard well Ø {self._ref_well_d:.1f} mm")
+                   f"well wall Ø {self._ref_well_d:.1f} mm")
+
+    def _draw_safe_boundary(self, p: QPainter):
+        """Inner 'needle-safe' ring: the well wall inset by the needle radius.
+        Keeping the toolpath inside this ring guarantees the needle outer wall
+        never touches the well wall."""
+        if self._safe_well_d <= 0:
+            return
+        r = self._safe_well_d / 2.0 * self._scale
+        c = self._w2s(0, 0)
+        col = QColor(COLORS.get("red", "#f38ba8"))
+        pen = QPen(col, s(1.2), Qt.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(c, r, r)
+        p.setPen(col)
+        p.drawText(int(c.x() - r), int(c.y() + r) + s(12),
+                   f"needle-safe Ø {self._safe_well_d:.1f} mm")
 
     def _draw_toolpath(self, p: QPainter):
         if not self._tp_runs:
             return
+        # Bead width to stroke print runs at when "show thickness" is on — the
+        # deposited line per pass is the fill pitch (≈ the needle Ø).
+        bead_px = max(1.0, self._sketch.line_spacing_mm * self._scale)
         for cat, wpts in self._tp_runs:
             if len(wpts) < 2:
                 continue
             poly = QPolygonF([self._w2s(x, y) for (x, y) in wpts])
-            if cat < 0:                    # travel move
+            if cat < 0:                    # travel move (never deposited)
                 pen = QPen(QColor(150, 150, 150, 70), s(0.8), Qt.DashLine)
             else:                          # print move — colour by pump
                 col = QColor(PUMP_HEX[cat % len(PUMP_HEX)])
-                col.setAlpha(235)
-                pen = QPen(col, s(1.6))
+                if self._show_thickness:   # render the real bead footprint
+                    col.setAlpha(140)
+                    pen = QPen(col, bead_px)
+                else:
+                    col.setAlpha(235)
+                    pen = QPen(col, s(1.6))
                 pen.setCapStyle(Qt.RoundCap)
                 pen.setJoinStyle(Qt.RoundJoin)
             p.setPen(pen)

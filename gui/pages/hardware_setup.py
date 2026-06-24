@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QScrollArea, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QFormLayout, QDialogButtonBox,
     QCheckBox, QAbstractItemView, QListWidget, QListWidgetItem,
+    QSlider,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QStandardItem
@@ -59,8 +60,10 @@ from SupportClasses.HardwareConfig import (
 from SupportClasses.PhysicalModels import (
     NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert, CameraSpec,
     load_needle_catalog, load_syringe_catalog, load_camera_catalog,
+    WellRole, ROLE_COLORS, well_role_for_ink_type, ink_type_border_color,
+    WELL_TYPES, INK_SUBTYPES, is_service_reagent,
 )
-from SupportClasses.WellPlate import PLATE_DEFINITIONS
+from SupportClasses.WellPlate import PLATE_DEFINITIONS, WellPlate
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
@@ -84,7 +87,11 @@ NIKON_TI2U_OBJECTIVES = [1.0, 2.0, 4.0, 10.0, 20.0]
 class InkEditorDialog(QDialog):
     """Dialog for adding/editing an ink in the library."""
 
-    INK_TYPES = ["hydrogel", "cells", "media", "buffer", "granular", "custom"]
+    # v7.5.x: ``ink_type`` is the WELL TYPE (drives behavior). Only the printable
+    # ``ink`` type carries an informational SUBTYPE (INK_SUBTYPES); service types
+    # (wash/buffer/waste/oil) have no subtype.
+    INK_TYPES = list(WELL_TYPES)            # ["ink", "wash", "buffer", "waste", "oil"]
+    INK_SUBTYPE_PRESETS = list(INK_SUBTYPES)
 
     def __init__(self, ink: InkSpec | None = None, parent=None):
         super().__init__(parent)
@@ -102,10 +109,24 @@ class InkEditorDialog(QDialog):
         self.type_combo = QComboBox()
         self.type_combo.addItems(self.INK_TYPES)
         if ink:
-            idx = self.type_combo.findText(ink.ink_type)
+            idx = self.type_combo.findText((ink.ink_type or "").strip().lower())
             if idx >= 0:
                 self.type_combo.setCurrentIndex(idx)
-        layout.addRow("Type:", self.type_combo)
+        self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        layout.addRow("Well type:", self.type_combo)
+
+        # v7.5.x: informational ink subtype — editable, pre-filled with the
+        # standard presets, only meaningful (and enabled) when type == "ink".
+        self.subtype_combo = QComboBox()
+        self.subtype_combo.setEditable(True)
+        self.subtype_combo.addItem("")          # "(none)"
+        self.subtype_combo.addItems(self.INK_SUBTYPE_PRESETS)
+        if ink and (ink.ink_subtype or "").strip():
+            self.subtype_combo.setCurrentText(ink.ink_subtype.strip())
+        else:
+            self.subtype_combo.setCurrentText("")
+        layout.addRow("Ink subtype:", self.subtype_combo)
+        self._on_type_changed(self.type_combo.currentText())
 
         self.viscosity_spin = QDoubleSpinBox()
         self.viscosity_spin.setRange(0.1, 100000)
@@ -154,6 +175,13 @@ class InkEditorDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addRow(buttons)
 
+    def _on_type_changed(self, text: str):
+        """Subtype only applies to the printable ``ink`` well type."""
+        is_ink = (text or "").strip().lower() == "ink"
+        self.subtype_combo.setEnabled(is_ink)
+        if not is_ink:
+            self.subtype_combo.setCurrentText("")
+
     def _pick_ink_color(self):
         from PySide6.QtWidgets import QColorDialog
         color = QColorDialog.getColor(QColor(self._ink_color), self, "Ink Color")
@@ -167,9 +195,13 @@ class InkEditorDialog(QDialog):
         name = self.name_edit.text().strip()
         if not name:
             return None
+        well_type = self.type_combo.currentText()
+        subtype = (self.subtype_combo.currentText().strip()
+                   if well_type == "ink" else "")
         return InkSpec(
             name=name,
-            ink_type=self.type_combo.currentText(),
+            ink_type=well_type,
+            ink_subtype=subtype,
             viscosity_cP=self.viscosity_spin.value(),
             granule_diameter_um=self.granule_spin.value(),
             cell_diameter_um=self.cell_spin.value(),
@@ -496,6 +528,10 @@ class HardwareSetupPage(ModePage):
     # v7.5.x: emitted when the Stage sub-page saves new XY safety limits to
     # the live controller, so the app can re-centre the default plate.
     safety_limits_changed = Signal()
+    # v7.5.x: carries the background camera probe result (OpenCV indices, or
+    # None on failure) from the worker thread back to the GUI thread so startup
+    # camera detection + start runs without freezing the window.
+    _cameras_probed = Signal(object)
 
     # v7.4.0-b: Settings reference used by the Stage sub-page (safety limits,
     # ZP feedrates, axis flips). Set via set_settings() from MainWindow.
@@ -520,6 +556,8 @@ class HardwareSetupPage(ModePage):
         # remembered camera setup (role→identity assignments + per-camera
         # µm/px) auto-restores without the user clicking Detect each session.
         self._auto_detect_done = False
+        # Background-probe result → GUI-thread finish (queued connection).
+        self._cameras_probed.connect(self._finish_auto_load)
 
         # v7.2.4: Channel mapping widgets (dynamic)
         self._channel_map_widgets: list[tuple[QLabel, QComboBox]] = []
@@ -720,9 +758,9 @@ class HardwareSetupPage(ModePage):
         ink_group.setStyleSheet(self._group_style())
         ink_lay = QVBoxLayout(ink_group)
 
-        self.ink_table = QTableWidget(0, 5)
+        self.ink_table = QTableWidget(0, 6)
         self.ink_table.setHorizontalHeaderLabels(
-            ["Name", "Type", "Viscosity", "Granule Ø", "Cell Ø"])
+            ["Name", "Type", "Subtype", "Viscosity", "Granule Ø", "Cell Ø"])
         self.ink_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Stretch)
         self.ink_table.setSelectionBehavior(
@@ -752,6 +790,12 @@ class HardwareSetupPage(ModePage):
 
         self._sub_layouts["inks"].addWidget(ink_group)
 
+        # ── v7.5.x: Reagent Locations ─────────────────────────────
+        # Pin each reagent (ink/wash/buffer/oil…) to one or more plate
+        # wells. Reuses the print workflow's WellPlateView so rosette
+        # sub-wells (A1.a) show up automatically once the plate is built.
+        self._build_reagent_locations_group()
+
         # ── Section 4: Pump Channels (v7.2.4: with exclusive inks) ─
         pump_group = QGroupBox("Pump Channels")
         pump_group.setStyleSheet(self._group_style())
@@ -773,6 +817,51 @@ class HardwareSetupPage(ModePage):
         pump_lay.addWidget(self.pump_ink_summary)
 
         self._sub_layouts["pumps_inks"].addWidget(pump_group)
+
+        # v7.5.x: the per-pump Plunger Setup (Set Dispensed/Set Aspirated) now
+        # lives on the Stage sub-page, directly beneath the Z Axis Setup block
+        # (order Z, P1, P2, P3) — see StageHardwarePanel.
+        # ── v7.5.x: Global pump timing (settle + prime) ──────────────
+        # Settle = blocking dwell before AND after every discrete pump
+        # actuation (prime, aspirate, dispense, pick/place, EXTRUDE) so the
+        # fluid/pressure settles before the next step. Prime = the pre-flow
+        # lead-in duration that printing workflows use (volume = flow × time).
+        timing_group = QGroupBox("Pump Timing (all pumps)")
+        timing_group.setStyleSheet(self._group_style())
+        timing_lay = QGridLayout(timing_group)
+        timing_lay.setHorizontalSpacing(s(12))
+        timing_lay.setVerticalSpacing(s(10))
+
+        timing_lay.addWidget(QLabel("Settle time:"), 0, 0)
+        self._pump_settle_spin = QDoubleSpinBox()
+        self._pump_settle_spin.setRange(0.0, 10.0)
+        self._pump_settle_spin.setDecimals(2)
+        self._pump_settle_spin.setSingleStep(0.05)
+        self._pump_settle_spin.setSuffix(" s")
+        self._pump_settle_spin.setToolTip(
+            "Dwell held BEFORE and AFTER every discrete pump move (prime, "
+            "aspirate, dispense, pick/place) so the fluid settles "
+            "before the workflow advances. Does not apply to the streamed "
+            "print path or manual jog. 0 = no dwell.")
+        self._pump_settle_spin.valueChanged.connect(self._on_config_changed)
+        timing_lay.addWidget(self._pump_settle_spin, 0, 1)
+
+        timing_lay.addWidget(QLabel("Prime time:"), 1, 0)
+        self._pump_prime_spin = QDoubleSpinBox()
+        self._pump_prime_spin.setRange(0.0, 10.0)
+        self._pump_prime_spin.setDecimals(2)
+        self._pump_prime_spin.setSingleStep(0.05)
+        self._pump_prime_spin.setSuffix(" s")
+        self._pump_prime_spin.setToolTip(
+            "Pre-flow lead-in duration printing workflows use to prime the "
+            "needle: the pump runs at the print flow for this long before the "
+            "path starts (prime volume = flow × time). Quick Print seeds its "
+            "per-run pre-flow knob from this value.")
+        self._pump_prime_spin.valueChanged.connect(self._on_config_changed)
+        timing_lay.addWidget(self._pump_prime_spin, 1, 1)
+        timing_lay.setColumnStretch(2, 1)
+
+        self._sub_layouts["pumps_inks"].addWidget(timing_group)
 
         # v7.2.9: Ink Swap Strategy UI moved to Print Setup → Plan of Action
 
@@ -909,6 +998,33 @@ class HardwareSetupPage(ModePage):
         )
         assign_lay.addWidget(intro)
 
+        # v7.5.x: Save / Load the FULL camera setup as this machine's default.
+        # Save snapshots every section (sources→roles, µm/px, image correction,
+        # camera-side hardware controls, and which cameras are running). Load
+        # detects, restores all of that, and starts the saved cameras. The same
+        # restore runs automatically at startup.
+        setup_row = QHBoxLayout()
+        setup_row.setSpacing(s(10))
+        self._btn_save_cam_setup = icon_button(
+            "Save Camera Settings", "save", object_name="accentBtn",
+            tooltip="Save the current camera setup (sources, roles, µm/px, "
+                    "image correction, camera hardware controls, and which "
+                    "cameras are running) as this machine's default.")
+        self._btn_save_cam_setup.clicked.connect(self._on_save_camera_settings)
+        setup_row.addWidget(self._btn_save_cam_setup)
+        self._btn_load_cam_setup = icon_button(
+            "Load Cameras", "play",
+            tooltip="Detect cameras, restore the saved setup for every "
+                    "section, and start the cameras that were running when "
+                    "you last saved.")
+        self._btn_load_cam_setup.clicked.connect(self._on_load_cameras)
+        setup_row.addWidget(self._btn_load_cam_setup)
+        self._lbl_cam_setup_status = StatusBadge("", variant="pending")
+        self._lbl_cam_setup_status.setVisible(False)
+        setup_row.addWidget(self._lbl_cam_setup_status)
+        setup_row.addStretch()
+        assign_lay.addLayout(setup_row)
+
         detect_row = QHBoxLayout()
         detect_row.setSpacing(s(10))
         self._btn_detect_live_cams = icon_button(
@@ -934,6 +1050,9 @@ class HardwareSetupPage(ModePage):
         self._live_cam_start_btns: list[QPushButton] = []
         self._live_cam_preview_holders: list[QWidget] = []
         self._live_cam_previews: list = []
+        # v7.5.x: per-slot image-correction control strip (brightness/contrast/
+        # gamma sliders), built lazily under each preview in _ensure_camera_previews.
+        self._live_cam_correction: list = []
         self._cam_preview_signals_wired = False
 
         from gui.styles import build_glass_panel_style
@@ -1035,6 +1154,7 @@ class HardwareSetupPage(ModePage):
             rl.addWidget(preview, 2, 0, 1, 5)
             self._live_cam_preview_holders.append(preview)
             self._live_cam_previews.append(None)
+            self._live_cam_correction.append(None)
 
             self._live_cam_rows_container.addWidget(row)
 
@@ -1320,11 +1440,14 @@ class HardwareSetupPage(ModePage):
         self.add_sub_page("file-text", "Identity",        self._sub_scrolls["identity"])
         self._plate_sub_index = len(self._sub_pages)
         self.add_sub_page("microscope","Plate",           self._sub_scrolls["plate"])
-        self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
-        self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
-        self.add_sub_page("flask",     "Ink",             self._sub_scrolls["inks"])
+        # v7.5.x: order the dependent setups left-to-right so each
+        # section's options build on the ones to its left:
+        # Rosette → Ink → Needle → Pump.
         self._rosette_sub_index = len(self._sub_pages)
         self.add_sub_page("flower",    "Rosette",         self._sub_scrolls["rosette"])
+        self.add_sub_page("flask",     "Ink",             self._sub_scrolls["inks"])
+        self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
+        self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
         self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
         self.add_sub_page("gamepad",   "Xbox Controller", self._sub_scrolls["xbox"])
 
@@ -1472,12 +1595,25 @@ class HardwareSetupPage(ModePage):
         self._refresh_channel_map_pump_options()
         self._on_config_changed()
 
+    def _pump_ink_names(self) -> list[str]:
+        """Ink-library names a pump may aspirate — PRINTABLE inks only.
+
+        v7.5.x: service reagents (wash/waste/buffer/oil — by well type OR by an
+        ink literally named one of those roles) are excluded; a pump never
+        aspirates from a service well.
+        """
+        return [
+            name for name, ink in self._config.ink_library.items()
+            if not is_service_reagent(name, getattr(ink, "ink_type", ""))
+        ]
+
     def _refresh_pump_ink_exclusions(self):
         """
         v7.2.8: Refresh ink checklists in all pump widgets.
         No exclusion — inks can be assigned to multiple pumps.
+        v7.5.x: service reagents are filtered out (printable inks only).
         """
-        ink_names = list(self._config.ink_library.keys())
+        ink_names = self._pump_ink_names()
         for pid, pw in self._pump_widgets.items():
             pw.set_ink_names(ink_names)
 
@@ -1521,8 +1657,31 @@ class HardwareSetupPage(ModePage):
                         len(spec.preview_resolutions) - 1)
             self.cam_resolution_combo.blockSignals(False)
 
+        # v7.5.x: if the microscope camera is live, push the chosen resolution
+        # to the *device* too (mapped to the nearest supported mode), so the
+        # spec combo and the hardware stay in sync. The gear-button dialog
+        # offers the device's exact native resolutions.
+        if sender is self.cam_resolution_combo:
+            self._maybe_apply_resolution_to_device()
+
         self._update_camera_info_labels()
         self._on_config_changed()
+
+    def _maybe_apply_resolution_to_device(self):
+        """Drive the live microscope camera to the spec-combo resolution."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        mic_idx = self._config.camera_for_role(CameraRole.MICROSCOPE)
+        if mic_idx is None or not mgr.is_running(mic_idx):
+            return
+        data = self.cam_resolution_combo.currentData()
+        if not data:
+            return
+        actual = mgr.set_capture_resolution(mic_idx, int(data[0]), int(data[1]))
+        logger.info(
+            f"Microscope capture resolution requested {tuple(data)} -> "
+            f"device adopted {actual}")
 
     def _on_camera_override_toggled(self, checked: bool):
         """Toggle between computed and custom micron/pixel scale."""
@@ -1627,6 +1786,10 @@ class HardwareSetupPage(ModePage):
                     lambda *_: self._refresh_camera_preview_state())
                 manager.camera_stopped.connect(
                     lambda *_: self._refresh_camera_preview_state())
+                # v7.5.x: on every camera start, restore persisted hardware
+                # controls and log the read-back settings to the terminal so
+                # the operator can confirm they come FROM the camera.
+                manager.camera_started.connect(self._on_camera_started_hw)
                 self._cam_preview_signals_wired = True
             except Exception as exc:
                 logger.debug(f"camera preview signal wiring skipped: {exc}")
@@ -1671,16 +1834,20 @@ class HardwareSetupPage(ModePage):
             return
         try:
             from SupportClasses.CameraCalibrationStore import get_store
-            if not get_store().all_assignments():
+            store = get_store()
+            if not store.all_assignments() and not store.any_autostart():
                 return  # nothing remembered yet — wait for a manual Detect
         except Exception as exc:
             logger.debug(f"auto-detect gate check failed: {exc}")
             return
         self._auto_detect_done = True  # set before scheduling to avoid re-entry
         logger.info(
-            "Hardware Setup: remembered camera setup found — auto-detecting "
-            "to restore source assignments + calibrations")
-        QTimer.singleShot(0, self._on_detect_live_cameras)
+            "Hardware Setup: remembered camera setup found — auto-loading "
+            "to restore source assignments + calibrations and start the "
+            "cameras that were running when the setup was saved")
+        # Detect + restore every section, then start the saved (autostart)
+        # cameras — the startup reload of the last-used camera setup.
+        QTimer.singleShot(0, self._auto_load_cameras)
 
     # ── Live camera Start/Stop + preview (v7.5.x) ─────────────────
 
@@ -1713,8 +1880,138 @@ class HardwareSetupPage(ModePage):
                 )
                 holder.layout().addWidget(fv, stretch=1)
                 self._live_cam_previews[i] = fv
+                # v7.5.x: image-correction sliders beneath the live preview.
+                if i < len(self._live_cam_correction) and self._live_cam_correction[i] is None:
+                    strip = self._build_correction_strip(i)
+                    holder.layout().addWidget(strip)
             except Exception as exc:
                 logger.warning(f"failed to build camera preview {i}: {exc}")
+
+    def _build_correction_strip(self, cam_idx: int) -> QWidget:
+        """Build the per-slot brightness/contrast/gamma control strip.
+
+        Each slider pushes live to the shared CameraManager (display-only
+        correction) and, on release, persists the value keyed by the camera's
+        device identity so it auto-restores next session.
+        """
+        from gui.styles import build_glass_panel_style
+        strip = QFrame()
+        strip.setObjectName("camMiniCard")
+        strip.setStyleSheet(build_glass_panel_style("camMiniCard"))
+        grid = QGridLayout(strip)
+        grid.setContentsMargins(s(10), s(8), s(10), s(8))
+        grid.setHorizontalSpacing(s(10))
+        grid.setVerticalSpacing(s(6))
+        grid.setColumnStretch(1, 1)
+
+        title = QLabel("Image Correction")
+        title.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {sf(9)}pt; font-weight: 700;")
+        grid.addWidget(title, 0, 0, 1, 3)
+
+        refs: dict = {}
+
+        def _add(row: int, name: str, key: str, lo: int, hi: int,
+                 init: int, fmt) -> None:
+            grid.addWidget(self._field_label(name), row, 0)
+            sld = QSlider(Qt.Horizontal)
+            sld.setRange(lo, hi)
+            sld.setValue(init)
+            grid.addWidget(sld, row, 1)
+            val = QLabel(fmt(init))
+            val.setMinimumWidth(s(34))
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            grid.addWidget(val, row, 2)
+            sld.valueChanged.connect(
+                lambda v, k=key, l=val, f=fmt: (
+                    l.setText(f(v)),
+                    self._on_correction_changed(cam_idx, k, v),
+                ))
+            sld.sliderReleased.connect(
+                lambda c=cam_idx: self._persist_correction(c))
+            refs[key] = sld
+            refs[key + "_lbl"] = val
+
+        _add(1, "Brightness", "brightness", -100, 100, 0, lambda v: str(int(v)))
+        _add(2, "Contrast", "contrast", 10, 300, 100,
+             lambda v: f"{v / 100.0:.2f}")
+        _add(3, "Gamma", "gamma", 10, 300, 100,
+             lambda v: f"{v / 100.0:.2f}")
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.setMinimumWidth(s(72))
+        reset_btn.setToolTip("Reset brightness / contrast / gamma to neutral")
+        reset_btn.clicked.connect(lambda _=False, c=cam_idx: self._reset_correction(c))
+        grid.addWidget(reset_btn, 4, 2, Qt.AlignRight)
+
+        self._live_cam_correction[cam_idx] = refs
+        return strip
+
+    def _on_correction_changed(self, cam_idx: int, key: str, raw: int):
+        """Push a live slider value to the CameraManager (display-only)."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        if key == "brightness":
+            mgr.set_brightness(cam_idx, int(raw))
+        elif key == "contrast":
+            mgr.set_contrast(cam_idx, raw / 100.0)
+        elif key == "gamma":
+            mgr.set_gamma(cam_idx, raw / 100.0)
+
+    def _persist_correction(self, cam_idx: int):
+        """Save the slot's current correction keyed by device identity."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        identity = mgr.camera_identity(cam_idx)
+        if identity is None:
+            return
+        corr = mgr.image_correction(cam_idx)
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            get_store().set_image_correction(
+                identity[0],
+                brightness=corr.get("brightness", 0),
+                contrast=corr.get("contrast", 1.0),
+                gamma=corr.get("gamma", 1.0),
+                name=identity[1],
+            )
+        except Exception as exc:
+            logger.debug(f"persist correction slot {cam_idx}: {exc}")
+
+    def _reset_correction(self, cam_idx: int):
+        """Reset a slot's correction to neutral, sync sliders, and persist."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is not None:
+            mgr.reset_image_correction(cam_idx)
+        self._sync_correction_sliders(cam_idx)
+        self._persist_correction(cam_idx)
+
+    def _sync_correction_sliders(self, cam_idx: int):
+        """Reflect the manager's current correction values on the sliders."""
+        mgr = getattr(self, "_camera_manager", None)
+        if (mgr is None or cam_idx >= len(self._live_cam_correction)
+                or self._live_cam_correction[cam_idx] is None):
+            return
+        refs = self._live_cam_correction[cam_idx]
+        corr = mgr.image_correction(cam_idx)
+        vals = {
+            "brightness": int(corr.get("brightness", 0)),
+            "contrast": int(round(corr.get("contrast", 1.0) * 100)),
+            "gamma": int(round(corr.get("gamma", 1.0) * 100)),
+        }
+        for key, iv in vals.items():
+            sld = refs.get(key)
+            if sld is not None and sld.value() != iv:
+                sld.blockSignals(True)
+                sld.setValue(iv)
+                sld.blockSignals(False)
+            lbl = refs.get(key + "_lbl")
+            if lbl is not None:
+                lbl.setText(str(iv) if key == "brightness"
+                            else f"{iv / 100.0:.2f}")
 
     def _on_live_cam_source_changed(self, cam_idx: int):
         """Apply the slot's selected source to the CameraManager.
@@ -1802,6 +2099,17 @@ class HardwareSetupPage(ModePage):
             return
         if mgr.is_running(cam_idx):
             mgr.stop(cam_idx)
+            # Implicit "last-used": a deliberate stop means "don't auto-start
+            # next launch" for the microscope. App shutdown stops via stop_all
+            # (not this handler), so it preserves the flag.
+            try:
+                if cam_idx == self._config.camera_for_role(CameraRole.MICROSCOPE):
+                    identity = mgr.camera_identity(cam_idx)
+                    if identity is not None:
+                        from SupportClasses.CameraCalibrationStore import get_store
+                        get_store().set_autostart(identity[0], False)
+            except Exception as exc:
+                logger.debug(f"microscope autostart clear failed: {exc}")
         else:
             data = (
                 self._live_cam_source_combos[cam_idx].currentData()
@@ -1918,7 +2226,22 @@ class HardwareSetupPage(ModePage):
         except Exception as exc:
             logger.debug(f"camera calibration store read failed: {exc}")
             entry = None
-        if not entry or entry.get("um_per_px") is None:
+        if not entry:
+            return False
+        # v7.5.x: restore the display correction (independent of µm/px).
+        corr = entry.get("image_correction")
+        if isinstance(corr, dict):
+            try:
+                mgr.set_image_correction(
+                    cam_idx,
+                    brightness=corr.get("brightness"),
+                    contrast=corr.get("contrast"),
+                    gamma=corr.get("gamma"),
+                )
+                self._sync_correction_sliders(cam_idx)
+            except Exception as exc:
+                logger.debug(f"restore correction slot {cam_idx}: {exc}")
+        if entry.get("um_per_px") is None:
             return False
         try:
             mgr.set_um_per_px(cam_idx, float(entry["um_per_px"]))
@@ -1938,6 +2261,92 @@ class HardwareSetupPage(ModePage):
             return
         for i in range(len(getattr(self, "_live_cam_source_combos", []))):
             self._restore_calibration_for_slot(i)
+
+    def _on_camera_started_hw(self, cam_idx: int):
+        """On camera start: restore persisted hardware controls + log readback.
+
+        The readback log is the operator's confirmation that the live settings
+        come from the camera (not a software default). Runs for any start,
+        including from other pages, since it's wired to the manager signal.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        identity = None
+        hw = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                hw = get_store().get_hw_controls(identity[0])
+            except Exception as exc:
+                logger.debug(f"hw controls read failed: {exc}")
+                hw = None
+            if hw:
+                self._apply_hw_controls(cam_idx, hw)
+        # v7.5.x: microscope "apply the last used camera automatically".
+        # (1) Bring it up at its last-used resolution even without an explicit
+        # "Save Camera Settings": when no per-camera hw_controls resolution was
+        # restored above, apply the persisted spec-combo resolution
+        # (camera_config.active_resolution, saved with the normal hardware
+        # config). hw_controls.resolution, when present, already set it above
+        # and takes precedence. (2) Flag the microscope to auto-start on the
+        # next launch — implicit "last-used" tracking. Cleared only on a
+        # deliberate user stop (see _on_toggle_camera); app shutdown stops via
+        # stop_all, which does NOT route there, so the flag survives.
+        try:
+            if cam_idx == self._config.camera_for_role(CameraRole.MICROSCOPE):
+                if not (hw and hw.get("resolution")):
+                    self._maybe_apply_resolution_to_device()
+                if identity is not None:
+                    from SupportClasses.CameraCalibrationStore import get_store
+                    get_store().set_autostart(identity[0], True)
+        except Exception as exc:
+            logger.debug(f"microscope auto-apply/autostart failed: {exc}")
+        # Always log the resulting settings, read back from the device.
+        try:
+            mgr.log_hw_settings(cam_idx, prefix="[camera start] ")
+        except Exception as exc:
+            logger.debug(f"log_hw_settings failed: {exc}")
+
+    def _apply_hw_controls(self, cam_idx: int, hw: dict):
+        """Push a persisted hardware-control set onto a running camera."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None or not isinstance(hw, dict):
+            return
+        auto = hw.get("auto_exposure")
+        # Only drive auto-exposure when we have a CLEAN boolean. OpenCV/DShow
+        # cameras often report a raw CAP_PROP value (e.g. -1.0) or nothing for
+        # auto-exposure; coercing that via bool() would wrongly force auto ON,
+        # so ignore non-bool values rather than guess.
+        if isinstance(auto, bool):
+            mgr.set_hw_auto_exposure(cam_idx, auto)
+        res = hw.get("resolution")
+        if res:
+            try:
+                mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
+            except Exception as exc:
+                logger.debug(f"restore resolution failed: {exc}")
+        # Restore manual exposure/gain UNLESS auto-exposure is explicitly on.
+        # (When auto is unknown/None — e.g. an OpenCV cam — we still restore the
+        # saved exposure so "reload exactly" holds; there's no auto state to
+        # clobber. Previously `if not auto:` skipped restore only when auto was
+        # truthy, which was correct, but `auto is not True` is clearer + robust
+        # to the non-bool values now filtered above.)
+        if auto is not True:
+            if hw.get("exposure_us") is not None:
+                mgr.set_hw_exposure_us(cam_idx, hw["exposure_us"])
+            if hw.get("exposure_gain_pct") is not None:
+                mgr.set_hw_exposure_gain(cam_idx, hw["exposure_gain_pct"])
+        if hw.get("gamma") is not None:
+            mgr.set_hw_gamma(cam_idx, hw["gamma"])
+        if hw.get("brightness") is not None:
+            mgr.set_hw_brightness(cam_idx, hw["brightness"])
+        if hw.get("contrast") is not None:
+            mgr.set_hw_contrast(cam_idx, hw["contrast"])
 
     def _on_calibrate_needle(self, role: CameraRole):
         """Launch the stage-motion µm/px calibration for a needle camera.
@@ -1995,8 +2404,16 @@ class HardwareSetupPage(ModePage):
                     f"({role.value}) = {result:.4f} µm/px"
                 )
 
-    def _on_detect_live_cameras(self):
-        """Detect live cameras via CameraManager and populate source combos."""
+    def _on_detect_live_cameras(self, opencv_indices=None):
+        """Detect live cameras via CameraManager and populate source combos.
+
+        ``opencv_indices`` (a list) may carry a pre-probed OpenCV index list
+        from the background startup probe, so the slow device opens aren't
+        repeated on the GUI thread. QPushButton.clicked emits a bool, so any
+        non-list value is treated as "no pre-probe" → synchronous detect.
+        """
+        if not isinstance(opencv_indices, list):
+            opencv_indices = None
         mgr = getattr(self, '_camera_manager', None)
         if mgr is None:
             logger.warning("No CameraManager set on HardwareSetupPage")
@@ -2005,7 +2422,7 @@ class HardwareSetupPage(ModePage):
         self._btn_detect_live_cams.setEnabled(False)
         self._btn_detect_live_cams.setText("Detecting...")
 
-        mgr.detect_cameras()
+        mgr.detect_cameras(opencv_indices)
         sources = mgr.available_sources
         num = len(sources)
 
@@ -2042,6 +2459,146 @@ class HardwareSetupPage(ModePage):
             self._refresh_role_derived_displays()
         self._refresh_camera_preview_state()
         logger.info(f"Hardware Setup: detected {num} live camera sources")
+
+    # ── Save / Load the whole camera setup (v7.5.x) ───────────────
+
+    def _set_cam_setup_status(self, variant: str, text: str) -> None:
+        lbl = getattr(self, "_lbl_cam_setup_status", None)
+        if lbl is None:
+            return
+        lbl.set_status(variant, text)
+        lbl.setVisible(True)
+
+    def _on_save_camera_settings(self):
+        """Snapshot the current camera setup as this machine's default.
+
+        For each slot with an assigned source: re-affirm its role→identity
+        assignment, persist its image correction and (while running) its
+        camera-side hardware controls, and flag whether it is currently running
+        so Load / startup can bring the cameras back exactly as they are now.
+        µm/px + rotation already persist when calibrated, so they are left as-is.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            store = get_store()
+        except Exception as exc:
+            logger.warning(f"camera store unavailable: {exc}")
+            self._set_cam_setup_status("warn", "Save failed (no store)")
+            return
+        saved = 0
+        for i, combo in enumerate(getattr(self, "_live_cam_source_combos", [])):
+            if combo.currentData() is None:
+                continue
+            identity = mgr.camera_identity(i)
+            if identity is None:
+                continue
+            key, name = identity
+            self._remember_assignment(i)          # role → identity
+            try:
+                self._persist_correction(i)        # brightness/contrast/gamma
+            except Exception as exc:
+                logger.debug(f"save correction slot {i}: {exc}")
+            running = mgr.is_running(i)
+            if running:                            # hw controls only read live
+                try:
+                    st = mgr.get_hw_settings(i)
+                    if st.get("source") in ("toupcam", "opencv"):
+                        store.set_hw_controls(key, {
+                            "auto_exposure": st.get("auto_exposure"),
+                            "exposure_us": st.get("exposure_us"),
+                            "exposure_gain_pct": st.get("exposure_gain_pct"),
+                            "gamma": st.get("gamma"),
+                            "brightness": st.get("brightness"),
+                            "contrast": st.get("contrast"),
+                            "resolution": (list(st["resolution"])
+                                           if st.get("resolution") else None),
+                        }, name=name)
+                except Exception as exc:
+                    logger.debug(f"save hw controls slot {i}: {exc}")
+            store.set_autostart(key, running)
+            saved += 1
+        self._set_cam_setup_status(
+            "ok" if saved else "warn",
+            f"Saved {saved} camera(s) as default" if saved
+            else "No assigned cameras to save")
+        logger.info(f"Hardware Setup: saved camera setup for {saved} slot(s)")
+
+    def _on_load_cameras(self):
+        """Detect + restore the saved setup for every section, then start the
+        cameras that were running when the setup was last saved."""
+        self._on_detect_live_cameras()
+        n = self._start_saved_cameras()
+        self._set_cam_setup_status(
+            "ok", f"Loaded saved setup — started {n} camera(s)")
+
+    def _auto_load_cameras(self):
+        """Startup path: probe cameras in the BACKGROUND so the GUI loads and
+        stays responsive, then finish on the GUI thread (restore every section
+        + start the saved cameras). The slow OpenCV device opens run off the
+        GUI thread; the result returns via the queued ``_cameras_probed`` signal
+        → ``_finish_auto_load``."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        if hasattr(mgr, "detect_cameras_async"):
+            mgr.detect_cameras_async(self._cameras_probed.emit)
+        else:  # older manager — synchronous fallback
+            self._on_detect_live_cameras()
+            self._start_saved_cameras()
+
+    def _finish_auto_load(self, opencv_indices):
+        """GUI-thread continuation of the background startup probe: populate
+        combos from the pre-probed inventory (no re-probe), restore every
+        section, then start the cameras flagged autostart."""
+        self._on_detect_live_cameras(opencv_indices)
+        self._start_saved_cameras()
+
+    def _start_saved_cameras(self) -> int:
+        """Start every assigned-but-stopped slot whose camera was flagged
+        autostart in the store. Returns the number started."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return 0
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            store = get_store()
+        except Exception as exc:
+            logger.debug(f"start-saved-cameras: store unavailable: {exc}")
+            return 0
+        started = 0
+        for i, combo in enumerate(getattr(self, "_live_cam_source_combos", [])):
+            data = combo.currentData()
+            if data is None or mgr.is_running(i):
+                continue
+            # Sync the slot's source FIRST, then resolve identity: camera_identity
+            # reads the manager's selected source, which can lag the UI combo
+            # (the detect "restore-prev" branch sets the combo with signals
+            # blocked, so set_source was never fired). Resolving before the sync
+            # would check the autostart flag against a stale identity.
+            try:
+                mgr.set_source(i, data)
+            except Exception as exc:
+                logger.debug(f"auto-start set_source slot {i} failed: {exc}")
+                continue
+            identity = mgr.camera_identity(i)
+            if identity is None or not store.get_autostart(identity[0]):
+                continue
+            try:
+                self._restore_calibration_for_slot(i)
+                self._remember_assignment(i)
+                mgr.start(i)
+                started += 1
+            except Exception as exc:
+                logger.debug(f"auto-start camera slot {i} failed: {exc}")
+        if started and hasattr(self, "_needle_cards"):
+            self._refresh_role_derived_displays()
+        self._refresh_camera_preview_state()
+        if started:
+            logger.info(f"Hardware Setup: started {started} saved camera(s)")
+        return started
 
     def _on_live_cam_role_changed(self, cam_idx: int):
         """v7.4.x: Persist the workflow role assigned to this camera.
@@ -2282,6 +2839,9 @@ class HardwareSetupPage(ModePage):
             self.config_validated.emit(valid)
 
         self._sync_validity_display()
+        # v7.5.x: a plate-format/custom-plate change must reload the reagent
+        # locations well view (guarded — no-op unless the key changed).
+        self._sync_loc_plate_on_config_change()
         self.config_changed.emit(self._config)
 
     def _rebuild_config(self):
@@ -2332,6 +2892,14 @@ class HardwareSetupPage(ModePage):
                     logger.warning(f"{pid}: Ink '{ink.name}' no longer in library")
             pcfg.inks = resolved_inks
             self._config.pumps[pid] = pcfg
+
+        # v7.5.x: global pump timing (settle + prime)
+        if hasattr(self, "_pump_settle_spin"):
+            self._config.pump_settle_time_s = float(
+                self._pump_settle_spin.value())
+        if hasattr(self, "_pump_prime_spin"):
+            self._config.pump_prime_time_s = float(
+                self._pump_prime_spin.value())
 
         # v7.2.4 S3.12: Capture channel map state
         self._config.needle_channel_pump_map.clear()
@@ -2397,6 +2965,7 @@ class HardwareSetupPage(ModePage):
                 self._config.add_ink(ink)
                 self._refresh_ink_table()
                 self._refresh_pump_ink_combos()
+                self._refresh_reagent_locations()
                 self._on_config_changed()
 
     def _edit_ink(self):
@@ -2413,9 +2982,12 @@ class HardwareSetupPage(ModePage):
             if new_ink:
                 if new_ink.name != name:
                     self._config.remove_ink(name)
+                    # v7.5.x: carry the reagent's pinned wells to the new name
+                    self._config.rename_ink_location(name, new_ink.name)
                 self._config.add_ink(new_ink)
                 self._refresh_ink_table()
                 self._refresh_pump_ink_combos()
+                self._refresh_reagent_locations()
                 self._on_config_changed()
 
     def _remove_ink(self):
@@ -2424,8 +2996,11 @@ class HardwareSetupPage(ModePage):
             return
         name = self.ink_table.item(row, 0).text()
         self._config.remove_ink(name)
+        # v7.5.x: drop this reagent's pinned wells too
+        self._config.clear_ink_location(name)
         self._refresh_ink_table()
         self._refresh_pump_ink_combos()
+        self._refresh_reagent_locations()
         self._on_config_changed()
 
     def _refresh_ink_table(self):
@@ -2440,15 +3015,286 @@ class HardwareSetupPage(ModePage):
             self.ink_table.setItem(row, 0, name_item)
             self.ink_table.setItem(row, 1, QTableWidgetItem(ink.ink_type))
             self.ink_table.setItem(row, 2, QTableWidgetItem(
-                f"{ink.viscosity_cP:.1f} cP"))
+                (ink.ink_subtype or "—") if ink.ink_type == "ink" else "—"))
             self.ink_table.setItem(row, 3, QTableWidgetItem(
-                f"{ink.granule_diameter_um:.0f} µm" if ink.granule_diameter_um else "—"))
+                f"{ink.viscosity_cP:.1f} cP"))
             self.ink_table.setItem(row, 4, QTableWidgetItem(
+                f"{ink.granule_diameter_um:.0f} µm" if ink.granule_diameter_um else "—"))
+            self.ink_table.setItem(row, 5, QTableWidgetItem(
                 f"{ink.cell_diameter_um:.0f} µm" if ink.cell_diameter_um else "—"))
 
     def _refresh_pump_ink_combos(self):
         """Refresh ink names in all pump combos with exclusion support."""
         self._refresh_pump_ink_exclusions()
+
+    # ════════════════════════════════════════════════════════════════
+    #  v7.5.x: REAGENT LOCATIONS (ink → wells)
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_reagent_locations_group(self):
+        """Build the Reagent Locations group on the Ink sub-page.
+
+        Reuses the print workflow's :class:`WellPlateView` so the operator
+        picks wells (incl. rosette sub-wells like ``A1.a``) for each reagent
+        exactly as in Print Setup. Pinned wells persist in
+        ``HardwareConfig.ink_locations`` and auto-fill the per-print Well
+        Setup (see ``seed_assignments_from_ink_locations``).
+        """
+        from gui.widgets.well_plate_view import WellPlateView
+
+        self._loc_plate_key = None  # track the currently-loaded plate key
+        self._loc_plate = None      # the loaded WellPlate (for well lookups)
+
+        loc_group = QGroupBox("Reagent Locations")
+        loc_group.setStyleSheet(self._group_style())
+        loc_lay = QVBoxLayout(loc_group)
+
+        loc_help = QLabel(
+            "Pin each reagent (ink / wash / buffer / oil…) to one or more "
+            "plate wells. Rosette sub-wells (e.g. A1.a) appear automatically "
+            "once the plate is built on the Plate / Rosette pages. These "
+            "locations auto-fill the per-print Well Setup and are reused "
+            "across workflows.")
+        loc_help.setWordWrap(True)
+        loc_help.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')};")
+        loc_lay.addWidget(loc_help)
+
+        sel_row = QHBoxLayout()
+        sel_row.setSpacing(s(8))
+        sel_row.addWidget(QLabel("Reagent:"))
+        self._loc_ink_combo = QComboBox()
+        self._loc_ink_combo.setMinimumWidth(s(200))
+        self._loc_ink_combo.currentIndexChanged.connect(self._on_loc_ink_changed)
+        sel_row.addWidget(self._loc_ink_combo)
+        sel_row.addStretch()
+        loc_lay.addLayout(sel_row)
+
+        self._loc_plate_view = WellPlateView()
+        self._loc_plate_view.setMinimumHeight(s(240))
+        self._loc_plate_view.setMaximumHeight(s(380))
+        self._loc_plate_view.selection_changed.connect(
+            self._on_loc_selection_changed)
+        loc_lay.addWidget(self._loc_plate_view)
+
+        loc_btns = QHBoxLayout()
+        loc_btns.setSpacing(s(8))
+        self._loc_btn_assign = icon_button(
+            "Assign selected", "plus", object_name="accentBtn")
+        self._loc_btn_assign.clicked.connect(self._loc_assign_selected)
+        loc_btns.addWidget(self._loc_btn_assign)
+        btn_clear_sel = icon_button("Clear selected", "minus")
+        btn_clear_sel.clicked.connect(self._loc_clear_selected)
+        loc_btns.addWidget(btn_clear_sel)
+        btn_clear_ink = icon_button(
+            "Clear reagent", "trash", object_name="dangerBtn")
+        btn_clear_ink.clicked.connect(self._loc_clear_ink)
+        loc_btns.addWidget(btn_clear_ink)
+        loc_btns.addStretch()
+        loc_lay.addLayout(loc_btns)
+
+        self._loc_summary = QLabel("")
+        self._loc_summary.setWordWrap(True)
+        self._loc_summary.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')};")
+        loc_lay.addWidget(self._loc_summary)
+
+        self._sub_layouts["inks"].addWidget(loc_group)
+
+        # Seed initial state (default config → empty, but keeps widgets valid).
+        self._refresh_reagent_locations()
+
+    @staticmethod
+    def _reagent_type_label(ink) -> str:
+        """"(ink · cells)" / "(wash)" — well type plus subtype for inks."""
+        if ink is None:
+            return ""
+        t = (ink.ink_type or "").strip()
+        sub = (getattr(ink, "ink_subtype", "") or "").strip()
+        return f"({t} · {sub})" if t == "ink" and sub else f"({t})"
+
+    def _loc_selected_ink_name(self) -> str | None:
+        """Currently-selected reagent name in the locations combo, if any."""
+        combo = getattr(self, "_loc_ink_combo", None)
+        if combo is None or combo.count() == 0:
+            return None
+        return combo.currentData()
+
+    def _refresh_reagent_locations(self):
+        """Full refresh of the Reagent Locations group from the config."""
+        if not hasattr(self, "_loc_ink_combo"):
+            return
+        self._refresh_loc_ink_combo()
+        self._refresh_loc_plate()
+        self._refresh_loc_colors()
+        self._refresh_loc_summary()
+        # Re-highlight the selected reagent's wells.
+        self._on_loc_ink_changed()
+
+    def _refresh_loc_ink_combo(self):
+        """Populate the reagent selector from the ink library."""
+        combo = self._loc_ink_combo
+        prev = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for name, ink in self._config.ink_library.items():
+            label = f"{name}  {self._reagent_type_label(ink)}"
+            combo.addItem(label, name)
+            idx = combo.count() - 1
+            try:
+                combo.setItemData(idx, QColor(ink.color), Qt.ForegroundRole)
+            except Exception:
+                pass
+        if prev is not None:
+            pidx = combo.findData(prev)
+            if pidx >= 0:
+                combo.setCurrentIndex(pidx)
+        combo.blockSignals(False)
+        has_inks = combo.count() > 0
+        if hasattr(self, "_loc_btn_assign"):
+            self._loc_btn_assign.setEnabled(has_inks)
+
+    def _refresh_loc_plate(self, *, force: bool = False) -> bool:
+        """(Re)load the active plate into the locations well view.
+
+        Reloads only when the active plate key changed (or ``force``),
+        because ``set_plate`` clears the current selection. Returns True
+        when a reload actually happened.
+        """
+        key = self._config.active_plate_key
+        if not force and key == self._loc_plate_key:
+            return False
+        try:
+            plate = WellPlate.load(key)
+        except Exception as exc:
+            logger.warning(f"Reagent-locations plate load failed ({key}): {exc}")
+            return False
+        self._loc_plate_view.set_plate(plate)
+        self._loc_plate = plate
+        self._loc_plate_key = key
+        self._loc_plate_view.fit_view()
+        return True
+
+    def _sync_loc_plate_on_config_change(self):
+        """Reload the locations plate if the active plate key changed."""
+        if not hasattr(self, "_loc_plate_view"):
+            return
+        if self._refresh_loc_plate():
+            self._refresh_loc_colors()
+            self._refresh_loc_summary()
+            self._on_loc_ink_changed()
+
+    def _refresh_loc_colors(self):
+        """Color each well by its assigned reagent.
+
+        Center fill  = the reagent's own ``InkSpec.color`` (the color set in
+        the Ink editor above), so the plate matches the ink swatches.
+        Border       = a type color (ink / wash / waste / buffer / oil) via
+        :func:`ink_type_border_color`, so the functional type reads at a
+        glance. Both are persisted on the well item so they survive a
+        hover-leave (see ``WellGraphicsItem.set_appearance``).
+        """
+        view = getattr(self, "_loc_plate_view", None)
+        plate = getattr(self, "_loc_plate", None)
+        if view is None or plate is None:
+            return
+        empty_fill = ROLE_COLORS.get(WellRole.EMPTY, "#585b70")
+        reagent_of = self._config.well_reagent_map
+        lib = self._config.ink_library
+        appearances: dict = {}
+        for well in plate.well_names:
+            ink_name = reagent_of.get(well)
+            ink = lib.get(ink_name) if ink_name else None
+            if ink is not None:
+                fill = ink.color or empty_fill
+                border = ink_type_border_color(ink.ink_type)
+                label = f"{ink_name} ({ink.ink_type})"
+                appearances[well] = (fill, border, label)
+            else:
+                # Unassigned (or dangling) well → gray, default border.
+                appearances[well] = (empty_fill, None, "")
+        view.update_reagent_appearances(appearances)
+
+    def _refresh_loc_summary(self):
+        """Human-readable list of current reagent → wells assignments."""
+        lbl = getattr(self, "_loc_summary", None)
+        if lbl is None:
+            return
+        locs = self._config.ink_locations
+        if not locs:
+            lbl.setText("No reagent locations assigned yet.")
+            return
+        lib = self._config.ink_library
+        parts = []
+        for name, wells in locs.items():
+            if not wells:
+                continue
+            ink = lib.get(name)
+            t = f" {self._reagent_type_label(ink)}" if ink else ""
+            parts.append(f"{name}{t}: {', '.join(wells)}")
+        lbl.setText("  •  ".join(parts) if parts else
+                    "No reagent locations assigned yet.")
+
+    def _on_loc_ink_changed(self, *_):
+        """Reagent selection changed — highlight its wells + update button."""
+        view = getattr(self, "_loc_plate_view", None)
+        ink_name = self._loc_selected_ink_name()
+        if hasattr(self, "_loc_btn_assign"):
+            self._loc_btn_assign.setText(
+                f"Assign selected → {ink_name}" if ink_name
+                else "Assign selected")
+        if view is None or ink_name is None:
+            return
+        wells = list(self._config.ink_locations.get(ink_name, []))
+        view.blockSignals(True)
+        view.set_selection(wells)
+        view.blockSignals(False)
+
+    def _on_loc_selection_changed(self, _wells):
+        """Selection changed in the well view (currently informational)."""
+        # Hook kept for future live-count feedback; no state change needed.
+        pass
+
+    def _loc_assign_selected(self):
+        """Pin the well-view selection to the selected reagent."""
+        view = getattr(self, "_loc_plate_view", None)
+        ink_name = self._loc_selected_ink_name()
+        if view is None or ink_name is None:
+            return
+        wells = view.get_selected_wells()
+        if not wells:
+            QMessageBox.information(
+                self, "No wells selected",
+                "Select one or more wells on the plate first.")
+            return
+        self._config.assign_wells_to_ink(ink_name, wells)
+        self._refresh_loc_colors()
+        self._refresh_loc_summary()
+        self._on_config_changed()
+
+    def _loc_clear_selected(self):
+        """Unassign whichever reagents currently own the selected wells."""
+        view = getattr(self, "_loc_plate_view", None)
+        if view is None:
+            return
+        wells = view.get_selected_wells()
+        if not wells:
+            return
+        for well in wells:
+            self._config.unassign_well(well)
+        self._refresh_loc_colors()
+        self._refresh_loc_summary()
+        self._on_config_changed()
+
+    def _loc_clear_ink(self):
+        """Clear ALL pinned wells for the selected reagent."""
+        ink_name = self._loc_selected_ink_name()
+        if ink_name is None:
+            return
+        self._config.clear_ink_location(ink_name)
+        self._refresh_loc_colors()
+        self._refresh_loc_summary()
+        self._on_loc_ink_changed()  # re-highlight (now empty)
+        self._on_config_changed()
 
     # ════════════════════════════════════════════════════════════════
     #  ROSETTE LIBRARY CRUD
@@ -2601,13 +3447,20 @@ class HardwareSetupPage(ModePage):
         self._refresh_ink_table()
         # v7.2.5: Force pump ink combo refresh BEFORE pump restore
         self._refresh_pump_ink_combos()
-        ink_names = list(self._config.ink_library.keys())
-        logger.debug(f"  Ink library: {len(ink_names)} inks — pump combos refreshed")
+        # v7.5.x: pumps only ever offer printable inks (no service reagents).
+        ink_names = self._pump_ink_names()
+        logger.debug(f"  Ink library: {len(ink_names)} printable inks — pump combos refreshed")
 
         # ── 4. Rosette Library ───────────────────────────────────
         self._refresh_rosette_table()
         logger.debug(
             f"  Rosette library: {len(self._config.rosette_library)} rosettes")
+
+        # v7.5.x: reagent locations (force a plate reload — the active plate
+        # key may have changed with the loaded config; _on_config_changed is
+        # suppressed during restore so refresh here explicitly).
+        self._refresh_loc_plate(force=True)
+        self._refresh_reagent_locations()
 
         # ── 5. Needle Config ─────────────────────────────────────
         self.gauge_combo.blockSignals(True)
@@ -2647,10 +3500,16 @@ class HardwareSetupPage(ModePage):
                     f"inks={pcfg.ink_names}, "
                     f"mode={pcfg.printing_mode.value}")
 
-        # v7.2.8: Verify pump ink assignments after restore
+        # v7.2.8: Verify pump ink assignments after restore.
+        # v7.5.x: only the PRINTABLE inks are offered to a pump, so compare
+        # against that filtered set — a legacy config that assigned a service
+        # reagent (now excluded) must not log a spurious mismatch every load
+        # (it is intentionally dropped on the next save).
+        offered = set(ink_names)
         for pid, pw in self._pump_widgets.items():
             actual = set(pw.get_selected_ink_names())
-            expected = set(self._config.pumps[pid].ink_names) if pid in self._config.pumps else set()
+            expected = (set(self._config.pumps[pid].ink_names) & offered
+                        if pid in self._config.pumps else set())
             if expected and actual != expected:
                 logger.warning(f"  {pid} ink mismatch: expected={expected}, actual={actual}")
                 pw.set_config(self._config.pumps[pid], ink_names=ink_names)
@@ -2658,6 +3517,18 @@ class HardwareSetupPage(ModePage):
         # Refresh ink lists after all pumps loaded
         self._refresh_pump_ink_exclusions()
         self._update_pump_ink_summary()
+
+        # ── 6b. Global pump timing (v7.5.x) ──────────────────────
+        if hasattr(self, "_pump_settle_spin"):
+            self._pump_settle_spin.blockSignals(True)
+            self._pump_settle_spin.setValue(
+                float(getattr(self._config, "pump_settle_time_s", 0.0) or 0.0))
+            self._pump_settle_spin.blockSignals(False)
+        if hasattr(self, "_pump_prime_spin"):
+            self._pump_prime_spin.blockSignals(True)
+            self._pump_prime_spin.setValue(
+                float(getattr(self._config, "pump_prime_time_s", 0.25) or 0.0))
+            self._pump_prime_spin.blockSignals(False)
 
         # ── 7. Needle Channel → Pump Map (v7.2.4 S3.11) ─────────
         self._rebuild_channel_map_rows()
@@ -2684,7 +3555,25 @@ class HardwareSetupPage(ModePage):
         cam_cfg = self._config.camera_config
         self.camera_combo.blockSignals(True)
         if cam_cfg.camera_spec:
-            cidx = self.camera_combo.findData(cam_cfg.camera_spec.name)
+            # v7.5.x: the spec combo stores the catalog KEY as item data
+            # (addItem(name, name) iterates catalog KEYS, e.g. "BUC3D-1000C"),
+            # but cam_cfg.camera_spec.name is the long display name from
+            # cameras.json ("Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)").
+            # findData matches DATA exactly, so searching by the long name never
+            # matched → the spec dropdown reset to "None" every launch and the
+            # operator had to re-pick it. Resolve the KEY whose spec.name matches
+            # the saved spec, with a legacy fallback for configs that saved the
+            # key itself.
+            _saved_name = cam_cfg.camera_spec.name
+            _catalog_key = next(
+                (k for k, sp in self._camera_catalog.items()
+                 if getattr(sp, "name", None) == _saved_name),
+                None,
+            )
+            if _catalog_key is None and _saved_name in self._camera_catalog:
+                _catalog_key = _saved_name
+            cidx = (self.camera_combo.findData(_catalog_key)
+                    if _catalog_key is not None else -1)
             if cidx >= 0:
                 self.camera_combo.setCurrentIndex(cidx)
             # Populate resolution combo for this camera

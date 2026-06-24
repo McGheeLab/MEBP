@@ -25,9 +25,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QSizePolicy
-from PySide6.QtCore import Qt, Signal, QEvent
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QMouseEvent
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QLabel, QSizePolicy, QPushButton,
+)
+from PySide6.QtCore import Qt, Signal, QEvent, QPointF
+from PySide6.QtGui import (
+    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QFont, QMouseEvent,
+)
 
 from gui.styles import COLORS
 
@@ -49,12 +53,21 @@ class CameraFeedView(QWidget):
 
     def __init__(self, camera_manager=None, cam_idx: int = 0,
                  show_crosshair: bool = True, label: str = "",
+                 enable_settings: bool = True,
                  parent=None):
         super().__init__(parent)
         self._manager = camera_manager
         self._cam_idx = cam_idx
         self._show_crosshair = show_crosshair
         self._label_text = label
+        # v7.5.x: when True, a gear button appears top-right whenever the
+        # backing camera reports controllable hardware (e.g. the ToupCam
+        # microscope), opening a pop-out hardware-settings dialog. Disabled
+        # for the small preview the dialog itself hosts (avoids recursion).
+        self._enable_settings = bool(enable_settings)
+        self._settings_btn = None
+        self._settings_dialog = None
+        self._frame_count = 0  # throttle for gear-visibility SDK polling
         self._connected_cam = None  # CameraWidget we're subscribed to
         self._last_pixmap: Optional[QPixmap] = None
         self._last_qimage: Optional[QImage] = None  # full-res for re-render on show
@@ -62,9 +75,46 @@ class CameraFeedView(QWidget):
         # v7.5.x: optional displacement-vector overlay drawn from image
         # center — (dx_px, dy_px, label) in image pixels, or None.
         self._overlay_vector: Optional[tuple[float, float, str]] = None
+        # v7.5.x: persistent reference markers (e.g. taught well centres) in
+        # ABSOLUTE stage µm, projected into the live frame so the operator can
+        # verify registration. camera centre == stage centre.
+        self._ref_markers: list[tuple[str, float, float]] = []
+        self._ref_stage_um: tuple[float, float] = (0.0, 0.0)
+        self._ref_um_per_px: float = 0.0
 
         self._setup_ui()
         self._connect_camera()
+
+    def set_reference_markers(self, markers, stage_x_um: Optional[float] = None,
+                              stage_y_um: Optional[float] = None,
+                              um_per_px: Optional[float] = None) -> None:
+        """Overlay persistent reference points on the feed.
+
+        ``markers``: iterable of ``(name, x_um, y_um)`` in absolute stage µm.
+        Each is projected to a pixel via ``(x_um - stage_x)/um_per_px + w/2``
+        (camera centre = stage centre), so the markers track as the stage
+        moves. Supply ``stage_*``/``um_per_px`` here or via
+        ``set_reference_stage_position`` / once at setup."""
+        self._ref_markers = [
+            (str(n), float(x), float(y)) for (n, x, y) in markers
+        ]
+        if stage_x_um is not None and stage_y_um is not None:
+            self._ref_stage_um = (float(stage_x_um), float(stage_y_um))
+        if um_per_px is not None and um_per_px > 0:
+            self._ref_um_per_px = float(um_per_px)
+        self._rerender_last()
+
+    def set_reference_stage_position(self, x_um: float, y_um: float) -> None:
+        """Update the stage centre used to project reference markers."""
+        new = (float(x_um), float(y_um))
+        if new != self._ref_stage_um:
+            self._ref_stage_um = new
+            if self._ref_markers:
+                self._rerender_last()
+
+    def _rerender_last(self) -> None:
+        if self._last_qimage is not None and self.isVisible():
+            self._render_frame(self._last_qimage)
 
     def set_overlay_vector(self, dx_px: Optional[float], dy_px: Optional[float],
                            label: str = ""):
@@ -109,6 +159,76 @@ class CameraFeedView(QWidget):
         # to parent QWidget is unreliable in PySide6 when a pixmap is set.
         self._display.installEventFilter(self)
 
+        # v7.5.x: gear button (overlay, top-right of the video) → pop-out
+        # hardware settings. Hidden until the camera reports controllable HW.
+        if self._enable_settings:
+            self._settings_btn = QPushButton("⚙", self._display)
+            self._settings_btn.setToolTip("Camera settings (exposure, gamma, …)")
+            self._settings_btn.setCursor(Qt.PointingHandCursor)
+            self._settings_btn.setFixedSize(26, 26)
+            self._settings_btn.setStyleSheet(
+                "QPushButton {"
+                "  background: rgba(30,30,46,170); color: #cdd6f4;"
+                "  border: 1px solid rgba(180,190,254,120);"
+                "  border-radius: 13px; font-size: 14px; padding: 0px; }"
+                "QPushButton:hover { background: rgba(49,50,68,210); }")
+            self._settings_btn.clicked.connect(self._open_settings_dialog)
+            self._settings_btn.hide()
+            self._position_settings_btn()
+
+    # ── Settings gear (v7.5.x) ────────────────────────────────────
+
+    def _position_settings_btn(self):
+        if self._settings_btn is None:
+            return
+        margin = 6
+        x = max(margin, self._display.width() - self._settings_btn.width() - margin)
+        self._settings_btn.move(x, margin)
+        self._settings_btn.raise_()
+
+    def _update_settings_visibility(self):
+        """Show the gear only when the backing camera has controllable HW."""
+        btn = self._settings_btn
+        if btn is None:
+            return
+        controllable = False
+        if self._manager is not None:
+            try:
+                caps = self._manager.hardware_capabilities(self._cam_idx)
+                controllable = bool(caps.get("controllable"))
+            except Exception:
+                controllable = False
+        btn.setVisible(controllable)
+        if controllable:
+            self._position_settings_btn()
+
+    def _open_settings_dialog(self):
+        if self._manager is None:
+            return
+        dlg = self._settings_dialog
+        if dlg is None:
+            try:
+                from gui.dialogs.camera_settings_dialog import CameraSettingsDialog
+            except Exception as exc:
+                logger.warning(f"camera settings dialog unavailable: {exc}")
+                return
+
+            def _identity():
+                mgr = self._manager
+                if mgr is not None and hasattr(mgr, "camera_identity"):
+                    return mgr.camera_identity(self._cam_idx)
+                return None
+
+            dlg = CameraSettingsDialog(
+                self._manager, self._cam_idx,
+                identity_getter=_identity, parent=self.window())
+            self._settings_dialog = dlg
+        else:
+            dlg.reload()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     # ── Camera connection ─────────────────────────────────────────
 
     def set_camera(self, cam_idx: int):
@@ -116,6 +236,14 @@ class CameraFeedView(QWidget):
         self._disconnect_camera()
         self._cam_idx = cam_idx
         self._connect_camera()
+        if self._settings_dialog is not None:
+            # Different camera now — drop the stale dialog.
+            try:
+                self._settings_dialog.close()
+            except Exception:
+                pass
+            self._settings_dialog = None
+        self._update_settings_visibility()
 
     def _connect_camera(self):
         """Subscribe to the CameraWidget's frame_captured signal."""
@@ -155,6 +283,14 @@ class CameraFeedView(QWidget):
         if not self.isVisible():
             return
 
+        # Reconcile the gear's visibility with the backing camera's HW support.
+        # hardware_capabilities() does synchronous SDK round-trips for ToupCam,
+        # so throttle it (once per ~30 frames) rather than calling it every
+        # frame on the GUI thread; fire on the first visible frame for snappiness.
+        self._frame_count += 1
+        if self._settings_btn is not None and (self._frame_count % 30 == 1):
+            self._update_settings_visibility()
+
         self._render_frame(q_img)
 
     def _render_frame(self, q_img: QImage):
@@ -169,6 +305,10 @@ class CameraFeedView(QWidget):
         if self._overlay_vector is not None:
             self._draw_overlay_vector(pixmap)
 
+        # v7.5.x: persistent reference markers projected from stage µm
+        if self._ref_markers and self._ref_um_per_px > 0:
+            self._draw_reference_markers(pixmap)
+
         # Scale to fit display label
         display_size = self._display.size()
         if display_size.width() < 1 or display_size.height() < 1:
@@ -180,6 +320,9 @@ class CameraFeedView(QWidget):
         )
         self._last_pixmap = scaled
         self._display.setPixmap(scaled)
+        # Keep the gear pinned to the top-right above the pixmap.
+        if self._settings_btn is not None and self._settings_btn.isVisible():
+            self._position_settings_btn()
 
     def _draw_crosshair(self, pixmap: QPixmap):
         """Draw crosshair overlay on the pixmap."""
@@ -214,6 +357,36 @@ class CameraFeedView(QWidget):
             painter.drawLine(int(ex), int(ey), int(hx), int(hy))
         if label:
             painter.drawText(int(ex) + 6, int(ey) - 6, label)
+        painter.end()
+
+    def _draw_reference_markers(self, pixmap: QPixmap):
+        """Project absolute-stage-µm reference markers into the frame and draw
+        each as a ring + crosshair + label (camera centre = stage centre)."""
+        img_w = pixmap.width()
+        img_h = pixmap.height()
+        if not img_w or not img_h:
+            return
+        upp = self._ref_um_per_px
+        sx, sy = self._ref_stage_um
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor(COLORS.get("pink", "#f5c2e7"))
+        pen_w = max(2, pixmap.width() // 400)
+        r = max(7.0, pixmap.width() / 70.0)
+        font = QFont("Consolas", max(8, pixmap.width() // 110))
+        painter.setFont(font)
+        for name, mx, my in self._ref_markers:
+            ix = (mx - sx) / upp + img_w / 2.0
+            iy = (my - sy) / upp + img_h / 2.0
+            if ix < -40 or iy < -40 or ix > img_w + 40 or iy > img_h + 40:
+                continue
+            painter.setPen(QPen(color, pen_w))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QPointF(ix, iy), r, r)
+            painter.drawLine(QPointF(ix - r - 3, iy), QPointF(ix + r + 3, iy))
+            painter.drawLine(QPointF(ix, iy - r - 3), QPointF(ix, iy + r + 3))
+            if name:
+                painter.drawText(int(ix + r + 5), int(iy - 4), name)
         painter.end()
 
     # ── Properties ────────────────────────────────────────────────
@@ -298,6 +471,11 @@ class CameraFeedView(QWidget):
         # Re-render the most recent frame at correct display size
         if self._last_qimage is not None:
             self._render_frame(self._last_qimage)
+        self._update_settings_visibility()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_settings_btn()
 
     def hideEvent(self, event):
         # Keep connected — the signal is cheap when we skip rendering

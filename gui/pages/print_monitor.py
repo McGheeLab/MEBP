@@ -74,6 +74,12 @@ class PlateOverviewWidget(QWidget):
         self._needle_y: float | None = None
         self._margin = 28
         self._active_well = ""
+        # v7.5.x: per-machine plate orientation. Wells are drawn PLATE-LOCAL
+        # (A1 top-left, +col right / +row down), but the live needle is fed in
+        # the zero-ref STAGE frame. On a 180°-mounted stage (ME3B V1) the two
+        # frames are anti-aligned, so the needle is mapped through the plate
+        # axis sign (negated) before plotting so it registers with the wells.
+        self._flip_180 = False
 
     def set_plate(self, plate):
         self._wells = [{"name": w.name, "x": w.x, "y": w.y,
@@ -100,6 +106,15 @@ class PlateOverviewWidget(QWidget):
 
     def set_needle_position(self, x_mm, y_mm):
         self._needle_x = x_mm; self._needle_y = y_mm; self.update()
+
+    def set_plate_flip_180(self, flip: bool):
+        """v7.5.x: per-machine plate orientation (from StageController
+        ``plate_flip_180``). When True the zero-ref needle is mapped through
+        the plate axis sign so it registers with the plate-local wells."""
+        flip = bool(flip)
+        if flip != self._flip_180:
+            self._flip_180 = flip
+            self.update()
 
     def set_active_well(self, name: str):
         """Mark a well as actively printing. Only print wells change state."""
@@ -145,8 +160,11 @@ class PlateOverviewWidget(QWidget):
                            Qt.AlignmentFlag.AlignCenter, name)
 
         if self._needle_x is not None and self._needle_y is not None:
-            nx = self._margin + self._needle_x * scale
-            ny = self._margin + self._needle_y * scale
+            # Map the zero-ref needle into the plate-local well frame: on a
+            # 180°-mounted stage the plate axes are negated relative to stage.
+            nsign = -1.0 if self._flip_180 else 1.0
+            nx = self._margin + (self._needle_x * nsign) * scale
+            ny = self._margin + (self._needle_y * nsign) * scale
             pen = QPen(self.NEEDLE_COLOR, 2)
             p.setPen(pen)
             p.drawLine(QPointF(nx - 8, ny), QPointF(nx + 8, ny))
@@ -1293,6 +1311,8 @@ class PrintMonitorPage(QWidget):
             pz = (z_val - zero.get('Z', 0)) if z_val is not None else 0.0
 
             # Update all views (set_needle_position appends to trail)
+            if hasattr(ctrl, "plate_flip_180"):
+                self.plate_view.set_plate_flip_180(ctrl.plate_flip_180())
             self.plate_view.set_needle_position(px, py)
             self.xy_detail.set_needle_position(px, py)
             self.yz_view.set_needle_position(py, pz)

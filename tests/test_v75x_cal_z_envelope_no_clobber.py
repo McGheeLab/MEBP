@@ -47,6 +47,9 @@ def _fake_page(sl: SafetyLimits) -> SimpleNamespace:
         _zoff_lbl_max_z=MagicMock(),
         _zoff_lbl_plate_bottom_z=MagicMock(),
         _emit_calibration_data_changed=lambda: None,
+        # v7.5.x: the label now renders the value in the unified user frame;
+        # the controller stub has no converter, so identity is fine here.
+        _zoff_user_z=lambda z: z,
     )
 
 

@@ -550,6 +550,20 @@ class StageHardwarePanel(QWidget):
         self.lbl_jog_status = QLabel("")
         self.lbl_jog_status.setVisible(False)
 
+        # ── v7.5.x: Z Axis Setup (datum + direction + limits) ──
+        outer.addWidget(self._build_z_axis_setup_group())
+
+        # ── v7.5.x: per-pump Plunger Setup (twin of the Z Axis Setup) ──
+        # One block per pump, ordered right under the Z block (Z, P1, P2, P3).
+        # Capturing the empty/full extremes derives the direction AND updates +
+        # saves the pump soft-limit (calibration) extents.
+        self._pump_setup_dispensed_raw: dict[str, float | None] = {}
+        self._pump_setup_dispensed_btns: dict[str, QPushButton] = {}
+        self._pump_setup_aspirated_btns: dict[str, QPushButton] = {}
+        self._pump_setup_status_lbls: dict[str, QLabel] = {}
+        for pid in ("P1", "P2", "P3"):
+            outer.addWidget(self._build_pump_plunger_setup_block(pid))
+
         # ── Per-axis position + record + min/max spinboxes ─────
         limits_grp = QGroupBox(
             "Per-axis position && safety limits "
@@ -833,8 +847,10 @@ class StageHardwarePanel(QWidget):
     def _on_jog_array_z(self, dz_mm: float) -> None:
         if self._controller is None:
             return
+        # v7.5.x: dz_mm is a HEIGHT-frame delta (+ = up); route through
+        # move_z_user_relative so the device-page jog follows z_up_sign too.
         try:
-            self._controller.move_z_relative(dz_mm, bypass_safety=True)
+            self._controller.move_z_user_relative(dz_mm, bypass_safety=True)
         except Exception as e:
             logger.warning(f"jog Z {dz_mm} failed: {e}")
         self._refresh_jog_positions()
@@ -2001,10 +2017,11 @@ class StageHardwarePanel(QWidget):
                 v = self._logical_zp_value(zp, logical)
                 if v is None:
                     continue
-                # v7.5.x: the limit-row + live-position readouts show Z as
-                # height (up = +); pumps unchanged. (The Override card below
-                # stays zero-ref raw — it re-declares the firmware counter.)
-                disp = z_raw_to_display(v) if logical == "Z" else v
+                # v7.5.x: the limit-row + live-position readouts show Z in the
+                # unified user frame (0 at the bottom datum, + up); pumps
+                # unchanged. (The Override card below stays zero-ref raw — it
+                # re-declares the firmware counter.)
+                disp = self._z_raw_to_user(v) if logical == "Z" else v
                 txt = f"{disp:.3f}"
                 _set("lbl_axis_pos", logical, txt)
                 _set("lbl_jog_pos", logical, txt)
@@ -2093,6 +2110,397 @@ class StageHardwarePanel(QWidget):
                 f"Zeroed {axis} on hardware. zero_position saved.")
         logger.info(f"Set {axis} zero on hardware (was {previous})")
 
+    # ── v7.5.x: unified user-facing Z conversion (0 at bottom, + up) ──
+    #
+    # Route every Z display/spinbox through the live controller so the whole
+    # UI agrees on the per-machine datum + direction. Falls back to the module
+    # height helpers (no datum subtraction) only when there is no controller
+    # (headless/standalone), which is never the case in the live app.
+
+    def _z_raw_to_user(self, raw_mm: float) -> float:
+        c = self._controller
+        if c is not None and hasattr(c, "raw_to_user_z"):
+            return c.raw_to_user_z(raw_mm)
+        return z_raw_to_display(raw_mm)
+
+    def _z_user_to_raw(self, user_mm: float) -> float:
+        c = self._controller
+        if c is not None and hasattr(c, "user_z_to_raw"):
+            return c.user_z_to_raw(user_mm)
+        return z_display_to_raw(user_mm)
+
+    # ── v7.5.x: Z Axis Setup — one procedure for datum + direction + limits ──
+
+    def _build_z_axis_setup_group(self) -> QGroupBox:
+        """The single Z setup: jog to the mechanical extremes and capture them.
+        Bottom (needle all the way DOWN) becomes user Z = 0; Top (all the way
+        UP) fixes the travel. The controller DERIVES the up-direction from the
+        two readings (so user Z always increases as the needle rises) and sets
+        the soft-limit envelope. Re-running it is also the migration path."""
+        grp = QGroupBox("Z Axis Setup — sets 0 at the bottom, direction & limits")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        v = QVBoxLayout(grp)
+        info = QLabel(
+            "Use the jog pad to drive the needle to each mechanical extreme, "
+            "then capture it. <b>Bottom = needle all the way DOWN → Z = 0.</b> "
+            "Top = all the way UP. Direction (up = +) and the Z soft limits are "
+            "derived automatically. Max / Replace Z stay manual."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {COLORS['subtext0']};")
+        v.addWidget(info)
+        row = QHBoxLayout()
+        self.btn_z_setup_bottom = QPushButton("1 · Set Bottom (Z = 0)")
+        self.btn_z_setup_bottom.setToolTip(
+            "Jog the needle ALL THE WAY DOWN first, then click. This raw Z "
+            "becomes user Z = 0 (the datum).")
+        self.btn_z_setup_bottom.clicked.connect(self._z_setup_capture_bottom)
+        row.addWidget(self.btn_z_setup_bottom)
+        self.btn_z_setup_top = QPushButton("2 · Set Top")
+        self.btn_z_setup_top.setToolTip(
+            "Jog the needle ALL THE WAY UP, then click. The up-direction and "
+            "the Z soft-limit envelope are derived from bottom → top.")
+        self.btn_z_setup_top.setEnabled(False)
+        self.btn_z_setup_top.clicked.connect(self._z_setup_capture_top)
+        row.addWidget(self.btn_z_setup_top)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.lbl_z_setup_status = QLabel("Bottom not captured yet.")
+        self.lbl_z_setup_status.setWordWrap(True)
+        self.lbl_z_setup_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        v.addWidget(self.lbl_z_setup_status)
+        self._z_setup_bottom_raw: float | None = None
+
+        # ── Standard plate offsets (mm BELOW the needle-cam fiducial) ──
+        # Used by the calibration page to PRE-FILL plate Z guesses from the
+        # needle-tip-camera Z captured during XY needle cal.
+        off_lbl = QLabel(
+            "Standard plate offsets — mm below the needle-cam Z to each "
+            "feature (used to pre-fill plate Z guesses):")
+        off_lbl.setWordWrap(True)
+        off_lbl.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        v.addWidget(off_lbl)
+        off_row = QHBoxLayout()
+
+        def _off_spin(default: float) -> QDoubleSpinBox:
+            sp_w = QDoubleSpinBox()
+            sp_w.setRange(-500.0, 500.0)
+            sp_w.setDecimals(2)
+            sp_w.setSuffix(" mm")
+            sp_w.setValue(default)
+            sp_w.setMinimumWidth(s(90))
+            return sp_w
+
+        self.spin_zoff_top = _off_spin(10.0)
+        self.spin_zoff_bottom = _off_spin(20.0)
+        self.spin_zoff_safe = _off_spin(5.0)
+        for lbl_text, spin in (("Top:", self.spin_zoff_top),
+                               ("Bottom:", self.spin_zoff_bottom),
+                               ("Safe:", self.spin_zoff_safe)):
+            off_row.addWidget(QLabel(lbl_text))
+            off_row.addWidget(spin)
+        btn_off = QPushButton("Save offsets")
+        btn_off.setToolTip("Persist the standard plate offsets to the device "
+                           "profile and push them to the controller.")
+        btn_off.clicked.connect(self._save_plate_z_offsets)
+        off_row.addWidget(btn_off)
+        off_row.addStretch(1)
+        v.addLayout(off_row)
+
+        # ── v7.5.x: well-plate orientation (single source of truth) ──
+        # One per-machine setting drives BOTH the 180° display flip on every
+        # stage-frame plate view AND the plate-local→stage geometry sign, so
+        # "well A1 top-left / stage 0,0 bottom-right" is enforced everywhere.
+        self.chk_plate_flip_180 = QCheckBox(
+            "Plate mounted 180° to stage (well A1 top-left, stage 0,0 "
+            "bottom-right)")
+        self.chk_plate_flip_180.setToolTip(
+            "ON for the ME3B V1 Prior stage (origin bottom-right, +X/+Y toward "
+            "top-left). Drives the display flip on all plate views and the "
+            "geometric well→stage mapping. Re-teach plate calibration after "
+            "changing this.")
+        self.chk_plate_flip_180.toggled.connect(self._on_plate_flip_toggled)
+        v.addWidget(self.chk_plate_flip_180)
+        return grp
+
+    def _on_plate_flip_toggled(self, checked: bool) -> None:
+        """Push the orientation to the controller + persist it. Mirrors the
+        z_up_sign persistence path."""
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_plate_flip_180"):
+            ctrl.set_plate_flip_180(bool(checked))
+        s = self._settings
+        if s is not None:
+            s.set("device_profile.plate_flip_180", bool(checked))
+            s.save()
+            try:
+                self._persist_active_profile()
+            except Exception:
+                pass
+
+    def _save_plate_z_offsets(self) -> None:
+        """Persist the three standard plate offsets + push to the controller."""
+        top = self.spin_zoff_top.value()
+        bottom = self.spin_zoff_bottom.value()
+        safe = self.spin_zoff_safe.value()
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_plate_z_offsets"):
+            ctrl.set_plate_z_offsets(top=top, bottom=bottom, safe=safe)
+        s = self._settings
+        if s is not None:
+            s.set("device_profile.plate_z_offsets",
+                  {"top": top, "bottom": bottom, "safe": safe})
+            s.save()
+            try:
+                self._persist_active_profile()
+            except Exception:
+                pass
+        if hasattr(self, "lbl_z_setup_status"):
+            self.lbl_z_setup_status.setText(
+                f"Plate offsets saved: top {top:.2f}, bottom {bottom:.2f}, "
+                f"safe {safe:.2f} mm below needle-cam.")
+            self.lbl_z_setup_status.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 9pt;")
+
+    def _z_setup_capture_bottom(self) -> None:
+        ctrl = self._controller
+        if ctrl is None or not hasattr(ctrl, "capture_current_z_raw"):
+            self.lbl_z_setup_status.setText("No controller available.")
+            return
+        raw = ctrl.capture_current_z_raw()
+        if raw is None:
+            self.lbl_z_setup_status.setText(
+                "Could not read Z (is the ZP controller connected?).")
+            return
+        self._z_setup_bottom_raw = float(raw)
+        self.btn_z_setup_top.setEnabled(True)
+        self.lbl_z_setup_status.setText(
+            f"Bottom captured (raw {raw:.3f} mm) → will become Z = 0. "
+            f"Now jog the needle ALL THE WAY UP and click Set Top.")
+        self.lbl_z_setup_status.setStyleSheet(
+            f"color: {COLORS['blue']}; font-size: 9pt;")
+
+    def _z_setup_capture_top(self) -> None:
+        ctrl = self._controller
+        if ctrl is None or self._z_setup_bottom_raw is None:
+            self.lbl_z_setup_status.setText("Capture the bottom first.")
+            return
+        raw_top = ctrl.capture_current_z_raw()
+        if raw_top is None:
+            self.lbl_z_setup_status.setText("Could not read Z.")
+            return
+        summary = ctrl.apply_z_setup(self._z_setup_bottom_raw, float(raw_top))
+        # Reflect the derived envelope into the Z limit spinboxes (user frame).
+        u_a = self._z_raw_to_user(ctrl.safety_limits.z_min)
+        u_b = self._z_raw_to_user(ctrl.safety_limits.z_max)
+        self.spin_z_min.setValue(min(u_a, u_b))
+        self.spin_z_max.setValue(max(u_a, u_b))
+        # Persist: datum (zero_position), envelope (safety_limits), direction.
+        s = self._settings
+        if s is not None:
+            s.set_section("zero_position", ctrl.zero_position)
+            s.set("safety_limits.z_min", ctrl.safety_limits.z_min)
+            s.set("safety_limits.z_max", ctrl.safety_limits.z_max)
+            s.set("device_profile.z_up_sign", ctrl.z_up_sign())
+            s.save()
+            try:
+                self._persist_active_profile()
+            except Exception:
+                pass
+        try:
+            self._refresh_jog_positions()
+        except Exception:
+            pass
+        if summary.get("direction_ok"):
+            self.lbl_z_setup_status.setText(
+                f"✅ Z setup complete. Up = {'+raw' if summary['z_up_sign'] > 0 else '−raw'} "
+                f"(sign {summary['z_up_sign']:+.0f}); travel "
+                f"{summary['travel_height_mm']:.2f} mm; user Z 0 → "
+                f"{summary['travel_height_mm']:.2f}. Saved.")
+            self.lbl_z_setup_status.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: 9pt;")
+        else:
+            self.lbl_z_setup_status.setText(
+                "⚠ Bottom and top are too close to tell the direction apart. "
+                "Datum + limits were saved, but jog further apart and re-run "
+                "so the up-direction is unambiguous.")
+            self.lbl_z_setup_status.setStyleSheet(
+                f"color: {COLORS['yellow']}; font-size: 9pt;")
+        self._z_setup_bottom_raw = None
+        self.btn_z_setup_top.setEnabled(False)
+
+    # ── v7.5.x: per-pump Plunger Setup (syringe twin of the Z Axis Setup) ──
+    #
+    # ZERO = plunger ALL THE WAY IN (syringe empty) → "Set Dispensed" (fill 0).
+    # MAX  = plunger ALL THE WAY OUT (syringe full)  → "Set Aspirated".
+    # apply_pump_setup() captures both extremes, DERIVES the dispense/aspirate
+    # direction (which it then OWNS, like z_up_sign owns Z), and sets the pump
+    # soft-limit (calibration) extents. Each pump is its own block, placed in
+    # order right beneath the Z block. ASPIRATE = draw fluid IN (toward full);
+    # DISPENSE = push fluid OUT (toward empty). Jog the plunger to each extreme
+    # with the jog pad first.
+
+    def _build_pump_plunger_setup_block(self, pump: str) -> QGroupBox:
+        """The per-pump plunger calibration block: jog the plunger to its
+        mechanical extremes, capture them, and the controller derives the
+        direction + soft-limit extents — the syringe-pump twin of the Z setup."""
+        grp = QGroupBox(
+            f"{pump} Plunger Setup — empty = 0, full = max, direction & limits")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        v = QVBoxLayout(grp)
+        info = QLabel(
+            "Use the jog pad to drive this pump's plunger to each mechanical "
+            "extreme and capture it. <b>Dispensed = plunger all the way IN "
+            "(syringe empty) → fill 0.</b> Aspirated = all the way OUT (full). "
+            "The <b>ASPIRATE</b> (draw-in) / <b>DISPENSE</b> (push-out) "
+            "direction and the pump soft-limit extents are derived and saved "
+            "automatically.")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        v.addWidget(info)
+
+        row = QHBoxLayout()
+        btn_disp = QPushButton("1 · Set Dispensed (empty, fill 0)")
+        btn_disp.setToolTip(
+            "Jog this pump's plunger ALL THE WAY IN (syringe empty) first, then "
+            "click. This raw position becomes fill = 0 (the datum).")
+        btn_disp.clicked.connect(
+            lambda _=False, p=pump: self._pump_setup_capture_dispensed(p))
+        row.addWidget(btn_disp)
+        btn_asp = QPushButton("2 · Set Aspirated (full)")
+        btn_asp.setToolTip(
+            "Jog the plunger ALL THE WAY OUT (syringe full), then click. The "
+            "aspirate/dispense direction and the pump soft-limit extents are "
+            "derived from dispensed → aspirated and saved.")
+        btn_asp.setEnabled(False)
+        btn_asp.clicked.connect(
+            lambda _=False, p=pump: self._pump_setup_capture_aspirated(p))
+        row.addWidget(btn_asp)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        status = QLabel("Dispensed extreme not captured yet.")
+        status.setWordWrap(True)
+        status.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        v.addWidget(status)
+
+        self._pump_setup_dispensed_btns[pump] = btn_disp
+        self._pump_setup_aspirated_btns[pump] = btn_asp
+        self._pump_setup_status_lbls[pump] = status
+        self._pump_setup_dispensed_raw[pump] = None
+        return grp
+
+    def _pump_setup_capture_dispensed(self, pump: str) -> None:
+        ctrl = self._controller
+        status = self._pump_setup_status_lbls.get(pump)
+        if ctrl is None or not hasattr(ctrl, "capture_current_pump_raw"):
+            if status is not None:
+                status.setText("No controller available.")
+            return
+        raw = ctrl.capture_current_pump_raw(pump)
+        if raw is None:
+            if status is not None:
+                status.setText(
+                    "Could not read the pump position (is the ZP controller "
+                    "connected?).")
+            return
+        self._pump_setup_dispensed_raw[pump] = float(raw)
+        self._pump_setup_aspirated_btns[pump].setEnabled(True)
+        if status is not None:
+            status.setText(
+                f"{pump}: dispensed (empty) captured (raw {raw:.3f} mm) → will "
+                f"become fill 0. Now jog the plunger ALL THE WAY OUT (full) and "
+                f"click Set Aspirated.")
+            status.setStyleSheet(f"color: {COLORS['blue']}; font-size: 9pt;")
+
+    def _pump_setup_capture_aspirated(self, pump: str) -> None:
+        ctrl = self._controller
+        status = self._pump_setup_status_lbls.get(pump)
+        dispensed = self._pump_setup_dispensed_raw.get(pump)
+        if ctrl is None or dispensed is None:
+            if status is not None:
+                status.setText("Capture the dispensed (empty) extreme first.")
+            return
+        raw_aspirated = ctrl.capture_current_pump_raw(pump)
+        if raw_aspirated is None:
+            if status is not None:
+                status.setText("Could not read the pump position.")
+            return
+        # The aspirate/dispense direction is about to become authoritative —
+        # confirm the operator really is at the full (all-the-way-OUT) extreme.
+        resp = QMessageBox.question(
+            self, "Confirm plunger setup",
+            f"Set {pump} aspirated (FULL) extreme from the current position?\n\n"
+            f"The ASPIRATE / DISPENSE direction and the soft-limit extents will "
+            f"be derived from this and the dispensed extreme, and will OWN this "
+            f"pump's direction from now on. Only proceed if the plunger is truly "
+            f"at its mechanical extremes (empty → full).",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            if status is not None:
+                status.setText(f"{pump}: setup cancelled.")
+            return
+        summary = ctrl.apply_pump_setup(pump, float(dispensed),
+                                        float(raw_aspirated))
+        self._pump_setup_persist(pump)
+        cap = summary.get("capacity_uL")
+        cap_txt = (f"{cap:.1f} µL" if cap is not None
+                   else f"{summary.get('capacity_mm', 0.0):.2f} mm "
+                        f"(no syringe configured)")
+        if status is not None:
+            if summary.get("direction_ok"):
+                status.setText(
+                    f"✅ {pump} plunger setup complete. Aspirate = "
+                    f"{'+raw' if summary['aspirate_sign'] > 0 else '−raw'} "
+                    f"(sign {summary['aspirate_sign']:+.0f}); capacity {cap_txt}; "
+                    f"fill 0 (empty) → {cap_txt} (full). Limits saved.")
+                status.setStyleSheet(f"color: {COLORS['green']}; font-size: 9pt;")
+            else:
+                status.setText(
+                    f"⚠ {pump}: dispensed and aspirated are too close to tell "
+                    f"the direction apart. Datum + limits were saved, but jog "
+                    f"further apart and re-run so the direction is unambiguous.")
+                status.setStyleSheet(
+                    f"color: {COLORS['yellow']}; font-size: 9pt;")
+        self._pump_setup_dispensed_raw[pump] = None
+        self._pump_setup_aspirated_btns[pump].setEnabled(False)
+
+    def _pump_setup_persist(self, pump: str) -> None:
+        """Persist the datum + the derived pump soft-limit extents after a
+        successful capture, mirror them into the visible limit spinboxes, and
+        save the device profile (mirrors the Z setup persistence)."""
+        ctrl = self._controller
+        s = self._settings
+        lo = hi = None
+        if ctrl is not None:
+            try:
+                lo = getattr(ctrl.safety_limits, f"{pump.lower()}_min")
+                hi = getattr(ctrl.safety_limits, f"{pump.lower()}_max")
+            except AttributeError:
+                lo = hi = None
+        # Reflect the captured extents into the visible safety-limit spinboxes.
+        if lo is not None and hi is not None and hasattr(self, "spin_p_mins") \
+                and pump in self.spin_p_mins:
+            self.spin_p_mins[pump].setValue(float(lo))
+            self.spin_p_maxs[pump].setValue(float(hi))
+        if ctrl is None or s is None:
+            return
+        try:
+            s.set_section("zero_position", ctrl.zero_position)
+            if lo is not None and hi is not None:
+                s.set(f"safety_limits.{pump.lower()}_min", lo)
+                s.set(f"safety_limits.{pump.lower()}_max", hi)
+            if hasattr(ctrl, "get_pump_setup"):
+                s.set("device_profile.pump_setup", ctrl.get_pump_setup())
+            s.save()
+        except Exception as e:
+            logger.warning(f"Pump plunger setup persist failed ({pump}): {e}")
+        try:
+            self._persist_active_profile()
+        except Exception:
+            pass
+
     def _record_limit(self, axis: str, which: str) -> None:
         """Copy current position into the matching safety spinbox.
 
@@ -2131,11 +2539,11 @@ class StageHardwarePanel(QWidget):
             v = self._logical_zp_value(zp, "Z")
             if v is not None:
                 target_spin = self.spin_z_min if which == "min" else self.spin_z_max
-                # v7.5.x: the Z limit spinboxes are height-frame (up = +).
-                # Convert the raw Marlin reading so "Set Max" at the top
-                # records +60 (not -60). Min/Max never invert: bottom →
-                # spin_z_min (≈0), top → spin_z_max (≈+60).
-                recorded_val = z_raw_to_display(float(v))
+                # v7.5.x: the Z limit spinboxes are the unified user frame
+                # (0 at the bottom datum, up = +). Convert the raw Marlin
+                # reading so "Set Max" at the top records the travel height
+                # (not a negative). Bottom → spin_z_min (≈0), top → spin_z_max.
+                recorded_val = self._z_raw_to_user(float(v))
                 target_spin.setValue(recorded_val)
         elif axis in ("P1", "P2", "P3"):
             v = self._logical_zp_value(zp, axis)
@@ -2165,13 +2573,29 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_max_x.setValue(float(s.get("safety_limits.xy_max_x", 130000.0)))
         self.spin_xy_min_y.setValue(float(s.get("safety_limits.xy_min_y", -85000.0)))
         self.spin_xy_max_y.setValue(float(s.get("safety_limits.xy_max_y", 85000.0)))
-        # v7.5.x: spinboxes are height-frame (up = +); stored limits are raw
-        # Marlin. ZDIR=-1 reverses ordering, so convert AND swap min/max:
-        # display-min = -z_max_raw, display-max = -z_min_raw.
+        # v7.5.x: spinboxes are the unified user frame (0 at bottom, up = +);
+        # stored limits are absolute raw Marlin. Convert each raw bound to the
+        # user frame and assign min/max by VALUE (polarity-general — no manual
+        # swap, correct for either Z direction).
         _z_min_raw = float(s.get("safety_limits.z_min", -10.0))
         _z_max_raw = float(s.get("safety_limits.z_max", 50.0))
-        self.spin_z_min.setValue(z_raw_to_display(_z_max_raw))
-        self.spin_z_max.setValue(z_raw_to_display(_z_min_raw))
+        _u_a = self._z_raw_to_user(_z_min_raw)
+        _u_b = self._z_raw_to_user(_z_max_raw)
+        self.spin_z_min.setValue(min(_u_a, _u_b))
+        self.spin_z_max.setValue(max(_u_a, _u_b))
+        # v7.5.x: standard plate offsets (needle-cam → plate features).
+        _off = s.get("device_profile.plate_z_offsets") or {}
+        if hasattr(self, "spin_zoff_top"):
+            self.spin_zoff_top.setValue(float(_off.get("top", 10.0)))
+            self.spin_zoff_bottom.setValue(float(_off.get("bottom", 20.0)))
+            self.spin_zoff_safe.setValue(float(_off.get("safe", 5.0)))
+        # v7.5.x: well-plate orientation (None ⇒ default ON for ME3B).
+        if hasattr(self, "chk_plate_flip_180"):
+            _flip = s.get("device_profile.plate_flip_180")
+            self.chk_plate_flip_180.blockSignals(True)
+            self.chk_plate_flip_180.setChecked(
+                True if _flip is None else bool(_flip))
+            self.chk_plate_flip_180.blockSignals(False)
         for pid in ("P1", "P2", "P3"):
             self.spin_p_mins[pid].setValue(
                 float(s.get(f"safety_limits.{pid.lower()}_min", -50.0)))
@@ -2458,12 +2882,16 @@ class StageHardwarePanel(QWidget):
         s.set("safety_limits.xy_max_x", self.spin_xy_max_x.value())
         s.set("safety_limits.xy_min_y", self.spin_xy_min_y.value())
         s.set("safety_limits.xy_max_y", self.spin_xy_max_y.value())
-        # v7.5.x: spinboxes are height-frame (up = +); store raw Marlin with
-        # the min/max SWAP (ZDIR=-1 reverses ordering). This guarantees
-        # z_min < z_max whenever height-min < height-max → never an inverted
-        # (frozen) envelope.
-        s.set("safety_limits.z_min", z_display_to_raw(self.spin_z_max.value()))
-        s.set("safety_limits.z_max", z_display_to_raw(self.spin_z_min.value()))
+        # v7.5.x: spinboxes are the unified user frame (0 at bottom, up = +);
+        # store absolute raw Marlin. Convert both bounds and assign min/max by
+        # VALUE (polarity-general → z_min < z_max always, never a frozen
+        # envelope, for either Z direction).
+        _zr_a = self._z_user_to_raw(self.spin_z_min.value())
+        _zr_b = self._z_user_to_raw(self.spin_z_max.value())
+        _z_min_raw_out = min(_zr_a, _zr_b)
+        _z_max_raw_out = max(_zr_a, _zr_b)
+        s.set("safety_limits.z_min", _z_min_raw_out)
+        s.set("safety_limits.z_max", _z_max_raw_out)
         for pid in ("P1", "P2", "P3"):
             s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
             s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
@@ -2479,9 +2907,10 @@ class StageHardwarePanel(QWidget):
             sl.xy_max_x = self.spin_xy_max_x.value()
             sl.xy_min_y = self.spin_xy_min_y.value()
             sl.xy_max_y = self.spin_xy_max_y.value()
-            # v7.5.x: height-frame spinboxes → raw Marlin, swapped (see above).
-            sl.z_min = z_display_to_raw(self.spin_z_max.value())
-            sl.z_max = z_display_to_raw(self.spin_z_min.value())
+            # v7.5.x: user-frame spinboxes → absolute raw Marlin (computed
+            # min/max above; polarity-general).
+            sl.z_min = _z_min_raw_out
+            sl.z_max = _z_max_raw_out
             for pid in ("P1", "P2", "P3"):
                 pid_l = pid.lower()
                 if hasattr(sl, f"{pid_l}_min"):
@@ -2606,12 +3035,16 @@ class StageHardwarePanel(QWidget):
         s.set("safety_limits.xy_max_x", self.spin_xy_max_x.value())
         s.set("safety_limits.xy_min_y", self.spin_xy_min_y.value())
         s.set("safety_limits.xy_max_y", self.spin_xy_max_y.value())
-        # v7.5.x: spinboxes are height-frame (up = +); store raw Marlin with
-        # the min/max SWAP (ZDIR=-1 reverses ordering). This guarantees
-        # z_min < z_max whenever height-min < height-max → never an inverted
-        # (frozen) envelope.
-        s.set("safety_limits.z_min", z_display_to_raw(self.spin_z_max.value()))
-        s.set("safety_limits.z_max", z_display_to_raw(self.spin_z_min.value()))
+        # v7.5.x: spinboxes are the unified user frame (0 at bottom, up = +);
+        # store absolute raw Marlin. Convert both bounds and assign min/max by
+        # VALUE (polarity-general → z_min < z_max always, never a frozen
+        # envelope, for either Z direction).
+        _zr_a = self._z_user_to_raw(self.spin_z_min.value())
+        _zr_b = self._z_user_to_raw(self.spin_z_max.value())
+        _z_min_raw_out = min(_zr_a, _zr_b)
+        _z_max_raw_out = max(_zr_a, _zr_b)
+        s.set("safety_limits.z_min", _z_min_raw_out)
+        s.set("safety_limits.z_max", _z_max_raw_out)
         for pid in ("P1", "P2", "P3"):
             s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
             s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
@@ -2678,10 +3111,13 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_max_x.setValue(130000.0)
         self.spin_xy_min_y.setValue(-85000.0)
         self.spin_xy_max_y.setValue(85000.0)
-        # v7.5.x: spinboxes are height-frame (up = +); show the raw defaults
-        # (z_min=-10, z_max=50) converted + swapped.
-        self.spin_z_min.setValue(z_raw_to_display(50.0))
-        self.spin_z_max.setValue(z_raw_to_display(-10.0))
+        # v7.5.x: spinboxes are the unified user frame (0 at bottom, up = +);
+        # show the raw defaults (z_min=-10, z_max=50) converted to user-Z by
+        # value (min/max), polarity-general.
+        _u_a = self._z_raw_to_user(-10.0)
+        _u_b = self._z_raw_to_user(50.0)
+        self.spin_z_min.setValue(min(_u_a, _u_b))
+        self.spin_z_max.setValue(max(_u_a, _u_b))
         for pid in ("P1", "P2", "P3"):
             self.spin_p_mins[pid].setValue(-50.0)
             self.spin_p_maxs[pid].setValue(50.0)

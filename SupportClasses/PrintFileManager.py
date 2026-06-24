@@ -736,8 +736,11 @@ def save_trajectory_as_print_object(
             writer.writerow([f"{v:.6f}" for v in row])
 
     # ── Print file JSON (csv_import object) ──
-    params = {"csv_path": str(csv_path), "source": source,
-              "num_waypoints": int(len(arr))}
+    # Key the CSV pointer as ``source_file`` — the contract every csv_import
+    # reader understands (matches the manual-import path in print_objects.py).
+    # ``csv_path`` is kept as an alias for back-compat / human readability.
+    params = {"source_file": str(csv_path), "csv_path": str(csv_path),
+              "source": source, "num_waypoints": int(len(arr))}
     if extra_params:
         params.update(extra_params)
 

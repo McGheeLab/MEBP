@@ -297,6 +297,18 @@ class PlateWarpCalibrator:
         t = self._Aaug[2, :]
         return rot, scale, (float(t[0]), float(t[1]))
 
+    def linear_scale_range(self) -> Tuple[float, float]:
+        """``(min, max)`` singular value of the affine linear part.
+
+        Both ≈ 1.0 for a clean rigid-ish alignment. A degenerate fit
+        (control points nearly collinear / too close, or a wild click) shows
+        up as one axis stretched (large max) or squashed (near-zero min), so
+        callers can reject it before it extrapolates distant wells off the
+        plate. Independent of plate size and translation."""
+        lin = self._Aaug[:2, :].T
+        s = np.linalg.svd(lin, compute_uv=False)
+        return (float(np.min(s)), float(np.max(s)))
+
     # ── Persistence ───────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
@@ -324,3 +336,32 @@ class PlateWarpCalibrator:
         if warp.n_points:
             warp.solve()
         return warp
+
+
+def register_from_template(template_wells: dict, measured_wells: dict):
+    """Re-register a whole plate from a saved as-built template + a few measured
+    wells (the "scan once, then re-measure 3 wells" workflow).
+
+    Fits a warp mapping the TEMPLATE well centres → the freshly MEASURED ones
+    (shared names only; ≥3 → affine, 2 → similarity), then applies it to every
+    template well. ``template_wells`` / ``measured_wells`` map well name →
+    (x_um, y_um) absolute stage µm.
+
+    Returns ``(registered_positions, warp)`` where ``registered_positions`` is
+    ``{name: (x_um, y_um)}`` for all template wells, or ``({}, None)`` if fewer
+    than 2 shared correspondences.
+    """
+    if not template_wells or not measured_wells:
+        return {}, None
+    shared = [n for n in measured_wells if n in template_wells]
+    if len(shared) < 2:
+        return {}, None
+    warp = PlateWarpCalibrator()
+    for n in shared:
+        tx, ty = template_wells[n]
+        mx, my = measured_wells[n]
+        warp.add_point(float(tx), float(ty), float(mx), float(my))
+    warp.solve()
+    registered = warp.correct_positions(
+        {n: (float(v[0]), float(v[1])) for n, v in template_wells.items()})
+    return registered, warp

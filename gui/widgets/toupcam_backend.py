@@ -460,18 +460,22 @@ class ToupCamBackend:
         
         # Start pull mode with callback
         self._callback_ref = _EVENT_CALLBACK(self._on_event)
-        
+
+        # Set running BEFORE StartPullMode: callbacks begin dispatching the
+        # instant the stream starts, and _on_event now gates on self._running,
+        # so flipping it first avoids dropping the first frame(s).
+        self._running = True
         hr = lib.Toupcam_StartPullModeWithCallback(
             self._handle, self._callback_ref, None
         )
-        
+
         if hr < 0:
             logger.warning(f"ToupCam: StartPullMode failed (0x{hr & 0xFFFFFFFF:08X})")
+            self._running = False
             lib.Toupcam_Close(self._handle)
             self._handle = None
             return False
-        
-        self._running = True
+
         logger.info(f"ToupCam opened: {self._w}x{self._h}")
         return True
     
@@ -495,19 +499,31 @@ class ToupCamBackend:
         self._lib.Toupcam_put_eSize(self._handle, min(2, 0))
     
     def _on_event(self, nEvent, pCtx):
-        """Callback from ToupTek SDK thread."""
-        if nEvent == TOUPCAM_EVENT_IMAGE and self._handle and self._lib:
+        """Callback from ToupTek SDK thread.
+
+        The native PullImageV3 write AND the buffer copy run under self._lock,
+        and the handle/buffer are re-checked inside the lock. Teardown
+        (release / set_resolution_index) takes the same lock before closing the
+        handle or swapping _buf/_buf_ptr, so the SDK can never write into a
+        freed/closed handle or a reallocated buffer. Lock hold time is bounded
+        because PullImageV3 is called non-blocking (nWaitMS=0).
+        """
+        if nEvent == TOUPCAM_EVENT_IMAGE:
             try:
-                hr = self._lib.Toupcam_PullImageV3(
-                    self._handle, self._buf_ptr, 0, 24, 0, None
-                )
-                if hr >= 0:
-                    with self._lock:
+                with self._lock:
+                    if not (self._running and self._handle and self._lib
+                            and self._buf_ptr is not None
+                            and self._buf is not None):
+                        return
+                    hr = self._lib.Toupcam_PullImageV3(
+                        self._handle, self._buf_ptr, 0, 24, 0, None
+                    )
+                    if hr >= 0:
                         self._frame = self._buf.copy()
-                    self._frame_ready.set()
+                        self._frame_ready.set()
             except Exception as e:
                 logger.debug(f"ToupCam pull error: {e}")
-        
+
         elif nEvent == TOUPCAM_EVENT_ERROR:
             logger.warning("ToupCam: error event received")
         elif nEvent == TOUPCAM_EVENT_DISCONNECTED:
@@ -540,23 +556,31 @@ class ToupCamBackend:
         return False, None
     
     def release(self):
-        """Stop and close the camera."""
-        if self._handle is not None and bool(self._handle) and self._lib:
-            try:
-                self._lib.Toupcam_Stop(self._handle)
-            except Exception:
-                pass
-            try:
-                self._lib.Toupcam_Close(self._handle)
-            except Exception:
-                pass
-        
-        self._handle = None
+        """Stop and close the camera.
+
+        Serialized against the SDK callback: clear _running first (so a fresh
+        callback bails), then null the handle/buffers UNDER self._lock so any
+        in-flight _on_event finishes its locked pull before we proceed. The
+        native Stop/Close then run on a local handle — by then no callback can
+        touch it (they see _handle=None and bail)."""
         self._running = False
-        self._frame = None
-        self._buf = None
-        self._buf_ptr = None
-        self._callback_ref = None
+        with self._lock:
+            handle = self._handle
+            lib = self._lib
+            self._handle = None
+            self._frame = None
+            self._buf = None
+            self._buf_ptr = None
+            self._callback_ref = None
+        if handle is not None and bool(handle) and lib:
+            try:
+                lib.Toupcam_Stop(handle)
+            except Exception:
+                pass
+            try:
+                lib.Toupcam_Close(handle)
+            except Exception:
+                pass
         self._frame_ready.clear()
         # Skip logging if the interpreter is shutting down (e.g. release()
         # invoked from __del__): the logging machinery may be half-torn-down,
@@ -570,41 +594,59 @@ class ToupCamBackend:
     
     def set_resolution_index(self, index: int) -> bool:
         """Switch to a different resolution index.
-        
-        Note: This restarts the capture internally.
+
+        Restarts the pull-mode stream internally. Serialized against the SDK
+        callback: _running is cleared before Stop (so dispatched callbacks
+        bail), and the _buf/_buf_ptr swap happens UNDER self._lock so a pull
+        can never write into a half-reallocated / wrong-sized buffer.
         """
         if not self._handle or not self._lib:
             return False
-        
-        # Stop current capture
+
+        # Gate the callback off, then stop dispatch.
+        self._running = False
         try:
             self._lib.Toupcam_Stop(self._handle)
         except Exception:
             pass
-        
+
         hr = self._lib.Toupcam_put_eSize(self._handle, index)
         if hr < 0:
             return False
-        
+
         # Re-read size
         w_val, h_val = ctypes.c_int(), ctypes.c_int()
         self._lib.Toupcam_get_Size(self._handle, ctypes.byref(w_val), ctypes.byref(h_val))
-        self._w = w_val.value
-        self._h = h_val.value
-        
-        # Reallocate buffer
-        self._buf = np.zeros((self._h, self._w, 3), dtype=np.uint8)
-        self._buf_ptr = self._buf.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
-        self._frame = None
+        new_w, new_h = w_val.value, h_val.value
+        if new_w <= 0 or new_h <= 0:
+            logger.warning("ToupCam: invalid size after eSize change")
+            return False
+
+        # Allocate the new buffer, then publish it atomically under the lock so
+        # an in-flight pull (which holds the lock) can't see a torn state.
+        new_buf = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+        new_ptr = new_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+        with self._lock:
+            self._w, self._h = new_w, new_h
+            self._buf = new_buf
+            self._buf_ptr = new_ptr
+            self._frame = None
         self._frame_ready.clear()
-        
-        # Restart capture
+
+        # Restart capture — set running first so callbacks aren't dropped.
+        self._running = True
         hr = self._lib.Toupcam_StartPullModeWithCallback(
             self._handle, self._callback_ref, None
         )
-        
+        if hr < 0:
+            logger.warning(
+                f"ToupCam: StartPullMode failed after resize "
+                f"(0x{hr & 0xFFFFFFFF:08X})")
+            self._running = False
+            return False
+
         logger.info(f"ToupCam resolution changed: {self._w}x{self._h}")
-        return hr >= 0
+        return True
     
     def set_auto_exposure(self, enabled: bool) -> bool:
         """Enable or disable auto-exposure."""
@@ -612,7 +654,177 @@ class ToupCamBackend:
             return False
         hr = self._lib.Toupcam_put_AutoExpoEnable(self._handle, 1 if enabled else 0)
         return hr >= 0
-    
+
+    # ── Hardware image controls (v7.5.x) ───────────────────────────
+    # These set values ON the camera via the ToupTek SDK (firmware-side),
+    # distinct from the post-capture software correction in CameraWidget.
+    # Ranges per toupcam.h, validated against the BUC3D-1000C (C3CMOS10000KPA).
+
+    # (min, max, default)
+    HW_RANGES = {
+        "brightness": (-64, 64, 0),
+        "contrast": (-100, 100, 0),
+        "gamma": (20, 180, 100),
+    }
+
+    def _bind(self, name: str, argtypes, restype=ctypes.c_int):
+        """Resolve + cache a DLL function signature; None if the DLL lacks it."""
+        lib = self._lib
+        if lib is None:
+            return None
+        try:
+            fn = getattr(lib, name)
+        except AttributeError:
+            return None
+        fn.argtypes = argtypes
+        fn.restype = restype
+        return fn
+
+    def _get_scalar(self, name: str, ctype=ctypes.c_int):
+        """Call a ``get_X(handle, *out)`` HRESULT getter; return value or None."""
+        if not self._handle or not bool(self._handle):
+            return None
+        fn = self._bind(name, [ctypes.c_void_p, ctypes.POINTER(ctype)])
+        if fn is None:
+            return None
+        out = ctype()
+        try:
+            hr = fn(self._handle, ctypes.byref(out))
+        except Exception as exc:
+            logger.debug(f"ToupCam {name} failed: {exc}")
+            return None
+        return out.value if hr >= 0 else None
+
+    def _put_scalar(self, name: str, value, ctype=ctypes.c_int) -> bool:
+        """Call a ``put_X(handle, value)`` HRESULT setter; True on success."""
+        if not self._handle or not bool(self._handle):
+            return False
+        fn = self._bind(name, [ctypes.c_void_p, ctype])
+        if fn is None:
+            return False
+        try:
+            hr = fn(self._handle, ctype(int(value)))
+        except Exception as exc:
+            logger.debug(f"ToupCam {name} failed: {exc}")
+            return False
+        return hr >= 0
+
+    def get_brightness(self):
+        return self._get_scalar("Toupcam_get_Brightness")
+
+    def put_brightness(self, v) -> bool:
+        return self._put_scalar("Toupcam_put_Brightness", v)
+
+    def get_contrast(self):
+        return self._get_scalar("Toupcam_get_Contrast")
+
+    def put_contrast(self, v) -> bool:
+        return self._put_scalar("Toupcam_put_Contrast", v)
+
+    def get_gamma(self):
+        return self._get_scalar("Toupcam_get_Gamma")
+
+    def put_gamma(self, v) -> bool:
+        return self._put_scalar("Toupcam_put_Gamma", v)
+
+    def get_exposure_time(self):
+        """Current exposure time in microseconds (or None)."""
+        return self._get_scalar("Toupcam_get_ExpoTime", ctypes.c_uint)
+
+    def put_exposure_time(self, microseconds) -> bool:
+        return self._put_scalar(
+            "Toupcam_put_ExpoTime", microseconds, ctypes.c_uint)
+
+    def get_exposure_gain(self):
+        """Analog gain in percent (100 = 1.0x), or None."""
+        return self._get_scalar("Toupcam_get_ExpoAGain", ctypes.c_ushort)
+
+    def put_exposure_gain(self, percent) -> bool:
+        return self._put_scalar(
+            "Toupcam_put_ExpoAGain", percent, ctypes.c_ushort)
+
+    def get_auto_exposure(self):
+        v = self._get_scalar("Toupcam_get_AutoExpoEnable")
+        return None if v is None else bool(v)
+
+    def _get_triple(self, name: str, ctype=ctypes.c_uint):
+        if not self._handle or not bool(self._handle):
+            return None
+        fn = self._bind(name, [ctypes.c_void_p] + [ctypes.POINTER(ctype)] * 3)
+        if fn is None:
+            return None
+        a, b, c = ctype(), ctype(), ctype()
+        try:
+            hr = fn(self._handle, ctypes.byref(a), ctypes.byref(b),
+                    ctypes.byref(c))
+        except Exception as exc:
+            logger.debug(f"ToupCam {name} failed: {exc}")
+            return None
+        return (a.value, b.value, c.value) if hr >= 0 else None
+
+    def get_exposure_time_range(self):
+        """(min_us, max_us, default_us) or None."""
+        return self._get_triple("Toupcam_get_ExpTimeRange", ctypes.c_uint)
+
+    def get_exposure_gain_range(self):
+        """(min_pct, max_pct, default_pct) or None."""
+        return self._get_triple("Toupcam_get_ExpoAGainRange", ctypes.c_ushort)
+
+    def get_eSize(self):
+        """Current resolution index (0 = largest), or None."""
+        return self._get_scalar("Toupcam_get_eSize", ctypes.c_uint)
+
+    def get_resolution_list(self) -> list:
+        """All supported (width, height) resolutions, queried from the device.
+
+        Works around the empty list returned by EnumV2 on this SDK build by
+        reading ResolutionNumber / get_Resolution from the open handle.
+        """
+        if not self._handle or not bool(self._handle):
+            return []
+        rn = self._bind("Toupcam_get_ResolutionNumber", [ctypes.c_void_p])
+        gr = self._bind(
+            "Toupcam_get_Resolution",
+            [ctypes.c_void_p, ctypes.c_uint,
+             ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)])
+        if rn is None or gr is None:
+            return []
+        try:
+            n = rn(self._handle)
+        except Exception:
+            return []
+        out = []
+        for i in range(max(int(n), 0)):
+            w, h = ctypes.c_int(), ctypes.c_int()
+            try:
+                hr = gr(self._handle, i, ctypes.byref(w), ctypes.byref(h))
+            except Exception:
+                continue
+            if hr >= 0 and w.value > 0 and h.value > 0:
+                out.append((w.value, h.value))
+        return out
+
+    def get_settings(self) -> dict:
+        """Read EVERY hardware setting back from the device (for the readout).
+
+        All values are fetched via SDK getters against the open handle — never
+        cached/echoed — so the caller can prove the values come FROM the camera.
+        """
+        return {
+            "brightness": self.get_brightness(),
+            "contrast": self.get_contrast(),
+            "gamma": self.get_gamma(),
+            "exposure_us": self.get_exposure_time(),
+            "exposure_gain_pct": self.get_exposure_gain(),
+            "auto_exposure": self.get_auto_exposure(),
+            "exposure_range_us": self.get_exposure_time_range(),
+            "gain_range_pct": self.get_exposure_gain_range(),
+            "resolution": self.get_resolution(),
+            "eSize": self.get_eSize(),
+            "resolutions": self.get_resolution_list(),
+            "device_id": self._device_id,
+        }
+
     def __del__(self):
         try:
             self.release()

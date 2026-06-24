@@ -1,0 +1,166 @@
+{
+  "version": "1.0",
+  "by_speed": {
+    "5.00": {
+      "speed_mm_s": 5.0,
+      "effective_speed_mm_s": 1.8475,
+      "correction_factor": 2.7063,
+      "lag_rate_mm_per_s": 1.25563,
+      "seg_len_mm": 0.2618,
+      "runs": 4,
+      "samples": 1649,
+      "last_duration_s": 60.0,
+      "last_updated": "2026-06-18T18:21:22"
+    }
+  },
+  "by_turn": {
+    "square|2.00|1.00": {
+      "shape": "square",
+      "speed_mm_s": 2.0,
+      "distance_mm": 1.0,
+      "lag_mean_s": 0.019,
+      "lag_std_s": 0.0517,
+      "turns": 30,
+      "runs": 3,
+      "last_updated": "2026-06-18T17:57:22",
+      "divergence_rate_s_per_s": 0.00056,
+      "fps": 12.68
+    },
+    "square|2.00|2.00": {
+      "shape": "square",
+      "speed_mm_s": 2.0,
+      "distance_mm": 2.0,
+      "lag_mean_s": 0.0407,
+      "lag_std_s": 0.0671,
+      "turns": 20,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:27:26",
+      "divergence_rate_s_per_s": -0.002955,
+      "fps": 12.84
+    },
+    "square|2.00|4.00": {
+      "shape": "square",
+      "speed_mm_s": 2.0,
+      "distance_mm": 4.0,
+      "lag_mean_s": 0.0815,
+      "lag_std_s": 0.22,
+      "turns": 24,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:28:08",
+      "divergence_rate_s_per_s": -0.008507,
+      "fps": 12.78
+    },
+    "square|5.00|1.00": {
+      "shape": "square",
+      "speed_mm_s": 5.0,
+      "distance_mm": 1.0,
+      "lag_mean_s": 0.0591,
+      "lag_std_s": 0.0361,
+      "turns": 24,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:28:26",
+      "divergence_rate_s_per_s": 0.000788,
+      "fps": 12.72
+    },
+    "square|5.00|2.00": {
+      "shape": "square",
+      "speed_mm_s": 5.0,
+      "distance_mm": 2.0,
+      "lag_mean_s": 0.0483,
+      "lag_std_s": 0.0636,
+      "turns": 23,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:28:35",
+      "divergence_rate_s_per_s": -0.015529,
+      "fps": 12.72
+    },
+    "square|5.00|4.00": {
+      "shape": "square",
+      "speed_mm_s": 5.0,
+      "distance_mm": 4.0,
+      "lag_mean_s": 0.0573,
+      "lag_std_s": 0.0596,
+      "turns": 24,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:28:54",
+      "divergence_rate_s_per_s": -0.012068,
+      "fps": 12.78
+    },
+    "square|10.00|1.00": {
+      "shape": "square",
+      "speed_mm_s": 10.0,
+      "distance_mm": 1.0,
+      "lag_mean_s": 0.0186,
+      "lag_std_s": 0.017,
+      "turns": 23,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:29:03",
+      "divergence_rate_s_per_s": 0.008743,
+      "fps": 13.11
+    },
+    "square|10.00|2.00": {
+      "shape": "square",
+      "speed_mm_s": 10.0,
+      "distance_mm": 2.0,
+      "lag_mean_s": 0.0459,
+      "lag_std_s": 0.0413,
+      "turns": 23,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:29:09",
+      "divergence_rate_s_per_s": -0.002708,
+      "fps": 13.06
+    },
+    "square|10.00|4.00": {
+      "shape": "square",
+      "speed_mm_s": 10.0,
+      "distance_mm": 4.0,
+      "lag_mean_s": 0.0527,
+      "lag_std_s": 0.0509,
+      "turns": 24,
+      "runs": 2,
+      "last_updated": "2026-06-18T17:29:19",
+      "divergence_rate_s_per_s": -0.005549,
+      "fps": 12.71
+    }
+  },
+  "by_phase": {
+    "5.00|1.00": {
+      "speed_mm_s": 5.0,
+      "seg_len_mm": 1.0,
+      "intercept_s": 0.12153,
+      "slope_s_per_seg": 0.00266,
+      "n_points": 8,
+      "runs": 5,
+      "last_updated": "2026-06-22T11:50:31"
+    },
+    "5.00|3.30": {
+      "speed_mm_s": 5.0,
+      "seg_len_mm": 3.3,
+      "intercept_s": -0.12003,
+      "slope_s_per_seg": 1.562355,
+      "n_points": 3,
+      "runs": 1,
+      "last_updated": "2026-06-22T10:45:51"
+    },
+    "5.00|0.50": {
+      "speed_mm_s": 5.0,
+      "seg_len_mm": 0.5,
+      "intercept_s": 0.57657,
+      "slope_s_per_seg": 0.0,
+      "n_points": 1,
+      "runs": 1,
+      "last_updated": "2026-06-22T10:46:32"
+    },
+    "1.00|0.50": {
+      "speed_mm_s": 1.0,
+      "seg_len_mm": 0.5,
+      "intercept_s": -0.23596,
+      "slope_s_per_seg": 0.87546,
+      "n_points": 8,
+      "runs": 1,
+      "last_updated": "2026-06-22T10:50:57"
+    }
+  },
+  "enabled": true,
+  "xy_max_speed_um_s": 22281.941527858107
+}

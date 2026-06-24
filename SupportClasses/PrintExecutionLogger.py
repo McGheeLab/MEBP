@@ -251,6 +251,23 @@ class PrintExecutionLogger:
                             rec["p3"] = round(float(zp[3]), 4)
                 except Exception:
                     pass
+                # v7.5.x: ZP comm health over the print — commands issued vs
+                # cleanly acked, ack failures, board resets, and live-connected.
+                # Lets a post-hoc analysis see exactly WHEN the link started
+                # missing acks relative to the motion (no extra serial traffic;
+                # these are in-memory counters).
+                try:
+                    zp_stage = getattr(ctrl, "zp_stage", None)
+                    if zp_stage is not None and hasattr(
+                            zp_stage, "get_comm_counters"):
+                        c = zp_stage.get_comm_counters()
+                        rec["zp_cmd"] = c.get("cmd")
+                        rec["zp_ok"] = c.get("ok")
+                        rec["zp_ok_fail"] = c.get("ok_fail")
+                        rec["zp_reset"] = c.get("reset")
+                    rec["zp_conn"] = bool(getattr(ctrl, "is_zp_connected", False))
+                except Exception:
+                    pass
                 if rec:
                     self.log("sample", **rec)
             except Exception:

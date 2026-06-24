@@ -6,10 +6,10 @@ container (`WorkflowsModePage`) maps that ID to a sub-page in its
 QStackedWidget.
 
 Workflows:
-    spheroid_pickup       — Spheroid Pick & Place (functional in v7.4.3)
-    cell_targeting        — Cell Targeting & Removal (stub)
-    cell_labeling         — Cell Labeling (stub)
-    quick_print           — Quick Print (stub)
+    spheroid_pickup       — Spheroid Pick & Place (functional)
+    cell_targeting        — Cell Targeting & Removal (functional in v7.5.x)
+    cell_labeling         — Cell Labeling / staining (functional in v7.5.x)
+    quick_print           — Quick Print (functional)
     immuno                — Immuno (stub)
 """
 
@@ -49,15 +49,25 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         workflow_id="cell_targeting",
         icon="🎯",
         title="Cell Targeting & Removal",
-        description="Identify and aspirate individual cells from a culture.",
-        enabled=False,
+        description="Load a cell-release reagent, trypsinize cells in place, "
+                    "then extract and relocate them.",
+        enabled=True,
+    ),
+    WorkflowTile(
+        workflow_id="fluorescence_mosaic",
+        icon="🔬",
+        title="Fluorescence Mosaic",
+        description="High-resolution multi-channel mosaic of one well "
+                    "(DAPI / FITC / mCherry / Cy5). Overlays into other workflows.",
+        enabled=True,
     ),
     WorkflowTile(
         workflow_id="cell_labeling",
         icon="🏷️",
         title="Cell Labeling",
-        description="Apply fluorescent dyes to targeted cells.",
-        enabled=False,
+        description="Select regions and a stain, deposit it slowly, incubate "
+                    "for a set time, then aspirate it back off to waste.",
+        enabled=True,
     ),
     WorkflowTile(
         workflow_id="quick_print",
@@ -72,6 +82,22 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         title="Immuno",
         description="Multi-step immunostaining wash + incubation cycles.",
         enabled=False,
+    ),
+    WorkflowTile(
+        workflow_id="stress_test",
+        icon="🔁",
+        title="ZP Stress Test",
+        description="Bench-validate the ZP board: loop prints + jog/travel "
+                    "under load and watch for any disconnect or reset.",
+        enabled=True,
+    ),
+    WorkflowTile(
+        workflow_id="timing_calibration",
+        icon="⏱️",
+        title="XY↔ZP Timing Calibration",
+        description="Measure how far the needle (XY) lags the commands over a "
+                    "1–5 min run, so the pump stays synced to the needle.",
+        enabled=True,
     ),
 )
 

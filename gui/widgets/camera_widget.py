@@ -8,7 +8,7 @@ for display in a QLabel.
 Features:
     - Auto-detect available cameras
     - Live feed with configurable FPS
-    - Software brightness / gamma adjustment (hardware-independent)
+    - Software brightness / contrast / gamma adjustment (hardware-independent)
     - Crosshair overlay for needle alignment
     - Snapshot capture (save to file)
     - Compact mode for multi-camera layouts
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -206,8 +207,11 @@ class CameraWidget(QWidget):
         self._camera_label = camera_label
         self._compact = compact
 
-        # Software image adjustments
-        self._brightness: int = 0       # -100 … +100
+        # Software image adjustments (display-only — applied AFTER the raw
+        # frame is cached for detection, so vision/calibration see real
+        # sensor data).
+        self._brightness: int = 0       # -100 … +100  (additive offset)
+        self._contrast: float = 1.0     # 0.1 … 3.0    (×, pivots on mid-gray)
         self._gamma: float = 1.0        # 0.1 … 3.0
         self._gamma_lut = None          # Precomputed LUT for speed
 
@@ -218,6 +222,12 @@ class CameraWidget(QWidget):
         # v7.3.0: Thread-safe frame buffer for detection workers
         self._current_frame = None        # Latest BGR numpy array (or None)
         self._frame_lock = threading.Lock()
+        # v7.5.x: monotonic frame counter, incremented each grab. Lets a worker
+        # thread (e.g. the mosaic scanner) wait for N genuinely-new frames from
+        # the GUI display timer after a stage move — draining any buffered
+        # backlog so the captured frame is post-move — without touching the
+        # camera backend itself (which only the grab timer reads).
+        self._frame_seq = 0
 
         # v7.4.4: Edge-pick mode (Needle Location workflow)
         self._edge_pick_mode = False
@@ -302,6 +312,19 @@ class CameraWidget(QWidget):
             bri_row.addWidget(self._lbl_brightness)
             sp_layout.addLayout(bri_row)
 
+            # Contrast slider
+            con_row = QHBoxLayout()
+            con_row.addWidget(QLabel("Contrast:"))
+            self._sld_contrast = QSlider(Qt.Horizontal)
+            self._sld_contrast.setRange(10, 300)
+            self._sld_contrast.setValue(100)
+            self._sld_contrast.valueChanged.connect(self._on_contrast_slider)
+            con_row.addWidget(self._sld_contrast)
+            self._lbl_contrast = QLabel("1.00")
+            self._lbl_contrast.setMinimumWidth(s(28))
+            con_row.addWidget(self._lbl_contrast)
+            sp_layout.addLayout(con_row)
+
             # Gamma slider
             gam_row = QHBoxLayout()
             gam_row.addWidget(QLabel("Gamma:"))
@@ -376,39 +399,60 @@ class CameraWidget(QWidget):
         self._cameras_detected = False
         self.camera_combo.addItem("Click Detect or Start", -1)
 
-    def refresh_cameras(self):
+    def refresh_cameras(self, probe: "dict | None" = None):
         """Detect cameras and populate the combo.
 
         v7.3-camera: Detects both OpenCV and ToupCam cameras.
         Combo item data is a tuple: ("opencv", index) or ("toupcam", device_id).
+
+        v7.5.x: ``probe`` is an optional pre-computed source inventory
+        ``{"opencv": [indices], "dshow": [...], "toupcam": [...]}``. The
+        CameraManager probes ONCE and passes the same inventory to every
+        widget, so the slow OpenCV device probe runs a single time (and can be
+        run off the GUI thread at startup) instead of each widget re-probing.
+        When None, this widget probes synchronously itself (the lazy
+        ``start()`` path).
         """
         self.camera_combo.clear()
         if not CAMERA_AVAILABLE:
             return
+
+        if probe is None:
+            # Synchronous self-probe (lazy first-start). Mirrors the inventory
+            # the CameraManager builds.
+            ds_cams = []
+            opencv_indices = []
+            if CV2_AVAILABLE:
+                try:
+                    from gui.widgets.camera_identity import enumerate_directshow_cameras
+                    ds_cams = enumerate_directshow_cameras()
+                except Exception:
+                    ds_cams = []
+                opencv_indices = detect_cameras()
+            probe = {"opencv": opencv_indices, "dshow": ds_cams,
+                     "toupcam": detect_toupcam_cameras()}
 
         # OpenCV cameras — v7.5.x: label with the DirectShow friendly name
         # + USB port tag (e.g. "Teslong Camera (port 6&29d1719c&2)") so two
         # identical cameras are distinguishable. Falls back to the index
         # when no DirectShow info is available.
         if CV2_AVAILABLE:
+            ds_cams = probe.get("dshow") or []
             try:
-                from gui.widgets.camera_identity import (
-                    enumerate_directshow_cameras, label_for,
-                )
-                ds_cams = enumerate_directshow_cameras()
+                from gui.widgets.camera_identity import label_for
             except Exception:
-                ds_cams = []
-            for idx in detect_cameras():
+                label_for = None
+            for idx in (probe.get("opencv") or []):
                 entry = next(
                     (c for c in ds_cams if c.get("index") == idx), None)
-                if entry:
+                if entry and label_for is not None:
                     text = label_for(entry["name"], entry["device_path"])
                 else:
                     text = f"Camera {idx}"
                 self.camera_combo.addItem(text, ("opencv", idx))
 
         # ToupCam cameras  (v7.3-camera)
-        for tc_dev in detect_toupcam_cameras():
+        for tc_dev in (probe.get("toupcam") or []):
             name = tc_dev.get('displayname', 'ToupCam')
             dev_id = tc_dev.get('id', '')
             self.camera_combo.addItem(f"TC: {name}", ("toupcam", dev_id))
@@ -473,6 +517,9 @@ class CameraWidget(QWidget):
 
         self._camera_index = camera_index
         self._running = True
+        # v7.5.x: assert the backend so a slot reused after a ToupCam/sim run
+        # can never report a stale source/controls (see get_hw_settings).
+        self._backend_type = "opencv"
         self._timer.start(int(1000 / self._fps))
         if hasattr(self, 'btn_start'):
             self.btn_start.setText("⏹ Stop")
@@ -485,6 +532,18 @@ class CameraWidget(QWidget):
         if self._capture:
             self._capture.release()
             self._capture = None
+        # v7.5.x: release the ToupCam SDK stream too (previously stop() only
+        # released the OpenCV capture, so a ToupCam kept streaming and
+        # _backend_type stayed stale — making get_hw_settings mislabel a later
+        # OpenCV source as source='toupcam').
+        tc = getattr(self, '_toupcam', None)
+        if tc is not None:
+            try:
+                tc.release()
+            except Exception:
+                pass
+            self._toupcam = None
+        self._backend_type = "opencv"
         # v7.3.0: Clear simulated camera reference
         if hasattr(self, '_simulated_camera'):
             self._simulated_camera = None
@@ -545,24 +604,285 @@ class CameraWidget(QWidget):
 
     def set_brightness(self, value: int):
         """Set software brightness offset (-100 to +100)."""
-        self._brightness = max(-100, min(100, value))
+        self._brightness = max(-100, min(100, int(value)))
+        sld = getattr(self, "_sld_brightness", None)
+        if sld is not None and sld.value() != self._brightness:
+            sld.blockSignals(True)
+            sld.setValue(self._brightness)
+            sld.blockSignals(False)
+        if hasattr(self, "_lbl_brightness"):
+            self._lbl_brightness.setText(str(self._brightness))
+
+    def set_contrast(self, value: float):
+        """Set software contrast multiplier (0.1 to 3.0).  1.0 = no change.
+
+        Pivots on mid-gray (128) so raising contrast does not also brighten;
+        combined with brightness in a single ``convertScaleAbs`` pass.
+        """
+        self._contrast = max(0.1, min(3.0, float(value)))
+        sld = getattr(self, "_sld_contrast", None)
+        if sld is not None:
+            iv = int(round(self._contrast * 100))
+            if sld.value() != iv:
+                sld.blockSignals(True)
+                sld.setValue(iv)
+                sld.blockSignals(False)
+        if hasattr(self, "_lbl_contrast"):
+            self._lbl_contrast.setText(f"{self._contrast:.2f}")
 
     def set_gamma(self, value: float):
         """Set software gamma (0.1 to 3.0).  1.0 = no change."""
-        self._gamma = max(0.1, min(3.0, value))
+        self._gamma = max(0.1, min(3.0, float(value)))
         # Precompute a lookup table for speed
         inv_gamma = 1.0 / self._gamma
         self._gamma_lut = np.array(
             [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
         ).astype("uint8")
+        sld = getattr(self, "_sld_gamma", None)
+        if sld is not None:
+            iv = int(round(self._gamma * 100))
+            if sld.value() != iv:
+                sld.blockSignals(True)
+                sld.setValue(iv)
+                sld.blockSignals(False)
+        if hasattr(self, "_lbl_gamma"):
+            self._lbl_gamma.setText(f"{self._gamma:.2f}")
+
+    def image_correction(self) -> dict:
+        """Snapshot of the current correction as a plain dict (for persistence)."""
+        return {
+            "brightness": int(self._brightness),
+            "contrast": float(self._contrast),
+            "gamma": float(self._gamma),
+        }
+
+    def reset_image_correction(self):
+        """Restore neutral brightness/contrast/gamma (no correction)."""
+        self.set_brightness(0)
+        self.set_contrast(1.0)
+        self.set_gamma(1.0)
 
     @property
     def brightness(self) -> int:
         return self._brightness
 
     @property
+    def contrast(self) -> float:
+        return self._contrast
+
+    @property
     def gamma(self) -> float:
         return self._gamma
+
+    # ── Hardware (camera-side) controls (v7.5.x) ──────────────────
+    # These drive the *camera firmware* via its SDK/driver (ToupCam SDK, or
+    # OpenCV CAP_PROP_* for UVC) — NOT the software post-processing above.
+    # All getters read back FROM the device so a readout can be trusted.
+
+    def hardware_capabilities(self) -> dict:
+        """What the live backend can control, with ranges where known.
+
+        ``controllable`` is False for stopped / simulated cameras. ``controls``
+        maps a control name to ``{"range": (min,max,def) | None}``.
+        """
+        backend = getattr(self, "_backend_type", "opencv")
+        caps = {"source": "none", "controllable": False,
+                "resolution": False, "controls": {}, "device_name": ""}
+        if not self._running:
+            return caps
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            tc = self._toupcam
+            caps.update(source="toupcam", controllable=True, resolution=True,
+                        device_name=getattr(tc, "_device_id", "ToupCam"))
+            caps["controls"] = {
+                "auto_exposure": {"range": None},
+                "exposure_us": {"range": tc.get_exposure_time_range()},
+                "exposure_gain_pct": {"range": tc.get_exposure_gain_range()},
+                "gamma": {"range": tc.HW_RANGES["gamma"]},
+                "brightness": {"range": tc.HW_RANGES["brightness"]},
+                "contrast": {"range": tc.HW_RANGES["contrast"]},
+            }
+        elif backend == "opencv" and self._capture is not None:
+            caps.update(source="opencv", controllable=True, resolution=True,
+                        device_name=f"OpenCV #{self._camera_index}")
+            # UVC ranges are driver-specific and not reliably queryable;
+            # expose generic 0–255 ranges and let the readback show reality.
+            caps["controls"] = {
+                "auto_exposure": {"range": None},
+                "exposure_us": {"range": None},
+                "exposure_gain_pct": {"range": (0, 255, 0)},
+                "gamma": {"range": (0, 255, 128)},
+                "brightness": {"range": (0, 255, 128)},
+                "contrast": {"range": (0, 255, 128)},
+            }
+        elif backend == "simulated":
+            caps["source"] = "simulated"
+        return caps
+
+    def get_hw_settings(self) -> dict:
+        """Read current hardware settings back FROM the device.
+
+        Returns a dict that always carries a ``source`` key
+        (``"toupcam"``/``"opencv"``/``"simulated"``/``"none"``) so a caller can
+        prove whether the values came from the camera or not.
+        """
+        backend = getattr(self, "_backend_type", "opencv")
+        if not self._running:
+            return {"source": "none"}
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            d = self._toupcam.get_settings()
+            d["source"] = "toupcam"
+            return d
+        if backend == "opencv" and self._capture is not None:
+            cap = self._capture
+            try:
+                # UVC/DirectShow returns -1 for properties the driver doesn't
+                # support; surface those as None ("unknown") so the readout
+                # never presents a sentinel as a real device value.
+                def _q(prop):
+                    v = cap.get(prop)
+                    return None if (v is None or v < 0) else v
+                # DirectShow auto-exposure convention: 0.75 = auto, 0.25 =
+                # manual. Anything else (incl. -1 unsupported) = unknown/None,
+                # so bool() can't flip a manual/unsupported cam to "auto".
+                raw_ae = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                auto = (True if raw_ae == 0.75
+                        else (False if raw_ae == 0.25 else None))
+                return {
+                    "source": "opencv",
+                    "device_id": f"index {self._camera_index}",
+                    "brightness": _q(cv2.CAP_PROP_BRIGHTNESS),
+                    "contrast": _q(cv2.CAP_PROP_CONTRAST),
+                    "gamma": _q(cv2.CAP_PROP_GAMMA),
+                    "exposure_us": _q(cv2.CAP_PROP_EXPOSURE),
+                    "exposure_gain_pct": _q(cv2.CAP_PROP_GAIN),
+                    "auto_exposure": auto,
+                    "resolution": (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                                   int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+                    "eSize": None,
+                    "resolutions": [],
+                }
+            except Exception as exc:
+                logger.debug(f"OpenCV get_hw_settings failed: {exc}")
+                return {"source": "opencv", "error": str(exc)}
+        return {"source": backend}
+
+    def set_hw_auto_exposure(self, enabled: bool) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.set_auto_exposure(bool(enabled))
+        if backend == "opencv" and self._capture is not None:
+            # DirectShow: 0.75 = auto, 0.25 = manual.
+            return bool(self._capture.set(
+                cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if enabled else 0.25))
+        return False
+
+    def set_hw_exposure_us(self, microseconds) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.put_exposure_time(microseconds)
+        if backend == "opencv" and self._capture is not None:
+            return bool(self._capture.set(cv2.CAP_PROP_EXPOSURE, microseconds))
+        return False
+
+    def set_hw_exposure_gain(self, percent) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.put_exposure_gain(percent)
+        if backend == "opencv" and self._capture is not None:
+            return bool(self._capture.set(cv2.CAP_PROP_GAIN, percent))
+        return False
+
+    def set_hw_gamma(self, value) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.put_gamma(value)
+        if backend == "opencv" and self._capture is not None:
+            return bool(self._capture.set(cv2.CAP_PROP_GAMMA, value))
+        return False
+
+    def set_hw_brightness(self, value) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.put_brightness(value)
+        if backend == "opencv" and self._capture is not None:
+            return bool(self._capture.set(cv2.CAP_PROP_BRIGHTNESS, value))
+        return False
+
+    def set_hw_contrast(self, value) -> bool:
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            return self._toupcam.put_contrast(value)
+        if backend == "opencv" and self._capture is not None:
+            return bool(self._capture.set(cv2.CAP_PROP_CONTRAST, value))
+        return False
+
+    def set_capture_resolution(self, width: int, height: int):
+        """Reconfigure the *device* capture resolution. Returns actual (w,h).
+
+        ToupCam: maps (w,h) to the nearest supported eSize and restarts the
+        pull-mode stream. OpenCV: sets CAP_PROP_FRAME_WIDTH/HEIGHT. Returns the
+        resolution actually adopted (read back from the device), or None.
+
+        NOTE: changing capture resolution changes the effective µm/px, so any
+        existing pixel-scale calibration for this camera must be redone.
+        """
+        backend = getattr(self, "_backend_type", "opencv")
+        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
+            res = self._toupcam.get_resolution_list()
+            if not res:
+                return None
+            target_area = int(width) * int(height)
+            idx = min(range(len(res)),
+                      key=lambda i: abs(res[i][0] * res[i][1] - target_area))
+            ok = self._toupcam.set_resolution_index(idx)
+            actual = self._toupcam.get_resolution()
+            logger.info(
+                f"{self._camera_label}: capture resolution -> {actual} "
+                f"(eSize {idx}){'' if ok else ' [FAILED]'} — µm/px calibration "
+                f"may need redoing")
+            return actual if ok else None
+        if backend == "opencv" and self._capture is not None:
+            self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+            self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            actual = (int(self._capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                      int(self._capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            logger.info(
+                f"{self._camera_label}: capture resolution -> {actual} — "
+                f"µm/px calibration may need redoing")
+            return actual
+        return None
+
+    def log_hw_settings(self, prefix: str = ""):
+        """Log the device's current hardware settings to the terminal.
+
+        Reads every value back from the camera via getters and prints a
+        labelled block stating the SOURCE, so the operator can confirm the
+        settings come from the camera (not a software default). Returns
+        ``(settings_dict, formatted_text)``.
+        """
+        st = self.get_hw_settings()
+        src = st.get("source", "none")
+        head = f"{prefix}{self._camera_label}: hardware settings — source = {src}"
+        lines = [head]
+        if src in ("toupcam", "opencv"):
+            lines.append(f"  device       : {st.get('device_id', '?')}")
+            lines.append(f"  resolution   : {st.get('resolution')}"
+                         + (f"  (eSize {st.get('eSize')})"
+                            if st.get("eSize") is not None else ""))
+            lines.append(f"  auto-exposure: {st.get('auto_exposure')}")
+            lines.append(f"  exposure     : {st.get('exposure_us')} µs"
+                         + (f"  range={st.get('exposure_range_us')}"
+                            if st.get("exposure_range_us") else ""))
+            lines.append(f"  gain         : {st.get('exposure_gain_pct')} %")
+            lines.append(f"  gamma        : {st.get('gamma')}")
+            lines.append(f"  brightness   : {st.get('brightness')}")
+            lines.append(f"  contrast     : {st.get('contrast')}")
+        else:
+            lines.append(f"  (no controllable camera backend — source={src})")
+        text = "\n".join(lines)
+        logger.info(text)
+        return st, text
 
     # ── Frame Capture ─────────────────────────────────────────────
 
@@ -598,13 +918,19 @@ class CameraWidget(QWidget):
         # v7.3.0: Store raw BGR frame for detection workers (thread-safe)
         with self._frame_lock:
             self._current_frame = frame.copy()
+            self._frame_seq += 1
 
         # Convert BGR -> RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Apply software brightness
-        if self._brightness != 0:
-            rgb = cv2.convertScaleAbs(rgb, alpha=1.0, beta=self._brightness)
+        # Apply software brightness + contrast in one pass.
+        # out = contrast*(in - 128) + 128 + brightness
+        #     = contrast*in + (128 - 128*contrast + brightness)
+        # Contrast pivots on mid-gray (so it doesn't also brighten); reduces to
+        # the legacy brightness-only path when contrast == 1.0.
+        if self._brightness != 0 or abs(self._contrast - 1.0) > 0.01:
+            beta = 128.0 - 128.0 * self._contrast + self._brightness
+            rgb = cv2.convertScaleAbs(rgb, alpha=self._contrast, beta=beta)
 
         # Apply software gamma via LUT
         if self._gamma_lut is not None and abs(self._gamma - 1.0) > 0.01:
@@ -664,13 +990,12 @@ class CameraWidget(QWidget):
 
     def _on_brightness_slider(self, value: int):
         self.set_brightness(value)
-        if hasattr(self, '_lbl_brightness'):
-            self._lbl_brightness.setText(str(value))
+
+    def _on_contrast_slider(self, value: int):
+        self.set_contrast(value / 100.0)
 
     def _on_gamma_slider(self, value: int):
         self.set_gamma(value / 100.0)
-        if hasattr(self, '_lbl_gamma'):
-            self._lbl_gamma.setText(f"{value / 100.0:.2f}")
 
     def _on_fps_spinner(self, value: int):
         self._fps = value
@@ -694,37 +1019,76 @@ class CameraWidget(QWidget):
                 return self._current_frame.copy()
             return None
 
-    def capture_fresh_frame(self):
+    def frame_count_value(self) -> int:
+        """v7.5.x: monotonic count of frames grabbed by the display timer.
+
+        Thread-safe. A worker thread can sample this before/after a stage move
+        and wait for it to advance by N to guarantee N fresh frames have been
+        grabbed (draining any buffered backlog) before reading
+        ``get_current_frame()``.
+        """
+        with self._frame_lock:
+            return self._frame_seq
+
+    def capture_fresh_frame(self, discard_n_frames: int = 0,
+                            settle_ms: int = 0):
         """Capture a fresh frame directly from the camera backend.
 
         Unlike get_current_frame() which returns the last timer-grabbed frame,
         this forces a new read() call. Essential after stage movement to ensure
         the frame content matches the current stage position.
 
+        v7.5.x: optional ``settle_ms`` (sleep first — lets the exposure window /
+        callback advance past the move) and ``discard_n_frames`` (pull+discard
+        buffered frames before returning the final one). On OpenCV this drains
+        the driver's FIFO backlog (back-to-back ``read()`` advances it); on
+        ToupCam the callback fills a single slot, so the settle is what makes
+        the frame post-move and the discard loop adds a small inter-frame gap so
+        a new callback frame can arrive. CAUTION: this touches the backend
+        directly — do NOT call it concurrently with the display grab timer from
+        another thread; for off-thread use prefer ``frame_count_value()`` +
+        ``get_current_frame()``.
+
         Supports OpenCV, ToupCam, and SimulatedCamera backends.
 
         Returns:
             np.ndarray (BGR, uint8) or None
         """
+        if settle_ms and settle_ms > 0:
+            time.sleep(settle_ms / 1000.0)
+
         backend = getattr(self, '_backend_type', 'opencv')
 
-        if backend == 'toupcam':
-            tc = getattr(self, '_toupcam', None)
-            if tc is None or not tc.isOpened():
-                return None
-            ret, frame = tc.read()
-        else:
-            if not self._capture or not self._capture.isOpened():
-                return None
-            # Use read_fresh() if available (SimulatedCamera) for uncached position
-            if hasattr(self._capture, 'read_fresh'):
-                ret, frame = self._capture.read_fresh()
+        def _read_once():
+            if backend == 'toupcam':
+                tc = getattr(self, '_toupcam', None)
+                if tc is None or not tc.isOpened():
+                    return None
+                ret, frame = tc.read()
             else:
-                ret, frame = self._capture.read()
+                if not self._capture or not self._capture.isOpened():
+                    return None
+                # SimulatedCamera exposes read_fresh() for an uncached position.
+                if hasattr(self._capture, 'read_fresh'):
+                    ret, frame = self._capture.read_fresh()
+                else:
+                    ret, frame = self._capture.read()
+            return frame if (ret and frame is not None) else None
 
-        if ret and frame is not None:
-            return frame.copy()
-        return None
+        last = None
+        for _ in range(max(0, int(discard_n_frames))):
+            f = _read_once()
+            if f is not None:
+                last = f
+            # ToupCam returns the same cached frame back-to-back; give the async
+            # callback a moment to deliver a newer one.
+            if backend == 'toupcam':
+                time.sleep(0.02)
+
+        final = _read_once()
+        if final is not None:
+            return final.copy()
+        return last.copy() if last is not None else None
 
     # ── Snapshot ──────────────────────────────────────────────────
 

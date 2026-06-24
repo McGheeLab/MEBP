@@ -174,6 +174,7 @@ class TestBeginClickRim(unittest.TestCase):
                 cam_idx=0, set_overlay_vector=lambda *a, **k: None),
             controller=SimpleNamespace(
                 move_xy_absolute_um=lambda *a, **k: moves.append(a)),
+            _safe_z=None,  # → _ploc_safe_goto falls back to a bare XY move
             _ploc_click_points=[],
             _ploc_confirm_label=SimpleNamespace(
                 setVisible=lambda v: None, setText=lambda t: None),
@@ -185,6 +186,7 @@ class TestBeginClickRim(unittest.TestCase):
         stub._moves = moves
         stub._ploc_update_click_rim_prompt = (
             CalibrationPage._ploc_update_click_rim_prompt.__get__(stub))
+        stub._ploc_safe_goto = CalibrationPage._ploc_safe_goto.__get__(stub)
         return stub
 
     def test_anchors_at_predicted_center_only(self):
@@ -195,6 +197,35 @@ class TestBeginClickRim(unittest.TestCase):
         self.assertEqual(stub._ploc_click_points, [])
         # Exactly one automatic move — to the predicted well center.
         self.assertEqual(stub._moves, [(5000.0, 6000.0)])
+
+
+class TestSafeGoto(unittest.TestCase):
+    """_ploc_safe_goto retracts Z (via safe-travel) before an inter-well XY
+    hop when Safe Z is known, and only does a bare move as a last resort."""
+
+    def test_retracts_via_safe_nav_when_safe_z_set(self):
+        calls = []
+        stub = SimpleNamespace(
+            _safe_z=5.0,
+            _safe_navigate_to=lambda x, y, lower_z=True: calls.append(
+                ("safe", x, y, lower_z)),
+            controller=SimpleNamespace(
+                move_xy_absolute_um=lambda *a: calls.append(("bare",) + a)),
+        )
+        CalibrationPage._ploc_safe_goto(stub, 1000.0, 2000.0)
+        # Routed through safe-travel, staying retracted (lower_z=False).
+        self.assertEqual(calls, [("safe", 1000.0, 2000.0, False)])
+
+    def test_bare_move_when_no_safe_z(self):
+        calls = []
+        stub = SimpleNamespace(
+            _safe_z=None,
+            _safe_navigate_to=lambda *a, **k: calls.append(("safe",)),
+            controller=SimpleNamespace(
+                move_xy_absolute_um=lambda *a: calls.append(("bare",) + a)),
+        )
+        CalibrationPage._ploc_safe_goto(stub, 1000.0, 2000.0)
+        self.assertEqual(calls, [("bare", 1000.0, 2000.0)])
 
 
 @unittest.skipIf(_FIT is None, "opencv/vision helpers unavailable")
@@ -217,6 +248,7 @@ class TestFinalizeFit(unittest.TestCase):
             _plate=SimpleNamespace(well_diameter=6.4),  # r_exp = 3200 µm
             _PLOC_RADIUS_TOL=CalibrationPage._PLOC_RADIUS_TOL,
             _ploc_well_results={},
+            _reference_markers={},
             _ploc_run_idx=0,
             _ploc_live_view=SimpleNamespace(
                 set_overlay_vector=lambda *a, **k: None),
@@ -239,9 +271,17 @@ class TestFinalizeFit(unittest.TestCase):
         gx, gy = stub._ploc_well_results["C3"]
         self.assertAlmostEqual(gx, cx, delta=1.0)
         self.assertAlmostEqual(gy, cy, delta=1.0)
+        # Permanent reference marker recorded at the taught centre.
+        self.assertIn("C3", stub._reference_markers)
+        self.assertAlmostEqual(stub._reference_markers["C3"][0], cx, delta=1.0)
         self.assertEqual(stub._ploc_run_idx, 1)
         self.assertTrue(advanced)
         self.assertEqual(stub._ploc_pause_kind, None)
+
+    def test_rejected_fit_records_no_reference_marker(self):
+        stub, _ = self._stub([(1.0, 2.0), (3.0, 4.0)])  # <3 → no fit
+        CalibrationPage._ploc_finalize_click_rim(stub)
+        self.assertEqual(stub._reference_markers, {})
 
     def test_fewer_than_three_clicks_leaves_uncalibrated(self):
         stub, advanced = self._stub([(1.0, 2.0), (3.0, 4.0)])
@@ -283,6 +323,92 @@ class TestSkipWell(unittest.TestCase):
         self.assertNotIn("B2", stub._ploc_well_results)
         self.assertIsNone(stub._ploc_pause_kind)
         self.assertTrue(advanced)
+
+
+class TestReferenceMarkers(unittest.TestCase):
+    """Taught reference markers convert absolute→zero-ref for the plate view
+    and round-trip through save/load semantics."""
+
+    def test_reference_in_zero_ref_subtracts_zero(self):
+        stub = SimpleNamespace(
+            controller=SimpleNamespace(zero_position={"x": 1000.0, "y": 2000.0}),
+            _reference_markers={"A1": (51000.0, 32000.0),
+                                "H12": (101000.0, 72000.0)},
+        )
+        zr = CalibrationPage._reference_in_zero_ref(stub)
+        self.assertEqual(zr["A1"], (50000.0, 30000.0))
+        self.assertEqual(zr["H12"], (100000.0, 70000.0))
+
+    def test_reference_in_zero_ref_empty_when_none(self):
+        stub = SimpleNamespace(
+            controller=SimpleNamespace(zero_position={"x": 0.0, "y": 0.0}),
+            _reference_markers={},
+        )
+        self.assertEqual(CalibrationPage._reference_in_zero_ref(stub), {})
+
+    def test_persist_round_trip_shape(self):
+        # The save shape is {name: [x, y]}; load coerces back to {name:(x,y)}.
+        markers = {"A1": (51000.0, 32000.0)}
+        saved = {n: [x, y] for n, (x, y) in markers.items()}
+        restored = {}
+        for n, xy in saved.items():
+            restored[str(n)] = (float(xy[0]), float(xy[1]))
+        self.assertEqual(restored, markers)
+
+
+class TestFitSanityCheck(unittest.TestCase):
+    """_warp_is_plausible rejects degenerate fits (wild linear part) that would
+    send the stage to a wrong extreme (the 'stage drove off' report), while
+    allowing a legitimate large translation (the plate can sit anywhere in
+    travel, and may be larger than the travel)."""
+
+    def _stub(self):
+        return SimpleNamespace(
+            _FIT_MIN_SCALE=CalibrationPage._FIT_MIN_SCALE,
+            _FIT_MAX_SCALE=CalibrationPage._FIT_MAX_SCALE,
+            _FIT_MAX_ROTATION_DEG=CalibrationPage._FIT_MAX_ROTATION_DEG,
+        )
+
+    @staticmethod
+    def _warp(pairs):
+        from SupportClasses.PlateWarpCalibrator import PlateWarpCalibrator
+        w = PlateWarpCalibrator()
+        for (px, py), (mx, my) in pairs:
+            w.add_point(px, py, mx, my)
+        w.solve()
+        return w
+
+    # Non-collinear predicted control triangle.
+    _PRED = [(50000.0, 30000.0), (60000.0, 30000.0), (50000.0, 40000.0)]
+
+    def test_accepts_near_identity_fit(self):
+        warp = self._warp([(p, (p[0] + 50.0, p[1] - 30.0)) for p in self._PRED])
+        ok, why = CalibrationPage._warp_is_plausible(self._stub(), warp)
+        self.assertTrue(ok, why)
+
+    def test_accepts_large_translation(self):
+        # Identity linear + big shift (plate sits far from the seed) → fine.
+        warp = self._warp([(p, (p[0] + 40000.0, p[1] - 25000.0))
+                           for p in self._PRED])
+        ok, why = CalibrationPage._warp_is_plausible(self._stub(), warp)
+        self.assertTrue(ok, why)
+
+    def test_rejects_anisotropic_scale(self):
+        # One axis stretched 3× → max singular value ≈ 3.
+        warp = self._warp([(p, (p[0] * 3.0, p[1])) for p in self._PRED])
+        ok, why = CalibrationPage._warp_is_plausible(self._stub(), warp)
+        self.assertFalse(ok)
+        self.assertIn("scale", why)
+
+    def test_rejects_large_rotation(self):
+        import math as _m
+        a = _m.radians(45.0)
+        c, s_ = _m.cos(a), _m.sin(a)
+        warp = self._warp([(p, (p[0] * c - p[1] * s_, p[0] * s_ + p[1] * c))
+                           for p in self._PRED])
+        ok, why = CalibrationPage._warp_is_plausible(self._stub(), warp)
+        self.assertFalse(ok)
+        self.assertIn("rotation", why)
 
 
 class TestModeToggle(unittest.TestCase):

@@ -2077,10 +2077,11 @@ class PrintObjectsTab(QWidget):
         # CSV import: use pre-loaded trajectory directly (skip GeometryEngine)
         if is_csv:
             csv_data = params.get("_csv_data")
-            if csv_data is None and "source_file" in params:
+            csv_src = params.get("source_file") or params.get("csv_path")
+            if csv_data is None and csv_src:
                 try:
                     from SupportClasses.TrajectoryPlanner import import_csv_trajectory
-                    csv_data = import_csv_trajectory(params["source_file"])
+                    csv_data = import_csv_trajectory(csv_src)
                 except Exception as e:
                     logger.error(f"Failed to load CSV trajectory for '{name}': {e}")
             if csv_data is not None and HAS_NUMPY:

@@ -643,7 +643,7 @@ class PrintSetupPage(QWidget):
 
         self._swap_checks = {}
         swap_steps = [
-            ("waste", "Waste (expel remaining ink)"),
+            ("waste", "Waste (dispense remaining ink)"),
             ("wash_pre", "Wash (pre-buffer rinse)"),
             ("buffer", "Buffer flush"),
             ("wash_post", "Wash (post-buffer rinse)"),
@@ -818,7 +818,7 @@ class PrintSetupPage(QWidget):
         clean_lay.setSpacing(_sc(7))
         self._cleanup_grp = clean_grp
 
-        self._cleanup_waste_cb = QCheckBox("Waste (eject remaining)")
+        self._cleanup_waste_cb = QCheckBox("Waste (dispense remaining)")
         self._cleanup_waste_cb.setChecked(True)
         clean_lay.addWidget(self._cleanup_waste_cb)
 
@@ -1223,6 +1223,10 @@ class PrintSetupPage(QWidget):
         # v7.5.x: stamp the reference-vector up-direction so layer build-up and
         # per-well dispense Z step the correct way on either Z polarity.
         s.z_up_sign = self._print_z_dir()
+        # v7.5.x: stamp the per-machine plate orientation so any GEOMETRIC well
+        # centre resolved at execution time maps to the physically-correct well.
+        if hasattr(self.controller, "plate_axis_sign"):
+            s.plate_axis_sign = self.controller.plate_axis_sign()
         s.travel_z_height = self.travel_z_spin.value()
         s.settle_delay = self.settle_spin.value()
 
@@ -1380,14 +1384,22 @@ class PrintSetupPage(QWidget):
             logger.warning("No print wells assigned")
             return None
 
-        # 3. Build well_positions: list of (name, x_mm, y_mm)
+        # 3. Build well_positions: list of (name, x_mm, y_mm).
+        # get_well_position returns a PLATE-LOCAL (A1-relative mm) offset; map
+        # it onto the stage axes with the per-machine sign so the print lands
+        # on the physically-correct well on a 180°-mounted stage (ME3B V1).
+        try:
+            _s = self.controller.plate_axis_sign()
+            sx, sy = float(_s[0]), float(_s[1])
+        except Exception:
+            sx, sy = 1.0, 1.0
         well_positions = []
         for name in print_wells:
             try:
                 x, y = plate.get_well_position(name)
             except Exception:
                 x, y = 0.0, 0.0
-            well_positions.append((name, x, y))
+            well_positions.append((name, sx * x, sy * y))
 
         # 4. Get path points from Tab 2 objects
         path_points = self._get_path_from_objects()
@@ -1526,10 +1538,11 @@ class PrintSetupPage(QWidget):
         # CSV import: extract XY from stored trajectory data
         if obj_type == 'csv_import':
             csv_data = obj_data.get('_csv_data') if isinstance(obj_data, dict) else None
-            if csv_data is None and 'source_file' in params:
+            csv_src = params.get('source_file') or params.get('csv_path')
+            if csv_data is None and csv_src:
                 try:
                     from SupportClasses.TrajectoryPlanner import import_csv_trajectory
-                    csv_data = import_csv_trajectory(params['source_file'])
+                    csv_data = import_csv_trajectory(csv_src)
                 except Exception as e:
                     logger.warning(f"Failed to load CSV for path extraction: {e}")
                     return [(0.0, 0.0)]

@@ -99,7 +99,7 @@ class InkSwapStrategy:
 
     Full sequence: waste -> wash -> buffer -> wash -> ink_load -> wash -> print
     """
-    waste: bool = True          # Expel remaining ink to waste reservoir
+    waste: bool = True          # Dispense remaining ink to waste reservoir
     wash_pre: bool = True       # Wash line before buffer
     buffer: bool = True         # Flush with buffer solution
     wash_post: bool = True      # Wash line after buffer
@@ -292,7 +292,7 @@ class XYTravelConfig:
 class FinalCleanupConfig:
     """Configuration for the end-of-print cleanup sequence."""
     enabled: bool = True
-    do_waste: bool = True       # Eject remaining ink to waste
+    do_waste: bool = True       # Dispense remaining ink to waste
     do_wash: bool = True        # Wash needle after final waste
     do_dry_run: bool = False    # Run pump forward to clear residual
     wash_cycles: int = 3
@@ -1263,8 +1263,25 @@ def validate_well_setup(hw_config, well_model, plan=None):
 # v7.2.6: Plan -> PrintCommand Execution Bridge
 # ═══════════════════════════════════════════════════════════════════
 
+def _signed_well_xy(plate, name, settings):
+    """v7.5.x: plate-local well centre (A1-relative mm) mapped onto stage axes
+    via the per-machine ``settings.plate_axis_sign`` so a GEOMETRIC well centre
+    reaches the physically-correct well on a 180°-mounted stage (ME3B V1)."""
+    wx, wy = plate.get_well_position(name)
+    try:
+        _s = getattr(settings, "plate_axis_sign", (1.0, 1.0))
+        sx, sy = float(_s[0]), float(_s[1])
+    except Exception:
+        sx, sy = 1.0, 1.0
+    return (sx * wx, sy * wy)
+
+
 def _find_service_well(well_model, plate, role_value: str):
-    """Find first well with given role. Returns (name, x, y) or None."""
+    """Find first well with given role. Returns (name, x, y) or None.
+
+    NOTE: x, y are PLATE-LOCAL (A1-relative mm). Callers that turn these into
+    a stage move must map them with the per-machine sign — re-resolve via
+    :func:`_signed_well_xy` (the raw return is kept for back-compat)."""
     if well_model is None or plate is None:
         return None
     assignments = getattr(well_model, 'assignments', {})
@@ -1280,18 +1297,19 @@ def _find_service_well(well_model, plate, role_value: str):
 
 
 def _waste_commands(step, well_model, plate, settings):
-    """Generate waste ejection commands using settings feedrates."""
+    """Generate waste-dispense commands using settings feedrates."""
     from SupportClasses.PrintManager import PrintCommand, CommandType
     well = _find_service_well(well_model, plate, "waste")
     if not well:
         return [PrintCommand(
             type=CommandType.COMMENT, label="SKIP: No waste well")]
     name, x, y = well
+    x, y = _signed_well_xy(plate, name, settings)  # map plate-local → stage axes
     pump = (step.pump_id
             or getattr(settings, 'active_pump', 'P1') or 'P1')
     z_fr = getattr(settings, 'z_feedrate', 60.0)
     p_fr = getattr(settings, 'pump_feedrate', 30.0)
-    eject_vol = 5.0
+    dispense_vol = 5.0
     return [
         PrintCommand(type=CommandType.COMMENT,
                      label=f"== Waste: {name} =="),
@@ -1304,10 +1322,10 @@ def _waste_commands(step, well_model, plate, settings):
         PrintCommand(type=CommandType.TRAVEL_DOWN,
                      params={"feedrate": z_fr},
                      label="Lower to waste depth"),
-        PrintCommand(type=CommandType.EXTRUDE,
-                     params={"pump": pump, "amount": eject_vol,
+        PrintCommand(type=CommandType.DISPENSE,
+                     params={"pump": pump, "amount": dispense_vol,
                              "feedrate": p_fr},
-                     label=f"Eject {eject_vol:.1f} into waste"),
+                     label=f"Dispense {dispense_vol:.1f} into waste"),
         PrintCommand(type=CommandType.DWELL,
                      params={"seconds": 0.5}, label="Settle"),
         PrintCommand(type=CommandType.TRAVEL_UP,
@@ -1324,6 +1342,7 @@ def _wash_commands(step, well_model, plate, settings):
         return [PrintCommand(
             type=CommandType.COMMENT, label="SKIP: No wash well")]
     name, x, y = well
+    x, y = _signed_well_xy(plate, name, settings)  # map plate-local → stage axes
     z_fr = getattr(settings, 'z_feedrate', 60.0)
     return [
         PrintCommand(type=CommandType.COMMENT,
@@ -1353,6 +1372,7 @@ def _buffer_commands(step, well_model, plate, settings):
         return [PrintCommand(
             type=CommandType.COMMENT, label="SKIP: No buffer well")]
     name, x, y = well
+    x, y = _signed_well_xy(plate, name, settings)  # map plate-local → stage axes
     pump = (step.pump_id
             or getattr(settings, 'active_pump', 'P1') or 'P1')
     z_fr = getattr(settings, 'z_feedrate', 60.0)
@@ -1368,7 +1388,7 @@ def _buffer_commands(step, well_model, plate, settings):
         PrintCommand(type=CommandType.TRAVEL_DOWN,
                      params={"feedrate": z_fr},
                      label="Lower into buffer"),
-        PrintCommand(type=CommandType.EXTRUDE,
+        PrintCommand(type=CommandType.DISPENSE,
                      params={"pump": pump, "amount": -5.0,
                              "feedrate": p_fr},
                      label="Aspirate buffer"),
@@ -1388,6 +1408,7 @@ def _load_ink_commands(step, well_model, plate, settings):
         return [PrintCommand(
             type=CommandType.COMMENT, label="SKIP: No ink well")]
     name, x, y = well
+    x, y = _signed_well_xy(plate, name, settings)  # map plate-local → stage axes
     pump = (step.pump_id
             or getattr(settings, 'active_pump', 'P1') or 'P1')
     z_fr = getattr(settings, 'z_feedrate', 60.0)
@@ -1406,7 +1427,7 @@ def _load_ink_commands(step, well_model, plate, settings):
         PrintCommand(type=CommandType.TRAVEL_DOWN,
                      params={"feedrate": z_fr},
                      label="Lower into ink"),
-        PrintCommand(type=CommandType.EXTRUDE,
+        PrintCommand(type=CommandType.DISPENSE,
                      params={"pump": pump, "amount": -volume,
                              "feedrate": p_fr},
                      label=f"Aspirate {volume:.1f}uL {ink_name}"),
@@ -1481,7 +1502,7 @@ def plan_to_commands(plan, well_model, plate, path_points, settings,
             # Fast XY travel -- resolve well position
             if step.target_wells:
                 try:
-                    x, y = plate.get_well_position(step.target_wells[0])
+                    x, y = _signed_well_xy(plate, step.target_wells[0], settings)
                     all_commands.append(PrintCommand(
                         type=CommandType.MOVE_XY,
                         params={"x": x, "y": y},
@@ -1521,7 +1542,7 @@ def plan_to_commands(plan, well_model, plate, path_points, settings,
             well_positions = []
             for wn in target_wells:
                 try:
-                    x, y = plate.get_well_position(wn)
+                    x, y = _signed_well_xy(plate, wn, settings)
                     well_positions.append((wn, x, y))
                 except Exception:
                     continue

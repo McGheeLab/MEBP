@@ -235,7 +235,21 @@ class XYStageManager:
             if self.simulate:
                 self.spo.stop()
             else:
-                self.spo.close()
+                # v7.5.x CRASH FIX (twin of ZPStage.stop): serialize close()
+                # against any in-flight read under _serial_lock. stop() is
+                # called from the watchdog / poller thread on a disconnect,
+                # while another thread (poller, or the Stress Test's concurrent
+                # XY oscillator → position reads) may be mid-read on this port.
+                # Closing a USB-serial handle mid-read is a hard crash on
+                # Windows. Bounded acquire so shutdown can't deadlock on a
+                # wedged read (Prior reads self-time-out), then close regardless.
+                lock = getattr(self, "_serial_lock", None)
+                got = lock.acquire(timeout=5.0) if lock is not None else False
+                try:
+                    self.spo.close()
+                finally:
+                    if got and lock is not None:
+                        lock.release()
         except Exception as e:
             logger.warning(f"Error closing XY stage: {e}")
         logger.info("XY stage stopped")
@@ -689,6 +703,49 @@ class XYStageManager:
 
     # ── Stage Settings (P8.19, P8.20) ────────────────────────────
 
+    def _max_speed_um_s(self) -> float:
+        """The stage's TRUE top speed (µm/s) at 100% SMS — the denominator for
+        the mm/s ↔ SMS-% conversion.
+
+        v7.5.x BUGFIX: this used to read ``_protocol_max_speed_um_s``, which is
+        set ONLY in the simulator branch — so on real hardware the conversion
+        silently fell back to a hardcoded 50000 µm/s (XYStage.py), making e.g.
+        ``set_speed_mm_s(1.0)`` send ``SMS,2`` against a 50 mm/s assumption that
+        was never sourced from the real stage. Now resolve, in priority order:
+          1. a measured/configured per-machine override (``set_max_speed_um_s``),
+          2. the sim override (``_protocol_max_speed_um_s``, sim only),
+          3. the loaded protocol's ``parameters.max_speed``,
+          4. a 50000 µm/s last resort (logged once).
+        The conversion is only CORRECT once (1) or (3) reflects the real stage —
+        confirm/measure it; 50000 is an unverified guess.
+        """
+        for attr in ("_max_speed_override_um_s", "_protocol_max_speed_um_s"):
+            v = getattr(self, attr, None)
+            if v:
+                return float(v)
+        try:
+            ms = self._protocol._config.get("parameters", {}).get("max_speed")
+            if ms:
+                return float(ms)
+        except Exception:
+            pass
+        if not getattr(self, "_warned_default_max_speed", False):
+            self._warned_default_max_speed = True
+            logger.warning(
+                "XY top speed unknown (no per-machine override and no protocol "
+                "'max_speed') — mm/s↔SMS%% conversion uses the 50000 µm/s "
+                "default, which is an UNVERIFIED guess. Measure/set the real "
+                "stage top speed or moves will run at the wrong speed.")
+        return 50000.0
+
+    def set_max_speed_um_s(self, value_um_s: float) -> None:
+        """Set the measured/known true top speed (µm/s at 100% SMS) for this
+        machine, so the mm/s↔SMS-% conversion is correct. Persisted by the
+        caller (e.g. the device profile)."""
+        self._max_speed_override_um_s = float(value_um_s)
+        logger.info("XY top speed set to %.0f µm/s (%.1f mm/s) — mm/s↔SMS%% "
+                    "conversion now uses this.", value_um_s, value_um_s / 1000.0)
+
     def set_velocity(self, velocity: int) -> None:
         """v7.2.7: SMS percentage — Set max stage velocity.
 
@@ -700,7 +757,7 @@ class XYStageManager:
         """
         if velocity > 100:
             # Caller sent µm/s — convert to percentage
-            max_speed = getattr(self, '_protocol_max_speed_um_s', 50000)
+            max_speed = self._max_speed_um_s()
             pct = max(1, min(100, int(velocity / max_speed * 100)))
             logger.debug(f"set_velocity: {velocity} µm/s → SMS {pct}%")
         else:
@@ -720,11 +777,11 @@ class XYStageManager:
         Args:
             speed_mm_s: Desired speed in mm/s (e.g., 1.0, 5.0, 50.0)
         """
-        max_speed_um_s = getattr(self, '_protocol_max_speed_um_s', 50000)
+        max_speed_um_s = self._max_speed_um_s()
         speed_um_s = speed_mm_s * 1000.0
-        pct = max(1, min(100, int(speed_um_s / max_speed_um_s * 100)))
+        pct = max(1, min(100, int(round(speed_um_s / max_speed_um_s * 100))))
         logger.info(f"set_speed_mm_s: {speed_mm_s:.1f} mm/s = {speed_um_s:.0f} µm/s "
-                    f"= SMS {pct}% (max={max_speed_um_s} µm/s)")
+                    f"= SMS {pct}% (max={max_speed_um_s:.0f} µm/s)")
         self._send_protocol_command(
             "set_max_speed",
             fallback_cmd=f"SMS,{pct}",

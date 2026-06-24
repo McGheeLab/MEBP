@@ -147,7 +147,9 @@ audit run output; fix proposals consolidated in the plan below.)
 ### Medium
 - **GEO-3** `quick_print_workflow.py:501-504` — multi-object prints
   concatenate into one PRINT_PATH; inter-object jumps are extruded at print
-  Z with no lift/settle.
+  Z with no lift/settle. **✅ FIXED** (`MEBP_v75x_MULTI_OBJECT_PRINT_SEAM.md`,
+  Jun 2026) — confirmed on hardware via the PIAR.json log; one PRINT_PATH per
+  object + lift→travel→lower between them; worst in-path jump 4.288→0.197 mm.
 - **GEO-4** `quick_print_workflow.py:435-479` — blind XY extraction: csv/
   sketch travel rows print; Z-stacks flatten; pixel-unit CSVs command
   meter-scale offsets.

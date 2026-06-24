@@ -213,6 +213,9 @@ class TestJobBuilding(_Base):
         page = self._make_page()
         page._safe_z = 7.5
         page._flow_spin.setValue(0.4)
+        # v7.5.x: print-speed % scales BOTH speed and flow. At 100% the Flow
+        # knob passes straight through to the pump rate.
+        page._speed_pct_spin.setValue(100)
         page._printz_spin.setValue(0.2)
         # v7.5.x: the print-Z spin is now a height above the plate bottom,
         # resolved via the controller. Uncalibrated (None) → the height passes

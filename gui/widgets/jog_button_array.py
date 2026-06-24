@@ -12,7 +12,8 @@ v7.4.2: redesigned layout per user direction.
     P3▼, so each pump reads as a single vertical column.
 
 Signals emitted: ``jog_xy_requested(dx_um, dy_um)``,
-``jog_z_requested(dz_mm)``, ``jog_pump_requested(pump_id, dist)``,
+``jog_z_requested(dz_mm)`` (height frame, + = up — route through
+``move_z_user_relative``), ``jog_pump_requested(pump_id, dist)``,
 ``home_requested()``. Parent wires them to the controller.
 """
 
@@ -197,7 +198,10 @@ class JogButtonArray(QWidget):
 
     Signals:
         jog_xy_requested(float, float): (dx_um, dy_um) relative XY move.
-        jog_z_requested(float): dz_mm relative Z move.
+        jog_z_requested(float): dz_mm relative Z move in the HEIGHT frame
+            (+ = up, toward the taught Top). v7.5.x: consumers must convert to
+            a raw move via StageController.move_z_user_relative (z_up_sign), NOT
+            pass it straight to move_z_relative.
         jog_pump_requested(str, float): (pump_id, distance_uL) pump move.
         home_requested(): Move-to-zero requested.
     """
@@ -208,10 +212,16 @@ class JogButtonArray(QWidget):
     home_requested = Signal()
 
     def __init__(self, compact: bool = False, show_pumps: bool = False,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *,
+                 pump_action_labels: bool = False):
         super().__init__(parent)
         self._compact = compact
         self._show_pumps = show_pumps
+        # v7.5.x: when True the pump buttons read ASPIRATE (top, draw fluid in →
+        # raises fill) / DISPENSE (bottom, push fluid out → lowers fill) instead
+        # of the ▲/▼ extend/retract arrows. Used on every jog SIDE panel; the
+        # Hardware Setup page keeps the raw extend/retract arrows (False).
+        self._pump_action_labels = pump_action_labels
         # Whether the pump axis is in µL mode (display unit). Step
         # magnitudes are always 1/10/100/1000/10000 of the native unit.
         self._pump_step_is_uL = True
@@ -300,22 +310,35 @@ class JogButtonArray(QWidget):
         controls.addWidget(btn_down, 2, 1)
 
         # Z column (col 3) — stacked up/down beside the XY pad.
+        # v7.5.x: emit a HEIGHT-frame delta (+ = up, toward the taught Top).
+        # Z▲ = +1, Z▼ = −1. Consumers convert to a raw move via
+        # StageController.move_z_user_relative (z_up_sign), so direction is
+        # machine-independent — "up" always retracts the needle.
         btn_z_up = self._dir_btn("Z ▲", btn_size)
         btn_z_up.setToolTip("Move Z up")
-        btn_z_up.clicked.connect(partial(self._on_z, -1))
+        btn_z_up.clicked.connect(partial(self._on_z, 1))
         controls.addWidget(btn_z_up, 0, 3)
 
         btn_z_down = self._dir_btn("Z ▼", btn_size)
         btn_z_down.setToolTip("Move Z down")
-        btn_z_down.clicked.connect(partial(self._on_z, 1))
+        btn_z_down.clicked.connect(partial(self._on_z, -1))
         controls.addWidget(btn_z_down, 2, 3)
 
         layout.addLayout(controls)
 
-        # ── Pump columns (P1▲/▼, P2▲/▼, P3▲/▼) — each pump stacked ─
+        # ── Pump columns — each pump stacked vertically ────────────────
         # v7.4.2: pump buttons live in a wider, centered grid so each
         # column is a clearly clickable target on a wide context pane.
-        if self._show_pumps:
+        # v7.5.x: two layouts —
+        #   * action labels (side panels): ASPIRATE (top, draw in → fill up,
+        #     emits −) / DISPENSE (bottom, push out → fill down, emits +).
+        #   * arrows (Hardware Setup): P{n}▲ extend (+) / P{n}▼ retract (−).
+        # The emitted sign convention is unchanged (+ = dispense, − = aspirate,
+        # see StageController.move_pump_uL); only which button carries which
+        # sign + the label differ.
+        if self._show_pumps and self._pump_action_labels:
+            self._build_pump_action_columns(layout, btn_size)
+        elif self._show_pumps:
             pump_btn_w = max(btn_size, _sc(56))
             pump_row = QHBoxLayout()
             pump_row.setSpacing(_sc(10))
@@ -339,6 +362,67 @@ class JogButtonArray(QWidget):
                 self._pump_buttons[pump_id] = (btn_ext, btn_ret)
             pump_row.addStretch(1)  # center horizontally
             layout.addLayout(pump_row)
+
+    def _build_pump_action_columns(self, layout, btn_size: int) -> None:
+        """v7.5.x: ASPIRATE / DISPENSE pump columns for the jog side panels.
+
+        Per pump: a small ``P{n}`` header, then an ASPIRATE button (draws fluid
+        IN → raises the syringe fill; emits a NEGATIVE step) above a DISPENSE
+        button (pushes fluid OUT → lowers fill; emits a POSITIVE step). The
+        emitted (pump, distance) sign matches StageController's convention so
+        consumers are unchanged.
+        """
+        pump_btn_w = max(btn_size, _sc(82))   # wide enough for the word labels
+        pump_row = QHBoxLayout()
+        pump_row.setSpacing(_sc(10))
+        pump_row.addStretch(1)
+        self._pump_buttons = {}
+        for pump_id in ("P1", "P2", "P3"):
+            col = QVBoxLayout()
+            col.setSpacing(_sc(4))
+            col.setContentsMargins(0, 0, 0, 0)
+            head = QLabel(pump_id)
+            head.setAlignment(Qt.AlignCenter)
+            head.setStyleSheet(
+                f"color: {_FG_MUTED}; font-weight: 700; "
+                f"font-size: {_sf(9.5)}pt;")
+            col.addWidget(head)
+            btn_asp = self._action_btn("Aspirate", pump_btn_w, btn_size)
+            btn_asp.setToolTip(
+                f"Aspirate {pump_id} — draw fluid IN (raises the syringe fill)")
+            btn_asp.clicked.connect(partial(self._on_pump, pump_id, -1))
+            col.addWidget(btn_asp)
+            btn_disp = self._action_btn("Dispense", pump_btn_w, btn_size)
+            btn_disp.setToolTip(
+                f"Dispense {pump_id} — push fluid OUT (lowers the syringe fill)")
+            btn_disp.clicked.connect(partial(self._on_pump, pump_id, 1))
+            col.addWidget(btn_disp)
+            pump_row.addLayout(col)
+            # (aspirate, dispense) — keep the dict shape useful to callers.
+            self._pump_buttons[pump_id] = (btn_asp, btn_disp)
+        pump_row.addStretch(1)
+        layout.addLayout(pump_row)
+
+    def _action_btn(self, text: str, width: int, btn_size: int) -> QPushButton:
+        """A wide, non-square jog button (fits a word label like 'Dispense')."""
+        btn = QPushButton(text)
+        btn.setFixedHeight(btn_size)
+        btn.setMinimumWidth(width)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background-color: {_BG};"
+            f"  border: 1px solid {_BG_HOVER};"
+            f"  border-radius: 6px;"
+            f"  color: {_FG};"
+            f"  font-weight: 600;"
+            f"  font-size: {_sf(9.5)}pt;"
+            f"  padding: 0 6px;"
+            f"}}"
+            f"QPushButton:hover {{ background-color: {_BG_HOVER}; }}"
+            f"QPushButton:pressed {{ background-color: {_BG_ACTIVE}; }}"
+        )
+        return btn
 
     def _dir_btn(self, text: str, btn_size: int) -> QPushButton:
         btn = QPushButton(text)

@@ -154,10 +154,14 @@ class TestRecordLimitZBranch(unittest.TestCase):
             def setValue(self, x):
                 self.v = x
 
+        # v7.5.x: _record_limit now converts via the controller's unified
+        # user frame raw_to_user_z = z_up_sign·(raw − zero). Emulate ME3B
+        # (z_up_sign=-1, zero=0): raw -60 → user +60, raw 0 → 0.
         page = SimpleNamespace(
             _controller=SimpleNamespace(
                 get_xy_position=lambda cached=False: (None, None, None),
                 get_zp_position=lambda cached=False: (0, 0, raw_z, 0),
+                raw_to_user_z=lambda raw: -1.0 * (raw - 0.0),
             ),
             _logical_zp_value=lambda zp, a: raw_z,
             spin_z_min=_Spin(),
@@ -165,6 +169,8 @@ class TestRecordLimitZBranch(unittest.TestCase):
             _update_position_displays=lambda xy, zp: None,
             lbl_jog_status=SimpleNamespace(setText=lambda *_: None),
         )
+        # Bind the real helper so the real conversion path is exercised.
+        page._z_raw_to_user = StageHardwarePanel._z_raw_to_user.__get__(page)
         StageHardwarePanel._record_limit(page, "Z", which)
         return page
 

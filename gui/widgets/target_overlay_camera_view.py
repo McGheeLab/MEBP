@@ -35,7 +35,12 @@ class TargetOverlayCameraView(CameraFeedView):
     def __init__(self, camera_manager=None, cam_idx: int = 0,
                  show_crosshair: bool = True, label: str = "",
                  parent=None):
-        super().__init__(camera_manager, cam_idx, show_crosshair, label, parent)
+        # Forward by KEYWORD: the base signature now has `enable_settings`
+        # before `parent`, so positional forwarding would bind `parent` to
+        # `enable_settings`. Pick/place overlays don't want the HW-settings gear.
+        super().__init__(camera_manager=camera_manager, cam_idx=cam_idx,
+                         show_crosshair=show_crosshair, label=label,
+                         enable_settings=False, parent=parent)
         self._targets: list[PickPlaceTarget] = []
         self._stage_x_um: float = 0.0
         self._stage_y_um: float = 0.0

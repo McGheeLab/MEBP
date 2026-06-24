@@ -318,10 +318,24 @@ class SimulatedCamera:
 
         return frame
 
+    def _plate_axis_sign(self) -> tuple[float, float]:
+        """v7.5.x: per-machine plate-local→stage axis sign, mirrored from the
+        controller so the simulated plate faithfully reflects the machine
+        orientation (anti-aligned on ME3B V1) and stays consistent with the
+        calibration page's geometric prediction. Defaults to ``(1, 1)``."""
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "plate_axis_sign"):
+            try:
+                return ctrl.plate_axis_sign()
+            except Exception:
+                pass
+        return (1.0, 1.0)
+
     def _draw_wells(self, frame: np.ndarray) -> None:
         """Draw all visible wells onto the frame as red holes in the plate."""
         plate = self._plate
         ox, oy = self._plate_origin_um
+        sx, sy = self._plate_axis_sign()
 
         # FOV bounds in world µm (with margin for partially visible wells)
         half_w = self._fov_w_um / 2.0
@@ -335,9 +349,11 @@ class SimulatedCamera:
         well_radius_px = self._um_to_px(well_radius_um)
 
         for well in plate.get_all_wells():
-            # Well absolute position in µm
-            wx_um = ox + well.x * 1000.0
-            wy_um = oy + well.y * 1000.0
+            # Well absolute position in µm (plate-local offset mapped onto
+            # stage axes via the per-machine sign — matches the calibration
+            # prediction in WellPlate.get_all_positions_from_a1).
+            wx_um = ox + sx * well.x * 1000.0
+            wy_um = oy + sy * well.y * 1000.0
 
             # Bounds check: skip wells that can't overlap the FOV
             if (wx_um + well_radius_um < fov_left or

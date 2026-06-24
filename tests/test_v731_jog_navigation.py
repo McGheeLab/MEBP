@@ -14,6 +14,7 @@ Tests cover:
 import math
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 from SupportClasses.WellPlate import WellPlate
@@ -222,12 +223,36 @@ class TestSafeTravelTo(unittest.TestCase):
             15.0, from_zero_ref=True, feedrate_mm_min=ctrl._zp_retract_feedrate))
 
     def test_xy_only(self):
-        """With no ZP connected, only XY move happens."""
+        """No ZP and NO needle configured → XY move still happens (true XY-only
+        rig, nothing to drag)."""
         ctrl = self._make_controller(zp_connected=False)
         ctrl.safe_travel_to(5000.0, 10000.0, safe_z_mm=15.0, target_z_mm=5.0)
 
         ctrl.move_z_absolute.assert_not_called()
         ctrl.move_xy_absolute.assert_called_once()
+
+    def test_refuses_xy_when_needle_present_but_zp_down(self):
+        """v7.5.x SAFETY: if the ZP board dropped (a needle exists) but XY is
+        still connected, safe_travel_to must NOT drive XY unretracted — it
+        returns False and issues no XY move (would otherwise drag the needle)."""
+        ctrl = self._make_controller(zp_connected=False)
+        # A needle exists this session (board dropped). Either signal suffices.
+        ctrl._zp_ever_connected = True
+        ok = ctrl.safe_travel_to(5000.0, 10000.0, safe_z_mm=15.0, target_z_mm=5.0)
+
+        self.assertFalse(ok)
+        ctrl.move_z_absolute.assert_not_called()
+        ctrl.move_xy_absolute.assert_not_called()
+
+    def test_refuses_xy_when_pumps_configured_but_zp_down(self):
+        """Same guard via the hardware-config signal (pumps configured = the
+        machine has a needle), even if ZP never connected this session."""
+        ctrl = self._make_controller(zp_connected=False)
+        ctrl._hardware_config = SimpleNamespace(pumps={"P1": object()})
+        ok = ctrl.safe_travel_to(5000.0, 10000.0, safe_z_mm=15.0, target_z_mm=5.0)
+
+        self.assertFalse(ok)
+        ctrl.move_xy_absolute.assert_not_called()
 
     def test_zp_only(self):
         """With no XY connected, only Z moves happen."""

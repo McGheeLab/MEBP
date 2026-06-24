@@ -246,7 +246,7 @@ class TestPlanToCommands(unittest.TestCase):
         self.assertIn(CommandType.TRAVEL_UP, cmd_types)
         self.assertIn(CommandType.MOVE_XY, cmd_types)
         # Should have EXTRUDE for ink loading (negative = aspirate)
-        extrude_cmds = [c for c in job.commands if c.type == CommandType.EXTRUDE]
+        extrude_cmds = [c for c in job.commands if c.type == CommandType.DISPENSE]
         self.assertGreater(len(extrude_cmds), 0)
 
     def test_missing_service_well_produces_comment(self):

@@ -1,9 +1,10 @@
 {
-  "_description": "Starter ink library loaded by OnboardingWizard if user has no inks (v7.4.0-c). Five common bioprinting materials with reasonable defaults — users can edit/delete after first run.",
+  "_description": "Starter ink library loaded by OnboardingWizard if user has no inks (v7.4.0-c; v7.5.x well-type+subtype scheme). Well type drives behavior (ink/wash/buffer/waste/oil); ink_subtype is informational and only used for the printable 'ink' type. Users can edit/delete after first run.",
   "inks": {
     "PBS": {
       "name": "PBS",
       "ink_type": "buffer",
+      "ink_subtype": "",
       "viscosity_cP": 1.0,
       "granule_diameter_um": 0.0,
       "cell_diameter_um": 0.0,
@@ -12,7 +13,8 @@
     },
     "Alginate 2%": {
       "name": "Alginate 2%",
-      "ink_type": "hydrogel",
+      "ink_type": "ink",
+      "ink_subtype": "hydrogel monomer",
       "viscosity_cP": 250.0,
       "granule_diameter_um": 0.0,
       "cell_diameter_um": 0.0,
@@ -21,7 +23,8 @@
     },
     "GelMA": {
       "name": "GelMA",
-      "ink_type": "hydrogel",
+      "ink_type": "ink",
+      "ink_subtype": "hydrogel monomer",
       "viscosity_cP": 500.0,
       "granule_diameter_um": 0.0,
       "cell_diameter_um": 0.0,
@@ -31,6 +34,7 @@
     "Water": {
       "name": "Water",
       "ink_type": "buffer",
+      "ink_subtype": "",
       "viscosity_cP": 1.0,
       "granule_diameter_um": 0.0,
       "cell_diameter_um": 0.0,
@@ -39,7 +43,8 @@
     },
     "Cell Media": {
       "name": "Cell Media",
-      "ink_type": "media",
+      "ink_type": "ink",
+      "ink_subtype": "media",
       "viscosity_cP": 1.1,
       "granule_diameter_um": 0.0,
       "cell_diameter_um": 0.0,

@@ -67,6 +67,36 @@ class DeviceProfile:
     xy_velocity_pct: Optional[int] = None
     xy_acceleration: Optional[int] = None
     xy_jerk: Optional[int] = None
+    # v7.5.x: unified Z convention (see MEBP_v75x_Z_AXIS_CONVENTION_RETHINK).
+    # The Z setup derives the user-facing up-direction from the captured
+    # bottom/top extremes; +1 = user_Z grows with raw Z, -1 = user_Z grows as
+    # raw Z shrinks (ME3B V1). None ⇒ fall back to the module ZDIR.
+    z_up_sign: Optional[float] = None
+    # v7.5.x: per-machine well-plate orientation. True = plate is mounted 180°
+    # to the stage axes (ME3B V1: stage 0,0 bottom-right, well A1 top-left), so
+    # plate displays flip 180° and the plate-local→stage geometry sign is
+    # (-1, -1). None ⇒ fall back to StageController.DEFAULT_PLATE_FLIP_180.
+    plate_flip_180: Optional[bool] = None
+    # v7.5.x: needle-tip-camera Z fiducial (user-frame mm = height above the
+    # bottom datum), captured during XY needle calibration. Stable across
+    # power cycles as long as the bottom datum is re-established by the Z setup.
+    needle_cam_z: Optional[float] = None
+    # v7.5.x: standard mechanical offsets (mm BELOW the needle-cam fiducial) to
+    # the plate features — used to PRE-FILL plate Z reference guesses. Keys:
+    # "top", "bottom", "safe". Max/Replace Z stay manual (not here).
+    plate_z_offsets: dict = field(default_factory=dict)
+    # v7.5.x: approximate needle location — the centered needle position in the
+    # ABSOLUTE Prior stage frame ([x_um, y_um]). The side cameras are bolted to
+    # the frame, so this is a stable per-machine datum; the Needle Location tab's
+    # "Go to needle location" quick-move drives here. None ⇒ not captured.
+    needle_loc_xy_um: Optional[list] = None
+    # v7.5.x: per-pump plunger calibration (mirror of the Z setup). Maps pump
+    # ("P1"/"P2"/"P3") → {"raw_dispensed", "raw_aspirated", "aspirate_sign",
+    # "capacity_uL"} captured by the "Set Dispensed / Set Aspirated" flow.
+    # ZERO = plunger all the way IN (empty); MAX = all the way OUT (full). The
+    # dispense/aspirate DIRECTION is derived from these extremes and owned by the
+    # calibration. The soft-limit envelope itself lives in safety_limits.p*.
+    pump_setup: dict = field(default_factory=dict)
 
     # ── JSON I/O ─────────────────────────────────────────────────
 
@@ -90,6 +120,12 @@ class DeviceProfile:
             "xy_velocity_pct": self.xy_velocity_pct,
             "xy_acceleration": self.xy_acceleration,
             "xy_jerk": self.xy_jerk,
+            "z_up_sign": self.z_up_sign,
+            "plate_flip_180": self.plate_flip_180,
+            "needle_cam_z": self.needle_cam_z,
+            "plate_z_offsets": self.plate_z_offsets,
+            "needle_loc_xy_um": self.needle_loc_xy_um,
+            "pump_setup": self.pump_setup,
         }
 
     @classmethod
@@ -107,6 +143,12 @@ class DeviceProfile:
             xy_velocity_pct=data.get("xy_velocity_pct"),
             xy_acceleration=data.get("xy_acceleration"),
             xy_jerk=data.get("xy_jerk"),
+            z_up_sign=data.get("z_up_sign"),
+            plate_flip_180=data.get("plate_flip_180"),
+            needle_cam_z=data.get("needle_cam_z"),
+            plate_z_offsets=data.get("plate_z_offsets", {}) or {},
+            needle_loc_xy_um=data.get("needle_loc_xy_um"),
+            pump_setup=data.get("pump_setup", {}) or {},
         )
 
     def save(self, path: Path | None = None) -> Path:
@@ -147,6 +189,12 @@ class DeviceProfile:
             xy_velocity_pct=settings.get("device_profile.xy_velocity_pct"),
             xy_acceleration=settings.get("device_profile.xy_acceleration"),
             xy_jerk=settings.get("device_profile.xy_jerk"),
+            z_up_sign=settings.get("device_profile.z_up_sign"),
+            plate_flip_180=settings.get("device_profile.plate_flip_180"),
+            needle_cam_z=settings.get("device_profile.needle_cam_z"),
+            plate_z_offsets=settings.get("device_profile.plate_z_offsets") or {},
+            needle_loc_xy_um=settings.get("device_profile.needle_loc_xy_um"),
+            pump_setup=settings.get("device_profile.pump_setup") or {},
         )
 
     def apply_to_settings(self, settings) -> None:
@@ -180,6 +228,19 @@ class DeviceProfile:
             settings.set("device_profile.xy_acceleration", self.xy_acceleration)
         if self.xy_jerk is not None:
             settings.set("device_profile.xy_jerk", self.xy_jerk)
+        if self.z_up_sign is not None:
+            settings.set("device_profile.z_up_sign", self.z_up_sign)
+        if self.plate_flip_180 is not None:
+            settings.set("device_profile.plate_flip_180", self.plate_flip_180)
+        if self.needle_cam_z is not None:
+            settings.set("device_profile.needle_cam_z", self.needle_cam_z)
+        if self.plate_z_offsets:
+            settings.set("device_profile.plate_z_offsets", self.plate_z_offsets)
+        if self.needle_loc_xy_um is not None:
+            settings.set("device_profile.needle_loc_xy_um",
+                         self.needle_loc_xy_um)
+        if self.pump_setup:
+            settings.set("device_profile.pump_setup", self.pump_setup)
 
 
 # ── Module-level helpers ─────────────────────────────────────────

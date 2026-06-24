@@ -38,16 +38,22 @@ import logging
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
-    QHBoxLayout, QMessageBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QVBoxLayout, QWidget,
 )
 
 from SupportClasses.StageController import StageController, ZDIR
 from gui.scaling import s
+from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.components import Card
 from gui.widgets.jog_workspace_view import JogWorkspaceView
 from gui.widgets.pump_rack import PumpRack
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.xz_side_view import XZSideView
+
+try:
+    from SupportClasses.HardwareConfig import CameraRole
+except Exception:  # pragma: no cover - defensive import
+    CameraRole = None
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +71,8 @@ class JogControlPage(QWidget):
 
     _page_title_text = "Jog Control"
 
-    def __init__(self, controller: StageController, parent=None):
+    def __init__(self, controller: StageController, camera_manager=None,
+                 parent=None):
         super().__init__(parent)
         self.controller = controller
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -73,6 +80,14 @@ class JogControlPage(QWidget):
         self._context_widget: StandardJogContextPanel | None = None
         self._hardware_config = None
         self._settings = None
+
+        # v7.5.x: shared microscope live feed. Bound to the MICROSCOPE camera
+        # slot and started/stopped with the page's visibility so we don't keep
+        # the camera running in the background. ``_camera_started_by_us`` makes
+        # the stop a no-op when another page already owned the feed.
+        self._camera_manager = camera_manager
+        self._camera_view: CameraFeedView | None = None
+        self._camera_started_by_us = False
 
         # Calibration state
         self._plate = None
@@ -144,6 +159,9 @@ class JogControlPage(QWidget):
 
         self._workspace_view = JogWorkspaceView()
         self._workspace_view.set_safety_limits(self.controller.safety_limits)
+        if hasattr(self.controller, "plate_flip_180"):
+            self._workspace_view.set_plate_flip_180(
+                self.controller.plate_flip_180())
         self._workspace_view.position_clicked.connect(
             self._on_workspace_position_clicked)
         self._workspace_view.well_clicked.connect(
@@ -164,12 +182,57 @@ class JogControlPage(QWidget):
         # width — no padding bars on the left/right edges.
         ws_card = Card("XY Workspace", flush=True)
         ws_card.add_widget(self._workspace_view)
+        # v7.5.x: choose what the workspace draws on the plate — the idealized
+        # well grid, the stitched full-plate mosaic (captured on Calibration →
+        # Plate Location), or the mosaic overlaid on the well grid. The two
+        # mosaic modes are disabled until a mosaic exists for the active plate.
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("Plate view:"))
+        self._plate_view_combo = QComboBox()
+        self._plate_view_combo.setToolTip(
+            "Idealized well grid, the stitched full-plate mosaic captured on "
+            "the Calibration → Plate Location tab, or both overlaid.")
+        self._plate_view_combo.addItem("Ideal well", "well")
+        self._plate_view_combo.addItem("Mosaic", "mosaic")
+        self._plate_view_combo.addItem("Mosaic + well", "overlay")
+        self._plate_view_combo.currentIndexChanged.connect(
+            self._on_plate_view_mode_changed)
+        view_row.addWidget(self._plate_view_combo)
+        self._fluor_check = QCheckBox("🔬 Fluorescence")
+        self._fluor_check.setToolTip(
+            "Overlay the captured fluorescence mosaic(s) for this plate "
+            "(from the Fluorescence Mosaic workflow).")
+        self._fluor_check.toggled.connect(self._on_fluor_toggled)
+        view_row.addWidget(self._fluor_check)
+        view_row.addStretch()
+        ws_card.add_layout(view_row)
         top.addWidget(ws_card, stretch=10)
 
+        # ── Live microscope feed ───────────────────────────────────
+        # Bound to the MICROSCOPE camera slot; started on showEvent and
+        # stopped on hideEvent (see below). Display-only — no click-to-move.
+        if self._camera_manager is not None:
+            self._camera_view = CameraFeedView(
+                camera_manager=self._camera_manager,
+                cam_idx=self._resolve_microscope_cam_idx(),
+                show_crosshair=True,
+                label="Microscope feed — starts on this page",
+            )
+            cam_widget: QWidget = self._camera_view
+        else:
+            cam_widget = QLabel("No camera manager available.")
+            cam_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cam_card = Card("Microscope", flush=True)
+        cam_card.add_widget(cam_widget)
+        top.addWidget(cam_card, stretch=6)
+
         self._xz_view = XZSideView()
-        # v7.5.x: number Z as height (up = +) on this machine; display-only,
-        # the go-to emit stays in the raw zero-ref move frame.
-        self._xz_view.set_z_display_sign(ZDIR)
+        # v7.5.x: number Z in the unified user frame (0 at bottom datum, up =
+        # +) using the machine's DERIVED up-direction; display-only, the go-to
+        # emit stays in the raw zero-ref move frame.
+        self._xz_view.set_z_display_sign(
+            self.controller.z_up_sign()
+            if hasattr(self.controller, "z_up_sign") else ZDIR)
         self._xz_view.set_safety_limits(self.controller.safety_limits)
         self._xz_view.go_to_z_requested.connect(
             self._on_go_to_z_requested)
@@ -187,6 +250,55 @@ class JogControlPage(QWidget):
         # pump rack stays compact thanks to its own min/max height.
         root.addLayout(top, stretch=1)
         root.addWidget(pump_card)
+
+    # ════════════════════════════════════════════════════════════════
+    #  LIVE MICROSCOPE FEED — page-visibility lifecycle
+    # ════════════════════════════════════════════════════════════════
+
+    def _resolve_microscope_cam_idx(self) -> int:
+        if self._hardware_config is not None and CameraRole is not None:
+            try:
+                idx = self._hardware_config.camera_for_role(
+                    CameraRole.MICROSCOPE)
+                if idx is not None:
+                    return int(idx)
+            except Exception:
+                pass
+        return 0
+
+    def _start_camera(self) -> None:
+        if self._camera_manager is None or self._camera_view is None:
+            return
+        cam_idx = self._resolve_microscope_cam_idx()
+        try:
+            if self._camera_view.cam_idx != cam_idx:
+                self._camera_view.set_camera(cam_idx)
+            if not self._camera_manager.is_running(cam_idx):
+                self._camera_manager.start(cam_idx)
+                self._camera_started_by_us = True
+        except Exception as e:
+            logger.debug("Jog: microscope camera start failed: %s", e)
+
+    def _stop_camera(self) -> None:
+        if (self._camera_manager is None or self._camera_view is None
+                or not self._camera_started_by_us):
+            return
+        try:
+            self._camera_manager.stop(self._camera_view.cam_idx)
+        except Exception as e:
+            logger.debug("Jog: microscope camera stop failed: %s", e)
+        finally:
+            self._camera_started_by_us = False
+
+    def showEvent(self, event):
+        self._start_camera()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        # Stop the live feed when the page is hidden (only if we started it),
+        # so the microscope camera doesn't keep running in the background.
+        self._stop_camera()
+        super().hideEvent(event)
 
     # ════════════════════════════════════════════════════════════════
     #  STATUS UPDATE — main-area visualizations + forward to panel
@@ -306,6 +418,21 @@ class JogControlPage(QWidget):
         # Refresh safety limits in case HW config changed them
         self._workspace_view.set_safety_limits(self.controller.safety_limits)
         self._xz_view.set_safety_limits(self.controller.safety_limits)
+        # Re-push plate orientation (a device-profile switch can change it).
+        if hasattr(self.controller, "plate_flip_180"):
+            self._workspace_view.set_plate_flip_180(
+                self.controller.plate_flip_180())
+        # v7.5.x: the MICROSCOPE role may have moved to a different camera
+        # slot — rebind the live feed (and (re)start it if we're visible).
+        if self._camera_view is not None:
+            try:
+                cam_idx = self._resolve_microscope_cam_idx()
+                if self._camera_view.cam_idx != cam_idx:
+                    self._camera_view.set_camera(cam_idx)
+                if self.isVisible():
+                    self._start_camera()
+            except Exception as e:
+                logger.debug("Jog: microscope rebind failed: %s", e)
         # Forward into the standard context panel
         if self._context_widget is not None:
             self._context_widget.set_hardware_config(config)
@@ -358,6 +485,13 @@ class JogControlPage(QWidget):
         self._workspace_view.set_well_positions(
             self._wells_in_zero_ref(), "calibrated")
         self._xz_view.set_safe_z(safe_z)
+        # v7.5.x: refresh the stitched-plate mosaic overlay for this plate
+        # (the calibration page emits calibration_data_changed after a mosaic
+        # scan, which routes here).
+        self._load_mosaic_overlay()
+        # v7.5.x: re-apply the fluorescence overlay if the operator has it on.
+        if getattr(self, "_fluor_check", None) is not None and self._fluor_check.isChecked():
+            self._on_fluor_toggled(True)
         # Forward into the standard context panel
         if self._context_widget is not None:
             self._context_widget.set_calibration_data(
@@ -399,17 +533,90 @@ class JogControlPage(QWidget):
             zero = self.controller.zero_position
             center_x = float(zero.get("x", 0.0))
             center_y = float(zero.get("y", 0.0))
+        _sign = (self.controller.plate_axis_sign()
+                 if hasattr(self.controller, "plate_axis_sign")
+                 else (1.0, 1.0))
         approx_positions = plate.get_all_positions_from_plate_center(
-            center_x, center_y)
+            center_x, center_y, _sign)
 
         self._plate = plate
         self._well_positions = approx_positions
         self._workspace_view.set_plate(plate)
         self._workspace_view.set_well_positions(
             self._wells_in_zero_ref(), "approximate")
+        self._load_mosaic_overlay()
         if self._context_widget is not None:
             self._context_widget.set_calibration_data(
                 plate, approx_positions, self._safe_z)
+
+    # ── v7.5.x: stitched-plate mosaic overlay ──────────────────────
+
+    def _jog_plate_key(self) -> str:
+        key = (getattr(self._plate, "format", None)
+               if getattr(self, "_plate", None) is not None else None)
+        return str(key) if key is not None else "plate"
+
+    def _load_mosaic_overlay(self) -> None:
+        """Load the stored stitched mosaic for the active plate (if any) into
+        the workspace overlay and enable/disable the toggle accordingly."""
+        try:
+            from SupportClasses.MosaicStore import get_store
+            from gui.widgets.jog_workspace_view import pixmap_from_bgr
+        except Exception:
+            return
+        try:
+            store = get_store()
+            key = self._jog_plate_key()
+            if not store.has(key):
+                self._workspace_view.set_mosaic_overlay(None, None)
+                self._set_mosaic_modes_enabled(False)
+                return
+            img = store.load_image(key)
+            extent = store.get_extent_um(key)
+            pm = pixmap_from_bgr(img)
+            self._workspace_view.set_mosaic_overlay(
+                pm, tuple(extent) if extent else None)
+            ok = pm is not None and extent is not None
+            self._set_mosaic_modes_enabled(ok)
+        except Exception as e:
+            logger.debug(f"Jog: mosaic overlay load skipped: {e}")
+
+    def _set_mosaic_modes_enabled(self, ok: bool) -> None:
+        """Enable/disable the mosaic-dependent view modes and apply the
+        resulting mode to the workspace. Falls back to the ideal-well view when
+        no mosaic is available."""
+        model = self._plate_view_combo.model()
+        for idx in (1, 2):  # "Mosaic", "Mosaic + well"
+            item = model.item(idx)
+            if item is not None:
+                item.setEnabled(ok)
+        if not ok and self._plate_view_combo.currentIndex() != 0:
+            self._plate_view_combo.setCurrentIndex(0)  # fires the handler
+        else:
+            self._on_plate_view_mode_changed()
+
+    def _on_plate_view_mode_changed(self, _idx: int = 0) -> None:
+        mode = self._plate_view_combo.currentData() or "well"
+        self._workspace_view.set_plate_display_mode(mode)
+
+    def _on_fluor_toggled(self, checked: bool = False) -> None:
+        """Show/hide the persisted fluorescence overlay on the plate view."""
+        if not checked:
+            try:
+                self._workspace_view.set_fluor_visible(False)
+            except Exception:
+                pass
+            return
+        try:
+            from gui.pages.workflows._fluorescence_overlay import (
+                load_plate_fluor_overlay)
+            ok = load_plate_fluor_overlay(
+                self._workspace_view, self._jog_plate_key(), visible=True)
+        except Exception as e:
+            logger.debug("Jog: fluor overlay load skipped: %s", e)
+            ok = False
+        if not ok:
+            self._fluor_check.setChecked(False)
 
     # v7.5.x: the Jog page intentionally has NO recenter_default_plate() —
     # bounds-change re-centering is owned solely by the Calibration page,
@@ -570,7 +777,9 @@ class JogControlPage(QWidget):
     def _key_jog_z(self, dz_sign: int) -> None:
         if not self.controller.is_zp_connected:
             return
-        self.controller.move_z_relative(dz_sign * _KEY_STEP_Z_MM)
+        # v7.5.x: PageUp = +1 = up. Route through move_z_user_relative so the
+        # key follows the taught z_up_sign (consistent with the jog buttons).
+        self.controller.move_z_user_relative(dz_sign * _KEY_STEP_Z_MM)
 
     def _emergency_stop(self) -> None:
         if self.controller.zp_stage:

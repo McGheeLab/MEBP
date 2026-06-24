@@ -269,6 +269,7 @@ class ConnectionWatchdog:
         name: str,
         port_getter: Callable,
         on_disconnect: Callable,
+        fail_threshold: int = 3,
     ) -> None:
         """
         Register a port to monitor.
@@ -277,18 +278,50 @@ class ConnectionWatchdog:
             name:           Identifier for this connection (e.g. "XY").
             port_getter:    Callable that returns the serial port object.
             on_disconnect:  Called (once) when a disconnect is detected.
+            fail_threshold: v7.5.x — consecutive failed health checks required
+                before declaring a disconnect (debounce). A single transient
+                ``check_port_health`` failure must NOT tear down the connection:
+                on Windows, ``serial.in_waiting`` (ClearCommError) can raise
+                intermittently under the heavy write load of a print, which is
+                NOT a real disconnect. A genuine unplug/power-off fails every
+                check, so it is still caught after ``fail_threshold`` cycles.
         """
         with self._lock:
             self._watches[name] = {
                 "port_getter": port_getter,
                 "on_disconnect": on_disconnect,
                 "was_connected": False,
+                "fail_count": 0,
+                "fail_threshold": max(1, int(fail_threshold)),
+                "paused": False,
             }
 
     def unwatch(self, name: str) -> None:
         """Stop watching a named connection."""
         with self._lock:
             self._watches.pop(name, None)
+
+    def pause(self, name: str) -> None:
+        """v7.5.x: temporarily stop health-checking a watch. Used so the
+        print's dense PRINT_PATH write burst is the ONLY thing touching that
+        COM handle — the health check reads ``serial.in_waiting``
+        (ClearCommError), and a concurrent ClearCommError + WriteFile on a
+        flow-control-paused CH340 is a fault surface (ERROR_BAD_COMMAND).
+        Idempotent; safe if ``name`` isn't watched. ALWAYS pair with
+        :meth:`resume` in a try/finally."""
+        with self._lock:
+            w = self._watches.get(name)
+            if w is not None:
+                w["paused"] = True
+
+    def resume(self, name: str) -> None:
+        """v7.5.x: re-enable a paused watch and reset its debounce window so a
+        single check right after resume can't fire a false disconnect."""
+        with self._lock:
+            w = self._watches.get(name)
+            if w is not None:
+                w["paused"] = False
+                w["fail_count"] = 0
 
     def add_periodic(self, callback: Callable) -> None:
         """v7.3.5: Register a callback to run on every watchdog cycle."""
@@ -324,32 +357,53 @@ class ConnectionWatchdog:
 
     def _check_loop(self) -> None:
         while self._running:
-            with self._lock:
-                watches = list(self._watches.items())
+            self._run_one_cycle()
+            time.sleep(self.check_interval)
 
-            for name, info in watches:
-                try:
-                    port = info["port_getter"]()
-                    is_connected = check_port_health(port)
+    def _run_one_cycle(self) -> None:
+        """One watchdog pass: health-check every watch (with debounce) + run
+        periodic callbacks. Extracted so the debounce logic is unit-testable
+        without the timing loop."""
+        with self._lock:
+            watches = list(self._watches.items())
 
-                    if info["was_connected"] and not is_connected:
-                        logger.warning(f"[Watchdog] {name} disconnected!")
+        for name, info in watches:
+            if info.get("paused"):
+                continue  # v7.5.x: skip health check while paused (PRINT_PATH)
+            try:
+                port = info["port_getter"]()
+                is_connected = check_port_health(port)
+
+                if is_connected:
+                    # Healthy → reset the debounce window.
+                    info["fail_count"] = 0
+                    info["was_connected"] = True
+                else:
+                    # v7.5.x: debounce — only declare a disconnect after
+                    # ``fail_threshold`` CONSECUTIVE failed checks, so a
+                    # single transient I/O error (e.g. in_waiting raising
+                    # under a print's serial write load) is ridden out
+                    # instead of falsely tearing down a live connection.
+                    info["fail_count"] = info.get("fail_count", 0) + 1
+                    if (info["was_connected"]
+                            and info["fail_count"] >= info["fail_threshold"]):
+                        logger.warning(
+                            f"[Watchdog] {name} disconnected (after "
+                            f"{info['fail_count']} consecutive failed "
+                            f"health checks)!")
                         try:
                             info["on_disconnect"]()
                         except Exception as e:
                             logger.error(f"[Watchdog] Disconnect callback error for {name}: {e}")
+                        info["was_connected"] = False
+            except Exception:
+                pass  # Don't crash the watchdog
 
-                    info["was_connected"] = is_connected
-                except Exception:
-                    pass  # Don't crash the watchdog
-
-            # v7.3.5: Run periodic callbacks (e.g. position save)
-            with self._lock:
-                callbacks = list(self._periodic_callbacks)
-            for cb in callbacks:
-                try:
-                    cb()
-                except Exception as e:
-                    logger.debug(f"[Watchdog] Periodic callback error: {e}")
-
-            time.sleep(self.check_interval)
+        # v7.3.5: Run periodic callbacks (e.g. position save)
+        with self._lock:
+            callbacks = list(self._periodic_callbacks)
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as e:
+                logger.debug(f"[Watchdog] Periodic callback error: {e}")

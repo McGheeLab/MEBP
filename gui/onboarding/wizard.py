@@ -519,17 +519,9 @@ class OnboardingWizard(QDialog):
                 data = json.load(f)
             inks = data.get("inks", {})
             for ink_name, ink_dict in inks.items():
-                # Strip the wrapper "name" field — InkSpec accepts a dict
-                # mirroring its fields.
-                spec = InkSpec(
-                    name=ink_dict.get("name", ink_name),
-                    ink_type=ink_dict.get("ink_type", "custom"),
-                    viscosity_cP=float(ink_dict.get("viscosity_cP", 1.0)),
-                    granule_diameter_um=float(ink_dict.get("granule_diameter_um", 0.0)),
-                    cell_diameter_um=float(ink_dict.get("cell_diameter_um", 0.0)),
-                    density_g_mL=float(ink_dict.get("density_g_mL", 1.0)),
-                    color=ink_dict.get("color", "#a6e3a1"),
-                )
+                # v7.5.x: InkSpec.from_dict applies the well-type/subtype
+                # migration (legacy material ink_type → ink + subtype).
+                spec = InkSpec.from_dict({**ink_dict, "name": ink_dict.get("name", ink_name)})
                 self._config.ink_library[ink_name] = spec
             logger.info(f"Loaded {len(inks)} prefab inks")
         except Exception as e:

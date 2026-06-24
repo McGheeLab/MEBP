@@ -174,15 +174,30 @@ class LiveTargetPicker(QWidget):
     MODE_PICK = "pick"
     MODE_PLACE = "place"
 
-    def __init__(self, controller, camera_manager, parent: QWidget | None = None):
+    def __init__(self, controller, camera_manager, parent: QWidget | None = None,
+                 *, pick_only: bool = False):
         super().__init__(parent)
         self._controller = controller
         self._camera_manager = camera_manager
+        # pick_only: hide the Place list + Mode toggle and force every click to
+        # the Pick list. Used by workflows that only "select regions" with no
+        # paired placement (e.g. Cell Labeling). The picker stays usable as the
+        # shared multi-target picker; only the place machinery is hidden.
+        self._pick_only: bool = bool(pick_only)
 
         self._hw_config = None
         self._cam_idx: int = 0
         self._objective_name: Optional[str] = None
         self._camera_model: Optional[str] = None
+
+        # µm/px calibration state. ``_base_um_per_px`` is the value as measured
+        # (at ``_cal_resolution`` px); the value actually used for the live
+        # feed is rescaled to the current frame width — see
+        # ``_sync_live_um_per_px``. ``_last_live_w`` debounces the rescale to
+        # actual resolution changes.
+        self._base_um_per_px: Optional[float] = None
+        self._cal_resolution: Optional[tuple[int, int]] = None
+        self._last_live_w: Optional[int] = None
 
         self._picks: list[PickPlaceTarget] = []
         self._places: list[PickPlaceTarget] = []
@@ -243,9 +258,17 @@ class LiveTargetPicker(QWidget):
         rl.setContentsMargins(s(6), s(6), s(6), s(6))
         rl.setSpacing(s(8))
 
-        rl.addWidget(self._build_mode_toggle())
-        rl.addWidget(self._build_pick_section(), stretch=1)
-        rl.addWidget(self._build_place_section(), stretch=1)
+        mode_toggle = self._build_mode_toggle()
+        pick_section = self._build_pick_section()
+        place_section = self._build_place_section()
+        if self._pick_only:
+            # Force pick mode and hide the place machinery entirely.
+            self._mode = self.MODE_PICK
+            mode_toggle.setVisible(False)
+            place_section.setVisible(False)
+        rl.addWidget(mode_toggle)
+        rl.addWidget(pick_section, stretch=1)
+        rl.addWidget(place_section, stretch=1)
         rl.addWidget(self._build_pairing_status())
 
         split.addWidget(right)
@@ -511,21 +534,30 @@ class LiveTargetPicker(QWidget):
         img_w, img_h = self._view.image_size
         if img_w == 0 or img_h == 0 or self._camera_manager is None:
             return None
+        # pixel_to_stage_offset resolves µm/px against the LIVE frame width
+        # (img_w), so the click→stage scale tracks the current resolution.
         dx_um, dy_um = self._camera_manager.pixel_to_stage_offset(
             self._cam_idx, px_x, px_y, img_w, img_h)
-        stage_xy_mm = self._read_stage_xy_mm()
-        if stage_xy_mm is None:
+        stage_xy_um = self._read_stage_xy_um()
+        if stage_xy_um is None:
             return None
-        sx_um = stage_xy_mm[0] * 1000.0
-        sy_um = stage_xy_mm[1] * 1000.0
-        return (sx_um + dx_um, sy_um + dy_um)
+        # stage_xy_um is ABSOLUTE stage µm (the camera centre); add the
+        # in-frame offset (also µm) to get the absolute target.
+        return (stage_xy_um[0] + dx_um, stage_xy_um[1] + dy_um)
 
-    def _read_stage_xy_mm(self) -> Optional[tuple[float, float]]:
+    def _read_stage_xy_um(self) -> Optional[tuple[float, float]]:
+        """Current absolute stage XY in µm.
+
+        ``StageController.get_xy_position`` already returns absolute stage
+        µm (``get_xy_position_mm`` divides it by 1000), so it is used
+        directly — the earlier ``× 1000`` here inflated every target ~1000×,
+        driving the stage into the envelope corner.
+        """
         if self._controller is None:
             return None
         try:
             pos = self._controller.get_xy_position(cached=True)
-            if pos is None:
+            if pos is None or pos[0] is None or pos[1] is None:
                 return None
             return float(pos[0]), float(pos[1])
         except Exception as e:
@@ -554,6 +586,19 @@ class LiveTargetPicker(QWidget):
 
     def _update_pairing_status(self):
         np_, nd = len(self._picks), len(self._places)
+        if self._pick_only:
+            if np_ == 0:
+                self._pairing_label.setText("No regions selected yet.")
+                self._pairing_label.setStyleSheet(
+                    f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
+                    f"padding: {s(4)}px;")
+            else:
+                self._pairing_label.setText(
+                    f"✓ {np_} region(s) selected.")
+                self._pairing_label.setStyleSheet(
+                    f"color: {COLORS['green']}; font-size: {sf(9)}pt; "
+                    f"padding: {s(4)}px;")
+            return
         if np_ == 0 and nd == 0:
             self._pairing_label.setText("No targets yet.")
             self._pairing_label.setStyleSheet(
@@ -571,30 +616,83 @@ class LiveTargetPicker(QWidget):
                 f"color: {COLORS['peach']}; font-size: {sf(9)}pt; padding: {s(4)}px;")
 
     def _refresh_stage_position(self):
-        xy_mm = self._read_stage_xy_mm()
-        if xy_mm is None:
+        # Keep µm/px in step with the live resolution before projecting
+        # markers / converting clicks (the live feed may switch resolution).
+        self._sync_live_um_per_px()
+        xy_um = self._read_stage_xy_um()
+        if xy_um is None:
             return
-        self._view.set_stage_position(xy_mm[0] * 1000.0, xy_mm[1] * 1000.0)
+        # set_stage_position expects absolute stage µm — get_xy_position is
+        # already µm, so pass it straight through (no × 1000).
+        self._view.set_stage_position(xy_um[0], xy_um[1])
 
     def _refresh_um_per_px(self):
-        upp = None
+        """Resolve the calibration µm/px (+ the resolution it was measured at)
+        for the current camera + objective, push it to the shared
+        CameraManager, then apply the live-resolution-scaled value."""
+        base = None
+        cal_res: Optional[tuple[int, int]] = None
         if self._camera_model and self._objective_name:
             try:
                 from SupportClasses.ObjectiveCalibration import get_store
                 cal = get_store().get_calibration(
                     self._camera_model, self._objective_name)
                 if cal:
-                    upp = float(cal.get("measured_um_per_px", 0.0)) or None
+                    base = float(cal.get("measured_um_per_px", 0.0)) or None
+                    res = cal.get("resolution")
+                    if res and len(res) >= 2 and res[0] and res[1]:
+                        cal_res = (int(res[0]), int(res[1]))
             except Exception as e:
                 logger.debug("ObjectiveCalibrationStore lookup failed: %s", e)
-        if upp is None and self._camera_manager is not None:
-            upp = self._camera_manager.get_um_per_px(self._cam_idx)
-        if upp is None or upp <= 0:
+        if base is None and self._camera_manager is not None:
+            # Fallback: the per-device µm/px. Its calibration resolution isn't
+            # exposed here, so no rescale is applied (assume it matches live).
+            base = self._camera_manager.get_um_per_px(self._cam_idx)
+        if base is None or base <= 0:
             return
-        self._view.set_um_per_px(upp)
+
+        self._base_um_per_px = base
+        self._cal_resolution = cal_res
+        # Push the calibration value + resolution to the manager so the shared
+        # pixel→stage transform (pixel_to_stage_offset) rescales to whatever
+        # resolution the live feed runs at — used by the click conversion and
+        # any downstream consumer.
         if self._camera_manager is not None:
-            # Keep CameraManager's cached value in sync so the same
-            # transform is used by both the picker and downstream
-            # consumers (e.g. PickPlaceExecutor).
-            self._camera_manager.set_um_per_px(self._cam_idx, upp)
-        self._um_per_px_label.setText(f"µm/px: {upp:.3f}")
+            try:
+                self._camera_manager.set_um_per_px(
+                    self._cam_idx, base, resolution=cal_res)
+            except TypeError:
+                # Older signature without the resolution kwarg.
+                self._camera_manager.set_um_per_px(self._cam_idx, base)
+        self._sync_live_um_per_px(force=True)
+
+    def _sync_live_um_per_px(self, force: bool = False):
+        """Recompute the µm/px for the current live frame width and push it to
+        the overlay view + readout, so the overlay's µm→pixel projection stays
+        consistent with the (resolution-aware) click transform."""
+        base = self._base_um_per_px
+        if base is None or base <= 0:
+            return
+        img = self._view.image_size
+        live_w = int(img[0]) if img and img[0] else 0
+        if not force and live_w == self._last_live_w:
+            return
+        self._last_live_w = live_w
+
+        eff = base
+        mgr = self._camera_manager
+        if mgr is not None and live_w and hasattr(mgr, "effective_um_per_px"):
+            try:
+                eff = mgr.effective_um_per_px(self._cam_idx, live_w)
+            except Exception:
+                eff = base
+        elif self._cal_resolution and self._cal_resolution[0] and live_w:
+            eff = base * float(self._cal_resolution[0]) / float(live_w)
+
+        self._view.set_um_per_px(eff)
+        cal_w = self._cal_resolution[0] if self._cal_resolution else None
+        if cal_w and live_w and abs(live_w - cal_w) > 1:
+            self._um_per_px_label.setText(
+                f"µm/px: {eff:.3f}  (cal {base:.3f}@{cal_w} → live {live_w}px)")
+        else:
+            self._um_per_px_label.setText(f"µm/px: {eff:.3f}")

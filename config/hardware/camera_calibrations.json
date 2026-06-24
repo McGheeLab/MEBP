@@ -2,10 +2,26 @@
   "version": "1.0",
   "cameras": {
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
-      "um_per_px": 5.944101,
+      "um_per_px": 5.703728,
       "name": "Teslong Camera",
       "rotation_deg": 45.0,
-      "date": "2026-06-15"
+      "date": "2026-06-16",
+      "image_correction": {
+        "brightness": -4,
+        "contrast": 0.91,
+        "gamma": 0.97
+      },
+      "hw_controls": {
+        "exposure_gain_pct": 1.0,
+        "gamma": 75.0,
+        "brightness": 40.0,
+        "contrast": 2.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "autostart": true
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&b643b4c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "um_per_px": 5.272355,
@@ -14,20 +30,54 @@
       "date": "2026-06-05"
     },
     "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13": {
-      "um_per_px": 3.1041,
+      "um_per_px": 1.540434,
       "name": "ToupCam",
-      "date": "2026-06-15"
+      "date": "2026-06-17",
+      "image_correction": {
+        "brightness": 21,
+        "contrast": 1.25,
+        "gamma": 0.81
+      },
+      "hw_controls": {
+        "auto_exposure": false,
+        "exposure_us": 40000,
+        "exposure_gain_pct": 3281,
+        "gamma": 43,
+        "brightness": 37,
+        "contrast": 2,
+        "resolution": [
+          3664,
+          2748
+        ]
+      },
+      "autostart": true
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
-      "um_per_px": 5.439254,
+      "um_per_px": 5.585643,
       "name": "Teslong Camera",
       "rotation_deg": -45.0,
-      "date": "2026-06-15"
+      "date": "2026-06-16",
+      "image_correction": {
+        "brightness": 1,
+        "contrast": 1.04,
+        "gamma": 0.96
+      },
+      "hw_controls": {
+        "exposure_gain_pct": 1.0,
+        "gamma": 69.0,
+        "brightness": 48.0,
+        "contrast": 33.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "autostart": true
     }
   },
   "assignments": {
     "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
     "microscope": "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13"
   }
 }

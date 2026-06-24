@@ -68,6 +68,36 @@ class _CalState(Enum):
     ERROR = auto()
 
 
+def plus_column_direction_deg(commanded_deg: float, measured_dx_px: float,
+                              measured_dy_px: float = 0.0) -> float:
+    """Stage angle (deg, CCW from +X) along which displacing the needle
+    INCREASES its image column — the value `TwoCameraNeedleAligner` expects.
+
+    Derived from the *measured* content displacement, NOT the commanded preset.
+    The commanded angle alone has two problems: its sign is arbitrary (for a
+    ~45° mount both opposite "lateral" presets look valid), and it is quantized
+    to the preset the operator clicked — if the camera's true lateral axis sits
+    a few degrees off that preset, the leftover tilt biases the two-camera solve
+    and the needle lands off-center.
+
+    Model the stage→image map as scale·R(α) (rotation by α, no mirror). Moving
+    the cameras by ``+m = D·(cosθ, sinθ)`` makes stationary content shift by
+    ``p = −scale·R(α)·m`` (measured ``p = (dx, dy)``, image convention +x =
+    right). The stage direction that maps to image +column is therefore
+    ``−α = θ − atan2(dy, dx) − 180°`` — independent of which preset θ the
+    operator picked, and exact for off-axis moves. On a purely lateral move
+    this reduces to the simple ±180° sign rule.
+
+    (HW note: assumes a non-mirrored image — the aligner only models a single
+    rotation per camera anyway. If both cameras come out 180° off, the
+    ``measure_pixel_displacement`` / ``cv2.phaseCorrelate`` sign is inverted on
+    this build; negate the ``180.0`` term.)
+    """
+    phi = math.degrees(math.atan2(measured_dy_px, measured_dx_px))
+    angle = float(commanded_deg) - phi - 180.0
+    return ((angle + 180.0) % 360.0) - 180.0  # normalize to [−180, 180)
+
+
 # Move-direction presets (stage-frame angle, degrees CCW from +X).
 _DIRECTION_PRESETS = [
     ("X →", 0.0),
@@ -118,6 +148,10 @@ class PixelCalibrationDialog(QDialog):
                 cam_idx=self._cam_idx,
                 show_crosshair=True,
                 label=f"Camera {self._cam_idx + 1} — live",
+                # No settings gear here: this dialog PRODUCES a µm/px
+                # calibration, and changing capture resolution mid-measurement
+                # would change the effective µm/px and corrupt the result.
+                enable_settings=False,
             )
             self._feed.setMinimumSize(s(480), s(380))
             outer.addWidget(self._feed, stretch=1)
@@ -409,7 +443,13 @@ class PixelCalibrationDialog(QDialog):
         self._lbl_umpx.setText(f"{um_per_px:.4f} µm/px")
 
         self.result_um_per_px = um_per_px
-        self.result_rotation_deg = float(self._spin_direction.value())
+        # v7.5.x: the rotation fed to TwoCameraNeedleAligner must be the stage
+        # direction along which displacing the needle INCREASES its image column
+        # (the "+column" direction), NOT just the commanded move angle whose sign
+        # is arbitrary for a ~45°-mounted camera — that was the wrong-direction
+        # auto-center bug. Resolve the sign from the measured displacement.
+        self.result_rotation_deg = plus_column_direction_deg(
+            self._spin_direction.value(), dx, dy)
 
         self._set_status(
             "Good lateral motion — Accept to use this µm/px and direction, "

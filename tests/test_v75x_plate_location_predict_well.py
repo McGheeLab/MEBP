@@ -50,13 +50,17 @@ def _stub(plate, *, calibrated=None, predicted=None, taught_a1=None,
         zero_position={"x": zero[0], "y": zero[1]},
         default_plate_center_um=_default_plate_center_um,
     )
-    return SimpleNamespace(
+    stub = SimpleNamespace(
         controller=controller,
         _plate=plate,
         _calibrated_positions=calibrated,
         _predicted_positions=predicted,
         _taught_a1=taught_a1,
     )
+    # v7.5.x: bind the real per-machine axis-sign helper; the stub controller
+    # has no ``plate_axis_sign`` so it falls back to the aligned (1, 1) default.
+    stub._plate_axis_sign = CalibrationPage._plate_axis_sign.__get__(stub)
+    return stub
 
 
 def _predict(stub, well_name):

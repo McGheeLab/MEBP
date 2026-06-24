@@ -50,6 +50,11 @@ class _RecordingSerial:
     def flush(self) -> None:
         pass
 
+    def readline(self) -> bytes:
+        # v7.5.x flow control: send_data now waits for Marlin's 'ok'. Ack every
+        # command immediately so move_relative completes synchronously.
+        return b"ok\n"
+
     def close(self) -> None:  # used by __del__ → stop() in teardown
         self.is_open = False
 

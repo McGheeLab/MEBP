@@ -22,11 +22,24 @@ Usage:
 """
 
 import argparse
+import faulthandler
 import logging
 import os
 import signal
 import sys
 import time
+
+# ── Crash diagnostics ───────────────────────────────────────────────
+# Dump a full per-thread Python traceback on a hard crash (segfault / fatal
+# error) — these print NOTHING by default, so an end-of-print "ZP retract"
+# crash left no trail. Writes to stderr (the console) AND to logs/crash.log so
+# the traceback survives even if the terminal scrolls away. Cheap + always-on.
+try:
+    os.makedirs("logs", exist_ok=True)
+    _crash_log = open(os.path.join("logs", "crash.log"), "a", buffering=1)
+    faulthandler.enable(file=_crash_log, all_threads=True)
+except Exception:
+    faulthandler.enable(all_threads=True)  # stderr fallback
 
 # ── HiDPI support ───────────────────────────────────────────────────
 # Let Qt6 handle DPI scaling natively instead of locking to 96 DPI.
@@ -47,13 +60,42 @@ from SupportClasses.Settings import Settings
 
 
 def setup_logging(verbose=False):
-    """Configure logging for the application."""
+    """Configure logging for the application.
+
+    Console at the chosen level, plus a persistent rotating file at
+    ``logs/app.log`` (always DEBUG) so a session's full log survives after the
+    terminal scrolls away / the app exits — essential for diagnosing the
+    intermittent ZP comms faults. The ZP serial link has its own dedicated
+    trace file (``logs/zp_serial.log``, see ``SupportClasses/ZPSerialTrace``).
+    """
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    fmt = logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S")
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    console = logging.StreamHandler()
+    console.setLevel(level)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    try:
+        from logging.handlers import RotatingFileHandler
+        os.makedirs("logs", exist_ok=True)
+        fileh = RotatingFileHandler(
+            os.path.join("logs", "app.log"), maxBytes=8_000_000,
+            backupCount=5, encoding="utf-8")
+        # Full-resolution date on the file (the console keeps the short time).
+        fileh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+        fileh.setLevel(logging.DEBUG)
+        root.addHandler(fileh)
+        root.info("=== app.log opened (level=%s) ===",
+                  logging.getLevelName(level))
+    except Exception as e:  # never let logging setup break startup
+        root.warning("Could not open logs/app.log: %s", e)
 
 
 def run_headless(controller: StageController, settings: Settings):
@@ -249,6 +291,23 @@ def main():
         _log.getLogger(__name__).info(
             f"Safety limits loaded from settings "
             f"(enabled={controller.safety_limits.enabled})")
+
+    # v7.5.x: restore the unified Z convention (per-machine up-direction +
+    # needle-cam fiducial + standard plate offsets) and the well-plate
+    # orientation (plate_flip_180) from the device profile.
+    controller.apply_z_convention(
+        z_up_sign=settings.get("device_profile.z_up_sign"),
+        needle_cam_z=settings.get("device_profile.needle_cam_z"),
+        plate_z_offsets=settings.get("device_profile.plate_z_offsets"),
+        plate_flip_180=settings.get("device_profile.plate_flip_180"),
+    )
+
+    # v7.5.x: restore the per-pump plunger convention (datum + derived
+    # dispense/aspirate direction from the captured Set Dispensed / Set
+    # Aspirated extremes). Soft limits come from the safety_limits section
+    # above; this re-establishes the direction the calibration owns.
+    controller.apply_pump_convention(
+        settings.get("device_profile.pump_setup"))
 
     if args.headless:
         run_headless(controller, settings)

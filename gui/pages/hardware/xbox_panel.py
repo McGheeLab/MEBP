@@ -190,6 +190,9 @@ class XboxHardwarePanel(QWidget):
         super().__init__(parent)
         self._controller = None
         self._settings = None
+        # v7.5.x: cache of the last-persisted jog speed-% per group so the
+        # 20 Hz read-out only writes settings when the value actually changes.
+        self._last_persisted_jog_pct: dict[str, float] = {}
         # v7.4.2: panel paints the page background colour explicitly so
         # it doesn't inherit Qt's native white from the parent scroll
         # area.
@@ -215,10 +218,32 @@ class XboxHardwarePanel(QWidget):
     def set_controller(self, controller) -> None:
         self._controller = controller
         self._sync_status()
+        self._restore_jog_speed_pct()
 
     def set_settings(self, settings) -> None:
         self._settings = settings
         self._load_from_settings()
+        self._restore_jog_speed_pct()
+
+    def _restore_jog_speed_pct(self) -> None:
+        """Push the persisted per-axis jog speed-% into the controller (which
+        re-applies it to the jog handlers now or on their next connect).
+        Needs both the controller and settings; safe to call repeatedly."""
+        ctrl = self._controller
+        s_obj = self._settings
+        if ctrl is None or s_obj is None or not hasattr(ctrl, "set_jog_speed_pct"):
+            return
+        for key, _name in self._JOG_SPEED_GROUPS:
+            try:
+                pct = float(s_obj.get(f"xbox.jog_speed_pct.{key}", 10.0))
+            except (TypeError, ValueError):
+                pct = 10.0
+            try:
+                ctrl.set_jog_speed_pct(key, pct)
+            except Exception as e:
+                logger.debug(f"Restore jog speed-% for {key} failed: {e}")
+            # Seed the persist cache so the read-out doesn't re-write it.
+            self._last_persisted_jog_pct[key] = pct
 
     def on_status_update(self) -> None:
         self._sync_status()
@@ -255,6 +280,7 @@ class XboxHardwarePanel(QWidget):
 
         outer.addWidget(self._build_status_group())
         outer.addWidget(self._build_monitor_group())
+        outer.addWidget(self._build_jog_speed_group())
         outer.addWidget(self._build_calibration_group())
         outer.addWidget(self._build_behavior_group())
         outer.addWidget(self._build_mapping_group())
@@ -325,6 +351,93 @@ class XboxHardwarePanel(QWidget):
         lay.addLayout(footer)
 
         return grp
+
+    # ── Jog speed group (read-out) ─────────────────────────────
+
+    # Display order + labels for the three joystick-driven axis groups.
+    _JOG_SPEED_GROUPS = (("xy", "XY"), ("z", "Z"), ("p", "Pump"))
+
+    def _build_jog_speed_group(self) -> QGroupBox:
+        """Read-out of each joystick group's jog speed as a % of the
+        calibrated max (cycled with the controller — see Button Mapping)."""
+        grp = QGroupBox("Jog Speed (% of calibrated max)")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        lay = QVBoxLayout(grp)
+        lay.setSpacing(s(8))
+
+        info = QLabel(
+            "Each axis jogs at a percentage of its calibrated max move speed, "
+            "stepping through "
+            "<b>0.1 → 0.3 → 1 → 3 → 10 → 30 → 100%</b>. Cycle a group up/down "
+            "with the controller (the <i>increment …speed</i> buttons in "
+            "Button Mapping — by default the bumpers / D-pad). The selected "
+            "speed is remembered between sessions."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {COLORS['subtext0']};")
+        lay.addWidget(info)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(s(12))
+        form.setVerticalSpacing(s(8))
+        self._jog_speed_labels: dict[str, QLabel] = {}
+        for key, name in self._JOG_SPEED_GROUPS:
+            val = QLabel("—")
+            val.setStyleSheet(
+                f"color: {COLORS['text']}; font-family: monospace; "
+                f"font-weight: 600;")
+            self._jog_speed_labels[key] = val
+            form.addRow(f"{name}:", val)
+        lay.addLayout(form)
+        return grp
+
+    def _update_jog_speed_readout(self) -> None:
+        """Refresh the per-axis % + resolved speed from the controller and
+        persist any controller-driven change so it survives a restart."""
+        labels = getattr(self, "_jog_speed_labels", None)
+        if not labels:
+            return
+        ctrl = self._controller
+        state = {}
+        if ctrl is not None and hasattr(ctrl, "get_jog_speed_state"):
+            try:
+                state = ctrl.get_jog_speed_state() or {}
+            except Exception:
+                state = {}
+        for key, _name in self._JOG_SPEED_GROUPS:
+            lbl = labels.get(key)
+            if lbl is None:
+                continue
+            info = state.get(key)
+            if not info:
+                lbl.setText("— <span style='color:%s'>(connect stage)</span>"
+                            % COLORS['subtext0'])
+                continue
+            pct = info.get("pct")
+            speed = info.get("speed")
+            unit = info.get("unit", "")
+            pct_txt = f"{pct:g}%" if pct is not None else "—"
+            if speed is None:
+                lbl.setText(
+                    f"{pct_txt}  "
+                    f"<span style='color:{COLORS['subtext0']}'>"
+                    f"(connect stage)</span>")
+            else:
+                lbl.setText(
+                    f"<span style='color:{COLORS['mauve']}'>{pct_txt}</span>"
+                    f"  <span style='color:{COLORS['subtext0']}'>•</span>  "
+                    f"{speed:.3g} {unit}")
+            # Persist a controller-driven change (cheap; values change rarely).
+            if pct is not None:
+                self._maybe_persist_jog_pct(key, float(pct))
+
+    def _maybe_persist_jog_pct(self, key: str, pct: float) -> None:
+        cache = self._last_persisted_jog_pct
+        prev = cache.get(key)
+        if prev is not None and abs(prev - pct) < 1e-6:
+            return
+        cache[key] = pct
+        self._persist_xbox_setting(f"xbox.jog_speed_pct.{key}", pct)
 
     # ── Calibration group ──────────────────────────────────────
 
@@ -567,6 +680,10 @@ class XboxHardwarePanel(QWidget):
     }
 
     def _tick_monitor(self) -> None:
+        # v7.5.x: the jog speed-% read-out reflects the stage jog handlers,
+        # which exist whenever the stage is connected — independent of whether
+        # the Xbox controller (poller) is connected. Update it first.
+        self._update_jog_speed_readout()
         poller = getattr(self._controller, "xbox_poller", None) \
             if self._controller is not None else None
         if poller is None:

@@ -155,7 +155,7 @@ Click a step size button to select it, then use the direction pad.
 ### Z and Pump Controls
 
 - **Z Up/Down** — Move the needle vertically.
-- **P1/P2/P3 Extrude/Retract** — Move individual syringe pumps.
+- **P1/P2/P3 Dispense/Aspirate** — Move individual syringe pumps (dispense = push fluid out; aspirate = draw fluid in).
 
 **Z/Pump Step Sizes**: 0.01, 0.05, 0.1, 0.5, 1.0, 5.0 mm
 

@@ -40,6 +40,18 @@ def _axis_letter(zp_stage, logical: str) -> str | None:
 _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
 
 
+# ── v7.5.x: settle-aware discrete pump moves ───────────────────────────
+# A pump G0 returns on Marlin `ok` (admitted to the planner buffer), NOT
+# motion-complete, so a settle-aware discrete actuation must block for the
+# (open-loop) move duration before its post-settle dwell. The estimate is
+# abs(volume)/rate + 0.1 s, capped — byte-identical to the legacy EXTRUDE
+# completion wait it subsumes.
+_PUMP_MOVE_WAIT_CAP_S = 10.0
+# Fallback flow rate (µL/s) used only for the completion estimate when a
+# settle-aware caller passes no explicit rate.
+_PUMP_SETTLE_FALLBACK_RATE_UL_S = 1.0
+
+
 # ── v7.5.x: Z display-numbering sign (ME3B V1) ─────────────────────────
 # On this machine the needle physically DESCENDS as the raw Marlin Z
 # counter INCREASES (steps_per_mm["Z"] = +5255). The app numbers Z by the
@@ -55,6 +67,40 @@ _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
 # Because ZDIR = -1 reverses ordering, converting between the height limit
 # spinboxes and the raw-stored limits also requires a min/max SWAP.
 ZDIR = -1.0
+
+# v7.5.x: per-machine well-plate ORIENTATION. The canonical convention is
+# "well A1 displays top-left; stage physical 0,0 is bottom-right". On the
+# ME3B V1 Prior ProScan II the stage origin is at the bottom-right with +X/+Y
+# toward the top-left, so the plate-local axes (A1 at (0,0), +col→right,
+# +row→down) are ANTI-aligned with the stage axes. ``plate_flip_180`` (True
+# on ME3B V1) drives BOTH the 180° display flip (stage-frame views) and the
+# plate-local→stage geometry sign (``plate_axis_sign`` = (-1, -1) when True).
+# Defaults to True to preserve today's ME3B rendering on a machine whose
+# device profile predates this setting; flip to False for a stage mounted
+# with the conventional origin/axes.
+DEFAULT_PLATE_FLIP_180 = True
+
+
+# ── v7.5.x: Xbox jog-speed ladder (percentage of the calibrated max) ───
+# Each joystick-driven axis group (XY / Z / Pump) jogs at a fixed PERCENTAGE
+# of that group's calibrated max move speed (100% = the per-axis max from the
+# Hardware Setup pages). The controller cycles a group up/down one rung at a
+# time via the increment_{xy,z,p}speed_up/down commands.
+JOG_SPEED_LADDER_PCT: tuple[float, ...] = (0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0)
+
+
+def _jog_speed_ladder_step(current_pct: float, direction: int) -> float:
+    """Step *current_pct* to the next (direction>0) / previous rung of
+    ``JOG_SPEED_LADDER_PCT``, snapping from an arbitrary value to the nearest
+    rung first and clamping at both ends."""
+    ladder = JOG_SPEED_LADDER_PCT
+    try:
+        cur = float(current_pct)
+    except (TypeError, ValueError):
+        cur = ladder[0]
+    idx = min(range(len(ladder)), key=lambda i: abs(ladder[i] - cur))
+    idx = max(0, min(len(ladder) - 1, idx + (1 if direction > 0 else -1)))
+    return ladder[idx]
 
 
 def z_raw_to_display(raw: float) -> float:
@@ -107,6 +153,38 @@ def derive_z_up_sign(plate_top_zref: float | None,
         if abs(d) > 1e-6:
             return 1.0 if d > 0 else -1.0
     return ZDIR if fallback is None else fallback
+
+
+def _shorten_only_delta(cur: float, requested: float,
+                        clamped_dest: float) -> float:
+    """Soft-limit a RELATIVE jog so the clamp can only SHORTEN the move.
+
+    Given the current axis position ``cur``, the operator's ``requested`` delta,
+    and the already-clamped absolute destination ``clamped_dest`` (=
+    ``clamp(cur + requested)``), return the delta to actually send. Invariant:
+    the result **never reverses the sign** of ``requested`` and **never exceeds
+    it in magnitude**.
+
+    Why this matters (the "Xbox kept moving the axis constantly" bug): when
+    ``cur`` is already OUTSIDE the envelope — a stale/incoherent Z frame, or the
+    *cached* jog position lagging behind the real one — ``clamped_dest - cur`` is
+    a large delta pointing back toward the limit, OPPOSITE the request. The
+    velocity jog loop re-sent that every segment before the cached position
+    caught up, so the axis ran continuously into the wall. Shorten-only kills
+    that: a jog that would push further out of bounds becomes a no-op, and a jog
+    back toward the valid range moves by at most the requested step (no surprise
+    snap). For an in-bounds jog this is identical to the old ``clamped - cur``.
+    """
+    raw = clamped_dest - cur
+    if raw == 0.0 or (raw > 0.0) != (requested > 0.0):
+        # At the wall (or the clamp wants to move opposite the request, i.e.
+        # cur is out of bounds and we're pushing further out) → don't move.
+        return 0.0
+    if abs(raw) > abs(requested):
+        # cur is out of bounds and the snap-back would overshoot the request →
+        # cap to the requested step so the operator re-enters at jog speed.
+        return requested
+    return raw
 
 
 def _axis_index(zp_stage, logical: str) -> int | None:
@@ -282,6 +360,8 @@ class ZPJogHandler:
         get_zp_position: Callable | None = None,
         zero_position: dict | None = None,  # v7.2.6: zero ref for clamping
         flip_provider: Callable[[str], float] | None = None,  # v7.5.x
+        z_up_sign_provider: Callable[[], float] | None = None,  # v7.5.x
+        pump_dir_sign_provider: Callable[[str], float] | None = None,  # v7.5.x
     ):
         self.processor = processor
         self.stage = zp_stage
@@ -289,10 +369,22 @@ class ZPJogHandler:
         self._get_zp_position = get_zp_position
         self._zero_position = zero_position or {}  # v7.2.6: zero ref for jog clamping
         # v7.5.x: per-logical-axis direction flip. Callable(logical) -> ±1.0,
-        # supplied by StageController so the Xbox jog honors the same
-        # axis_flip settings as the GUI jog buttons (move_z_relative /
-        # move_pump_relative both apply _flip_sign). None = no flip (×1.0).
+        # supplied by StageController so the Xbox PUMP jog honors the same
+        # axis_flip settings as the GUI jog buttons (move_pump_relative applies
+        # _flip_sign). None = no flip (×1.0). Z is NOT flipped here — its
+        # direction comes from z_up_sign (see _z_up_sign).
         self._flip_provider = flip_provider
+        # v7.5.x: the per-machine Z up-direction sign (±1.0) DERIVED by the Set
+        # Bottom/Top setup. Callable() -> ±1.0, supplied by StageController so
+        # the Xbox Z jog moves "up" toward the taught Top exactly like the GUI
+        # buttons (move_z_user_relative). None ⇒ ZDIR (legacy, pre-setup).
+        self._z_up_sign_provider = z_up_sign_provider
+        # v7.5.x: per-pump dispense-direction sign (raw mm per mm of dispense
+        # intent), OWNED by the plunger calibration. Callable(logical) -> ±1.0,
+        # supplied by StageController so the Xbox PUMP jog moves the same
+        # direction as move_pump_relative. None ⇒ fall back to _flip_sign so
+        # uncalibrated pumps jog exactly as before.
+        self._pump_dir_sign_provider = pump_dir_sign_provider
 
         # Velocity state (updated by command handlers)
         self.vel_z: float = 0.0
@@ -303,10 +395,23 @@ class ZPJogHandler:
 
         # Tuning parameters
         self.segment_time: float = 0.12   # seconds per move segment
-        self.z_speed: float = 1.0         # Z speed multiplier
-        self.p_speed: float = 0.5         # Pump speed: µL/s when hw config, mm/s otherwise
-        self.max_speed: float = 1.0
+        # v7.5.x: jog speed = a PERCENTAGE of the per-axis calibrated max move
+        # speed (see JOG_SPEED_LADDER_PCT). ``z_speed``/``p_speed`` are the
+        # effective scalars (DERIVED = speed_pct/100 * speed_max) consumed by
+        # the jog loop; they're recomputed by _recompute_zp_speeds() whenever a
+        # % or max changes. ``*_speed_max`` (100% anchor) is pushed by
+        # StageController.refresh_jog_speed_limits() from the calibrated values.
+        #   Z  : mm/s     (calibrated Z feedrate mm/min ÷ 60)
+        #   P  : µL/s     when a HardwareConfig is set; mm/s otherwise
+        self.z_speed_pct: float = 10.0
+        self.p_speed_pct: float = 10.0
+        self.z_speed_max: float = 1.0     # mm/s at 100%
+        self.p_speed_max: float = 10.0    # µL/s (µL mode) / mm/s (legacy) at 100%
+        self.z_speed: float = 0.0         # derived (mm/s at full deflection)
+        self.p_speed: float = 0.0         # derived
+        self.max_speed: float = 1.0       # legacy general cap (pump mm/s fallback)
         self._hardware_config = None      # Set via set_hardware_config()
+        self._recompute_zp_speeds()
 
         # v7.5.x: velocity staleness watchdog. The Xbox worker re-sends a
         # held non-zero velocity every avg_interval (0.1 s); if commands
@@ -374,9 +479,53 @@ class ZPJogHandler:
         """Enable µL-based pump jog. p_speed becomes µL/s."""
         self._hardware_config = config
         self._pump_disabled_warned.clear()  # re-evaluate on config change
+        # v7.5.x: the pump 100% anchor (p_speed_max) is pushed separately by
+        # StageController.refresh_jog_speed_limits() once the flow limits are
+        # known; just recompute the derived scalar against the current anchor.
+        self._recompute_zp_speeds()
         if config and config.configured_pump_ids:
-            self.p_speed = 1.0  # sensible default: 1 µL/s
-            logger.info("ZPJog: µL mode enabled, p_speed = 1.0 µL/s")
+            logger.info("ZPJog: µL mode enabled (pump jog speed = "
+                        f"{self.p_speed_pct:g}% of {self.p_speed_max:g} µL/s)")
+
+    # ── v7.5.x: percentage-of-max speed plumbing ──────────────────
+    def _recompute_zp_speeds(self) -> None:
+        """Recompute the effective Z/pump scalars from the current % + max."""
+        self.z_speed = max(0.0, self.z_speed_pct / 100.0 * self.z_speed_max)
+        self.p_speed = max(0.0, self.p_speed_pct / 100.0 * self.p_speed_max)
+
+    def set_z_speed_max(self, mm_s: float) -> None:
+        """Set the Z 100% anchor (mm/s) and recompute the effective scalar."""
+        try:
+            v = float(mm_s)
+        except (TypeError, ValueError):
+            return
+        if v > 0:
+            self.z_speed_max = v
+            self._recompute_zp_speeds()
+
+    def set_p_speed_max(self, val: float) -> None:
+        """Set the pump 100% anchor (µL/s in µL mode, mm/s legacy)."""
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return
+        if v > 0:
+            self.p_speed_max = v
+            self._recompute_zp_speeds()
+
+    def set_z_speed_pct(self, pct: float) -> None:
+        try:
+            self.z_speed_pct = float(pct)
+        except (TypeError, ValueError):
+            return
+        self._recompute_zp_speeds()
+
+    def set_p_speed_pct(self, pct: float) -> None:
+        try:
+            self.p_speed_pct = float(pct)
+        except (TypeError, ValueError):
+            return
+        self._recompute_zp_speeds()
 
     @property
     def p_speed_is_uL(self) -> bool:
@@ -385,7 +534,8 @@ class ZPJogHandler:
         return hw is not None and bool(hw.configured_pump_ids)
 
     def speeds(self) -> dict[str, float]:
-        return {"z": self.z_speed, "p": self.p_speed}
+        return {"z": self.z_speed, "p": self.p_speed,
+                "z_pct": self.z_speed_pct, "p_pct": self.p_speed_pct}
 
     # ── Velocity Extraction ───────────────────────────────────────
 
@@ -397,8 +547,12 @@ class ZPJogHandler:
             return val[1] if len(val) > 1 else val[0]
         return float(val)
 
-    def _clamp_vel(self, raw: float, multiplier: float) -> float:
-        return max(-self.max_speed, min(self.max_speed, raw * multiplier))
+    def _clamp_vel(self, raw: float, multiplier: float,
+                   cap: float | None = None) -> float:
+        # v7.5.x: optional explicit cap so Z clamps at its own z_speed_max
+        # (100% anchor) rather than the shared legacy max_speed.
+        c = self.max_speed if cap is None else cap
+        return max(-c, min(c, raw * multiplier))
 
     def _flip_sign(self, logical: str) -> float:
         """v7.5.x: direction-flip sign for a logical axis (Z/P1/P2/P3).
@@ -414,6 +568,35 @@ class ZPJogHandler:
         except Exception:
             return 1.0
 
+    def _z_up_sign(self) -> float:
+        """v7.5.x: per-machine Z up-direction sign (±1.0) for the Xbox jog.
+
+        Mirrors ``StageController.z_up_sign`` so stick-up retracts the needle
+        toward the taught Top regardless of raw-Z polarity. Falls back to the
+        module ``ZDIR`` when no provider is wired (legacy / pre-setup), which
+        reproduces the old ``-vz`` Z jog exactly.
+        """
+        if self._z_up_sign_provider is None:
+            return ZDIR
+        try:
+            s = float(self._z_up_sign_provider())
+            return s if s != 0.0 else ZDIR
+        except Exception:
+            return ZDIR
+
+    def _pump_dir_sign(self, logical: str) -> float:
+        """v7.5.x: dispense-direction sign for a pump (raw mm per mm of dispense
+        intent), OWNED by the plunger calibration. Mirrors
+        ``StageController.pump_dir_sign`` so the Xbox pump jog moves the same
+        direction as ``move_pump_relative``. Falls back to ``_flip_sign`` when no
+        provider is wired (uncalibrated / legacy)."""
+        if self._pump_dir_sign_provider is None:
+            return self._flip_sign(logical)
+        try:
+            return float(self._pump_dir_sign_provider(logical))
+        except Exception:
+            return self._flip_sign(logical)
+
     def _pump_vel_mm_s(self, raw: float, pump_id: str) -> float:
         """Convert raw Xbox axis to pump velocity in mm/s.
 
@@ -427,10 +610,17 @@ class ZPJogHandler:
             if pump_cfg and pump_cfg.is_configured:
                 target_uL_s = raw * self.p_speed  # µL/s
                 vel_mm_s = pump_cfg.uL_to_mm(abs(target_uL_s))
-                vel_mm_s = min(vel_mm_s, self.max_speed)
+                # v7.5.x: cap at this pump's own 100%-flow ceiling (mm/s) so a
+                # full deflection can't exceed the anchored max; the per-pump
+                # safe rate is still enforced by _clamp_pump_flow downstream.
+                try:
+                    cap_mm_s = pump_cfg.uL_to_mm(self.p_speed_max)
+                except Exception:
+                    cap_mm_s = self.max_speed
+                vel_mm_s = min(vel_mm_s, cap_mm_s)
                 return vel_mm_s if target_uL_s >= 0 else -vel_mm_s
-        # Fallback: mm/s mode
-        return self._clamp_vel(raw, self.p_speed)
+        # Fallback: mm/s mode — anchor the cap to the (mm/s) pump max.
+        return self._clamp_vel(raw, self.p_speed, cap=self.p_speed_max)
 
     # ── Command Handlers ──────────────────────────────────────────
 
@@ -447,7 +637,8 @@ class ZPJogHandler:
     def _handle_z_vel(self, *args, **kwargs):
         raw = self._extract_velocity(*args, **kwargs)
         with self._lock:
-            self.vel_z = self._clamp_vel(raw, self.z_speed)
+            # v7.5.x: 100% (full stick) reaches z_speed_max and never exceeds it.
+            self.vel_z = self._clamp_vel(raw, self.z_speed, cap=self.z_speed_max)
             self._last_vel_cmd_time = time.time()  # v7.5.x: watchdog feed
 
     def _clamp_pump_flow(self, vel, pump_id):
@@ -509,22 +700,31 @@ class ZPJogHandler:
         self._handle_pump_vel("P3", "vel_p3", *args, **kwargs)
 
     def _incr_z_up(self, *a, **kw):
-        self.z_speed = min(self.z_speed * 10, 100)
-        logger.info(f"Z speed: {self.z_speed}")
+        # v7.5.x: step the percentage-of-max ladder instead of ×10 decades.
+        self.z_speed_pct = _jog_speed_ladder_step(self.z_speed_pct, +1)
+        self._recompute_zp_speeds()
+        logger.info(f"Z jog speed: {self.z_speed_pct:g}% of max "
+                    f"({self.z_speed:.3f} mm/s)")
 
     def _incr_z_down(self, *a, **kw):
-        self.z_speed = max(self.z_speed / 10, 0.01)
-        logger.info(f"Z speed: {self.z_speed}")
+        self.z_speed_pct = _jog_speed_ladder_step(self.z_speed_pct, -1)
+        self._recompute_zp_speeds()
+        logger.info(f"Z jog speed: {self.z_speed_pct:g}% of max "
+                    f"({self.z_speed:.3f} mm/s)")
 
     def _incr_p_up(self, *a, **kw):
-        self.p_speed = min(self.p_speed * 10, 100)
+        self.p_speed_pct = _jog_speed_ladder_step(self.p_speed_pct, +1)
+        self._recompute_zp_speeds()
         unit = "µL/s" if self.p_speed_is_uL else "mm/s"
-        logger.info(f"P speed: {self.p_speed} {unit}")
+        logger.info(f"Pump jog speed: {self.p_speed_pct:g}% of max "
+                    f"({self.p_speed:.3f} {unit})")
 
     def _incr_p_down(self, *a, **kw):
-        self.p_speed = max(self.p_speed / 10, 0.01)
+        self.p_speed_pct = _jog_speed_ladder_step(self.p_speed_pct, -1)
+        self._recompute_zp_speeds()
         unit = "µL/s" if self.p_speed_is_uL else "mm/s"
-        logger.info(f"P speed: {self.p_speed} {unit}")
+        logger.info(f"Pump jog speed: {self.p_speed_pct:g}% of max "
+                    f"({self.p_speed:.3f} {unit})")
 
 
     def _jog_loop(self) -> None:
@@ -554,14 +754,20 @@ class ZPJogHandler:
                 time.sleep(0.01)
                 continue
 
-            # v7.5.x: apply per-axis direction flip before clamping (matches
-            # the GUI jog order in move_z_relative / move_pump_relative). The
-            # leading -vz keeps the "right-stick-up = +Z" convention; the flip
-            # then inverts it (and each pump) when that axis is flip-enabled.
-            dz = -vz * self.segment_time * self._flip_sign("Z")
-            dp1 = vp1 * self.segment_time * self._flip_sign("P1")
-            dp2 = vp2 * self.segment_time * self._flip_sign("P2")
-            dp3 = vp3 * self.segment_time * self._flip_sign("P3")
+            # v7.5.x: Z direction comes from the per-machine z_up_sign (the Set
+            # Bottom/Top setup) so stick-up retracts the needle toward the
+            # taught Top — exactly like the GUI buttons (move_z_user_relative).
+            # stick-up delivers vz > 0; dz = vz·seg·z_up_sign. This is
+            # algebraically identical to the old "-vz·seg" when z_up_sign = -1
+            # (ZDIR), and correctly flips when the setup derived +1. Pumps keep
+            # the per-axis _flip_sign.
+            # v7.5.x: pump direction is OWNED by the plunger calibration
+            # (_pump_dir_sign → −aspirate_sign once calibrated), mirroring how Z
+            # uses z_up_sign; uncalibrated pumps fall back to _flip_sign.
+            dz = vz * self.segment_time * self._z_up_sign()
+            dp1 = vp1 * self.segment_time * self._pump_dir_sign("P1")
+            dp2 = vp2 * self.segment_time * self._pump_dir_sign("P2")
+            dp3 = vp3 * self.segment_time * self._pump_dir_sign("P3")
 
             # Apply safety limits
             if self.safety_limits and self.safety_limits.enabled and self._get_zp_position:
@@ -578,12 +784,18 @@ class ZPJogHandler:
                         # (Was zero-ref: clamp((cur+delta)-zero)+zero-cur, which
                         # went stale after a Set Z Zero / needle-zero re-anchor
                         # and wrongly clamped the Xbox jog.)
+                        # v7.5.x: shorten-only clamp — see _shorten_only_delta.
+                        # An out-of-bounds CACHED position must NOT make the
+                        # loop synthesize a large opposite-direction delta and
+                        # re-send it every segment (the "kept moving constantly"
+                        # runaway). The clamp may only shorten the jog.
                         def _clamp_delta(logical, delta, clamp_fn):
                             i = _axis_index(self.stage, logical)
                             if i is None or i >= len(pos) or pos[i] is None:
                                 return delta
                             cur = pos[i]
-                            return clamp_fn(cur + delta) - cur
+                            return _shorten_only_delta(
+                                cur, delta, clamp_fn(cur + delta))
 
                         dz = _clamp_delta("Z", dz, self.safety_limits.clamp_z)
                         dp1 = _clamp_delta(
@@ -649,9 +861,16 @@ class XYJogHandler:
         self._lock = threading.Lock()
 
         # Tuning
-        self.xy_speed: float = 100.0
-        self.max_speed: float = 5000.0
+        # v7.5.x: jog speed = a PERCENTAGE of the calibrated XY max (µm/s).
+        # ``xy_speed`` (effective scalar) and ``max_speed`` (velocity cap) are
+        # both derived from speed_pct + speed_max; the 100% anchor (speed_max)
+        # is pushed by StageController.refresh_jog_speed_limits().
+        self.speed_pct: float = 10.0
+        self.speed_max: float = 10000.0   # µm/s at 100% (= safety max_xy_speed)
+        self.xy_speed: float = 0.0        # derived
+        self.max_speed: float = 0.0       # derived (= speed_max)
         self.update_interval: float = 0.1
+        self._recompute_xy_speed()
 
         # v7.5.x: velocity staleness watchdog (see ZPJogHandler).
         self.stale_timeout: float = 0.5
@@ -708,6 +927,30 @@ class XYJogHandler:
     def speed(self) -> float:
         return self.xy_speed
 
+    # ── v7.5.x: percentage-of-max speed plumbing ──────────────────
+    def _recompute_xy_speed(self) -> None:
+        """Recompute the effective XY scalar + cap from the current % + max.
+        100% (full stick) reaches speed_max and never exceeds it."""
+        self.xy_speed = max(0.0, self.speed_pct / 100.0 * self.speed_max)
+        self.max_speed = self.speed_max
+
+    def set_speed_max(self, um_s: float) -> None:
+        """Set the XY 100% anchor (µm/s) and recompute the effective scalar."""
+        try:
+            v = float(um_s)
+        except (TypeError, ValueError):
+            return
+        if v > 0:
+            self.speed_max = v
+            self._recompute_xy_speed()
+
+    def set_speed_pct(self, pct: float) -> None:
+        try:
+            self.speed_pct = float(pct)
+        except (TypeError, ValueError):
+            return
+        self._recompute_xy_speed()
+
     def _handle_vel(self, *args, **kwargs):
         val = kwargs.get("average", (0, 0))
         if isinstance(val, (list, tuple)) and len(val) >= 2:
@@ -719,14 +962,19 @@ class XYJogHandler:
             self.vel_y = max(-self.max_speed, min(self.max_speed, vy * self.xy_speed))
             self._last_vel_cmd_time = time.time()  # v7.5.x: watchdog feed
 
-    def _incr_up(self, *a, **kw):  # v7.2.7: decade speed
-        self.xy_speed = min(self.xy_speed * 10, 10000)
-        logger.info(f"XY speed: {self.xy_speed}")
+    def _incr_up(self, *a, **kw):
+        # v7.5.x: step the percentage-of-max ladder instead of ×10 decades.
+        self.speed_pct = _jog_speed_ladder_step(self.speed_pct, +1)
+        self._recompute_xy_speed()
+        logger.info(f"XY jog speed: {self.speed_pct:g}% of max "
+                    f"({self.xy_speed:.0f} µm/s)")
 
 
-    def _incr_down(self, *a, **kw):  # v7.2.7: decade speed
-        self.xy_speed = max(self.xy_speed / 10, 1)
-        logger.info(f"XY speed: {self.xy_speed}")
+    def _incr_down(self, *a, **kw):
+        self.speed_pct = _jog_speed_ladder_step(self.speed_pct, -1)
+        self._recompute_xy_speed()
+        logger.info(f"XY jog speed: {self.speed_pct:g}% of max "
+                    f"({self.xy_speed:.0f} µm/s)")
 
 
     def _jog_loop(self) -> None:
@@ -837,6 +1085,14 @@ class PositionPoller:
 
     def resume(self) -> None:
         """Resume normal polling after a programmatic move completes."""
+        # v7.5.x ZP-disconnect fix: start a FRESH liveness window on resume.
+        # _zp_fail_count is only meaningful as "consecutive failures while
+        # actively polling". Failures accrued during/around a suspend (e.g. a
+        # print's PRINT_PATH where the poller contends with the per-segment
+        # write stream, or a long safe_travel_to) must NOT carry over and trip
+        # the threshold on the very first post-resume read — that manufactures
+        # a false "ZP disconnected" mid-print. Mirrors set_stages()'s reset.
+        self._zp_fail_count = 0
         self._suspended = False
 
     def set_stages(
@@ -996,11 +1252,22 @@ class StageController:
         # Pushed to Marlin once the ZP stage connects so software and
         # firmware start in sync.
         self._pending_per_axis_max_feedrate: dict | None = None
+        # v7.5.x: per-group Xbox jog speed % (XY / Z / Pump). Owned here so it
+        # survives (re)connect — the GUI restores the persisted value once and
+        # the controller re-applies it whenever the jog handlers are recreated
+        # (see set_jog_speed_pct / _apply_jog_speed_pct / refresh_jog_speed_limits).
+        self._jog_speed_pct: dict[str, float] = {}
         # v7.4.2 hotfix: last-known-good ZP serial port. Tried first on
         # connect_stages() so we skip the rediscovery scan. Set by
         # the caller from settings (zp_stage.last_port) and re-saved
         # whenever the ZP stage reports its connected_port.
         self._preferred_zp_port: str | None = None
+
+        # v7.5.x: True once a REAL ZP board has connected this session. Sticky
+        # (never reset on disconnect) so safe_travel_to can tell a dropped board
+        # (needle present, now unretractable → refuse XY) from a rig that never
+        # had one. See _needle_present() / safe_travel_to.
+        self._zp_ever_connected: bool = False
 
         # Zero reference (set during calibration)
         self.zero_position: dict[str, float] = {
@@ -1048,9 +1315,39 @@ class StageController:
             "Z": False, "P1": False, "P2": False, "P3": False,
         }
 
-        # v7.3.5: Configurable ZP feedrates (mm/min), set from Settings page
+        # v7.5.x: per-pump plunger calibration (mirror of the Z setup). Each
+        # pump's DISPENSE/ASPIRATE direction is OWNED by the calibration (the
+        # "Set Dispensed / Set Aspirated" capture), exactly like z_up_sign owns
+        # Z. ``_pump_aspirate_sign`` = the raw-Marlin-mm direction toward FULL
+        # (aspirate); ``_pump_setup`` holds the captured extremes per pump so
+        # the fill readout + capacity are independent of the soft-limit store.
+        # Empty / sign defaults until a pump is calibrated → the legacy
+        # _flip_sign path is used (nothing changes for uncalibrated pumps).
+        self._pump_aspirate_sign: dict[str, float] = {
+            "P1": 1.0, "P2": 1.0, "P3": 1.0,
+        }
+        self._pump_setup: dict[str, dict] = {}
+
+        # v7.3.5: Configurable ZP feedrates (mm/min), set from Settings page.
+        # v7.5.x: refreshed from the configured Z max so Z moves are FAST —
+        # short motor on-time (less heat) and they complete well within the
+        # M400 flush timeout. Retract (UP, safe) = the Z max; insert (DOWN to
+        # print) = a moderate fraction. See _refresh_zp_move_feedrates().
         self._zp_retract_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE
         self._zp_insert_feedrate: float = ZPStageManager.DEFAULT_FEEDRATE / 2
+
+        # v7.5.x: auto-reconnect the ZP on an UNEXPECTED loss (USB drop /
+        # re-enumeration — the CH340 typically comes back on the same COM
+        # port). A background reconnect self-heals the link without an app
+        # restart. Reopening DTR-resets Marlin (position lost) → on_connect
+        # fires the position-restore prompt; a running print has already
+        # aborted (is_zp_connected went False). Only triggered from
+        # _handle_disconnect (the unexpected path) — never a manual disconnect.
+        self.auto_reconnect_zp: bool = True
+        self._zp_reconnect_attempts: int = 6
+        self._zp_reconnect_delay_s: float = 2.0
+        self._zp_reconnecting: bool = False
+        self._shutting_down: bool = False
         # v7.4.8: minimum safe travel Z (zero-referenced mm) that clears the
         # tallest plate insert/tube. None = no floor. Set from the active
         # plate's max_rim_height + calibration top Z.
@@ -1066,6 +1363,27 @@ class StageController:
         # hard-coded ZDIR. None until the plate top is taught in calibration.
         self._plate_top_z_zref: float | None = None
         self._print_floor_active: bool = False
+        # v7.5.x: per-machine user-facing Z up-direction (+1 or -1). The
+        # canonical user frame is  user_Z = z_up_sign · (raw − zero["Z"]),
+        # with the datum (zero["Z"]) at the needle-all-the-way-DOWN raw
+        # position. Both are established by the one Z setup procedure
+        # (`apply_z_setup`), which DERIVES this sign from the captured
+        # bottom/top extremes so user_Z always increases as the needle rises.
+        # Defaults to the module ZDIR until setup runs (so behaviour is
+        # unchanged on an un-set-up machine).
+        self._z_up_sign: float = ZDIR
+        # v7.5.x: per-machine well-plate orientation (see DEFAULT_PLATE_FLIP_180).
+        # Single source of truth for both the display flip and the plate-local→
+        # stage geometry sign. Restored from the device profile via
+        # ``apply_z_convention``.
+        self._plate_flip_180: bool = DEFAULT_PLATE_FLIP_180
+        # v7.5.x: needle-tip-camera Z fiducial (USER-frame mm = height above
+        # the bottom datum), captured during XY needle calibration, + the
+        # standard mechanical offsets (mm BELOW the fiducial) to the plate
+        # features. Together they PRE-FILL plate Z reference guesses
+        # (plate top / bottom / safe-travel). Max/Replace Z stay manual.
+        self._needle_cam_z_user: float | None = None
+        self._plate_z_offsets: dict = {"top": 10.0, "bottom": 20.0, "safe": 5.0}
         # v7.3.5: Periodic position save to Marlin EEPROM (M500)
         self._zp_auto_save_position: bool = False
 
@@ -1137,6 +1455,20 @@ class StageController:
                     lambda: self._handle_disconnect("XY"),
                 )
             xy_just_connected = True
+            # v7.5.x: on REAL hardware apply the measured XY top speed (if the
+            # timing tool calibrated one) so the mm/s↔SMS-% conversion is
+            # correct for prints/jog WITHOUT having to open the timing tool.
+            # Guarded — never blocks the connect.
+            if not sim_xy:
+                try:
+                    from SupportClasses.PrintTimingCalibrationStore import (
+                        get_store as _get_tc_store,
+                    )
+                    _ms = _get_tc_store().get_xy_max_speed_um_s()
+                    if _ms and hasattr(self.xy_stage, "set_max_speed_um_s"):
+                        self.xy_stage.set_max_speed_um_s(_ms)
+                except Exception as e:
+                    logger.debug("apply stored XY max speed failed: %s", e)
             logger.info(f"XY stage connected ({'SIM' if sim_xy else 'REAL'})")
 
         if zp and self.zp_stage is None:
@@ -1186,6 +1518,14 @@ class StageController:
                 # jog buttons. Bound method reads the live _axis_flip dict, so
                 # later set_axis_flip(s) calls take effect without reconnect.
                 flip_provider=self._flip_sign,
+                # v7.5.x: Z jog direction follows the live per-machine
+                # z_up_sign (the Set Bottom/Top setup), so the Xbox stick agrees
+                # with the GUI buttons + the readout. Bound method = live value.
+                z_up_sign_provider=self.z_up_sign,
+                # v7.5.x: pump jog direction follows the live per-pump plunger
+                # calibration (pump_dir_sign), so the Xbox pump jog agrees with
+                # move_pump_relative once a pump is calibrated.
+                pump_dir_sign_provider=self.pump_dir_sign,
             )
             self.zp_jog.start()
             if not sim_zp:
@@ -1197,6 +1537,12 @@ class StageController:
                 # v7.3.5: Register periodic position save (M500)
                 self._watchdog.add_periodic(self._periodic_zp_position_save)
             zp_just_connected = True
+            # v7.5.x: sticky session flag — once a real ZP board has been live
+            # this session, a needle exists and a later is_zp_connected==False
+            # means it DROPPED (not "XY-only rig"). Drives the safe_travel_to
+            # refuse-XY-when-unretractable guard. Never reset on disconnect.
+            if not sim_zp:
+                self._zp_ever_connected = True
             logger.info(f"ZP stage connected ({'SIM' if sim_zp else 'REAL'})")
 
             # v7.4.2: Apply any pending device settings (axis_map, steps_per_mm)
@@ -1213,6 +1559,13 @@ class StageController:
                     self._pending_per_axis_max_feedrate, persist=True)
 
         self._pos_poller.set_stages(self.xy_stage, self.zp_stage)
+
+        # v7.5.x: anchor the Xbox jog speed-% ladder to the calibrated per-axis
+        # max and re-apply the restored % to the freshly-created jog handlers.
+        try:
+            self.refresh_jog_speed_limits()
+        except Exception as e:
+            logger.debug(f"refresh_jog_speed_limits (connect) failed: {e}")
 
         # v7.5.x: notify the GUI of new connections (after set_stages so the
         # poller already has the stage and the callback can read position).
@@ -1275,6 +1628,432 @@ class StageController:
             logger.info(f"StageController: min travel Z floor = {z_mm:.2f} mm "
                         f"(clears plate inserts)")
 
+    # ── v7.5.x: unified user-facing Z frame (0 at the bottom datum, + up) ──
+    #
+    # ONE canonical convention for everything the operator sees or types:
+    #
+    #     user_Z = z_up_sign · (raw − zero_position["Z"])
+    #     raw    = zero_position["Z"] + user_Z / z_up_sign
+    #
+    # The datum ``zero_position["Z"]`` is the needle-all-the-way-DOWN raw
+    # position captured during the Z setup; ``z_up_sign`` is DERIVED from that
+    # setup so user_Z increases as the needle rises regardless of motor wiring.
+    # Internals (motion, the raw soft-limit envelope) stay in the raw frame —
+    # these convert only at the operator boundary. Use them for EVERY Z readout,
+    # spinbox, limit display, and calibration capture so the whole UI agrees.
+
+    def z_up_sign(self) -> float:
+        """Per-machine user-Z up-direction (+1 or -1). Derived by the Z setup
+        (`apply_z_setup`); defaults to the module ``ZDIR`` until setup runs."""
+        return getattr(self, "_z_up_sign", ZDIR)
+
+    def set_z_up_sign(self, sign: float) -> None:
+        """Set the user-Z up-direction (+1 or -1). Normally derived by the Z
+        setup; exposed for persistence/restore."""
+        s = 1.0 if float(sign) >= 0 else -1.0
+        self._z_up_sign = s
+        logger.info(f"StageController: user-Z up-direction sign = {s:+.0f}")
+
+    # ── v7.5.x: well-plate orientation (single source of truth) ─────────
+    #
+    # ONE per-machine setting (``plate_flip_180``) enforces the canonical
+    # convention "well A1 top-left; stage physical 0,0 bottom-right" everywhere.
+    # It drives BOTH the 180° display flip (stage-frame plate views) and the
+    # plate-local→stage geometry sign (``plate_axis_sign``). See
+    # DEFAULT_PLATE_FLIP_180. The ``getattr`` fallbacks keep ``__new__`` test
+    # stubs working (mirrors ``z_up_sign``).
+
+    def plate_flip_180(self) -> bool:
+        """Whether plate displays / geometry are rotated 180° relative to the
+        stage axes (True on ME3B V1: origin bottom-right, A1 top-left)."""
+        return bool(getattr(self, "_plate_flip_180", DEFAULT_PLATE_FLIP_180))
+
+    def set_plate_flip_180(self, flip: bool) -> None:
+        """Set the per-machine plate orientation. Exposed for persistence /
+        restore from the device profile."""
+        self._plate_flip_180 = bool(flip)
+        logger.info(f"StageController: plate_flip_180 = {self._plate_flip_180}")
+
+    def plate_axis_sign(self) -> tuple[float, float]:
+        """Sign mapping plate-local axes (+col→+X, +row→+Y) onto stage axes.
+
+        ``(-1.0, -1.0)`` when the plate is mounted 180° to the stage (ME3B V1),
+        else ``(+1.0, +1.0)``. Multiply an A1-relative offset by this before
+        adding it to a taught A1 / plate-centre stage coordinate so geometric
+        well prediction lands on the physically-correct side of A1.
+        """
+        return (-1.0, -1.0) if self.plate_flip_180() else (1.0, 1.0)
+
+    def raw_to_user_z(self, raw_mm: float) -> float:
+        """Raw Marlin Z (mm) → user-facing Z (mm; 0 at the bottom datum, + up)."""
+        return self.z_up_sign() * (float(raw_mm) - self.zero_position.get("Z", 0.0))
+
+    def user_z_to_raw(self, user_z_mm: float) -> float:
+        """User-facing Z (mm) → raw Marlin Z (mm)."""
+        return (self.zero_position.get("Z", 0.0)
+                + float(user_z_mm) / self.z_up_sign())
+
+    def zref_to_user_z(self, zref_mm: float) -> float:
+        """Zero-ref Z (mm) → user-facing Z (mm) — i.e. ``z_up_sign · zref``.
+
+        Equals :meth:`z_height_of`; the working/calibration/print code stores
+        Z in the zero-ref frame, so this is the converter for those values.
+        """
+        return self.z_up_sign() * float(zref_mm)
+
+    def user_z_to_zref(self, user_z_mm: float) -> float:
+        """User-facing Z (mm) → zero-ref Z (mm)."""
+        return float(user_z_mm) / self.z_up_sign()
+
+    def capture_current_z_raw(self) -> float | None:
+        """Read the current RAW Marlin Z (mm) for the Z setup captures, or None
+        when the ZP stage can't be read."""
+        zp = self.get_zp_position(cached=False)
+        return self.zp_logical_value(zp, "Z") if zp else None
+
+    def apply_z_setup(self, raw_bottom_mm: float, raw_top_mm: float,
+                      min_travel_mm: float = 1.0) -> dict:
+        """Establish the whole Z convention from two captured raw extremes.
+
+        This is the single source of truth for the Z datum, direction, and
+        soft limits (decisions D1–D4):
+
+        * ``raw_bottom_mm`` — needle all the way DOWN (mechanical hard-bottom).
+          Becomes user **Z = 0** (``zero_position["Z"] = raw_bottom``).
+        * ``raw_top_mm`` — needle all the way UP.
+
+        Derived (no hard-coded polarity):
+
+        * ``z_up_sign = sign(raw_top − raw_bottom)`` so user_Z increases toward
+          the top — this *verifies/establishes the direction*.
+        * soft-limit envelope (stored ABSOLUTE raw, Set-Zero-independent):
+          ``z_min = min(raw_bottom, raw_top)``, ``z_max = max(...)``.
+
+        Returns a summary dict including ``direction_ok`` (False when the two
+        extremes are closer than ``min_travel_mm`` — the caller should warn and
+        the sign is left unchanged).
+        """
+        rb = float(raw_bottom_mm)
+        rt = float(raw_top_mm)
+        d = rt - rb
+        ok = abs(d) >= float(min_travel_mm)
+        # Datum: the bottom is user Z = 0.
+        self.zero_position["Z"] = rb
+        # Direction: only trust it when the extremes are meaningfully apart.
+        if ok:
+            self.set_z_up_sign(1.0 if d > 0 else -1.0)
+        # Soft-limit envelope in the absolute raw frame.
+        self.safety_limits.z_min = min(rb, rt)
+        self.safety_limits.z_max = max(rb, rt)
+        summary = {
+            "raw_bottom": rb,
+            "raw_top": rt,
+            "z_up_sign": self._z_up_sign,
+            "travel_height_mm": abs(d),
+            "z_min": self.safety_limits.z_min,
+            "z_max": self.safety_limits.z_max,
+            "direction_ok": ok,
+        }
+        logger.info(
+            "Z setup applied: bottom(raw)=%.3f→userZ=0, top(raw)=%.3f, "
+            "up_sign=%+.0f, travel=%.3f mm, z_envelope_raw=[%.3f, %.3f], "
+            "direction_ok=%s",
+            rb, rt, self._z_up_sign, abs(d),
+            self.safety_limits.z_min, self.safety_limits.z_max, ok)
+        return summary
+
+    # ── v7.5.x: per-pump plunger setup (mirror of apply_z_setup) ──────────
+    #
+    # ONE capture flow per pump establishes the whole fill convention:
+    #
+    #   * "Set Dispensed" — plunger ALL THE WAY IN (syringe empty). This raw
+    #     position becomes the datum (fill = 0); ``zero_position[pump] = raw``.
+    #   * "Set Aspirated" — plunger ALL THE WAY OUT (syringe full).
+    #
+    # Derived (no hard-coded polarity): the aspirate direction sign and the
+    # soft-limit envelope. ASPIRATE = draw fluid IN (toward full, raises fill);
+    # DISPENSE = push fluid OUT (toward empty, lowers fill). The derived
+    # direction is OWNED by this setup — once calibrated it drives motion
+    # (see ``pump_dir_sign`` / ``move_pump_relative``), retiring the per-pump
+    # _flip_sign hack, exactly as z_up_sign superseded the Z axis-flip.
+
+    def pump_aspirate_sign(self, pump: str) -> float:
+        """Per-pump raw-Marlin-mm direction toward FULL (+1 / -1), DERIVED by
+        :meth:`apply_pump_setup`. Defaults to +1 until the pump is calibrated."""
+        return getattr(self, "_pump_aspirate_sign", {}).get(pump, 1.0)
+
+    def set_pump_aspirate_sign(self, pump: str, sign: float) -> None:
+        """Set/restore a pump's aspirate-direction sign (+1 / -1). Normally
+        derived by the plunger setup; exposed for persistence/restore."""
+        if not hasattr(self, "_pump_aspirate_sign"):
+            self._pump_aspirate_sign = {"P1": 1.0, "P2": 1.0, "P3": 1.0}
+        self._pump_aspirate_sign[pump] = 1.0 if float(sign) >= 0 else -1.0
+        logger.info(f"StageController: {pump} aspirate-direction sign = "
+                    f"{self._pump_aspirate_sign[pump]:+.0f}")
+
+    def is_pump_plunger_calibrated(self, pump: str) -> bool:
+        """True once :meth:`apply_pump_setup` has captured both extremes for
+        ``pump`` — the point at which the calibration OWNS its direction."""
+        s = getattr(self, "_pump_setup", {}).get(pump)
+        return bool(s and "raw_dispensed" in s and "raw_aspirated" in s)
+
+    def pump_dir_sign(self, pump: str) -> float:
+        """Raw-mm direction for one mm of *dispense intent* (the sign applied in
+        :meth:`move_pump_relative`). Calibration-owned when the pump is
+        calibrated: dispense moves toward empty = ``−aspirate_sign``. Falls back
+        to the legacy per-axis ``_flip_sign`` for uncalibrated pumps so nothing
+        changes until a pump is set up."""
+        if self.is_pump_plunger_calibrated(pump):
+            return -self.pump_aspirate_sign(pump)
+        return self._flip_sign(pump)
+
+    def capture_current_pump_raw(self, pump: str) -> float | None:
+        """Read the current RAW Marlin position (mm) for a pump's plunger setup
+        captures, routed through the live axis_map. None when unreadable."""
+        zp = self.get_zp_position(cached=False)
+        return self.zp_logical_value(zp, pump) if zp else None
+
+    def apply_pump_setup(self, pump: str, raw_dispensed_mm: float,
+                         raw_aspirated_mm: float,
+                         min_travel_mm: float = 1.0) -> dict:
+        """Establish a pump's whole fill/direction convention from two captured
+        raw extremes — the pump twin of :meth:`apply_z_setup`.
+
+        * ``raw_dispensed_mm`` — plunger ALL THE WAY IN (syringe empty). Becomes
+          the datum (fill = 0); ``zero_position[pump] = raw_dispensed``.
+        * ``raw_aspirated_mm`` — plunger ALL THE WAY OUT (syringe full).
+
+        Derived:
+
+        * ``aspirate_sign = sign(raw_aspirated − raw_dispensed)`` (the raw
+          direction toward FULL) — this *establishes the plunger direction* and
+          becomes authoritative for motion (see :meth:`pump_dir_sign`).
+        * soft-limit envelope (ABSOLUTE raw, exact captured extremes — no margin,
+          so the plunger is never commanded past its mechanical hard stops):
+          ``p_min = min(...)``, ``p_max = max(...)``.
+
+        Returns a summary dict including ``direction_ok`` (False when the two
+        extremes are closer than ``min_travel_mm`` — the sign is left unchanged,
+        but datum + limits are still set).
+        """
+        if pump not in ("P1", "P2", "P3"):
+            raise ValueError(f"Invalid pump ID: {pump}")
+        rd = float(raw_dispensed_mm)
+        ra = float(raw_aspirated_mm)
+        d = ra - rd
+        ok = abs(d) >= float(min_travel_mm)
+        # Datum: plunger all-the-way-in (empty) is fill = 0.
+        self.zero_position[pump] = rd
+        # Direction: only trust it when the extremes are meaningfully apart.
+        if ok:
+            self.set_pump_aspirate_sign(pump, 1.0 if d > 0 else -1.0)
+        # Soft-limit envelope in the absolute raw frame (exact extremes).
+        lo, hi = min(rd, ra), max(rd, ra)
+        setattr(self.safety_limits, f"{pump.lower()}_min", lo)
+        setattr(self.safety_limits, f"{pump.lower()}_max", hi)
+        # Capacity (µL) from the calibrated stroke, when a syringe is configured.
+        capacity_uL = self._pump_mm_to_uL(pump, abs(d))
+        # Remember the extremes so the fill readout + capacity are independent
+        # of the soft-limit store (which a hw-config re-apply could overwrite).
+        if not hasattr(self, "_pump_setup"):
+            self._pump_setup = {}
+        self._pump_setup[pump] = {
+            "raw_dispensed": rd,
+            "raw_aspirated": ra,
+            "aspirate_sign": self.pump_aspirate_sign(pump),
+            "capacity_uL": capacity_uL,
+        }
+        summary = {
+            "pump": pump,
+            "raw_dispensed": rd,
+            "raw_aspirated": ra,
+            "aspirate_sign": self.pump_aspirate_sign(pump),
+            "capacity_mm": abs(d),
+            "capacity_uL": capacity_uL,
+            "p_min": lo,
+            "p_max": hi,
+            "direction_ok": ok,
+        }
+        logger.info(
+            "%s plunger setup: dispensed(raw)=%.3f→fill0, aspirated(raw)=%.3f, "
+            "aspirate_sign=%+.0f, stroke=%.3f mm (%s µL), envelope_raw=[%.3f, "
+            "%.3f], direction_ok=%s",
+            pump, rd, ra, self.pump_aspirate_sign(pump), abs(d),
+            f"{capacity_uL:.1f}" if capacity_uL is not None else "n/a",
+            lo, hi, ok)
+        return summary
+
+    def apply_pump_convention(self, pump_setup: dict | None = None) -> None:
+        """Restore the persisted per-pump plunger convention at startup (mirror
+        of :meth:`apply_z_convention`). ``pump_setup`` maps pump → dict with
+        ``raw_dispensed`` / ``raw_aspirated`` / ``aspirate_sign``. Re-establishes
+        each pump's datum + sign (re-deriving the sign from the extremes as a
+        self-check); soft limits are restored from the ``safety_limits`` section
+        separately. Does NOT move."""
+        if not pump_setup:
+            return
+        if not hasattr(self, "_pump_setup"):
+            self._pump_setup = {}
+        for pump, s in pump_setup.items():
+            if pump not in ("P1", "P2", "P3") or not isinstance(s, dict):
+                continue
+            rd = s.get("raw_dispensed")
+            ra = s.get("raw_aspirated")
+            if rd is None or ra is None:
+                continue
+            rd, ra = float(rd), float(ra)
+            self.zero_position[pump] = rd
+            d = ra - rd
+            # Prefer the stored sign; re-derive from the extremes if absent.
+            sign = s.get("aspirate_sign")
+            if sign is None and abs(d) > 0:
+                sign = 1.0 if d > 0 else -1.0
+            if sign is not None:
+                self.set_pump_aspirate_sign(pump, sign)
+            self._pump_setup[pump] = {
+                "raw_dispensed": rd,
+                "raw_aspirated": ra,
+                "aspirate_sign": self.pump_aspirate_sign(pump),
+                "capacity_uL": s.get("capacity_uL",
+                                     self._pump_mm_to_uL(pump, abs(d))),
+            }
+        logger.info(f"Pump plunger convention restored: "
+                    f"{sorted(self._pump_setup.keys())}")
+
+    def get_pump_setup(self) -> dict:
+        """Per-pump captured extremes + derived sign (for persistence)."""
+        return {k: dict(v) for k, v in getattr(self, "_pump_setup", {}).items()}
+
+    # ── v7.5.x: plunger FILL readout (0 = empty/dispensed → capacity = full) ──
+
+    def _pump_mm_to_uL(self, pump: str, mm: float) -> float | None:
+        """Convert a plunger travel (mm) to µL via the configured syringe spec,
+        or None when no syringe is configured for ``pump``."""
+        hw = getattr(self, "_hardware_config", None)
+        cfg = hw.pumps.get(pump) if hw else None
+        if not cfg or not cfg.is_configured:
+            return None
+        try:
+            return cfg.mm_to_uL(float(mm))
+        except (ValueError, AttributeError):
+            return None
+
+    def pump_capacity_uL(self, pump: str) -> float | None:
+        """Calibrated usable plunger capacity in µL (full − empty), or None when
+        the pump isn't calibrated or has no syringe configured."""
+        s = getattr(self, "_pump_setup", {}).get(pump)
+        if not s or "raw_dispensed" not in s or "raw_aspirated" not in s:
+            return None
+        stroke_mm = abs(float(s["raw_aspirated"]) - float(s["raw_dispensed"]))
+        uL = self._pump_mm_to_uL(pump, stroke_mm)
+        return abs(uL) if uL is not None else None
+
+    def raw_to_pump_fill_uL(self, pump: str, raw_mm: float) -> float | None:
+        """Raw Marlin position (mm) → plunger FILL in µL: 0 at the dispensed
+        datum (empty), growing toward the aspirated extreme (full). None when
+        the pump isn't calibrated or has no syringe. Uses the calibration-owned
+        ``aspirate_sign`` so fill grows the right way on either polarity."""
+        if not self.is_pump_plunger_calibrated(pump):
+            return None
+        fill_mm = self.pump_aspirate_sign(pump) * (
+            float(raw_mm) - self.zero_position.get(pump, 0.0))
+        return self._pump_mm_to_uL(pump, fill_mm)
+
+    def pump_fill_uL(self, pump: str) -> float | None:
+        """Current plunger fill in µL (0 = empty/dispensed → capacity =
+        full/aspirated), or None when uncalibrated / unreadable."""
+        idx_pos = self.get_zp_position(cached=True)
+        raw = self.zp_logical_value(idx_pos, pump) if idx_pos else None
+        if raw is None:
+            return None
+        return self.raw_to_pump_fill_uL(pump, raw)
+
+    # ── v7.5.x: needle-tip-camera Z fiducial → plate-reference guesses ──
+    #
+    # The needle-tip calibration cameras sit at a fixed height. When the tip is
+    # centered in them (XY needle cal), the needle is at a repeatable Z. We
+    # capture that Z (the "needle-cam fiducial") and apply STANDARD mechanical
+    # offsets (mm below the fiducial) to PRE-FILL guesses for the plate Z
+    # references (plate top / bottom / safe-travel). Max/Replace Z stay manual.
+
+    def set_needle_cam_z_from_raw(self, raw_mm: float) -> float:
+        """Record the needle-tip-camera Z fiducial from a live RAW Z reading
+        (captured at the needle edge clicks). Stored in the USER frame (height
+        above the bottom datum) so it stays meaningful across power cycles once
+        the datum is re-established. Returns the stored user-Z."""
+        self._needle_cam_z_user = self.raw_to_user_z(float(raw_mm))
+        logger.info("Needle-cam Z fiducial = %.3f mm (user) from raw %.3f",
+                    self._needle_cam_z_user, float(raw_mm))
+        return self._needle_cam_z_user
+
+    def set_needle_cam_z_user(self, user_z_mm: float | None) -> None:
+        """Set/restore the needle-cam Z fiducial directly in the USER frame
+        (mm above the bottom datum), or None to clear."""
+        self._needle_cam_z_user = (None if user_z_mm is None
+                                   else float(user_z_mm))
+
+    def get_needle_cam_z_user(self) -> float | None:
+        """Needle-cam Z fiducial (USER-frame mm), or None if not captured."""
+        return self._needle_cam_z_user
+
+    def set_plate_z_offsets(self, top: float | None = None,
+                            bottom: float | None = None,
+                            safe: float | None = None) -> None:
+        """Set the standard mm-BELOW-the-fiducial offsets to the plate features.
+        Only the provided keys are updated."""
+        if top is not None:
+            self._plate_z_offsets["top"] = float(top)
+        if bottom is not None:
+            self._plate_z_offsets["bottom"] = float(bottom)
+        if safe is not None:
+            self._plate_z_offsets["safe"] = float(safe)
+
+    def get_plate_z_offsets(self) -> dict:
+        """The standard plate offsets (mm below the needle-cam fiducial)."""
+        return dict(self._plate_z_offsets)
+
+    def estimate_plate_z_refs(self) -> dict | None:
+        """Guess the plate Z references from the needle-cam fiducial + the
+        standard offsets. Returns ``{"plate_top_z", "plate_bottom_z",
+        "safe_z"}`` in ZERO-REF mm (the frame the calibration references and
+        ``set_plate_*_z`` use), or None if the fiducial isn't captured.
+
+        The plate features sit BELOW the fiducial (the needle descends from the
+        camera height to the plate), so each guess is ``fiducial − offset`` in
+        the user/height frame, then converted to zero-ref.
+        """
+        cam = self._needle_cam_z_user
+        if cam is None:
+            return None
+        off = self._plate_z_offsets
+        top_user = cam - float(off.get("top", 0.0))
+        bottom_user = cam - float(off.get("bottom", 0.0))
+        safe_user = cam - float(off.get("safe", 0.0))
+        return {
+            "plate_top_z": self.user_z_to_zref(top_user),
+            "plate_bottom_z": self.user_z_to_zref(bottom_user),
+            "safe_z": self.user_z_to_zref(safe_user),
+        }
+
+    def apply_z_convention(self, z_up_sign: float | None = None,
+                           needle_cam_z: float | None = None,
+                           plate_z_offsets: dict | None = None,
+                           plate_flip_180: bool | None = None) -> None:
+        """Restore the persisted Z + plate-orientation convention (called on
+        load/connect from the device profile / settings). All args optional;
+        None leaves the current value unchanged."""
+        if z_up_sign is not None:
+            self.set_z_up_sign(z_up_sign)
+        if needle_cam_z is not None:
+            self._needle_cam_z_user = float(needle_cam_z)
+        if plate_z_offsets:
+            self.set_plate_z_offsets(
+                top=plate_z_offsets.get("top"),
+                bottom=plate_z_offsets.get("bottom"),
+                safe=plate_z_offsets.get("safe"))
+        if plate_flip_180 is not None:
+            self.set_plate_flip_180(plate_flip_180)
+
     # ── v7.5.x: plate-bottom Z datum + print-time "don't punch through" ──
 
     def set_plate_bottom_z(self, z_zero_ref_mm: float | None) -> None:
@@ -1322,7 +2101,8 @@ class StageController:
         behaviour is unchanged until both references are taught.
         """
         return derive_z_up_sign(getattr(self, "_plate_top_z_zref", None),
-                                getattr(self, "_plate_bottom_z_zref", None))
+                                getattr(self, "_plate_bottom_z_zref", None),
+                                fallback=self.z_up_sign())
 
     def set_print_floor_active(self, active: bool) -> None:
         """Arm/disarm the plate-bottom floor (armed only during printing)."""
@@ -1414,6 +2194,19 @@ class StageController:
             if per_axis_max_feedrate is not None:
                 self.zp_stage.set_per_axis_max_feedrate(
                     per_axis_max_feedrate, persist=persist_feedrate)
+        # v7.5.x: the Z jog speed-% is anchored to per_axis_max_feedrate['Z'],
+        # so re-anchor whenever it changes (no-op if jog handler not connected).
+        if per_axis_max_feedrate is not None:
+            try:
+                self.refresh_jog_speed_limits()
+            except Exception as e:
+                logger.debug(f"refresh_jog_speed_limits (device settings) failed: {e}")
+        # v7.5.x: re-derive the Z retract/insert feedrates from the (possibly
+        # updated) Z max so Z moves stay fast.
+        try:
+            self._refresh_zp_move_feedrates()
+        except Exception as e:
+            logger.debug(f"_refresh_zp_move_feedrates failed: {e}")
 
     def connect_xy(self, simulate: bool | None = None) -> None:
         """Connect only the XY stage.
@@ -1453,6 +2246,77 @@ class StageController:
                 return
         if self.on_disconnect:
             self.on_disconnect(stage_name)
+        # v7.5.x: an UNEXPECTED ZP loss (USB drop) → try to auto-reconnect in
+        # the background. Gated to real hardware + enabled + not shutting down.
+        # getattr-safe so __new__-constructed test controllers don't trigger it.
+        if (stage_name == "ZP" and getattr(self, "auto_reconnect_zp", False)
+                and not getattr(self, "_default_simulate_zp", True)
+                and not getattr(self, "_shutting_down", False)):
+            self._schedule_zp_reconnect()
+
+    def _schedule_zp_reconnect(self) -> None:
+        """Start a background ZP reconnect attempt (idempotent)."""
+        if self._zp_reconnecting or self._shutting_down:
+            return
+        self._zp_reconnecting = True
+        threading.Thread(target=self._zp_reconnect_loop, daemon=True,
+                         name="ZPReconnect").start()
+
+    def _zp_reconnect_loop(self) -> None:
+        """Retry connecting the ZP a few times (the CH340 re-enumerates on the
+        same COM port after a drop). On success, connect_stages fires
+        on_connect("ZP") → the GUI's position-restore prompt (Marlin reset on
+        the reopen). Best-effort; never raises."""
+        try:
+            n = max(1, int(self._zp_reconnect_attempts))
+            for attempt in range(1, n + 1):
+                if self._shutting_down:
+                    return
+                time.sleep(max(0.2, float(self._zp_reconnect_delay_s)))
+                if self.is_zp_connected:
+                    return  # came back (e.g. a manual reconnect) — done
+                logger.info(f"ZP auto-reconnect: attempt {attempt}/{n}…")
+                try:
+                    self.connect_zp(simulate=False)
+                except Exception as e:
+                    logger.info(f"ZP auto-reconnect attempt {attempt} "
+                                f"failed: {e}")
+                if self.is_zp_connected:
+                    logger.info("ZP auto-reconnect succeeded — re-declare the "
+                                "Z position (Marlin reset on reopen).")
+                    try:
+                        _zp_tracer = __import__(
+                            "SupportClasses.ZPSerialTrace",
+                            fromlist=["tracer"]).tracer()
+                        _zp_tracer.event("auto_reconnect_ok",
+                                         attempt=attempt)
+                    except Exception:
+                        pass
+                    return
+            logger.warning(f"ZP auto-reconnect gave up after {n} attempts — "
+                           f"reconnect manually on Hardware Setup → Device.")
+        finally:
+            self._zp_reconnecting = False
+
+    def _refresh_zp_move_feedrates(self) -> None:
+        """v7.5.x: set the Z retract/insert feedrates from the configured Z max
+        so Z moves are fast — short on-time (less heat) and they finish within
+        the M400 flush timeout. Retract (UP, always safe) uses the full Z max;
+        insert (DOWN toward the plate) uses a moderate 0.6× so the descent isn't
+        slammed (it's also plate-floor clamped + arrival-confirmed). No-op if no
+        Z max is configured (keeps the conservative __init__ defaults)."""
+        z_max = None
+        pa = getattr(self, "_pending_per_axis_max_feedrate", None) or {}
+        try:
+            if pa.get("Z"):
+                z_max = float(pa["Z"])
+            elif getattr(self.safety_limits, "max_z_feedrate", 0):
+                z_max = float(self.safety_limits.max_z_feedrate)
+        except Exception:
+            z_max = None
+        if z_max and z_max > 0:
+            self._zp_retract_feedrate = z_max
+            self._zp_insert_feedrate = max(z_max * 0.6, 100.0)
 
     def disconnect_xy(self) -> None:
         if self.xy_jog:
@@ -1683,6 +2547,118 @@ class StageController:
             return False
 
 
+    # ── v7.5.x: Xbox jog speed as a % of the calibrated max ────────
+
+    def _pump_jog_max_native(self) -> float:
+        """Pump 100% anchor for the jog speed-%.
+
+        µL mode (HardwareConfig present) → the largest configured safe flow
+        rate (µL/s); the per-pump safe rate is still enforced downstream by
+        ``_clamp_pump_flow`` so anchoring to the fastest can't let a slower
+        pump exceed its limit. Legacy/no-config → ``max_pump_feedrate`` ÷ 60
+        (mm/s). Returns 0.0 when nothing usable is configured (no-op upstream).
+        """
+        hw = self._hardware_config
+        sl = self.safety_limits
+        if hw is not None and getattr(hw, "configured_pump_ids", None):
+            rates: list[float] = []
+            if sl is not None:
+                for pid in hw.configured_pump_ids:
+                    try:
+                        r = float(sl.get_max_flow_rate(pid))
+                    except Exception:
+                        r = 0.0
+                    if r > 0:
+                        rates.append(r)
+            if rates:
+                return max(rates)
+            return 10.0  # µL/s default when no flow limit is computed yet
+        if sl is not None and getattr(sl, "max_pump_feedrate", 0):
+            try:
+                return float(sl.max_pump_feedrate) / 60.0
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def refresh_jog_speed_limits(self) -> None:
+        """Push the per-axis calibrated max move speed (100% anchor) into the
+        Xbox jog handlers and re-apply the chosen %. Sources mirror the Control
+        Panel "Speeds" seeding:
+          XY  → safety_limits.max_xy_speed (µm/s)
+          Z   → per_axis_max_feedrate['Z'] or max_z_feedrate (mm/min) ÷ 60 → mm/s
+          Pump→ _pump_jog_max_native() (µL/s in µL mode, else mm/s)
+        Safe to call any time (no-op for handlers that aren't connected yet)."""
+        sl = self.safety_limits
+        if self.xy_jog is not None and sl is not None:
+            xy_max = getattr(sl, "max_xy_speed", 0.0)
+            if xy_max and xy_max > 0:
+                self.xy_jog.set_speed_max(float(xy_max))
+        if self.zp_jog is not None:
+            z_feed_mm_min = None
+            pa = self._pending_per_axis_max_feedrate or {}
+            if pa.get("Z"):
+                z_feed_mm_min = pa.get("Z")
+            elif sl is not None and getattr(sl, "max_z_feedrate", 0):
+                z_feed_mm_min = sl.max_z_feedrate
+            if z_feed_mm_min and float(z_feed_mm_min) > 0:
+                self.zp_jog.set_z_speed_max(float(z_feed_mm_min) / 60.0)
+            p_max = self._pump_jog_max_native()
+            if p_max and p_max > 0:
+                self.zp_jog.set_p_speed_max(p_max)
+        # Re-apply any restored/operator-chosen % against the new anchors.
+        self._apply_jog_speed_pct()
+
+    def _apply_jog_speed_pct(self) -> None:
+        """Apply the stored per-group % to whichever jog handlers exist."""
+        p = self._jog_speed_pct
+        if self.xy_jog is not None and "xy" in p:
+            self.xy_jog.set_speed_pct(p["xy"])
+        if self.zp_jog is not None:
+            if "z" in p:
+                self.zp_jog.set_z_speed_pct(p["z"])
+            if "p" in p:
+                self.zp_jog.set_p_speed_pct(p["p"])
+
+    def set_jog_speed_pct(self, group: str, pct: float) -> None:
+        """Set a group's jog speed % (group ∈ {'xy','z','p'/'pump'}). Stored on
+        the controller so it survives (re)connect, then applied to live handlers."""
+        g = str(group).lower()
+        if g == "pump":
+            g = "p"
+        if g not in ("xy", "z", "p"):
+            return
+        try:
+            self._jog_speed_pct[g] = float(pct)
+        except (TypeError, ValueError):
+            return
+        self._apply_jog_speed_pct()
+
+    def get_jog_speed_state(self) -> dict:
+        """Read-out for the GUI: {group: {pct, speed, unit}} for present groups.
+        Falls back to the stored % (no resolved speed) when a handler isn't
+        connected so the page can still show the selected value."""
+        out: dict[str, dict] = {}
+        if self.xy_jog is not None:
+            out["xy"] = {"pct": self.xy_jog.speed_pct,
+                         "speed": self.xy_jog.xy_speed, "unit": "µm/s"}
+        elif "xy" in self._jog_speed_pct:
+            out["xy"] = {"pct": self._jog_speed_pct["xy"],
+                         "speed": None, "unit": "µm/s"}
+        if self.zp_jog is not None:
+            out["z"] = {"pct": self.zp_jog.z_speed_pct,
+                        "speed": self.zp_jog.z_speed, "unit": "mm/s"}
+            p_unit = "µL/s" if self.zp_jog.p_speed_is_uL else "mm/s"
+            out["p"] = {"pct": self.zp_jog.p_speed_pct,
+                        "speed": self.zp_jog.p_speed, "unit": p_unit}
+        else:
+            if "z" in self._jog_speed_pct:
+                out["z"] = {"pct": self._jog_speed_pct["z"],
+                            "speed": None, "unit": "mm/s"}
+            if "p" in self._jog_speed_pct:
+                out["p"] = {"pct": self._jog_speed_pct["p"],
+                            "speed": None, "unit": "µL/s"}
+        return out
+
     def calibrate_xbox_sticks(self, duration: float = 2.0) -> dict:
         """Run stick center calibration. Returns offsets dict.
 
@@ -1820,12 +2796,34 @@ class StageController:
         # pump under a non-default map). A wrong-axis read here could
         # falsely confirm Z arrival and let XY move / Z descend early.
         zi = _axis_index(self.zp_stage, "Z")
+
+        # v7.5.x: fast-fail on a dead board. ``get_current_position`` returns
+        # the last *stale* floats when the board stops answering M114, so a
+        # genuine ZP drop used to make this loop wait out the full timeout
+        # comparing a frozen position to the target (and freeze any GUI-thread
+        # caller for that whole window). Track consecutive read failures via
+        # the explicit ``_last_position_read_ok`` flag (the same signal the
+        # poller-liveness watchdog uses) and bail early once the board has
+        # clearly gone silent. Debounced so a single transient miss under a
+        # busy write stream is ridden out, not treated as a disconnect.
+        read_fail_streak = 0
+        read_fail_limit = 5  # ~0.75 s of consecutive silence at poll_interval
         while time.monotonic() < deadline:
             pos = self.get_zp_position(cached=False)
-            if zi is not None and zi < len(pos) and pos[zi] is not None:
-                z_mm = (pos[zi] - self.zero_position.get("Z", 0))
-                if abs(z_mm - target_z_mm) <= tolerance_mm:
-                    return True
+            if getattr(self.zp_stage, "_last_position_read_ok", True):
+                read_fail_streak = 0
+                if zi is not None and zi < len(pos) and pos[zi] is not None:
+                    z_mm = (pos[zi] - self.zero_position.get("Z", 0))
+                    if abs(z_mm - target_z_mm) <= tolerance_mm:
+                        return True
+            else:
+                read_fail_streak += 1
+                if read_fail_streak >= read_fail_limit:
+                    logger.warning(
+                        f"wait_for_z_arrival: ZP stopped answering M114 "
+                        f"({read_fail_streak} consecutive failures) — "
+                        f"treating Z move as unconfirmed (target={target_z_mm:.2f})")
+                    return False
             time.sleep(poll_interval)
 
         pos = self.get_zp_position(cached=False)
@@ -2379,20 +3377,47 @@ class StageController:
             position = self.safety_limits.clamp_z(position)
         # v7.5.x: never punch through the plate bottom during a print.
         position = self._apply_print_floor_raw(position)
+        # v7.5.x ROOT-CAUSE FIX ("ZP drops on the Z retract"): a Z move with no
+        # explicit feedrate emits a bare "G0 Z…" that INHERITS Marlin's last
+        # modal F. Z and the pump are ONE Marlin board sharing modal feedrate,
+        # so during a print the slow per-segment pump moves leave that F at the
+        # flow rate (e.g. F1.8 mm/min). A bare full-travel Z retract then
+        # crawled for ~12 min while Marlin sat "busy" → M400 timed out, the Z
+        # motor overheated ("only Z gets hot"), and the board fell off USB.
+        # Always supply a proper Z feedrate so a Z move can NEVER inherit the
+        # pump's flow rate. (Jog/standalone travel always set their own F —
+        # which is why only the print, with its interleaved pump moves, tripped
+        # this.) Resolve: configured retract feedrate → Z max → conservative.
+        if feedrate_mm_min is None:
+            feedrate_mm_min = (
+                getattr(self, "_zp_retract_feedrate", None)
+                or getattr(self.safety_limits, "max_z_feedrate", None)
+                or 200.0)
         self.zp_stage.move_absolute(
             {_axis_letter(self.zp_stage, "Z"): position}, fast,
             feedrate_mm_min=feedrate_mm_min)
 
     def move_z_relative(self, distance: float, feedrate: float | None = None,
                         bypass_safety: bool = False) -> None:
-        """Move Z by relative distance. v7.3.2: applies axis flip.
+        """Move Z by a relative RAW (zero-ref) delta — the low-level primitive.
+
+        ``distance`` is a raw Marlin Z delta (+ = larger raw Z), NOT a
+        height-frame delta. JOG inputs must NOT call this directly; they go
+        through :meth:`move_z_user_relative`, which maps the operator's
+        height-frame intent (up = +) to a raw delta via the per-machine
+        ``z_up_sign``. Print / calibration pass raw deltas here as before.
+
+        v7.5.x: Z direction is owned solely by ``z_up_sign`` (the Set
+        Bottom/Top setup), so this no longer multiplies by ``_flip_sign("Z")``
+        — the Z axis-flip UI was removed in v7.4.2 and ``axis_flip['Z']`` is
+        force-zeroed (it was already a dead ×1.0); keeping it risked a
+        double-invert against ``z_up_sign``. Pumps still honor ``_flip_sign``.
 
         v7.4.2: ``bypass_safety=True`` skips the soft-limit clamp.
         Used by the Hardware Setup → Device sub-page jog buttons.
         """
         if not self.zp_stage:
             return
-        distance = distance * self._flip_sign("Z")
         if feedrate and self.safety_limits.enabled and not bypass_safety:
             feedrate = self.safety_limits.clamp_z_feedrate(feedrate)
         if self.safety_limits.enabled and not bypass_safety:
@@ -2418,11 +3443,36 @@ class StageController:
                     clamped = self.safety_limits.clamp_z(cur_z + distance)
                     # v7.5.x: also hold above the plate bottom during a print.
                     clamped = self._apply_print_floor_raw(clamped)
-                    distance = clamped - cur_z
+                    # v7.5.x: the clamp may only SHORTEN the jog, never reverse
+                    # or amplify it — so an out-of-bounds cached position can't
+                    # produce a large opposite-direction snap (the jog-runaway).
+                    distance = _shorten_only_delta(cur_z, distance, clamped)
             except Exception:
                 pass
         self.zp_stage.move_relative(
             {_axis_letter(self.zp_stage, "Z"): distance}, feedrate)
+
+    def move_z_user_relative(self, user_delta_mm: float,
+                             feedrate: float | None = None,
+                             bypass_safety: bool = False) -> None:
+        """Jog Z by a delta in the USER / HEIGHT frame (up = +).
+
+        This is the single entry point for every JOG input — on-screen Z▲/Z▼,
+        PageUp/PageDown, the device-page jog, and (via its own provider) the
+        Xbox stick. It maps the operator's height-frame intent to a raw Marlin
+        delta with the per-machine ``z_up_sign`` — the up-direction DERIVED by
+        the Set Bottom / Set Top setup (:meth:`apply_z_setup`):
+
+            Δraw = Δuser · z_up_sign        (z_up_sign = ±1)
+
+        so "up" always retracts the needle toward the taught Top, and the jog
+        agrees with the position readout, regardless of the machine's raw-Z
+        polarity (e.g. ME3B V1's negative ``steps_per_mm.Z``). Direction is
+        owned here by ``z_up_sign`` alone (``move_z_relative`` no longer applies
+        the retired Z ``axis_flip``), so there is no double-invert.
+        """
+        self.move_z_relative(float(user_delta_mm) * self.z_up_sign(),
+                             feedrate=feedrate, bypass_safety=bypass_safety)
 
     # ── v7.5.x: polarity-safe travel-Z retract guarantee ───────────────
     #
@@ -2436,12 +3486,13 @@ class StageController:
     def z_height_of(self, raw_zref_mm: float) -> float:
         """Zero-ref raw Z (mm) → operator HEIGHT frame (up = +).
 
-        Multiplying by ``ZDIR`` yields a monotonic height where *larger always
-        means the needle is physically higher* (further from the plate),
-        regardless of the machine's raw-Z polarity. Use this for any
-        "is the needle high enough?" comparison instead of comparing raw Z.
+        Multiplying by the per-machine ``z_up_sign`` yields a monotonic height
+        where *larger always means the needle is physically higher* (further
+        from the plate), regardless of the machine's raw-Z polarity. Use this
+        for any "is the needle high enough?" comparison instead of comparing raw
+        Z. Identical to :meth:`zref_to_user_z` (the user frame *is* this height).
         """
-        return ZDIR * float(raw_zref_mm)
+        return self.z_up_sign() * float(raw_zref_mm)
 
     def default_travel_z(self, reference_z_zero_ref_mm: float,
                          margin_mm: float = 10.0) -> float:
@@ -2449,11 +3500,12 @@ class StageController:
 
         Returns a height ``margin_mm`` ABOVE ``reference`` in the polarity-safe
         HEIGHT frame, so the needle is genuinely retracted above the work
-        position regardless of ``ZDIR`` (NOT a raw literal like ``5.0``, which is
-        a *descent* on a ZDIR=-1 machine). The insert-clearance floor and the
-        soft-limit envelope are still applied when this value is fed to a move.
+        position regardless of the machine's Z polarity (NOT a raw literal like
+        ``5.0``, which is a *descent* on a ZDIR=-1 machine). The insert-clearance
+        floor and the soft-limit envelope are still applied when this value is
+        fed to a move.
         """
-        return float(reference_z_zero_ref_mm) + ZDIR * abs(margin_mm)
+        return float(reference_z_zero_ref_mm) + self.z_up_sign() * abs(margin_mm)
 
     def needle_at_or_above(self, current_raw_zref_mm: float,
                            reference_raw_zref_mm: float,
@@ -2517,6 +3569,74 @@ class StageController:
             return ok
         finally:
             self._pos_poller.resume()
+
+    def suspend_position_poller(self) -> None:
+        """Pause the background ZP/XY position poller.
+
+        v7.5.x ZP-disconnect fix: during a print's dense per-segment ZP motion
+        the poller's M114 reads contend with the command write-stream, fail to
+        parse, and after ~2.5 s of consecutive failures the liveness watchdog
+        FALSE-POSITIVES a "ZP disconnected" mid-print. Callers that run such a
+        write burst (e.g. the discrete PRINT_PATH) suspend the poller for the
+        duration. Idempotent and guarded — safe when no poller exists (e.g.
+        headless/mock controllers). ALWAYS pair with
+        :meth:`resume_position_poller` in a try/finally so an abort/exception
+        cannot leave the poller (and the live position display) frozen.
+        """
+        p = getattr(self, "_pos_poller", None)
+        if p is not None:
+            p.suspend()
+
+    def resume_position_poller(self) -> None:
+        """Resume the background position poller (pairs with
+        :meth:`suspend_position_poller`). Also resets the liveness fail window
+        (see :meth:`PositionPoller.resume`). Guarded — safe when no poller."""
+        p = getattr(self, "_pos_poller", None)
+        if p is not None:
+            p.resume()
+
+    def suspend_zp_watchdog(self) -> None:
+        """v7.5.x: pause the ZP port-health watchdog for the duration of a dense
+        write burst (PRINT_PATH). The watchdog reads ``serial.in_waiting``
+        (ClearCommError) on the ZP COM handle every ~2 s; a concurrent
+        ClearCommError + WriteFile on a flow-control-paused CH340 is a fault
+        surface. Pausing it (alongside the poller) makes the print thread the
+        SOLE accessor of the ZP handle during the burst. Guarded + idempotent;
+        ALWAYS pair with :meth:`resume_zp_watchdog` in a try/finally."""
+        wd = getattr(self, "_watchdog", None)
+        if wd is not None and hasattr(wd, "pause"):
+            try:
+                wd.pause("ZP")
+            except Exception:
+                pass
+
+    def resume_zp_watchdog(self) -> None:
+        """Resume the ZP port-health watchdog (pairs with
+        :meth:`suspend_zp_watchdog`); resets its debounce window. Guarded."""
+        wd = getattr(self, "_watchdog", None)
+        if wd is not None and hasattr(wd, "resume"):
+            try:
+                wd.resume("ZP")
+            except Exception:
+                pass
+
+    def _needle_present(self) -> bool:
+        """True if this machine has a Z/needle (ZP) axis that could be dragged.
+
+        Used by ``safe_travel_to`` to decide whether an automated XY travel must
+        be REFUSED when the needle can't be confirmed retracted (ZP not
+        connected). True when the ZP board is connected now, was ever connected
+        this session (a real needle that has since dropped), or the hardware
+        config defines pumps (the machine is built with a needle). Only a rig
+        with genuinely no ZP axis (no board, never connected, no pumps
+        configured) reads False — there XY travel is safe with no retract.
+        """
+        if self.is_zp_connected:
+            return True
+        if getattr(self, "_zp_ever_connected", False):
+            return True
+        hw = getattr(self, "_hardware_config", None)
+        return bool(hw is not None and getattr(hw, "pumps", None))
 
     def safe_travel_to(
         self,
@@ -2593,6 +3713,22 @@ class StageController:
                 logger.info(f"safe_travel_to: Z confirmed at safe height "
                             f"{safe_z_mm:.2f} mm — proceeding to XY")
 
+            elif self._needle_present():
+                # CRITICAL SAFETY: the retract block above is gated on
+                # is_zp_connected. If the ZP board is NOT connected but this
+                # machine has a needle (board dropped mid-session, or pumps are
+                # configured), we cannot confirm — let alone perform — the
+                # safe-Z retract, so we must NOT drive XY: that would drag the
+                # needle (typically left DOWN) across the plate. Abort the
+                # travel. A rig with genuinely no ZP axis falls through and
+                # moves XY normally (nothing to drag).
+                logger.error(
+                    "safe_travel_to: ZP board not connected but a needle is "
+                    "present — ABORTING XY move (cannot confirm/perform the "
+                    "safe-Z retract; would drag the needle). Reconnect the ZP "
+                    "board.")
+                return False
+
             # Step 2: Fast XY travel and WAIT for arrival
             if self.is_xy_connected:
                 if hasattr(self, 'xy_stage') and self.xy_stage:
@@ -2652,19 +3788,25 @@ class StageController:
         self, pump: str, distance: float, feedrate: float | None = None,
         bypass_safety: bool = False,
     ) -> None:
-        """Move a pump (P1/P2/P3) by relative distance. v7.3.2: applies axis flip.
+        """Move a pump (P1/P2/P3) by relative distance (mm of *dispense intent*:
+        positive = DISPENSE, toward empty; negative = ASPIRATE, toward full).
+
+        v7.5.x: the raw-mm direction is OWNED by the plunger calibration once a
+        pump is calibrated (:meth:`pump_dir_sign` → ``−aspirate_sign``), the same
+        way ``z_up_sign`` owns Z. Uncalibrated pumps fall back to the legacy
+        per-axis ``_flip_sign`` so nothing changes until a pump is set up.
 
         v7.4.2: ``bypass_safety=True`` skips both the soft-limit clamp
-        AND the ``is_pump_enabled`` check. Used by the Hardware Setup
-        → Device sub-page jog buttons so users can jog pumps to find
-        their mechanical limits before HardwareConfig is set up.
+        AND the ``is_pump_enabled`` check. Used by the Hardware Setup jog
+        (incl. the plunger-setup capture) so users can jog pumps to their
+        mechanical limits before HardwareConfig / calibration is set up.
         """
         if not self.zp_stage:
             return
         if not bypass_safety and not self.is_pump_enabled(pump):
             logger.warning(f"Pump {pump} is disabled — move blocked")
             return
-        distance = distance * self._flip_sign(pump)
+        distance = distance * self.pump_dir_sign(pump)
         if feedrate and self.safety_limits.enabled and not bypass_safety:
             feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
         if self.safety_limits.enabled and not bypass_safety:
@@ -2681,7 +3823,9 @@ class StageController:
                         # round-trip), so it stays valid after a pump re-zero.
                         clamped = self.safety_limits.clamp_pump(
                             cur + distance, pump)
-                        distance = clamped - cur
+                        # v7.5.x: shorten-only — an out-of-bounds cached pump
+                        # position can't produce a large opposite snap.
+                        distance = _shorten_only_delta(cur, distance, clamped)
             except Exception:
                 pass
         mapped = _axis_letter(self.zp_stage, pump)
@@ -2797,6 +3941,8 @@ class StageController:
     def shutdown(self) -> None:
         """Clean shutdown of all components."""
         logger.info("Shutting down StageController…")
+        # v7.5.x: stop any in-flight ZP auto-reconnect from fighting shutdown.
+        self._shutting_down = True
         self._watchdog.stop()
         self._pos_poller.stop()
         self.disconnect_xbox()
@@ -2828,20 +3974,57 @@ class StageController:
         if self.zp_jog and hasattr(self.zp_jog, 'set_hardware_config'):
             self.zp_jog.set_hardware_config(config)
 
-        # Update safety limits from hardware config
+        # Update safety limits from hardware config. v7.5.x: skip the
+        # syringe-stroke pump-limit overwrite for pumps whose envelope was set
+        # by the plunger calibration (apply_pump_setup) — the calibration's
+        # exact captured extremes must win over the coarse stroke estimate.
         if self.safety_limits:
-            self.safety_limits.update_from_hardware_config(config)
+            calibrated = [p for p in ("P1", "P2", "P3")
+                          if self.is_pump_plunger_calibrated(p)]
+            self.safety_limits.update_from_hardware_config(
+                config, skip_pumps=calibrated)
+
+        # v7.5.x: the pump jog speed-% is anchored to the configured flow
+        # limits, which just changed — re-anchor (no-op if ZP not connected).
+        try:
+            self.refresh_jog_speed_limits()
+        except Exception as e:
+            logger.debug(f"refresh_jog_speed_limits (hw config) failed: {e}")
 
     @property
     def hardware_config(self) -> HardwareConfig | None:
         """Get the current hardware configuration."""
         return self._hardware_config
 
+    def pump_settle_time_s(self) -> float:
+        """v7.5.x: configured global pump settle dwell (s), 0 if unset / no
+        config. Applied BEFORE and AFTER each discrete pump actuation (see
+        ``move_pump_uL(settle=True)``). Set on Hardware Setup → Pump."""
+        cfg = self._hardware_config
+        try:
+            return max(0.0, float(getattr(cfg, "pump_settle_time_s", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
     def move_pump_uL(
-        self, pump: str, volume_uL: float, rate_uL_s: float | None = None
+        self, pump: str, volume_uL: float, rate_uL_s: float | None = None,
+        *, settle: bool = False,
     ) -> None:
         """
         Move a pump by a specified volume in µL.
+
+        ── Plunger conventions (single source of truth) ───────────────────
+        ASPIRATE = draw fluid IN  (plunger toward MAX/full; raises fill level).
+        DISPENSE = push fluid OUT (plunger toward ZERO/empty; lowers fill level).
+        Volume-delta sign here: ``+`` = DISPENSE, ``−`` = ASPIRATE.
+        Fill/position frame: 0 = empty (fully dispensed), capacity = full (fully
+        aspirated). Per-pump dispense/aspirate DIRECTION is owned by the plunger
+        calibration (:meth:`apply_pump_setup`) — the same way ``z_up_sign`` owns
+        Z — and is applied in :meth:`move_pump_relative` via :meth:`pump_dir_sign`.
+        Reserved terms NOT folded into this verb pair: 'prime' (start-of-print
+        pre-flow lead-in) and 'retract' (Z safe-travel raise / pump pressure
+        relief).
+        ───────────────────────────────────────────────────────────────────
 
         This is the primary pump movement method for v7.2+.
         Converts µL → mm using the syringe spec, and µL/s → mm/min
@@ -2849,8 +4032,14 @@ class StageController:
 
         Args:
             pump: Pump identifier ("P1", "P2", "P3")
-            volume_uL: Volume to dispense (+) or aspirate (-) in µL
+            volume_uL: Volume to DISPENSE (+) or ASPIRATE (−) in µL
             rate_uL_s: Flow rate in µL/s. If None, uses default feedrate.
+            settle: v7.5.x — when True this is a *discrete* actuation: sleep
+                the configured ``pump_settle_time_s`` before the move, BLOCK
+                for the (open-loop) move to complete, then sleep the settle
+                time again after, so the caller's next step doesn't begin
+                until the pump has finished and settled. Leave False for the
+                streamed print path and manual jog (they pace themselves).
 
         Raises:
             ValueError: If pump has no syringe configured
@@ -2881,7 +4070,26 @@ class StageController:
             + f") → {distance_mm:+.5f} mm"
             + (f", {feedrate_mm_min:.1f} mm/min" if feedrate_mm_min else "")
         )
+
+        # v7.5.x: discrete-actuation settle. The dwell brackets the move so the
+        # fluid/pressure settles and the caller does not advance until the pump
+        # has finished. settle=False (streamed print path, manual jog) is a pure
+        # passthrough — unchanged behavior.
+        settle_s = self.pump_settle_time_s() if settle else 0.0
+        if settle_s > 0:
+            time.sleep(settle_s)               # pre-move settle
+
         self.move_pump_relative(pump, distance_mm, feedrate_mm_min)
+
+        if settle:
+            # Block for the move to physically complete (the G0 returned on
+            # `ok`, not motion-complete) so the post-settle is a true settle.
+            eff_rate = (abs(rate_uL_s) if rate_uL_s
+                        else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
+            move_s = abs(volume_uL) / max(eff_rate, 0.001) + 0.1
+            time.sleep(min(move_s, _PUMP_MOVE_WAIT_CAP_S))
+            if settle_s > 0:
+                time.sleep(settle_s)           # post-move settle
 
     def get_pump_position_uL(self, pump: str) -> float | None:
         """
@@ -2918,24 +4126,25 @@ class StageController:
         """Get all pump positions in µL as a dict."""
         return {pid: self.get_pump_position_uL(pid) for pid in ["P1", "P2", "P3"]}
 
-    def extrude_uL(
+    def dispense_uL(
         self, pump: str, volume_uL: float, rate_uL_s: float | None = None
     ) -> bool:
         """
-        Extrude (dispense) a specific volume with fluid column tracking.
+        DISPENSE (push fluid out) / ASPIRATE a specific volume with fluid-column
+        tracking. v7.5.x: renamed from ``extrude_uL``.
 
-        Positive volume_uL = dispense, negative = aspirate.
+        Positive volume_uL = DISPENSE (push out), negative = ASPIRATE (draw in).
         Updates FluidColumn in HardwareConfig if available.
 
         Returns True if executed successfully.
         """
         if not self._hardware_config:
-            logger.error("No hardware config — cannot extrude")
+            logger.error("No hardware config — cannot dispense")
             return False
 
         pump_cfg = self._hardware_config.pumps.get(pump)
         if not pump_cfg or not pump_cfg.is_configured:
-            logger.error(f"{pump}: not configured — cannot extrude")
+            logger.error(f"{pump}: not configured — cannot dispense")
             return False
 
         # Track fluid column
@@ -2951,3 +4160,9 @@ class StageController:
 
         self.move_pump_uL(pump, volume_uL, rate_uL_s)
         return True
+
+    # v7.5.x: back-compat alias (renamed to dispense_uL). Kept so any external
+    # script/caller still resolves; new code should use dispense_uL.
+    def extrude_uL(self, pump: str, volume_uL: float,
+                   rate_uL_s: float | None = None) -> bool:
+        return self.dispense_uL(pump, volume_uL, rate_uL_s)

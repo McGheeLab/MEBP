@@ -120,3 +120,31 @@ objective µm/px keep their own identity-keyed stores
 - **Marlin/ZP position** on restore: applying `zero_position` is a software
   reference only (no motion). The ZP firmware counter is a separate concern
   handled by the existing ZP position-restore prompt.
+
+## Addendum (2026-06-16) — accept = auto "Apply + Save"
+
+**Reported:** accepting the calibration-restore popup (and the ZP
+position-restore popup) filled the numbers in, but did **not** update the limits
+or save — the operator still had to go to Hardware Setup → Device and click
+*Apply + Save* to lock it in. Root cause: both `MainWindow._maybe_prompt_*`
+handlers mutated **in-memory** state only (`settings.set_section` writes the live
+dict, not disk; `override_zp_position` is a G92 with no persist), so the restored
+`zero_position` / calibration were lost until the next clean shutdown.
+
+**Fix** (`gui/app.py`): new `MainWindow._apply_and_save_after_restore(what)`,
+called at the end of **both** restore-accept paths. It:
+1. **Apply** — mirrors the persisted `safety_limits` into the **live** envelope
+   object *in place* (mutates fields; never rebinds it, so the jog handlers'
+   held reference stays valid). Idempotent — guarantees the live limits match
+   disk after a restore / ZP reconnect.
+2. **Save** — calls `save_settings()` now (same path a clean shutdown uses:
+   window geo, hardware config, `zero_position`, `zp_last_position`, calibration
+   snapshot + `settings.save()`), so the restored state is durable immediately.
+3. Refreshes the left-panel limit bars (best-effort).
+
+The live Z envelope itself was already correct after startup (the Z setup
+persists `safety_limits.z_min/z_max` to the top-level section that `main.py`
+loads); the real gap was persistence of the *restored* values + a one-call
+lock-in. Tests: `tests/test_v75x_last_known_calibration.py::
+TestApplyAndSaveAfterRestore` (2) — limits mirrored in place + `save_settings`
+called; save failure is non-fatal.

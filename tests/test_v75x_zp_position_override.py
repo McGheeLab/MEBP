@@ -44,6 +44,10 @@ class _RecordingSerial:
     def flush(self) -> None:
         pass
 
+    def readline(self) -> bytes:
+        # v7.5.x flow control: send_data waits for 'ok' — ack each command.
+        return b"ok\n"
+
     def close(self) -> None:
         self.is_open = False
 

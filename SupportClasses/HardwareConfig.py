@@ -366,6 +366,18 @@ class HardwareConfig:
         "P3": PumpChannelConfig(pump_id="P3"),
     })
 
+    # ── v7.5.x: Global pump timing (configured on Hardware Setup → Pump) ──
+    # Settle dwell (s) applied BEFORE and AFTER every *discrete* pump
+    # actuation (prime, aspirate, dispense, pick/place push-pull, needle-prep
+    # oil/wash/buffer, DISPENSE commands) so the fluid/pressure settles and the
+    # workflow does not advance to the next step until the pump has finished.
+    # NOT applied to the streamed per-segment print path or manual jog.
+    pump_settle_time_s: float = 0.0
+    # Pre-flow prime duration (s). Printing workflows dispense a prime of
+    # volume = flow × this time just before the print path. (Default matches
+    # the legacy Quick Print _PREFLOW_S constant.)
+    pump_prime_time_s: float = 0.25
+
     # ── Well plate ────────────────────────────────────────────────
     plate_format: int = 24  # 6, 12, 24, 48, 96, 384 — legacy field, still
                             # honored when `plate_name` is empty.
@@ -378,6 +390,13 @@ class HardwareConfig:
 
     # ── Ink library (persisted across sessions) ───────────────────
     ink_library: dict[str, InkSpec] = field(default_factory=dict)
+
+    # ── v7.5.x: Reagent locations (ink name → well/sub-well names) ─
+    # The canonical "go-to" locations for each reagent, picked in
+    # Hardware Setup → Ink. Wells may be rosette sub-wells (e.g. "A1.a").
+    # Invariant: one reagent per well (a well appears in at most one
+    # ink's list). Used to auto-fill the per-print Well Setup.
+    ink_locations: dict[str, list[str]] = field(default_factory=dict)
 
     # ── Rosette library ───────────────────────────────────────────
     rosette_library: dict[str, RosetteInsert] = field(default_factory=dict)
@@ -449,6 +468,93 @@ class HardwareConfig:
         """Get list of ink names in the library not assigned to any pump."""
         assigned = set(self.ink_pump_map.keys())
         return [name for name in self.ink_library if name not in assigned]
+
+    # ══════════════════════════════════════════════════════════════
+    #  v7.5.x: REAGENT LOCATIONS (ink name → wells)
+    # ══════════════════════════════════════════════════════════════
+
+    @property
+    def well_reagent_map(self) -> dict[str, str]:
+        """Reverse lookup: ``well_name -> ink_name``.
+
+        One reagent per well (the invariant maintained by
+        ``assign_wells_to_ink``). If stale data ever holds a well under
+        two inks, the last one encountered wins.
+        """
+        result: dict[str, str] = {}
+        for ink_name, wells in self.ink_locations.items():
+            for w in wells:
+                result[w] = ink_name
+        return result
+
+    def assign_wells_to_ink(
+        self,
+        ink_name: str,
+        wells: list[str],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Assign ``wells`` to ``ink_name`` as reagent locations.
+
+        Enforces one-reagent-per-well: each well in ``wells`` is first
+        removed from any *other* ink's list. When ``replace`` is True the
+        ink's existing list is cleared first (so it becomes exactly
+        ``wells``); otherwise ``wells`` are appended (de-duped).
+        """
+        wells = [w for w in dict.fromkeys(wells) if w]  # de-dup, drop blanks
+        # Drop these wells from every other ink (one-reagent-per-well).
+        for other, lst in list(self.ink_locations.items()):
+            if other == ink_name:
+                continue
+            kept = [w for w in lst if w not in wells]
+            if kept:
+                self.ink_locations[other] = kept
+            else:
+                self.ink_locations.pop(other, None)
+
+        existing = [] if replace else list(self.ink_locations.get(ink_name, []))
+        merged = list(dict.fromkeys(existing + wells))
+        if merged:
+            self.ink_locations[ink_name] = merged
+        else:
+            self.ink_locations.pop(ink_name, None)
+
+    def clear_ink_location(self, ink_name: str) -> None:
+        """Remove all reagent-location wells for an ink."""
+        self.ink_locations.pop(ink_name, None)
+
+    def unassign_well(self, well_name: str) -> None:
+        """Remove ``well_name`` from whichever ink currently owns it."""
+        for ink_name, lst in list(self.ink_locations.items()):
+            if well_name in lst:
+                kept = [w for w in lst if w != well_name]
+                if kept:
+                    self.ink_locations[ink_name] = kept
+                else:
+                    self.ink_locations.pop(ink_name, None)
+
+    def rename_ink_location(self, old_name: str, new_name: str) -> None:
+        """Move an ink's location list to a new ink name (on rename)."""
+        if old_name == new_name or old_name not in self.ink_locations:
+            return
+        self.ink_locations[new_name] = self.ink_locations.pop(old_name)
+
+    def _prune_ink_locations(self) -> None:
+        """Drop locations for inks not in the library; de-dupe lists.
+
+        Wells are NOT validated against the active plate here — the plate
+        can change between sessions, and a reagent should reappear when
+        its plate is reloaded. The UI only displays wells present in the
+        current plate.
+        """
+        pruned: dict[str, list[str]] = {}
+        for ink_name, wells in self.ink_locations.items():
+            if ink_name not in self.ink_library:
+                continue
+            clean = [w for w in dict.fromkeys(wells) if w]
+            if clean:
+                pruned[ink_name] = clean
+        self.ink_locations = pruned
 
     @property
     def enabled_pump_ids(self) -> list[str]:
@@ -748,9 +854,17 @@ class HardwareConfig:
             "notes": self.notes,
             "needle": self.needle.to_dict() if self.needle else None,
             "pumps": {pid: p.to_dict() for pid, p in self.pumps.items()},
+            # v7.5.x: global pump timing
+            "pump_settle_time_s": self.pump_settle_time_s,
+            "pump_prime_time_s": self.pump_prime_time_s,
             "plate_format": self.plate_format,
             "plate_name": self.plate_name,  # v7.4.5
             "ink_library": {name: ink.to_dict() for name, ink in self.ink_library.items()},
+            # v7.5.x: reagent locations (ink name → wells); skip empty lists
+            "ink_locations": {
+                name: list(wells)
+                for name, wells in self.ink_locations.items() if wells
+            },
             "rosette_library": {
                 name: r.to_dict() for name, r in self.rosette_library.items()
             },
@@ -792,6 +906,16 @@ class HardwareConfig:
             if pid in config.pumps:
                 config.pumps[pid] = PumpChannelConfig.from_dict(pdata)
 
+        # v7.5.x: global pump timing (tolerate missing / bad values)
+        def _nonneg_float(key, default):
+            try:
+                v = float(data.get(key, default))
+                return v if v >= 0 else default
+            except (TypeError, ValueError):
+                return default
+        config.pump_settle_time_s = _nonneg_float("pump_settle_time_s", 0.0)
+        config.pump_prime_time_s = _nonneg_float("pump_prime_time_s", 0.25)
+
         # Plate format
         config.plate_format = data.get("plate_format", 24)
         # v7.4.5: custom plate name (takes precedence when non-empty)
@@ -800,6 +924,16 @@ class HardwareConfig:
         # Ink library
         for name, ink_data in data.get("ink_library", {}).items():
             config.ink_library[name] = InkSpec.from_dict(ink_data)
+
+        # v7.5.x: reagent locations (ink name → wells). Tolerate a single
+        # string value by wrapping it in a list. Pruned against the library
+        # below so a stale entry for a deleted ink doesn't linger.
+        raw_locs = data.get("ink_locations", {}) or {}
+        for name, wells in raw_locs.items():
+            if isinstance(wells, str):
+                wells = [wells]
+            config.ink_locations[name] = [str(w) for w in (wells or []) if w]
+        config._prune_ink_locations()
 
         # Rosette library
         for name, r_data in data.get("rosette_library", {}).items():

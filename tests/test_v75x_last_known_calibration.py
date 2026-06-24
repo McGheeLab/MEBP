@@ -224,5 +224,62 @@ class TestHasPlateCalibration(unittest.TestCase):
             self._call(_three_well_calibration=SimpleNamespace(is_identity=False)))
 
 
+class TestApplyAndSaveAfterRestore(unittest.TestCase):
+    """v7.5.x: accepting a restore popup now does the Device-page 'Apply + Save'
+    automatically — mirror the persisted safety_limits into the LIVE envelope
+    (in place, so jog handlers' reference stays valid) and persist to disk now.
+
+    Invoked unbound against a fake `self` (no Qt construction needed).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from gui.app import MainWindow
+        except Exception as exc:  # PySide6/Qt unavailable in this env
+            raise unittest.SkipTest(f"MainWindow import failed: {exc}")
+        cls._mw = MainWindow
+
+    def _fake(self, save_fn=None):
+        from SupportClasses.SafetyLimits import SafetyLimits
+        live = SafetyLimits()
+        live.z_min, live.z_max, live.enabled = 999.0, 999.0, False  # stale
+        saved = []
+
+        class _Settings:
+            def get_section(self, name):
+                if name == "safety_limits":
+                    return {"z_min": -48.2, "z_max": 1.8, "enabled": True,
+                            "max_z_feedrate": 500.0}
+                return {}
+
+        fake = SimpleNamespace(
+            controller=SimpleNamespace(safety_limits=live),
+            settings=_Settings(),
+            _page_widgets=[],
+            save_settings=(save_fn or (lambda: saved.append(True))),
+        )
+        return fake, live, saved
+
+    def test_mirrors_limits_in_place_and_saves(self):
+        fake, live, saved = self._fake()
+        self._mw._apply_and_save_after_restore(fake, "test")
+        # Mutated in place (same object the jog handlers reference), not rebound.
+        self.assertIs(fake.controller.safety_limits, live)
+        self.assertAlmostEqual(live.z_min, -48.2)
+        self.assertAlmostEqual(live.z_max, 1.8)
+        self.assertTrue(live.enabled)
+        self.assertAlmostEqual(live.max_z_feedrate, 500.0)
+        self.assertTrue(saved, "save_settings was not called on accept")
+
+    def test_save_failure_is_non_fatal(self):
+        def boom():
+            raise RuntimeError("disk full")
+        fake, live, _ = self._fake(save_fn=boom)
+        # Best-effort: a save failure must not raise (limits already applied).
+        self._mw._apply_and_save_after_restore(fake, "test")
+        self.assertAlmostEqual(live.z_min, -48.2)
+
+
 if __name__ == "__main__":
     unittest.main()

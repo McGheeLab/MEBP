@@ -1,0 +1,38 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "cell_targeting",
+  "name": "__last__",
+  "saved": "2026-06-22T21:46:14",
+  "values": {
+    "removal_z": 0.1,
+    "place_z": 0.5,
+    "bore": {
+      "text": "P2",
+      "data": null
+    },
+    "reagent": {
+      "text": "Inert LLS Ink",
+      "data": "Inert LLS Ink"
+    },
+    "reagent_z": 0.5,
+    "push_depth": 0.1,
+    "pull_mult": 2.0,
+    "dwell": 60.0,
+    "push_speed": 0.5,
+    "pull_speed": 5.0,
+    "prep": true,
+    "clean": true,
+    "service_z": 0.5,
+    "prep_rate": 1.0,
+    "oil_needles": 1.0,
+    "buffer_needles": 4.0,
+    "wash_cycles": 3,
+    "wash_z_amp": 0.5,
+    "wash_xy_amp": 200.0,
+    "wash_dwell": 0.3,
+    "post_dispense": 1.0,
+    "intra_retract": 1.0,
+    "z_timeout": 15.0,
+    "xy_timeout": 30.0
+  }
+}

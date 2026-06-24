@@ -52,6 +52,9 @@ class MeasurementCameraView(CameraFeedView):
             cam_idx=cam_idx,
             show_crosshair=False,
             label=label,
+            # Measurement is itself a calibration step — no HW-settings gear
+            # (a resolution change would invalidate the measurement).
+            enable_settings=False,
             parent=parent,
         )
         self._p1: Optional[tuple[float, float]] = None

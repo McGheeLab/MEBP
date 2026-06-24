@@ -102,8 +102,12 @@ class CommandType(Enum):
     MOVE_XY = "move_xy"             # Move XY to absolute position (relative to zero ref)
     MOVE_Z = "move_z"               # Move Z to absolute height
     MOVE_Z_REL = "move_z_rel"       # Move Z by relative amount
-    EXTRUDE = "extrude"             # Extrude from a pump (relative)
-    PRINT_PATH = "print_path"       # Coordinated XY move + extrusion
+    # v7.5.x: DISPENSE = push fluid OUT (a relative pump move; + volume =
+    # dispense, − = aspirate — see StageController.move_pump_uL). Renamed from
+    # EXTRUDE; the value stays "extrude" so persisted exec-log manifests stay
+    # comparable.
+    DISPENSE = "extrude"            # Pump move (+ dispense / − aspirate), relative
+    PRINT_PATH = "print_path"       # Coordinated XY move + dispense
     DWELL = "dwell"                 # Wait for specified time
     TRAVEL_UP = "travel_up"         # Raise Z to travel height
     TRAVEL_DOWN = "travel_down"     # Lower Z to print height
@@ -144,6 +148,13 @@ class PrintSettings:
     # increases). Layer build-up steps by `z_up_sign * layer_height` so layers
     # grow UP on either polarity. Default +1 preserves legacy additive behaviour.
     z_up_sign: float = 1.0
+    # v7.5.x: per-machine plate-local→stage axis sign, stamped from
+    # StageController.plate_axis_sign() at job-build time. (-1, -1) when the
+    # plate is mounted 180° to the stage (ME3B V1) so a GEOMETRIC well centre
+    # (plate.get_well_position, A1-relative mm) maps to the physically-correct
+    # well. (1, 1) = aligned (legacy). Applied only to geometric well centres,
+    # never to already-taught/calibrated positions.
+    plate_axis_sign: tuple = (1.0, 1.0)
     retract_amount: float = 0.0      # Pump retraction after path segment (legacy single-pump)
     prime_amount: float = 0.0        # Pump prime before path segment (legacy single-pump)
     dwell_after_move: float = 0.0    # Seconds to wait after travel moves
@@ -151,6 +162,12 @@ class PrintSettings:
     # Session 4: Per-pump retract/prime amounts
     retract_amounts: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
     prime_amounts: dict = field(default_factory=lambda: {"P1": 0.0, "P2": 0.0, "P3": 0.0})
+
+    # v7.5.x: small lift between objects printed in the SAME well (mm above
+    # print Z). Just enough to clear thin printed material on an inter-object
+    # hop — NOT the full travel retract. Applied in the polarity-safe height
+    # frame; floored by the plate-insert clearance.
+    intra_well_hop_z_mm: float = 1.0
 
     # v7.2: µL-based pump settings
     pump_rate_uL_s: float = 0.25         # Default pump flow rate (µL/s)
@@ -513,12 +530,14 @@ def build_well_plate_job(
     job_name: str = "Well Plate Print",
     pump_sequence: list[str] | None = None,
     pump_per_layer: dict[str, str] | None = None,
+    path_segments: list[list[tuple[float, float]]] | None = None,
+    return_home: bool = True,
 ) -> PrintJob:
     """
     Build a print job that prints a pattern in each well of a well plate.
-    
+
     Session 4: Now supports multi-material via pump_sequence or pump_per_layer.
-    
+
     Args:
         well_positions: List of (well_name, x, y) for each well to print
         path_points: Pattern points relative to well center (0,0)
@@ -528,7 +547,21 @@ def build_well_plate_job(
         job_name: Name for the job
         pump_sequence: List of pumps to cycle through wells ["P1", "P2"]
         pump_per_layer: Dict mapping layer number (str) to pump {"1": "P1", "2": "P2"}
-        
+        path_segments: v7.5.x — OPTIONAL list of independent sub-paths (each a
+            list of (x, y) relative to well center). When given, each sub-path
+            becomes its own PRINT_PATH with a full lift→travel→lower prologue
+            between them, so the needle never drags through already-printed
+            material across an inter-object seam (e.g. a saved print made of
+            several spirals at different offsets). When None, the single
+            ``path_points`` list is used — identical to the prior behavior.
+        return_home: v7.5.x — when True (default, legacy behavior) the job ends
+            with a final ``TRAVEL_UP`` then ``HOME_XY`` (return to the zero
+            reference, i.e. XY 0,0). When False the job still ends with the
+            final ``TRAVEL_UP`` (needle retracted out of the well to the travel
+            Z) but the ``HOME_XY`` is omitted, so the stage is left where it
+            finished printing instead of driving back to 0,0. Quick Print uses
+            False (do not slam back to origin).
+
     Returns:
         PrintJob ready for execution
     """
@@ -576,93 +609,137 @@ def build_well_plate_job(
                     ))
                     active_pump = well_pump
 
-            # Travel to well
-            commands.append(PrintCommand(
-                type=CommandType.TRAVEL_UP,
-                label=f"Travel up for {well_name}",
-            ))
-            commands.append(PrintCommand(
-                type=CommandType.MOVE_XY,
-                params={"x": well_x + path_points[0][0], "y": well_y + path_points[0][1]},
-                label=f"Move to {well_name} start",
-            ))
+            # v7.5.x: a well may contain MULTIPLE objects (e.g. Quick Print of
+            # a saved multi-spiral file). Each object is its own PRINT_PATH with
+            # a full lift→travel→lower prologue between them, so the needle never
+            # drags through already-printed material across the inter-object
+            # seam. Single-object / legacy callers pass path_segments=None and
+            # get exactly one segment == path_points (byte-identical plan).
+            segments = [s for s in (path_segments or [path_points]) if s]
 
-            if settings.dwell_after_move > 0:
+            # v7.5.x: small intra-well hop height between objects (a few mm
+            # apart) — just enough to clear the thin printed material, not a
+            # full travel retract. Computed in the polarity-safe HEIGHT frame:
+            # `z_up * hop_mm` above the print Z (z_up = -1 on ME3B V1, so this
+            # is genuinely "up"/away from the plate on either polarity).
+            hop_mm = abs(getattr(settings, "intra_well_hop_z_mm", 1.0))
+            hop_z = z_height + z_up * hop_mm
+
+            for seg_idx, seg_points in enumerate(segments):
+                multi = len(segments) > 1
+                seg_label = (well_name if not multi
+                             else f"{well_name} obj {seg_idx + 1}/{len(segments)}")
+
+                if seg_idx == 0:
+                    # First object in this well: approach from the full travel
+                    # height (inter-well / from job start). The MOVE_XY handler
+                    # retracts to travel Z and CONFIRMS arrival before XY.
+                    commands.append(PrintCommand(
+                        type=CommandType.TRAVEL_UP,
+                        label=f"Travel up for {seg_label}",
+                    ))
+                    commands.append(PrintCommand(
+                        type=CommandType.MOVE_XY,
+                        params={"x": well_x + seg_points[0][0],
+                                "y": well_y + seg_points[0][1]},
+                        label=f"Move to {seg_label} start",
+                    ))
+                else:
+                    # Subsequent object in the SAME well: a small confirmed hop
+                    # (hop_z, ~1 mm) clears the printed material without a costly
+                    # full retract. `hop_z` routes MOVE_XY's retract through
+                    # ensure_retracted_to(hop_z) — still raise-only / never
+                    # descends, and floored by the insert clearance.
+                    commands.append(PrintCommand(
+                        type=CommandType.MOVE_XY,
+                        params={"x": well_x + seg_points[0][0],
+                                "y": well_y + seg_points[0][1],
+                                "hop_z": hop_z},
+                        label=f"Hop to {seg_label} start",
+                    ))
+
+                if settings.dwell_after_move > 0:
+                    commands.append(PrintCommand(
+                        type=CommandType.DWELL,
+                        params={"seconds": settings.dwell_after_move},
+                        label="Settle",
+                    ))
+
+                # Lower to print height
                 commands.append(PrintCommand(
-                    type=CommandType.DWELL,
-                    params={"seconds": settings.dwell_after_move},
-                    label="Settle",
+                    type=CommandType.MOVE_Z,
+                    params={"z": z_height},
+                    label="Lower to print height",
                 ))
 
-            # Lower to print height
-            commands.append(PrintCommand(
-                type=CommandType.MOVE_Z,
-                params={"z": z_height},
-                label="Lower to print height",
-            ))
+                # Prime (v7.2: µL amounts, legacy mm fallback)
+                prime_uL = settings.get_prime_uL(active_pump)
+                prime_mm = settings.get_prime_amount(active_pump)
+                if prime_uL > 0:
+                    commands.append(PrintCommand(
+                        type=CommandType.DISPENSE,
+                        params={"pump": active_pump, "amount_uL": prime_uL,
+                                "rate_uL_s": settings.get_pump_rate(active_pump)},
+                        label=f"Prime {active_pump} ({prime_uL:.2f} µL)",
+                    ))
+                elif prime_mm > 0:
+                    commands.append(PrintCommand(
+                        type=CommandType.DISPENSE,
+                        params={"pump": active_pump, "amount": prime_mm,
+                                "feedrate": settings.pump_feedrate},
+                        label=f"Prime {active_pump} (legacy)",
+                    ))
 
-            # Prime (v7.2: µL amounts, legacy mm fallback)
-            prime_uL = settings.get_prime_uL(active_pump)
-            prime_mm = settings.get_prime_amount(active_pump)
-            if prime_uL > 0:
+                # Print the path (v7.2: include flow_rate_uL_s)
+                well_path = [(well_x + px, well_y + py) for px, py in seg_points]
+                path_params = {
+                    "points": well_path,
+                    "pump": active_pump,
+                    "flow_rate": flow_rate,
+                }
+                # If flow_rate looks like µL/s (> 0.05), tag as v7.2
+                pump_rate = settings.get_pump_rate(active_pump) if hasattr(settings, 'get_pump_rate') else 0
+                if pump_rate > 0:
+                    path_params["flow_rate_uL_s"] = pump_rate
                 commands.append(PrintCommand(
-                    type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount_uL": prime_uL,
-                            "rate_uL_s": settings.get_pump_rate(active_pump)},
-                    label=f"Prime {active_pump} ({prime_uL:.2f} µL)",
-                ))
-            elif prime_mm > 0:
-                commands.append(PrintCommand(
-                    type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount": prime_mm,
-                            "feedrate": settings.pump_feedrate},
-                    label=f"Prime {active_pump} (legacy)",
-                ))
-
-            # Print the path in this well (v7.2: include flow_rate_uL_s)
-            well_path = [(well_x + px, well_y + py) for px, py in path_points]
-            path_params = {
-                "points": well_path,
-                "pump": active_pump,
-                "flow_rate": flow_rate,
-            }
-            # If flow_rate looks like µL/s (> 0.05), tag as v7.2
-            pump_rate = settings.get_pump_rate(active_pump) if hasattr(settings, 'get_pump_rate') else 0
-            if pump_rate > 0:
-                path_params["flow_rate_uL_s"] = pump_rate
-            commands.append(PrintCommand(
-                type=CommandType.PRINT_PATH,
-                params=path_params,
-                label=f"Print in {well_name}",
-            ))
-
-            # Retract (v7.2: µL amounts, legacy mm fallback)
-            retract_uL = settings.get_retract_uL(active_pump) if hasattr(settings, 'get_retract_uL') else 0
-            retract_mm = settings.get_retract_amount(active_pump)
-            if retract_uL > 0:
-                commands.append(PrintCommand(
-                    type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount_uL": -retract_uL,
-                            "rate_uL_s": settings.get_pump_rate(active_pump)},
-                    label=f"Retract {active_pump} ({retract_uL:.2f} µL)",
-                ))
-            elif retract_mm > 0:
-                commands.append(PrintCommand(
-                    type=CommandType.EXTRUDE,
-                    params={"pump": active_pump, "amount": -retract_mm,
-                            "feedrate": settings.pump_feedrate},
-                    label=f"Retract {active_pump} (legacy)",
+                    type=CommandType.PRINT_PATH,
+                    params=path_params,
+                    label=f"Print {seg_label}",
                 ))
 
-    # Final travel up
+                # Retract (v7.2: µL amounts, legacy mm fallback)
+                retract_uL = settings.get_retract_uL(active_pump) if hasattr(settings, 'get_retract_uL') else 0
+                retract_mm = settings.get_retract_amount(active_pump)
+                if retract_uL > 0:
+                    commands.append(PrintCommand(
+                        type=CommandType.DISPENSE,
+                        params={"pump": active_pump, "amount_uL": -retract_uL,
+                                "rate_uL_s": settings.get_pump_rate(active_pump)},
+                        label=f"Retract {active_pump} ({retract_uL:.2f} µL)",
+                    ))
+                elif retract_mm > 0:
+                    commands.append(PrintCommand(
+                        type=CommandType.DISPENSE,
+                        params={"pump": active_pump, "amount": -retract_mm,
+                                "feedrate": settings.pump_feedrate},
+                        label=f"Retract {active_pump} (legacy)",
+                    ))
+
+    # Final travel up — always retract the needle out of the well to the
+    # travel Z when the job ends.
     commands.append(PrintCommand(
         type=CommandType.TRAVEL_UP,
         label="Final travel up",
     ))
-    commands.append(PrintCommand(
-        type=CommandType.HOME_XY,
-        label="Return home",
-    ))
+    # v7.5.x: optionally return XY to the zero reference (0,0). Quick Print
+    # passes return_home=False so the stage stays where it finished printing
+    # (needle already retracted by the TRAVEL_UP above) instead of driving the
+    # plate all the way back to origin.
+    if return_home:
+        commands.append(PrintCommand(
+            type=CommandType.HOME_XY,
+            label="Return home",
+        ))
 
     return PrintJob(
         name=job_name,
@@ -937,6 +1014,18 @@ class DirectCommandExecutor:
             self.exec_logger.log("extrude", context="service",
                                  pump=pump_id, vol_uL=round(volume_uL, 4),
                                  rate_uL_s=rate_uL_s)
+        # v7.5.x: discrete actuation → bracket with the configured pump settle
+        # dwell. This method keeps its own abort-aware completion wait below
+        # (better than move_pump_uL's blind sleep), so it does NOT pass
+        # settle=True; it brackets explicitly instead.
+        _settle_s = 0.0
+        if hasattr(self.ctrl, "pump_settle_time_s"):
+            try:
+                _settle_s = max(0.0, float(self.ctrl.pump_settle_time_s()))
+            except Exception:
+                _settle_s = 0.0
+        if _settle_s > 0:
+            time.sleep(_settle_s)            # pre-move settle
         self.ctrl.move_pump_uL(pump_id, volume_uL, rate_uL_s)
         # Estimate pump move duration and wait
         rate = rate_uL_s or 5.0
@@ -946,6 +1035,8 @@ class DirectCommandExecutor:
             if self._abort.is_set():
                 return False
             time.sleep(0.1)
+        if _settle_s > 0:
+            time.sleep(_settle_s)            # post-move settle
         return True
 
     def dwell(self, seconds: float) -> bool:
@@ -1044,6 +1135,20 @@ class HybridPlanExecutor:
         self._abort_flag = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # not paused initially
+
+    def _plate_axis_sign(self) -> tuple[float, float]:
+        """v7.5.x: per-machine plate-local→stage axis sign. ``get_well_position``
+        returns a PLATE-LOCAL (A1-relative mm) offset; multiply by this before
+        using it as a zero-ref/stage coordinate so the needle reaches the
+        physically-correct well on a 180°-mounted stage (ME3B V1)."""
+        ctrl = self.controller
+        if ctrl is not None and hasattr(ctrl, "plate_axis_sign"):
+            try:
+                sign = ctrl.plate_axis_sign()
+                return (float(sign[0]), float(sign[1]))
+            except Exception:
+                pass
+        return (1.0, 1.0)
 
     def abort(self):
         self._abort_flag.set()
@@ -1164,6 +1269,8 @@ class HybridPlanExecutor:
                 for wn in target_wells:
                     try:
                         wx, wy = self.plate.get_well_position(wn)
+                        _sx, _sy = self._plate_axis_sign()
+                        wx, wy = _sx * wx, _sy * wy
                     except Exception:
                         continue
                     # First path point offset
@@ -1261,6 +1368,8 @@ class HybridPlanExecutor:
                 if tw:
                     try:
                         wx, wy = self.plate.get_well_position(tw[0])
+                        _sx, _sy = self._plate_axis_sign()
+                        wx, wy = _sx * wx, _sy * wy
                         total += _xy_travel(cur_x, cur_y, wx, wy, xy_travel)
                         cur_x, cur_y = wx, wy
                     except Exception:
@@ -1388,6 +1497,8 @@ class HybridPlanExecutor:
                             if _xy and hasattr(_xy, 'set_speed_mm_s'):
                                 _xy.set_speed_mm_s(_svc_spd)
                         wx, wy = self.plate.get_well_position(target_wells[0])
+                        _sx, _sy = self._plate_axis_sign()
+                        wx, wy = _sx * wx, _sy * wy
                         direct.move_xy(wx, wy, timeout_s=20.0)
                     except Exception as e:
                         logger.warning(f"TRAVEL_XY failed: {e}")
@@ -1453,7 +1564,7 @@ class HybridPlanExecutor:
         # Action depends on role
         if role == "waste":
             vol = getattr(step, 'volume_uL', 50.0) or 50.0
-            direct.move_pump(pump_id, vol)  # eject (positive = push)
+            direct.move_pump(pump_id, vol)  # dispense (positive = push out)
             direct.dwell(0.5)
 
         elif role == "wash":
@@ -1507,6 +1618,11 @@ class HybridPlanExecutor:
 
                 try:
                     wx, wy = self.plate.get_well_position(well_name)
+                    # Map the plate-local well offset onto the stage axes;
+                    # move_xy below treats these as zero-ref mm (anchored at
+                    # the taught A1 = zero). See _plate_axis_sign.
+                    _sx, _sy = self._plate_axis_sign()
+                    wx, wy = _sx * wx, _sy * wy
                 except Exception:
                     logger.error(f"Well {well_name}: position lookup failed")
                     continue
@@ -1657,13 +1773,13 @@ class ServiceSequenceExecutor:
         return True
 
     def _do_waste(self, ctrl, pump, tracker, settings):
-        """Eject old ink + contaminated buffer into waste well."""
+        """Dispense old ink + contaminated buffer into waste well."""
         # Travel to waste well position (would come from well_setup)
         ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
         time.sleep(0.5)
-        # Eject: push pump to expel contents
-        eject_amount = 2.0  # mm (configurable from behavior)
-        ctrl.move_pump_relative(pump, eject_amount, settings.pump_feedrate)
+        # Dispense: push the pump to expel the contents out
+        dispense_amount = 2.0  # mm (configurable from behavior)
+        ctrl.move_pump_relative(pump, dispense_amount, settings.pump_feedrate)
         time.sleep(1.0)
         if tracker:
             tracker.record_waste(pump)
@@ -1767,7 +1883,7 @@ class FluidColumnTracker:
         col["ink_remaining_uL"] = max(0, col.get("ink_remaining_uL", 0) - volume_uL)
 
     def record_waste(self, pump: str) -> None:
-        """Record waste ejection — ink column is now empty."""
+        """Record waste dispense — ink column is now empty."""
         col = self._columns.get(pump, {})
         col["ink_remaining_uL"] = 0
 
@@ -1819,6 +1935,12 @@ class PrintManager:
     - FluidColumnTracker for ink state management (P8.7, P8.8)
     - Incremental vs continuous mode handling (P8.9)
     """
+
+    # v7.5.x: drain Marlin's planner buffer (M400) every N PRINT_PATH segments
+    # so a long open-loop path can never admit pump G0s faster than the board
+    # executes them and saturate the buffer. 8 ≈ half Marlin's default 16-block
+    # buffer, so depth stays comfortably bounded.
+    _PATH_BARRIER_EVERY = 8
 
     def __init__(self, controller):
         """
@@ -2055,6 +2177,13 @@ class PrintManager:
         logger.info(f"Starting print: {self.job.name}" +
                      (f" (resuming from step {start_from})" if start_from else ""))
 
+        # v7.5.x: remember whether the ZP board was present at the start so we
+        # can ABORT (not silently dry-run) if it drops mid-print. Every ZP move
+        # no-ops on zp_stage=None, so without this a disconnect produces a bogus
+        # "completed" with no Z/pump motion (observed in the logs).
+        self._zp_connected_at_start = getattr(
+            self.controller, "is_zp_connected", False)
+
         # Session 4: Log print start
         pos_logger = getattr(self.controller, 'position_logger', None)
         if pos_logger:
@@ -2081,6 +2210,27 @@ class PrintManager:
                 self._pause_event.wait()
 
                 if self._abort_flag.is_set():
+                    return
+
+                # v7.5.x: if the ZP board was present at the start but has
+                # dropped mid-print, ABORT rather than dry-run the rest of the
+                # plan against a dead board (which no-ops every ZP move and
+                # logs a misleading "completed"). Surfaces the disconnect in the
+                # execution log so the exact step/time is captured.
+                if (self._zp_connected_at_start
+                        and not getattr(self.controller,
+                                        "is_zp_connected", True)):
+                    msg = "ZP stage disconnected during print — aborting"
+                    logger.error(msg)
+                    if self.exec_logger:
+                        self.exec_logger.log(
+                            "zp_disconnected", step=i + 1,
+                            total=self.job.total_steps)
+                    self._set_state(PrintState.ERROR)
+                    self._report_progress(msg)
+                    self._record_history("error",
+                                         error_message="ZP disconnected")
+                    self._stop_recorder("error")
                     return
 
                 self._current_step = i + 1
@@ -2165,6 +2315,14 @@ class PrintManager:
             self._stop_recorder("error")
 
         finally:
+            # v7.5.x CRITICAL SAFETY: ALWAYS leave the needle at the safe /
+            # travel Z, no matter how the print ended — normal completion, an
+            # exception, or the abort early-returns above. Raise-only and
+            # idempotent, so for a plan that already ended with TRAVEL_UP this
+            # is a confirmed no-op; for an error/abort mid-pattern it lifts the
+            # needle out of the well. Done while the exec log is still open so
+            # it is recorded.
+            self._retract_to_safe_z("loop_end")
             # v7.5.x: disarm the plate-bottom floor (covers completion,
             # error, and the abort early-returns) so it never lingers into
             # subsequent calibration / jogging.
@@ -2213,7 +2371,8 @@ class PrintManager:
         except Exception as e:
             logger.warning(f"Failed to record print history: {e}")
 
-    def _retract_for_travel(self, context: str) -> None:
+    def _retract_for_travel(self, context: str,
+                            target_z: float | None = None) -> None:
         """v7.5.x CRITICAL SAFETY: retract the needle to the travel / "move" Z
         before a cross-position XY move (``MOVE_XY`` / ``HOME_XY``).
 
@@ -2226,6 +2385,12 @@ class PrintManager:
         (ZDIR=±1) and NEVER lowers the needle, so a misconfigured/too-low
         travel-Z degrades to a no-op rather than a crash.
 
+        ``target_z`` (zero-ref mm) overrides the full travel height — used for a
+        SMALL intra-well hop between nearby objects (just clears the printed
+        material). ``ensure_retracted_to`` still only raises and is floored by
+        the insert clearance, so a small target can never cause a descent or a
+        crash into a tall insert.
+
         ``PRINT_PATH`` (within-well) moves are intentionally NOT routed through
         here — Z stays at print height for the print pattern itself.
         """
@@ -2234,7 +2399,8 @@ class PrintManager:
             return
         if not hasattr(ctrl, "ensure_retracted_to"):
             return  # older controller — plan's TRAVEL_UP still applies
-        travel_z = getattr(self.job.settings, "travel_z_height", None)
+        travel_z = (target_z if target_z is not None
+                    else getattr(self.job.settings, "travel_z_height", None))
         if travel_z is None:
             return
         if self.exec_logger:
@@ -2245,6 +2411,51 @@ class PrintManager:
         if not ok:
             logger.warning("Retract-for-travel (%s): needle not confirmed at "
                            "travel Z — XY move may be unsafe", context)
+
+    def _retract_to_safe_z(self, context: str = "print_end",
+                           travel_z: float | None = None) -> None:
+        """v7.5.x CRITICAL SAFETY: unconditionally retract the needle to the
+        travel / safe Z at the END of a print — on completion, error, OR abort
+        — regardless of execution mode (discrete / hybrid / trajectory) and
+        regardless of whether the plan happened to end with a retract step.
+
+        This is the single guarantee that *every* print always leaves the
+        needle at a safe Z before the operator is free to jog, recalibrate, or
+        start the next run (a print that errors or is aborted mid-pattern would
+        otherwise leave the needle down in the well at print height). It is
+        polarity-safe and RAISE-ONLY (delegates to
+        :meth:`StageController.ensure_retracted_to`): it never lowers the
+        needle, so when the plan already retracted (the normal completion case)
+        it is a confirmed no-op, and a misconfigured/too-low travel-Z degrades
+        to a no-op rather than a crash-down.
+
+        Best-effort — never raises (the print is already ending). ``travel_z``
+        (zero-ref mm) overrides the height; otherwise the job's
+        ``travel_z_height`` is used. ``move_z_absolute`` is the fallback only on
+        an older controller without ``ensure_retracted_to``.
+        """
+        ctrl = self.controller
+        try:
+            if not getattr(ctrl, "is_zp_connected", False):
+                return
+            if travel_z is None:
+                travel_z = (getattr(self.job.settings, "travel_z_height", None)
+                            if self.job else None)
+            if travel_z is None:
+                return
+            if self.exec_logger:
+                try:
+                    self.exec_logger.log(
+                        "z_move", context=f"retract_to_safe_z:{context}",
+                        z_mm=round(float(travel_z), 4))
+                except Exception:
+                    pass
+            if hasattr(ctrl, "ensure_retracted_to"):
+                ctrl.ensure_retracted_to(float(travel_z))
+            else:  # older controller — best-effort raise (no confirm)
+                ctrl.move_z_absolute(float(travel_z), from_zero_ref=True)
+        except Exception as e:
+            logger.error("Final safe-Z retract (%s) failed: %s", context, e)
 
     def _execute_command(self, cmd: PrintCommand):
         """Execute a single print command."""
@@ -2259,10 +2470,19 @@ class PrintManager:
         elif cmd.type == CommandType.MOVE_XY:
             x, y = p.get("x", 0), p.get("y", 0)
             # v7.5.x CRITICAL SAFETY: MOVE_XY is travel to a DIFFERENT location
-            # (well start / pen-up move). Guarantee the needle is retracted to
-            # the travel Z (and confirmed there) BEFORE the XY move — do not
-            # rely solely on a separate preceding TRAVEL_UP. Never descends.
-            self._retract_for_travel("move_xy")
+            # (well start / pen-up move). Guarantee the needle is retracted (and
+            # confirmed there) BEFORE the XY move — do not rely solely on a
+            # separate preceding TRAVEL_UP. Never descends.
+            #
+            # A "hop_z" param requests a SMALL intra-well hop (a few mm above
+            # print Z) instead of the full travel retract — used between nearby
+            # objects in one well so the needle clears the thin printed material
+            # without a slow full retract / re-approach.
+            hop_z = p.get("hop_z", None)
+            if hop_z is not None:
+                self._retract_for_travel("move_xy_hop", target_z=float(hop_z))
+            else:
+                self._retract_for_travel("move_xy")
             # v7.2.7: Set travel speed before XY move
             _tspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
@@ -2278,7 +2498,9 @@ class PrintManager:
                     pass
             if self.exec_logger:
                 self.exec_logger.log(
-                    "xy_cmd", context="travel", speed_mm_s=_tspd,
+                    "xy_cmd",
+                    context=("hop" if hop_z is not None else "travel"),
+                    speed_mm_s=_tspd,
                     **self.exec_logger.xy_cmd_fields(ctrl, x, y))
             ctrl.move_xy_absolute(x, y, from_zero_ref=True)
             self._wait_for_xy_settle(x, y, timeout=10.0)
@@ -2294,8 +2516,54 @@ class PrintManager:
             if self.exec_logger:
                 self.exec_logger.log("z_move", context="move_z",
                                      z_mm=round(float(z), 4))
-            ctrl.move_z_absolute(z, from_zero_ref=True)
-            time.sleep(0.5)
+            # v7.5.x: drive the descent at the controller's INSERT feedrate (a
+            # moderate, deterministic speed) rather than inheriting whatever
+            # feedrate the previous command happened to leave set — so the
+            # descent's duration is bounded and predictable (shorter on-time).
+            ctrl.move_z_absolute(
+                z, from_zero_ref=True,
+                feedrate_mm_min=getattr(ctrl, "_zp_insert_feedrate", None))
+            # v7.5.x print-setup routine step 3: CONFIRM the needle physically
+            # reached the print Z (M400 + position poll) BEFORE the next step
+            # (prime / print) — do not start extruding/printing until the Z move
+            # has actually completed. Mirrors safe_travel_to's Z verification.
+            # The poller is suspended for the wait so its M114 reads don't race
+            # the M400/M114 verification. Degrades gracefully to a fixed settle
+            # when the controller can't confirm (older controller / mock / no ZP).
+            if (getattr(ctrl, "is_zp_connected", False)
+                    and hasattr(ctrl, "wait_for_z_arrival")):
+                _had_poller = hasattr(ctrl, "suspend_position_poller")
+                if _had_poller:
+                    ctrl.suspend_position_poller()
+                _z_confirmed = True
+                try:
+                    zp = getattr(ctrl, "zp_stage", None)
+                    _m400_ok = True
+                    if zp is not None and hasattr(zp, "flush_moves"):
+                        _m400_ok = zp.flush_moves(timeout_s=10.0)
+                    if not _m400_ok or not ctrl.wait_for_z_arrival(
+                            float(z), timeout_s=10.0):
+                        _z_confirmed = False
+                finally:
+                    if _had_poller:
+                        ctrl.resume_position_poller()
+                if not _z_confirmed:
+                    # v7.5.x SAFETY: the needle did NOT confirm at print Z
+                    # (board stuck "busy", or dropped). Do NOT continue —
+                    # extruding / dragging at the wrong Z against a stuck or
+                    # half-dropped board is unsafe and ruins the print. Raise
+                    # so _execute_loop aborts cleanly (state→ERROR, history +
+                    # recorder closed) and its finally retracts to safe Z.
+                    if self.exec_logger:
+                        self.exec_logger.log(
+                            "z_move", context="move_z_abort_unconfirmed",
+                            z_mm=round(float(z), 4))
+                    raise RuntimeError(
+                        f"Z move to print height {float(z):.3f} mm not "
+                        "confirmed (board stuck or disconnected) — aborting "
+                        "before extrusion")
+            else:
+                time.sleep(0.5)
 
         elif cmd.type == CommandType.MOVE_Z_REL:
             dist = p.get("distance", 0)
@@ -2303,7 +2571,7 @@ class PrintManager:
             ctrl.move_z_relative(dist, feedrate)
             time.sleep(0.3)
 
-        elif cmd.type == CommandType.EXTRUDE:
+        elif cmd.type == CommandType.DISPENSE:
             pump = p.get("pump", self._active_pump)
 
             # v7.2: Check for µL-based command first
@@ -2315,14 +2583,24 @@ class PrintManager:
                                          pump=pump,
                                          vol_uL=round(float(amount_uL), 4),
                                          rate_uL_s=rate_uL_s)
+                # v7.5.x: discrete actuation → settle=True. move_pump_uL now
+                # brackets the move with the configured pump settle dwell AND
+                # blocks for completion (subsuming the manual wait below).
+                _settled = False
                 if hasattr(ctrl, 'move_pump_uL'):
-                    ctrl.move_pump_uL(pump, amount_uL, rate_uL_s)
+                    try:
+                        ctrl.move_pump_uL(pump, amount_uL, rate_uL_s, settle=True)
+                        _settled = True
+                    except TypeError:
+                        # Older controller / fake without the settle kwarg.
+                        ctrl.move_pump_uL(pump, amount_uL, rate_uL_s)
                 else:
                     # Fallback if controller not yet patched
                     logger.warning("Controller missing move_pump_uL — using raw mm")
                     ctrl.move_pump_relative(pump, amount_uL * 0.3, 30.0)
-                wait = abs(amount_uL) / max(rate_uL_s, 0.001) + 0.1
-                time.sleep(min(wait, 10.0))
+                if not _settled:
+                    wait = abs(amount_uL) / max(rate_uL_s, 0.001) + 0.1
+                    time.sleep(min(wait, 10.0))
 
             # v7.1 legacy: mm-based command
             elif "amount" in p:
@@ -2333,7 +2611,32 @@ class PrintManager:
                 time.sleep(min(wait, 5.0))
 
         elif cmd.type == CommandType.PRINT_PATH:
-            self._execute_print_path(cmd)
+            # v7.5.x ZP-disconnect fix: a PRINT_PATH issues a dense per-segment
+            # ZP write stream (one pump G0 per segment, ~1 write/100 ms). With
+            # the background poller ACTIVE its M114 reads contend with that
+            # stream, fail to parse, and after ~2.5 s of consecutive failures
+            # the liveness watchdog FALSE-POSITIVES a "ZP disconnected" — the
+            # exact mid-print disconnect seen in the logs. Suspend the poller
+            # for the path (its cached position is display-only here; the print
+            # is open-loop), and ALWAYS resume in finally so an abort/exception
+            # cannot leave polling frozen. resume() also resets the fail window.
+            _has_poller = hasattr(ctrl, "suspend_position_poller")
+            _has_wd = hasattr(ctrl, "suspend_zp_watchdog")
+            if _has_poller:
+                ctrl.suspend_position_poller()
+            # v7.5.x: also pause the port-health watchdog so NOTHING but the
+            # print thread touches the ZP COM handle during the dense burst
+            # (its in_waiting/ClearCommError racing a flow-control-paused write
+            # is a USB fault surface). Resumed in finally.
+            if _has_wd:
+                ctrl.suspend_zp_watchdog()
+            try:
+                self._execute_print_path(cmd)
+            finally:
+                if _has_poller:
+                    ctrl.resume_position_poller()
+                if _has_wd:
+                    ctrl.resume_zp_watchdog()
 
         elif cmd.type == CommandType.DWELL:
             seconds = p.get("seconds", 0)
@@ -2348,7 +2651,11 @@ class PrintManager:
                 self.exec_logger.log(
                     "z_move", context="travel_up",
                     z_mm=round(float(settings.travel_z_height), 4))
-            ctrl.move_z_absolute(settings.travel_z_height, from_zero_ref=True)
+            # v7.5.x: explicit RETRACT feedrate — never a bare G0 Z that would
+            # inherit the pump's slow modal F (the ~12-min-crawl ZP-hang bug).
+            ctrl.move_z_absolute(
+                settings.travel_z_height, from_zero_ref=True,
+                feedrate_mm_min=getattr(ctrl, "_zp_retract_feedrate", None))
             time.sleep(0.5)
 
         elif cmd.type == CommandType.TRAVEL_DOWN:
@@ -2356,7 +2663,10 @@ class PrintManager:
                 self.exec_logger.log(
                     "z_move", context="travel_down",
                     z_mm=round(float(settings.print_z_height), 4))
-            ctrl.move_z_absolute(settings.print_z_height, from_zero_ref=True)
+            # v7.5.x: explicit INSERT (descent) feedrate — see TRAVEL_UP.
+            ctrl.move_z_absolute(
+                settings.print_z_height, from_zero_ref=True,
+                feedrate_mm_min=getattr(ctrl, "_zp_insert_feedrate", None))
             time.sleep(0.3)
 
         elif cmd.type == CommandType.HOME_XY:
@@ -2600,11 +2910,21 @@ class PrintManager:
             speed_mm_s = 5.0
         ctrl = self.controller
         if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
+            # v7.5.x: set ACCELERATION too — short print segments are
+            # accel-dominated, and the Prior otherwise uses whatever (often
+            # low) accel was last set, so moves take far longer than
+            # seg_len/speed implies. A brisk accel keeps short moves crisp.
+            if hasattr(ctrl.xy_stage, 'set_acceleration'):
+                try:
+                    ctrl.xy_stage.set_acceleration(
+                        getattr(self.job.settings, 'xy_accel_pct', 80)
+                        if self.job else 80)
+                except Exception:
+                    pass
             if hasattr(ctrl.xy_stage, 'set_speed_mm_s'):
                 ctrl.xy_stage.set_speed_mm_s(speed_mm_s)
             else:
-                pct = max(1, min(100, int(speed_mm_s * 1000 / 50000 * 100)))
-                ctrl.xy_stage.set_velocity(pct)
+                ctrl.xy_stage.set_velocity(speed_mm_s * 1000)   # µm/s → SMS%
             logger.info(f"Print speed set: {speed_mm_s:.1f} mm/s")
             if self.exec_logger:
                 self.exec_logger.log("speed_set", context="print_path",
@@ -2637,6 +2957,7 @@ class PrintManager:
         lg = self.exec_logger
         _spd = getattr(settings, 'print_speed_mm_s', 0) or \
             max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+
         if lg:
             lg.log("path_start", n_points=len(points), pump=pump,
                    flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
@@ -2658,6 +2979,21 @@ class PrintManager:
             if self._abort_flag.is_set():
                 if lg:
                     lg.log("path_end", aborted_at_segment=i,
+                           wall_s=round(time.monotonic() - _path_t0, 3),
+                           planned_s=round(_planned_s, 3))
+                return
+
+            # v7.5.x: if ZP dropped mid-path, stop NOW — do not drag the needle
+            # dry through the print at print Z (XY is a separate board and would
+            # keep moving with the pump dead). The outer _execute_loop logs the
+            # disconnect + aborts the job at the next command boundary. Gated on
+            # "was connected at start" so a job intentionally run without ZP
+            # (e.g. an XY-only sim / log test) is unaffected.
+            if (getattr(self, "_zp_connected_at_start", False)
+                    and not getattr(ctrl, "is_zp_connected", True)):
+                logger.error("PRINT_PATH: ZP disconnected mid-path — stopping")
+                if lg:
+                    lg.log("path_end", zp_disconnect_at_segment=i,
                            wall_s=round(time.monotonic() - _path_t0, 3),
                            planned_s=round(_planned_s, 3))
                 return
@@ -2716,7 +3052,16 @@ class PrintManager:
             if _speed_mm_s <= 0:
                 _speed_mm_s = max(settings.print_feedrate, 1) / 60.0
             move_time = seg_length / max(_speed_mm_s, 0.01)
-            _sleep_s = max(move_time, 0.05)
+            # v7.5.x: pace by the RATE-LIMITING axis, not just XY transit. The
+            # pump dispense for this segment physically takes
+            # _seg_vol_uL / flow_rate_uL_s seconds; if that exceeds the XY move
+            # time, the old XY-only sleep UNDER-counted it and the loop admitted
+            # pump G0s faster than Marlin could execute them → planner buffer
+            # fills → board stalls under flow control → USB write faults.
+            pump_move_s = 0.0
+            if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0 and _seg_vol_uL > 0:
+                pump_move_s = _seg_vol_uL / flow_rate_uL_s
+            _sleep_s = max(move_time, pump_move_s, 0.05)
             time.sleep(_sleep_s)
 
             # v7.5.x exec log: one line per segment. drift_s = how far the
@@ -2738,10 +3083,45 @@ class PrintManager:
                 _ev.update(_xy_fields)
                 lg.log("path_segment", **_ev)
 
-        # v7.5.x exec log: path summary. NOTE — wall_s only measures the
-        # command loop; the stage may still be physically tracing the
-        # path (open-loop pacing). Compare with subsequent 'sample'
-        # events to measure the physical completion time.
+            # v7.5.x: periodic planner-buffer barrier. Marlin's 'ok' = admitted
+            # to the planner buffer, NOT move-complete; over a long, finely-
+            # sampled path the loop can admit pump G0s faster than the board
+            # executes them, fill the ~16-block buffer, stall under flow
+            # control, and fault the USB write (the observed "crawl" → ZP drop).
+            # Draining the buffer every _PATH_BARRIER_EVERY segments bounds its
+            # depth so it can NEVER saturate. The poller + watchdog are already
+            # suspended for PRINT_PATH, so this M400 round trip is uncontended;
+            # it's near-instant when the buffer is shallow (or ZP has no queued
+            # moves, e.g. a dry/low-flow print) and only waits when motion is
+            # genuinely backed up — exactly when we need it to.
+            if (i % self._PATH_BARRIER_EVERY == 0
+                    and getattr(ctrl, "is_zp_connected", False)):
+                _zp = getattr(ctrl, "zp_stage", None)
+                if _zp is not None and hasattr(_zp, "flush_moves"):
+                    _bok = _zp.flush_moves(timeout_s=10.0)
+                    if lg and not _bok:
+                        lg.log("path_barrier", i=i, ok=False)
+
+        # v7.5.x SYNC FIX (XY/ZP de-sync at the END of a print): the per-segment
+        # XY moves above are OPEN-LOOP streamed — each Prior "G x,y" returns its
+        # "R" (received) ack immediately and moves asynchronously, paced only by
+        # this loop's sleep, NOT by arrival. So the Prior builds a backlog of
+        # queued moves and is still draining them when the segment loop ends.
+        # Without waiting here, _execute_command returns, the plan advances to
+        # the Z retract / next step, and the stage keeps moving AFTER the print
+        # is "done" — the needle retracts out of sync while XY is still tracing
+        # the tail of the path (the reported symptom). DRAIN the queue: block
+        # until the stage physically reaches the final path point before
+        # returning. (cached=False direct query works with the poller suspended;
+        # _wait_for_xy_settle honors the abort flag and logs a settle_wait.)
+        if points:
+            final_x, final_y = points[-1][0], points[-1][1]
+            self._wait_for_xy_settle(final_x, final_y, timeout=30.0)
+
+        # v7.5.x exec log: path summary. wall_s now includes the end-of-path XY
+        # drain above, so it reflects the TRUE physical path-completion time —
+        # the stage is settled at the final point when this fires, so the
+        # subsequent Z retract / next command starts in sync with XY.
         if lg:
             lg.log("path_end",
                    wall_s=round(time.monotonic() - _path_t0, 3),
@@ -2984,7 +3364,7 @@ def export_gcode(job: PrintJob, filepath: str) -> None:
         MOVE_XY    → G0 Xn Yn
         MOVE_Z     → G0 Zn
         MOVE_Z_REL → G91; G0 Zn; G90
-        EXTRUDE    → G1 En Fn
+        DISPENSE   → G1 En Fn
         PRINT_PATH → G1 Xn Yn En Fn (coordinated moves)
         DWELL      → G4 Sn
         TRAVEL_UP  → G0 Z{travel_height}
@@ -3050,13 +3430,13 @@ def export_gcode(job: PrintJob, filepath: str) -> None:
             lines.append(f"G0 Z{dist:.4f} F{feedrate}")
             lines.append("G90 ; Absolute")
 
-        elif cmd.type == CommandType.EXTRUDE:
+        elif cmd.type == CommandType.DISPENSE:
             pump = p.get("pump", "P1")
             if "amount_uL" in p:
                 # v7.2: µL-based — note in comment, use raw value for G-code
                 amount_uL = p["amount_uL"]
                 rate = p.get("rate_uL_s", settings.pump_rate_uL_s if hasattr(settings, 'pump_rate_uL_s') else 0.25)
-                lines.append(f"; v7.2 EXTRUDE {pump}: {amount_uL:.3f} µL at {rate:.3f} µL/s")
+                lines.append(f"; v7.2 DISPENSE {pump}: {amount_uL:.3f} µL at {rate:.3f} µL/s")
                 lines.append(f"G1 E{amount_uL:.5f} F{rate * 60:.1f} ; {pump} {cmd.label} (µL units)")
             else:
                 amount = p.get("amount", 0)

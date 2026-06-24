@@ -312,7 +312,11 @@ class HardwareSummaryWidget(QWidget):
             row = self._ink_table.rowCount()
             self._ink_table.insertRow(row)
             self._ink_table.setItem(row, 0, QTableWidgetItem(ink.name))
-            self._ink_table.setItem(row, 1, QTableWidgetItem(ink.ink_type))
+            # v7.5.x: show the informational ink subtype alongside the well type.
+            _sub = (getattr(ink, "ink_subtype", "") or "").strip()
+            _type_label = (f"{ink.ink_type} · {_sub}"
+                           if ink.ink_type == "ink" and _sub else ink.ink_type)
+            self._ink_table.setItem(row, 1, QTableWidgetItem(_type_label))
             self._ink_table.setItem(row, 2, QTableWidgetItem(
                 f"{ink.viscosity_cP:.1f} cP"))
             extras = []

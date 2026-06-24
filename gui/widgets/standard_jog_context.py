@@ -143,6 +143,9 @@ class StandardJogContextPanel(QWidget):
             show_connect=show_connect,
             bypass_safety=bypass_safety,
             embedded=True,
+            # v7.5.x: every jog SIDE panel labels the pump buttons
+            # ASPIRATE / DISPENSE (the Hardware Setup page keeps ▲/▼).
+            pump_action_labels=True,
         )
         layout.addWidget(self._hw_panel)
 
@@ -213,10 +216,15 @@ class StandardJogContextPanel(QWidget):
             return
         target_x_um_zr = float(self._goto_x.value())
         target_y_um_zr = float(self._goto_y.value())
-        # v7.5.x: the Z box is height-frame (up = +); convert to the raw
-        # zero-ref frame the move methods expect so a positive target moves
-        # UP, not down.
-        target_z_mm_zr = z_display_to_raw(float(self._goto_z.value()))
+        # v7.5.x: the Z box is the unified user frame (0 at bottom datum,
+        # up = +); convert to the zero-ref frame the move methods expect so a
+        # positive target moves UP, not down. Uses the live controller's
+        # per-machine sign (falls back to the module helper).
+        if hasattr(self._controller, "user_z_to_zref"):
+            target_z_mm_zr = self._controller.user_z_to_zref(
+                float(self._goto_z.value()))
+        else:
+            target_z_mm_zr = z_display_to_raw(float(self._goto_z.value()))
 
         zero = self._controller.zero_position
         abs_x_um = target_x_um_zr + zero["x"]
@@ -377,7 +385,14 @@ class StandardJogContextPanel(QWidget):
             # Fast-move-z falls back to the legacy attr for back-compat.
             if val is None and key == "fast_move_z":
                 val = self._safe_z
-            # v7.5.x: references are stored zero-ref (raw); show as height
-            # (up = +) so they agree with the rest of the jog-page Z readouts.
-            lbl.setText(
-                f"{z_raw_to_display(val):.2f} mm" if val is not None else "unset")
+            # v7.5.x: references are stored zero-ref; show in the unified user
+            # frame (0 at bottom datum, up = +) so they agree with the rest of
+            # the jog-page Z readouts. Uses the live controller's per-machine
+            # sign (falls back to the module helper).
+            if val is None:
+                lbl.setText("unset")
+            elif self._controller is not None and hasattr(
+                    self._controller, "zref_to_user_z"):
+                lbl.setText(f"{self._controller.zref_to_user_z(val):.2f} mm")
+            else:
+                lbl.setText(f"{z_raw_to_display(val):.2f} mm")

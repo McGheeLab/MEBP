@@ -134,6 +134,7 @@ from SupportClasses.WellSetup import (
     WashBehavior, WasteBehavior, BufferBehavior,
     InkPickupBehavior, SortedCellBehavior, PlaneResult,
     auto_assign_block, auto_assign_checkerboard, auto_assign_border,
+    seed_assignments_from_ink_locations,
 )
 
 from SupportClasses.PrintPlanOfAction import (
@@ -276,6 +277,25 @@ class WellSetupTab(QWidget):
                     self._refresh_plate()
                 except Exception as exc:
                     logger.error(f"Plate format sync failed: {exc}")
+
+        # v7.5.x: auto-fill from hardware reagent locations (ink/wash/buffer/
+        # oil pinned to wells in Hardware Setup → Ink). Non-destructive — only
+        # EMPTY wells are filled, so manual PRINT assignments survive.
+        try:
+            changed = seed_assignments_from_ink_locations(
+                self._model,
+                getattr(config, "ink_locations", None),
+                getattr(config, "ink_library", None),
+            )
+            if changed:
+                logger.info(
+                    "Seeded %d reagent location(s) from hardware config",
+                    len(changed))
+                self._refresh_well_colors()
+                self._refresh_summary_table()
+                self.setup_changed.emit()
+        except Exception as exc:
+            logger.error(f"Reagent-location seeding failed: {exc}")
 
     def update_needle_position(self, x_mm, y_mm, z_mm=None) -> None:
         """Forward needle position to plate view overlay."""

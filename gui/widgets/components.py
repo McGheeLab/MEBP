@@ -45,7 +45,7 @@ class Card(QFrame):
 
     def __init__(self, title: str | None = None, collapsible: bool = False,
                  parent: QWidget | None = None, *,
-                 flush: bool = False):
+                 flush: bool = False, compact: bool = False):
         """Build a card.
 
         Args:
@@ -57,6 +57,10 @@ class Card(QFrame):
                    The title — if shown — keeps its own internal padding
                    so it reads correctly. Use for full-bleed
                    visualisations that want to claim every pixel.
+            compact: When True, the title header uses tight vertical
+                   padding and a slightly smaller font so it claims as
+                   little vertical space as possible. Use when the body
+                   (e.g. a plate view) should own the height.
         """
         super().__init__(parent)
         self.setObjectName("componentCard")
@@ -86,7 +90,10 @@ class Card(QFrame):
             if flush:
                 # Re-introduce internal padding for the title only,
                 # since the outer layout no longer provides it.
-                header.setContentsMargins(s(12), s(8), s(12), s(6))
+                if compact:
+                    header.setContentsMargins(s(12), s(3), s(12), s(3))
+                else:
+                    header.setContentsMargins(s(12), s(8), s(12), s(6))
             else:
                 header.setContentsMargins(0, 0, 0, 0)
             header.setSpacing(s(6))
@@ -94,7 +101,7 @@ class Card(QFrame):
             self._title_label = QLabel(title)
             self._title_label.setStyleSheet(
                 f"color: {COLORS['blue']};"
-                f"font-size: {sf(10)}pt;"
+                f"font-size: {sf(9) if compact else sf(10)}pt;"
                 f"font-weight: 600;"
             )
             header.addWidget(self._title_label)

@@ -52,6 +52,13 @@ except ImportError:
     phase_cross_correlation = None
     SKIMAGE_AVAILABLE = False
 
+# v7.5.x: minimum grayscale std-dev (0–255) for an overlap to be considered
+# "textured" enough to register. Featureless tiles (between wells, or a flat
+# in-well region with no edge) fall below this and are EXCLUDED from the global
+# alignment estimate — they're still placed by the (trusted) stage + given the
+# global shift like every other tile.
+_REGISTER_MIN_STD = 6.0
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Data Structures
@@ -371,11 +378,43 @@ class MosaicBuilder:
         micron_per_pixel: float = 3.34,
         overlap: float = 0.10,
         target_mosaic_px: int = 2000,
+        register: bool = False,
+        max_shift_um: float = 0.0,
+        register_mode: str = "global",
+        initial_shift_um: tuple[float, float] = (0.0, 0.0),
     ):
         self._frame_size_px = frame_size_px
         self._um_per_px = micron_per_pixel
         self._overlap = overlap
         self._target_mosaic_px = target_mosaic_px
+        # v7.5.x: GLOBAL registration. The stage is accurate, so relative tile
+        # placement (by stage coordinates) is trusted and tiles are NEVER
+        # shifted individually (a single bad match must not move one image).
+        # When True, the per-overlap misalignment is *measured* during stitching
+        # and aggregated into ONE robust (median) shift applied uniformly to the
+        # whole mosaic — correcting a systematic stage↔image offset only.
+        # max_shift_um bounds that global shift (0 → auto = 20% of the FOV).
+        #
+        # register_mode = "global" (default — one shift for all tiles, the
+        # right choice for an accurate stage) | "per_tile" (each tile nudged by
+        # its own bounded measured shift). "per_tile" is RETAINED for future
+        # applications (e.g. a drifting/open-loop stage) but is NOT used by the
+        # plate mosaic scan.
+        self._register = bool(register)
+        self._max_shift_um = float(max_shift_um)
+        self._register_mode = (
+            "per_tile" if str(register_mode) == "per_tile" else "global")
+        # Per-overlap measurements (dx_px, dy_px) + the finalized global shift.
+        # The global shift is pre-seeded with any learned correction
+        # (initial_shift_um, from a prior calibration for this camera+objective)
+        # so the mosaic is registered from the first tile; finalize replaces it
+        # with the freshly-measured median when measurements were collected.
+        self._measured_shifts: list[tuple[float, float]] = []
+        try:
+            self._global_shift_um: tuple[float, float] = (
+                float(initial_shift_um[0]), float(initial_shift_um[1]))
+        except Exception:
+            self._global_shift_um = (0.0, 0.0)
         self._records: list[FrameRecord] = []
 
         # Grid shape (set during raster generation)
@@ -399,9 +438,18 @@ class MosaicBuilder:
         """World extent of the composite canvas (min_x, min_y, max_x, max_y) in µm.
 
         Includes half-FOV padding beyond the scan bounds on each side.
-        Returns None if canvas not yet initialized.
+        Returns None if canvas not yet initialized. v7.5.x: shifted by the
+        finalized global alignment offset (0 until ``finalize_global_shift``
+        runs), so detection + overlay get the single systematic correction
+        without the composite pixels being re-placed.
         """
-        return getattr(self, '_canvas_extent_um', None)
+        ext = getattr(self, '_canvas_extent_um', None)
+        if ext is None:
+            return None
+        gx, gy = getattr(self, '_global_shift_um', (0.0, 0.0))
+        if gx or gy:
+            return (ext[0] + gx, ext[1] + gy, ext[2] + gx, ext[3] + gy)
+        return ext
 
     @property
     def composite(self) -> np.ndarray | None:
@@ -410,6 +458,51 @@ class MosaicBuilder:
         Returns cached display image. Updated incrementally by _blend_tile_to_composite.
         """
         return self._display_cache
+
+    def tile_rects_px(self) -> list[tuple[float, float, float, float]]:
+        """Footprint of every captured tile on the composite canvas, as
+        ``(x, y, w, h)`` in mosaic pixels — the stage-commanded placement (same
+        math as ``_blend_tile_to_composite``). Used to outline each image taken
+        in the manual-registration mosaic view. Empty until the canvas exists.
+        """
+        origin = getattr(self, "_canvas_origin_um", None)
+        scale = getattr(self, "_mosaic_scale", None)
+        if origin is None or not scale:
+            return []
+        fov_w_um = self._frame_size_px[0] * self._um_per_px
+        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        ox, oy = origin
+        w = fov_w_um * scale
+        h = fov_h_um * scale
+        rects: list[tuple[float, float, float, float]] = []
+        for rec in self._records:
+            left = (rec.stage_x_um - fov_w_um / 2.0 - ox) * scale
+            top = (rec.stage_y_um - fov_h_um / 2.0 - oy) * scale
+            rects.append((left, top, w, h))
+        return rects
+
+    def tile_images_px(self) -> list:
+        """Each captured tile as ``(frame_bgr, left, top, w, h)`` — the raw frame
+        plus its footprint on the composite canvas (mosaic px). Lets a viewer
+        render tiles INDIVIDUALLY (e.g. to adjust the inter-tile spacing and align
+        features in the overlaps). Same placement as ``tile_rects_px``. Empty until
+        the canvas exists.
+        """
+        origin = getattr(self, "_canvas_origin_um", None)
+        scale = getattr(self, "_mosaic_scale", None)
+        if origin is None or not scale:
+            return []
+        fov_w_um = self._frame_size_px[0] * self._um_per_px
+        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        ox, oy = origin
+        w = max(1, int(fov_w_um * scale))
+        h = max(1, int(fov_h_um * scale))
+        out: list = []
+        for rec in self._records:
+            left = (rec.stage_x_um - fov_w_um / 2.0 - ox) * scale
+            top = (rec.stage_y_um - fov_h_um / 2.0 - oy) * scale
+            out.append((rec.frame, left, top, w, h))
+        return out
 
     def _normalize_full(self):
         """Normalize the entire composite accumulator into the display cache."""
@@ -437,6 +530,8 @@ class MosaicBuilder:
         self,
         bounds_um: tuple[float, float, float, float],
         overlap: float = 0.1,
+        step_x_um: float | None = None,
+        step_y_um: float | None = None,
     ) -> list[tuple[float, float]]:
         """Generate a serpentine raster grid of scan positions covering the given area.
 
@@ -447,6 +542,10 @@ class MosaicBuilder:
             bounds_um: (min_x, min_y, max_x, max_y) of the scan area in µm.
             overlap: Fractional overlap between adjacent frames (0.0–0.5).
                      Default 10% ensures seamless stitching.
+            step_x_um / step_y_um: v7.5.x — explicit grid spacing (µm) between
+                tile centres. When given (> 0) these OVERRIDE the FOV×(1−overlap)
+                computation, so the operator can dial spacing in directly when
+                the FOV-derived value doesn't match reality.
 
         Returns:
             List of (x_um, y_um) stage positions in serpentine (meander) order.
@@ -458,9 +557,11 @@ class MosaicBuilder:
         fov_w = self._frame_size_px[0] * self._um_per_px
         fov_h = self._frame_size_px[1] * self._um_per_px
 
-        # Step size with overlap
-        step_x = fov_w * (1.0 - overlap)
-        step_y = fov_h * (1.0 - overlap)
+        # Step size with overlap — or the explicit override when provided.
+        step_x = (float(step_x_um) if step_x_um and step_x_um > 0
+                  else fov_w * (1.0 - overlap))
+        step_y = (float(step_y_um) if step_y_um and step_y_um > 0
+                  else fov_h * (1.0 - overlap))
 
         # Inset by half-FOV so the camera center stays within bounds
         # while the frame edges still cover the boundary
@@ -720,6 +821,87 @@ class MosaicBuilder:
         self._blend_tile_to_composite(rec)
         return self.composite
 
+    def _max_shift_px(self) -> float:
+        """Per-tile registration bound in mosaic px (0 µm → 20% of the FOV)."""
+        if self._max_shift_um and self._max_shift_um > 0:
+            return float(self._max_shift_um) * self._mosaic_scale
+        fov_w_px = self._frame_size_px[0] * self._um_per_px * self._mosaic_scale
+        return 0.2 * fov_w_px
+
+    def _measure_tile_shift(self, resized, px, py, tw, th):
+        """MEASURE this tile's overlap misalignment vs the already-stitched
+        composite (phase correlation). Returns (dx_px, dy_px) sub-pixel, or
+        None when there isn't enough prior content or the match is weak. The
+        tile is NOT moved — the measurements are aggregated globally.
+        """
+        if (not SKIMAGE_AVAILABLE or self._display_cache is None
+                or self._weight_sum is None):
+            return None
+        ch, cw = self._weight_sum.shape[:2]
+        x1 = max(0, px)
+        y1 = max(0, py)
+        x2 = min(cw, px + tw)
+        y2 = min(ch, py + th)
+        if (x2 - x1) < 8 or (y2 - y1) < 8:
+            return None
+        covered = self._weight_sum[y1:y2, x1:x2] > 0
+        # Need enough already-stitched content in the overlap to register to.
+        if float(covered.mean()) < 0.25:
+            return None
+        try:
+            comp_region = self._display_cache[y1:y2, x1:x2]
+            comp_gray = cv2.cvtColor(comp_region, cv2.COLOR_BGR2GRAY)
+            sx1 = x1 - px
+            sy1 = y1 - py
+            tile_region = resized[sy1:sy1 + (y2 - y1), sx1:sx1 + (x2 - x1)]
+            tile_gray = cv2.cvtColor(tile_region, cv2.COLOR_BGR2GRAY)
+            # Zero out the not-yet-stitched pixels in BOTH so they don't bias
+            # the correlation toward the empty canvas.
+            mask = ~covered
+            comp_gray = comp_gray.copy()
+            tile_gray = tile_gray.copy()
+            comp_gray[mask] = 0
+            tile_gray[mask] = 0
+            # Featureless overlap (uniform colour — between wells, or an in-well
+            # region with no edge in view) can't be registered: phase
+            # correlation on a flat patch returns noise. Skip it so it neither
+            # fails nor injects a bogus shift; it still gets the global shift.
+            cov = covered
+            if (float(comp_gray[cov].std()) < _REGISTER_MIN_STD
+                    or float(tile_gray[cov].std()) < _REGISTER_MIN_STD):
+                return None
+            # Shift to bring the new tile (b) onto the existing composite (a).
+            dy, dx, conf = _phase_correlate_overlap(comp_gray, tile_gray)
+        except Exception:
+            return None
+        if conf < 0.05:
+            return None
+        return float(dx), float(dy)
+
+    def finalize_global_shift(self) -> tuple[float, float]:
+        """Aggregate the per-overlap measurements into ONE global alignment
+        shift (robust median, bounded by max_shift) applied uniformly to the
+        whole mosaic via ``canvas_extent_um``. Trusts the accurate stage for
+        relative placement — a single bad overlap match can't move one tile,
+        and per-tile stage noise is averaged out. Returns the shift in µm.
+        """
+        if not self._register or not self._measured_shifts:
+            # No fresh measurements — keep any pre-seeded learned correction.
+            return self._global_shift_um
+        arr = np.array(self._measured_shifts, dtype=float)   # (N, 2) = (dx, dy) px
+        gdx = float(np.median(arr[:, 0]))
+        gdy = float(np.median(arr[:, 1]))
+        m = self._max_shift_px()
+        gdx = max(-m, min(m, gdx))
+        gdy = max(-m, min(m, gdy))
+        scale = self._mosaic_scale if self._mosaic_scale else 1.0
+        self._global_shift_um = (gdx / scale, gdy / scale)
+        logger.info(
+            "Mosaic global alignment: shift "
+            f"({self._global_shift_um[0]:.1f}, {self._global_shift_um[1]:.1f}) "
+            f"µm (median of {len(self._measured_shifts)} overlaps)")
+        return self._global_shift_um
+
     def _blend_tile_to_composite(self, rec: FrameRecord):
         """Blend a single tile into the composite canvas with feathering."""
         if self._composite is None or self._weight_sum is None:
@@ -746,6 +928,27 @@ class MosaicBuilder:
                                  interpolation=cv2.INTER_AREA)
         except Exception:
             return
+
+        # v7.5.x: registration. Measure this tile's overlap misalignment, then
+        # either (global, default) record it for ONE uniform shift finalized
+        # later — trusting the accurate stage for relative placement — or
+        # (per_tile, retained for future apps) nudge THIS tile by its own
+        # bounded shift now.
+        if self._register:
+            try:
+                shift = self._measure_tile_shift(resized, px, py,
+                                                 tile_w, tile_h)
+                if shift is not None:
+                    if self._register_mode == "per_tile":
+                        m = self._max_shift_px()
+                        px += int(round(max(-m, min(m, shift[0]))))
+                        py += int(round(max(-m, min(m, shift[1]))))
+                        rec.refined_x_px = float(px + tile_w / 2.0)
+                        rec.refined_y_px = float(py + tile_h / 2.0)
+                    else:
+                        self._measured_shifts.append(shift)
+            except Exception as e:
+                logger.debug(f"Overlap registration skipped: {e}")
 
         # Get feather weights (resize if dimensions don't match)
         if (self._feather_weights is not None

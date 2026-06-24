@@ -287,7 +287,7 @@ class SafetyLimits:
 
     # ── v7.2: Auto-configure from HardwareConfig ─────────────────
 
-    def update_from_hardware_config(self, hardware_config) -> None:
+    def update_from_hardware_config(self, hardware_config, skip_pumps=()) -> None:
         """
         v7.2: Auto-configure safety limits from hardware config.
 
@@ -295,9 +295,15 @@ class SafetyLimits:
         Uses conservative lookup table: smaller gauge = lower max flow.
 
         Also updates pump travel limits based on syringe stroke length.
+
+        v7.5.x: ``skip_pumps`` — pumps whose travel-limit overwrite should be
+        SKIPPED because their envelope was set by the plunger calibration
+        (:meth:`StageController.apply_pump_setup`), which must win over the
+        coarse syringe-stroke estimate. Flow-rate limits are still updated.
         """
         if hardware_config is None:
             return
+        skip_pumps = set(skip_pumps or ())
 
         # Max flow rate by needle gauge (µL/s) — conservative defaults
         # Based on typical bioprinting literature recommendations
@@ -329,8 +335,9 @@ class SafetyLimits:
                 self.set_max_flow_rate(pid, max_rate)
                 logger.info(f"{pid}: max flow rate = {max_rate:.1f} µL/s ({gauge}G needle)")
 
-            # Set pump travel limits from syringe stroke length
-            if pump_cfg.syringe:
+            # Set pump travel limits from syringe stroke length — UNLESS the
+            # plunger calibration already set a (more accurate) envelope.
+            if pump_cfg.syringe and pid not in skip_pumps:
                 stroke_mm = pump_cfg.syringe.stroke_length_mm
                 # Allow ±stroke from zero reference (generous)
                 attr_min = f"{pid.lower()}_min"

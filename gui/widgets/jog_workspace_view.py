@@ -34,14 +34,37 @@ import math
 from collections import deque
 from typing import Literal
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QMouseEvent, QPainter, QPen,
+    QBrush, QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap,
 )
-from PySide6.QtWidgets import QMenu, QSizePolicy, QWidget
+from PySide6.QtWidgets import QMenu, QSizePolicy, QToolButton, QWidget
 
 from gui.scaling import s, scaled_font_size
 from gui.styles import COLORS
+from gui.widgets.icons import icon
+
+
+def pixmap_from_bgr(bgr) -> QPixmap | None:
+    """Convert a numpy BGR (or grayscale) uint8 image to a QPixmap.
+
+    Shared by the pages that push a stitched plate mosaic into
+    :meth:`JogWorkspaceView.set_mosaic_overlay`. ``.copy()`` detaches the
+    QImage from the numpy buffer so the pixmap survives the array being freed.
+    """
+    if bgr is None:
+        return None
+    try:
+        import numpy as np
+        arr = np.ascontiguousarray(bgr)
+        h, w = arr.shape[:2]
+        if arr.ndim == 2:
+            img = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8)
+        else:
+            img = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+        return QPixmap.fromImage(img.copy())
+    except Exception:
+        return None
 
 # ── Tuning ─────────────────────────────────────────────────────────
 
@@ -83,9 +106,13 @@ class JogWorkspaceView(QWidget):
     # unflipped canvas (+X→right, +Y→down) draws the plate upside-down relative
     # to the operator's physical view. Reflecting both axes about the envelope
     # centre matches the physical orientation. Applied in BOTH the forward and
-    # inverse coordinate maps, so click targeting stays correct. Flip to False
-    # for a stage mounted with the conventional origin/axes. (A future per-
-    # machine setting could drive this; hardcoded for now.)
+    # inverse coordinate maps, so click targeting stays correct.
+    #
+    # This is now driven by the per-machine ``plate_flip_180`` setting (single
+    # source of truth on ``StageController`` — see DEFAULT_PLATE_FLIP_180); the
+    # owning page pushes it via :meth:`set_plate_flip_180`. The class constant
+    # below is only the construction-time default until the page pushes the
+    # live value.
     _FLIP_DISPLAY_180 = True
 
     def __init__(self, parent: QWidget | None = None):
@@ -98,6 +125,10 @@ class JogWorkspaceView(QWidget):
 
         # State
         self._safety_limits = None
+        # v7.5.x: per-machine 180° display flip (driven by plate_flip_180).
+        # Defaults to the class constant until the owning page pushes the live
+        # per-machine value via set_plate_flip_180().
+        self._flip_180: bool = self._FLIP_DISPLAY_180
         # v7.5.x: the XY envelope is stored ABSOLUTE stage µm, but this view is
         # fed zero-referenced needle/well positions. Subtract the current zero
         # reference from the envelope bounds so both share the zero-ref frame.
@@ -118,11 +149,196 @@ class JogWorkspaceView(QWidget):
         self._toggle_rect_free: QRectF | None = None
         self._toggle_rect_snap: QRectF | None = None
 
+        # v7.5.x: persistent reference markers (e.g. taught well centres),
+        # zero-ref µm, drawn as a distinct ⊕ so the operator can confirm
+        # registration against the plate/wells.
+        self._ref_markers: dict[str, tuple[float, float]] = {}
+
+        # v7.5.x: optional stitched full-plate mosaic drawn UNDER the wells as
+        # a background overlay. Extent is ABSOLUTE stage µm (shifted by
+        # _zero_off at paint time, like the envelope). Toggled via
+        # set_mosaic_visible(); built by the Plate Location mosaic scan.
+        self._mosaic_pixmap: QPixmap | None = None
+        self._mosaic_extent_abs: tuple[float, float, float, float] | None = None
+        self._mosaic_visible: bool = False
+        self._mosaic_opacity: float = 0.55
+        # v7.5.x: the idealized well grid can be hidden so the operator can view
+        # the mosaic on its own. Combined with _mosaic_visible this gives the
+        # three plate-view modes: ideal-well / mosaic / mosaic-overlaid-on-well
+        # (see set_plate_display_mode()).
+        self._wells_visible: bool = True
+        # v7.5.x: live manual-alignment nudge (µm) added to the overlay extent
+        # so the operator can slide the mosaic onto the well grid by eye.
+        self._mosaic_user_shift: tuple[float, float] = (0.0, 0.0)
+        # v7.5.x: SEPARATE multi-channel fluorescence overlay (independent of the
+        # brightfield plate mosaic above). Built by the Fluorescence Mosaic
+        # workflow + persisted per (plate, well); any workflow can show it as a
+        # registered background. Extent is ABSOLUTE stage µm (shifted by
+        # _zero_off at paint, like the mosaic). Toggled via set_fluor_visible().
+        self._fluor_pixmap: QPixmap | None = None
+        self._fluor_extent_abs: tuple[float, float, float, float] | None = None
+        self._fluor_visible: bool = False
+        self._fluor_opacity: float = 0.75
+        # v7.5.x: zoom + pan so the operator can magnify small features (e.g.
+        # spots seen in the mosaic). Enabled by default on every page. The wheel
+        # zooms about the cursor; +/- buttons zoom about centre; PAN happens on
+        # Shift+left-drag OR when the hand tool is toggled on (so a plain left-
+        # click still travels / snaps / teaches). _zoom multiplies the
+        # fit-to-envelope scale; _pan is an extra pixel offset.
+        self._zoom_enabled: bool = True
+        self._zoom: float = 1.0
+        self._pan: list[float] = [0.0, 0.0]
+        self._panning: bool = False
+        self._pan_anchor_px: tuple[float, float] | None = None
+        self._pan_anchor_val: tuple[float, float] | None = None
+        # Hand/pan tool: when active a plain left-drag pans (no Shift needed).
+        self._pan_tool_active: bool = False
+        self._build_zoom_controls()
+
     # ── Public API ─────────────────────────────────────────────────
+
+    _ZOOM_MIN = 1.0
+    _ZOOM_MAX = 60.0
+
+    def set_zoom_enabled(self, enabled: bool) -> None:
+        """Enable wheel-zoom + pan + the overlay +/-/hand controls. On by
+        default; disable to lock a view at fit-to-envelope."""
+        self._zoom_enabled = bool(enabled)
+        if not self._zoom_enabled:
+            self._pan_tool_active = False
+            if hasattr(self, "_btn_pan"):
+                self._btn_pan.setChecked(False)
+            self.reset_view()
+        self._update_zoom_controls_visibility()
+        self._update_pan_cursor()
+
+    # ── Overlay zoom/pan controls (+/-/hand) ───────────────────────
+
+    def _build_zoom_controls(self) -> None:
+        """Create the floating +/-/hand buttons over the canvas (top-right).
+        Present on every page that hosts this view, so zoom/pan is always
+        available."""
+        r = s(6)
+        c = _qc('surface0')
+        bg = f"rgba({c.red()},{c.green()},{c.blue()},0.86)"
+        sheet = (
+            "QToolButton {"
+            f"  background: {bg};"
+            f"  border: 1px solid {COLORS['surface2']};"
+            f"  border-radius: {r}px;"
+            "}"
+            f"QToolButton:hover {{ background: {COLORS['surface1']}; }}"
+            f"QToolButton:checked {{ background: {COLORS['mauve']};"
+            f"  border-color: {COLORS['mauve']}; }}"
+        )
+
+        def _mk(name: str, tip: str, checkable: bool = False) -> QToolButton:
+            b = QToolButton(self)
+            b.setIcon(icon(name, px=s(15)))
+            b.setIconSize(QSize(s(15), s(15)))
+            b.setToolTip(tip)
+            b.setCheckable(checkable)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setFixedSize(s(26), s(26))
+            b.setStyleSheet(sheet)
+            return b
+
+        self._btn_zoom_in = _mk("plus", "Zoom in (mouse wheel up)")
+        self._btn_zoom_out = _mk("minus", "Zoom out (mouse wheel down)")
+        self._btn_pan = _mk(
+            "hand",
+            "Pan tool — drag to pan (or hold Shift + drag any time). "
+            "Click again to return to click-to-move.",
+            checkable=True)
+        self._btn_zoom_in.clicked.connect(lambda: self._zoom_about_center(1.6))
+        self._btn_zoom_out.clicked.connect(
+            lambda: self._zoom_about_center(1.0 / 1.6))
+        self._btn_pan.toggled.connect(self._on_pan_tool_toggled)
+        self._update_zoom_controls_visibility()
+        self._layout_zoom_controls()
+
+    def _update_zoom_controls_visibility(self) -> None:
+        for name in ("_btn_zoom_in", "_btn_zoom_out", "_btn_pan"):
+            b = getattr(self, name, None)
+            if b is not None:
+                b.setVisible(self._zoom_enabled)
+
+    def _layout_zoom_controls(self) -> None:
+        if not hasattr(self, "_btn_zoom_in"):
+            return
+        m = s(8)
+        gap = s(4)
+        bw = self._btn_zoom_in.width()
+        x = max(0, self.width() - m - bw)
+        y = s(10)
+        for b in (self._btn_zoom_in, self._btn_zoom_out, self._btn_pan):
+            b.move(int(x), int(y))
+            b.raise_()
+            y += b.height() + gap
+
+    def _on_pan_tool_toggled(self, checked: bool) -> None:
+        self._pan_tool_active = bool(checked)
+        self._update_pan_cursor()
+
+    def _update_pan_cursor(self) -> None:
+        if self._zoom_enabled and self._pan_tool_active:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+
+    def _zoom_about_center(self, factor: float) -> None:
+        """Zoom by ``factor`` about the centre of the drawn content (used by the
+        +/- buttons; the wheel zooms about the cursor instead)."""
+        if not self._zoom_enabled:
+            return
+        rect = self._content_rect()
+        cx, cy = rect.center().x(), rect.center().y()
+        ux, uy = self._px_to_um(cx, cy)
+        new_zoom = max(self._ZOOM_MIN, min(self._ZOOM_MAX, self._zoom * factor))
+        if new_zoom == self._zoom:
+            return
+        self._zoom = new_zoom
+        if abs(new_zoom - self._ZOOM_MIN) < 1e-6:
+            self._pan = [0.0, 0.0]            # snap back to fit at min zoom
+        else:
+            npx = self._um_to_px(ux, uy)      # keep centre point fixed
+            self._pan[0] += cx - npx.x()
+            self._pan[1] += cy - npx.y()
+        self.update()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._layout_zoom_controls()
+
+    def set_zoom(self, zoom: float) -> None:
+        z = max(self._ZOOM_MIN, min(self._ZOOM_MAX, float(zoom)))
+        if z != self._zoom:
+            self._zoom = z
+            self.update()
+
+    def zoom(self) -> float:
+        return self._zoom
+
+    def reset_view(self) -> None:
+        """Back to fit-to-envelope (zoom 1, no pan)."""
+        self._zoom = 1.0
+        self._pan = [0.0, 0.0]
+        self.update()
 
     def set_safety_limits(self, limits) -> None:
         self._safety_limits = limits
         self.update()
+
+    def set_plate_flip_180(self, flip: bool) -> None:
+        """v7.5.x: per-machine 180° display flip (from StageController
+        ``plate_flip_180``). Pushed by the owning page so every plate view
+        agrees on the orientation convention (A1 top-left / stage 0,0
+        bottom-right)."""
+        flip = bool(flip)
+        if flip != self._flip_180:
+            self._flip_180 = flip
+            self.update()
 
     def set_zero_offset(self, zero_x_um: float, zero_y_um: float) -> None:
         """v7.5.x: current zero reference (absolute stage µm). The absolute XY
@@ -154,6 +370,120 @@ class JogWorkspaceView(QWidget):
                 if n not in self._wells_cal
             }
         self.update()
+
+    def set_reference_markers(
+        self, markers: dict[str, tuple[float, float]] | None
+    ) -> None:
+        """Persistent reference points (zero-ref µm) drawn as a distinct ⊕ —
+        e.g. the taught well centres, so the operator can verify the plate map
+        registers against them."""
+        self._ref_markers = dict(markers) if markers else {}
+        self.update()
+
+    def set_mosaic_overlay(
+        self,
+        pixmap: QPixmap | None,
+        extent_abs_um: tuple[float, float, float, float] | None,
+    ) -> None:
+        """Set (or clear) the stitched full-plate mosaic background overlay.
+
+        ``pixmap`` is the composite (use :func:`pixmap_from_bgr`); ``extent_abs_um``
+        is its world extent ``(min_x, min_y, max_x, max_y)`` in **absolute stage
+        µm** (``MosaicBuilder.canvas_extent_um``). Pass ``None`` to clear.
+        Visibility is controlled separately by :meth:`set_mosaic_visible`.
+        """
+        self._mosaic_pixmap = pixmap
+        if (extent_abs_um is not None and len(extent_abs_um) == 4
+                and pixmap is not None):
+            self._mosaic_extent_abs = tuple(float(v) for v in extent_abs_um)
+        else:
+            self._mosaic_extent_abs = None
+            self._mosaic_pixmap = None
+        # A fresh overlay starts un-nudged; the page seeds any stored shift.
+        self._mosaic_user_shift = (0.0, 0.0)
+        self.update()
+
+    def set_mosaic_visible(self, visible: bool) -> None:
+        self._mosaic_visible = bool(visible)
+        self.update()
+
+    def set_wells_visible(self, visible: bool) -> None:
+        """Show/hide the idealized well grid (paint-only; snapping is
+        unaffected)."""
+        self._wells_visible = bool(visible)
+        self.update()
+
+    def set_plate_display_mode(self, mode: str) -> None:
+        """Set the plate-view mode in one call. ``mode`` is one of:
+
+        * ``"well"``    — idealized well grid only (mosaic hidden)
+        * ``"mosaic"``  — stitched plate mosaic only (well grid hidden)
+        * ``"overlay"`` — mosaic drawn under the idealized well grid
+
+        Unknown values fall back to ``"well"``.
+        """
+        if mode not in ("well", "mosaic", "overlay"):
+            mode = "well"
+        self._wells_visible = mode in ("well", "overlay")
+        self._mosaic_visible = mode in ("mosaic", "overlay")
+        self.update()
+
+    def set_mosaic_shift(self, dx_um: float, dy_um: float) -> None:
+        """Live manual-alignment nudge (µm) applied to the overlay extent — lets
+        the operator slide the mosaic onto the well grid by eye. Does not rebuild
+        the pixmap."""
+        sh = (float(dx_um), float(dy_um))
+        if sh != self._mosaic_user_shift:
+            self._mosaic_user_shift = sh
+            self.update()
+
+    def mosaic_shift(self) -> tuple[float, float]:
+        return self._mosaic_user_shift
+
+    def set_mosaic_opacity(self, opacity: float) -> None:
+        a = max(0.05, min(1.0, float(opacity)))
+        if a != self._mosaic_opacity:
+            self._mosaic_opacity = a
+            self.update()
+
+    def has_mosaic(self) -> bool:
+        return self._mosaic_pixmap is not None and self._mosaic_extent_abs is not None
+
+    # ── Fluorescence overlay (independent of the brightfield mosaic) ──
+
+    def set_fluor_overlay(
+        self,
+        pixmap: QPixmap | None,
+        extent_abs_um: tuple[float, float, float, float] | None,
+    ) -> None:
+        """Set (or clear) the multi-channel fluorescence overlay.
+
+        ``pixmap`` is the blended false-colour image (use :func:`pixmap_from_bgr`
+        on ``FluorescenceMosaicStore.composite_overlay``); ``extent_abs_um`` is
+        its world extent ``(min_x, min_y, max_x, max_y)`` in **absolute stage µm**.
+        Pass ``None`` to clear. Visibility is controlled by :meth:`set_fluor_visible`.
+        """
+        self._fluor_pixmap = pixmap
+        if (extent_abs_um is not None and len(extent_abs_um) == 4
+                and pixmap is not None):
+            self._fluor_extent_abs = tuple(float(v) for v in extent_abs_um)
+        else:
+            self._fluor_extent_abs = None
+            self._fluor_pixmap = None
+        self.update()
+
+    def set_fluor_visible(self, visible: bool) -> None:
+        self._fluor_visible = bool(visible)
+        self.update()
+
+    def set_fluor_opacity(self, opacity: float) -> None:
+        a = max(0.05, min(1.0, float(opacity)))
+        if a != self._fluor_opacity:
+            self._fluor_opacity = a
+            self.update()
+
+    def has_fluor(self) -> bool:
+        return self._fluor_pixmap is not None and self._fluor_extent_abs is not None
 
     def set_needle(self, outer_diameter_um: float | None) -> None:
         if outer_diameter_um and outer_diameter_um > 0:
@@ -230,21 +560,25 @@ class JogWorkspaceView(QWidget):
         rect = self._content_rect()
         sx = rect.width() / env_w
         sy = rect.height() / env_h
-        k = min(sx, sy)
+        # Fit-to-envelope base scale, then the opt-in zoom multiplier + pan.
+        k = min(sx, sy) * (self._zoom if self._zoom_enabled else 1.0)
         drawn_w = env_w * k
         drawn_h = env_h * k
         ox = rect.left() + (rect.width() - drawn_w) / 2.0 - x_min * k
         oy = rect.top() + (rect.height() - drawn_h) / 2.0 - y_min * k
+        if self._zoom_enabled:
+            ox += self._pan[0]
+            oy += self._pan[1]
         return (k, ox, oy)
 
     def _apply_display_flip(
         self, x_um: float, y_um: float
     ) -> tuple[float, float]:
         """Reflect a zero-ref µm point about the envelope centre when the
-        display is rotated 180° (see ``_FLIP_DISPLAY_180``). The reflection is
+        display is rotated 180° (see ``set_plate_flip_180``). The reflection is
         its own inverse, so applying it in both the forward (µm→px) and inverse
         (px→µm) maps rotates the whole render while keeping clicks accurate."""
-        if not self._FLIP_DISPLAY_180:
+        if not self._flip_180:
             return (x_um, y_um)
         env = self._envelope_bounds()
         if env is None:
@@ -332,19 +666,32 @@ class JogWorkspaceView(QWidget):
         # Solid dark base
         p.fillRect(self.rect(), _qc('base'))
 
-        self._paint_toggle(p)
-
         if self._safety_limits is None:
             self._paint_placeholder(p)
+            self._paint_toggle(p)
             p.end()
             return
 
+        # Workspace content is clipped to the content rect so an off-envelope
+        # well (e.g. from a coarse/bad calibration) can't bleed into the toggle
+        # band at the top or spill outside the workspace box.
+        p.save()
+        p.setClipRect(self._content_rect())
         self._paint_envelope(p)
+        self._paint_mosaic_overlay(p)
+        self._paint_fluor_overlay(p)
         self._paint_plate_and_wells(p)
         self._paint_breadcrumbs(p)
+        self._paint_reference_markers(p)
         self._paint_needle(p)
         self._paint_hover_ghost(p)
+        p.restore()
+
         self._paint_readout(p)
+        # v7.5.x: toggle painted LAST so the Free / Snap-to-well buttons are
+        # never obscured by the plate or wells (they used to paint over a
+        # toggle drawn first when a well rendered near the top-left corner).
+        self._paint_toggle(p)
 
         p.end()
 
@@ -449,9 +796,65 @@ class JogWorkspaceView(QWidget):
             p.setPen(QPen(_qc('red'), 1.6))
             p.drawRoundedRect(rect, s(8), s(8))
 
+    # ── Mosaic overlay ─────────────────────────────────────────────
+
+    def _paint_mosaic_overlay(self, p: QPainter) -> None:
+        """Draw the stitched plate mosaic registered to its world extent.
+
+        Extent is absolute stage µm → shifted into the zero-ref frame (like the
+        envelope). Under the 180° display flip, the world-min corner maps to the
+        screen-max corner, so the image is rotated 180° about the rect centre to
+        register pixel(0,0) (= world min) onto its flipped screen position.
+        """
+        if (not self._mosaic_visible or self._mosaic_pixmap is None
+                or self._mosaic_extent_abs is None):
+            return
+        zx, zy = self._zero_off
+        ux, uy = self._mosaic_user_shift           # live manual-align nudge
+        min_x, min_y, max_x, max_y = self._mosaic_extent_abs
+        tl = self._um_to_px(min_x - zx + ux, min_y - zy + uy)
+        br = self._um_to_px(max_x - zx + ux, max_y - zy + uy)
+        rect = QRectF(tl, br).normalized()
+        if rect.width() < 1 or rect.height() < 1:
+            return
+        p.save()
+        p.setOpacity(self._mosaic_opacity)
+        if self._flip_180:
+            p.translate(rect.center())
+            p.rotate(180)
+            p.translate(-rect.center())
+        p.drawPixmap(rect, self._mosaic_pixmap,
+                     QRectF(self._mosaic_pixmap.rect()))
+        p.restore()
+
+    def _paint_fluor_overlay(self, p: QPainter) -> None:
+        """Draw the blended fluorescence overlay registered to its world extent
+        (same frame handling as the brightfield mosaic)."""
+        if (not self._fluor_visible or self._fluor_pixmap is None
+                or self._fluor_extent_abs is None):
+            return
+        zx, zy = self._zero_off
+        min_x, min_y, max_x, max_y = self._fluor_extent_abs
+        tl = self._um_to_px(min_x - zx, min_y - zy)
+        br = self._um_to_px(max_x - zx, max_y - zy)
+        rect = QRectF(tl, br).normalized()
+        if rect.width() < 1 or rect.height() < 1:
+            return
+        p.save()
+        p.setOpacity(self._fluor_opacity)
+        if self._flip_180:
+            p.translate(rect.center())
+            p.rotate(180)
+            p.translate(-rect.center())
+        p.drawPixmap(rect, self._fluor_pixmap,
+                     QRectF(self._fluor_pixmap.rect()))
+        p.restore()
+
     # ── Plate + wells ──────────────────────────────────────────────
 
     def _paint_plate_and_wells(self, p: QPainter) -> None:
+        if not self._wells_visible:
+            return
         wells = self._all_wells()
         if not wells:
             return
@@ -532,6 +935,31 @@ class JogWorkspaceView(QWidget):
         p.setBrush(QBrush(fill))
         p.setPen(QPen(border, 1.2))
         p.drawEllipse(center, r_px, r_px)
+
+    # ── Reference markers (taught well centres) ────────────────────
+
+    def _paint_reference_markers(self, p: QPainter) -> None:
+        """Draw persistent reference points as a distinct pink ⊕ + label."""
+        if not self._ref_markers:
+            return
+        color = _qc('pink')
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(8))
+        font.setBold(True)
+        p.setFont(font)
+        r = s(5)
+        for name, (x_um, y_um) in self._ref_markers.items():
+            c = self._um_to_px(x_um, y_um)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(color, 1.6))
+            p.drawEllipse(c, r, r)
+            p.drawLine(QPointF(c.x() - r - s(2), c.y()),
+                       QPointF(c.x() + r + s(2), c.y()))
+            p.drawLine(QPointF(c.x(), c.y() - r - s(2)),
+                       QPointF(c.x(), c.y() + r + s(2)))
+            if name:
+                p.setPen(QPen(color))
+                p.drawText(QPointF(c.x() + r + s(3), c.y() - s(3)), name)
 
     # ── Breadcrumb trail ───────────────────────────────────────────
 
@@ -711,20 +1139,53 @@ class JogWorkspaceView(QWidget):
 
     # ── Mouse handling ─────────────────────────────────────────────
 
+    def wheelEvent(self, event) -> None:
+        if not self._zoom_enabled:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        px = event.position().x()
+        py = event.position().y()
+        ux, uy = self._px_to_um(px, py)             # µm under cursor (old zoom)
+        new_zoom = max(self._ZOOM_MIN,
+                       min(self._ZOOM_MAX, self._zoom * (1.0015 ** delta)))
+        if new_zoom == self._zoom:
+            event.accept()
+            return
+        self._zoom = new_zoom
+        if abs(new_zoom - self._ZOOM_MIN) < 1e-6:
+            self._pan = [0.0, 0.0]                   # snap back to fit at min
+        else:
+            # Keep the µm point under the cursor fixed (zoom about cursor).
+            npx = self._um_to_px(ux, uy)
+            self._pan[0] += px - npx.x()
+            self._pan[1] += py - npx.y()
+        # If a left-drag pan is in progress (wheel + drag with one mouse),
+        # re-anchor it to the just-updated pan so the next mouseMove doesn't
+        # snap the overlay back to the press-time snapshot.
+        if self._panning:
+            self._pan_anchor_px = (px, py)
+            self._pan_anchor_val = (self._pan[0], self._pan[1])
+        self.update()
+        event.accept()
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._hover_px = (event.position().x(), event.position().y())
+        if (self._panning and self._pan_anchor_px is not None
+                and (event.buttons() & Qt.MouseButton.LeftButton)):
+            ax, ay = self._pan_anchor_px
+            bx, by = self._pan_anchor_val
+            self._pan = [bx + (event.position().x() - ax),
+                         by + (event.position().y() - ay)]
         self.update()
 
     def leaveEvent(self, _e) -> None:
         self._hover_px = None
         self.update()
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        px = event.position().x()
-        py = event.position().y()
-
+    def _handle_click_at(self, px: float, py: float) -> None:
         if self._toggle_rect_free and self._toggle_rect_free.contains(px, py):
             self.set_target_mode("free")
             return
@@ -749,6 +1210,40 @@ class JogWorkspaceView(QWidget):
             self.position_clicked.emit(wx, wy)
         else:
             self.position_clicked.emit(ux, uy)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        px = event.position().x()
+        py = event.position().y()
+        # Pan when the hand tool is active or Shift is held; otherwise the press
+        # is a normal click (travel / snap / rim teach), handled on press as
+        # before. The Free/Snap toggle always wins so it stays usable.
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        want_pan = self._zoom_enabled and (self._pan_tool_active or shift)
+        if want_pan:
+            if (self._toggle_rect_free
+                    and self._toggle_rect_free.contains(px, py)):
+                self.set_target_mode("free")
+                return
+            if (self._toggle_rect_snap
+                    and self._toggle_rect_snap.contains(px, py)):
+                self.set_target_mode("snap")
+                return
+            self._panning = True
+            self._pan_anchor_px = (px, py)
+            self._pan_anchor_val = (self._pan[0], self._pan[1])
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        self._handle_click_at(px, py)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self._panning:
+            return
+        self._panning = False
+        self._pan_anchor_px = None
+        self._pan_anchor_val = None
+        self._update_pan_cursor()
 
     # ── Right-click context menu ───────────────────────────────────
 

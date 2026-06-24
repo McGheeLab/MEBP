@@ -370,9 +370,11 @@ class ObjectiveCalibrationCard(QGroupBox):
             return
         um_per_px = float(cal["measured_um_per_px"])
         rotation_deg = cal.get("rotation_deg")
+        cal_resolution = cal.get("resolution")
         if self._camera_manager is not None:
             try:
-                self._camera_manager.set_um_per_px(cam_idx, um_per_px)
+                self._camera_manager.set_um_per_px(
+                    cam_idx, um_per_px, resolution=cal_resolution)
                 if rotation_deg is not None:
                     self._camera_manager.set_rotation_deg(
                         cam_idx, float(rotation_deg))
@@ -593,7 +595,8 @@ class ObjectiveCalibrationCard(QGroupBox):
         )
         if self._camera_manager is not None:
             try:
-                self._camera_manager.set_um_per_px(cam_idx, um_per_px)
+                self._camera_manager.set_um_per_px(
+                    cam_idx, um_per_px, resolution=resolution)
                 if rotation_deg is not None:
                     self._camera_manager.set_rotation_deg(cam_idx, rotation_deg)
             except Exception as exc:

@@ -475,7 +475,13 @@ def calculate_flow_safety(
         )
 
     # --- 4. Cell shear stress ---
-    has_cells = ink.cell_diameter_um > 0 or ink.ink_type == "cells"
+    # v7.5.x: cell inks are now ink_type=="ink" with ink_subtype=="cells";
+    # the legacy ink_type=="cells" is still honored for directly-constructed
+    # (un-migrated) specs.
+    _subtype = (getattr(ink, "ink_subtype", "") or "").strip().lower()
+    has_cells = (ink.cell_diameter_um > 0
+                 or ink.ink_type == "cells"
+                 or _subtype == "cells")
     if has_cells and d_m > 0 and mu > 0:
         tau = wall_shear_stress(mu, Q_m3_s, d_m)
         result.wall_shear_stress_Pa = tau

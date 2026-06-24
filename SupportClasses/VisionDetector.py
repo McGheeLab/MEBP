@@ -266,6 +266,266 @@ class WellDetector:
         )
 
     @staticmethod
+    def detect_wells(
+        frame: np.ndarray,
+        expected_diameter_px: float,
+        tolerance: float = 0.35,
+        min_dist_px: float | None = None,
+        dp: float = 1.5,
+        param1: float = 100.0,
+        param2: float = 30.0,
+        blur_ksize: int = 9,
+        max_wells: int = 4096,
+    ) -> list[DetectionResult]:
+        """Detect MANY circular wells in one (large, stitched) image.
+
+        Unlike :meth:`detect_well` (the single best circle near the frame
+        centre), this returns *every* HoughCircles hit whose radius is within
+        ``tolerance`` of ``expected_diameter_px`` — used to find all wells at
+        once on a full-plate mosaic, where single-frame edge detection on each
+        well is unreliable. ``confidence`` here is the radius match only (centre
+        proximity is meaningless on a mosaic).
+
+        Args:
+            frame: BGR (or gray) image — typically a stitched plate mosaic.
+            expected_diameter_px: Expected well diameter in mosaic pixels.
+            tolerance: Fractional radius window (±35% default).
+            min_dist_px: Minimum centre spacing (default 0.8·diameter ≈ pitch).
+            max_wells: Hard cap on returned circles.
+
+        Returns:
+            List of :class:`DetectionResult` (``method="hough_multi"``), one
+            per detected circle (possibly empty).
+        """
+        if frame is None or frame.size == 0 or expected_diameter_px <= 0:
+            return []
+
+        gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if len(frame.shape) == 3 else frame.copy())
+        if blur_ksize and blur_ksize >= 3:
+            k = int(blur_ksize) | 1   # force odd
+            gray = cv2.GaussianBlur(gray, (k, k), 2)
+
+        expected_radius = expected_diameter_px / 2.0
+        min_radius = max(1, int(expected_radius * (1.0 - tolerance)))
+        max_radius = max(min_radius + 1, int(expected_radius * (1.0 + tolerance)))
+        if min_dist_px is None:
+            min_dist_px = expected_diameter_px * 0.8
+
+        circles = cv2.HoughCircles(
+            gray, cv2.HOUGH_GRADIENT, dp=dp,
+            minDist=max(1.0, float(min_dist_px)),
+            param1=param1, param2=param2,
+            minRadius=min_radius, maxRadius=max_radius,
+        )
+        if circles is None:
+            return []
+
+        out: list[DetectionResult] = []
+        for c in circles[0][:max_wells]:
+            cx, cy, r = float(c[0]), float(c[1]), float(c[2])
+            radius_match = (min(r, expected_radius) / max(r, expected_radius)
+                            if expected_radius > 0 else 0.5)
+            out.append(DetectionResult(
+                center_px=(cx, cy), radius_px=r,
+                confidence=float(radius_match), method="hough_multi"))
+        return out
+
+    @staticmethod
+    def _fit_circle_taubin(xs, ys):
+        """Algebraic (Taubin) circle fit → (cx, cy, r) or None. Robust on a
+        PARTIAL arc, so a well clipped at the image edge recovers its true
+        centre when border points are excluded."""
+        x = np.asarray(xs, dtype=float)
+        y = np.asarray(ys, dtype=float)
+        if len(x) < 5:
+            return None
+        xm, ym = x.mean(), y.mean()
+        u, v = x - xm, y - ym
+        Suu = float((u * u).sum()); Svv = float((v * v).sum())
+        Suv = float((u * v).sum())
+        Suuu = float((u * u * u).sum()); Svvv = float((v * v * v).sum())
+        Suvv = float((u * v * v).sum()); Svuu = float((v * u * u).sum())
+        A = np.array([[Suu, Suv], [Suv, Svv]])
+        b = 0.5 * np.array([Suuu + Suvv, Svvv + Svuu])
+        try:
+            uc, vc = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return None
+        cx, cy = uc + xm, vc + ym
+        r = float(np.sqrt(uc * uc + vc * vc + (Suu + Svv) / len(x)))
+        return float(cx), float(cy), r
+
+    @staticmethod
+    def _fit_circle_robust(pts):
+        """Circle fit that RESPECTS THE WELL EDGE even when the well is partial
+        (cut by a straight chord — clipped at the mosaic margin or image border).
+
+        A clipped disc's contour = the true arc + a straight chord across the
+        missing part. Taubin over ALL points is pulled inward by the chord
+        (undersizes + shifts the centre). Instead: seed with the min-enclosing
+        circle (defined by the ARC's extreme points, so the chord is interior and
+        ignored), then refine with Taubin on inliers only (drops the chord). The
+        result hugs the visible arc and may extend off-image, which is correct.
+
+        Returns ``(cx, cy, r, inlier_fraction)`` or None.
+        """
+        p = np.asarray(pts, dtype=float)
+        if len(p) < 5:
+            return None
+        try:
+            (sx, sy), sr = cv2.minEnclosingCircle(p.astype(np.float32))
+        except Exception:
+            return None
+        cx, cy, r = float(sx), float(sy), float(sr)
+        for _ in range(4):
+            d = np.hypot(p[:, 0] - cx, p[:, 1] - cy)
+            thr = max(2.0, 0.10 * r)
+            inl = p[np.abs(d - r) < thr]
+            if len(inl) < 12:
+                break
+            fit = WellDetector._fit_circle_taubin(inl[:, 0], inl[:, 1])
+            if fit is None:
+                break
+            cx, cy, r = fit
+        d = np.hypot(p[:, 0] - cx, p[:, 1] - cy)
+        frac = float((np.abs(d - r) < max(2.0, 0.10 * r)).mean())
+        return cx, cy, r, frac
+
+    @staticmethod
+    def detect_filled_wells(
+        frame: np.ndarray,
+        min_area_frac: float = 0.12,
+        circularity_min: float = 0.55,
+        max_wells: int = 4096,
+    ) -> list[DetectionResult]:
+        """Detect FILLED-disc wells on a stitched mosaic — the robust path for
+        high-contrast filled circles (where HoughCircles is finicky/misses).
+
+        Colour- and illumination-agnostic: brightness = max over BGR channels
+        (wells are bright vs the dark gaps regardless of stain colour) → Otsu →
+        morphology → connected components → keep large, roughly-round blobs → fit
+        a circle to each blob's contour with image-BORDER points dropped, so a
+        well clipped at the mosaic edge still recovers its true centre.
+
+        ``min_area_frac`` keeps blobs ≥ this fraction of the largest blob's area
+        (rejects specks + mid-size smudges). ``confidence`` = blob circularity.
+        Returns DetectionResult list (``method="filled_blob"``).
+        """
+        if frame is None or frame.size == 0:
+            return []
+        bright = frame.max(axis=2) if frame.ndim == 3 else frame
+        bright = cv2.GaussianBlur(bright, (5, 5), 0)
+        _, mask = cv2.threshold(bright, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if n <= 1:
+            return []
+        H, W = mask.shape
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        area_min = max(50.0, float(areas.max()) * float(min_area_frac))
+
+        out: list[DetectionResult] = []
+        for i in range(1, n):
+            area = float(stats[i, cv2.CC_STAT_AREA])
+            if area < area_min:
+                continue
+            comp = (lbl == i).astype(np.uint8)
+            cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+            if not cnts:
+                continue
+            cnt = max(cnts, key=cv2.contourArea)
+            pts = cnt.reshape(-1, 2)
+            # Chord-robust circle fit (handles wells clipped by a straight edge,
+            # at the image border OR an interior mosaic margin) — see
+            # _fit_circle_robust. ``frac`` = fraction of the contour explained by
+            # the fitted circle (high for full AND clipped wells; low for junk).
+            rfit = WellDetector._fit_circle_robust(pts)
+            if rfit is None:
+                (cx, cy), r = cv2.minEnclosingCircle(cnt)
+                cx, cy, r, frac = float(cx), float(cy), float(r), 1.0
+            else:
+                cx, cy, r, frac = rfit
+            # The arc must be well explained by a circle (rejects merged/odd
+            # blobs while still accepting partial wells, whose arc still fits).
+            if frac < circularity_min:
+                continue
+            out.append(DetectionResult(
+                center_px=(cx, cy), radius_px=r,
+                confidence=float(max(0.0, min(1.0, frac))),
+                method="filled_blob"))
+            if len(out) >= max_wells:
+                break
+        return out
+
+    @staticmethod
+    def fit_well_grid(centers, n_rows: int, n_cols: int, iters: int = 8):
+        """Fit a known ``n_rows × n_cols`` lattice to detected well centres.
+
+        Iterative snap-to-nearest-node + least-squares affine — robust to a few
+        missing wells, spurious extra blobs, and plate rotation/skew. Returns
+        ``(affine 2x3 [[a,b,c],[d,e,f]] mapping (col,row)->(x,y), assign)`` where
+        ``assign`` maps ``(row, col) -> index into centers``. ``(None, {})`` if
+        fewer than 4 centres.
+        """
+        pts = np.array([(float(c[0]), float(c[1])) for c in centers], dtype=float)
+        if len(pts) < 4 or n_rows < 1 or n_cols < 1:
+            return None, {}
+        # ROBUST seed: percentile span (not min/max) so a few off-grid spurious
+        # blobs can't corrupt the origin/pitch (a grid has n_rows wells sharing
+        # each extreme column's x, so the 8th–92nd percentile still spans it).
+        xs, ys = pts[:, 0], pts[:, 1]
+        x0, x1 = np.percentile(xs, 8), np.percentile(xs, 92)
+        y0, y1 = np.percentile(ys, 8), np.percentile(ys, 92)
+        px = max(1.0, (x1 - x0) / max(1, n_cols - 1))
+        py = max(1.0, (y1 - y0) / max(1, n_rows - 1))
+        aff = np.array([[px, 0.0, x0], [0.0, py, y0]])   # (col,row) -> (x,y)
+        assign: dict = {}
+        cost: dict = {}
+        for _ in range(max(1, iters)):
+            A, t = aff[:, :2], aff[:, 2]
+            try:
+                Ainv = np.linalg.inv(A)
+            except np.linalg.LinAlgError:
+                break
+            assign, cost = {}, {}
+            for idx, p in enumerate(pts):
+                cr = Ainv @ (p - t)
+                j = min(max(int(round(cr[0])), 0), n_cols - 1)
+                i = min(max(int(round(cr[1])), 0), n_rows - 1)
+                pred = A @ np.array([j, i]) + t
+                d = float(np.hypot(*(p - pred)))
+                if (i, j) not in cost or d < cost[(i, j)]:
+                    cost[(i, j)] = d
+                    assign[(i, j)] = idx
+            # Refit on INLIERS only (residual < 0.6·pitch) so an outlier that
+            # snapped to a node can't drag the lattice.
+            pitch = 0.5 * (np.linalg.norm(A[:, 0]) + np.linalg.norm(A[:, 1]))
+            thr = 0.6 * max(pitch, 1.0)
+            ij = [(j, i) for (i, j) in assign if cost[(i, j)] <= thr]
+            xy = [pts[assign[(i, j)]] for (i, j) in assign
+                  if cost[(i, j)] <= thr]
+            if len(ij) >= 3:
+                M = np.column_stack([np.array(ij, float), np.ones(len(ij))])
+                xy = np.array(xy, float)
+                cxr, *_ = np.linalg.lstsq(M, xy[:, 0], rcond=None)
+                cyr, *_ = np.linalg.lstsq(M, xy[:, 1], rcond=None)
+                aff = np.array([cxr, cyr])
+        # Drop final outlier assignments (a spurious blob claiming a node whose
+        # real well was missing) so callers don't get a bogus centre.
+        if cost:
+            A = aff[:, :2]
+            pitch = 0.5 * (np.linalg.norm(A[:, 0]) + np.linalg.norm(A[:, 1]))
+            thr = 0.6 * max(pitch, 1.0)
+            assign = {k: v for k, v in assign.items() if cost.get(k, 0.0) <= thr}
+        return aff, assign
+
+    @staticmethod
     def _detect_well_contour(
         frame: np.ndarray,
         expected_diameter_px: float,

@@ -28,7 +28,9 @@ import math
 
 from PySide6.QtWidgets import QWidget, QToolTip
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF
-from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QMouseEvent
+from PySide6.QtGui import (
+    QPainter, QPen, QBrush, QColor, QFont, QMouseEvent, QPainterPath,
+)
 
 from gui.scaling import s, scaled_font_size
 
@@ -67,6 +69,11 @@ class WellPlateNavigator(QWidget):
         self._current_well: str | None = None
         self._hover_well: str | None = None
         self._well_positions: dict[str, tuple[float, float]] | None = None  # well → (x_um, y_um)
+        # v7.5.x: optional raster-grid preview drawn inside the current well
+        # (cols × rows tile grid) — used by the Fluorescence Mosaic workflow to
+        # show the planned single-well raster coverage. 0,0 = off.
+        self._raster_cols = 0
+        self._raster_rows = 0
 
         self.setMinimumSize(s(160), s(100))
         self.setMouseTracking(True)
@@ -111,6 +118,17 @@ class WellPlateNavigator(QWidget):
         """Highlight the well nearest to the current stage position."""
         if well_name != self._current_well:
             self._current_well = well_name
+            self.update()
+
+    def set_raster_grid(self, cols: int, rows: int):
+        """v7.5.x: overlay a ``cols`` × ``rows`` raster-tile grid inside the
+        current well (clipped to its circle). Pass 0, 0 to clear. Used by the
+        Fluorescence Mosaic workflow to preview single-well scan coverage."""
+        cols = max(0, int(cols))
+        rows = max(0, int(rows))
+        if (cols, rows) != (self._raster_cols, self._raster_rows):
+            self._raster_cols = cols
+            self._raster_rows = rows
             self.update()
 
     def update_current_from_position(self, x_um: float, y_um: float):
@@ -250,6 +268,38 @@ class WellPlateNavigator(QWidget):
             p.setPen(QPen(border, 1.0))
             p.setBrush(QBrush(fill))
             p.drawEllipse(QPointF(cx, cy), r, r)
+
+        # v7.5.x: raster-grid preview inside the current well (Fluorescence
+        # Mosaic). Drawn last so it sits on top of the well fill, clipped to the
+        # well circle so it reads as "the tile grid that will cover this well".
+        if (self._raster_cols > 0 and self._raster_rows > 0
+                and self._current_well):
+            well_obj = next(
+                (w for w in self._plate.get_all_wells()
+                 if w.name == self._current_well), None)
+            if well_obj is not None:
+                cx, cy = self._well_center(layout, well_obj.row, well_obj.col)
+                p.save()
+                clip = QPainterPath()
+                clip.addEllipse(QPointF(cx, cy), r, r)
+                p.setClipPath(clip)
+                grid_pen = QPen(QColor("#cdd6f4"), 0.6)
+                p.setPen(grid_pen)
+                left, top = cx - r, cy - r
+                cw = (2 * r) / self._raster_cols
+                ch = (2 * r) / self._raster_rows
+                for i in range(1, self._raster_cols):
+                    x = left + i * cw
+                    p.drawLine(QPointF(x, top), QPointF(x, top + 2 * r))
+                for j in range(1, self._raster_rows):
+                    y = top + j * ch
+                    p.drawLine(QPointF(left, y), QPointF(left + 2 * r, y))
+                # Emphasise the previewed well's outline.
+                p.setClipping(False)
+                p.setPen(QPen(QColor("#f9e2af"), 1.4))
+                p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                p.drawEllipse(QPointF(cx, cy), r, r)
+                p.restore()
 
         p.end()
 

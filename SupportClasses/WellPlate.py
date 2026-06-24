@@ -8,6 +8,25 @@ All standard-format coordinates are relative to the A1 well centre, which aligns
 with the zero reference position set during calibration. Custom plates
 likewise place their first/anchor well at the workspace origin.
 
+Orientation convention (v7.5.x — ONE convention everywhere):
+  * This data model is PLATE-LOCAL: A1 is at relative (0, 0); column index
+    increases +X (drawn to screen-right), row index increases +Y (drawn
+    screen-down). The model itself is orientation-agnostic and is NEVER
+    flipped — ``get_well_position("H12")`` is always ``(99.0, 63.0)`` on a
+    96-well plate.
+  * The canonical machine convention is "well A1 displays TOP-LEFT; stage
+    physical 0,0 is BOTTOM-RIGHT". Whether the plate-local axes align with the
+    stage axes is a PER-MACHINE property (``StageController.plate_flip_180``).
+    On ME3B V1 (Prior origin bottom-right, +X/+Y toward top-left) they are
+    ANTI-aligned, so the plate-local→stage mapping multiplies the A1-relative
+    offset by ``plate_axis_sign`` = ``(-1, -1)``.
+  * The geometric helpers below (``get_all_positions_from_a1`` /
+    ``get_a1_from_plate_center`` / ``get_well_area_bounds_*``) take an optional
+    ``plate_axis_sign`` (default ``(1, 1)`` = aligned/legacy) so callers that
+    turn a well into a STAGE coordinate pass ``controller.plate_axis_sign()``.
+    Positions that are explicitly TAUGHT/warped are already absolute stage µm
+    and must NOT be re-signed.
+
 Path generators produce lists of (x, y) waypoints for common fill
 patterns: line, meander, spiral, grid, and concentric rings.
 
@@ -485,32 +504,46 @@ class WellPlate:
     # ── v7.3.1: Geometry-predicted positions ───────────────────────
 
     def get_all_positions_from_a1(
-        self, a1_x_um: float, a1_y_um: float
+        self, a1_x_um: float, a1_y_um: float,
+        plate_axis_sign: tuple[float, float] = (1.0, 1.0),
     ) -> dict[str, tuple[float, float]]:
         """Compute absolute stage positions (µm) for every well given A1's position.
 
         Uses plate geometry (well spacing) to predict all well centres.
         Coordinates are in the same frame as *a1_x_um / a1_y_um* (absolute stage µm).
 
+        ``plate_axis_sign`` maps the plate-local axes (+col→+X, +row→+Y) onto the
+        stage axes — pass ``StageController.plate_axis_sign()``. On a 180°-mounted
+        stage (ME3B V1) it is ``(-1, -1)`` so prediction lands on the physically
+        correct side of A1; the default ``(1, 1)`` is byte-identical to the
+        legacy behaviour for callers that don't supply it.
+
         Returns:
             Dict mapping well name → (x_um, y_um).
         """
+        sx, sy = plate_axis_sign
         positions: dict[str, tuple[float, float]] = {}
         for well in self.get_all_wells():
-            # well.x / well.y are mm relative to A1
+            # well.x / well.y are mm relative to A1 (plate-local frame)
             positions[well.name] = (
-                a1_x_um + well.x * 1000.0,
-                a1_y_um + well.y * 1000.0,
+                a1_x_um + sx * well.x * 1000.0,
+                a1_y_um + sy * well.y * 1000.0,
             )
         return positions
 
     def get_a1_from_plate_center(
-        self, center_x_um: float, center_y_um: float
+        self, center_x_um: float, center_y_um: float,
+        plate_axis_sign: tuple[float, float] = (1.0, 1.0),
     ) -> tuple[float, float]:
         """Compute A1 absolute position (µm) given the plate center position.
 
         Uses ANSI/SLAS footprint (127.76 × 85.48 mm) and the per-format
         A1 offset from the top-left corner of the plate.
+
+        ``plate_axis_sign`` maps plate-local axes onto stage axes (see
+        :meth:`get_all_positions_from_a1`); on a 180°-mounted stage the plate's
+        "top-left" corner is on the opposite stage side, so the A1-offset term
+        reflects with the sign.
 
         Args:
             center_x_um: Plate center X in µm (absolute stage coords).
@@ -519,18 +552,21 @@ class WellPlate:
         Returns:
             (a1_x_um, a1_y_um) — absolute stage position of well A1.
         """
+        sx, sy = plate_axis_sign
         # A1 is offset from the plate's top-left corner by (a1_offset_x, a1_offset_y).
         # Plate center is at (footprint/2) from that corner.
-        a1_x_um = center_x_um + (self.a1_offset_x - PLATE_FOOTPRINT_X_MM / 2.0) * 1000.0
-        a1_y_um = center_y_um + (self.a1_offset_y - PLATE_FOOTPRINT_Y_MM / 2.0) * 1000.0
+        a1_x_um = center_x_um + sx * (self.a1_offset_x - PLATE_FOOTPRINT_X_MM / 2.0) * 1000.0
+        a1_y_um = center_y_um + sy * (self.a1_offset_y - PLATE_FOOTPRINT_Y_MM / 2.0) * 1000.0
         return (a1_x_um, a1_y_um)
 
     def get_all_positions_from_plate_center(
-        self, center_x_um: float, center_y_um: float
+        self, center_x_um: float, center_y_um: float,
+        plate_axis_sign: tuple[float, float] = (1.0, 1.0),
     ) -> dict[str, tuple[float, float]]:
         """Compute all well positions (µm) from the plate center position.
 
         Convenience method combining get_a1_from_plate_center + get_all_positions_from_a1.
+        ``plate_axis_sign`` is threaded into both (see :meth:`get_all_positions_from_a1`).
 
         Args:
             center_x_um: Plate center X in µm (absolute stage coords).
@@ -539,16 +575,20 @@ class WellPlate:
         Returns:
             Dict mapping well name → (x_um, y_um).
         """
-        a1_x, a1_y = self.get_a1_from_plate_center(center_x_um, center_y_um)
-        return self.get_all_positions_from_a1(a1_x, a1_y)
+        a1_x, a1_y = self.get_a1_from_plate_center(
+            center_x_um, center_y_um, plate_axis_sign)
+        return self.get_all_positions_from_a1(a1_x, a1_y, plate_axis_sign)
 
     def get_well_area_bounds_um(
-        self, center_x_um: float, center_y_um: float
+        self, center_x_um: float, center_y_um: float,
+        plate_axis_sign: tuple[float, float] = (1.0, 1.0),
     ) -> tuple[float, float, float, float]:
         """Bounding box (µm) of the well area from plate center, for raster scanning.
 
         Returns the min/max stage coordinates that enclose all wells with
         a half-well-diameter margin, clamped to stage travel limits.
+        ``plate_axis_sign`` maps plate-local axes onto stage axes (see
+        :meth:`get_all_positions_from_a1`).
 
         Args:
             center_x_um: Plate center X in µm.
@@ -557,16 +597,20 @@ class WellPlate:
         Returns:
             (min_x_um, min_y_um, max_x_um, max_y_um)
         """
-        a1_x, a1_y = self.get_a1_from_plate_center(center_x_um, center_y_um)
-        return self.get_well_area_bounds_from_a1_um(a1_x, a1_y)
+        a1_x, a1_y = self.get_a1_from_plate_center(
+            center_x_um, center_y_um, plate_axis_sign)
+        return self.get_well_area_bounds_from_a1_um(a1_x, a1_y, plate_axis_sign)
 
     def get_well_area_bounds_from_a1_um(
-        self, a1_x_um: float, a1_y_um: float
+        self, a1_x_um: float, a1_y_um: float,
+        plate_axis_sign: tuple[float, float] = (1.0, 1.0),
     ) -> tuple[float, float, float, float]:
         """Bounding box (µm) of the well area from A1 position.
 
         Returns the min/max stage coordinates that enclose all wells with
         a half-well-diameter margin, clamped to stage travel limits.
+        ``plate_axis_sign`` maps plate-local axes onto stage axes; a negative
+        sign mirrors the box, so min/max are re-normalised before clamping.
 
         Args:
             a1_x_um: Well A1 X in µm (absolute stage coords).
@@ -575,14 +619,17 @@ class WellPlate:
         Returns:
             (min_x_um, min_y_um, max_x_um, max_y_um)
         """
-        r_um = self._max_well_radius_mm() * 1000.0
+        sx, sy = plate_axis_sign
 
         # Use plate bounding box (handles both standard and custom plates).
         bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y = self.get_bounding_box()
-        min_x = a1_x_um + bbox_min_x * 1000.0
-        min_y = a1_y_um + bbox_min_y * 1000.0
-        max_x = a1_x_um + bbox_max_x * 1000.0
-        max_y = a1_y_um + bbox_max_y * 1000.0
+        x_a = a1_x_um + sx * bbox_min_x * 1000.0
+        x_b = a1_x_um + sx * bbox_max_x * 1000.0
+        y_a = a1_y_um + sy * bbox_min_y * 1000.0
+        y_b = a1_y_um + sy * bbox_max_y * 1000.0
+        # A negative sign swaps which corner is min/max — re-normalise.
+        min_x, max_x = (x_a, x_b) if x_a <= x_b else (x_b, x_a)
+        min_y, max_y = (y_a, y_b) if y_a <= y_b else (y_b, y_a)
 
         # Clamp to stage travel limits (stage range: 0 to travel_mm * 1000)
         max_travel_x = STAGE_TRAVEL_X_MM * 1000.0

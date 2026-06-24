@@ -64,7 +64,7 @@ class WellRole(Enum):
     PRINT = "print"                 # Active printing target
     INK = "ink"                     # Ink reservoir — aspirate ink from here
     WASH = "wash"                   # Wash station — jiggle needle to clean
-    WASTE = "waste"                 # Waste deposit — eject buffer+old ink
+    WASTE = "waste"                 # Waste deposit — dispense buffer+old ink
     BUFFER = "buffer"               # Buffer pickup — aspirate buffer material
     SORTED_CELLS = "sorted"         # Deposit sorted/picked cells
 
@@ -79,6 +79,134 @@ ROLE_COLORS: dict[WellRole, str] = {
     WellRole.BUFFER:       "#cba6f7",   # Mauve/Purple
     WellRole.SORTED_CELLS: "#fab387",   # Peach/Orange
 }
+
+
+# ---------------------------------------------------------------------------
+# Reagent taxonomy — well type vs ink subtype (v7.5.x)
+# ---------------------------------------------------------------------------
+#
+# A reagent's PRIMARY classification is its WELL TYPE, stored in
+# ``InkSpec.ink_type``. This single value drives ALL behavior: service-well
+# resolution (``_reagent_prep.service_well_names`` and the ``__waste__`` /
+# ``__oil__`` / ``__wash__`` / ``__buffer__`` keys in ``PickAndPlaceManager``),
+# the role mapping (:func:`well_role_for_ink_type`), and the reagent-location
+# colors (:func:`ink_type_border_color`). The four SERVICE well types are never
+# printable inks (a pump never aspirates from them).
+#
+# A printable ink may ALSO carry an INK SUBTYPE (``InkSpec.ink_subtype``) — an
+# INFORMATIONAL material category, meaningful only when the well type is
+# ``ink``. It changes no motion/pump behavior; it just tells the operator what
+# the ink is. The list is editable (operators may add their own).
+
+WELL_TYPES: tuple[str, ...] = ("ink", "wash", "buffer", "waste", "oil")
+
+# The non-printable service well types. The pump ink list and the printable-ink
+# filters exclude these (by well type OR by an ink literally named one of them).
+SERVICE_WELL_TYPES: tuple[str, ...] = ("waste", "wash", "buffer", "oil")
+
+# Standard informational subtypes offered for the ``ink`` well type.
+INK_SUBTYPES: tuple[str, ...] = (
+    "granular material",
+    "fluorescent stains",
+    "cells",
+    "hydrogel monomer",
+    "media",
+    "cell removal reagents",
+    "ELISA Beads",
+    "Growth Factor Beads",
+)
+
+# Pre-v7.5.x stored the material category in ``ink_type`` itself. The
+# type/subtype split moves it to ``ink_subtype`` and sets the well type to the
+# printable ``ink``. Maps legacy ``ink_type`` → the new subtype.
+_LEGACY_MATERIAL_SUBTYPE: dict[str, str] = {
+    "granular": "granular material",
+    "cells": "cells",
+    "hydrogel": "hydrogel monomer",
+    "media": "media",
+    "custom": "",
+}
+
+
+def is_service_reagent(name: str | None, ink_type: str | None) -> bool:
+    """True when this reagent is a SERVICE reagent (wash/waste/buffer/oil).
+
+    Matched by the well type OR by an ink literally named one of the service
+    roles (mirrors the workflow-page printable-ink filters). Case-insensitive.
+    """
+    t = (ink_type or "").strip().lower()
+    n = (name or "").strip().lower()
+    return t in SERVICE_WELL_TYPES or n in SERVICE_WELL_TYPES
+
+
+def is_printable_ink_type(ink_type: str | None) -> bool:
+    """True when this WELL TYPE is a printable ink (not a service reagent)."""
+    return (ink_type or "").strip().lower() not in SERVICE_WELL_TYPES
+
+
+def split_legacy_ink_type(
+    ink_type: str | None, ink_subtype: str | None = "",
+) -> tuple[str, str]:
+    """Normalize a possibly-legacy ``(ink_type, ink_subtype)`` pair to v7.5.x.
+
+    Legacy material well types (``granular``/``cells``/``hydrogel``/``media``/
+    ``custom``) become ``("ink", <subtype>)`` — keeping an explicit subtype if
+    one is already present, else the mapped default. Valid well types
+    (``ink``/``wash``/``buffer``/``waste``/``oil``) pass through unchanged; an
+    empty/unknown type defaults to ``ink``.
+    """
+    t = (ink_type or "").strip().lower()
+    sub = (ink_subtype or "").strip()
+    if t in _LEGACY_MATERIAL_SUBTYPE:
+        return "ink", (sub or _LEGACY_MATERIAL_SUBTYPE[t])
+    return (t or "ink"), sub
+
+
+def well_role_for_ink_type(ink_type: str | None) -> WellRole:
+    """Map an :class:`InkSpec` ``ink_type`` to a :class:`WellRole`.
+
+    v7.5.x: reagent locations reuse the ink's material/purpose ``ink_type``
+    (there is no separate role enum on the ink). Service types map to their
+    dedicated roles; every other type — including ``oil`` and the material
+    types (``hydrogel``/``cells``/``media``/``granular``/``custom``/``ink``) —
+    is treated as an INK reservoir (a place the needle aspirates from).
+    """
+    t = (ink_type or "").strip().lower()
+    if t == "wash":
+        return WellRole.WASH
+    if t == "waste":
+        return WellRole.WASTE
+    if t == "buffer":
+        return WellRole.BUFFER
+    return WellRole.INK
+
+
+# Outline colors for reagent locations, keyed by InkSpec.ink_type.
+# The well *fill* is the reagent's own InkSpec.color; this map gives the
+# *border*, so the operator reads the functional type (ink/wash/waste/buffer/
+# oil) at a glance while the fill reads the specific reagent. Oil has no
+# WellRole of its own (well_role_for_ink_type maps it to INK), so it gets a
+# dedicated border color here to stay visually distinct.
+INK_TYPE_COLORS: dict[str, str] = {
+    "ink":    "#89b4fa",   # Blue   (matches WellRole.INK)
+    "wash":   "#f9e2af",   # Yellow (matches WellRole.WASH)
+    "waste":  "#f38ba8",   # Red    (matches WellRole.WASTE)
+    "buffer": "#cba6f7",   # Mauve  (matches WellRole.BUFFER)
+    "oil":    "#fab387",   # Peach  (oil-specific)
+}
+
+
+def ink_type_border_color(ink_type: str | None) -> str:
+    """Outline color for a reagent location, keyed by its ``ink_type``.
+
+    Service + oil types get distinct colors (see :data:`INK_TYPE_COLORS`);
+    every other (material) type falls back to the INK role color via
+    :func:`well_role_for_ink_type`.
+    """
+    t = (ink_type or "").strip().lower()
+    if t in INK_TYPE_COLORS:
+        return INK_TYPE_COLORS[t]
+    return ROLE_COLORS.get(well_role_for_ink_type(t), "#585b70")
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +262,14 @@ class NeedleSpec:
     def cross_section_area_mm2(self) -> float:
         """Inner cross-sectional area in mm²."""
         return math.pi * (self.id_mm / 2) ** 2
+
+    @property
+    def internal_volume_uL(self) -> float:
+        """Internal bore volume (µL) — the needle modelled as a cylinder of its
+        inner diameter and length. ``1 mm³ == 1 µL``, so this is just
+        ``cross_section_area_mm2 × length_mm``. This is "1 needle's worth" of
+        fluid used by the pick & place prep (waste/oil/buffer volumes)."""
+        return self.cross_section_area_mm2 * self.length_mm
 
     def to_dict(self) -> dict:
         """Serialize to dictionary."""
@@ -358,7 +494,16 @@ class InkSpec:
     shear stress safety calculations — NOT for extrusion rate corrections.
     """
     name: str
-    ink_type: str = "custom"            # "granular", "cells", "media", "hydrogel", "buffer", "custom"
+    # v7.5.x: ``ink_type`` is the WELL TYPE — one of WELL_TYPES
+    # (ink/wash/buffer/waste/oil). It drives all behavior (service-well
+    # resolution, roles, colors). The legacy material categories
+    # (granular/cells/media/hydrogel/custom) now live in ``ink_subtype`` and a
+    # loaded legacy ``ink_type`` is migrated to ``ink`` + the matching subtype
+    # (see split_legacy_ink_type, applied in from_dict).
+    ink_type: str = "ink"
+    # Informational material subtype, meaningful only when ink_type == "ink"
+    # (e.g. "cells", "hydrogel monomer", "ELISA Beads"). Editable; see INK_SUBTYPES.
+    ink_subtype: str = ""
     viscosity_cP: float = 1.0           # Dynamic viscosity (centipoise)
     granule_diameter_um: float = 0.0    # For granular inks
     cell_diameter_um: float = 0.0       # For cell inks
@@ -442,6 +587,7 @@ class InkSpec:
         return {
             "name": self.name,
             "ink_type": self.ink_type,
+            "ink_subtype": self.ink_subtype,
             "viscosity_cP": self.viscosity_cP,
             "granule_diameter_um": self.granule_diameter_um,
             "cell_diameter_um": self.cell_diameter_um,
@@ -451,7 +597,20 @@ class InkSpec:
 
     @classmethod
     def from_dict(cls, data: dict) -> InkSpec:
-        return cls(**data)
+        # v7.5.x: migrate a legacy material ink_type (granular/cells/...) to the
+        # well-type + subtype scheme. Service/ink well types pass through.
+        well_type, subtype = split_legacy_ink_type(
+            data.get("ink_type"), data.get("ink_subtype", ""))
+        return cls(
+            name=data["name"],
+            ink_type=well_type,
+            ink_subtype=subtype,
+            viscosity_cP=data.get("viscosity_cP", 1.0),
+            granule_diameter_um=data.get("granule_diameter_um", 0.0),
+            cell_diameter_um=data.get("cell_diameter_um", 0.0),
+            density_g_mL=data.get("density_g_mL", 1.0),
+            color=data.get("color", "#a6e3a1"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -513,14 +672,14 @@ class FluidColumn:
 
     def waste_ink(self) -> float:
         """
-        Eject all ink to waste (push until only buffer remains).
+        Dispense all ink to waste (push until only buffer remains).
 
-        Returns volume ejected.
+        Returns the volume dispensed.
         """
-        ejected = self.ink_volume_uL
+        dispensed = self.ink_volume_uL
         self.ink_volume_uL = 0.0
         self.ink_spec = None
-        return ejected
+        return dispensed
 
     def refresh_buffer(self, buffer_uL: float, buffer_ink: InkSpec | None = None) -> None:
         """Reset buffer layer (waste old buffer+ink, aspirate fresh buffer)."""

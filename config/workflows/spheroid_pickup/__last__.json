@@ -1,0 +1,34 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "spheroid_pickup",
+  "name": "__last__",
+  "saved": "2026-06-22T21:46:57",
+  "values": {
+    "diameter": 200.0,
+    "bore": {
+      "text": "P2",
+      "data": null
+    },
+    "safety_factor": 1.5,
+    "pick_z": 0.1,
+    "place_z": 0.5,
+    "pick_flow": 1.0,
+    "place_flow": 1.0,
+    "pick_dwell": 0.0,
+    "place_dwell": 0.0,
+    "prep": true,
+    "service_z": 0.5,
+    "prep_rate": 1.0,
+    "oil_needles": 1.0,
+    "buffer_needles": 4.0,
+    "wash_cycles": 3,
+    "wash_z_amp": 0.5,
+    "wash_xy_amp": 200.0,
+    "wash_dwell": 0.3,
+    "post_clean": false,
+    "post_dispense": 1.0,
+    "intra_retract": 1.0,
+    "z_timeout": 15.0,
+    "xy_timeout": 30.0
+  }
+}

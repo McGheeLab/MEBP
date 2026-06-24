@@ -200,8 +200,10 @@ class SettingsPage(QWidget):
         cal_desc.setStyleSheet(f"color: {COLORS['overlay0']}; font-size: 9pt;")
         lay.addWidget(cal_desc)
 
-        # Embedded jog controls (compact + pumps)
-        self._ctx_jog = JogButtonArray(compact=True, show_pumps=True)
+        # Embedded jog controls (compact + pumps). v7.5.x: a jog side panel →
+        # pump buttons read ASPIRATE / DISPENSE (not the raw ▲/▼ arrows).
+        self._ctx_jog = JogButtonArray(compact=True, show_pumps=True,
+                                       pump_action_labels=True)
         self._ctx_jog.jog_xy_requested.connect(self._ctx_jog_xy)
         self._ctx_jog.jog_z_requested.connect(self._ctx_jog_z)
         self._ctx_jog.jog_pump_requested.connect(self._ctx_jog_pump)
@@ -324,7 +326,9 @@ class SettingsPage(QWidget):
         self.controller.move_xy_relative_um(dx, dy)
 
     def _ctx_jog_z(self, dz: float):
-        self.controller.move_z_relative(dz)
+        # v7.5.x: dz is a HEIGHT-frame delta (+ = up) from the JogButtonArray;
+        # route through move_z_user_relative so it follows the taught z_up_sign.
+        self.controller.move_z_user_relative(dz)
 
     def _ctx_jog_pump(self, pump: str, dist: float):
         self.controller.move_pump_relative(pump, dist)

@@ -61,6 +61,13 @@ class SketchPage(QWidget):
         self._syringe = None
         self._needle_od_mm = 0.0
         self._building = False
+        # v7.5.x: the well whose geometry defines the drawing boundary. The
+        # sketch is authored in well-relative mm with (0,0) = well center, so
+        # the boundary circles are centered at the origin.
+        self._plate = None
+        self._selected_well: str | None = None
+        self._safe_radius_mm = 0.0        # needle-safe radius (mm); 0 = none
+        self._last_oob = False            # toolpath crosses the safe boundary
         # v7.5.x: calibrated plate bottom (zero-ref mm); the Sketch's print
         # height (``z_start_mm``) is measured up from it, not absolute.
         self._plate_bottom_z: float | None = None
@@ -76,6 +83,20 @@ class SketchPage(QWidget):
         self._canvas.set_sketch(Sketch())
         self._rebuild_props()
         self._schedule_preview()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Default to a zoomed-in single-well view on entry, but only when the
+        # canvas is empty so an in-progress sketch keeps the user's pan/zoom.
+        # Defer to the next event-loop tick so the canvas has its laid-out
+        # size before framing (avoids locking in a bad zoom on first show,
+        # since fit_view marks the view initialised).
+        if not self._canvas.sketch().shapes:
+            QTimer.singleShot(0, self._fit_canvas_if_empty)
+
+    def _fit_canvas_if_empty(self):
+        if not self._canvas.sketch().shapes:
+            self._canvas.fit_view()
 
     # ── UI construction ───────────────────────────────────────────
 
@@ -206,6 +227,10 @@ class SketchPage(QWidget):
             self._toggle_osnap, checkable=True)
         self._osnap_btn.setChecked(True)   # object snap on by default
         col.addWidget(self._osnap_btn)
+        self._thickness_btn = self._action_btn(
+            "line", "Show line thickness (draw the toolpath at the needle "
+            "bead width)", self._toggle_thickness, checkable=True)
+        col.addWidget(self._thickness_btn)
         col.addStretch(1)
         return frame
 
@@ -250,6 +275,9 @@ class SketchPage(QWidget):
         v.setContentsMargins(s(8), s(6), s(8), s(8))
         v.setSpacing(s(12))
 
+        # Well boundary selector (persistent — not rebuilt with the props).
+        v.addWidget(self._build_well_card())
+
         # Properties (scrollable)
         self._props_scroll = QScrollArea()
         self._props_scroll.setWidgetResizable(True)
@@ -268,6 +296,34 @@ class SketchPage(QWidget):
         self._send_btn.clicked.connect(self._send_to_print_setup)
         v.addWidget(self._send_btn)
         return panel
+
+    def _build_well_card(self) -> QGroupBox:
+        """Persistent well-boundary selector: pick which well defines the
+        drawing boundary; shows the well-wall Ø and the needle-safe Ø."""
+        grp = self._group("Well boundary")
+        lay = grp.layout()
+
+        self._well_combo = QComboBox()
+        self._well_combo.setToolTip(
+            "Which well's geometry defines the drawing boundary. The dashed "
+            "outer circle is the well wall; the inner circle is inset by the "
+            "needle radius so the needle never touches the wall.")
+        self._well_combo.currentIndexChanged.connect(self._on_well_changed)
+        self._field_row(lay, "Well", self._well_combo)
+
+        self._boundary_info_lbl = QLabel("No plate configured.")
+        self._boundary_info_lbl.setWordWrap(True)
+        self._boundary_info_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
+        lay.addWidget(self._boundary_info_lbl)
+
+        self._bounds_warn_lbl = QLabel("")
+        self._bounds_warn_lbl.setWordWrap(True)
+        self._bounds_warn_lbl.setVisible(False)
+        self._bounds_warn_lbl.setStyleSheet(
+            f"color: {COLORS.get('yellow', '#f9e2af')}; font-size: {_sf(9)}pt;")
+        lay.addWidget(self._bounds_warn_lbl)
+        return grp
 
     # ── Properties panel ──────────────────────────────────────────
 
@@ -457,16 +513,26 @@ class SketchPage(QWidget):
         nl.setValue(sk.num_layers)
         sp = self._dspin(sk.print_speed_mm_s, 0.1, 200, 0.5, " mm/s")
         ls = self._dspin(sk.line_spacing_mm, 0.05, 20, 0.05)
+        # Lift the needle this far above the print to travel between shapes
+        # (and passes/layers), so it clears already-printed material.
+        lift = self._dspin(sk.travel_clearance_mm, 0.0, 40.0, 0.5)
+        lift.setToolTip(
+            "How far the needle lifts above the print to travel between "
+            "shapes. Larger = safer clearance over printed material; 0 = "
+            "just above the top layer.")
 
         zs.valueChanged.connect(lambda v: self._set_sketch("z_start_mm", v))
         lh.valueChanged.connect(lambda v: self._set_sketch("layer_height_mm", v))
         nl.valueChanged.connect(lambda v: self._set_sketch("num_layers", v))
         sp.valueChanged.connect(lambda v: self._set_sketch("print_speed_mm_s", v))
         ls.valueChanged.connect(lambda v: self._set_sketch("line_spacing_mm", v))
+        lift.valueChanged.connect(
+            lambda v: self._set_sketch("travel_clearance_mm", v))
 
         self._field_row(lay, "Print height", zs)
         self._field_row(lay, "Layer h", lh)
         self._field_row(lay, "# Layers", nl)
+        self._field_row(lay, "Lift between shapes", lift)
         self._field_row(lay, "Speed", sp)
         self._field_row(lay, "Raster step", ls)
         if self._plate_bottom_z is None:
@@ -525,6 +591,9 @@ class SketchPage(QWidget):
     def _toggle_osnap(self, on):
         self._canvas.set_object_snap(bool(on))
 
+    def _toggle_thickness(self, on):
+        self._canvas.set_show_thickness(bool(on))
+
     # ── Canvas callbacks ──────────────────────────────────────────
 
     def _on_sketch_changed(self):
@@ -564,6 +633,7 @@ class SketchPage(QWidget):
             self._canvas.set_toolpath(None, None)
             self._stats_lbl.setText("Empty sketch — draw a shape")
             self._send_btn.setEnabled(False)
+            self._update_bounds_warning(None)
             return
 
         # Render the compiled toolpath as the main raster view.
@@ -573,6 +643,7 @@ class SketchPage(QWidget):
             f"path {result.total_length_mm:.1f} mm · "
             f"~{result.total_time_s:.1f} s · {result.total_volume_uL:.2f} µL")
         self._send_btn.setEnabled(True)
+        self._update_bounds_warning(result.trajectory)
 
     def _send_to_print_setup(self):
         sk = self._canvas.sketch()
@@ -581,6 +652,18 @@ class SketchPage(QWidget):
             QMessageBox.warning(self, "Empty sketch",
                                 "Draw at least one shape first.")
             return
+
+        # Non-blocking safe-boundary guard: warn (and confirm) if the toolpath
+        # crosses the needle-safe ring, but let the operator proceed.
+        if self._exceeds_safe_boundary(result.trajectory):
+            resp = QMessageBox.warning(
+                self, "Outside needle-safe boundary",
+                f"This sketch extends past the needle-safe boundary for well "
+                f"{self._selected_well or '?'} — the needle could contact the "
+                f"well wall when printing.\n\nSend it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if resp != QMessageBox.Yes:
+                return
 
         base_name = (self._print_name or "").strip() or "Sketch"
 
@@ -646,8 +729,9 @@ class SketchPage(QWidget):
 
     def set_hardware_config(self, config) -> None:
         """Pull needle + syringe (for volume accuracy), base the bead width /
-        outline width / raster step on the needle diameter, and show the
-        active plate's standard-well size as a sizing reference."""
+        outline width / raster step on the needle diameter, load the active
+        plate, and zoom the canvas to the selected well with a needle-safe
+        boundary inset by the needle radius."""
         try:
             self._needle = getattr(config, "needle", None)
             self._syringe = None
@@ -665,27 +749,141 @@ class SketchPage(QWidget):
             self._canvas.sketch().line_spacing_mm = float(od)
             self._canvas.set_default_line_width(float(od))
 
-        # Show the standard well outline at the origin for scale.
-        self._canvas.set_reference_well(self._well_diameter_from_config(config))
+        # Load the active plate and (re)populate the well selector.
+        self._plate = self._load_plate(config)
+        self._populate_well_combo()
 
         self._rebuild_props()
-        self._canvas.fit_view()
+        self._apply_well_boundary()        # sets boundaries + fits the view
         self._schedule_preview()
 
+    # ── Well boundary ─────────────────────────────────────────────
+
     @staticmethod
-    def _well_diameter_from_config(config) -> float:
+    def _load_plate(config):
         try:
             from SupportClasses.WellPlate import WellPlate
-            plate = WellPlate.load(config.active_plate_key)
-            d = float(getattr(plate, "well_diameter", 0.0) or 0.0)
-            if d > 0:
-                return d
-            wells = getattr(plate, "wells", None) or []
+            return WellPlate.load(config.active_plate_key)
+        except Exception as e:
+            logger.debug(f"plate load failed: {e}")
+            return None
+
+    @staticmethod
+    def _default_well_name(names: list[str]) -> str | None:
+        if not names:
+            return None
+        return "A1" if "A1" in names else names[0]
+
+    def _populate_well_combo(self) -> None:
+        names = list(self._plate.well_names) if self._plate else []
+        self._well_combo.blockSignals(True)
+        self._well_combo.clear()
+        self._well_combo.addItems(names)
+        # Keep the prior selection if it still exists, else pick a default.
+        sel = (self._selected_well if self._selected_well in names
+               else self._default_well_name(names))
+        self._selected_well = sel
+        if sel is not None:
+            idx = self._well_combo.findText(sel)
+            if idx >= 0:
+                self._well_combo.setCurrentIndex(idx)
+        self._well_combo.setEnabled(bool(names))
+        self._well_combo.blockSignals(False)
+
+    def _on_well_changed(self, _idx: int) -> None:
+        name = self._well_combo.currentText().strip()
+        self._selected_well = name or None
+        self._apply_well_boundary()
+        self._schedule_preview()           # re-evaluate the safe-boundary check
+
+    def _well_diameter_for_selected(self) -> float:
+        """Diameter (mm) of the selected well; falls back to the plate's
+        uniform diameter, then the largest well on custom/varied plates."""
+        if self._plate is None:
+            return 0.0
+        try:
+            if self._selected_well:
+                d = float(self._plate.get_well_info(self._selected_well).diameter or 0.0)
+                if d > 0:
+                    return d
+        except Exception:
+            pass
+        d = float(getattr(self._plate, "well_diameter", 0.0) or 0.0)
+        if d > 0:
+            return d
+        try:
+            wells = self._plate.get_all_wells()
             if wells:
                 return float(max(w.diameter for w in wells))
-        except Exception as e:
-            logger.debug(f"reference well lookup failed: {e}")
+        except Exception:
+            pass
         return 0.0
+
+    def _apply_well_boundary(self) -> None:
+        """Push the well-wall + needle-safe boundary circles to the canvas and
+        zoom to frame the selected well."""
+        well_d = self._well_diameter_for_selected()
+        self._canvas.set_reference_well(well_d)
+        # Needle-safe boundary = well wall inset by the needle radius on each
+        # side → inner Ø = well Ø − needle Ø. Needs a known needle diameter.
+        nod = self._needle_od_mm
+        if well_d > 0 and nod > 0:
+            inner = max(0.0, well_d - nod)
+            self._canvas.set_safe_boundary(inner)
+            self._safe_radius_mm = inner / 2.0
+        else:
+            self._canvas.set_safe_boundary(0.0)
+            self._safe_radius_mm = 0.0
+        self._update_boundary_info(well_d)
+        self._canvas.fit_view()
+
+    def _update_boundary_info(self, well_d: float) -> None:
+        if well_d <= 0:
+            self._boundary_info_lbl.setText("No plate configured — draw freely.")
+            return
+        nod = self._needle_od_mm
+        if nod > 0:
+            inner = max(0.0, well_d - nod)
+            self._boundary_info_lbl.setText(
+                f"Well wall Ø {well_d:.2f} mm · needle-safe Ø {inner:.2f} mm "
+                f"(inset {nod / 2.0:.2f} mm)")
+        else:
+            self._boundary_info_lbl.setText(
+                f"Well wall Ø {well_d:.2f} mm · configure a needle to show the "
+                f"needle-safe boundary")
+
+    @staticmethod
+    def _max_radius_mm(trajectory) -> float:
+        """Largest distance of any waypoint from the well center (origin)."""
+        try:
+            import numpy as _np
+            xy = _np.asarray(trajectory, dtype=_np.float64)[:, :2]
+            if not len(xy):
+                return 0.0
+            return float(_np.sqrt((xy ** 2).sum(axis=1)).max())
+        except Exception:
+            return 0.0
+
+    def _exceeds_safe_boundary(self, trajectory) -> bool:
+        if trajectory is None or self._safe_radius_mm <= 0:
+            return False
+        return self._max_radius_mm(trajectory) > self._safe_radius_mm + 1e-6
+
+    def _update_bounds_warning(self, trajectory) -> None:
+        self._last_oob = False
+        if trajectory is None or self._safe_radius_mm <= 0:
+            self._bounds_warn_lbl.setVisible(False)
+            return
+        r_max = self._max_radius_mm(trajectory)
+        if r_max > self._safe_radius_mm + 1e-6:
+            self._last_oob = True
+            self._bounds_warn_lbl.setText(
+                f"⚠ Sketch extends {r_max - self._safe_radius_mm:.2f} mm past "
+                f"the needle-safe boundary — the needle may contact the well "
+                f"wall.")
+            self._bounds_warn_lbl.setVisible(True)
+        else:
+            self._bounds_warn_lbl.setVisible(False)
 
     def get_page_title(self) -> str:
         return "Sketch"

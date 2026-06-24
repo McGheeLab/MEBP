@@ -47,31 +47,31 @@
     },
     "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)": {
       "4x": {
-        "measured_um_per_px": 1.546395,
+        "measured_um_per_px": 0.77872,
         "resolution": [
           916,
           686
         ],
-        "date": "2026-05-29",
-        "rotation_deg": 0.0
+        "date": "2026-06-17",
+        "rotation_deg": -179.951
       },
       "2x": {
-        "measured_um_per_px": 3.1041,
+        "measured_um_per_px": 1.540434,
         "resolution": [
           916,
           686
         ],
-        "date": "2026-05-29",
-        "rotation_deg": 0.0
+        "date": "2026-06-17",
+        "rotation_deg": 179.773
       },
       "10x": {
-        "measured_um_per_px": 0.628959,
+        "measured_um_per_px": 0.314136,
         "resolution": [
           916,
           686
         ],
-        "date": "2026-05-29",
-        "rotation_deg": 0.0
+        "date": "2026-06-17",
+        "rotation_deg": -179.99
       }
     }
   },

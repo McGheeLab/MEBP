@@ -1,0 +1,2208 @@
+{
+  "guides": [
+    {
+      "id": "hardware_setup",
+      "title": "Getting Hardware Set Up",
+      "overview": "Hardware Setup is Page 0 — the gating page. Every other mode (Jog, Calibration, Print Builder, Printing, Workflows) stays locked in the sidebar until this page reports a valid config; only Hardware Setup and Settings are always reachable. The page is a row of sub-pages (Device, Identity, Plate, Rosette, Ink, Needle, Pump, Cameras, Xbox Controller) with a persistent left-edge control panel (Connect Hardware + Jog Stages + Live Position) that stays visible on every sub-page. An operator uses it once per machine to describe the physical rig (connect stages, calibrate steppers, set the Z datum/direction/limits, calibrate pump plungers, record the safety envelope, set feedrates, pick/design the plate, define inks/needle, calibrate cameras) and again per experiment to pick the plate/inks/needle. A config becomes valid when a needle gauge is selected, at least one pump is enabled with a syringe, every enabled pump has at least one ink, the plate format (or custom-plate file) is recognized, and each needle channel maps to a unique enabled pump.",
+      "where_to_find": "Sidebar → first icon \"Hardware Setup\" (always enabled, even on a fresh launch). Inside, switch sub-pages via the top tab strip in this order: Device · Identity · Plate · Rosette · Ink · Needle · Pump · Cameras · Xbox Controller. The Connect Hardware / Jog Stages / Live Position panel is docked on the far left and is shared across all sub-pages.",
+      "prerequisites": [
+        "Physical rig wired and powered: Prior ProScan XY box on, Marlin Z+pumps board on USB, optional Xbox controller, microscope + needle cameras plugged in.",
+        "Know your hardware: needle gauge/length, syringe volume per pump, and which physical Marlin axis (X/Y/Z/E) drives each logical axis (Z, P1, P2, P3) on your wiring.",
+        "On ME3B V1 the needle DESCENDS as raw Z increases — do not assume up=larger Z. The Z Axis Setup derives the true up-direction for you; just jog to the real mechanical extremes when prompted.",
+        "You can do the whole walkthrough in Simulate mode (no hardware) to learn the page; calibration values captured in simulation are not physically meaningful.",
+        "Camera µm/px, objective calibrations, image correction, and role→camera assignments persist per physical camera (by device identity) in a per-machine store, so they survive setup-file loads and restarts independently of the hardware config."
+      ],
+      "steps": [
+        {
+          "title": "Connect the stages (or simulate)",
+          "detail": "In the left Connect Hardware card, click Connect on XY stage and on Z + Pumps (or Simulate for the built-in simulator, no hardware). Optionally Connect the Xbox controller. Badges read Not connected → Connecting…/Starting simulator… → Connected or Simulated; a red Failed/Error means the port didn't open. The Disconnect (×) button tears a device down so you can switch real↔simulator. On a real ZP connect the app caches the COM port and ~1 s later auto-runs a Marlin alignment check.",
+          "screenshot_ref": "connect-and-jog"
+        },
+        {
+          "title": "Pick a device profile (Device sub-page)",
+          "detail": "Open Device. At the top, choose a Profile (ships with Standard / Conservative) and click Load to populate every section below with that machine's saved values, or Save As… to create your own. The profile bundles safety limits, feedrates, axis map, steps/mm, Z setup, plate orientation, and pump calibration.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Set the axis mapping",
+          "detail": "In Axis Mapping, set which physical Marlin axis (X/Y/Z/E) drives each logical axis (Z, P1, P2, P3). Defaults are Z→X, P1→Y, P2→Z, P3→E. Click Save Mapping to push it to the live ZP stage and persist to settings + the active profile.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Calibrate XY motion",
+          "detail": "In XY Stage Calibration set Velocity (% max), Acceleration, and optional Jerk, and click Save XY Calibration (sends to ProScan + persists). Optionally use the report-only Units verification row (Axis · Distance · Move · Measured · Compare) to confirm 1:1 travel.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Calibrate steppers and feedrates (ZP Stage Calibration)",
+          "detail": "Pick an axis, enter a Commanded distance, click Move + / Move − at a chosen Feedrate, measure the real travel, enter the Measured distance, and click Calculate & Send M92. Use Invert Direction to flip an axis sign. Raise the feedrate and test until you find a safe ceiling, then Record as Max. Set per-axis max accel, then Save Calibration (sends M92/M201). Check alignment compares Marlin (M503) against the profile and turns mismatched axes red. You can also click any steps/mm or max-feedrate cell to edit it directly.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Run the Z Axis Setup (datum + direction + limits)",
+          "detail": "Using the left jog pad, drive the needle ALL THE WAY DOWN, then click 1 · Set Bottom (Z = 0). Jog ALL THE WAY UP and click 2 · Set Top. The controller derives the up-direction (z_up_sign) and the Z soft-limit envelope automatically; status turns green. Optionally set the three Standard plate offsets (mm below the needle-cam fiducial) and Save offsets. Tick 'Plate mounted 180° to stage' if A1 should display top-left with stage 0,0 bottom-right (default ON for ME3B V1) — re-teach plate calibration after changing it.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Calibrate each pump plunger (Pump Plunger Setup)",
+          "detail": "On the Device sub-page (right under the Z block, one block per P1/P2/P3): jog the plunger ALL THE WAY IN (syringe empty) and click 1 · Set Dispensed (empty, fill 0); jog ALL THE WAY OUT (full) and click 2 · Set Aspirated (full), then confirm in the dialog. This derives and OWNS the aspirate/dispense direction and saves the pump soft-limit extents. Green status confirms the derived sign and capacity.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Record the XY/Z/pump safety envelope",
+          "detail": "In Jog & Safety Limits the jog pad bypasses soft limits so you can find the mechanical extremes. For each axis row, jog to an extreme and click ⤓ Set Min / ⤒ Set Max to stamp the current position into the spinboxes; ⊙ Set Zero re-stamps a zero reference. Leave 'Enable safety limits' on. Click Save Safety Limits & Zero to push the envelope to the live controller and persist.",
+          "screenshot_ref": "connect-and-jog"
+        },
+        {
+          "title": "Set ZP feedrates and apply everything",
+          "detail": "In ZP Stage Feedrates (% of Z max) set Max/Retract/Insert/Jog as percentages of the Z max you recorded; the live mm/min is shown next to each. Click Save Feedrates. Use Override / Sync Axis Position only to recover position after a ZP power cycle. Finally click Apply Settings at the bottom to commit the whole Device page in one go.",
+          "screenshot_ref": "device-z-setup"
+        },
+        {
+          "title": "Name the setup (Identity)",
+          "detail": "On Identity, type a Name (becomes the save filename) and optional Notes. The Saved setups list shows every config in config/hardware/ — select one and click Load Setup (or double-click) to apply a whole accessory setup (plate/inks/needle/pumps/cameras).",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Choose or design the plate (Plate)",
+          "detail": "On Plate, pick a bundled format (● 6/12/24/48/96/384) or a saved custom plate (○) from the picker, or design one with Select/Single-Well/Grid/Circle-Pattern/Line/Construction-Line/Dimension tools plus constraints, then New / Save / Save As… / Delete. Fit reframes the view; Snap toggles 1 mm drag snapping; Wheel zoom toggles scroll-wheel zoom; Dim ref switches new dimensions between well center and edge.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Design rosette sub-wells (Rosette, optional)",
+          "detail": "On Rosette, double-click a well to drill into it and design its sub-wells (which flatten into A1.a, A1.b… and become first-class wells). It shares the plate design with the Plate page; Save plate delegates to the Plate page save. A legacy Rosette Library (Add/Edit/Remove) of RosetteInsert presets is also available.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Build the Ink Library + reagent locations (Ink)",
+          "detail": "On Ink, click Add Ink — set Name, Well type (ink/wash/buffer/waste/oil), optional Ink subtype (enabled only for 'ink'), Viscosity/Granule Ø/Cell Ø/Density, and Color; Edit/Remove manage rows. In Reagent Locations, pick a reagent then click wells on the plate view and click Assign selected to pin it (well fill = ink color, outline = type color). Service types are excluded from the per-pump ink checklist automatically.",
+          "screenshot_ref": "ink-reagent-locations"
+        },
+        {
+          "title": "Configure the needle and channel mapping (Needle)",
+          "detail": "On Needle, pick the Gauge (info line shows ID/OD/Wall in µm), Length (1.0/1.5/2.0\"), and number of Channels (1–3). In Needle Channel Assignment, map each channel to a unique enabled pump; the status reads ✓ All channels assigned when complete.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Set up pumps and timing (Pump)",
+          "detail": "On Pump, Enable each used pump, pick its Syringe (volume), Mode (Incremental/Continuous), and check the inks it can aspirate from the printable-ink list. The summary shows P1→[…] assignments. Under Pump Timing (all pumps) set the global Settle time and Prime time.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Detect, assign, and calibrate cameras (Cameras)",
+          "detail": "On Cameras, click Detect Cameras (or Load Cameras to restore + start a saved setup). For each slot pick a Source and a Role (Microscope / Needle X-view / Needle Y-view — singletons), click ▶ Start to verify the live feed, and tune Brightness/Contrast/Gamma under the preview. Calibrate µm/px… on each needle camera and add+calibrate objectives in Objective Calibration Setup. Click Save Camera Settings to make it this machine's startup default.",
+          "screenshot_ref": "cameras-detect-assign"
+        },
+        {
+          "title": "Confirm valid + save",
+          "detail": "Watch the Setup Status banner: ⚠ lines list what's missing; ✓ Setup complete means the config is valid and the sidebar unlocks every page. Click Save Config to write the hardware config to disk (config/hardware/).",
+          "screenshot_ref": "setup-status-gating"
+        }
+      ],
+      "settings": [
+        {
+          "name": "XY stage / Z+Pumps / Xbox: Connect",
+          "what_it_does": "Opens the real serial connection to that device (Prior ProScan XY, Marlin Z+pumps board, Xbox controller). Badge goes Connecting… → Connected.",
+          "default": "Not connected",
+          "recommendation": "Connect both stages before any jog/calibration. ZP connect also caches the COM port and runs a Marlin alignment check ~1 s later."
+        },
+        {
+          "name": "XY stage / Z+Pumps: Simulate",
+          "what_it_does": "Opens the built-in software simulator for that device instead of real hardware — no app restart needed.",
+          "default": "off",
+          "recommendation": "Use to learn the page or test without hardware; badge reads Simulated. Calibration captured in sim is not physically meaningful."
+        },
+        {
+          "name": "Disconnect (×) per device",
+          "what_it_does": "Tears down the current stage/controller so you can switch between real and simulator or re-open.",
+          "default": "—",
+          "recommendation": "Use before switching a device between Connect and Simulate."
+        },
+        {
+          "name": "Jog Stages: jog pad (XY pad / Z buttons / pump buttons + step selectors)",
+          "what_it_does": "Drives each stage manually. On Hardware Setup this jog runs in setup mode: soft-limit clamping and the pump-enabled check are bypassed so you can reach mechanical extremes (a yellow banner warns of this).",
+          "default": "—",
+          "recommendation": "Watch the Live Position bars — markers ring red past the recorded envelope. Z▲ retracts (height-frame up), following the taught z_up_sign."
+        },
+        {
+          "name": "Jog Stages → Speeds: XY / Z / P",
+          "what_it_does": "Per-axis jog speed: XY in µm/s (applied to ProScan via SMS on each jog), Z and pumps in mm/min feedrate.",
+          "default": "Seeded to half of the calibrated max on first settings load; spinbox defaults XY 2000 µm/s, Z 600 mm/min, P 200 mm/min",
+          "recommendation": "Leave near default; each spinbox max is capped at the calibrated max. A manual edit is preserved across reloads."
+        },
+        {
+          "name": "Jog Stages → Refresh Positions",
+          "what_it_does": "Forces a fresh, uncached position read from each connected stage into the Live Position readouts.",
+          "default": "—",
+          "recommendation": "Use after a jog if the readout looks stale."
+        },
+        {
+          "name": "Live Position (X/Y/Z/P1/P2/P3 bars + readouts)",
+          "what_it_does": "Shows each axis position vs its safety-limit envelope. Z reads in the unified user frame (0=bottom datum, up=+). A calibrated pump reads as fill in µL (0=empty→capacity=full) with raw mm in the tooltip; uncalibrated pumps read raw mm.",
+          "default": "—",
+          "recommendation": "A red ring on a marker means the axis is outside the recorded envelope."
+        },
+        {
+          "name": "Device → Device Profile (combo + Load / Save / Save As… / Delete / Refresh)",
+          "what_it_does": "Loads/saves a physical-machine settings bundle (safety limits, feedrates, axis map, steps/mm, Z setup, plate orientation, pump calibration) to config/hardware/devices/<name>.json. Load applies it to every section below.",
+          "default": "Ships with Standard and Conservative",
+          "recommendation": "Save your own profile per machine so the calibration travels with the rig regardless of which experiment config is loaded."
+        },
+        {
+          "name": "Device → Axis Mapping (Z/P1/P2/P3 → X/Y/Z/E) + Save Mapping",
+          "what_it_does": "Maps each logical axis to the physical Marlin axis that drives it on your wiring. Save Mapping pushes to the live ZP stage and persists to settings + the active profile.",
+          "default": "Z→X, P1→Y, P2→Z, P3→E",
+          "recommendation": "Set this to match how your steppers are physically wired before calibrating steps/mm."
+        },
+        {
+          "name": "Device → XY Stage Calibration: Velocity (% max)",
+          "what_it_does": "ProScan SMS — max XY velocity as a percentage of the controller's hardware ceiling.",
+          "default": "100 %",
+          "recommendation": "Leave at 100% unless you want gentler XY motion."
+        },
+        {
+          "name": "Device → XY Stage Calibration: Acceleration",
+          "what_it_does": "ProScan SAS acceleration as a percentage (1–100).",
+          "default": "50",
+          "recommendation": "Default is fine for most rigs."
+        },
+        {
+          "name": "Device → XY Stage Calibration: Jerk (optional)",
+          "what_it_does": "ProScan SCS jerk; silently ignored if the controller protocol doesn't declare set_jerk. 0 = leave the controller default.",
+          "default": "0",
+          "recommendation": "Leave 0 unless you have a reason to tune it."
+        },
+        {
+          "name": "Device → XY Stage Calibration: Units verification (Axis / Distance / Move / Measured / Compare)",
+          "what_it_does": "Report-only check: command a distance on X or Y, measure with a caliper, enter it, Compare shows deviation %. No value is auto-corrected.",
+          "default": "Distance 1000 µm, Measured 1000 µm",
+          "recommendation": "ProScan moves natively at 1:1; a >1% deviation flags a mechanical issue, not a software fix."
+        },
+        {
+          "name": "Device → XY Stage Calibration: Save XY Calibration",
+          "what_it_does": "Sends velocity/acceleration/jerk to ProScan and persists to settings + the active device profile.",
+          "default": "—",
+          "recommendation": "Click after editing velocity/acceleration/jerk."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: Axis / Commanded distance / Move +/− / Feedrate",
+          "what_it_does": "Sends a known-distance ZP move (Z or pump) in either direction at the chosen feedrate (bypasses soft limits — setup mode) so you can measure real travel and probe the max feedrate.",
+          "default": "Commanded 1.0 mm, Feedrate 600 mm/min (seeds from the axis's recorded max when you switch axis)",
+          "recommendation": "Lower the feedrate if the motor stalls or skips steps."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: Measured distance / Calculate & Send M92",
+          "what_it_does": "Computes new steps/mm = current × (commanded ÷ measured) and sends M92 to Marlin, persisting to settings + the device profile.",
+          "default": "Measured 1.0 mm",
+          "recommendation": "Measure the actual physical movement precisely; this sets the axis's true scale."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: Invert Direction",
+          "what_it_does": "Negates the saved steps/mm for the selected axis — flips which way 'positive' moves on Marlin without changing step magnitude.",
+          "default": "—",
+          "recommendation": "Use if an axis jogs the wrong way after calibration."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: Record as Max",
+          "what_it_does": "Saves the current feedrate as the experimentally-discovered max for the selected axis (device_profile.per_axis_max_feedrate).",
+          "default": "—",
+          "recommendation": "Find a safe ceiling (no stall/skipped steps) before recording. The Z max feeds the ZP Feedrates percentages."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: max accel (mm/s²) per axis",
+          "what_it_does": "Per-axis max acceleration sent to Marlin via M201 on Save Calibration.",
+          "default": "Z 100, P1/P2/P3 1000",
+          "recommendation": "Keep Z low; default values are sensible."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: steps/mm & max feedrate cells (clickable)",
+          "what_it_does": "Read-only grid (columns Z/P1/P2/P3) of current steps/mm and max feedrate per axis; click any cell to edit it directly in a popup (sends M92/M203 + persists).",
+          "default": "From profile",
+          "recommendation": "Quick edit path when you already know the value and don't need the move/measure workflow."
+        },
+        {
+          "name": "Device → ZP Stage Calibration: Check alignment / Save Calibration",
+          "what_it_does": "Check alignment queries Marlin (M503) and turns mismatched axes red. Save Calibration re-sends steps/mm (M92), per-axis max accel (M201), and per-axis max feedrate, persisting to settings/profile.",
+          "default": "—",
+          "recommendation": "Run Check alignment after edits; Save Calibration is a 'commit everything in this section' convenience."
+        },
+        {
+          "name": "Device → Z Axis Setup: 1 · Set Bottom (Z = 0)",
+          "what_it_does": "Captures the raw Z with the needle jogged all the way DOWN and makes it the user-Z = 0 datum.",
+          "default": "Not captured",
+          "recommendation": "Jog fully down FIRST; this is the mechanical hard-bottom datum."
+        },
+        {
+          "name": "Device → Z Axis Setup: 2 · Set Top",
+          "what_it_does": "Captures the raw Z with the needle all the way UP; the controller derives the up-direction (z_up_sign) and the Z soft-limit envelope automatically.",
+          "default": "Disabled until Bottom is captured",
+          "recommendation": "Jog far from bottom so the direction is unambiguous; status warns if they're too close."
+        },
+        {
+          "name": "Device → Z Axis Setup: Standard plate offsets (Top / Bottom / Safe) + Save offsets",
+          "what_it_does": "Three offsets in mm BELOW the needle-cam fiducial; the Calibration page uses them to pre-fill plate-Z guesses. Save offsets persists to the device profile and pushes to the controller.",
+          "default": "Top 10.0, Bottom 20.0, Safe 5.0 mm",
+          "recommendation": "Tune to your plate geometry; Max/Replace Z stay manual."
+        },
+        {
+          "name": "Device → Z Axis Setup: Plate mounted 180° to stage",
+          "what_it_does": "Single per-machine orientation switch: drives BOTH the 180° display flip on stage-frame plate views AND the plate-local→stage geometry sign (well A1 top-left, stage 0,0 bottom-right).",
+          "default": "ON when unset (default for ME3B V1)",
+          "recommendation": "Leave ON for ME3B V1. Re-teach plate calibration after changing it (a mismatch invalidates the taught XY calibration)."
+        },
+        {
+          "name": "Device → Jog & Safety Limits: Enable safety limits",
+          "what_it_does": "Master switch for the recorded soft-limit envelope across the whole app. (The setup jog pad bypasses it either way.)",
+          "default": "on",
+          "recommendation": "Keep ON in normal operation; the envelope protects the needle/plate."
+        },
+        {
+          "name": "Device → Per-axis position & safety limits: ⊙ Set Zero / ⤓ Set Min / ⤒ Set Max (X,Y,Z,P1,P2,P3)",
+          "what_it_does": "Set Zero stamps the current position as that axis's zero reference. Set Min/Set Max stamp the current position into the min/max spinbox. XY and pump store absolute raw; Z stores the unified user frame.",
+          "default": "X ±130000 µm, Y ±85000 µm, Z derived by setup (default spins −10/50), P ±50 mm",
+          "recommendation": "Jog to each true mechanical extreme before stamping; remember to Save."
+        },
+        {
+          "name": "Device → Save Safety Limits & Zero",
+          "what_it_does": "Persists safety_limits + zero positions to settings and pushes them to the live StageController.",
+          "default": "—",
+          "recommendation": "Click after recording min/max so the live envelope updates."
+        },
+        {
+          "name": "Device → Pump Plunger Setup (P1/P2/P3): 1 · Set Dispensed (empty, fill 0)",
+          "what_it_does": "Captures the raw plunger position all the way IN (syringe empty) as the fill=0 datum.",
+          "default": "Not captured",
+          "recommendation": "Jog the plunger fully in first; this is the empty datum."
+        },
+        {
+          "name": "Device → Pump Plunger Setup: 2 · Set Aspirated (full)",
+          "what_it_does": "Captures the plunger all the way OUT (full); after a confirm dialog, derives and OWNS the aspirate/dispense direction and sets the pump soft-limit extents.",
+          "default": "Disabled until Dispensed is captured",
+          "recommendation": "Only confirm if the plunger is truly at its mechanical extremes (empty→full). Re-run per machine after a wiring change; a wrong sign reverses fluid flow."
+        },
+        {
+          "name": "Device → Override / Sync Axis Position (Z/P1/P2/P3 → set to … + ⟳ Set Position)",
+          "what_it_does": "After a ZP power cycle (Marlin has no absolute encoder), enter where each axis physically is in zero-referenced mm and Set Position rebases the firmware counter via G92 — no motion.",
+          "default": "—",
+          "recommendation": "Use only to recover position after a board power cycle; values are in the same mm frame as the Jog page, not the raw counter."
+        },
+        {
+          "name": "Device → ZP Stage Feedrates (% of Z max): Max / Retract / Insert / Jog",
+          "what_it_does": "Each is a percentage of the Z-axis max feedrate; the live mm/min is shown next to each spin.",
+          "default": "Max 100%, Retract 50%, Insert 20%, Jog 40%",
+          "recommendation": "Set the Z max in ZP Stage Calibration first; then Save Feedrates (sends M203, updates retract/insert/jog)."
+        },
+        {
+          "name": "Device → ZP Stage Feedrates: Auto-save position to EEPROM",
+          "what_it_does": "When on, periodically saves position to the board's EEPROM (M500).",
+          "default": "off",
+          "recommendation": "Leave off unless you specifically need persisted firmware position."
+        },
+        {
+          "name": "Device → Save Feedrates",
+          "what_it_does": "Computes absolute mm/min from the percentages, persists to settings, sends M203 to Marlin for the max feedrate, and updates the controller's retract/insert/jog feedrates.",
+          "default": "—",
+          "recommendation": "Click after editing the feedrate percentages."
+        },
+        {
+          "name": "Device → Apply Settings / Reset to Defaults",
+          "what_it_does": "Apply commits every Device section at once (the per-section Save buttons do the same scoped). Reset discards unsaved edits and reloads the saved device profile.",
+          "default": "—",
+          "recommendation": "Click Apply Settings after a full Device pass."
+        },
+        {
+          "name": "Identity → Name / Notes",
+          "what_it_does": "Free-text setup name (becomes the save filename) and optional notes for this hardware config.",
+          "default": "Name placeholder 'My Experiment Setup'",
+          "recommendation": "Name it after the experiment/accessory set so saved setups are easy to find."
+        },
+        {
+          "name": "Identity → Saved setups list + Load Setup / Refresh",
+          "what_it_does": "Lists every saved hardware config in config/hardware/; Load Setup (or double-click) applies the selected one to every section (plate/inks/needle/pumps/cameras).",
+          "default": "—",
+          "recommendation": "Use to swap whole accessory setups quickly."
+        },
+        {
+          "name": "Plate → format/custom picker",
+          "what_it_does": "Selects the active well plate — a bundled standard (● 6/12/24/48/96/384) or a user-saved custom design (○). Drives the plate model the whole app uses.",
+          "default": "Loads 96-well on first open; config default 24",
+          "recommendation": "Pick the plate you'll actually print into; a custom plate must exist under config/hardware/plates/user/ to validate."
+        },
+        {
+          "name": "Plate → designer tools (Select / Single Well / Grid Pattern / Circle Pattern / Line / Construction Line / Dimension)",
+          "what_it_does": "Parametric sketch tools to draw wells and impose constraints; output compiles to a WellPlate.",
+          "default": "Select",
+          "recommendation": "Only needed when authoring a custom plate; use bundled standards otherwise."
+        },
+        {
+          "name": "Plate → New / Save / Save As… / Delete",
+          "what_it_does": "New starts a blank ANSI-footprint plate; Save/Save As… persist a custom plate; Delete removes a user plate. (Saving a bundled standard forks it to a custom name.)",
+          "default": "—",
+          "recommendation": "Save custom plates with a clear name."
+        },
+        {
+          "name": "Plate → Fit / Snap / Wheel zoom / Dim ref",
+          "what_it_does": "Fit (F) reframes the view; Snap toggles 1 mm drag snapping; Wheel zoom toggles scroll-wheel zoom; Dim ref (Center/Edge) chooses whether new dimensions reference the well center or its near edge.",
+          "default": "Snap off, Wheel zoom on, Dim ref Center",
+          "recommendation": "Turn Snap on for clean grid placement; Edge dim ref is handy for needle-clearance spacing."
+        },
+        {
+          "name": "Rosette → designer (double-click a well to drill in) + Save plate",
+          "what_it_does": "Designs sub-wells inside a well; they flatten to A1.a, A1.b… and become first-class wells. Shares the plate design with the Plate page; Save plate delegates to the Plate page save (forks standards to a custom name).",
+          "default": "Mirrors the Plate page layout",
+          "recommendation": "Use for multi-spot inserts; edits mark the shared design dirty until you Save."
+        },
+        {
+          "name": "Rosette → Rosette Library (table + Add / Edit / Remove)",
+          "what_it_does": "Legacy RosetteInsert preset library — Add/Edit dialog sets Name, Well format, Ring sub-wells, Center well (Yes/No), Sub-well Ø, Sub-well depth, Insert Z offset.",
+          "default": "empty",
+          "recommendation": "Optional; the in-canvas rosette designer is the primary path."
+        },
+        {
+          "name": "Ink → Ink Library table + Add Ink / Edit / Remove",
+          "what_it_does": "Defines reagents. Add/Edit opens a dialog: Name, Well type (ink/wash/buffer/waste/oil), Ink subtype (editable presets, enabled only for 'ink'), Viscosity (cP), Granule Ø (µm), Cell Ø (µm), Density (g/mL), Color. Table shows Name/Type/Subtype/Viscosity/Granule Ø/Cell Ø.",
+          "default": "empty; new ink defaults viscosity 1.0 cP, density 1.0 g/mL, color #a6e3a1, granule 0, cell 0",
+          "recommendation": "Well type drives behavior (service-well resolution, colors); subtype is informational. Name service wells by role (wash/waste/buffer/oil) or set the matching well type."
+        },
+        {
+          "name": "Ink → Reagent Locations: Reagent combo",
+          "what_it_does": "Selects which reagent the well clicks below assign. The combo lists every ink in the library with its type label and is colored to the ink's color.",
+          "default": "first ink (empty until inks exist)",
+          "recommendation": "Pick the reagent before clicking wells."
+        },
+        {
+          "name": "Ink → Reagent Locations: plate view + Assign selected / Clear selected / Clear reagent",
+          "what_it_does": "Click wells (incl. rosette sub-wells A1.a) to select, then Assign selected pins them to the chosen reagent; Clear selected unpins the selected wells; Clear reagent removes all of this reagent's pins. Well fill = the ink's color, outline = the type color (ink/wash/waste/buffer/oil). One reagent per well.",
+          "default": "empty",
+          "recommendation": "Assign service-well locations (wash/waste/buffer/oil) here — prep/cleanup workflows resolve them from these pins, and they auto-fill the per-print Well Setup."
+        },
+        {
+          "name": "Needle → Gauge",
+          "what_it_does": "Selects the needle gauge; info line shows ID/OD/Wall in µm. Required for a valid config.",
+          "default": "— Select —",
+          "recommendation": "Match the physical needle; ID drives the per-needle bore-volume used by prep/pick-place."
+        },
+        {
+          "name": "Needle → Length",
+          "what_it_does": "Needle length (1.0\"/1.5\"/2.0\"), used in internal-bore volume and geometry.",
+          "default": "1.0\"",
+          "recommendation": "Set to the actual installed needle length."
+        },
+        {
+          "name": "Needle → Channels",
+          "what_it_does": "Number of needle channels (1–3); rebuilds the channel-assignment rows.",
+          "default": "1",
+          "recommendation": "Use >1 only for true multi-channel needles."
+        },
+        {
+          "name": "Needle → Needle Channel Assignment (per-channel pump combo)",
+          "what_it_does": "Maps each channel to a unique enabled pump; status reads ✓ All channels assigned, or flags a duplicate/unassigned channel.",
+          "default": "unassigned",
+          "recommendation": "Every channel must map to a distinct enabled pump for the config to validate."
+        },
+        {
+          "name": "Pump → per-pump Enable / Syringe / Mode / Inks (P1,P2,P3)",
+          "what_it_does": "Enable turns the pump on; Syringe sets the volume (and shows µL/mm + stroke in the info line); Mode is Incremental/Continuous; Inks is a checklist of printable inks this pump may aspirate (service reagents excluded).",
+          "default": "disabled; syringe — None —; mode Incremental; no inks checked",
+          "recommendation": "At least one pump must be enabled with a syringe and ≥1 ink for a valid config. The summary shows P1→[…] assignments."
+        },
+        {
+          "name": "Pump → Pump Timing (all pumps): Settle time",
+          "what_it_does": "Blocking dwell held BEFORE and AFTER every discrete pump actuation (prime, aspirate, dispense, pick/place) so fluid settles before the workflow advances. Not applied to the streamed print path or manual jog.",
+          "default": "0.00 s (range 0–10 s, step 0.05)",
+          "recommendation": "Add a small settle (e.g. 0.1–0.5 s) for viscous inks; 0 still waits for move completion."
+        },
+        {
+          "name": "Pump → Pump Timing (all pumps): Prime time",
+          "what_it_does": "Pre-flow lead-in duration printing workflows use to prime the needle (prime volume = flow × time). Quick Print seeds its per-run pre-flow knob from this.",
+          "default": "0.25 s (range 0–10 s, step 0.05)",
+          "recommendation": "Increase if prints start dry; this is the default Quick Print inherits."
+        },
+        {
+          "name": "Cameras → Save Camera Settings / Load Cameras",
+          "what_it_does": "Save snapshots the full camera setup (sources→roles, µm/px, image correction, hardware controls, which cameras are running) as this machine's default. Load detects, restores all of that, and starts the saved cameras (same as the automatic startup restore).",
+          "default": "—",
+          "recommendation": "Save once after a full camera setup so it auto-restores every launch."
+        },
+        {
+          "name": "Cameras → Detect Cameras",
+          "what_it_does": "Scans for available camera sources (OpenCV / ToupCam / Simulated) and fills each slot's Source combo; auto-assigns sources from the remembered role→identity map.",
+          "default": "0 sources found",
+          "recommendation": "Click after plugging cameras in; the count badge confirms discovery."
+        },
+        {
+          "name": "Cameras → per-slot Source combo",
+          "what_it_does": "Picks which detected camera plays this slot. Applies it to the live manager so Start opens this slot's camera; restores that camera's stored µm/px and remembers the role→identity.",
+          "default": "— None —",
+          "recommendation": "Assign before Start; the assignment auto-restores next session by device identity."
+        },
+        {
+          "name": "Cameras → per-slot Role combo (Unassigned / Microscope / Needle X-view / Needle Y-view)",
+          "what_it_does": "Tags the slot's workflow role. Microscope/Needle X/Needle Y are singletons — assigning one clears it from any other slot. Roles drive the rest of the page and the calibration tabs.",
+          "default": "Unassigned",
+          "recommendation": "Assign Microscope to the overhead-objective camera and Needle X/Y to the two side cameras."
+        },
+        {
+          "name": "Cameras → per-slot ▶ Start / ⏹ Stop + live preview",
+          "what_it_does": "Powers the slot's camera on/off via the shared manager and shows a live preview so you can verify the feed. Disabled until a source is picked.",
+          "default": "Stopped (preview hidden)",
+          "recommendation": "Start the camera before running its µm/px calibration."
+        },
+        {
+          "name": "Cameras → per-slot Image Correction sliders (Brightness / Contrast / Gamma + Reset)",
+          "what_it_does": "Per-slot display-only correction pushed live to the manager; persisted per device identity on slider release. Reset returns to neutral.",
+          "default": "Brightness 0, Contrast 1.00, Gamma 1.00",
+          "recommendation": "Display-only — does not affect the raw frame used for detection/calibration; tune for a clear preview."
+        },
+        {
+          "name": "Cameras → Microscope Camera Setup: Camera spec",
+          "what_it_does": "Picks the microscope camera model (sensor spec). Selecting one repopulates the Resolution combo.",
+          "default": "None",
+          "recommendation": "Pick the model that matches the assigned microscope camera."
+        },
+        {
+          "name": "Cameras → Microscope Camera Setup: Resolution",
+          "what_it_does": "Active capture resolution; changing it on a live microscope also drives the device to the nearest supported mode.",
+          "default": "Lowest resolution selected when a spec is picked",
+          "recommendation": "Changing capture resolution may require redoing µm/px — the app logs a warning."
+        },
+        {
+          "name": "Cameras → Microscope Camera Setup: Installed objective (read-only)",
+          "what_it_does": "Mirrors the objective chosen in Objective Calibration Setup; drives the spec-computed magnification.",
+          "default": "(no objectives defined)",
+          "recommendation": "Set it via the 'Currently installed' combo in Objective Calibration Setup below."
+        },
+        {
+          "name": "Cameras → Microscope Camera Setup: Pixel scale / Override (Use custom scale + µm/px)",
+          "what_it_does": "Shows the active µm/px; ticking 'Use custom scale' enables a manual µm/px spin that overrides the computed value.",
+          "default": "override off; spin 1.67 µm/px",
+          "recommendation": "Prefer a measured objective calibration; use the override only as a fallback."
+        },
+        {
+          "name": "Cameras → Microscope Camera Setup: Field of view (read-only)",
+          "what_it_does": "Displays the computed field of view from resolution × µm/px.",
+          "default": "—",
+          "recommendation": "A sanity check that the scale is plausible."
+        },
+        {
+          "name": "Cameras → Needle Cameras Setup: Calibrate µm/px… (X-view / Y-view)",
+          "what_it_does": "Launches the stage-motion µm/px calibration for that needle camera (move the stage a known distance, correlate pixel displacement). Disabled until that role is assigned; requires the camera started and the stage connected.",
+          "default": "— (not calibrated)",
+          "recommendation": "Calibrate both side cameras; the card shows the measured µm/px (and rotation) once done."
+        },
+        {
+          "name": "Cameras → Objective Calibration Setup: Currently installed combo",
+          "what_it_does": "Selects the mounted objective; pushes its stored µm/px (and rotation) into the live pipeline on swap.",
+          "default": "first/none",
+          "recommendation": "Switch this whenever you physically change objectives."
+        },
+        {
+          "name": "Cameras → Objective Calibration Setup: Add Objective… / Remove Selected",
+          "what_it_does": "Add opens a dialog (Name + nominal magnification) to define a user objective; Remove deletes it and its calibrations on every camera (confirm).",
+          "default": "empty library; Add dialog defaults nominal 4.0×",
+          "recommendation": "Define one entry per physical objective; the nominal mag only seeds spec-computed µm/px until you calibrate."
+        },
+        {
+          "name": "Cameras → Objective Calibration Setup: Calibrate Selected… / Clear Calibration",
+          "what_it_does": "Calibrate runs the stage-motion PixelCalibrationDialog and stores the measured µm/px per objective (needs the microscope started + stage connected). Clear removes the stored value (falls back to spec-computed).",
+          "default": "no calibration → spec-computed µm/px",
+          "recommendation": "Calibrate each objective you use; a ⚠ on the Date column means it was calibrated at a different resolution than active."
+        },
+        {
+          "name": "Xbox Controller sub-page",
+          "what_it_does": "Dedicated Xbox controller setup (mapping editor, jog-speed read-outs, deadzones/offsets). Shares state with the Connect Hardware panel's Xbox row.",
+          "default": "—",
+          "recommendation": "Optional — only needed if you jog with an Xbox controller."
+        },
+        {
+          "name": "Actions → Save Config / Load Config",
+          "what_it_does": "Save writes the current hardware config to disk (config/hardware/); Load reads a previously saved hardware config.",
+          "default": "—",
+          "recommendation": "Save once the Setup Status reads ✓ Setup complete."
+        },
+        {
+          "name": "Setup Status banner",
+          "what_it_does": "Live validity readout: ⚠ lines list each missing requirement; ✓ Setup complete means the config validates and all sidebar pages unlock.",
+          "default": "⚠ Setup incomplete",
+          "recommendation": "This is the gate — resolve every ⚠ line to unlock the rest of the app."
+        }
+      ],
+      "safety_notes": [
+        "The setup-mode jog pad on Hardware Setup BYPASSES soft-limit clamping AND the pump-enabled check (a yellow banner warns of this) so you can reach mechanical extremes — drive carefully; the needle/plate are not protected here. Watch the Live Position bars: markers ring red past the recorded envelope.",
+        "On ME3B V1 the needle descends as raw Z increases. Do the Z Axis Setup (Set Bottom while fully DOWN, Set Top while fully UP) so the up-direction is derived correctly; a wrong assumption can drive the needle into the plate. If Bottom/Top are too close the status warns the direction is ambiguous — jog further apart and re-run.",
+        "The Z soft-limit envelope is owned by Device → Z Axis Setup / Save Safety Limits & Zero. After recording min/max, Save so the live controller clamps real moves; with 'Enable safety limits' off, nothing clamps anywhere in the app.",
+        "Pump Plunger Setup DERIVES and OWNS the aspirate/dispense direction. Only confirm 2 · Set Aspirated when the plunger is truly empty→full. A wrong derived sign reverses fluid flow — re-run per machine after any pump wiring change.",
+        "Override / Sync Axis Position sends G92 to rebase Marlin's counter (no motion) — only use it to recover position after a ZP power cycle, in the zero-referenced mm frame (not the raw counter shown in the limit rows).",
+        "Changing the 'Plate mounted 180°' checkbox or the plate format/custom plate invalidates the taught XY plate calibration — re-teach plate calibration on the Calibration page afterward, or motion will drive to a mirrored/garbage well.",
+        "Inverting an axis (ZP Stage Calibration → Invert Direction, or a negative steps/mm, or a clicked steps/mm cell) flips Marlin's positive direction permanently for that axis; verify jog direction afterward.",
+        "Marlin loses absolute position on power-cycle; if the ZP board was power-cycled the readout may be wrong until you Override/Sync or re-run the Z setup.",
+        "Calibrating capture resolution changes µm/px validity — the app warns that µm/px may need redoing after a resolution change; a ⚠ on an objective's Date column means it was calibrated at a different resolution than the active one.",
+        "The config is invalid (sidebar stays locked) until a needle gauge is set, ≥1 pump is enabled with a syringe and an ink, the plate format/custom plate is recognized, and each needle channel maps to a unique enabled pump — the Setup Status banner names exactly what is missing."
+      ],
+      "tips": [
+        "The Connect Hardware + Jog Stages + Live Position panel is the same panel on every sub-page (left edge) — you never lose access to jogging or position while configuring other sections. Its sections are collapsible cards.",
+        "Sub-pages are ordered so each builds on the one to its left: Device → Identity → Plate → Rosette → Ink → Needle → Pump → Cameras → Xbox. Work left to right the first time.",
+        "Camera µm/px, objective calibrations, image correction, and role→camera assignments live in a per-machine store keyed by device identity (USB port + name), so they survive loading a different setup file and restarts — they are NOT inside the swappable hardware config.",
+        "Device → Device Profile is the fastest way to restore a whole machine: Load applies safety limits, feedrates, axis map, steps/mm, Z setup, plate orientation, and pump calibration in one click.",
+        "Per-section Save buttons (Save Mapping, Save XY Calibration, Save Calibration, Save Feedrates, Save Safety Limits & Zero, Save offsets) each persist their own section; the bottom Apply Settings commits the whole Device page at once.",
+        "The per-pump Inks checklist only lists printable inks — wash/waste/buffer/oil are filtered out (by well type or by an ink named one of those roles), so you can't accidentally aspirate a service reagent.",
+        "Pump Plunger Setup blocks live on the Device sub-page right beneath the Z Axis Setup, in order Z, P1, P2, P3 — not on the Pump sub-page (that one has Enable/Syringe/Mode/Inks + Pump Timing).",
+        "If a Cameras button seems to do nothing, the camera may not be Started — Calibrate µm/px and objective calibration both require the relevant camera running and the stage connected."
+      ],
+      "screenshots": [
+        {
+          "id": "connect-and-jog",
+          "caption": "The persistent left panel: Connect Hardware (XY/ZP/Xbox Connect+Simulate+Disconnect with status badges), the setup-mode Jog Stages pad with Speeds + Refresh Positions, and the Live Position bars/readouts.",
+          "nav": "Hardware Setup → any sub-page (left edge panel). Connect a stage (or Simulate) so the badge reads Connected/Simulated and the Live Position bars populate."
+        },
+        {
+          "id": "device-z-setup",
+          "caption": "Device sub-page: Device Profile, Axis Mapping, XY/ZP Stage Calibration (steps/mm + feedrate grids), Z Axis Setup (Set Bottom/Set Top, plate offsets, 180° plate checkbox), the per-pump Plunger Setup blocks, safety-limit rows, and ZP Feedrates.",
+          "nav": "Hardware Setup → Device. Scroll to the Z Axis Setup and Pump Plunger Setup blocks inside Jog & Safety Limits."
+        },
+        {
+          "id": "ink-reagent-locations",
+          "caption": "Ink sub-page: the Ink Library table with Add Ink/Edit/Remove and the Reagent Locations plate view with the Reagent combo and Assign selected / Clear selected / Clear reagent buttons (well fill = ink color, outline = type color).",
+          "nav": "Hardware Setup → Ink. Add at least one ink, select it, then click a well and Assign selected to show the colored assignment."
+        },
+        {
+          "id": "cameras-detect-assign",
+          "caption": "Cameras sub-page: Save Camera Settings / Load Cameras + Detect Cameras, the three per-slot cards (Source, Role, Start/Stop, live preview + image-correction sliders), Microscope Camera Setup, Needle Cameras Setup, and Objective Calibration Setup.",
+          "nav": "Hardware Setup → Cameras. Click Detect Cameras, assign a Source + Role to a slot, and Start it so the live preview and calibrate buttons enable."
+        },
+        {
+          "id": "setup-status-gating",
+          "caption": "The Setup Status banner reading ✓ Setup complete (or the ⚠ list of missing items) plus the Actions row with Save Config / Load Config — the gate that unlocks the rest of the sidebar.",
+          "nav": "Hardware Setup → any sub-page, scroll to the Setup Status group near the bottom (Actions row directly above/below it)."
+        }
+      ]
+    },
+    {
+      "id": "calibration",
+      "title": "Calibration",
+      "overview": "The Calibration page teaches the machine three things it needs before printing or running any workflow: where the needle tip sits (Needle Location), how high the needle can travel and where the plate surfaces are (Needle Offset Calibration / Z reference heights), and where each well is in stage XY (Plate Location) plus how deep each well bottom is (Plate Z Auto-Cal). It is organized as five tabs in left-to-right order: Needle Location, Needle Offset Calibration, Plate Location, Plate Z Auto-Cal, and Custom (power-user wizards). An operator works left to right: center the needle, capture the safe/travel and plate heights, map the wells, then find each well bottom by focus. A \"Use last known location\" shortcut and a \"Re-derive wells from saved mosaic\" shortcut let you skip the long workflows when nothing has physically changed.",
+      "where_to_find": "Sidebar → Calibration page. Tabs across the top, left to right: Needle Location, Needle Offset Calibration, Plate Location, Plate Z Auto-Cal, Custom.",
+      "prerequisites": [
+        "Hardware Setup → Cameras: assign the Needle X-view and Needle Y-view roles to the two side cameras (the Needle Location camera tiles stay as placeholders until both NEEDLE_X / NEEDLE_Y roles are assigned), and assign the Microscope role to the overhead camera (needed for Plate Location auto edge-detect, the mosaic scan, and Plate Z Auto-Cal focus).",
+        "Hardware Setup → Cameras: calibrate µm/pixel for the microscope objective. Plate Location well edge-fit, the mosaic scan, and the needle-offset preview refuse to run on an uncalibrated camera (the Run handler explicitly blocks with 'Microscope camera µm/pixel not calibrated').",
+        "Stage controller connected (XY + ZP). Many actions warn 'Stage controller required' / 'not connected' if missing.",
+        "Hardware Setup → Device: set the Z soft-limit envelope (z_min/z_max). The calibration tab no longer owns it — capturing Max Z / Plate Bottom Z here does NOT change the safety envelope.",
+        "Hardware Setup → Cameras: select the microscope objective in use — when wells are queued, the Plate Location Run is blocked by a 'Confirm objective' dialog if no objective is selected, and you must answer Yes that the scope is physically set to that objective.",
+        "Order matters: capture the Fast Move (Safe) Z on the Needle Offset Calibration tab BEFORE running Plate Location, a Mosaic scan, 'Go to needle location', or Plate Z Auto-Cal whenever the ZP/needle is connected — those steps retract the needle to the Safe Z, and with no Safe Z the retract would fall back to zero-ref 0 (the bottom datum = a crash)."
+      ],
+      "steps": [
+        {
+          "title": "Center the needle (Needle Location tab)",
+          "detail": "Open Needle Location. The X-view and Y-view side cameras appear at top (placeholders until the NEEDLE_X / NEEDLE_Y roles are assigned in Hardware Setup → Cameras). Jog the needle into both views. The wizard walks 4 steps in order: click the tip's left edge in X-view, the right edge in X-view, then the left and right edges in Y-view. Each click is logged in the 4-row pick table (X-view left/right, Y-view left/right) and the step banner advances.",
+          "screenshot_ref": "needle-location-main"
+        },
+        {
+          "title": "Review the offset preview and save the needle origin",
+          "detail": "Once all four edges are picked, 'Offset preview' shows the computed ΔX/ΔY (and ΔZ if 'Also center Z' is on) plus a per-camera column-offset breakdown. Click 'Center & Save needle origin' — the stage moves XY (and optionally Z) to put the tip on both crosshairs, captures the post-move XY as needle_origin_um (label turns green), saves the absolute XY as the quick-move location, and records the needle-cam Z fiducial. If the crosshair already sits WITHIN the needle's width in both views, it records the origin WITHOUT moving (a deadband against click-noise). Use 'Reset picks' to start the four clicks over.",
+          "screenshot_ref": "needle-location-main"
+        },
+        {
+          "title": "(Optional) skip re-centering when nothing changed",
+          "detail": "If the needle, its mounting, and the side cameras are unchanged since last session, click '✓ Use last known location'. It restores the saved needle reference (needle zero + needle-cam Z + saved needle XY) read straight from settings, software-only — NO stage motion. Then verify with '⤵ Go to needle location' and only re-center if it looks off. On a brand-new machine, use 'Set current as location' once to seed the quick-move before the first Center & Save.",
+          "screenshot_ref": "needle-location-main"
+        },
+        {
+          "title": "Capture the Z reference heights (Needle Offset Calibration tab)",
+          "detail": "Open Needle Offset Calibration. Jog Z to each reference height and click its 'Set …' button to capture the current Z: Replace Z (needle-swap clearance), Max Z (upper print reference), Fast Move Z (travel height — REQUIRED before Plate Location), Plate Top Z (plate surface), Plate Bottom Z (well floor). Each label turns green with the saved mm value. Optionally click 'Estimate plate Z (pre-fill guesses)' to pre-fill Plate Top / Plate Bottom / Fast-Move Z from the needle-cam fiducial minus the standard offsets (Max/Replace are left manual). 'Go to Replace Z' retracts Z to the captured swap height (XY stays put).",
+          "screenshot_ref": "z-offset-heights"
+        },
+        {
+          "title": "Map the wells in XY (Plate Location tab)",
+          "detail": "Open Plate Location. Choose the Well-fit mode: 'Manual — click well edge in live view' (default) or 'Auto — camera edge-detect'. Use the Free/Snap toggle on the plate view to enqueue targets: Snap = click wells, Free = click anywhere to drop a freeform point (clicking an already-queued well/point removes it). Queue several wells spread across the plate, then click 'Run'. If the ZP is connected and you have not set the Fast Move Z, Run is blocked with a warning — go set it first.",
+          "screenshot_ref": "plate-location-main"
+        },
+        {
+          "title": "Teach each well during the run",
+          "detail": "When wells are queued, you must first confirm the in-use objective (a dialog that blocks if none is selected). The stage then retracts to Safe Z once and travels to each queued target. In Manual mode, JOG to bring each rim edge into the microscope view and click the well EDGE (each click records a rim point at the CURRENT stage position — the stage is never driven by a click); collect ~3+ points (8 suggested) around the rim, then click 'Confirm position' to circle-fit the center (needs ≥3 valid points). In Auto mode the camera edge-detects automatically and falls back to a manual 3-point pick if it fails. For freeform points, jog to center the target and Confirm. 'Skip' leaves a well/point uncalibrated and advances; 'Cancel run' aborts and discards results. Taught well centers show as pink reference markers on the plate and microscope views.",
+          "screenshot_ref": "plate-location-main"
+        },
+        {
+          "title": "(Alternative) full-plate mosaic scan",
+          "detail": "Instead of clicking each well, click 'Mosaic scan' in the Mosaic group to raster the whole plate (needle retracted to Safe Z), stitch one composite image on a worker thread, and detect every well at once. Tune it via 'Settings…' (camera settle/timing, FOV overlap, resolution, detection sensitivity). 'Calibrate…' builds a small mosaic to estimate and store this camera+objective's alignment delta. 'Map wells…' lets you place the 3 corner wells by hand on the stitched mosaic and auto-place the rest. 'Quick re-register' re-fits the whole plate from a saved template by visiting only 3 reference wells. 'Scan well…' maps the sub-wells of one rosette well. Use the 'Plate view' combo (Ideal well / Mosaic / Mosaic + well) and the 'Manual align' sliders + 'Re-anchor map (1 point)…' to verify and correct registration by eye.",
+          "screenshot_ref": "plate-location-mosaic"
+        },
+        {
+          "title": "(Shortcut) re-derive wells after a plate-orientation change",
+          "detail": "If the plate orientation changed and the saved map is mirrored/stale, click 'Re-derive wells from saved mosaic (ground truth)'. It re-labels every well from the saved mosaic's detected centers for the current orientation and stores them directly as the calibration, discarding the old taught/warp state. This is software-only — NO stage motion.",
+          "screenshot_ref": "plate-location-mosaic"
+        },
+        {
+          "title": "Find each well bottom (Plate Z Auto-Cal tab)",
+          "detail": "Open Plate Z Auto-Cal (it comes after Plate Location because it drives to the mapped wells). Click 'Start Z Auto-Cal'. Start validates that a plate is selected, Fast Move Z and Plate Top Z are set, the XY map (Plate Location) is finished, and a camera is running. For each calibration well (A1, A-last-col, last-row-last-col) the stage retracts and travels there. Focus the microscope on the glass with the manual knob, then click 'Confirm focus & lower needle' — the needle lowers (coarse 0.15 mm then fine 0.03 mm steps) and the best-focus Z (sharpest needle circle = tip at glass) is recorded. Click 'Accept & next well' to keep it, or 'Redo well' to re-teach. Use 'Record now' to manually capture the current Z if auto-detect picks the wrong frame. After the last well the Z plane (tilt) is fit. 'Cancel' stops and retracts to Safe Z.",
+          "screenshot_ref": "plate-z-autocal"
+        },
+        {
+          "title": "Retract the needle safely while teaching (Z side view)",
+          "detail": "On the Plate Location tab, the 'Z side view' panel (right of the plate map) shows the needle height. Click the green 'Safe' badge to drive Z up to the captured Fast Move Z — a manual absolute Z move that respects soft limits and is a no-op if the ZP stage is not connected — before or while teaching wells, so a needle you jogged down to focus is lifted clear of the plate.",
+          "screenshot_ref": "plate-location-main"
+        }
+      ],
+      "settings": [
+        {
+          "name": "X-view / Y-view camera tiles (Needle Location)",
+          "what_it_does": "Live feeds from the two side cameras assigned the NEEDLE_X and NEEDLE_Y roles, with a crosshair. Clicking inside a tile records the needle tip's edge for the current wizard step. Each shows a placeholder until both roles are assigned in Hardware Setup → Cameras.",
+          "default": "placeholder until roles assigned",
+          "recommendation": "Jog the needle into BOTH views before clicking. Click the actual tip edges, not the shaft."
+        },
+        {
+          "name": "⤵ Go to needle location",
+          "what_it_does": "Quick-moves to the saved approximate needle location: retracts Z to the Fast-Move height, travels XY, then lowers to the saved needle-cam Z so the needle re-enters both side views. Warns if no location is saved or the stage isn't connected; refuses (warns) if ZP is connected and no Fast Move (Safe) Z is set.",
+          "default": "",
+          "recommendation": "Use to bring the needle back into the side cameras instead of hand-jogging."
+        },
+        {
+          "name": "Set current as location",
+          "what_it_does": "Captures the current stage XY as the approximate needle location (the quick-move target). Persisted per machine. Warns if the stage isn't connected or the position can't be read.",
+          "default": "",
+          "recommendation": "Use once on a fresh machine to seed the quick-move before your first Center & Save."
+        },
+        {
+          "name": "✓ Use last known location",
+          "what_it_does": "Restores the last-known needle calibration (needle zero + needle-cam Z + saved needle XY) read from settings, software-only with no stage motion. Lets you skip the camera re-centering entirely.",
+          "default": "",
+          "recommendation": "ONLY use when nothing about the needle, its mounting, or the side cameras has changed since it was saved — otherwise the needle reference will be wrong."
+        },
+        {
+          "name": "Also center Z (tip → crosshair) [checkbox]",
+          "what_it_does": "When checked, after recentering XY the needle Z is moved so the tip's center-bottom lands on the camera crosshair. The move is clamped by the Z soft-limit (move_z_user_relative). The ΔZ is shown in the offset preview.",
+          "default": "checked (on)",
+          "recommendation": "Leave on for a full center."
+        },
+        {
+          "name": "Invert Z direction (flipped camera mount) [checkbox]",
+          "what_it_does": "Flips the sign of the Z-centering move for vertically-mirrored camera mounts.",
+          "default": "unchecked (off)",
+          "recommendation": "Toggle only if the Z move drives the tip AWAY from the crosshair instead of toward it."
+        },
+        {
+          "name": "Reset picks",
+          "what_it_does": "Clears all four edge picks and returns the wizard to step 1.",
+          "default": "",
+          "recommendation": "Use if you mis-clicked an edge."
+        },
+        {
+          "name": "Center & Save needle origin",
+          "what_it_does": "Drives the stage to put the needle on both crosshairs (XY and optional Z), then saves the current stage position as needle_origin_um, the quick-move XY, and the needle-cam Z fiducial. Disabled until all four edges are picked. Skips the XY move if the crosshair already lies within the needle width in both views (deadband).",
+          "default": "disabled until 4 edges picked",
+          "recommendation": "Review the offset preview first; large offsets will produce a real move."
+        },
+        {
+          "name": "Set Replace Z",
+          "what_it_does": "Captures the current Z (zero-ref) as the needle-swap clearance height — the highest safe Z used when changing the needle. Kept as a reference; does not change the safety envelope.",
+          "default": "not set (label shows '—')",
+          "recommendation": "Jog Z to your comfortable needle-swap height first, then capture."
+        },
+        {
+          "name": "Set Max Z",
+          "what_it_does": "Captures the current Z as the upper print/Z reference (stored in self._max_z). NOTE: despite its tooltip saying 'soft-limit ceiling', in this version it does NOT write into the Z safety envelope — that is owned by Hardware Setup → Device. (The old behavior could invert the envelope and freeze Z.)",
+          "default": "not set",
+          "recommendation": "Optional reference. Set the actual soft-limit ceiling on Hardware Setup → Device."
+        },
+        {
+          "name": "Set Fast Move Z",
+          "what_it_does": "Captures the current Z as the travel height for fast XY moves between wells (retract-before-XY height). This is the Safe Z the Plate Location run, Mosaic scan, Go-to-needle, and Plate Z Auto-Cal retract to. Stored as self._safe_z.",
+          "default": "not set",
+          "recommendation": "REQUIRED before running Plate Location / Mosaic scan / Plate Z Auto-Cal when the ZP is connected. Set it well above the tallest plate feature."
+        },
+        {
+          "name": "Set Plate Top Z",
+          "what_it_does": "Captures the current Z as the plate's top surface (first contact from above). Pushed to the controller as the plate-top datum for printing. Required before Plate Z Auto-Cal.",
+          "default": "not set",
+          "recommendation": "Jog the needle just touching the plate top, then capture."
+        },
+        {
+          "name": "Set Plate Bottom Z",
+          "what_it_does": "Captures the current Z as the well floor (needle just touching the bottom of a calibrated well, stored in self._plate_bottom_z). Kept as a print/Z reference; does not change the safety envelope. Used as a fallback reference for the Z auto-cal descent window.",
+          "default": "not set",
+          "recommendation": "Capture against a known well bottom; the Z auto-cal refines per-well."
+        },
+        {
+          "name": "Estimate plate Z (pre-fill guesses)",
+          "what_it_does": "Pre-fills Plate Top / Plate Bottom / Fast-Move Z with guesses derived from the captured needle-cam Z minus the standard offsets set on Hardware Setup → Device. Max/Replace Z are left untouched. Warns if no needle-cam Z has been captured.",
+          "default": "",
+          "recommendation": "Run a needle Center & Save first (records the needle-cam Z), then use this to seed the heights and refine them."
+        },
+        {
+          "name": "Go to Replace Z",
+          "what_it_does": "Drives Z to the captured Replace Z for needle swapping (absolute Z move via move_z_absolute; XY stays put). Information popup if Replace Z is not set; returns silently if the controller is missing.",
+          "default": "",
+          "recommendation": "Use before physically changing the needle."
+        },
+        {
+          "name": "Well fit mode combo (Plate Location)",
+          "what_it_does": "Chooses how each queued well is centered during a run. 'Manual — click well edge in live view': the stage anchors at the predicted center, you jog and click the rim edge in the microscope feed (≥3 clicks → circle fit). 'Auto — camera edge-detect': automatic detection with a manual 3-point fallback.",
+          "default": "Manual — click well edge in live view",
+          "recommendation": "Manual is the most reliable when wells are larger than the field of view or detection is noisy."
+        },
+        {
+          "name": "Plate view + Free/Snap toggle",
+          "what_it_does": "Top-down workspace view (same JogWorkspaceView as the Jog page): safety envelope, plate outline, wells colored by calibrated/approximate status, needle to scale, and pink reference markers for taught centers. The built-in Free/Snap toggle (top-left of the view) routes clicks: Snap = click wells to enqueue, Free = click anywhere to drop a freeform point. Clicking an already-queued well/point removes it.",
+          "default": "Snap mode",
+          "recommendation": "Mix Snap (wells) and Free (arbitrary points), then Run."
+        },
+        {
+          "name": "Microscope live feed (Plate Location)",
+          "what_it_does": "Live microscope camera feed (with crosshair) under the plate map. In Manual well-fit, clicking the well edge here records a rim point at the current stage position (converted to absolute µm via the calibrated µm/px). Starts on Run / Mosaic scan or from the Cameras tab.",
+          "default": "starts on Run/Mosaic scan",
+          "recommendation": "Spread your rim clicks around the whole circle for a good fit."
+        },
+        {
+          "name": "Mosaic (live) preview",
+          "what_it_does": "Shows the stitched mosaic building tile-by-tile during a Mosaic scan (worker thread), and any previously-saved mosaic for the plate.",
+          "default": "'No mosaic yet — run a Mosaic scan'",
+          "recommendation": ""
+        },
+        {
+          "name": "Target queue list + Clear queue + Run",
+          "what_it_does": "Lists queued wells and freeform points. 'Clear queue' empties it. 'Run' starts the calibration run (disabled until there is something to run; also blocked if no plate/controller, if Fast Move Z is unset with ZP connected, or if wells are queued and the microscope camera/µm-px isn't ready).",
+          "default": "Run disabled until queue has entries",
+          "recommendation": "Queue several wells spread across the plate for an accurate XY fit."
+        },
+        {
+          "name": "Mosaic scan",
+          "what_it_does": "Rasters the whole plate (needle retracted to Safe Z), stitches every snapshot into one image on a worker thread, then detects all wells at once on the stitched field. Robust where single-frame per-well detection fails.",
+          "default": "",
+          "recommendation": "Use for a fresh full-plate map. Requires a calibrated microscope µm/px and a Microscope-role camera."
+        },
+        {
+          "name": "Settings… (Mosaic)",
+          "what_it_does": "Opens the mosaic-scan settings dialog: camera settle/timing, FOV overlap, mosaic resolution, and well-detection sensitivity/tolerance. Persisted in settings.json.",
+          "default": "",
+          "recommendation": "Increase camera settle if the camera can't keep up during the raster."
+        },
+        {
+          "name": "Calibrate… (Mosaic)",
+          "what_it_does": "Opens the alignment calibration pop-out: build a small (e.g. 5×5) mosaic you define, run global registration to estimate this camera + objective's alignment delta, and store it so full mosaics start pre-registered.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "Map wells…",
+          "what_it_does": "Maps wells on the stitched mosaic by hand: click the 3 corner wells, the rest auto-place from the plate layout, drag to refine, then confirm. Also saves the labeled mosaic for detection R&D.",
+          "default": "",
+          "recommendation": "Good fallback when automatic well detection mis-labels wells."
+        },
+        {
+          "name": "Quick re-register",
+          "what_it_does": "Re-registers the plate from a saved mosaic template: the camera drives to 3 reference wells, auto-detects each, and fits the whole plate — no full re-scan. Needs the SAME camera + objective.",
+          "default": "",
+          "recommendation": "Use when you remounted a previously-scanned plate and just need to re-lock the map."
+        },
+        {
+          "name": "Scan well…",
+          "what_it_does": "Builds a high-resolution mosaic of one rosette well and maps its sub-wells (uses the plate's sub-well layout).",
+          "default": "",
+          "recommendation": "Only for plates with rosette sub-wells."
+        },
+        {
+          "name": "Re-derive wells from saved mosaic (ground truth)",
+          "what_it_does": "Re-labels every well from the saved mosaic's detected centers for the current plate orientation and stores them directly as the calibration, discarding the previous taught/warp calibration. Software-only — NO stage motion.",
+          "default": "",
+          "recommendation": "Use after the plate orientation changed (e.g. the map became mirrored). Discards prior calibration, so be sure."
+        },
+        {
+          "name": "Plate view combo (Ideal well / Mosaic / Mosaic + well)",
+          "what_it_does": "Switches the plate map between the idealized well grid, the stitched plate mosaic, or both overlaid.",
+          "default": "Ideal well",
+          "recommendation": "Use 'Mosaic + well' to visually verify the well map registers to the real plate image."
+        },
+        {
+          "name": "Re-anchor map (1 point)…",
+          "what_it_does": "Fallback for a mis-registered map: pick a well/point on the plate overview (the stage travels there), then click that same feature in the live microscope view. The measured offset re-anchors the ENTIRE well map (a pure translation) and is saved permanently.",
+          "default": "",
+          "recommendation": "Use when the whole map is shifted by a constant offset that auto re-register can't fix."
+        },
+        {
+          "name": "Manual align group (Δx µm / Δy µm / Opacity sliders + Store / Reset / Clear stored)",
+          "what_it_does": "Checkable group to slide the stitched mosaic onto the well grid by eye. Δx/Δy sliders range ±10000 µm; Opacity 5–100% (default 55%). 'Store alignment' saves the shift as this camera+objective's alignment delta (added to any prior) and bakes it into the saved overlay. 'Reset' clears the live sliders. 'Clear stored' forgets the stored delta so auto registration sets it next scan.",
+          "default": "group off; Δx/Δy = 0; Opacity = 55%",
+          "recommendation": "Use only when auto registration can't lock on (featureless tiles). Store once you have it aligned by eye."
+        },
+        {
+          "name": "Confirm position / Skip / Cancel run (Plate Location, shown only while paused)",
+          "what_it_does": "These three buttons are hidden until the run pauses at a target. Confirm = fit/record the current paused target (a freeform point, a well's 3-point pick, or the click-rim edges collected so far). Skip = leave the current well/point uncalibrated and advance. Cancel run = abort the whole run and discard results.",
+          "default": "hidden until the run pauses",
+          "recommendation": "Confirm needs ≥3 valid rim points for a manual/edge-fit well; otherwise it warns and leaves the well uncalibrated."
+        },
+        {
+          "name": "Z side view + green 'Safe' badge (Plate Location)",
+          "what_it_does": "Shows the needle height on a vertical scale plus the captured Z references. Clicking the green 'Safe' badge drives Z up to the Fast Move Z (move_z_absolute, soft limits respected). No-op when the ZP stage is not connected.",
+          "default": "",
+          "recommendation": "Click it before/while teaching wells to lift a lowered needle clear of the plate."
+        },
+        {
+          "name": "Start Z Auto-Cal / Cancel (Plate Z Auto-Cal)",
+          "what_it_does": "Start begins the guided per-well Z-bottom calibration. It validates that a plate is selected, Fast Move Z and Plate Top Z are set, the XY map (Plate Location) is finished, and a camera is running — warning and aborting if any is missing. Cancel stops the run, retracts to Safe Z, and stops detection.",
+          "default": "Cancel disabled until a run starts",
+          "recommendation": "Finish Plate Location first; the auto-cal drives to the mapped wells."
+        },
+        {
+          "name": "Confirm focus & lower needle (Plate Z Auto-Cal)",
+          "what_it_does": "Tells the system the microscope is focused on the glass at the current well. The needle then lowers (coarse 0.15 mm then fine 0.03 mm steps) within a bounded, soft-limited window to find the sharpest-focus Z (tip at the glass plane).",
+          "default": "enabled only while awaiting focus confirmation",
+          "recommendation": "Focus crisply on the glass with the manual knob first — that defines the search baseline."
+        },
+        {
+          "name": "Record now (Plate Z Auto-Cal)",
+          "what_it_does": "Manual override during the descent: records the current best-focus Z (or the live Z if none seen yet) as this well's bottom.",
+          "default": "enabled only during the coarse/fine descent",
+          "recommendation": "Use if the auto peak-finder picks the wrong frame."
+        },
+        {
+          "name": "Accept & next well / Redo well (Plate Z Auto-Cal)",
+          "what_it_does": "Accept keeps the provisional best-focus Z for this well, advances to the next, and (after the last well) fits the Z plane / tilt. Redo discards the provisional Z and re-arms the focus gate so you re-teach this well.",
+          "default": "enabled only once a Z is recorded",
+          "recommendation": "Redo if the recorded value looks wrong (e.g. 'no clear focus peak')."
+        },
+        {
+          "name": "Live microscope feed (Plate Z Auto-Cal)",
+          "what_it_does": "Passive microscope feed (with crosshair) for watching the needle approach focus while teaching. Starts automatically when this tab is shown.",
+          "default": "starts when tab shown",
+          "recommendation": ""
+        },
+        {
+          "name": "Well depth spin (Custom → Plate Calibration, Step 2)",
+          "what_it_does": "Well depth in mm (range 1.0–50.0, default 17.4; tooltip 'Distance from plate top surface to well bottom glass'). Auto-populated from the selected plate. Seeds the fallback search window for the per-well Z descent when no previous accepted Z and no Plate Bottom Z exist.",
+          "default": "17.4 mm",
+          "recommendation": "Auto-populated from the selected plate; usually leave as-is."
+        },
+        {
+          "name": "Custom tab → Camera Setup / Full Wizard / Plate Calibration sub-tabs",
+          "what_it_does": "Power-user area: a live multi-camera grid plus the full legacy wizards — Camera Setup, the complete needle wizard (Full Wizard), and manual plate calibration (Plate Calibration: plate-format combo, per-well manual Z teach, edge-finding, the well-depth spin, and Z-plane tilt fit).",
+          "default": "",
+          "recommendation": "Use only when the streamlined workflow tabs don't cover a manual step you need."
+        }
+      ],
+      "safety_notes": [
+        "Set the Fast Move (Safe) Z on the Needle Offset Calibration tab BEFORE running Plate Location, a Mosaic scan, 'Go to needle location', or Plate Z Auto-Cal whenever the ZP/needle is connected. Those steps retract the needle to that Safe Z; without it the retract would fall back to zero-ref 0 (the bottom datum on this machine = a crash). The Run, Go-to-needle, and Start-Z-Auto-Cal handlers are explicitly gated and will warn you.",
+        "The Plate Location run retracts the needle to Safe Z ONCE before the scan and again before every inter-well/inter-point hop (via ensure_retracted_to / safe_travel_to, which never descend), so a needle you jogged down to focus is lifted before the stage travels.",
+        "Plate Z Auto-Cal lowers the needle toward the glass under a bounded, soft-limit-clamped descent window; it stops at the focus peak or the safety floor and never descends past the window. Cancel and the per-well flow retract to Safe Z.",
+        "Capturing Max Z and Plate Bottom Z on the Needle Offset tab does NOT change the Z safety envelope (it's owned by Hardware Setup → Device), even though Max Z's tooltip still reads 'soft-limit ceiling'. This is intentional — the old behavior could invert the envelope and freeze Z. Set the real soft limits on the Device page.",
+        "'Use last known location' and 'Re-derive wells from saved mosaic' are software-only (no motion) — but they overwrite the live needle/plate calibration, so only use them when you are sure the physical setup is unchanged (last-known) or the orientation truly changed (re-derive discards the previous taught/warp calibration).",
+        "The green 'Safe' badge and 'Go to Replace Z' issue real Z moves; they only act when the ZP stage is connected and respect Z soft limits. 'Go to needle location' performs a full retract→XY→lower travel and is gated on a known Safe Z when ZP is connected.",
+        "When wells are queued, the Plate Location Run is blocked by a 'Confirm objective' dialog if no objective is selected, and you must confirm the scope is physically set to that objective — the wrong objective's µm/px would map your clicks to the wrong stage positions.",
+        "Plate Location well edge-fit and the mosaic scan refuse to run on an uncalibrated microscope µm/px (the Run handler warns 'Microscope camera µm/pixel not calibrated'); calibrate the objective in Hardware Setup → Cameras first."
+      ],
+      "tips": [
+        "Work the tabs left to right: Needle Location → Needle Offset Calibration (capture at least Fast Move Z + Plate Top Z) → Plate Location → Plate Z Auto-Cal.",
+        "In Plate Location Manual mode, every live-view click uses the stage's CURRENT position, so jog freely between clicks — the stage is never driven by a click. Spread ~8 clicks around the whole rim for the best circle fit (≥3 minimum).",
+        "Calibration changes auto-save (debounced) so you won't lose a taught Safe Z / Top Z / well centers if you forget to save manually.",
+        "The pink reference markers on the plate map and microscope view mark your taught well centers — use them to confirm the map registers to the real plate.",
+        "If a Mosaic-scan or Re-derive button seems to do nothing, check the terminal/log: those handlers are wrapped to surface errors, but a stuck busy flag means another run is in progress — Cancel it first (Run is also blocked while a mosaic scan owns the stage).",
+        "The Z Auto-Cal calibrates 3 wells forming a right triangle (A1, A-last-column, last-row-last-column) to fit the plate tilt plane; you don't have to teach every well's bottom."
+      ],
+      "screenshots": [
+        {
+          "id": "needle-location-main",
+          "caption": "Needle Location tab: the X-view/Y-view side cameras, the 4-step edge-pick wizard with pick table, offset preview, and the Go to / Set current / Use last known buttons.",
+          "nav": "Calibration → Needle Location tab (with NEEDLE_X and NEEDLE_Y cameras assigned and the needle in view)"
+        },
+        {
+          "id": "z-offset-heights",
+          "caption": "Needle Offset Calibration tab: the five 'Set …' Z reference-height buttons (Replace/Max/Fast Move/Plate Top/Plate Bottom), the 'Estimate plate Z' pre-fill, and Go to Replace Z.",
+          "nav": "Calibration → Needle Offset Calibration tab"
+        },
+        {
+          "id": "plate-location-main",
+          "caption": "Plate Location tab: the Well-fit mode combo, plate map with Free/Snap toggle and pink reference markers, the Z side view with the green Safe badge, the microscope live feed, and the target queue + Run + Confirm/Skip/Cancel.",
+          "nav": "Calibration → Plate Location tab"
+        },
+        {
+          "id": "plate-location-mosaic",
+          "caption": "Plate Location Mosaic group: Mosaic scan / Settings / Calibrate / Map wells / Quick re-register / Scan well, the Re-derive-from-saved-mosaic button, the Plate view combo, Re-anchor, and the Manual align sliders.",
+          "nav": "Calibration → Plate Location tab → Mosaic group (control panel, right side)"
+        },
+        {
+          "id": "plate-z-autocal",
+          "caption": "Plate Z Auto-Cal tab: Start/Cancel, the per-well Confirm focus / Record now / Accept / Redo buttons, the progress line, and the live microscope feed.",
+          "nav": "Calibration → Plate Z Auto-Cal tab (after Plate Location is finished)"
+        }
+      ]
+    },
+    {
+      "id": "quick_print",
+      "title": "Quick Print Workflow",
+      "overview": "Quick Print is the \"no-frills, one-object, one-well\" print workflow. You pick a single object (a built-in shape — Dot, Circle, or Meander-filled disc — or any saved print from the print library), click one well on the plate map, optionally let it auto-prep the needle and pick up ink, then press Print. It builds the same single-well print job the standard Print Setup uses and runs it through a fresh PrintManager in discrete mode, so motion matches the normal print flow. Operators use it for fast single deposits or quick verification prints without going through full Print Setup. By default (Prep ON, Cleanup ON) one press runs the full bioprint sequence: prep the needle (waste -> oil -> wash -> buffer), pick up the print's ink, position over the well (needle retracted), print hands-free, then clean the needle (waste -> wash -> reset oil).",
+      "where_to_find": "Workflows mode -> Workflow picker -> \"Quick Print\" tile. Use the \"← Back to Workflows\" button (top-left) to return to the picker. The full option set lives behind the \"⚙ Settings\" button in the top-right header.",
+      "prerequisites": [
+        "XY stage AND ZP (Z + pumps) stage both connected — Print stays disabled and the run refuses to start until both report connected.",
+        "A plate must be available and calibrated — run Calibration so the page receives well positions (set_calibration_data). The selected well must resolve to a position (calibrated, else geometric).",
+        "Safe Z / move height must be set on the Calibration page if Prep, ink pickup, OR post-print cleanup is enabled — any well descent needs it; the run refuses to start without it. A plain print (no prep/ink/cleanup) only shows a 'No Safe Z' continue-anyway prompt.",
+        "Plate bottom Z must be calibrated when Prep, ink pickup, or cleanup is on (needed to resolve the ink/service dip heights above the bottom).",
+        "For ink pickup: the chosen ink must have a reagent location assigned (Hardware Setup -> Ink) AND that well must be in the calibrated plate map (run Plate Location).",
+        "For Prep: the needle inner diameter + length must be set (Hardware Setup -> Needle) so '1 needle' bore volume is known, and all four service wells (waste, oil, wash, buffer) must be assigned and calibrated.",
+        "For post-print cleanup: needle geometry set, plus the waste, wash, and oil wells assigned and calibrated.",
+        "A microscope camera assigned to the MICROSCOPE role lets the live feed display (otherwise the camera pane shows a 'No camera manager available.' placeholder)."
+      ],
+      "steps": [
+        {
+          "title": "Open Quick Print",
+          "detail": "From Workflows mode, click the Quick Print tile. The page shows: header (← Back to Workflows, title, a live settings summary, ⚙ Settings), an Object/Size row, a setup-status strip, the main area (trajectory monitor + live camera over the well-plate selector), and a run row (Print / Abort + status). The live microscope feed starts on this page.",
+          "screenshot_ref": "quick-print-main"
+        },
+        {
+          "title": "Choose an object",
+          "detail": "In the Object combo pick a built-in shape (⋅ Dot, ◯ Circle, ◉ Meander (filled disc)) or a saved print listed as '📄 name  (N)' where N is the object count. Use the ⟳ button next to it to rescan config/prints (the list also auto-refreshes each time the page is shown). For Circle and Meander a 'Size' spin appears (0.1–20.00 mm = the radius); Dot and saved prints hide it. The trajectory monitor updates with the planned path.",
+          "screenshot_ref": "quick-print-main"
+        },
+        {
+          "title": "Select the well",
+          "detail": "Click a well on the well-plate navigator (bottom pane, titled 'Well — click to place the object'). The status line confirms 'Well X selected.' and the planned path re-centers on that well with its boundary circle.",
+          "screenshot_ref": "quick-print-main"
+        },
+        {
+          "title": "Open ⚙ Settings and set print parameters",
+          "detail": "Click ⚙ Settings (top-right) to open the scrollable popout. In the Print section set Pump/bore, Flow @100% (µL/s), Print speed (% of max), and Height above bottom (mm). The setup-status strip and the header summary update live as you change values.",
+          "screenshot_ref": "settings-print"
+        },
+        {
+          "title": "Set ink pickup (optional)",
+          "detail": "In the Ink pickup section choose the Ink (defaults to the selected pump's assigned ink if it's printable; '(none — needle already loaded)' skips pickup). Set Ink dip Z (height above bottom when aspirating) and the Pickup safety (×) multiplier. The status strip shows 'Ink \"X\" ← well · pick up ~N µL' or a peach ⚠ if the ink has no reagent location or its well isn't calibrated.",
+          "screenshot_ref": "settings-ink"
+        },
+        {
+          "title": "Review needle prep + post-print cleanup",
+          "detail": "Needle prep (default ON) does waste -> oil -> wash -> buffer before ink pickup; set Service dip Z and Wash cycles. Post-print cleanup (default ON) does waste -> wash -> reset oil afterward; set Waste (× needle) and Oil refill fallback. Service dip Z and Wash cycles are shared by prep and cleanup, so they stay enabled regardless of the Prep checkbox. The status strip shows ✓ when service wells map correctly, or a ⚠ listing what to assign/calibrate.",
+          "screenshot_ref": "settings-prep"
+        },
+        {
+          "title": "Optionally save a settings profile",
+          "detail": "Use the profile bar at the top of the popout: Save overwrites the selected file (or acts as Save As if none is selected); Save As… names a reusable file; the 'Settings file' combo loads a saved file; Delete removes the selected file after a confirm; Import…/Export… read/write a JSON anywhere; Reset restores factory defaults. The last-used values auto-restore on the next visit. Close with the Close button when done.",
+          "screenshot_ref": "settings-profile-bar"
+        },
+        {
+          "title": "Read the setup-status strip",
+          "detail": "Back on the page, the status strip summarizes Print mm/s + µL/s, the ink source and pickup volume, prep mapping, and cleanup plan. Green = a preamble/cleanup is active and ready, peach = a warning/gap to fix, gray subtext = a plain print with no preamble.",
+          "screenshot_ref": "quick-print-main"
+        },
+        {
+          "title": "Press Print and confirm setup",
+          "detail": "Click Print. If the chosen height is below the calibrated plate bottom you first get a 'Below plate bottom' warning (the needle is clamped, not crashed). If a preamble (prep/ink) OR the post-print cleanup is active you then get a 'Confirm print setup' dialog listing exactly what will run (prep, ink pickup volume + source well, the print, and the cleanup plan). Click Yes to proceed.",
+          "screenshot_ref": "confirm-setup-dialog"
+        },
+        {
+          "title": "Let preflight run (hands-free)",
+          "detail": "On a worker thread the page runs prep (if on), picks up ink (if selected), then travels XY to the print-start point with the needle RETRACTED to safe Z. The live microscope keeps updating. Abort is available during the preamble (but not during a plain preposition with nothing to interrupt). The print then starts automatically — there is no per-print position confirmation. The run is refused if the preamble aborted/errored, the ZP board dropped during positioning, or the positioning move did not confirm arrival.",
+          "screenshot_ref": "quick-print-main"
+        },
+        {
+          "title": "Watch the print + cleanup",
+          "detail": "The trajectory monitor records the executed path (green) and a fading needle ghost trail over the planned path; the status shows [done/total] steps and the execution log filename (logs/prints/...). On a completed print, if cleanup is on it runs waste -> wash -> reset oil on its own worker thread, then the status confirms 'needle cleaned'. The needle ends retracted out of the well at the travel Z (it does NOT return to 0,0). Use Abort at any time to stop.",
+          "screenshot_ref": "quick-print-main"
+        }
+      ],
+      "settings": [
+        {
+          "name": "Object (combo)",
+          "what_it_does": "Selects what to print: built-in shapes ⋅ Dot, ◯ Circle, ◉ Meander (filled disc), plus every saved print from config/prints shown as '📄 name  (N)' where N is the object count. Drives the planned-path preview and the printed geometry. Inline on the page.",
+          "default": "First item (⋅ Dot)",
+          "recommendation": "Use Dot for a single deposit, Circle/Meander for parametric rings/fills, or a saved print for a designed/imported pattern. Press ⟳ to refresh the saved list."
+        },
+        {
+          "name": "⟳ Refresh saved prints (button)",
+          "what_it_does": "Re-scans config/prints and rebuilds the Object list, preserving the current selection. The list also auto-refreshes every time the page is shown.",
+          "default": "",
+          "recommendation": "Click after creating a print in Sketch / Image Import / manual import so it appears without restarting."
+        },
+        {
+          "name": "Size (spin)",
+          "what_it_does": "Radius in mm for the Circle and Meander built-in shapes. Range 0.1–20.00 mm, step 0.5, default 1.00 mm. Hidden for Dot and saved prints (which carry their own geometry). Updates the path preview and pickup-volume estimate.",
+          "default": "1.00 mm",
+          "recommendation": "Keep the radius inside the well's needle-safe boundary shown on the trajectory monitor."
+        },
+        {
+          "name": "Pump / bore (combo)",
+          "what_it_does": "(Settings -> Print) Which pump drives the print and is used for prep/cleanup/ink pickup. Populated from enabled+configured pumps; defaults to P1 if none are configured. Changing it re-defaults the Ink combo to that pump's assigned ink.",
+          "default": "P1",
+          "recommendation": "Pick the pump physically loaded with the print ink."
+        },
+        {
+          "name": "Flow @100% (spin)",
+          "what_it_does": "(Settings -> Print) Pump flow in µL/s at 100% print speed. Range 0.0–50.0, step 0.05, 3 decimals. Print speed % scales BOTH the XY traverse and this flow together, so the deposited bead width stays constant regardless of the %.",
+          "default": "0.250 µL/s",
+          "recommendation": "Tune to your ink/needle so the bead width is right; the % only changes overall speed, not bead width. Flow 0 = dry run (no extrusion, and no ink pickup volume computed)."
+        },
+        {
+          "name": "Print speed (spin)",
+          "what_it_does": "(Settings -> Print) Print speed as a % of the calibrated maximum XY speed. Range 1–100% (0 decimals, step 5). Scales the XY traverse (% × XY max) and the pump flow together. The 100% anchor is the measured top speed from the timing calibration, else the safety-limit max XY speed, else 10 mm/s.",
+          "default": "25 % max",
+          "recommendation": "Start ~25% and raise as motion/sync allows; lower if the stage can't keep up with the pump."
+        },
+        {
+          "name": "Height above bottom (Print-Z, spin)",
+          "what_it_does": "(Settings -> Print) Print height measured up from the calibrated plate bottom. Range 0.0–40.0 mm, step 0.1, 2 decimals. 0 = at the plate bottom; larger = higher. Converted to a zero-ref Z via the plate-bottom datum; the controller hard-clamps so it never prints below the bottom.",
+          "default": "0.20 mm",
+          "recommendation": "Small positive offset just off the glass. If set below the bottom you get a 'Below plate bottom' confirm; the needle is clamped, not crashed."
+        },
+        {
+          "name": "Ink (combo)",
+          "what_it_does": "(Settings -> Ink pickup) Which library ink this print uses. Lists '(none — needle already loaded)' plus printable inks (NOT service reagents — filtered by ink_type and by name) that have a reagent location. When an ink is chosen the needle aspirates it from that well before printing.",
+          "default": "Pump's assigned ink if printable, else '(none)'",
+          "recommendation": "Leave '(none)' if you pre-loaded the needle. Otherwise pick the print ink; the status strip shows the source well + pickup volume or a ⚠ if it lacks a reagent location or calibrated well."
+        },
+        {
+          "name": "Ink dip Z (↑ bottom, spin)",
+          "what_it_does": "(Settings -> Ink pickup) Needle dip height above the plate bottom when aspirating ink. Range 0.0–30.0 mm, step 0.1, 2 decimals.",
+          "default": "0.50 mm",
+          "recommendation": "Just above the well bottom so the bore is submerged in ink but not jammed on glass."
+        },
+        {
+          "name": "Pickup safety (×, spin)",
+          "what_it_does": "(Settings -> Ink pickup) Safety multiplier on the computed ink pickup volume. Range 1.0–10.0, step 0.1, 2 decimals. Pickup = (path-dispensed + pre-flow prime) × this, floored to the prime so even a single-point dot still draws ink.",
+          "default": "1.50",
+          "recommendation": "Keep ~1.5; raise if the print runs dry at the end (extra margin), lower to conserve ink."
+        },
+        {
+          "name": "Prep needle (checkbox)",
+          "what_it_does": "(Settings -> Needle prep) Label 'Prep needle (waste → oil → wash → buffer)'. When ON, before picking up ink it dispenses 1 needle of oil to waste, aspirates fresh oil, washes, then aspirates buffer. Uses the four service wells from Hardware Setup -> Ink. Toggling it refreshes the status/summary.",
+          "default": "ON (checked)",
+          "recommendation": "Leave ON for a fresh conditioned needle. Turn OFF only if the needle is already prepped/loaded."
+        },
+        {
+          "name": "Service dip Z (↑ bottom, spin)",
+          "what_it_does": "(Settings -> Needle prep) Needle dip height above the plate bottom at the service wells (also used by post-print cleanup, so it stays enabled regardless of the Prep checkbox). Range 0.0–30.0 mm, step 0.1, 2 decimals.",
+          "default": "0.50 mm",
+          "recommendation": "Just above the well bottom in the service wells."
+        },
+        {
+          "name": "Wash cycles (spin)",
+          "what_it_does": "(Settings -> Needle prep) Number of dip-jiggle cycles at the wash well. Range 0–50. Shared with the post-print cleanup wash step.",
+          "default": "3",
+          "recommendation": "3 is a good default; increase for stickier inks."
+        },
+        {
+          "name": "Clean needle after print (checkbox)",
+          "what_it_does": "(Settings -> Post-print cleanup) Label 'Clean needle after print (waste → wash → reset oil)'. When ON, after a COMPLETED print it dispenses a multiple of the needle to waste, washes, then aspirates oil to reset the syringe's oil level (returning the plunger to its pre-run position). Aborted/errored prints skip it.",
+          "default": "ON (checked)",
+          "recommendation": "Leave ON to keep the needle clean and reset oil between prints."
+        },
+        {
+          "name": "Waste (× needle, spin)",
+          "what_it_does": "(Settings -> Post-print cleanup) How many needle volumes to dispense to waste after the print. Range 0.0–50.0, step 1.0, 1 decimal.",
+          "default": "6.0",
+          "recommendation": "6× clears the bore; reduce only if conserving fluid."
+        },
+        {
+          "name": "Oil refill (× needle, fallback, spin)",
+          "what_it_does": "(Settings -> Post-print cleanup) Fallback oil aspirate to reset the syringe when the live pump position is unavailable; normally the plunger simply returns to its pre-run (oil_baseline) position. Range 0.0–50.0, step 1.0, 1 decimal.",
+          "default": "1.0",
+          "recommendation": "Leave at 1× — it's only used if the live position can't be read."
+        },
+        {
+          "name": "Travel speed (spin)",
+          "what_it_does": "(Settings -> Advanced) XY speed for non-printing travel moves (approach to the well, hops between objects). Range 0.5–100.0 mm/s, step 1.0, 1 decimal. Feeds PrintSettings.travel_speed_mm_s.",
+          "default": "10.0 mm/s",
+          "recommendation": "10 mm/s is a safe default; raise for faster repositioning."
+        },
+        {
+          "name": "Pre-flow lead-in (spin)",
+          "what_it_does": "(Settings -> Advanced) The pump runs at the print flow for this long after the confirmed descent to print Z and before the path starts, so a bead is already forming. Range 0.0–5.0 s, step 0.05, 2 decimals. Implemented as the EXTRUDE prime (flow × this time). Default seeded from Hardware Setup -> Pump (Prime time).",
+          "default": "Hardware Setup pump prime time (else 0.25 s)",
+          "recommendation": "Keep ~0.25 s; increase if the print start is under-extruded."
+        },
+        {
+          "name": "Locations & Hardware (read-only info panel)",
+          "what_it_does": "(Settings, bottom) Rebuilt each time the popout is shown. Shows needle geometry (gauge, inner/outer Ø, length, 1-needle bore volume, bore cross-section), each pump's syringe + assigned inks, all ink/reagent locations with calibrated count + color swatch + type[·subtype], the four service-well roles (✓ green = calibrated / yellow = not calibrated / peach = unassigned), calibration heights (calibrated well count, Safe/move Z, plate bottom/top, fast-move, max, replace Z — only those present), and a 'This workflow' section (the selected print ink and its source well).",
+          "default": "",
+          "recommendation": "Read this to confirm where every ink/service well is and which heights are calibrated before printing."
+        },
+        {
+          "name": "Settings file (profile combo)",
+          "what_it_does": "(Settings, profile bar) Lists '(unsaved)' plus saved settings files for Quick Print. Selecting one loads it into all fields (warns on a read failure).",
+          "default": "(unsaved)",
+          "recommendation": "Save named profiles per ink/print recipe so you can reload them."
+        },
+        {
+          "name": "Save / Save As… / Delete (buttons)",
+          "what_it_does": "(Settings, profile bar) Save overwrites the selected file (acts as Save As if none selected); Save As… prompts for a name; Delete removes the selected file after a confirm. Backed by WorkflowSettingsStore; surfaces a warning on save failure.",
+          "default": "",
+          "recommendation": "Use Save As… to capture a working configuration; the last-used values also auto-restore via __last__.json."
+        },
+        {
+          "name": "Import… / Export… (buttons)",
+          "what_it_does": "(Settings, profile bar) Import… loads settings from any JSON on disk; Export… writes the current settings to a JSON file you choose (auto-appends .json). Surfaces a warning dialog on read/write failure.",
+          "default": "",
+          "recommendation": "Use to move a configuration between machines or back it up."
+        },
+        {
+          "name": "Reset (button)",
+          "what_it_does": "(Settings, profile bar) Restores all fields to their factory defaults and sets the profile combo to '(unsaved)'.",
+          "default": "",
+          "recommendation": "Use to start clean if settings drift."
+        },
+        {
+          "name": "Close (button)",
+          "what_it_does": "(Settings, footer) Hides the settings popout. The popout is also auto-hidden when the page is hidden, and the current values are saved as the last-used profile.",
+          "default": "",
+          "recommendation": "Close when done; your changes are kept and auto-restored next visit."
+        },
+        {
+          "name": "Print (button)",
+          "what_it_does": "Starts the run: gating checks -> optional 'Below plate bottom' warning -> optional 'Confirm print setup' dialog -> preflight (prep/ink pickup/preposition on a worker thread) -> hands-free print -> optional cleanup. Disabled unless XY+ZP connected, a well is selected, a plate exists, and an object is chosen, and not while running, positioning, or cleaning.",
+          "default": "Enabled when ready",
+          "recommendation": "Press once everything is green. If it stays disabled, check connection, well selection, and object choice."
+        },
+        {
+          "name": "Abort (button)",
+          "what_it_does": "Stops the active stage: during the preamble it sets the executor abort flag (and a sticky request so the print won't start), otherwise it aborts the PrintManager. Enabled during a print AND during the preflight preamble/cleanup when there's an active executor to interrupt; a plain preposition (no preamble) has nothing to abort.",
+          "default": "Disabled",
+          "recommendation": "Use to safely stop; the needle is left retracted at safe Z on any abort."
+        }
+      ],
+      "safety_notes": [
+        "Print is gated off until BOTH the XY and ZP stages report connected; if the ZP board drops during positioning the print is refused (it re-checks is_zp_connected) so it can't dry-run with the needle parked down.",
+        "Any well descent (prep, ink pickup, post-print cleanup) requires a Safe Z set on the Calibration page; the run refuses to start without it and tells you to set it or disable Prep/ink/cleanup. A plain print only shows a 'No Safe Z' continue-anyway prompt.",
+        "The print height is measured up from the calibrated plate bottom; the controller hard-clamps so a height below the bottom does NOT crash the needle — you get a 'Below plate bottom' warning and the needle is clamped to the bottom, not driven deeper.",
+        "When no Safe Z is calibrated the page never falls back to a raw literal travel Z (which would be a DESCENT on ME3B V1 where Z increases downward) — it derives a polarity-safe travel height 10 mm above the print Z.",
+        "Pre-positioning travels XY with the needle RETRACTED to safe Z (safe_travel_to with target_z_mm=None: raise -> wait -> XY -> wait, never lowers). It runs on a worker thread so the live feed keeps painting.",
+        "Hands-free safety: with no per-print position confirm, the print is refused if the positioning move did not confirm arrival (timeout/unsettled stage) — the needle stays at safe Z.",
+        "On any preamble abort/error the worker's finally retracts the needle to safe Z (executor._retract_to_safe_z) before bailing out, and the print does not start. An Abort requested during a blocking pump/travel move is honored via a sticky flag so the print still won't launch.",
+        "The print ends by retracting out of the well to the travel Z and stopping where it finished (return_home=False) — it does NOT drive the stage back to XY 0,0.",
+        "Multi-object saved prints get one PRINT_PATH per object with a lift -> travel -> lower between them, so the needle does not extrude across seams or drag through already-printed material.",
+        "Aborted or errored prints skip the post-print cleanup; the print's own finally has already left the needle at safe Z. Cleanup is also skipped (with a status note) if the ZP board is disconnected at completion, and the cleanup worker always retracts to safe Z on exit."
+      ],
+      "tips": [
+        "The header summary line (pump · flow µL/s @ % · ink · prep on/off) and the setup-status strip update live — green means a preamble/cleanup is active and ready, peach flags a gap to fix before printing.",
+        "Print speed % is a single master lever: it scales XY traverse and pump flow together so bead width is constant — change it freely to speed up/slow down without re-tuning Flow.",
+        "Leave Ink at '(none — needle already loaded)' if you pre-loaded the needle; the run then skips ink pickup. With Prep also off and Cleanup off, it behaves as a plain legacy print (no preamble, no confirm dialog).",
+        "Use the read-only Locations & Hardware panel in the popout to confirm service-well calibration (✓/yellow/peach) and all reference heights before a run.",
+        "The trajectory monitor shows the planned path, a green executed trace, the well boundary, and a fading needle ghost trail — handy for verifying the path lands inside the well's needle-safe zone.",
+        "Saved settings auto-restore each visit; save named profiles per recipe so you can reload pump/flow/ink/prep combinations quickly.",
+        "The status line reports the execution log filename (logs/prints/...) — useful for diagnosing a run afterward."
+      ],
+      "screenshots": [
+        {
+          "id": "quick-print-main",
+          "caption": "Quick Print main page: header (Back, title, summary, ⚙ Settings), Object + Size row, setup-status strip, trajectory monitor + live camera over the well-plate navigator, and the Print/Abort run row.",
+          "nav": "Workflows mode -> Quick Print tile, with an object selected and a well clicked so the planned path and well boundary render."
+        },
+        {
+          "id": "settings-print",
+          "caption": "Settings popout — Print section: Pump/bore, Flow @100%, Print speed (% max), Height above bottom.",
+          "nav": "Quick Print -> ⚙ Settings, scrolled to the top 'Print' section."
+        },
+        {
+          "id": "settings-ink",
+          "caption": "Settings popout — Ink pickup section: Ink combo (printable inks), Ink dip Z, Pickup safety ×.",
+          "nav": "Quick Print -> ⚙ Settings, 'Ink pickup' section."
+        },
+        {
+          "id": "settings-prep",
+          "caption": "Settings popout — Needle prep + Post-print cleanup sections with their checkboxes and sub-fields.",
+          "nav": "Quick Print -> ⚙ Settings, scrolled to 'Needle prep' and 'Post-print cleanup'."
+        },
+        {
+          "id": "settings-profile-bar",
+          "caption": "Settings popout profile bar: Settings file combo + Save / Save As… / Delete / Import… / Export… / Reset, and the read-only Locations & Hardware panel below.",
+          "nav": "Quick Print -> ⚙ Settings, top profile bar and bottom info panel."
+        },
+        {
+          "id": "confirm-setup-dialog",
+          "caption": "'Confirm print setup' dialog listing prep, ink pickup volume + source well, the print, and the cleanup plan, with a Yes/No gate.",
+          "nav": "Quick Print -> press Print with Prep or ink pickup or cleanup enabled."
+        }
+      ]
+    },
+    {
+      "id": "cell_targeting",
+      "title": "Cell Targeting & Removal Workflow",
+      "overview": "Cell Targeting & Removal trypsinizes cells in place and then extracts and relocates them. For each picked removal location, the needle loads a cell-release reagent (e.g. trypsin) from its reagent well, travels to the cell just off the plate bottom, SLOWLY pushes in a tiny reagent column (needle inner cross-section area x push depth), waits an incubation dwell, then QUICKLY pulls up a multiple of that volume (reagent + released cells), travels to a paired placement location and gently dispenses. An operator uses this to micro-trypsinize specific cells/colonies under the microscope and move them to a new well or spot, with optional standard needle prep before and clean-up after the run. Each removal must be paired one-to-one with a placement target (pick count must equal place count) for Start to enable.",
+      "where_to_find": "Workflows mode -> Workflow picker -> \"Cell Targeting & Removal\" tile. The page opens with the Live target picker on the left and an \"XY Workspace\" view (top) + \"Side View (XZ)\" view (bottom) on the right. The header shows Back, the title, the hint \"Pick = removal location(s) . Place = placement(s)\", a one-line settings summary, a \"Fluorescence\" checkbox, and a \"Settings\" gear button (far right) that opens the full saveable settings popout.",
+      "prerequisites": [
+        "Hardware Setup complete: XY stage connected AND the ZP (Z + pump) board connected. Cell removal refuses to start without ZP because it needs to retract the needle and run the pumps. Click-to-travel in the XY Workspace also requires the XY stage connected.",
+        "A Safe Z height set on the Calibration page (Start refuses without it; click-to-travel will prompt/warn if it is missing).",
+        "Plate bottom Z calibrated on the Calibration page so the removal / place / reagent-dip / service-dip heights (all expressed as a height above the plate bottom) can be resolved. If it is uncalibrated the run is blocked.",
+        "Plate Location run so wells have calibrated XY positions (needed for the reagent well, and for the four service wells if prep/clean is on).",
+        "Needle inner diameter set (Hardware Setup -> Needle): the push volume = needle inner cross-section area x push depth, so a missing/zero bore area gives a non-positive push volume and blocks Start. Needle inner diameter + length are also needed for the '1 needle' prep/clean volume.",
+        "A cell-release reagent (e.g. trypsin) defined in the Ink library, assigned to a reagent location (Hardware Setup -> Ink -> Reagent Locations), and that well calibrated by Plate Location. (Optional: you may choose '(none - needle already loaded)' to skip the reagent load.)",
+        "If prep/clean is enabled: oil, wash, waste, and buffer reagents assigned to wells and calibrated.",
+        "Microscope camera + objective calibrated (um/px) so live-view clicks map to correct stage positions (the picker header shows the effective um/px)."
+      ],
+      "steps": [
+        {
+          "title": "Open the page and the Settings popout",
+          "detail": "From the Workflows picker open the Cell Targeting & Removal tile. Click the 'Settings' gear button in the header to open the scrollable, saveable settings popout where the reagent, push/pull, dwell, speeds, heights and prep/clean are configured. The header shows a one-line summary that reads like 'push X/pull Y uL . dwell Zs . prep on/off'.",
+          "screenshot_ref": "ct-main"
+        },
+        {
+          "title": "Choose the bore and cell-release reagent",
+          "detail": "In Settings -> 'Pump & cell-release reagent', pick the Pump/bore that holds the reagent, then choose the Cell-release reagent. The combo lists library inks that have a reagent location and are NOT service reagents (not wash/waste/buffer/oil, by ink type or by name); it defaults to the bore's assigned ink. There is also a '(none - needle already loaded)' option. Confirm the green status: '✓ Reagent \"X\" <- well Y . load ~Z uL on the P1 bore'. A peach warning means no reagent selected, no reagent location, or the well is not in the calibrated plate.",
+          "screenshot_ref": "ct-settings-pushpull"
+        },
+        {
+          "title": "Set push / pull mechanics and dwell",
+          "detail": "In 'Reagent push / pull' set Push depth (column = needle inner area x depth), Pull (x) multiplier, Dwell (incubation) time, Push flow (slow) and Pull flow (fast). Watch the readout 'push X uL . pull Y uL' (4 decimals) update. If it shows 'V = - (set needle inner Ø)', set the needle in Hardware Setup -> Needle.",
+          "screenshot_ref": "ct-settings-pushpull"
+        },
+        {
+          "title": "Set the heights",
+          "detail": "In 'Removal & placement heights' set Removal Z (height above plate bottom at the cell, default 0.10 mm - just off the glass) and Place Z (height when dispensing, default 0.50 mm). In 'Pump & cell-release reagent' set Reagent dip Z (when aspirating reagent). If using prep/clean also set Service dip Z. All are heights above the calibrated plate bottom and resolved polarity-safely; if plate bottom is uncalibrated the run is blocked.",
+          "screenshot_ref": "ct-settings-pushpull"
+        },
+        {
+          "title": "Configure needle prep / clean (optional)",
+          "detail": "Leave 'Prep needle (waste -> oil -> wash -> buffer)' and 'Clean after (waste -> wash -> buffer)' checked (both default ON) to condition the needle once before the loop and clean once after. Tune Prep/clean flow, Oil/Buffer needles, Wash cycles + Z/XY jiggle + settle, and Clean dispense. The prep status turns green ('✓ 1 needle = X uL . oil=.. wash=.. waste=.. buffer=..') once the needle volume and all four service wells are assigned and calibrated. Turning BOTH off makes the run 'removal only' and disables the prep/clean sub-fields.",
+          "screenshot_ref": "ct-settings-prep"
+        },
+        {
+          "title": "Pick the removal locations",
+          "detail": "In the Live target picker, set the 'Click adds to:' radio to Pick. Left-click each cell/colony to remove - each becomes a green P001, P002... marker. Right-click near a marker (within ~250 um) to remove the nearest one, or use 'Remove selected' / 'Clear all' in the Pick targets list.",
+          "screenshot_ref": "ct-picker-modes"
+        },
+        {
+          "title": "Pick the placement locations (one per removal)",
+          "detail": "Switch the 'Click adds to:' radio to Place and left-click each destination - mauve D001, D002... markers appear, joined to their paired pick by a dashed connector (P001->D001 by index). The pairing status must read '✓ N pick->place pair(s) ready.' (green). If counts differ it warns 'N pick(s) / M place(s) - counts must match.' (peach) and Start stays disabled.",
+          "screenshot_ref": "ct-picker-modes"
+        },
+        {
+          "title": "Start the run",
+          "detail": "Click 'Start cell removal'. The button only enables when pairs are balanced (>=1 pair, equal counts), a bore exists, and no run is active. On click the page also gates on Safe Z set, ZP connected, resolved plate-bottom heights (removal/place/reagent-dip + service-dip if prep/clean), a positive push volume (needle inner Ø set), a reagent with a calibrated well + dip Z, and - when prep/clean is on - the needle volume + the four service wells (waste/oil/wash/buffer) assigned and calibrated. If any gate fails the status line states exactly what to fix.",
+          "screenshot_ref": "ct-main"
+        },
+        {
+          "title": "Monitor and finish",
+          "detail": "Prep runs once first (if enabled). For each pair the executor loads reagent, travels to the removal target and lowers to Removal Z, slow-pushes, incubates the dwell, fast-pulls, travels to the placement and lowers to Place Z, then gently dispenses. Clean runs once after the loop (if enabled). The status shows per-region sub-steps and a [done/total] progress line. 'Abort' requests a cooperative stop. On any exit (done/abort/error) the needle is always raised to Safe Z; the status ends 'Done.' or 'Stopped (aborted or failed).'",
+          "screenshot_ref": "ct-main"
+        }
+      ],
+      "settings": [
+        {
+          "name": "'Click adds to: Pick / Place' radio (live picker)",
+          "what_it_does": "Two radio buttons that route the next left-click in the live view into the Pick list (green removal targets P001...) or the Place list (mauve placement targets D001...). Right-click removes the nearest target in the active list within ~250 um.",
+          "default": "Pick",
+          "recommendation": "Pick all removal cells first, then switch to Place and add one destination per pick."
+        },
+        {
+          "name": "Pick targets list + 'Clear all' / 'Remove selected'",
+          "what_it_does": "Lists each removal target as 'P00n -> D00n (x, y)' in absolute stage um. 'Clear all' empties the picks (resets numbering to P001); 'Remove selected' deletes highlighted rows.",
+          "default": "empty",
+          "recommendation": "Use right-click on the feed for quick single removals; list buttons for bulk edits."
+        },
+        {
+          "name": "Place targets list + 'Clear all' / 'Remove selected'",
+          "what_it_does": "Lists each placement target as 'P00n -> D00n (x, y)' in absolute stage um, with the same clear/remove controls. Pairing is by index; counts must equal the picks to enable Start.",
+          "default": "empty",
+          "recommendation": "Keep place count equal to pick count - the pairing banner only turns green when balanced."
+        },
+        {
+          "name": "Pairing status banner (live picker)",
+          "what_it_does": "Read-only status: 'No targets yet.', '✓ N pick->place pair(s) ready.' (green when balanced), or '⚠ N pick(s) / M place(s) - counts must match. Each pick needs its own place.' (peach).",
+          "default": "No targets yet.",
+          "recommendation": "Wait for the green message before clicking Start."
+        },
+        {
+          "name": "um/px readout (live picker header)",
+          "what_it_does": "Shows the effective microscope um/px used to map clicks to stage um, rescaled to the live frame width (shows 'cal X@W -> live Wpx' when the calibration and live resolutions differ).",
+          "default": "um/px: —",
+          "recommendation": "If it reads '—', calibrate the objective so clicks land accurately."
+        },
+        {
+          "name": "Fluorescence checkbox (header)",
+          "what_it_does": "Overlays the captured fluorescence mosaic(s) for this plate (from the Fluorescence Mosaic workflow) on the XY Workspace. If none exists it auto-unchecks and the status explains to run that workflow first.",
+          "default": "off",
+          "recommendation": "Turn on to locate fluorescently-labeled cells before picking removal spots."
+        },
+        {
+          "name": "Settings gear button (header)",
+          "what_it_does": "Opens the full, scrollable, saveable settings popout (heights, reagent, push/pull, dwell, speeds, prep/clean, motion, locations). It is a modeless child that hides when the page is hidden.",
+          "default": "n/a",
+          "recommendation": "Save a named profile per protocol so you can reload exact push/pull/dwell settings later."
+        },
+        {
+          "name": "Start cell removal (run row)",
+          "what_it_does": "Builds one operation per pick->place pair and runs the queue on a worker thread. Enabled only when pairs are balanced, a bore exists, and no run is active; on click it re-checks all safety/calibration gates and reports the first missing item in the status line.",
+          "default": "disabled until balanced",
+          "recommendation": "If Start seems to do nothing, read the status line - it names the exact unmet condition."
+        },
+        {
+          "name": "Abort (run row)",
+          "what_it_does": "Sets the executor abort flag for a cooperative stop; the run finishes the current safe step, retracts to Safe Z, and reports 'Stopped (aborted or failed).' Enabled only while running.",
+          "default": "disabled",
+          "recommendation": "Use to safely halt; the needle still ends at Safe Z."
+        },
+        {
+          "name": "XY Workspace view (right, top)",
+          "what_it_does": "Top-down plate/needle view showing calibrated wells, current stage position, and pick (green) / place (mauve) overlays. Left-click = click-to-travel (always retracts via safe_travel_to when Safe Z is known, target_z None = stays retracted); right-click = 'Fast travel here' (retract Z, travel XY, restore the current Z). Prompts/warns if no Safe Z. Requires the XY stage connected.",
+          "default": "n/a",
+          "recommendation": "Use click-to-travel to verify a target before running; it never lowers the needle at a new XY without retracting first."
+        },
+        {
+          "name": "Side View (XZ) + Z-reference 'Go to' badges (right, bottom)",
+          "what_it_does": "Side profile of needle height vs. plate, showing Safe Z and the Z-reference heights (replace/max/fast-move/plate-top/plate-bottom). Clicking a Z badge issues move_z_absolute to that zero-ref Z (no-op if ZP disconnected).",
+          "default": "n/a",
+          "recommendation": "Use the Safe badge to retract Z manually while setting up."
+        },
+        {
+          "name": "Removal Z (↑ bottom) [Settings]",
+          "what_it_does": "Needle height above the plate bottom at the cell-removal location. Range 0.0-20.0 mm, 2 decimals, 0.05 step. Maps to CellRemovalConfig.removal_z_offset_mm (executor pick_z_mm).",
+          "default": "0.10 mm",
+          "recommendation": "Keep small (just off the glass) so the reagent column lands on the cells."
+        },
+        {
+          "name": "Place Z (↑ bottom) [Settings]",
+          "what_it_does": "Needle height above the plate bottom when dispensing extracted cells. Range 0.0-20.0 mm, 2 decimals, 0.05 step. Maps to place_z_offset_mm (executor place_z_mm).",
+          "default": "0.50 mm",
+          "recommendation": "Slightly higher than removal Z so the droplet releases cleanly."
+        },
+        {
+          "name": "Pump / bore [Settings]",
+          "what_it_does": "Selects which pump/bore (P1, P2...) holds and dispenses the reagent. Populated from enabled + configured pumps (falls back to P1). Maps to CellRemovalConfig.reagent_bore and the prep_bore.",
+          "default": "first enabled+configured pump (else P1)",
+          "recommendation": "Match the bore that physically carries the trypsin/reagent line."
+        },
+        {
+          "name": "Cell-release reagent [Settings]",
+          "what_it_does": "The reagent the needle loads (e.g. trypsin). Lists library inks that have a reagent location and are NOT service reagents. Defaults to the bore's assigned ink; '(none - needle already loaded)' skips the reagent load. Status shows resolved well + load volume (green), or a peach warning if no reagent / no location / well not calibrated.",
+          "default": "bore's assigned printable ink, else (none)",
+          "recommendation": "Required for Start unless you intentionally choose '(none - needle already loaded)'; confirm the green status before running."
+        },
+        {
+          "name": "Reagent dip Z (↑ bottom) [Settings]",
+          "what_it_does": "Needle dip height above the plate bottom when aspirating reagent at its well. Range 0.0-30.0 mm, 2 decimals, 0.1 step. Resolved to a zero-ref Z (executor reagent_dip_z_mm).",
+          "default": "0.50 mm",
+          "recommendation": "Deep enough to reach the reagent fluid without touching the well bottom."
+        },
+        {
+          "name": "Push depth [Settings]",
+          "what_it_does": "Reagent column pushed in = needle inner cross-section area x this depth (mm^3 = uL). Range 0.001-5.0 mm, 3 decimals, 0.05 step. Drives the live push uL readout and release_depth_mm/release_volume_uL.",
+          "default": "0.10 mm",
+          "recommendation": "A small column relative to the bore; increase only if more reagent is needed to release the cells."
+        },
+        {
+          "name": "Pull (×) [Settings]",
+          "what_it_does": "Extraction pull volume = this multiple of the pushed volume (reagent + released cells). Range 1.0-20.0, 2 decimals, 0.5 step. Maps to extract_multiplier.",
+          "default": "2.0",
+          "recommendation": "~2x recovers reagent plus released cells without grabbing too much surrounding fluid."
+        },
+        {
+          "name": "Dwell (incubation) [Settings]",
+          "what_it_does": "Incubation time the reagent dwells at the cell before extraction. Range 0-3600 s, 0 decimals, 5 s step. Maps to dwell_time_s; the run blocks at the cell for this time per region.",
+          "default": "60 s",
+          "recommendation": "Set to your trypsinization time for the cell line."
+        },
+        {
+          "name": "Push flow (slow) [Settings]",
+          "what_it_does": "Slow flow rate to push reagent in (and the gentle final dispense). Range 0.01-50.0 uL/s, 2 decimals, 0.1 step. Maps to push_speed_uL_s.",
+          "default": "0.5 uL/s",
+          "recommendation": "Keep slow so the reagent is delivered gently onto the cells."
+        },
+        {
+          "name": "Pull flow (fast) [Settings]",
+          "what_it_does": "Fast flow rate to pull released cells up. Range 0.01-50.0 uL/s, 2 decimals, 0.5 step. Maps to pull_speed_uL_s.",
+          "default": "5.0 uL/s",
+          "recommendation": "Fast so detached cells are drawn up before they resettle."
+        },
+        {
+          "name": "Prep needle (waste -> oil -> wash -> buffer) checkbox [Settings]",
+          "what_it_does": "When checked, runs standard needle conditioning ONCE before the loop: dispense oil to waste, draw oil, wash, draw buffer. Enables the prep/clean sub-fields and requires the four service wells + needle volume at Start.",
+          "default": "on",
+          "recommendation": "Leave on for a clean needle; turn off (with clean off) for a quick removal-only run."
+        },
+        {
+          "name": "Clean after (waste -> wash -> buffer) checkbox [Settings]",
+          "what_it_does": "When checked, runs needle clean-up ONCE after the loop: dispense residual to waste, wash, draw buffer. Also enables the prep/clean sub-fields and contributes to the service-well requirement.",
+          "default": "on",
+          "recommendation": "Leave on to clean residual reagent/cells out of the needle after the run."
+        },
+        {
+          "name": "Service dip Z (↑ bottom) [Settings]",
+          "what_it_does": "Needle dip height above plate bottom at the service wells (waste/oil/wash/buffer). Range 0.0-30.0 mm, 2 decimals, 0.1 step. Enabled only when prep or clean is on (executor service_z_mm).",
+          "default": "0.50 mm",
+          "recommendation": "Deep enough to reach fluid in the service wells."
+        },
+        {
+          "name": "Prep / clean flow [Settings]",
+          "what_it_does": "Aspirate/dispense flow rate during prep and clean. Range 0.01-50.0 uL/s, 2 decimals, 0.1 step (executor prep_rate_uL_s). Enabled only when prep or clean is on.",
+          "default": "1.0 uL/s",
+          "recommendation": "Moderate flow; slow it down for viscous or shear-sensitive reagents."
+        },
+        {
+          "name": "Oil (needles) [Settings]",
+          "what_it_does": "Number of needle-volumes of oil dispensed to waste / aspirated from oil during prep. Range 0.0-20.0, 1 decimal, 0.5 step (executor oil_needles). '1 needle' = needle inner area x length. Enabled only when prep or clean is on.",
+          "default": "1.0",
+          "recommendation": "Default 1 needle is usually enough to refresh the oil bracket."
+        },
+        {
+          "name": "Buffer (needles) [Settings]",
+          "what_it_does": "Number of needle-volumes of buffer drawn after the wash during prep. Range 0.0-20.0, 1 decimal, 0.5 step (executor buffer_needles). Enabled only when prep or clean is on.",
+          "default": "4.0",
+          "recommendation": "Default 4 needles fills the line with buffer ahead of the run."
+        },
+        {
+          "name": "Wash cycles [Settings]",
+          "what_it_does": "Number of dip-jiggle cycles at the wash well during prep/clean. Integer 0-50 (executor wash_cycles). Enabled only when prep or clean is on.",
+          "default": "3",
+          "recommendation": "More cycles = more thorough wash; 3 is a reasonable default."
+        },
+        {
+          "name": "Wash Z jiggle [Settings]",
+          "what_it_does": "How far up/down each wash jiggle moves. Range 0.0-10.0 mm, 2 decimals, 0.1 step (executor wash_z_amplitude_mm). Enabled only when prep or clean is on.",
+          "default": "0.5 mm",
+          "recommendation": "Keep within the wash well depth so the tip stays submerged."
+        },
+        {
+          "name": "Wash XY jiggle [Settings]",
+          "what_it_does": "Random XY radius about the wash well centre during the wash. Range 0.0-5000.0 um, 0 decimals, 10 um step (executor wash_xy_amplitude_um). Enabled only when prep or clean is on.",
+          "default": "200 um",
+          "recommendation": "Keep well inside the wash well so the tip never hits the wall."
+        },
+        {
+          "name": "Wash settle [Settings]",
+          "what_it_does": "Settle time between wash jiggles. Range 0.0-30.0 s, 2 decimals, 0.1 step (executor wash_dwell_s). Enabled only when prep or clean is on.",
+          "default": "0.3 s",
+          "recommendation": "Short settle is fine; increase for more agitation time."
+        },
+        {
+          "name": "Clean dispense (needles) [Settings]",
+          "what_it_does": "Number of needle-volumes of residual dispensed to waste during the post-clean. Range 0.0-20.0, 1 decimal, 0.5 step (executor post_dispense_needles). Enabled only when prep or clean is on.",
+          "default": "1.0",
+          "recommendation": "Default 1 needle clears residual reagent/cells to waste."
+        },
+        {
+          "name": "Intra-well retract [Settings, advanced]",
+          "what_it_does": "Short Z retract used for moves within one well. Range 0.0-20.0 mm, 2 decimals, 0.1 step (executor intra_well_retract_mm). Always applied.",
+          "default": "1.0 mm",
+          "recommendation": "Leave at default unless intra-well hops drag the needle."
+        },
+        {
+          "name": "Z timeout [Settings, advanced]",
+          "what_it_does": "Z-move arrival timeout. Range 1.0-120.0 s, 0 decimals, 1 s step (executor z_timeout_s). Always applied.",
+          "default": "15 s",
+          "recommendation": "Raise only if slow Z moves time out on your hardware."
+        },
+        {
+          "name": "XY timeout [Settings, advanced]",
+          "what_it_does": "XY-move arrival timeout. Range 1.0-240.0 s, 0 decimals, 1 s step (executor xy_timeout_s). Always applied.",
+          "default": "30 s",
+          "recommendation": "Raise only if long XY travels time out on your hardware."
+        },
+        {
+          "name": "Locations & Hardware (read-only info section) [Settings]",
+          "what_it_does": "Read-only summary of where all inks/reagents/service wells are, needle/syringe geometry, pump<->ink, calibrated Z heights and Safe Z, plus the selected cell-release reagent and its well. Rebuilt each time the popout is shown.",
+          "default": "n/a",
+          "recommendation": "Glance here to confirm the reagent and service wells resolve before a run."
+        },
+        {
+          "name": "Profile bar: Save / Save As / Delete / Import / Export / Reset + profile combo [Settings]",
+          "what_it_does": "Save, reload, delete, import/export, or reset named settings profiles for this workflow; the last-used set auto-restores when the page opens.",
+          "default": "last-used profile",
+          "recommendation": "Save a profile per cell line/protocol so push/pull/dwell/heights are one click away."
+        }
+      ],
+      "safety_notes": [
+        "The ZP (Z + pump) board MUST be connected before Start - the workflow needs it to retract the needle and run the pumps, and it refuses to start otherwise with an explicit status message.",
+        "If the ZP board drops mid-run, the executor's _safe_move_to raises AbortException (is_zp_connected check), stopping the run instead of dragging a lowered needle.",
+        "Every cross-position XY move (reagent well, removal target, placement, service wells, click-to-travel) routes through StageController.safe_travel_to, which retracts Z to Safe Z and waits for arrival before moving XY - the needle is never dragged across the plate while lowered.",
+        "On ANY exit (completion, abort, or error) the run's finally block raises the needle to Safe Z via ensure_retracted_to (raise-only, polarity-safe) - it never leaves the needle parked down in a well.",
+        "Start is blocked (with an explicit status message) unless: pick/place counts are balanced (>=1 pair), Safe Z is set, ZP is connected, plate bottom Z is calibrated (removal/place/reagent-dip + service-dip heights resolve), the push volume is positive (needle inner diameter set), the reagent has a calibrated well + dip Z, and - when prep/clean is on - the needle volume + all four service wells (waste/oil/wash/buffer) are assigned and calibrated.",
+        "Removal Z defaults to 0.10 mm above the plate bottom (just off the glass) - too small a value risks the tip contacting the bottom; verify the calibrated plate bottom is correct before running.",
+        "Click-to-travel in the XY Workspace with no Safe Z prompts (Yes/No, default No) before moving XY without retracting; right-click 'Fast travel here' refuses entirely without a Safe Z. Both require the XY stage connected.",
+        "Heights are resolved polarity-safe for ME3B V1 (needle descends as raw Z increases); a missing/uncalibrated plate bottom yields None and blocks the run rather than guessing."
+      ],
+      "tips": [
+        "Pick i pairs with Place i by index, shown by the dashed connector on the live feed - the run truncates to the shorter list, but Start requires equal counts (is_balanced).",
+        "The push volume is computed as needle inner cross-section area x Push depth, so the same Push depth gives a different uL on a different bore - the live 'push X uL . pull Y uL' readout (4 decimals) reflects the actual needle.",
+        "The pump is volume-balanced per region (load - push - pull + dispense = 0) so it does not drift over a multi-region run.",
+        "Right-click near a marker on the live feed removes the nearest target within ~250 um - faster than the list buttons for one-offs.",
+        "Prep and clean each run only ONCE (before / after the whole loop), not per region - so the per-region time is dominated by the Dwell incubation.",
+        "Turn BOTH Prep and Clean off for a fast 'removal only' run when the needle is already conditioned; this also drops the service-well requirement at Start and disables the prep/clean sub-fields.",
+        "Use the XY Workspace click-to-travel or the Fluorescence overlay to confirm you are aiming at the right cells before committing to a run."
+      ],
+      "screenshots": [
+        {
+          "id": "ct-main",
+          "caption": "Full Cell Targeting & Removal page: header (Back, title, hint 'Pick = removal location(s) . Place = placement(s)', settings summary, Fluorescence checkbox, Settings gear), live picker on the left, XY Workspace + Side View (XZ) on the right, and the run row (Start cell removal / Abort / status).",
+          "nav": "Workflows -> Workflow picker -> Cell Targeting & Removal tile."
+        },
+        {
+          "id": "ct-picker-modes",
+          "caption": "Live target picker with the 'Click adds to: Pick / Place' radios, several green pick markers (P001...) joined by dashed connectors to mauve place markers (D001...), the Pick/Place lists, and the green '✓ N pick->place pair(s) ready.' status.",
+          "nav": "On the page, add a few removal points (Pick mode) and destinations (Place mode) to populate both lists."
+        },
+        {
+          "id": "ct-settings-pushpull",
+          "caption": "Settings popout scrolled to 'Removal & placement heights', 'Pump & cell-release reagent', and 'Reagent push / pull' - showing the reagent combo + green status, push/pull/dwell/speed spinboxes, and the live 'push X uL . pull Y uL' readout.",
+          "nav": "Click the Settings gear; top three sections of the dialog."
+        },
+        {
+          "id": "ct-settings-prep",
+          "caption": "Settings popout scrolled to 'Needle prep / clean' - Prep and Clean checkboxes, service dip Z, prep/clean flow, oil/buffer needles, wash cycles/amplitudes/settle, clean dispense, and the green prep status listing the resolved service wells.",
+          "nav": "Click the Settings gear; scroll to the Needle prep / clean section."
+        },
+        {
+          "id": "ct-settings-locations",
+          "caption": "Settings popout 'Motion & timeouts (advanced)', the 'Locations & Hardware' read-only panel, plus the profile bar (Save / Save As / Delete / Import / Export / Reset + profile combo).",
+          "nav": "Click the Settings gear; scroll to the bottom info section and the profile bar."
+        }
+      ]
+    },
+    {
+      "id": "spheroid_pickup",
+      "title": "Spheroid Pick & Place Workflow",
+      "overview": "This workflow aspirates spheroids one-at-a-time from source locations you click on the live microscope view and deposits each at a paired destination location. You click multiple \"pick\" points (green, P001…) and an equal number of \"place\" points (mauve, D001…) in the shared camera view; pick i is deposited at place i (paired by index, joined by a dashed connector line). For every pick/place pair the needle safe-travels to the source, lowers to the Pick Z, aspirates a volume computed from the spheroid diameter, raises and travels to the destination, lowers to the Place Z, and dispenses the same volume. An optional needle-conditioning PREP (waste → oil → wash → buffer) runs once before the loop and an optional post-clean (dispense → wash → buffer) runs once after. The needle always ends raised at the Safe Z on completion, abort, or error.",
+      "where_to_find": "Workflows mode → Workflow picker → \"Spheroid Pick & Place\" tile. (Backend page: gui/pages/workflows/spheroid_pickup_workflow.py, routed via workflows_mode.py.)",
+      "prerequisites": [
+        "Hardware Setup completed: XY (Prior) stage AND ZP (Z + pump) board both connected. The Start gate refuses to run if the ZP board is not connected (it is needed to retract the needle before XY moves and to drive the aspirate/dispense pumps).",
+        "A microscope camera assigned to the MICROSCOPE role with a calibrated objective (microscope µm/px). Clicks in the live view are converted to stage µm using the objective calibration; without it the picker shows 'µm/px: —' and clicked targets will be mis-located.",
+        "Calibration page: a Safe Z (safe travel height) must be set, and the plate-bottom Z must be calibrated. Both are gated at Start: the Pick Z and Place Z offsets are heights above the calibrated plate bottom, so they cannot be resolved without it.",
+        "A pump/bore configured (the Pump/bore combo is populated from enabled + configured pumps; falls back to P1 if none are found).",
+        "If using PREP or post-clean: a configured needle with inner diameter + length set (Hardware Setup → Needle), so one 'needle' volume is known; and the waste / oil / wash / buffer service wells assigned in Hardware Setup → Ink (Reagent Locations) AND calibrated in the plate map. Prep needs all four (waste/oil/wash/buffer); post-clean needs waste/wash/buffer."
+      ],
+      "steps": [
+        {
+          "title": "Open the workflow",
+          "detail": "From Workflows mode, click the 'Spheroid Pick & Place' tile. The page shows the Live target picker (left), the XY Workspace and Side View (XZ) (right, in a vertical split), and a Start/Abort + status row at the bottom. The left context panel is the standard Jog panel (jog controls, shared with the Jog page; the connect controls are hidden here).",
+          "screenshot_ref": "spheroid-main"
+        },
+        {
+          "title": "Confirm the live view is calibrated",
+          "detail": "Check the 'µm/px:' readout at the top of the Live target picker. If it shows a number (optionally 'cal 0.xxx@W → live Wpx' when the live resolution differs from the calibration resolution), the click-to-stage transform is valid. If it shows '—', assign the microscope camera and select/calibrate its objective in Hardware Setup first.",
+          "screenshot_ref": "spheroid-picker"
+        },
+        {
+          "title": "Set the spheroid size, bore and heights in Settings",
+          "detail": "Click '⚙ Settings' in the header. In 'Spheroid & bore' set Spheroid diameter (drives the aspirate/dispense volume), choose the Pump/bore, and adjust the Safety factor. The live 'V = … µL (×…)' readout shows the computed per-pick volume. In 'Heights (above plate bottom)' set Pick Z and Place Z. Optionally tune Flow rates and Pauses/dwell.",
+          "screenshot_ref": "spheroid-settings"
+        },
+        {
+          "title": "Pick the source locations",
+          "detail": "With the Mode toggle ('Click adds to:') set to 'Pick' (default), left-click each spheroid in the live view. Each click adds a green marker (P001, P002, …) and a row to the Pick targets list. Right-click near a marker removes the nearest pick (within 250 µm); 'Remove selected' / 'Clear all' also edit the list.",
+          "screenshot_ref": "spheroid-picker"
+        },
+        {
+          "title": "Pick the destination(s)",
+          "detail": "Switch the Mode toggle to 'Place', then left-click each deposit location (mauve markers D001, D002, …). A dashed connector line joins each pick to its paired place. You need exactly one place per pick — the pairing status reads '✓ N pick→place pair(s) ready.' (green) when balanced, or a peach '⚠ N pick(s) / M place(s) — counts must match' warning otherwise.",
+          "screenshot_ref": "spheroid-picker"
+        },
+        {
+          "title": "Configure needle conditioning (optional)",
+          "detail": "In Settings, the 'Prep needle (waste → oil → wash → buffer)' checkbox (default ON) runs prep once before picking. Set Service dip Z, Prep flow, Oil/Buffer needle counts, and wash parameters. 'Clean after the run (dispense → wash → buffer)' (default OFF) runs once after the run. The prep status line shows '✓ 1 needle = … µL · waste=… oil=… wash=… buffer=…' when everything is assigned + calibrated, or a peach warning naming what is missing (needle geometry, unassigned wells, or uncalibrated plate bottom).",
+          "screenshot_ref": "spheroid-prep"
+        },
+        {
+          "title": "Verify targets and stage position",
+          "detail": "The XY Workspace mirrors your picks (green) and places (mauve) as overlays and shows the live needle position (tracked ~5 Hz); the Side View (XZ) shows needle height with clickable Z-reference badges. Left-click the workspace to safe-travel the stage there (always retracts Z first); right-click for 'Fast travel here' (retract, travel, restore previous Z).",
+          "screenshot_ref": "spheroid-main"
+        },
+        {
+          "title": "Start the run",
+          "detail": "Click 'Start spheroid pickup'. It is enabled only when picks/places are balanced, a bore exists, and no run is in progress. At Start the page validates in order: balanced picks/places, Safe Z set, ZP connected, plate-bottom Z calibrated (resolves Pick Z + Place Z), and — if prep/clean is on — needle volume + required service wells + service dip Z. Status shows 'Running N spheroid pickup(s)…' then per-step messages. The needle conditions (if prep on), then for each pair: travel → lower to Pick Z → aspirate → (pause after pick) → travel → lower to Place Z → dispense → (pause after place).",
+          "screenshot_ref": "spheroid-run"
+        },
+        {
+          "title": "Monitor and abort if needed",
+          "detail": "Watch the status label for '[done/total] …' progress and per-operation sub-steps. Click 'Abort' (enabled only while running) to stop after the current sub-step. On completion, abort, or error the executor always retracts the needle to the Safe Z (raise-only), so it never parks down in a well. Final status reads 'Done.' or 'Stopped (aborted or failed).'",
+          "screenshot_ref": "spheroid-run"
+        }
+      ],
+      "settings": [
+        {
+          "name": "← Back to Workflows (header button)",
+          "what_it_does": "Returns to the Workflows picker.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "🔬 Fluorescence (header checkbox)",
+          "what_it_does": "Overlays the captured fluorescence mosaic(s) for this plate (from the Fluorescence Mosaic workflow) onto the XY Workspace. If no mosaic exists for the plate it unticks itself and shows a status hint.",
+          "default": "off",
+          "recommendation": "Turn on only after you have captured a fluorescence mosaic for this plate."
+        },
+        {
+          "name": "⚙ Settings (header button)",
+          "what_it_does": "Opens the full scrollable, saveable settings popout (Spheroid & bore, Heights, Flow rates, Pauses, Needle prep, Post-clean, Motion & timeouts, Locations). A one-line summary 'Ø…µm · pick …/place … µL/s · prep on/off' stays in the header.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "Live target picker — Mode toggle ('Click adds to:' Pick / Place radio)",
+          "what_it_does": "Routes the next left-click: Pick adds a green extraction target (P###); Place adds a mauve destination (D###). Right-click removes the nearest target of the active mode within 250 µm.",
+          "default": "Pick",
+          "recommendation": "Add all picks first, then switch to Place and add one place per pick."
+        },
+        {
+          "name": "Live target picker — Pick targets list + Clear all / Remove selected",
+          "what_it_does": "Lists pick targets with their pairing ('P001 → D001' or '(unpaired)') and stage µm coordinates. 'Clear all' empties the pick list; 'Remove selected' deletes highlighted rows.",
+          "default": "empty",
+          "recommendation": ""
+        },
+        {
+          "name": "Live target picker — Place targets list + Clear all / Remove selected",
+          "what_it_does": "Lists place targets with their pairing and stage µm coordinates. 'Clear all' empties the place list; 'Remove selected' deletes highlighted rows.",
+          "default": "empty",
+          "recommendation": "Keep the place count equal to the pick count or Start stays disabled."
+        },
+        {
+          "name": "XY Workspace — left-click (Travel here)",
+          "what_it_does": "Click-to-travel: safe-travels the stage to the clicked point. Always retracts Z to the Safe Z first via safe_travel_to (a near no-op if already retracted). If no Safe Z is set it asks before moving XY without retracting. No-op if the XY stage is not connected.",
+          "default": "",
+          "recommendation": "Use to position the live view over a region before picking."
+        },
+        {
+          "name": "XY Workspace — right-click (Fast travel here)",
+          "what_it_does": "Retracts Z to Safe Z, travels XY, then restores the previous Z. Requires a Safe Z (warns and cancels if unset). No-op if the XY stage is not connected.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "Side View (XZ) — Z-reference badges",
+          "what_it_does": "Clicking a Z badge issues move_z_absolute to that zero-ref height. No-op when the ZP board is disconnected.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "Spheroid diameter (µm)",
+          "what_it_does": "Estimated spheroid diameter; sets the aspirate/dispense volume via V = (4/3)π(d/2)³ × safety factor (µm³ → µL). Shown live in the 'V = …' label.",
+          "default": "200.0 µm",
+          "recommendation": "Range 1–5000 µm (step 10). Set to your spheroid's measured diameter; volume scales with the cube of diameter."
+        },
+        {
+          "name": "Pump / bore",
+          "what_it_does": "Which pump drives both the aspirate and the dispense. Populated from enabled + configured pumps in the hardware config; falls back to a single 'P1' entry if none are found.",
+          "default": "first available pump (else P1)",
+          "recommendation": "Pick the pump connected to the needle bore you are using."
+        },
+        {
+          "name": "Safety factor (×)",
+          "what_it_does": "Volume multiplier on the computed spheroid volume — aspirate a bit more than the bare spheroid volume so the spheroid is reliably captured.",
+          "default": "1.5",
+          "recommendation": "Range 1.0–5.0 (step 0.1). 1.5 is a good start; increase if spheroids are missed."
+        },
+        {
+          "name": "Pick Z (↑ bottom)",
+          "what_it_does": "Needle height above the calibrated plate bottom when aspirating at the source (pick_z_offset_mm). Resolved to a zero-ref Z via the plate-bottom datum.",
+          "default": "0.10 mm",
+          "recommendation": "Range 0–20 mm (step 0.05). Keep it just off the glass (~0.1 mm) to grab a settled spheroid."
+        },
+        {
+          "name": "Place Z (↑ bottom)",
+          "what_it_does": "Needle height above the calibrated plate bottom when dispensing at the destination (place_z_offset_mm).",
+          "default": "0.50 mm",
+          "recommendation": "Range 0–20 mm (step 0.05). Usually higher than Pick Z so the spheroid is released cleanly."
+        },
+        {
+          "name": "Pick (aspirate) flow (µL/s)",
+          "what_it_does": "Aspiration flow rate at the pick location (pickup_speed_uL_s). The pump command clamps to the safe flow limit internally.",
+          "default": "1.0 µL/s",
+          "recommendation": "Range 0.01–50 (step 0.1). Slower is gentler on fragile spheroids."
+        },
+        {
+          "name": "Place (dispense) flow (µL/s)",
+          "what_it_does": "Dispense flow rate at the place location (release_speed_uL_s).",
+          "default": "1.0 µL/s",
+          "recommendation": "Range 0.01–50 (step 0.1)."
+        },
+        {
+          "name": "Pause after pick (s)",
+          "what_it_does": "Hold time after aspirating, so the spheroid settles into the bore (pick_dwell_s). 0 = no pause.",
+          "default": "0.0 s",
+          "recommendation": "Range 0–3600 (step 0.5). Add a short hold (e.g. 1–2 s) if spheroids slip back out."
+        },
+        {
+          "name": "Pause after place (s)",
+          "what_it_does": "Hold time after dispensing, so the spheroid releases from the bore (place_dwell_s). 0 = no pause.",
+          "default": "0.0 s",
+          "recommendation": "Range 0–3600 (step 0.5)."
+        },
+        {
+          "name": "Prep needle (waste → oil → wash → buffer) (checkbox)",
+          "what_it_does": "Runs the needle-conditioning prep ONCE before the pick/place loop: dispense oil to waste, aspirate fresh oil, wash, aspirate buffer. Service-well locations are inherited from Hardware Setup → Ink (Reagent Locations).",
+          "default": "on",
+          "recommendation": "Leave on for clean picks; turn off only for a quick bare pick/place test."
+        },
+        {
+          "name": "Service dip Z (↑ bottom)",
+          "what_it_does": "Needle dip height above the plate bottom at the service wells during prep/clean (service_z_mm). Enabled when prep OR post-clean is on.",
+          "default": "0.50 mm",
+          "recommendation": "Range 0–30 mm (step 0.1). Enough to dip into reagent without touching glass."
+        },
+        {
+          "name": "Prep flow (µL/s)",
+          "what_it_does": "Aspirate/dispense flow rate used throughout prep and post-clean (prep_rate_uL_s). Enabled when prep OR post-clean is on.",
+          "default": "1.0 µL/s",
+          "recommendation": "Range 0.01–50 (step 0.1)."
+        },
+        {
+          "name": "Oil (needles)",
+          "what_it_does": "Number of needle-bore volumes of oil dispensed to waste AND aspirated from the oil well during prep (oil_needles). Prep-only — enabled only when prep is on.",
+          "default": "1.0",
+          "recommendation": "Range 0–20 (step 0.5). 1 needle is typical."
+        },
+        {
+          "name": "Buffer (needles)",
+          "what_it_does": "Number of needle-bore volumes of buffer aspirated after the wash (buffer_needles). Used by BOTH prep and post-clean; enabled when either is on.",
+          "default": "4.0",
+          "recommendation": "Range 0–20 (step 0.5)."
+        },
+        {
+          "name": "Wash cycles",
+          "what_it_does": "Number of dip-jiggle cycles (Z jiggle + random XY about the well centre) at the wash well (wash_cycles). Used by prep and post-clean; enabled when either is on.",
+          "default": "3",
+          "recommendation": "Range 0–50 (integer)."
+        },
+        {
+          "name": "Wash Z jiggle (mm)",
+          "what_it_does": "How far up/down each wash jiggle moves the needle (wash_z_amplitude_mm). The needle always returns to the exact dip Z with an absolute move so it can't walk toward the glass. Enabled when prep OR post-clean is on.",
+          "default": "0.5 mm",
+          "recommendation": "Range 0–10 mm (step 0.1)."
+        },
+        {
+          "name": "Wash XY jiggle (µm)",
+          "what_it_does": "Random XY radius about the wash well centre during the wash (wash_xy_amplitude_um). Enabled when prep OR post-clean is on.",
+          "default": "200 µm",
+          "recommendation": "Range 0–5000 µm (step 10)."
+        },
+        {
+          "name": "Wash settle (s)",
+          "what_it_does": "Settle time between wash jiggles (wash_dwell_s). Enabled when prep OR post-clean is on.",
+          "default": "0.3 s",
+          "recommendation": "Range 0–30 s (step 0.1)."
+        },
+        {
+          "name": "Clean after the run (dispense → wash → buffer) (checkbox)",
+          "what_it_does": "Runs ONCE after the last place: dispense residual to waste, wash, reload buffer so the needle ends conditioned (do_post_clean).",
+          "default": "off",
+          "recommendation": "Turn on to leave the needle clean and buffer-loaded after a run."
+        },
+        {
+          "name": "Dispense (needles)",
+          "what_it_does": "Number of needle-bore volumes of residual dispensed to waste during post-clean (post_dispense_needles). Clean-only — enabled only when post-clean is on.",
+          "default": "1.0",
+          "recommendation": "Range 0–20 (step 0.5)."
+        },
+        {
+          "name": "Intra-well retract (mm)",
+          "what_it_does": "Short Z retract used for moves that stay within the SAME named well (intra_well_retract_mm). Clicked spheroid points carry no well name, so every move here uses the full safe-Z travel instead — this rarely applies. Always applied to the executor.",
+          "default": "1.0 mm",
+          "recommendation": "Range 0–20 mm (step 0.1). Leave at default."
+        },
+        {
+          "name": "Z timeout (s)",
+          "what_it_does": "Maximum time to wait for a Z move to reach its target before timing out (z_timeout_s). Always applied.",
+          "default": "15 s",
+          "recommendation": "Range 1–120 s. Increase only if Z moves legitimately take longer."
+        },
+        {
+          "name": "XY timeout (s)",
+          "what_it_does": "Maximum time to wait for an XY move to arrive before timing out (xy_timeout_s). Always applied.",
+          "default": "30 s",
+          "recommendation": "Range 1–240 s."
+        },
+        {
+          "name": "Locations & Hardware (read-only info section)",
+          "what_it_does": "Read-only panel showing where all inks/reagents/service wells are, needle/syringe geometry, pump↔ink mapping, and calibrated Z heights. Rebuilt each time the popout is shown.",
+          "default": "",
+          "recommendation": "Use it to confirm the prep service wells are assigned and calibrated before running."
+        },
+        {
+          "name": "Settings profile bar (Save / Save As… / Delete / Import… / Export… / Reset + profile combo)",
+          "what_it_does": "Saves, loads, deletes, imports and exports named setting profiles for this workflow; last-used values auto-restore when the page opens. Reset returns fields to defaults.",
+          "default": "",
+          "recommendation": "Save a named profile per spheroid type / plate so you can reload tuned settings."
+        },
+        {
+          "name": "Start spheroid pickup (button)",
+          "what_it_does": "Validates the Start gate and launches the run on a worker thread. Enabled only when picks/places are balanced, a bore exists, and no run is in progress.",
+          "default": "",
+          "recommendation": ""
+        },
+        {
+          "name": "Abort (button)",
+          "what_it_does": "Sets the executor abort flag; the run stops after the current sub-step and the needle is retracted to Safe Z. Enabled only while a run is in progress.",
+          "default": "disabled",
+          "recommendation": ""
+        }
+      ],
+      "safety_notes": [
+        "Every cross-position move retracts Z to the Safe Z BEFORE moving XY (via safe_travel_to). Clicked spheroid targets have no well name, so they always use the full safe-Z travel — they are never treated as intra-well 1 mm hops.",
+        "The ZP (Z + pump) board is REQUIRED. Start refuses to run if it is disconnected, and mid-run _safe_move_to raises an abort if the ZP board drops, so the stage never drags an unretracted needle across the plate.",
+        "On ANY exit (completion, abort, or error) the executor retracts the needle to the Safe Z via ensure_retracted_to (raise-only, polarity-safe). The needle never stays parked down in a well at the Place Z.",
+        "Start is gated, in order, on: balanced picks/places, a bore present, Safe Z configured, ZP connected, and a calibrated plate-bottom Z (needed to resolve Pick Z / Place Z). If prep or post-clean is on, it additionally requires a needle inner diameter + length and the required service wells (prep: waste/oil/wash/buffer; clean: waste/wash/buffer) assigned AND calibrated, plus a resolvable service dip Z — otherwise it shows a status message and refuses to start.",
+        "If no Safe Z is set and you left-click the XY workspace, the app asks before moving XY without retracting Z — declining cancels the move. Right-click 'Fast travel' simply refuses (warns) when no Safe Z is set.",
+        "During the wash, the needle returns to the exact dip Z with an absolute move so a soft-limit-clamped lift cannot walk the tip toward the glass over repeated cycles.",
+        "Pick Z and Place Z are heights above the calibrated plate bottom; a wrong plate-bottom calibration directly changes how close the needle gets to the glass."
+      ],
+      "tips": [
+        "Pair order matters: pick i goes to place i. Add picks in the order you want them deposited, then add the matching places in the same order. The dashed connector lines on the camera view confirm the pairing.",
+        "The aspirate/dispense volume scales with diameter cubed — small changes in Spheroid diameter make large volume changes. Watch the live 'V = … µL' readout in Settings.",
+        "The same volume is aspirated and dispensed per pair, so the pump stays net-balanced across a pick/place.",
+        "Save a Settings profile per spheroid type so flow rates, Pick/Place Z, and prep counts reload instantly next session; the last-used values also auto-restore when you reopen the page.",
+        "The XY Workspace and Side View are the same widgets as the Jog page and track the live stage at ~5 Hz; use the workspace click-to-travel to scout regions before clicking picks in the camera view.",
+        "If the picker µm/px reads '—', clicks will be mis-located — fix the microscope objective calibration in Hardware Setup before picking."
+      ],
+      "screenshots": [
+        {
+          "id": "spheroid-main",
+          "caption": "Full Spheroid Pick & Place page: live target picker (left), XY Workspace + Side View (right), Start/Abort + status row (bottom).",
+          "nav": "Workflows → Spheroid Pick & Place (default view, no run in progress)"
+        },
+        {
+          "id": "spheroid-picker",
+          "caption": "Live target picker with several green pick markers, mauve place markers, and dashed pairing connectors; pairing status shows '✓ N pick→place pair(s) ready', µm/px readout at top.",
+          "nav": "Spheroid Pick & Place — add picks in Pick mode, switch to Place and add equal places"
+        },
+        {
+          "id": "spheroid-settings",
+          "caption": "Settings popout scrolled to Spheroid & bore + Heights + Flow rates, showing the live 'V = … µL' volume readout.",
+          "nav": "Spheroid Pick & Place → click '⚙ Settings'"
+        },
+        {
+          "id": "spheroid-prep",
+          "caption": "Settings popout Needle prep section: prep checkbox on, service dip Z, oil/buffer needle counts, wash parameters, and the green '✓ 1 needle = … µL · waste=… oil=… wash=… buffer=…' status.",
+          "nav": "Spheroid Pick & Place → '⚙ Settings' → scroll to Needle prep (with service wells assigned + calibrated)"
+        },
+        {
+          "id": "spheroid-run",
+          "caption": "Run in progress: Abort enabled, status label showing '[done/total]' progress and the current sub-step.",
+          "nav": "Spheroid Pick & Place → click 'Start spheroid pickup' with balanced picks/places"
+        }
+      ]
+    },
+    {
+      "id": "cell_labeling",
+      "title": "Cell Staining (Cell Labeling) Workflow",
+      "overview": "Cell Labeling is a stain-in-place workflow: you click one or more regions to stain on the live microscope view, pick a stain reagent, and the machine — for each region — loads the stain from its reagent well, lowers just off the plate bottom, SLOWLY deposits a tiny stain column, waits a user-set incubation time (the headline knob), SLOWLY aspirates a multiple of that volume back up, then travels to the waste well and dispenses it. There is NO placement target (unlike Cell Targeting & Removal); the picker runs in \"pick_only\" mode so you only ever select regions to stain. An optional needle prep brackets the start (waste → oil → wash → buffer) and an optional clean runs at the end (waste → wash → buffer). The waste dump is always part of the operation, so a calibrated waste well is required even with prep/clean off. The pump is volume-balanced per region (load − deposit − aspirate + waste-dispense = 0) so it never drifts.",
+      "where_to_find": "Main sidebar → Workflows → workflow picker → Cell Labeling tile (id: cell_labeling). Opens the Cell Labeling page: header row (Back, title, \"Pick = regions to stain\", a settings summary label, 🔬 Fluorescence checkbox, ⚙ Settings button); a horizontal split with the live picker on the LEFT and a vertical split on the RIGHT holding the XY Workspace (top) over the Side View (XZ) (bottom); and a Start staining / Abort / status run row at the bottom.",
+      "prerequisites": [
+        "Hardware connected: both XY stage AND the ZP (Z + pump) board. The ZP board is required to retract the needle and run the pumps — Start refuses without it.",
+        "Plate calibrated on the Calibration page: a calibrated plate-bottom Z (so the label height, stain dip Z, and service/waste dip Z can each be resolved) and a Safe Z (move/travel height).",
+        "A Safe Z configured (Calibration page). Without it, Start refuses; a left-click on the XY Workspace then prompts you before traveling without retracting Z, and right-click Fast travel is blocked.",
+        "Needle geometry set in Hardware Setup → Needle: inner diameter (its cross-section area drives the deposit volume), plus length if using prep/clean (the prep 'needle volume' uses area × length). A zero/unknown bore gives zero deposit volume and blocks Start.",
+        "Stain reagent assigned a reagent location in Hardware Setup → Ink → Reagent Locations, AND that well present in the calibrated plate (run Plate Location). Only library inks that have a reagent location AND are NOT service reagents (oil/wash/waste/buffer, by ink_type or by name) appear in the combo.",
+        "A waste well assigned + calibrated (Hardware Setup → Ink → Reagent Locations) — ALWAYS required; the recovered stain is dumped there after every region, independent of prep/clean.",
+        "If using needle prep and/or clean after: oil, wash, and buffer service wells must also be assigned + calibrated, and the needle inner Ø + length must be set."
+      ],
+      "steps": [
+        {
+          "title": "Open the workflow",
+          "detail": "Go to Workflows and click the Cell Labeling tile. The header reads 'Cell Labeling' (blue) with the hint 'Pick = regions to stain' and a one-line settings summary. The left pane is the live microscope picker; the right pane stacks the XY Workspace (top, ~3:2 stretch) over the Side View (XZ, bottom).",
+          "screenshot_ref": "cell-labeling-main"
+        },
+        {
+          "title": "Open Settings and set the stain reagent + pump",
+          "detail": "Click the ⚙ Settings button (top-right) to open the scrollable, saveable popout. In the 'Pump & stain reagent' section, choose the Pump / bore (P1/P2/P3, populated from enabled + configured pumps; falls back to P1) and the Stain reagent combo. Set 'Stain dip Z (↑ bottom)' (default 0.50 mm). The status line shows '✓ Stain \"X\" ← <well> · load ~N µL on the <bore> bore' when resolved, or a peach ⚠ if no stain is selected, the stain has no reagent location, or its well isn't in the calibrated plate.",
+          "screenshot_ref": "cell-labeling-settings"
+        },
+        {
+          "title": "Set the headline incubation time",
+          "detail": "In the 'Stain incubation' section, set 'Stain time (incubation)' (default 300 s, range 0–14400 s, 15 s steps). This is how long the stain develops on the cells before it is aspirated back off — the central knob of this workflow. The hint below reads '= <Ns/m/h> of incubation per region.'",
+          "screenshot_ref": "cell-labeling-settings"
+        },
+        {
+          "title": "Set the region height",
+          "detail": "In 'Region height' set 'Label Z (↑ bottom)' (default 0.10 mm, range 0–20 mm) — the needle height above the plate bottom at each stain region. Keep small (just off the bottom); it is resolved polarity-safely to a zero-ref Z and pushed as the executor's label height.",
+          "screenshot_ref": "cell-labeling-settings"
+        },
+        {
+          "title": "Tune deposit / aspirate mechanics (optional)",
+          "detail": "In 'Stain deposit / removal' set Deposit depth (default 0.10 mm → deposit volume = needle inner area × depth), Aspirate (×) multiplier (default 2.0), and the two SLOW flows: Deposit flow (default 0.5 µL/s, also used for the waste dispense) and Aspirate flow (default 0.5 µL/s, used to load AND to aspirate the stain back off). The 'V = …' readout shows the resolved deposit and aspirate µL, or 'V = — (set needle inner Ø)' if no bore area is configured.",
+          "screenshot_ref": "cell-labeling-settings"
+        },
+        {
+          "title": "Configure prep / clean (optional) and confirm the waste well",
+          "detail": "In 'Needle prep / clean' leave 'Prep needle (waste → oil → wash → buffer)' and 'Clean after (waste → wash → buffer)' on (defaults) or turn them off. Note 'Service / waste dip Z (↑ bottom)' (default 0.50 mm) stays ACTIVE even when prep/clean are off, because the post-incubation waste dump always needs it. The prep status shows '✓ 1 needle = N µL · oil=… wash=… waste=… buffer=…' when service wells resolve, a 'Prep + clean disabled — staining only (waste=…)' note when both are off, or a peach ⚠ telling you exactly what to assign/calibrate.",
+          "screenshot_ref": "cell-labeling-prep"
+        },
+        {
+          "title": "Pick regions to stain",
+          "detail": "On the live picker (left), click each spot you want to stain. The picker is in pick_only mode: there is no Place section and no Mode toggle — every click adds a region. The status shows '✓ N region(s) selected.' Use 'Clear all' or 'Remove selected' to edit. Selected regions appear as green overlay dots on the XY Workspace.",
+          "screenshot_ref": "cell-labeling-picker"
+        },
+        {
+          "title": "Verify positions on the workspace",
+          "detail": "Confirm the green region dots, the needle position, and the plate orientation in the XY Workspace. Optionally toggle '🔬 Fluorescence' (header) to overlay a previously-captured fluorescence mosaic for this plate. Use the Side View (XZ) green 'Safe' badge (or other Z-reference badges) to send the needle to a safe Z before any manual repositioning.",
+          "screenshot_ref": "cell-labeling-main"
+        },
+        {
+          "title": "Start staining",
+          "detail": "Click 'Start staining'. The button is enabled only when ≥1 region is selected and a bore exists (and not while a run is active). On click the page runs all the Start gates in order: ≥1 region; Safe Z set; ZP connected; plate-bottom calibrated (label Z resolves); deposit volume > 0 (needle inner Ø set); a stain reagent selected with a calibrated reagent well and resolvable dip Z; a calibrated waste well with resolvable service/waste dip Z; and — if prep or clean is on — needle inner Ø + length and the oil/wash/buffer wells. Any failure shows the reason in the status line and aborts before motion. When all pass the status reads 'Staining N region(s)…' and the run starts on a daemon thread.",
+          "screenshot_ref": "cell-labeling-main"
+        },
+        {
+          "title": "Monitor and (if needed) abort",
+          "detail": "The status line shows [done/total] progress and per-region sub-steps: 'Loading … µL of stain', 'Moving to stain region …', 'Depositing … (slow)', 'Stain incubation', 'Aspirating … (slow)', 'Moving to waste', 'Dispensing … to waste', then 'Complete'. Click 'Abort' to request a stop; it sets the abort flag and the executor stops at the next safe checkpoint and retracts to Safe Z. On finish the status reads 'Done.' or 'Stopped (aborted or failed).'",
+          "screenshot_ref": "cell-labeling-main"
+        }
+      ],
+      "settings": [
+        {
+          "name": "← Back to Workflows (header button)",
+          "what_it_does": "Returns to the workflow picker (emits back_requested).",
+          "default": "",
+          "recommendation": "Use when finished or to switch workflows."
+        },
+        {
+          "name": "🔬 Fluorescence (header checkbox)",
+          "what_it_does": "Overlays the captured fluorescence mosaic(s) for this plate (from the Fluorescence Mosaic workflow) onto the XY Workspace. If no mosaic exists for the plate it un-checks itself and the status line says to run the Fluorescence Mosaic workflow first.",
+          "default": "off",
+          "recommendation": "Turn on to line up stain regions with previously imaged fluorescence; purely a visual aid."
+        },
+        {
+          "name": "⚙ Settings (header button)",
+          "what_it_does": "Opens the full, scrollable, saveable settings popout (stain reagent, incubation time, deposit/aspirate, prep/clean, motion/timeouts, locations). The popout is a persistent modeless child window, hidden when you leave the page.",
+          "default": "",
+          "recommendation": "Open this first to set the stain, incubation time, and Z heights."
+        },
+        {
+          "name": "Settings summary (header label)",
+          "what_it_does": "Read-only one-line summary mirroring the popout: 'stain <time> · deposit X/aspirate Y µL · prep on/off'.",
+          "default": "",
+          "recommendation": "Glance here to confirm key settings without opening the popout."
+        },
+        {
+          "name": "Live target picker (left pane)",
+          "what_it_does": "Microscope live view + region list. In pick_only mode: no Place section, no Mode toggle — every click adds a region to stain. Shows '✓ N region(s) selected.' with green list entries; clicks map to stage µm via the calibrated objective µm/px.",
+          "default": "no regions",
+          "recommendation": "Click each spot to stain. Picks drive the green dots on the XY Workspace."
+        },
+        {
+          "name": "Clear all (picker button)",
+          "what_it_does": "Removes all selected regions.",
+          "default": "",
+          "recommendation": "Use to start the region list over."
+        },
+        {
+          "name": "Remove selected (picker button)",
+          "what_it_does": "Removes the highlighted region(s) from the list.",
+          "default": "",
+          "recommendation": "Use to drop a single mis-clicked region."
+        },
+        {
+          "name": "XY Workspace (right, top)",
+          "what_it_does": "Top-down plate view showing wells, the live needle position, and the selected regions as green pick overlays. Left-click = click-to-travel (always retracts via safe_travel_to when a Safe Z is set; if no Safe Z, prompts before a no-retract move). Right-click = 'Fast travel here' (retract Z, travel XY, restore the current Z; requires a Safe Z). No-op when XY is disconnected.",
+          "default": "",
+          "recommendation": "Use to confirm region placement and to jog the stage to a spot before staining."
+        },
+        {
+          "name": "Side View (XZ) (right, bottom)",
+          "what_it_does": "Side profile showing the needle Z vs. the plate and Z reference heights. The green 'Safe' badge (and other Z-reference badges) emit a go-to-Z request → moves the needle to that zero-ref Z via move_z_absolute (no-op if ZP disconnected).",
+          "default": "",
+          "recommendation": "Use the Safe badge to retract the needle before manual repositioning."
+        },
+        {
+          "name": "Start staining (run-row button)",
+          "what_it_does": "Validates all Start gates and, if they pass, queues one CELL_LABELING operation per region and runs the executor on a daemon thread. Enabled only when ≥1 region is selected and a bore exists, and not while a run is active.",
+          "default": "",
+          "recommendation": "If it stays idle on click, read the status line — it names the gate that failed."
+        },
+        {
+          "name": "Abort (run-row button)",
+          "what_it_does": "Sets the executor abort flag. Enabled only while a run is active; the executor stops at the next safe checkpoint and retracts to Safe Z (it does NOT halt motion mid-step).",
+          "default": "disabled",
+          "recommendation": "Use to stop a run; expect it to finish the current safe step first."
+        },
+        {
+          "name": "Status line (run row)",
+          "what_it_does": "Shows idle/progress text: gate-failure reasons, [done/total] progress, per-region sub-steps, and the final 'Done.' / 'Stopped (aborted or failed).'",
+          "default": "Idle.",
+          "recommendation": "Your primary feedback channel during a run."
+        },
+        {
+          "name": "Stain time (incubation) — popout 'Stain incubation'",
+          "what_it_does": "Headline knob: how long the stain develops on the cells before it is aspirated back off. QDoubleSpinBox, range 0–14400 s, step 15 s, 0 decimals. Maps to CellLabelingConfig.stain_dwell_time_s; the executor dwells this long per region after deposit. A hint below shows it formatted (s/m/h).",
+          "default": "300 s",
+          "recommendation": "Set to your stain protocol's incubation time."
+        },
+        {
+          "name": "Label Z (↑ bottom) — popout 'Region height'",
+          "what_it_does": "Needle height above the plate bottom at the stain region. Range 0–20 mm, step 0.05, 2 decimals. Resolved polarity-safely to a zero-ref Z and pushed as the executor's pick_z_mm (reused as the label height). Maps to label_z_offset_mm.",
+          "default": "0.10 mm",
+          "recommendation": "Keep small (just off the bottom) so the stain lands on the cells; don't drive into the glass."
+        },
+        {
+          "name": "Pump / bore — popout 'Pump & stain reagent'",
+          "what_it_does": "Which pump/bore holds and dispenses the stain. Populated from enabled + configured pumps (P1/P2/P3); falls back to 'P1' if none. Maps to stain_bore. Changing it re-filters the reagent combo (defaults to that bore's assigned ink if present).",
+          "default": "P1 (or first configured pump)",
+          "recommendation": "Pick the bore physically loaded with the stain syringe."
+        },
+        {
+          "name": "Stain reagent — popout 'Pump & stain reagent'",
+          "what_it_does": "The stain the needle loads. Lists '(none — needle already loaded)' plus library inks that have a reagent location AND are NOT service reagents (oil/wash/waste/buffer, by ink_type or name). The status line shows the resolved well + load volume or a ⚠.",
+          "default": "the selected bore's assigned ink if it appears in the list, else '(none — needle already loaded)'",
+          "recommendation": "Choose your dye/stain; if it's missing, assign it a reagent location in Hardware Setup → Ink and calibrate that well (Plate Location)."
+        },
+        {
+          "name": "Stain dip Z (↑ bottom) — popout 'Pump & stain reagent'",
+          "what_it_does": "Needle dip height above the plate bottom when aspirating the stain from its reagent well. Range 0–30 mm, step 0.1, 2 decimals. Pushed as the executor's reagent_dip_z_mm.",
+          "default": "0.50 mm",
+          "recommendation": "Set so the tip dips into the stain reservoir without bottoming out."
+        },
+        {
+          "name": "Deposit depth — popout 'Stain deposit / removal'",
+          "what_it_does": "Sets the deposited stain column: deposit volume = needle inner cross-section area × this depth (1 mm³ = 1 µL). Range 0.001–5.0 mm, step 0.05, 3 decimals. Maps to deposit_depth_mm; updates the V= readout.",
+          "default": "0.10 mm",
+          "recommendation": "Keep tiny so a small amount relative to the needle bore is delivered."
+        },
+        {
+          "name": "Aspirate (×) — popout 'Stain deposit / removal'",
+          "what_it_does": "Stain-removal volume = this multiple × the deposited volume (stain plus a little surrounding fluid). Range 1.0–20.0, step 0.5, 2 decimals. Maps to aspirate_multiplier.",
+          "default": "2.0",
+          "recommendation": "2× recovers the deposited stain plus excess; raise to pull more surrounding fluid."
+        },
+        {
+          "name": "Deposit flow (slow) — popout 'Stain deposit / removal'",
+          "what_it_does": "SLOW flow rate used to deposit the stain — also used for the final waste dispense. Range 0.01–50 µL/s, step 0.1, 2 decimals. Maps to deposit_speed_uL_s.",
+          "default": "0.5 µL/s",
+          "recommendation": "Keep slow so the stain is delivered gently onto the cells."
+        },
+        {
+          "name": "Aspirate flow (slow) — popout 'Stain deposit / removal'",
+          "what_it_does": "SLOW flow rate used to load the stain from its well AND to aspirate it back off. Range 0.01–50 µL/s, step 0.1, 2 decimals. Maps to aspirate_speed_uL_s.",
+          "default": "0.5 µL/s",
+          "recommendation": "Keep slow so the stain is withdrawn gently without disturbing cells."
+        },
+        {
+          "name": "V = … readout — popout 'Stain deposit / removal'",
+          "what_it_does": "Read-only: shows 'deposit X µL · aspirate Y µL' from needle area × depth × multiplier, or 'V = — (set needle inner Ø)' when no bore area is configured.",
+          "default": "V = —",
+          "recommendation": "Confirm a sane volume; if it says set needle inner Ø, fix Hardware Setup → Needle."
+        },
+        {
+          "name": "Prep needle (waste → oil → wash → buffer) — popout 'Needle prep / clean'",
+          "what_it_does": "Checkbox; when on, runs the conditioning prep once before the region loop: dispense oil to waste, draw fresh oil, wash, draw buffer. Maps to executor.do_prep. Toggling it enables/disables the prep parameter spinboxes (except the service/waste dip Z).",
+          "default": "on",
+          "recommendation": "Leave on for a clean needle; turn off if you've already conditioned it (then oil/wash/buffer wells aren't required, but the waste well still is)."
+        },
+        {
+          "name": "Clean after (waste → wash → buffer) — popout 'Needle prep / clean'",
+          "what_it_does": "Checkbox; when on, runs a clean once after the region loop. Maps to executor.do_post_clean. Shares the prep parameter enable state.",
+          "default": "on",
+          "recommendation": "Leave on to leave the needle clean; turn off to skip the end-of-run clean."
+        },
+        {
+          "name": "Service / waste dip Z (↑ bottom) — popout 'Needle prep / clean'",
+          "what_it_does": "Needle dip height above the plate bottom at the service wells AND the always-required post-incubation waste dump. Range 0–30 mm, step 0.1, 2 decimals. Deliberately NOT disabled when prep/clean are off — the waste dump always needs it. Pushed as executor.service_z_mm.",
+          "default": "0.50 mm",
+          "recommendation": "Set so the tip dips into the service/waste wells without bottoming out."
+        },
+        {
+          "name": "Prep / clean flow — popout 'Needle prep / clean'",
+          "what_it_does": "Aspirate/dispense flow rate during prep and clean steps. Range 0.01–50 µL/s, step 0.1, 2 decimals. Disabled unless prep or clean is on. Maps to prep_rate_uL_s.",
+          "default": "1.0 µL/s",
+          "recommendation": "Default is fine; only used during conditioning, not deposition."
+        },
+        {
+          "name": "Oil (needles) — popout 'Needle prep / clean'",
+          "what_it_does": "Needles of oil dispensed to waste then aspirated from the oil well during prep. Range 0–20, step 0.5, 1 decimal. Disabled unless prep/clean on. Maps to oil_needles.",
+          "default": "1.0",
+          "recommendation": "1 needle is the standard oil refresh."
+        },
+        {
+          "name": "Buffer (needles) — popout 'Needle prep / clean'",
+          "what_it_does": "Needles of buffer drawn after the wash during prep. Range 0–20, step 0.5, 1 decimal. Disabled unless prep/clean on. Maps to buffer_needles.",
+          "default": "4.0",
+          "recommendation": "Default 4; raise to fill more buffer behind the stain."
+        },
+        {
+          "name": "Wash cycles — popout 'Needle prep / clean'",
+          "what_it_does": "Number of dip-jiggle cycles at the wash well. QSpinBox 0–50. Disabled unless prep/clean on. Maps to wash_cycles.",
+          "default": "3",
+          "recommendation": "More cycles = more thorough wash."
+        },
+        {
+          "name": "Wash Z jiggle — popout 'Needle prep / clean'",
+          "what_it_does": "How far up/down each wash jiggle moves. Range 0–10 mm, step 0.1, 2 decimals. Disabled unless prep/clean on. Maps to wash_z_amplitude_mm.",
+          "default": "0.5 mm",
+          "recommendation": "Default is fine; keep within the well depth."
+        },
+        {
+          "name": "Wash XY jiggle — popout 'Needle prep / clean'",
+          "what_it_does": "Random XY radius about the wash well centre during washing. Range 0–5000 µm, step 10, 0 decimals. Disabled unless prep/clean on. Maps to wash_xy_amplitude_um.",
+          "default": "200 µm",
+          "recommendation": "Keep inside the wash well radius."
+        },
+        {
+          "name": "Wash settle — popout 'Needle prep / clean'",
+          "what_it_does": "Settle/dwell time between wash jiggles. Range 0–30 s, step 0.1, 2 decimals. Disabled unless prep/clean on. Maps to wash_dwell_s.",
+          "default": "0.3 s",
+          "recommendation": "Default is fine."
+        },
+        {
+          "name": "Clean dispense (needles) — popout 'Needle prep / clean'",
+          "what_it_does": "Needles of residual dispensed to waste during the post-clean. Range 0–20, step 0.5, 1 decimal. Disabled unless prep/clean on. Maps to post_dispense_needles.",
+          "default": "1.0",
+          "recommendation": "Default is fine."
+        },
+        {
+          "name": "Intra-well retract — popout 'Motion & timeouts (advanced)'",
+          "what_it_does": "Short Z retract distance used for moves within one well. Range 0–20 mm, step 0.1, 2 decimals. Always applied. Maps to executor.intra_well_retract_mm.",
+          "default": "1.0 mm",
+          "recommendation": "Leave default unless you see the needle dragging within a well."
+        },
+        {
+          "name": "Z timeout — popout 'Motion & timeouts (advanced)'",
+          "what_it_does": "How long to wait for a Z move to arrive before reporting a timeout. Range 1–120 s, step 1, 0 decimals. Maps to executor.z_timeout_s.",
+          "default": "15 s",
+          "recommendation": "Raise only if Z moves are legitimately slow."
+        },
+        {
+          "name": "XY timeout — popout 'Motion & timeouts (advanced)'",
+          "what_it_does": "How long to wait for an XY move to arrive before reporting a timeout. Range 1–240 s, step 1, 0 decimals. Maps to executor.xy_timeout_s.",
+          "default": "30 s",
+          "recommendation": "Raise only for long plate-spanning travels."
+        },
+        {
+          "name": "Locations & Hardware (read-only info section) — popout",
+          "what_it_does": "Read-only panel rebuilt on show: shows where inks/reagents/service wells are, needle/syringe geometry, pump↔ink mapping, and calibrated Z heights, plus an extra 'Stain reagent: <name> ← <well>' line for the currently selected stain.",
+          "default": "",
+          "recommendation": "Use to verify the stain well, waste well, and Z references resolve before starting."
+        },
+        {
+          "name": "Profile bar (Save / Save As… / Delete / Import… / Export… / Reset + profile combo) — popout",
+          "what_it_does": "Standard WorkflowSettingsDialog profile controls: save the current settings as a named profile, reload, delete, import/export a file, or reset to defaults. The last-used settings auto-restore on open (load_last), and pending hardware-populated combo selections (bore/reagent) resolve once the combos populate.",
+          "default": "__last__ auto-restored",
+          "recommendation": "Save a named profile per stain protocol so you can reload its incubation time, multiplier, and slow flows in one click."
+        }
+      ],
+      "safety_notes": [
+        "The ZP (Z + pump) board MUST be connected — Start refuses if not, because staining needs it to retract the needle and run the pumps.",
+        "A Safe Z must be configured (Calibration page). Without it Start refuses; on the XY Workspace a left-click then prompts before traveling without retracting Z, and right-click Fast travel is blocked.",
+        "Plate-bottom Z must be calibrated — all heights (label Z, stain dip Z, service/waste dip Z) are 'above plate bottom' and are resolved polarity-safely; if uncalibrated, Start aborts with a message instead of moving.",
+        "Cross-position click-to-travel and all inter-region/inter-well executor moves retract the needle via safe_travel_to (a near-no-op when already retracted), so the needle is not dragged across the plate.",
+        "The waste well is ALWAYS required — the recovered stain is dumped there after every region. The service/waste dip Z stays enabled even with prep/clean off for this reason, and Start refuses without a calibrated waste well + resolvable dip Z.",
+        "The deposit volume must be > 0 — Start refuses if the needle inner diameter (bore area) is not set, since deposit = area × depth.",
+        "If prep or clean is enabled, Start additionally requires the needle inner Ø + length (the 'needle volume') and calibrated oil/wash/buffer wells, or it tells you to turn prep/clean off.",
+        "The pump is volume-balanced per region (load − deposit − aspirate + waste-dispense = 0), so it does not drift over a run.",
+        "Abort does not stop motion instantly: it sets a flag and the executor stops at the next checkpoint, then retracts to Safe Z. On any finish/abort/failure the run ends and the button state resets.",
+        "Keep Label Z and the dip Z heights small but above zero so the needle stays just off the glass; an overly small/incorrect height risks contacting the plate bottom."
+      ],
+      "tips": [
+        "Open ⚙ Settings first — set the stain reagent, pump, incubation time, and Z heights before picking regions. The header summary and the popout status lines tell you what's still missing.",
+        "The reagent combo only shows printable library inks that have a reagent location; service reagents (oil/wash/waste/buffer) are intentionally excluded. If your stain is missing, assign it a location in Hardware Setup → Ink and run Plate Location.",
+        "Watch the popout status lines: a green '✓' means the stain/well/service wells resolved; a peach '⚠' tells you exactly what to assign or calibrate.",
+        "Deposit volume is computed from the needle bore (area × deposit depth). If the V= readout shows '—', set the needle inner diameter in Hardware Setup → Needle.",
+        "Turn prep/clean off to stain only — but you still need a calibrated waste well, since the post-incubation dump is core to the operation.",
+        "Both the deposit and aspirate flows are intentionally slow (0.5 µL/s default) so the stain is delivered and withdrawn gently — only change them if your protocol needs it.",
+        "Use the '🔬 Fluorescence' overlay to align stain regions with a previously captured fluorescence mosaic of the same plate.",
+        "Save a named settings profile per stain protocol so the incubation time, multiplier, and slow flows reload in one click."
+      ],
+      "screenshots": [
+        {
+          "id": "cell-labeling-main",
+          "caption": "Full Cell Labeling page: header (Back, blue title, 'Pick = regions to stain', settings summary, 🔬 Fluorescence, ⚙ Settings), live picker on the left, XY Workspace + Side View (XZ) on the right, and the Start staining / Abort / status run row at the bottom.",
+          "nav": "Workflows → Cell Labeling tile; capture with the page idle and a couple of regions selected."
+        },
+        {
+          "id": "cell-labeling-settings",
+          "caption": "The ⚙ Settings popout scrolled to show Stain incubation (headline, with the s/m/h hint), Region height, Pump & stain reagent (with the resolved '✓ Stain … ← well' status line), and Stain deposit / removal with the V= readout.",
+          "nav": "Cell Labeling → ⚙ Settings; scroll through the Stain incubation, Region height, Pump & stain reagent, and Stain deposit / removal sections."
+        },
+        {
+          "id": "cell-labeling-prep",
+          "caption": "The Settings popout 'Needle prep / clean' section showing the Prep and Clean checkboxes, the always-enabled service/waste dip Z, the wash/oil/buffer parameters, and the green '✓ 1 needle = N µL · oil=… wash=… waste=… buffer=…' status.",
+          "nav": "Cell Labeling → ⚙ Settings; scroll to the 'Needle prep / clean' section."
+        },
+        {
+          "id": "cell-labeling-picker",
+          "caption": "The pick_only live picker with several regions clicked, showing no Place section / no Mode toggle and the '✓ N region(s) selected.' status, with matching green dots on the XY Workspace.",
+          "nav": "Cell Labeling main page; click several regions on the microscope live view."
+        }
+      ]
+    }
+  ]
+}

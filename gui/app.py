@@ -699,7 +699,8 @@ class MainWindow(QMainWindow):
             HardwareSetupPage(),                                          # 0
             CalibrationPage(self.controller, settings=self.settings,
                            camera_manager=self._camera_manager),          # 1
-            JogControlPage(self.controller),                              # 2
+            JogControlPage(self.controller,
+                          camera_manager=self._camera_manager),           # 2
             self._print_builder,                                          # 3  v7.5.x mode
             self._printing_mode,                                          # 4  v7.3.3 mode
             self._workflows_mode,                                         # 5  v7.4.3 mode
@@ -1260,6 +1261,15 @@ class MainWindow(QMainWindow):
                             pm.exec_logger.log_error(str(exc), exc)
                         pm._set_state(PrintState.ERROR)
                     finally:
+                        # v7.5.x CRITICAL SAFETY: always leave the needle at the
+                        # safe / travel Z (completion, error, or abort) — raise-
+                        # only + idempotent, so a plan that already ended at safe
+                        # Z is a no-op.
+                        if hasattr(pm, '_retract_to_safe_z'):
+                            pm._retract_to_safe_z(
+                                "hybrid_end",
+                                travel_z=getattr(job.settings,
+                                                 'travel_z_height', None))
                         if hasattr(pm, '_stop_recorder'):
                             try:
                                 pm._stop_recorder(pm.state.name.lower())
@@ -1371,6 +1381,16 @@ class MainWindow(QMainWindow):
                         pm.exec_logger.log_error(str(exc), exc)
                     pm._set_state(PrintState.ERROR)
                 finally:
+                    # v7.5.x CRITICAL SAFETY: always leave the needle at the
+                    # safe / travel Z (completion, error, or abort) — raise-only
+                    # + idempotent, so a trajectory that already ended retracted
+                    # is a no-op. Covers the planner's known ZDIR=+1 Z-geometry
+                    # gap by guaranteeing a polarity-safe final retract.
+                    if hasattr(pm, '_retract_to_safe_z'):
+                        pm._retract_to_safe_z(
+                            "trajectory_end",
+                            travel_z=getattr(job.settings,
+                                             'travel_z_height', None))
                     if hasattr(pm, '_stop_recorder'):
                         try:
                             pm._stop_recorder(pm.state.name.lower())
@@ -2089,6 +2109,9 @@ class MainWindow(QMainWindow):
                 logger.warning(
                     f"ZP restore {ax} failed: {res.get('error', 'unknown')}")
         logger.info(f"ZP position restored: {', '.join(applied) or 'none'}")
+        # v7.5.x: lock the limits into the live controller + persist to disk now
+        # (the same Apply+Save the operator otherwise had to do by hand).
+        self._apply_and_save_after_restore("ZP position restore")
         try:
             self._update_status()
         except Exception:
@@ -2180,8 +2203,57 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error(f"Failed to restore calibration snapshot: {e}")
 
+        # v7.5.x: do the Hardware Setup → Device "Apply + Save" automatically so
+        # the restored setup is locked into the live limits and persisted to
+        # disk right now — previously the restore only mutated in-memory state,
+        # so the operator had to go to the Device page and Apply+Save by hand
+        # (and the restored values were lost until the next clean shutdown).
+        self._apply_and_save_after_restore("calibration restore")
+
         try:
             self._update_status()
+        except Exception:
+            pass
+
+    def _apply_and_save_after_restore(self, what: str) -> None:
+        """After accepting a last-known restore, replicate the Device-page
+        "Apply + Save" so the operator doesn't have to:
+
+        * **Apply** — mirror the persisted ``safety_limits`` into the LIVE
+          envelope object (mutating its fields in place; never rebinding it, so
+          the jog handlers' held reference stays valid). Idempotent — it just
+          guarantees the live limits match what's on disk after the restore /
+          ZP reconnect.
+        * **Save** — persist everything to disk now via ``save_settings`` (the
+          same path a clean shutdown uses: window geo, hardware config,
+          ``zero_position``, ``zp_last_position``, and the calibration
+          snapshot), instead of waiting for a clean shutdown.
+
+        Then refresh the left-panel limit bars so the change is visible.
+        """
+        # Apply: mirror persisted limits into the live envelope (in place).
+        try:
+            saved = self.settings.get_section("safety_limits") or {}
+            sl = getattr(self.controller, "safety_limits", None)
+            if sl is not None and saved:
+                for key, val in saved.items():
+                    if hasattr(sl, key) and isinstance(val, (int, float, bool)):
+                        setattr(sl, key, val)
+        except Exception as e:
+            logger.warning(f"{what}: applying safety limits failed: {e}")
+        # Save: persist to disk now (not just on clean shutdown).
+        try:
+            self.save_settings()
+            logger.info(f"{what}: applied limits + saved configuration to disk")
+        except Exception as e:
+            logger.warning(f"{what}: save_settings failed: {e}")
+        # Refresh the persistent left-panel position/limit bars so the new
+        # envelope extents show immediately (best-effort).
+        try:
+            hw_page = self._page_widgets[0] if self._page_widgets else None
+            cp = getattr(hw_page, "_control_panel", None) if hw_page else None
+            if cp is not None and hasattr(cp, "refresh_safety_limits"):
+                cp.refresh_safety_limits()
         except Exception:
             pass
 
@@ -2409,6 +2481,10 @@ class MainWindow(QMainWindow):
         for page in self._page_widgets:
             if hasattr(page, '_shutdown_detection_worker'):
                 page._shutdown_detection_worker()
+            # v7.5.x: also stop the Plate Location mosaic scan thread so we
+            # don't tear down the controller/page under a running QThread.
+            if hasattr(page, '_shutdown_mosaic_worker'):
+                page._shutdown_mosaic_worker()
 
         # v7.3.3: Stop all cameras
         if hasattr(self, '_camera_manager'):

@@ -159,6 +159,18 @@ class PrintTrajectoryPlanner:
         self._segment_id: int = 0
         self._fluid_balance: dict[str, float] = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
         self._issues: list[str] = []
+        # v7.5.x: per-machine plate-local→stage axis sign, set from
+        # settings.plate_axis_sign at the start of generate(). Applied to
+        # GEOMETRIC well centres (plate.get_well_position) so they map to the
+        # physically-correct well on a 180°-mounted stage (ME3B V1).
+        self._plate_axis_sign: tuple = (1.0, 1.0)
+
+    def _well_xy(self, plate, well_name):
+        """Plate-local well centre (A1-relative mm) mapped onto stage axes via
+        the per-machine sign — the planner's single well→stage resolver."""
+        wx, wy = plate.get_well_position(well_name)
+        sx, sy = self._plate_axis_sign
+        return (sx * wx, sy * wy)
 
     def _wp(self, segment="", well="", is_travel=False, is_retract=False):
         """Append current state as a waypoint."""
@@ -395,9 +407,9 @@ class PrintTrajectoryPlanner:
 
 
     def _do_waste(self, plate, well_model, pump_id, settings):
-        """Waste: travel → lower → eject syringe contents → raise.
+        """Waste: travel → lower → DISPENSE syringe contents → raise.
         # v7.2.6-dsf: waste clamp
-        Ejects only what is currently loaded (no overshoot).
+        Dispenses only what is currently loaded (no overshoot).
         Uses service_pump_rate_uL_s from auto-settings if available.
         """
         well = _find_well(well_model, plate, "waste")
@@ -405,20 +417,21 @@ class PrintTrajectoryPlanner:
             logger.info("Skipping: no waste well assigned — will proceed without")
             return
         name, wx, wy = well
+        wx, wy = self._well_xy(plate, name)  # map plate-local → stage axes
         uL_per_mm = _get_uL_per_mm(settings, pump_id)
 
-        # Eject the pump's current fluid balance (what was loaded)
+        # Dispense the pump's current fluid balance (what was loaded)
         # Clamp to a safe maximum to avoid runaway
         fluid_loaded_mm = max(0.0, self._fluid_balance.get(pump_id, 0.0) / uL_per_mm
                               if uL_per_mm > 0 else 0.0)
-        eject_vol_mm = min(fluid_loaded_mm + (5.0 / uL_per_mm), 50.0 / uL_per_mm)
-        eject_vol_mm = max(eject_vol_mm, 1.0 / uL_per_mm)  # at least 1 uL
+        dispense_vol_mm = min(fluid_loaded_mm + (5.0 / uL_per_mm), 50.0 / uL_per_mm)
+        dispense_vol_mm = max(dispense_vol_mm, 1.0 / uL_per_mm)  # at least 1 uL
 
         svc_fr = getattr(settings, 'pump_feedrate', 30.0)
 
         self._travel_to_well(wx, wy, settings, well=name)
         self._lower_to_print(settings, well=name)
-        self._move_pump(pump_id, eject_vol_mm, svc_fr,
+        self._move_pump(pump_id, dispense_vol_mm, svc_fr,
                         segment="service", well=name)
         # After waste, pump balance resets to zero
         self._fluid_balance[pump_id] = 0.0
@@ -433,6 +446,7 @@ class PrintTrajectoryPlanner:
             logger.info("Skipping: no wash well assigned — will proceed without")
             return
         name, wx, wy = well
+        wx, wy = self._well_xy(plate, name)  # map plate-local → stage axes
         self._travel_to_well(wx, wy, settings, well=name)
         self._lower_to_print(settings, well=name)
         self._dwell(5.0, segment="service", well=name)
@@ -445,6 +459,7 @@ class PrintTrajectoryPlanner:
             logger.info("Skipping: no buffer well assigned — will proceed without")
             return
         name, wx, wy = well
+        wx, wy = self._well_xy(plate, name)  # map plate-local → stage axes
         self._travel_to_well(wx, wy, settings, well=name)
         self._lower_to_print(settings, well=name)
         aspirate_mm = -5.0 / _get_uL_per_mm(settings, pump_id)
@@ -461,6 +476,7 @@ class PrintTrajectoryPlanner:
             logger.info("Skipping: no ink well assigned — will proceed without")
             return
         name, wx, wy = well
+        wx, wy = self._well_xy(plate, name)  # map plate-local → stage axes
         uL_per_mm = _get_uL_per_mm(settings, pump_id)
         aspirate_mm = -volume_uL / uL_per_mm  # negative = aspirate
         self._travel_to_well(wx, wy, settings, well=name)
@@ -485,7 +501,7 @@ class PrintTrajectoryPlanner:
     def _do_service_and_print(self, plate, well_model, well_names, pump_id,
                               path_points, flow_rate, settings):
         """Full bioprinting workflow for a run:
-        1. Waste — eject whatever is in the syringe
+        1. Waste — dispense whatever is in the syringe
         2. Wash — clean needle
         3. Load buffer — aspirate buffer
         4. Wash — clean after buffer
@@ -503,7 +519,7 @@ class PrintTrajectoryPlanner:
             f"Run service: {len(well_names)} wells, "
             f"ink needed={ink_mm:.2f}mm ({ink_uL:.1f}uL), pump={pump_id}")
 
-        # 1. WASTE — eject current syringe contents
+        # 1. WASTE — dispense current syringe contents
         self._do_waste(plate, well_model, pump_id, settings)
 
         # 2. WASH — clean needle
@@ -551,7 +567,7 @@ class PrintTrajectoryPlanner:
         """Print a list of wells: for each → travel, lower, prime, print, retract, raise."""
         for well_name in well_names:
             try:
-                wx, wy = plate.get_well_position(well_name)
+                wx, wy = self._well_xy(plate, well_name)
             except Exception:
                 self._issues.append(f"Well {well_name}: position lookup failed")
                 continue
@@ -701,6 +717,11 @@ class PrintTrajectoryPlanner:
         self._segment_id = 0
         self._fluid_balance = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
         self._issues = []
+        try:
+            _s = getattr(settings, "plate_axis_sign", (1.0, 1.0))
+            self._plate_axis_sign = (float(_s[0]), float(_s[1]))
+        except Exception:
+            self._plate_axis_sign = (1.0, 1.0)
 
         # Initial waypoint
         self._wp(segment="start")
@@ -773,7 +794,7 @@ class PrintTrajectoryPlanner:
                 target_wells = getattr(step, 'target_wells', [])
                 if target_wells:
                     try:
-                        wx, wy = plate.get_well_position(target_wells[0])
+                        wx, wy = self._well_xy(plate, target_wells[0])
                         speed = getattr(step, 'travel_speed_mm_s', 10.0)
                         self._move_xy(wx, wy, speed * 60.0,
                                       segment="travel",

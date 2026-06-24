@@ -1,0 +1,29 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "quick_print",
+  "name": "__last__",
+  "saved": "2026-06-22T21:47:43",
+  "values": {
+    "pump": {
+      "text": "P2",
+      "data": null
+    },
+    "flow": 0.25,
+    "speed_pct": 25.0,
+    "printz": 0.2,
+    "ink": {
+      "text": "Inert LLS Ink",
+      "data": "Inert LLS Ink"
+    },
+    "ink_z": 0.5,
+    "pickup_safety": 1.5,
+    "prep": true,
+    "service_z": 0.5,
+    "wash_cycles": 3,
+    "postclean": true,
+    "postclean_waste": 6.0,
+    "postclean_oil": 1.0,
+    "travel_speed": 10.0,
+    "preflow": 0.25
+  }
+}

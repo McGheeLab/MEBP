@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +30,85 @@ import numpy as np
 
 from SupportClasses.PhysicalModels import (
     WellRole, ROLE_COLORS, InkSpec, RosetteInsert, WorkspaceConfig,
+    well_role_for_ink_type,
 )
 from SupportClasses.WellPlate import WellPlate, WellInfo, ROW_LABELS
 
 logger = logging.getLogger(__name__)
+
+
+# v7.5.x: plunger-vocabulary back-compat. Old saved well-behaviour JSON used
+# "eject_rate_uL_s" for the push-out rate; the canonical verb is now DISPENSE,
+# so the field is "dispense_rate_uL_s". Translate the old key on load and drop
+# any unknown keys (these dataclasses construct via cls(**data), which is strict).
+_WELL_BEHAVIOR_KEY_ALIASES = {
+    "eject_rate_uL_s": "dispense_rate_uL_s",
+}
+
+
+def _well_behavior_from_dict(cls, data: dict):
+    """Tolerant loader for the role-behaviour dataclasses: applies the v7.5.x
+    key aliases and filters to the class's known fields."""
+    d = dict(data or {})
+    for old, new in _WELL_BEHAVIOR_KEY_ALIASES.items():
+        if old in d and new not in d:
+            d[new] = d.pop(old)
+    allowed = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in allowed})
+
+
+def seed_assignments_from_ink_locations(
+    model: "WellSetupModel",
+    ink_locations: dict[str, list[str]] | None,
+    ink_library: dict | None = None,
+    *,
+    destructive: bool = False,
+) -> list[str]:
+    """Apply hardware reagent locations to a :class:`WellSetupModel`.
+
+    v7.5.x: the Hardware Setup → Ink page pins reagents to wells
+    (``HardwareConfig.ink_locations``). This auto-fills the per-print
+    well assignments from that map so the operator doesn't re-pick the
+    ink / wash / buffer / oil locations for every print.
+
+    The reagent's :class:`WellRole` is derived from its ``ink_type`` via
+    :func:`well_role_for_ink_type` (wash/waste/buffer → those roles,
+    everything else → INK). INK-role wells also receive ``ink_name``.
+
+    Non-destructive by default: only wells currently ``WellRole.EMPTY``
+    are filled, so a manual PRINT (or any other) assignment is never
+    clobbered. Wells absent from the model's plate are skipped. Pass
+    ``destructive=True`` to overwrite every listed well regardless.
+
+    Returns the list of well names that were changed.
+    """
+    if not ink_locations:
+        return []
+    ink_library = ink_library or {}
+    try:
+        valid = set(model.plate.well_names)
+    except Exception:
+        valid = None  # tolerate a duck-typed model in tests
+
+    changed: list[str] = []
+    for ink_name, wells in ink_locations.items():
+        ink = ink_library.get(ink_name)
+        ink_type = getattr(ink, "ink_type", "") if ink is not None else ""
+        role = well_role_for_ink_type(ink_type)
+        for well in wells or []:
+            if valid is not None and well not in valid:
+                continue
+            try:
+                wa = model.get_assignment(well)
+            except Exception:
+                continue
+            if not destructive and wa.role != WellRole.EMPTY:
+                continue
+            model.set_role([well], role)
+            if role == WellRole.INK:
+                model.set_ink([well], ink_name)
+            changed.append(well)
+    return changed
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -64,12 +139,13 @@ class WashBehavior:
 @dataclass
 class WasteBehavior:
     """
-    Waste well: eject material to reset needle conditions.
+    Waste well: DISPENSE material to reset needle conditions.
 
-    Sequence: travel to well → lower → push pump to eject → raise.
+    Sequence: travel to well → lower → push pump to dispense → raise.
     """
     waste_depth_mm: float = 2.0
-    eject_rate_uL_s: float = 2.0
+    # v7.5.x: renamed from eject_rate_uL_s (DISPENSE = push fluid out).
+    dispense_rate_uL_s: float = 2.0
     extra_push_uL: float = 5.0
     settle_time_s: float = 0.5
 
@@ -78,7 +154,7 @@ class WasteBehavior:
 
     @classmethod
     def from_dict(cls, data: dict) -> WasteBehavior:
-        return cls(**data)
+        return _well_behavior_from_dict(cls, data)
 
 
 @dataclass
@@ -128,11 +204,12 @@ class SortedCellBehavior:
     """
     Sorted cell well: deposit picked/sorted cells.
 
-    Sequence: travel to well → lower → eject deposit volume → settle → raise.
+    Sequence: travel to well → lower → DISPENSE deposit volume → settle → raise.
     """
     deposit_depth_mm: float = 1.0
     deposit_volume_uL: float = 1.0
-    eject_rate_uL_s: float = 0.5
+    # v7.5.x: renamed from eject_rate_uL_s (DISPENSE = push fluid out).
+    dispense_rate_uL_s: float = 0.5
     settle_time_s: float = 1.0
 
     def to_dict(self) -> dict:
@@ -140,7 +217,7 @@ class SortedCellBehavior:
 
     @classmethod
     def from_dict(cls, data: dict) -> SortedCellBehavior:
-        return cls(**data)
+        return _well_behavior_from_dict(cls, data)
 
 
 # Behavior factory: creates default behavior for a given role
