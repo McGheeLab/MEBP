@@ -258,6 +258,8 @@ class _FakeExecutor:
         self.cleanup_waste_needles = None
         self.cleanup_oil_needles = None
         self.cleanup_oil_baseline_uL = None
+        self.cleanup_reset_to_initial = None
+        self.cleanup_oil_margin_uL = None
         self._abort_flag = threading.Event()
         _FakeExecutor.instances.append(self)
 
@@ -790,7 +792,6 @@ class TestPostPrintCleanup(_QtBase):
         page = self._page()
         page._prep_check.setChecked(True)
         page._postclean_check.setChecked(True)
-        page._postclean_waste_spin.setValue(6)
         page._ink_combo.setCurrentIndex(page._ink_combo.findData("Alginate"))
         with patch("gui.pages.workflows.quick_print_workflow.PickPlaceExecutor",
                    _FakeExecutor), \
@@ -802,7 +803,9 @@ class TestPostPrintCleanup(_QtBase):
             self._drain_full(page)
         cleanups = [e for e in _FakeExecutor.instances if e.cleanup_ran]
         self.assertEqual(len(cleanups), 1)
-        self.assertEqual(cleanups[0].cleanup_waste_needles, 6.0)
+        # v7.5.x: cleanup is now "reset to initial condition" (waste computed
+        # live from the leftover + oil margin), not a fixed needle count.
+        self.assertTrue(cleanups[0].cleanup_reset_to_initial)
         self.assertTrue(cleanups[0].retracted)
 
     def test_no_cleanup_when_disabled(self):

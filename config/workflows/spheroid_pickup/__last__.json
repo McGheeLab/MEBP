@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "spheroid_pickup",
   "name": "__last__",
-  "saved": "2026-06-22T21:46:57",
+  "saved": "2026-06-24T21:59:44",
   "values": {
     "diameter": 200.0,
     "bore": {

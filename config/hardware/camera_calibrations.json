@@ -14,7 +14,7 @@
       "hw_controls": {
         "exposure_gain_pct": 1.0,
         "gamma": 75.0,
-        "brightness": 40.0,
+        "brightness": 53.0,
         "contrast": 2.0,
         "resolution": [
           640,
@@ -30,20 +30,20 @@
       "date": "2026-06-05"
     },
     "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13": {
-      "um_per_px": 1.540434,
+      "um_per_px": 0.778843,
       "name": "ToupCam",
-      "date": "2026-06-17",
+      "date": "2026-06-27",
       "image_correction": {
-        "brightness": 21,
+        "brightness": 20,
         "contrast": 1.25,
         "gamma": 0.81
       },
       "hw_controls": {
         "auto_exposure": false,
-        "exposure_us": 40000,
-        "exposure_gain_pct": 3281,
-        "gamma": 43,
-        "brightness": 37,
+        "exposure_us": 175000,
+        "exposure_gain_pct": 587,
+        "gamma": 20,
+        "brightness": 0,
         "contrast": 2,
         "resolution": [
           3664,
@@ -77,7 +77,7 @@
   },
   "assignments": {
     "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
     "microscope": "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13"
   }
 }

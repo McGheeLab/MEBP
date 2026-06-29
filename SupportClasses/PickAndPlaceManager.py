@@ -494,7 +494,7 @@ class PickPlaceExecutor:
         self.prep_bore: str = "P1"           # pump/bore used for prep aspirate/dispense
         self.needle_volume_uL: float = 0.0   # "1 needle's worth" (bore cylinder)
         self.oil_needles: float = 1.0        # dispensed to waste AND aspirated from oil
-        self.buffer_needles: float = 4.0     # aspirated from the buffer well
+        self.buffer_needles: float = 1.0     # aspirated from the buffer well
         self.prep_rate_uL_s: float = 1.0     # aspirate/dispense flow during prep
         self.service_z_mm: Optional[float] = None  # dip Z at service wells (zero-ref)
         # Wash = dip + jiggle Z up/down + random XY jiggle about the well centre.
@@ -520,6 +520,15 @@ class PickPlaceExecutor:
         self.cleanup_waste_needles: float = 6.0
         self.cleanup_oil_needles: float = 1.0   # fixed fallback oil aspirate
         self.cleanup_oil_baseline_uL: Optional[float] = None  # pre-run plunger µL
+        # v7.5.x: "reset syringe to initial condition" mode. When True the waste
+        # step DISPENSES the live leftover (current plunger − baseline = the
+        # unprinted ink + buffer) PLUS a small oil flush margin, then the oil
+        # step returns the plunger to ``cleanup_oil_baseline_uL`` (its pre-run /
+        # initial position). So the run ends with the syringe back to its
+        # initial state: pure oil at the initial fill. ``cleanup_waste_needles``
+        # is ignored in this mode (waste is computed live).
+        self.cleanup_reset_to_initial: bool = False
+        self.cleanup_oil_margin_uL: float = 0.0  # small oil flushed past the tip
 
         # State
         self._current_well: str = ""
@@ -1035,6 +1044,42 @@ class PickPlaceExecutor:
 
         self._set_sub_step(clean_op, "Clean complete")
 
+    def prepare_starting_oil(self, volume_uL: float, *,
+                             dispense_to_waste: bool = True):
+        """v7.5.x syringe-budget remedy: bring the syringe to a feasible
+        STARTING fill BEFORE the prep / ink / print sequence so the whole run
+        stays inside the plunger envelope.
+
+        ``dispense_to_waste=True`` → travel (full safe-Z) to the WASTE well and
+        DISPENSE ``volume_uL`` of oil (lowers the starting fill — the
+        operator-confirmed "waste that amount of oil first" when the run would
+        otherwise over-fill the syringe). ``dispense_to_waste=False`` → travel
+        to the OIL well and ASPIRATE ``volume_uL`` of fresh oil (raises the
+        starting fill when the run would otherwise run the plunger dry).
+        Abort-aware; raises if the needed service well is unresolved (the GUI
+        gates on this up front)."""
+        v = abs(float(volume_uL or 0.0))
+        if v <= 1e-6:
+            return
+        op = SimpleNamespace(op_id="OIL_PREP", sub_step="")
+        bore = self.prep_bore
+        rate = self.prep_rate_uL_s
+        sz = self.service_z_mm
+        self._check_abort()
+        if dispense_to_waste:
+            self._set_sub_step(op, f"Oil prep: waste {v:.3f} µL of oil")
+            if not self._safe_move_to_well("__waste__", target_z_mm=sz):
+                raise RuntimeError(
+                    "Oil prep: waste well not configured/resolved (__waste__)")
+            _settled_pump_move(self.controller, bore, +v, rate_uL_s=rate)
+        else:
+            self._set_sub_step(op, f"Oil prep: aspirate {v:.3f} µL of oil")
+            if not self._safe_move_to_well("__oil__", target_z_mm=sz):
+                raise RuntimeError(
+                    "Oil prep: oil well not configured/resolved (__oil__)")
+            _settled_pump_move(self.controller, bore, -v, rate_uL_s=rate)
+        self._check_abort()
+
     def run_print_cleanup(self):
         """Clean + reset the needle ONCE after a Quick Print finishes.
 
@@ -1061,6 +1106,7 @@ class PickPlaceExecutor:
         bore = self.prep_bore
         rate = self.prep_rate_uL_s
         sz = self.service_z_mm
+        baseline = self.cleanup_oil_baseline_uL
 
         def goto(key, label):
             self._check_abort()
@@ -1069,15 +1115,64 @@ class PickPlaceExecutor:
                 raise RuntimeError(
                     f"Cleanup: {label} well not configured/resolved ({key})")
 
-        # 1. Waste — dispense residual (ink + buffer + oil) so the needle empties.
+        def _vol_to_baseline():
+            """Polarity-correct signed ``move_pump_uL`` volume (``+`` = dispense)
+            that returns the plunger from its CURRENT live position to
+            ``baseline`` = ``pump_dir_sign × (baseline − current)``. Returns None
+            if the live position is unreadable. (``move_pump_uL`` applies
+            ``pump_dir_sign`` but ``get_pump_position_uL`` does not, so the naive
+            ``baseline − current`` only works when ``pump_dir_sign == +1``;
+            ``getattr`` defaults the sign to +1 on controllers/fakes that don't
+            expose it.)"""
+            if baseline is None:
+                return None
+            try:
+                cur = self.controller.get_pump_position_uL(bore)
+            except Exception:
+                cur = None
+            if cur is None:
+                return None
+            try:
+                sign = float(self.controller.pump_dir_sign(bore))
+            except Exception:
+                sign = 1.0
+            return sign * (float(baseline) - float(cur))
+
+        # 1. Waste — dispense residual so the needle empties.
+        #
+        # v7.5.x "reset to initial condition": the waste volume is computed LIVE
+        # = (current plunger − baseline) [the unprinted ink + buffer that piled
+        # up since the run started] + a small oil flush margin (pushes a little
+        # oil past the tip so the last of the ink/buffer is expelled). The oil
+        # step below then re-aspirates the margin to return the plunger to the
+        # baseline (initial) position. Falls back to the fixed needle multiple
+        # when reset mode is off or the live position is unreadable.
         goto("__waste__", "waste")
-        if unit > 0 and self.cleanup_waste_needles > 0:
+        waste_uL = None
+        if self.cleanup_reset_to_initial and baseline is not None and unit >= 0:
+            # Leftover above baseline as a DISPENSE volume (+ = push out): the
+            # signed move that returns the plunger to baseline. + = a net
+            # dispense (the unprinted ink + buffer to expel); <= 0 means the
+            # plunger is already at/below baseline (nothing extra to waste).
+            to_baseline = _vol_to_baseline()
+            if to_baseline is not None:
+                leftover = max(0.0, float(to_baseline))
+                margin = max(0.0, float(self.cleanup_oil_margin_uL or 0.0))
+                cap = (20.0 * unit) if unit > 0 else None
+                cand = leftover + margin
+                if cap is None or cand <= cap:
+                    waste_uL = cand
+                else:
+                    logger.warning(
+                        "Cleanup reset waste %.3f µL exceeds cap %.3f — using "
+                        "fixed %g-needle fallback", cand, cap,
+                        self.cleanup_waste_needles)
+        if waste_uL is None:
+            waste_uL = unit * self.cleanup_waste_needles
+        if waste_uL > 1e-6:
             self._set_sub_step(
-                clean_op,
-                f"Cleanup: dispense {self.cleanup_waste_needles:g} needle(s) to "
-                f"waste")
-            _settled_pump_move(self.controller, 
-                bore, +unit * self.cleanup_waste_needles, rate_uL_s=rate)
+                clean_op, f"Cleanup: dispense {waste_uL:.3f} µL to waste")
+            _settled_pump_move(self.controller, bore, +waste_uL, rate_uL_s=rate)
             self._check_abort()
 
         # 2. Wash.
@@ -1085,20 +1180,16 @@ class PickPlaceExecutor:
         self._set_sub_step(clean_op, "Cleanup: wash needle")
         self._do_wash()
 
-        # 3. Oil — reset the syringe oil level.
+        # 3. Oil — reset the syringe oil level (return plunger to baseline).
         goto("__oil__", "oil")
         oil_uL = None
-        baseline = self.cleanup_oil_baseline_uL
         if baseline is not None:
-            try:
-                current = self.controller.get_pump_position_uL(bore)
-            except Exception:
-                current = None
-            if current is not None:
-                # move_pump_uL and get_pump_position_uL share the same µL↔mm +
-                # zero-ref frame, so (baseline − current) returns the plunger to
-                # the pre-run position regardless of the absolute sign.
-                reset = float(baseline) - float(current)
+            # POLARITY-SAFE: the signed move_pump_uL volume that drives
+            # get_pump_position_uL back to `baseline` — correct on either
+            # pump_dir_sign (the old `baseline − current` omitted the
+            # pump_dir_sign factor and only worked when pump_dir_sign == +1).
+            reset = _vol_to_baseline()
+            if reset is not None:
                 cap = (20.0 * unit) if unit > 0 else None
                 if cap is None or abs(reset) <= cap:
                     oil_uL = reset

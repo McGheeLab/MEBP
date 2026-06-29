@@ -31,7 +31,8 @@ from SupportClasses.HardwareConfig import HardwareConfig
 from SupportClasses.SafetyLimits import SafetyLimits
 from SupportClasses.StageController import (
     StageController,
-    _PUMP_MOVE_WAIT_CAP_S,
+    _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S,
+    _PUMP_MOVE_DRAIN_MARGIN_S,
     _PUMP_SETTLE_FALLBACK_RATE_UL_S,
 )
 from SupportClasses.PickAndPlaceManager import _settled_pump_move
@@ -156,21 +157,38 @@ class TestMovePumpSettle(unittest.TestCase):
 
     def test_settle_true_zero_dwell_still_waits_for_completion(self):
         # settle time 0 but settle=True → only the completion wait (preserves
-        # the legacy EXTRUDE blocking semantics this path subsumes).
+        # the legacy EXTRUDE blocking semantics this path subsumes). The fake
+        # _ctrl has no zp_stage.flush_moves, so this exercises the open-loop
+        # fallback wait (the full estimate, no longer truncated at 10 s).
         c = _ctrl(settle=0.0)
         sleeps = self._run(c, settle=True)
         self.assertEqual(len(sleeps), 1)
         self.assertAlmostEqual(sleeps[0], 0.3)
 
-    def test_completion_wait_is_capped(self):
-        # Huge volume / tiny rate → the completion wait clamps at the cap.
+    def test_fallback_completion_wait_not_truncated_at_10s(self):
+        # No board confirmation (fake without flush_moves) → the open-loop
+        # fallback now waits the FULL estimated move duration, not a 10 s cap.
+        # A 4-needle buffer aspirate (~27 µL at 1 µL/s) is the real-world case
+        # the old 10 s truncation broke (pump still running into the next M400).
+        c = _ctrl(settle=0.0)
+        sleeps = []
+        with mock.patch("SupportClasses.StageController.time.sleep",
+                        side_effect=sleeps.append):
+            c.move_pump_uL("P2", -27.222, rate_uL_s=1.0, settle=True)
+        self.assertEqual(len(sleeps), 1)
+        expected = 27.222 / 1.0 + 0.1
+        self.assertAlmostEqual(sleeps[0], expected)   # ~27.3 s, NOT 10 s
+
+    def test_fallback_completion_wait_is_capped_at_backstop(self):
+        # Pathological volume / tiny rate → the fallback wait clamps at the
+        # absolute backstop so it can never hang forever.
         c = _ctrl(settle=0.0)
         sleeps = []
         with mock.patch("SupportClasses.StageController.time.sleep",
                         side_effect=sleeps.append):
             c.move_pump_uL("P1", 1e6, rate_uL_s=0.01, settle=True)
         self.assertEqual(len(sleeps), 1)
-        self.assertAlmostEqual(sleeps[0], _PUMP_MOVE_WAIT_CAP_S)
+        self.assertAlmostEqual(sleeps[0], _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S)
 
     def test_completion_wait_uses_fallback_rate_when_none(self):
         # rate_uL_s=None → completion estimate uses the fallback rate.
@@ -181,6 +199,88 @@ class TestMovePumpSettle(unittest.TestCase):
             c.move_pump_uL("P1", 1.0, rate_uL_s=None, settle=True)
         expected = 1.0 / _PUMP_SETTLE_FALLBACK_RATE_UL_S + 0.1
         self.assertAlmostEqual(sleeps[0], expected)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  move_pump_uL settle — board-confirmed (M400) completion drain
+# ════════════════════════════════════════════════════════════════════
+
+class _FakeZP:
+    """Records flush_moves(timeout_s=) calls; returns ``result``."""
+
+    def __init__(self, result=True):
+        self.result = result
+        self.flush_calls = []
+
+    def flush_moves(self, timeout_s=15.0):
+        self.flush_calls.append(timeout_s)
+        return self.result
+
+
+def _ctrl_with_zp(settle=0.0, flush_result=True):
+    c = _ctrl(settle=settle)
+    c.zp_stage = _FakeZP(result=flush_result)
+    # Poller suspend/resume must be no-ops on this bare stub.
+    c._pos_poller = None
+    return c
+
+
+class TestMovePumpSettleM400Confirm(unittest.TestCase):
+    """When the board can confirm completion, the long discrete pump move is
+    drained via M400 (scaled timeout) instead of an open-loop sleep — so a
+    multi-needle buffer aspirate finishes before the next safe_travel_to M400
+    (the bug: the pump bled into that M400 and tripped its 15 s timeout)."""
+
+    def test_buffer_move_drained_via_flush_not_sleep(self):
+        c = _ctrl_with_zp(settle=0.0, flush_result=True)
+        sleeps = []
+        with mock.patch("SupportClasses.StageController.time.sleep",
+                        side_effect=sleeps.append):
+            c.move_pump_uL("P2", -27.222, rate_uL_s=1.0, settle=True)
+        # flush_moves confirmed completion → NO open-loop completion sleep.
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(c.zp_stage.flush_calls), 1)
+        # Timeout scales with the move (~27.3 s) + margin, well over 15 s.
+        expected_to = (27.222 / 1.0 + 0.1) + _PUMP_MOVE_DRAIN_MARGIN_S
+        self.assertAlmostEqual(c.zp_stage.flush_calls[0], expected_to)
+
+    def test_flush_timeout_does_not_double_wait(self):
+        # flush_moves available but times out → it already waited ~move_s, so
+        # the caller must NOT sleep again on top of it.
+        c = _ctrl_with_zp(settle=0.0, flush_result=False)
+        sleeps = []
+        with mock.patch("SupportClasses.StageController.time.sleep",
+                        side_effect=sleeps.append):
+            c.move_pump_uL("P2", -27.222, rate_uL_s=1.0, settle=True)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(c.zp_stage.flush_calls), 1)
+
+    def test_settle_dwell_still_brackets_flush_path(self):
+        # The pre/post settle dwell is still applied around the M400 drain.
+        c = _ctrl_with_zp(settle=0.2, flush_result=True)
+        sleeps = []
+        with mock.patch("SupportClasses.StageController.time.sleep",
+                        side_effect=sleeps.append):
+            c.move_pump_uL("P1", 2.0, rate_uL_s=10.0, settle=True)
+        self.assertEqual(sleeps, [0.2, 0.2])          # pre + post, no mid sleep
+        self.assertEqual(len(c.zp_stage.flush_calls), 1)
+
+    def test_flush_drain_timeout_capped_at_backstop(self):
+        c = _ctrl_with_zp(settle=0.0, flush_result=True)
+        with mock.patch("SupportClasses.StageController.time.sleep"):
+            c.move_pump_uL("P1", 1e6, rate_uL_s=0.01, settle=True)
+        self.assertAlmostEqual(c.zp_stage.flush_calls[0],
+                               _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S)
+
+    def test_settle_false_never_confirms(self):
+        # Streamed print path / manual jog: no flush, no sleep, pure passthrough.
+        c = _ctrl_with_zp(settle=0.2, flush_result=True)
+        sleeps = []
+        with mock.patch("SupportClasses.StageController.time.sleep",
+                        side_effect=sleeps.append):
+            c.move_pump_uL("P1", 2.0, rate_uL_s=10.0, settle=False)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(c.zp_stage.flush_calls), 0)
 
 
 # ════════════════════════════════════════════════════════════════════

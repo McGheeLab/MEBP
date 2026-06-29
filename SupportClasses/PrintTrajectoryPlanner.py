@@ -164,10 +164,19 @@ class PrintTrajectoryPlanner:
         # GEOMETRIC well centres (plate.get_well_position) so they map to the
         # physically-correct well on a 180°-mounted stage (ME3B V1).
         self._plate_axis_sign: tuple = (1.0, 1.0)
+        # v7.5.x: the active PrintSettings, captured at the start of generate()
+        # / generate_inwell_print() so _well_xy can consult the CALIBRATED
+        # well-position map (settings.well_positions_mm). None until set.
+        self._settings = None
 
     def _well_xy(self, plate, well_name):
-        """Plate-local well centre (A1-relative mm) mapped onto stage axes via
-        the per-machine sign — the planner's single well→stage resolver."""
+        """Well centre in ZERO-REF mm — prefers the CALIBRATED taught position
+        (settings.well_positions_mm), else the GEOMETRIC plate-local offset
+        (A1-relative mm) mapped onto the stage axes via the per-machine sign.
+        See :func:`resolve_well_xy_mm`."""
+        if self._settings is not None:
+            return resolve_well_xy_mm(well_name, plate, self._settings)
+        # Pre-generate fallback (settings not yet captured): legacy geometric.
         wx, wy = plate.get_well_position(well_name)
         sx, sy = self._plate_axis_sign
         return (sx * wx, sy * wy)
@@ -632,6 +641,7 @@ class PrintTrajectoryPlanner:
         self._y = well_y + (path_points[0][1] if path_points else 0.0)
         self._z = settings.print_z_height  # already at print height
         self._issues = []
+        self._settings = settings
 
         flow = getattr(settings, 'flow_rate', 0.01) or 0.01
 
@@ -717,6 +727,9 @@ class PrintTrajectoryPlanner:
         self._segment_id = 0
         self._fluid_balance = {"P1": 0.0, "P2": 0.0, "P3": 0.0}
         self._issues = []
+        # v7.5.x: capture settings so _well_xy can prefer the CALIBRATED
+        # well-position map over the geometric offset.
+        self._settings = settings
         try:
             _s = getattr(settings, "plate_axis_sign", (1.0, 1.0))
             self._plate_axis_sign = (float(_s[0]), float(_s[1]))
@@ -856,6 +869,36 @@ class PrintTrajectoryPlanner:
 # ═══════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════
+
+def resolve_well_xy_mm(well_name, plate, settings):
+    """Well centre in ZERO-REF mm — the single well→stage resolver for the
+    print path (the frame ``move_xy_absolute(from_zero_ref=True)`` and the
+    trajectory waypoints expect).
+
+    Prefers the per-job CALIBRATED map stamped on ``settings.well_positions_mm``
+    (taught/warped absolute stage positions already converted to zero-ref mm at
+    job-build time). Falls back to the GEOMETRIC plate-local offset
+    (``plate.get_well_position`` — A1 at origin) mapped onto the stage axes by
+    ``settings.plate_axis_sign`` when the well has no calibration. The geometric
+    branch is byte-identical to the legacy behaviour, so uncalibrated jobs and
+    tests are unaffected. A malformed sign degrades to aligned ``(1, 1)``."""
+    cal = getattr(settings, "well_positions_mm", None)
+    if cal:
+        p = cal.get(well_name)
+        if p is None and isinstance(well_name, str):
+            p = cal.get(well_name.upper())
+        if p is not None:
+            try:
+                return (float(p[0]), float(p[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+    wx, wy = plate.get_well_position(well_name)
+    try:
+        sgn = getattr(settings, "plate_axis_sign", (1.0, 1.0))
+        return (float(sgn[0]) * wx, float(sgn[1]) * wy)
+    except (TypeError, ValueError, IndexError):
+        return (wx, wy)
+
 
 def _find_well(well_model, plate, role_value: str):
     """Find first well with given role. Returns (name, x, y) or None."""

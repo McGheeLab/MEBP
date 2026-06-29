@@ -1,0 +1,150 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "A_2",
+    "description": "A: 3 shape(s), 1 layer(s), 23.3 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-06-26T08:46:34.220758+00:00",
+    "modified": "2026-06-26T08:46:34.220758+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "A": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\A_2.csv",
+        "csv_path": "config\\prints\\A_2.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 55,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "auto_layout": false,
+      "in_well": true
+    },
+    "Point_25": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        2.0,
+        0.0,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Point_26": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        1.0000000000000002,
+        1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Point_27": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        -0.9999999999999996,
+        1.7320508075688774,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Point_28": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        -2.0,
+        2.4492935982947064e-16,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Point_29": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        -1.0000000000000009,
+        -1.732050807568877,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    },
+    "Point_30": {
+      "object_type": "point",
+      "params": {
+        "cx": 0.0,
+        "cy": 0.0,
+        "dwell_time_s": 1.0,
+        "dispense_volume_uL": 0.1,
+        "filled": false
+      },
+      "position": [
+        1.0000000000000002,
+        -1.7320508075688772,
+        0.0
+      ],
+      "color": "#a6e3a1",
+      "ink": "Inert LLS",
+      "auto_layout": true,
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

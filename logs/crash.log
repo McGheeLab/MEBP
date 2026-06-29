@@ -1,0 +1,24 @@
+Windows fatal exception: code 0x80010108
+
+Thread 0x0000e5b8 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010012
+
+Thread 0x0000e5b8 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010108
+
+Thread 0x0000cb8c (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010108
+
+Thread 0x0000df58 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010012
+
+Thread 0x0000df58 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010108
+
+Thread 0x00011da0 (most recent call first):
+  <no Python frame>

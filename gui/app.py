@@ -868,6 +868,23 @@ class MainWindow(QMainWindow):
                         wf.set_settings(self.settings)
                 except Exception as e:
                     logger.debug(f"push cal data to workflows mode failed: {e}")
+            # v7.5.x: push the calibrated well positions to the Printing-mode
+            # setup page so its print path (discrete / hybrid / trajectory)
+            # drives to the TAUGHT wells instead of a geometric grid anchored
+            # at the stage origin (which, on the (-1,-1) plate flip, clamped to
+            # 0,0 — the "moved to 0,0 / wrong coordinates" operator bug). The
+            # Jog page and Workflows mode already get this; the Printing setup
+            # page was missing it.
+            printing_mode = getattr(self, "_printing_mode", None)
+            if printing_mode is not None:
+                try:
+                    setup_pg = getattr(printing_mode, "setup_page", None)
+                    if setup_pg is not None and hasattr(
+                            setup_pg, "set_calibration_data"):
+                        setup_pg.set_calibration_data(
+                            *cal_page.get_calibration_data())
+                except Exception as e:
+                    logger.debug(f"push cal data to printing setup failed: {e}")
             # v7.5.x: push the Z-reference set to the Print Builder so its
             # Sketch sub-page can express print Z as a height above the
             # plate bottom.

@@ -471,35 +471,57 @@ class QuickPrintWorkflowPage(QWidget):
         self._service_z_spin = self._dspin(
             0.0, 30.0, 0.50, " mm", 2, 0.1,
             "Needle dip height above the plate bottom at the service wells.")
+        self._buffer_needles_spin = self._dspin(
+            0.0, 20.0, 1.0, "", 1, 0.5,
+            "Needles of buffer aspirated after the wash during prep.")
         self._wash_cycles_spin = self._ispin(
             0, 50, 3, "Dip-jiggle cycles at the wash well.")
         sec = dlg.add_section("Needle prep")
         sec.add_check("prep", self._prep_check, True)
         sec.add("service_z", "Service dip Z (↑ bottom)", self._service_z_spin, 0.50)
+        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles_spin, 1.0)
         sec.add("wash_cycles", "Wash cycles", self._wash_cycles_spin, 3)
+
+        # ── Between print lines (lift between strokes / sub-paths) ──
+        self._line_retract_spin = self._dspin(
+            0.0, 40.0, 1.0, " mm", 2, 0.1,
+            "Height the needle lifts above the print Z between separate strokes "
+            "(sub-paths / objects) before travelling to the next one. A "
+            "continuous fill prints as one stroke and is not lifted mid-fill.")
+        self._line_z_speed_spin = self._dspin(
+            0.0, 100.0, 0.0, " mm/s", 1, 1.0,
+            "Quick-move Z speed for the inter-line lift + lower. 0 = use the "
+            "controller default.")
+        self._line_xy_speed_spin = self._dspin(
+            0.0, 200.0, 0.0, " mm/s", 1, 1.0,
+            "Quick-move XY speed for the inter-line travel. 0 = use the Advanced "
+            "travel speed.")
+        sec = dlg.add_section("Between print lines")
+        sec.add("line_retract", "Retract after each line",
+                self._line_retract_spin, 1.0)
+        sec.add("line_z_speed", "Line-move Z speed", self._line_z_speed_spin, 0.0)
+        sec.add("line_xy_speed", "Line-move XY speed", self._line_xy_speed_spin, 0.0)
 
         # ── Post-print cleanup ──
         self._postclean_check = QCheckBox(
-            "Clean needle after print (waste → wash → reset oil)")
+            "Reset syringe to initial condition after print")
         self._postclean_check.setChecked(True)
         self._postclean_check.setToolTip(
-            "After the print: dispense a multiple of the needle to waste, wash, "
-            "then aspirate oil to reset the syringe's oil level.")
+            "After the print: dispense the unprinted ink + buffer (computed live "
+            "from the plunger position) plus a small oil flush margin to waste, "
+            "wash, then top the oil back up so the plunger returns to its pre-run "
+            "(initial) position — the syringe ends as it started.")
         self._postclean_check.toggled.connect(
             lambda *_: (self._refresh_setup_status(), self._update_settings_summary()))
-        self._postclean_waste_spin = self._dspin(
-            0.0, 50.0, 6.0, "", 1, 1.0,
-            "How many needle volumes to dispense to waste after the print.")
-        self._postclean_oil_spin = self._dspin(
-            0.0, 50.0, 1.0, "", 1, 1.0,
-            "Fallback oil aspirate to reset the syringe when the live pump "
-            "position "
-            "is unavailable (normally it returns to the pre-run plunger position).")
+        self._postclean_margin_spin = self._dspin(
+            0.0, 50.0, 1.0, "", 1, 0.5,
+            "Small extra oil (× needle) flushed past the tip to expel the last "
+            "of the ink/buffer, then re-aspirated so the plunger returns to its "
+            "initial position. 0 = waste exactly the unprinted volume.")
         sec = dlg.add_section("Post-print cleanup")
         sec.add_check("postclean", self._postclean_check, True)
-        sec.add("postclean_waste", "Waste (× needle)", self._postclean_waste_spin, 6.0)
-        sec.add("postclean_oil", "Oil refill (× needle, fallback)",
-                self._postclean_oil_spin, 1.0)
+        sec.add("postclean_margin", "Oil flush margin (× needle)",
+                self._postclean_margin_spin, 1.0)
 
         # ── Advanced ──
         self._travel_speed = self._dspin(
@@ -1174,6 +1196,134 @@ class QuickPrintWorkflowPage(QWidget):
         safety = float(self._pickup_safety_spin.value())
         return max((dispensed + prime) * safety, prime)
 
+    def _print_dispense_volume_uL(self) -> float:
+        """Volume the print path itself DISPENSES (µL) = flow × print time,
+        excluding the prime and the pickup safety factor. Used by the
+        syringe-budget pre-flight to model the print's net dispense."""
+        speed, flow, _prime = self._resolved_print_kinematics()
+        if flow <= 0 or speed <= 0:
+            return 0.0
+        try:
+            segments = self._path_segments_for_selection()
+        except Exception:
+            segments = []
+        path_len_mm = 0.0
+        for seg in segments:
+            for i in range(1, len(seg)):
+                dx = seg[i][0] - seg[i - 1][0]
+                dy = seg[i][1] - seg[i - 1][1]
+                path_len_mm += (dx * dx + dy * dy) ** 0.5
+        return flow * (path_len_mm / speed)
+
+    def _check_syringe_budget(self, pump, prep_enabled, ink_on, pickup_uL,
+                              settings, cleanup_enabled, cleanup_ctx):
+        """Pre-flight the FULL run's pump moves against the plunger envelope.
+
+        Assembles the ordered signed volumes (prep dispense/aspirate → ink
+        pickup → print prime + path dispense), folds in the post-print reset
+        trough (``baseline − oil margin``), and simulates via
+        ``StageController.simulate_pump_budget``. Returns the budget dict ONLY
+        when it is ACTIONABLE (calibrated, live fill readable, out of bounds);
+        returns None to proceed (in-bounds, uncalibrated, or fill unreadable)."""
+        ctrl = self._controller
+        try:
+            start_fill = ctrl.pump_fill_uL(pump)
+        except Exception:
+            start_fill = None
+        if start_fill is None:
+            return None
+        try:
+            needle_uL = needle_volume_uL(self._hw_config)
+        except Exception:
+            needle_uL = 0.0
+        moves = []
+        if prep_enabled and needle_uL > 0:
+            # prep: dispense 1 needle of oil → aspirate 1 needle of oil →
+            # aspirate buffer. Oil count = the executor default (1 needle);
+            # Quick Print exposes only the buffer count.
+            try:
+                buf = float(self._buffer_needles_spin.value())
+            except Exception:
+                buf = 1.0
+            moves += [+needle_uL, -needle_uL, -buf * needle_uL]
+        if ink_on and pickup_uL > 0:
+            moves += [-float(pickup_uL)]              # aspirate ink
+        try:
+            prime_uL = float(settings.prime_amounts_uL.get(pump, 0.0))
+        except Exception:
+            prime_uL = 0.0
+        if prime_uL > 0:
+            moves += [+prime_uL]
+        printed_uL = self._print_dispense_volume_uL()
+        if printed_uL > 0:
+            moves += [+printed_uL]
+        # The post-print reset dips the plunger to (baseline − oil margin) before
+        # topping oil back up. That trough does NOT shift with a starting-oil
+        # remedy, so fold it in as a fixed low-water mark, not a shiftable move.
+        extra_min = None
+        if cleanup_enabled and cleanup_ctx and cleanup_ctx.get("reset_to_initial"):
+            extra_min = start_fill - float(cleanup_ctx.get("oil_margin_uL", 0.0))
+        try:
+            budget = ctrl.simulate_pump_budget(
+                pump, moves, start_fill_uL=start_fill,
+                extra_min_fill_uL=extra_min)
+        except Exception as e:
+            logger.warning("Quick Print syringe budget skipped: %s", e)
+            return None
+        if budget.get("ok", True) or budget.get("reason") != "out_of_bounds":
+            return None
+        return budget
+
+    def _offer_oil_remedy(self, budget):
+        """Ask whether to waste / aspirate oil to a feasible starting fill.
+        Returns a ``starting_oil`` dict to apply before the run, or None if the
+        operator declines or the remedy well isn't assigned + calibrated."""
+        remedy = budget.get("remedy")
+        rem_uL = float(budget.get("remedy_uL", 0.0))
+        rec_fill = float(budget.get("recommended_start_fill_uL", 0.0))
+        start_fill = float(budget.get("start_fill_uL", 0.0))
+        over = (remedy == "waste_oil")
+        role = "waste" if over else "oil"
+        positions, _missing = resolve_service_positions(
+            self._hw_config, self._well_positions)
+        service_z = self._plate_offset_to_zref(
+            float(self._service_z_spin.value()))
+        if role not in positions or service_z is None or self._safe_z is None:
+            QMessageBox.warning(
+                self, "Syringe won't fit at the current fill",
+                ("This run would over-fill the syringe by " if over
+                 else "This run would run the syringe dry by ")
+                + f"{rem_uL:.2f} µL. To auto-correct it I'd "
+                + ("waste" if over else "aspirate")
+                + f" {rem_uL:.2f} µL of oil first, but that needs a Safe Z and "
+                f"the {role} well assigned + calibrated (and the plate bottom Z "
+                "set). Set that up, or reduce the print / pickup / prep volumes.",
+                QMessageBox.StandardButton.Ok)
+            self._status.setText(
+                f"Syringe over budget — needs the {role} well to auto-correct.")
+            return None
+        verb = (f"waste {rem_uL:.2f} µL of oil to the waste well" if over
+                else f"aspirate {rem_uL:.2f} µL of oil from the oil well")
+        resp = QMessageBox.question(
+            self, "Adjust the starting oil?",
+            "The syringe can't hold this whole run at its current fill "
+            f"({start_fill:.2f} µL): it would "
+            + ("over-fill by " if over else "run dry by ")
+            + f"{rem_uL:.2f} µL.\n\nI can {verb} first so it starts at "
+            f"{rec_fill:.2f} µL, which fits. Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            self._status.setText("Cancelled — syringe over budget.")
+            return None
+        return {
+            "volume_uL": rem_uL,
+            "dispense_to_waste": over,
+            "role": role,
+            "well_pos": positions[role],
+            "service_z": service_z,
+        }
+
     def _plate_offset_to_zref(self, offset_mm: float) -> float | None:
         """Height above the calibrated plate bottom (mm) → zero-ref Z (mm),
         polarity-correct. Returns None if the plate bottom isn't calibrated.
@@ -1270,8 +1420,8 @@ class QuickPrintWorkflowPage(QWidget):
                 warn = True
             else:
                 msgs.append(
-                    f"✓ Clean after: waste {self._postclean_waste_spin.value():g}×"
-                    " → wash → reset oil")
+                    "✓ Reset to initial: waste unprinted ink+buffer → wash → "
+                    "top up oil")
 
         # Calibration prerequisites for any well descent (preamble or cleanup).
         active = self._preamble_active() or postclean_on
@@ -1414,6 +1564,22 @@ class QuickPrintWorkflowPage(QWidget):
             settings.prime_amounts_uL[pump] = prime_uL
         except Exception:
             pass
+        # v7.5.x Feature 3: per-line retract height + fast inter-line move speeds.
+        # build_well_plate_job lifts to (print Z + intra_well_hop_z_mm) between
+        # sub-paths and uses the line speeds for that hop's lift / XY / lower.
+        try:
+            settings.intra_well_hop_z_mm = float(self._line_retract_spin.value())
+        except Exception:
+            pass
+        try:
+            settings.line_move_z_speed_mm_s = float(self._line_z_speed_spin.value())
+        except Exception:
+            pass
+        try:
+            settings.line_move_xy_speed_mm_s = float(
+                self._line_xy_speed_spin.value())
+        except Exception:
+            pass
         return settings
 
     # ── Run / abort ───────────────────────────────────────────────
@@ -1548,9 +1714,11 @@ class QuickPrintWorkflowPage(QWidget):
                         "Plate bottom Z not calibrated — can't resolve the "
                         "prep service dip Z.")
                     return
-                # Capture wash cycles on the GUI thread (the spin lives in the
-                # modeless popout the operator can touch while the preamble runs).
+                # Capture wash cycles + buffer count on the GUI thread (the spins
+                # live in the modeless popout the operator can touch while the
+                # preamble runs).
                 wash_cycles = int(self._wash_cycles_spin.value())
+                buffer_needles = float(self._buffer_needles_spin.value())
         elif self._safe_z is None:
             # Plain print, no preamble: keep the legacy "no Safe Z" prompt.
             resp = QMessageBox.question(
@@ -1599,13 +1767,21 @@ class QuickPrintWorkflowPage(QWidget):
                 oil_baseline = self._controller.get_pump_position_uL(self._pump())
             except Exception:
                 oil_baseline = None
+            # v7.5.x: "reset to initial condition" — waste the unprinted
+            # ink + buffer (computed live) + a small oil flush margin, then top
+            # the oil back up to the pre-run plunger position.
+            margin_needles = float(self._postclean_margin_spin.value())
             cleanup_ctx = {
                 "bore": self._pump(),
                 "needle_uL": cl_needle,
                 "service_positions": cl_positions,
                 "service_z": cl_service_z,
-                "waste_needles": float(self._postclean_waste_spin.value()),
-                "oil_needles": float(self._postclean_oil_spin.value()),
+                "reset_to_initial": True,
+                "oil_margin_uL": margin_needles * cl_needle,
+                # Fixed fallbacks used only if the live plunger position can't
+                # be read at cleanup time (a bad M114).
+                "waste_needles": 6.0,
+                "oil_needles": max(margin_needles, 1.0),
                 "oil_baseline_uL": oil_baseline,
                 "wash_cycles": int(self._wash_cycles_spin.value()),
             }
@@ -1625,6 +1801,35 @@ class QuickPrintWorkflowPage(QWidget):
         start_zref_mm = (center[0] + path_points[0][0],
                          center[1] + path_points[0][1])
 
+        # ── v7.5.x Feature 1: syringe-budget pre-flight (Quick Print only) ──
+        # Simulate EVERY pump move this run makes — prep dispense/aspirate → ink
+        # pickup → print prime + path dispense → the post-print reset trough —
+        # against the calibrated plunger envelope [empty, full]. If it can't fit
+        # at ANY starting fill, tell the operator it won't work and block. If it
+        # CAN fit with a different start, offer to waste (over-fill) or aspirate
+        # (runs dry) that much oil first, then proceed. Skipped (proceeds) when
+        # the pump isn't plunger-calibrated or the live fill is unreadable.
+        starting_oil = None
+        budget = self._check_syringe_budget(
+            pump, prep_enabled, ink is not None, pickup_uL, settings,
+            cleanup_enabled, cleanup_ctx)
+        if budget is not None:
+            if not budget.get("feasible_by_shift"):
+                cap = budget.get("capacity_uL") or 0.0
+                QMessageBox.warning(
+                    self, "Won't fit the syringe",
+                    "This print won't work: its pump moves span "
+                    f"{budget.get('span_uL', 0.0):.2f} µL but the {pump} "
+                    f"syringe only holds {cap:.2f} µL. Reduce the print size, "
+                    "the ink pickup, or the prep buffer/oil volumes.",
+                    QMessageBox.StandardButton.Ok)
+                self._status.setText("Print won't fit the syringe — see dialog.")
+                return
+            # Feasible with a different starting fill → offer the oil remedy.
+            starting_oil = self._offer_oil_remedy(budget)
+            if starting_oil is None:
+                return  # operator cancelled, or the remedy well isn't set up
+
         # ── "Confirm all is setup" dialog — when there's a preamble or a
         # post-print cleanup (both are significant automated routines). ──
         if preamble or cleanup_enabled:
@@ -1638,8 +1843,8 @@ class QuickPrintWorkflowPage(QWidget):
             lines.append(f"  • Print “{obj_label}” in well {well}")
             if cleanup_enabled:
                 lines.append(
-                    f"  • Clean after: waste {cleanup_ctx['waste_needles']:g}× "
-                    "needle → wash → reset oil")
+                    "  • Reset the syringe to its initial condition: waste the "
+                    "unprinted ink+buffer → wash → top up oil")
             lines += ["", "Hardware set up correctly and ready to start?"]
             resp = QMessageBox.question(
                 self, "Confirm print setup", "\n".join(lines),
@@ -1658,11 +1863,14 @@ class QuickPrintWorkflowPage(QWidget):
         }
 
         self._print_btn.setEnabled(False)
-        self._abort_btn.setEnabled(preamble)  # abort can interrupt the preamble
+        # Abort can interrupt the preamble (prep / ink) or the starting-oil
+        # remedy — any automated pre-print routine on the worker thread.
+        self._abort_btn.setEnabled(preamble or (starting_oil is not None))
         self._preflight_error = None
         self._preflight_abort_requested = False
         self._status.setText(
-            (f"Preparing needle / picking up ink for {well}…" if preamble
+            (f"Preparing needle / picking up ink for {well}…"
+             if (preamble or starting_oil is not None)
              else f"Positioning needle over well {well} (retracted to safe Z)…"))
 
         bridge = self._bridge
@@ -1676,19 +1884,34 @@ class QuickPrintWorkflowPage(QWidget):
             err = None
             ok = False
             executor = None
+            # The executor runs the optional prep + ink pickup AND, when the
+            # syringe-budget pre-flight asked for it, the starting-oil remedy.
+            run_executor = preamble or (starting_oil is not None)
             try:
-                if preamble:
+                if run_executor:
                     executor = PickPlaceExecutor(
                         self._controller, self._hw_config)
                     executor.safe_z_mm = float(self._safe_z)
+                    executor.prep_bore = pump
                     executor.on_sub_step = (
                         lambda op, step: bridge.progress.emit(0, 0, str(step)))
                     self._active_executor = executor
+                    # v7.5.x Feature 1: bring the syringe to a feasible starting
+                    # fill BEFORE prep — waste (over-fill) or aspirate (runs dry)
+                    # the computed oil at the resolved service well.
+                    if starting_oil is not None:
+                        executor.service_z_mm = starting_oil["service_z"]
+                        setattr(executor,
+                                f"{starting_oil['role']}_well_pos",
+                                starting_oil["well_pos"])
+                        executor.prepare_starting_oil(
+                            starting_oil["volume_uL"],
+                            dispense_to_waste=starting_oil["dispense_to_waste"])
                     if prep_enabled:
-                        executor.prep_bore = pump
                         executor.needle_volume_uL = needle_uL
                         executor.service_z_mm = service_z
                         executor.wash_cycles = wash_cycles
+                        executor.buffer_needles = buffer_needles
                         executor.waste_well_pos = service_positions["waste"]
                         executor.oil_well_pos = service_positions["oil"]
                         executor.wash_well_pos = service_positions["wash"]
@@ -1918,6 +2141,12 @@ class QuickPrintWorkflowPage(QWidget):
                 executor.needle_volume_uL = cleanup_ctx["needle_uL"]
                 executor.service_z_mm = cleanup_ctx["service_z"]
                 executor.wash_cycles = int(cleanup_ctx["wash_cycles"])
+                # v7.5.x "reset to initial condition": waste = live leftover +
+                # margin; the needle multiples are fixed fallbacks only.
+                executor.cleanup_reset_to_initial = bool(
+                    cleanup_ctx.get("reset_to_initial", False))
+                executor.cleanup_oil_margin_uL = float(
+                    cleanup_ctx.get("oil_margin_uL", 0.0))
                 executor.cleanup_waste_needles = cleanup_ctx["waste_needles"]
                 executor.cleanup_oil_needles = cleanup_ctx["oil_needles"]
                 executor.cleanup_oil_baseline_uL = cleanup_ctx["oil_baseline_uL"]

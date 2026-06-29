@@ -155,6 +155,17 @@ class PrintSettings:
     # well. (1, 1) = aligned (legacy). Applied only to geometric well centres,
     # never to already-taught/calibrated positions.
     plate_axis_sign: tuple = (1.0, 1.0)
+    # v7.5.x: CALIBRATED well centres in ZERO-REF mm, keyed by well name,
+    # stamped at job-build time from the plate calibration (taught/warped
+    # absolute stage positions converted to zero-ref mm). The execution path
+    # (discrete job + HybridPlanExecutor + PrintTrajectoryPlanner) PREFERS these
+    # over the GEOMETRIC plate-local offset so the needle reaches the
+    # physically-taught well — not a grid anchored at the stage origin (which,
+    # under plate_axis_sign=(-1,-1), lands on negative coords that clamp to 0,0).
+    # None = no calibration → geometric × plate_axis_sign fallback (legacy
+    # behaviour; uncalibrated jobs / tests unaffected). See
+    # PrintTrajectoryPlanner.resolve_well_xy_mm.
+    well_positions_mm: dict | None = None
     retract_amount: float = 0.0      # Pump retraction after path segment (legacy single-pump)
     prime_amount: float = 0.0        # Pump prime before path segment (legacy single-pump)
     dwell_after_move: float = 0.0    # Seconds to wait after travel moves
@@ -167,7 +178,20 @@ class PrintSettings:
     # print Z). Just enough to clear thin printed material on an inter-object
     # hop — NOT the full travel retract. Applied in the polarity-safe height
     # frame; floored by the plate-insert clearance.
+    #
+    # This is ALSO the operator-facing "retract height after each print line" in
+    # Quick Print: each sub-path/stroke is its own PRINT_PATH (see
+    # ``build_well_plate_job(path_segments=...)``), and between strokes the
+    # needle lifts to ``print Z + intra_well_hop_z_mm`` before the XY move.
     intra_well_hop_z_mm: float = 1.0
+    # v7.5.x: optional FAST move speeds for the inter-line/inter-object hop only
+    # (the lift up, the XY travel to the next stroke, and the lower back down).
+    # 0 = use the defaults (Z: the controller retract/insert feedrate; XY:
+    # ``travel_speed_mm_s``). Set by Quick Print's "Line-move Z/XY speed" knobs.
+    # The first object's full approach (TRAVEL_UP/MOVE_XY/MOVE_Z) is NOT affected
+    # — only the per-segment hop after a printed line.
+    line_move_z_speed_mm_s: float = 0.0   # mm/s; 0 = default
+    line_move_xy_speed_mm_s: float = 0.0  # mm/s; 0 = default
 
     # v7.2: µL-based pump settings
     pump_rate_uL_s: float = 0.25         # Default pump flow rate (µL/s)
@@ -625,6 +649,13 @@ def build_well_plate_job(
             hop_mm = abs(getattr(settings, "intra_well_hop_z_mm", 1.0))
             hop_z = z_height + z_up * hop_mm
 
+            # v7.5.x: optional FAST hop speeds (Quick Print "Line-move Z/XY
+            # speed"). Apply ONLY to the inter-segment hop (lift → XY → lower),
+            # not the first object's full approach. 0 / unset → defaults.
+            _line_z_mm_s = abs(float(getattr(settings, "line_move_z_speed_mm_s", 0.0) or 0.0))
+            _line_xy_mm_s = abs(float(getattr(settings, "line_move_xy_speed_mm_s", 0.0) or 0.0))
+            _hop_z_fr = (_line_z_mm_s * 60.0) if _line_z_mm_s > 0 else None  # mm/min
+
             for seg_idx, seg_points in enumerate(segments):
                 multi = len(segments) > 1
                 seg_label = (well_name if not multi
@@ -650,11 +681,17 @@ def build_well_plate_job(
                     # full retract. `hop_z` routes MOVE_XY's retract through
                     # ensure_retracted_to(hop_z) — still raise-only / never
                     # descends, and floored by the insert clearance.
+                    _hop_params = {"x": well_x + seg_points[0][0],
+                                   "y": well_y + seg_points[0][1],
+                                   "hop_z": hop_z}
+                    if _line_xy_mm_s > 0:
+                        _hop_params["xy_speed_mm_s"] = _line_xy_mm_s
+                    if _hop_z_fr is not None:
+                        # FAST lift-up feedrate for the hop retract.
+                        _hop_params["retract_feedrate_mm_min"] = _hop_z_fr
                     commands.append(PrintCommand(
                         type=CommandType.MOVE_XY,
-                        params={"x": well_x + seg_points[0][0],
-                                "y": well_y + seg_points[0][1],
-                                "hop_z": hop_z},
+                        params=_hop_params,
                         label=f"Hop to {seg_label} start",
                     ))
 
@@ -665,10 +702,14 @@ def build_well_plate_job(
                         label="Settle",
                     ))
 
-                # Lower to print height
+                # Lower to print height. On an inter-segment hop (seg_idx > 0)
+                # use the FAST line-move Z feedrate for the descent too.
+                _move_z_params = {"z": z_height}
+                if seg_idx > 0 and _hop_z_fr is not None:
+                    _move_z_params["feedrate_mm_min"] = _hop_z_fr
                 commands.append(PrintCommand(
                     type=CommandType.MOVE_Z,
-                    params={"z": z_height},
+                    params=_move_z_params,
                     label="Lower to print height",
                 ))
 
@@ -1150,6 +1191,16 @@ class HybridPlanExecutor:
                 pass
         return (1.0, 1.0)
 
+    def _well_xy_mm(self, well_name) -> tuple[float, float]:
+        """v7.5.x: well centre in ZERO-REF mm — the CALIBRATED taught position
+        (stamped on ``settings.well_positions_mm``) when available, else the
+        GEOMETRIC plate-local offset × ``plate_axis_sign``. This is what makes a
+        print land on the physically-taught well instead of a grid anchored at
+        the stage origin (which, on ME3B V1's (-1,-1) flip, clamps to 0,0). See
+        :func:`PrintTrajectoryPlanner.resolve_well_xy_mm`."""
+        from SupportClasses.PrintTrajectoryPlanner import resolve_well_xy_mm
+        return resolve_well_xy_mm(well_name, self.plate, self.settings)
+
     def abort(self):
         self._abort_flag.set()
 
@@ -1268,9 +1319,7 @@ class HybridPlanExecutor:
                 target_wells = getattr(step, 'target_wells', [])
                 for wn in target_wells:
                     try:
-                        wx, wy = self.plate.get_well_position(wn)
-                        _sx, _sy = self._plate_axis_sign()
-                        wx, wy = _sx * wx, _sy * wy
+                        wx, wy = self._well_xy_mm(wn)
                     except Exception:
                         continue
                     # First path point offset
@@ -1354,7 +1403,7 @@ class HybridPlanExecutor:
                 role = role_map.get(stype, "waste")
                 well = self._find_well(role)
                 if well:
-                    _, wx, wy = well
+                    wx, wy = self._well_xy_mm(well[0])
                     total += _travel_to_well_time(wx, wy)
                     total += _service_time(role, step)
                     total += _raise_time()
@@ -1367,9 +1416,7 @@ class HybridPlanExecutor:
                 tw = getattr(step, 'target_wells', [])
                 if tw:
                     try:
-                        wx, wy = self.plate.get_well_position(tw[0])
-                        _sx, _sy = self._plate_axis_sign()
-                        wx, wy = _sx * wx, _sy * wy
+                        wx, wy = self._well_xy_mm(tw[0])
                         total += _xy_travel(cur_x, cur_y, wx, wy, xy_travel)
                         cur_x, cur_y = wx, wy
                     except Exception:
@@ -1381,7 +1428,7 @@ class HybridPlanExecutor:
                     role = sub if isinstance(sub, str) else "waste"
                     well = self._find_well(role)
                     if well:
-                        _, wx, wy = well
+                        wx, wy = self._well_xy_mm(well[0])
                         total += _travel_to_well_time(wx, wy)
                         total += _service_time(role, step)
                         total += _raise_time()
@@ -1392,7 +1439,7 @@ class HybridPlanExecutor:
                     if sub in sub_steps:
                         well = self._find_well(sub)
                         if well:
-                            _, wx, wy = well
+                            wx, wy = self._well_xy_mm(well[0])
                             total += _travel_to_well_time(wx, wy)
                             total += _service_time(sub, step)
                             total += _raise_time()
@@ -1496,9 +1543,7 @@ class HybridPlanExecutor:
                             _xy = self.controller.xy_stage
                             if _xy and hasattr(_xy, 'set_speed_mm_s'):
                                 _xy.set_speed_mm_s(_svc_spd)
-                        wx, wy = self.plate.get_well_position(target_wells[0])
-                        _sx, _sy = self._plate_axis_sign()
-                        wx, wy = _sx * wx, _sy * wy
+                        wx, wy = self._well_xy_mm(target_wells[0])
                         direct.move_xy(wx, wy, timeout_s=20.0)
                     except Exception as e:
                         logger.warning(f"TRAVEL_XY failed: {e}")
@@ -1556,7 +1601,11 @@ class HybridPlanExecutor:
             logger.info(f"Skipping service '{role}': no well assigned")
             return
 
-        name, wx, wy = well
+        name = well[0]
+        # v7.5.x: resolve the role-matched well to its CALIBRATED zero-ref-mm
+        # centre (else geometric × sign). _find_well returns the RAW geometric
+        # offset, which on ME3B V1 lands service moves on the wrong well.
+        wx, wy = self._well_xy_mm(name)
 
         # Travel to well and lower
         direct.travel_to_well(wx, wy, self.settings)
@@ -1617,12 +1666,12 @@ class HybridPlanExecutor:
                     return
 
                 try:
-                    wx, wy = self.plate.get_well_position(well_name)
-                    # Map the plate-local well offset onto the stage axes;
-                    # move_xy below treats these as zero-ref mm (anchored at
-                    # the taught A1 = zero). See _plate_axis_sign.
-                    _sx, _sy = self._plate_axis_sign()
-                    wx, wy = _sx * wx, _sy * wy
+                    # v7.5.x: CALIBRATED taught well centre (zero-ref mm) when
+                    # available, else the geometric offset × plate_axis_sign.
+                    # move_xy below treats these as zero-ref mm. See
+                    # resolve_well_xy_mm — this is what lands the print on the
+                    # physically-taught well rather than a stage-origin grid.
+                    wx, wy = self._well_xy_mm(well_name)
                 except Exception:
                     logger.error(f"Well {well_name}: position lookup failed")
                     continue
@@ -2372,7 +2421,8 @@ class PrintManager:
             logger.warning(f"Failed to record print history: {e}")
 
     def _retract_for_travel(self, context: str,
-                            target_z: float | None = None) -> None:
+                            target_z: float | None = None,
+                            feedrate_mm_min: float | None = None) -> None:
         """v7.5.x CRITICAL SAFETY: retract the needle to the travel / "move" Z
         before a cross-position XY move (``MOVE_XY`` / ``HOME_XY``).
 
@@ -2407,7 +2457,18 @@ class PrintManager:
             self.exec_logger.log("z_move",
                                  context=f"retract_for_travel:{context}",
                                  z_mm=round(float(travel_z), 4))
-        ok = ctrl.ensure_retracted_to(float(travel_z))
+        # v7.5.x: a per-line hop may request a FAST retract feedrate. When none
+        # is given, call exactly as before (default retract feedrate) so the
+        # common full-travel retract is byte-identical for every caller.
+        if feedrate_mm_min is not None:
+            try:
+                ok = ctrl.ensure_retracted_to(
+                    float(travel_z), feedrate_mm_min=feedrate_mm_min)
+            except TypeError:
+                # Older controller without the feedrate kwarg.
+                ok = ctrl.ensure_retracted_to(float(travel_z))
+        else:
+            ok = ctrl.ensure_retracted_to(float(travel_z))
         if not ok:
             logger.warning("Retract-for-travel (%s): needle not confirmed at "
                            "travel Z — XY move may be unsafe", context)
@@ -2480,11 +2541,16 @@ class PrintManager:
             # without a slow full retract / re-approach.
             hop_z = p.get("hop_z", None)
             if hop_z is not None:
-                self._retract_for_travel("move_xy_hop", target_z=float(hop_z))
+                # v7.5.x: an inter-line hop may carry a FAST lift feedrate.
+                self._retract_for_travel(
+                    "move_xy_hop", target_z=float(hop_z),
+                    feedrate_mm_min=p.get("retract_feedrate_mm_min"))
             else:
                 self._retract_for_travel("move_xy")
-            # v7.2.7: Set travel speed before XY move
+            # v7.2.7: Set travel speed before XY move. v7.5.x: an inter-line hop
+            # may override with a faster per-line XY speed.
             _tspd = getattr(self.job.settings, 'travel_speed_mm_s', 10.0) if self.job else 10.0
+            _tspd = float(p.get("xy_speed_mm_s", _tspd))
             if hasattr(ctrl, 'xy_stage') and ctrl.xy_stage:
                 try:
                     if hasattr(ctrl.xy_stage, "set_speed_mm_s"):
@@ -2520,9 +2586,13 @@ class PrintManager:
             # moderate, deterministic speed) rather than inheriting whatever
             # feedrate the previous command happened to leave set — so the
             # descent's duration is bounded and predictable (shorter on-time).
+            # v7.5.x: an inter-line hop's lower-down may carry a FAST line-move
+            # Z feedrate (p["feedrate_mm_min"]); else the deterministic INSERT
+            # feedrate (never inherits the previous command's modal F).
             ctrl.move_z_absolute(
                 z, from_zero_ref=True,
-                feedrate_mm_min=getattr(ctrl, "_zp_insert_feedrate", None))
+                feedrate_mm_min=p.get(
+                    "feedrate_mm_min", getattr(ctrl, "_zp_insert_feedrate", None)))
             # v7.5.x print-setup routine step 3: CONFIRM the needle physically
             # reached the print Z (M400 + position poll) BEFORE the next step
             # (prime / print) — do not start extruding/printing until the Z move

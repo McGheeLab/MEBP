@@ -367,7 +367,7 @@ class SpheroidPickupWorkflowPage(QWidget):
             0.0, 20.0, 1.0, "", 1, 0.5,
             "Needles of oil dispensed to waste AND aspirated from the oil well.")
         self._buffer_needles = self._dspin(
-            0.0, 20.0, 4.0, "", 1, 0.5,
+            0.0, 20.0, 1.0, "", 1, 0.5,
             "Needles of buffer aspirated after the wash.")
         self._wash_cycles = self._ispin(
             0, 50, 3, "Dip-jiggle (Z + random XY) cycles at the wash well.")
@@ -383,7 +383,7 @@ class SpheroidPickupWorkflowPage(QWidget):
         sec.add("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
         sec.add("prep_rate", "Prep flow", self._prep_rate, 1.0)
         sec.add("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
-        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles, 4.0)
+        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles, 1.0)
         sec.add("wash_cycles", "Wash cycles", self._wash_cycles, 3)
         sec.add("wash_z_amp", "Wash Z jiggle", self._wash_z_amp, 0.5)
         sec.add("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)

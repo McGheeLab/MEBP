@@ -19,9 +19,9 @@
     "x": 0.0,
     "y": 0.0,
     "f": 0.0,
-    "Z": 0.49,
+    "Z": 18.79,
     "P1": 0.0,
-    "P2": 22.0,
+    "P2": -0.0,
     "P3": 0.0
   },
   "print_settings": {
@@ -42,11 +42,11 @@
     "deadzones": {
       "sticks": 0.09
     },
-    "reconnect_timeout_s": 23.0,
+    "reconnect_timeout_s": 20.0,
     "jog_speed_pct": {
-      "xy": 10.0,
+      "xy": 30.0,
       "p": 10.0,
-      "z": 10.0
+      "z": 100.0
     }
   },
   "logging": {
@@ -57,12 +57,12 @@
     "xy_min_y": 0.0,
     "xy_max_x": 114332.0,
     "xy_max_y": 76645.0,
-    "z_min": 0.49,
-    "z_max": 50.49,
+    "z_min": 18.79,
+    "z_max": 68.78999999999999,
     "p1_min": 0.0,
     "p1_max": 34.0,
-    "p2_min": 0.0,
-    "p2_max": 30.0,
+    "p2_min": -30.0,
+    "p2_max": 0.0,
     "p3_min": 0.0,
     "p3_max": 34.0,
     "max_xy_speed": 10000.0,
@@ -80,28 +80,22 @@
       104914.96445675842,
       68043.93761505079
     ],
-    "taught_corner": [
-      8594.999748677928,
-      10054.208078507461
-    ],
+    "taught_corner": null,
     "offset_x": 0.0,
     "offset_y": 0.0,
     "rotation": 0.0,
     "scale": 1.0,
-    "safe_z": 39.44,
-    "top_z": 37.6,
+    "safe_z": 34.910000000000004,
+    "top_z": 29.560000000000002,
     "taught_a1_z": null,
     "taught_corner_z": null,
-    "taught_third": [
-      27873.590784631044,
-      10053.861099218493
-    ],
+    "taught_third": null,
     "taught_third_z": null,
-    "third_well": "D5",
+    "third_well": null,
     "corner_well": "D6",
     "replace_z": 46.839999999999996,
     "max_z": 43.48,
-    "plate_bottom_z": 17.79,
+    "plate_bottom_z": 11.95,
     "plate_flip_180": true,
     "calibrated_positions": {
       "A1": [
@@ -300,9 +294,9 @@
       ]
     },
     "z_plane": {
-      "a": -0.0025906735751296188,
-      "b": -0.007253886010362531,
-      "c": 13.680000000000005,
+      "a": -0.0007253886010363346,
+      "b": -0.01986183074265971,
+      "c": 5.600000000000004,
       "r_squared": 1.0
     }
   },
@@ -403,27 +397,27 @@
         },
         "inks": [
           {
-            "name": "Inert LLS Ink",
+            "name": "GFP LLS",
             "ink_type": "ink",
-            "ink_subtype": "granular material",
+            "ink_subtype": "",
             "viscosity_cP": 1.0,
             "granule_diameter_um": 0.0,
             "cell_diameter_um": 0.0,
             "density_g_mL": 1.0,
-            "color": "#aa55ff"
+            "color": "#00ff00"
           },
           {
-            "name": "GFP Inert LLS",
+            "name": "Inert LLS",
             "ink_type": "ink",
-            "ink_subtype": "granular material",
+            "ink_subtype": "",
             "viscosity_cP": 1.0,
             "granule_diameter_um": 0.0,
             "cell_diameter_um": 0.0,
             "density_g_mL": 1.0,
-            "color": "#5555ff"
+            "color": "#0055ff"
           }
         ],
-        "printing_mode": "continuous",
+        "printing_mode": "incremental",
         "fluid_column": {
           "oil_volume_uL": 0.0,
           "buffer_volume_uL": 0.0,
@@ -448,13 +442,43 @@
       }
     },
     "pump_settle_time_s": 2.0,
-    "pump_prime_time_s": 0.25,
+    "pump_prime_time_s": 2.0,
     "plate_format": 24,
     "plate_name": "",
     "ink_library": {
-      "water": {
-        "name": "water",
+      "Waste Water": {
+        "name": "Waste Water",
+        "ink_type": "waste",
+        "ink_subtype": "",
+        "viscosity_cP": 1.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#565640"
+      },
+      "GFP LLS": {
+        "name": "GFP LLS",
+        "ink_type": "ink",
+        "ink_subtype": "",
+        "viscosity_cP": 1.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#00ff00"
+      },
+      "Wash": {
+        "name": "Wash",
         "ink_type": "wash",
+        "ink_subtype": "",
+        "viscosity_cP": 1.0,
+        "granule_diameter_um": 0.0,
+        "cell_diameter_um": 0.0,
+        "density_g_mL": 1.0,
+        "color": "#00aaff"
+      },
+      "Buffer": {
+        "name": "Buffer",
+        "ink_type": "buffer",
         "ink_subtype": "",
         "viscosity_cP": 1.0,
         "granule_diameter_um": 0.0,
@@ -462,75 +486,58 @@
         "density_g_mL": 1.0,
         "color": "#0000ff"
       },
-      "waste water": {
-        "name": "waste water",
-        "ink_type": "waste",
-        "ink_subtype": "",
-        "viscosity_cP": 1.0,
-        "granule_diameter_um": 0.0,
-        "cell_diameter_um": 0.0,
-        "density_g_mL": 1.0,
-        "color": "#aa00ff"
-      },
-      "Inert LLS": {
-        "name": "Inert LLS",
-        "ink_type": "buffer",
-        "ink_subtype": "",
-        "viscosity_cP": 1.0,
-        "granule_diameter_um": 0.0,
-        "cell_diameter_um": 0.0,
-        "density_g_mL": 1.0,
-        "color": "#a6e3a1"
-      },
-      "Mineral Oil": {
-        "name": "Mineral Oil",
+      "Oil": {
+        "name": "Oil",
         "ink_type": "oil",
         "ink_subtype": "",
         "viscosity_cP": 1.0,
         "granule_diameter_um": 0.0,
         "cell_diameter_um": 0.0,
         "density_g_mL": 1.0,
-        "color": "#ffff7f"
+        "color": "#ffaaff"
       },
-      "Inert LLS Ink": {
-        "name": "Inert LLS Ink",
+      "Inert LLS": {
+        "name": "Inert LLS",
         "ink_type": "ink",
-        "ink_subtype": "granular material",
+        "ink_subtype": "",
         "viscosity_cP": 1.0,
         "granule_diameter_um": 0.0,
         "cell_diameter_um": 0.0,
         "density_g_mL": 1.0,
-        "color": "#aa55ff"
+        "color": "#0055ff"
       },
-      "GFP Inert LLS": {
-        "name": "GFP Inert LLS",
+      "Test": {
+        "name": "Test",
         "ink_type": "ink",
-        "ink_subtype": "granular material",
+        "ink_subtype": "",
         "viscosity_cP": 1.0,
         "granule_diameter_um": 0.0,
         "cell_diameter_um": 0.0,
         "density_g_mL": 1.0,
-        "color": "#5555ff"
+        "color": "#000000"
       }
     },
     "ink_locations": {
-      "waste water": [
+      "Waste Water": [
         "A1"
       ],
-      "water": [
-        "B1"
-      ],
-      "Inert LLS": [
-        "C1"
-      ],
-      "Mineral Oil": [
-        "D1"
-      ],
-      "GFP Inert LLS": [
+      "GFP LLS": [
         "A2"
       ],
-      "Inert LLS Ink": [
+      "Wash": [
+        "B1"
+      ],
+      "Buffer": [
+        "C1"
+      ],
+      "Oil": [
+        "D1"
+      ],
+      "Inert LLS": [
         "B2"
+      ],
+      "Test": [
+        "A3"
       ]
     },
     "rosette_library": {},
@@ -632,17 +639,17 @@
       "bottom": 11.65,
       "safe": -10.0
     },
-    "needle_cam_z": 29.44,
+    "needle_cam_z": 22.42,
     "needle_loc_xy_um": [
-      58607.0,
-      54079.0
+      57686.0,
+      53876.0
     ],
     "pump_setup": {
       "P2": {
-        "raw_dispensed": 22.0,
-        "raw_aspirated": 2.0,
+        "raw_dispensed": -0.0,
+        "raw_aspirated": -30.0,
         "aspirate_sign": -1.0,
-        "capacity_uL": 166.66666666666669
+        "capacity_uL": 250.00000000000003
       }
     }
   },
@@ -665,11 +672,11 @@
     "p3": false
   },
   "zp_last_position": {
-    "Z": 39.44,
+    "Z": 34.91,
     "P1": 0.0,
-    "P2": 30.0,
+    "P2": -14.05,
     "P3": 0.0,
-    "timestamp": "2026-06-23T05:30:31"
+    "timestamp": "2026-06-29T13:50:57"
   },
   "xbox_stick_offsets": {
     "0": 0.0,

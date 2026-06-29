@@ -121,6 +121,12 @@ class PrintSetupPage(QWidget):
         from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
         self._xy_position_scale = DEFAULT_XY_POSITION_SCALE
         self._hardware_config = None
+        # v7.5.x: CALIBRATED taught well positions (absolute stage µm, by name),
+        # pushed from the Calibration page via set_calibration_data. The print
+        # path PREFERS these over the geometric plate-local offset so the needle
+        # reaches the physically-taught well (not a stage-origin grid that, on
+        # the (-1,-1) plate flip, clamps to 0,0). None until calibration arrives.
+        self._calibrated_well_positions = None
         self._setup_ui()
 
     # ════════════════════════════════════════════════════════════════
@@ -135,6 +141,66 @@ class PrintSetupPage(QWidget):
 
     def set_xy_position_scale(self, value: float):
         self._xy_position_scale = value
+
+    def set_calibration_data(self, plate, well_positions, safe_z=None):
+        """v7.5.x: receive the CALIBRATED taught well positions from the
+        Calibration page (``cal_page.get_calibration_data()`` →
+        ``(plate, well_positions, safe_z)``). ``well_positions`` is a dict
+        ``{name: (x_um, y_um)}`` in ABSOLUTE stage µm. Stored so the print path
+        (``_build_job`` / hybrid / trajectory) drives to the taught wells rather
+        than a geometric grid anchored at the stage origin. Mirrors the wiring
+        the Jog page and Workflows mode already receive. No motion, no UI rebuild
+        — purely updates the resolver source for the next built job."""
+        if isinstance(well_positions, dict) and well_positions:
+            self._calibrated_well_positions = dict(well_positions)
+        else:
+            self._calibrated_well_positions = None
+        # v7.5.x: the calibrated SAFE / "Fast Move" Z is the height the print
+        # retracts to before every cross-well travel. The legacy auto-derive
+        # (_compute_auto_settings) reads it from app settings, but this page is
+        # composed DETACHED in the wizard (parent=None, no _app_settings), so
+        # that read silently fails and travel_z fell back to the 5.0 mm spinbox
+        # default — which on ME3B V1 (plate bottom ≈ 6.06, larger zero-ref Z =
+        # higher) is BELOW the plate, so "retract to safe Z" drove the needle
+        # DOWN ("Z not moving up"). Drive the spinbox from the calibrated value
+        # so both the discrete and hybrid/trajectory paths (which read it via
+        # _get_settings) retract to the real safe height.
+        try:
+            if safe_z is not None and float(safe_z) > 0 and hasattr(self, "travel_z_spin"):
+                sz = float(safe_z)
+                if sz > self.travel_z_spin.maximum():
+                    self.travel_z_spin.setMaximum(max(sz + 5.0, 100.0))
+                self.travel_z_spin.setValue(sz)
+        except Exception:
+            pass
+
+    def _well_xy_zref_mm(self, name, plate):
+        """Well centre in ZERO-REF mm for the print path. Prefers the CALIBRATED
+        taught position (absolute stage µm → zero-ref mm via ``zero_position``);
+        falls back to the GEOMETRIC plate-local offset × ``plate_axis_sign``.
+        Matches Quick Print's ``_well_center_zero_ref_mm`` so both print entry
+        points resolve wells identically."""
+        cal = getattr(self, '_calibrated_well_positions', None)
+        if cal and self.controller is not None:
+            p = cal.get(name)
+            if p is None and isinstance(name, str):
+                p = cal.get(name.upper())
+            if p is not None:
+                try:
+                    zero = self.controller.zero_position
+                    return ((float(p[0]) - zero["x"]) / 1000.0,
+                            (float(p[1]) - zero["y"]) / 1000.0)
+                except Exception:
+                    pass
+        try:
+            x, y = plate.get_well_position(name)
+        except Exception:
+            return (0.0, 0.0)
+        try:
+            sgn = self.controller.plate_axis_sign()
+            return (float(sgn[0]) * x, float(sgn[1]) * y)
+        except Exception:
+            return (x, y)
 
     def set_hardware_config(self, config):
         """
@@ -1081,7 +1147,21 @@ class PrintSetupPage(QWidget):
         return None
 
     def _calibration_plate_bottom_z(self):
-        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated."""
+        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated.
+
+        v7.5.x: prefer the CONTROLLER datum (pushed from the Calibration page
+        via app.py::_update_print_floor_datum). The legacy app-settings read
+        below silently fails when this page is composed detached in the wizard
+        (no _app_settings / broken parent walk), which left print_z at the 0.1
+        default. The controller datum is the same value, reliably available."""
+        try:
+            ctrl = getattr(self, "controller", None)
+            if ctrl is not None and hasattr(ctrl, "get_plate_bottom_z"):
+                pb = ctrl.get_plate_bottom_z()
+                if pb is not None:
+                    return float(pb)
+        except Exception:
+            pass
         try:
             app_settings = self._find_app_settings()
             if app_settings is None:
@@ -1227,7 +1307,34 @@ class PrintSetupPage(QWidget):
         # centre resolved at execution time maps to the physically-correct well.
         if hasattr(self.controller, "plate_axis_sign"):
             s.plate_axis_sign = self.controller.plate_axis_sign()
+        # v7.5.x: stamp the CALIBRATED taught well positions in ZERO-REF mm so
+        # the hybrid/trajectory execution path (which re-derives well centres
+        # from names) drives to the taught wells. The discrete builder uses
+        # _well_xy_zref_mm directly; this covers the plan-step executors via
+        # PrintTrajectoryPlanner.resolve_well_xy_mm. None → geometric fallback.
+        try:
+            cal = getattr(self, '_calibrated_well_positions', None)
+            if cal and self.controller is not None:
+                zero = self.controller.zero_position
+                s.well_positions_mm = {
+                    n: ((float(p[0]) - zero["x"]) / 1000.0,
+                        (float(p[1]) - zero["y"]) / 1000.0)
+                    for n, p in cal.items()
+                }
+        except Exception:
+            s.well_positions_mm = None
         s.travel_z_height = self.travel_z_spin.value()
+        # v7.5.x: plate-top Z (zero-ref mm) from the controller datum (pushed by
+        # the Calibration page). Used by the descent staging (fast to top_z+0.5,
+        # then slow entry). The legacy app-settings read fails on the detached
+        # wizard page, so source it from the controller like the plate bottom.
+        try:
+            if self.controller is not None and hasattr(self.controller, "get_plate_top_z"):
+                _pt = self.controller.get_plate_top_z()
+                if _pt is not None:
+                    s.top_z_height = float(_pt)
+        except Exception:
+            pass
         s.settle_delay = self.settle_spin.value()
 
         # Find first enabled pump as active
@@ -1384,22 +1491,16 @@ class PrintSetupPage(QWidget):
             logger.warning("No print wells assigned")
             return None
 
-        # 3. Build well_positions: list of (name, x_mm, y_mm).
-        # get_well_position returns a PLATE-LOCAL (A1-relative mm) offset; map
-        # it onto the stage axes with the per-machine sign so the print lands
-        # on the physically-correct well on a 180°-mounted stage (ME3B V1).
-        try:
-            _s = self.controller.plate_axis_sign()
-            sx, sy = float(_s[0]), float(_s[1])
-        except Exception:
-            sx, sy = 1.0, 1.0
+        # 3. Build well_positions: list of (name, x_mm, y_mm) in ZERO-REF mm.
+        # v7.5.x: prefer the CALIBRATED taught position (set_calibration_data),
+        # falling back to the geometric plate-local offset × plate_axis_sign
+        # when uncalibrated. Without this the print used a geometric grid
+        # anchored at the stage origin → on the (-1,-1) flip the wells went
+        # negative and clamped to 0,0 (operator bug). See _well_xy_zref_mm.
         well_positions = []
         for name in print_wells:
-            try:
-                x, y = plate.get_well_position(name)
-            except Exception:
-                x, y = 0.0, 0.0
-            well_positions.append((name, sx * x, sy * y))
+            wx, wy = self._well_xy_zref_mm(name, plate)
+            well_positions.append((name, wx, wy))
 
         # 4. Get path points from Tab 2 objects
         path_points = self._get_path_from_objects()

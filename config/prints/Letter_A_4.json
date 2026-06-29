@@ -1,0 +1,35 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "Letter_A_4",
+    "description": "Letter: A: 3 shape(s), 1 layer(s), 27.4 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-06-28T01:59:51.398288+00:00",
+    "modified": "2026-06-28T01:59:51.398288+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "Letter: A": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\Letter_A_4.csv",
+        "csv_path": "config\\prints\\Letter_A_4.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 63,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

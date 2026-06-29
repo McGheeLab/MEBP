@@ -42,11 +42,24 @@ _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
 
 # ── v7.5.x: settle-aware discrete pump moves ───────────────────────────
 # A pump G0 returns on Marlin `ok` (admitted to the planner buffer), NOT
-# motion-complete, so a settle-aware discrete actuation must block for the
-# (open-loop) move duration before its post-settle dwell. The estimate is
-# abs(volume)/rate + 0.1 s, capped — byte-identical to the legacy EXTRUDE
-# completion wait it subsumes.
-_PUMP_MOVE_WAIT_CAP_S = 10.0
+# motion-complete, so a settle-aware discrete actuation must block until the
+# pump has PHYSICALLY finished before its post-settle dwell — otherwise the
+# still-running move drains behind the caller's next Z/XY safe_travel_to M400
+# and trips its timeout (a 4-needle buffer aspirate at 1 µL/s is ~27 s; a 15 s
+# M400 cannot absorb it → "Z retract M400 timed out — ABORTING"). A small ink
+# aspirate fit under the old 10 s open-loop sleep cap and "worked"; a larger
+# prep volume did not. We now confirm completion via M400 (the same mechanism
+# safe_travel_to uses for Z) with a timeout scaled to the estimated duration,
+# so buffer and ink behave identically regardless of volume.
+#
+# The open-loop estimate is abs(volume)/rate + 0.1 s. It is used (a) to scale
+# the M400 confirmation timeout and (b) as a fallback sleep ONLY when no board
+# confirmation is available (older controller / fake without ``flush_moves``).
+# Absolute backstop so a pathological near-zero rate can't hang forever.
+_PUMP_MOVE_DRAIN_TIMEOUT_CAP_S = 180.0
+# Extra margin (s) added to the move estimate for the M400 confirmation
+# timeout, covering accel/decel ramps and busy keep-alives.
+_PUMP_MOVE_DRAIN_MARGIN_S = 5.0
 # Fallback flow rate (µL/s) used only for the completion estimate when a
 # settle-aware caller passes no explicit rate.
 _PUMP_SETTLE_FALLBACK_RATE_UL_S = 1.0
@@ -185,6 +198,90 @@ def _shorten_only_delta(cur: float, requested: float,
         # cap to the requested step so the operator re-enters at jog speed.
         return requested
     return raw
+
+
+def compute_pump_budget(moves_uL, start_fill_uL: float, capacity_uL: float,
+                        *, extra_min_fill_uL: float | None = None,
+                        tol_uL: float = 1e-3) -> dict:
+    """Pure pre-flight budget for a sequence of plunger moves against the
+    calibrated syringe envelope ``[empty = 0, full = capacity_uL]``.
+
+    ``moves_uL``: ordered signed volumes as passed to ``move_pump_uL``
+    (``+`` = DISPENSE = lowers fill, ``−`` = ASPIRATE = raises fill).
+    ``start_fill_uL``: the plunger fill (µL) before the first move.
+    ``extra_min_fill_uL``: an optional FIXED extra low-water mark to fold into
+    the trough (e.g. a later cleanup dip that does not scale with the start
+    shift — checked but excluded from the shift remedy by the caller; here it
+    only widens the reported trough).
+
+    Returns a dict::
+
+        ok                        bool — every fill stayed in [0, capacity]
+        capacity_uL               echo
+        start_fill_uL             echo
+        peak_fill_uL / min_fill_uL  highest / lowest fill reached (incl. start)
+        span_uL                   peak − min
+        overflow_uL               max(0, peak − capacity)
+        underflow_uL              max(0, −min)
+        feasible_by_shift         bool — a different start fill would fit
+                                  (span ≤ capacity)
+        remedy                    'waste_oil' | 'add_oil' | None
+        remedy_uL                 µL of oil to waste (dispense) / add (aspirate)
+        recommended_start_fill_uL the feasible start fill after the remedy
+
+    The span is invariant to the starting fill, so when ``span ≤ capacity`` a
+    feasible start always exists: an overflow (``peak > capacity``) is cured by
+    starting lower (waste oil), an underflow (``min < 0``) by starting higher
+    (aspirate oil).
+    """
+    cap = float(capacity_uL)
+    fill = float(start_fill_uL)
+    peak = fill
+    trough = fill
+    for v in moves_uL:
+        fill += -float(v)          # + dispense lowers fill; − aspirate raises it
+        if fill > peak:
+            peak = fill
+        if fill < trough:
+            trough = fill
+    if extra_min_fill_uL is not None and float(extra_min_fill_uL) < trough:
+        trough = float(extra_min_fill_uL)
+    span = peak - trough
+    overflow = peak - cap
+    underflow = -trough
+    ok = (peak <= cap + tol_uL) and (trough >= -tol_uL)
+    result = {
+        "ok": ok,
+        "capacity_uL": cap,
+        "start_fill_uL": float(start_fill_uL),
+        "peak_fill_uL": peak,
+        "min_fill_uL": trough,
+        "span_uL": span,
+        "overflow_uL": max(0.0, overflow),
+        "underflow_uL": max(0.0, underflow),
+        "feasible_by_shift": False,
+        "remedy": None,
+        "remedy_uL": 0.0,
+        "recommended_start_fill_uL": float(start_fill_uL),
+    }
+    if ok:
+        return result
+    if span > cap + tol_uL:
+        # No starting fill fits — the run needs more travel than the syringe has.
+        return result
+    result["feasible_by_shift"] = True
+    if overflow > tol_uL:
+        # Over-fills → start LOWER by wasting oil.
+        delta = -overflow
+        result["remedy"] = "waste_oil"
+        result["remedy_uL"] = overflow
+    else:
+        # Runs dry → start HIGHER by aspirating oil.
+        delta = underflow
+        result["remedy"] = "add_oil"
+        result["remedy_uL"] = underflow
+    result["recommended_start_fill_uL"] = float(start_fill_uL) + delta
+    return result
 
 
 def _axis_index(zp_stage, logical: str) -> int | None:
@@ -3520,7 +3617,8 @@ class StageController:
 
     def ensure_retracted_to(self, safe_z_zero_ref_mm: float,
                             tol_mm: float = 0.1,
-                            timeout_s: float = 15.0) -> bool:
+                            timeout_s: float = 15.0,
+                            feedrate_mm_min: float | None = None) -> bool:
         """Guarantee the needle is retracted to >= ``safe_z`` before XY travel.
 
         Raises the needle (in the HEIGHT frame) to at least ``safe_z``
@@ -3552,10 +3650,15 @@ class StageController:
                 return True
 
         # Retract up to the target height and wait (M400 + position poll).
+        # v7.5.x: an optional per-call feedrate (e.g. Quick Print's FAST per-line
+        # hop) overrides the default retract feedrate; never a bare G0 Z (which
+        # would inherit the pump's slow modal F).
+        _retract_fr = (float(feedrate_mm_min) if feedrate_mm_min
+                       else self._zp_retract_feedrate)
         self._pos_poller.suspend()
         try:
             self.move_z_absolute(target, from_zero_ref=True,
-                                 feedrate_mm_min=self._zp_retract_feedrate)
+                                 feedrate_mm_min=_retract_fr)
             if hasattr(self.zp_stage, "flush_moves"):
                 if not self.zp_stage.flush_moves(timeout_s=timeout_s):
                     logger.error("ensure_retracted_to: Z retract M400 timed out "
@@ -4082,14 +4185,57 @@ class StageController:
         self.move_pump_relative(pump, distance_mm, feedrate_mm_min)
 
         if settle:
-            # Block for the move to physically complete (the G0 returned on
-            # `ok`, not motion-complete) so the post-settle is a true settle.
+            # Block until the move PHYSICALLY completes (the G0 returned on
+            # `ok` = admitted to the planner, not motion-complete) so the
+            # caller's next step — typically a safe_travel_to whose Z-retract
+            # M400 would otherwise have to absorb this still-running pump move
+            # and time out — does not start while the pump is still moving.
             eff_rate = (abs(rate_uL_s) if rate_uL_s
                         else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
             move_s = abs(volume_uL) / max(eff_rate, 0.001) + 0.1
-            time.sleep(min(move_s, _PUMP_MOVE_WAIT_CAP_S))
+            if self._wait_pump_move_complete(move_s) is None:
+                # No board confirmation available (older controller / fake
+                # without flush_moves) — fall back to an open-loop sleep of the
+                # FULL estimated duration (no 10 s truncation; that truncation
+                # is what left a long buffer aspirate running into the next
+                # M400 and aborted the run).
+                time.sleep(min(move_s, _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S))
             if settle_s > 0:
                 time.sleep(settle_s)           # post-move settle
+
+    def _wait_pump_move_complete(self, move_s: float) -> bool | None:
+        """Block until the pump's in-flight move drains from Marlin's planner.
+
+        Confirms motion-complete via M400 (``ZPStage.flush_moves``) — the same
+        mechanism :meth:`safe_travel_to` uses for Z — with a timeout scaled to
+        the estimated move duration, so a long but legitimate discrete pump
+        actuation (e.g. a multi-needle buffer aspirate, ~27 s at 1 µL/s) is
+        fully drained before the caller advances, instead of bleeding into the
+        next safe-travel M400 and tripping its 15 s timeout. The poller is
+        suspended for the wait so its M114 reads don't contend for the bus.
+
+        Returns:
+            True  — Marlin confirmed completion (or there is no real board / sim).
+            False — flush_moves was available but timed out (it already waited
+                    ~move_s, so the caller should NOT sleep again).
+            None  — no flush_moves available (fake / older controller); the
+                    caller should fall back to an open-loop sleep.
+        """
+        zp = getattr(self, "zp_stage", None)
+        flush = getattr(zp, "flush_moves", None)
+        if not callable(flush):
+            return None
+        timeout_s = min(max(move_s + _PUMP_MOVE_DRAIN_MARGIN_S,
+                            _PUMP_MOVE_DRAIN_MARGIN_S),
+                        _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S)
+        self.suspend_position_poller()
+        try:
+            return bool(flush(timeout_s=timeout_s))
+        except Exception as e:                  # never let a confirm failure crash a prep
+            logger.warning(f"_wait_pump_move_complete: flush_moves error: {e}")
+            return None
+        finally:
+            self.resume_position_poller()
 
     def get_pump_position_uL(self, pump: str) -> float | None:
         """
@@ -4121,6 +4267,73 @@ class StageController:
             return pump_cfg.mm_to_uL(relative_mm)
         except ValueError:
             return None
+
+    def pump_volume_to_reach_uL(self, pump: str,
+                                target_position_uL: float) -> float | None:
+        """Signed :meth:`move_pump_uL` volume (µL, ``+`` = dispense) that makes
+        :meth:`get_pump_position_uL` equal ``target_position_uL``.
+
+        ── POLARITY (single source of truth) ──────────────────────────────
+        ``move_pump_uL`` applies :meth:`pump_dir_sign` to the volume, but
+        ``get_pump_position_uL`` does NOT, so a ``move_pump_uL(V)`` changes the
+        reported position by ``pump_dir_sign × V``. To drive the reported
+        position from ``current`` to ``target`` therefore requires
+        ``V = pump_dir_sign × (target − current)`` — NOT simply
+        ``target − current`` (which is only correct when ``pump_dir_sign == +1``
+        and drives the plunger the WRONG way on a pump calibrated to
+        ``pump_dir_sign == −1``). Use this helper to "return the plunger to a
+        captured position" instead of hand-rolling the difference.
+        ───────────────────────────────────────────────────────────────────
+
+        Returns None if the current position is unreadable.
+        """
+        current = self.get_pump_position_uL(pump)
+        if current is None:
+            return None
+        try:
+            sign = float(self.pump_dir_sign(pump))
+        except Exception:
+            sign = 1.0
+        return sign * (float(target_position_uL) - float(current))
+
+    def move_pump_to_position_uL(self, pump: str, target_position_uL: float,
+                                 rate_uL_s: float | None = None,
+                                 *, settle: bool = True) -> float | None:
+        """Move the plunger so :meth:`get_pump_position_uL` reaches
+        ``target_position_uL`` (polarity-correct via
+        :meth:`pump_volume_to_reach_uL`). Returns the volume moved (µL), or None
+        if the current position is unreadable (no move issued)."""
+        vol = self.pump_volume_to_reach_uL(pump, target_position_uL)
+        if vol is None:
+            return None
+        if abs(vol) > 1e-6:
+            self.move_pump_uL(pump, vol, rate_uL_s, settle=settle)
+        return vol
+
+    def simulate_pump_budget(self, pump: str, moves_uL, *,
+                             start_fill_uL: float | None = None,
+                             extra_min_fill_uL: float | None = None) -> dict:
+        """Pre-flight a planned pump-move sequence against this pump's calibrated
+        envelope. Resolves the live plunger fill (``pump_fill_uL``) and capacity
+        (``pump_capacity_uL``) and delegates to :func:`compute_pump_budget`.
+
+        Returns the :func:`compute_pump_budget` dict on success, or a dict with
+        ``ok=False`` and a ``reason`` of ``'uncalibrated'`` (no capacity) /
+        ``'fill_unreadable'`` (no live position) when it can't simulate — the
+        caller then skips the budget gate rather than blocking a valid print."""
+        cap = self.pump_capacity_uL(pump)
+        if cap is None or cap <= 0:
+            return {"ok": False, "reason": "uncalibrated", "capacity_uL": cap}
+        if start_fill_uL is None:
+            start_fill_uL = self.pump_fill_uL(pump)
+        if start_fill_uL is None:
+            return {"ok": False, "reason": "fill_unreadable",
+                    "capacity_uL": cap}
+        result = compute_pump_budget(
+            moves_uL, float(start_fill_uL), float(cap),
+            extra_min_fill_uL=extra_min_fill_uL)
+        result["reason"] = "ok" if result["ok"] else "out_of_bounds"
+        return result
 
     def get_all_pump_positions_uL(self) -> dict[str, float | None]:
         """Get all pump positions in µL as a dict."""

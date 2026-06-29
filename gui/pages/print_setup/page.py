@@ -153,9 +153,33 @@ class WizardPrintSetupPage(QWidget):
     def get_page_subtitle(self) -> str:
         return "Workspace → objects → wells → plan"
 
+    @property
+    def print_manager(self):
+        """Forward to the composed legacy page's PrintManager.
+
+        v7.5.x: the Printing-mode setup page is this wizard shell, but the
+        ``PrintManager`` is created/owned by the legacy page (``self._legacy``).
+        ``gui/app.py`` reaches ``setup_page.print_manager`` from five sites —
+        ``_on_monitor_start`` (Start), ``_wire_print_manager_to_monitor``
+        (recorder/bridge wiring), and the Pause/Resume/Abort handlers. Without
+        this forward, ``hasattr(setup_page, "print_manager")`` was False, so
+        Start logged "No print_manager on setup page" and silently returned —
+        the print never ran. Read-only on purpose; the legacy page owns the
+        object's lifecycle. Returns None if the legacy page hasn't built one.
+        """
+        return getattr(self._legacy, "print_manager", None)
+
     def set_xy_position_scale(self, value: float) -> None:
         if hasattr(self._legacy, "set_xy_position_scale"):
             self._legacy.set_xy_position_scale(value)
+
+    def set_calibration_data(self, plate, well_positions, safe_z=None) -> None:
+        """v7.5.x: forward the calibrated taught well positions to the composed
+        legacy page so the print path drives to the taught wells (not a
+        geometric stage-origin grid). Mirrors the Jog/Workflows wiring; the
+        legacy page owns the resolver state."""
+        if hasattr(self._legacy, "set_calibration_data"):
+            self._legacy.set_calibration_data(plate, well_positions, safe_z)
 
     def set_hardware_config(self, config) -> None:
         if hasattr(self._legacy, "set_hardware_config"):

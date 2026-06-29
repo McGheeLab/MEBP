@@ -1264,9 +1264,18 @@ def validate_well_setup(hw_config, well_model, plan=None):
 # ═══════════════════════════════════════════════════════════════════
 
 def _signed_well_xy(plate, name, settings):
-    """v7.5.x: plate-local well centre (A1-relative mm) mapped onto stage axes
-    via the per-machine ``settings.plate_axis_sign`` so a GEOMETRIC well centre
-    reaches the physically-correct well on a 180°-mounted stage (ME3B V1)."""
+    """v7.5.x: well centre in ZERO-REF mm — the CALIBRATED taught position
+    (``settings.well_positions_mm``) when available, else the GEOMETRIC
+    plate-local offset (A1-relative mm) mapped onto stage axes via the
+    per-machine ``settings.plate_axis_sign`` (180°-mounted stage, ME3B V1).
+    Delegates to the shared resolver so this plan→commands path agrees with the
+    trajectory/hybrid path. Lazy import avoids a circular dependency
+    (PrintTrajectoryPlanner imports PlanStepType from this module)."""
+    try:
+        from SupportClasses.PrintTrajectoryPlanner import resolve_well_xy_mm
+        return resolve_well_xy_mm(name, plate, settings)
+    except Exception:
+        pass
     wx, wy = plate.get_well_position(name)
     try:
         _s = getattr(settings, "plate_axis_sign", (1.0, 1.0))
