@@ -22,7 +22,7 @@ from SupportClasses.SketchTrajectory import (
 
 def _circle(cx=0.0, cy=0.0, r=2.0) -> SketchShape:
     return SketchShape(kind="circle", cx=cx, cy=cy, radius=r,
-                       pump_index=0, color="#89b4fa", line_width_mm=0.4)
+                       ink_id=1, color="#89b4fa", line_width_mm=0.4)
 
 
 class TestLiftBetweenShapes(unittest.TestCase):
@@ -80,11 +80,12 @@ class TestPageWiring(_Base):
 
     def test_thickness_toggle_drives_canvas(self):
         page = self._page()
-        self.assertFalse(page._canvas._show_thickness)
-        page._toggle_thickness(True)
+        # v7.5.x: the shaded print-thickness preview is ON by default now.
         self.assertTrue(page._canvas._show_thickness)
         page._toggle_thickness(False)
         self.assertFalse(page._canvas._show_thickness)
+        page._toggle_thickness(True)
+        self.assertTrue(page._canvas._show_thickness)
 
     def test_lift_setter_writes_sketch(self):
         page = self._page()

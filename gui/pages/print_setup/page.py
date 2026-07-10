@@ -181,6 +181,13 @@ class WizardPrintSetupPage(QWidget):
         if hasattr(self._legacy, "set_calibration_data"):
             self._legacy.set_calibration_data(plate, well_positions, safe_z)
 
+    def set_common_print_settings(self, common) -> None:
+        """v7.5.x: forward the shared CommonPrintSettings model to the composed
+        legacy page (global pump settle/relief/prime + prep defaults). Mirrors
+        the set_calibration_data forward; the legacy page owns the model state."""
+        if hasattr(self._legacy, "set_common_print_settings"):
+            self._legacy.set_common_print_settings(common)
+
     def set_hardware_config(self, config) -> None:
         if hasattr(self._legacy, "set_hardware_config"):
             self._legacy.set_hardware_config(config)

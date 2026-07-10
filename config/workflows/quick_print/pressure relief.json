@@ -1,0 +1,37 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "quick_print",
+  "name": "pressure relief",
+  "saved": "2026-06-30T14:49:36",
+  "values": {
+    "pump": {
+      "text": "P2",
+      "data": null
+    },
+    "extrusion_mod": 1.5000000000000004,
+    "speed_pct": 2.0,
+    "printz": 0.6999999999999997,
+    "ink": {
+      "text": "Inert GFP",
+      "data": "Inert GFP"
+    },
+    "ink_z": 1.2,
+    "ink_padding": 4.999999999999998,
+    "prep": false,
+    "service_z": 2.1,
+    "service_z__ovr": true,
+    "buffer_needles": 1.0,
+    "buffer_needles__ovr": false,
+    "wash_cycles": 10,
+    "wash_cycles__ovr": true,
+    "line_retract": 5.0,
+    "line_z_speed": 80.0,
+    "line_xy_speed": 80.0,
+    "postclean": true,
+    "postclean_margin": 1.1,
+    "travel_speed": 10.0,
+    "preflow": 2.0,
+    "g_settle": 3.0,
+    "g_relief": 0.8
+  }
+}

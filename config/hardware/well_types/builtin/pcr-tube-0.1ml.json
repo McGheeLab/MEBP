@@ -1,0 +1,11 @@
+{
+  "id": "pcr-tube-0.1ml",
+  "display_name": "0.1 mL PCR tube",
+  "diameter_mm": 6.0,
+  "well_depth_mm": 20.0,
+  "rim_height_mm": 20.0,
+  "ink_z_mm": null,
+  "volume_uL": 100.0,
+  "builtin": true,
+  "_note": "Single-diameter approximation of a tapered PCR tube (6 mm top / 3 mm bottom). rim_height_mm is the safety-critical clearance guess (how far the tube top sits above the plate) -- tune per physical rack/insert."
+}

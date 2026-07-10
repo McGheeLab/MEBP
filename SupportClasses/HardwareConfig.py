@@ -377,6 +377,31 @@ class HardwareConfig:
     # volume = flow × this time just before the print path. (Default matches
     # the legacy Quick Print _PREFLOW_S constant.)
     pump_prime_time_s: float = 0.25
+    # ── v7.5.x: Gentle-Z near the plate (configured on Common Print Settings) ──
+    # Every needle motion near a print/work position eases in and out: the first
+    # ``gentle_z_slow_dist_mm`` of a LIFT out of a print and the last
+    # ``gentle_z_slow_dist_mm`` of a DESCENT back into position both run at
+    # ``gentle_z_slow_speed_mm_s`` (mm/s), with the rest of the travel at the
+    # fast retract/insert feedrate. The slow lift keeps a deposited bead from
+    # peeling up with the needle; the slow descent is a controlled touch-down
+    # instead of a crash-down. Applied to EVERY workflow via
+    # ``ensure_retracted_to`` / ``safe_travel_to`` / the discrete ``MOVE_Z``
+    # handler. One distance + one speed drives BOTH directions (their defaults
+    # are identical). ``gentle_z_slow_dist_mm`` = 0 disables the eased motion
+    # (single-speed — legacy). Pushed to StageController.set_retract_slow_lift /
+    # set_descend_slow_final in set_hardware_config.
+    gentle_z_slow_dist_mm: float = 1.0
+    gentle_z_slow_speed_mm_s: float = 1.0
+    # ── v7.5.x: Pump compliance / "pressure relief" (µL, PER PUMP) ──
+    # The pressure-relief / backlash value is now an ABSOLUTE µL per pump,
+    # measured by the Needle Location compliance calibration (= ½ the
+    # aspirate-back volume) and stored per-machine in
+    # ``device_profile.pump_compliance_uL`` (read via
+    # ``StageController.pump_relief_uL(pump)``). It drives backlash compensation
+    # (take-up on reversal + unload on stop), gated by the pump-jog-panel toggle
+    # (``device_profile.backlash_comp_enabled``). It is NOT a HardwareConfig
+    # field — the legacy ``pump_relief_percent`` + ``pump_relief_on_*`` toggles
+    # were retired here (ignored on load; see ``from_dict``).
 
     # ── Well plate ────────────────────────────────────────────────
     plate_format: int = 24  # 6, 12, 24, 48, 96, 384 — legacy field, still
@@ -387,6 +412,15 @@ class HardwareConfig:
     # `WellPlate.load(cfg.active_plate_key)` to pick up either a standard
     # (int) or a user-saved design (file under config/hardware/plates/user/).
     plate_name: str = ""
+
+    # ── v7.5.x: Selectable plate TYPE (product) ───────────────────
+    # A plate type is a thin overlay on a base standard format (Corning glass
+    # bottom, NEST plastic, …) — same XY grid, but its own Z offsets + its own
+    # mosaic. The id (resolved via `PlateTypeStore`) becomes the
+    # `active_plate_key` so per-plate stores auto-segregate. Empty = "generic"
+    # (active key falls back to the bare int format). Takes precedence over
+    # both `plate_name` and `plate_format`.
+    plate_type_id: str = ""
 
     # ── Ink library (persisted across sessions) ───────────────────
     ink_library: dict[str, InkSpec] = field(default_factory=dict)
@@ -566,12 +600,43 @@ class HardwareConfig:
     def active_plate_key(self) -> int | str:
         """The key to pass to `WellPlate.load()` for this config.
 
-        Returns `plate_name` (str) when a custom plate is active, otherwise
-        falls back to the legacy `plate_format` (int). Centralizes the
-        precedence rule so downstream callers stop reaching into both
-        fields.
+        Precedence (v7.5.x): `plate_type_id` (a selectable plate product)
+        → `plate_name` (a custom parametric design) → `plate_format` (the
+        legacy standard int). Centralizes the rule so downstream callers and
+        the per-plate stores (mosaic / template / well-training) stop reaching
+        into the individual fields. A plate-type id resolves to its base
+        format geometry inside `WellPlate.load`, so the returned key may be a
+        string even though the plate is geometrically a standard format.
         """
+        if self.plate_type_id:
+            return self.plate_type_id
         return self.plate_name if self.plate_name else self.plate_format
+
+    @property
+    def geometry_plate_key(self) -> int | str:
+        """The key to pass to `WellPlate.load()` for this config's GEOMETRY.
+
+        Split from `active_plate_key` (v7.5.x): a plate TYPE (`plate_type_id`)
+        carries identity (per-plate mosaic/calibration segregation) and Z
+        offsets, but resolves to a PLAIN base-format geometry — so a layered
+        custom design (e.g. a rosette added in the plate designer, saved under
+        `plate_name`) would be dropped if geometry loaded from the type id.
+
+        When both a plate type AND a custom design are set, the custom design
+        wins for GEOMETRY (so its rosette sub-wells are honored everywhere)
+        while `active_plate_key` keeps the type's identity (the type's Z
+        offsets still apply — they key on `plate_type_id` directly). The custom
+        file must exist; otherwise fall back to `active_plate_key` so a stale
+        `plate_name` can't break the load.
+        """
+        if self.plate_type_id and self.plate_name:
+            try:
+                from SupportClasses.WellPlate import USER_PLATES_DIR
+                if (USER_PLATES_DIR / f"{self.plate_name}.json").exists():
+                    return self.plate_name
+            except Exception:   # pragma: no cover - defensive
+                pass
+        return self.active_plate_key
 
     # ══════════════════════════════════════════════════════════════
     #  VALIDATION (v7.2.4 enhanced — S3.3)
@@ -599,8 +664,20 @@ class HardwareConfig:
             if pcfg.enabled and pcfg.syringe and not pcfg.has_ink:
                 issues.append(f"{pid} is enabled but has no ink assigned")
 
-        # Plate format / custom plate name (v7.4.5)
-        if self.plate_name:
+        # Plate type / custom plate name / format (v7.5.x precedence)
+        if self.plate_type_id:
+            # Selectable plate product — must resolve to a known base format.
+            from SupportClasses.PlateTypeStore import get_store as _pt_store
+            pt = _pt_store().get(self.plate_type_id)
+            if pt is None:
+                issues.append(
+                    f"Plate type '{self.plate_type_id}' not found in the "
+                    f"plate-type library")
+            elif pt.base_format not in PLATE_DEFINITIONS:
+                issues.append(
+                    f"Plate type '{self.plate_type_id}' has an invalid base "
+                    f"format: {pt.base_format}")
+        elif self.plate_name:
             # Custom plate — file must exist under user plates dir.
             from SupportClasses.WellPlate import USER_PLATES_DIR
             if not (USER_PLATES_DIR / f"{self.plate_name}.json").exists():
@@ -857,8 +934,15 @@ class HardwareConfig:
             # v7.5.x: global pump timing
             "pump_settle_time_s": self.pump_settle_time_s,
             "pump_prime_time_s": self.pump_prime_time_s,
+            # v7.5.x: gentle-Z near the plate (slow lift + slow descent)
+            "gentle_z_slow_dist_mm": self.gentle_z_slow_dist_mm,
+            "gentle_z_slow_speed_mm_s": self.gentle_z_slow_speed_mm_s,
+            # v7.5.x: pressure relief / compliance is now per-pump µL, persisted
+            # in device_profile.pump_compliance_uL (NOT here). The legacy
+            # pump_relief_percent + pump_relief_on_* fields were retired.
             "plate_format": self.plate_format,
             "plate_name": self.plate_name,  # v7.4.5
+            "plate_type_id": self.plate_type_id,  # v7.5.x
             "ink_library": {name: ink.to_dict() for name, ink in self.ink_library.items()},
             # v7.5.x: reagent locations (ink name → wells); skip empty lists
             "ink_locations": {
@@ -915,11 +999,23 @@ class HardwareConfig:
                 return default
         config.pump_settle_time_s = _nonneg_float("pump_settle_time_s", 0.0)
         config.pump_prime_time_s = _nonneg_float("pump_prime_time_s", 0.25)
+        # v7.5.x: gentle-Z near the plate (dist 0 disables; speed kept positive)
+        config.gentle_z_slow_dist_mm = _nonneg_float("gentle_z_slow_dist_mm", 1.0)
+        config.gentle_z_slow_speed_mm_s = _nonneg_float(
+            "gentle_z_slow_speed_mm_s", 1.0)
+        # v7.5.x: pressure relief / compliance moved to per-pump µL
+        # (device_profile.pump_compliance_uL) + a backlash-comp toggle. The
+        # legacy `pump_relief_percent` / `pump_relief_on_*` / the older absolute
+        # `pump_relief_volume_uL` keys are IGNORED here (discarded on load) — the
+        # per-pump value now comes from the Needle Location compliance
+        # calibration, not from this config.
 
         # Plate format
         config.plate_format = data.get("plate_format", 24)
         # v7.4.5: custom plate name (takes precedence when non-empty)
         config.plate_name = data.get("plate_name", "") or ""
+        # v7.5.x: selectable plate type/product id (takes precedence over both)
+        config.plate_type_id = data.get("plate_type_id", "") or ""
 
         # Ink library
         for name, ink_data in data.get("ink_library", {}).items():

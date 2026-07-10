@@ -1,0 +1,602 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "Sadah_A_Logo",
+    "description": "Sadah_A_Logo: 18 shape(s), 1 layer(s), 55.2 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-07-10T06:24:28.119344+00:00",
+    "modified": "2026-07-10T06:24:28.119344+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "Sadah_A_Logo": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\Sadah_A_Logo.csv",
+        "csv_path": "config\\prints\\Sadah_A_Logo.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 136,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.1823056242606733,
+                  -5.051085062909987
+                ],
+                [
+                  2.1777761049575215,
+                  -5.070377459941926
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.32000000000000006,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.1777761049575215,
+                  -5.070377459941926
+                ],
+                [
+                  2.2163608990213994,
+                  -3.372646521131301
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.1777761049575215,
+                -5.070377459941926
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.2163608990213994,
+                  -3.372646521131301
+                ],
+                [
+                  1.386787826648026,
+                  -3.372646521131301
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.2163608990213994,
+                -3.372646521131301
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.386787826648026,
+                  -3.372646521131301
+                ],
+                [
+                  3.026641574362834,
+                  2.0099322507796566
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                1.386787826648026,
+                -3.372646521131301
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  3.026641574362834,
+                  2.0099322507796566
+                ],
+                [
+                  4.570033336917947,
+                  2.0292246478115956
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                3.026641574362834,
+                2.0099322507796566
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.586809334337024,
+                  2.0292246478115956
+                ],
+                [
+                  4.66397892246478,
+                  3.919879556941609
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                4.586809334337024,
+                2.0292246478115956
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.647202925045703,
+                  3.919879556941609
+                ],
+                [
+                  0.9816474889773089,
+                  3.977756748037426
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                4.647202925045703,
+                3.919879556941609
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  0.9816474889773089,
+                  3.977756748037426
+                ],
+                [
+                  0.9237702978814921,
+                  2.607996558769763
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                0.9816474889773089,
+                3.977756748037426
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.08632403221556334,
+                  -4.651227243510544
+                ],
+                [
+                  1.9200852591060837,
+                  2.4097900701791
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                1.9200852591060837,
+                2.4097900701791
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.0022647596515758574,
+                  -4.679247001031873
+                ],
+                [
+                  -2.2980600064523067,
+                  2.516817091881343
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -0.0022647596515758574,
+                -4.679247001031873
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -3.103288673410668,
+                  2.300925372423698
+                ],
+                [
+                  -4.299417289390881,
+                  2.320217769455637
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -3.103288673410668,
+                2.300925372423698
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.439516076997527,
+                  2.222148618130985
+                ],
+                [
+                  -4.478100871061405,
+                  3.977756748037426
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -4.439516076997527,
+                2.222148618130985
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.478100871061405,
+                  3.977756748037426
+                ],
+                [
+                  -1.3527325518873,
+                  3.997049145069365
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -4.478100871061405,
+                3.977756748037426
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.3527325518873,
+                  3.997049145069365
+                ],
+                [
+                  -1.3527325518873,
+                  2.762335735025274
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -1.3527325518873,
+                3.997049145069365
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.2948553607914832,
+                  -3.3147693300354844
+                ],
+                [
+                  -3.243387461017314,
+                  2.202856221099046
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -3.243387461017314,
+                2.202856221099046
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.1823056242606733,
+                  -3.3147693300354844
+                ],
+                [
+                  -1.2948553607914832,
+                  -3.3147693300354844
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -1.2948553607914832,
+                -3.3147693300354844
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.4032282220283063,
+                  -4.989473611625309
+                ],
+                [
+                  -2.4032282220283063,
+                  -3.2531578787508066
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 2,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -2.4032282220283063,
+                -3.2531578787508066
+              ]
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.585298628733646,
+                  0.2967093749356158
+                ],
+                [
+                  1.4051820475409649,
+                  0.28789298765638804
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -1.585298628733646,
+                0.2967093749356158
+              ]
+            }
+          ],
+          "inks": [
+            {
+              "id": 1,
+              "name": "Inner A",
+              "color": "#89b4fa"
+            },
+            {
+              "id": 2,
+              "name": "Outer A",
+              "color": "#a6e3a1"
+            }
+          ],
+          "_next_ink_id": 3,
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 0.718,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0,
+          "single_needle": false
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

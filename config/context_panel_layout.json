@@ -1,0 +1,24 @@
+{
+  "_format": "mebp-context-panel-layout",
+  "version": 1,
+  "sections": [
+    {
+      "type": "positions",
+      "id": "acdb878468fd451b992c331bb2584907",
+      "options": {},
+      "collapsed": false
+    },
+    {
+      "type": "syringe",
+      "id": "6c7c44ec086345159ddd7389717c7664",
+      "options": {},
+      "collapsed": false
+    },
+    {
+      "type": "camera",
+      "id": "f533c877a7dc49b2ad6ca5bf8e88a2fb",
+      "options": {},
+      "collapsed": false
+    }
+  ]
+}

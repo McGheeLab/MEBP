@@ -1,0 +1,1218 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "AzA_oultine_1_copy",
+    "description": "AzA_oultine_1_copy: 37 shape(s), 1 layer(s), 98.3 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-07-03T23:39:27.902620+00:00",
+    "modified": "2026-07-03T23:39:27.902620+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "AzA_oultine_1_copy": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\AzA_oultine_1_copy.csv",
+        "csv_path": "config\\prints\\AzA_oultine_1_copy.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 224,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.751235,
+                  3.41841
+                ],
+                [
+                  -1.765245,
+                  4.132914
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.765245,
+                  4.132914
+                ],
+                [
+                  -2.29762,
+                  4.139919
+                ],
+                [
+                  -2.829996,
+                  4.146924
+                ],
+                [
+                  -3.362371,
+                  4.153929
+                ],
+                [
+                  -3.894746,
+                  4.160934
+                ],
+                [
+                  -4.427122,
+                  4.167939
+                ],
+                [
+                  -4.959497,
+                  4.174944
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.959497,
+                  4.174944
+                ],
+                [
+                  -4.966502,
+                  3.47445
+                ],
+                [
+                  -4.973507,
+                  2.773956
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.973507,
+                  2.773956
+                ],
+                [
+                  -4.385092,
+                  2.773956
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.385092,
+                  2.773956
+                ],
+                [
+                  -4.191756,
+                  2.306026
+                ],
+                [
+                  -3.998419,
+                  1.838096
+                ],
+                [
+                  -3.805083,
+                  1.370166
+                ],
+                [
+                  -3.611747,
+                  0.902236
+                ],
+                [
+                  -3.41841,
+                  0.434306
+                ],
+                [
+                  -3.225074,
+                  -0.033624
+                ],
+                [
+                  -3.031738,
+                  -0.501554
+                ],
+                [
+                  -2.838401,
+                  -0.969484
+                ],
+                [
+                  -2.645065,
+                  -1.437414
+                ],
+                [
+                  -2.451729,
+                  -1.905344
+                ],
+                [
+                  -2.258392,
+                  -2.373273
+                ],
+                [
+                  -2.065056,
+                  -2.841203
+                ],
+                [
+                  -1.87172,
+                  -3.309133
+                ],
+                [
+                  -1.678383,
+                  -3.777063
+                ],
+                [
+                  -1.485047,
+                  -4.244993
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 1,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.485047,
+                  -4.244993
+                ],
+                [
+                  -2.409699,
+                  -4.230983
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.409699,
+                  -4.230983
+                ],
+                [
+                  -2.405029,
+                  -4.740009
+                ],
+                [
+                  -2.400359,
+                  -5.249035
+                ],
+                [
+                  -2.395689,
+                  -5.75806
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.395689,
+                  -5.75806
+                ],
+                [
+                  -1.87888,
+                  -5.75806
+                ],
+                [
+                  -1.362072,
+                  -5.75806
+                ],
+                [
+                  -0.845263,
+                  -5.75806
+                ],
+                [
+                  -0.328454,
+                  -5.75806
+                ],
+                [
+                  0.188355,
+                  -5.75806
+                ],
+                [
+                  0.705164,
+                  -5.75806
+                ],
+                [
+                  1.221973,
+                  -5.75806
+                ],
+                [
+                  1.738782,
+                  -5.75806
+                ],
+                [
+                  2.25559,
+                  -5.75806
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.25559,
+                  -5.75806
+                ],
+                [
+                  2.248586,
+                  -5.043556
+                ],
+                [
+                  2.241581,
+                  -4.329053
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.241581,
+                  -4.329053
+                ],
+                [
+                  1.330938,
+                  -4.329053
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.3589577575213292,
+                  -4.329053
+                ],
+                [
+                  1.5494927575213293,
+                  -3.864859
+                ],
+                [
+                  1.7400267575213293,
+                  -3.400665
+                ],
+                [
+                  1.9305617575213292,
+                  -2.936471
+                ],
+                [
+                  2.121095757521329,
+                  -2.472277
+                ],
+                [
+                  2.311629757521329,
+                  -2.008083
+                ],
+                [
+                  2.5021647575213293,
+                  -1.543889
+                ],
+                [
+                  2.6926987575213293,
+                  -1.079695
+                ],
+                [
+                  2.8832327575213292,
+                  -0.615501
+                ],
+                [
+                  3.0737677575213294,
+                  -0.151307
+                ],
+                [
+                  3.2643017575213293,
+                  0.312887
+                ],
+                [
+                  3.4548357575213293,
+                  0.777081
+                ],
+                [
+                  3.6453707575213294,
+                  1.241275
+                ],
+                [
+                  3.8359047575213294,
+                  1.705469
+                ],
+                [
+                  4.02643875752133,
+                  2.169663
+                ],
+                [
+                  4.216973757521329,
+                  2.633857
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 1,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.188954,
+                  2.633857
+                ],
+                [
+                  4.945487,
+                  2.647867
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.945487,
+                  2.647867
+                ],
+                [
+                  4.966502,
+                  3.397396
+                ],
+                [
+                  4.987517,
+                  4.146924
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.987517,
+                  4.146924
+                ],
+                [
+                  4.413112,
+                  4.149259
+                ],
+                [
+                  3.838707,
+                  4.151594
+                ],
+                [
+                  3.264302,
+                  4.153929
+                ],
+                [
+                  2.689897,
+                  4.156264
+                ],
+                [
+                  2.115492,
+                  4.158599
+                ],
+                [
+                  1.541087,
+                  4.160934
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "region",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.541087,
+                  4.160934
+                ],
+                [
+                  1.541087,
+                  3.278312
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.4,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.5270767849124383,
+                  3.2502918724741807
+                ],
+                [
+                  1.696805348843736,
+                  3.257896247474181
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.696805348843736,
+                  3.257896247474181
+                ],
+                [
+                  1.7108152276044006,
+                  4.0144297005500675
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.77024793978939,
+                  4.040917442922108
+                ],
+                [
+                  4.852421267135595,
+                  4.026907564161443
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.861427929950606,
+                  3.992815446789403
+                ],
+                [
+                  4.8334081724292774,
+                  2.7599461158509206
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.8334081724292774,
+                  2.7599461158509206
+                ],
+                [
+                  4.118904355635384,
+                  2.7599461158509206
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  4.118904355635384,
+                  2.7599461158509206
+                ],
+                [
+                  1.148810058374495,
+                  -4.427121688370005
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.148810058374495,
+                  -4.427121688370005
+                ],
+                [
+                  2.157521329142344,
+                  -4.427121688370005
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.157521329142344,
+                  -4.427121688370005
+                ],
+                [
+                  2.1329996671039355,
+                  -5.647730317904831
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.1329996671039355,
+                  -5.647730317904831
+                ],
+                [
+                  -2.29762011674899,
+                  -5.631971261787158
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.29762011674899,
+                  -5.631971261787158
+                ],
+                [
+                  -2.29762011674899,
+                  -4.399101930848675
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.29762011674899,
+                  -4.399101930848675
+                ],
+                [
+                  -1.2975259342065157,
+                  -4.394730235527449
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.2975259342065157,
+                  -4.394730235527449
+                ],
+                [
+                  -4.331757362954587,
+                  2.8995083865916866
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.331757362954587,
+                  2.8995083865916866
+                ],
+                [
+                  -4.857620932889275,
+                  2.8952229613661267
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.857620932889275,
+                  2.8952229613661267
+                ],
+                [
+                  -4.840115492946627,
+                  4.014707818031004
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.840115492946627,
+                  4.014707818031004
+                ],
+                [
+                  -1.8831525063939327,
+                  4.023919540730545
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.8831525063939327,
+                  4.023919540730545
+                ],
+                [
+                  -1.8739407836943915,
+                  3.3698872290631265
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.739842717451255,
+                  2.697431471996626
+                ],
+                [
+                  -0.10529002538249978,
+                  -4.4048067293495645
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -0.10529002538249978,
+                  -4.4048067293495645
+                ],
+                [
+                  2.6213798936816666,
+                  2.6513728584989207
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.6213798936816666,
+                  2.6513728584989207
+                ],
+                [
+                  2.525258797940538,
+                  2.657520007983251
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.5131887256249223,
+                  2.6021563619521713
+                ],
+                [
+                  1.1959123795905442,
+                  -0.8430279276762012
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  1.1959123795905442,
+                  -0.8430279276762012
+                ],
+                [
+                  -1.2706821184337733,
+                  -0.8023140077706381
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -1.3662934857833027,
+                  -0.8046304558595071
+                ],
+                [
+                  -2.6895751838447857,
+                  2.714252862611514
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            }
+          ],
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 0.413,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

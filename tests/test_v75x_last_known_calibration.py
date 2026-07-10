@@ -240,7 +240,7 @@ class TestApplyAndSaveAfterRestore(unittest.TestCase):
             raise unittest.SkipTest(f"MainWindow import failed: {exc}")
         cls._mw = MainWindow
 
-    def _fake(self, save_fn=None):
+    def _fake(self, save_fn=None, pump_setup=None, saved_pump_limits=None):
         from SupportClasses.SafetyLimits import SafetyLimits
         live = SafetyLimits()
         live.z_min, live.z_max, live.enabled = 999.0, 999.0, False  # stale
@@ -249,12 +249,18 @@ class TestApplyAndSaveAfterRestore(unittest.TestCase):
         class _Settings:
             def get_section(self, name):
                 if name == "safety_limits":
-                    return {"z_min": -48.2, "z_max": 1.8, "enabled": True,
-                            "max_z_feedrate": 500.0}
+                    sec = {"z_min": -48.2, "z_max": 1.8, "enabled": True,
+                           "max_z_feedrate": 500.0}
+                    if saved_pump_limits:
+                        sec.update(saved_pump_limits)
+                    return sec
                 return {}
 
         fake = SimpleNamespace(
-            controller=SimpleNamespace(safety_limits=live),
+            controller=SimpleNamespace(
+                safety_limits=live,
+                get_pump_setup=(lambda: dict(pump_setup or {})),
+            ),
             settings=_Settings(),
             _page_widgets=[],
             save_settings=(save_fn or (lambda: saved.append(True))),
@@ -278,6 +284,29 @@ class TestApplyAndSaveAfterRestore(unittest.TestCase):
         fake, live, _ = self._fake(save_fn=boom)
         # Best-effort: a save failure must not raise (limits already applied).
         self._mw._apply_and_save_after_restore(fake, "test")
+        self.assertAlmostEqual(live.z_min, -48.2)
+
+    def test_calibrated_pump_envelope_survives_stale_mirror(self):
+        """Regression: a calibrated pump's soft-limit envelope is owned by the
+        plunger calibration (pump_setup), NOT the persisted safety_limits mirror.
+
+        Reproduces the ME3B V3 "Quick Print goes to pick up ink and nothing
+        happens" bug: the mirror on disk was the sign-flipped [0, 30] while the
+        captured extremes (raw 0 → -30) imply [-30, 0]. Mirroring the stale
+        value here set p2_min=0, so every aspirate (toward negative raw mm)
+        clamped to 0 and the shorten-only guard zeroed the move. After the fix,
+        the calibrated envelope is re-derived from the captured extremes and
+        wins over the stale mirror."""
+        fake, live, _ = self._fake(
+            pump_setup={"P2": {"raw_dispensed": 0.0, "raw_aspirated": -30.0,
+                               "aspirate_sign": -1.0, "capacity_uL": 250.0}},
+            saved_pump_limits={"p2_min": 0.0, "p2_max": 30.0},  # stale/flipped
+        )
+        self._mw._apply_and_save_after_restore(fake, "test")
+        # Calibration wins: envelope re-derived from min/max(0, -30) = [-30, 0].
+        self.assertAlmostEqual(live.p2_min, -30.0)
+        self.assertAlmostEqual(live.p2_max, 0.0)
+        # Non-pump (Device-owned) limits still mirror from disk.
         self.assertAlmostEqual(live.z_min, -48.2)
 
 

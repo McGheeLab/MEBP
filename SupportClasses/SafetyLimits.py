@@ -29,6 +29,17 @@ from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# v7.5.x: the per-pump max FLOW RATE ceiling is derived from needle geometry
+# (inner diameter + length) via FlowPhysics' Hagen–Poiseuille calc, using a
+# FIXED reference viscosity so the ceiling is a HARDWARE limit independent of
+# whichever ink is loaded. Water (≈1 cP) is the least-viscous realistic fluid,
+# giving the highest Q_max for the pressure budget — i.e. the most permissive
+# geometry-only ceiling. Per-ink / per-move flow safety is still applied
+# elsewhere (FlowPhysics.calculate_flow_safety, clamp_flow_rate). Lives here
+# (not in FlowPhysics) to keep FlowPhysics ink-agnostic and avoid a circular
+# import.
+REFERENCE_VISCOSITY_CP = 1.0
+
 
 @dataclass
 class SafetyLimits:
@@ -305,35 +316,50 @@ class SafetyLimits:
             return
         skip_pumps = set(skip_pumps or ())
 
-        # Max flow rate by needle gauge (µL/s) — conservative defaults
-        # Based on typical bioprinting literature recommendations
-        GAUGE_MAX_FLOW = {
-            16: 50.0,   # 16G: very wide, high flow ok
-            18: 30.0,
-            20: 15.0,
-            22: 8.0,
-            23: 5.0,
-            25: 3.0,
-            27: 1.5,
-            28: 1.0,
-            30: 0.5,
-            32: 0.2,
-        }
-
-        gauge = None
-        if hasattr(hardware_config, 'needle') and hardware_config.needle:
-            gauge = hardware_config.needle.gauge
+        # v7.5.x: per-pump max flow ceiling = a NEEDLE-DERIVED flow rate (µL/s)
+        # from needle inner-diameter + length via Hagen–Poiseuille, using the
+        # fixed REFERENCE_VISCOSITY_CP (ink-independent). Replaces the old coarse
+        # gauge→flow lookup table. One value per needle → applied to every
+        # configured pump. A missing/degenerate needle leaves the existing
+        # ceilings UNTOUCHED (never widened to 0 = "no limit").
+        needle = getattr(hardware_config, "needle", None)
+        gauge = getattr(needle, "gauge", None) if needle else None
+        ceiling = None
+        if needle is not None:
+            try:
+                from .FlowPhysics import (
+                    max_safe_flow_rate_uL_s, DEFAULT_PRESSURE_LIMIT_PA,
+                )
+                from .PhysicalModels import InkSpec
+                ref_ink = InkSpec(name="__reference__",
+                                  viscosity_cP=REFERENCE_VISCOSITY_CP)
+                if getattr(needle, "id_m", 0) and needle.id_m > 0:
+                    c = max_safe_flow_rate_uL_s(needle, ref_ink,
+                                                DEFAULT_PRESSURE_LIMIT_PA)
+                    if c and c > 0:
+                        ceiling = float(c)
+            except Exception as e:
+                logger.warning(f"needle-derived flow ceiling failed: {e}")
+        if ceiling is None:
+            logger.warning(
+                "Pump max flow ceiling NOT updated (no needle / invalid bore / "
+                "calc failed) — keeping existing per-pump limits.")
 
         for pid in ["P1", "P2", "P3"]:
             pump_cfg = hardware_config.pumps.get(pid)
             if pump_cfg is None or not pump_cfg.is_configured:
                 continue
 
-            # Set flow rate limit from needle gauge
-            if gauge and gauge in GAUGE_MAX_FLOW:
-                max_rate = GAUGE_MAX_FLOW[gauge]
-                self.set_max_flow_rate(pid, max_rate)
-                logger.info(f"{pid}: max flow rate = {max_rate:.1f} µL/s ({gauge}G needle)")
+            # Set the needle-derived flow-rate ceiling (same for every pump on
+            # this needle). Skip when no valid ceiling so an existing limit isn't
+            # clobbered.
+            if ceiling is not None:
+                self.set_max_flow_rate(pid, ceiling)
+                length_mm = getattr(needle, "length_mm", 0.0)
+                logger.info(
+                    f"{pid}: max flow rate = {ceiling:.3f} µL/s "
+                    f"({gauge}G, L={length_mm:.1f} mm, "
+                    f"ref µ={REFERENCE_VISCOSITY_CP:g} cP)")
 
             # Set pump travel limits from syringe stroke length — UNLESS the
             # plunger calibration already set a (more accurate) envelope.

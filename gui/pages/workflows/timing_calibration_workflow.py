@@ -848,6 +848,38 @@ class TimingCalibrationWorkflowPage(QWidget):
             headline=d.get("headline", ""),
             xlabel=d.get("xlabel", "segments →"),
             ylabel=d.get("ylabel", "delay (ms)"))
+        # v7.5.x: a measured XY top speed WRITES the single common XY-max source
+        # (so every page inherits it). Runs on the GUI thread (bridge signal).
+        top = d.get("xy_top_speed_um_s")
+        if top:
+            self._apply_measured_xy_top_speed(float(top))
+
+    def _apply_measured_xy_top_speed(self, um_s: float) -> None:
+        """Persist a measured XY top speed as THE single common XY max:
+        live ``safety_limits.max_xy_speed`` + settings, then broadcast so every
+        jog/speed surface re-reads it. The worker already applied it to the live
+        XYStage + the timing store; this makes it the canonical safety value too."""
+        if um_s <= 0:
+            return
+        ctrl = self._controller
+        sl = getattr(ctrl, "safety_limits", None) if ctrl else None
+        if sl is not None:
+            try:
+                sl.max_xy_speed = float(um_s)
+            except Exception as e:
+                logger.debug(f"set live max_xy_speed failed: {e}")
+        if self._settings is not None:
+            try:
+                self._settings.set("safety_limits.max_xy_speed", float(um_s))
+                self._settings.save()
+            except Exception as e:
+                logger.debug(f"persist max_xy_speed failed: {e}")
+        # Broadcast on the GUI thread → app fans refresh_speed_limits() out.
+        if ctrl is not None and hasattr(ctrl, "notify_speed_limits_changed"):
+            try:
+                ctrl.notify_speed_limits_changed()
+            except Exception as e:
+                logger.debug(f"notify_speed_limits_changed failed: {e}")
 
     def _on_finished(self, ok: bool, summary: str) -> None:
         self._thread = None
@@ -1328,7 +1360,11 @@ class TimingCalibrationWorkflowPage(QWidget):
                     "points": pts, "slope": slope, "intercept": intercept,
                     "headline": (f"top speed {cruise_mm_s:.2f} mm/s "
                                  f"(overhead {intercept * 1000:.0f} ms)"),
-                    "xlabel": "distance (mm) →", "ylabel": "time (ms)"})
+                    "xlabel": "distance (mm) →", "ylabel": "time (ms)",
+                    # v7.5.x: hand the measured top speed to the GUI thread so
+                    # _on_result writes it into the SINGLE common XY-max source
+                    # (safety_limits.max_xy_speed + settings) and fans out.
+                    "xy_top_speed_um_s": cruise_um_s})
                 self._log_t(
                     f"XY TOP SPEED = {cruise_mm_s:.2f} mm/s ({cruise_um_s:.0f} "
                     f"µm/s) at SMS,100. STORED + APPLIED — the mm/s↔SMS "

@@ -41,6 +41,8 @@ from SupportClasses.PrintHistory import PrintHistory
 from SupportClasses.PrintManager import load_print_progress, clear_print_progress
 from SupportClasses.PrintRecorder import PrintRecorder
 from SupportClasses.HardwareConfig import HardwareConfig
+from SupportClasses.CommonPrintSettings import CommonPrintSettings
+from SupportClasses.ContextPanelLayoutStore import ContextPanelLayoutStore
 from gui.styles import DARK_THEME, COLORS, build_theme, apply_scaled_styles
 from gui.ui_functions import UIFunctions, AppSettings
 from gui.scaling import s, scale_factor, scaled_font_size
@@ -53,7 +55,6 @@ from gui.pages.hardware_setup import HardwareSetupPage
 # v7.4.2: DashboardPage removed; its readouts merged into Jog + Hardware Setup
 from gui.pages.jog_control import JogControlPage
 from gui.pages.calibration import CalibrationPage
-from gui.pages.printing_mode import PrintingModePage      # v7.3.3
 from gui.pages.print_builder import PrintBuilderPage       # v7.5.x
 from gui.pages.workflows_mode import WorkflowsModePage    # v7.4.3
 from gui.pages.settings_page import SettingsPage
@@ -62,6 +63,10 @@ from gui.widgets.xbox_mapping_editor import XboxMappingEditor
 from gui.widgets.camera_manager import CameraManager       # v7.3.3
 from gui.widgets.components import LoadingBanner            # v7.4.0-a
 from gui.widgets.page_transition import fade_swap           # v7.4.0-a
+from gui.widgets.context_panel_host import ContextPanelHost  # v7.5.x
+from gui.widgets.context_sections import (                  # v7.5.x
+    SectionContext, known_types as _context_section_types,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -338,8 +343,9 @@ class MainWindow(QMainWindow):
             ("btn_calibrate",    "📐", "Calibration"),
             ("btn_jog",          "🕹️", "Jog Control"),
             ("btn_printbuilder", "✏️", "Print Builder"),     # mode page (v7.5.x)
-            ("btn_printing",     "🖨️", "Printing"),            # mode page
             ("btn_workflows",    "🧫", "Workflows"),            # mode page (v7.4.3)
+            # v7.5.x: the former "Printing" mode is now the "Full Print" tile
+            # inside Workflows (gui/pages/workflows/full_print_workflow.py).
         ]
         for obj_name, icon_text, label_text in menu_items:
             btn = self._make_menu_button(obj_name, icon_text, label_text)
@@ -389,14 +395,26 @@ class MainWindow(QMainWindow):
         btn_close_context = _icon_button("", "x", tooltip="Hide context panel")
         btn_close_context.setObjectName("extraCloseColumnBtn")
         btn_close_context.setFixedSize(s(28), s(28))
-        btn_close_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
+        btn_close_context.clicked.connect(self._toggle_left_context)
         extra_top_layout.addWidget(btn_close_context)
 
         extra_layout.addWidget(extra_top)
 
-        self._context_stack = QStackedWidget()
-        self._context_stack.setObjectName("extraContent")
-        extra_layout.addWidget(self._context_stack)
+        # v7.5.x: the left context is a SINGLE global ContextPanelHost (pill
+        # picker: Jog | Custom) mounted here, replacing the old per-page
+        # QStackedWidget. The host itself is created in _create_pages (once the
+        # controller / camera manager / layout store exist) and dropped into
+        # this holder. One managed widget + explicit visibility (see
+        # _refresh_left_context) eliminates the old show/hide-vs-content desync
+        # that made the jog panel "sometimes disappear" in workflows.
+        self._context_content = QWidget()
+        self._context_content.setObjectName("extraContent")
+        _context_content_lay = QVBoxLayout(self._context_content)
+        _context_content_lay.setContentsMargins(0, 0, 0, 0)
+        _context_content_lay.setSpacing(0)
+        self._context_content_layout = _context_content_lay
+        self._context_host = None  # created in _create_pages
+        extra_layout.addWidget(self._context_content)
 
         # ── Right context panel (v7.4.2) ─────────────────────────
         # A mirror of the left context panel anchored on the right
@@ -449,7 +467,7 @@ class MainWindow(QMainWindow):
         btn_context.setFixedSize(s(32), s(32))
         btn_context.setCursor(Qt.PointingHandCursor)
         btn_context.setToolTip("Toggle context panel")
-        btn_context.clicked.connect(lambda: UIFunctions.toggleLeftBox(self))
+        btn_context.clicked.connect(self._toggle_left_context)
         top_bar_layout.addWidget(btn_context)
 
         title_frame = QWidget()
@@ -666,15 +684,15 @@ class MainWindow(QMainWindow):
         """
         Instantiate all page widgets.
 
-        v7.5.x page indices (Print Builder inserted before Printing):
+        v7.5.x page indices (Printing mode re-homed into Workflows as the
+        "Full Print" tile, so its sidebar slot is removed):
             0: Hardware Setup (always enabled)
             1: Calibration
             2: Jog Control
             3: Print Builder (mode — sub-pages: Sketch, Image Import,
                Hardware, Print Settings)
-            4: Printing (mode — sub-pages: Setup, Monitor, Results)
-            5: Workflows (mode)
-            6: Settings (always enabled)
+            4: Workflows (mode — incl. the Full Print tile = Setup/Monitor/Results)
+            5: Settings (always enabled)
 
         v7.2.3: Also wires the job pipeline (Setup → Monitor)
         and execution control signals (Monitor → PrintManager).
@@ -682,15 +700,32 @@ class MainWindow(QMainWindow):
         # Restore hardware config from settings
         self._hardware_config = self._restore_hardware_config()
 
+        # v7.5.x: shared "Common Print Settings" model. Globals (settle / relief
+        # / prime) proxy the live HardwareConfig; the promoted prep defaults are
+        # restored from settings.json. A listener persists + propagates changes.
+        self._common_print_settings = CommonPrintSettings()
+        self._common_print_settings.set_hardware_config(self._hardware_config)
+        try:
+            self._common_print_settings.load_promoted(
+                self.settings.get("common_print_settings"))
+        except Exception as e:
+            logger.debug("restore common_print_settings failed: %s", e)
+        self._common_print_settings.add_listener(self._on_common_setting_changed)
+
         # v7.3.3: Shared camera manager for all pages
         self._camera_manager = CameraManager(max_cameras=3)
 
         # v7.3.3: Mode pages wrap sub-pages internally
-        self._printing_mode = PrintingModePage(self.controller, self.settings)
         self._print_builder = PrintBuilderPage(self.controller, self.settings)  # v7.5.x
         self._workflows_mode = WorkflowsModePage(
             self.controller, self.settings,
             camera_manager=self._camera_manager)
+        # v7.5.x: the former "Printing" mode (Setup/Monitor/Results) now lives
+        # inside Workflows as the "Full Print" tile. Grab a direct handle so the
+        # job pipeline / monitor / results wiring below can reach its
+        # setup_page / monitor_page / results_page (same surface PrintingModePage
+        # exposed). The wrapper hosts a PrintingModePage internally.
+        self._full_print_page = self._workflows_mode.full_print_page
 
         # v7.4.3: Calibration sits between Hardware Setup and Jog Control,
         # matching the sidebar menu order above. The pages list index is
@@ -702,9 +737,8 @@ class MainWindow(QMainWindow):
             JogControlPage(self.controller,
                           camera_manager=self._camera_manager),           # 2
             self._print_builder,                                          # 3  v7.5.x mode
-            self._printing_mode,                                          # 4  v7.3.3 mode
-            self._workflows_mode,                                         # 5  v7.4.3 mode
-            SettingsPage(self.controller, self.settings),                 # 6
+            self._workflows_mode,                                         # 4  v7.4.3 mode
+            SettingsPage(self.controller, self.settings),                 # 5
         ]
 
         # Wire Hardware Setup signals
@@ -734,17 +768,18 @@ class MainWindow(QMainWindow):
         if self._hardware_config:
             hw_page.set_config(self._hardware_config)
 
-        # Wire recorder to printing mode sub-pages
-        if self.recorder:
-            monitor = self._printing_mode.monitor_page
+        # Wire recorder to the Full Print sub-pages (Setup/Monitor/Results,
+        # re-homed into the Workflows "Full Print" tile).
+        if self.recorder and self._full_print_page is not None:
+            monitor = self._full_print_page.monitor_page
             if hasattr(monitor, 'set_recorder'):
                 monitor.set_recorder(self.recorder)
 
-            results_page = self._printing_mode.results_page
+            results_page = self._full_print_page.results_page
             if hasattr(results_page, 'set_recorder'):
                 results_page.set_recorder(self.recorder)
 
-            setup = self._printing_mode.setup_page
+            setup = self._full_print_page.setup_page
             if hasattr(setup, 'print_manager') and setup.print_manager:
                 setup.print_manager.recorder = self.recorder
 
@@ -754,27 +789,9 @@ class MainWindow(QMainWindow):
             self._page_widgets.append(page)
             self._page_stack.addWidget(page)
 
-            # Create context panel
-            # v7.3.3: Mode pages manage context dynamically via
-            # _update_mode_context — use placeholder to avoid double-wrap.
-            # v7.4.x: WorkflowsModePage uses the same dynamic context
-            # pattern even though it doesn't subclass ModePage.
-            if isinstance(page, ModePage) or isinstance(page, WorkflowsModePage):
-                placeholder = QWidget()
-                self._context_stack.addWidget(placeholder)
-            else:
-                ctx = None
-                if hasattr(page, 'get_context_widget'):
-                    ctx = page.get_context_widget()
-                if ctx is not None:
-                    scroll = QScrollArea()
-                    scroll.setObjectName("contextScrollArea")
-                    scroll.setWidgetResizable(True)
-                    scroll.setWidget(ctx)
-                    self._context_stack.addWidget(scroll)
-                else:
-                    placeholder = QWidget()
-                    self._context_stack.addWidget(placeholder)
+            # v7.5.x: the LEFT context is no longer a per-page stack — a single
+            # global ContextPanelHost (created below) hosts each page's context
+            # widget in its "Jog" view slot on demand. See _refresh_left_context.
 
             # v7.4.2: parallel right-context panel. Pages opt in by
             # implementing get_right_context_widget; everyone else
@@ -805,9 +822,37 @@ class MainWindow(QMainWindow):
                 page.sub_page_changed.connect(
                     lambda idx, page_idx=i: self._on_mode_sub_page_changed(page_idx))
 
+        # v7.5.x: build the single global left-context host now that the
+        # controller, camera manager and settings all exist. The Custom view's
+        # layout is a shared, persisted machine-level thing (ContextPanelLayoutStore).
+        self._context_layout_store = ContextPanelLayoutStore(
+            known_types=_context_section_types())
+        self._context_section_ctx = SectionContext(
+            controller=self.controller,
+            hardware_config=self._hardware_config,
+            camera_manager=self._camera_manager,
+            settings=self.settings,
+            layout_store=self._context_layout_store,
+        )
+        self._context_host = ContextPanelHost(self._context_section_ctx)
+        self._context_host.view_changed.connect(self._on_context_view_changed)
+        self._context_content_layout.addWidget(self._context_host)
+        # Restore persisted collapse + active-view state.
+        self._left_context_user_collapsed = bool(
+            self.settings.get("context_panel.collapsed", False))
+        try:
+            self._context_host.set_active_view(
+                self.settings.get("context_panel.active_view", "jog"))
+        except Exception as e:
+            logger.debug("restore context_panel.active_view failed: %s", e)
+
         # Propagate existing hardware config to pages
         if self._hardware_config:
             self._propagate_hardware_config(self._hardware_config)
+
+        # v7.5.x: fan the Common Print Settings model out to the workflow pages
+        # (Common Print Settings page + each workflow's inheriting fields).
+        self._fanout_common_print_settings()
 
         # Initial page gating
         is_valid = (self._hardware_config is not None
@@ -822,10 +867,22 @@ class MainWindow(QMainWindow):
         # (Image Import + Sketch) — both bake a csv_import object that
         # should land in Print Setup's custom-prints area.
         for _author_page in (self._print_builder.image_import_page,
-                             self._print_builder.sketch_page):
+                             self._print_builder.sketch_page,
+                             self._print_builder.library_page):
             if hasattr(_author_page, 'print_file_created'):
                 _author_page.print_file_created.connect(
                     self._on_print_created)
+
+        # v7.5.x: the Print Library (Prints tab) can rename/delete/duplicate
+        # print files on disk — refresh the consumers' saved-print lists.
+        _lib = self._print_builder.library_page
+        if hasattr(_lib, 'print_files_changed'):
+            _lib.print_files_changed.connect(self._on_print_files_changed)
+        # Saving edits to an existing print (Sketch "Save changes") also
+        # changes files on disk without creating a new one.
+        if hasattr(self._print_builder.sketch_page, 'print_file_saved'):
+            self._print_builder.sketch_page.print_file_saved.connect(
+                lambda _n: self._on_print_files_changed())
 
         # v7.4.3: page order is now (HW=0, Calibration=1, Jog=2,
         # Printing=3, P&P=4, Settings=5).
@@ -868,23 +925,12 @@ class MainWindow(QMainWindow):
                         wf.set_settings(self.settings)
                 except Exception as e:
                     logger.debug(f"push cal data to workflows mode failed: {e}")
-            # v7.5.x: push the calibrated well positions to the Printing-mode
-            # setup page so its print path (discrete / hybrid / trajectory)
-            # drives to the TAUGHT wells instead of a geometric grid anchored
-            # at the stage origin (which, on the (-1,-1) plate flip, clamped to
-            # 0,0 — the "moved to 0,0 / wrong coordinates" operator bug). The
-            # Jog page and Workflows mode already get this; the Printing setup
-            # page was missing it.
-            printing_mode = getattr(self, "_printing_mode", None)
-            if printing_mode is not None:
-                try:
-                    setup_pg = getattr(printing_mode, "setup_page", None)
-                    if setup_pg is not None and hasattr(
-                            setup_pg, "set_calibration_data"):
-                        setup_pg.set_calibration_data(
-                            *cal_page.get_calibration_data())
-                except Exception as e:
-                    logger.debug(f"push cal data to printing setup failed: {e}")
+            # v7.5.x: the Full Print setup page (re-homed into Workflows) gets
+            # the calibrated well positions through the Workflows-mode fanout
+            # above (wf.set_calibration_data → FullPrintWorkflowPage →
+            # setup_page), so its print path drives to the TAUGHT wells instead
+            # of a geometric grid anchored at the stage origin. No separate push
+            # is needed now that "Printing" no longer has its own sidebar slot.
             # v7.5.x: push the Z-reference set to the Print Builder so its
             # Sketch sub-page can express print Z as a height above the
             # plate bottom.
@@ -921,6 +967,20 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     logger.debug(f"recenter_default_plate failed: {e}")
             hw_page.safety_limits_changed.connect(_recenter_plate_in_bounds)
+
+        # v7.5.x: ONE common per-axis MAX speed — when it changes anywhere
+        # (Stage Panel edit, per-axis Z popup, or the timing tool's measured
+        # top speed) fan a refresh out to every jog/speed surface so they
+        # re-read the single source. Page edits use the Qt signal; the timing
+        # worker's GUI-thread continuation calls controller.on_speed_limits_changed
+        # → the same signal (so the fan-out always runs on the GUI thread).
+        if hasattr(hw_page, 'safety_limits_changed'):
+            hw_page.safety_limits_changed.connect(self._refresh_all_speed_limits)
+            try:
+                self.controller.on_speed_limits_changed = \
+                    hw_page.safety_limits_changed.emit
+            except Exception as e:
+                logger.debug(f"wire on_speed_limits_changed failed: {e}")
 
         # v7.3.3: CameraManager is shared — no need to manually wire cameras
 
@@ -962,8 +1022,11 @@ class MainWindow(QMainWindow):
             Monitor.resume_requested() → PrintManager.resume()
             Monitor.abort_requested()  → PrintManager.abort()
         """
-        setup_page = self._printing_mode.setup_page
-        monitor_page = self._printing_mode.monitor_page
+        if self._full_print_page is None:
+            logger.warning("_wire_job_pipeline: no full_print_page")
+            return
+        setup_page = self._full_print_page.setup_page
+        monitor_page = self._full_print_page.monitor_page
 
         # Job pipeline: PrintSetup → app → PrintMonitor
         if hasattr(setup_page, 'job_ready'):
@@ -991,10 +1054,13 @@ class MainWindow(QMainWindow):
         We bounce through a QObject signal bridge so all GUI updates
         execute on the main thread.
 
-        v7.3.3: Access sub-pages through PrintingModePage.
+        v7.5.x: Access sub-pages through the Full Print workflow page.
         """
-        setup_page = self._printing_mode.setup_page
-        monitor_page = self._printing_mode.monitor_page
+        if self._full_print_page is None:
+            logger.warning("_wire_print_manager_to_monitor: no full_print_page")
+            return
+        setup_page = self._full_print_page.setup_page
+        monitor_page = self._full_print_page.monitor_page
 
         if not hasattr(setup_page, "print_manager"):
             logger.warning("_wire_print_manager_to_monitor: no print_manager")
@@ -1073,10 +1139,14 @@ class MainWindow(QMainWindow):
         Initializes plate overview, trajectory view, and syringe displays
         before the job is received by the monitor page.
 
-        v7.3.3: Access via PrintingModePage + auto-switch to monitor sub-page.
+        v7.5.x: Access via the Full Print workflow page + auto-navigate to
+        Workflows → Full Print → Monitor sub-page.
         """
-        monitor_page = self._printing_mode.monitor_page
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            logger.warning("_send_job_to_monitor: no full_print_page")
+            return
+        monitor_page = self._full_print_page.monitor_page
+        setup_page = self._full_print_page.setup_page
 
         # ── Initialize monitor visualization ──────────────────────
         try:
@@ -1087,10 +1157,16 @@ class MainWindow(QMainWindow):
         if hasattr(monitor_page, 'receive_job'):
             monitor_page.receive_job(job)
 
-        # v7.3.3: Switch to Printing mode page + Monitor sub-page
-        # v7.4.2: was index 4 with Dashboard; now index 3.
-        self._printing_mode.switch_to_monitor()
-        self._switch_page(3)
+        # v7.5.x: navigate sidebar → Workflows, open the Full Print tile, then
+        # switch its inner mode page to the Monitor sub-page. Order matters: the
+        # Workflows page must be the visible stack page before we select the
+        # tile + sub-page so the title/context refresh lands correctly. (This
+        # also fixes the old stale `_switch_page(3)` which navigated to Print
+        # Builder instead of Printing.)
+        self._navigate_to(self._workflows_index())
+        self._workflows_mode.open_workflow("full_print")
+        self._full_print_page.switch_to_monitor()
+
     def _setup_monitor_visualization(self, setup_page, monitor_page, job):
         """v7.2.6: Feed plate/trajectory/syringe data to monitor widgets."""
         try:
@@ -1194,7 +1270,10 @@ class MainWindow(QMainWindow):
 
         Default is "position" — simplest and most reliable.
         """
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            logger.error("No full_print_page for monitor start")
+            return
+        setup_page = self._full_print_page.setup_page
         if not hasattr(setup_page, "print_manager"):
             logger.error("No print_manager on setup page")
             return
@@ -1428,28 +1507,36 @@ class MainWindow(QMainWindow):
 
     def _on_monitor_pause(self):
         """Monitor requested pause — forward to PrintManager."""
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            return
+        setup_page = self._full_print_page.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.pause()
 
     def _on_monitor_resume(self):
         """Monitor requested resume — forward to PrintManager."""
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            return
+        setup_page = self._full_print_page.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.resume()
 
     def _on_monitor_abort(self):
         """Monitor requested abort — forward to PrintManager."""
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            return
+        setup_page = self._full_print_page.setup_page
         if hasattr(setup_page, 'print_manager'):
             setup_page.print_manager.abort()
 
     def _on_print_completed_v726(self):
         """v7.2.6: On print completion, notify results page.
 
-        v7.3.3: Access results page through PrintingModePage.
+        v7.5.x: Access results page through the Full Print workflow page.
         """
-        results_page = self._printing_mode.results_page
+        if self._full_print_page is None:
+            return
+        results_page = self._full_print_page.results_page
         if hasattr(results_page, 'load_latest_recording'):
             try:
                 results_page.load_latest_recording()
@@ -1472,9 +1559,12 @@ class MainWindow(QMainWindow):
         csv_import print file — load it into Print Setup's object list and
         jump to the Setup sub-page.
 
-        v7.5.x: sources are Print Builder sub-pages; Printing is now index 4.
+        v7.5.x: sources are Print Builder sub-pages; the print stack now lives
+        in the Workflows "Full Print" tile.
         """
-        setup_page = self._printing_mode.setup_page
+        if self._full_print_page is None:
+            return
+        setup_page = self._full_print_page.setup_page
         # The wizard PrintSetupPage composes the legacy page internally as
         # ``_legacy``; the objects tab (PrintObjectsTab) lives on either.
         tab = getattr(setup_page, 'tab_objects', None)
@@ -1486,9 +1576,37 @@ class MainWindow(QMainWindow):
                 tab._load_print_file(filename)
             elif hasattr(tab, '_emit_prints_changed'):
                 tab._emit_prints_changed()
-        # Switch to Printing mode, Setup sub-page (Printing is index 4 in v7.5.x)
-        self._printing_mode.switch_to_setup()
-        self._navigate_to(4)
+        # Navigate to Workflows → Full Print → Setup sub-page.
+        self._navigate_to(self._workflows_index())
+        self._workflows_mode.open_workflow("full_print")
+        self._full_print_page.switch_to_setup()
+
+    def _on_print_files_changed(self):
+        """The Print Library renamed/deleted/duplicated print files on disk —
+        best-effort refresh of the pages that list saved prints so their combos
+        don't go stale (both also re-scan on their own showEvent)."""
+        # Quick Print objects combo.
+        try:
+            qp = self._workflows_mode.quick_print_page
+            if qp is not None and hasattr(qp, "_refresh_objects"):
+                qp._refresh_objects()
+        except Exception as e:
+            logger.debug(f"quick print refresh after file change failed: {e}")
+        # Full Print objects tab list.
+        try:
+            if self._full_print_page is not None:
+                setup_page = self._full_print_page.setup_page
+                tab = getattr(setup_page, "tab_objects", None)
+                if tab is None:
+                    legacy = getattr(setup_page, "_legacy", None)
+                    tab = getattr(legacy, "tab_objects", None)
+                for m in ("_refresh_print_list_section", "_refresh_file_combo",
+                          "_emit_prints_changed"):
+                    if tab is not None and hasattr(tab, m):
+                        getattr(tab, m)()
+                        break
+        except Exception as e:
+            logger.debug(f"full print refresh after file change failed: {e}")
 
 
     # ════════════════════════════════════════════════════════════════
@@ -1565,6 +1683,41 @@ class MainWindow(QMainWindow):
             self._emit_invalidation(prev, config)
         finally:
             self._propagating_config = False
+
+    def _fanout_common_print_settings(self):
+        """v7.5.x: push the shared CommonPrintSettings model to the Workflows
+        mode so the Common Print Settings page + every workflow's inheriting
+        fields re-sync to the current common values."""
+        wf = getattr(self, "_workflows_mode", None)
+        cps = getattr(self, "_common_print_settings", None)
+        if wf is not None and cps is not None and hasattr(
+                wf, "set_common_print_settings"):
+            try:
+                wf.set_common_print_settings(cps)
+            except Exception as e:
+                logger.debug("fanout common print settings failed: %s", e)
+
+    def _on_common_setting_changed(self, common, key: str):
+        """v7.5.x: a Common Print Settings value changed (from the Common page
+        OR a workflow popout's global field). Persist + propagate.
+
+        Global keys live on HardwareConfig (single source of truth) → persist +
+        propagate the config. Promoted prep defaults persist to settings.json.
+        Either way, re-fan-out so inheriting workflow fields re-sync.
+        """
+        try:
+            if common.is_global(key):
+                cfg = self._hardware_config
+                if cfg is not None:
+                    self._save_hardware_config(cfg)
+                    self._propagate_hardware_config(cfg)
+            else:
+                self.settings.set(
+                    "common_print_settings", common.promoted_dict())
+                self.settings.save()
+        except Exception as e:
+            logger.warning("persist common setting '%s' failed: %s", key, e)
+        self._fanout_common_print_settings()
 
     def _emit_invalidation(self, prev, current):
         """v7.4.0-b: Emit hw_config_invalidated with what changed.
@@ -1650,6 +1803,12 @@ class MainWindow(QMainWindow):
             self.controller.set_hardware_config(config)
             logger.debug("HW config → StageController")
 
+        # v7.5.x: keep the Common Print Settings model pointed at the live
+        # config so its global params (settle / relief / prime) proxy it.
+        cps = getattr(self, "_common_print_settings", None)
+        if cps is not None:
+            cps.set_hardware_config(config)
+
         for i, page in enumerate(self._page_widgets):
             # Skip the hardware setup page — it's the SOURCE, not the target
             if isinstance(page, HardwareSetupPage):
@@ -1664,6 +1823,16 @@ class MainWindow(QMainWindow):
                                  f"({page_name}): {e}")
             else:
                 logger.debug(f"HW config → Page {i}: {page_name} (no set_hardware_config)")
+
+        # v7.5.x: the left-context host is not a page — push config to it so the
+        # Custom view's config-driven sections (positions ranges, syringe,
+        # hardware info) refresh too.
+        host = getattr(self, "_context_host", None)
+        if host is not None:
+            try:
+                host.set_hardware_config(config)
+            except Exception as e:
+                logger.debug("HW config → context host failed: %s", e)
 
     def _update_page_gating(self, hardware_valid: bool):
         """Enable/disable navigation buttons for pages requiring hardware setup.
@@ -1725,12 +1894,20 @@ class MainWindow(QMainWindow):
             "btn_calibrate":    1,
             "btn_jog":          2,
             "btn_printbuilder": 3,   # mode page (v7.5.x)
-            "btn_printing":     4,   # mode page
-            "btn_workflows":    5,   # mode page (v7.4.3)
-            "btn_settings":     6,
+            "btn_workflows":    4,   # mode page (v7.4.3); hosts Full Print
+            "btn_settings":     5,
         }
         index = btn_map.get(btn.objectName(), 0)
         self._navigate_to(index)
+
+    def _workflows_index(self) -> int:
+        """Page-stack index of the Workflows mode page. Derived from the live
+        page list so it survives reindexing (e.g. the v7.5.x Printing-mode
+        removal), with a static fallback."""
+        try:
+            return self._page_widgets.index(self._workflows_mode)
+        except (ValueError, AttributeError):
+            return 4
 
     def _navigate_to(self, index: int):
         """Switch to the page at the given index.
@@ -1752,24 +1929,15 @@ class MainWindow(QMainWindow):
         if hasattr(page, 'get_page_title'):
             title = page.get_page_title()
         else:
-            # v7.5.x: Print Builder inserted before Printing.
+            # v7.5.x: Printing mode re-homed into Workflows (Full Print tile).
             titles = ["Hardware Setup", "Calibration", "Jog Control",
-                      "Print Builder", "Printing", "Workflows", "Settings"]
+                      "Print Builder", "Workflows", "Settings"]
             title = titles[index] if index < len(titles) else title
         self._page_title.setText(title)
 
-        # Context panel: mode pages may need dynamic context from sub-page
-        from gui.pages.mode_page import ModePage
-        if isinstance(page, ModePage):
-            self._update_mode_context(index, page)
-        else:
-            self._context_stack.setCurrentIndex(index)
-            context_titles = ["Hardware", "Calibration", "Jog Settings",
-                              "Print Builder", "Printing", "Workflows",
-                              "Settings"]
-            self._context_title.setText(
-                context_titles[index] if index < len(context_titles) else "Settings"
-            )
+        # v7.5.x: left context — one centralized refresh that mounts the page's
+        # context widget in the host's Jog slot AND sets visibility explicitly.
+        self._refresh_left_context()
 
         # Highlight the active menu button
         for i, btn in enumerate(self._menu_buttons):
@@ -1777,16 +1945,6 @@ class MainWindow(QMainWindow):
                 btn.setStyleSheet(UIFunctions.selectMenu(btn.styleSheet()))
             else:
                 btn.setStyleSheet(UIFunctions.deselectMenu(btn.styleSheet()))
-
-        # Auto-show/hide context panel based on page
-        has_context = (hasattr(page, 'get_context_widget')
-                       and page.get_context_widget() is not None)
-        if has_context:
-            if not self.ui_extraLeftBox.isVisible():
-                UIFunctions.toggleLeftBox(self)
-        else:
-            if self.ui_extraLeftBox.isVisible():
-                UIFunctions.toggleLeftBox(self)
 
         # v7.4.2: same dance for the right context panel.
         right_ctx = None
@@ -1919,37 +2077,101 @@ class MainWindow(QMainWindow):
             logger.debug(f"_allocate_right_context_width failed: {e}")
 
     def _on_mode_sub_page_changed(self, mode_page_index: int):
-        """v7.3.3: When a mode page switches sub-pages, update context panel."""
+        """v7.3.3: When a mode/workflow page switches sub-pages, refresh the
+        top-bar title AND the left context (content + visibility) in one place.
+
+        v7.5.x: the left context is now managed solely by _refresh_left_context
+        (which reads the active page's get_context_widget and sets visibility
+        explicitly) — so a workflow tile switch can no longer leave the box
+        shown-but-empty or content-mounted-but-hidden (the old jog-vanishing bug)."""
         if self._current_page_index == mode_page_index:
             page = self._page_widgets[mode_page_index]
             if hasattr(page, 'get_page_title'):
                 self._page_title.setText(page.get_page_title())
-            self._update_mode_context(mode_page_index, page)
+            self._refresh_left_context()
 
-    def _update_mode_context(self, page_index: int, mode_page):
-        """v7.3.3: Update context panel for a mode page's active sub-page."""
-        ctx = mode_page.get_context_widget()
-        if ctx is not None:
-            # Check if this widget is already inside a QScrollArea in the stack
-            for i in range(self._context_stack.count()):
-                wrapper = self._context_stack.widget(i)
-                if isinstance(wrapper, QScrollArea) and wrapper.widget() is ctx:
-                    self._context_stack.setCurrentIndex(i)
-                    break
-            else:
-                # First time seeing this context widget — wrap and add
-                scroll = QScrollArea()
-                scroll.setObjectName("contextScrollArea")
-                scroll.setWidgetResizable(True)
-                scroll.setWidget(ctx)
-                new_idx = self._context_stack.addWidget(scroll)
-                self._context_stack.setCurrentIndex(new_idx)
+    def _context_title_for(self, page, index: int) -> str:
+        """The small label above the left context box."""
+        if page is not None and hasattr(page, 'get_sub_page_title'):
+            try:
+                t = page.get_sub_page_title()
+                if t:
+                    return t
+            except Exception:
+                pass
+        titles = ["Hardware", "Calibration", "Jog Settings",
+                  "Print Builder", "Workflows", "Settings"]
+        return titles[index] if 0 <= index < len(titles) else "Context"
 
-            sub_title = mode_page.get_sub_page_title() if hasattr(
-                mode_page, 'get_sub_page_title') else "Settings"
-            self._context_title.setText(sub_title)
+    def _refresh_left_context(self) -> None:
+        """v7.5.x: THE single source of truth for the left context box.
+
+        Mounts the current page's context widget in the host's native (Jog) slot
+        and sets the box's visibility EXPLICITLY (no animation toggle). Called
+        from both _navigate_to and _on_mode_sub_page_changed so visibility and
+        content can never desync — the root cause of the "jog panel sometimes
+        disappears in a workflow" report.
+        """
+        host = getattr(self, "_context_host", None)
+        if host is None:
+            return
+        idx = self._current_page_index
+        page = (self._page_widgets[idx]
+                if 0 <= idx < len(self._page_widgets) else None)
+
+        native = None
+        if page is not None and hasattr(page, "get_context_widget"):
+            try:
+                native = page.get_context_widget()
+            except Exception as e:  # a delegate error must never vanish the box
+                logger.debug("get_context_widget failed for page %s: %s",
+                             type(page).__name__, e)
+                native = None
+
+        host.set_native_widget(native)
+        host.set_native_available(native is not None)
+        # Label the native pill for the current page ("Jog" for jog-capable
+        # pages; the page's own controls elsewhere).
+        cls = type(page).__name__ if page is not None else ""
+        host.set_native_label(
+            {"HardwareSetupPage": "Controls",
+             "SettingsPage": "Safety"}.get(cls, "Jog"))
+        self._context_title.setText(self._context_title_for(page, idx))
+
+        # Scope = "everywhere the left box already appears": a page qualifies iff
+        # it provides a native context widget (jog panel / control panel / quick
+        # safety). The shared Custom view rides alongside it. Pages that return
+        # None (Print Builder, Full Print inner, Fluorescence, Common Print
+        # Settings, the workflow picker) keep NO left box — unchanged behaviour.
+        in_scope = native is not None
+        should_show = in_scope and not getattr(
+            self, "_left_context_user_collapsed", False)
+
+        box = self.ui_extraLeftBox
+        if should_show:
+            if not box.isVisible():
+                box.show()
+            if hasattr(self, "_apply_saved_context_width"):
+                self._apply_saved_context_width()
         else:
-            self._context_stack.setCurrentIndex(page_index)
+            if box.isVisible():
+                box.hide()
+        self._update_context_panel_bounds()
+
+    def _toggle_left_context(self) -> None:
+        """Manual show/hide via the context close-x or the top-bar toggle. Flips
+        the user's collapse preference, then re-evaluates (so re-showing mounts
+        the right content). Persisted in save_settings."""
+        self._left_context_user_collapsed = not getattr(
+            self, "_left_context_user_collapsed", False)
+        self._refresh_left_context()
+
+    def _on_context_view_changed(self, view: str) -> None:
+        """Persist the active pill (Jog / Custom) immediately."""
+        try:
+            self.settings.set("context_panel.active_view", view)
+        except Exception as e:
+            logger.debug("persist context_panel.active_view failed: %s", e)
 
     def _switch_page(self, index: int):
         """
@@ -2018,6 +2240,15 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._tick()
 
+        # v7.5.x: fast display-only animation tick (~30 fps). It does real work
+        # ONLY while a jog/travel motion estimate is live (see _motion_anim_tick),
+        # so it is a cheap boolean check at idle. Repeating QTimer — the work is
+        # light (label/needle refresh), so no single-shot reschedule is needed.
+        self._motion_anim_timer = QTimer(self)
+        self._motion_anim_timer.setInterval(33)
+        self._motion_anim_timer.timeout.connect(self._motion_anim_tick)
+        self._motion_anim_timer.start()
+
     def _tick(self):
         if getattr(self, "_closing", False):
             return
@@ -2027,8 +2258,21 @@ class MainWindow(QMainWindow):
             self._update_status()
         finally:
             elapsed_ms = (_time.monotonic() - _t0) * 1000
-            if elapsed_ms > 20:
-                logger.debug(f"[Tick] _update_status took {elapsed_ms:.1f}ms")
+            # v7.5.x perf diag: on a slow tick, OR once per ~60 s, log the tick
+            # cost + the live Qt widget count. A "slow over time" regression
+            # then shows up in logs/app.log as a widget count that CLIMBS across
+            # a session (a leak) vs a roughly constant count (uniform slowness).
+            # The allWidgets() scan only runs on those infrequent samples.
+            self._tick_count = getattr(self, "_tick_count", 0) + 1
+            if elapsed_ms > 20 or (self._tick_count % 200 == 0):
+                try:
+                    from PySide6.QtWidgets import QApplication as _QApp
+                    _nw = len(_QApp.allWidgets())
+                except Exception:
+                    _nw = -1
+                logger.debug(
+                    f"[Tick] _update_status {elapsed_ms:.1f}ms | "
+                    f"widgets={_nw} | tick#{self._tick_count}")
             if not getattr(self, "_closing", False):
                 interval = self.settings.get("polling.position_interval_ms", 300)
                 QTimer.singleShot(interval, self._tick)
@@ -2258,6 +2502,29 @@ class MainWindow(QMainWindow):
                         setattr(sl, key, val)
         except Exception as e:
             logger.warning(f"{what}: applying safety limits failed: {e}")
+        # v7.5.x: a CALIBRATED pump's soft-limit envelope is owned by the
+        # plunger calibration (``pump_setup``), NOT the persisted safety_limits
+        # mirror — the same way ``z_up_sign`` owns Z (CLAUDE.md principle #4).
+        # The mirror above can be stale/sign-flipped (e.g. ME3B V3's on-disk
+        # ``p2 [0, 30]`` vs the captured raw ``0 → -30 ⇒ [-30, 0]``); blindly
+        # mirroring it here re-broke the envelope that ``apply_pump_convention``
+        # had correctly re-derived at boot, so every aspirate clamped to 0 and
+        # ink pickup did nothing. Re-derive each calibrated pump's envelope from
+        # the authoritative captured extremes so calibration wins over the
+        # mirror (exact extremes, no margin — matches ``apply_pump_setup`` /
+        # ``apply_pump_convention``). Uncalibrated pumps keep the mirror.
+        try:
+            pump_setup = self.controller.get_pump_setup()
+            if sl is not None and pump_setup:
+                for pump, s in pump_setup.items():
+                    rd, ra = s.get("raw_dispensed"), s.get("raw_aspirated")
+                    if rd is None or ra is None:
+                        continue
+                    lo, hi = min(float(rd), float(ra)), max(float(rd), float(ra))
+                    setattr(sl, f"{pump.lower()}_min", lo)
+                    setattr(sl, f"{pump.lower()}_max", hi)
+        except Exception as e:
+            logger.warning(f"{what}: re-deriving pump envelope failed: {e}")
         # Save: persist to disk now (not just on clean shutdown).
         try:
             self.save_settings()
@@ -2273,6 +2540,35 @@ class MainWindow(QMainWindow):
                 cp.refresh_safety_limits()
         except Exception:
             pass
+
+    def _refresh_all_speed_limits(self):
+        """v7.5.x: re-apply the per-axis max anchors to the jog handlers and
+        fan a ``refresh_speed_limits()`` refresh out to every page / jog-context
+        panel that has one, so the single common speed source is reflected
+        everywhere live. Best-effort; runs on the GUI thread."""
+        try:
+            if self.controller is not None and hasattr(
+                    self.controller, "refresh_jog_speed_limits"):
+                self.controller.refresh_jog_speed_limits()
+        except Exception as e:
+            logger.debug(f"refresh_jog_speed_limits failed: {e}")
+        seen: set[int] = set()
+
+        def _refresh(obj):
+            if obj is None or id(obj) in seen:
+                return
+            seen.add(id(obj))
+            fn = getattr(obj, "refresh_speed_limits", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        for page in (getattr(self, "_page_widgets", None) or []):
+            _refresh(page)
+            for attr in ("_control_panel", "_context_widget",
+                         "_context_panel", "_hw_panel"):
+                _refresh(getattr(page, attr, None))
 
     def _update_status(self):
         """Update connection dots, position readouts, and page callbacks."""
@@ -2300,63 +2596,8 @@ class MainWindow(QMainWindow):
             if proto_val is not None and proto_val != self._xy_position_scale:
                 self.xy_position_scale = proto_val
 
-        # Position readouts
-        try:
-            xy = self.controller.get_xy_position(cached=True)
-            zp = self.controller.get_zp_position(cached=True)
-            speeds = self.controller.get_speed_info()
-
-            # XY in µm
-            if xy[0] is not None:
-                zx = xy[0] - self.controller.zero_position["x"]
-                zy = xy[1] - self.controller.zero_position["y"]
-                ux = stage_to_um(zx, self._xy_position_scale)
-                uy = stage_to_um(zy, self._xy_position_scale)
-                self.sb_xy.setText(f"XY: {ux:,.1f} , {uy:,.1f} µm")
-            else:
-                self.sb_xy.setText("XY: — , — µm")
-
-            # Z in mm, Pumps in µL when syringe configured else mm
-            # v7.4.2 hotfix: route ZP reads through logical axis so the
-            # status bar matches the user's axis_map.
-            z_val = self.controller.zp_logical_value(zp, "Z")
-            if z_val is not None:
-                zz = self.controller.zero_position.get("Z", 0)
-                self.sb_z.setText(f"Z: {z_val - zz:.2f}")
-
-                for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
-                    pos_mm = self.controller.zp_logical_value(zp, pid)
-                    lbl = getattr(self, f"sb_p{idx}", None)
-                    if lbl is None:
-                        continue
-
-                    zero_ref = self.controller.zero_position.get(pid, 0)
-                    if pos_mm is not None and self._hardware_config:
-                        pump_cfg = self._hardware_config.pumps.get(pid)
-                        if pump_cfg and pump_cfg.is_configured:
-                            try:
-                                pos_uL = pump_cfg.mm_to_uL(pos_mm - zero_ref)
-                                lbl.setText(f"{pid}: {pos_uL:.2f} µL")
-                                continue
-                            except ValueError:
-                                pass
-                    if pos_mm is not None:
-                        lbl.setText(f"{pid}: {pos_mm - zero_ref:.2f} mm")
-                    else:
-                        lbl.setText(f"{pid}: —")
-            else:
-                self.sb_z.setText("Z: —")
-                for idx in [1, 2, 3]:
-                    lbl = getattr(self, f"sb_p{idx}", None)
-                    if lbl:
-                        lbl.setText(f"P{idx}: —")
-
-            self.sb_speed.setText(
-                f"Speed XY:{speeds['xy']:,.0f} Z:{speeds['z']:.1f} "
-                f"P:{speeds['p']:.1f}"
-            )
-        except Exception:
-            pass
+        # Position readouts (display getters → animate during a move)
+        self._update_status_bar_positions()
 
         # Safety status — only re-style when state changes
         sl = self.controller.safety_limits
@@ -2379,6 +2620,112 @@ class MainWindow(QMainWindow):
         page = self._page_widgets[self._current_page_index]
         if hasattr(page, 'on_status_update'):
             page.on_status_update()
+
+        # v7.5.x: the left-context host lives outside the page stack — tick its
+        # Custom view's live sections (camera / syringe / positions) directly.
+        host = getattr(self, "_context_host", None)
+        if host is not None:
+            try:
+                host.on_status_update()
+            except Exception:
+                pass
+
+    def _update_status_bar_positions(self) -> None:
+        """v7.5.x: status-bar XY/Z/pump readouts, sourced from the DISPLAY
+        getters so they ANIMATE toward the destination during a jog/travel move
+        and snap to the measured value on arrival. Estimated axes are marked
+        with a leading '~' (see MEBP_v75x_JOG_MOTION_INTERPOLATION)."""
+        try:
+            c = self.controller
+            xy = (c.get_display_xy_position()
+                  if hasattr(c, "get_display_xy_position")
+                  else c.get_xy_position(cached=True))
+            zp = (c.get_display_zp_position()
+                  if hasattr(c, "get_display_zp_position")
+                  else c.get_zp_position(cached=True))
+            speeds = c.get_speed_info()
+            est = c.motion_estimating() if hasattr(c, "motion_estimating") else set()
+
+            def _mark(axis: str, text: str) -> str:
+                return ("~" + text) if axis in est else text
+
+            # XY in µm
+            if xy[0] is not None:
+                zx = xy[0] - c.zero_position["x"]
+                zy = xy[1] - c.zero_position["y"]
+                ux = stage_to_um(zx, self._xy_position_scale)
+                uy = stage_to_um(zy, self._xy_position_scale)
+                self.sb_xy.setText(
+                    f"XY: {_mark('X', f'{ux:,.1f}')} , "
+                    f"{_mark('Y', f'{uy:,.1f}')} µm")
+            else:
+                self.sb_xy.setText("XY: — , — µm")
+
+            # Z in mm, Pumps in µL when syringe configured else mm.
+            # v7.4.2 hotfix: route ZP reads through logical axis (axis_map).
+            z_val = c.zp_logical_value(zp, "Z")
+            if z_val is not None:
+                zz = c.zero_position.get("Z", 0)
+                self.sb_z.setText(f"Z: {_mark('Z', f'{z_val - zz:.2f}')}")
+
+                for idx, pid in enumerate(["P1", "P2", "P3"], start=1):
+                    pos_mm = c.zp_logical_value(zp, pid)
+                    lbl = getattr(self, f"sb_p{idx}", None)
+                    if lbl is None:
+                        continue
+                    zero_ref = c.zero_position.get(pid, 0)
+                    if pos_mm is not None and self._hardware_config:
+                        pump_cfg = self._hardware_config.pumps.get(pid)
+                        if pump_cfg and pump_cfg.is_configured:
+                            try:
+                                pos_uL = pump_cfg.mm_to_uL(pos_mm - zero_ref)
+                                lbl.setText(
+                                    f"{pid}: {_mark(pid, f'{pos_uL:.2f}')} µL")
+                                continue
+                            except ValueError:
+                                pass
+                    if pos_mm is not None:
+                        lbl.setText(
+                            f"{pid}: {_mark(pid, f'{pos_mm - zero_ref:.2f}')} mm")
+                    else:
+                        lbl.setText(f"{pid}: —")
+            else:
+                self.sb_z.setText("Z: —")
+                for idx in [1, 2, 3]:
+                    lbl = getattr(self, f"sb_p{idx}", None)
+                    if lbl:
+                        lbl.setText(f"P{idx}: —")
+
+            self.sb_speed.setText(
+                f"Speed XY:{speeds['xy']:,.0f} Z:{speeds['z']:.1f} "
+                f"P:{speeds['p']:.1f}"
+            )
+        except Exception:
+            pass
+
+    def _motion_anim_tick(self) -> None:
+        """v7.5.x: fast (~33 ms) display-only animation tick. Does work ONLY
+        while a jog/travel motion estimate is live — refreshes the status-bar
+        positions and the active page's needle/readout so they glide toward the
+        destination between the ~300 ms hardware polls, then idle (cheap)."""
+        if getattr(self, "_closing", False):
+            return
+        try:
+            c = self.controller
+            if c is None or not hasattr(c, "motion_estimate_active"):
+                return
+            if not c.motion_estimate_active():
+                return
+            self._update_status_bar_positions()
+            page = self._page_widgets[self._current_page_index]
+            fn = getattr(page, "on_motion_tick", None)
+            if callable(fn):
+                fn()
+            host = getattr(self, "_context_host", None)
+            if host is not None:
+                host.on_motion_tick()
+        except Exception:
+            pass
 
     def _update_conn_dot(self, name: str, state: str):
         """Update a connection status dot — only re-styles when state changes.
@@ -2435,6 +2782,18 @@ class MainWindow(QMainWindow):
         self.settings.set("window.width", self.width())
         self.settings.set("window.height", self.height())
         self.settings.set("window.active_tab", self._current_page_index)
+        # v7.5.x: persist the left-context pill + collapse state (the custom
+        # layout itself lives in ContextPanelLayoutStore's own JSON).
+        try:
+            host = getattr(self, "_context_host", None)
+            if host is not None:
+                self.settings.set("context_panel.active_view",
+                                  host.requested_view())
+            self.settings.set("context_panel.collapsed",
+                              bool(getattr(self, "_left_context_user_collapsed",
+                                           False)))
+        except Exception as e:
+            logger.debug("persist context_panel state failed: %s", e)
         if self._hardware_config:
             self._save_hardware_config(self._hardware_config)
         # v7.5.x: persist the live zero reference on clean shutdown so it
@@ -2490,6 +2849,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean shutdown — stop timers, save settings, stop recording."""
         self._closing = True  # stops the self-rescheduling _tick loop
+        _at = getattr(self, "_motion_anim_timer", None)
+        if _at is not None:
+            _at.stop()
         self.save_settings()
         if self.recorder and self.recorder.is_recording:
             self.recorder.stop_recording()

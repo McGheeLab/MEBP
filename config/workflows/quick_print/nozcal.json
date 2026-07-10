@@ -2,27 +2,30 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "nozcal",
-  "saved": "2026-06-29T13:24:02",
+  "saved": "2026-06-29T18:24:29",
   "values": {
     "pump": {
       "text": "P2",
       "data": null
     },
-    "flow": 10.0,
-    "speed_pct": 5.0,
-    "printz": 1.0,
+    "flow": 4.5,
+    "speed_pct": 2.0,
+    "printz": 1.5,
     "ink": {
-      "text": "GFP LLS",
-      "data": "GFP LLS"
+      "text": "Inert GFP",
+      "data": "Inert GFP"
     },
-    "ink_z": 1.1,
-    "pickup_safety": 3.0,
-    "prep": true,
-    "service_z": 1.1,
-    "wash_cycles": 3,
+    "ink_z": 0.5,
+    "pickup_safety": 5.0,
+    "prep": false,
+    "service_z": 2.1,
+    "buffer_needles": 1.0,
+    "wash_cycles": 10,
+    "line_retract": 5.0,
+    "line_z_speed": 80.0,
+    "line_xy_speed": 80.0,
     "postclean": true,
-    "postclean_waste": 8.0,
-    "postclean_oil": 1.0,
+    "postclean_margin": 1.1,
     "travel_speed": 10.0,
     "preflow": 2.0
   }

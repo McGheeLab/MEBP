@@ -40,6 +40,7 @@ from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card
 from gui.widgets.live_target_picker import LiveTargetPicker
+from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.workspace_target_view import WorkspaceTargetView
 from gui.widgets.xz_side_view import XZSideView
@@ -117,6 +118,12 @@ class CellTargetingWorkflowPage(QWidget):
         self._bridge.progress.connect(self._on_progress)
         self._bridge.sub_step.connect(self._on_sub_step)
         self._bridge.finished.connect(self._on_finished)
+
+        # v7.5.x FREEZE FIX: click-to-travel safe_travel_to runs on a worker
+        # thread so a needle-down retract can't freeze the GUI (see the Jog page
+        # / gui/widgets/safe_travel_worker.py). Separate from the executor thread.
+        self._travel_worker = SafeTravelWorker(self)
+        self._travel_worker.finished.connect(self._on_travel_finished)
 
         # Comprehensive settings popout (scrollable, saveable). Built eagerly so
         # config widgets exist for _current_config() / _on_start() + the tests.
@@ -373,6 +380,15 @@ class CellTargetingWorkflowPage(QWidget):
         self._clean_check = QCheckBox("Clean after (waste → wash → buffer)")
         self._clean_check.setChecked(True)
         self._clean_check.toggled.connect(self._on_prep_toggled)
+        self._wash_after_pickup_check = QCheckBox(
+            "Wash needle after reagent pickup (rinse exterior before deposit)")
+        self._wash_after_pickup_check.setChecked(True)
+        self._wash_after_pickup_check.setToolTip(
+            "After aspirating the cell-release reagent, dip + jiggle the needle "
+            "at the wash well to rinse the reagent film off its exterior before "
+            "travelling to the cell — so only the metered pushed volume reaches "
+            "the cells. The aspirated reagent stays in the bore.")
+        self._wash_after_pickup_check.toggled.connect(self._on_prep_toggled)
         self._service_z = self._dspin(
             0.0, 30.0, 0.50, " mm", 2, 0.1,
             "Needle dip height above the plate bottom at the service wells.")
@@ -397,14 +413,18 @@ class CellTargetingWorkflowPage(QWidget):
         sec = dlg.add_section("Needle prep / clean")
         sec.add_check("prep", self._prep_check, True)
         sec.add_check("clean", self._clean_check, True)
-        sec.add("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
-        sec.add("prep_rate", "Prep / clean flow", self._prep_rate, 1.0)
-        sec.add("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
-        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles, 1.0)
-        sec.add("wash_cycles", "Wash cycles", self._wash_cycles, 3)
-        sec.add("wash_z_amp", "Wash Z jiggle", self._wash_z_amp, 0.5)
-        sec.add("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)
-        sec.add("wash_dwell", "Wash settle", self._wash_dwell, 0.3)
+        sec.add_check("wash_after_pickup", self._wash_after_pickup_check, True)
+        sec.add_note(
+            "Prep values are shared defaults from Common Print Settings — tick "
+            "Override to set a workflow-specific value.")
+        sec.add_common("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
+        sec.add_common("prep_rate", "Prep / clean flow", self._prep_rate, 1.0)
+        sec.add_common("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
+        sec.add_common("buffer_needles", "Buffer (needles)", self._buffer_needles, 1.0)
+        sec.add_common("wash_cycles", "Wash cycles", self._wash_cycles, 3)
+        sec.add_common("wash_z_amp", "Wash Z jiggle", self._wash_z_amp, 0.5)
+        sec.add_common("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)
+        sec.add_common("wash_dwell", "Wash settle", self._wash_dwell, 0.3)
         sec.add("post_dispense", "Clean dispense (needles)", self._post_dispense, 1.0)
         self._prep_status = QLabel("")
         self._prep_status.setWordWrap(True)
@@ -423,6 +443,18 @@ class CellTargetingWorkflowPage(QWidget):
         sec.add("intra_retract", "Intra-well retract", self._intra_retract, 1.0)
         sec.add("z_timeout", "Z timeout", self._z_timeout, 15.0)
         sec.add("xy_timeout", "XY timeout", self._xy_timeout, 30.0)
+
+        # ── Common — Pump (global) ──
+        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
+        self._g_prime = self._dspin(0.0, 10.0, 0.25, " s", 2, 0.05)
+        sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
+        sec.add_note(
+            "Global pump values (edited here or on the Common Print Settings "
+            "page — one value used everywhere).")
+        sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
+                       0.0, common_key="pump_settle_time_s", overridable=False)
+        sec.add_common("g_prime", "Prime time", self._g_prime, 0.25,
+                       common_key="pump_prime_time_s", overridable=False)
 
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
@@ -444,11 +476,19 @@ class CellTargetingWorkflowPage(QWidget):
             z_references=self._z_references, safe_z=self._safe_z, extras=extras)
 
     def _on_prep_toggled(self, *_):
-        on = self._prep_check.isChecked() or self._clean_check.isChecked()
-        for w in (self._service_z, self._wash_cycles, self._prep_rate,
-                  self._oil_needles, self._buffer_needles, self._wash_z_amp,
-                  self._wash_xy_amp, self._wash_dwell, self._post_dispense):
-            w.setEnabled(on)
+        prep_clean = self._prep_check.isChecked() or self._clean_check.isChecked()
+        wash_ap = self._wash_after_pickup_check.isChecked()
+        any_service = prep_clean or wash_ap
+        # Service dip Z + wash mechanics are shared by prep/clean AND the
+        # after-pickup wash.
+        for w in (self._service_z, self._wash_cycles, self._wash_z_amp,
+                  self._wash_xy_amp, self._wash_dwell):
+            w.setEnabled(any_service)
+        # Oil / buffer / prep flow / post-dispense are prep/clean-only (the
+        # after-pickup wash does no pump moves).
+        for w in (self._prep_rate, self._oil_needles, self._buffer_needles,
+                  self._post_dispense):
+            w.setEnabled(prep_clean)
         self._refresh_prep_status()
         self._update_settings_summary()
 
@@ -562,6 +602,32 @@ class CellTargetingWorkflowPage(QWidget):
         if not hasattr(self, "_prep_status"):
             return
         if not (self._prep_check.isChecked() or self._clean_check.isChecked()):
+            # Prep + clean off. The after-pickup wash still needs the wash well.
+            if self._wash_after_pickup_check.isChecked():
+                positions, _missing = resolve_service_positions(
+                    self._hw_config, self._well_positions)
+                names = service_well_names(self._hw_config)
+                if "wash" not in positions:
+                    self._prep_status.setText(
+                        "⚠ Wash-after-pickup needs a wash well assigned + "
+                        "calibrated (Hardware Setup → Ink → Reagent Locations).")
+                    self._prep_status.setStyleSheet(
+                        f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+                    return
+                if self._plate_offset_to_zref(
+                        float(self._service_z.value())) is None:
+                    self._prep_status.setText(
+                        "⚠ Plate bottom Z not calibrated — needed for the wash "
+                        "dip Z.")
+                    self._prep_status.setStyleSheet(
+                        f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+                    return
+                self._prep_status.setText(
+                    f"Prep + clean off — wash after reagent pickup only "
+                    f"(wash={names.get('wash', '?')}).")
+                self._prep_status.setStyleSheet(
+                    f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+                return
             self._prep_status.setText("Prep + clean disabled — removal only.")
             self._prep_status.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
@@ -670,6 +736,12 @@ class CellTargetingWorkflowPage(QWidget):
         except Exception:
             pass
         super().hideEvent(event)
+
+    # ── Common Print Settings hook ────────────────────────────────
+
+    def set_common_print_settings(self, common):
+        if getattr(self, "_settings_dialog", None) is not None:
+            self._settings_dialog.set_common(common)
 
     # ── hw_config hook ────────────────────────────────────────────
 
@@ -838,11 +910,24 @@ class CellTargetingWorkflowPage(QWidget):
 
     # ── Workspace + XZ click handlers (mirror of JogControlPage) ──
 
+    def _travel_blocked_by_run(self) -> bool:
+        """True (+ shows a hint) if a workflow run is active — don't launch a
+        manual click-to-travel on top of the executor thread (both drive the
+        stage and toggle the non-refcounted poller suspend). Abort the run
+        first. The Jog page owns no executor and needs no such guard."""
+        t = getattr(self, "_exec_thread", None)
+        if t is not None and t.is_alive():
+            self._status.setText("Busy running — abort first to move manually.")
+            return True
+        return False
+
     def _on_workspace_position_clicked(
         self, x_um_zr: float, y_um_zr: float
     ) -> None:
         """Click-to-travel from the XY workspace (zero-ref µm)."""
         if not getattr(self._controller, "is_xy_connected", False):
+            return
+        if self._travel_blocked_by_run():
             return
 
         zero = self._controller.zero_position
@@ -865,14 +950,19 @@ class CellTargetingWorkflowPage(QWidget):
 
         # Cross-position click-to-travel ALWAYS retracts via safe_travel_to
         # (polarity-safe; a near-no-op when the needle is already retracted).
-        self._controller.safe_travel_to(
-            stage_x, stage_y, safe_z_mm=self._safe_z, target_z_mm=None)
+        # v7.5.x FREEZE FIX: dispatch the blocking move to a worker thread so a
+        # needle-down retract can't freeze the GUI; busy-guard ignores re-clicks.
+        self._travel_worker.start(
+            self._controller, stage_x, stage_y,
+            safe_z_mm=self._safe_z, target_z_mm=None)
 
     def _on_workspace_fast_travel_requested(
         self, x_um_zr: float, y_um_zr: float
     ) -> None:
         """Right-click → Fast travel here: retract Z, travel XY, restore Z."""
         if not getattr(self._controller, "is_xy_connected", False):
+            return
+        if self._travel_blocked_by_run():
             return
 
         if self._safe_z is None:
@@ -897,9 +987,17 @@ class CellTargetingWorkflowPage(QWidget):
                 except Exception:
                     current_z_zr = None
 
-        self._controller.safe_travel_to(
-            stage_x, stage_y,
+        # v7.5.x FREEZE FIX: worker thread (see _on_workspace_position_clicked).
+        self._travel_worker.start(
+            self._controller, stage_x, stage_y,
             safe_z_mm=self._safe_z, target_z_mm=current_z_zr)
+
+    def _on_travel_finished(self, ok: bool) -> None:
+        """Worker-thread click-to-travel finished (queued to the GUI thread)."""
+        if not ok:
+            logger.warning(
+                "Click-to-travel did not confirm (Z retract / XY arrival timed "
+                "out, or the ZP board is not connected).")
 
     def _on_go_to_z_requested(self, z_mm: float) -> None:
         """Z-reference badge in the XZ view → move_z_absolute (zero-ref mm)."""
@@ -1043,12 +1141,22 @@ class CellTargetingWorkflowPage(QWidget):
                 "dip Z.")
             return
 
-        # Prep / clean inputs + gates (shared service wells).
+        # Prep / clean / wash-after-pickup inputs + gates (shared service wells).
         prep_enabled = self._prep_check.isChecked()
         clean_enabled = self._clean_check.isChecked()
+        wash_after_pickup = self._wash_after_pickup_check.isChecked()
         service_positions: dict[str, tuple[float, float]] = {}
         service_z = None
         needle_uL = 0.0
+        if prep_enabled or clean_enabled or wash_after_pickup:
+            service_positions, missing = resolve_service_positions(
+                self._hw_config, self._well_positions)
+            service_z = self._plate_offset_to_zref(float(self._service_z.value()))
+            if service_z is None:
+                self._status.setText(
+                    "Plate bottom Z is not calibrated — can't resolve the "
+                    "service / wash dip Z.")
+                return
         if prep_enabled or clean_enabled:
             needle_uL = needle_volume_uL(self._hw_config)
             if needle_uL <= 0:
@@ -1056,20 +1164,17 @@ class CellTargetingWorkflowPage(QWidget):
                     "Prep / clean needs the needle inner diameter + length "
                     "(Hardware Setup → Needle), or turn them off.")
                 return
-            service_positions, missing = resolve_service_positions(
-                self._hw_config, self._well_positions)
             if missing:
                 self._status.setText(
                     "Prep / clean needs these reagent wells assigned in Hardware "
                     f"Setup → Ink (Reagent Locations) and calibrated: "
                     f"{', '.join(missing)} — or turn them off.")
                 return
-            service_z = self._plate_offset_to_zref(float(self._service_z.value()))
-            if service_z is None:
-                self._status.setText(
-                    "Plate bottom Z is not calibrated — can't resolve the "
-                    "service dip Z for prep / clean.")
-                return
+        elif wash_after_pickup and "wash" not in service_positions:
+            self._status.setText(
+                "Wash-after-pickup needs a wash well assigned + calibrated "
+                "(Hardware Setup → Ink → Reagent Locations), or turn it off.")
+            return
 
         queue = OperationQueue()
         for pick, place in pairs:
@@ -1092,24 +1197,28 @@ class CellTargetingWorkflowPage(QWidget):
         executor.intra_well_retract_mm = float(self._intra_retract.value())
         executor.z_timeout_s = float(self._z_timeout.value())
         executor.xy_timeout_s = float(self._xy_timeout.value())
-        if prep_enabled or clean_enabled:
-            executor.prep_bore = cfg.reagent_bore
-            executor.needle_volume_uL = needle_uL
+        # Service dip Z + wash mechanics + the wash well — shared by prep/clean
+        # AND the after-pickup wash.
+        if prep_enabled or clean_enabled or wash_after_pickup:
             executor.service_z_mm = service_z
-            executor.prep_rate_uL_s = float(self._prep_rate.value())
-            executor.oil_needles = float(self._oil_needles.value())
-            executor.buffer_needles = float(self._buffer_needles.value())
             executor.wash_cycles = int(self._wash_cycles.value())
             executor.wash_z_amplitude_mm = float(self._wash_z_amp.value())
             executor.wash_xy_amplitude_um = float(self._wash_xy_amp.value())
             executor.wash_dwell_s = float(self._wash_dwell.value())
+            executor.wash_well_pos = service_positions.get("wash")
+        if prep_enabled or clean_enabled:
+            executor.prep_bore = cfg.reagent_bore
+            executor.needle_volume_uL = needle_uL
+            executor.prep_rate_uL_s = float(self._prep_rate.value())
+            executor.oil_needles = float(self._oil_needles.value())
+            executor.buffer_needles = float(self._buffer_needles.value())
             executor.post_dispense_needles = float(self._post_dispense.value())
             executor.waste_well_pos = service_positions["waste"]
             executor.oil_well_pos = service_positions["oil"]
-            executor.wash_well_pos = service_positions["wash"]
             executor.buffer_well_pos = service_positions["buffer"]
         executor.do_prep = prep_enabled
         executor.do_post_clean = clean_enabled
+        executor.wash_after_pickup = wash_after_pickup
 
         bridge = self._bridge
         executor.on_op_started = lambda op: bridge.op_started.emit(op)

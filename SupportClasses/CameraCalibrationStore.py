@@ -123,6 +123,48 @@ class CameraCalibrationStore:
             f"[{identity[:48]}…]"
         )
 
+    def get_rotation(self, identity: str) -> Optional[float]:
+        """Return the stored camera→stage rotation (deg) for an identity, or
+        None. Independent of µm/px — orientation may be calibrated on its own."""
+        if not identity:
+            return None
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return None
+        rot = entry.get("rotation_deg")
+        try:
+            return float(rot) if rot is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_rotation(self, identity: str, rotation_deg: Optional[float],
+                     name: str = "") -> None:
+        """Store/replace ONLY a camera's rotation vs the stage axes (deg).
+
+        The camera's mount rotation is measured on its own (stage-motion
+        "Calibrate orientation") and does not require a µm/px value. Kept in the
+        same identity entry as µm/px so a physical camera carries both; does not
+        disturb any existing ``um_per_px`` / ``image_correction`` siblings.
+        Passing ``None`` clears the stored rotation.
+        """
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        if rotation_deg is None:
+            entry.pop("rotation_deg", None)
+        else:
+            entry["rotation_deg"] = round(float(rotation_deg), 4)
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera orientation saved: {entry.get('name', '?')} "
+            f"= {rotation_deg if rotation_deg is None else round(rotation_deg, 2)}"
+            f"° vs stage [{identity[:48]}…]")
+
     def clear_calibration(self, identity: str) -> None:
         try:
             del self._data["cameras"][identity]

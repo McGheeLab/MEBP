@@ -90,6 +90,20 @@ class ZPStageManager:
     # never see this — 'ok' returns in milliseconds.
     SILENT_OK_TIMEOUT_S = 0.5
 
+    # v7.5.x: absolute wall-clock ceiling for the per-command 'ok' handshake.
+    # A Marlin 'busy' keep-alive RESETS the per-line wait window (so a genuinely
+    # long move keeps the link alive), but with no upper bound a command whose
+    # 'ok' NEVER comes — a stuck axis, or the documented bare-G0/F1.8 modal-
+    # feedrate crawl that makes a ~21 mm Z retract take ~12 min — keeps
+    # _read_until_ok (holding _serial_lock) alive forever, hanging the caller and
+    # starving every other thread that needs the ZP port. This cap makes such a
+    # move FAIL after a generous ceiling instead of hanging indefinitely. It is
+    # deliberately large: an 'ok' means "admitted to the planner buffer" (ms on a
+    # healthy board), so even a saturated planner admits the next command in far
+    # less than this — only a truly stuck board reaches it. flush_moves (M400) is
+    # already bounded separately.
+    READ_OK_HARD_CAP_S = 180.0
+
     # Lines that mean "Marlin just (re)booted" — seeing one mid-session is a
     # board reset (position counter lost).
     _RESET_MARKERS = ("start", "firmware_name", "marlin")
@@ -871,10 +885,24 @@ class ZPStageManager:
           * silence past the deadline  → board not answering → ok=False.
         """
         deadline = time.monotonic() + ok_timeout
+        # v7.5.x: absolute ceiling so 'busy' keep-alives (which reset `deadline`)
+        # can never extend the wait forever on a never-completing move. Honor a
+        # caller that intentionally passes an ok_timeout larger than the cap.
+        hard_deadline = time.monotonic() + max(float(ok_timeout),
+                                               self.READ_OK_HARD_CAP_S)
         parts: list[str] = []
         rx_count = 0
         busy_count = 0
         while time.monotonic() < deadline:
+            if time.monotonic() >= hard_deadline:
+                logger.error(
+                    f"ZP _read_until_ok: no 'ok' within the "
+                    f"{self.READ_OK_HARD_CAP_S:.0f}s hard cap "
+                    f"(rx_lines={rx_count}, busy={busy_count}) — board appears "
+                    f"stuck (move never completing?); failing the command")
+                return (False, "\n".join(parts),
+                        {"outcome": "hard_timeout", "rx": rx_count,
+                         "busy": busy_count})
             try:
                 raw = self.serial.readline()
             except Exception as e:
@@ -900,6 +928,9 @@ class ZPStageManager:
                          "busy": busy_count})
             if "busy" in low:
                 # Still processing (long move) — board is alive, extend window.
+                # The absolute hard cap (checked at the top of the loop) still
+                # bounds the total wait, so a never-ending 'busy' stream can't
+                # extend this forever.
                 busy_count += 1
                 deadline = time.monotonic() + ok_timeout
                 continue
@@ -917,7 +948,10 @@ class ZPStageManager:
             if collect:
                 parts.append(line)
             # A live line is progress: don't let a chatty-but-slow board be cut
-            # off right at the deadline.
+            # off right at the deadline. Left UNCAPPED (like the busy branch) so
+            # the top-of-loop hard-cap check is the single exit for a stuck-but-
+            # chatty board — it then reports 'hard_timeout' uniformly rather than
+            # a plain 'timeout' (the absolute wait is still bounded by the cap).
             deadline = max(deadline, time.monotonic() + 0.5)
         return (False, "\n".join(parts),
                 {"outcome": "timeout", "rx": rx_count, "busy": busy_count})

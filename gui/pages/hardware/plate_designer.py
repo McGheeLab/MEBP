@@ -25,7 +25,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtCore import Qt, Signal, QSize, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QToolButton, QLabel,
@@ -1221,6 +1221,46 @@ class PlateDesignerWidget(QWidget):
         # above the plate (travel clearance); ink Z = dispense height
         # relative to plate top (blank = use global print Z).
         if self._edit_context is not None:
+            # v7.5.x: well-type preset picker — stamps this sub-well's
+            # geometry (diameter / depth / rim height / ink Z) from a named
+            # vessel type (e.g. "0.1 mL PCR tube"). Rim height is the one
+            # that drives needle travel clearance.
+            from SupportClasses.WellTypeStore import get_store as _wt_get_store
+            _wt_store = _wt_get_store()
+            wt_combo = QComboBox()
+            wt_combo.addItem("(custom)", None)
+            for wt in _wt_store.all():
+                wt_combo.addItem(wt.label, wt.id)
+            _wt_idx = (wt_combo.findData(well.well_type_id)
+                       if well.well_type_id else 0)
+            wt_combo.setCurrentIndex(_wt_idx if _wt_idx >= 0 else 0)
+            wt_combo.setToolTip(
+                "Stamp this sub-well's geometry from a standard vessel type. "
+                "Rim height drives the plate-wide needle travel clearance.")
+            # Connect AFTER setCurrentIndex so seeding the selection does not
+            # trigger a re-stamp.
+            wt_combo.currentIndexChanged.connect(
+                lambda _=0, c=wt_combo, wid=well.id:
+                    self._apply_well_type(wid, c.currentData()))
+            form.addRow("Well type:", wt_combo)
+
+            wt_btn_row = QHBoxLayout()
+            save_wt_btn = QPushButton("Save as well type…")
+            save_wt_btn.clicked.connect(
+                lambda _=False, wid=well.id:
+                    self._save_current_as_well_type(wid))
+            wt_btn_row.addWidget(save_wt_btn)
+            del_wt_btn = QPushButton("Delete")
+            _cur_wt = _wt_store.get(well.well_type_id)
+            del_wt_btn.setEnabled(_cur_wt is not None and not _cur_wt.builtin)
+            del_wt_btn.clicked.connect(
+                lambda _=False, tid=well.well_type_id:
+                    self._delete_selected_well_type(tid))
+            wt_btn_row.addWidget(del_wt_btn)
+            wt_btn_holder = QWidget()
+            wt_btn_holder.setLayout(wt_btn_row)
+            form.addRow("", wt_btn_holder)
+
             rim_spin = QDoubleSpinBox()
             rim_spin.setRange(0.0, 100.0)
             rim_spin.setDecimals(2)
@@ -1739,6 +1779,91 @@ class PlateDesignerWidget(QWidget):
             ent.ink_z_mm = value      # float or None
             self._dirty = True
             self._update_dirty_label()
+
+    # ── Well-type presets (v7.5.x) ────────────────────────────────
+
+    def _apply_well_type(self, well_id: EntityId, type_id) -> None:
+        """Stamp a well-type preset's geometry onto a sub-well.
+
+        ``type_id`` None = "(custom)" → keep the current geometry and just
+        clear the preset link. Otherwise copy diameter / depth / rim height
+        (and ink Z, only if the type prescribes one) from the type.
+        """
+        if self._design is None:
+            return
+        ent = self._design.entities.get(well_id)
+        if not isinstance(ent, Well):
+            return
+        if type_id is None:
+            ent.well_type_id = None
+        else:
+            from SupportClasses.WellTypeStore import get_store
+            wt = get_store().get(type_id)
+            if wt is None:
+                return
+            ent.diameter = wt.diameter_mm
+            ent.well_depth_mm = wt.well_depth_mm
+            ent.rim_height_mm = wt.rim_height_mm
+            if wt.ink_z_mm is not None:
+                ent.ink_z_mm = wt.ink_z_mm
+            ent.well_type_id = type_id
+        self._dirty = True
+        self._update_dirty_label()
+        self._canvas._rebuild_scene()
+        # Defer the panel rebuild — the combo that emitted this is the
+        # sender and would otherwise be destroyed mid-signal.
+        QTimer.singleShot(0, self._rebuild_properties_panel)
+
+    def _save_current_as_well_type(self, well_id: EntityId) -> None:
+        """Save the sub-well's current geometry as a user well type."""
+        if self._design is None:
+            return
+        ent = self._design.entities.get(well_id)
+        if not isinstance(ent, Well):
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save Well Type", "Well type name:")
+        if not ok or not name.strip():
+            return
+        from SupportClasses.WellTypeStore import WellType, get_store, safe_id
+        tid = safe_id(name.strip().lower().replace(" ", "-"))
+        wt = WellType(
+            id=tid,
+            display_name=name.strip(),
+            diameter_mm=ent.diameter,
+            well_depth_mm=ent.well_depth_mm,
+            rim_height_mm=ent.rim_height_mm,
+            ink_z_mm=ent.ink_z_mm,
+        )
+        if not get_store().save_user(wt):
+            QMessageBox.warning(
+                self, "Save failed", "Could not save the well type.")
+            return
+        ent.well_type_id = tid
+        self._dirty = True
+        self._update_dirty_label()
+        self._rebuild_properties_panel()
+        QMessageBox.information(
+            self, "Saved", f"Well type '{name.strip()}' saved.")
+
+    def _delete_selected_well_type(self, type_id) -> None:
+        """Delete a USER well type (built-ins cannot be removed)."""
+        if not type_id:
+            return
+        from SupportClasses.WellTypeStore import get_store
+        store = get_store()
+        wt = store.get(type_id)
+        if wt is None or wt.builtin:
+            QMessageBox.information(
+                self, "Cannot delete",
+                "Built-in well types cannot be deleted.")
+            return
+        if QMessageBox.question(
+                self, "Delete well type",
+                f"Delete well type '{wt.label}'?") != QMessageBox.Yes:
+            return
+        store.delete_user(type_id)
+        self._rebuild_properties_panel()
 
     def _set_rosette_rotation(self, well_id: EntityId, value: float) -> None:
         """Rotate a well's rosette layout (top-level design)."""

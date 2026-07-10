@@ -1845,7 +1845,8 @@ class TestWellMappingDialog(unittest.TestCase):
         for w in corners:                          # click each corner: px=nom*5+60
             nx, ny = plate.get_well_position(w)
             dlg._on_view_clicked(QPointF(nx * 5 + 60, ny * 5 + 60))
-        # All wells auto-placed from the 3 corners.
+            dlg._on_confirm_well()                 # v7.5.x guided per-well confirm
+        # All wells auto-placed from the 3 confirmed corners.
         self.assertEqual(len(dlg._well_items), len(plate.well_names))
         dlg._on_confirm()
         res = dlg.results()

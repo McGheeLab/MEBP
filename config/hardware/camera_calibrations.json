@@ -32,7 +32,7 @@
     "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13": {
       "um_per_px": 0.778843,
       "name": "ToupCam",
-      "date": "2026-06-27",
+      "date": "2026-07-06",
       "image_correction": {
         "brightness": 20,
         "contrast": 1.25,
@@ -40,10 +40,10 @@
       },
       "hw_controls": {
         "auto_exposure": false,
-        "exposure_us": 175000,
-        "exposure_gain_pct": 587,
-        "gamma": 20,
-        "brightness": 0,
+        "exposure_us": 50000,
+        "exposure_gain_pct": 2152,
+        "gamma": 64,
+        "brightness": -17,
         "contrast": 2,
         "resolution": [
           3664,
@@ -72,6 +72,12 @@
           480
         ]
       },
+      "autostart": true
+    },
+    "toupcam:\\\\?\\usb#vid_0547&pid_13a9#6&2c564b76&0&2": {
+      "autostart": true
+    },
+    "simulated:microscope": {
       "autostart": true
     }
   },

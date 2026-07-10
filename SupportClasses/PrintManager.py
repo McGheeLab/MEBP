@@ -1046,6 +1046,29 @@ class DirectCommandExecutor:
                    duration_s=round(time.monotonic() - t0, 3))
         return ok
 
+    def raise_z(self, z_mm: float, feedrate_mm_min: float | None = None,
+                timeout_s: float = 15.0) -> bool:
+        """Retract Z UP to ``z_mm`` for a lift-OUT-of-print / pre-travel move.
+
+        v7.5.x: prefers the controller's ``ensure_retracted_to`` so the lift's
+        first millimetre is GENTLE (slow-then-fast — the deposited bead can't
+        peel off with the needle) and raise-only / polarity-safe / insert-
+        floored / confirmed. Falls back to a plain confirmed :meth:`move_z` on
+        an older controller. Use this for every lift; use :meth:`move_z` for
+        DESCENTS (which must not be slowed)."""
+        ctrl = self.ctrl
+        if not ctrl.is_zp_connected:
+            return True
+        if hasattr(ctrl, "ensure_retracted_to"):
+            try:
+                return bool(ctrl.ensure_retracted_to(
+                    float(z_mm), timeout_s=timeout_s,
+                    feedrate_mm_min=feedrate_mm_min))
+            except TypeError:
+                return bool(ctrl.ensure_retracted_to(float(z_mm)))
+        return self.move_z(z_mm, feedrate_mm_min=feedrate_mm_min,
+                           timeout_s=timeout_s)
+
     def move_pump(self, pump_id: str, volume_uL: float,
                   rate_uL_s: float | None = None) -> bool:
         """Move pump and wait estimated duration."""
@@ -1104,8 +1127,9 @@ class DirectCommandExecutor:
         z_fast = getattr(settings, 'fast_z_feedrate_mm_min', None)
         z_entry = getattr(settings, 'entry_z_feedrate_mm_min', None)
 
-        # Phase 1: raise to safe Z (fast)
-        if not self.move_z(safe_z, feedrate_mm_min=z_fast):
+        # Phase 1: raise to safe Z — gentle slow first mm (lift out of any
+        # previous print without peeling the bead), then fast.
+        if not self.raise_z(safe_z, feedrate_mm_min=z_fast):
             return False
         self.dwell(1.0)  # settle after Z up
 
@@ -1142,9 +1166,10 @@ class DirectCommandExecutor:
         return True
 
     def raise_from_well(self, settings) -> bool:
-        """Raise Z to safe travel height (fast feedrate)."""
+        """Raise Z out of the well to safe travel height — gentle slow first mm
+        (so the deposited bead doesn't peel off with the needle), then fast."""
         z_fast = getattr(settings, 'fast_z_feedrate_mm_min', None)
-        return self.move_z(settings.travel_z_height, feedrate_mm_min=z_fast)
+        return self.raise_z(settings.travel_z_height, feedrate_mm_min=z_fast)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1523,20 +1548,21 @@ class HybridPlanExecutor:
 
             elif stype == PlanStepType.MOVE_SAFE_Z:
                 z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
-                direct.move_z(self.settings.travel_z_height,
-                              feedrate_mm_min=z_fast)
+                direct.raise_z(self.settings.travel_z_height,
+                               feedrate_mm_min=z_fast)
 
             elif stype == PlanStepType.TRAVEL_XY:
                 target_wells = getattr(step, 'target_wells', [])
                 if target_wells:
                     try:
                         # v7.5.x CRITICAL SAFETY: TRAVEL_XY is cross-well travel.
-                        # Retract to the travel Z and WAIT (blocking move_z) before
-                        # the XY move — do not rely solely on a preceding
-                        # MOVE_SAFE_Z plan step (mirrors RETURN_HOME below).
+                        # Retract to the travel Z and WAIT before the XY move — do
+                        # not rely solely on a preceding MOVE_SAFE_Z plan step
+                        # (mirrors RETURN_HOME below). v7.5.x: gentle slow first
+                        # mm (raise_z) so the bead doesn't peel off the needle.
                         z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
-                        direct.move_z(self.settings.travel_z_height,
-                                      feedrate_mm_min=z_fast)
+                        direct.raise_z(self.settings.travel_z_height,
+                                       feedrate_mm_min=z_fast)
                         # v7.2.9: Set service speed for XY travel
                         _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
                         if _svc_spd and self.controller.is_xy_connected:
@@ -1571,8 +1597,8 @@ class HybridPlanExecutor:
 
             elif stype == PlanStepType.RETURN_HOME:
                 z_fast = getattr(self.settings, 'fast_z_feedrate_mm_min', None)
-                direct.move_z(self.settings.travel_z_height,
-                              feedrate_mm_min=z_fast)
+                direct.raise_z(self.settings.travel_z_height,
+                               feedrate_mm_min=z_fast)
                 # v7.2.9: Set service speed for return travel
                 _svc_spd = getattr(self.settings, 'service_xy_speed_mm_s', None)
                 if _svc_spd and self.controller.is_xy_connected:
@@ -1990,6 +2016,16 @@ class PrintManager:
     # executes them and saturate the buffer. 8 ≈ half Marlin's default 16-block
     # buffer, so depth stays comfortably bounded.
     _PATH_BARRIER_EVERY = 8
+
+    # v7.5.x (Finding C): minimum per-emission pump volume (µL). A single print
+    # segment's dispense can round below this on finely-sampled paths / thin
+    # beads, but the volume is REAL — instead of dropping it (was: silent under-
+    # extrusion, worst at low extrusion where the operator then over-cranks the
+    # modifier to compensate), _execute_print_path ACCUMULATES the residual and
+    # emits one pump move once the pending total crosses this floor, flushing
+    # the tail at path end. So the total dispensed volume is conserved
+    # regardless of segment sampling.
+    _PATH_PUMP_EMIT_MIN_UL = 0.001
 
     def __init__(self, controller):
         """
@@ -2541,6 +2577,10 @@ class PrintManager:
             # without a slow full retract / re-approach.
             hop_z = p.get("hop_z", None)
             if hop_z is not None:
+                # v7.5.x (F-4): quick-move relief — before this in-well quick
+                # move, suck back so flow stops while the needle travels (then
+                # retract + hop). The next object's prime re-primes on arrival.
+                self._print_pump_suckback("quick_move")
                 # v7.5.x: an inter-line hop may carry a FAST lift feedrate.
                 self._retract_for_travel(
                     "move_xy_hop", target_z=float(hop_z),
@@ -2589,10 +2629,23 @@ class PrintManager:
             # v7.5.x: an inter-line hop's lower-down may carry a FAST line-move
             # Z feedrate (p["feedrate_mm_min"]); else the deterministic INSERT
             # feedrate (never inherits the previous command's modal F).
-            ctrl.move_z_absolute(
-                z, from_zero_ref=True,
-                feedrate_mm_min=p.get(
-                    "feedrate_mm_min", getattr(ctrl, "_zp_insert_feedrate", None)))
+            #
+            # v7.5.x gentle re-entry: on a real controller EMIT a two-segment
+            # descent whose FINAL _descend_slow_dist_mm runs slowly (controlled
+            # touch-down onto the plate / into a bead), the bulk at the fast
+            # feedrate above. Emit-only — the confirm/abort block below stays the
+            # single source of truth (no double-wait). On a mock / older
+            # controller (no numeric _descend_slow_dist_mm) fall back to the
+            # legacy single move so that block still sees exactly one
+            # move_z_absolute. The hop's FAST per-line feedrate drives the fast
+            # leg; the final mm always runs at _descend_slow_feedrate.
+            _z_fr = p.get(
+                "feedrate_mm_min", getattr(ctrl, "_zp_insert_feedrate", None))
+            if isinstance(getattr(ctrl, "_descend_slow_dist_mm", None),
+                          (int, float)) and hasattr(ctrl, "emit_descent_moves"):
+                ctrl.emit_descent_moves(z, _z_fr)
+            else:
+                ctrl.move_z_absolute(z, from_zero_ref=True, feedrate_mm_min=_z_fr)
             # v7.5.x print-setup routine step 3: CONFIRM the needle physically
             # reached the print Z (M400 + position poll) BEFORE the next step
             # (prime / print) — do not start extruding/printing until the Z move
@@ -2602,6 +2655,23 @@ class PrintManager:
             # when the controller can't confirm (older controller / mock / no ZP).
             if (getattr(ctrl, "is_zp_connected", False)
                     and hasattr(ctrl, "wait_for_z_arrival")):
+                # v7.5.x: SIZE the confirm timeout to the descent's estimated
+                # duration. The gentle "slow last mm" re-entry runs its final
+                # leg at a low feedrate (e.g. 1 mm @ 6 mm/min = 10 s), so a
+                # FIXED 10 s M400 wait expires while a perfectly healthy slow
+                # descent is still finishing and FALSELY trips the "board stuck"
+                # abort below. Floor at 10 s, add margin, cap as a backstop.
+                # (Mirrors move_pump_uL(settle=True)'s duration-scaled drain.)
+                _confirm_to = 10.0
+                if hasattr(ctrl, "estimate_gentle_z_time_s"):
+                    try:
+                        _confirm_to = max(
+                            10.0,
+                            float(ctrl.estimate_gentle_z_time_s(float(z), _z_fr))
+                            + 5.0)
+                        _confirm_to = min(_confirm_to, 120.0)
+                    except Exception:
+                        _confirm_to = 10.0
                 _had_poller = hasattr(ctrl, "suspend_position_poller")
                 if _had_poller:
                     ctrl.suspend_position_poller()
@@ -2610,9 +2680,9 @@ class PrintManager:
                     zp = getattr(ctrl, "zp_stage", None)
                     _m400_ok = True
                     if zp is not None and hasattr(zp, "flush_moves"):
-                        _m400_ok = zp.flush_moves(timeout_s=10.0)
+                        _m400_ok = zp.flush_moves(timeout_s=_confirm_to)
                     if not _m400_ok or not ctrl.wait_for_z_arrival(
-                            float(z), timeout_s=10.0):
+                            float(z), timeout_s=_confirm_to):
                         _z_confirmed = False
                 finally:
                     if _had_poller:
@@ -2656,13 +2726,17 @@ class PrintManager:
                 # v7.5.x: discrete actuation → settle=True. move_pump_uL now
                 # brackets the move with the configured pump settle dwell AND
                 # blocks for completion (subsuming the manual wait below).
+                # compensate=False: the print path owns its own prime (take-up)
+                # and _print_pump_suckback (unload), so this discrete
+                # prime/dispense must NOT be auto-bracketed by backlash comp.
                 _settled = False
                 if hasattr(ctrl, 'move_pump_uL'):
                     try:
-                        ctrl.move_pump_uL(pump, amount_uL, rate_uL_s, settle=True)
+                        ctrl.move_pump_uL(pump, amount_uL, rate_uL_s,
+                                          settle=True, compensate=False)
                         _settled = True
                     except TypeError:
-                        # Older controller / fake without the settle kwarg.
+                        # Older controller / fake without the settle/compensate kwarg.
                         ctrl.move_pump_uL(pump, amount_uL, rate_uL_s)
                 else:
                     # Fallback if controller not yet patched
@@ -2721,12 +2795,21 @@ class PrintManager:
                 self.exec_logger.log(
                     "z_move", context="travel_up",
                     z_mm=round(float(settings.travel_z_height), 4))
-            # v7.5.x: explicit RETRACT feedrate — never a bare G0 Z that would
-            # inherit the pump's slow modal F (the ~12-min-crawl ZP-hang bug).
-            ctrl.move_z_absolute(
-                settings.travel_z_height, from_zero_ref=True,
-                feedrate_mm_min=getattr(ctrl, "_zp_retract_feedrate", None))
-            time.sleep(0.5)
+            # v7.5.x: retract OUT of the print to the travel Z with a GENTLE
+            # slow first mm (back-pressure / surface tension can't peel the
+            # deposited bead off with the needle at high speed) + confirmed
+            # arrival, via ensure_retracted_to (raise-only, polarity-safe,
+            # insert-floored, slow-then-fast). This is the inter-well /
+            # end-of-print lift. Falls back to an explicit-feedrate move (never
+            # a bare G0 Z — the ~12-min-crawl ZP-hang bug) on an older
+            # controller without ensure_retracted_to.
+            if hasattr(ctrl, "ensure_retracted_to"):
+                ctrl.ensure_retracted_to(float(settings.travel_z_height))
+            else:
+                ctrl.move_z_absolute(
+                    settings.travel_z_height, from_zero_ref=True,
+                    feedrate_mm_min=getattr(ctrl, "_zp_retract_feedrate", None))
+                time.sleep(0.5)
 
         elif cmd.type == CommandType.TRAVEL_DOWN:
             if self.exec_logger:
@@ -3001,6 +3084,40 @@ class PrintManager:
                                      mm_s=round(speed_mm_s, 3))
 
 
+    def _print_pump_suckback(self, context: str, pump: str | None = None) -> None:
+        """v7.5.x: suck back the per-pump compliance / relief volume during ink
+        printing to stop drool — after a deposit (``context='deposit'``, end of a
+        print path) and before a quick / inter-object move
+        (``context='quick_move'``). This is the print-path "unload" half of
+        backlash compensation, gated on the single ``backlash_comp_enabled``
+        toggle; the volume is the per-pump ``pump_relief_uL`` (µL measured by the
+        Needle Location compliance calibration). Best-effort and exception-safe —
+        never breaks a print. Re-priming after a quick move is handled by the next
+        object's existing prime dispense (the print-start "take-up")."""
+        ctrl = self.controller
+        pump = pump or getattr(self, "_active_pump", None)
+        if not pump:
+            return
+        relief_fn = getattr(ctrl, "pump_relief_uL", None)
+        enabled_fn = getattr(ctrl, "backlash_comp_enabled", None)
+        if not (callable(relief_fn) and callable(enabled_fn)):
+            return  # older controller / fake without the compliance readers
+        try:
+            if not enabled_fn():
+                return
+            r = float(relief_fn(pump) or 0.0)
+            if r <= 0:
+                return
+            # This IS the explicit unload; move_pump_uL(settle=False) never
+            # auto-brackets, so it won't recursively re-suck-back.
+            ctrl.move_pump_uL(pump, -r)   # ASPIRATE = suck-back
+            if self.exec_logger:
+                self.exec_logger.log("pump_relief", context=context,
+                                     uL=round(-r, 4), pump=pump)
+            logger.debug(f"print suck-back ({context}): {-r:+.4f} µL on {pump}")
+        except Exception as e:   # pragma: no cover - defensive
+            logger.debug(f"print suck-back ({context}) skipped: {e}")
+
     def _execute_print_path(self, cmd: PrintCommand):
         """
         Execute a coordinated print path: move XY while extruding.
@@ -3035,6 +3152,9 @@ class PrintManager:
                    **PrintExecutionLogger._path_stats(points))
         _path_t0 = time.monotonic()
         _planned_s = 0.0
+        # v7.5.x (Finding C): residual pump volume that hasn't yet crossed the
+        # per-emission floor; accumulated across segments, flushed at path end.
+        _pending_pump_uL = 0.0
 
         # Move to start of path
         start_x, start_y = points[0][0], points[0][1]
@@ -3087,19 +3207,32 @@ class PrintManager:
                 seg_time = seg_length / max(_ext_speed_mm_s, 0.01) if _ext_speed_mm_s > 0 else 0
                 volume_uL = flow_rate_uL_s * seg_time
                 _seg_vol_uL = volume_uL
-                _seg_vol_dropped = volume_uL <= 0.001
-                if volume_uL > 0.001 and hasattr(ctrl, 'move_pump_uL'):
-                    ctrl.move_pump_uL(pump, volume_uL, flow_rate_uL_s)
-                elif volume_uL > 0.001:
-                    # v7.4.2: honor configurable per-machine axis_map
-                    _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
-                        if ctrl.zp_stage else AXIS_MAP
-                    mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
-                    if mapped and ctrl.zp_stage:
-                        ctrl.zp_stage.move_relative(
-                            {mapped: volume_uL * 0.3},
-                            settings.pump_feedrate,
-                        )
+                # v7.5.x (Finding C): ACCUMULATE sub-threshold volume instead of
+                # dropping it. A single segment's dispense can round below the
+                # emit floor (fine paths / thin beads), but the volume is REAL —
+                # carry the residual forward and emit one pump move once the
+                # pending total is worth moving, so the print is not cumulatively
+                # under-extruded (the leftover is flushed at path end). Pacing +
+                # logging still use the nominal per-segment volume, so timing is
+                # unchanged.
+                _pending_pump_uL += volume_uL
+                if _pending_pump_uL > self._PATH_PUMP_EMIT_MIN_UL:
+                    _emit_uL = _pending_pump_uL
+                    _pending_pump_uL = 0.0
+                    if hasattr(ctrl, 'move_pump_uL'):
+                        ctrl.move_pump_uL(pump, _emit_uL, flow_rate_uL_s)
+                    else:
+                        # v7.4.2: honor configurable per-machine axis_map
+                        _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                            if ctrl.zp_stage else AXIS_MAP
+                        mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
+                        if mapped and ctrl.zp_stage:
+                            ctrl.zp_stage.move_relative(
+                                {mapped: _emit_uL * 0.3},
+                                settings.pump_feedrate,
+                            )
+                else:
+                    _seg_vol_dropped = True   # deferred (accumulating residual)
             else:
                 # Legacy: extrude proportional to segment length (dimensionless ratio)
                 extrude_amount = seg_length * flow_rate
@@ -3172,6 +3305,23 @@ class PrintManager:
                     if lg and not _bok:
                         lg.log("path_barrier", i=i, ok=False)
 
+        # v7.5.x (Finding C): flush any residual accumulated pump volume that
+        # never crossed the per-emission floor mid-path, so the tail of the
+        # print isn't under-extruded. (Abort / ZP-disconnect take an early
+        # return above and correctly skip this.)
+        if (use_uL and flow_rate_uL_s and flow_rate_uL_s > 0
+                and _pending_pump_uL > 0):
+            if hasattr(ctrl, 'move_pump_uL'):
+                ctrl.move_pump_uL(pump, _pending_pump_uL, flow_rate_uL_s)
+            else:
+                _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                    if ctrl.zp_stage else AXIS_MAP
+                mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
+                if mapped and ctrl.zp_stage:
+                    ctrl.zp_stage.move_relative(
+                        {mapped: _pending_pump_uL * 0.3}, settings.pump_feedrate)
+            _pending_pump_uL = 0.0
+
         # v7.5.x SYNC FIX (XY/ZP de-sync at the END of a print): the per-segment
         # XY moves above are OPEN-LOOP streamed — each Prior "G x,y" returns its
         # "R" (received) ack immediately and moves asynchronously, paced only by
@@ -3187,6 +3337,12 @@ class PrintManager:
         if points:
             final_x, final_y = points[-1][0], points[-1][1]
             self._wait_for_xy_settle(final_x, final_y, timeout=30.0)
+
+        # v7.5.x (F-4): deposit relief — suck back a little after the deposit so
+        # ink doesn't string/drool as the needle lifts or travels. Gated on the
+        # deposit toggle; fires once per print path (for the common single-object
+        # print that's at the end). Re-primed by the next object's prime.
+        self._print_pump_suckback("deposit", pump)
 
         # v7.5.x exec log: path summary. wall_s now includes the end-of-path XY
         # drain above, so it reflects the TRUE physical path-completion time —

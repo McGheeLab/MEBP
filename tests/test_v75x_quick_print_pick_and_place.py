@@ -13,10 +13,18 @@ Covers:
     called with the computed volume), driven against fakes — no hardware.
 """
 
+import os
 import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Isolate the workflow-settings store BEFORE the page is built so its settings
+# dialog restores CODE defaults — not the operator's real saved Quick Print
+# profile (prep/preflow/etc.), which would make these tests machine-dependent.
+os.environ["MEBP_WORKFLOW_SETTINGS_DIR"] = tempfile.mkdtemp(
+    prefix="mebp_qp_settings_")
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -324,6 +332,16 @@ class _QtBase(unittest.TestCase):
         ctrl.print_height_to_zref.return_value = -25.0
         ctrl.print_z_dir.return_value = -1.0
         ctrl.safe_travel_to.return_value = True
+        # v7.5.x: bind the REAL single-source resolvers so the page reads the
+        # same safety-primary XY/Z max it would in production (a bare MagicMock
+        # method returns 1.0 via __float__). Z reads _pending_per_axis then
+        # safety_limits.max_z_feedrate.
+        ctrl._pending_per_axis_max_feedrate = None
+        from SupportClasses.StageController import StageController as _SC
+        ctrl.get_max_xy_speed_um_s.side_effect = (
+            lambda: _SC.get_max_xy_speed_um_s(ctrl))
+        ctrl.get_max_z_feedrate_mm_min.side_effect = (
+            lambda: _SC.get_max_z_feedrate_mm_min(ctrl))
         return ctrl
 
     def _page(self, ctrl=None, *, hw=True, cal=True):
@@ -387,83 +405,62 @@ class TestInkCombo(_QtBase):
         self.assertEqual(page._ink_source_pos(), _WELLS["A2"])
 
 
-class TestPickupVolume(_QtBase):
-    def test_circle_volume_positive_and_above_prime(self):
-        page = self._page()
-        page._flow_spin.setValue(0.25)
-        page._pickup_safety_spin.setValue(1.5)
-        vol = page._compute_pickup_volume_uL()
-        prime = 0.25 * page._PREFLOW_S
-        self.assertGreater(vol, prime)        # path adds to the prime
-        # Larger safety factor → strictly larger pickup.
-        page._pickup_safety_spin.setValue(3.0)
-        self.assertGreater(page._compute_pickup_volume_uL(), vol)
+class TestAutoFlow(_QtBase):
+    """v7.5.x: flow @100% is AUTO-calculated = needle bore cross-section × XY
+    max × extrusion modifier. The % scales speed + flow together; the modifier
+    thickens the bead and feeds the pickup."""
 
-    def test_dot_floored_to_prime(self):
-        page = self._page()
-        idx = page._object_combo.findData("simple:dot")
-        page._object_combo.setCurrentIndex(idx)
-        page._flow_spin.setValue(0.4)
-        page._speed_pct_spin.setValue(100)   # flow passes through 1:1
-        page._pickup_safety_spin.setValue(1.0)
-        # A dot is a single point → no path length → just the prime (×1.0).
-        self.assertAlmostEqual(
-            page._compute_pickup_volume_uL(), 0.4 * page._PREFLOW_S, places=6)
-
-    def test_zero_flow_zero_volume(self):
-        page = self._page()
-        page._flow_spin.setValue(0.0)
-        self.assertEqual(page._compute_pickup_volume_uL(), 0.0)
-
-
-class TestPrintSpeedPercent(_QtBase):
-    def _speed_page(self, max_um_s=20000.0):
+    def _flow_page(self, area=0.01, xy_um_s=20000.0):
         ctrl = self._ctrl()
         ctrl.safety_limits = MagicMock()
-        ctrl.safety_limits.max_xy_speed = max_um_s
-        return self._page(ctrl=ctrl)
+        ctrl.safety_limits.max_xy_speed = xy_um_s
+        page = self._page(ctrl=ctrl)
+        page._needle_cross_section_mm2 = lambda: area   # deterministic bore
+        page._extrusion_mod_spin.setValue(1.0)
+        return page
 
-    def test_xy_max_from_safety_when_no_measured(self):
-        page = self._speed_page(max_um_s=20000.0)
+    def test_flow_100_is_area_times_xymax_times_modifier(self):
+        page = self._flow_page(area=0.01, xy_um_s=20000.0)   # xy_max = 20 mm/s
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = None
-            self.assertAlmostEqual(page._xy_max_mm_s(), 20.0)  # 20000 µm/s
+            self.assertAlmostEqual(page._auto_flow_100_uL_s(), 0.2)  # 0.01×20×1
+            page._extrusion_mod_spin.setValue(2.0)
+            self.assertAlmostEqual(page._auto_flow_100_uL_s(), 0.4)  # thicker
 
-    def test_measured_top_speed_preferred(self):
-        page = self._speed_page(max_um_s=20000.0)
+    def test_flow_falls_back_without_needle(self):
+        page = self._flow_page(area=0.0)
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            self.assertAlmostEqual(page._auto_flow_100_uL_s(),
+                                   page._FLOW_FALLBACK_UL_S)
+
+    def test_xy_max_from_safety_when_no_measured(self):
+        page = self._flow_page(xy_um_s=20000.0)
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            self.assertAlmostEqual(page._xy_max_mm_s(), 20.0)
+
+    def test_safety_limit_is_the_single_xy_source(self):
+        # v7.5.x: safety_limits.max_xy_speed is the ONE editable XY max every
+        # page (incl. the print) reads; the timing tool's "Measure top speed"
+        # WRITES it. A persisted measured value no longer silently overrides it.
+        page = self._flow_page(xy_um_s=20000.0)
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = 60000.0
-            self.assertAlmostEqual(page._xy_max_mm_s(), 60.0)
+            self.assertAlmostEqual(page._xy_max_mm_s(), 20.0)
 
     def test_scales_both_speed_and_flow(self):
-        page = self._speed_page(max_um_s=20000.0)
-        page._flow_spin.setValue(0.5)
+        page = self._flow_page(area=0.01, xy_um_s=20000.0)
         page._speed_pct_spin.setValue(50)
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = None
             s = page._build_settings()
-        self.assertAlmostEqual(s.print_speed_mm_s, 10.0)   # 50% × 20 mm/s
-        self.assertAlmostEqual(s.pump_rate_uL_s, 0.25)     # 50% × 0.5 µL/s
-        self.assertAlmostEqual(s.get_pump_rate(page._pump()), 0.25)
-        # The prime scales with the resolved flow.
-        self.assertAlmostEqual(
-            s.prime_amounts_uL[page._pump()], 0.25 * page._PREFLOW_S)
+        self.assertAlmostEqual(s.print_speed_mm_s, 10.0)    # 50% × 20 mm/s
+        self.assertAlmostEqual(s.pump_rate_uL_s, 0.1)       # 50% × 0.2 µL/s
+        self.assertAlmostEqual(s.get_pump_rate(page._pump()), 0.1)
 
-    def test_lower_bound_1pct_small_but_positive(self):
-        page = self._speed_page(max_um_s=20000.0)
-        page._flow_spin.setValue(0.5)
-        page._speed_pct_spin.setValue(1)
-        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
-            gs.return_value.get_xy_max_speed_um_s.return_value = None
-            s = page._build_settings()
-        self.assertAlmostEqual(s.print_speed_mm_s, 0.20)   # 1% × 20 mm/s
-        self.assertAlmostEqual(s.pump_rate_uL_s, 0.005)    # 1% × 0.5 µL/s
-        self.assertGreater(s.print_speed_mm_s, 0.0)
-        self.assertGreater(s.pump_rate_uL_s, 0.0)
-
-    def test_bead_volume_per_mm_constant_across_pct(self):
-        page = self._speed_page(max_um_s=20000.0)
-        page._flow_spin.setValue(0.5)
+    def test_bead_volume_per_mm_is_bore_area_invariant_to_pct(self):
+        page = self._flow_page(area=0.01, xy_um_s=20000.0)
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = None
             page._speed_pct_spin.setValue(25)
@@ -472,8 +469,101 @@ class TestPrintSpeedPercent(_QtBase):
             sp2, fl2, _ = page._resolved_print_kinematics()
         self.assertGreater(sp2, sp1)
         self.assertGreater(fl2, fl1)
-        # flow / speed (≈ volume per mm) is invariant to the speed %.
+        # volume per mm == bore area (× modifier 1), independent of the % knob.
+        self.assertAlmostEqual(fl1 / sp1, 0.01, places=6)
         self.assertAlmostEqual(fl1 / sp1, fl2 / sp2, places=6)
+
+    def test_modifier_thickens_bead(self):
+        page = self._flow_page(area=0.01, xy_um_s=20000.0)
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            _, fl1, _ = page._resolved_print_kinematics()
+            page._extrusion_mod_spin.setValue(2.0)
+            _, fl2, _ = page._resolved_print_kinematics()
+        self.assertAlmostEqual(fl2, 2.0 * fl1)   # 2× flow at same speed = 2× bead
+
+
+class TestPickupVolume(_QtBase):
+    def _pk_page(self, area=0.01, xy_um_s=20000.0):
+        ctrl = self._ctrl()
+        ctrl.safety_limits = MagicMock()
+        ctrl.safety_limits.max_xy_speed = xy_um_s
+        page = self._page(ctrl=ctrl)
+        page._needle_cross_section_mm2 = lambda: area
+        page._preflow.setValue(0.0)          # isolate the prime
+        page._extrusion_mod_spin.setValue(1.0)
+        page._ink_padding_spin.setValue(0.0)
+        return page
+
+    def test_pickup_is_dispense_plus_reserve_plus_padding(self):
+        page = self._pk_page()
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            dispensed = page._print_dispense_volume_uL()
+            self.assertGreater(dispensed, 0.0)      # a circle has path length
+            # A needle-bore reserve of ink is kept behind the deposit so the
+            # print never reaches the buffer/oil (esp. after a prep).
+            reserve = page._needle_dead_volume_uL()
+            self.assertGreater(reserve, 0.0)
+            self.assertAlmostEqual(
+                page._compute_pickup_volume_uL(), dispensed + reserve)  # pad 0
+            page._ink_padding_spin.setValue(2.0)
+            self.assertAlmostEqual(
+                page._compute_pickup_volume_uL(),
+                dispensed + reserve + 2.0)          # +operator padding
+
+    def test_modifier_scales_deposit_not_reserve(self):
+        page = self._pk_page()
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            reserve = page._needle_dead_volume_uL()
+            v1 = page._compute_pickup_volume_uL()
+            page._extrusion_mod_spin.setValue(2.0)
+            v2 = page._compute_pickup_volume_uL()
+        self.assertGreater(v2, v1)
+        # The DEPOSIT doubles with the modifier; the bore reserve is constant.
+        self.assertAlmostEqual(v2 - reserve, 2.0 * (v1 - reserve))
+
+    def test_dot_picks_up_reserve_plus_padding(self):
+        page = self._pk_page()
+        idx = page._object_combo.findData("simple:dot")
+        page._object_combo.setCurrentIndex(idx)
+        page._ink_padding_spin.setValue(1.5)
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            reserve = page._needle_dead_volume_uL()
+            # dot → no path length → dispensed 0, prime 0 → reserve + padding.
+            self.assertAlmostEqual(
+                page._compute_pickup_volume_uL(), reserve + 1.5)
+
+
+class TestLineMoveSpeedPercent(_QtBase):
+    """v7.5.x: the per-line Z/XY quick-move speeds are entered as a % of each
+    stage's calibrated max and resolved to mm/s in _build_settings."""
+
+    def _spd_page(self, xy_um_s=20000.0, z_mm_min=600.0):
+        ctrl = self._ctrl()
+        ctrl.safety_limits = MagicMock()
+        ctrl.safety_limits.max_xy_speed = xy_um_s
+        ctrl.safety_limits.max_z_feedrate = z_mm_min
+        ctrl._pending_per_axis_max_feedrate = None
+        return self._page(ctrl=ctrl)
+
+    def test_z_max_mm_s_from_safety_feedrate(self):
+        page = self._spd_page(z_mm_min=600.0)   # 600 mm/min ÷ 60 = 10 mm/s
+        self.assertAlmostEqual(page._z_max_mm_s(), 10.0)
+
+    def test_line_speeds_resolved_from_percent(self):
+        page = self._spd_page(xy_um_s=20000.0, z_mm_min=600.0)
+        page._line_z_speed_spin.setValue(50)    # 50% × 10 mm/s = 5
+        page._line_xy_speed_spin.setValue(25)   # 25% × 20 mm/s = 5
+        page._line_retract_spin.setValue(2.5)
+        with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
+            gs.return_value.get_xy_max_speed_um_s.return_value = None
+            s = page._build_settings()
+        self.assertAlmostEqual(s.line_move_z_speed_mm_s, 5.0)
+        self.assertAlmostEqual(s.line_move_xy_speed_mm_s, 5.0)
+        self.assertAlmostEqual(s.intra_well_hop_z_mm, 2.5)
 
 
 class TestSetupStatus(_QtBase):
@@ -563,8 +653,8 @@ class TestPreflightWorker(_QtBase):
         _FakePM.instances.clear()
         page = self._page()
         page._prep_check.setChecked(True)
-        page._flow_spin.setValue(0.25)
-        # Ensure the Alginate ink is selected.
+        # v7.5.x: flow @100% is auto-calculated; expected_vol is read back from
+        # the same computation the run uses.
         page._ink_combo.setCurrentIndex(page._ink_combo.findData("Alginate"))
         expected_vol = page._compute_pickup_volume_uL()
 

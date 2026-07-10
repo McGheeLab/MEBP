@@ -216,6 +216,29 @@ class ObjectiveCalibrationCard(QGroupBox):
         obj_row.addWidget(self._lbl_obj_note, stretch=1)
         active_lay.addLayout(obj_row)
 
+        # v7.5.x: camera-vs-stage orientation readout. The camera can be mounted
+        # rotated relative to the stage axes (≈180°, but "not exactly"); the
+        # measured angle is applied to the live-view click→stage mapping (see
+        # CameraManager.pixel_to_stage_offset) so re-anchor / well-fit clicks land
+        # in the correct XY direction. Objective µm/px calibration measures this
+        # as a side effect; "Calibrate orientation…" measures it on its own.
+        orient_row = QHBoxLayout()
+        orient_row.setSpacing(s(8))
+        self._lbl_orient = QLabel("Camera rotation vs stage: not calibrated")
+        self._lbl_orient.setStyleSheet(
+            f"color: {COLORS['subtext0']}; "
+            f"font-size: {scaled_font_size(9)}pt;"
+        )
+        orient_row.addWidget(self._lbl_orient, stretch=1)
+        self._btn_orient = QPushButton("Calibrate orientation…")
+        self._btn_orient.setToolTip(
+            "Measure the camera's rotation relative to the stage axes by moving "
+            "the stage (does not change µm/px). This corrects the direction a "
+            "live-view click maps to on the stage — needed for accurate "
+            "re-anchor / well fits when the camera is mounted rotated.")
+        orient_row.addWidget(self._btn_orient)
+        active_lay.addLayout(orient_row)
+
         # Library + status table.
         self._table = QTableWidget(0, 4)
         self._table.setHorizontalHeaderLabels(
@@ -286,6 +309,7 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_add.clicked.connect(self._on_add_clicked)
         self._btn_remove.clicked.connect(self._on_remove_clicked)
         self._btn_calibrate.clicked.connect(self._on_calibrate_clicked)
+        self._btn_orient.clicked.connect(self._on_calibrate_orientation_clicked)
         self._btn_clear.clicked.connect(self._on_clear_clicked)
 
     # ── Public API ────────────────────────────────────────────────
@@ -326,6 +350,7 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._lbl_empty.setVisible(has_microscope and not has_objectives)
         self._cmb_objective.setEnabled(has_objectives)
         self._refresh_button_state()
+        self._refresh_orientation_readout()
         if has_microscope:
             self._refresh_objective_note()
 
@@ -355,6 +380,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             config.camera_config.current_objective_name = name or None
         self._refresh_objective_note()
         self._push_stored_um_per_px_to_manager(name)
+        self._refresh_orientation_readout()
         self._refresh_table()
         self.calibration_changed.emit()
 
@@ -471,6 +497,8 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_add.setEnabled(True)
         self._btn_remove.setEnabled(has_selection)
         self._btn_calibrate.setEnabled(has_microscope and has_selection)
+        # Orientation is objective-independent → only needs a microscope camera.
+        self._btn_orient.setEnabled(has_microscope)
         if has_microscope and has_selection:
             cam_key = self._camera_key()
             cal = (
@@ -606,7 +634,117 @@ class ObjectiveCalibrationCard(QGroupBox):
             self.um_per_px_committed.emit(cam_idx, um_per_px)
         self._refresh_table()
         self._refresh_objective_note()
+        self._refresh_orientation_readout()
         self.calibration_changed.emit()
+
+    def _on_calibrate_orientation_clicked(self) -> None:
+        """Measure the camera's rotation vs the stage axes (does NOT change
+        µm/px), push it live so live-view clicks map correctly, and persist it
+        per camera identity so it restores when the camera is reassigned."""
+        cam_idx = self._microscope_idx()
+        if cam_idx is None:
+            return
+        controller = self._controller_getter()
+        if controller is None or not getattr(controller, "xy_stage", None):
+            QMessageBox.warning(
+                self, "Calibrate orientation",
+                "Stage controller not connected — orientation calibration moves "
+                "the stage to measure the camera's rotation. Connect hardware "
+                "first.",
+            )
+            return
+        if self._camera_manager is None or not self._camera_manager.is_running(cam_idx):
+            QMessageBox.warning(
+                self, "Calibrate orientation",
+                f"Start the microscope camera (Cam {cam_idx + 1}) before "
+                "calibrating so the dialog can see the live feed.",
+            )
+            return
+
+        dlg = PixelCalibrationDialog(
+            self._camera_manager, controller, cam_idx=cam_idx, parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        rotation_deg = dlg.result_rotation_deg
+        if rotation_deg is None:
+            QMessageBox.information(
+                self, "Calibrate orientation",
+                "No rotation was measured (move too small / low confidence). "
+                "Try a larger stage move along a clear plate feature.",
+            )
+            return
+
+        # Push live so the click→stage mapping is corrected immediately.
+        try:
+            self._camera_manager.set_rotation_deg(cam_idx, float(rotation_deg))
+        except Exception as exc:
+            logger.debug(f"orientation: push to manager — {exc}")
+        # Persist per camera IDENTITY (independent of µm/px; restored on slot
+        # assignment via hardware_setup._restore_calibration_for_slot).
+        try:
+            from SupportClasses.CameraCalibrationStore import (
+                get_store as _cam_store)
+            ident = None
+            cam_identity = getattr(self._camera_manager, "camera_identity", None)
+            if callable(cam_identity):
+                ident = cam_identity(cam_idx)
+            if ident and ident[0]:
+                _cam_store().set_rotation(
+                    ident[0], float(rotation_deg),
+                    name=(ident[1] if len(ident) > 1 else ""))
+        except Exception as exc:
+            logger.debug(f"orientation: persist per identity — {exc}")
+        # The mount rotation is a property of the CAMERA, not the objective —
+        # sync it into EVERY objective that has a µm/px calibration for this
+        # camera, so a later objective swap (_push_stored_um_per_px_to_manager
+        # pushes the per-objective rotation) can't push a STALE rotation back
+        # over this fresh measurement.
+        try:
+            cam_key = self._camera_key()
+            if cam_key:
+                cals = self._store.all_calibrations_for_camera(cam_key) or {}
+                for obj, cal in cals.items():
+                    if cal and cal.get("measured_um_per_px"):
+                        self._store.set_calibration(
+                            cam_key, obj, float(cal["measured_um_per_px"]),
+                            cal.get("resolution") or (0, 0),
+                            rotation_deg=float(rotation_deg))
+        except Exception as exc:
+            logger.debug(f"orientation: sync per-objective — {exc}")
+
+        self._refresh_orientation_readout()
+        self.calibration_changed.emit()
+        QMessageBox.information(
+            self, "Calibrate orientation",
+            f"Camera rotation vs stage measured: {rotation_deg:.1f}°.\n\n"
+            "Live-view clicks (re-anchor, well fits) now map in the corrected "
+            "direction. A previously scanned mosaic is unaffected — the rotation "
+            "only changes the click→stage mapping, not the stored image.",
+        )
+
+    def _refresh_orientation_readout(self) -> None:
+        """Show the current camera→stage rotation (from the live manager)."""
+        if getattr(self, "_lbl_orient", None) is None:
+            return
+        cam_idx = self._microscope_idx()
+        theta = None
+        if cam_idx is not None and self._camera_manager is not None:
+            try:
+                theta = self._camera_manager.get_rotation_deg(cam_idx)
+            except Exception:
+                theta = None
+        if theta is None:
+            self._lbl_orient.setText("Camera rotation vs stage: not calibrated")
+            self._lbl_orient.setStyleSheet(
+                f"color: {COLORS['subtext0']}; "
+                f"font-size: {scaled_font_size(9)}pt;")
+        else:
+            self._lbl_orient.setText(
+                f"Camera rotation vs stage: {float(theta):.1f}°")
+            self._lbl_orient.setStyleSheet(
+                f"color: {COLORS['green']}; "
+                f"font-size: {scaled_font_size(9)}pt;")
 
     def _on_clear_clicked(self) -> None:
         cam_key = self._camera_key()

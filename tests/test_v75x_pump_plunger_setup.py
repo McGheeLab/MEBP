@@ -222,6 +222,10 @@ class TestApplyPumpConvention(unittest.TestCase):
         self.assertEqual(c.pump_aspirate_sign("P1"), -1.0)
         self.assertTrue(c.is_pump_plunger_calibrated("P1"))
         self.assertEqual(c.pump_dir_sign("P1"), 1.0)
+        # v7.5.x: the soft-limit envelope is RE-DERIVED from the extremes
+        # (min/max of the captured raw extremes), not left at the default.
+        self.assertEqual(c.safety_limits.p1_min, 5.0)
+        self.assertEqual(c.safety_limits.p1_max, 40.0)
 
     def test_rederive_sign_when_absent(self):
         c = _make_controller()
@@ -229,6 +233,32 @@ class TestApplyPumpConvention(unittest.TestCase):
             "P2": {"raw_dispensed": 0.0, "raw_aspirated": 30.0},
         })
         self.assertEqual(c.pump_aspirate_sign("P2"), 1.0)
+
+    def test_envelope_restored_overrides_stale_mirror(self):
+        """The reported bug: location restores correctly but min/max don't.
+
+        A stale ``safety_limits`` mirror (here the sign-flipped [0, 30] seen on
+        ME3B V3) must be CORRECTED by apply_pump_convention to the envelope
+        implied by the authoritative captured extremes (raw 0 → -30 ⇒ [-30, 0]),
+        not preserved. Mirrors the real settings.json/device-profile state."""
+        c = _make_controller()
+        # Pre-load the WRONG persisted mirror (what main.py loads from
+        # settings.json before apply_pump_convention runs).
+        c.safety_limits.p2_min = 0.0
+        c.safety_limits.p2_max = 30.0
+        c.apply_pump_convention({
+            "P2": {"raw_dispensed": 0.0, "raw_aspirated": -30.0,
+                   "aspirate_sign": -1.0, "capacity_uL": 250.0},
+        })
+        # Datum (location) was already right; the envelope is now corrected.
+        self.assertEqual(c.zero_position["P2"], 0.0)
+        self.assertEqual(c.safety_limits.p2_min, -30.0)
+        self.assertEqual(c.safety_limits.p2_max, 0.0)
+        # And it matches a fresh live calibration of the same extremes.
+        ref = _make_controller()
+        ref.apply_pump_setup("P2", 0.0, -30.0)
+        self.assertEqual(c.safety_limits.p2_min, ref.safety_limits.p2_min)
+        self.assertEqual(c.safety_limits.p2_max, ref.safety_limits.p2_max)
 
     def test_empty_is_noop(self):
         c = _make_controller()
@@ -269,6 +299,65 @@ class TestClobberGuard(unittest.TestCase):
         sl2 = SafetyLimits(p1_min=5.0, p1_max=40.0)
         sl2.update_from_hardware_config(_HWg())
         self.assertNotEqual(sl2.p1_max, 40.0)
+
+
+class TestBeginPumpPlungerSetup(unittest.TestCase):
+    """The 'Set Dispensed' (set-zero) step zeroes the firmware counter at the
+    empty extreme so the datum is raw 0.0 and the full extreme reads a positive
+    fill, then widens the soft limits for the jog out."""
+
+    class _FakeZP:
+        def __init__(self):
+            self.zeroed = []
+
+        def set_zero(self, logical):
+            self.zeroed.append(logical)
+            return True
+
+    def _ctrl(self, empty_raw=70.0):
+        c = _make_controller()
+        c.zp_stage = self._FakeZP()
+        c.capture_current_pump_raw = lambda pump, _v=empty_raw: _v
+        return c
+
+    def test_zeroes_datum_and_widens_limits(self):
+        c = self._ctrl(empty_raw=70.0)
+        r = c.begin_pump_plunger_setup("P2")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["previous_raw"], 70.0)
+        self.assertEqual(c.zero_position["P2"], 0.0)           # datum zeroed
+        self.assertIn("P2", c.zp_stage.zeroed)                 # G92 sent
+        # Widened symmetric to the syringe stroke (35 mm × 1.2 = 42).
+        self.assertAlmostEqual(c.safety_limits.p2_min, -42.0)
+        self.assertAlmostEqual(c.safety_limits.p2_max, 42.0)
+        # Only the datum is set so far — not yet a complete calibration.
+        self.assertFalse(c.is_pump_plunger_calibrated("P2"))
+
+    def test_begin_then_apply_gives_zero_empty_positive_full(self):
+        c = self._ctrl(empty_raw=70.0)
+        c.begin_pump_plunger_setup("P2")              # empty zeroed → raw 0
+        # ME3B polarity: motor counts DOWN to full → full reads -30 after zero.
+        s = c.apply_pump_setup("P2", 0.0, -30.0)
+        self.assertEqual(c.zero_position["P2"], 0.0)          # empty = 0.0
+        self.assertEqual(c.pump_aspirate_sign("P2"), -1.0)
+        self.assertTrue(s["direction_ok"])
+        # Fill: 0 at empty, POSITIVE toward full — "fully extended is positive".
+        self.assertAlmostEqual(c.raw_to_pump_fill_uL("P2", 0.0), 0.0)
+        self.assertGreater(c.raw_to_pump_fill_uL("P2", -30.0), 0.0)
+        # Final tight envelope replaces the widened span.
+        self.assertEqual(c.safety_limits.p2_min, -30.0)
+        self.assertEqual(c.safety_limits.p2_max, 0.0)
+
+    def test_no_zp_stage_reports_not_ok_but_sets_datum(self):
+        c = _make_controller()       # no zp_stage attribute
+        r = c.begin_pump_plunger_setup("P1")
+        self.assertFalse(r["ok"])
+        self.assertEqual(c.zero_position["P1"], 0.0)
+
+    def test_invalid_pump_raises(self):
+        c = self._ctrl()
+        with self.assertRaises(ValueError):
+            c.begin_pump_plunger_setup("P9")
 
 
 # ── Offscreen GUI smoke: the per-pump Plunger Setup blocks + handlers ──────
@@ -316,6 +405,15 @@ class TestPumpPlungerSetupPanel(unittest.TestCase):
         def _capture(pump):
             return ctrl._fake_raw.get(pump)
         ctrl.capture_current_pump_raw = _capture
+
+        # Set Dispensed zeroes the firmware counter (G92) — model a ZP stage
+        # whose set_zero succeeds so begin_pump_plunger_setup reports ok.
+        class _FakeZP:
+            steps_per_mm = {}          # read by _refresh_steps_grid on load
+
+            def set_zero(self, logical):
+                return True
+        ctrl.zp_stage = _FakeZP()
         panel._controller = ctrl
         panel._settings = _FakeSettings()
         return panel, ctrl
@@ -333,12 +431,15 @@ class TestPumpPlungerSetupPanel(unittest.TestCase):
         from gui.pages.hardware import stage_panel as sp
 
         panel, ctrl = self._panel_with_ctrl()
-        # Capture P1's empty extreme.
+        # Set Dispensed at the empty extreme ZEROES the pump → datum raw 0.0.
         ctrl._fake_raw["P1"] = 40.0
         panel._pump_setup_capture_dispensed("P1")
         self.assertTrue(panel._pump_setup_aspirated_btns["P1"].isEnabled())
-        # Move to the full extreme, then confirm (auto-Yes the dialog).
-        ctrl._fake_raw["P1"] = 5.0
+        self.assertEqual(ctrl.zero_position["P1"], 0.0)         # zeroed at empty
+        self.assertEqual(panel._pump_setup_dispensed_raw["P1"], 0.0)
+        # After zeroing at empty (was raw 40), the full extreme reads in the
+        # re-zeroed frame: 5 − 40 = −35. Confirm (auto-Yes the dialog).
+        ctrl._fake_raw["P1"] = -35.0
         orig = sp.QMessageBox.question
         sp.QMessageBox.question = staticmethod(
             lambda *a, **k: sp.QMessageBox.Yes)
@@ -346,19 +447,70 @@ class TestPumpPlungerSetupPanel(unittest.TestCase):
             panel._pump_setup_capture_aspirated("P1")
         finally:
             sp.QMessageBox.question = orig
-        # The pump is now calibrated with the derived (ME3B) polarity.
+        # The pump is now calibrated; empty = 0, full = negative raw → −1 sign.
         self.assertTrue(ctrl.is_pump_plunger_calibrated("P1"))
         self.assertEqual(ctrl.pump_aspirate_sign("P1"), -1.0)
+        # Empty datum is 0.0; the FILL reads 0 at empty, POSITIVE at full.
+        self.assertEqual(ctrl.zero_position["P1"], 0.0)
+        self.assertAlmostEqual(ctrl.raw_to_pump_fill_uL("P1", 0.0), 0.0)
+        self.assertGreater(ctrl.raw_to_pump_fill_uL("P1", -35.0), 0.0)
         # Persistence wrote zero_position + extents + device_profile.pump_setup.
         s = panel._settings
         self.assertIn("zero_position", s.data)
-        self.assertEqual(s.get("safety_limits.p1_min"), 5.0)
-        self.assertEqual(s.get("safety_limits.p1_max"), 40.0)
+        self.assertEqual(s.get("safety_limits.p1_min"), -35.0)
+        self.assertEqual(s.get("safety_limits.p1_max"), 0.0)
         self.assertIn("P1", s.get("device_profile.pump_setup"))
         self.assertIn("✅", panel._pump_setup_status_lbls["P1"].text())
-        # The visible safety-limit (calibration extent) spinboxes were updated.
-        self.assertAlmostEqual(panel.spin_p_mins["P1"].value(), 5.0, places=3)
-        self.assertAlmostEqual(panel.spin_p_maxs["P1"].value(), 40.0, places=3)
+        # v7.5.x: the visible limit spinboxes are the user FILL frame (0 =
+        # empty → +capacity = full, always positive), like Z — NOT the raw
+        # [-35, 0] motor frame that's persisted for the clamp. So after
+        # calibration they read [0, 35].
+        self.assertAlmostEqual(panel.spin_p_mins["P1"].value(), 0.0, places=3)
+        self.assertAlmostEqual(panel.spin_p_maxs["P1"].value(), 35.0, places=3)
+
+    def test_limit_spinboxes_use_fill_frame_but_persist_raw(self):
+        """v7.5.x: a calibrated pump's limit spinboxes show the POSITIVE fill
+        frame [0, capacity] (like Z), while settings + the live clamp keep the
+        raw Marlin envelope. ME3B P2: raw [-30, 0] ⇄ fill [0, 30]. This is the
+        operator report — 'loaded min=-30, max=0; should be 0 and 30'."""
+        panel, ctrl = self._panel_with_ctrl()
+        # Calibrate P2 the ME3B way: empty=raw0, full=raw-30 (motor counts down).
+        ctrl.apply_pump_convention({
+            "P2": {"raw_dispensed": 0.0, "raw_aspirated": -30.0,
+                   "aspirate_sign": -1.0, "capacity_uL": 250.0},
+        })
+        self.assertTrue(ctrl.is_pump_plunger_calibrated("P2"))
+        # Stored/clamp envelope is raw [-30, 0].
+        s = panel._settings
+        s.set("safety_limits.p2_min", -30.0)
+        s.set("safety_limits.p2_max", 0.0)
+        # LOAD → spinboxes show the positive fill frame [0, 30] (raw min/max
+        # swapped by value because aspirate_sign is negative).
+        panel._load_from_settings()
+        self.assertAlmostEqual(panel.spin_p_mins["P2"].value(), 0.0, places=3)
+        self.assertAlmostEqual(panel.spin_p_maxs["P2"].value(), 30.0, places=3)
+        # SAVE → settings AND the live clamp go back to raw [-30, 0] (the
+        # display never leaks into the frame the clamp compares in).
+        panel._apply_safety_and_zero()
+        self.assertAlmostEqual(s.get("safety_limits.p2_min"), -30.0, places=3)
+        self.assertAlmostEqual(s.get("safety_limits.p2_max"), 0.0, places=3)
+        self.assertAlmostEqual(ctrl.safety_limits.p2_min, -30.0, places=3)
+        self.assertAlmostEqual(ctrl.safety_limits.p2_max, 0.0, places=3)
+
+    def test_uncalibrated_pump_limits_shown_and_stored_raw(self):
+        """An UNcalibrated pump has no fill frame → spinboxes show the raw
+        envelope unchanged (identity conversion), and it round-trips raw."""
+        panel, ctrl = self._panel_with_ctrl()  # only P1 has _fake_raw; none calibrated
+        self.assertFalse(ctrl.is_pump_plunger_calibrated("P3"))
+        s = panel._settings
+        s.set("safety_limits.p3_min", 0.0)
+        s.set("safety_limits.p3_max", 34.0)
+        panel._load_from_settings()
+        self.assertAlmostEqual(panel.spin_p_mins["P3"].value(), 0.0, places=3)
+        self.assertAlmostEqual(panel.spin_p_maxs["P3"].value(), 34.0, places=3)
+        panel._apply_safety_and_zero()
+        self.assertAlmostEqual(s.get("safety_limits.p3_min"), 0.0, places=3)
+        self.assertAlmostEqual(s.get("safety_limits.p3_max"), 34.0, places=3)
 
     def test_capture_is_independent_per_pump(self):
         from gui.pages.hardware import stage_panel as sp

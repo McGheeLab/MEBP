@@ -382,7 +382,17 @@ class MosaicBuilder:
         max_shift_um: float = 0.0,
         register_mode: str = "global",
         initial_shift_um: tuple[float, float] = (0.0, 0.0),
+        retain_frames: bool = True,
     ):
+        # v7.5.x: ``retain_frames`` — when False, each tile's raw frame is freed
+        # immediately after it is blended into the incremental composite
+        # (``stitch_incremental``). A long full-plate scan (hundreds of tiles ×
+        # ~2 MB/frame) otherwise accumulates ~½ GB of dead image data in
+        # ``_records`` → swap thrash → seconds-per-tile slowdown. Set False ONLY
+        # for scans that consume the live ``.composite`` (display cache) and
+        # never call ``build_mosaic`` / ``tile_images_px`` / ``_ensure_composite``
+        # (which re-blend the raw frames). Default True preserves those paths.
+        self._retain_frames = bool(retain_frames)
         self._frame_size_px = frame_size_px
         self._um_per_px = micron_per_pixel
         self._overlap = overlap
@@ -499,6 +509,8 @@ class MosaicBuilder:
         h = max(1, int(fov_h_um * scale))
         out: list = []
         for rec in self._records:
+            if rec.frame is None:    # freed in frame-light mode
+                continue
             left = (rec.stage_x_um - fov_w_um / 2.0 - ox) * scale
             top = (rec.stage_y_um - fov_h_um / 2.0 - oy) * scale
             out.append((rec.frame, left, top, w, h))
@@ -819,7 +831,24 @@ class MosaicBuilder:
 
         rec = self._records[-1]
         self._blend_tile_to_composite(rec)
+        # v7.5.x: in frame-light mode, drop the raw frame now that it's blended
+        # into the composite — it is never needed again (this builder doesn't
+        # re-blend via build_mosaic). Keeps RAM bounded over a long scan.
+        if not self._retain_frames:
+            rec.frame = None
         return self.composite
+
+    def free_accumulators(self) -> None:
+        """v7.5.x: release the float64 accumulators (``_composite`` +
+        ``_weight_sum`` — together ~190 MB on a full-plate canvas) once the scan
+        is complete, keeping only the uint8 ``_display_cache`` (the finished
+        mosaic). Call after the final tile + ``finalize_global_shift``; the
+        display cache is already complete (updated incrementally per tile), so
+        the global shift (applied via ``canvas_extent_um``) is unaffected. After
+        this, ``stitch_incremental`` / ``build_mosaic`` are no-ops until re-init.
+        """
+        self._composite = None
+        self._weight_sum = None
 
     def _max_shift_px(self) -> float:
         """Per-tile registration bound in mosaic px (0 µm → 20% of the FOV)."""
@@ -1022,8 +1051,11 @@ class MosaicBuilder:
         )
         self._init_composite(bounds)
 
-        # Blend all existing frames into the fresh canvas
+        # Blend all existing frames into the fresh canvas (skip any freed in
+        # frame-light mode — defensive; the frame-light scan never re-blends).
         for rec in self._records:
+            if rec.frame is None:
+                continue
             self._blend_tile_to_composite(rec)
 
     def build_mosaic(self) -> np.ndarray | None:

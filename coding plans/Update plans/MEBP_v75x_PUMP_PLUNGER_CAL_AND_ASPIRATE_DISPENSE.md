@@ -157,3 +157,60 @@ zero/max **update + save the calibration extents**.
   per-pump independence / extents-spinboxes-updated / cancel) — 20 green;
   z-display / ink-location / camera-image-correction page suites green (43).
   **Needs real-HW verification on ME3B V1.**
+
+---
+
+## Addendum (2026-06-30) — "Set Dispensed" now ZEROES the pump first
+
+**Operator request:** *"when calibrating the pump axis to the extents, the
+locations need to zero automatically first as a part of the set zero step so
+that when we are done the syringe plunger position when fully extended is
+positive and the zero position is 0.0 (plunger fully in)."*
+
+Before, **Set Dispensed** merely *captured* the empty-extreme raw (e.g. 70 mm)
+and `apply_pump_setup` stamped `zero_position[pump] = raw_dispensed`, so the
+datum was an arbitrary offset (70), not 0.0. Now the **Set Dispensed** step is a
+true *set-zero*: it rebases the firmware counter to **0.0** at the empty
+extreme, so empty = position 0.0 and (via the derived `aspirate_sign`) the
+displayed plunger **fill grows POSITIVE toward full**, regardless of which raw
+direction the motor counts.
+
+- **`StageController.begin_pump_plunger_setup(pump)`** (new) — the "Set
+  Dispensed" half. Reads the current raw (for the status/log), sends `G92`
+  (`zp_stage.set_zero(pump)`) so the empty extreme becomes raw **0.0**, sets
+  `zero_position[pump] = 0.0`, and **temporarily widens** the pump soft-limit
+  envelope to ±(syringe stroke ×1.2, or ±100 mm if no syringe — new
+  `_pump_widen_span_mm`) so the jog out to the full extreme isn't clamped by the
+  now-stale absolute-raw limits. `apply_pump_setup` tightens the envelope to the
+  captured extremes at the end. **No motion** (G92 only rebases the counter).
+  Returns `{"pump","ok","previous_raw"}` (`ok` False ⇒ ZP not connected/zeroing
+  failed; capture is exception-guarded for `__new__` test controllers).
+- **`StageHardwarePanel._pump_setup_capture_dispensed`** now calls
+  `begin_pump_plunger_setup`, stores `dispensed_raw = 0.0`, persists
+  `zero_position` immediately (new `_pump_setup_persist_zero`, so the saved datum
+  matches the firmware G92 even if the operator stops before Set Aspirated), and
+  refuses (status message) when `ok` is False. Block text + button relabelled to
+  reflect the auto-zero ("Set Dispensed (empty → zero)").
+- **`_pump_setup_capture_aspirated`** unchanged in shape — it now always calls
+  `apply_pump_setup(pump, 0.0, raw_aspirated)` (dispensed datum is 0.0).
+- **Stage-panel pump readout** (`_update_position_displays` →
+  new `_pump_raw_to_user`): a *calibrated* pump now shows the signed travel from
+  the empty datum (**0 at empty → +stroke at full**), mirroring how Z is shown
+  in the `z_up_sign` user frame, so the calibration page also reads positive at
+  full. Uncalibrated pumps still show raw mm. The Override card stays zero-ref
+  raw (it re-declares the firmware counter). The limit spinboxes remain the
+  absolute-raw envelope (clamping works in the raw frame).
+- **Why fill, not a motor-direction flip:** on ME3B the pump motor counts DOWN
+  toward full (full at the smaller raw), so after zeroing at empty the *raw* full
+  reads negative; `G92` (an additive offset) cannot make both empty = 0 and raw
+  full = +positive, and flipping `steps_per_mm` only inverts future move
+  directions (not the reported mm). So "fully extended is positive" is delivered
+  the same way Z's "up is positive" is — a software sign at the display boundary
+  (`aspirate_sign`/`raw_to_pump_fill_uL`), which the control panel already used.
+- Tests: `tests/test_v75x_pump_plunger_setup.py` +`TestBeginPumpPlungerSetup`
+  (4) + updated `TestPumpPlungerSetupPanel` (fake ZP `set_zero`; ME3B flow now
+  asserts empty datum 0.0, full reads positive fill, envelope `[-35, 0]`) — 24
+  green; z-axis-setup / zp-envelope / zp-position-override / jog-direction
+  suites green (53). **Needs real-HW verification on ME3B V1** (jog plunger
+  all-in → Set Dispensed reads 0.0; jog all-out → Set Aspirated reads positive
+  fill; restart preserves; aspirate/dispense flow correct).

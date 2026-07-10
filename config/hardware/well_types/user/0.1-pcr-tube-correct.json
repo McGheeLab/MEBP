@@ -1,0 +1,12 @@
+{
+  "id": "0.1-pcr-tube-correct",
+  "display_name": "0.1 PCR Tube correct",
+  "manufacturer": "",
+  "model": "",
+  "diameter_mm": 6.0,
+  "well_depth_mm": 20.0,
+  "rim_height_mm": 3.0,
+  "ink_z_mm": 1.0,
+  "volume_uL": null,
+  "builtin": false
+}

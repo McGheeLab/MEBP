@@ -157,6 +157,60 @@ class SettingsSection:
             self.add_note(help)
         return checkbox
 
+    def add_common(self, key: str, label: str, widget: QWidget, default,
+                   common_key: str | None = None, *,
+                   overridable: bool = True, help: str | None = None) -> QWidget:
+        """Add a field linked to the shared Common Print Settings.
+
+        ``overridable=True`` (a promoted prep knob): the field shows an "Override
+        common" checkbox. Unchecked = INHERIT (the widget is disabled and mirrors
+        the common value live); checked = the workflow's own LOCAL value. Because
+        an inheriting widget is force-set to the common value, the workflow's
+        runtime read (``widget.value()``) returns the effective value with no
+        other change needed.
+
+        ``overridable=False`` (a global hardware param like settle / relief /
+        prime): no checkbox; the widget always reflects the single shared value
+        and editing it writes straight back through to it.
+
+        ``common_key`` defaults to ``key`` (the workflow field key usually equals
+        the common key).
+        """
+        common_key = common_key or key
+        self._dialog._register(key, widget, default)
+
+        container = QWidget()
+        hb = QHBoxLayout(container)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(s(8))
+        hb.addWidget(widget, stretch=1)
+
+        override = None
+        if overridable:
+            override = QCheckBox("Override")
+            override.setToolTip(
+                "Off = inherit the shared value from Common Print Settings.\n"
+                "On = use this workflow's own value here.")
+            self._dialog._register(f"{key}__ovr", override, False)
+            override.toggled.connect(
+                lambda _checked, k=key: self._dialog._on_override_toggled(k))
+            hb.addWidget(override)
+        else:
+            # Global field — edits write straight through to the shared value.
+            sig = getattr(widget, "valueChanged", None)
+            if sig is not None:
+                sig.connect(
+                    lambda _v, k=key: self._dialog._on_global_edit(k))
+
+        self._dialog._register_common_link(
+            key, widget, override, common_key, overridable)
+
+        row = FormRow(label, container, help_text=help)
+        if help:
+            row.set_help_visible(True)
+        self._card.add_widget(row)
+        return widget
+
     def add_widget(self, w: QWidget) -> QWidget:
         """Add a display-only widget (status label, swatch, …) — not persisted."""
         self._card.add_widget(w)
@@ -203,6 +257,14 @@ class WorkflowSettingsDialog(QDialog):
 
         self._info_card: Card | None = None
         self._info_refresher: Optional[Callable[[], QWidget]] = None
+
+        # v7.5.x: common-settings links (Common Print Settings page).
+        # key -> {value, override, common_key, overridable}
+        self._common = None
+        self._common_links: dict[str, dict] = {}
+        # Guard so programmatic widget mutation (apply/reset/sync) doesn't write
+        # back through a global field or re-enter the override handler.
+        self._applying = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(s(12), s(12), s(12), s(12))
@@ -420,26 +482,121 @@ class WorkflowSettingsDialog(QDialog):
     def collect(self) -> dict:
         return {k: widget_value(w) for k, (w, _d) in self._fields.items()}
 
+    # ── Common Print Settings links ───────────────────────────────
+
+    def _register_common_link(self, key, value_widget, override_widget,
+                              common_key, overridable) -> None:
+        self._common_links[key] = {
+            "value": value_widget,
+            "override": override_widget,
+            "common_key": common_key,
+            "overridable": overridable,
+        }
+
+    def set_common(self, common) -> None:
+        """Attach the shared :class:`CommonPrintSettings` model and re-sync every
+        linked widget. Called by the page on each app-level common fan-out, so an
+        inheriting widget always reflects the current shared value even if the
+        dialog was never opened."""
+        self._common = common
+        self._resync_common_links()
+
+    def _common_value(self, key: str):
+        link = self._common_links.get(key)
+        if link is None:
+            return None
+        if self._common is not None:
+            return self._common.get(link["common_key"])
+        # Fall back to the registered default (== the canonical common default).
+        return self._fields.get(key, (None, None))[1]
+
+    def _sync_common_link(self, key: str) -> None:
+        link = self._common_links.get(key)
+        if link is None:
+            return
+        widget = link["value"]
+        cv = self._common_value(key)
+        if not link["overridable"]:
+            # Global field: always shows the shared value; stays editable.
+            if cv is not None:
+                widget.blockSignals(True)
+                set_widget_value(widget, cv)
+                widget.blockSignals(False)
+            return
+        overridden = bool(link["override"].isChecked()) if link["override"] else False
+        widget.setEnabled(overridden)
+        if not overridden and cv is not None:
+            widget.blockSignals(True)
+            set_widget_value(widget, cv)
+            widget.blockSignals(False)
+
+    def _resync_common_links(self) -> None:
+        prev = self._applying
+        self._applying = True
+        try:
+            for key in self._common_links:
+                self._sync_common_link(key)
+        finally:
+            self._applying = prev
+
+    def _on_override_toggled(self, key: str) -> None:
+        if self._applying:
+            return
+        self._sync_common_link(key)
+        self._emit_change()
+
+    def _on_global_edit(self, key: str) -> None:
+        if self._applying or self._common is None:
+            return
+        link = self._common_links.get(key)
+        if link is None:
+            return
+        self._common.set(link["common_key"], widget_value(link["value"]))
+
     def apply(self, values: dict, *, reapply_combos: bool = False) -> None:
         if not isinstance(values, dict):
             return
-        for key, (widget, _default) in self._fields.items():
-            if key not in values:
-                continue
-            ok = set_widget_value(widget, values[key])
-            if isinstance(widget, QComboBox):
-                if not ok:
-                    self._pending[key] = values[key]
+        self._applying = True
+        try:
+            for key, (widget, _default) in self._fields.items():
+                if key not in values:
+                    continue
+                ok = set_widget_value(widget, values[key])
+                if isinstance(widget, QComboBox):
+                    if not ok:
+                        self._pending[key] = values[key]
+                    else:
+                        self._pending.pop(key, None)
+                    # A restored combo can still be clobbered by the page's own
+                    # combo repopulate (which auto-defaults). Re-assert it once
+                    # after that repopulate when this is the initial restore.
+                    if reapply_combos:
+                        self._reapply_combos[key] = values[key]
                 else:
                     self._pending.pop(key, None)
-                # A restored combo can still be clobbered by the page's own
-                # combo repopulate (which auto-defaults). Re-assert it once after
-                # that repopulate when this is the initial last-used restore.
-                if reapply_combos:
-                    self._reapply_combos[key] = values[key]
-            else:
-                self._pending.pop(key, None)
+            self._migrate_common_links(values)
+        finally:
+            self._applying = False
+        self._resync_common_links()
         self._emit_change()
+
+    def _migrate_common_links(self, values: dict) -> None:
+        """Back-compat: a saved file from before this feature has the value key
+        (e.g. ``service_z``) but no ``service_z__ovr`` override flag. Preserve a
+        customised value as an explicit override; inherit one that matches the
+        common default."""
+        for key, link in self._common_links.items():
+            if not link["overridable"] or link["override"] is None:
+                continue
+            ovr_key = f"{key}__ovr"
+            if ovr_key in values or key not in values:
+                continue        # new-format file (has the flag) or field absent
+            cv = self._common_value(key)
+            try:
+                differs = abs(float(values[key]) - float(cv)) > 1e-9
+            except (TypeError, ValueError):
+                differs = True
+            link["override"].setChecked(bool(differs))
 
     def resolve_pending(self) -> None:
         """Re-assert hardware-dependent combos after the page repopulates them:
@@ -457,10 +614,16 @@ class WorkflowSettingsDialog(QDialog):
             self._reapply_combos.pop(key, None)
 
     def reset_defaults(self) -> None:
-        for _key, (widget, default) in self._fields.items():
-            set_widget_value(widget, default)
+        self._applying = True
+        try:
+            for _key, (widget, default) in self._fields.items():
+                set_widget_value(widget, default)
+        finally:
+            self._applying = False
         self._pending.clear()
         self._reapply_combos.clear()
+        # Override flags reset to False (inherit) → re-sync to the common values.
+        self._resync_common_links()
         self._emit_change()
 
     def _emit_change(self) -> None:

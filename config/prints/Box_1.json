@@ -1,24 +1,58 @@
 {
   "schema_version": "7.5.0",
   "metadata": {
-    "name": "Box_1",
-    "description": "Box: 1 shape(s), 1 layer(s), 27.5 mm path \u00b7 print height 0.20 mm above plate bottom",
-    "created": "2026-06-28T02:53:54.391254+00:00",
-    "modified": "2026-06-28T02:53:54.391254+00:00",
+    "name": "box_1",
+    "description": "box: 1 shape(s), 1 layer(s), 29.3 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-07-04T00:26:36.937153+00:00",
+    "modified": "2026-07-04T00:26:36.937153+00:00",
     "author": "Print Builder"
   },
   "objects": {
-    "Box": {
+    "box": {
       "object_type": "csv_import",
       "params": {
-        "source_file": "config\\prints\\Box_1.csv",
-        "csv_path": "config\\prints\\Box_1.csv",
+        "source_file": "config\\prints\\box_1.csv",
+        "csv_path": "config\\prints\\box_1.csv",
         "source": "SketchTrajectory",
-        "num_waypoints": 57,
+        "num_waypoints": 62,
         "z_above_plate_bottom_mm": 0.2,
         "z_datum": "plate_bottom",
         "layer_height_mm": 0.2,
-        "num_layers": 1
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "rect",
+              "cx": -0.15098397677169584,
+              "cy": -0.2768039574147756,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 5.871599096677063,
+              "height": 8.77384665017744,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 1,
+              "color": "#a6e3a1",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            }
+          ],
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 0.4,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0
+        }
       },
       "position": [
         0.0,

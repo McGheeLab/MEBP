@@ -119,6 +119,13 @@ class StageHardwarePanel(QWidget):
         if not hasattr(self, 'lbl_axis_pos'):
             return
         self._refresh_jog_positions()
+
+    def on_motion_tick(self):
+        """v7.5.x: fast (~30 fps) display-only refresh of the per-axis position
+        readouts while a jog/travel motion estimate is live."""
+        if not hasattr(self, 'lbl_axis_pos'):
+            return
+        self._refresh_jog_positions()
         self._sync_connection_badges()
 
     def _sync_connection_badges(self):
@@ -434,11 +441,21 @@ class StageHardwarePanel(QWidget):
         return grp
 
     def _z_max_feedrate_mm_min(self) -> float:
-        """v7.4.2 hotfix: resolve Z's per-axis max for the percentage math.
+        """Resolve Z's per-axis max for the percentage math.
 
-        Falls back to a sensible default if no calibration value is
-        available yet.
+        v7.5.x: prefer the controller's SINGLE common resolver
+        (``get_max_z_feedrate_mm_min``) so this editor surface reflects the same
+        Z max every page reads; fall back to the settings value (this panel is
+        also where that value is edited) then a sensible default.
         """
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "get_max_z_feedrate_mm_min"):
+            try:
+                v = float(ctrl.get_max_z_feedrate_mm_min())
+                if v > 0:
+                    return v
+            except Exception:
+                pass
         if self._settings is not None:
             per_axis = self._settings.get("device_profile.per_axis_max_feedrate") or {}
             v = per_axis.get("Z")
@@ -1880,21 +1897,29 @@ class StageHardwarePanel(QWidget):
             self._persist_active_profile()
         # v7.4.2 hotfix: push M203 immediately so Marlin agrees and the
         # alignment cell goes green without requiring a Save Calibration.
+        # v7.5.x: route through apply_device_settings so the controller's CACHED
+        # per-axis max (the single resolver source — get_max_z_feedrate_mm_min)
+        # updates too, not just Marlin; it pushes M203 when connected and
+        # re-anchors the jog/move feedrates.
         pushed = False
         ctrl = self._controller
-        if ctrl is not None and ctrl.zp_stage is not None:
+        if ctrl is not None:
             try:
-                ctrl.zp_stage.set_per_axis_max_feedrate(per_axis, persist=True)
-                pushed = True
+                ctrl.apply_device_settings(
+                    per_axis_max_feedrate=per_axis, persist_feedrate=True)
+                pushed = ctrl.zp_stage is not None
             except Exception as e:
-                logger.warning(f"set_per_axis_max_feedrate (popup) failed: {e}")
-        elif ctrl is not None:
-            ctrl.apply_device_settings(per_axis_max_feedrate=per_axis)
+                logger.warning(f"apply per-axis feedrate (popup) failed: {e}")
         self._refresh_max_feedrate_grid()
         # The ZP Feedrates derived-mm/min display uses Z max — if Z
         # changed, refresh the derived labels.
         if axis == "Z" and hasattr(self, '_refresh_zp_feedrate_derived'):
             self._refresh_zp_feedrate_derived()
+        # v7.5.x: a per-axis MAX changed → refresh the Control Panel speed read-
+        # outs + emit safety_limits_changed so every page re-reads the single
+        # common source (app fans refresh_speed_limits out to all jog surfaces).
+        if axis == "Z":
+            self._notify_control_panel_safety_changed()
         # Re-check alignment so the cell colour reflects the new state.
         try:
             self._check_marlin_alignment(quiet=True)
@@ -1999,17 +2024,31 @@ class StageHardwarePanel(QWidget):
         position labels so the left-side live display stays in sync
         when a Set Zero / Set Min / Set Max click forces a fresh read.
         """
+        # v7.5.x: mark a readout currently showing a (display-only) motion
+        # estimate with a leading '~'. The Override card stays unmarked (it
+        # re-declares the firmware counter, not a live readout).
+        est: set = set()
+        if self._controller is not None and hasattr(
+                self._controller, "motion_estimating"):
+            try:
+                est = self._controller.motion_estimating()
+            except Exception:
+                est = set()
+
+        def _mark(axis, txt):
+            return ("~" + txt) if axis in est else txt
+
         def _set(d, key, val):
             if val is None or not hasattr(self, d) or key not in getattr(self, d):
                 return
             getattr(self, d)[key].setText(val)
         if xy:
             if xy[0] is not None:
-                txt = f"{xy[0]:,.1f}"
+                txt = _mark("X", f"{xy[0]:,.1f}")
                 _set("lbl_axis_pos", "X", txt)
                 _set("lbl_jog_pos", "X", txt)
             if xy[1] is not None:
-                txt = f"{xy[1]:,.1f}"
+                txt = _mark("Y", f"{xy[1]:,.1f}")
                 _set("lbl_axis_pos", "Y", txt)
                 _set("lbl_jog_pos", "Y", txt)
         if zp:
@@ -2018,11 +2057,14 @@ class StageHardwarePanel(QWidget):
                 if v is None:
                     continue
                 # v7.5.x: the limit-row + live-position readouts show Z in the
-                # unified user frame (0 at the bottom datum, + up); pumps
-                # unchanged. (The Override card below stays zero-ref raw — it
-                # re-declares the firmware counter.)
-                disp = self._z_raw_to_user(v) if logical == "Z" else v
-                txt = f"{disp:.3f}"
+                # unified user frame (0 at the bottom datum, + up); a calibrated
+                # pump shows the signed travel from the empty datum (0 = empty,
+                # + toward full) so "full" reads positive regardless of the raw
+                # motor direction. (The Override card below stays zero-ref raw —
+                # it re-declares the firmware counter.)
+                disp = (self._z_raw_to_user(v) if logical == "Z"
+                        else self._pump_raw_to_user(logical, v))
+                txt = _mark(logical, f"{disp:.3f}")
                 _set("lbl_axis_pos", logical, txt)
                 _set("lbl_jog_pos", logical, txt)
                 # v7.5.x: the Override card shows the zero-referenced
@@ -2059,8 +2101,14 @@ class StageHardwarePanel(QWidget):
         if ctrl is None or not hasattr(self, 'lbl_axis_pos'):
             return
         try:
-            xy = ctrl.get_xy_position(cached=True)
-            zp = ctrl.get_zp_position(cached=True)
+            # v7.5.x: display getters animate toward a jog/travel target, then
+            # snap to the measured value (fallback to cached for stubs).
+            get_xy = getattr(ctrl, "get_display_xy_position", None) or (
+                lambda: ctrl.get_xy_position(cached=True))
+            get_zp = getattr(ctrl, "get_display_zp_position", None) or (
+                lambda: ctrl.get_zp_position(cached=True))
+            xy = get_xy()
+            zp = get_zp()
         except Exception:
             return
         self._update_position_displays(xy, zp)
@@ -2128,6 +2176,41 @@ class StageHardwarePanel(QWidget):
         if c is not None and hasattr(c, "user_z_to_raw"):
             return c.user_z_to_raw(user_mm)
         return z_display_to_raw(user_mm)
+
+    def _pump_raw_to_user(self, logical: str, raw: float) -> float:
+        """v7.5.x: a calibrated pump's displayed position is the signed travel
+        from the empty (dispensed) datum — 0 at empty, growing POSITIVE toward
+        full — so the readout reads 0.0 empty / +stroke full regardless of which
+        raw direction the motor counts (mirrors how Z is shown in the z_up_sign
+        user frame). Uncalibrated pumps fall back to the raw Marlin value."""
+        c = self._controller
+        if (c is not None and hasattr(c, "is_pump_plunger_calibrated")
+                and c.is_pump_plunger_calibrated(logical)):
+            try:
+                sign = float(c.pump_aspirate_sign(logical))
+                zero = float(c.zero_position.get(logical, 0.0))
+                val = sign * (float(raw) - zero)
+                return 0.0 if val == 0.0 else val   # normalise -0.0 → 0.0
+            except Exception:
+                return float(raw)
+        return float(raw)
+
+    def _pump_user_to_raw(self, logical: str, user: float) -> float:
+        """Inverse of :meth:`_pump_raw_to_user`: user-fill mm (0 = empty, +
+        toward full) → absolute Marlin raw mm. Used when writing the fill-frame
+        limit spinboxes back to the raw-stored ``safety_limits.p*``. Since
+        ``aspirate_sign`` ∈ {+1, -1}, ``raw = zero + sign·user`` inverts
+        ``user = sign·(raw − zero)`` exactly. Uncalibrated pumps pass through."""
+        c = self._controller
+        if (c is not None and hasattr(c, "is_pump_plunger_calibrated")
+                and c.is_pump_plunger_calibrated(logical)):
+            try:
+                sign = float(c.pump_aspirate_sign(logical))
+                zero = float(c.zero_position.get(logical, 0.0))
+                return zero + sign * float(user)
+            except Exception:
+                return float(user)
+        return float(user)
 
     # ── v7.5.x: Z Axis Setup — one procedure for datum + direction + limits ──
 
@@ -2352,19 +2435,22 @@ class StageHardwarePanel(QWidget):
         info = QLabel(
             "Use the jog pad to drive this pump's plunger to each mechanical "
             "extreme and capture it. <b>Dispensed = plunger all the way IN "
-            "(syringe empty) → fill 0.</b> Aspirated = all the way OUT (full). "
-            "The <b>ASPIRATE</b> (draw-in) / <b>DISPENSE</b> (push-out) "
-            "direction and the pump soft-limit extents are derived and saved "
+            "(syringe empty).</b> Clicking <b>Set Dispensed</b> ZEROES the pump "
+            "here, so empty = position 0.0. Then jog ALL THE WAY OUT (full) and "
+            "click <b>Set Aspirated</b> — full reads a positive fill. The "
+            "<b>ASPIRATE</b> (draw-in) / <b>DISPENSE</b> (push-out) direction "
+            "and the pump soft-limit extents are derived and saved "
             "automatically.")
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
         v.addWidget(info)
 
         row = QHBoxLayout()
-        btn_disp = QPushButton("1 · Set Dispensed (empty, fill 0)")
+        btn_disp = QPushButton("1 · Set Dispensed (empty → zero)")
         btn_disp.setToolTip(
             "Jog this pump's plunger ALL THE WAY IN (syringe empty) first, then "
-            "click. This raw position becomes fill = 0 (the datum).")
+            "click. This ZEROES the pump's position here (fill = 0, the datum) "
+            "so the full extreme will read positive.")
         btn_disp.clicked.connect(
             lambda _=False, p=pump: self._pump_setup_capture_dispensed(p))
         row.addWidget(btn_disp)
@@ -2380,7 +2466,8 @@ class StageHardwarePanel(QWidget):
         row.addStretch(1)
         v.addLayout(row)
 
-        status = QLabel("Dispensed extreme not captured yet.")
+        status = QLabel("Plunger not zeroed yet — jog to empty and Set "
+                        "Dispensed.")
         status.setWordWrap(True)
         status.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
         v.addWidget(status)
@@ -2394,24 +2481,31 @@ class StageHardwarePanel(QWidget):
     def _pump_setup_capture_dispensed(self, pump: str) -> None:
         ctrl = self._controller
         status = self._pump_setup_status_lbls.get(pump)
-        if ctrl is None or not hasattr(ctrl, "capture_current_pump_raw"):
+        if ctrl is None or not hasattr(ctrl, "begin_pump_plunger_setup"):
             if status is not None:
                 status.setText("No controller available.")
             return
-        raw = ctrl.capture_current_pump_raw(pump)
-        if raw is None:
+        # The dispensed (empty) extreme is the "set zero" step: zero the pump's
+        # Marlin counter HERE so the datum is genuinely raw 0.0 and the full
+        # extreme reads a positive fill (G92 only rebases the counter, no move).
+        result = ctrl.begin_pump_plunger_setup(pump)
+        if not result.get("ok"):
             if status is not None:
                 status.setText(
-                    "Could not read the pump position (is the ZP controller "
+                    "Could not zero the pump position (is the ZP controller "
                     "connected?).")
             return
-        self._pump_setup_dispensed_raw[pump] = float(raw)
+        self._pump_setup_dispensed_raw[pump] = 0.0
+        self._pump_setup_persist_zero(pump)
         self._pump_setup_aspirated_btns[pump].setEnabled(True)
         if status is not None:
+            prev = result.get("previous_raw")
+            prev_txt = (f" (was raw {prev:.3f} mm)"
+                        if isinstance(prev, (int, float)) else "")
             status.setText(
-                f"{pump}: dispensed (empty) captured (raw {raw:.3f} mm) → will "
-                f"become fill 0. Now jog the plunger ALL THE WAY OUT (full) and "
-                f"click Set Aspirated.")
+                f"{pump}: zeroed at the dispensed (empty) extreme → position "
+                f"0.0{prev_txt}. Now jog the plunger ALL THE WAY OUT (full) and "
+                f"click Set Aspirated — it will read a positive fill.")
             status.setStyleSheet(f"color: {COLORS['blue']}; font-size: 9pt;")
 
     def _pump_setup_capture_aspirated(self, pump: str) -> None:
@@ -2466,6 +2560,20 @@ class StageHardwarePanel(QWidget):
         self._pump_setup_dispensed_raw[pump] = None
         self._pump_setup_aspirated_btns[pump].setEnabled(False)
 
+    def _pump_setup_persist_zero(self, pump: str) -> None:
+        """Persist just the re-zeroed datum after the 'Set Dispensed' step so the
+        saved zero_position matches the firmware G92 even if the operator stops
+        before capturing the aspirated extreme."""
+        ctrl = self._controller
+        s = self._settings
+        if ctrl is None or s is None:
+            return
+        try:
+            s.set_section("zero_position", ctrl.zero_position)
+            s.save()
+        except Exception as e:
+            logger.warning(f"Pump plunger zero persist failed ({pump}): {e}")
+
     def _pump_setup_persist(self, pump: str) -> None:
         """Persist the datum + the derived pump soft-limit extents after a
         successful capture, mirror them into the visible limit spinboxes, and
@@ -2480,10 +2588,16 @@ class StageHardwarePanel(QWidget):
             except AttributeError:
                 lo = hi = None
         # Reflect the captured extents into the visible safety-limit spinboxes.
+        # v7.5.x: the spinboxes are the user FILL frame (0 = empty → +full,
+        # always positive); ``lo/hi`` are raw Marlin. Convert + assign min/max
+        # by VALUE so a calibrated pump reads [0, +capacity] (the settings write
+        # below keeps the raw envelope). ``settings`` stores raw regardless.
         if lo is not None and hi is not None and hasattr(self, "spin_p_mins") \
                 and pump in self.spin_p_mins:
-            self.spin_p_mins[pump].setValue(float(lo))
-            self.spin_p_maxs[pump].setValue(float(hi))
+            _ua = self._pump_raw_to_user(pump, float(lo))
+            _ub = self._pump_raw_to_user(pump, float(hi))
+            self.spin_p_mins[pump].setValue(min(_ua, _ub))
+            self.spin_p_maxs[pump].setValue(max(_ua, _ub))
         if ctrl is None or s is None:
             return
         try:
@@ -2549,7 +2663,11 @@ class StageHardwarePanel(QWidget):
             v = self._logical_zp_value(zp, axis)
             if v is not None:
                 target_dict = self.spin_p_mins if which == "min" else self.spin_p_maxs
-                recorded_val = float(v)  # absolute Marlin raw mm
+                # v7.5.x: the pump limit spinboxes are the user FILL frame (0 =
+                # empty → +full, always positive), like Z. Convert the raw
+                # Marlin reading so stamping at empty records ~0 and at full
+                # records +capacity (not a negative). Stored back as raw on save.
+                recorded_val = self._pump_raw_to_user(axis, float(v))
                 target_dict[axis].setValue(recorded_val)
         # Update visible position labels with the fresh read
         self._update_position_displays(xy, zp)
@@ -2596,11 +2714,19 @@ class StageHardwarePanel(QWidget):
             self.chk_plate_flip_180.setChecked(
                 True if _flip is None else bool(_flip))
             self.chk_plate_flip_180.blockSignals(False)
+        # v7.5.x: pump limit spinboxes are the user FILL frame (0 = empty →
+        # +capacity = full, always positive), same as Z. Stored limits are
+        # absolute raw Marlin (what the clamp uses); convert each raw bound to
+        # the fill frame and assign min/max by VALUE (polarity-general — a
+        # calibrated pump with aspirate_sign=-1 has raw_min↔user_max, so the
+        # swap is essential to show [0, +cap] not [-cap, 0]).
         for pid in ("P1", "P2", "P3"):
-            self.spin_p_mins[pid].setValue(
-                float(s.get(f"safety_limits.{pid.lower()}_min", -50.0)))
-            self.spin_p_maxs[pid].setValue(
-                float(s.get(f"safety_limits.{pid.lower()}_max", 50.0)))
+            _raw_lo = float(s.get(f"safety_limits.{pid.lower()}_min", -50.0))
+            _raw_hi = float(s.get(f"safety_limits.{pid.lower()}_max", 50.0))
+            _ua = self._pump_raw_to_user(pid, _raw_lo)
+            _ub = self._pump_raw_to_user(pid, _raw_hi)
+            self.spin_p_mins[pid].setValue(min(_ua, _ub))
+            self.spin_p_maxs[pid].setValue(max(_ua, _ub))
         self.spin_max_xy_speed.setValue(float(s.get("safety_limits.max_xy_speed", 10000.0)))
         self.spin_max_z_feed.setValue(float(s.get("safety_limits.max_z_feedrate", 500.0)))
         self.spin_max_pump_feed.setValue(float(s.get("safety_limits.max_pump_feedrate", 200.0)))
@@ -2892,9 +3018,15 @@ class StageHardwarePanel(QWidget):
         _z_max_raw_out = max(_zr_a, _zr_b)
         s.set("safety_limits.z_min", _z_min_raw_out)
         s.set("safety_limits.z_max", _z_max_raw_out)
+        # v7.5.x: fill-frame spinboxes → absolute raw Marlin (min/max by VALUE,
+        # polarity-general), so the clamp keeps its raw envelope.
+        _p_raw = {}
         for pid in ("P1", "P2", "P3"):
-            s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
-            s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
+            _ra = self._pump_user_to_raw(pid, self.spin_p_mins[pid].value())
+            _rb = self._pump_user_to_raw(pid, self.spin_p_maxs[pid].value())
+            _p_raw[pid] = (min(_ra, _rb), max(_ra, _rb))
+            s.set(f"safety_limits.{pid.lower()}_min", _p_raw[pid][0])
+            s.set(f"safety_limits.{pid.lower()}_max", _p_raw[pid][1])
         s.set("safety_limits.max_xy_speed", self.spin_max_xy_speed.value())
         s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
         s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
@@ -2914,8 +3046,10 @@ class StageHardwarePanel(QWidget):
             for pid in ("P1", "P2", "P3"):
                 pid_l = pid.lower()
                 if hasattr(sl, f"{pid_l}_min"):
-                    setattr(sl, f"{pid_l}_min", self.spin_p_mins[pid].value())
-                    setattr(sl, f"{pid_l}_max", self.spin_p_maxs[pid].value())
+                    # v7.5.x: use the raw-converted bounds computed above so the
+                    # live clamp envelope stays in the raw Marlin frame.
+                    setattr(sl, f"{pid_l}_min", _p_raw[pid][0])
+                    setattr(sl, f"{pid_l}_max", _p_raw[pid][1])
             sl.max_xy_speed = self.spin_max_xy_speed.value()
             sl.max_z_feedrate = self.spin_max_z_feed.value()
             sl.max_pump_feedrate = self.spin_max_pump_feed.value()
@@ -3045,9 +3179,12 @@ class StageHardwarePanel(QWidget):
         _z_max_raw_out = max(_zr_a, _zr_b)
         s.set("safety_limits.z_min", _z_min_raw_out)
         s.set("safety_limits.z_max", _z_max_raw_out)
+        # v7.5.x: fill-frame spinboxes → absolute raw Marlin (min/max by VALUE).
         for pid in ("P1", "P2", "P3"):
-            s.set(f"safety_limits.{pid.lower()}_min", self.spin_p_mins[pid].value())
-            s.set(f"safety_limits.{pid.lower()}_max", self.spin_p_maxs[pid].value())
+            _ra = self._pump_user_to_raw(pid, self.spin_p_mins[pid].value())
+            _rb = self._pump_user_to_raw(pid, self.spin_p_maxs[pid].value())
+            s.set(f"safety_limits.{pid.lower()}_min", min(_ra, _rb))
+            s.set(f"safety_limits.{pid.lower()}_max", max(_ra, _rb))
         s.set("safety_limits.max_xy_speed", self.spin_max_xy_speed.value())
         s.set("safety_limits.max_z_feedrate", self.spin_max_z_feed.value())
         s.set("safety_limits.max_pump_feedrate", self.spin_max_pump_feed.value())
@@ -3118,9 +3255,14 @@ class StageHardwarePanel(QWidget):
         _u_b = self._z_raw_to_user(50.0)
         self.spin_z_min.setValue(min(_u_a, _u_b))
         self.spin_z_max.setValue(max(_u_a, _u_b))
+        # v7.5.x: pump spinboxes are the user FILL frame; show the raw ±50
+        # defaults converted by value (no-op for the symmetric default, but
+        # correct + consistent with Z on either polarity).
         for pid in ("P1", "P2", "P3"):
-            self.spin_p_mins[pid].setValue(-50.0)
-            self.spin_p_maxs[pid].setValue(50.0)
+            _pa = self._pump_raw_to_user(pid, -50.0)
+            _pb = self._pump_raw_to_user(pid, 50.0)
+            self.spin_p_mins[pid].setValue(min(_pa, _pb))
+            self.spin_p_maxs[pid].setValue(max(_pa, _pb))
         self.spin_max_xy_speed.setValue(10000.0)
         self.spin_max_z_feed.setValue(500.0)
         self.spin_max_pump_feed.setValue(200.0)

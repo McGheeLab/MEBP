@@ -2,7 +2,7 @@
 MEBP Bioprinter Application — Entry Point
 
 Supports two modes:
-  --headless : Xbox controller only (no GUI)
+  --headles : Xbox controller only (no GUI)
   (default)  : Full PyDracula-style GUI application
 
 GUI mode: stages start disconnected. Click Connect (real hardware) or
@@ -308,6 +308,14 @@ def main():
     # above; this re-establishes the direction the calibration owns.
     controller.apply_pump_convention(
         settings.get("device_profile.pump_setup"))
+
+    # v7.5.x: restore the per-pump compliance / "pressure relief" values (µL)
+    # measured by the Needle Location compliance calibration, and the global
+    # backlash-compensation enable toggle (take-up on reversal + unload on stop).
+    controller.apply_pump_relief(
+        settings.get("device_profile.pump_compliance_uL"))
+    controller.set_backlash_comp_enabled(
+        bool(settings.get("device_profile.backlash_comp_enabled")))
 
     if args.headless:
         run_headless(controller, settings)

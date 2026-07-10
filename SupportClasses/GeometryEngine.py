@@ -9,9 +9,12 @@ Print Object Types:
   3D (multi-layer): Sphere, Cube, Cylinder, Ellipsoid — each in shell/solid variants
 
 Key calculations:
-  - Line spacing = needle_OD × (1 - overlap_fraction)
-  - Volume conservation: flow_rate = travel_speed × needle_OD × layer_height
-  - Pump rate = flow_rate / syringe.cross_section_area
+  - Line spacing = needle_OD × (1 - overlap_fraction)  (fill raster pitch)
+  - Volume conservation (v7.5.x F-1): deposited volume per mm of travel =
+    inner-bore cross-section × extrusion_modifier  (NOT outer-Ø × layer_height;
+    layer_height is now only the Z step between stacked layers). See
+    ``compute_pump_positions`` / ``FlowPhysics.extrusion_flow_rate``.
+  - Pump travel per mm = volume_per_mm × syringe.mm_per_uL
   - Time parameterization based on target print speed
 
 All coordinates are in mm relative to well center. The trajectory planner
@@ -109,6 +112,12 @@ class PrintObject:
     # is persisted in print files / sessions.
     source: str = "parametric"              # "parametric" | "csv"
 
+    # v7.5.x (F-1): bead "thickness" multiplier. Deposited volume per mm of
+    # path = inner-bore area × this. 1.0 = a pure bore-sized stream. Quick
+    # Print has its own modifier knob; this carries it for the trajectory /
+    # Print-Builder path (UI exposure is a tracked follow-up).
+    extrusion_modifier: float = 1.0
+
     # Generated trajectory — set by generate_object_trajectory()
     trajectory: np.ndarray | None = None    # Nx7: [x, y, z, p1, p2, p3, t]
 
@@ -147,6 +156,7 @@ class PrintObject:
             "ink_assignments": dict(self.ink_assignments),
             "color": self.color,
             "source": self.source,
+            "extrusion_modifier": self.extrusion_modifier,
             "total_length_mm": self.total_length_mm,
             "total_volume_uL": self.total_volume_uL,
             "total_time_s": self.total_time_s,
@@ -170,6 +180,7 @@ class PrintObject:
             ink_assignments=data.get("ink_assignments", {}),
             color=data.get("color", "#a6e3a1"),
             source=data.get("source", "parametric"),
+            extrusion_modifier=float(data.get("extrusion_modifier", 1.0)),
             total_length_mm=data.get("total_length_mm", 0.0),
             total_volume_uL=data.get("total_volume_uL", 0.0),
             total_time_s=data.get("total_time_s", 0.0),
@@ -333,25 +344,31 @@ def compute_pump_positions(
     distances: np.ndarray,
     needle: NeedleSpec,
     syringe: SyringeSpec,
-    layer_height_mm: float,
+    layer_height_mm: float = 0.0,   # v7.5.x F-1: retained for compat; UNUSED for volume
+    extrusion_modifier: float = 1.0,
 ) -> np.ndarray:
     """
     Compute cumulative pump plunger positions along a path.
 
-    Volume conservation: deposited volume = needle_OD × layer_height × distance
-    Pump travel = volume / syringe.uL_per_mm  (since 1 mm³ = 1 µL)
+    v7.5.x (F-1) — bead model = inner-bore stream × modifier (see
+    ``FlowPhysics.extrusion_flow_rate``). ``layer_height`` no longer scales the
+    volume; it only sets the Z step between stacked layers elsewhere.
+
+      Volume per mm = π·(id/2)² × modifier  (µL/mm, since 1 mm³ = 1 µL)
+      Pump travel   = volume / syringe.uL_per_mm
 
     Args:
         distances: Cumulative path distances (mm) — N-length array
-        needle: Needle specification
+        needle: Needle specification (uses the INNER bore)
         syringe: Syringe specification
-        layer_height_mm: Layer height (mm)
+        layer_height_mm: Deprecated — ignored (kept for positional callers).
+        extrusion_modifier: Bead thickness multiplier (1.0 = pure bore stream).
 
     Returns:
         N-length array of cumulative pump positions (mm)
     """
-    # Volume per mm of travel = needle_OD × layer_height (µL/mm since mm² ≈ µL/mm)
-    volume_per_mm = needle.od_mm * layer_height_mm
+    # Volume per mm of travel = inner-bore cross-section × modifier (µL/mm).
+    volume_per_mm = needle.cross_section_area_mm2 * extrusion_modifier
     # Total volume along path
     volumes_uL = distances * volume_per_mm
     # Convert to pump plunger travel
@@ -361,15 +378,16 @@ def compute_pump_positions(
 def compute_total_volume(
     path_length_mm: float,
     needle: NeedleSpec,
-    layer_height_mm: float,
+    layer_height_mm: float = 0.0,   # v7.5.x F-1: retained for compat; UNUSED
+    extrusion_modifier: float = 1.0,
 ) -> float:
     """
-    Compute total ink volume for a path.
+    Compute total ink volume for a path (v7.5.x F-1: inner-bore × modifier).
 
     Returns:
         Volume in µL
     """
-    return path_length_mm * needle.od_mm * layer_height_mm
+    return path_length_mm * needle.cross_section_area_mm2 * extrusion_modifier
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +736,13 @@ def generate_object_trajectory(
     pump_col = {"P1": COL_P1, "P2": COL_P2, "P3": COL_P3}.get(pump_id, COL_P1)
     spacing = line_spacing(needle, overlap_fraction)
 
+    # v7.5.x (Finding E): the deposited volume per mm = inner-bore area ×
+    # this modifier. Previously this field existed on PrintObject but was never
+    # threaded here, so the parametric / trajectory print path ran locked at 1×
+    # (the bore-area minimum) with no way to thicken the bead. Read it once and
+    # thread it through every builder → compute_pump_positions.
+    mod = max(0.0, float(getattr(obj, "extrusion_modifier", 1.0) or 1.0))
+
     otype = obj.object_type
     p = obj.params
     ox, oy, oz = obj.position
@@ -735,6 +760,7 @@ def generate_object_trajectory(
                 p.get("num_points", 50),
             ),
             oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            modifier=mod,
         )
         obj.num_layers = 1
 
@@ -748,12 +774,13 @@ def generate_object_trajectory(
             traj = _gen_2d_fill_then_outline(
                 fill_pts, outline_pts, oz, print_speed_mm_s,
                 layer_height_mm, needle, syringe, pump_col,
-                outer_ring_volume_uL=outer_uL,
+                outer_ring_volume_uL=outer_uL, modifier=mod,
             )
         else:
             traj = _gen_2d_trajectory(
                 generate_circle(ox, oy, radius, num_points),
                 oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+                modifier=mod,
             )
         obj.num_layers = 1
 
@@ -767,12 +794,13 @@ def generate_object_trajectory(
             traj = _gen_2d_fill_then_outline(
                 fill_pts, outline_pts, oz, print_speed_mm_s,
                 layer_height_mm, needle, syringe, pump_col,
-                outer_ring_volume_uL=outer_uL,
+                outer_ring_volume_uL=outer_uL, modifier=mod,
             )
         else:
             traj = _gen_2d_trajectory(
                 generate_square(ox, oy, side, points_per_side),
                 oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+                modifier=mod,
             )
         obj.num_layers = 1
 
@@ -786,12 +814,13 @@ def generate_object_trajectory(
             traj = _gen_2d_fill_then_outline(
                 fill_pts, outline_pts, oz, print_speed_mm_s,
                 layer_height_mm, needle, syringe, pump_col,
-                outer_ring_volume_uL=outer_uL,
+                outer_ring_volume_uL=outer_uL, modifier=mod,
             )
         else:
             traj = _gen_2d_trajectory(
                 generate_triangle(ox, oy, side, points_per_side),
                 oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+                modifier=mod,
             )
         obj.num_layers = 1
 
@@ -800,6 +829,7 @@ def generate_object_trajectory(
             generate_spiral(ox, oy, p.get("max_radius", 2.0), spacing,
                            p.get("num_points_per_turn", 64)),
             oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+            modifier=mod,
         )
         obj.num_layers = 1
 
@@ -814,59 +844,68 @@ def generate_object_trajectory(
             traj = _gen_2d_fill_then_outline(
                 fill_pts, outline_pts, oz, print_speed_mm_s,
                 layer_height_mm, needle, syringe, pump_col,
-                outer_ring_volume_uL=outer_uL,
+                outer_ring_volume_uL=outer_uL, modifier=mod,
             )
         else:
             traj = _gen_2d_trajectory(
                 generate_ellipse(ox, oy, a, b, num_points),
                 oz, print_speed_mm_s, layer_height_mm, needle, syringe, pump_col,
+                modifier=mod,
             )
         obj.num_layers = 1
 
     # ----- 3D Shell Objects -----
     elif otype == ObjectType.SPHERE_SHELL.value:
         traj = _gen_sphere_shell(p, ox, oy, oz, spacing, print_speed_mm_s,
-                                 layer_height_mm, needle, syringe, pump_col)
+                                 layer_height_mm, needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.CUBE_SHELL.value:
         traj = _gen_cube_shell(p, ox, oy, oz, print_speed_mm_s,
-                               layer_height_mm, needle, syringe, pump_col)
+                               layer_height_mm, needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.CYLINDER_SHELL.value:
         traj = _gen_cylinder_shell(p, ox, oy, oz, print_speed_mm_s,
-                                   layer_height_mm, needle, syringe, pump_col)
+                                   layer_height_mm, needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.ELLIPSOID_SHELL.value:
         traj = _gen_ellipsoid_shell(p, ox, oy, oz, spacing, print_speed_mm_s,
-                                    layer_height_mm, needle, syringe, pump_col)
+                                    layer_height_mm, needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     # ----- 3D Solid Objects -----
     elif otype == ObjectType.SPHERE_SOLID.value:
         traj = _gen_sphere_solid(p, ox, oy, oz, spacing, fill_pattern,
                                  print_speed_mm_s, layer_height_mm,
-                                 needle, syringe, pump_col)
+                                 needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.CUBE_SOLID.value:
         traj = _gen_cube_solid(p, ox, oy, oz, spacing, fill_pattern,
                                print_speed_mm_s, layer_height_mm,
-                               needle, syringe, pump_col)
+                               needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.CYLINDER_SOLID.value:
         traj = _gen_cylinder_solid(p, ox, oy, oz, spacing, fill_pattern,
                                    print_speed_mm_s, layer_height_mm,
-                                   needle, syringe, pump_col)
+                                   needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     elif otype == ObjectType.ELLIPSOID_SOLID.value:
         traj = _gen_ellipsoid_solid(p, ox, oy, oz, spacing, fill_pattern,
                                     print_speed_mm_s, layer_height_mm,
-                                    needle, syringe, pump_col)
+                                    needle, syringe, pump_col,
+                                 modifier=mod)
         obj.num_layers = _count_layers(traj)
 
     else:
@@ -879,7 +918,7 @@ def generate_object_trajectory(
         obj.total_time_s = float(traj[-1, COL_T] - traj[0, COL_T])
         obj.total_length_mm = _path_length(traj[:, :3])
         obj.total_volume_uL = compute_total_volume(
-            obj.total_length_mm, needle, layer_height_mm
+            obj.total_length_mm, needle, layer_height_mm, extrusion_modifier=mod
         )
     return traj
 
@@ -917,6 +956,7 @@ def _gen_2d_trajectory(
     needle: NeedleSpec,
     syringe: SyringeSpec | None,
     pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Build trajectory for any 2D path at a fixed Z."""
     if len(xy_points) == 0:
@@ -925,7 +965,8 @@ def _gen_2d_trajectory(
     times, dists = _time_parameterize(xy_points, z, speed)
     pump_pos = np.zeros(len(xy_points))
     if syringe is not None:
-        pump_pos = compute_pump_positions(dists, needle, syringe, layer_h)
+        pump_pos = compute_pump_positions(
+            dists, needle, syringe, layer_h, modifier)
     return _build_trajectory(xy_points, z, times, pump_col, pump_pos)
 
 
@@ -939,6 +980,7 @@ def _gen_2d_fill_then_outline(
     syringe: SyringeSpec | None,
     pump_col: int,
     outer_ring_volume_uL: float = 0.0,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """
     Build a combined trajectory: raster fill, then perimeter outline.
@@ -964,7 +1006,7 @@ def _gen_2d_fill_then_outline(
     fill_pump = np.zeros(len(fill_pts))
     if syringe is not None:
         fill_pump = compute_pump_positions(
-            fill_dists, needle, syringe, layer_h)
+            fill_dists, needle, syringe, layer_h, modifier)
     fill_traj = _build_trajectory(
         fill_pts, z, fill_times, pump_col, fill_pump,
     )
@@ -979,9 +1021,11 @@ def _gen_2d_fill_then_outline(
     out_pump_deltas = np.zeros(len(outline_pts))
     if syringe is not None:
         # Natural extrusion the flow physics would compute for the
-        # outline at the current speed / layer height / needle
+        # outline at the current speed / layer height / needle. The
+        # extrusion modifier cancels in the outer_ring_volume_uL ratio
+        # below, so an explicit outer-ring target stays absolute.
         natural = compute_pump_positions(
-            out_dists, needle, syringe, layer_h)
+            out_dists, needle, syringe, layer_h, modifier)
         out_pump_deltas = natural - natural[0]
         if outer_ring_volume_uL and outer_ring_volume_uL > 0:
             # Scale deltas to hit the requested outer-ring volume
@@ -1012,6 +1056,7 @@ def _gen_multilayer(
     needle: NeedleSpec,
     syringe: SyringeSpec | None,
     pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """
     Build a multi-layer trajectory by stacking single-layer paths.
@@ -1030,7 +1075,8 @@ def _gen_multilayer(
         times, dists = _time_parameterize(xy, z, speed, t_start=t_offset)
         pump_pos = np.zeros(len(xy))
         if syringe is not None:
-            pump_pos = compute_pump_positions(dists, needle, syringe, layer_h) + p_offset
+            pump_pos = compute_pump_positions(
+                dists, needle, syringe, layer_h, modifier) + p_offset
 
         layer_traj = _build_trajectory(xy, z, times, pump_col, pump_pos)
         all_layers.append(layer_traj)
@@ -1060,6 +1106,7 @@ def _gen_sphere_shell(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Sphere shell: circular perimeters varying by Z."""
     radius = p.get("radius", 1.0)
@@ -1075,13 +1122,15 @@ def _gen_sphere_shell(
             return np.empty((0, 2))
         return generate_circle(ox, oy, r, n_pts)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_cube_shell(
     p: dict, ox: float, oy: float, oz: float,
     speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Cube shell: square perimeters stacked."""
     side = p.get("side", 2.0)
@@ -1094,13 +1143,15 @@ def _gen_cube_shell(
     def layer_gen(z):
         return generate_square(ox, oy, side, pps)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_cylinder_shell(
     p: dict, ox: float, oy: float, oz: float,
     speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Cylinder shell: circular perimeters stacked."""
     radius = p.get("radius", 1.0)
@@ -1113,13 +1164,15 @@ def _gen_cylinder_shell(
     def layer_gen(z):
         return generate_circle(ox, oy, radius, n_pts)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_ellipsoid_shell(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Ellipsoid shell: elliptical perimeters varying by Z."""
     a = p.get("a", 2.0)
@@ -1137,7 +1190,8 @@ def _gen_ellipsoid_shell(
             return np.empty((0, 2))
         return generate_ellipse(ox, oy, ra, rb, n_pts)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1202,7 @@ def _gen_sphere_solid(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, fill: str, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Sphere solid: filled circles per layer."""
     radius = p.get("radius", 1.0)
@@ -1164,13 +1219,15 @@ def _gen_sphere_solid(
             return generate_spiral_fill(ox, oy, r, spacing)
         return generate_circular_meander_fill(ox, oy, r, spacing)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_cube_solid(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, fill: str, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Cube solid: filled squares per layer."""
     side = p.get("side", 2.0)
@@ -1182,13 +1239,15 @@ def _gen_cube_solid(
     def layer_gen(z):
         return generate_meander_fill(ox, oy, side, side, spacing)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_cylinder_solid(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, fill: str, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Cylinder solid: filled circles stacked."""
     radius = p.get("radius", 1.0)
@@ -1202,13 +1261,15 @@ def _gen_cylinder_solid(
             return generate_spiral_fill(ox, oy, radius, spacing)
         return generate_circular_meander_fill(ox, oy, radius, spacing)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 def _gen_ellipsoid_solid(
     p: dict, ox: float, oy: float, oz: float,
     spacing: float, fill: str, speed: float, layer_h: float,
     needle: NeedleSpec, syringe: SyringeSpec | None, pump_col: int,
+    modifier: float = 1.0,
 ) -> np.ndarray:
     """Ellipsoid solid: filled elliptical cross-sections per layer."""
     a = p.get("a", 2.0)
@@ -1225,7 +1286,8 @@ def _gen_ellipsoid_solid(
             return np.empty((0, 2))
         return generate_elliptical_meander_fill(ox, oy, ra, rb, spacing)
 
-    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe, pump_col)
+    return _gen_multilayer(layer_gen, z_values, speed, lh, needle, syringe,
+                           pump_col, modifier)
 
 
 # ---------------------------------------------------------------------------

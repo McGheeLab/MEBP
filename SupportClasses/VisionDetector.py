@@ -1712,6 +1712,42 @@ def fit_circle_to_points(points) -> "tuple[float, float, float] | None":
     return NeedleDetector._fit_circle_kasa(arr)
 
 
+def find_template(frame: np.ndarray, patch: np.ndarray
+                  ) -> "tuple[float, float, float] | None":
+    """Locate ``patch`` inside ``frame`` by normalized cross-correlation.
+
+    v7.5.x: powers "Auto re-anchor mosaic" — the saved feature patch is
+    re-found in a live camera frame. Both images are matched in grayscale with
+    ``cv2.matchTemplate`` (TM_CCOEFF_NORMED, robust to uniform brightness
+    changes). Returns ``(cx, cy, confidence)`` — the patch CENTRE in frame
+    pixels plus the peak correlation in [−1, 1] — or None when matching is
+    impossible (missing/too-large patch). The CALLER gates on confidence
+    (≈0.5+ = trustworthy).
+    """
+    if frame is None or patch is None:
+        return None
+    try:
+        fh, fw = frame.shape[:2]
+        ph, pw = patch.shape[:2]
+    except Exception:
+        return None
+    if ph < 8 or pw < 8 or ph > fh or pw > fw:
+        return None
+    try:
+        f_gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                  if frame.ndim == 3 else frame)
+        p_gray = (cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                  if patch.ndim == 3 else patch)
+        res = cv2.matchTemplate(f_gray, p_gray, cv2.TM_CCOEFF_NORMED)
+        _min_v, max_v, _min_l, max_l = cv2.minMaxLoc(res)
+        cx = float(max_l[0]) + pw / 2.0
+        cy = float(max_l[1]) + ph / 2.0
+        return (cx, cy, float(max_v))
+    except Exception as exc:
+        logger.debug(f"find_template failed: {exc}")
+        return None
+
+
 def detect_rim_point_near_center(
     frame: np.ndarray,
     canny_low: int = 50,

@@ -307,9 +307,28 @@ class WellPlate:
         if isinstance(name_or_format, int):
             return cls.from_format(name_or_format)
 
+        name = name_or_format
+
+        # v7.5.x: a selectable plate TYPE (Corning glass-bottom, NEST plastic,
+        # …) is a thin overlay on a base standard format — resolve it to that
+        # format's geometry. The type's identity lives in `active_plate_key`
+        # (so per-plate mosaic/template/well-training stores segregate), NOT
+        # here: the runtime `format` stays the base int so every same-format
+        # guard / PLATE_DEFINITIONS lookup keeps working. Lazy import + guarded
+        # so an unknown id never crashes a caller.
+        try:
+            from SupportClasses.PlateTypeStore import get_store as _pt_store
+            plate_type = _pt_store().get(name)
+        except Exception:   # pragma: no cover - defensive
+            plate_type = None
+        if plate_type is not None and plate_type.base_format in PLATE_DEFINITIONS:
+            plate = cls.from_format(plate_type.base_format)
+            if plate_type.well_depth_mm is not None:
+                plate.well_depth_mm = float(plate_type.well_depth_mm)
+            return plate
+
         # Strip the "custom:" tag the dataclass uses internally so users
         # can round-trip `WellPlate.load(plate.format)`.
-        name = name_or_format
         if name.startswith("custom:"):
             name = name[7:]
 

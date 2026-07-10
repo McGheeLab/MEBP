@@ -8,12 +8,16 @@ short. Inside each column, top to bottom:
       ▌━━━━━━━━━━━━━━━━━━━━━┃░░░░░░ ▓▓▓▓▓ █████ ╞═╡──▶
                                                         ← needle tip
                          [P1]              ← PID chip
-                       42.3 µL             ← primary readout
+                       42.3 µL             ← LIVE plunger fill
                      100 µL · Ink A        ← capacity + ink subtext
 
 Three columns are arranged side-by-side in :class:`PumpRack`, giving
 the same "row with three columns" layout but with horizontal barrels
 that keep the total section height low.
+
+The primary readout reflects the LIVE plunger fill (how full the
+syringe is right now, derived from the plunger position via the
+controller's plunger calibration) — see :meth:`PumpColumn.set_live_fill`.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from PySide6.QtWidgets import (
 
 from gui.scaling import s, sf, sp
 from gui.styles import COLORS
-from SupportClasses.PhysicalModels import FluidColumn, PumpLoadout
+from SupportClasses.PhysicalModels import FluidColumn, PumpLoadout, SyringeSpec
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +230,14 @@ class PumpColumn(QWidget):
         super().__init__(parent)
         self._pump_id = pump_id
         self._loadout: PumpLoadout | None = None
+        # v7.5.x perf: set_live_fill runs on EVERY 300ms status tick AND every
+        # 33ms motion tick (jog pump panel + the always-mounted Custom "Syringe
+        # overview" section). setStyleSheet forces a full QSS re-parse of the
+        # widget subtree — doing it 4×/column/tick made the UI uniformly
+        # sluggish. Cache the last STYLE state so the (expensive) restyle only
+        # runs when the visual style actually changes; text + bar fraction (the
+        # only things that change every tick) update unconditionally + cheaply.
+        self._style_state: tuple | None = None
 
         self._card = QFrame(self)
         self._card.setObjectName("pumpColCard")
@@ -281,18 +293,136 @@ class PumpColumn(QWidget):
 
     def set_pump_loadout(self, loadout: PumpLoadout) -> None:
         self._loadout = loadout
+        self._style_state = None  # legacy path → force the next restyle
         self._refresh()
 
     def update_fluid_column(self, fc: FluidColumn) -> None:
         if self._loadout:
             self._loadout.fluid_column = fc
+            self._style_state = None
             self._refresh()
 
     def set_unconfigured(self) -> None:
         self._loadout = None
+        # Per-tick guard (see set_live_fill): only restyle on the first
+        # transition into the unconfigured state — this runs every tick for a
+        # pump with no syringe.
+        if self._style_state == ("unconfigured",):
+            return
+        self._style_state = ("unconfigured",)
         self._refresh()
 
+    def set_live_fill(
+        self,
+        *,
+        fill_uL: float | None,
+        capacity_uL: float | None,
+        raw_mm: float | None,
+        syringe: SyringeSpec | None,
+        ink_spec=None,
+        calibrated: bool,
+    ) -> None:
+        """v7.5.x: show the LIVE plunger fill — how much fluid is in the
+        syringe right now, derived from the live plunger position via the
+        controller's plunger calibration (0 = empty/fully dispensed →
+        capacity = full/fully aspirated). Mirrors the control-panel P1/P2/P3
+        readout and replaces the static, never-updated ``FluidColumn`` view.
+
+        * ``calibrated`` + ``fill_uL`` known → µL fill + a proportional bar.
+        * configured but un-calibrated → the raw plunger position (mm), which
+          still updates live, plus a "calibrate plunger" hint.
+        * no syringe configured → the "not configured" placeholder.
+        """
+        self._loadout = None  # live-fill path owns the display now
+
+        if syringe is None:
+            self.set_unconfigured()
+            return
+
+        # InkSpec's hex display colour is `.color` (NOT `display_color`, which
+        # is not an attribute — the getattr would silently fall through).
+        ink_color = getattr(ink_spec, "color", None) if ink_spec is not None \
+            else None
+        ink_name = getattr(ink_spec, "name", None) if ink_spec is not None \
+            else None
+        # A pump with no ink assigned still has a meaningful fill level — show
+        # it in a neutral accent rather than implying ink is loaded.
+        accent = ink_color if ink_color \
+            else COLORS.get("mauve", DEFAULT_INK_COLOR)
+
+        # Nominal capacity: calibrated stroke if available, else the syringe's
+        # rated volume (so the bar/subtext still read sensibly pre-calibration).
+        nominal_cap = (capacity_uL if capacity_uL and capacity_uL > 0
+                       else float(syringe.volume_uL))
+
+        live = bool(calibrated and fill_uL is not None)
+        warning = bool(live and fill_uL <= LOW_INK_THRESHOLD_UL)
+        # Everything that changes an actual STYLESHEET (accent, warning colour,
+        # calibrated-vs-raw layout, enabled state). Gate the QSS re-parse on it.
+        style_state = ("live" if live else "raw", accent, warning)
+        restyle = style_state != self._style_state
+        if restyle:
+            self._style_state = style_state
+            self._barrel.set_enabled_state(True)
+            self._refresh_card_style(active=True)
+            self._refresh_chip_style(active=True, ink_color=accent)
+            self._barrel.set_warning(warning)
+            if live:
+                self._set_vol_style("red" if warning else "text",
+                                    weight=800 if warning else 700)
+                self._set_sub_style("red" if warning else "subtext0",
+                                    weight=600 if warning else 400)
+            else:
+                self._set_vol_style("subtext0", weight=700)
+                self._set_sub_style("overlay0", italic=True)
+
+        if live:
+            frac = 0.0
+            if nominal_cap and nominal_cap > 0:
+                frac = max(0.0, min(1.0, fill_uL / nominal_cap))
+            self._barrel.set_fractions(
+                {"ink": frac, "empty": max(0.0, 1.0 - frac)}, accent)
+            # Normalise the "-0.0" that signed arithmetic produces at the empty
+            # datum; keep a genuine (past-empty) negative visible.
+            shown = 0.0 if round(fill_uL, 1) == 0.0 else fill_uL
+            self._vol_label.setText(f"{shown:.1f} µL")
+            cap_txt = f"{nominal_cap:g} µL"
+            short = ink_name if (ink_name and len(ink_name) <= 14) \
+                else (ink_name[:13] + "…" if ink_name else None)
+            sub = f"{cap_txt}  ·  {short}" if short else f"{cap_txt} full"
+            self._sub_label.setText(sub)
+            self._sub_label.setToolTip(
+                f"{shown:.2f} µL in a {nominal_cap:g} µL syringe"
+                + (f"  (raw {raw_mm:.3f} mm)" if raw_mm is not None else ""))
+        else:
+            # Configured but the plunger isn't calibrated — we can't express a
+            # true volume, but the raw position still updates live.
+            self._barrel.set_fractions({"empty": 1.0}, accent)
+            self._vol_label.setText(
+                f"{raw_mm:.2f} mm" if raw_mm is not None else "—")
+            self._sub_label.setText("calibrate plunger for µL")
+            self._sub_label.setToolTip(
+                "Run the Hardware Setup → Pump plunger calibration "
+                "(Set Dispensed / Set Aspirated) to read fill in µL.")
+
     # ── Styling helpers ────────────────────────────────────────────
+
+    def _set_vol_style(self, color_key: str, *, weight: int = 700) -> None:
+        self._vol_label.setStyleSheet(
+            f"color: {COLORS[color_key]};"
+            f"font-size: {sf(13)}pt;"
+            f"font-weight: {weight};"
+            f"letter-spacing: 0.3px;"
+        )
+
+    def _set_sub_style(self, color_key: str, *, italic: bool = False,
+                       weight: int = 400) -> None:
+        self._sub_label.setStyleSheet(
+            f"color: {COLORS[color_key]};"
+            f"font-size: {sf(8)}pt;"
+            + (f"font-weight: {weight};" if weight != 400 else "")
+            + ("font-style: italic;" if italic else "")
+        )
 
     def _refresh_card_style(self, active: bool) -> None:
         if active:
@@ -449,3 +579,17 @@ class PumpRack(QWidget):
                 col.set_pump_loadout(loadout)
             else:
                 col.set_unconfigured()
+
+    def update_live_fills(self, fills: dict[str, dict | None]) -> None:
+        """v7.5.x: drive each column from a live plunger-fill snapshot.
+
+        ``fills`` maps pump id → kwargs for :meth:`PumpColumn.set_live_fill`
+        (``fill_uL`` / ``capacity_uL`` / ``raw_mm`` / ``syringe`` /
+        ``ink_spec`` / ``calibrated``), or ``None`` for an unconfigured pump.
+        """
+        for pid, col in self.columns.items():
+            spec = fills.get(pid)
+            if spec is None:
+                col.set_unconfigured()
+            else:
+                col.set_live_fill(**spec)

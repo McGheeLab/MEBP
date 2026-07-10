@@ -1,0 +1,332 @@
+{
+  "version": "1.0",
+  "wells": {
+    "nest-plastic-24|C5": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "C5",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_C5_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            19322.354997291273,
+            19181.801842079916,
+            40116.03574929127,
+            39262.06240607992
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        },
+        "Cy5": {
+          "image": "fluor_mosaics/nest-plastic-24_C5_Cy5.png",
+          "color": [
+            255,
+            0,
+            230
+          ],
+          "extent_um": [
+            19322.354997291273,
+            19181.801842079916,
+            40116.03574929127,
+            39262.06240607992
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    },
+    "nest-plastic-24|D5": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "D5",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_D5_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            20146.329376872854,
+            950.1430651122279,
+            39519.28313687285,
+            19964.858385112228
+          ],
+          "um_per_px": 0.39109,
+          "mosaic_scale": 0.1290458869086776,
+          "frames": 252,
+          "exposure_us": 0.0,
+          "date": "2026-07-02"
+        }
+      },
+      "objective": "4x",
+      "date": "2026-07-02"
+    },
+    "nest-plastic-24|A5": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "A5",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_A5_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            19733.369736091026,
+            57078.67405407241,
+            40527.05048809102,
+            77158.93461807241
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449118,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-09"
+        },
+        "DAPI": {
+          "image": "fluor_mosaics/nest-plastic-24_A5_DAPI.png",
+          "color": [
+            60,
+            120,
+            255
+          ],
+          "extent_um": [
+            19733.369736091026,
+            57078.67405407241,
+            40527.05048809102,
+            77158.93461807241
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449118,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-09"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-09"
+    },
+    "nest-plastic-24|D4": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "D4",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_D4_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            39349.53836084016,
+            1042.7630441345786,
+            58722.492120840165,
+            20057.47836413458
+          ],
+          "um_per_px": 0.39109,
+          "mosaic_scale": 0.12904588690867758,
+          "frames": 252,
+          "exposure_us": 0.0,
+          "date": "2026-07-01"
+        }
+      },
+      "objective": "4x",
+      "date": "2026-07-01"
+    },
+    "nest-plastic-24|B4": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "B4",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_B4_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            38441.493588248144,
+            38374.8546286204,
+            59235.174340248144,
+            58455.115192620404
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    },
+    "nest-plastic-24|C6": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "C6",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_C6_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            141.62124334806163,
+            19144.844744288115,
+            20935.30199534806,
+            39225.10530828811
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    },
+    "nest-plastic-24|A4": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "A4",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_A4_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            38952.067239492055,
+            57059.49842513492,
+            59745.747991492055,
+            77139.75898913492
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-09"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-09"
+    },
+    "nest-plastic-24|B5": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "B5",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_B5_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            19260.759834304936,
+            38337.897530828595,
+            40054.44058630494,
+            58418.1580948286
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449114,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    },
+    "nest-plastic-24|B6": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "B6",
+      "channels": {
+        "FITC": {
+          "image": "fluor_mosaics/nest-plastic-24_B6_FITC.png",
+          "color": [
+            0,
+            230,
+            0
+          ],
+          "extent_um": [
+            80.02608036174047,
+            38300.940433036805,
+            20873.706832361742,
+            58381.20099703681
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        },
+        "Cy5": {
+          "image": "fluor_mosaics/nest-plastic-24_B6_Cy5.png",
+          "color": [
+            255,
+            0,
+            230
+          ],
+          "extent_um": [
+            80.02608036174047,
+            38300.940433036805,
+            20873.706832361742,
+            58381.20099703681
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    },
+    "nest-plastic-24|C4": {
+      "plate_key": "nest-plastic-24",
+      "well_name": "C4",
+      "channels": {
+        "Cy5": {
+          "image": "fluor_mosaics/nest-plastic-24_C4_Cy5.png",
+          "color": [
+            255,
+            0,
+            230
+          ],
+          "extent_um": [
+            38503.088751234485,
+            19218.758939871714,
+            59296.769503234485,
+            39299.01950387171
+          ],
+          "um_per_px": 0.778843,
+          "mosaic_scale": 0.12022883441449116,
+          "frames": 63,
+          "exposure_us": 0.0,
+          "date": "2026-07-08"
+        }
+      },
+      "objective": "2x",
+      "date": "2026-07-08"
+    }
+  }
+}

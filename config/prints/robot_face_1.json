@@ -1,0 +1,112 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "robot_face_1",
+    "description": "robot face: 3 shape(s), 1 layer(s), 28.5 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-07-02T17:31:41.926882+00:00",
+    "modified": "2026-07-02T17:31:41.926882+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "robot face": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\robot_face_1.csv",
+        "csv_path": "config\\prints\\robot_face_1.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 70,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "rect",
+              "cx": -1.9964077233947015,
+              "cy": -3.145217781769196,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 2.7319263583295914,
+              "height": 2.423709025594971,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "rect",
+              "cx": 2.3606645711719807,
+              "cy": -2.647867085765604,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 2.956084418500225,
+              "height": 2.773955994611585,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -3.4604400538841493,
+                  2.4657386618769648
+                ],
+                [
+                  3.2362819937135163,
+                  2.872025145936237
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 0.413,
+              "pump_index": 0,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false
+            }
+          ],
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 0.4,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

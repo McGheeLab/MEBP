@@ -576,6 +576,16 @@ class MosaicCalibrationDialog(QDialog):
         key = self._align_key
         if self._store is not None and key and corr > 0:
             try:
+                # Stamp the capture resolution the value was measured at, so a
+                # consumer at a different frame width (e.g. the objective-
+                # selectable fluorescence mosaic) can rescale it. Backward-
+                # compatible: the store makes it optional; the full-plate scan
+                # reads um_per_px without rescaling as before.
+                self._store.set_um_per_px(
+                    key, corr, source="quick_fov",
+                    resolution=(self._fw, self._fh))
+            except TypeError:
+                # Older store signature without the resolution kwarg.
                 self._store.set_um_per_px(key, corr, source="quick_fov")
             except Exception as e:
                 logger.warning(f"FOV store failed: {e}")

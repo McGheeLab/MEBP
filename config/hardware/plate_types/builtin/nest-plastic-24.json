@@ -1,0 +1,17 @@
+{
+  "id": "nest-plastic-24",
+  "base_format": 24,
+  "display_name": "NEST plastic-bottom (24-well)",
+  "manufacturer": "NEST",
+  "model": "polystyrene",
+  "bottom_material": "plastic",
+  "well_depth_mm": null,
+  "z_offsets": {
+    "top": 10.0,
+    "bottom": 27.4,
+    "safe": 5.0,
+    "max": 0.0
+  },
+  "builtin": true,
+  "_note": "z_offsets are mm BELOW the needle-cam fiducial; starting GUESSES only. Teach + 'Save Z offsets to plate type' to learn true values for this machine."
+}

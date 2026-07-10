@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QWidget, QSizePolicy
 from gui.styles import COLORS
 from gui.scaling import s
 from SupportClasses.SketchTrajectory import (
-    Sketch, SketchShape, compute_fill_region,
+    Sketch, SketchShape, compute_fill_region, backtrace_shape,
 )
 
 
@@ -41,10 +41,16 @@ class Tool(Enum):
     ELLIPSE = auto()
     POLYGON = auto()
     FILL = auto()      # paint-bucket: click inside an enclosed region
+    TRAVEL = auto()    # place a retract-&-move point (pen-up break)
 
 
 # Default per-pump colours for shapes.
 PUMP_HEX = ["#89b4fa", "#a6e3a1", "#f9b387"]
+
+# Colour for retract-&-move (travel) point markers — distinct from every pump
+# colour, the grey travel line, mauve selection, red safe-boundary and yellow
+# snap/warning cues.
+TRAVEL_HEX = "#f5c2e7"     # pink
 
 _HANDLE_PX = 7          # resize-handle half-size (screen px, pre-scale)
 _HIT_PX = 8             # hit-test tolerance (screen px, pre-scale)
@@ -67,7 +73,8 @@ class SketchCanvas(QWidget):
 
         self._sketch = Sketch()
         self._tool = Tool.SELECT
-        self._selected = -1
+        self._selected = -1                # primary index (single-shape props)
+        self._selection: set[int] = set()  # all selected shape indices
 
         # View transform: screen = origin + world * scale (px per mm).
         self._scale = 8.0
@@ -78,7 +85,7 @@ class SketchCanvas(QWidget):
         self._grid_mm = 5.0
         self._osnap = True                 # snap to existing object borders
         self._snap_marker = None           # world QPointF of active snap hit
-        self._active_pump = 0              # pump for new shapes/fills
+        self._active_ink_id = 1            # abstract ink for new shapes/fills
         self._default_line_width = 0.4     # bead width for new shapes (needle Ø)
         self._ref_well_d = 0.0             # reference standard-well Ø (mm); 0=off
         self._safe_well_d = 0.0            # needle-safe inner boundary Ø (mm); 0=off
@@ -86,9 +93,15 @@ class SketchCanvas(QWidget):
         # (pump_index | -1 for travel, [(x,y) world mm, ...]).
         self._tp_runs: list[tuple[int, list[tuple[float, float]]]] = []
         self._show_thickness = False       # draw print runs at the bead width
+        # World-mm width of the shaded thickness band (deposited bead). Set by
+        # the page to needle inner Ø × extrusion multiplier; 0 = fall back to
+        # the fill pitch (``line_spacing_mm``).
+        self._bead_width_mm = 0.0
 
         # Interaction state
-        self._mode = None                  # 'draw' | 'move' | 'resize' | 'pan' | 'poly'
+        # _mode: 'draw' | 'move' | 'resize' | 'pan' | 'poly'
+        #        | 'marquee' (rubber-band select) | 'gmove' | 'gresize'
+        self._mode = None
         self._draw_start = None            # world QPointF
         self._draw_cur = None
         self._poly_pts: list[tuple[float, float]] = []
@@ -96,6 +109,13 @@ class SketchCanvas(QWidget):
         self._move_orig = None             # snapshot of shape at grab
         self._resize_kind = None           # which handle
         self._pan_start = None
+        # Marquee (lasso) + group-transform state
+        self._marquee_start = None         # world QPointF
+        self._marquee_cur = None           # world QPointF
+        self._marquee_additive = False     # Ctrl/Shift → add to selection
+        self._group_orig = None            # {idx: SketchShape} snapshot at grab
+        self._group_anchor = None          # (x, y) scale anchor (world mm)
+        self._group_ref = None             # (x, y) handle pos at grab (world mm)
 
         # Undo
         self._undo: list[dict] = []
@@ -109,11 +129,19 @@ class SketchCanvas(QWidget):
 
     def set_sketch(self, sketch: Sketch):
         self._sketch = sketch
+        # Reset the active abstract ink to a valid one so new shapes reference
+        # an ink that exists in this sketch.
+        self._active_ink_id = sketch.inks[0].id if getattr(
+            sketch, "inks", None) else 1
         self._selected = -1
+        self._selection = set()
         self._undo.clear()
         self._redo.clear()
         self.selection_changed.emit(-1)
         self.update()
+
+    def active_ink_id(self) -> int:
+        return int(self._active_ink_id)
 
     def selected_index(self) -> int:
         return self._selected
@@ -124,7 +152,34 @@ class SketchCanvas(QWidget):
         return None
 
     def set_selected(self, index: int):
-        self._selected = index if 0 <= index < len(self._sketch.shapes) else -1
+        """Select exactly one shape (or none if out of range)."""
+        n = len(self._sketch.shapes)
+        self._set_selection({index} if 0 <= index < n else set())
+
+    def select_indices(self, indices):
+        """Select an explicit set of shapes (used by the sequence panel to
+        highlight a section's shapes on click)."""
+        self._set_selection({int(i) for i in indices})
+
+    def selected_indices(self) -> list[int]:
+        return sorted(self._selection)
+
+    def selection_count(self) -> int:
+        return len(self._selection)
+
+    def select_all(self):
+        self._set_selection(set(range(len(self._sketch.shapes))))
+
+    def clear_selection(self):
+        self._set_selection(set())
+
+    def _set_selection(self, indices: set[int]):
+        """Set the full selection set; the primary index (for the single-shape
+        properties panel) is the sole member when exactly one is selected."""
+        n = len(self._sketch.shapes)
+        self._selection = {i for i in indices if 0 <= i < n}
+        self._selected = (next(iter(self._selection))
+                          if len(self._selection) == 1 else -1)
         self.selection_changed.emit(self._selected)
         self.update()
 
@@ -135,8 +190,7 @@ class SketchCanvas(QWidget):
         self._poly_pts = []
         self._mode = None
         if tool != Tool.SELECT:
-            self._selected = -1
-            self.selection_changed.emit(-1)
+            self._set_selection(set())
         self.tool_changed.emit(tool)
         self.update()
 
@@ -149,8 +203,16 @@ class SketchCanvas(QWidget):
     def set_object_snap(self, enabled: bool):
         self._osnap = bool(enabled)
 
-    def set_active_pump(self, index: int):
-        self._active_pump = max(0, min(2, int(index)))
+    def set_active_ink(self, ink_id: int):
+        """Abstract ink id stamped on newly drawn shapes/fills."""
+        self._active_ink_id = int(ink_id)
+
+    def _active_ink_color(self) -> str:
+        """Colour of the active abstract ink (palette fallback if unknown)."""
+        ink = self._sketch.ink_by_id(self._active_ink_id)
+        if ink is not None:
+            return ink.color
+        return PUMP_HEX[(self._active_ink_id - 1) % len(PUMP_HEX)]
 
     def set_default_line_width(self, mm: float):
         """Bead width applied to newly drawn shapes (typically needle Ø)."""
@@ -170,11 +232,19 @@ class SketchCanvas(QWidget):
         self.update()
 
     def set_show_thickness(self, on: bool):
-        """When on, render print runs at the deposited bead width (the fill
-        pitch ``line_spacing_mm``, ≈ the needle Ø) instead of a thin line, so
-        the user sees how thick the printed lines will be."""
+        """When on, draw a shaded band around each print run at the deposited
+        bead width (see :meth:`set_bead_width_mm`), with a crisp centerline on
+        top, so the user sees how thick the printed lines will be."""
         self._show_thickness = bool(on)
         self.update()
+
+    def set_bead_width_mm(self, mm: float):
+        """World-mm width of the shaded print-thickness band — the deposited
+        bead. Typically needle inner Ø × extrusion multiplier. 0 falls back to
+        the fill pitch (``line_spacing_mm``)."""
+        self._bead_width_mm = max(0.0, float(mm or 0.0))
+        if self._show_thickness:
+            self.update()
 
     def set_toolpath(self, trajectory, pump_states):
         """Set the compiled toolpath to render as the main raster view.
@@ -221,8 +291,10 @@ class SketchCanvas(QWidget):
             span_x = max(maxx - minx, 1.0)
             span_y = max(maxy - miny, 1.0)
             margin = 0.85
-            self._scale = max(1.0, min((w * margin) / span_x,
-                                       (h * margin) / span_y))
+            # Clamp to the same ceiling as wheel-zoom so a tiny-span sketch
+            # (e.g. only tightly-clustered travel points) can't zoom to absurdity.
+            self._scale = min(200.0, max(1.0, min((w * margin) / span_x,
+                                                   (h * margin) / span_y)))
             cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
             self._origin = QPointF(w / 2 - cx * self._scale,
                                    h / 2 - cy * self._scale)
@@ -257,19 +329,25 @@ class SketchCanvas(QWidget):
 
     def _restore(self, snap: dict):
         self._sketch = Sketch.from_dict(snap)
-        self._selected = min(self._selected, len(self._sketch.shapes) - 1)
+        keep = {i for i in self._selection
+                if 0 <= i < len(self._sketch.shapes)}
+        self._selection = keep
+        self._selected = next(iter(keep)) if len(keep) == 1 else -1
         self.selection_changed.emit(self._selected)
         self.sketch_changed.emit()
         self.update()
 
     def delete_selected(self):
-        if 0 <= self._selected < len(self._sketch.shapes):
-            self._snapshot()
-            self._sketch.shapes.pop(self._selected)
-            self._selected = -1
-            self.selection_changed.emit(-1)
-            self.sketch_changed.emit()
-            self.update()
+        """Delete every selected shape (supports multi-selection)."""
+        if not self._selection:
+            return
+        self._snapshot()
+        for i in sorted(self._selection, reverse=True):
+            if 0 <= i < len(self._sketch.shapes):
+                self._sketch.shapes.pop(i)
+        self._set_selection(set())
+        self.sketch_changed.emit()
+        self.update()
 
     # ── Coordinate transforms ─────────────────────────────────────
 
@@ -312,6 +390,9 @@ class SketchCanvas(QWidget):
         out = []
         for i, sh in enumerate(self._sketch.shapes):
             if i == exclude or sh.kind == "region":
+                continue
+            if sh.kind == "travel":
+                out.append((sh.cx, sh.cy))
                 continue
             if sh.kind in ("circle", "ellipse", "rect"):
                 out.append((sh.cx, sh.cy))
@@ -371,6 +452,8 @@ class SketchCanvas(QWidget):
 
     @staticmethod
     def _shape_extent(sh: SketchShape):
+        if sh.kind == "travel":
+            return [(sh.cx, sh.cy)]
         if sh.kind == "circle":
             return [(sh.cx - sh.radius, sh.cy - sh.radius),
                     (sh.cx + sh.radius, sh.cy + sh.radius)]
@@ -381,6 +464,79 @@ class SketchCanvas(QWidget):
             return [(sh.cx - sh.width / 2, sh.cy - sh.height / 2),
                     (sh.cx + sh.width / 2, sh.cy + sh.height / 2)]
         return list(sh.points)
+
+    # ── Group selection geometry / transforms ─────────────────────
+
+    def _group_bbox(self):
+        """Bounding box (minx, miny, maxx, maxy) of all selected shapes' extents,
+        or None when nothing is selected."""
+        xs, ys = [], []
+        for i in self._selection:
+            if 0 <= i < len(self._sketch.shapes):
+                for (x, y) in self._shape_extent(self._sketch.shapes[i]):
+                    xs.append(x)
+                    ys.append(y)
+        if not xs:
+            return None
+        return min(xs), min(ys), max(xs), max(ys)
+
+    @staticmethod
+    def _shape_bbox(sh: SketchShape):
+        xs = [x for x, _ in SketchCanvas._shape_extent(sh)]
+        ys = [y for _, y in SketchCanvas._shape_extent(sh)]
+        if not xs:
+            return None
+        return min(xs), min(ys), max(xs), max(ys)
+
+    @staticmethod
+    def _transform_shape(dst: SketchShape, src: SketchShape,
+                         translate, anchor, sc):
+        """Rebuild ``dst`` from snapshot ``src`` under an optional translation
+        ``(dx, dy)`` then a uniform scale ``sc`` about ``anchor`` (world mm).
+        Used for group move (sc=None) and group resize (translate=None)."""
+        def xf(x, y):
+            if translate is not None:
+                x += translate[0]
+                y += translate[1]
+            if sc is not None and anchor is not None:
+                x = anchor[0] + (x - anchor[0]) * sc
+                y = anchor[1] + (y - anchor[1]) * sc
+            return x, y
+
+        k = src.kind
+        if k in ("circle", "ellipse", "rect", "travel"):
+            dst.cx, dst.cy = xf(src.cx, src.cy)
+            if sc is not None:                  # travel points carry no size
+                if k == "circle":
+                    dst.radius = max(0.05, src.radius * sc)
+                elif k == "ellipse":
+                    dst.rx = max(0.05, src.rx * sc)
+                    dst.ry = max(0.05, src.ry * sc)
+                elif k == "rect":
+                    dst.width = max(0.05, src.width * sc)
+                    dst.height = max(0.05, src.height * sc)
+                # k == "travel": position-only, carries no size — nothing to scale
+        else:                                   # line / polygon / region
+            dst.points = [xf(px, py) for (px, py) in src.points]
+
+    def scale_selection(self, factor: float):
+        """Uniformly scale every selected shape about the selection's centre
+        by ``factor`` (used by the properties-panel 'Apply scale' button)."""
+        if not self._selection or factor <= 0:
+            return
+        bbox = self._group_bbox()
+        if bbox is None:
+            return
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        self._snapshot()
+        for i in list(self._selection):
+            if 0 <= i < len(self._sketch.shapes):
+                sh = self._sketch.shapes[i]
+                self._transform_shape(sh, copy.deepcopy(sh), None,
+                                      (cx, cy), float(factor))
+        self.sketch_changed.emit()
+        self.update()
 
     # ── Painting ──────────────────────────────────────────────────
 
@@ -401,8 +557,9 @@ class SketchCanvas(QWidget):
         self._draw_toolpath(p)             # the raster (what prints)
 
         for i, sh in enumerate(self._sketch.shapes):
-            self._draw_shape(p, sh, selected=(i == self._selected))
+            self._draw_shape(p, sh, selected=(i in self._selection))
 
+        self._draw_selection_overlay(p)
         self._draw_in_progress(p)
 
         if self._snap_marker is not None:
@@ -476,28 +633,50 @@ class SketchCanvas(QWidget):
     def _draw_toolpath(self, p: QPainter):
         if not self._tp_runs:
             return
-        # Bead width to stroke print runs at when "show thickness" is on — the
-        # deposited line per pass is the fill pitch (≈ the needle Ø).
-        bead_px = max(1.0, self._sketch.line_spacing_mm * self._scale)
+        # Width of the shaded bead band when "show thickness" is on — the
+        # deposited bead (needle inner Ø × extrusion multiplier, pushed via
+        # ``set_bead_width_mm``); falls back to the fill pitch when unset.
+        bead_mm = (self._bead_width_mm if self._bead_width_mm > 0
+                   else self._sketch.line_spacing_mm)
+        bead_px = max(1.0, bead_mm * self._scale)
+        p.setBrush(Qt.NoBrush)
         for cat, wpts in self._tp_runs:
             if len(wpts) < 2:
                 continue
             poly = QPolygonF([self._w2s(x, y) for (x, y) in wpts])
-            if cat < 0:                    # travel move (never deposited)
-                pen = QPen(QColor(150, 150, 150, 70), s(0.8), Qt.DashLine)
-            else:                          # print move — colour by pump
-                col = QColor(PUMP_HEX[cat % len(PUMP_HEX)])
-                if self._show_thickness:   # render the real bead footprint
-                    col.setAlpha(140)
-                    pen = QPen(col, bead_px)
-                else:
-                    col.setAlpha(235)
-                    pen = QPen(col, s(1.6))
+            if cat < 0:                    # travel / fast move (never deposited)
+                col = QColor(COLORS.get("overlay1", "#7f849c"))
+                col.setAlpha(200)
+                pen = QPen(col, s(1.0), Qt.DashLine)
+                p.setPen(pen)
+                p.drawPolyline(poly)
+                continue
+            # Print move — colour by pump.
+            base = QColor(PUMP_HEX[cat % len(PUMP_HEX)])
+            if self._show_thickness:
+                # Shaded deposited-bead footprint …
+                band = QColor(base)
+                band.setAlpha(80)
+                band_pen = QPen(band, bead_px)
+                band_pen.setCapStyle(Qt.RoundCap)
+                band_pen.setJoinStyle(Qt.RoundJoin)
+                p.setPen(band_pen)
+                p.drawPolyline(poly)
+                # … with a crisp centerline on top so the path stays legible.
+                core = QColor(base)
+                core.setAlpha(235)
+                core_pen = QPen(core, s(1.3))
+                core_pen.setCapStyle(Qt.RoundCap)
+                core_pen.setJoinStyle(Qt.RoundJoin)
+                p.setPen(core_pen)
+                p.drawPolyline(poly)
+            else:
+                base.setAlpha(235)
+                pen = QPen(base, s(1.6))
                 pen.setCapStyle(Qt.RoundCap)
                 pen.setJoinStyle(Qt.RoundJoin)
-            p.setPen(pen)
-            p.setBrush(Qt.NoBrush)
-            p.drawPolyline(poly)
+                p.setPen(pen)
+                p.drawPolyline(poly)
 
     def _draw_shape(self, p: QPainter, sh: SketchShape, selected: bool):
         """Editable overlay: thin shape boundary on top of the raster. The
@@ -505,6 +684,30 @@ class SketchCanvas(QWidget):
         overlay is just a slim outline + handles for editing."""
         col = QColor(sh.color)
         bright = QColor(COLORS.get("text", "#cdd6f4"))
+
+        # Retract-&-move point: a colour-coded diamond with an up-chevron
+        # (needle lifts here). No printed geometry.
+        if sh.kind == "travel":
+            c = self._w2s(sh.cx, sh.cy)
+            tc = QColor(TRAVEL_HEX)
+            r = s(6)
+            diamond = QPolygonF([
+                QPointF(c.x(), c.y() - r), QPointF(c.x() + r, c.y()),
+                QPointF(c.x(), c.y() + r), QPointF(c.x() - r, c.y())])
+            fill = QColor(tc)
+            fill.setAlpha(170 if selected else 90)
+            p.setBrush(QBrush(fill))
+            p.setPen(QPen(bright if selected else tc,
+                          s(2) if selected else s(1.5)))
+            p.drawPolygon(diamond)
+            # Up-chevron = retract cue.
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(bright if selected else tc, s(1.5)))
+            p.drawLine(QPointF(c.x() - r * 0.45, c.y() + r * 0.15),
+                       QPointF(c.x(), c.y() - r * 0.45))
+            p.drawLine(QPointF(c.x() + r * 0.45, c.y() + r * 0.15),
+                       QPointF(c.x(), c.y() - r * 0.45))
+            return
 
         # Region = baked fill: a dashed bounding outline so it's selectable.
         if sh.kind == "region":
@@ -552,8 +755,15 @@ class SketchCanvas(QWidget):
                 else:
                     p.drawPolyline(poly)
 
-        if selected and self._tool == Tool.SELECT:
+        # Per-shape resize handles only for a lone selection; a multi-selection
+        # uses the group bounding-box handle instead.
+        if (selected and self._tool == Tool.SELECT
+                and len(self._selection) == 1):
             self._draw_handles(p, sh)
+            # Draggable print-start marker (outline shapes only) — lets the user
+            # set WHERE the shape begins printing, snapping to existing lines.
+            if self._shape_supports_start(sh):
+                self._draw_start_marker(p, sh)
 
     def _draw_handles(self, p: QPainter, sh: SketchShape):
         p.setBrush(QBrush(QColor(COLORS.get("blue", "#89b4fa"))))
@@ -562,6 +772,59 @@ class SketchCanvas(QWidget):
         for (hx, hy) in self._handle_points(sh).values():
             c = self._w2s(hx, hy)
             p.drawRect(int(c.x() - hh), int(c.y() - hh), 2 * hh, 2 * hh)
+
+    def _draw_start_marker(self, p: QPainter, sh: SketchShape):
+        """Green print-start marker for the selected outline shape: a dot on the
+        shape's effective start + a leader to a small flag offset outward (so it
+        never collides with the blue resize handles). Drag it to set the start
+        point (see ``_press_select`` / ``_apply_resize``)."""
+        green = QColor(COLORS.get("green", "#a6e3a1"))
+        sw_world = self._effective_start_world(sh)
+        sw = self._w2s(sw_world.x(), sw_world.y())
+        m = self._start_marker_screen(sh)
+        p.setPen(QPen(green, s(1.2)))
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(sw, m)
+        p.setBrush(QBrush(green))
+        p.setPen(QPen(green, s(1)))
+        p.drawEllipse(sw, s(3), s(3))
+        r = s(6)
+        tri = QPolygonF([QPointF(m.x() - r, m.y() - r),
+                         QPointF(m.x() + r, m.y() - r),
+                         QPointF(m.x(), m.y() + r)])
+        fill = QColor(green)
+        fill.setAlpha(210)
+        p.setBrush(QBrush(fill))
+        p.setPen(QPen(QColor(COLORS.get("crust", "#11111b")), s(1)))
+        p.drawPolygon(tri)
+
+    def _draw_selection_overlay(self, p: QPainter):
+        """Group bounding box + resize handle (2+ selected) and the marquee
+        rubber-band while a lasso drag is in progress."""
+        blue = QColor(COLORS.get("blue", "#89b4fa"))
+        if len(self._selection) >= 2:
+            bbox = self._group_bbox()
+            if bbox is not None:
+                tl = self._w2s(bbox[0], bbox[1])
+                br = self._w2s(bbox[2], bbox[3])
+                p.setPen(QPen(blue, s(1.4), Qt.DashLine))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(QRectF(tl, br))
+                # Bottom-right corner = the group resize handle.
+                hh = s(_HANDLE_PX)
+                p.setBrush(QBrush(blue))
+                p.setPen(QPen(QColor(COLORS.get("crust", "#11111b")), 1))
+                p.drawRect(int(br.x() - hh), int(br.y() - hh), 2 * hh, 2 * hh)
+
+        if (self._mode == "marquee" and self._marquee_start is not None
+                and self._marquee_cur is not None):
+            a = self._w2s(self._marquee_start.x(), self._marquee_start.y())
+            b = self._w2s(self._marquee_cur.x(), self._marquee_cur.y())
+            fill = QColor(blue)
+            fill.setAlpha(40)
+            p.setPen(QPen(blue, s(1.2), Qt.DashLine))
+            p.setBrush(QBrush(fill))
+            p.drawRect(QRectF(a, b))
 
     @staticmethod
     def _handle_points(sh: SketchShape) -> dict:
@@ -646,9 +909,11 @@ class SketchCanvas(QWidget):
             return
 
         if self._tool == Tool.SELECT:
-            self._press_select(pos, raw)
+            self._press_select(pos, raw, event.modifiers())
         elif self._tool == Tool.FILL:
             self._do_fill(raw)
+        elif self._tool == Tool.TRAVEL:
+            self._place_travel(w)
         elif self._tool == Tool.POLYGON:
             self._poly_pts.append((w.x(), w.y()))
             self._mode = "poly"
@@ -666,6 +931,23 @@ class SketchCanvas(QWidget):
         if self._mode == "pan" and self._pan_start is not None:
             self._origin += pos - self._pan_start
             self._pan_start = pos
+            self.update()
+            return
+
+        if self._mode == "marquee":
+            self._marquee_cur = raw
+            self.update()
+            return
+
+        if self._mode == "gmove" and self._group_orig is not None:
+            # No object-snap here: it would latch onto the very shapes being
+            # dragged (``_snap`` can exclude only one index, not the group).
+            self._apply_group_move(raw)
+            self.update()
+            return
+
+        if self._mode == "gresize" and self._group_orig is not None:
+            self._apply_group_resize(raw)
             self.update()
             return
 
@@ -691,7 +973,7 @@ class SketchCanvas(QWidget):
 
         # Idle hover with a drawing tool — preview the snap target.
         if self._tool in (Tool.LINE, Tool.RECT, Tool.CIRCLE, Tool.ELLIPSE,
-                          Tool.POLYGON):
+                          Tool.POLYGON, Tool.TRAVEL):
             self._snap(raw)
             self.update()
 
@@ -705,10 +987,27 @@ class SketchCanvas(QWidget):
             self._commit_draw()
             return
 
+        if self._mode == "marquee":
+            self._commit_marquee()
+            return
+
         if self._mode in ("move", "resize"):
+            # A start-point drag changes the shape's custom/default state, so
+            # nudge the properties panel to rebuild (via selection_changed).
+            was_start = (self._mode == "resize" and self._resize_kind == "start")
             self._mode = None
             self._move_orig = None
             self._resize_kind = None
+            self.sketch_changed.emit()
+            if was_start:
+                self.selection_changed.emit(self._selected)
+            return
+
+        if self._mode in ("gmove", "gresize"):
+            self._mode = None
+            self._group_orig = None
+            self._group_anchor = None
+            self._group_ref = None
             self.sketch_changed.emit()
             return
 
@@ -718,11 +1017,14 @@ class SketchCanvas(QWidget):
 
     def keyPressEvent(self, event):
         k = event.key()
-        if k in (Qt.Key_Delete, Qt.Key_Backspace):
+        if k == Qt.Key_A and (event.modifiers() & Qt.ControlModifier):
+            self.select_all()
+        elif k in (Qt.Key_Delete, Qt.Key_Backspace):
             self.delete_selected()
         elif k == Qt.Key_Escape:
             self._poly_pts = []
             self._mode = None
+            self.clear_selection()
             self.update()
         elif k in (Qt.Key_Return, Qt.Key_Enter):
             if self._tool == Tool.POLYGON and self._mode == "poly":
@@ -732,24 +1034,143 @@ class SketchCanvas(QWidget):
 
     # ── Interaction helpers ───────────────────────────────────────
 
-    def _press_select(self, screen_pos: QPointF, w: QPointF):
-        # Resize handle first (for the already-selected shape).
-        sh = self.selected_shape()
-        if sh is not None:
-            kind = self._handle_at(sh, screen_pos)
-            if kind is not None:
-                self._snapshot()
-                self._mode = "resize"
-                self._resize_kind = kind
-                return
-        # Otherwise hit-test shapes (topmost first).
+    def _press_select(self, screen_pos: QPointF, w: QPointF, modifiers=None):
+        additive = bool(modifiers is not None and (
+            modifiers & (Qt.ControlModifier | Qt.ShiftModifier)))
+
+        # 1) Group resize handle (bottom-right of the multi-selection bbox).
+        if len(self._selection) >= 2 and self._group_handle_at(screen_pos):
+            self._begin_group_resize()
+            return
+
+        # 2) Per-shape resize handle for a lone selection. The print-start flag
+        # is checked FIRST (it sits offset outside the shape) so it stays
+        # grabbable even where it would otherwise overlap an endpoint handle.
+        if len(self._selection) == 1:
+            sh = self.selected_shape()
+            if sh is not None:
+                if (self._shape_supports_start(sh)
+                        and self._start_handle_at(sh, screen_pos)):
+                    self._snapshot()
+                    self._mode = "resize"
+                    self._resize_kind = "start"
+                    return
+                kind = self._handle_at(sh, screen_pos)
+                if kind is not None:
+                    self._snapshot()
+                    self._mode = "resize"
+                    self._resize_kind = kind
+                    return
+
+        # 3) Hit-test shapes (topmost first).
         idx = self._shape_at(w)
-        self.set_selected(idx)
         if idx >= 0:
+            if additive:                       # Ctrl/Shift → toggle membership
+                sel = set(self._selection)
+                sel.discard(idx) if idx in sel else sel.add(idx)
+                self._set_selection(sel)
+                return
+            if idx in self._selection and len(self._selection) >= 2:
+                self._begin_group_move(w)      # drag within a group → move all
+                return
+            self.set_selected(idx)             # select one + start moving it
             self._snapshot()
             self._mode = "move"
             self._move_anchor = w
             self._move_orig = copy.deepcopy(self._sketch.shapes[idx])
+            return
+
+        # 4) Empty space → marquee (lasso) rubber-band select.
+        self._mode = "marquee"
+        self._marquee_start = w
+        self._marquee_cur = w
+        self._marquee_additive = additive
+        self.update()
+
+    # ── Group / marquee interaction ───────────────────────────────
+
+    def _group_handle_at(self, screen_pos: QPointF) -> bool:
+        bbox = self._group_bbox()
+        if bbox is None:
+            return False
+        c = self._w2s(bbox[2], bbox[3])        # bottom-right corner
+        tol = s(_HIT_PX) + s(_HANDLE_PX)
+        return math.hypot(c.x() - screen_pos.x(),
+                          c.y() - screen_pos.y()) <= tol
+
+    def _group_snapshot(self) -> dict:
+        return {i: copy.deepcopy(self._sketch.shapes[i])
+                for i in self._selection if 0 <= i < len(self._sketch.shapes)}
+
+    def _begin_group_move(self, w: QPointF):
+        self._snapshot()
+        self._mode = "gmove"
+        self._move_anchor = w
+        self._group_orig = self._group_snapshot()
+
+    def _begin_group_resize(self):
+        bbox = self._group_bbox()
+        if bbox is None:
+            return
+        self._snapshot()
+        self._mode = "gresize"
+        self._group_anchor = (bbox[0], bbox[1])    # top-left = scale anchor
+        self._group_ref = (bbox[2], bbox[3])       # bottom-right = grabbed handle
+        self._group_orig = self._group_snapshot()
+
+    def _apply_group_move(self, w: QPointF):
+        if self._move_anchor is None:
+            return
+        dx = w.x() - self._move_anchor.x()
+        dy = w.y() - self._move_anchor.y()
+        for idx, orig in self._group_orig.items():
+            if 0 <= idx < len(self._sketch.shapes):
+                self._transform_shape(self._sketch.shapes[idx], orig,
+                                      (dx, dy), None, None)
+
+    def _apply_group_resize(self, w: QPointF):
+        ax, ay = self._group_anchor
+        rx, ry = self._group_ref
+        d0 = math.hypot(rx - ax, ry - ay)
+        if d0 < 1e-6:
+            return
+        sc = max(0.05, min(50.0, math.hypot(w.x() - ax, w.y() - ay) / d0))
+        for idx, orig in self._group_orig.items():
+            if 0 <= idx < len(self._sketch.shapes):
+                self._transform_shape(self._sketch.shapes[idx], orig,
+                                      None, (ax, ay), sc)
+
+    def _commit_marquee(self):
+        a, b = self._marquee_start, self._marquee_cur
+        additive = self._marquee_additive
+        self._mode = None
+        self._marquee_start = self._marquee_cur = None
+        self._marquee_additive = False
+        if a is None or b is None:
+            self.update()
+            return
+        # A negligible drag = a click on empty space → clear (unless additive).
+        if abs(b.x() - a.x()) < 0.2 and abs(b.y() - a.y()) < 0.2:
+            if not additive:
+                self._set_selection(set())
+            else:
+                self.update()
+            return
+        rect = (min(a.x(), b.x()), min(a.y(), b.y()),
+                max(a.x(), b.x()), max(a.y(), b.y()))
+        hits = {i for i, sh in enumerate(self._sketch.shapes)
+                if self._shape_in_rect(sh, rect)}
+        self._set_selection((set(self._selection) | hits) if additive else hits)
+
+    def _shape_in_rect(self, sh: SketchShape, rect) -> bool:
+        """True when a shape's bounding box intersects the marquee rectangle."""
+        bb = self._shape_bbox(sh)
+        if bb is None:
+            return False
+        sminx, sminy, smaxx, smaxy = bb
+        rminx, rminy, rmaxx, rmaxy = rect
+        return not (smaxx < rminx or sminx > rmaxx
+                    or smaxy < rminy or sminy > rmaxy)
 
     def _handle_at(self, sh: SketchShape, screen_pos: QPointF):
         tol = s(_HIT_PX) + s(_HANDLE_PX)
@@ -758,6 +1179,130 @@ class SketchCanvas(QWidget):
             if math.hypot(c.x() - screen_pos.x(), c.y() - screen_pos.y()) <= tol:
                 return name
         return None
+
+    # ── Print-start point (continuity control) ────────────────────
+
+    @staticmethod
+    def _shape_supports_start(sh: SketchShape) -> bool:
+        """Only unfilled outlines have a controllable print-start point; fills /
+        regions (rasters) and travel markers do not."""
+        return (sh.kind in ("line", "circle", "ellipse", "rect", "polygon")
+                and not sh.filled)
+
+    @staticmethod
+    def _default_start_world(sh: SketchShape):
+        """Geometric default start (matches the compiler's untouched path)."""
+        k = sh.kind
+        if k == "circle":
+            return (sh.cx + sh.radius, sh.cy)
+        if k == "ellipse":
+            return (sh.cx + sh.rx, sh.cy)
+        if k == "rect":
+            return (sh.cx - sh.width / 2, sh.cy - sh.height / 2)
+        if k in ("line", "polygon") and sh.points:
+            return (sh.points[0][0], sh.points[0][1])
+        return (sh.cx, sh.cy)
+
+    @staticmethod
+    def _resolve_start_on_shape(sh: SketchShape, sp):
+        """Nearest point ON the shape's outline to ``sp`` — mirrors where the
+        compiler will actually begin the path (closest ring vertex / endpoint)."""
+        x, y = float(sp[0]), float(sp[1])
+        k = sh.kind
+        if k == "circle":
+            dx, dy = x - sh.cx, y - sh.cy
+            d = math.hypot(dx, dy) or 1.0
+            return (sh.cx + sh.radius * dx / d, sh.cy + sh.radius * dy / d)
+        if k == "ellipse":
+            ang = math.atan2(y - sh.cy, x - sh.cx)
+            return (sh.cx + sh.rx * math.cos(ang), sh.cy + sh.ry * math.sin(ang))
+        if k == "rect":
+            hw, hh = sh.width / 2, sh.height / 2
+            corners = [(sh.cx - hw, sh.cy - hh), (sh.cx + hw, sh.cy - hh),
+                       (sh.cx + hw, sh.cy + hh), (sh.cx - hw, sh.cy + hh),
+                       (sh.cx - hw, sh.cy - hh)]
+            best, bd = None, None
+            for j in range(4):
+                nx, ny = _nearest_on_seg(x, y, *corners[j], *corners[j + 1])
+                dd = math.hypot(nx - x, ny - y)
+                if bd is None or dd < bd:
+                    bd, best = dd, (nx, ny)
+            return best
+        if k == "line" and len(sh.points) >= 2:
+            p0, p1 = sh.points[0], sh.points[1]
+            return p0 if (math.hypot(p0[0] - x, p0[1] - y)
+                          <= math.hypot(p1[0] - x, p1[1] - y)) else p1
+        if k == "polygon" and sh.points:
+            if len(sh.points) >= 3:
+                pts = list(sh.points) + [sh.points[0]]
+                best, bd = None, None
+                for j in range(len(pts) - 1):
+                    nx, ny = _nearest_on_seg(x, y, *pts[j], *pts[j + 1])
+                    dd = math.hypot(nx - x, ny - y)
+                    if bd is None or dd < bd:
+                        bd, best = dd, (nx, ny)
+                return best
+            p0, p1 = sh.points[0], sh.points[-1]
+            return p0 if (math.hypot(p0[0] - x, p0[1] - y)
+                          <= math.hypot(p1[0] - x, p1[1] - y)) else p1
+        return (sh.cx, sh.cy)
+
+    def _effective_start_world(self, sh: SketchShape) -> QPointF:
+        """Where the shape actually begins printing: the resolved start_point if
+        set, else the geometric default."""
+        sp = getattr(sh, "start_point", None)
+        if sp is None:
+            return QPointF(*self._default_start_world(sh))
+        return QPointF(*self._resolve_start_on_shape(sh, sp))
+
+    def _start_marker_screen(self, sh: SketchShape) -> QPointF:
+        """Screen position of the draggable start flag — the effective start
+        pushed a fixed distance outward from the shape's centre so it never
+        overlaps a resize handle."""
+        sw = self._effective_start_world(sh)
+        bb = self._shape_bbox(sh)
+        base = self._w2s(sw.x(), sw.y())
+        if bb is None:
+            return base
+        cx, cy = (bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0
+        dx, dy = sw.x() - cx, sw.y() - cy
+        L = math.hypot(dx, dy)
+        if L < 1e-9:
+            dx, dy, L = 1.0, -1.0, math.sqrt(2.0)
+        off = s(_HANDLE_PX) * 2.2
+        return QPointF(base.x() + dx / L * off, base.y() + dy / L * off)
+
+    def _start_handle_at(self, sh: SketchShape, screen_pos: QPointF) -> bool:
+        c = self._start_marker_screen(sh)
+        tol = s(_HIT_PX) + s(_HANDLE_PX)
+        return math.hypot(c.x() - screen_pos.x(),
+                          c.y() - screen_pos.y()) <= tol
+
+    def clear_start_point(self, index: int):
+        """Reset a shape's print start to its geometric default."""
+        if not (0 <= index < len(self._sketch.shapes)):
+            return
+        sh = self._sketch.shapes[index]
+        if getattr(sh, "start_point", None) is None:
+            return
+        self._snapshot()
+        sh.start_point = None
+        self.sketch_changed.emit()
+        self.update()
+
+    def optimize(self, needle=None):
+        """Reorder shapes + set start points to minimize print discontinuities
+        (user-placed retract points stay as fixed breaks). In single-needle mode
+        (resolved from the sketch/``needle``) it also groups same-channel shapes
+        to cut ink swaps. Undoable."""
+        from SupportClasses.SketchTrajectory import optimize_print_order
+        if len(self._sketch.shapes) < 2:
+            return
+        self._snapshot()
+        self._sketch = optimize_print_order(self._sketch, needle=needle)
+        self._set_selection(set())
+        self.sketch_changed.emit()
+        self.update()
 
     def _shape_at(self, w: QPointF) -> int:
         tol = s(_HIT_PX) / self._scale
@@ -769,6 +1314,8 @@ class SketchCanvas(QWidget):
     @staticmethod
     def _hit(sh: SketchShape, w: QPointF, tol: float) -> bool:
         x, y = w.x(), w.y()
+        if sh.kind == "travel":
+            return math.hypot(x - sh.cx, y - sh.cy) <= tol
         if sh.kind == "region":
             if not sh.points:
                 return False
@@ -807,7 +1354,7 @@ class SketchCanvas(QWidget):
         dy = w.y() - self._move_anchor.y()
         sh = self._sketch.shapes[self._selected]
         orig = self._move_orig
-        if orig.kind in ("circle", "ellipse", "rect"):
+        if orig.kind in ("circle", "ellipse", "rect", "travel"):
             sh.cx = orig.cx + dx
             sh.cy = orig.cy + dy
         else:
@@ -816,6 +1363,12 @@ class SketchCanvas(QWidget):
     def _apply_resize(self, w: QPointF):
         sh = self._sketch.shapes[self._selected]
         k = self._resize_kind
+        if k == "start":
+            # ``w`` is already snapped to existing lines/vertices (see
+            # mouseMoveEvent). Store the raw anchor; the compiler + the marker
+            # resolve it onto the shape's own outline.
+            sh.start_point = (w.x(), w.y())
+            return
         if k == "r":
             sh.radius = max(0.1, math.hypot(w.x() - sh.cx, w.y() - sh.cy))
         elif k == "rxry":
@@ -836,40 +1389,41 @@ class SketchCanvas(QWidget):
         if a is None or b is None:
             self.update()
             return
-        color = PUMP_HEX[self._active_pump]
-        pump = self._active_pump
+        ink_id = self._active_ink_id
+        color = self._active_ink_color()
         lw = self._default_line_width
         sh = None
         if self._tool == Tool.LINE:
             if math.hypot(b.x() - a.x(), b.y() - a.y()) > 0.2:
                 sh = SketchShape(kind="line",
                                  points=[(a.x(), a.y()), (b.x(), b.y())],
-                                 pump_index=pump, color=color, line_width_mm=lw)
+                                 ink_id=ink_id, color=color, line_width_mm=lw)
         elif self._tool == Tool.CIRCLE:
             r = math.hypot(b.x() - a.x(), b.y() - a.y())
             if r > 0.2:
                 sh = SketchShape(kind="circle", cx=a.x(), cy=a.y(),
-                                 radius=r, pump_index=pump, color=color,
+                                 radius=r, ink_id=ink_id, color=color,
                                  line_width_mm=lw)
         elif self._tool == Tool.RECT:
             w_, h_ = abs(b.x() - a.x()), abs(b.y() - a.y())
             if w_ > 0.2 and h_ > 0.2:
                 sh = SketchShape(kind="rect",
                                  cx=(a.x() + b.x()) / 2, cy=(a.y() + b.y()) / 2,
-                                 width=w_, height=h_, pump_index=pump,
+                                 width=w_, height=h_, ink_id=ink_id,
                                  color=color, line_width_mm=lw)
         elif self._tool == Tool.ELLIPSE:
             rx, ry = abs(b.x() - a.x()) / 2, abs(b.y() - a.y()) / 2
             if rx > 0.1 and ry > 0.1:
                 sh = SketchShape(kind="ellipse",
                                  cx=(a.x() + b.x()) / 2, cy=(a.y() + b.y()) / 2,
-                                 rx=rx, ry=ry, pump_index=pump, color=color,
+                                 rx=rx, ry=ry, ink_id=ink_id, color=color,
                                  line_width_mm=lw)
         if sh is not None:
             self._snapshot()
             self._sketch.shapes.append(sh)
-            self._selected = len(self._sketch.shapes) - 1
-            self.selection_changed.emit(self._selected)
+            # Select the new shape via the canonical setter so BOTH _selection
+            # (highlight + handles) and _selected (props panel) stay in sync.
+            self._set_selection({len(self._sketch.shapes) - 1})
             self.sketch_changed.emit()
         self.update()
 
@@ -884,11 +1438,10 @@ class SketchCanvas(QWidget):
         sh = SketchShape(
             kind="region",
             points=[(float(x), float(y)) for (x, y) in pts],
-            pump_index=self._active_pump,
-            color=PUMP_HEX[self._active_pump])
+            ink_id=self._active_ink_id,
+            color=self._active_ink_color())
         self._sketch.shapes.append(sh)
-        self._selected = len(self._sketch.shapes) - 1
-        self.selection_changed.emit(self._selected)
+        self._set_selection({len(self._sketch.shapes) - 1})
         self.sketch_changed.emit()
         self.fill_result.emit(True)
         self.update()
@@ -901,14 +1454,64 @@ class SketchCanvas(QWidget):
         if len(pts) >= 2:
             self._snapshot()
             sh = SketchShape(kind="polygon", points=pts,
-                             pump_index=self._active_pump,
-                             color=PUMP_HEX[self._active_pump],
+                             ink_id=self._active_ink_id,
+                             color=self._active_ink_color(),
                              line_width_mm=self._default_line_width)
             self._sketch.shapes.append(sh)
-            self._selected = len(self._sketch.shapes) - 1
-            self.selection_changed.emit(self._selected)
+            self._set_selection({len(self._sketch.shapes) - 1})
             self.sketch_changed.emit()
         self.update()
+
+    # ── Retract-&-move points + back-trace ─────────────────────────
+
+    def _place_travel(self, w: QPointF):
+        """Append a retract-&-move point at ``w`` (world mm): the needle lifts
+        and travels here (pen-up), splitting the print into separate runs."""
+        self._snapshot()
+        sh = SketchShape(kind="travel", cx=w.x(), cy=w.y(), color=TRAVEL_HEX)
+        self._sketch.shapes.append(sh)
+        self._set_selection({len(self._sketch.shapes) - 1})
+        self.sketch_changed.emit()
+        self.update()
+
+    def _run_indices(self, seed: int) -> list[int]:
+        """Indices of the maximal contiguous run of PRINTING shapes containing
+        ``seed`` — i.e. the 'continuous collection of lines between retract
+        points'. A ``travel`` shape bounds the run. Empty if ``seed`` is a
+        travel point / out of range."""
+        shapes = self._sketch.shapes
+        if not (0 <= seed < len(shapes)) or shapes[seed].kind == "travel":
+            return []
+        lo = seed
+        while lo - 1 >= 0 and shapes[lo - 1].kind != "travel":
+            lo -= 1
+        hi = seed
+        while hi + 1 < len(shapes) and shapes[hi + 1].kind != "travel":
+            hi += 1
+        return list(range(lo, hi + 1))
+
+    def backtrace_run(self, seed_index: int, z_offset: float = 0.0,
+                      xy_offset: float = 0.0, print_on_return: bool = True
+                      ) -> int:
+        """Back-trace the continuous run containing ``seed_index``: append a
+        reversed copy of every shape in the run (in reverse order), offset by
+        ``z_offset`` mm in height and ``xy_offset`` mm in-plane, right after the
+        run so the needle retraces it. ``print_on_return=False`` = move-only.
+        Returns the number of shapes added."""
+        run = self._run_indices(seed_index)
+        if not run:
+            return 0
+        self._snapshot()
+        src = [self._sketch.shapes[i] for i in run]
+        new = [backtrace_shape(sh, z_offset=z_offset, xy_offset=xy_offset,
+                               print_on_return=print_on_return)
+               for sh in reversed(src)]
+        at = run[-1] + 1
+        self._sketch.shapes[at:at] = new
+        self._set_selection(set(range(at, at + len(new))))
+        self.sketch_changed.emit()
+        self.update()
+        return len(new)
 
 
 # ── Geometry helpers ──────────────────────────────────────────────

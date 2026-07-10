@@ -1,0 +1,16 @@
+{
+  "id": "nest-plastic-24",
+  "base_format": 24,
+  "display_name": "NEST plastic-bottom (24-well)",
+  "manufacturer": "NEST",
+  "model": "polystyrene",
+  "bottom_material": "plastic",
+  "well_depth_mm": null,
+  "z_offsets": {
+    "top": -7.5400000000000045,
+    "bottom": 9.759999999999998,
+    "safe": -10.540000000000004,
+    "max": -26.54
+  },
+  "builtin": false
+}

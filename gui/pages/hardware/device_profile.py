@@ -97,6 +97,15 @@ class DeviceProfile:
     # dispense/aspirate DIRECTION is derived from these extremes and owned by the
     # calibration. The soft-limit envelope itself lives in safety_limits.p*.
     pump_setup: dict = field(default_factory=dict)
+    # v7.5.x: per-pump compliance / "pressure relief" value in µL (mirror of
+    # pump_setup). Maps pump ("P1"/"P2"/"P3") → µL = half the aspirate-back
+    # volume measured by the Needle Location compliance calibration. Used by the
+    # backlash-compensation engine (take-up on reversal + unload on stop). 0 /
+    # absent ⇒ no compensation for that pump.
+    pump_compliance_uL: dict = field(default_factory=dict)
+    # v7.5.x: global enable for backlash / pressure compensation at every pump
+    # start/stop. Toggled from the pump jog panel. None ⇒ default False (off).
+    backlash_comp_enabled: Optional[bool] = None
 
     # ── JSON I/O ─────────────────────────────────────────────────
 
@@ -126,6 +135,8 @@ class DeviceProfile:
             "plate_z_offsets": self.plate_z_offsets,
             "needle_loc_xy_um": self.needle_loc_xy_um,
             "pump_setup": self.pump_setup,
+            "pump_compliance_uL": self.pump_compliance_uL,
+            "backlash_comp_enabled": self.backlash_comp_enabled,
         }
 
     @classmethod
@@ -149,6 +160,8 @@ class DeviceProfile:
             plate_z_offsets=data.get("plate_z_offsets", {}) or {},
             needle_loc_xy_um=data.get("needle_loc_xy_um"),
             pump_setup=data.get("pump_setup", {}) or {},
+            pump_compliance_uL=data.get("pump_compliance_uL", {}) or {},
+            backlash_comp_enabled=data.get("backlash_comp_enabled"),
         )
 
     def save(self, path: Path | None = None) -> Path:
@@ -195,6 +208,10 @@ class DeviceProfile:
             plate_z_offsets=settings.get("device_profile.plate_z_offsets") or {},
             needle_loc_xy_um=settings.get("device_profile.needle_loc_xy_um"),
             pump_setup=settings.get("device_profile.pump_setup") or {},
+            pump_compliance_uL=settings.get(
+                "device_profile.pump_compliance_uL") or {},
+            backlash_comp_enabled=settings.get(
+                "device_profile.backlash_comp_enabled"),
         )
 
     def apply_to_settings(self, settings) -> None:
@@ -241,6 +258,12 @@ class DeviceProfile:
                          self.needle_loc_xy_um)
         if self.pump_setup:
             settings.set("device_profile.pump_setup", self.pump_setup)
+        if self.pump_compliance_uL:
+            settings.set("device_profile.pump_compliance_uL",
+                         self.pump_compliance_uL)
+        if self.backlash_comp_enabled is not None:
+            settings.set("device_profile.backlash_comp_enabled",
+                         self.backlash_comp_enabled)
 
 
 # ── Module-level helpers ─────────────────────────────────────────

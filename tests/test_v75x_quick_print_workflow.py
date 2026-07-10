@@ -13,9 +13,16 @@ quick_print_workflow.py):
 - End-to-end: build_well_plate_job offsets the path by the well center.
 """
 
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
+
+# Isolate the workflow-settings store so the page's settings dialog restores
+# CODE defaults, not the operator's real saved Quick Print profile.
+os.environ["MEBP_WORKFLOW_SETTINGS_DIR"] = tempfile.mkdtemp(
+    prefix="mebp_qp_settings_")
 
 from PySide6.QtWidgets import QApplication
 
@@ -212,9 +219,9 @@ class TestJobBuilding(_Base):
     def test_settings_use_safe_z_and_flow(self):
         page = self._make_page()
         page._safe_z = 7.5
-        page._flow_spin.setValue(0.4)
-        # v7.5.x: print-speed % scales BOTH speed and flow. At 100% the Flow
-        # knob passes straight through to the pump rate.
+        page._auto_flow_100_uL_s = lambda: 0.4   # auto flow (needle×speed×mod)
+        # v7.5.x: print-speed % scales BOTH speed and flow. At 100% the auto
+        # Flow@100% passes straight through to the pump rate.
         page._speed_pct_spin.setValue(100)
         page._printz_spin.setValue(0.2)
         # v7.5.x: the print-Z spin is now a height above the plate bottom,

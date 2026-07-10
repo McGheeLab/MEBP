@@ -108,6 +108,82 @@ Root-caused via a parallel investigate→adversarial-verify workflow (`fluor-mos
   (FOV w×h mm)`. Regression: `test_grid_preview_populates_viewer_and_navigator`,
   `TestNavigatorRasterGrid`.
 
+## Bug fix — raster spacing ignored the selected objective (round 3, 2026-07-01)
+
+- **Operator report:** "on the fluorescence mosaic workflow … the grid points
+  are set for a 2x maybe. I just finished a raster scan with a 4x and it wasn't
+  spaced out properly." **Root cause:** `_compute_raster_plan` resolved the
+  effective µm/px with the SAME precedence as the fixed-objective full-plate
+  scan — the shared `mosaic_scan.fov_um` override *first*, objective µm/px only
+  as a fallback. On ME3B V1 that override is a calibrated **2822 µm** (≈ the 2×
+  field of view). So regardless of the objective the operator picked, tiles were
+  spaced for a 2× FOV: at 4× (real FOV ≈ 1426 µm) the grid stepped ≈ 2681 µm
+  (`fov·(1−overlap)`) → **≈ 1255 µm gaps between tiles**. The workflow already
+  resolves the correct per-objective µm/px (objective combo + `_on_objective_changed`
+  + `_microscope_um_per_px`), but the `fov_um` short-circuit discarded it. The
+  full-plate scan is unaffected — its objective is fixed, so its `fov_um` is
+  valid there; only this objective-SELECTABLE workflow was wrong.
+- **Fix (scoped to `fluorescence_mosaic_workflow.py`):** invert the precedence to
+  **selected-objective µm/px > shared `fov_um` fallback > live camera µm/px**.
+  New `_objective_um_per_px(frame_w)` returns the resolution-rescaled µm/px for
+  the current objective (or `None` when uncalibrated); `_microscope_um_per_px`
+  now delegates to it; `_compute_raster_plan` tries it first and only falls back
+  to `fov_um`/camera µm/px when no objective calibration resolves (graceful
+  degradation — no worse than before on an uncalibrated objective). The camera
+  key + objective lookup are the exact pair the objective card WROTE the
+  calibrations under, so the read is symmetric with the write. `spacing_um`
+  remains an objective-independent manual step override. Because the actual scan
+  drives off `self._scan_um_per_px = plan["eff_um_per_px"]`, fixing the plan
+  fixes both the preview and the scan. **Needs real-HW verification on ME3B V1**
+  (pick 4× → grid preview tiles overlap; raster covers the well with no gaps;
+  switch to 2×/10× → spacing tracks). Regression:
+  `test_objective_um_per_px_overrides_shared_fov` (4× @ 916 px = 1.547 µm/px wins
+  over a 2822 fov_um; helper rescales by live width) + `test_fov_override_is_fallback_when_no_objective_cal`
+  (renamed from `test_fov_override_sizes_tiles` — fov_um now the fallback).
+  Suite: `tests/test_v75x_fluorescence_mosaic.py` (28) green.
+
+## Feature — in-workflow mosaic FOV/spacing calibration (round 4, 2026-07-01)
+
+- **Operator request:** "on the fluorescence mosaic workflow page I want the
+  ability to do a mosaic calibration beforehand … in the settings to mirror the
+  full mosaic scan version." **What was added:** a **"Calibrate…"** button + a
+  per-objective status label in a new **"Mosaic FOV calibration"** section of the
+  fluorescence Settings popout, opening the **same** `MosaicCalibrationDialog` the
+  full-plate scan uses (Calibration → Plate Location → Mosaic scan → Calibrate…),
+  wired to this workflow's controller / microscope camera / **per-camera+objective
+  align key** (`_align_key`, identical scheme to
+  `calibration._ploc_camera_objective_key`) / **selected-well centre**. Same
+  Safe-Z + camera + µm/px gates as the scan. After it closes, the grid preview +
+  status refresh.
+- **Making the calibration take effect (resolution-safe):** the dialog stores a
+  learned effective µm/px per camera+objective in `MosaicAlignmentStore`; the
+  fluorescence raster planner now consumes it as the **top** precedence:
+  `learned (rescaled) > objective µm/px (rescaled) > shared fov_um fallback >
+  camera µm/px` (`_learned_um_per_px`). This preserves the round-3 principle
+  (per-objective sources beat the shared 2× `fov_um`) — learned is also per
+  camera+objective. Opened from here, the dialog is handed `fov_um=0` so the
+  **calibration mosaic itself** builds at the objective scale, not the shared 2×.
+- **Resolution stamp (the stale-value guard):** the on-disk store had a stale 2×
+  learned value (3.094 µm/px) captured at **916 px** while the camera now runs at
+  **3664 px** — consuming it naively would reintroduce the wrong-spacing bug. Fix:
+  `MosaicAlignmentStore.set_um_per_px` gained an optional `resolution=` (stored)
+  + `get_resolution()`; `MosaicCalibrationDialog._store_manual_align` now stamps
+  `(fw, fh)`; `_learned_um_per_px` **rescales** by `cal_w / live_w` and
+  **ignores** any legacy value with no resolution stamp (so the stale 2× value is
+  bypassed → the resolution-safe objective value is used). All additive +
+  backward-compatible: the full-plate scan still reads `get_um_per_px` un-rescaled
+  and is unchanged. **Needs real-HW verification on ME3B V1** (Settings →
+  Calibrate… at 4× → build a small mosaic → tune spacing → Store FOV/spacing →
+  status shows "calibrated · µm/px @ 3664px"; the raster grid tiles tighten to
+  match; a fresh scan covers the well with no gaps). Regression:
+  `test_learned_calibration_overrides_objective_and_rescales`,
+  `test_legacy_learned_without_resolution_is_ignored`,
+  `test_settings_dialog_has_calibrate_button`,
+  `test_open_mosaic_calibration_wires_dialog`, `TestMosaicAlignmentStoreResolution`.
+  Suite: `tests/test_v75x_fluorescence_mosaic.py` (33) green; plate-mosaic /
+  camera-rotation / camera-cal-liveview / spheroid-picker-scaling (146) green
+  (only the documented pre-existing CV `test_real_24_well_mosaic` fails).
+
 ## Issues & Decisions
 
 - **No filter hardware** → manual per-channel capture (one full single-well

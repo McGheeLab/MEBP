@@ -127,6 +127,11 @@ class PrintSetupPage(QWidget):
         # reaches the physically-taught well (not a stage-origin grid that, on
         # the (-1,-1) plate flip, clamps to 0,0). None until calibration arrives.
         self._calibrated_well_positions = None
+        # v7.5.x: shared CommonPrintSettings model (set via
+        # set_common_print_settings). Global pump settle/relief/prime are applied
+        # at execution time via the controller; this retains the model for read
+        # access (prep defaults + the Quick-Print-profile import).
+        self._common_print_settings = None
         self._setup_ui()
 
     # ════════════════════════════════════════════════════════════════
@@ -173,6 +178,14 @@ class PrintSetupPage(QWidget):
                 self.travel_z_spin.setValue(sz)
         except Exception:
             pass
+
+    def set_common_print_settings(self, common):
+        """v7.5.x: bind the shared CommonPrintSettings model (global pump
+        settle / relief / prime + the promoted needle-prep defaults). The
+        global pump values are already applied at execution time via the
+        controller / live HardwareConfig, so this just retains the model for
+        read access (future prep parity + the Quick-Print-profile import)."""
+        self._common_print_settings = common
 
     def _well_xy_zref_mm(self, name, plate):
         """Well centre in ZERO-REF mm for the print path. Prefers the CALIBRATED
@@ -497,6 +510,25 @@ class PrintSetupPage(QWidget):
             f"color: {COLORS.get('blue', '#89b4fa')}; "
             f"padding: {_sp(2)} 0px;")
         left_col.addWidget(left_title)
+
+        # v7.5.x: import the conditions tuned in a Quick Print test run. Quick
+        # Print is where you dial in printing conditions on one object/well;
+        # this loads a saved Quick Print profile and maps its speed / fill /
+        # height / prime / motion knobs onto these Full Print controls so the
+        # tested conditions transfer in one click.
+        self.btn_load_qp_profile = QPushButton("Load from Quick Print profile…")
+        self.btn_load_qp_profile.setCursor(Qt.PointingHandCursor)
+        self.btn_load_qp_profile.setToolTip(
+            "Apply the printing conditions (speed, fill/extrusion, print height, "
+            "prime, inter-line motion) from a saved Quick Print settings profile "
+            "onto these Full Print parameters. Ink-pickup / prep / cleanup and "
+            "global pump values are not imported.")
+        self.btn_load_qp_profile.clicked.connect(self._on_load_quick_print_profile)
+        left_col.addWidget(self.btn_load_qp_profile)
+        self._qp_import_status = QLabel("")
+        self._qp_import_status.setWordWrap(True)
+        self._qp_import_status.setStyleSheet(dim_style)
+        left_col.addWidget(self._qp_import_status)
 
         # ── Extrusion ─────────────────────────────────────────────
         ext_grp = QGroupBox("Extrusion")
@@ -1131,6 +1163,214 @@ class PrintSetupPage(QWidget):
         return (print_speed, flow_rate, max_speed)
 
     # ════════════════════════════════════════════════════════════════
+    #  v7.5.x: import tuned conditions from a Quick Print profile
+    # ════════════════════════════════════════════════════════════════
+
+    def _line_move_speed_maxes(self):
+        """(z_max_mm_s, xy_max_mm_s) — the calibrated 100% anchors used to turn
+        Quick Print's line-move % knobs into mm/s. Mirrors Quick Print's
+        ``_z_max_mm_s``/``_xy_max_mm_s`` (single common controller source);
+        returns (0, 0) when no controller so the caller leaves the defaults."""
+        z_max = xy_max = 0.0
+        ctrl = getattr(self, "controller", None)
+        if ctrl is not None:
+            try:
+                if hasattr(ctrl, "get_max_z_feedrate_mm_min"):
+                    v = float(ctrl.get_max_z_feedrate_mm_min())
+                    if v > 0:
+                        z_max = v / 60.0
+            except Exception:
+                pass
+            try:
+                if hasattr(ctrl, "get_max_xy_speed_um_s"):
+                    v = float(ctrl.get_max_xy_speed_um_s())
+                    if v > 0:
+                        xy_max = v / 1000.0
+            except Exception:
+                pass
+        return (z_max, xy_max)
+
+    def _on_load_quick_print_profile(self):
+        """Let the operator pick a saved Quick Print settings profile (or import
+        a file) and apply its tuned conditions to the Finalize controls."""
+        from PySide6.QtWidgets import QInputDialog
+        try:
+            from SupportClasses.WorkflowSettingsStore import WorkflowSettingsStore
+        except Exception as e:
+            logger.warning("Quick Print profile import unavailable: %s", e)
+            return
+        store = WorkflowSettingsStore("quick_print")
+        names = list(store.list_profiles())
+        # Build the chooser list: saved profiles + last-used + import-from-file.
+        LAST = "★ Last used (auto-saved)"
+        IMPORT = "Import from file…"
+        choices = list(names)
+        if store.load_last() is not None:
+            choices.insert(0, LAST)
+        choices.append(IMPORT)
+        if not choices:
+            QMessageBox.information(
+                self, "Load from Quick Print profile",
+                "No saved Quick Print profiles found yet. Open the Quick Print "
+                "workflow, tune its settings, and Save a profile first.")
+            return
+        choice, ok = QInputDialog.getItem(
+            self, "Load from Quick Print profile",
+            "Apply the printing conditions from:", choices, 0, False)
+        if not ok or not choice:
+            return
+        if choice == IMPORT:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Import Quick Print settings", "",
+                "Settings (*.json);;All files (*)")
+            if not path:
+                return
+            values = store.read_file(path)
+        elif choice == LAST:
+            values = store.load_last()
+        else:
+            values = store.load_profile(choice)
+        if not values:
+            QMessageBox.warning(
+                self, "Load from Quick Print profile",
+                "That profile could not be read.")
+            return
+        summary = self._apply_quick_print_profile(values)
+        if hasattr(self, "_qp_import_status"):
+            self._qp_import_status.setText(summary)
+
+    def _apply_quick_print_profile(self, values: dict) -> str:
+        """Map a saved Quick Print profile's tuned conditions onto the Full
+        Print Finalize controls. Returns a short human-readable summary of what
+        transferred + what was skipped.
+
+        Scope (safety): touches ONLY speed / fill / print-height / prime /
+        inter-line motion knobs. It NEVER changes well positions, calibration,
+        or the GLOBAL HardwareConfig pump values (``g_settle``/``g_relief``) —
+        those are not per-print conditions. Combo fields serialize as
+        ``{"text","data"}`` dicts (see WorkflowSettingsDialog) — decode ``data``."""
+        if not isinstance(values, dict):
+            return "No settings found in that profile."
+
+        applied: list[str] = []
+        skipped: list[str] = []
+
+        def _num(key):
+            try:
+                return float(values.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        def _combo_token(key):
+            v = values.get(key)
+            if isinstance(v, dict):
+                # Combos serialize as {"text","data"}; some (e.g. the Quick
+                # Print pump combo) carry no userData → "data" is present but
+                # None. dict.get's default only fires on a MISSING key, so fall
+                # back to the visible text whenever data is None.
+                data = v.get("data")
+                return data if data is not None else v.get("text")
+            return v
+
+        # speed_pct → speed_scale_spin (both "% of calibrated XY max"; exact).
+        sp = _num("speed_pct")
+        if sp is not None and hasattr(self, "speed_scale_spin"):
+            self.speed_scale_spin.setValue(int(max(1, min(100, round(sp)))))
+            applied.append(f"speed {int(round(sp))}%")
+
+        # printz → print_height_spin (both "mm above calibrated plate bottom").
+        pz = _num("printz")
+        if pz is not None and hasattr(self, "print_height_spin"):
+            try:
+                if pz > self.print_height_spin.maximum():
+                    self.print_height_spin.setMaximum(pz)
+                self.print_height_spin.setValue(pz)
+                applied.append(f"print Z {pz:.2f} mm")
+            except Exception:
+                pass
+
+        # extrusion_mod → volume_fraction_spin. SEMANTIC ADAPTER (not 1:1):
+        # Quick Print's modifier multiplies an auto bore-flow; the legacy "fill"
+        # is a % of the bore cross-section. 1.0× ≈ a full-bore bead = 100%.
+        em = _num("extrusion_mod")
+        if em is not None and hasattr(self, "volume_fraction_spin"):
+            vf = int(max(1, min(100, round(em * 100))))
+            self.volume_fraction_spin.setValue(vf)
+            applied.append(f"fill {vf}% (≈{em:.2f}× extrusion)")
+
+        # preflow (s) → per-pump prime µL = derived flow × preflow seconds.
+        pf = _num("preflow")
+        if pf is not None and getattr(self, "_prime_spins", None):
+            try:
+                _, flow_uL_s, _ = self._get_derived_speed_and_flow()
+            except Exception:
+                flow_uL_s = 0.0
+            prime_uL = max(0.0, flow_uL_s * pf)
+            pump_id = _combo_token("pump")
+            target = pump_id if pump_id in self._prime_spins else None
+            if target is None:
+                target = next(iter(self._prime_spins), None)
+            if target is not None:
+                spin = self._prime_spins[target]
+                try:
+                    if prime_uL > spin.maximum():
+                        spin.setMaximum(prime_uL)
+                    spin.setValue(prime_uL)
+                    applied.append(f"prime {prime_uL:.2f} µL ({target})")
+                except Exception:
+                    pass
+            if flow_uL_s <= 0:
+                skipped.append("prime (no needle → flow unknown)")
+
+        # line_retract → intra-well hop; line_*_speed (%) → inter-line speeds
+        # (mm/s). Stashed; consumed by _get_settings (defaults preserve behavior).
+        lr = _num("line_retract")
+        if lr is not None:
+            self._qp_intra_well_hop_z_mm = lr
+            applied.append(f"line hop {lr:.2f} mm")
+        z_max, xy_max = self._line_move_speed_maxes()
+        lz = _num("line_z_speed")
+        if lz is not None and z_max > 0:
+            self._qp_line_move_z_speed_mm_s = max(0.0, lz / 100.0 * z_max)
+        lxy = _num("line_xy_speed")
+        if lxy is not None and xy_max > 0:
+            self._qp_line_move_xy_speed_mm_s = max(0.0, lxy / 100.0 * xy_max)
+
+        # travel_speed (mm/s) → overrides the derived travel speed.
+        ts = _num("travel_speed")
+        if ts is not None:
+            self._qp_travel_speed_mm_s = ts
+            applied.append(f"travel {ts:.1f} mm/s")
+
+        # Explicitly NOT imported (no clean Full-Print analog / global state).
+        for k, why in (("ink", "ink pickup"), ("prep", "needle prep"),
+                       ("postclean", "post-print cleanup"),
+                       ("g_settle", "global pump dwell"),
+                       ("g_relief", "global pressure relief")):
+            if k in values:
+                skipped.append(why)
+
+        # Recompute the derived read-outs (flow/speed/etc.) from the new spins.
+        if hasattr(self, "_update_derived"):
+            try:
+                self._update_derived()
+            except Exception:
+                pass
+
+        if not applied:
+            return "Nothing transferred from that profile."
+        msg = "Imported: " + ", ".join(applied) + "."
+        if skipped:
+            # De-dup the skip reasons.
+            seen, uniq = set(), []
+            for sname in skipped:
+                if sname not in seen:
+                    seen.add(sname)
+                    uniq.append(sname)
+            msg += " Not imported: " + ", ".join(uniq) + "."
+        return msg
+
+    # ════════════════════════════════════════════════════════════════
     #  v7.5.x: plate-bottom-relative print Z
     # ════════════════════════════════════════════════════════════════
 
@@ -1345,13 +1585,40 @@ class PrintSetupPage(QWidget):
                     s.active_pump = pid
                     break
 
-        # Per-pump retract/prime
-        s.retract_amounts = {
-            pid: spin.value() for pid, spin in self._retract_spins.items()
+        # Per-pump retract/prime. The Finalize spins are labelled µL, so feed
+        # the µL-native dicts that ``build_well_plate_job`` consults FIRST
+        # (``get_prime_uL``/``get_retract_uL`` win over the legacy mm dicts).
+        # Previously these µL values were only written to the legacy mm
+        # ``retract_amounts``/``prime_amounts`` dicts, so the µL-labelled value
+        # drove a mm pump move — a units bug. Populate both; the µL path wins.
+        # (CLAUDE.md §4: µL-native pumps.)
+        retract_uL = {
+            pid: float(spin.value()) for pid, spin in self._retract_spins.items()
         }
-        s.prime_amounts = {
-            pid: spin.value() for pid, spin in self._prime_spins.items()
+        prime_uL = {
+            pid: float(spin.value()) for pid, spin in self._prime_spins.items()
         }
+        s.retract_amounts = dict(retract_uL)
+        s.prime_amounts = dict(prime_uL)
+        s.retract_amounts_uL = dict(retract_uL)
+        s.prime_amounts_uL = dict(prime_uL)
+
+        # v7.5.x: consume the inter-object / inter-line motion knobs stashed by
+        # a "Load from Quick Print profile" import (Phase 3b). Defaults preserve
+        # the current behavior (PrintSettings: hop 1.0 mm, line speeds 0 =
+        # default-speed), so an un-imported job builds byte-identically.
+        _hop = getattr(self, "_qp_intra_well_hop_z_mm", None)
+        if _hop is not None:
+            s.intra_well_hop_z_mm = float(_hop)
+        _lz = getattr(self, "_qp_line_move_z_speed_mm_s", None)
+        if _lz is not None:
+            s.line_move_z_speed_mm_s = float(_lz)
+        _lxy = getattr(self, "_qp_line_move_xy_speed_mm_s", None)
+        if _lxy is not None:
+            s.line_move_xy_speed_mm_s = float(_lxy)
+        _tspeed = getattr(self, "_qp_travel_speed_mm_s", None)
+        if _tspeed is not None:
+            s.travel_speed_mm_s = float(_tspeed)
 
         # v7.5.x: print Z is a height above the calibrated plate bottom (not an
         # absolute Z), resolved here so both job-build paths (_build_current_job
@@ -1502,8 +1769,15 @@ class PrintSetupPage(QWidget):
             wx, wy = self._well_xy_zref_mm(name, plate)
             well_positions.append((name, wx, wy))
 
-        # 4. Get path points from Tab 2 objects
+        # 4. Get path points from Tab 2 objects.
+        # v7.5.x: also extract them as PER-OBJECT segments so the multi-object
+        # seam fix in build_well_plate_job applies — each object becomes its own
+        # PRINT_PATH with a lift/travel between them (a small intra-well hop for
+        # objects in the same well) instead of the needle dragging through
+        # already-printed material across the seam. The flattened path_points is
+        # kept for the empty/meander fallback + previews.
         path_points = self._get_path_from_objects()
+        path_segments = self._get_path_segments_from_objects()
         if not path_points:
             # Fallback: default meander pattern sized to well
             try:
@@ -1519,6 +1793,7 @@ class PrintSetupPage(QWidget):
                 )
             except Exception:
                 path_points = [(0.0, 0.0)]
+            path_segments = None  # single fallback path → no per-object seam
             logger.info(f"Using fallback meander pattern ({len(path_points)} pts)")
 
         # 5. Get settings from context panel
@@ -1563,11 +1838,14 @@ class PrintSetupPage(QWidget):
                 pump=pump,
                 flow_rate=flow_rate,
                 job_name=f"Well Plate {getattr(plate, 'format', '?')}-well",
+                path_segments=path_segments if path_segments else None,
+                return_home=True,  # full-plate print returns home when done
                 **mm_params,
             )
             logger.info(
                 f"Built job: {job.name}, {job.total_steps} commands, "
-                f"{len(well_positions)} wells, {len(path_points)} path pts")
+                f"{len(well_positions)} wells, {len(path_points)} path pts, "
+                f"{len(path_segments) if path_segments else 1} object segment(s)")
             return job
         except Exception as exc:
             logger.error(f"build_well_plate_job failed: {exc}", exc_info=True)
@@ -1617,6 +1895,65 @@ class PrintSetupPage(QWidget):
             if all_points:
                 logger.info(f"Extracted {len(all_points)} path points from file data")
                 return all_points
+
+        return []
+
+    def _get_path_segments_from_objects(self):
+        """Extract per-object path segments from Tab 2 print objects.
+
+        v7.5.x: companion to ``_get_path_from_objects`` that returns ONE point
+        list per object (with that object's position offset applied) instead of
+        flattening every object into a single list. Fed to
+        ``build_well_plate_job(path_segments=...)`` so each object prints as its
+        own ``PRINT_PATH`` with a lift/travel between objects (multi-object seam
+        fix). Returns ``list[list[(x, y)]]`` (empty objects dropped), or ``[]``
+        when no objects are present (caller falls back to the meander path).
+        """
+        if not hasattr(self, 'tab_objects'):
+            return []
+
+        tab = self.tab_objects
+        segments: list[list] = []
+
+        def _offset(pts, pos):
+            if (isinstance(pos, (list, tuple)) and len(pos) >= 2):
+                return [(x + pos[0], y + pos[1]) for x, y in pts]
+            return list(pts)
+
+        # Primary: in-memory _objects list (matches _get_path_from_objects).
+        objects_list = getattr(tab, '_objects', None)
+        if objects_list and isinstance(objects_list, list) and len(objects_list) > 0:
+            for obj in objects_list:
+                if not isinstance(obj, dict):
+                    continue
+                pts = self._single_object_to_points(obj)
+                if not pts:
+                    continue
+                seg = _offset(pts, obj.get('position', (0, 0, 0)))
+                if seg:
+                    segments.append(seg)
+            if segments:
+                logger.info(
+                    f"Extracted {len(segments)} object segment(s) "
+                    f"from {len(objects_list)} objects")
+                return segments
+
+        # Secondary: PrintFileData objects dict.
+        current_file = getattr(tab, '_current_file', None)
+        if current_file and hasattr(current_file, 'objects') and current_file.objects:
+            for obj_name, obj_data in current_file.objects.items():
+                if not isinstance(obj_data, dict):
+                    continue
+                pts = self._single_object_to_points(obj_data)
+                if not pts:
+                    continue
+                seg = _offset(pts, obj_data.get('position', [0, 0, 0]))
+                if seg:
+                    segments.append(seg)
+            if segments:
+                logger.info(
+                    f"Extracted {len(segments)} object segment(s) from file data")
+                return segments
 
         return []
 

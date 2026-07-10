@@ -555,30 +555,77 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         return sb
 
     def _build_settings_dialog(self, dlg: WorkflowSettingsDialog):
-        self._overlap = self._dspin(0.0, 90.0, 25.0, " %", 0, 5.0)
         self._target_px = QSpinBox()
         self._target_px.setRange(500, 12000)
         self._target_px.setSingleStep(250)
         self._target_px.setValue(2500)
-        self._settle_ms = QSpinBox()
-        self._settle_ms.setRange(0, 5000)
-        self._settle_ms.setSingleStep(50)
-        self._settle_ms.setValue(300)
-        self._fresh_frames = QSpinBox()
-        self._fresh_frames.setRange(1, 20)
-        self._fresh_frames.setValue(3)
         self._well_margin = self._dspin(1.0, 2.0, 1.15, "×", 2, 0.05)
-        self._frame_orient = QComboBox()
-        self._frame_orient.addItems(["none", "rot180", "fliph", "flipv"])
         sec = dlg.add_section("Scan")
-        sec.add("overlap_pct", "Tile overlap", self._overlap, 25.0)
         sec.add("target_px", "Mosaic resolution (px)", self._target_px, 2500)
         sec.add("well_margin", "Well coverage", self._well_margin, 1.15)
-        sec.add("frame_orient", "Frame orientation", self._frame_orient, "none")
-        sec = dlg.add_section("Camera timing")
-        sec.add("settle_ms", "Settle after move", self._settle_ms, 300)
-        sec.add("fresh_frames", "Fresh frames", self._fresh_frames, 3)
+        # The stitch-critical scan parameters — camera-mount orientation
+        # (frame_orient), FOV override, tile overlap, registration and the
+        # camera-settle timing — are NOT duplicated here. They are inherited
+        # from the SAME persisted ``mosaic_scan`` settings the full-plate
+        # Plate-Location mosaic uses (see _scan_settings), so a single-well
+        # fluorescence mosaic stitches with the exact same pattern as the
+        # full-plate mosaic. (Tune them on Calibration → Plate Location →
+        # Mosaic scan → Settings.)
+        note = QLabel(
+            "Camera orientation, FOV, overlap and settle timing are inherited "
+            "from the full-plate Mosaic scan settings (Calibration → Plate "
+            "Location → Mosaic scan → Settings).")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        sec.add_widget(note)
+
+        # ── Mosaic FOV calibration (mirrors the full-plate scan's Calibrate…) ──
+        cal = dlg.add_section("Mosaic FOV calibration")
+        cal.add_note(
+            "Build a small mosaic for the CURRENT objective and tune the tile "
+            "spacing so the overlaps line up. The learned FOV/spacing is stored "
+            "per camera + objective and sizes the raster grid — do this before a "
+            "long multi-channel scan so the tiles tile correctly.")
+        self._cal_button = QPushButton("Calibrate…")
+        self._cal_button.setCursor(Qt.PointingHandCursor)
+        self._cal_button.setToolTip(
+            "Open the small-mosaic FOV/spacing calibration for the selected "
+            "objective (the same tool as the full-plate scan).")
+        self._cal_button.clicked.connect(self._open_mosaic_calibration)
+        cal.add_widget(self._cal_button)
+        self._cal_status_lbl = QLabel("")
+        self._cal_status_lbl.setWordWrap(True)
+        cal.add_widget(self._cal_status_lbl)
+
         dlg.finalize()
+        self._refresh_calibration_status()
+
+    def _scan_settings(self) -> dict:
+        """Stitch-critical scan parameters, sourced from the SAME persisted
+        ``mosaic_scan`` settings the full-plate Plate-Location mosaic uses.
+
+        This is the fix for the single-well mosaic misalignment: the camera on
+        ME3B V1 is mounted rotated (``frame_orient="rot180"``) and the operator
+        calibrated an explicit FOV (``fov_um``) + overlap for the full-plate
+        mosaic. The fluorescence workflow previously kept its OWN copies of
+        these (defaulting frame_orient to "none"), so every captured tile was
+        un-rotated relative to its stage placement and the mosaic couldn't
+        stitch. Reading the shared section makes the single-well scan follow
+        the exact same pattern as the full-plate scan. Robust to a ``settings``
+        object without ``get_section`` (returns the documented defaults)."""
+        try:
+            from gui.dialogs.mosaic_settings_dialog import merged_settings
+            stored = None
+            if (self._settings is not None
+                    and hasattr(self._settings, "get_section")):
+                stored = self._settings.get_section("mosaic_scan")
+            return merged_settings(stored)
+        except Exception:
+            try:
+                from gui.dialogs.mosaic_settings_dialog import MOSAIC_SCAN_DEFAULTS
+                return dict(MOSAIC_SCAN_DEFAULTS)
+            except Exception:
+                return {}
 
     def _open_settings(self):
         self._settings_dialog.show()
@@ -756,12 +803,16 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             obj = self._objective_combo.currentText()
         return obj
 
-    def _microscope_um_per_px(self, frame_w: float, fallback: float) -> float:
-        """Objective-store µm/px rescaled to the LIVE frame width — mirrors
-        calibration.py::_ploc_microscope_um_per_px so the FOV is correct even
-        when the CameraManager carries no resolution stamp (the normal startup
-        state). Falls back to ``fallback`` when the current objective has no
-        stored calibration."""
+    def _objective_um_per_px(self, frame_w: float) -> float | None:
+        """Resolution-rescaled µm/px for the CURRENTLY SELECTED objective, or
+        ``None`` when that objective has no stored calibration for this camera.
+
+        Per-camera + per-objective, so the raster FOV tracks the objective
+        (2x / 4x / 10x). This is what makes the grid spacing follow the
+        objective selection — mirrors calibration.py::_ploc_microscope_um_per_px
+        (the objective's ``measured_um_per_px`` was taken at ``resolution``; if
+        the camera now captures at a different width, µm/px scales inversely by
+        ``cal_width / current_width``)."""
         try:
             from SupportClasses.ObjectiveCalibration import get_store as obj_store
             cam_key = self._camera_key()
@@ -776,7 +827,211 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                         return meas * (cal_w / float(frame_w))
         except Exception:
             pass
-        return fallback
+        return None
+
+    def _microscope_um_per_px(self, frame_w: float, fallback: float) -> float:
+        """Objective-store µm/px rescaled to the LIVE frame width (see
+        :meth:`_objective_um_per_px`), falling back to ``fallback`` when the
+        current objective has no stored calibration."""
+        eff = self._objective_um_per_px(frame_w)
+        return eff if (eff and eff > 0) else fallback
+
+    # ── Mosaic FOV/spacing calibration (mirrors the full-plate scan) ──
+
+    def _align_store(self):
+        """The shared per-camera+objective mosaic-alignment store (learned FOV /
+        spacing + registration shift) — the same store the full-plate scan's
+        'Calibrate…' writes to."""
+        try:
+            from SupportClasses.MosaicAlignmentStore import get_store
+            return get_store()
+        except Exception:
+            return None
+
+    def _align_key(self) -> str:
+        """Key for the alignment store: microscope camera IDENTITY + current
+        objective — identical scheme to calibration.py::_ploc_camera_objective_key
+        so a calibration done here (or in Plate Location) round-trips for the
+        same camera + objective."""
+        obj = self._current_objective_name() or "default"
+        ident = None
+        mgr = self._camera_manager
+        cam_idx = self._resolve_microscope_cam_idx()
+        if mgr is not None:
+            try:
+                res = mgr.camera_identity(cam_idx)   # (key, name) | None
+                if res:
+                    ident = res[0]
+            except Exception:
+                ident = None
+        return f"{ident}|{obj}" if ident else str(obj)
+
+    def _learned_um_per_px(self, frame_w: float) -> float | None:
+        """The learned effective µm/px from a mosaic FOV/spacing calibration for
+        THIS camera + objective, rescaled to the live frame width, or ``None``.
+
+        Resolution-safe: the stored value carries the capture resolution it was
+        measured at, so a value taken at 916 px is rescaled for a 3664 px live
+        frame (µm/px ∝ 1/width). A LEGACY value with no recorded resolution is
+        deliberately ignored here — without the resolution it can't be trusted
+        across the objective-selectable widths this workflow runs at, and the
+        resolution-safe objective-store value (``_objective_um_per_px``) is the
+        better fallback."""
+        store = self._align_store()
+        key = self._align_key()
+        if store is None or not key:
+            return None
+        try:
+            val = store.get_um_per_px(key)
+            if not val or val <= 0:
+                return None
+            res = store.get_resolution(key)
+            if res and res[0] > 0 and frame_w > 0:
+                return float(val) * (float(res[0]) / float(frame_w))
+        except Exception:
+            pass
+        return None
+
+    def _open_mosaic_calibration(self):
+        """Open the small-mosaic FOV/spacing calibration for the CURRENT
+        objective — the same pop-out the full-plate scan uses (Calibration →
+        Plate Location → Mosaic scan → Calibrate…), wired to this workflow's
+        camera + objective + selected well. Building a small mosaic and tuning
+        the spacing stores a learned effective µm/px (per camera + objective)
+        that :meth:`_learned_um_per_px` then feeds into the raster grid — so the
+        tiles tile correctly for the chosen objective before a long scan."""
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(
+                self, "Mosaic calibration",
+                "Wait for the current capture to finish before calibrating.")
+            return
+        if self._controller is None or self._camera_manager is None:
+            QMessageBox.warning(
+                self, "Mosaic calibration",
+                "Stage controller and camera manager are required.")
+            return
+        # Safe-Z gate — same as the scan (the calibration mosaic retracts the
+        # needle before every XY hop; on ME3B V1 (ZDIR=-1) a retract with no
+        # Safe Z would drive the needle DOWN into the plate).
+        if getattr(self._controller, "is_zp_connected", False) and self._safe_z is None:
+            QMessageBox.warning(
+                self, "Mosaic calibration",
+                "Set the Safe / Move Z on the Calibration page first — the "
+                "calibration mosaic retracts the needle before every move.")
+            return
+        cam_idx = self._resolve_microscope_cam_idx()
+        try:
+            cam = self._camera_manager.cameras[cam_idx]
+        except (AttributeError, IndexError):
+            QMessageBox.warning(
+                self, "Mosaic calibration", f"Camera {cam_idx} not available.")
+            return
+        try:
+            if not self._camera_manager.is_running(cam_idx):
+                self._camera_manager.start(cam_idx)
+                self._camera_started_by_us = True
+        except Exception:
+            pass
+        if not self._camera_manager.is_um_per_px_calibrated(cam_idx):
+            QMessageBox.warning(
+                self, "Mosaic calibration",
+                "Calibrate the microscope objective µm/pixel first "
+                "(Hardware Setup → Cameras).")
+            return
+        frame = None
+        try:
+            frame = cam.get_current_frame()
+            if frame is None and hasattr(cam, "capture_fresh_frame"):
+                frame = cam.capture_fresh_frame(discard_n_frames=2, settle_ms=300)
+        except Exception:
+            frame = None
+        if frame is None:
+            QMessageBox.warning(
+                self, "Mosaic calibration",
+                "Microscope camera is not producing frames yet — start it and retry.")
+            return
+        fh, fw = frame.shape[:2]
+        # Objective-resolved µm/px at the LIVE width (the "assumed" FOV the
+        # spacing slider corrects). Same value the raster planner uses.
+        base = 0.0
+        try:
+            base = float(self._camera_manager.effective_um_per_px(cam_idx, fw)
+                         or self._camera_manager.get_um_per_px(cam_idx) or 0.0)
+        except Exception:
+            base = float(self._camera_manager.get_um_per_px(cam_idx) or 0.0)
+        um_cam = self._microscope_um_per_px(fw, base)
+        if um_cam <= 0:
+            QMessageBox.warning(
+                self, "Mosaic calibration", "Microscope µm/pixel not calibrated.")
+            return
+        # Centre the calibration mosaic on the selected well (texture + where the
+        # scan happens), falling back to the plate centre.
+        center = self._well_center_um(self._scan_well) if self._scan_well else None
+        if center is None:
+            try:
+                center = self._controller.default_plate_center_um()
+            except Exception:
+                center = (0.0, 0.0)
+        try:
+            from gui.dialogs.mosaic_calibration_dialog import MosaicCalibrationDialog
+        except Exception as e:
+            logger.warning("Mosaic calibration dialog unavailable: %s", e)
+            QMessageBox.warning(
+                self, "Mosaic calibration",
+                "The mosaic calibration dialog is unavailable.")
+            return
+        # Inherit the shared stitch settings (orientation / overlap / settle /
+        # timing) BUT force fov_um=0 so the calibration mosaic sizes its tiles
+        # from the objective-resolved µm/px we pass (``um_per_px_camera``), not
+        # the shared full-plate FOV — which is calibrated for ONE objective and
+        # would build a wrong-scale calibration mosaic for a different one.
+        cal_settings = dict(self._scan_settings())
+        cal_settings["fov_um"] = 0
+        dlg = MosaicCalibrationDialog(
+            self._controller, self._camera_manager, cam_idx,
+            safe_z=self._safe_z,
+            align_key=self._align_key(),
+            store=self._align_store(),
+            settings=cal_settings,
+            center_um=center,
+            frame_size=(fw, fh),
+            um_per_px_camera=um_cam,
+            parent=self)
+        dlg.exec()
+        # A stored learned FOV/spacing changes the grid; refresh preview + status.
+        self._refresh_calibration_status()
+        self._refresh_grid_preview()
+
+    def _refresh_calibration_status(self):
+        """Update the settings-popout label with the learned FOV/spacing state
+        for the current camera + objective."""
+        lbl = getattr(self, "_cal_status_lbl", None)
+        if lbl is None:
+            return
+        obj = self._current_objective_name() or "—"
+        store = self._align_store()
+        key = self._align_key()
+        val = None
+        res = None
+        if store is not None and key:
+            try:
+                val = store.get_um_per_px(key)
+                res = store.get_resolution(key)
+            except Exception:
+                val = res = None
+        if val and val > 0:
+            res_txt = (f" @ {int(res[0])}px" if res else
+                       " (no resolution — recalibrate)")
+            lbl.setText(
+                f"{obj}: calibrated · {float(val):.3f} µm/px{res_txt}")
+            lbl.setStyleSheet(
+                f"color: {COLORS['green']}; font-size: {sf(9)}pt;")
+        else:
+            lbl.setText(
+                f"{obj}: not calibrated — using the objective µm/px "
+                f"(Calibrate… to fine-tune the spacing).")
+            lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
 
     def _refresh_objectives(self):
         try:
@@ -838,7 +1093,9 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                     cam_idx, float(cal["rotation_deg"]))
         except Exception as exc:
             logger.debug("Fluor mosaic objective apply failed: %s", exc)
-        # The FOV (and thus the grid) depends on the objective scale.
+        # The FOV (and thus the grid) depends on the objective scale; the learned
+        # FOV/spacing is per-objective, so refresh its status readout too.
+        self._refresh_calibration_status()
         self._refresh_grid_preview()
 
     # ── Well selection ────────────────────────────────────────────
@@ -957,15 +1214,38 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             fw, fh = self._scan_frame_size
         if fw <= 0 or fh <= 0:
             return None
-        try:
-            base = float(self._camera_manager.effective_um_per_px(cam_idx, fw)
-                         or self._camera_manager.get_um_per_px(cam_idx) or 0.0)
-        except Exception:
-            base = float(self._camera_manager.get_um_per_px(cam_idx) or 0.0)
-        eff = self._microscope_um_per_px(fw, base)
+        # Effective µm/px. UNLIKE the fixed-objective full-plate mosaic, this
+        # workflow is OBJECTIVE-SELECTABLE (2x / 4x / 10x), so the per-objective
+        # sources are AUTHORITATIVE and size the tiles — they must NOT be
+        # overridden by the shared full-plate ``fov_um`` (calibrated for ONE
+        # objective; it would size 4x/10x tiles as if they were 2x → big gaps).
+        # Precedence, all per camera+objective except the shared fallbacks:
+        #   1. learned FOV/spacing from a mosaic calibration (this workflow's
+        #      "Calibrate…" or Plate Location's), rescaled to the live width,
+        #   2. the objective-store µm/px (also rescaled),
+        #   3. the shared ``fov_um`` override (fallback), then
+        #   4. the live camera µm/px.
+        # (The ``spacing_um`` setting below still forces the grid step directly,
+        # objective-independently, when needed.)
+        scan = self._scan_settings()
+        eff = self._learned_um_per_px(fw) or 0.0
+        if eff <= 0:
+            eff = self._objective_um_per_px(fw) or 0.0
+        if eff <= 0:
+            fov_um = float(scan.get("fov_um", 0) or 0)
+            if fov_um > 0 and fw > 0:
+                eff = fov_um / float(fw)
+            else:
+                try:
+                    eff = float(self._camera_manager.effective_um_per_px(cam_idx, fw)
+                                or self._camera_manager.get_um_per_px(cam_idx) or 0.0)
+                except Exception:
+                    eff = float(self._camera_manager.get_um_per_px(cam_idx) or 0.0)
         if eff <= 0:
             return None
-        overlap_frac = float(self._overlap.value()) / 100.0
+        overlap_frac = float(scan.get("overlap_pct", 25)) / 100.0
+        spacing_um = float(scan.get("spacing_um", 0) or 0)
+        step = spacing_um if spacing_um > 0 else None
         margin = float(self._well_margin.value())
         r_um = (diam_mm / 2.0) * 1000.0 * margin
         cx, cy = center
@@ -980,7 +1260,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         tmpl = MosaicBuilder(
             frame_size_px=(fw, fh), micron_per_pixel=eff,
             overlap=overlap_frac, target_mosaic_px=target_px, register=True)
-        grid = tmpl.generate_raster_positions(bounds, overlap=overlap_frac)
+        grid = tmpl.generate_raster_positions(
+            bounds, overlap=overlap_frac, step_x_um=step, step_y_um=step)
         env = self._envelope()
         if env is not None:
             grid = [(x, y) for (x, y) in grid
@@ -1176,11 +1457,21 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._status.setText("Camera unavailable.")
             return
         fw, fh = self._scan_frame_size
-        overlap_frac = float(self._overlap.value()) / 100.0
+        # Stitch-critical params inherited from the shared full-plate mosaic
+        # settings (frame_orient / overlap / registration / camera timing), so
+        # the single-well scan stitches with the exact same pattern as the
+        # full-plate scan. Only the resolution is fluorescence-local.
+        scan = self._scan_settings()
+        overlap_frac = float(scan.get("overlap_pct", 25)) / 100.0
+        spacing_um = float(scan.get("spacing_um", 0) or 0)
+        step = spacing_um if spacing_um > 0 else None
         target_px = int(self._target_px.value())
-        settle_ms = int(self._settle_ms.value())
-        fresh_frames = int(self._fresh_frames.value())
-        frame_orient = str(self._frame_orient.currentText())
+        settle_ms = int(scan.get("settle_ms", 300))
+        fresh_frames = int(scan.get("fresh_frames", 3))
+        fresh_timeout_s = float(scan.get("fresh_timeout_s", 2.5))
+        frame_orient = str(scan.get("frame_orient", "none"))
+        register = bool(scan.get("register", True))
+        max_shift_um = float(scan.get("max_shift_um", 0) or 0)
         try:
             from SupportClasses.MosaicBuilder import MosaicBuilder
         except ImportError:
@@ -1188,7 +1479,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             return
         builder = MosaicBuilder(
             frame_size_px=(fw, fh), micron_per_pixel=self._scan_um_per_px,
-            overlap=overlap_frac, target_mosaic_px=target_px, register=True)
+            overlap=overlap_frac, target_mosaic_px=target_px,
+            register=register, max_shift_um=max_shift_um)
         # CRITICAL: allocate the composite canvas on the SAME builder the worker
         # uses. generate_raster_positions() is the only thing that calls
         # _init_composite(); in _on_start the grid was generated on a THROWAWAY
@@ -1200,7 +1492,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         if self._scan_bounds is not None:
             try:
                 builder.generate_raster_positions(
-                    self._scan_bounds, overlap=overlap_frac)
+                    self._scan_bounds, overlap=overlap_frac,
+                    step_x_um=step, step_y_um=step)
             except Exception as e:
                 logger.warning("Fluor mosaic: builder canvas init failed: %s", e)
         safe_z = self._safe_z if self._safe_z is not None else 0.0
@@ -1209,8 +1502,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             f"Scanning {channel}: 0/{len(self._scan_positions)}…")
         self._worker = _SingleWellMosaicWorker(
             self._controller, cam, builder, self._scan_positions, safe_z,
-            fresh_frames=fresh_frames, settle_ms=settle_ms,
-            frame_orient=frame_orient)
+            fresh_frames=fresh_frames, fresh_timeout_s=fresh_timeout_s,
+            settle_ms=settle_ms, frame_orient=frame_orient)
         self._worker.progress.connect(self._on_channel_progress)
         self._worker.tile.connect(self._on_channel_tile)
         self._worker.finished_ok.connect(

@@ -22,3 +22,46 @@ Windows fatal exception: code 0x80010108
 
 Thread 0x00011da0 (most recent call first):
   <no Python frame>
+Windows fatal exception: code 0x80010108
+
+Thread 0x00000da0 (most recent call first):
+  <no Python frame>
+Windows fatal exception: access violation
+
+Thread 0x00005188 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Python313\Lib\threading.py", line 994 in run
+  File "C:\Python313\Lib\threading.py", line 1043 in _bootstrap_inner
+  File "C:\Python313\Lib\threading.py", line 1014 in _bootstrap
+
+Thread 0x00006b64 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Python313\Lib\threading.py", line 994 in run
+  File "C:\Python313\Lib\threading.py", line 1043 in _bootstrap_inner
+  File "C:\Python313\Lib\threading.py", line 1014 in _bootstrap
+
+Thread 0x00009a90 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\SupportClasses\StageController.py", line 1313 in _poll_loop
+  File "C:\Python313\Lib\threading.py", line 994 in run
+  File "C:\Python313\Lib\threading.py", line 1043 in _bootstrap_inner
+  File "C:\Python313\Lib\threading.py", line 1014 in _bootstrap
+
+Thread 0x00009128 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Python313\Lib\threading.py", line 994 in run
+  File "C:\Python313\Lib\threading.py", line 1043 in _bootstrap_inner
+  File "C:\Python313\Lib\threading.py", line 1014 in _bootstrap
+
+Thread 0x00008598 (most recent call first):
+  File "C:\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Python313\Lib\queue.py", line 210 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Python313\Lib\threading.py", line 994 in run
+  File "C:\Python313\Lib\threading.py", line 1043 in _bootstrap_inner
+  File "C:\Python313\Lib\threading.py", line 1014 in _bootstrap
+
+Current thread 0x00008b0c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\gui\widgets\camera_widget.py", line 933 in _grab_frame
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 330 in <module>

@@ -90,7 +90,7 @@
         },
         {
           "title": "Detect, assign, and calibrate cameras (Cameras)",
-          "detail": "On Cameras, click Detect Cameras (or Load Cameras to restore + start a saved setup). For each slot pick a Source and a Role (Microscope / Needle X-view / Needle Y-view — singletons), click ▶ Start to verify the live feed, and tune Brightness/Contrast/Gamma under the preview. Calibrate µm/px… on each needle camera and add+calibrate objectives in Objective Calibration Setup. Click Save Camera Settings to make it this machine's startup default.",
+          "detail": "On Cameras, click Detect Cameras (or Load Cameras to restore + start a saved setup). For each slot pick a Source and a Role (Microscope / Needle X-view / Needle Y-view — singletons), click ▶ Start to verify the live feed, and tune Brightness/Contrast/Gamma under the preview. Calibrate µm/px… on each needle camera and add+calibrate objectives in Objective Calibration Setup. In that same card, click 'Calibrate orientation…' for the microscope camera to measure its rotation relative to the stage axes (the readout shows 'Camera rotation vs stage: θ°'); this makes live-view clicks — used by Plate Location well-fits and Re-anchor — map to the correct stage direction even when the camera is mounted rotated (≈180°, but rarely exactly). Click Save Camera Settings to make it this machine's startup default.",
           "screenshot_ref": "cameras-detect-assign"
         },
         {
@@ -509,6 +509,12 @@
           "recommendation": "Calibrate each objective you use; a ⚠ on the Date column means it was calibrated at a different resolution than active."
         },
         {
+          "name": "Cameras → Objective Calibration Setup: Calibrate orientation… + 'Camera rotation vs stage' readout",
+          "what_it_does": "Measures the microscope camera's rotation relative to the stage axes by moving the stage (stage-motion PixelCalibrationDialog; needs the camera started + stage connected). Does NOT change µm/px. The measured angle is applied to the live-view click→stage mapping so Plate Location well-fits and 'Re-anchor map' clicks map in the correct XY direction even when the camera is mounted rotated (≈180°, but rarely exactly). Persisted per physical camera and restored on reassignment. A previously scanned mosaic is NOT invalidated — the rotation only affects the click mapping, not the stored image.",
+          "default": "not calibrated → clicks assume the camera is aligned to the stage (identity mapping)",
+          "recommendation": "Calibrate it once per rig. If a live-view click ends up mirrored/rotated on the stage, re-run it (or check the readout angle looks plausible)."
+        },
+        {
           "name": "Xbox Controller sub-page",
           "what_it_does": "Dedicated Xbox controller setup (mapping editor, jog-speed read-outs, deadzones/offsets). Shares state with the Connect Hardware panel's Xbox row.",
           "default": "—",
@@ -580,11 +586,12 @@
     {
       "id": "calibration",
       "title": "Calibration",
-      "overview": "The Calibration page teaches the machine three things it needs before printing or running any workflow: where the needle tip sits (Needle Location), how high the needle can travel and where the plate surfaces are (Needle Offset Calibration / Z reference heights), and where each well is in stage XY (Plate Location) plus how deep each well bottom is (Plate Z Auto-Cal). It is organized as five tabs in left-to-right order: Needle Location, Needle Offset Calibration, Plate Location, Plate Z Auto-Cal, and Custom (power-user wizards). An operator works left to right: center the needle, capture the safe/travel and plate heights, map the wells, then find each well bottom by focus. A \"Use last known location\" shortcut and a \"Re-derive wells from saved mosaic\" shortcut let you skip the long workflows when nothing has physically changed.",
+      "overview": "The Calibration page teaches the machine three things it needs before printing or running any workflow: where the needle tip sits (Needle Location), how high the needle can travel and where the plate surfaces are (Needle Offset Calibration / Z reference heights), and where each well is in stage XY (Plate Location) plus how deep each well bottom is (Plate Z Auto-Cal). Tabs run left to right: Needle Location, Pump Compliance, Plate Location, Rosettes (sub-well calibration from single-well mosaics), Plate Z Auto-Cal, and Custom (power-user wizards). An operator works left to right: center the needle, capture the safe/travel and plate heights, map the MAIN wells, calibrate rosette sub-wells, then find each well bottom by focus. A \"Use last known location\" shortcut and a \"Re-derive wells from saved mosaic\" shortcut let you skip the long workflows when nothing has physically changed; a no-travel \"Re-anchor mosaic\" fix re-aligns the whole map (the mosaic image AND the well centres, together) after the plate is remounted — and \"Auto re-anchor mosaic\" repeats that hands-free from the saved feature.",
       "where_to_find": "Sidebar → Calibration page. Tabs across the top, left to right: Needle Location, Needle Offset Calibration, Plate Location, Plate Z Auto-Cal, Custom.",
       "prerequisites": [
         "Hardware Setup → Cameras: assign the Needle X-view and Needle Y-view roles to the two side cameras (the Needle Location camera tiles stay as placeholders until both NEEDLE_X / NEEDLE_Y roles are assigned), and assign the Microscope role to the overhead camera (needed for Plate Location auto edge-detect, the mosaic scan, and Plate Z Auto-Cal focus).",
         "Hardware Setup → Cameras: calibrate µm/pixel for the microscope objective. Plate Location well edge-fit, the mosaic scan, and the needle-offset preview refuse to run on an uncalibrated camera (the Run handler explicitly blocks with 'Microscope camera µm/pixel not calibrated').",
+        "Hardware Setup → Cameras → Objective Calibration Setup: 'Calibrate orientation…' for the microscope camera if it is mounted rotated relative to the stage. This makes live-view clicks — Plate Location well-fits and 'Re-anchor map' — map to the correct stage direction. Uncalibrated = clicks assume the camera is aligned to the stage.",
         "Stage controller connected (XY + ZP). Many actions warn 'Stage controller required' / 'not connected' if missing.",
         "Hardware Setup → Device: set the Z soft-limit envelope (z_min/z_max). The calibration tab no longer owns it — capturing Max Z / Plate Bottom Z here does NOT change the safety envelope.",
         "Hardware Setup → Cameras: select the microscope objective in use — when wells are queued, the Plate Location Run is blocked by a 'Confirm objective' dialog if no objective is selected, and you must answer Yes that the scope is physically set to that objective.",
@@ -612,19 +619,19 @@
           "screenshot_ref": "z-offset-heights"
         },
         {
-          "title": "Map the wells in XY (Plate Location tab)",
-          "detail": "Open Plate Location. Choose the Well-fit mode: 'Manual — click well edge in live view' (default) or 'Auto — camera edge-detect'. Use the Free/Snap toggle on the plate view to enqueue targets: Snap = click wells, Free = click anywhere to drop a freeform point (clicking an already-queued well/point removes it). Queue several wells spread across the plate, then click 'Run'. If the ZP is connected and you have not set the Fast Move Z, Run is blocked with a warning — go set it first.",
+          "title": "Pick the plate-calibration workflow version (Plate Location tab)",
+          "detail": "Open Plate Location. The 'Plate calibration:' combo at the top of the tab switches between two VERSIONS of the tab: 'Mosaic workflow (recommended)' — the DEFAULT, showing the Mosaic tools described in the next step — and 'Legacy well-fit / target queue (deprecated)', the old per-well flow kept until it is removed. Only one version's controls are shown at a time; the choice persists across restarts, and switching is refused while a run or scan is active. Stay on the Mosaic workflow unless you specifically need the legacy flow.",
           "screenshot_ref": "plate-location-main"
         },
         {
-          "title": "Teach each well during the run",
-          "detail": "When wells are queued, you must first confirm the in-use objective (a dialog that blocks if none is selected). The stage then retracts to Safe Z once and travels to each queued target. In Manual mode, JOG to bring each rim edge into the microscope view and click the well EDGE (each click records a rim point at the CURRENT stage position — the stage is never driven by a click); collect ~3+ points (8 suggested) around the rim, then click 'Confirm position' to circle-fit the center (needs ≥3 valid points). In Auto mode the camera edge-detects automatically and falls back to a manual 3-point pick if it fails. For freeform points, jog to center the target and Confirm. 'Skip' leaves a well/point uncalibrated and advances; 'Cancel run' aborts and discards results. Taught well centers show as pink reference markers on the plate and microscope views.",
-          "screenshot_ref": "plate-location-main"
-        },
-        {
-          "title": "(Alternative) full-plate mosaic scan",
-          "detail": "Instead of clicking each well, click 'Mosaic scan' in the Mosaic group to raster the whole plate (needle retracted to Safe Z), stitch one composite image on a worker thread, and detect every well at once. Tune it via 'Settings…' (camera settle/timing, FOV overlap, resolution, detection sensitivity). 'Calibrate…' builds a small mosaic to estimate and store this camera+objective's alignment delta. 'Map wells…' lets you place the 3 corner wells by hand on the stitched mosaic and auto-place the rest. 'Quick re-register' re-fits the whole plate from a saved template by visiting only 3 reference wells. 'Scan well…' maps the sub-wells of one rosette well. Use the 'Plate view' combo (Ideal well / Mosaic / Mosaic + well) and the 'Manual align' sliders + 'Re-anchor map (1 point)…' to verify and correct registration by eye.",
+          "title": "Map the wells in XY — Mosaic workflow (default)",
+          "detail": "The Mosaic group is a VERTICAL list of five main buttons. 'Calibrate mosaic scan' builds a small mosaic to estimate and store this camera+objective's alignment delta (full scans then start pre-registered). 'Mosaic scan' rasters the whole plate (needle retracted to Safe Z), stitches one composite on a worker thread, detects every well, and AUTO-OPENS the guided mapping dialog — the mosaic displays in the same orientation as the plate overlay (A1 top-left), you zoom/pan, pick each guided MAIN well by centre-click or 3+ edge points, and Confirm each before the next (rosette sub-wells are calibrated on the Rosettes tab, not here; a rosette well is fitted as ONE circle at the plate's NORMAL well diameter). 'Map wells…' re-opens that guided mapping on the stored mosaic without re-scanning — and every confirmed mapping is SAVED WITH the mosaic, so loading that mosaic later restores the mapping automatically. 'Re-anchor mosaic' is the manual no-travel two-click fix for a remounted plate (click a feature in the live view, then the same feature on the overview — the mosaic image AND well centres slide together); that live click also SAVES the feature. 'Auto re-anchor mosaic' then re-anchors hands-free: it travels to the saved feature's last position, finds it in the live view by template match, and shifts the whole map by the measured offset. Everything else lives under 'Advanced… ▾': scan Settings, Load mosaic from another plate (adopt a mosaic already scanned under a different plate selection — its saved well mapping loads with it), Quick re-register (template), Scan well (any well → re-register anchors), Re-register from scanned wells (1 = shift, 2 = +rotation, 3+ = affine), Re-derive from saved mosaic, and the Manual align sliders. Use the 'Plate view' combo (Ideal well / Mosaic / Mosaic + well — overlay mode shows the mosaic as background with outline circles at every well, including calibrated sub-wells) and the 'Well scans' checkbox to overlay saved single-well mosaics.",
           "screenshot_ref": "plate-location-mosaic"
+        },
+        {
+          "title": "(Deprecated legacy version) teach wells by hand with the target queue",
+          "detail": "Switch the 'Plate calibration' combo to 'Legacy well-fit / target queue (deprecated)' first — the queue controls are hidden in the default Mosaic version and plate-view clicks only enqueue targets in Legacy mode. Choose the Well-fit mode: 'Manual — click well edge in live view' (default) or 'Auto — camera edge-detect'. Use the Free/Snap toggle on the plate view to enqueue targets: Snap = click wells, Free = click anywhere to drop a freeform point (clicking an already-queued well/point removes it). Queue several wells spread across the plate, then click 'Run' (blocked if Fast Move Z is unset with the ZP connected). Confirm the in-use objective; the stage retracts to Safe Z and travels to each target. In Manual mode, JOG each rim edge into the microscope view and click the well EDGE (each click records a rim point at the CURRENT stage position); collect ~3+ points around the rim, then 'Confirm position' to circle-fit the center. In Auto mode the camera edge-detects with a manual 3-point fallback. For freeform points, jog to center the target and Confirm. 'Skip' advances without teaching; 'Cancel run' aborts. This flow will be removed in a future version — prefer the Mosaic workflow.",
+          "screenshot_ref": "plate-location-main"
         },
         {
           "title": "(Shortcut) re-derive wells after a plate-orientation change",
@@ -734,16 +741,22 @@
           "recommendation": "Use before physically changing the needle."
         },
         {
-          "name": "Well fit mode combo (Plate Location)",
-          "what_it_does": "Chooses how each queued well is centered during a run. 'Manual — click well edge in live view': the stage anchors at the predicted center, you jog and click the rim edge in the microscope feed (≥3 clicks → circle fit). 'Auto — camera edge-detect': automatic detection with a manual 3-point fallback.",
+          "name": "Plate calibration workflow combo (Plate Location)",
+          "what_it_does": "Switches which VERSION of the Plate Location tab is shown: 'Mosaic workflow (recommended)' — the default, showing the Mosaic group (Calibrate mosaic scan / Mosaic scan / Re-anchor / Auto re-anchor / Plate view / Well scans / Advanced…) — or 'Legacy well-fit / target queue (deprecated)', the old per-well flow (Well-fit combo, target queue, Clear/Run, queue status). Only visibility switches; nothing is removed. Persisted in settings.json (plate_location_prefs.workflow). Switching is refused while a queue run or mosaic scan is active.",
+          "default": "Mosaic workflow (recommended)",
+          "recommendation": "Stay on Mosaic. The legacy flow is kept temporarily and will be removed in a future version."
+        },
+        {
+          "name": "Well fit mode combo (Plate Location — legacy version only)",
+          "what_it_does": "Chooses how each queued well is centered during a legacy run. 'Manual — click well edge in live view': the stage anchors at the predicted center, you jog and click the rim edge in the microscope feed (≥3 clicks → circle fit). 'Auto — camera edge-detect': automatic detection with a manual 3-point fallback. Hidden in the default Mosaic workflow.",
           "default": "Manual — click well edge in live view",
           "recommendation": "Manual is the most reliable when wells are larger than the field of view or detection is noisy."
         },
         {
           "name": "Plate view + Free/Snap toggle",
-          "what_it_does": "Top-down workspace view (same JogWorkspaceView as the Jog page): safety envelope, plate outline, wells colored by calibrated/approximate status, needle to scale, and pink reference markers for taught centers. The built-in Free/Snap toggle (top-left of the view) routes clicks: Snap = click wells to enqueue, Free = click anywhere to drop a freeform point. Clicking an already-queued well/point removes it.",
+          "what_it_does": "Top-down workspace view (same JogWorkspaceView as the Jog page): safety envelope, plate outline, wells colored by calibrated/approximate status, needle to scale, and pink reference markers for taught centers. The built-in Free/Snap toggle (top-left of the view) routes clicks: Snap = click wells, Free = click anywhere. Clicks ENQUEUE targets only in the legacy workflow (clicking an already-queued well/point removes it); in the default Mosaic workflow plate-view clicks are ignored except during a Re-anchor (which uses them to pick the map point).",
           "default": "Snap mode",
-          "recommendation": "Mix Snap (wells) and Free (arbitrary points), then Run."
+          "recommendation": "In the legacy workflow, mix Snap (wells) and Free (arbitrary points), then Run."
         },
         {
           "name": "Microscope live feed (Plate Location)",
@@ -758,10 +771,10 @@
           "recommendation": ""
         },
         {
-          "name": "Target queue list + Clear queue + Run",
-          "what_it_does": "Lists queued wells and freeform points. 'Clear queue' empties it. 'Run' starts the calibration run (disabled until there is something to run; also blocked if no plate/controller, if Fast Move Z is unset with ZP connected, or if wells are queued and the microscope camera/µm-px isn't ready).",
-          "default": "Run disabled until queue has entries",
-          "recommendation": "Queue several wells spread across the plate for an accurate XY fit."
+          "name": "Well-fit queue (legacy) group — Target queue list + Clear queue + Run",
+          "what_it_does": "The deprecated per-well flow, shown only in the legacy workflow version (with an inline deprecation note). Lists queued wells and freeform points. 'Clear queue' empties it. 'Run' starts the calibration run (disabled until there is something to run; also blocked if no plate/controller, if Fast Move Z is unset with ZP connected, or if wells are queued and the microscope camera/µm-px isn't ready).",
+          "default": "hidden (Mosaic workflow is the default); Run disabled until queue has entries",
+          "recommendation": "Prefer the Mosaic workflow. If you do use it, queue several wells spread across the plate for an accurate XY fit."
         },
         {
           "name": "Mosaic scan",
@@ -782,10 +795,16 @@
           "recommendation": ""
         },
         {
-          "name": "Map wells…",
-          "what_it_does": "Maps wells on the stitched mosaic by hand: click the 3 corner wells, the rest auto-place from the plate layout, drag to refine, then confirm. Also saves the labeled mosaic for detection R&D.",
+          "name": "Map wells… (main button; auto-opens after every Mosaic scan)",
+          "what_it_does": "Guided well mapping on the stitched mosaic, shown in the SAME orientation as the plate overlay (A1 top-left — no more upside-down mosaic). Maps MAIN wells only (a rosette well appears as ONE circle at its pattern centre, sized at the plate's NORMAL well diameter — never the small sub-well geometry; its sub-wells are calibrated on the Rosettes tab). Zoom (wheel) and pan (middle-drag) freely. For each guided well pick a selection mode: 'Centre click' (one click places the circle; drag it to refine) or 'Edge points (3+)' (click 3 or more points ON the well rim — a circle is fitted through them, with a radius sanity check). You must press 'Confirm well' before the next well starts (Redo re-picks, Skip keeps an auto placement). Flow: confirm the 3 corner wells → the rest auto-place from the plate layout (or auto-detect pre-places everything) → refine any → 'Confirm all + calibrate + save'. The confirmed mapping is SAVED WITH the mosaic (so loading the mosaic later restores it) and as a labeled sample for detection R&D.",
+          "default": "Centre click mode",
+          "recommendation": "Use 'Edge points' when a well's centre is hard to judge — the fitted circle finds it from the rim. Good fallback when automatic well detection mis-labels wells."
+        },
+        {
+          "name": "Load mosaic from another plate… (Advanced menu)",
+          "what_it_does": "Adopts a mosaic already scanned under ANOTHER plate selection as this plate's mosaic — a COPY (the source stays), including its single-well scans and its last good well mapping, which is applied automatically when it matches the current plate layout. Extents are absolute stage µm, so after loading use Re-anchor / Auto re-anchor to line the map up with the current mount (or Map wells… to re-map).",
           "default": "",
-          "recommendation": "Good fallback when automatic well detection mis-labels wells."
+          "recommendation": "Use when the same physical plate type was scanned under a different plate selection — scan once, load everywhere. Mosaics mapped before this feature carry no saved mapping; run Map wells… once to seed it."
         },
         {
           "name": "Quick re-register",
@@ -794,10 +813,34 @@
           "recommendation": "Use when you remounted a previously-scanned plate and just need to re-lock the map."
         },
         {
-          "name": "Scan well…",
-          "what_it_does": "Builds a high-resolution mosaic of one rosette well and maps its sub-wells (uses the plate's sub-well layout).",
+          "name": "Scan well… (Advanced menu)",
+          "what_it_does": "Builds a high-resolution mosaic of ONE well (any well — '(scanned)' marks wells that already have one). A ROSETTE well opens the guided sub-well flow (also available on the dedicated Rosettes tab); a PLAIN well just picks its centre (centre-click or edge-points). Each picked centre records an anchor for 'Re-register from scanned wells'. The single-well mosaic is saved per well and never overwrites the plate mosaic — and it composites onto the plate mosaic when the 'Well scans' toggle is on.",
           "default": "",
-          "recommendation": "Only for plates with rosette sub-wells."
+          "recommendation": "For rosette sub-well calibration prefer the Rosettes tab. Scan 1–3 wells after a remount to re-register the plate without a full re-scan."
+        },
+        {
+          "name": "Auto re-anchor mosaic",
+          "what_it_does": "Hands-free re-anchor from the feature saved by the last manual 'Re-anchor mosaic' click: the stage safe-travels to the feature's last known position, grabs a live frame, finds the feature by template match (rescaled for the current objective, confidence-gated), and shifts the WHOLE map — well centres AND mosaic image together — by the measured offset. The saved feature position tracks every later map correction, so it always reflects where the map currently believes the feature to be.",
+          "default": "disabled until a feature is saved for this plate",
+          "recommendation": "Run 'Re-anchor mosaic' once (its live click saves the feature over a distinctive mark), then re-anchor future remounts with this one click. If the match fails, jog the feature into view and redo the manual re-anchor to re-save it."
+        },
+        {
+          "name": "Advanced… ▾ (Mosaic group)",
+          "what_it_does": "Menu holding the less-common tools: Settings… (scan tuning), Map wells… (re-open the guided mapping without re-scanning), Quick re-register (template), Scan well…, Re-register from scanned wells (N), Re-derive wells from saved mosaic, and the Manual align sliders (checkable — shows/hides the slider group). Entries mirror the live enabled state and counts.",
+          "default": "",
+          "recommendation": "The four main buttons cover the normal workflow; open this only for recovery/tuning tools."
+        },
+        {
+          "name": "Rosettes tab (after Plate Location)",
+          "what_it_does": "Dedicated tab for calibrating ROSETTE SUB-WELL locations. Pick a rosette-assigned well ('(scanned)' marks saved scans) → 'Scan rosette well' mosaics just that well and opens the guided sub-well mapping: click the pattern CENTRE once, all sub-wells auto-place from the rosette design geometry (rotation included), drag any to refine, confirm — the sub-well centres (A1.a, A1.b, …) AND the parent centre are stored as calibration. 'Map sub-wells from saved scan…' re-opens the mapping on the SAVED mosaic with no re-scan and no stage motion. The status line shows scanned/calibrated state; the live microscope feed starts when the tab is shown.",
+          "default": "",
+          "recommendation": "Finish Plate Location first (the scan bounds come from the plate map). Plate-level mapping places only MAIN wells — sub-wells are calibrated here."
+        },
+        {
+          "name": "Re-register from scanned wells (N)",
+          "what_it_does": "Uses the well centres you picked on single-well mosaics to re-register the WHOLE plate: 1 scanned well = pure translation (the mosaic image and every well centre shift together); 2 wells = translation + rotation; 3+ = affine fit. The scanned wells themselves stay pinned exactly at their measured centres. Anchors are session-only and reset after applying (and whenever anything else moves the map). No stage motion.",
+          "default": "disabled until ≥1 well is scanned + picked",
+          "recommendation": "After remounting a plate: Scan well… on one recognizable well → pick its centre → press this. Scan a 2nd/3rd well first if you suspect rotation."
         },
         {
           "name": "Re-derive wells from saved mosaic (ground truth)",
@@ -806,16 +849,16 @@
           "recommendation": "Use after the plate orientation changed (e.g. the map became mirrored). Discards prior calibration, so be sure."
         },
         {
-          "name": "Plate view combo (Ideal well / Mosaic / Mosaic + well)",
-          "what_it_does": "Switches the plate map between the idealized well grid, the stitched plate mosaic, or both overlaid.",
-          "default": "Ideal well",
+          "name": "Plate view combo (Ideal well / Mosaic / Mosaic + well) + 'Well scans' toggle",
+          "what_it_does": "Switches the plate map between the idealized well grid, the stitched plate mosaic, or the overlay. 'Mosaic + well' shows the mosaic as the BACKGROUND with only outline circles at the well locations (green = calibrated, yellow = approximate, blue = current) — including calibrated rosette sub-wells — so the image is never obscured. The 'Well scans' checkbox (also on the Jog page) composites the saved high-res single-well mosaics onto the plate mosaic.",
+          "default": "Ideal well; Well scans ON",
           "recommendation": "Use 'Mosaic + well' to visually verify the well map registers to the real plate image."
         },
         {
-          "name": "Re-anchor map (1 point)…",
-          "what_it_does": "Fallback for a mis-registered map: pick a well/point on the plate overview (the stage travels there), then click that same feature in the live microscope view. The measured offset re-anchors the ENTIRE well map (a pure translation) and is saved permanently.",
+          "name": "Re-anchor mosaic",
+          "what_it_does": "Fallback for a mis-registered map (e.g. the plate was remounted). NO-TRAVEL, two clicks: (1) jog a recognizable feature (a well, corner, or mark) into the LIVE microscope view and click its centre — this reads the feature's true stage position; (2) click that SAME feature on the plate overview (snap to its well, or Free-select the exact point) — this reads where the map thinks it is. The difference shifts the ENTIRE map — well centres AND the mosaic image, together, as one unit (a pure translation) — and is saved permanently. The stage does NOT move during re-anchor, so it corrects even a large remount offset.",
           "default": "",
-          "recommendation": "Use when the whole map is shifted by a constant offset that auto re-register can't fix."
+          "recommendation": "Use when the whole map is shifted by a constant offset that auto re-register can't fix. Click the LIVE view first, then the overview. Requires a calibrated microscope µm/px (and, ideally, a calibrated camera orientation so the live click maps in the right direction). The live click also saves the feature patch that powers 'Auto re-anchor mosaic'."
         },
         {
           "name": "Manual align group (Δx µm / Δy µm / Opacity sliders + Store / Reset / Clear stored)",
@@ -921,6 +964,102 @@
           "id": "plate-z-autocal",
           "caption": "Plate Z Auto-Cal tab: Start/Cancel, the per-well Confirm focus / Record now / Accept / Redo buttons, the progress line, and the live microscope feed.",
           "nav": "Calibration → Plate Z Auto-Cal tab (after Plate Location is finished)"
+        }
+      ]
+    },
+    {
+      "id": "pump_compliance_calibration",
+      "title": "Pump Compliance Calibration & Backlash Compensation",
+      "overview": "When a pump dispenses or aspirates very small volumes, the syringe, tubing and plunger drivetrain FLEX slightly (this is the pump's compliance, a kind of backlash). Pulling the plunger back loads the flex in one direction; to then push, the plunger must first overcome that flex before any fluid actually moves, and then load the flex the other way. This dead volume makes small-volume flow inaccurate and leaves residual pressure in the needle that drools or ingests air while the stage travels between wells. This screen measures each pump's compliance value (in microlitres) so the software can compensate for it.",
+      "where_to_find": "Sidebar -> Calibration -> Pump Compliance tab (right next to Needle Location). A live needle side-camera view is on top so you can watch the droplet; the guided calibration controls are below. The backlash on/off toggle lives on the Jog page (Pumps panel); per-pump values are also shown on Workflows -> Common Print Settings.",
+      "prerequisites": [
+        "The pump's plunger has been calibrated (Hardware Setup -> Pump -> Pump Plunger Setup) so volumes read in microlitres.",
+        "A syringe + needle are fitted and the needle is primed with the working fluid.",
+        "The needle is parked at the needle location so it is framed in the side cameras on this tab, over a safe area to catch a droplet (run the Needle Location centring first, then switch to the Pump Compliance tab)."
+      ],
+      "steps": [
+        {
+          "title": "Select the pump and step size",
+          "detail": "Pick the pump to calibrate. Leave the step at 0.1 microlitres (small enough to find the droplet point precisely) and a slow rate such as 0.5 microlitres per second.",
+          "screenshot_ref": "pump-compliance"
+        },
+        {
+          "title": "Step 1 - dispense until a droplet appears",
+          "detail": "Click 'Dispense +step' repeatedly while watching the needle tip in the side cameras. Each click pushes one step of fluid out. Stop as soon as a droplet becomes visible at the tip. This phase is not counted - it just forms the droplet and leaves the flex fully loaded toward dispense.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Step 2 - Start calibration (zero)",
+          "detail": "When the droplet looks right, click 'Start calibration'. All counters zero out. From this point the flex is fully toward dispense, so the aspirate you do next measures the full backlash span.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Step 3 - aspirate the droplet back in",
+          "detail": "Click 'Aspirate -step' repeatedly until the droplet is pulled all the way back into the needle. The card sums these steps since Start as A (the aspirate-back total). If you overshoot, a 'Dispense +step' subtracts from A.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Step 4 - Finish (compute c)",
+          "detail": "Click 'Finish (compute c)'. The relief value is c = A / 2 (half the aspirate-back volume) - the plunger travel needed to remove the residual flex in one direction. It is filled into the 'Relief c' box; edit it there if you want a manual override.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Step 5 - Save (and Reset to retry)",
+          "detail": "Click 'Save relief' to store c for this pump. Repeat for each pump. To redo a measurement, click 'Reset' - it returns to the free-dispense phase and clears the counters.",
+          "screenshot_ref": ""
+        },
+        {
+          "title": "Enable backlash compensation",
+          "detail": "On the Jog page, tick 'Backlash compensation'. From then on, every discrete pump start/stop is bracketed: the plunger first takes up the flex (so the commanded volume actually flows), then unloads it after the move (so the tip is pressure-neutral before the stage travels). Turn it off for fast, coarse pump jogging.",
+          "screenshot_ref": ""
+        }
+      ],
+      "settings": [
+        {
+          "name": "Pump",
+          "what_it_does": "Which pump you are calibrating (P1/P2/P3).",
+          "default": "P1",
+          "recommendation": "Calibrate every pump you print or dispense with."
+        },
+        {
+          "name": "Step",
+          "what_it_does": "Volume dispensed/aspirated per button click.",
+          "default": "0.1 microlitres",
+          "recommendation": "Keep small (0.05-0.1) to pinpoint the droplet."
+        },
+        {
+          "name": "Rate",
+          "what_it_does": "Flow rate for each calibration step.",
+          "default": "0.5 microlitres/second",
+          "recommendation": "Slow, so you can watch the droplet form and retract."
+        },
+        {
+          "name": "Relief c",
+          "what_it_does": "The compliance value that will be saved for this pump (auto-filled as A/2; editable).",
+          "default": "from measurement",
+          "recommendation": "Use the computed value; fine-tune only if flow is still off."
+        },
+        {
+          "name": "Backlash compensation (Jog page)",
+          "what_it_does": "Enables the take-up-on-reversal + unload-on-stop compensation using each pump's saved relief value.",
+          "default": "Off",
+          "recommendation": "Turn on once every pump you use has been calibrated."
+        }
+      ],
+      "safety_notes": [
+        "The calibration itself runs with compensation OFF (it is measuring the flex, so it must not compensate for it).",
+        "The volume-balanced spheroid/cell micro-captures deliberately do NOT use backlash compensation - it would dwarf their nanolitre volumes - so their exact balance is preserved."
+      ],
+      "tips": [
+        "The dispense phase before 'Start calibration' does NOT count toward the measurement - only the aspirate after Start. Start is what zeroes the counters, so form the droplet first, then Start, then aspirate.",
+        "The relief value is a physical property of the pump + syringe + needle; re-calibrate after changing any of them.",
+        "If small dabs still under-deliver, nudge the saved relief value up slightly; if the tip drools during travel, it is a little low."
+      ],
+      "screenshots": [
+        {
+          "id": "pump-compliance",
+          "caption": "The pump compliance / pressure-relief calibration card on the Needle Location tab.",
+          "nav": "Calibration -> Needle Location; scroll to the calibration card below the wizard."
         }
       ]
     },

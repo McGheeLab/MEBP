@@ -42,6 +42,7 @@ from SupportClasses.PickAndPlaceManager import _settled_pump_move
 
 class _FakePumpCfg:
     is_configured = True
+    syringe = SimpleNamespace(volume_uL=100.0)
 
     def uL_to_mm(self, v):
         return v * 0.3
@@ -57,17 +58,22 @@ class _FakeHW:
         self.pumps = {p: _FakePumpCfg() for p in ("P1", "P2", "P3")}
 
 
-def _ctrl(settle=0.0):
+def _ctrl(settle=0.0, relief_uL=0.0, backlash=False):
     """StageController with just enough state for move_pump_uL.
 
     move_pump_relative is monkeypatched to a recorder so the test isolates the
     settle/completion-wait logic (the relative-move safety machinery is covered
     elsewhere). safety_limits.enabled = False skips the flow-rate clamp branch.
+
+    v7.5.x: ``relief_uL`` seeds P1's per-pump compliance value and ``backlash``
+    the global enable, so the take-up/unload comp path can be exercised.
     """
     c = StageController.__new__(StageController)
     c._hardware_config = _FakeHW(settle=settle)
     c.safety_limits = SafetyLimits()
     c.safety_limits.enabled = False
+    c._pump_relief_uL = {"P1": relief_uL, "P2": relief_uL, "P3": relief_uL}
+    c._backlash_comp_enabled = backlash
     c.pump_moves = []
     c.move_pump_relative = (
         lambda pump, dist, fr=None: c.pump_moves.append((pump, dist, fr)))
@@ -103,6 +109,19 @@ class TestHardwareConfigFields(unittest.TestCase):
             {"pump_settle_time_s": -1.0, "pump_prime_time_s": "nope"})
         self.assertEqual(out.pump_settle_time_s, 0.0)
         self.assertEqual(out.pump_prime_time_s, 0.25)
+
+    def test_legacy_relief_keys_are_ignored(self):
+        # v7.5.x: pressure relief moved to per-pump µL (device profile). A config
+        # carrying the legacy percent / toggle / absolute-µL keys loads cleanly
+        # with those keys DISCARDED (no HardwareConfig relief fields anymore).
+        out = HardwareConfig.from_dict({
+            "pump_relief_volume_uL": 0.8,
+            "pump_relief_percent": 3.0,
+            "pump_relief_on_pickup": False,
+        })
+        self.assertFalse(hasattr(out, "pump_relief_volume_uL"))
+        self.assertFalse(hasattr(out, "pump_relief_percent"))
+        self.assertFalse(hasattr(out, "pump_relief_on_pickup"))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -294,11 +313,24 @@ class TestSettledPumpHelper(unittest.TestCase):
 
         class _Ctrl:
             def move_pump_uL(self, pump, volume_uL, rate_uL_s=None, *,
-                             settle=False):
-                calls.append((pump, volume_uL, rate_uL_s, settle))
+                             settle=False, compensate=None):
+                calls.append((pump, volume_uL, rate_uL_s, settle, compensate))
 
+        # Default: compensate=False (captures + dispense-to-waste safe).
         _settled_pump_move(_Ctrl(), "P1", 1.5, 2.0)
-        self.assertEqual(calls, [("P1", 1.5, 2.0, True)])
+        self.assertEqual(calls, [("P1", 1.5, 2.0, True, False)])
+
+    def test_passes_compensate_when_requested(self):
+        calls = []
+
+        class _Ctrl:
+            def move_pump_uL(self, pump, volume_uL, rate_uL_s=None, *,
+                             settle=False, compensate=None):
+                calls.append((pump, volume_uL, rate_uL_s, settle, compensate))
+
+        # Reagent pickups pass compensate=None → auto per the global toggle.
+        _settled_pump_move(_Ctrl(), "P1", -1.5, 2.0, compensate=None)
+        self.assertEqual(calls, [("P1", -1.5, 2.0, True, None)])
 
     def test_falls_back_when_settle_unsupported(self):
         calls = []
@@ -307,10 +339,103 @@ class TestSettledPumpHelper(unittest.TestCase):
             def move_pump_uL(self, pump, volume_uL, rate_uL_s=None):
                 calls.append((pump, volume_uL, rate_uL_s))
 
-        # Must not raise — the TypeError from the settle kwarg is swallowed and
-        # the call is retried plain (keeps recording-fake test sequences stable).
-        _settled_pump_move(_OldCtrl(), "P1", 1.5, 2.0)
+        # Must not raise — the TypeError from the settle/compensate kwargs is
+        # swallowed and the call is retried plain (keeps recording-fake test
+        # sequences stable).
+        _settled_pump_move(_OldCtrl(), "P1", 1.5, 2.0, compensate=None)
         self.assertEqual(calls, [("P1", 1.5, 2.0)])
+
+    def test_falls_back_to_settle_only_when_compensate_unsupported(self):
+        # A controller that supports settle but not compensate degrades to a
+        # settle-only move rather than raising.
+        calls = []
+
+        class _SettleOnly:
+            def move_pump_uL(self, pump, volume_uL, rate_uL_s=None, *,
+                             settle=False):
+                calls.append((pump, volume_uL, rate_uL_s, settle))
+
+        _settled_pump_move(_SettleOnly(), "P1", -1.5, 2.0, compensate=None)
+        self.assertEqual(calls, [("P1", -1.5, 2.0, True)])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  move_pump_uL backlash / compliance compensation
+# ════════════════════════════════════════════════════════════════════
+
+class TestBacklashCompensation(unittest.TestCase):
+    """v7.5.x: take-up on reversal (+c before the fluid move) + unload on stop
+    (−c after), sized per-pump from pump_relief_uL. Auto-fires only for discrete
+    actuations (settle=True) when the global toggle is on; compensate=True/False
+    force it. c = 0 / toggle off / compensate=False ⇒ no comp. The fake _ctrl
+    has no zp_stage.flush_moves, so completion falls back to an open-loop sleep,
+    mocked here. uL_to_mm = ×0.3."""
+
+    def _run(self, ctrl, vol, **kw):
+        with mock.patch("SupportClasses.StageController.time.sleep"):
+            ctrl.move_pump_uL("P1", vol, rate_uL_s=10.0, **kw)
+
+    def test_dispense_brackets_takeup_fluid_unload(self):
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=True)
+        self._run(c, +2.0, settle=True)          # compensate=None → auto (on)
+        # take-up +0.5 (fluid dir), fluid +2.0, unload -0.5.
+        self.assertEqual(len(c.pump_moves), 3)
+        self.assertAlmostEqual(c.pump_moves[0][1], +0.5 * 0.3)   # take-up
+        self.assertAlmostEqual(c.pump_moves[1][1], +2.0 * 0.3)   # fluid
+        self.assertAlmostEqual(c.pump_moves[2][1], -0.5 * 0.3)   # unload
+        # Net plunger travel == the commanded volume.
+        self.assertAlmostEqual(sum(m[1] for m in c.pump_moves), 2.0 * 0.3)
+
+    def test_aspirate_brackets_in_fluid_direction(self):
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=True)
+        self._run(c, -2.0, settle=True)
+        self.assertEqual(len(c.pump_moves), 3)
+        self.assertAlmostEqual(c.pump_moves[0][1], -0.5 * 0.3)   # take-up (−)
+        self.assertAlmostEqual(c.pump_moves[1][1], -2.0 * 0.3)   # fluid
+        self.assertAlmostEqual(c.pump_moves[2][1], +0.5 * 0.3)   # unload (+)
+
+    def test_no_comp_when_toggle_off(self):
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=False)
+        self._run(c, -2.0, settle=True)          # auto resolves to off
+        self.assertEqual(len(c.pump_moves), 1)
+
+    def test_no_comp_when_relief_zero(self):
+        c = _ctrl(settle=0.0, relief_uL=0.0, backlash=True)
+        self._run(c, -2.0, settle=True)
+        self.assertEqual(len(c.pump_moves), 1)
+
+    def test_compensate_false_forces_off_even_with_toggle_on(self):
+        # Volume-balanced captures pass compensate=False → exact net-zero kept.
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=True)
+        self._run(c, -2.0, settle=True, compensate=False)
+        self.assertEqual(len(c.pump_moves), 1)
+
+    def test_settle_false_never_auto_comps(self):
+        # Streamed print path (settle=False) must never bracket even when the
+        # toggle is on and a relief value is set.
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=True)
+        self._run(c, -2.0, settle=False)
+        self.assertEqual(len(c.pump_moves), 1)
+
+    def test_compensate_true_forces_on_even_when_settle_false(self):
+        # A jog click (settle=False) explicitly requests comp → brackets.
+        c = _ctrl(settle=0.0, relief_uL=0.5, backlash=True)
+        self._run(c, +2.0, settle=False, compensate=True)
+        self.assertEqual(len(c.pump_moves), 3)
+
+    def test_relief_reader_and_setter(self):
+        c = _ctrl(relief_uL=0.0)
+        c.set_pump_relief_uL("P2", 0.9)
+        self.assertAlmostEqual(c.pump_relief_uL("P2"), 0.9)
+        # Negative clamps to 0.
+        c.set_pump_relief_uL("P2", -1.0)
+        self.assertEqual(c.pump_relief_uL("P2"), 0.0)
+
+    def test_relief_reader_defaults_zero(self):
+        # No per-pump value set → 0 (⇒ no compensation for that pump).
+        c = StageController.__new__(StageController)
+        c._hardware_config = None
+        self.assertEqual(c.pump_relief_uL("P1"), 0.0)
 
 
 # ════════════════════════════════════════════════════════════════════

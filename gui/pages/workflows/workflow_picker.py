@@ -73,7 +73,16 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         workflow_id="quick_print",
         icon="⚡",
         title="Quick Print",
-        description="Drop one object in a well and print — no setup.",
+        description="Drop one object in a well and print — no setup. Use it to "
+                    "dial in printing conditions before a full-plate run.",
+        enabled=True,
+    ),
+    WorkflowTile(
+        workflow_id="full_print",
+        icon="🖨️",
+        title="Full Print",
+        description="The complete print workflow — set up objects and wells, "
+                    "run the print with live monitoring, then review results.",
         enabled=True,
     ),
     WorkflowTile(
@@ -97,6 +106,15 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         title="XY↔ZP Timing Calibration",
         description="Measure how far the needle (XY) lags the commands over a "
                     "1–5 min run, so the pump stays synced to the needle.",
+        enabled=True,
+    ),
+    WorkflowTile(
+        workflow_id="common_print_settings",
+        icon="⚙️",
+        title="Common Print Settings",
+        description="Settings shared by every workflow — pump dwell, pressure "
+                    "relief, prime, and the needle-prep defaults workflows "
+                    "inherit.",
         enabled=True,
     ),
 )

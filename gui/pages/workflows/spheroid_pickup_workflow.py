@@ -38,6 +38,7 @@ from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card
 from gui.widgets.live_target_picker import LiveTargetPicker
+from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.workspace_target_view import WorkspaceTargetView
 from gui.widgets.xz_side_view import XZSideView
@@ -111,6 +112,7 @@ class SpheroidPickupWorkflowPage(QWidget):
 
         self._executor: Optional[PickPlaceExecutor] = None
         self._exec_thread: Optional[threading.Thread] = None
+        self._sink_calib_dialog = None  # lazy SinkDisengageCalibrationDialog
         self._bridge = _ExecutorBridge()
         self._bridge.op_started.connect(self._on_op_started)
         self._bridge.op_completed.connect(self._on_op_completed)
@@ -118,6 +120,12 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._bridge.progress.connect(self._on_progress)
         self._bridge.sub_step.connect(self._on_sub_step)
         self._bridge.finished.connect(self._on_finished)
+
+        # v7.5.x FREEZE FIX: click-to-travel safe_travel_to runs on a worker
+        # thread so a needle-down retract can't freeze the GUI (see the Jog page
+        # / gui/widgets/safe_travel_worker.py). Separate from the executor thread.
+        self._travel_worker = SafeTravelWorker(self)
+        self._travel_worker.finished.connect(self._on_travel_finished)
 
         # Comprehensive settings popout (scrollable, saveable). Built eagerly so
         # the config widgets exist for _current_config() / _on_start() and the
@@ -253,6 +261,7 @@ class SpheroidPickupWorkflowPage(QWidget):
     # ── Settings popout ───────────────────────────────────────────
 
     def _open_settings(self):
+        self._refresh_sink_status()
         self._settings_dialog.show()
         self._settings_dialog.raise_()
         self._settings_dialog.activateWindow()
@@ -261,6 +270,7 @@ class SpheroidPickupWorkflowPage(QWidget):
         """Called after a profile load / reset / import re-applies values."""
         self._refresh_volume_label()
         self._refresh_prep_status()
+        self._refresh_sink_status()
         self._update_settings_summary()
         self._update_button_state()
 
@@ -269,10 +279,16 @@ class SpheroidPickupWorkflowPage(QWidget):
             return
         try:
             prep = "prep on" if self._prep_check.isChecked() else "prep off"
+            extras = []
+            if self._sink_timing_enabled.isChecked():
+                extras.append("sink-timed")
+            if self._disengage_enabled.isChecked():
+                extras.append("disengage")
+            extra = (" · " + "/".join(extras)) if extras else ""
             self._settings_summary.setText(
                 f"Ø{self._diameter.value():.0f}µm · "
                 f"pick {self._pick_flow.value():.2g}/place "
-                f"{self._place_flow.value():.2g} µL/s · {prep}")
+                f"{self._place_flow.value():.2g} µL/s · {prep}{extra}")
         except Exception:
             pass
 
@@ -350,6 +366,61 @@ class SpheroidPickupWorkflowPage(QWidget):
         sec.add("pick_dwell", "Pause after pick", self._pick_dwell, 0.0)
         sec.add("place_dwell", "Pause after place", self._place_dwell, 0.0)
 
+        # ── Sink timing & disengage (optional) ──
+        self._disengage_enabled = QCheckBox(
+            "Extra disengage aspirate (pop the spheroid off the glass)")
+        self._disengage_enabled.setToolTip(
+            "A spheroid stuck to the plate sometimes needs extra suction. When "
+            "on, an extra aspirate is applied as the fast leading portion of the "
+            "pickup so it releases before rising up the bore.")
+        self._disengage_vol = self._dspin(
+            0.0, 200.0, 0.0, " µL", 3, 0.1,
+            "Extra aspirate volume used to disengage a stuck spheroid.")
+        self._disengage_rate = self._dspin(
+            0.01, 50.0, 2.0, " µL/s", 2, 0.5,
+            "Flow rate of the disengage aspirate (usually faster than the pick).")
+        self._sink_timing_enabled = QCheckBox(
+            "Size aspirate from sink timing (per move)")
+        self._sink_timing_enabled.setToolTip(
+            "Use the calibrated sink curve to choose the aspirate volume per "
+            "move so the spheroid finishes sinking to the tip right as the "
+            "needle arrives — it can't sink out in the well and isn't lifted "
+            "more than needed. Requires a calibrated curve + the needle inner Ø.")
+        self._travel_margin = self._dspin(
+            0.0, 60.0, 1.0, " s", 1, 0.5,
+            "Arrive with the spheroid slightly under-sunk (waited out at the "
+            "destination) — a safety buffer against travel-time estimate error.")
+        self._release_enabled = QCheckBox(
+            "Minimal-excess release dispense (needle keeps the rest)")
+        self._release_enabled.setToolTip(
+            "After the spheroid sinks to the tip, dispense only this small "
+            "volume so minimal excess is deposited. The needle retains the rest "
+            "— it accumulates across picks, so leave Post-clean on to clear it. "
+            "Off = dispense the full aspirated volume (volume-balanced).")
+        self._release_vol = self._dspin(
+            0.0, 200.0, 0.0, " µL", 3, 0.1,
+            "Small dispense volume at placement (minimal excess).")
+        sec = dlg.add_section("Sink timing & disengage (optional)")
+        sec.add_check("disengage_enabled", self._disengage_enabled, False)
+        sec.add("disengage_vol", "Disengage volume", self._disengage_vol, 0.0)
+        sec.add("disengage_rate", "Disengage flow", self._disengage_rate, 2.0)
+        sec.add_check("sink_timing", self._sink_timing_enabled, False)
+        sec.add("travel_margin", "Travel margin", self._travel_margin, 1.0)
+        sec.add_check("release_enabled", self._release_enabled, False)
+        sec.add("release_vol", "Release volume", self._release_vol, 0.0)
+        self._sink_status = QLabel("Sink curve: not calibrated")
+        self._sink_status.setWordWrap(True)
+        self._sink_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        sec.add_widget(self._sink_status)
+        self._calibrate_btn = QPushButton("Calibrate sink timing…")
+        self._calibrate_btn.setToolTip(
+            "Guided staircase: aspirate increasing volumes on one test spheroid "
+            "and click each time it reappears at the tip → builds the sink "
+            "timing curve. Also a disengage-test panel.")
+        self._calibrate_btn.clicked.connect(self._open_sink_calibration)
+        sec.add_widget(self._calibrate_btn)
+
         # ── Needle prep ──
         self._prep_check = QCheckBox("Prep needle (waste → oil → wash → buffer)")
         self._prep_check.setChecked(True)
@@ -380,14 +451,17 @@ class SpheroidPickupWorkflowPage(QWidget):
             0.0, 30.0, 0.3, " s", 2, 0.1, "Settle time between wash jiggles.")
         sec = dlg.add_section("Needle prep")
         sec.add_check("prep", self._prep_check, True)
-        sec.add("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
-        sec.add("prep_rate", "Prep flow", self._prep_rate, 1.0)
-        sec.add("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
-        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles, 1.0)
-        sec.add("wash_cycles", "Wash cycles", self._wash_cycles, 3)
-        sec.add("wash_z_amp", "Wash Z jiggle", self._wash_z_amp, 0.5)
-        sec.add("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)
-        sec.add("wash_dwell", "Wash settle", self._wash_dwell, 0.3)
+        sec.add_note(
+            "Prep values are shared defaults from Common Print Settings — tick "
+            "Override to set a workflow-specific value.")
+        sec.add_common("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
+        sec.add_common("prep_rate", "Prep flow", self._prep_rate, 1.0)
+        sec.add_common("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
+        sec.add_common("buffer_needles", "Buffer (needles)", self._buffer_needles, 1.0)
+        sec.add_common("wash_cycles", "Wash cycles", self._wash_cycles, 3)
+        sec.add_common("wash_z_amp", "Wash Z jiggle", self._wash_z_amp, 0.5)
+        sec.add_common("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)
+        sec.add_common("wash_dwell", "Wash settle", self._wash_dwell, 0.3)
         self._prep_status = QLabel("")
         self._prep_status.setWordWrap(True)
         self._prep_status.setStyleSheet(
@@ -420,6 +494,18 @@ class SpheroidPickupWorkflowPage(QWidget):
         sec.add("z_timeout", "Z timeout", self._z_timeout, 15.0)
         sec.add("xy_timeout", "XY timeout", self._xy_timeout, 30.0)
 
+        # ── Common — Pump (global) ──
+        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
+        self._g_prime = self._dspin(0.0, 10.0, 0.25, " s", 2, 0.05)
+        sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
+        sec.add_note(
+            "Global pump values (edited here or on the Common Print Settings "
+            "page — one value used everywhere).")
+        sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
+                       0.0, common_key="pump_settle_time_s", overridable=False)
+        sec.add_common("g_prime", "Prime time", self._g_prime, 0.25,
+                       common_key="pump_prime_time_s", overridable=False)
+
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
         dlg.set_info_refresher(self._build_locations_panel)
@@ -431,7 +517,10 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._diameter.valueChanged.connect(self._update_settings_summary)
         self._pick_flow.valueChanged.connect(self._update_settings_summary)
         self._place_flow.valueChanged.connect(self._update_settings_summary)
+        self._sink_timing_enabled.toggled.connect(self._update_settings_summary)
+        self._disengage_enabled.toggled.connect(self._update_settings_summary)
         self._refresh_volume_label()
+        self._refresh_sink_status()
 
     def _build_locations_panel(self):
         return build_locations_widget(
@@ -469,6 +558,55 @@ class SpheroidPickupWorkflowPage(QWidget):
             return float(getattr(needle, "internal_volume_uL", 0.0) or 0.0)
         except Exception:
             return 0.0
+
+    def _bore_area_mm2(self) -> float:
+        """Needle inner cross-section (mm²) — used for volume↔lift-height in the
+        sink-timing model. 0.0 if no needle is configured."""
+        needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
+        if needle is None:
+            return 0.0
+        try:
+            return float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _refresh_sink_status(self):
+        """Update the sink-curve status label in the settings popout."""
+        if not hasattr(self, "_sink_status"):
+            return
+        try:
+            from SupportClasses.SpheroidSinkCalibrationStore import get_store
+            store = get_store()
+            curve = store.get_curve()
+            if curve is None:
+                self._sink_status.setText("Sink curve: not calibrated")
+                return
+            meta = store.get_meta() or {}
+            when = str(meta.get("updated", "")).replace("T", " ")
+            self._sink_status.setText(
+                f"Sink curve: {curve.n_points} pt, "
+                f"~{curve.effective_rate_mm_s():.3f} mm/s"
+                + (f" · {when}" if when else ""))
+        except Exception:
+            self._sink_status.setText("Sink curve: not calibrated")
+
+    def _open_sink_calibration(self):
+        """Open the guided sink-timing / disengage calibration dialog (lazy)."""
+        if getattr(self, "_sink_calib_dialog", None) is None:
+            try:
+                from gui.pages.workflows.spheroid_sink_calibration import (
+                    SinkDisengageCalibrationDialog)
+            except Exception as exc:
+                logger.exception("Sink calibration dialog import failed: %s", exc)
+                QMessageBox.warning(
+                    self, "Calibration unavailable",
+                    f"Could not open the sink calibration dialog:\n{exc}")
+                return
+            self._sink_calib_dialog = SinkDisengageCalibrationDialog(
+                self, parent=self)
+        self._sink_calib_dialog.show()
+        self._sink_calib_dialog.raise_()
+        self._sink_calib_dialog.activateWindow()
 
     def _service_well_names(self) -> dict[str, str]:
         """role → well name, read from Hardware Setup reagent locations. A well
@@ -620,7 +758,21 @@ class SpheroidPickupWorkflowPage(QWidget):
                 self._settings_dialog.hide()
         except Exception:
             pass
+        try:
+            if (self._sink_calib_dialog is not None
+                    and self._sink_calib_dialog.isVisible()):
+                self._sink_calib_dialog.hide()
+        except Exception:
+            pass
         super().hideEvent(event)
+
+    # ── Common Print Settings hook ────────────────────────────────
+
+    def set_common_print_settings(self, common):
+        """v7.5.x: shared common settings — the dialog's inheriting prep fields
+        re-sync to these defaults; the global pump fields mirror/edit them."""
+        if getattr(self, "_settings_dialog", None) is not None:
+            self._settings_dialog.set_common(common)
 
     # ── hw_config hook ────────────────────────────────────────────
 
@@ -793,11 +945,24 @@ class SpheroidPickupWorkflowPage(QWidget):
 
     # ── Workspace + XZ click handlers (mirror of JogControlPage) ──
 
+    def _travel_blocked_by_run(self) -> bool:
+        """True (+ shows a hint) if a workflow run is active — don't launch a
+        manual click-to-travel on top of the executor thread (both drive the
+        stage and toggle the non-refcounted poller suspend). Abort the run
+        first. The Jog page owns no executor and needs no such guard."""
+        t = getattr(self, "_exec_thread", None)
+        if t is not None and t.is_alive():
+            self._status.setText("Busy running — abort first to move manually.")
+            return True
+        return False
+
     def _on_workspace_position_clicked(
         self, x_um_zr: float, y_um_zr: float
     ) -> None:
         """Click-to-travel from the XY workspace (zero-ref µm)."""
         if not getattr(self._controller, "is_xy_connected", False):
+            return
+        if self._travel_blocked_by_run():
             return
 
         zero = self._controller.zero_position
@@ -835,14 +1000,19 @@ class SpheroidPickupWorkflowPage(QWidget):
         # was polarity-wrong on ME3B V1 (ZDIR=-1) and skipped the retract while
         # the needle was DOWN. safe_travel_to is a near-no-op when the needle is
         # already retracted, so always using it is safe.
-        self._controller.safe_travel_to(
-            stage_x, stage_y, safe_z_mm=self._safe_z, target_z_mm=None)
+        # v7.5.x FREEZE FIX: dispatch the blocking move to a worker thread so a
+        # needle-down retract can't freeze the GUI; busy-guard ignores re-clicks.
+        self._travel_worker.start(
+            self._controller, stage_x, stage_y,
+            safe_z_mm=self._safe_z, target_z_mm=None)
 
     def _on_workspace_fast_travel_requested(
         self, x_um_zr: float, y_um_zr: float
     ) -> None:
         """Right-click → Fast travel here: retract Z, travel XY, restore Z."""
         if not getattr(self._controller, "is_xy_connected", False):
+            return
+        if self._travel_blocked_by_run():
             return
 
         if self._safe_z is None:
@@ -867,8 +1037,9 @@ class SpheroidPickupWorkflowPage(QWidget):
                 except Exception:
                     current_z_zr = None
 
-        self._controller.safe_travel_to(
-            stage_x, stage_y,
+        # v7.5.x FREEZE FIX: worker thread (see _on_workspace_position_clicked).
+        self._travel_worker.start(
+            self._controller, stage_x, stage_y,
             safe_z_mm=self._safe_z, target_z_mm=current_z_zr)
 
     def _on_go_to_z_requested(self, z_mm: float) -> None:
@@ -879,6 +1050,13 @@ class SpheroidPickupWorkflowPage(QWidget):
             self._controller.move_z_absolute(z_mm, from_zero_ref=True)
         except Exception as exc:
             logger.warning("Go-to-Z failed: %s", exc)
+
+    def _on_travel_finished(self, ok: bool) -> None:
+        """Worker-thread click-to-travel finished (queued to the GUI thread)."""
+        if not ok:
+            logger.warning(
+                "Click-to-travel did not confirm (Z retract / XY arrival timed "
+                "out, or the ZP board is not connected).")
 
     # ── config helpers ────────────────────────────────────────────
 
@@ -893,6 +1071,13 @@ class SpheroidPickupWorkflowPage(QWidget):
             place_z_offset_mm=float(self._place_z.value()),
             pick_dwell_s=float(self._pick_dwell.value()),
             place_dwell_s=float(self._place_dwell.value()),
+            disengage_enabled=bool(self._disengage_enabled.isChecked()),
+            disengage_volume_uL=float(self._disengage_vol.value()),
+            disengage_rate_uL_s=float(self._disengage_rate.value()),
+            sink_timing_enabled=bool(self._sink_timing_enabled.isChecked()),
+            travel_margin_s=float(self._travel_margin.value()),
+            release_enabled=bool(self._release_enabled.isChecked()),
+            release_volume_uL=float(self._release_vol.value()),
         )
 
     def _plate_offset_to_zref(self, offset_mm: float) -> float | None:
@@ -975,6 +1160,27 @@ class SpheroidPickupWorkflowPage(QWidget):
                 "Calibration page so the pick/place heights can be resolved.")
             return
 
+        # Sink-timing model: resolve the bore area + calibrated curve and gate on
+        # them so the executor doesn't silently fall back to the fixed carrier.
+        bore_area = self._bore_area_mm2()
+        sink_curve = None
+        if cfg.sink_timing_enabled:
+            if bore_area <= 0.0:
+                self._status.setText(
+                    "Sink timing needs the needle inner Ø (Hardware Setup → "
+                    "Needle) to size the aspirate — set it or turn sink timing off.")
+                return
+            try:
+                from SupportClasses.SpheroidSinkCalibrationStore import get_store
+                sink_curve = get_store().get_curve()
+            except Exception:
+                sink_curve = None
+            if sink_curve is None:
+                self._status.setText(
+                    "Sink timing needs a calibrated curve — run “Calibrate sink "
+                    "timing…” in Settings, or turn sink timing off.")
+                return
+
         # Resolve the prep / post-clean (needle conditioning) inputs up front and
         # gate on the service-well locations they inherit from Hardware Setup → Ink.
         prep_enabled = self._prep_check.isChecked()
@@ -1024,6 +1230,10 @@ class SpheroidPickupWorkflowPage(QWidget):
         executor.safe_z_mm = float(self._safe_z)
         executor.pick_z_mm = pick_z
         executor.place_z_mm = place_z
+        # Sink-timing model inputs (bore area + calibrated curve). No-op unless
+        # cfg.sink_timing_enabled (gated above); harmless to set otherwise.
+        executor.bore_area_mm2 = bore_area
+        executor.sink_curve = sink_curve
         # Advanced motion / timeout knobs (always applied).
         executor.intra_well_retract_mm = float(self._intra_retract.value())
         executor.z_timeout_s = float(self._z_timeout.value())

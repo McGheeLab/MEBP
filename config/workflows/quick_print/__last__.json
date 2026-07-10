@@ -2,28 +2,35 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "__last__",
-  "saved": "2026-06-29T13:50:15",
+  "saved": "2026-07-10T01:08:18",
   "values": {
     "pump": {
-      "text": "P2",
+      "text": "P1",
       "data": null
     },
-    "flow": 10.0,
-    "speed_pct": 5.0,
-    "printz": 1.0,
+    "extrusion_mod": 1.5,
+    "speed_pct": 2.0,
+    "printz": 0.7,
     "ink": {
-      "text": "GFP LLS",
-      "data": "GFP LLS"
+      "text": "mCherryFibrosonStoneLLS",
+      "data": "mCherryFibrosonStoneLLS"
     },
-    "ink_z": 1.1,
-    "pickup_safety": 3.0,
+    "ink_z": 1.2,
+    "ink_padding": 3.0,
     "prep": true,
-    "service_z": 1.1,
-    "wash_cycles": 3,
+    "service_z": 1.5,
+    "service_z__ovr": false,
+    "buffer_needles": 1.0,
+    "buffer_needles__ovr": false,
+    "wash_cycles": 10,
+    "wash_cycles__ovr": false,
+    "line_retract": 0.5,
+    "line_z_speed": 80.0,
+    "line_xy_speed": 80.0,
     "postclean": true,
-    "postclean_waste": 2.0,
-    "postclean_oil": 1.0,
+    "postclean_margin": 4.1,
     "travel_speed": 10.0,
-    "preflow": 2.0
+    "preflow": 1.0,
+    "g_settle": 6.0
   }
 }

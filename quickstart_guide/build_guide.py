@@ -502,10 +502,14 @@ FIGURES = {
     "cell_labeling": [
         ("24_cell_labeling.png", "Cell Staining: select the regions to stain (pick-only)."),
     ],
+    "pump_compliance_calibration": [
+        ("10_cal_needle_loc.png", "Calibration → Needle Location: the pump compliance / pressure-relief calibration card sits below the needle-centring wizard and uses the same side cameras to watch the droplet."),
+    ],
 }
 
-GUIDE_ORDER = ["hardware_setup", "calibration", "quick_print",
-               "cell_targeting", "spheroid_pickup", "cell_labeling"]
+GUIDE_ORDER = ["hardware_setup", "calibration", "pump_compliance_calibration",
+               "quick_print", "cell_targeting", "spheroid_pickup",
+               "cell_labeling"]
 
 
 def fig_path(rel):

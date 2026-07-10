@@ -30,12 +30,16 @@ from gui.pages.workflows.cell_labeling_workflow import (
     CellLabelingWorkflowPage,
 )
 from gui.pages.workflows.quick_print_workflow import QuickPrintWorkflowPage
+from gui.pages.workflows.full_print_workflow import FullPrintWorkflowPage
 from gui.pages.workflows.fluorescence_mosaic_workflow import (
     FluorescenceMosaicWorkflowPage,
 )
 from gui.pages.workflows.stress_test_workflow import StressTestWorkflowPage
 from gui.pages.workflows.timing_calibration_workflow import (
     TimingCalibrationWorkflowPage,
+)
+from gui.pages.workflows.common_print_settings_workflow import (
+    CommonPrintSettingsWorkflowPage,
 )
 
 if TYPE_CHECKING:
@@ -110,6 +114,12 @@ class WorkflowsModePage(QWidget):
                     settings=settings,
                     camera_manager=camera_manager,
                 )
+            elif tile.workflow_id == "full_print":
+                page = FullPrintWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
             elif tile.workflow_id == "fluorescence_mosaic":
                 page = FluorescenceMosaicWorkflowPage(
                     controller=controller,
@@ -128,9 +138,22 @@ class WorkflowsModePage(QWidget):
                     settings=settings,
                     camera_manager=camera_manager,
                 )
+            elif tile.workflow_id == "common_print_settings":
+                page = CommonPrintSettingsWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
             else:
                 page = StubWorkflowPage(tile.title)
             page.back_requested.connect(self._show_picker)
+            # Some workflow pages (e.g. Full Print) host their own internal
+            # sub-page nav; re-surface their sub_page_changed so the top-bar
+            # title refreshes when the user switches inner sub-pages.
+            if hasattr(page, "sub_page_changed"):
+                page.sub_page_changed.connect(
+                    lambda *_: self.sub_page_changed.emit(
+                        self._stack.currentIndex()))
             idx = self._stack.addWidget(page)
             self._workflow_index[tile.workflow_id] = idx
 
@@ -147,6 +170,32 @@ class WorkflowsModePage(QWidget):
             return
         self._stack.setCurrentIndex(idx)
         self.sub_page_changed.emit(idx)
+
+    def open_workflow(self, workflow_id: str) -> bool:
+        """Programmatically open a workflow by id (used by app.py to route a
+        print job/file straight to the Full Print tile). Returns False if the
+        id is unknown."""
+        idx = self._workflow_index.get(workflow_id)
+        if idx is None:
+            return False
+        self._stack.setCurrentIndex(idx)
+        self.sub_page_changed.emit(idx)
+        return True
+
+    @property
+    def full_print_page(self):
+        """The FullPrintWorkflowPage instance (or None if the tile is absent),
+        so app.py can reach the re-homed print stack's
+        setup_page/monitor_page/results_page + switch_to_* surface."""
+        idx = self._workflow_index.get("full_print")
+        return self._stack.widget(idx) if idx is not None else None
+
+    @property
+    def quick_print_page(self):
+        """The QuickPrintWorkflowPage instance (or None), so app.py can refresh
+        its saved-prints combo when the Print Library changes files on disk."""
+        idx = self._workflow_index.get("quick_print")
+        return self._stack.widget(idx) if idx is not None else None
 
     def _show_picker(self):
         self._stack.setCurrentIndex(0)
@@ -213,6 +262,18 @@ class WorkflowsModePage(QWidget):
             page = self._stack.widget(i)
             if hasattr(page, "set_hardware_config"):
                 page.set_hardware_config(hw_config)
+
+    def set_common_print_settings(self, common):
+        """Fan the shared CommonPrintSettings model out to workflow pages so
+        their inheriting fields re-sync to the current common values."""
+        self._common_print_settings = common
+        for i in range(1, self._stack.count()):
+            page = self._stack.widget(i)
+            if hasattr(page, "set_common_print_settings"):
+                try:
+                    page.set_common_print_settings(common)
+                except Exception as e:
+                    logger.debug("set_common_print_settings fanout failed: %s", e)
 
     def set_well_list(self, wells: list[str]):
         for i in range(1, self._stack.count()):

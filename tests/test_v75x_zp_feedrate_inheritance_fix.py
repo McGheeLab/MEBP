@@ -138,8 +138,18 @@ def _pm_with_ctrl():
 
 
 class TestTravelCommandsCarryFeedrate(unittest.TestCase):
-    def test_travel_up_uses_retract_feedrate(self):
+    def test_travel_up_uses_gentle_retract(self):
+        # v7.5.x: TRAVEL_UP now retracts via ensure_retracted_to (gentle slow
+        # first mm + confirmed arrival), which internally uses the retract
+        # feedrate (never a bare G0 Z).
         pm, ctrl = _pm_with_ctrl()
+        pm._execute_command(PrintCommand(type=CommandType.TRAVEL_UP))
+        ctrl.ensure_retracted_to.assert_called_once_with(39.59)
+
+    def test_travel_up_fallback_uses_retract_feedrate(self):
+        # Older controller without ensure_retracted_to → explicit-feedrate move.
+        pm, ctrl = _pm_with_ctrl()
+        del ctrl.ensure_retracted_to
         pm._execute_command(PrintCommand(type=CommandType.TRAVEL_UP))
         _, kwargs = ctrl.move_z_absolute.call_args
         self.assertEqual(kwargs.get("feedrate_mm_min"), 500.0)

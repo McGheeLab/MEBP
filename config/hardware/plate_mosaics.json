@@ -13,6 +13,70 @@
       "image": "mosaics/24.png",
       "frames": 1360,
       "date": "2026-06-17"
+    },
+    "nest-plastic-24": {
+      "extent_um": [
+        -1390.1711786981687,
+        -1024.8355590988467,
+        115763.82882130184,
+        77736.66444090116
+      ],
+      "um_per_px": 0.778843,
+      "mosaic_scale": 0.025607320279290507,
+      "image": "mosaics/nest-plastic-24.png",
+      "frames": 1677,
+      "shift_um": [
+        0.0,
+        0.0
+      ],
+      "date": "2026-07-10"
+    },
+    "plate-24_Rossette A1": {
+      "extent_um": [
+        -1411.0,
+        -1058.25,
+        115743.0,
+        77703.25
+      ],
+      "um_per_px": 0.778843,
+      "mosaic_scale": 0.025607320279290507,
+      "image": "mosaics/plate-24_Rossette_A1.png",
+      "frames": 1677,
+      "date": "2026-07-09"
+    },
+    "plate-24_RA2#A1": {
+      "extent_um": [
+        93285.0,
+        57034.25,
+        114707.0,
+        77703.25
+      ],
+      "um_per_px": 0.778843,
+      "mosaic_scale": 0.14004294650359445,
+      "image": "mosaics/plate-24_RA2_A1.png",
+      "frames": 70,
+      "shift_um": [
+        0.0,
+        0.0
+      ],
+      "date": "2026-07-09"
+    },
+    "nest-plastic-24#A2": {
+      "extent_um": [
+        78469.1719699189,
+        57518.83129004932,
+        97094.53175147038,
+        74985.6719919784
+      ],
+      "um_per_px": 0.778843,
+      "mosaic_scale": 0.16107071407938742,
+      "image": "mosaics/nest-plastic-24_A2.png",
+      "frames": 48,
+      "shift_um": [
+        0.0,
+        0.0
+      ],
+      "date": "2026-07-09"
     }
   }
 }

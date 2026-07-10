@@ -36,6 +36,11 @@ from gui.styles import COLORS
 # Z = µm / 1000  so user-facing magnitudes still read 1/10/100/1000/10000.
 _MAGNITUDES = (1.0, 10.0, 100.0, 1000.0, 10000.0)
 
+# v7.5.x: pump step magnitudes as a % of the syringe volume, used on every
+# non-Hardware-Setup page (the %/µL pump UI). Hardware Setup keeps the µm
+# magnitudes above (raw plunger jog for plunger calibration).
+_PUMP_PERCENT_MAGNITUDES = (0.1, 0.5, 1.0, 5.0, 10.0)
+
 # Catppuccin Mocha pieces used by the inline styles below.
 _BG = COLORS.get("surface0", "#313244")
 _BG_HOVER = COLORS.get("surface1", "#45475a")
@@ -225,6 +230,9 @@ class JogButtonArray(QWidget):
         # Whether the pump axis is in µL mode (display unit). Step
         # magnitudes are always 1/10/100/1000/10000 of the native unit.
         self._pump_step_is_uL = True
+        # v7.5.x: on the %/µL pages (action labels) the pump STEP is a % of the
+        # syringe volume; Hardware Setup (arrows) keeps the raw µm→mm step.
+        self._pump_step_is_percent = pump_action_labels
         self._setup_ui()
 
     # ── Public step-value accessors ────────────────────────────
@@ -241,10 +249,21 @@ class JogButtonArray(QWidget):
 
     @property
     def pump_step(self) -> float:
-        """Currently selected pump step in mm (the StageController's
-        native pump unit). User-facing magnitudes are µm; convert here.
+        """Currently selected pump step.
+
+        v7.5.x: in PERCENT mode (the %/µL pages, ``pump_action_labels=True``)
+        this returns the raw selected percentage of the syringe volume (NOT
+        scaled). In the legacy mm mode (Hardware Setup) it returns mm — the
+        user-facing magnitudes are µm, converted here.
         """
+        if self._pump_step_is_percent:
+            return float(self._p_step.current())
         return float(self._p_step.current()) / 1000.0
+
+    @property
+    def pump_step_is_percent(self) -> bool:
+        """True when ``pump_step`` is a % of syringe volume (non-HW pages)."""
+        return self._pump_step_is_percent
 
     def set_pump_step_mode(self, use_uL: bool) -> None:
         """v7.4.2: kept as a no-op for back-compat — the pump step is
@@ -272,11 +291,15 @@ class JogButtonArray(QWidget):
         steps_box.addLayout(xy_row)
         steps_box.addLayout(z_row)
         if self._show_pumps:
-            # v7.4.2: pump steps are in µm (linear motion) instead of
-            # µL — µL depends on syringe geometry and the user may
-            # not have configured the pump yet at this point.
-            p_row, self._p_step = _build_step_row(
-                "P", "µm", _MAGNITUDES, 100.0, on_change=None)
+            if self._pump_step_is_percent:
+                # v7.5.x: %/µL pages — pump step is a % of the syringe volume.
+                p_row, self._p_step = _build_step_row(
+                    "P", "%", _PUMP_PERCENT_MAGNITUDES, 1.0, on_change=None)
+            else:
+                # v7.4.2: Hardware Setup — pump steps are in µm (raw linear
+                # plunger motion) since the syringe may not be configured yet.
+                p_row, self._p_step = _build_step_row(
+                    "P", "µm", _MAGNITUDES, 100.0, on_change=None)
             steps_box.addLayout(p_row)
 
         layout.addLayout(steps_box)

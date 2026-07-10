@@ -1,0 +1,17 @@
+{
+  "id": "corning-glass-96",
+  "base_format": 96,
+  "display_name": "Corning glass-bottom (96-well)",
+  "manufacturer": "Corning",
+  "model": "glass-bottom",
+  "bottom_material": "glass",
+  "well_depth_mm": null,
+  "z_offsets": {
+    "top": 10.0,
+    "bottom": 21.0,
+    "safe": 5.0,
+    "max": 0.0
+  },
+  "builtin": true,
+  "_note": "z_offsets are mm BELOW the needle-cam fiducial; starting GUESSES only. Teach + 'Save Z offsets to plate type' to learn true values for this machine."
+}

@@ -29,14 +29,35 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 
-def _settled_pump_move(ctrl, pump, volume_uL, rate_uL_s=None):
+def _settled_pump_move(ctrl, pump, volume_uL, rate_uL_s=None, *,
+                       compensate=False):
     """v7.5.x: discrete, blocking pump actuation with the controller's
     configured settle dwell (Hardware Setup → Pump). Every pick/place pump
     move is discrete (a clear next step follows), so it brackets the move
-    with the settle time and blocks until the pump finishes. Falls back to a
-    plain move on older controllers / fakes that lack the ``settle`` kwarg."""
+    with the settle time and blocks until the pump finishes.
+
+    ``compensate`` controls v7.5.x backlash / compliance compensation (take-up
+    on reversal + unload on stop, see :meth:`StageController.move_pump_uL`):
+
+    * ``False`` (DEFAULT) — force it OFF. This is the safe default for the
+      volume-balanced pick&place captures (spheroid / cell / trypsin / dye),
+      whose nL net-zero balance a µL-scale compliance move would break, and for
+      dispense-to-waste moves that never needed relief.
+    * ``None`` — auto: comp iff the global backlash toggle is on. Pass this at
+      reagent-load aspirates (ink / oil / buffer) that DO want the residual
+      needle vacuum bled before the next inter-well travel.
+
+    Falls back cleanly on older controllers / fakes that lack the ``settle`` /
+    ``compensate`` kwargs."""
+    try:
+        ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate_uL_s,
+                          settle=True, compensate=compensate)
+        return
+    except TypeError:
+        pass
     try:
         ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate_uL_s, settle=True)
+        return
     except TypeError:
         ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate_uL_s)
 
@@ -115,6 +136,33 @@ class SpheroidPickupConfig:
     pick_dwell_s: float = 0.0
     place_dwell_s: float = 0.0
 
+    # ── v7.5.x: disengagement extra-aspirate ──────────────────────────
+    # A spheroid stuck to the glass sometimes needs extra suction to pop it off.
+    # When enabled, an EXTRA aspirate of ``disengage_volume_uL`` at
+    # ``disengage_rate_uL_s`` (usually faster) is applied as the FAST LEADING
+    # portion of the total pickup aspirate. Default off (0 → no-op).
+    disengage_enabled: bool = False
+    disengage_volume_uL: float = 0.0
+    disengage_rate_uL_s: float = 2.0
+
+    # ── v7.5.x: sink-timing model ─────────────────────────────────────
+    # Once aspirated, the spheroid rises into the bore then sinks back toward
+    # the tip. When enabled AND a sink curve is calibrated (SpheroidSinkCalibration
+    # Store) AND the needle bore area is known, the executor sizes the pickup
+    # aspirate PER MOVE so the spheroid finishes sinking right as the needle
+    # arrives at the destination (lift for the estimated travel time + margin),
+    # floored at the sphere-capture volume. Default off → fixed carrier volume.
+    sink_timing_enabled: bool = False
+    travel_margin_s: float = 1.0     # arrive slightly under-sunk; waited out at dest
+
+    # ── v7.5.x: minimal-excess release ────────────────────────────────
+    # After the spheroid has sunk to the tip, dispense only a small
+    # ``release_volume_uL`` (at ``release_speed_uL_s``) so minimal excess fluid is
+    # deposited; the needle keeps the rest (accumulates — clear with Post-clean).
+    # Default off → dispense the full aspirated volume (volume-balanced).
+    release_enabled: bool = False
+    release_volume_uL: float = 0.0
+
     def compute_volume_uL(self) -> float:
         """Compute pickup volume from spheroid diameter.
 
@@ -137,6 +185,13 @@ class SpheroidPickupConfig:
             "place_z_offset_mm": self.place_z_offset_mm,
             "pick_dwell_s": self.pick_dwell_s,
             "place_dwell_s": self.place_dwell_s,
+            "disengage_enabled": self.disengage_enabled,
+            "disengage_volume_uL": self.disengage_volume_uL,
+            "disengage_rate_uL_s": self.disengage_rate_uL_s,
+            "sink_timing_enabled": self.sink_timing_enabled,
+            "travel_margin_s": self.travel_margin_s,
+            "release_enabled": self.release_enabled,
+            "release_volume_uL": self.release_volume_uL,
         }
 
 
@@ -473,6 +528,18 @@ class PickPlaceExecutor:
         self.z_timeout_s: float = 15.0
         self.xy_timeout_s: float = 30.0
 
+        # v7.5.x sink-timing model (spheroid pickup). ``bore_area_mm2`` is the
+        # needle inner cross-section (set from the needle in the GUI) used for
+        # volume↔lift-height (1 µL == 1 mm³). ``sink_curve`` is a calibrated
+        # SinkCurve (SpheroidSinkCalibrationStore) or None → sink timing skipped.
+        self.bore_area_mm2: float = 0.0
+        self.sink_curve = None
+        # Fallbacks for the per-move travel-time estimate when the controller
+        # can't report speeds (µm/s and mm/s).
+        self._travel_xy_speed_fallback_um_s: float = 20000.0
+        self._travel_z_speed_fallback_mm_s: float = 5.0
+        self._travel_overhead_s: float = 1.0
+
         # Service well positions (ABSOLUTE stage µm). Populated by the workflow
         # page from the calibrated well positions + the Hardware Setup reagent
         # locations (which well each ink_type oil/wash/waste/buffer maps to).
@@ -502,6 +569,16 @@ class PickPlaceExecutor:
         self.wash_z_amplitude_mm: float = 0.5      # how far up/down each jiggle
         self.wash_xy_amplitude_um: float = 200.0   # random XY radius about centre
         self.wash_dwell_s: float = 0.3             # settle between jiggles
+
+        # ── Wash after reagent pickup (before deposit) ───────────────
+        # Cell removal / cell labeling: after aspirating the reagent (trypsin /
+        # stain) from its well, rinse the needle EXTERIOR at the wash well before
+        # travelling to deposit it. The aspirated volume stays in the bore (held
+        # by suction) — this only washes off the reagent film clinging to the
+        # outside so only the metered push/deposit column reaches the cells.
+        # Reuses the wash well + wash config above. Off by default (the two GUI
+        # pages default it ON).
+        self.wash_after_pickup: bool = False
 
         # ── Post-clean routine (run once after the loop, e.g. cell removal) ──
         # "Needle waste, wash, and reset": DISPENSE residual to waste, wash, then
@@ -680,19 +757,113 @@ class PickPlaceExecutor:
 
     # ── Spheroid Pickup ──────────────────────────────────────────
 
+    def _xy_travel_speed_um_s(self) -> float:
+        """XY travel speed (µm/s) for the travel-time estimate: the measured
+        top speed if calibrated, else the safety-limit max, else a fallback."""
+        try:
+            from SupportClasses.PrintTimingCalibrationStore import (
+                get_store as _pt_store)
+            v = _pt_store().get_xy_max_speed_um_s()
+            if v and float(v) > 0:
+                return float(v)
+        except Exception:
+            pass
+        try:
+            v = float(getattr(self.controller.safety_limits,
+                              "max_xy_speed", 0) or 0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        return float(self._travel_xy_speed_fallback_um_s)
+
+    def _z_travel_speed_mm_s(self) -> float:
+        """Z travel speed (mm/s) for the travel-time estimate."""
+        ctrl = self.controller
+        for attr in ("_zp_retract_feedrate", "max_z_feedrate"):
+            try:
+                fr = getattr(ctrl, attr, None)
+                if callable(fr):
+                    fr = fr()
+                if fr and float(fr) > 0:
+                    return float(fr) / 60.0   # mm/min → mm/s
+            except Exception:
+                pass
+        try:
+            d = getattr(getattr(ctrl, "device_profile", None),
+                        "per_axis_max_feedrate", None)
+            if isinstance(d, dict) and d.get("Z"):
+                return float(d["Z"]) / 60.0
+        except Exception:
+            pass
+        return float(self._travel_z_speed_fallback_mm_s)
+
+    def _estimate_travel_time_s(self, source, dest) -> float:
+        """Rough per-move travel time (s): XY distance ÷ XY speed + Z
+        retract+lower time + a fixed overhead. Divide-by-zero-safe."""
+        try:
+            dx = float(dest.x_um) - float(source.x_um)
+            dy = float(dest.y_um) - float(source.y_um)
+            xy_dist_um = math.hypot(dx, dy)
+        except Exception:
+            xy_dist_um = 0.0
+        xy_t = xy_dist_um / max(self._xy_travel_speed_um_s(), 1.0)
+        pick = self.pick_z_mm if self.pick_z_mm is not None else self.operating_z_mm
+        place = self.place_z_mm if self.place_z_mm is not None else self.operating_z_mm
+        z_v = max(self._z_travel_speed_mm_s(), 0.1)
+        z_t = (abs(float(self.safe_z_mm) - float(pick))
+               + abs(float(self.safe_z_mm) - float(place))) / z_v
+        return xy_t + z_t + float(self._travel_overhead_s)
+
+    def _planned_aspirate_uL(self, cfg, source, dest):
+        """Return ``(total_aspirate_uL, remaining_sink_wait_s)`` for a spheroid
+        move. With the sink-timing model on (and a calibrated curve + known bore
+        area), size the aspirate so the spheroid finishes sinking as the needle
+        arrives — floored at the sphere-capture volume; the arrival wait is the
+        leftover sink time. Otherwise the fixed carrier volume with no wait."""
+        carrier = cfg.compute_volume_uL()
+        curve = self.sink_curve
+        area = float(self.bore_area_mm2 or 0.0)
+        if (not getattr(cfg, "sink_timing_enabled", False)
+                or curve is None or area <= 0.0 or dest is None):
+            return carrier, 0.0
+        travel = self._estimate_travel_time_s(source, dest)
+        margin = max(0.0, float(getattr(cfg, "travel_margin_s", 0.0)))
+        lift = curve.lift_for_time(travel + margin)   # mm
+        timing_vol = lift * area                       # µL
+        total = max(carrier, timing_vol)
+        total_sink = curve.time_for_lift(total / area) if area > 0 else 0.0
+        remaining = max(0.0, total_sink - travel)
+        return total, remaining
+
     def _execute_spheroid_pickup(self, op: PickPlaceOperation):
         """Execute a spheroid pickup operation.
 
-        1. Navigate to source target (safe Z protocol)
-        2. Lower to operating Z
-        3. Aspirate computed volume
-        4. Raise + safe travel to destination
-        5. Dispense same volume
+        1. Navigate to source (safe Z protocol) and lower to the pick height.
+        2. Aspirate the planned volume — with the disengagement extra applied as
+           the fast leading portion when enabled.
+        3. Safe-travel to the destination (the spheroid sinks during travel).
+        4. Wait any remaining sink time so the spheroid reaches the tip.
+        5. Dispense — a small release volume (minimal excess) or the full aspirate.
         """
         cfg: SpheroidPickupConfig = op.config
-        volume_uL = cfg.compute_volume_uL()
         source = op.source_target
         dest = op.dest_target
+
+        # Plan the aspirate volume + arrival sink wait for THIS move.
+        total_vol, wait_s = self._planned_aspirate_uL(cfg, source, dest)
+        disengage_on = (getattr(cfg, "disengage_enabled", False)
+                        and float(getattr(cfg, "disengage_volume_uL", 0.0)) > 0.0)
+        diseng = float(getattr(cfg, "disengage_volume_uL", 0.0)) if disengage_on else 0.0
+        aspirate_total = max(total_vol, diseng)
+        # If the disengage pulse alone exceeds the planned volume, the spheroid is
+        # lifted higher than planned → recompute the remaining sink wait for it.
+        if (aspirate_total > total_vol and self.sink_curve is not None
+                and float(self.bore_area_mm2 or 0.0) > 0.0
+                and getattr(cfg, "sink_timing_enabled", False) and dest is not None):
+            travel = self._estimate_travel_time_s(source, dest)
+            wait_s = max(0.0, self.sink_curve.time_for_lift(
+                aspirate_total / self.bore_area_mm2) - travel)
 
         # Pick / place use independent operating heights when supplied.
         pick_z = self.pick_z_mm if self.pick_z_mm is not None else self.operating_z_mm
@@ -700,35 +871,64 @@ class PickPlaceExecutor:
 
         logger.info(
             f"Spheroid pickup: {source.target_id} → {dest.target_id if dest else 'N/A'}, "
-            f"diameter={cfg.spheroid_diameter_um}µm, volume={volume_uL:.4f}µL, "
-            f"pick_z={pick_z:.3f} place_z={place_z:.3f} mm")
+            f"diameter={cfg.spheroid_diameter_um}µm, aspirate={aspirate_total:.4f}µL"
+            f"{f' (disengage {diseng:.4f})' if disengage_on else ''}, "
+            f"sink_wait={wait_s:.2f}s, pick_z={pick_z:.3f} place_z={place_z:.3f} mm")
 
         # 1. Move to source (lower to the pick height)
         self._set_sub_step(op, f"Moving to source {source.target_id}")
         self._safe_move_to(source, target_z_mm=pick_z)
         self._check_abort()
 
-        # 2. Aspirate (move_pump_uL takes µL/s and clamps the flow rate itself)
-        self._set_sub_step(op, f"Aspirating {volume_uL:.4f} µL")
-        _settled_pump_move(self.controller, cfg.pickup_bore, -volume_uL,
-                                     rate_uL_s=cfg.pickup_speed_uL_s)
-        self._check_abort()
+        # 2. Aspirate. move_pump_uL takes µL/s and clamps the flow rate itself;
+        # NEGATIVE volume = aspirate. compensate=False (volume-balanced
+        # micro-capture — no backlash comp, keep the exact nL balance).
+        if disengage_on:
+            lead = min(diseng, aspirate_total)
+            self._set_sub_step(op, f"Disengage aspirate {lead:.4f} µL")
+            _settled_pump_move(self.controller, cfg.pickup_bore, -lead,
+                               rate_uL_s=cfg.disengage_rate_uL_s)
+            self._check_abort()
+            rest = aspirate_total - lead
+            if rest > 1e-9:
+                self._set_sub_step(op, f"Aspirating {rest:.4f} µL")
+                _settled_pump_move(self.controller, cfg.pickup_bore, -rest,
+                                   rate_uL_s=cfg.pickup_speed_uL_s)
+                self._check_abort()
+        else:
+            self._set_sub_step(op, f"Aspirating {aspirate_total:.4f} µL")
+            _settled_pump_move(self.controller, cfg.pickup_bore, -aspirate_total,
+                               rate_uL_s=cfg.pickup_speed_uL_s)
+            self._check_abort()
 
         # 2b. Optional pick pause (let the spheroid settle into the bore).
+        # NOTE: dwelling in the well risks losing a fast-sinking spheroid — the
+        # sink-timing model makes this unnecessary; default 0.
         if getattr(cfg, "pick_dwell_s", 0.0):
             self._dwell(op, float(cfg.pick_dwell_s), "Pick pause")
             self._check_abort()
 
-        # 3. Move to destination (lower to the place height)
+        # 3. Move to destination (lower to the place height). The spheroid sinks
+        #    during this travel (the retract+XY+lower is the sink window).
         if dest:
             self._set_sub_step(op, f"Moving to dest {dest.target_id}")
             self._safe_move_to(dest, target_z_mm=place_z)
             self._check_abort()
 
-            # 4. Dispense
-            self._set_sub_step(op, f"Dispensing {volume_uL:.4f} µL")
-            _settled_pump_move(self.controller, cfg.pickup_bore, volume_uL,
-                                         rate_uL_s=cfg.release_speed_uL_s)
+            # 3b. Wait any remaining sink time so the spheroid reaches the tip.
+            if wait_s and wait_s > 0:
+                self._dwell(op, float(wait_s), "Sink to tip")
+                self._check_abort()
+
+            # 4. Dispense — a small release volume (minimal excess; needle keeps
+            #    the rest) or the full aspirate (volume-balanced).
+            release_on = (getattr(cfg, "release_enabled", False)
+                          and float(getattr(cfg, "release_volume_uL", 0.0)) > 0.0)
+            dispense_vol = (float(cfg.release_volume_uL) if release_on
+                            else aspirate_total)
+            self._set_sub_step(op, f"Dispensing {dispense_vol:.4f} µL")
+            _settled_pump_move(self.controller, cfg.pickup_bore, dispense_vol,
+                               rate_uL_s=cfg.release_speed_uL_s)
 
             # 4b. Optional place pause (let the spheroid release from the bore).
             if getattr(cfg, "place_dwell_s", 0.0):
@@ -795,6 +995,11 @@ class PickPlaceExecutor:
             _settled_pump_move(self.controller, bore, -push_uL,
                                          rate_uL_s=cfg.push_speed_uL_s)
             self._check_abort()
+
+        # 1b. Rinse the needle exterior (wash off the reagent film) before we
+        #     go deposit it — the aspirated reagent stays in the bore.
+        if self.wash_after_pickup:
+            self._wash_needle(op, "Washing needle after reagent pickup")
 
         # 2. Travel to the cell-removal location (lower to the removal Z).
         self._set_sub_step(op, f"Moving to removal target {source.target_id}")
@@ -887,6 +1092,11 @@ class PickPlaceExecutor:
                                rate_uL_s=cfg.aspirate_speed_uL_s)
             self._check_abort()
 
+        # 1b. Rinse the needle exterior (wash off the stain film) before we go
+        #     deposit it — the aspirated stain stays in the bore.
+        if self.wash_after_pickup:
+            self._wash_needle(op, "Washing needle after stain pickup")
+
         # 2. Travel to the stain region (lower to the label Z).
         self._set_sub_step(op, f"Moving to stain region {source.target_id}")
         self._safe_move_to(source, target_z_mm=label_z)
@@ -970,8 +1180,8 @@ class PickPlaceExecutor:
         if unit > 0 and self.oil_needles > 0:
             self._set_sub_step(
                 prep_op, f"Prep: aspirate {self.oil_needles:g} needle(s) of oil")
-            _settled_pump_move(self.controller, 
-                bore, -unit * self.oil_needles, rate_uL_s=rate)
+            _settled_pump_move(self.controller,
+                bore, -unit * self.oil_needles, rate_uL_s=rate, compensate=None)
             self._check_abort()
 
         # 3. Wash.
@@ -985,8 +1195,8 @@ class PickPlaceExecutor:
             self._set_sub_step(
                 prep_op,
                 f"Prep: aspirate {self.buffer_needles:g} needle(s) of buffer")
-            _settled_pump_move(self.controller, 
-                bore, -unit * self.buffer_needles, rate_uL_s=rate)
+            _settled_pump_move(self.controller,
+                bore, -unit * self.buffer_needles, rate_uL_s=rate, compensate=None)
 
         self._set_sub_step(prep_op, "Prep complete")
 
@@ -1039,8 +1249,8 @@ class PickPlaceExecutor:
             self._set_sub_step(
                 clean_op,
                 f"Clean: aspirate {self.buffer_needles:g} needle(s) of buffer")
-            _settled_pump_move(self.controller, 
-                bore, -unit * self.buffer_needles, rate_uL_s=rate)
+            _settled_pump_move(self.controller,
+                bore, -unit * self.buffer_needles, rate_uL_s=rate, compensate=None)
 
         self._set_sub_step(clean_op, "Clean complete")
 
@@ -1077,7 +1287,8 @@ class PickPlaceExecutor:
             if not self._safe_move_to_well("__oil__", target_z_mm=sz):
                 raise RuntimeError(
                     "Oil prep: oil well not configured/resolved (__oil__)")
-            _settled_pump_move(self.controller, bore, -v, rate_uL_s=rate)
+            _settled_pump_move(self.controller, bore, -v, rate_uL_s=rate,
+                               compensate=None)
         self._check_abort()
 
     def run_print_cleanup(self):
@@ -1207,6 +1418,30 @@ class PickPlaceExecutor:
 
         self._set_sub_step(clean_op, "Cleanup complete")
 
+    def _wash_needle(self, op, label: str = "Washing needle") -> bool:
+        """Rinse the needle EXTERIOR at the wash well, then leave it there.
+
+        Safe-travel to the ``__wash__`` well (retract → cross → lower to the
+        service dip Z), then run :meth:`_do_wash` (Z + random XY jiggle). Used
+        after aspirating a reagent (before travelling to deposit it) so the film
+        on the needle's outer surface is washed off — the aspirated volume stays
+        in the bore. The next :meth:`_safe_move_to` retracts before travelling
+        on, so no explicit retract is needed here.
+
+        Returns True if the wash ran, False (a graceful no-op) when the wash well
+        isn't configured — the GUI gates on this up front. Abort-aware.
+        """
+        if self.wash_well_pos is None:
+            logger.warning("wash_after_pickup requested but no wash well set")
+            return False
+        self._check_abort()
+        self._set_sub_step(op, label)
+        if not self._safe_move_to_well("__wash__", target_z_mm=self.service_z_mm):
+            return False
+        self._do_wash()
+        self._check_abort()
+        return True
+
     def _do_wash(self):
         """Agitate the needle at the wash well (already dipped to the service
         Z): jiggle Z up/down and nudge XY to random vectors about the well
@@ -1293,7 +1528,8 @@ class PickPlaceExecutor:
         vol = float(volume_uL or 0.0)
         if vol > 0:
             rate = rate_uL_s if rate_uL_s is not None else self.prep_rate_uL_s
-            _settled_pump_move(self.controller, bore, -vol, rate_uL_s=rate)
+            _settled_pump_move(self.controller, bore, -vol, rate_uL_s=rate,
+                               compensate=None)
 
     # ── Trypsin Cell Pickup ──────────────────────────────────────
 

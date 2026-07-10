@@ -2,16 +2,9 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "fluorescence_mosaic",
   "name": "__last__",
-  "saved": "2026-06-23T05:01:56",
+  "saved": "2026-07-08T15:26:00",
   "values": {
-    "overlap_pct": 25.0,
     "target_px": 2500,
-    "well_margin": 1.15,
-    "frame_orient": {
-      "text": "none",
-      "data": null
-    },
-    "settle_ms": 300,
-    "fresh_frames": 3
+    "well_margin": 1.15
   }
 }

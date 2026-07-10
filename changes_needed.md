@@ -1,0 +1,2 @@
+when doing any of the workflows, we need a setting for max pump flow rates given the needle setup, currently i think its too high, and that is causeing air to build up in the needle since the pressure is too high and we cant pull in that much material. This max flow rate calculation should be shown in the settings. Also, the max print speed should be calculated given that we must obey this limit. also, when picking up or depositing ink or other materials , we need to ensure that pump flow rates are set as well, these should be settings the user has control over. 
+

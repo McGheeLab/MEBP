@@ -328,29 +328,37 @@ def pump_speed_to_flow_rate(
 def extrusion_flow_rate(
     print_speed_mm_s: float,
     needle: NeedleSpec,
-    layer_height_mm: float,
+    layer_height_mm: float = 0.0,   # v7.5.x F-1: retained for signature compat; UNUSED
+    extrusion_modifier: float = 1.0,
 ) -> float:
     """
-    Calculate required extrusion flow rate based on deposited filament geometry.
+    Calculate required extrusion flow rate from the deposited bead geometry.
 
-    Volume conservation: volume in (from needle) = volume deposited (on substrate)
+    v7.5.x (F-1) — ONE bead model everywhere: the deposited bead is a stream the
+    size of the needle's **inner bore**, optionally scaled by an extrusion
+    ``modifier`` (the operator's "line thickness" lever). This matches Quick
+    Print's auto-flow (``bore_area × modifier``); it replaces the legacy
+    ``outer-Ø × layer_height`` rectangular approximation. ``layer_height`` no
+    longer appears in the volume formula — it is now only the Z step between
+    stacked layers (see ``compute_layer_heights``).
 
-    Deposited cross-section ≈ needle_OD × layer_height (rectangular approx)
-    Volume per mm of travel = needle_OD × layer_height (mm³/mm = mm²)
-    Required flow rate = travel_speed × needle_OD × layer_height (mm³/s = µL/s)
-
-    NOTE: No granular packing correction — ink is deposited INTO granular
-    support medium, not extruded AS granular material.
+    Volume conservation: volume in (from needle) = volume deposited.
+      Deposited cross-section = π·(id/2)² × modifier  (mm²)
+      Volume per mm of travel  = cross-section            (µL/mm, since mm² ≡ µL/mm)
+      Required flow rate       = travel_speed × cross-section × modifier  (µL/s)
 
     Args:
         print_speed_mm_s: Linear travel speed (mm/s)
-        needle: Needle specification (for OD)
-        layer_height_mm: Layer height (mm)
+        needle: Needle specification (uses the INNER bore)
+        layer_height_mm: Deprecated — ignored (kept so older positional callers
+            don't break); pass the modifier instead.
+        extrusion_modifier: Bead thickness multiplier (1.0 = a pure bore-sized
+            stream).
 
     Returns:
         Required flow rate in µL/s (1 mm³ = 1 µL)
     """
-    return print_speed_mm_s * needle.od_mm * layer_height_mm
+    return print_speed_mm_s * needle.cross_section_area_mm2 * extrusion_modifier
 
 
 def extrusion_pump_speed(

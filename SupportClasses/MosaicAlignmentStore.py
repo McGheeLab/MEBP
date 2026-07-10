@@ -112,15 +112,40 @@ class MosaicAlignmentStore:
         except (TypeError, ValueError):
             return None
 
+    def get_resolution(self, key) -> Optional[tuple]:
+        """Frame (width, height) px the ``um_per_px`` was measured at, or None
+        when it wasn't recorded (legacy entries). A consumer running at a
+        different capture width must rescale by ``cal_width / current_width``
+        (µm/px ∝ 1/width) — see the fluorescence-mosaic raster planner."""
+        rec = self.get(key)
+        if not rec:
+            return None
+        r = rec.get("resolution")
+        if not (isinstance(r, (list, tuple)) and len(r) >= 2):
+            return None
+        try:
+            return (float(r[0]), float(r[1]))
+        except (TypeError, ValueError):
+            return None
+
     # ── Write ─────────────────────────────────────────────────────
 
-    def set_um_per_px(self, key, um_per_px: float, source: str = "quick_fov") -> None:
+    def set_um_per_px(self, key, um_per_px: float, source: str = "quick_fov",
+                      resolution=None) -> None:
         if not key or not um_per_px or um_per_px <= 0:
             return
         rec = self._data.setdefault("alignments", {}).setdefault(str(key), {})
         rec["um_per_px"] = round(float(um_per_px), 6)
         rec["source"] = source
         rec["date"] = date.today().isoformat()
+        # Record the capture resolution the value was measured at, so a consumer
+        # at a different frame width can rescale (µm/px ∝ 1/width). Optional +
+        # backward-compatible: legacy entries simply lack it.
+        if (isinstance(resolution, (list, tuple)) and len(resolution) >= 2):
+            try:
+                rec["resolution"] = [int(resolution[0]), int(resolution[1])]
+            except (TypeError, ValueError):
+                pass
         self._save()
         logger.info(f"MosaicAlignment: '{key}' µm/px = {um_per_px:.4f} ({source})")
 

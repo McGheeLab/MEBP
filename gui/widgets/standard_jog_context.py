@@ -38,6 +38,7 @@ from gui.pages.hardware.control_panel import HardwareControlPanel
 from gui.scaling import s, sf, sp
 from gui.styles import COLORS
 from gui.widgets.components import Card
+from gui.widgets.safe_travel_worker import SafeTravelWorker
 from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
 if TYPE_CHECKING:
@@ -74,6 +75,13 @@ class StandardJogContextPanel(QWidget):
             "fast_move_z": None, "plate_top_z": None,
             "plate_bottom_z": None,
         }
+
+        # v7.5.x: run the blocking Absolute-Go-To safe_travel_to off the GUI
+        # thread so a needle-down retract can't freeze the app (mirrors the Jog
+        # workspace click). See gui/widgets/safe_travel_worker.py.
+        self._travel_worker = SafeTravelWorker(self)
+        self._travel_worker.finished.connect(self._on_travel_finished)
+        self._btn_go = None
 
         self._build_ui(show_connect=show_connect, bypass_safety=bypass_safety)
 
@@ -125,6 +133,13 @@ class StandardJogContextPanel(QWidget):
 
     def refresh_safety_limits(self) -> None:
         self._hw_panel.refresh_safety_limits()
+
+    def refresh_speed_limits(self) -> None:
+        """v7.5.x: forward the common per-axis speed refresh to the inner jog
+        panel + re-render the Hardware Info card's needle-flow ceiling."""
+        if hasattr(self._hw_panel, "refresh_speed_limits"):
+            self._hw_panel.refresh_speed_limits()
+        self._refresh_hardware_info()
 
     # ── UI ─────────────────────────────────────────────────────────
 
@@ -208,6 +223,7 @@ class StandardJogContextPanel(QWidget):
         btn_row.addStretch(1)
         btn_row.addWidget(btn_go)
         card.add_layout(btn_row)
+        self._btn_go = btn_go
 
         return card
 
@@ -252,11 +268,15 @@ class StandardJogContextPanel(QWidget):
                     self._controller.move_z_absolute(
                         target_z_mm_zr, from_zero_ref=True)
                 return
-            self._controller.safe_travel_to(
-                abs_x_um, abs_y_um,
-                safe_z_mm=safe_z,
-                target_z_mm=target_z_mm_zr,
-            )
+            # v7.5.x FREEZE FIX: safe_travel_to is a blocking multi-second move
+            # (needle-down Z retract + arrival waits); dispatch it to a worker
+            # thread so the GUI stays responsive. Busy-guard ignores re-clicks.
+            if self._travel_worker.start(
+                    self._controller, abs_x_um, abs_y_um,
+                    safe_z_mm=safe_z, target_z_mm=target_z_mm_zr):
+                if self._btn_go is not None:
+                    self._btn_go.setEnabled(False)
+                    self._btn_go.setText("Travelling…")
         else:
             if self._controller.is_xy_connected:
                 # v7.5.x bugfix: µm → mm for move_xy_absolute (see above).
@@ -266,6 +286,16 @@ class StandardJogContextPanel(QWidget):
             if self._controller.is_zp_connected:
                 self._controller.move_z_absolute(
                     target_z_mm_zr, from_zero_ref=True)
+
+    def _on_travel_finished(self, ok: bool) -> None:
+        """Worker-thread Absolute-Go-To finished (queued back to the GUI thread)."""
+        if self._btn_go is not None:
+            self._btn_go.setEnabled(True)
+            self._btn_go.setText("Go")
+        if not ok:
+            logger.warning(
+                "Absolute Go To did not confirm (Z retract / XY arrival timed "
+                "out, or the ZP board is not connected).")
 
     # ── Hardware Info (read-only quick-reference) ──────────────────
 
@@ -350,6 +380,16 @@ class StandardJogContextPanel(QWidget):
                         ]
                         if names:
                             parts.append(", ".join(names))
+                    # v7.5.x: needle-derived max flow ceiling (gauge + length).
+                    ctrl = self._controller
+                    sl = getattr(ctrl, "safety_limits", None) if ctrl else None
+                    if sl is not None and hasattr(sl, "get_max_flow_rate"):
+                        try:
+                            fr = float(sl.get_max_flow_rate(pid))
+                        except Exception:
+                            fr = 0.0
+                        if fr > 0:
+                            parts.append(f"max flow {fr:.2f} µL/s")
                     text = " · ".join(parts) if parts else "Configured"
                 else:
                     text = "Not configured"

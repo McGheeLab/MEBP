@@ -210,6 +210,12 @@ class ObjectiveCalibrationStore:
         }
         if rotation_deg is not None:
             entry["rotation_deg"] = round(float(rotation_deg), 3)
+        else:
+            # v7.5.x: a µm/px-only update must not silently drop a previously
+            # measured rotation (mirrors CameraCalibrationStore.set_calibration).
+            prev = cam_cals.get(objective_name)
+            if isinstance(prev, dict) and prev.get("rotation_deg") is not None:
+                entry["rotation_deg"] = prev["rotation_deg"]
         cam_cals[objective_name] = entry
         self.save()
         logger.info(

@@ -17,9 +17,16 @@ Covered here:
   → PRINT_PATH (steps 1→5).
 """
 
+import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+
+# Isolate the workflow-settings store so the page's settings dialog restores
+# CODE defaults, not the operator's real saved Quick Print profile.
+os.environ["MEBP_WORKFLOW_SETTINGS_DIR"] = tempfile.mkdtemp(
+    prefix="mebp_qp_settings_")
 
 from PySide6.QtWidgets import QApplication
 
@@ -120,7 +127,7 @@ class TestQuickPrintPreflowSetting(unittest.TestCase):
 
     def test_build_settings_sets_preflow_prime_at_flow_rate(self):
         page = self._page()
-        page._flow_spin.setValue(0.4)
+        page._auto_flow_100_uL_s = lambda: 0.4   # auto flow (needle×speed×mod)
         page._speed_pct_spin.setValue(100)  # Flow@100% = the resolved flow
         s = page._build_settings()
         pump = page._pump()
@@ -130,7 +137,7 @@ class TestQuickPrintPreflowSetting(unittest.TestCase):
 
     def test_preflow_scales_with_flow(self):
         page = self._page()
-        page._flow_spin.setValue(2.0)
+        page._auto_flow_100_uL_s = lambda: 2.0
         page._speed_pct_spin.setValue(100)
         s = page._build_settings()
         pump = page._pump()

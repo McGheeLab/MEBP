@@ -1,0 +1,37 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "quick_print",
+  "name": "Standard",
+  "saved": "2026-07-02T12:06:33",
+  "values": {
+    "pump": {
+      "text": "P2",
+      "data": null
+    },
+    "extrusion_mod": 10.0,
+    "speed_pct": 3.0,
+    "printz": 0.7,
+    "ink": {
+      "text": "Inert GFP",
+      "data": "Inert GFP"
+    },
+    "ink_z": 0.8,
+    "ink_padding": 35.0,
+    "prep": true,
+    "service_z": 1.5999999999999999,
+    "service_z__ovr": true,
+    "buffer_needles": 2.2,
+    "buffer_needles__ovr": true,
+    "wash_cycles": 10,
+    "wash_cycles__ovr": false,
+    "line_retract": 1.0,
+    "line_z_speed": 80.0,
+    "line_xy_speed": 80.0,
+    "postclean": true,
+    "postclean_margin": 1.1,
+    "travel_speed": 10.0,
+    "preflow": 0.10000000000000007,
+    "g_settle": 2.55,
+    "g_relief": 0.3
+  }
+}

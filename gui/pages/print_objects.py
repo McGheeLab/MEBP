@@ -704,6 +704,29 @@ class PrintObjectsTab(QWidget):
         self._outer_ring_uL.setVisible(False)
         self._outer_ring_label.setVisible(False)
 
+        # ── v7.5.x (Finding E): extrusion modifier (bead thickness) ──
+        # Deposited volume per mm = inner-bore area × this. 1.0 = a pure
+        # bore-sized stream (the theoretical minimum); raise it to lay a
+        # thicker, more visible bead. Previously the parametric/trajectory
+        # print path was locked at 1× with no knob.
+        ext_row = QHBoxLayout()
+        self._extrusion_mod = QDoubleSpinBox()
+        self._extrusion_mod.setRange(0.1, 20.0)
+        self._extrusion_mod.setDecimals(2)
+        self._extrusion_mod.setSingleStep(0.25)
+        self._extrusion_mod.setValue(1.0)
+        self._extrusion_mod.setSuffix(" ×")
+        self._extrusion_mod.setMaximumWidth(_sc(120))
+        self._extrusion_mod.setToolTip(
+            "Extrusion modifier — scales the deposited volume per mm.\n"
+            "1.0 = a bead the size of the needle inner bore (the minimum);\n"
+            "raise it for a thicker, more visible line. Changes how MUCH is\n"
+            "laid, not WHERE the needle goes.")
+        self._extrusion_mod.valueChanged.connect(self._schedule_preview)
+        ext_row.addWidget(self._extrusion_mod)
+        ext_row.addStretch()
+        form.addRow("Extrusion ×:", ext_row)
+
         # ── Position ──────────────────────────────────────────────
         # Compact X/Y/Z row: no " mm" suffix (the label says mm) and
         # narrow spinboxes so all three fit the Tools column width.
@@ -1257,12 +1280,16 @@ class PrintObjectsTab(QWidget):
         new_name = self._name_edit.text().strip()
         if new_name and new_name != self._active_file_name:
             if self._file_manager and self._active_file_name:
-                # Rename = save-as + delete old
+                # Rename = flush current edits, then rename on disk (moves the
+                # JSON + sibling CSV and rewrites csv_import pointers). The old
+                # save_as+delete path stranded a csv_import print's CSV, since
+                # delete now removes the original's sibling CSV too.
                 try:
-                    self._file_manager.save_as(new_name)
                     old = self._active_file_name
-                    self._active_file_name = new_name
-                    self._file_manager.delete(old)
+                    self._file_manager.save()
+                    if self._file_manager.rename(old, new_name):
+                        self._active_file_name = new_name
+                        self._file_manager.load(new_name)
                     self._refresh_file_combo()
                     self._emit_prints_changed()
                 except Exception as e:
@@ -1522,6 +1549,11 @@ class PrintObjectsTab(QWidget):
         if (hasattr(self, '_outer_ring_uL')
                 and self._outer_ring_uL.isVisible()):
             params["outer_ring_volume_uL"] = float(self._outer_ring_uL.value())
+        # v7.5.x (Finding E): extrusion modifier — lifted onto the real
+        # PrintObject.extrusion_modifier field in _build_print_object (kept in
+        # params so it rides through every build call site without churn).
+        if hasattr(self, '_extrusion_mod'):
+            params["extrusion_modifier"] = float(self._extrusion_mod.value())
         return params
 
     def _set_params_from_dict(self, obj_type: str, params: dict):
@@ -1559,6 +1591,12 @@ class PrintObjectsTab(QWidget):
             self._outer_ring_uL.setValue(
                 float(params.get("outer_ring_volume_uL", 0.0)))
             self._outer_ring_uL.blockSignals(False)
+        # v7.5.x (Finding E): extrusion modifier
+        if hasattr(self, '_extrusion_mod'):
+            self._extrusion_mod.blockSignals(True)
+            self._extrusion_mod.setValue(
+                float(params.get("extrusion_modifier", 1.0)))
+            self._extrusion_mod.blockSignals(False)
         self._sync_filled_checkbox(obj_type)
 
     def _on_filled_toggled(self, _state):
@@ -2072,6 +2110,10 @@ class PrintObjectsTab(QWidget):
             ink_assignments={pump_id: "ink"},
             color=color,
             source=("csv" if is_csv else "parametric"),
+            # v7.5.x (Finding E): the modifier rides in params (GUI capture) —
+            # lift it onto the real field so generate_object_trajectory honors it
+            # (the parametric/trajectory path was previously locked at 1×).
+            extrusion_modifier=float(params.get("extrusion_modifier", 1.0)),
         )
 
         # CSV import: use pre-loaded trajectory directly (skip GeometryEngine)
@@ -2703,6 +2745,9 @@ class PrintObjectsTab(QWidget):
                 ink_assignments={self._resolve_ink_to_pump(entry.get("ink", entry.get("ink_pump", ""))): entry.get("ink", "ink")},
                 color=entry.get("color", DEFAULT_COLORS[0]),
                 source=("csv" if entry["object_type"] == "csv_import" else "parametric"),
+                # v7.5.x (Finding E): carry the per-object extrusion modifier.
+                extrusion_modifier=float(
+                    entry.get("params", {}).get("extrusion_modifier", 1.0)),
             )
             coll.add_object(obj)
 

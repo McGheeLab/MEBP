@@ -126,7 +126,8 @@ class HardwareControlPanel(QWidget):
                  show_connect: bool = True,
                  bypass_safety: bool = True,
                  embedded: bool = False,
-                 pump_action_labels: bool = False):
+                 pump_action_labels: bool = False,
+                 speed_as_max: bool = False):
         """Build the control panel.
 
         Args:
@@ -159,6 +160,11 @@ class HardwareControlPanel(QWidget):
         # v7.5.x: ASPIRATE/DISPENSE pump jog labels (jog side panels) vs the
         # raw ▲/▼ extend/retract arrows (Hardware Setup page, the default).
         self._pump_action_labels = pump_action_labels
+        # v7.5.x: on Hardware Setup ("hardware calibration") the speed section
+        # edits the ABSOLUTE per-axis max (the single common ceiling) instead of
+        # a % of it. Every other page keeps "% of max". Passed True only from
+        # hardware_setup.py so existing panels/tests default to percent mode.
+        self._speed_as_max = speed_as_max
         # v7.5.x: jog speeds default to 1/2 of the calibrated max once
         # settings arrive. Seed once; preserve a manual edit thereafter.
         self._speeds_seeded = False
@@ -171,32 +177,67 @@ class HardwareControlPanel(QWidget):
         self._controller = controller
         self._sync_badges()
         self.on_status_update()
+        # v7.5.x: adopt the controller's single per-axis max + shared jog-%.
+        self.refresh_speed_limits()
 
     def set_settings(self, settings) -> None:
         self._settings = settings
         # v7.4.2: pull safety-limit ranges into the position bars so the
         # slider extents reflect the user's recorded envelope.
         self._refresh_bar_ranges()
-        # v7.5.x: seed jog speeds to 1/2 of the calibrated max.
-        self._apply_speed_defaults_from_settings()
+        # v7.5.x: jog speed is now a % of the single common per-axis max — sync
+        # the percent spinboxes + resolved labels from the controller.
+        self.refresh_speed_limits()
+
+    def showEvent(self, event):  # noqa: N802 (Qt override)
+        """Re-read the common max + shared jog-% whenever the panel is shown,
+        so a max changed while this page was hidden is reflected on entry."""
+        try:
+            self.refresh_speed_limits()
+        except Exception:
+            pass
+        super().showEvent(event)
 
     def refresh_safety_limits(self) -> None:
         """v7.4.2: External hook — call after the user saves new safety
         limits in the Device sub-page so the bar extents update live.
-        """
+        v7.5.x: also re-read the per-axis speed maxes."""
         self._refresh_bar_ranges()
+        self.refresh_speed_limits()
 
     def on_status_update(self) -> None:
         """Refresh position labels + status badges. Called by MainWindow tick."""
         if self._controller is None:
             return
         try:
-            xy = self._controller.get_xy_position(cached=True)
-            zp = self._controller.get_zp_position(cached=True)
-            self._update_position_displays(xy, zp)
+            self._update_position_displays(
+                self._display_xy(), self._display_zp())
         except Exception:
             pass
         self._sync_badges()
+
+    def on_motion_tick(self) -> None:
+        """v7.5.x: fast (~30 fps) display-only refresh of just the position
+        readouts while a jog/travel motion estimate is live (no badge work)."""
+        if self._controller is None:
+            return
+        try:
+            self._update_position_displays(
+                self._display_xy(), self._display_zp())
+        except Exception:
+            pass
+
+    def _display_xy(self):
+        """XY for display — the interpolated estimate while a move is in flight,
+        else the raw poller cache (fallback for controllers without the getter)."""
+        c = self._controller
+        fn = getattr(c, "get_display_xy_position", None)
+        return fn() if fn is not None else c.get_xy_position(cached=True)
+
+    def _display_zp(self):
+        c = self._controller
+        fn = getattr(c, "get_display_zp_position", None)
+        return fn() if fn is not None else c.get_zp_position(cached=True)
 
     # ── UI ──────────────────────────────────────────────────────
 
@@ -424,121 +465,385 @@ class HardwareControlPanel(QWidget):
         outer.setContentsMargins(s(8), s(6), s(8), s(6))
         outer.setSpacing(s(4))
 
-        heading = QLabel("Speeds")
+        # v7.5.x: Hardware Setup edits the ABSOLUTE per-axis max (the single
+        # common ceiling); every other page shows "% of max".
+        if self._speed_as_max:
+            return self._build_max_speed_controls(wrap, outer)
+
+        heading = QLabel("Jog speed (% of max)")
         heading.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-weight: 600; "
             f"letter-spacing: 0.4px;")
+        heading.setToolTip(
+            "v7.5.x: jog speed is a percentage of the single calibrated "
+            "per-axis max (set once on Hardware Setup → Stage / Timing "
+            "calibration; inherited by every page). The resolved absolute "
+            "speed is shown beside each axis.")
         outer.addWidget(heading)
 
-        # XY speed — µm/s (ProScan native)
-        self.spin_xy_speed = self._speed_spin(10000, suffix=" µm/s",
-                                              default=2000, step=100)
-        outer.addLayout(self._labeled(
-            "XY", self.spin_xy_speed,
-            tooltip="ProScan max velocity in µm/s. Applied via SMS on each jog."))
-        # Z speed — mm/min feedrate
-        self.spin_z_speed = self._speed_spin(3000, suffix=" mm/min",
-                                             default=600, step=50)
-        outer.addLayout(self._labeled(
-            "Z", self.spin_z_speed,
-            tooltip="Z move feedrate in mm/min."))
-        # Pump speed — mm/min feedrate
-        self.spin_p_speed = self._speed_spin(3000, suffix=" mm/min",
-                                             default=200, step=50)
-        outer.addLayout(self._labeled(
-            "P", self.spin_p_speed,
-            tooltip="Pump move feedrate in mm/min."))
+        # v7.5.x: percent-of-max spinboxes + a read-only resolved-speed label.
+        # The per-axis MAX comes from the controller's single resolvers
+        # (get_max_xy_speed_um_s / get_max_z_feedrate_mm_min /
+        # get_max_pump_feedrate), so every page inherits the same source.
+        self.spin_xy_pct = self._pct_spin()
+        self.lbl_xy_resolved = self._resolved_label()
+        outer.addLayout(self._labeled_pct(
+            "XY", self.spin_xy_pct, self.lbl_xy_resolved,
+            tooltip="XY jog speed as a % of the calibrated XY top speed."))
 
-        # Push the XY speed to the controller whenever it changes so
-        # the next ProScan move uses the new SMS value.
-        self.spin_xy_speed.valueChanged.connect(self._apply_xy_speed)
+        self.spin_z_pct = self._pct_spin()
+        self.lbl_z_resolved = self._resolved_label()
+        outer.addLayout(self._labeled_pct(
+            "Z", self.spin_z_pct, self.lbl_z_resolved,
+            tooltip="Z jog speed as a % of the max Z feedrate."))
 
-        # v7.5.x: track manual edits so the half-of-max seeding never
-        # clobbers a value the user dialed in. editingFinished (not
-        # valueChanged) so programmatic seeding doesn't mark it dirty.
-        self.spin_xy_speed.editingFinished.connect(
-            lambda: self._speed_user_edited.__setitem__("xy", True))
-        self.spin_z_speed.editingFinished.connect(
-            lambda: self._speed_user_edited.__setitem__("z", True))
-        self.spin_p_speed.editingFinished.connect(
-            lambda: self._speed_user_edited.__setitem__("p", True))
+        # v7.5.x: the pump jog % can go below 1 % (down to 0.01 %) for fine
+        # plunger jogs — the operator asked for sub-1 % pump rates.
+        self.spin_p_pct = self._pct_spin(min_pct=0.01, decimals=2, step=0.1)
+        self.lbl_p_resolved = self._resolved_label()
+        outer.addLayout(self._labeled_pct(
+            "P", self.spin_p_pct, self.lbl_p_resolved,
+            tooltip="Pump jog speed as a % of the max pump flow / feedrate "
+                    "(can go below 1 %)."))
+
+        self.spin_xy_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("xy"))
+        self.spin_z_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("z"))
+        self.spin_p_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("p"))
         return wrap
 
-    def _apply_speed_defaults_from_settings(self) -> None:
-        """v7.5.x: default each jog speed to HALF of the calibrated max
-        and cap the spinbox at that max.
+    def _pct_spin(self, *, min_pct: float = 1.0, decimals: int = 0,
+                  step: float = 5.0) -> "QDoubleSpinBox":
+        from PySide6.QtWidgets import QDoubleSpinBox
+        sp_w = QDoubleSpinBox()
+        sp_w.setRange(min_pct, 100.0)
+        sp_w.setDecimals(decimals)
+        sp_w.setSingleStep(step)
+        sp_w.setValue(50.0)
+        sp_w.setSuffix(" %")
+        return sp_w
 
-        Reads the same keys the Stage-calibration page writes:
-          - XY  : ``safety_limits.max_xy_speed``        (µm/s)
-          - Z   : ``device_profile.per_axis_max_feedrate["Z"]`` (mm/min),
-                  falling back to ``safety_limits.max_z_feedrate``
-          - Pump: ``safety_limits.max_pump_feedrate``   (mm/min)
+    def _max_spin(self, *, maximum: float, decimals: int, step: float,
+                  unit: str) -> "QDoubleSpinBox":
+        """v7.5.x: absolute per-axis MAX-speed spinbox (Hardware Setup)."""
+        from PySide6.QtWidgets import QDoubleSpinBox
+        sp_w = QDoubleSpinBox()
+        sp_w.setRange(1.0, maximum)
+        sp_w.setDecimals(decimals)
+        sp_w.setSingleStep(step)
+        sp_w.setSuffix(f" {unit}")
+        return sp_w
 
-        Seeds once per panel; a manual edit (tracked via editingFinished)
-        is preserved on any later re-injection of settings.
-        """
-        if self._settings is None or not hasattr(self, 'spin_xy_speed'):
-            return
-        if self._speeds_seeded:
-            return
-        s_obj = self._settings
+    def _build_max_speed_controls(self, wrap: QWidget,
+                                  outer: "QVBoxLayout") -> QWidget:
+        """v7.5.x: Hardware Setup speed section — edit the ABSOLUTE per-axis max
+        speed (the single common ceiling every % page reads). Reuses the
+        ``spin_*_pct`` attribute names (they hold absolute values here) so the
+        shared handlers/refresh paths work with a ``_speed_as_max`` branch."""
+        heading = QLabel("Max speed (per axis)")
+        heading.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-weight: 600; "
+            f"letter-spacing: 0.4px;")
+        heading.setToolTip(
+            "v7.5.x: the maximum speed for each axis. This is the single "
+            "ceiling every other page reads — jog and print speeds elsewhere "
+            "are a % of these. Jogging here runs at the value you set.")
+        outer.addWidget(heading)
 
-        def _num(val, default):
-            try:
-                v = float(val)
-                return v if v > 0 else float(default)
-            except (TypeError, ValueError):
-                return float(default)
+        self.spin_xy_pct = self._max_spin(
+            maximum=1_000_000.0, decimals=0, step=100.0, unit="µm/s")
+        self.lbl_xy_resolved = self._resolved_label()
+        self.lbl_xy_resolved.setVisible(False)
+        outer.addLayout(self._labeled_pct(
+            "XY", self.spin_xy_pct, self.lbl_xy_resolved,
+            tooltip="Maximum XY speed (µm/s) — the 100% anchor everywhere."))
 
-        xy_max = _num(s_obj.get("safety_limits.max_xy_speed", 10000.0), 10000.0)
-        per_axis = s_obj.get("device_profile.per_axis_max_feedrate") or {}
-        z_max = _num(
-            per_axis.get("Z") or s_obj.get("safety_limits.max_z_feedrate", 500.0),
-            500.0)
-        pump_max = _num(
-            s_obj.get("safety_limits.max_pump_feedrate", 200.0), 200.0)
+        self.spin_z_pct = self._max_spin(
+            maximum=100_000.0, decimals=0, step=50.0, unit="mm/min")
+        self.lbl_z_resolved = self._resolved_label()
+        self.lbl_z_resolved.setVisible(False)
+        outer.addLayout(self._labeled_pct(
+            "Z", self.spin_z_pct, self.lbl_z_resolved,
+            tooltip="Maximum Z feedrate (mm/min) — the 100% anchor everywhere."))
 
-        for spin, axis, cap in (
-            (self.spin_xy_speed, "xy", xy_max),
-            (self.spin_z_speed, "z", z_max),
-            (self.spin_p_speed, "p", pump_max),
-        ):
-            if self._speed_user_edited.get(axis) or cap <= 0:
-                continue
-            spin.blockSignals(True)
-            # Cap the max BEFORE the half-value so it isn't clipped, and
-            # never below the spinbox's own minimum.
-            if cap > spin.minimum():
-                spin.setMaximum(cap)
-            spin.setValue(cap / 2.0)
-            spin.blockSignals(False)
-        self._speeds_seeded = True
+        self.spin_p_pct = self._max_spin(
+            maximum=100_000.0, decimals=0, step=10.0, unit="mm/min")
+        self.lbl_p_resolved = self._resolved_label()
+        self.lbl_p_resolved.setVisible(False)
+        outer.addLayout(self._labeled_pct(
+            "Pump", self.spin_p_pct, self.lbl_p_resolved,
+            tooltip="Maximum pump plunger feedrate (mm/min)."))
 
-    def _labeled(self, name: str, widget, tooltip: str = "") -> QHBoxLayout:
+        self.spin_xy_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("xy"))
+        self.spin_z_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("z"))
+        self.spin_p_pct.valueChanged.connect(
+            lambda: self._on_speed_pct_changed("p"))
+        return wrap
+
+    def _resolved_label(self) -> QLabel:
+        lbl = QLabel("—")
+        lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-family: monospace; "
+            f"font-size: {sf(8.5)}pt;")
+        lbl.setMinimumWidth(s(80))
+        return lbl
+
+    def _labeled_pct(self, name: str, spin, resolved: QLabel,
+                     tooltip: str = "") -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(s(6))
         row.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(name)
-        lbl.setStyleSheet(
-            f"color: {COLORS['text']}; font-weight: 500;")
+        lbl.setStyleSheet(f"color: {COLORS['text']}; font-weight: 500;")
         lbl.setMinimumWidth(s(22))
         row.addWidget(lbl)
-        row.addWidget(widget, 1)
+        row.addWidget(spin)
+        row.addWidget(resolved, 1)
         if tooltip:
-            widget.setToolTip(tooltip)
+            spin.setToolTip(tooltip)
             lbl.setToolTip(tooltip)
         return row
 
-    def _speed_spin(self, maximum: float, suffix: str, default: float,
-                    step: float) -> "QDoubleSpinBox":
-        from PySide6.QtWidgets import QDoubleSpinBox
-        sp_w = QDoubleSpinBox()
-        sp_w.setRange(1, maximum)
-        sp_w.setDecimals(0)
-        sp_w.setSingleStep(step)
-        sp_w.setValue(default)
-        sp_w.setSuffix(suffix)
-        return sp_w
+    # ── v7.5.x: % of the single calibrated max (shared across pages) ──
+
+    def _pump_speed_anchor(self) -> tuple[float, str]:
+        """The pump-jog 100% anchor + its unit, by mode.
+
+        %/µL pages → the needle-derived flow ceiling (µL/s) from the controller.
+        Hardware Setup (mm jog) → the legacy raw-plunger feedrate
+        (``safety_limits.max_pump_feedrate``, mm/min)."""
+        ctrl = self._controller
+        if self._pump_action_labels:
+            if ctrl is not None and hasattr(ctrl, "get_max_pump_feedrate"):
+                try:
+                    m = float(ctrl.get_max_pump_feedrate())
+                    if m > 0:
+                        return m, "µL/s"
+                except Exception:
+                    pass
+            return 0.0, "µL/s"
+        mpf = 0.0
+        sl = getattr(ctrl, "safety_limits", None) if ctrl else None
+        if sl is not None:
+            mpf = getattr(sl, "max_pump_feedrate", 0.0) or 0.0
+        if not mpf and self._settings is not None:
+            try:
+                mpf = float(self._settings.get(
+                    "safety_limits.max_pump_feedrate", 200.0))
+            except (TypeError, ValueError):
+                mpf = 200.0
+        return float(mpf or 200.0), "mm/min"
+
+    def _max_xy_speed_um_s(self) -> float:
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "get_max_xy_speed_um_s"):
+            try:
+                v = float(ctrl.get_max_xy_speed_um_s())
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+        if self._settings is not None:
+            try:
+                v = float(self._settings.get("safety_limits.max_xy_speed", 10000.0))
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        return 10000.0
+
+    def _max_z_feedrate_mm_min(self) -> float:
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "get_max_z_feedrate_mm_min"):
+            try:
+                v = float(ctrl.get_max_z_feedrate_mm_min())
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+        if self._settings is not None:
+            per_axis = self._settings.get(
+                "device_profile.per_axis_max_feedrate") or {}
+            try:
+                v = float(per_axis.get("Z")
+                          or self._settings.get("safety_limits.max_z_feedrate", 500.0))
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        return 500.0
+
+    def _resolve_speeds(self) -> None:
+        """Refresh the read-only resolved-speed labels from the current % and
+        the controller's single per-axis max resolvers."""
+        if not hasattr(self, "spin_xy_pct"):
+            return
+        # Max mode (Hardware Setup): the spins hold absolute values, the resolved
+        # labels are hidden — nothing to resolve.
+        if getattr(self, "_speed_as_max", False):
+            return
+        xy_max = self._max_xy_speed_um_s()
+        z_max = self._max_z_feedrate_mm_min()
+        p_max, p_unit = self._pump_speed_anchor()
+        xy = self.spin_xy_pct.value() / 100.0 * xy_max
+        z = self.spin_z_pct.value() / 100.0 * z_max
+        p = self.spin_p_pct.value() / 100.0 * p_max
+        self.lbl_xy_resolved.setText(f"= {xy:,.0f} µm/s")
+        self.lbl_z_resolved.setText(f"= {z:,.0f} mm/min")
+        if p_unit == "µL/s":
+            self.lbl_p_resolved.setText(
+                f"= {p:.2f} µL/s" if p_max > 0 else "= — µL/s")
+        else:
+            self.lbl_p_resolved.setText(f"= {p:,.0f} mm/min")
+
+    def _on_speed_pct_changed(self, group: str) -> None:
+        """A percent spinbox changed: persist the shared % on the controller,
+        refresh the resolved labels, and (for XY) push the velocity now."""
+        spin = {"xy": getattr(self, "spin_xy_pct", None),
+                "z": getattr(self, "spin_z_pct", None),
+                "p": getattr(self, "spin_p_pct", None)}.get(group)
+        if spin is None:
+            return
+        self._speed_user_edited[group] = True
+        # Max mode (Hardware Setup): the spin value IS the axis's max speed —
+        # write it to the one common source + fan out instead of a jog %.
+        if getattr(self, "_speed_as_max", False):
+            self._write_axis_max(group, float(spin.value()))
+            return
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_jog_speed_pct"):
+            try:
+                ctrl.set_jog_speed_pct(group, float(spin.value()))
+            except Exception as e:
+                logger.debug(f"set_jog_speed_pct({group}) failed: {e}")
+        self._resolve_speeds()
+        if group == "xy":
+            self._apply_xy_speed(spin.value() / 100.0 * self._max_xy_speed_um_s())
+
+    def _seed_jog_pct_from_controller(self) -> None:
+        """Adopt the shared jog-% the controller holds (so this panel agrees
+        with the Xbox page and any other surface). Falls back to the spinbox
+        default when the controller has no stored value yet."""
+        if not hasattr(self, "spin_xy_pct"):
+            return
+        ctrl = self._controller
+        state = {}
+        if ctrl is not None and hasattr(ctrl, "get_jog_speed_state"):
+            try:
+                state = ctrl.get_jog_speed_state() or {}
+            except Exception:
+                state = {}
+        for group, spin in (("xy", self.spin_xy_pct),
+                            ("z", self.spin_z_pct),
+                            ("p", self.spin_p_pct)):
+            st = state.get(group)
+            if st and st.get("pct") is not None:
+                spin.blockSignals(True)
+                try:
+                    spin.setValue(float(st["pct"]))
+                except (TypeError, ValueError):
+                    pass
+                spin.blockSignals(False)
+
+    def _seed_axis_max_from_controller(self) -> None:
+        """Max mode: seed the absolute-max spinboxes from the single common
+        resolvers so this panel reflects the stored ceilings."""
+        if not hasattr(self, "spin_xy_pct"):
+            return
+        p_max, _unit = self._pump_speed_anchor()   # mm/min in Hardware Setup mode
+        for spin, val in ((self.spin_xy_pct, self._max_xy_speed_um_s()),
+                          (self.spin_z_pct, self._max_z_feedrate_mm_min()),
+                          (self.spin_p_pct, p_max)):
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            if v <= 0:
+                continue
+            spin.blockSignals(True)
+            try:
+                spin.setValue(v)
+            except (TypeError, ValueError):
+                pass
+            spin.blockSignals(False)
+
+    def _write_axis_max(self, group: str, value: float) -> None:
+        """Max mode (Hardware Setup): write ``value`` as the axis's max speed to
+        the single common source, persist it, and fan the change out so every
+        %-of-max page re-anchors. XY → ``safety_limits.max_xy_speed`` (µm/s);
+        Z → ``device_profile.per_axis_max_feedrate['Z']`` (mm/min, resolver
+        primary) + mirror ``max_z_feedrate``; Pump → ``max_pump_feedrate``."""
+        ctrl = self._controller
+        s = self._settings
+        sl = getattr(ctrl, "safety_limits", None) if ctrl is not None else None
+        if group == "xy":
+            if sl is not None:
+                try:
+                    sl.max_xy_speed = value
+                except Exception:
+                    pass
+            if s is not None:
+                try:
+                    s.set("safety_limits.max_xy_speed", value)
+                    s.save()
+                except Exception:
+                    pass
+        elif group == "z":
+            per_axis = {}
+            if s is not None:
+                per_axis = dict(
+                    (s.get("device_profile.per_axis_max_feedrate") or {}))
+            per_axis["Z"] = value
+            if s is not None:
+                try:
+                    s.set("device_profile.per_axis_max_feedrate", per_axis)
+                    s.set("safety_limits.max_z_feedrate", value)
+                    s.save()
+                except Exception:
+                    pass
+            if ctrl is not None and hasattr(ctrl, "apply_device_settings"):
+                try:
+                    ctrl.apply_device_settings(
+                        per_axis_max_feedrate=per_axis, persist_feedrate=True)
+                except Exception as e:
+                    logger.debug(f"apply Z max failed: {e}")
+            if sl is not None:
+                try:
+                    sl.max_z_feedrate = value
+                except Exception:
+                    pass
+        else:  # pump
+            if sl is not None:
+                try:
+                    sl.max_pump_feedrate = value
+                except Exception:
+                    pass
+            if s is not None:
+                try:
+                    s.set("safety_limits.max_pump_feedrate", value)
+                    s.save()
+                except Exception:
+                    pass
+        # Re-anchor the jog handlers + fan out to every %-of-max surface.
+        if ctrl is not None and hasattr(ctrl, "notify_speed_limits_changed"):
+            try:
+                ctrl.notify_speed_limits_changed()
+            except Exception as e:
+                logger.debug(f"notify_speed_limits_changed failed: {e}")
+
+    def refresh_speed_limits(self) -> None:
+        """v7.5.x: external hook — re-read the single common per-axis max and
+        the shared jog-%. Call after any page changes a max (the GUI fans this
+        out via ``HardwareSetupPage.safety_limits_changed``) or on show."""
+        if getattr(self, "_speed_as_max", False):
+            self._seed_axis_max_from_controller()
+            return
+        self._seed_jog_pct_from_controller()
+        self._resolve_speeds()
 
     def _apply_xy_speed(self, value: float) -> None:
         """Push XY speed to ProScan via set_velocity (µm/s)."""
@@ -834,9 +1139,16 @@ class HardwareControlPanel(QWidget):
     def _on_jog_xy(self, dx_um: float, dy_um: float) -> None:
         if self._controller is None:
             return
-        # v7.4.2: ensure the latest speed is on ProScan before the move
-        # (the user may have edited the spinbox without pressing Tab).
-        self._apply_xy_speed(self.spin_xy_speed.value())
+        # v7.5.x: jog speed = % of the single calibrated XY max. Resolve the
+        # absolute µm/s now and push it to ProScan before the move. Floored at
+        # ≥1 so a zero/unset max can never command F0 (Marlin planner stall).
+        # In max mode (Hardware Setup) the spin already holds absolute µm/s.
+        if getattr(self, "_speed_as_max", False):
+            xy_um_s = max(1.0, self.spin_xy_pct.value())
+        else:
+            xy_um_s = max(1.0, self.spin_xy_pct.value() / 100.0
+                          * self._max_xy_speed_um_s())
+        self._apply_xy_speed(xy_um_s)
         bypass = self._bypass_safety
         try:
             self._controller.move_xy_relative_um(
@@ -848,9 +1160,16 @@ class HardwareControlPanel(QWidget):
     def _on_jog_z(self, dz_mm: float) -> None:
         if self._controller is None:
             return
-        feed = float(self.spin_z_speed.value())
+        # v7.5.x: jog speed = % of the single calibrated Z max feedrate.
+        # Floored at ≥1 mm/min so an unset max can never command F0.
+        # In max mode (Hardware Setup) the spin already holds absolute mm/min.
+        if getattr(self, "_speed_as_max", False):
+            feed = max(1.0, self.spin_z_pct.value())
+        else:
+            feed = max(1.0, self.spin_z_pct.value() / 100.0
+                       * self._max_z_feedrate_mm_min())
         bypass = self._bypass_safety
-        # v7.5.x: dz_mm is a HEIGHT-frame delta (+ = up); route through
+        # dz_mm is a HEIGHT-frame delta (+ = up); route through
         # move_z_user_relative so "up" follows the taught z_up_sign.
         try:
             self._controller.move_z_user_relative(
@@ -864,7 +1183,56 @@ class HardwareControlPanel(QWidget):
     def _on_jog_pump(self, pump: str, distance: float) -> None:
         if self._controller is None:
             return
-        feed = float(self.spin_p_speed.value())
+        ctrl = self._controller
+        # v7.5.x: %/µL pages drive the plunger by a % of the syringe volume;
+        # Hardware Setup (raw arrows) keeps the mm path for plunger calibration.
+        if self._pump_action_labels:
+            # ``distance`` here is a SIGNED % of the syringe volume
+            # (− = aspirate, + = dispense — matches move_pump_uL's convention).
+            volume_uL = None
+            if hasattr(ctrl, "pump_pct_to_uL"):
+                try:
+                    volume_uL = ctrl.pump_pct_to_uL(pump, distance)
+                except Exception:
+                    volume_uL = None
+            if volume_uL is None:
+                self.lbl_status.setText(
+                    f"{pump}: calibrate the plunger or assign a syringe to jog "
+                    f"in % of volume.")
+                return
+            p_max, _ = self._pump_speed_anchor()      # µL/s ceiling
+            rate = self.spin_p_pct.value() / 100.0 * p_max if p_max > 0 else None
+            # v7.5.x: backlash compensation — when enabled (pump jog toggle), the
+            # click is bracketed with a flex take-up + unload so it leaves the
+            # tip pressure-neutral. A single click is one discrete start→stop, so
+            # per-click bracketing is correct here. Off ⇒ compensate=False.
+            comp_on = False
+            _bce = getattr(ctrl, "backlash_comp_enabled", None)
+            if callable(_bce):
+                try:
+                    comp_on = bool(_bce())
+                except Exception:
+                    comp_on = False
+            try:
+                ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate,
+                                  compensate=comp_on)
+            except TypeError:
+                try:
+                    ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate)
+                except TypeError:
+                    ctrl.move_pump_uL(pump, volume_uL)
+            except Exception as e:
+                logger.warning(f"jog {pump} {distance:g}% failed: {e}")
+            self._force_refresh_positions()
+            return
+        # Hardware Setup mm jog — speed = the legacy raw-plunger feedrate.
+        # Max mode: the spin holds the absolute mm/min ceiling directly; percent
+        # mode (legacy / tests): % of the anchor.
+        feed, _ = self._pump_speed_anchor()           # mm/min
+        if getattr(self, "_speed_as_max", False):
+            feed = max(1.0, self.spin_p_pct.value())
+        else:
+            feed = self.spin_p_pct.value() / 100.0 * feed
         bypass = self._bypass_safety
         try:
             self._controller.move_pump_relative(
@@ -926,10 +1294,30 @@ class HardwareControlPanel(QWidget):
         return None
 
     def _update_position_displays(self, xy, zp) -> None:
+        # v7.5.x: axes whose readout is currently a (display-only) motion
+        # estimate — marked with a leading '~' + tooltip so the number can't be
+        # mistaken for a confirmed sensor reading. Empty when nothing is moving.
+        est: set = set()
+        c = self._controller
+        if c is not None and hasattr(c, "motion_estimating"):
+            try:
+                est = c.motion_estimating()
+            except Exception:
+                est = set()
+
         def _set(axis: str, value: float | None, fmt: str,
                  unit: str | None = None, tooltip: str | None = None) -> None:
             lbl = self.lbl_pos[axis]
-            lbl.setText(fmt.format(value) if value is not None else "—")
+            if value is not None:
+                text = fmt.format(value)
+                if axis in est:
+                    text = "~" + text
+                    if tooltip is None:
+                        tooltip = ("Estimated position (in motion) — snaps to "
+                                   "the measured value on arrival")
+                lbl.setText(text)
+            else:
+                lbl.setText("—")
             if tooltip is not None:
                 lbl.setToolTip(tooltip)
             if unit is not None and hasattr(self, "unit_lbl_pos"):
@@ -954,11 +1342,22 @@ class HardwareControlPanel(QWidget):
                 # v7.5.x: show pumps as a FILL LEVEL in µL (0 = empty/dispensed
                 # → capacity = full/aspirated) once the plunger is calibrated;
                 # keep the raw-mm readout (with the raw value in the tooltip)
-                # for uncalibrated pumps.
+                # for uncalibrated pumps. On the %/µL pages (action labels) also
+                # show the fill as a % of the syringe capacity.
                 if v is not None:
                     fill = self._pump_raw_to_fill_uL(logical, v)
                     if fill is not None:
-                        _set(logical, fill, "{:.1f}", unit="µL",
+                        unit = "µL"
+                        c = self._controller
+                        if (self._pump_action_labels and c is not None
+                                and hasattr(c, "pump_uL_to_pct")):
+                            try:
+                                pct = c.pump_uL_to_pct(logical, fill)
+                            except Exception:
+                                pct = None
+                            if pct is not None:
+                                unit = f"µL · {pct:.0f}%"
+                        _set(logical, fill, "{:.1f}", unit=unit,
                              tooltip=f"raw {v:.3f} mm")
                         continue
                 _set(logical, v, "{:.3f}", unit="mm")

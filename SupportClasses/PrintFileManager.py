@@ -495,44 +495,206 @@ class PrintFileManager:
             logger.error(f"Failed to load {target_path}: {e}")
             return None
 
-    # ── Delete ────────────────────────────────────────────────────
+    # ── Path resolution ───────────────────────────────────────────
 
-    def delete(self, name: str) -> bool:
-        """Delete a print file by name."""
+    def _find_path(self, name: str) -> Path | None:
+        """Resolve the on-disk ``.json`` path for a print by its metadata
+        name, falling back to the sanitized filename."""
         for fp in self.prints_dir.glob("*.json"):
             try:
                 with open(fp) as f:
                     data = json.load(f)
-                if data.get("metadata", {}).get("name") == name:
-                    fp.unlink()
-                    if self.current and self.current.name == name:
-                        self.current = None
-                        self.current_path = None
-                    logger.info(f"Deleted print file: {name}")
-                    return True
             except (json.JSONDecodeError, OSError):
                 continue
-
-        # Fallback
+            if data.get("metadata", {}).get("name") == name:
+                return fp
         candidate = self.prints_dir / (_sanitize_filename(name) + ".json")
-        if candidate.exists():
-            candidate.unlink()
-            if self.current and self.current.name == name:
-                self.current = None
-                self.current_path = None
-            logger.info(f"Deleted print file: {name}")
-            return True
+        return candidate if candidate.exists() else None
 
-        logger.warning(f"File not found for deletion: {name}")
-        return False
+    def _sibling_paths(self, json_path: Path) -> list[Path]:
+        """Companion files that belong to one print: the sibling
+        ``<stem>.csv`` (the baked trajectory) plus any
+        ``<name>.json.bak-*`` migration backups. The ``.json`` itself is
+        NOT included. Only files inside the prints dir are ever touched, so
+        a print that references a user's external CSV keeps it."""
+        sibs: list[Path] = []
+        csv = self.prints_dir / f"{json_path.stem}.csv"
+        if csv.exists():
+            sibs.append(csv)
+        sibs.extend(self.prints_dir.glob(f"{json_path.name}.bak-*"))
+        return sibs
+
+    # ── Delete ────────────────────────────────────────────────────
+
+    def delete(self, name: str) -> bool:
+        """Delete a print by name — the ``.json`` AND its companion files
+        (the sibling ``<stem>.csv`` baked trajectory + any ``.bak-*``
+        migration backups), so no orphaned files are left behind."""
+        fp = self._find_path(name)
+        if fp is None:
+            logger.warning(f"File not found for deletion: {name}")
+            return False
+        removed: list[str] = []
+        for p in [fp, *self._sibling_paths(fp)]:
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except OSError as e:
+                logger.warning(f"Could not delete {p}: {e}")
+        if self.current and self.current.name == name:
+            self.current = None
+            self.current_path = None
+        logger.info(f"Deleted print '{name}': {', '.join(removed)}")
+        return bool(removed)
+
+    # ── Rename ────────────────────────────────────────────────────
+
+    def rename(self, old_name: str, new_name: str) -> bool:
+        """Rename a print: the ``.json`` file, its ``metadata.name``, and the
+        sibling ``<stem>.csv`` (rewriting the object ``source_file`` /
+        ``csv_path`` pointers to the renamed CSV). Returns False if the new
+        name is empty or already taken by a *different* print (the UI warns —
+        no silent auto-increment, unlike :meth:`duplicate`)."""
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        old_path = self._find_path(old_name)
+        if old_path is None:
+            logger.warning(f"Rename: print not found: {old_name}")
+            return False
+
+        new_stem = _sanitize_filename(new_name)
+        new_json = self.prints_dir / f"{new_stem}.json"
+        if new_json.exists() and new_json.resolve() != old_path.resolve():
+            logger.warning(f"Rename: target already exists: {new_json}")
+            return False
+
+        try:
+            with open(old_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Rename: cannot read {old_path}: {e}")
+            return False
+        data.setdefault("metadata", {})["name"] = new_name
+
+        # Move the sibling <old_stem>.csv → <new_stem>.csv and rewrite any
+        # object pointer that referenced it (by basename).
+        old_csv = self.prints_dir / f"{old_path.stem}.csv"
+        new_csv = self.prints_dir / f"{new_stem}.csv"
+        csv_renamed = False
+        if old_csv.exists() and new_csv.resolve() != old_csv.resolve():
+            try:
+                old_csv.replace(new_csv)          # atomic within one dir
+                csv_renamed = True
+            except OSError as e:
+                logger.error(f"Rename: cannot move CSV {old_csv}: {e}")
+                return False
+        if csv_renamed:
+            self._rewrite_csv_pointers(data, old_csv.name, str(new_csv))
+
+        try:
+            with open(new_json, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            logger.error(f"Rename: cannot write {new_json}: {e}")
+            if csv_renamed:                        # roll back the CSV move
+                try:
+                    new_csv.replace(old_csv)
+                except OSError:
+                    pass
+            return False
+
+        if new_json.resolve() != old_path.resolve():
+            try:
+                old_path.unlink()
+            except OSError as e:
+                logger.warning(f"Rename: could not remove old {old_path}: {e}")
+
+        if (self.current_path is not None
+                and self.current_path.resolve() == old_path.resolve()):
+            self.current_path = new_json
+            if self.current is not None:
+                self.current.metadata.name = new_name
+        logger.info(f"Renamed print '{old_name}' → '{new_name}'")
+        return True
+
+    @staticmethod
+    def _rewrite_csv_pointers(data: dict, old_csv_name: str,
+                              new_csv_path: str) -> None:
+        """In-place: repoint any object CSV pointer that referenced
+        ``old_csv_name`` (basename) at ``new_csv_path``."""
+        objects = data.get("objects")
+        if not isinstance(objects, dict):
+            return
+        for obj in objects.values():
+            if not isinstance(obj, dict):
+                continue
+            params = obj.get("params")
+            if not isinstance(params, dict):
+                continue
+            for key in ("source_file", "csv_path"):
+                ptr = params.get(key)
+                if ptr and Path(ptr).name == old_csv_name:
+                    params[key] = new_csv_path
+
+    # ── Orphan cleanup ────────────────────────────────────────────
+
+    def orphan_files(self) -> list[Path]:
+        """Files in the prints dir that belong to no live print: ``.csv``
+        files whose stem has no matching ``.json`` AND that no ``.json``
+        references, plus ``*.bak-*`` migration backups. Conservative — a CSV
+        referenced by any print is never reported."""
+        json_stems: set[str] = set()
+        referenced: set[str] = set()
+        for fp in self.prints_dir.glob("*.json"):
+            json_stems.add(fp.stem)
+            try:
+                with open(fp) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            for obj in (data.get("objects") or {}).values():
+                if not isinstance(obj, dict):
+                    continue
+                params = obj.get("params") or {}
+                for key in ("source_file", "csv_path"):
+                    ptr = params.get(key)
+                    if ptr:
+                        referenced.add(Path(ptr).name)
+
+        orphans: list[Path] = []
+        for csv in self.prints_dir.glob("*.csv"):
+            if csv.stem not in json_stems and csv.name not in referenced:
+                orphans.append(csv)
+        orphans.extend(self.prints_dir.glob("*.bak-*"))
+        return sorted(set(orphans))
+
+    def cleanup_orphans(self) -> int:
+        """Delete all :meth:`orphan_files`. Returns the count removed."""
+        n = 0
+        for p in self.orphan_files():
+            try:
+                p.unlink()
+                n += 1
+            except OSError as e:
+                logger.warning(f"Could not delete orphan {p}: {e}")
+        if n:
+            logger.info(f"Cleaned up {n} orphaned print file(s)")
+        return n
 
     # ── Duplicate ─────────────────────────────────────────────────
 
     def duplicate(self, new_name: str) -> PrintFileData | None:
-        """Deep copy current file under a new name."""
+        """Deep copy current file under a new name.
+
+        Also copies the sibling ``<stem>.csv`` (rewriting the object
+        ``source_file`` / ``csv_path`` pointers) so the duplicate is
+        **standalone** — deleting the original later won't strand it (delete
+        removes the original's sibling CSV)."""
         if self.current is None:
             return None
 
+        src_path = self.current_path
         dup_data = copy.deepcopy(self.current.to_dict())
         dup_data["metadata"]["name"] = new_name
         now = datetime.now(timezone.utc).isoformat()
@@ -542,6 +704,20 @@ class PrintFileManager:
         self.current = PrintFileData.from_dict(dup_data)
         filename = _sanitize_filename(new_name) + ".json"
         self.current_path = self.prints_dir / filename
+
+        if src_path is not None:
+            old_csv = self.prints_dir / f"{src_path.stem}.csv"
+            new_csv = self.prints_dir / f"{self.current_path.stem}.csv"
+            if old_csv.exists() and old_csv.resolve() != new_csv.resolve():
+                try:
+                    import shutil
+                    shutil.copy2(old_csv, new_csv)
+                    self._rewrite_csv_pointers(
+                        {"objects": self.current.objects},
+                        old_csv.name, str(new_csv))
+                except OSError as e:
+                    logger.warning(f"Duplicate: CSV copy failed: {e}")
+
         self.save()
         logger.info(f"Duplicated as: {new_name}")
         return self.current
@@ -692,13 +868,19 @@ def save_trajectory_as_print_object(
     object_name: str = "Sketch_1",
     prints_dir: str = DEFAULT_PRINTS_DIR,
     extra_params: dict | None = None,
+    overwrite: bool = False,
 ) -> str:
     """Bake an Nx7 trajectory into a ``csv_import`` print file.
 
     Writes ``{prints_dir}/{name}.csv`` (header ``x,y,z,p1,p2,p3,t``) and a
     matching ``{name}.json`` print file whose single object has
-    ``object_type="csv_import"`` pointing at the CSV. The name is auto-
-    incremented from ``base_name`` so existing files are never clobbered.
+    ``object_type="csv_import"`` pointing at the CSV.
+
+    ``overwrite=False`` (default) auto-increments ``base_name`` so existing
+    files are never clobbered (the "save as new" path). ``overwrite=True`` uses
+    the sanitized ``base_name`` verbatim as the file stem and **replaces** an
+    existing print of that name (the "save changes" path used when editing a
+    print in the Sketch page).
 
     This is the shared contract used by both the Print Builder Sketch page
     and the Image Import (Helper Functions) page so the resulting object
@@ -720,11 +902,14 @@ def save_trajectory_as_print_object(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base = _sanitize_filename(base_name)
-    counter = 1
-    while (out_dir / f"{base}_{counter}.csv").exists() \
-            or (out_dir / f"{base}_{counter}.json").exists():
-        counter += 1
-    name = f"{base}_{counter}"
+    if overwrite:
+        name = base
+    else:
+        counter = 1
+        while (out_dir / f"{base}_{counter}.csv").exists() \
+                or (out_dir / f"{base}_{counter}.json").exists():
+            counter += 1
+        name = f"{base}_{counter}"
     csv_path = out_dir / f"{name}.csv"
     json_path = out_dir / f"{name}.json"
 
@@ -773,3 +958,19 @@ def save_trajectory_as_print_object(
     logger.info(f"save_trajectory_as_print_object → {name} "
                 f"({len(arr)} waypoints)")
     return name
+
+
+def read_print_objects(path: str | Path) -> dict:
+    """Read just the ``objects`` dict from a print file on disk.
+
+    No migration, no ``PrintFileManager`` state — a light read used by the
+    Print Library to build trajectory thumbnails without loading the file as
+    the manager's *current*. Returns ``{}`` on any error / malformed file.
+    """
+    try:
+        with open(Path(path)) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return {}
+    objects = data.get("objects")
+    return objects if isinstance(objects, dict) else {}

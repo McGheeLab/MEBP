@@ -576,7 +576,10 @@ class HardwareSetupPage(ModePage):
         # Always visible across all 7 sub-pages because the context
         # panel doesn't swap when the sub-page changes.
         from gui.pages.hardware.control_panel import HardwareControlPanel
-        self._control_panel = HardwareControlPanel()
+        # v7.5.x: on Hardware Setup ("hardware calibration") the speed section
+        # edits the ABSOLUTE per-axis max speed (the single common ceiling every
+        # %-of-max page reads), not a % of it.
+        self._control_panel = HardwareControlPanel(speed_as_max=True)
 
     def set_settings(self, settings):
         """v7.4.0-b: Inject Settings instance for the Stage sub-page widgets.
@@ -731,8 +734,15 @@ class HardwareSetupPage(ModePage):
         # or .findData() keeps working until the migration finishes.
         from gui.pages.hardware.plate_designer import PlateDesignerWidget
         self._plate_designer = PlateDesignerWidget(self, mode="plate")
-        self._plate_designer.plate_changed.connect(
-            lambda _key: self._on_config_changed())
+        self._plate_designer.plate_changed.connect(self._on_designer_plate_changed)
+        # v7.5.x: two-step plate-TYPE selector (Format → product) ABOVE the
+        # designer. The card is the primary plate selector — a product (Corning
+        # glass-bottom, NEST plastic, …) supplies the per-plate Z offsets and
+        # auto-loads its own mosaic. The designer below remains for custom
+        # geometry editing.
+        self._selected_plate_type_id = ""
+        self._plate_type_syncing = False
+        self._sub_layouts["plate"].addWidget(self._build_plate_type_card())
         self._sub_layouts["plate"].addWidget(self._plate_designer)
 
         # v7.4.8: the Rosette sub-page hosts a rosette-mode designer that
@@ -859,9 +869,43 @@ class HardwareSetupPage(ModePage):
             "per-run pre-flow knob from this value.")
         self._pump_prime_spin.valueChanged.connect(self._on_config_changed)
         timing_lay.addWidget(self._pump_prime_spin, 1, 1)
+
+        # v7.5.x: pressure relief / compliance is now an absolute µL value PER
+        # PUMP (retired the old "% of syringe" spin + 3 context toggles). It is
+        # measured by the Needle Location compliance calibration and applied as
+        # backlash compensation (take-up on reversal + unload on stop), enabled
+        # from the pump jog panel. Per-pump values are edited on the Common Print
+        # Settings page.
+        _relief_note = QLabel(
+            "Pressure relief is now per-pump (µL): calibrate it on "
+            "Calibration → Needle Location, review/edit values on Workflows → "
+            "Common Print Settings, and enable backlash compensation from the "
+            "pump jog panel.")
+        _relief_note.setWordWrap(True)
+        timing_lay.addWidget(_relief_note, 2, 0, 1, 3)
+
+        # v7.5.x: needle-derived MAX SAFE FLOW readout (Hagen–Poiseuille from the
+        # needle bore + length at a fixed water-reference viscosity). This is the
+        # ceiling SafetyLimits hard-caps every pump move to — shown here so the
+        # operator can see why a too-fast flow is being limited (over-pressure
+        # ingests air). Refreshed on any config change via _refresh_max_flow_display.
+        self._pump_maxflow_lbl = QLabel("Max safe pump flow: —")
+        self._pump_maxflow_lbl.setWordWrap(True)
+        self._pump_maxflow_lbl.setToolTip(
+            "Maximum safe pump flow rate computed from the configured needle "
+            "bore + length (Hagen–Poiseuille, water-reference viscosity). Every "
+            "pump move — print path, ink pickup, reagent deposit — is hard-"
+            "capped to this so the needle never over-pressures and ingests air. "
+            "Quick Print also reduces its max print speed to stay under it.")
+        self._pump_maxflow_lbl.setStyleSheet(
+            f"color: {COLORS.get('green', '#a6e3a1')}; "
+            f"padding: {sp(2)} {sp(2)}; font-weight: 600;")
+        timing_lay.addWidget(self._pump_maxflow_lbl, 6, 0, 1, 3)
+
         timing_lay.setColumnStretch(2, 1)
 
         self._sub_layouts["pumps_inks"].addWidget(timing_group)
+        self._refresh_max_flow_display()
 
         # v7.2.9: Ink Swap Strategy UI moved to Print Setup → Plan of Action
 
@@ -2241,13 +2285,19 @@ class HardwareSetupPage(ModePage):
                 self._sync_correction_sliders(cam_idx)
             except Exception as exc:
                 logger.debug(f"restore correction slot {cam_idx}: {exc}")
+        # v7.5.x: restore the camera→stage rotation independent of µm/px — the
+        # mount orientation is calibrated on its own ("Calibrate orientation…")
+        # and must load even for a camera that has no µm/px value yet.
+        rot = entry.get("rotation_deg")
+        if rot is not None:
+            try:
+                mgr.set_rotation_deg(cam_idx, float(rot))
+            except Exception as exc:
+                logger.debug(f"restore rotation slot {cam_idx}: {exc}")
         if entry.get("um_per_px") is None:
             return False
         try:
             mgr.set_um_per_px(cam_idx, float(entry["um_per_px"]))
-            rot = entry.get("rotation_deg")
-            if rot is not None:
-                mgr.set_rotation_deg(cam_idx, float(rot))
             return True
         except Exception as exc:
             logger.debug(f"restore calibration slot {cam_idx}: {exc}")
@@ -2842,7 +2892,217 @@ class HardwareSetupPage(ModePage):
         # v7.5.x: a plate-format/custom-plate change must reload the reagent
         # locations well view (guarded — no-op unless the key changed).
         self._sync_loc_plate_on_config_change()
+        # v7.5.x: keep the needle-derived max-flow readout in sync with the needle.
+        self._refresh_max_flow_display()
         self.config_changed.emit(self._config)
+
+    def _refresh_max_flow_display(self):
+        """v7.5.x: recompute + show the needle-derived max safe pump flow rate.
+
+        Mirrors ``SafetyLimits.update_from_hardware_config``: Hagen–Poiseuille
+        Q_max from the configured needle bore + length at the fixed water
+        reference viscosity (ink-independent). This is the ceiling every pump
+        move is hard-clamped to. Best-effort — never raises into config rebuild."""
+        lbl = getattr(self, "_pump_maxflow_lbl", None)
+        if lbl is None:
+            return
+        needle = getattr(self._config, "needle", None)
+        flow = 0.0
+        gauge = getattr(needle, "gauge", None) if needle else None
+        try:
+            if needle is not None and getattr(needle, "id_m", 0) and needle.id_m > 0:
+                from SupportClasses.FlowPhysics import (
+                    max_safe_flow_rate_uL_s, DEFAULT_PRESSURE_LIMIT_PA,
+                )
+                from SupportClasses.SafetyLimits import REFERENCE_VISCOSITY_CP
+                from SupportClasses.PhysicalModels import InkSpec
+                ref_ink = InkSpec(name="__reference__",
+                                  viscosity_cP=REFERENCE_VISCOSITY_CP)
+                flow = float(max_safe_flow_rate_uL_s(
+                    needle, ref_ink, DEFAULT_PRESSURE_LIMIT_PA) or 0.0)
+        except Exception as e:
+            logger.debug("max-flow display compute failed: %s", e)
+            flow = 0.0
+        if flow > 0:
+            g = f"{gauge}G, " if gauge else ""
+            lbl.setText(
+                f"Max safe pump flow ({g}water ref): {flow:.2f} µL/s — "
+                f"hard-capped on all pumps; bounds the max print speed")
+        else:
+            lbl.setText("Max safe pump flow: — (configure the needle bore)")
+
+    # ── v7.5.x: Plate TYPE (product) selection ────────────────────────
+
+    def _build_plate_type_card(self):
+        """Two-step plate-type selector: a Format combo narrows a Plate-type
+        combo of products for that format (+ a Generic entry). Selecting a
+        product sets ``plate_type_id`` (its own Z offsets + mosaic); Generic
+        falls back to the bare format."""
+        group = QGroupBox("Plate Type")
+        group.setStyleSheet(self._group_style())
+        lay = QVBoxLayout(group)
+        lay.setSpacing(s(6))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Format:"))
+        self._plate_type_format_combo = QComboBox()
+        for fmt in sorted(PLATE_DEFINITIONS.keys()):
+            pdef = PLATE_DEFINITIONS[fmt]
+            self._plate_type_format_combo.addItem(
+                f"{fmt}-well ({pdef.get('rows','?')}×{pdef.get('cols','?')})", fmt)
+        self._plate_type_format_combo.currentIndexChanged.connect(
+            self._on_plate_type_format_changed)
+        row.addWidget(self._plate_type_format_combo, 1)
+        row.addSpacing(s(8))
+        row.addWidget(QLabel("Plate type:"))
+        self._plate_type_combo = QComboBox()
+        self._plate_type_combo.setMinimumWidth(s(220))
+        self._plate_type_combo.currentIndexChanged.connect(
+            self._on_plate_type_changed)
+        row.addWidget(self._plate_type_combo, 2)
+        lay.addLayout(row)
+
+        self._plate_type_readout = QLabel("")
+        self._plate_type_readout.setWordWrap(True)
+        self._plate_type_readout.setStyleSheet(f"color: {COLORS['subtext0']};")
+        lay.addWidget(self._plate_type_readout)
+
+        # Initial population (default format 24 / Generic) — block signals so
+        # construction doesn't fire a config change.
+        self._plate_type_syncing = True
+        try:
+            idx = self._plate_type_format_combo.findData(24)
+            if idx >= 0:
+                self._plate_type_format_combo.setCurrentIndex(idx)
+            self._refresh_plate_type_combo(select_id="")
+        finally:
+            self._plate_type_syncing = False
+        self._sync_plate_type_readout()
+        return group
+
+    def _refresh_plate_type_combo(self, select_id: str = "") -> None:
+        """Rebuild the Plate-type combo for the currently-selected format:
+        a Generic entry (empty id) + every product of that base format."""
+        tcombo = getattr(self, "_plate_type_combo", None)
+        fcombo = getattr(self, "_plate_type_format_combo", None)
+        if tcombo is None or fcombo is None:
+            return
+        fmt = fcombo.currentData() or 24
+        was = tcombo.blockSignals(True)
+        tcombo.clear()
+        tcombo.addItem(f"Generic {fmt}-well", "")
+        try:
+            from SupportClasses.PlateTypeStore import get_store as _pt_store
+            for pt in _pt_store().list_for_format(fmt):
+                tcombo.addItem(pt.label, pt.id)
+        except Exception as e:
+            logger.debug(f"plate-type combo populate failed: {e}")
+        sidx = tcombo.findData(select_id or "")
+        tcombo.setCurrentIndex(sidx if sidx >= 0 else 0)
+        tcombo.blockSignals(was)
+
+    def _sync_plate_type_readout(self) -> None:
+        lbl = getattr(self, "_plate_type_readout", None)
+        if lbl is None:
+            return
+        pt_id = getattr(self, "_selected_plate_type_id", "")
+        if not pt_id:
+            lbl.setText(
+                "Generic plate — Z offsets come from the global Device "
+                "defaults. Pick a product for per-plate Z guesses and its own "
+                "auto-loading mosaic.")
+            lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
+            return
+        try:
+            from SupportClasses.PlateTypeStore import get_store as _pt_store
+            pt = _pt_store().get(pt_id)
+        except Exception:
+            pt = None
+        if pt is None:
+            lbl.setText(f"Plate type '{pt_id}' not found in the library.")
+            lbl.setStyleSheet(f"color: {COLORS['red']};")
+            return
+        off = pt.z_offsets or {}
+        mat = pt.bottom_material or "—"
+        lbl.setText(
+            f"{pt.label}  ·  bottom: {mat}  ·  Z offsets below fiducial (mm): "
+            f"top {off.get('top', 0):.1f} / bottom {off.get('bottom', 0):.1f} / "
+            f"safe {off.get('safe', 0):.1f} / max {off.get('max', 0):.1f}. "
+            f"Calibration inherits these; its own mosaic auto-loads.")
+        lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
+
+    def _on_plate_type_format_changed(self) -> None:
+        if getattr(self, "_plate_type_syncing", False):
+            return
+        fmt = self._plate_type_format_combo.currentData() or 24
+        # New base format → reset to Generic and load that geometry into the
+        # designer (no product selected yet for the new format).
+        self._selected_plate_type_id = ""
+        self._refresh_plate_type_combo(select_id="")
+        if hasattr(self, "_plate_designer"):
+            self._plate_type_syncing = True
+            try:
+                self._plate_designer.load_plate(fmt)
+            finally:
+                self._plate_type_syncing = False
+        self._sync_plate_type_readout()
+        self._on_config_changed()
+
+    def _on_plate_type_changed(self) -> None:
+        if getattr(self, "_plate_type_syncing", False):
+            return
+        # Geometry is identical across types of one format (the designer
+        # already shows the base format); only identity + Z offsets change.
+        self._selected_plate_type_id = self._plate_type_combo.currentData() or ""
+        self._sync_plate_type_readout()
+        self._on_config_changed()
+
+    def _on_designer_plate_changed(self, key) -> None:
+        """The designer's OWN picker changed (standard or custom geometry) —
+        that is never a product, so clear the plate-type selection and sync
+        the Plate Type card's format combo (best-effort)."""
+        if getattr(self, "_plate_type_syncing", False):
+            return   # programmatic load driven by the card — ignore
+        self._selected_plate_type_id = ""
+        fcombo = getattr(self, "_plate_type_format_combo", None)
+        if fcombo is not None:
+            self._plate_type_syncing = True
+            try:
+                if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
+                    fidx = fcombo.findData(int(key))
+                    if fidx >= 0:
+                        fcombo.setCurrentIndex(fidx)
+                self._refresh_plate_type_combo(select_id="")
+            finally:
+                self._plate_type_syncing = False
+        self._sync_plate_type_readout()
+        self._on_config_changed()
+
+    def _sync_plate_type_card_from_config(self) -> None:
+        """Mirror the active plate type/format from the loaded config onto the
+        Plate Type card (called from set_hardware_config; signals blocked)."""
+        fcombo = getattr(self, "_plate_type_format_combo", None)
+        if fcombo is None:
+            return
+        pt_id = getattr(self, "_selected_plate_type_id", "")
+        fmt = self._config.plate_format
+        if pt_id:
+            try:
+                from SupportClasses.PlateTypeStore import get_store as _pt_store
+                pt = _pt_store().get(pt_id)
+                if pt is not None:
+                    fmt = pt.base_format
+            except Exception:
+                pass
+        self._plate_type_syncing = True
+        try:
+            fidx = fcombo.findData(fmt)
+            if fidx >= 0:
+                fcombo.setCurrentIndex(fidx)
+            self._refresh_plate_type_combo(select_id=pt_id)
+        finally:
+            self._plate_type_syncing = False
+        self._sync_plate_type_readout()
 
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
@@ -2851,12 +3111,18 @@ class HardwareSetupPage(ModePage):
             self.name_edit.text().strip() or "Untitled Setup")
         self._config.notes = self.notes_edit.text().strip()
 
-        # Well plate (v7.4.5: designer widget owns both fields)
+        # Well plate (v7.4.5: designer widget owns geometry; v7.5.x: the Plate
+        # Type card owns the product id). A selected plate type keeps the
+        # designer on its base-format geometry, so current_plate_format() is
+        # the base int and current_plate_name() is "" — active_plate_key then
+        # resolves to plate_type_id.
         if hasattr(self, "_plate_designer"):
             self._config.plate_format = (
                 self._plate_designer.current_plate_format())
             self._config.plate_name = (
                 self._plate_designer.current_plate_name())
+            self._config.plate_type_id = (
+                getattr(self, "_selected_plate_type_id", "") or "")
             # Keep the shim combo in sync for legacy readers.
             idx = self.plate_combo.findData(self._config.plate_format)
             if idx >= 0:
@@ -2893,7 +3159,9 @@ class HardwareSetupPage(ModePage):
             pcfg.inks = resolved_inks
             self._config.pumps[pid] = pcfg
 
-        # v7.5.x: global pump timing (settle + prime)
+        # v7.5.x: global pump timing (settle + prime). Pressure relief /
+        # compliance is now per-pump µL (device profile), not a HardwareConfig
+        # field — configured via the Needle Location compliance calibration.
         if hasattr(self, "_pump_settle_spin"):
             self._config.pump_settle_time_s = float(
                 self._pump_settle_spin.value())
@@ -3160,7 +3428,11 @@ class HardwareSetupPage(ModePage):
         because ``set_plate`` clears the current selection. Returns True
         when a reload actually happened.
         """
-        key = self._config.active_plate_key
+        # v7.5.x: geometry_plate_key so reagent locations can be assigned to a
+        # rosette/custom design layered under a plate TYPE (falls back to
+        # active_plate_key when no custom design is present).
+        key = getattr(self._config, "geometry_plate_key", None) \
+            or self._config.active_plate_key
         if not force and key == self._loc_plate_key:
             return False
         try:
@@ -3430,18 +3702,41 @@ class HardwareSetupPage(ModePage):
         self.notes_edit.blockSignals(False)
         logger.debug(f"  Name: {self._config.config_name}")
 
-        # ── 2. Plate Format / Custom Plate (v7.4.5) ──────────────
-        # active_plate_key returns plate_name (str) when set, else
-        # plate_format (int). Designer handles both.
+        # ── 2. Plate Type / Format / Custom Plate (v7.5.x) ───────
+        # active_plate_key precedence: plate_type_id → plate_name → format.
+        # A plate TYPE id is NOT a designer document — load its BASE format
+        # geometry into the designer and reflect the product on the card.
+        # v7.5.x: but when a custom design (rosette) is ALSO layered under the
+        # type, load THAT into the designer (geometry_plate_key) so the user
+        # sees/edits their rosette instead of the plain base format — and can't
+        # accidentally re-save the base format over it.
         active_key = self._config.active_plate_key
+        self._selected_plate_type_id = self._config.plate_type_id or ""
+        designer_key = getattr(self._config, "geometry_plate_key", None) \
+            or active_key
+        if self._selected_plate_type_id and designer_key == active_key:
+            # Plate type selected with NO layered custom design → base format.
+            try:
+                from SupportClasses.PlateTypeStore import get_store as _pt_store
+                pt = _pt_store().get(self._selected_plate_type_id)
+                if pt is not None:
+                    designer_key = pt.base_format
+            except Exception as e:
+                logger.debug(f"plate-type resolve failed: {e}")
         if hasattr(self, "_plate_designer"):
-            self._plate_designer.load_plate(active_key)
+            self._plate_type_syncing = True
+            try:
+                self._plate_designer.load_plate(designer_key)
+            finally:
+                self._plate_type_syncing = False
+        self._sync_plate_type_card_from_config()
         self.plate_combo.blockSignals(True)
         pidx = self.plate_combo.findData(self._config.plate_format)
         if pidx >= 0:
             self.plate_combo.setCurrentIndex(pidx)
         self.plate_combo.blockSignals(False)
-        logger.debug(f"  Plate: {active_key}")
+        logger.debug(
+            f"  Plate: {active_key} (type={self._selected_plate_type_id or '-'})")
 
         # ── 3. Ink Library (MUST come before pumps) ──────────────
         self._refresh_ink_table()
@@ -3529,6 +3824,10 @@ class HardwareSetupPage(ModePage):
             self._pump_prime_spin.setValue(
                 float(getattr(self._config, "pump_prime_time_s", 0.25) or 0.0))
             self._pump_prime_spin.blockSignals(False)
+        # v7.5.x: pressure relief / compliance is now per-pump µL (device
+        # profile), not a HardwareConfig field — no UI to sync here.
+        # v7.5.x: refresh the needle-derived max-flow readout on config load.
+        self._refresh_max_flow_display()
 
         # ── 7. Needle Channel → Pump Map (v7.2.4 S3.11) ─────────
         self._rebuild_channel_map_rows()
@@ -3684,6 +3983,19 @@ class HardwareSetupPage(ModePage):
                 self._stage_panel.on_status_update()
             except Exception:
                 pass
+
+    def on_motion_tick(self):
+        """v7.5.x: fast (~30 fps) display-only tick — forward to the embedded
+        control + stage panels so a jog's position readout animates smoothly
+        (fired by MainWindow only while a motion estimate is live)."""
+        for attr in ("_control_panel", "_stage_panel"):
+            w = getattr(self, attr, None)
+            fn = getattr(w, "on_motion_tick", None) if w is not None else None
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
 
     def get_context_widget(self) -> QWidget | None:
         """v7.4.2: Return the HardwareControlPanel as the context widget.

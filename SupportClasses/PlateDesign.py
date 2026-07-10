@@ -150,6 +150,11 @@ class Well(Entity):
     # v7.4.8: insert/tube geometry (set on rosette sub-wells).
     rim_height_mm: float = 0.0       # top above plate (clearance)
     ink_z_mm: Optional[float] = None  # dispense Z rel. plate top; None=default
+    # v7.5.x: id of the WellTypeStore preset the geometry was stamped from
+    # (design-time only — lets the picker show the current selection and
+    # round-trip; the stamped diameter/depth/rim/ink_z are the source of
+    # truth, so compile()/WellInfo do NOT read this). None = custom.
+    well_type_id: Optional[str] = None
     TYPE: ClassVar[str] = "Well"
 
 
@@ -944,6 +949,10 @@ def _entity_to_dict(entity: Entity) -> dict:
             "rim_height_mm": entity.rim_height_mm,
             "ink_z_mm": entity.ink_z_mm,
         })
+        # v7.5.x: only emit the well-type id when set → byte-identical
+        # legacy output for wells with no stamped preset.
+        if entity.well_type_id is not None:
+            base["well_type_id"] = entity.well_type_id
     elif isinstance(entity, Group):
         base.update({
             "name": entity.name,
@@ -988,6 +997,7 @@ def _entity_from_dict(data: dict) -> Entity:
             rosette_rotation_deg=data.get("rosette_rotation_deg", 0.0),
             rim_height_mm=data.get("rim_height_mm", 0.0),
             ink_z_mm=data.get("ink_z_mm"),
+            well_type_id=data.get("well_type_id"),
         )
     if cls is Group:
         return Group(

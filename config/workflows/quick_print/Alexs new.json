@@ -1,0 +1,36 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "quick_print",
+  "name": "Alexs new",
+  "saved": "2026-07-09T23:27:40",
+  "values": {
+    "pump": {
+      "text": "P1",
+      "data": null
+    },
+    "extrusion_mod": 1.4999999999999996,
+    "speed_pct": 2.0,
+    "printz": 0.7,
+    "ink": {
+      "text": "GFP LLS",
+      "data": "GFP LLS"
+    },
+    "ink_z": 1.2,
+    "ink_padding": 3.0000000000000018,
+    "prep": true,
+    "service_z": 1.5,
+    "service_z__ovr": false,
+    "buffer_needles": 1.0,
+    "buffer_needles__ovr": false,
+    "wash_cycles": 10,
+    "wash_cycles__ovr": false,
+    "line_retract": 0.5,
+    "line_z_speed": 80.0,
+    "line_xy_speed": 80.0,
+    "postclean": true,
+    "postclean_margin": 4.1,
+    "travel_speed": 10.0,
+    "preflow": 0.9999999999999991,
+    "g_settle": 6.0
+  }
+}

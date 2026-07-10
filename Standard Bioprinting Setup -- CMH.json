@@ -1,0 +1,243 @@
+{
+  "version": "7.3.0",
+  "config_name": "Standard Bioprinting Setup -- CMH",
+  "notes": "22G needle, 250\u00b5L syringe on P1",
+  "needle": {
+    "gauge": 22,
+    "od_um": 718,
+    "id_um": 413,
+    "wall_um": 152,
+    "length_inches": 2.0,
+    "num_channels": 1,
+    "channel_pump_map": {
+      "1": "P1"
+    }
+  },
+  "pumps": {
+    "P1": {
+      "pump_id": "P1",
+      "syringe_volume_uL": 250,
+      "syringe": {
+        "volume_uL": 250,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 3.256,
+        "part_number": "1725"
+      },
+      "inks": [
+        {
+          "name": "GFP LLS",
+          "ink_type": "ink",
+          "ink_subtype": "",
+          "viscosity_cP": 1.0,
+          "granule_diameter_um": 0.0,
+          "cell_diameter_um": 0.0,
+          "density_g_mL": 1.0,
+          "color": "#00ff00"
+        },
+        {
+          "name": "Cy5 LLS",
+          "ink_type": "ink",
+          "ink_subtype": "",
+          "viscosity_cP": 1.0,
+          "granule_diameter_um": 0.0,
+          "cell_diameter_um": 0.0,
+          "density_g_mL": 1.0,
+          "color": "#ff0000"
+        }
+      ],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": true
+    },
+    "P2": {
+      "pump_id": "P2",
+      "syringe_volume_uL": 250,
+      "syringe": {
+        "volume_uL": 250,
+        "stroke_length_mm": 30.0,
+        "barrel_id_mm": 3.256,
+        "part_number": "1725"
+      },
+      "inks": [],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": false
+    },
+    "P3": {
+      "pump_id": "P3",
+      "syringe_volume_uL": null,
+      "syringe": null,
+      "inks": [],
+      "printing_mode": "incremental",
+      "fluid_column": {
+        "oil_volume_uL": 0.0,
+        "buffer_volume_uL": 0.0,
+        "ink_volume_uL": 0.0,
+        "dead_volume_uL": 2.0
+      },
+      "enabled": false
+    }
+  },
+  "pump_settle_time_s": 0.0,
+  "pump_prime_time_s": 0.25,
+  "gentle_z_slow_dist_mm": 1.0,
+  "gentle_z_slow_speed_mm_s": 1.0,
+  "pump_relief_percent": 1.0,
+  "pump_relief_on_pickup": true,
+  "pump_relief_on_deposit": true,
+  "pump_relief_on_quick_move": true,
+  "plate_format": 24,
+  "plate_name": "",
+  "plate_type_id": "nest-plastic-24",
+  "ink_library": {
+    "Water, Waste": {
+      "name": "Water, Waste",
+      "ink_type": "waste",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#555500"
+    },
+    "Water, Wash": {
+      "name": "Water, Wash",
+      "ink_type": "wash",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#00ffff"
+    },
+    "LLS, Buffer": {
+      "name": "LLS, Buffer",
+      "ink_type": "buffer",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#aaaaff"
+    },
+    "Oil": {
+      "name": "Oil",
+      "ink_type": "oil",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#282800"
+    },
+    "GFP LLS": {
+      "name": "GFP LLS",
+      "ink_type": "ink",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#00ff00"
+    },
+    "Cy5 LLS": {
+      "name": "Cy5 LLS",
+      "ink_type": "ink",
+      "ink_subtype": "",
+      "viscosity_cP": 1.0,
+      "granule_diameter_um": 0.0,
+      "cell_diameter_um": 0.0,
+      "density_g_mL": 1.0,
+      "color": "#ff0000"
+    }
+  },
+  "ink_locations": {
+    "Water, Waste": [
+      "A3"
+    ],
+    "Water, Wash": [
+      "B3"
+    ],
+    "LLS, Buffer": [
+      "C3"
+    ],
+    "Oil": [
+      "D3"
+    ],
+    "GFP LLS": [
+      "C2"
+    ],
+    "Cy5 LLS": [
+      "D2"
+    ]
+  },
+  "rosette_library": {},
+  "buffer_ink_name": "DPBS",
+  "needle_channel_pump_map": {
+    "0": "P1"
+  },
+  "ink_swap_strategy": {
+    "waste": true,
+    "wash_pre": true,
+    "buffer": true,
+    "wash_post": true,
+    "ink_load": true,
+    "wash_final": true,
+    "waste_volume_uL": 50.0,
+    "wash_volume_uL": 100.0,
+    "buffer_volume_uL": 100.0,
+    "ink_load_volume_uL": 50.0
+  },
+  "camera_config": {
+    "camera_spec": {
+      "name": "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)",
+      "sensor_pixel_size_um": 1.67,
+      "max_resolution": [
+        3664,
+        2748
+      ],
+      "preview_resolutions": [
+        [
+          3664,
+          2748
+        ],
+        [
+          1832,
+          1374
+        ],
+        [
+          916,
+          686
+        ]
+      ],
+      "interface": "USB 3.0",
+      "notes": "10MP CMOS, 1/2.3 inch sensor, VID_0547 PID_1377"
+    },
+    "objective_magnification": 2.0,
+    "active_resolution": [
+      916,
+      686
+    ],
+    "micron_per_pixel_override": null,
+    "camera_to_needle_offset_um": [
+      0.0,
+      0.0
+    ],
+    "current_objective_name": "2x"
+  },
+  "camera_roles": [
+    "needle_x",
+    "needle_y",
+    "microscope"
+  ]
+}

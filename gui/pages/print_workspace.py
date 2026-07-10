@@ -260,10 +260,13 @@ class HardwareSummaryWidget(QWidget):
         else:
             self._needle_label.setText("Not selected")
 
-        # Plate (v7.4.5: custom plates via active_plate_key)
+        # Plate (v7.4.5: custom plates via active_plate_key; v7.5.x:
+        # geometry_plate_key so a rosette/custom design layered under a plate
+        # TYPE is honored).
         from SupportClasses.WellPlate import WellPlate
-        key = getattr(config, "active_plate_key",
-                      getattr(config, "plate_format", 24))
+        key = getattr(config, "geometry_plate_key", None) or getattr(
+            config, "active_plate_key",
+            getattr(config, "plate_format", 24))
         try:
             plate = WellPlate.load(key)
         except Exception:

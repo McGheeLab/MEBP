@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from gui.pages.mode_page import ModePage
 from gui.pages.helper_functions import HelperFunctionsPage
 from gui.pages.print_builder_sketch import SketchPage
+from gui.pages.print_library import PrintLibraryPage
 from gui.pages.print_workspace import HardwareSummaryWidget
 from gui.scaling import s as _s, scaled_font_size as _sf
 from gui.styles import COLORS
@@ -174,16 +175,32 @@ class PrintBuilderPage(ModePage):
 
         self._sketch_page = SketchPage()
         self._image_page = HelperFunctionsPage()
+        self._library_page = PrintLibraryPage()
         self._hardware_page = PrintingHardwarePage()
         self._settings_page = PrintingSettingsPage()
 
-        self._titles = ["Sketch", "Image Import", "Hardware", "Print Settings"]
+        self._titles = ["Sketch", "Image Import", "Prints",
+                        "Hardware", "Print Settings"]
         self.add_sub_page("pencil",   "Sketch",         self._sketch_page)
         self.add_sub_page("camera",   "Image Import",   self._image_page)
+        self.add_sub_page("grid",     "Prints",         self._library_page)
         self.add_sub_page("needle",   "Hardware",       self._hardware_page)
         self.add_sub_page("settings", "Print Settings", self._settings_page)
 
-        logger.info("PrintBuilderPage initialized with 4 sub-pages")
+        # v7.5.x: "Edit in Sketch" on a Library card opens that print in the
+        # Sketch editor; a Save-changes there refreshes the Library grid.
+        self._library_page.edit_print_requested.connect(self._on_edit_print)
+        self._sketch_page.print_file_saved.connect(
+            lambda _n: self._library_page.refresh())
+
+        logger.info("PrintBuilderPage initialized with 5 sub-pages")
+
+    def _on_edit_print(self, name: str):
+        try:
+            self._sketch_page.load_print_for_edit(name)
+        except Exception as e:
+            logger.error(f"edit print '{name}' failed: {e}", exc_info=True)
+        self.switch_to_sketch()
 
     # ── Convenience accessors ─────────────────────────────────────
 
@@ -194,6 +211,10 @@ class PrintBuilderPage(ModePage):
     @property
     def image_import_page(self) -> HelperFunctionsPage:
         return self._image_page
+
+    @property
+    def library_page(self) -> PrintLibraryPage:
+        return self._library_page
 
     @property
     def hardware_page(self) -> PrintingHardwarePage:

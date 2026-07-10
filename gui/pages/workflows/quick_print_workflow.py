@@ -91,6 +91,10 @@ class _PrintBridge(QObject):
     # v7.5.x: the post-print cleanup (waste → wash → reset oil) runs on a worker
     # thread; this fires when it finishes (empty string = ok, else the reason).
     cleanup_done = Signal(str)
+    # v7.5.x: a multi-ink (abstract-ink) print runs its whole sequential
+    # ink-swap sequence on one worker thread; this fires when it finishes
+    # (empty string = ok, else the reason).
+    multi_done = Signal(str)
 
 
 class QuickPrintWorkflowPage(QWidget):
@@ -111,6 +115,12 @@ class QuickPrintWorkflowPage(QWidget):
     # calibration nor the safety limits report one — matches SafetyLimits'
     # default max_xy_speed (10_000 µm/s). Print speed = % × this.
     _XY_MAX_FALLBACK_MM_S = 10.0
+    # Fallback for the calibrated Z max speed (mm/s) when no per-axis / safety
+    # Z max feedrate is reported. Line-move Z speed = % × this.
+    _Z_MAX_FALLBACK_MM_S = 5.0
+    # Fallback flow @100% (µL/s) when no needle is configured so its bore
+    # cross-section is unknown (can't auto-calculate). Plain prints still flow.
+    _FLOW_FALLBACK_UL_S = 0.25
 
     def __init__(self, controller, settings, camera_manager=None,
                  parent: QWidget | None = None):
@@ -148,6 +158,17 @@ class QuickPrintWorkflowPage(QWidget):
         self._bridge.state.connect(self._on_state)
         self._bridge.prepositioned.connect(self._on_prepositioned)
         self._bridge.cleanup_done.connect(self._on_cleanup_done)
+        self._bridge.multi_done.connect(self._on_multi_done)
+
+        # v7.5.x: multi-ink (abstract-ink) print state. When the loaded object
+        # is a sketch that uses ≥2 abstract inks, Quick Print maps each abstract
+        # ink → a configured ink and runs sequential ink swaps.
+        self._loaded_sketch = None                 # SketchTrajectory.Sketch|None
+        self._ink_map: dict[int, str] = {}         # abstract ink id → ink name
+        self._ink_map_combos: dict[int, object] = {}
+        self._ink_map_last: dict[str, str] = {}    # ink name → mapped, remembered
+        self._multi_thread = None
+        self._multi_abort_requested = False
 
         # v7.5.x: pre-position runs off the GUI thread. Holds the print context
         # captured at launch so the confirm-and-run continuation
@@ -310,8 +331,9 @@ class QuickPrintWorkflowPage(QWidget):
             ink = self._selected_ink() or "(loaded)"
             prep = "prep on" if self._prep_check.isChecked() else "prep off"
             self._settings_summary.setText(
-                f"{self._pump()} · {self._flow_spin.value():g} µL/s @ "
-                f"{self._speed_pct_spin.value():.0f}% · ink {ink} · {prep}")
+                f"{self._pump()} · ~{self._auto_flow_100_uL_s():.3g} µL/s @ "
+                f"{self._speed_pct_spin.value():.0f}% (×{self._extrusion_modifier():g}) "
+                f"· ink {ink} · {prep}")
         except Exception:
             pass
 
@@ -413,11 +435,15 @@ class QuickPrintWorkflowPage(QWidget):
         self._pump_combo.setMinimumWidth(s(90))
         self._pump_combo.addItem("P1")
         self._pump_combo.currentIndexChanged.connect(self._on_pump_changed)
-        self._flow_spin = self._dspin(
-            0.0, 50.0, 0.25, " µL/s", 3, 0.05,
-            "Pump flow at 100% print speed. Print-speed % scales BOTH the XY "
-            "traverse and this flow together, so the bead width is constant.")
-        self._flow_spin.valueChanged.connect(
+        # v7.5.x: the flow @100% is AUTO-calculated from the needle bore and the
+        # print length (see _auto_flow_100_uL_s); the operator tunes line
+        # thickness with this extrusion modifier instead of a raw flow value.
+        self._extrusion_mod_spin = self._dspin(
+            0.1, 10.0, 1.0, " ×", 2, 0.1,
+            "Extrusion modifier on the auto-calculated flow. 1.0 = deposit a "
+            "bead equal to the needle bore cross-section along the path; >1 = a "
+            "thicker line. Scales the pump flow AND the ink pickup volume.")
+        self._extrusion_mod_spin.valueChanged.connect(
             lambda *_: (self._refresh_setup_status(), self._update_settings_summary()))
         self._speed_pct_spin = self._dspin(
             1.0, 100.0, 25.0, " % max", 0, 5.0,
@@ -433,7 +459,8 @@ class QuickPrintWorkflowPage(QWidget):
             lambda *_: self._refresh_setup_status())
         sec = dlg.add_section("Print")
         sec.add("pump", "Pump / bore", self._pump_combo, "P1")
-        sec.add("flow", "Flow @100%", self._flow_spin, 0.25)
+        sec.add("extrusion_mod", "Extrusion modifier (×)",
+                self._extrusion_mod_spin, 1.0)
         sec.add("speed_pct", "Print speed", self._speed_pct_spin, 25.0)
         sec.add("printz", "Height above bottom", self._printz_spin, 0.2)
 
@@ -450,15 +477,33 @@ class QuickPrintWorkflowPage(QWidget):
         self._ink_z_spin = self._dspin(
             0.0, 30.0, 0.50, " mm", 2, 0.1,
             "Needle dip height above the plate bottom when aspirating ink.")
-        self._pickup_safety_spin = self._dspin(
-            1.0, 10.0, 1.5, "", 2, 0.1,
-            "Safety multiplier on the computed ink pickup volume.")
-        self._pickup_safety_spin.valueChanged.connect(
+        self._ink_padding_spin = self._dspin(
+            0.0, 100.0, 0.0, " µL", 2, 0.1,
+            "Extra ink aspirated beyond the computed print volume so the needle "
+            "never runs dry (you don't dispense the very last of the ink). "
+            "Added to the pickup; flushed to waste in the post-print reset.")
+        self._ink_padding_spin.valueChanged.connect(
             lambda *_: self._refresh_setup_status())
         sec = dlg.add_section("Ink pickup")
         sec.add("ink", "Ink", self._ink_combo, "")
         sec.add("ink_z", "Ink dip Z (↑ bottom)", self._ink_z_spin, 0.50)
-        sec.add("pickup_safety", "Pickup safety (×)", self._pickup_safety_spin, 1.5)
+        sec.add("ink_padding", "Ink padding (µL)", self._ink_padding_spin, 0.0)
+
+        # ── Ink mapping (multi-ink sketch) ──
+        # When the loaded print is a sketch that uses ≥2 abstract inks, map each
+        # abstract ink → a configured ink. The run does sequential ink swaps
+        # (print → waste → wash → pick up next ink → print). The rows are
+        # rebuilt per object (session state, not persisted).
+        sec = dlg.add_section("Ink mapping (multi-ink sketch)")
+        sec.add_note(
+            "For a sketch that uses more than one abstract ink, map each "
+            "abstract ink to a configured ink here. The print runs with "
+            "sequential ink swaps between them.")
+        self._ink_map_container = QWidget()
+        self._ink_map_layout = QVBoxLayout(self._ink_map_container)
+        self._ink_map_layout.setContentsMargins(0, 0, 0, 0)
+        self._ink_map_layout.setSpacing(s(4))
+        sec.add_widget(self._ink_map_container)
 
         # ── Needle prep ──
         self._prep_check = QCheckBox("Prep needle (waste → oil → wash → buffer)")
@@ -478,9 +523,12 @@ class QuickPrintWorkflowPage(QWidget):
             0, 50, 3, "Dip-jiggle cycles at the wash well.")
         sec = dlg.add_section("Needle prep")
         sec.add_check("prep", self._prep_check, True)
-        sec.add("service_z", "Service dip Z (↑ bottom)", self._service_z_spin, 0.50)
-        sec.add("buffer_needles", "Buffer (needles)", self._buffer_needles_spin, 1.0)
-        sec.add("wash_cycles", "Wash cycles", self._wash_cycles_spin, 3)
+        sec.add_note(
+            "Prep values are shared defaults from Common Print Settings — tick "
+            "Override to set a workflow-specific value.")
+        sec.add_common("service_z", "Service dip Z (↑ bottom)", self._service_z_spin, 0.50)
+        sec.add_common("buffer_needles", "Buffer (needles)", self._buffer_needles_spin, 1.0)
+        sec.add_common("wash_cycles", "Wash cycles", self._wash_cycles_spin, 3)
 
         # ── Between print lines (lift between strokes / sub-paths) ──
         self._line_retract_spin = self._dspin(
@@ -489,18 +537,20 @@ class QuickPrintWorkflowPage(QWidget):
             "(sub-paths / objects) before travelling to the next one. A "
             "continuous fill prints as one stroke and is not lifted mid-fill.")
         self._line_z_speed_spin = self._dspin(
-            0.0, 100.0, 0.0, " mm/s", 1, 1.0,
-            "Quick-move Z speed for the inter-line lift + lower. 0 = use the "
-            "controller default.")
+            1.0, 100.0, 100.0, " % max", 0, 5.0,
+            "Quick-move Z speed for the inter-line lift + lower, as a % of the "
+            "Z stage's calibrated max feedrate.")
         self._line_xy_speed_spin = self._dspin(
-            0.0, 200.0, 0.0, " mm/s", 1, 1.0,
-            "Quick-move XY speed for the inter-line travel. 0 = use the Advanced "
-            "travel speed.")
+            1.0, 100.0, 100.0, " % max", 0, 5.0,
+            "Quick-move XY speed for the inter-line travel, as a % of the XY "
+            "stage's calibrated max speed.")
         sec = dlg.add_section("Between print lines")
         sec.add("line_retract", "Retract after each line",
                 self._line_retract_spin, 1.0)
-        sec.add("line_z_speed", "Line-move Z speed", self._line_z_speed_spin, 0.0)
-        sec.add("line_xy_speed", "Line-move XY speed", self._line_xy_speed_spin, 0.0)
+        sec.add("line_z_speed", "Line-move Z speed (% max)",
+                self._line_z_speed_spin, 100.0)
+        sec.add("line_xy_speed", "Line-move XY speed (% max)",
+                self._line_xy_speed_spin, 100.0)
 
         # ── Post-print cleanup ──
         self._postclean_check = QCheckBox(
@@ -535,6 +585,19 @@ class QuickPrintWorkflowPage(QWidget):
         sec = dlg.add_section("Advanced")
         sec.add("travel_speed", "Travel speed", self._travel_speed, 10.0)
         sec.add("preflow", "Pre-flow lead-in", self._preflow, self._prime_default_s())
+
+        # ── Common — Pump (global) ──
+        # (Prime time is already surfaced above via the per-run Pre-flow knob,
+        # which seeds from the global prime time — so only settle here. Pressure
+        # relief / compliance is now per-pump µL on the Common Print Settings
+        # page, not a global proxied here.)
+        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
+        sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
+        sec.add_note(
+            "Global pump values (edited here or on the Common Print Settings "
+            "page — one value used everywhere).")
+        sec.add_common("g_settle", "Dwell after syringe moves", self._g_settle,
+                       0.0, common_key="pump_settle_time_s", overridable=False)
 
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
@@ -716,6 +779,12 @@ class QuickPrintWorkflowPage(QWidget):
         if self._context_widget is not None:
             self._context_widget.set_settings(settings)
 
+    def set_common_print_settings(self, common):
+        """v7.5.x: shared common settings — re-sync the popout's inheriting prep
+        fields + global pump fields."""
+        if getattr(self, "_settings_dialog", None) is not None:
+            self._settings_dialog.set_common(common)
+
     def set_hardware_config(self, hw_config) -> None:
         self._hw_config = hw_config
 
@@ -842,6 +911,9 @@ class QuickPrintWorkflowPage(QWidget):
         sized = is_simple and ref in ("circle", "meander")
         self._size_label.setVisible(sized)
         self._size_spin.setVisible(sized)
+        # v7.5.x: detect an abstract-ink sketch + rebuild the runtime ink map.
+        self._loaded_sketch = self._load_selected_sketch()
+        self._rebuild_ink_mapping_ui()
         self._refresh_planned_path()
         self._refresh_setup_status()
         self._update_button_state()
@@ -900,11 +972,14 @@ class QuickPrintWorkflowPage(QWidget):
             "source": "parametric",
         }
 
-    def _obj_dict_to_path_points(self, obj_dict, needle, syringe_map):
-        """Convert one object dict → list[(x_mm, y_mm)] relative to well center.
+    def _obj_dict_to_trajectory(self, obj_dict, needle, syringe_map):
+        """Build one object's Nx7 trajectory ``[x,y,z,p1,p2,p3,t]`` (mm), in the
+        well-relative frame, or ``None`` if it can't be built.
 
         Uses the persisted trajectory for csv-sourced objects, otherwise the
-        canonical ``generate_object_trajectory`` pipeline. Only XY is used.
+        canonical ``generate_object_trajectory`` pipeline. The full Nx7 array
+        (not just XY) is returned so callers can inspect the Z (travel lifts)
+        and pump (extrude-on/off) columns — see :meth:`_obj_dict_to_subpaths`.
         """
         from SupportClasses.GeometryEngine import (
             PrintObject, generate_object_trajectory,
@@ -940,19 +1015,136 @@ class QuickPrintWorkflowPage(QWidget):
                     obj, needle, syringe_map, pump_id=self._pump())
                 traj = obj.trajectory
 
-        if traj is None or len(traj) == 0 or np.asarray(traj).ndim != 2:
-            return []
+        if traj is None or len(traj) == 0:
+            return None
         arr = np.asarray(traj, dtype=np.float64)
-        if arr.shape[1] < 2:
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            return None
+        return arr
+
+    def _obj_dict_to_path_points(self, obj_dict, needle, syringe_map):
+        """Convert one object dict → flat list[(x_mm, y_mm)] (well-relative).
+
+        Back-compat helper (XY only). Execution uses :meth:`_obj_dict_to_subpaths`
+        so internal travel moves break the path into separate print segments.
+        """
+        arr = self._obj_dict_to_trajectory(obj_dict, needle, syringe_map)
+        if arr is None:
             return []
-        return [(float(arr[i, 0]), float(arr[i, 1])) for i in range(len(arr))]
+        return [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
+
+    @staticmethod
+    def _travel_mask(arr: np.ndarray):
+        """Per-segment travel flag for an Nx7 trajectory, or ``None`` when the
+        path carries no travel information (so the whole object is one segment).
+
+        A segment i→i+1 is **travel** (a non-extruding "quick move to a new
+        location" — the needle should lift and the pump must stop) when:
+        - the path has pump info: the pump columns do NOT advance over it
+          (the compiler's printing=False moves) **AND the needle actually
+          moves** over the segment. This is the PREFERRED signal — robust,
+          layer-agnostic, and **polarity-independent**. The motion requirement
+          is essential: where the sketch compiler WELDS two connected paths
+          (shapes sharing a node) into one continuous bead, it emits a
+          zero-distance coincident waypoint at the shared node whose pump
+          column is flat. That is NOT a travel — it's the join — and splitting
+          there would lift the needle and restart the print mid-stroke (the
+          reported "connected lines print discontinuously" bug); OR
+        - the path has NO usable pump column but has Z lifts: the segment
+          touches the top Z band (the travel/lift height). This is only a
+          FALLBACK because it assumes travel is the numerically HIGHER Z, which
+          is NOT universal across saved trajectories — some older sketch/CSV
+          files lift to a LOWER Z (print plane numerically above the lift). If
+          the z-band were OR'd in alongside the pump signal, those reversed-
+          polarity files would have their entire print plane flagged as travel
+          (every sub-path dropped → blank preview + an empty, no-op print), so
+          the z-band is used ONLY when no pump info is available.
+
+        Returns a bool array of length N-1, or ``None`` if the path is flat in
+        BOTH Z and pump (e.g. a plain circle/meander) so legacy single-segment
+        behaviour is preserved exactly.
+        """
+        n = arr.shape[0]
+        if n < 2:
+            return None
+        has_pump = arr.shape[1] >= 6
+        if has_pump:
+            dp = np.abs(np.diff(arr[:, 3:6], axis=0)).sum(axis=1)
+            pump_info = bool(dp.sum() > 1e-9)
+        else:
+            dp = np.zeros(n - 1)
+            pump_info = False
+        z = arr[:, 2]
+        z_lo, z_hi = float(z.min()), float(z.max())
+        z_rng = z_hi - z_lo
+        z_info = z_rng > 1e-3
+        if not pump_info and not z_info:
+            return None     # flat path → one print segment (legacy)
+
+        mask = np.zeros(n - 1, dtype=bool)
+        if pump_info:
+            # Preferred: travel = the pump does not advance AND the needle
+            # actually repositions. Polarity-safe. Excluding zero-distance
+            # pump-flat segments keeps welded/coincident nodes (shared nodes of
+            # connected shapes) continuous instead of splitting the print there.
+            d3 = np.diff(arr[:, :3], axis=0)
+            seg_dist = np.sqrt((d3 ** 2).sum(axis=1))
+            mask |= (dp <= 1e-9) & (seg_dist > 1e-6)
+        elif z_info:
+            # Fallback only (no usable pump column): travel = the top Z band.
+            z_thresh = z_hi - max(1e-4, 0.02 * z_rng)
+            top = z >= z_thresh
+            mask |= (top[:-1] | top[1:])
+        return mask
+
+    def _obj_dict_to_subpaths(self, obj_dict, needle, syringe_map):
+        """Convert one object → list of print sub-paths ``[[(x,y)…], …]``.
+
+        Splits the object's trajectory at its internal travel moves so
+        ``build_well_plate_job`` inserts a lift→hop→lower→prime between print
+        runs (the pump stops + the needle retracts across the "quick move to a
+        new location"), instead of extruding straight through at print Z. A
+        path with no travel info yields a single sub-path == the legacy flat
+        path.
+        """
+        arr = self._obj_dict_to_trajectory(obj_dict, needle, syringe_map)
+        return self._subpaths_from_array(arr)
+
+    def _subpaths_from_array(self, arr):
+        """Split an Nx7 trajectory into print sub-paths ``[[(x,y)…], …]`` at its
+        internal travel moves (shared by the object path and the per-ink-group
+        multi-ink path). A path with no travel info yields one sub-path."""
+        if arr is None:
+            return []
+        pts = [(float(arr[i, 0]), float(arr[i, 1])) for i in range(arr.shape[0])]
+        mask = self._travel_mask(arr)
+        if mask is None:
+            return [pts] if len(pts) >= 2 else []
+
+        subpaths: list[list[tuple[float, float]]] = []
+        cur: list[tuple[float, float]] = [pts[0]]
+        for i in range(len(pts) - 1):
+            if bool(mask[i]):
+                # Segment i→i+1 is travel: close the current print run and
+                # restart at the travel destination (drop the travel hop).
+                if len(cur) >= 2:
+                    subpaths.append(cur)
+                cur = [pts[i + 1]]
+            else:
+                cur.append(pts[i + 1])
+        if len(cur) >= 2:
+            subpaths.append(cur)
+        return subpaths
 
     def _path_segments_for_selection(self) -> list[list[tuple[float, float]]]:
-        """One sub-path per object, relative to well center.
+        """One print sub-path per contiguous extrusion run, well-relative.
 
         A saved multi-object print (e.g. several spirals at different offsets)
-        yields one segment per object, so ``build_well_plate_job`` inserts a
-        lift→travel→lower between them instead of extruding across the seam and
+        yields one segment per object, AND each object's own internal travel
+        moves (pen-up "quick moves to a new location" — e.g. a multi-shape
+        sketch) split it further, so ``build_well_plate_job`` inserts a
+        lift→hop→lower→prime between every print run. This stops the pump and
+        retracts Z across the travel instead of extruding across the seam and
         dragging the needle through already-printed material.
         """
         data = self._parse_obj_data(self._object_combo.currentData())
@@ -976,9 +1168,9 @@ class QuickPrintWorkflowPage(QWidget):
 
         segments: list[list[tuple[float, float]]] = []
         for od in obj_dicts:
-            pts = self._obj_dict_to_path_points(od, needle, syringe_map)
-            if pts:
-                segments.append(pts)
+            for sub in self._obj_dict_to_subpaths(od, needle, syringe_map):
+                if sub and len(sub) >= 2:
+                    segments.append(sub)
         return segments
 
     def _path_points_for_selection(self) -> list[tuple[float, float]]:
@@ -1132,23 +1324,70 @@ class QuickPrintWorkflowPage(QWidget):
 
     def _xy_max_mm_s(self) -> float:
         """Calibrated max XY speed (mm/s) = the '100%' anchor for the print
-        speed. Prefers the measured top speed from the timing calibration, else
-        the safety-limit max (both µm/s); conservative fallback otherwise."""
-        try:
-            from SupportClasses.PrintTimingCalibrationStore import get_store
-            ms = get_store().get_xy_max_speed_um_s()
-            if ms and float(ms) > 0:
-                return float(ms) / 1000.0
-        except Exception:
-            pass
-        try:
-            sl = getattr(self._controller, "safety_limits", None)
-            v = getattr(sl, "max_xy_speed", None)
-            if v is not None and float(v) > 0:
-                return float(v) / 1000.0
-        except (TypeError, ValueError):
-            pass
+        speed. v7.5.x: read the SINGLE common source via
+        ``StageController.get_max_xy_speed_um_s`` so the print inherits the same
+        XY max as every other page. Falls back to the legacy inline read for a
+        controller-like without the resolver (older callers / test stubs), then
+        a conservative constant."""
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "get_max_xy_speed_um_s"):
+            try:
+                v = float(ctrl.get_max_xy_speed_um_s())
+                if v > 0:
+                    return v / 1000.0
+            except Exception:
+                pass
+        else:
+            # Legacy fallback: measured top speed, then safety-limit max.
+            try:
+                from SupportClasses.PrintTimingCalibrationStore import get_store
+                ms = get_store().get_xy_max_speed_um_s()
+                if ms and float(ms) > 0:
+                    return float(ms) / 1000.0
+            except Exception:
+                pass
+            try:
+                v = getattr(getattr(ctrl, "safety_limits", None),
+                            "max_xy_speed", None)
+                if v is not None and float(v) > 0:
+                    return float(v) / 1000.0
+            except (TypeError, ValueError):
+                pass
         return self._XY_MAX_FALLBACK_MM_S
+
+    def _z_max_mm_s(self) -> float:
+        """Calibrated max Z speed (mm/s) = the '100%' anchor for the line-move
+        Z speed. v7.5.x: read the SINGLE common source via
+        ``StageController.get_max_z_feedrate_mm_min`` (÷60). Falls back to the
+        legacy inline read for a controller-like without the resolver, then a
+        conservative constant."""
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "get_max_z_feedrate_mm_min"):
+            try:
+                v = float(ctrl.get_max_z_feedrate_mm_min())
+                if v > 0:
+                    return v / 60.0
+            except Exception:
+                pass
+        else:
+            z_feed_mm_min = None
+            try:
+                pa = getattr(ctrl, "_pending_per_axis_max_feedrate", None) or {}
+                if pa.get("Z"):
+                    z_feed_mm_min = float(pa["Z"])
+            except (TypeError, ValueError, AttributeError):
+                pass
+            if not z_feed_mm_min:
+                try:
+                    v = getattr(getattr(ctrl, "safety_limits", None),
+                                "max_z_feedrate", None)
+                    if v is not None and float(v) > 0:
+                        z_feed_mm_min = float(v)
+                except (TypeError, ValueError):
+                    pass
+            if z_feed_mm_min and z_feed_mm_min > 0:
+                return z_feed_mm_min / 60.0
+        return self._Z_MAX_FALLBACK_MM_S
 
     def _print_speed_pct(self) -> float:
         """Print speed fraction in [0.01, 1.0] from the % spin."""
@@ -1157,27 +1396,117 @@ class QuickPrintWorkflowPage(QWidget):
         except Exception:
             return 0.25
 
+    def _needle_cross_section_mm2(self) -> float:
+        """Inner-bore cross-section (mm²) of the configured needle, or 0.0 when
+        no needle is configured. = π·(inner Ø / 2)²."""
+        hw = getattr(self, "_hw_config", None)
+        needle = getattr(hw, "needle", None) if hw else None
+        if needle is None:
+            return 0.0
+        try:
+            return float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _extrusion_modifier(self) -> float:
+        """Line-thickness multiplier on the auto-calculated extrusion (≥ 0)."""
+        w = getattr(self, "_extrusion_mod_spin", None)
+        try:
+            return max(0.0, float(w.value())) if w is not None else 1.0
+        except Exception:
+            return 1.0
+
+    def _ink_padding_uL(self) -> float:
+        """Extra ink (µL) added to the pickup so the needle never runs dry."""
+        w = getattr(self, "_ink_padding_spin", None)
+        try:
+            return max(0.0, float(w.value())) if w is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def _max_pump_flow_uL_s(self) -> float:
+        """Per-pump needle-derived max flow ceiling (µL/s) from the controller's
+        safety limits, or 0.0 when unknown / no limit configured.
+
+        This is the Hagen–Poiseuille ceiling that ``SafetyLimits`` derives from
+        the needle bore (see ``SafetyLimits.update_from_hardware_config``); the
+        pump move itself is hard-clamped to it. We read it here so the print
+        SPEED can be bounded too — keeping the deposited bead correct instead of
+        letting the flow be silently clamped (under-extrusion). Guards against a
+        bare ``MagicMock`` (whose ``__float__`` is 1.0) by requiring a real
+        numeric return, so test stubs don't impose a bogus 1 µL/s limit."""
+        sl = getattr(self._controller, "safety_limits", None)
+        getter = getattr(sl, "get_max_flow_rate", None)
+        if not callable(getter):
+            return 0.0
+        try:
+            raw = getter(self._pump())
+        except Exception:
+            return 0.0
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return 0.0
+        return float(raw) if raw > 0 else 0.0
+
+    def _flow_limited_xy_max_mm_s(self) -> float:
+        """XY-max anchor (mm/s) bounded so the auto pump flow at 100% never
+        exceeds the needle's max safe flow.
+
+        flow@100% = area × xy_max × modifier; requiring flow@100% ≤ max_flow
+        gives xy_max ≤ max_flow / (area × modifier). Returns the unbounded XY
+        max when no flow limit / no bore is known, so behaviour is unchanged
+        until a needle-derived ceiling exists."""
+        xy = self._xy_max_mm_s()
+        maxflow = self._max_pump_flow_uL_s()
+        area = self._needle_cross_section_mm2()
+        mod = self._extrusion_modifier()
+        if maxflow > 0 and area > 0 and mod > 0:
+            xy_flow = maxflow / (area * mod)
+            if xy_flow < xy:
+                return xy_flow
+        return xy
+
+    def _auto_flow_100_uL_s(self) -> float:
+        """Auto-calculated pump flow at 100% print speed (µL/s).
+
+        The deposited bead is modelled as a cylinder of the needle's inner-bore
+        cross-section run along the path, so the volume per mm of travel =
+        ``cross_section_area`` (mm²) and the flow needed to keep up with the
+        stage is ``area × speed``. At 100% print speed (= the flow-limited XY
+        max), with the operator's extrusion modifier, ``flow@100% = area ×
+        xy_max × modifier`` (mm² × mm/s = mm³/s = µL/s). The XY max is bounded by
+        :meth:`_flow_limited_xy_max_mm_s` so flow@100% never exceeds the needle's
+        safe flow. Falls back to a small constant when no needle is configured
+        (its bore is unknown), so a plain print without prep still extrudes."""
+        area = self._needle_cross_section_mm2()
+        if area <= 0:
+            return self._FLOW_FALLBACK_UL_S
+        return area * self._flow_limited_xy_max_mm_s() * self._extrusion_modifier()
+
     def _resolved_print_kinematics(self) -> tuple[float, float, float]:
         """Apply the print-speed % to both axes and return
         ``(print_speed_mm_s, flow_uL_s, prime_uL)``.
 
-        The Flow knob is the flow at 100% speed; both the XY traverse (% × XY
-        max) and the pump flow (% × Flow@100%) scale by the same %, so the
-        deposited volume-per-mm (bead width) is independent of the % — the
-        single lever scales all print-path waypoint pacing for XY and the pump.
-        """
+        Flow@100% is AUTO-calculated (needle bore × flow-limited XY max ×
+        extrusion modifier, see :meth:`_auto_flow_100_uL_s`); both the XY
+        traverse (% × XY max) and the pump flow (% × flow@100%) scale by the same
+        % off the SAME flow-limited XY max, so the deposited volume-per-mm
+        (= bore area × modifier) is independent of the % — and the max print
+        speed is reduced whenever the needle's max safe flow would otherwise be
+        exceeded (so no air-ingesting over-pressure)."""
         pct = self._print_speed_pct()
-        flow_100 = float(self._flow_spin.value())
-        speed = pct * self._xy_max_mm_s()
+        xy_max = self._flow_limited_xy_max_mm_s()
+        flow_100 = self._auto_flow_100_uL_s()
+        speed = pct * xy_max
         flow = pct * flow_100
         prime = flow * self._preflow_s()
         return speed, flow, prime
 
     def _compute_pickup_volume_uL(self) -> float:
         """Volume to aspirate at the ink well = what the print path dispenses
-        (path length / print speed × flow) + the pre-flow prime, × safety;
-        floored to the prime so a single-point (dot) path still draws ink.
-        Uses the resolved (speed-%-scaled) kinematics. Returns 0 with no flow."""
+        (path length / print speed × flow, i.e. bore area × modifier × length)
+        + the pre-flow prime + the operator's ink padding. The extrusion
+        modifier is already folded into the resolved flow, so a thicker line
+        automatically picks up more. Returns 0 with no flow."""
         speed, flow, prime = self._resolved_print_kinematics()
         if flow <= 0:
             return 0.0
@@ -1193,8 +1522,23 @@ class QuickPrintWorkflowPage(QWidget):
                 path_len_mm += (dx * dx + dy * dy) ** 0.5
         print_time_s = (path_len_mm / speed) if speed > 0 else 0.0
         dispensed = flow * print_time_s
-        safety = float(self._pickup_safety_spin.value())
-        return max((dispensed + prime) * safety, prime)
+        # Keep a full needle-bore of ink BEHIND the deposit (the bore "dead
+        # volume") so the print never dispenses the buffer/oil sitting behind
+        # the ink plug. This matters most after a needle prep, which resets the
+        # needle to oil + buffer with NO residual ink — so the run relies solely
+        # on this pickup, and a pickup equal to just the deposit would leave the
+        # buffer right at the tip and print clear oil/buffer once the thin plug
+        # is gone. The operator's ink padding is additional reserve on top.
+        reserve = self._needle_dead_volume_uL()
+        return dispensed + prime + reserve + self._ink_padding_uL()
+
+    def _needle_dead_volume_uL(self) -> float:
+        """The needle bore's internal volume (µL) — the ink reserve kept behind
+        the deposit so the print never reaches the buffer/oil. 0 if no needle."""
+        try:
+            return float(needle_volume_uL(self._hw_config) or 0.0)
+        except Exception:
+            return 0.0
 
     def _print_dispense_volume_uL(self) -> float:
         """Volume the print path itself DISPENSES (µL) = flow × print time,
@@ -1360,6 +1704,25 @@ class QuickPrintWorkflowPage(QWidget):
         the line peach; an all-clear (or plain print) turns it green/subtext."""
         if not hasattr(self, "_setup_status"):
             return
+        # v7.5.x: multi-ink (abstract-ink) sketch → show the ink mapping + any
+        # gaps; the run does sequential swaps (no single ink/pump applies).
+        if self._is_multi_ink():
+            sk = self._loaded_sketch
+            parts = []
+            for iid in self._used_abstract_inks():
+                ink = sk.ink_by_id(iid) if sk else None
+                label = ink.name if ink else f"Ink {iid}"
+                mapped = self._ink_map.get(iid)
+                parts.append(f"{label}→{mapped}" if mapped else f"{label}→?")
+            warns = self._validate_ink_map()
+            text = "Multi-ink (sequential swaps): " + ", ".join(parts)
+            if warns:
+                text += "   ⚠ " + "; ".join(warns)
+            self._setup_status.setText(text)
+            self._setup_status.setStyleSheet(
+                f"color: {COLORS.get('yellow', '#f9e2af') if warns else COLORS['green']}; "
+                f"font-size: {sf(9)}pt;")
+            return
         msgs: list[str] = []
         warn = False
         # Resolved print kinematics (speed % applied to both XY and the pump).
@@ -1505,10 +1868,13 @@ class QuickPrintWorkflowPage(QWidget):
         )
         return resp == QMessageBox.StandardButton.Yes
 
-    def _build_settings(self) -> PrintSettings:
+    def _build_settings(self, pump: str | None = None) -> PrintSettings:
         # Print speed % scales the XY traverse AND the pump flow together.
+        # ``pump`` overrides which pump the flow/prime are stamped for (used by
+        # the multi-ink path per group); the flow VALUE is bore-based and the
+        # same for every pump, so this only routes the stamping.
         print_speed_mm_s, flow, prime_uL = self._resolved_print_kinematics()
-        pump = self._pump()
+        pump = pump or self._pump()
         # v7.5.x CRITICAL SAFETY: never fall back to a raw literal travel Z.
         # On ME3B V1 (ZDIR=-1) a raw 5.0 is a DESCENT toward the plate, not a
         # retract. When no Safe Z is calibrated, derive a polarity-safe travel
@@ -1567,19 +1933,26 @@ class QuickPrintWorkflowPage(QWidget):
         # v7.5.x Feature 3: per-line retract height + fast inter-line move speeds.
         # build_well_plate_job lifts to (print Z + intra_well_hop_z_mm) between
         # sub-paths and uses the line speeds for that hop's lift / XY / lower.
+        # The line-move speeds are entered as a % of each stage's calibrated max
+        # and resolved to mm/s here (PrintSettings stays in mm/s).
         try:
             settings.intra_well_hop_z_mm = float(self._line_retract_spin.value())
         except Exception:
             pass
         try:
-            settings.line_move_z_speed_mm_s = float(self._line_z_speed_spin.value())
+            pct_z = max(0.0, float(self._line_z_speed_spin.value())) / 100.0
+            settings.line_move_z_speed_mm_s = pct_z * self._z_max_mm_s()
         except Exception:
             pass
         try:
-            settings.line_move_xy_speed_mm_s = float(
-                self._line_xy_speed_spin.value())
+            pct_xy = max(0.0, float(self._line_xy_speed_spin.value())) / 100.0
+            settings.line_move_xy_speed_mm_s = pct_xy * self._xy_max_mm_s()
         except Exception:
             pass
+        # NOTE: quick-move pressure relief (suck-back before each inter-object
+        # hop) is handled at EXECUTION by PrintManager._print_pump_suckback
+        # ("quick_move"), which fires on every hop MOVE_XY this run's path-split
+        # creates — no per-run setting needed here.
         return settings
 
     # ── Run / abort ───────────────────────────────────────────────
@@ -1615,9 +1988,452 @@ class QuickPrintWorkflowPage(QWidget):
             logger.exception("Quick Print pre-position move failed: %s", e)
             return False
 
+    # ── Multi-ink (abstract-ink) sketch: detect / map / group / run ────
+
+    def _ink_color(self, ink_name: str) -> str | None:
+        hw = self._hw_config
+        lib = getattr(hw, "ink_library", {}) if hw else {}
+        spec = (lib or {}).get(ink_name)
+        return getattr(spec, "color", None) if spec is not None else None
+
+    def _load_selected_sketch(self):
+        """The vector Sketch embedded in the selected saved print, or None
+        (built-in shape / CSV / image import / no embedded sketch)."""
+        data = self._parse_obj_data(self._object_combo.currentData())
+        if not data or data[0] != "file":
+            return None
+        try:
+            pf = self._print_mgr.load(data[1])
+        except Exception:
+            return None
+        if pf is None:
+            return None
+        for od in (getattr(pf, "objects", None) or {}).values():
+            params = (od or {}).get("params") or {}
+            sk = params.get("sketch")
+            if isinstance(sk, dict) and "shapes" in sk:
+                try:
+                    from SupportClasses.SketchTrajectory import Sketch
+                    return Sketch.from_dict(sk)
+                except Exception:
+                    return None
+        return None
+
+    def _used_abstract_inks(self) -> list[int]:
+        """Distinct abstract ink ids used by PRINTING shapes, in first-use
+        order. Empty for a non-sketch object."""
+        sk = self._loaded_sketch
+        if sk is None:
+            return []
+        seen: set = set()
+        out: list[int] = []
+        for sh in sk.shapes:
+            if (getattr(sh, "kind", None) == "travel"
+                    or getattr(sh, "no_print", False)):
+                continue
+            iid = int(getattr(sh, "ink_id", 1))
+            if iid not in seen:
+                seen.add(iid)
+                out.append(iid)
+        return out
+
+    def _is_multi_ink(self) -> bool:
+        """True when the loaded sketch prints with ≥2 abstract inks (→ the
+        sequential ink-swap path). Single-ink / non-sketch = the legacy flow."""
+        return len(self._used_abstract_inks()) >= 2
+
+    def _rebuild_ink_mapping_ui(self) -> None:
+        """Rebuild the per-abstract-ink → configured-ink mapping rows for the
+        loaded sketch (session state; not persisted)."""
+        if not hasattr(self, "_ink_map_layout"):
+            return
+        while self._ink_map_layout.count():
+            it = self._ink_map_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+        self._ink_map_combos = {}
+        self._ink_map = {}
+        sk = self._loaded_sketch
+        used = self._used_abstract_inks()
+        if sk is None or len(used) < 2:
+            lbl = QLabel("(loaded print uses a single ink — no mapping needed)")
+            lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+            self._ink_map_layout.addWidget(lbl)
+            return
+        printable = self._printable_inks()
+        for iid in used:
+            ink = sk.ink_by_id(iid)
+            name = (ink.name if ink else f"Ink {iid}")
+            color = (ink.color if ink else "#89b4fa")
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(s(6))
+            sw = QLabel()
+            sw.setFixedSize(s(14), s(14))
+            sw.setStyleSheet(f"background: {color}; border-radius: {s(3)}px;")
+            h.addWidget(sw)
+            nl = QLabel(name)
+            nl.setMinimumWidth(s(70))
+            h.addWidget(nl)
+            combo = QComboBox()
+            combo.addItem("(choose ink)", "")
+            for pn in printable:
+                combo.addItem(pn, pn)
+            default = self._ink_map_last.get(name)
+            if default not in printable:
+                default = next((pn for pn in printable
+                                if self._ink_color(pn) == color), None) \
+                    or (printable[0] if printable else None)
+            if default:
+                idx = combo.findData(default)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+                self._ink_map[iid] = default
+                self._ink_map_last[name] = default
+            combo.currentIndexChanged.connect(
+                lambda _i, c=combo, i=iid, nm=name:
+                self._on_ink_map_changed(i, nm, c.currentData()))
+            h.addWidget(combo, 1)
+            self._ink_map_layout.addWidget(row)
+            self._ink_map_combos[iid] = combo
+
+    def _on_ink_map_changed(self, ink_id: int, name: str, value) -> None:
+        if value:
+            self._ink_map[int(ink_id)] = value
+            self._ink_map_last[name] = value
+        else:
+            self._ink_map.pop(int(ink_id), None)
+        self._refresh_setup_status()
+        self._update_button_state()
+
+    def _validate_ink_map(self) -> list[str]:
+        """Warnings for the current mapping (empty = OK to run)."""
+        hw = self._hw_config
+        printable = set(self._printable_inks())
+        wells = self._well_positions or {}
+        pumps = (getattr(hw, "pumps", {}) or {}) if hw else {}
+        locs = (getattr(hw, "ink_locations", {}) or {}) if hw else {}
+        warns: list[str] = []
+        sk = self._loaded_sketch
+        for iid in self._used_abstract_inks():
+            ink = sk.ink_by_id(iid) if sk else None
+            label = (ink.name if ink else f"Ink {iid}")
+            mapped = self._ink_map.get(iid)
+            if not mapped:
+                warns.append(f"“{label}” not mapped")
+                continue
+            if mapped not in printable:
+                warns.append(f"“{mapped}” has no reagent location")
+                continue
+            pump = hw.get_pump_for_ink(mapped) if hw else None
+            if not pump:
+                warns.append(f"“{mapped}” has no pump")
+                continue
+            pcfg = pumps.get(pump)
+            if pcfg is None or getattr(pcfg, "syringe", None) is None:
+                warns.append(f"{pump} has no syringe")
+                continue
+            wl = locs.get(mapped) or []
+            if not wl or wl[0] not in wells:
+                warns.append(f"“{mapped}” well not calibrated")
+        return warns
+
+    def _ink_groups(self):
+        """Partition the loaded sketch into ordered ink-contiguous groups →
+        list of ``(ink_id, sub_Sketch)`` (a maximal run of consecutive shapes
+        sharing one abstract ink). Travel markers ride with the following
+        group; all-``no_print`` groups are dropped."""
+        sk = self._loaded_sketch
+        if sk is None:
+            return []
+        groups: list = []                         # [(ink_id, [shapes])]
+        cur_id = None
+        pending: list = []
+        for sh in sk.shapes:
+            if getattr(sh, "kind", None) == "travel":
+                pending.append(sh)
+                continue
+            iid = int(getattr(sh, "ink_id", 1))
+            if iid != cur_id:
+                groups.append((iid, list(pending)))
+                cur_id = iid
+            else:
+                groups[-1][1].extend(pending)
+            pending = []
+            groups[-1][1].append(sh)
+        out = []
+        for iid, shapes in groups:
+            if not any(getattr(x, "kind", None) != "travel"
+                       and not getattr(x, "no_print", False) for x in shapes):
+                continue
+            sub = sk.copy()
+            sub.shapes = shapes
+            out.append((iid, sub))
+        return out
+
+    def _group_segments(self, sub, pump: str):
+        """Compile a sub-sketch → well-relative print sub-paths (recompiled, so
+        welds / retrace / overlap continuity within the group are preserved)."""
+        from SupportClasses.SketchTrajectory import compile_to_trajectory
+        needle, syringe_map = self._needle_and_syringe()
+        try:
+            arr = compile_to_trajectory(
+                sub, needle, syringe_map.get(pump)).trajectory
+        except Exception:
+            return []
+        return self._subpaths_from_array(arr)
+
+    def _pickup_uL_for_length(self, path_len_mm: float) -> float:
+        speed, flow, prime = self._resolved_print_kinematics()
+        if flow <= 0:
+            return 0.0
+        dispensed = flow * ((path_len_mm / speed) if speed > 0 else 0.0)
+        return (dispensed + prime + self._needle_dead_volume_uL()
+                + self._ink_padding_uL())
+
+    @staticmethod
+    def _segments_length_mm(segments) -> float:
+        total = 0.0
+        for seg in segments:
+            for i in range(1, len(seg)):
+                dx = seg[i][0] - seg[i - 1][0]
+                dy = seg[i][1] - seg[i - 1][1]
+                total += (dx * dx + dy * dy) ** 0.5
+        return total
+
+    def _start_multi_ink_run(self):
+        """Gate + resolve + launch a multi-ink sequential-swap run (one worker
+        owns the whole sequence; per group: swap → pick up mapped ink → print).
+        Non-sketch / single-ink runs never reach here (handled in _on_print)."""
+        well = self._selected_well
+        center = self._well_center_zero_ref_mm(well)
+        if center is None:
+            self._status.setText(f"Could not resolve position for well {well}.")
+            return
+        if self._safe_z is None:
+            self._status.setText(
+                "Multi-ink prints need a Safe Z — set it on the Calibration "
+                "page.")
+            return
+        warns = self._validate_ink_map()
+        if warns:
+            self._status.setText("Fix ink mapping: " + "; ".join(warns))
+            return
+        # Service wells are required for the between-ink swaps (waste/wash/
+        # buffer) and prep (oil).
+        service_positions, missing = resolve_service_positions(
+            self._hw_config, self._well_positions)
+        need = [r for r in ("waste", "oil", "wash", "buffer")
+                if r not in service_positions]
+        if need:
+            self._status.setText(
+                "Multi-ink swaps need these reagent wells assigned + "
+                f"calibrated: {', '.join(need)}.")
+            return
+        needle_uL = needle_volume_uL(self._hw_config)
+        if needle_uL <= 0:
+            self._status.setText(
+                "Multi-ink needs the needle inner Ø + length "
+                "(Hardware Setup → Needle).")
+            return
+        service_z = self._plate_offset_to_zref(float(self._service_z_spin.value()))
+        ink_dip_z = self._plate_offset_to_zref(float(self._ink_z_spin.value()))
+        if service_z is None or ink_dip_z is None:
+            self._status.setText(
+                "Plate bottom Z not calibrated — can't resolve the service / "
+                "ink dip Z.")
+            return
+        if not self._confirm_print_floor():
+            return
+
+        hw = self._hw_config
+        wells = self._well_positions or {}
+        locs = (getattr(hw, "ink_locations", {}) or {})
+        base_settings = self._build_settings()
+        travel_z = base_settings.travel_z_height
+
+        groups = []
+        for iid, sub in self._ink_groups():
+            ink_name = self._ink_map.get(iid)
+            pump = hw.get_pump_for_ink(ink_name)
+            wl = locs.get(ink_name) or []
+            ink_pos = wells.get(wl[0]) if wl else None
+            segments = self._group_segments(sub, pump)
+            if not segments or ink_pos is None:
+                continue
+            length = self._segments_length_mm(segments)
+            groups.append({
+                "ink_id": iid, "ink_name": ink_name, "pump": pump,
+                "ink_pos": ink_pos, "ink_dip_z": ink_dip_z,
+                "segments": segments, "well": well, "center": center,
+                "settings": self._build_settings(pump=pump),
+                "pickup_uL": self._pickup_uL_for_length(length),
+            })
+        if len(groups) < 2:
+            self._status.setText(
+                "Multi-ink run produced fewer than 2 printable ink groups.")
+            return
+
+        prep_ctx = {
+            "needle_uL": needle_uL, "service_z": service_z,
+            "service_positions": service_positions,
+            "wash_cycles": int(self._wash_cycles_spin.value()),
+            "buffer_needles": float(self._buffer_needles_spin.value()),
+        }
+        do_prep = self._prep_check.isChecked()
+        cleanup = self._postclean_check.isChecked()
+
+        lines = ["This run will print with sequential ink swaps:"]
+        if do_prep:
+            lines.append("  • Prep the needle (waste → oil → wash → buffer)")
+        for g in groups:
+            lines.append(f"  • Pick up ~{g['pickup_uL']:.3f} µL of "
+                         f"“{g['ink_name']}” ({g['pump']}) → print")
+        lines.append("    (waste → wash → buffer between inks)")
+        if cleanup:
+            lines.append("  • Clean the needle at the end")
+        lines += ["", "Hardware set up correctly and ready to start?"]
+        resp = QMessageBox.question(
+            self, "Confirm multi-ink print", "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            self._status.setText("Cancelled.")
+            return
+
+        self._print_btn.setEnabled(False)
+        self._abort_btn.setEnabled(True)
+        self._multi_abort_requested = False
+        self._status.setText(
+            f"Multi-ink print in {well}: {len(groups)} inks…")
+        bridge = self._bridge
+        safe_z = float(self._safe_z)
+
+        def _worker():
+            err = None
+            executor = None
+            try:
+                executor = PickPlaceExecutor(self._controller, self._hw_config)
+                executor.safe_z_mm = safe_z
+                executor.needle_volume_uL = prep_ctx["needle_uL"]
+                executor.service_z_mm = prep_ctx["service_z"]
+                executor.wash_cycles = prep_ctx["wash_cycles"]
+                executor.buffer_needles = prep_ctx["buffer_needles"]
+                # Between-ink swap (run_post_clean) expels the previous ink to
+                # waste before wash+buffer — clear several needles so no prior
+                # ink carries into the next.
+                executor.post_dispense_needles = 6.0
+                sp = prep_ctx["service_positions"]
+                executor.waste_well_pos = sp["waste"]
+                executor.oil_well_pos = sp["oil"]
+                executor.wash_well_pos = sp["wash"]
+                executor.buffer_well_pos = sp["buffer"]
+                executor.on_sub_step = (
+                    lambda op, step: bridge.progress.emit(0, 0, str(step)))
+                self._active_executor = executor
+                if do_prep:
+                    executor.prep_bore = groups[0]["pump"]
+                    executor.run_prep()
+                for gi, g in enumerate(groups):
+                    if self._multi_abort_requested:
+                        raise AbortException()
+                    if not getattr(self._controller, "is_zp_connected", False):
+                        raise AbortException()
+                    executor.prep_bore = g["pump"]
+                    if gi > 0:
+                        # Between-ink swap: waste → wash → buffer.
+                        bridge.progress.emit(
+                            0, 0, f"Ink swap → {g['ink_name']}…")
+                        executor.run_post_clean()
+                    bridge.progress.emit(
+                        0, 0,
+                        f"Picking up {g['pickup_uL']:.3f} µL of {g['ink_name']}…")
+                    executor.aspirate_ink(
+                        g["ink_pos"], g["pickup_uL"], bore=g["pump"],
+                        z_mm=g["ink_dip_z"])
+                    self._run_group_job_blocking(g)
+                if cleanup:
+                    executor.run_print_cleanup()
+            except AbortException:
+                err = "aborted"
+            except Exception as e:
+                logger.exception("Quick Print multi-ink run failed: %s", e)
+                err = str(e)
+            finally:
+                if err is None and executor is not None:
+                    try:
+                        if executor._abort_flag.is_set():
+                            err = "aborted"
+                    except Exception:
+                        pass
+                if executor is not None:
+                    try:
+                        executor._retract_to_safe_z()
+                    except Exception:
+                        pass
+                self._active_executor = None
+                self._pm = None
+            bridge.multi_done.emit(err or "")
+
+        self._multi_thread = threading.Thread(
+            target=_worker, name="QuickPrintMultiInkRun", daemon=True)
+        self._multi_thread.start()
+        self._update_button_state()
+
+    def _run_group_job_blocking(self, g: dict) -> None:
+        """Build + start one ink group's discrete print job and BLOCK the
+        worker thread until it reaches a terminal state (off the GUI thread).
+        Raises on abort / error so the worker's finally retracts to safe Z."""
+        job = build_well_plate_job(
+            well_positions=[(g["well"], g["center"][0], g["center"][1])],
+            path_points=[p for seg in g["segments"] for p in seg],
+            settings=g["settings"], pump=g["pump"], flow_rate=0.01,
+            job_name=f"Quick Print — {g['ink_name']} @ {g['well']}",
+            path_segments=g["segments"], return_home=False)
+        done = threading.Event()
+        result = {"state": None}
+        pm = PrintManager(self._controller)
+        bridge = self._bridge
+        pm.on_progress = lambda c, t, m: bridge.progress.emit(int(c), int(t),
+                                                              str(m))
+
+        def _st(st):
+            # Do NOT route through bridge.state (that drives the single-ink
+            # terminal/cleanup logic) — just release the worker.
+            if st in (PrintState.COMPLETED, PrintState.ABORTED,
+                      PrintState.ERROR):
+                result["state"] = st
+                done.set()
+        pm.on_state_changed = _st
+        self._pm = pm
+        pm.load_job(job)
+        pm.start()
+        done.wait()
+        self._pm = None
+        if result["state"] != PrintState.COMPLETED:
+            if result["state"] == PrintState.ABORTED:
+                raise AbortException()
+            raise RuntimeError(f"group print {result['state']}")
+
+    def _on_multi_done(self, err: str) -> None:
+        self._multi_thread = None
+        self._multi_abort_requested = False
+        self._pm = None
+        if err == "aborted":
+            self._status.setText("Multi-ink print aborted — needle at safe Z.")
+        elif err:
+            self._status.setText(f"Multi-ink print failed: {err}")
+        else:
+            self._status.setText("Multi-ink print complete — needle at safe Z.")
+        self._update_button_state()
+
     def _on_print(self):
         if self._is_running():
             return
+        if (self._multi_thread is not None and self._multi_thread.is_alive()):
+            return  # a multi-ink run is already in flight
         if (self._preposition_thread is not None
                 and self._preposition_thread.is_alive()):
             return  # a positioning / preflight move is already in flight
@@ -1634,6 +2450,12 @@ class QuickPrintWorkflowPage(QWidget):
             return
         if not self._object_combo.currentData():
             self._status.setText("Choose an object.")
+            return
+
+        # v7.5.x: an abstract-ink sketch using ≥2 inks runs the sequential
+        # ink-swap path; everything else takes the legacy single-ink flow below.
+        if self._is_multi_ink():
+            self._start_multi_ink_run()
             return
 
         center = self._well_center_zero_ref_mm(well)
@@ -2058,6 +2880,24 @@ class QuickPrintWorkflowPage(QWidget):
         self._update_button_state()
 
     def _on_abort(self):
+        # v7.5.x: a multi-ink run — set its sticky flag AND abort whichever
+        # sub-step is live (the executor between/around prints, or the
+        # PrintManager during one group's print).
+        if self._multi_thread is not None and self._multi_thread.is_alive():
+            self._multi_abort_requested = True
+            ex = self._active_executor
+            if ex is not None:
+                try:
+                    ex._abort_flag.set()
+                except Exception:
+                    pass
+            if self._pm is not None:
+                try:
+                    self._pm.abort()
+                except Exception:
+                    pass
+            self._status.setText("Abort requested…")
+            return
         # Abort routes to whichever stage is active: the pick-and-place preamble
         # (prep / ink pickup) during the preflight worker, else the PrintManager.
         ex = self._active_executor
@@ -2196,7 +3036,9 @@ class QuickPrintWorkflowPage(QWidget):
                        or (self._preposition_thread is not None
                            and self._preposition_thread.is_alive())
                        or (self._cleanup_thread is not None
-                           and self._cleanup_thread.is_alive()))
+                           and self._cleanup_thread.is_alive())
+                       or (self._multi_thread is not None
+                           and self._multi_thread.is_alive()))
         connected = (getattr(self._controller, "is_xy_connected", False)
                      and getattr(self._controller, "is_zp_connected", False))
         ready = (connected and self._selected_well is not None

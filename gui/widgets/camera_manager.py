@@ -27,6 +27,7 @@ authoritative reference list.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from typing import Optional
 
@@ -549,6 +550,21 @@ class CameraManager(QObject):
 
         Returns:
             (dx_um, dy_um) offset from stage center position
+
+        v7.5.x: if the camera has a calibrated rotation vs the stage axes
+        (``get_rotation_deg``, measured by the stage-motion PixelCalibrationDialog
+        / "Calibrate orientation"), the pixel offset is rotated into the stage
+        frame so a live-view click maps to the correct XY direction even when the
+        camera is mounted rotated (e.g. ~180°). With ``rotation_deg`` None/0 this
+        is byte-identical to the legacy identity mapping (``dx_px·µm/px``), so
+        uncalibrated cameras are unaffected. The DISPLAYED frame is intentionally
+        left un-rotated — only the click→stage mapping is corrected.
+
+        Sign convention: ``θ = get_rotation_deg`` follows PixelCalibrationDialog's
+        ``plus_column_direction_deg`` (the stage-plane angle, CCW from +X, that a
+        stage move traces to +image-column). Inverting that measurement gives the
+        click→stage map ``(dx_um, dy_um) = µm/px · R(θ) · (dx_px, dy_px)`` with the
+        standard CCW rotation ``R(θ)``; it reduces to the identity mapping at θ=0.
         """
         # v7.5.x: resolve µm/px against the LIVE frame size (image_w) so a
         # resolution mismatch between calibration and the live feed doesn't
@@ -562,7 +578,18 @@ class CameraManager(QObject):
         cy = image_h / 2.0
         dx_px = px_x - cx
         dy_px = px_y - cy
-        return (dx_px * um_per_px, dy_px * um_per_px)
+        dx_um = dx_px * um_per_px
+        dy_um = dy_px * um_per_px
+        # Apply the calibrated camera→stage rotation (getattr-guarded for test
+        # doubles). None/0 → identity, so behaviour is unchanged when unmeasured.
+        get_rot = getattr(self, "get_rotation_deg", None)
+        theta = get_rot(cam_idx) if callable(get_rot) else None
+        if not theta:
+            return (dx_um, dy_um)
+        t = math.radians(float(theta))
+        c, s = math.cos(t), math.sin(t)
+        return (dx_um * c - dy_um * s,
+                dx_um * s + dy_um * c)
 
     # ── Cleanup ───────────────────────────────────────────────────
 

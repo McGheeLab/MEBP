@@ -141,7 +141,7 @@ class TestPreviewWarning(_Base):
         page.set_hardware_config(_Cfg(_needle(), plate_key=96))  # safe r≈2.816
         page._canvas.sketch().shapes.append(
             SketchShape(kind="circle", cx=0.0, cy=0.0, radius=5.0,
-                        pump_index=0, color="#89b4fa", line_width_mm=0.4))
+                        ink_id=1, color="#89b4fa", line_width_mm=0.4))
         page._recompute_preview()
         self.assertTrue(page._last_oob)
         # isHidden() reflects the explicit setVisible() state regardless of
@@ -153,7 +153,7 @@ class TestPreviewWarning(_Base):
         page.set_hardware_config(_Cfg(_needle(), plate_key=96))
         page._canvas.sketch().shapes.append(
             SketchShape(kind="circle", cx=0.0, cy=0.0, radius=1.0,
-                        pump_index=0, color="#89b4fa", line_width_mm=0.4))
+                        ink_id=1, color="#89b4fa", line_width_mm=0.4))
         page._recompute_preview()
         self.assertFalse(page._last_oob)
         self.assertTrue(page._bounds_warn_lbl.isHidden())

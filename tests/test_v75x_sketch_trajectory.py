@@ -12,6 +12,7 @@ import numpy as np
 from SupportClasses.SketchTrajectory import (
     Sketch,
     SketchShape,
+    SketchInk,
     compile_to_trajectory,
     compute_fill_region,
 )
@@ -77,8 +78,8 @@ class TestSketchCompiler(unittest.TestCase):
     def test_pump_states_zero_on_travel(self):
         # Two separate shapes → at least one travel segment between them.
         sk = Sketch(shapes=[
-            SketchShape(kind="circle", cx=0, cy=0, radius=3, pump_index=0),
-            SketchShape(kind="circle", cx=20, cy=20, radius=3, pump_index=0),
+            SketchShape(kind="circle", cx=0, cy=0, radius=3, ink_id=1),
+            SketchShape(kind="circle", cx=20, cy=20, radius=3, ink_id=1),
         ])
         result = compile_to_trajectory(sk, _needle(), _syringe())
         self.assertEqual(len(result.pump_states), len(result.trajectory))
@@ -88,16 +89,18 @@ class TestSketchCompiler(unittest.TestCase):
         self.assertTrue(any_print)
         self.assertTrue(any_travel)
 
-    def test_pump_column_routing(self):
-        # A shape on P2 must accumulate displacement only in column index 4.
+    def test_ink_preview_column_routing(self):
+        # The trajectory's 3 pump columns are now a PREVIEW artifact keyed by
+        # each ink's ORDER index % 3 (the sketch is pump-agnostic). A shape on
+        # the 2nd abstract ink (order index 1) accumulates in column index 4.
         sk = Sketch(shapes=[SketchShape(kind="line",
-                                        points=[(0, 0), (10, 0)],
-                                        pump_index=1)])
+                                        points=[(0, 0), (10, 0)], ink_id=2)])
+        sk.inks = [SketchInk(1, "A", "#89b4fa"), SketchInk(2, "B", "#a6e3a1")]
         result = compile_to_trajectory(sk, _needle(), _syringe())
         final = result.trajectory[-1]
-        self.assertEqual(final[3], 0.0)          # P1 untouched
-        self.assertGreater(final[4], 0.0)        # P2 advanced
-        self.assertEqual(final[5], 0.0)          # P3 untouched
+        self.assertEqual(final[3], 0.0)          # column 0 untouched
+        self.assertGreater(final[4], 0.0)        # column 1 (2nd ink) advanced
+        self.assertEqual(final[5], 0.0)          # column 2 untouched
 
     def test_pump_displacement_monotonic(self):
         sk = Sketch(shapes=[SketchShape(kind="circle", cx=0, cy=0, radius=5,
@@ -157,11 +160,12 @@ class TestSketchCompiler(unittest.TestCase):
         circle = SketchShape(kind="circle", cx=0, cy=0, radius=8)
         pts = compute_fill_region([circle], (0.0, 0.0), spacing_mm=1.0)
         self.assertIsNotNone(pts)
-        region = SketchShape(kind="region", points=pts, pump_index=2)
+        # circle → ink 1 (col 0); region → ink 2 (order index 1 → col 1).
+        region = SketchShape(kind="region", points=pts, ink_id=2)
         result = compile_to_trajectory(Sketch(shapes=[circle, region]))
         self._assert_valid_traj(result.trajectory)
-        # The region prints on P3.
-        self.assertGreater(result.trajectory[-1, 5], 0.0)
+        # The region prints on its own preview column (index 4 = 2nd ink).
+        self.assertGreater(result.trajectory[-1, 4], 0.0)
 
 
 if __name__ == "__main__":

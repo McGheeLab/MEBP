@@ -37,6 +37,7 @@ from typing import Literal
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap,
+    QTransform,
 )
 from PySide6.QtWidgets import QMenu, QSizePolicy, QToolButton, QWidget
 
@@ -162,11 +163,18 @@ class JogWorkspaceView(QWidget):
         self._mosaic_extent_abs: tuple[float, float, float, float] | None = None
         self._mosaic_visible: bool = False
         self._mosaic_opacity: float = 0.55
+        # v7.5.x: cache the scaled (+180°-rotated) overlay so paintEvent doesn't
+        # re-scale the full-res mosaic (~18 MB) on every repaint (needle moves,
+        # hovers). Rebuilt only when the on-screen size / flip / source change;
+        # keyed by (w, h, flip, source-id). Fixes the post-mosaic-build lag.
+        self._mosaic_scaled_cache: QPixmap | None = None
+        self._mosaic_cache_key: tuple | None = None
         # v7.5.x: the idealized well grid can be hidden so the operator can view
         # the mosaic on its own. Combined with _mosaic_visible this gives the
         # three plate-view modes: ideal-well / mosaic / mosaic-overlaid-on-well
         # (see set_plate_display_mode()).
         self._wells_visible: bool = True
+        self._plate_display_mode: str = "well"
         # v7.5.x: live manual-alignment nudge (µm) added to the overlay extent
         # so the operator can slide the mosaic onto the well grid by eye.
         self._mosaic_user_shift: tuple[float, float] = (0.0, 0.0)
@@ -399,6 +407,9 @@ class JogWorkspaceView(QWidget):
         else:
             self._mosaic_extent_abs = None
             self._mosaic_pixmap = None
+        # Invalidate the scaled-overlay cache (a new/cleared source).
+        self._mosaic_scaled_cache = None
+        self._mosaic_cache_key = None
         # A fresh overlay starts un-nudged; the page seeds any stored shift.
         self._mosaic_user_shift = (0.0, 0.0)
         self.update()
@@ -424,6 +435,9 @@ class JogWorkspaceView(QWidget):
         """
         if mode not in ("well", "mosaic", "overlay"):
             mode = "well"
+        # v7.5.x: "overlay" renders the wells as OUTLINE-ONLY circles over the
+        # mosaic background (no plate body / fills) — the mosaic IS the plate.
+        self._plate_display_mode = mode
         self._wells_visible = mode in ("well", "overlay")
         self._mosaic_visible = mode in ("mosaic", "overlay")
         self.update()
@@ -817,14 +831,24 @@ class JogWorkspaceView(QWidget):
         rect = QRectF(tl, br).normalized()
         if rect.width() < 1 or rect.height() < 1:
             return
+        # v7.5.x: scale (+180° rotate) ONCE into a cache, keyed by on-screen size
+        # + flip + source identity. The manual-align nudge only moves rect's
+        # top-left (size is shift-invariant), so panning/needle motion reuse the
+        # cache; only zoom / a new mosaic / flip change rebuild it. paintEvent
+        # then blits the pre-rendered pixmap with no per-frame scale/transform.
+        tw = max(1, int(round(rect.width())))
+        th = max(1, int(round(rect.height())))
+        key = (tw, th, bool(self._flip_180), id(self._mosaic_pixmap))
+        if key != self._mosaic_cache_key or self._mosaic_scaled_cache is None:
+            scaled = self._mosaic_pixmap.scaled(
+                tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            if self._flip_180:
+                scaled = scaled.transformed(QTransform().rotate(180))
+            self._mosaic_scaled_cache = scaled
+            self._mosaic_cache_key = key
         p.save()
         p.setOpacity(self._mosaic_opacity)
-        if self._flip_180:
-            p.translate(rect.center())
-            p.rotate(180)
-            p.translate(-rect.center())
-        p.drawPixmap(rect, self._mosaic_pixmap,
-                     QRectF(self._mosaic_pixmap.rect()))
+        p.drawPixmap(rect.topLeft(), self._mosaic_scaled_cache)
         p.restore()
 
     def _paint_fluor_overlay(self, p: QPainter) -> None:
@@ -859,34 +883,40 @@ class JogWorkspaceView(QWidget):
         if not wells:
             return
 
-        # Plate bounds with tasteful padding
-        r_um = self._well_radius_um()
-        xs = [w[0] for w in wells.values()]
-        ys = [w[1] for w in wells.values()]
-        x_min, x_max = min(xs) - r_um, max(xs) + r_um
-        y_min, y_max = min(ys) - r_um, max(ys) + r_um
-        pad = r_um * 0.45
-        plate_rect = QRectF(
-            self._um_to_px(x_min - pad, y_min - pad),
-            self._um_to_px(x_max + pad, y_max + pad),
-        ).normalized()
+        # v7.5.x: in "overlay" mode the MOSAIC is the plate — draw no plate
+        # body and no fills, just outline circles at the well locations
+        # (including calibrated rosette sub-wells; the positions dicts carry
+        # them and _well_radius_um resolves their per-well diameters).
+        overlay = (getattr(self, "_plate_display_mode", "well") == "overlay")
+        if not overlay:
+            # Plate bounds with tasteful padding
+            r_um = self._well_radius_um()
+            xs = [w[0] for w in wells.values()]
+            ys = [w[1] for w in wells.values()]
+            x_min, x_max = min(xs) - r_um, max(xs) + r_um
+            y_min, y_max = min(ys) - r_um, max(ys) + r_um
+            pad = r_um * 0.45
+            plate_rect = QRectF(
+                self._um_to_px(x_min - pad, y_min - pad),
+                self._um_to_px(x_max + pad, y_max + pad),
+            ).normalized()
 
-        # Plate body with a very faint gradient feel via two
-        # overlapping rounded rects (cheap "elevation").
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(_qc('crust')))
-        p.drawRoundedRect(plate_rect, s(10), s(10))
-        # Subtle highlight at top
-        highlight = QColor(_qc('surface0'))
-        highlight.setAlpha(60)
-        p.setBrush(QBrush(highlight))
-        p.drawRoundedRect(
-            plate_rect.adjusted(0, 0, 0, -plate_rect.height() * 0.55),
-            s(10), s(10))
-        # Hairline border
-        p.setPen(QPen(_qc('surface1'), 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(plate_rect, s(10), s(10))
+            # Plate body with a very faint gradient feel via two
+            # overlapping rounded rects (cheap "elevation").
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(_qc('crust')))
+            p.drawRoundedRect(plate_rect, s(10), s(10))
+            # Subtle highlight at top
+            highlight = QColor(_qc('surface0'))
+            highlight.setAlpha(60)
+            p.setBrush(QBrush(highlight))
+            p.drawRoundedRect(
+                plate_rect.adjusted(0, 0, 0, -plate_rect.height() * 0.55),
+                s(10), s(10))
+            # Hairline border
+            p.setPen(QPen(_qc('surface1'), 1.0))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(plate_rect, s(10), s(10))
 
         # Wells: soft circles with a clean border
         sc = self._scale()
@@ -913,6 +943,7 @@ class JogWorkspaceView(QWidget):
     def _paint_well(self, p: QPainter, wx: float, wy: float,
                     r_px: float, name: str, *, current: bool) -> None:
         center = self._um_to_px(wx, wy)
+        overlay = (getattr(self, "_plate_display_mode", "well") == "overlay")
         if name in self._wells_cal:
             fill = _qc('green', 36)
             border = _qc('green', 200)
@@ -922,6 +953,16 @@ class JogWorkspaceView(QWidget):
         else:
             fill = QColor(0, 0, 0, 0)
             border = _qc('surface2')
+
+        if overlay:
+            # Mosaic background mode: OUTLINE circles only — never obscure
+            # the image (current well = blue ring, slightly thicker).
+            if current:
+                border = _qc('blue')
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(border, 1.8 if current else 1.4))
+            p.drawEllipse(center, r_px, r_px)
+            return
 
         if current:
             # Soft halo behind the current-well marker

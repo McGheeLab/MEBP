@@ -391,6 +391,234 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
         self.assertGreater(pg._navigator._raster_cols, 1)
         self.assertGreater(pg._navigator._raster_rows, 1)
 
+    def test_inherits_shared_mosaic_frame_orient(self):
+        """The single-well scan must follow the EXACT same pattern as the
+        full-plate mosaic: it reads frame_orient / overlap / fov_um from the
+        shared ``mosaic_scan`` settings section (not its own defaults). This is
+        the misalignment fix — ME3B V1's camera is mounted rot180."""
+        class _Settings:
+            def get_section(self, name):
+                if name == "mosaic_scan":
+                    return {"frame_orient": "rot180", "overlap_pct": 5,
+                            "fov_um": 2822}
+                return None
+
+        pg = self._page(eff=0.385)
+        pg._settings = _Settings()
+        scan = pg._scan_settings()
+        self.assertEqual(scan["frame_orient"], "rot180")
+        self.assertEqual(scan["overlap_pct"], 5)
+        self.assertEqual(scan["fov_um"], 2822)
+
+    def test_fov_override_is_fallback_when_no_objective_cal(self):
+        """When the selected objective has NO stored calibration, the shared
+        ``fov_um`` override sizes the tiles (a graceful fallback). Here the page
+        has no matching objective calibration, so fov_um wins."""
+        class _Settings:
+            def get_section(self, name):
+                return {"fov_um": 916.0} if name == "mosaic_scan" else None
+
+        pg = self._page(eff=0.385)
+        pg._settings = _Settings()
+        plan = pg._compute_raster_plan("A1")
+        self.assertIsNotNone(plan)
+        # fov_um=916 over a 916 px frame → eff = 1.0 µm/px → FOV = 916 µm.
+        self.assertAlmostEqual(plan["eff_um_per_px"], 1.0, places=3)
+        self.assertAlmostEqual(plan["fov_um"][0], 916.0, places=1)
+
+    def test_objective_um_per_px_overrides_shared_fov(self):
+        """REGRESSION: the fluorescence workflow is objective-SELECTABLE, so the
+        per-objective calibrated µm/px must WIN over the shared full-plate
+        ``fov_um``. Otherwise a 4x scan inherits the 2x FOV and the raster is
+        spaced too far apart (gaps between tiles). Here a 4x objective is
+        calibrated at 1.547 µm/px @ 916 px while a stale 2822 µm (2x) FOV
+        override is present — the plan must use the 4x value, not the override."""
+        import SupportClasses.ObjectiveCalibration as oc
+
+        class _FakeObjStore:
+            def get_calibration(self, cam, obj):
+                if obj == "4x":
+                    return {"measured_um_per_px": 1.547113,
+                            "resolution": [916, 686]}
+                return None
+
+        class _Settings:
+            def get_section(self, name):
+                # Stale 2x-sized FOV override (≈2854 µm) — must be IGNORED
+                # because the selected objective (4x) has a real calibration.
+                return {"fov_um": 2822} if name == "mosaic_scan" else None
+
+        class _Cfg:
+            class camera_config:
+                current_objective_name = "4x"
+                camera_spec = type("S", (), {"name": "BUC3D"})()
+
+        orig = oc.get_store
+        oc.get_store = lambda *a, **k: _FakeObjStore()
+        try:
+            pg = self._page(eff=0.385)
+            pg._settings = _Settings()
+            pg._hw_config = _Cfg()
+            plan = pg._compute_raster_plan("A1")
+            self.assertIsNotNone(plan)
+            # 4x @ 916 px → 1.547 µm/px → FOV ≈ 1417 µm (NOT the 2822 override).
+            self.assertAlmostEqual(plan["eff_um_per_px"], 1.547113, places=4)
+            self.assertLess(plan["fov_um"][0], 1600.0)
+            # And the objective helper agrees, rescaling to the live width.
+            self.assertAlmostEqual(pg._objective_um_per_px(916), 1.547113, places=4)
+            self.assertAlmostEqual(
+                pg._objective_um_per_px(1832), 1.547113 * 916 / 1832, places=5)
+        finally:
+            oc.get_store = orig
+
+    def test_learned_calibration_overrides_objective_and_rescales(self):
+        """A mosaic FOV/spacing calibration (learned, per camera+objective) wins
+        over the objective µm/px AND is resolution-safe: a value measured at
+        916 px rescales for a wider live frame."""
+        import SupportClasses.ObjectiveCalibration as oc
+        import SupportClasses.MosaicAlignmentStore as mas
+
+        class _ObjStore:
+            def get_calibration(self, cam, obj):
+                return {"measured_um_per_px": 1.54, "resolution": [916, 686]}
+
+        class _AlignStore:      # learned spacing correction @ 916 px
+            def get_um_per_px(self, key):
+                return 1.20
+            def get_resolution(self, key):
+                return (916, 686)
+
+        o_orig, a_orig = oc.get_store, mas.get_store
+        oc.get_store = lambda *a, **k: _ObjStore()
+        mas.get_store = lambda *a, **k: _AlignStore()
+        try:
+            pg = self._page(eff=0.385)
+
+            class _Cfg:
+                class camera_config:
+                    current_objective_name = "4x"
+                    camera_spec = type("S", (), {"name": "BUC3D"})()
+            pg._hw_config = _Cfg()
+            # Live frame is 916 px (the fake cam) → learned used directly, and it
+            # beats the objective's 1.54.
+            self.assertAlmostEqual(pg._learned_um_per_px(916), 1.20, places=3)
+            plan = pg._compute_raster_plan("A1")
+            self.assertAlmostEqual(plan["eff_um_per_px"], 1.20, places=3)
+            # At a wider live frame the learned value rescales (µm/px ∝ 1/width).
+            self.assertAlmostEqual(
+                pg._learned_um_per_px(1832), 1.20 * 916 / 1832, places=4)
+        finally:
+            oc.get_store, mas.get_store = o_orig, a_orig
+
+    def test_legacy_learned_without_resolution_is_ignored(self):
+        """REGRESSION: a learned value with NO recorded resolution (a stale
+        pre-resolution-stamp entry, e.g. the 2x value captured at 916 px) must be
+        ignored so it can't reintroduce the wrong-spacing bug at a different live
+        resolution — the resolution-safe objective µm/px is used instead."""
+        import SupportClasses.ObjectiveCalibration as oc
+        import SupportClasses.MosaicAlignmentStore as mas
+
+        class _ObjStore:
+            def get_calibration(self, cam, obj):
+                return {"measured_um_per_px": 0.778843, "resolution": [3664, 2748]}
+
+        class _AlignStore:      # stale 2x value, NO resolution stamp
+            def get_um_per_px(self, key):
+                return 3.094
+            def get_resolution(self, key):
+                return None
+
+        o_orig, a_orig = oc.get_store, mas.get_store
+        oc.get_store = lambda *a, **k: _ObjStore()
+        mas.get_store = lambda *a, **k: _AlignStore()
+        try:
+            pg = self._page(eff=0.385)
+
+            class _Cfg:
+                class camera_config:
+                    current_objective_name = "2x"
+                    camera_spec = type("S", (), {"name": "BUC3D"})()
+            pg._hw_config = _Cfg()
+            # Un-stamped learned → ignored at any width.
+            self.assertIsNone(pg._learned_um_per_px(916))
+            self.assertIsNone(pg._learned_um_per_px(3664))
+            # Plan falls to the resolution-safe objective value (rescaled to the
+            # 916 px live frame), NOT the stale learned 3.094 or the fov_um.
+            plan = pg._compute_raster_plan("A1")
+            self.assertAlmostEqual(
+                plan["eff_um_per_px"], 0.778843 * 3664 / 916, places=3)
+        finally:
+            oc.get_store, mas.get_store = o_orig, a_orig
+
+    def test_settings_dialog_has_calibrate_button(self):
+        """The settings popout exposes the mosaic-calibration entry point."""
+        pg = self._page(eff=0.385)
+        self.assertTrue(hasattr(pg, "_cal_button"))
+        self.assertTrue(hasattr(pg, "_cal_status_lbl"))
+        self.assertEqual(pg._cal_button.text(), "Calibrate…")
+        # Refreshing the status must not raise (no calibration → objective note).
+        pg._refresh_calibration_status()
+        self.assertIn("not calibrated", pg._cal_status_lbl.text())
+
+    def test_open_mosaic_calibration_wires_dialog(self):
+        """Calibrate… opens the shared MosaicCalibrationDialog wired to this
+        workflow's camera / objective key / selected well, and forces fov_um=0
+        so the calibration mosaic uses the OBJECTIVE scale, not the shared 2x
+        FOV override."""
+        import gui.dialogs.mosaic_calibration_dialog as mcd
+
+        captured = {}
+
+        class _FakeDlg:
+            def __init__(self, controller, mgr, cam_idx, **kw):
+                captured["cam_idx"] = cam_idx
+                captured.update(kw)
+
+            def exec(self):
+                return 0
+
+        class _Settings:
+            def get_section(self, name):
+                return {"fov_um": 2822} if name == "mosaic_scan" else None
+
+        orig = mcd.MosaicCalibrationDialog
+        mcd.MosaicCalibrationDialog = _FakeDlg
+        try:
+            pg = self._page(eff=0.385)   # ctrl not ZP-connected; µm/px calibrated
+            pg._settings = _Settings()
+            pg._scan_well = "A1"
+            pg._open_mosaic_calibration()
+            self.assertIn("align_key", captured)
+            self.assertGreater(captured["um_per_px_camera"], 0.0)
+            # The shared 2822 FOV must be overridden to 0 (objective scale).
+            self.assertEqual(captured["settings"]["fov_um"], 0)
+            self.assertEqual(captured["frame_size"], (916, 686))
+            # Centre = the selected well (A1 at (50000, 40000) in _page()).
+            self.assertEqual(captured["center_um"], (50000.0, 40000.0))
+        finally:
+            mcd.MosaicCalibrationDialog = orig
+
+
+@unittest.skipUnless(_QT, "PySide6 not available")
+class TestMosaicAlignmentStoreResolution(unittest.TestCase):
+    """The alignment store records + returns the capture resolution (so a
+    consumer at a different width can rescale), backward-compatibly."""
+
+    def test_resolution_round_trip_and_legacy(self):
+        from SupportClasses.MosaicAlignmentStore import MosaicAlignmentStore
+        st = MosaicAlignmentStore(Path(tempfile.mkdtemp()) / "ma.json")
+        st.set_um_per_px("cam|4x", 1.23, source="quick_fov",
+                         resolution=(3664, 2748))
+        self.assertAlmostEqual(st.get_um_per_px("cam|4x"), 1.23, places=3)
+        self.assertEqual(st.get_resolution("cam|4x"), (3664.0, 2748.0))
+        # Legacy write (no resolution) → get_resolution is None.
+        st.set_um_per_px("cam|2x", 0.7)
+        self.assertAlmostEqual(st.get_um_per_px("cam|2x"), 0.7, places=3)
+        self.assertIsNone(st.get_resolution("cam|2x"))
+        # Survives a reload.
+        st2 = MosaicAlignmentStore(st._path)
+        self.assertEqual(st2.get_resolution("cam|4x"), (3664.0, 2748.0))
+
 
 @unittest.skipUnless(_QT, "PySide6 not available")
 class TestWorkerProducesComposite(unittest.TestCase):

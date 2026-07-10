@@ -16,10 +16,24 @@ EXCEPT within-well print-pattern moves. These tests cover:
   * Quick Print's travel-Z fallback is a polarity-safe lift, not the raw 5.0.
 """
 
+import os
+import sys
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from SupportClasses.StageController import StageController, ZDIR
+
+_app = None
+
+
+def setUpModule():
+    # A QApplication is needed for the SafeTravelWorker (QObject) used by the
+    # click-to-travel tests below (v7.5.x: travel now runs off the GUI thread).
+    global _app
+    from PySide6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
 
 
 def _make_controller(zp_connected=True):
@@ -232,13 +246,24 @@ class TestClickToTravelAlwaysRetracts(unittest.TestCase):
         ctrl.move_xy_absolute = MagicMock()
         return ctrl
 
+    @staticmethod
+    def _join_travel(worker):
+        # v7.5.x: click-to-travel dispatches safe_travel_to to a worker thread;
+        # join it so the (still-guaranteed) call has happened before asserting.
+        if getattr(worker, "_thread", None) is not None:
+            worker._thread.join(2.0)
+
     def test_jog_click_always_safe_travel_when_safe_z_set(self):
         from gui.pages.jog_control import JogControlPage
+        from gui.widgets.safe_travel_worker import SafeTravelWorker
         page = JogControlPage.__new__(JogControlPage)
         # Needle DOWN at print (raw 25) — the old gate would skip the retract.
         page.controller = self._ctrl(current_z_raw=25.0)
         page._safe_z = 0.0
+        page._travel_worker = SafeTravelWorker()
+        page._set_travelling = lambda busy: None  # __new__ page has no widgets
         page._on_workspace_position_clicked(9000.0, 0.0)
+        self._join_travel(page._travel_worker)
         page.controller.safe_travel_to.assert_called_once()
         page.controller.move_xy_absolute.assert_not_called()
 
@@ -246,10 +271,13 @@ class TestClickToTravelAlwaysRetracts(unittest.TestCase):
         from gui.pages.workflows.spheroid_pickup_workflow import (
             SpheroidPickupWorkflowPage,
         )
+        from gui.widgets.safe_travel_worker import SafeTravelWorker
         page = SpheroidPickupWorkflowPage.__new__(SpheroidPickupWorkflowPage)
         page._controller = self._ctrl(current_z_raw=25.0)
         page._safe_z = 0.0
+        page._travel_worker = SafeTravelWorker()
         page._on_workspace_position_clicked(9000.0, 0.0)
+        self._join_travel(page._travel_worker)
         page._controller.safe_travel_to.assert_called_once()
         page._controller.move_xy_absolute.assert_not_called()
 

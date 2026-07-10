@@ -47,6 +47,7 @@ from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.components import Card
 from gui.widgets.jog_workspace_view import JogWorkspaceView
 from gui.widgets.pump_rack import PumpRack
+from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.xz_side_view import XZSideView
 
@@ -99,6 +100,13 @@ class JogControlPage(QWidget):
         from gui.unit_helpers import DEFAULT_XY_POSITION_SCALE
         self._xy_position_scale: float = DEFAULT_XY_POSITION_SCALE
 
+        # v7.5.x: click-to-travel runs safe_travel_to on a worker thread so a
+        # needle-down retract (10-60+ s of blocking M400/arrival waits) can't
+        # freeze the Qt event loop. Busy-guard = re-clicks are ignored, not
+        # queued. See gui/widgets/safe_travel_worker.py.
+        self._travel_worker = SafeTravelWorker(self)
+        self._travel_worker.finished.connect(self._on_travel_finished)
+
         self._setup_ui()
         self._setup_shortcuts()
 
@@ -141,6 +149,40 @@ class JogControlPage(QWidget):
         self._settings = settings
         if self._context_widget is not None:
             self._context_widget.set_settings(settings)
+        self._sync_backlash_chk()
+
+    # ── v7.5.x: backlash / compliance compensation toggle ──────────
+
+    def _sync_backlash_chk(self) -> None:
+        """Reflect the controller's live backlash-comp flag in the checkbox."""
+        chk = getattr(self, "_backlash_chk", None)
+        if chk is None:
+            return
+        fn = getattr(self.controller, "backlash_comp_enabled", None)
+        if not callable(fn):
+            return
+        chk.blockSignals(True)
+        try:
+            chk.setChecked(bool(fn()))
+        except Exception:
+            pass
+        finally:
+            chk.blockSignals(False)
+
+    def _on_backlash_toggled(self, on: bool) -> None:
+        ctrl = self.controller
+        if hasattr(ctrl, "set_backlash_comp_enabled"):
+            try:
+                ctrl.set_backlash_comp_enabled(bool(on))
+            except Exception:
+                pass
+        if self._settings is not None:
+            try:
+                self._settings.set(
+                    "device_profile.backlash_comp_enabled", bool(on))
+                self._settings.save()
+            except Exception:
+                pass
 
     # ════════════════════════════════════════════════════════════════
     #  MAIN CONTENT — visualization only
@@ -198,6 +240,16 @@ class JogControlPage(QWidget):
         self._plate_view_combo.currentIndexChanged.connect(
             self._on_plate_view_mode_changed)
         view_row.addWidget(self._plate_view_combo)
+        # v7.5.x: overlay the saved single-well mosaics ("Scan well…" /
+        # Rosettes tab) onto the plate mosaic — toggleable, default ON.
+        self._wellscan_check = QCheckBox("Well scans")
+        self._wellscan_check.setChecked(True)
+        self._wellscan_check.setToolTip(
+            "Overlay the saved single-well mosaics (high-res “Scan well” "
+            "images) onto the plate mosaic.")
+        self._wellscan_check.toggled.connect(
+            lambda _c: self._load_mosaic_overlay())
+        view_row.addWidget(self._wellscan_check)
         self._fluor_check = QCheckBox("🔬 Fluorescence")
         self._fluor_check.setToolTip(
             "Overlay the captured fluorescence mosaic(s) for this plate "
@@ -245,6 +297,20 @@ class JogControlPage(QWidget):
         self._pump_panel = PumpRack()
         pump_card = Card("Pumps")
         pump_card.add_widget(self._pump_panel)
+        # v7.5.x: backlash / compliance compensation toggle. When on, every
+        # discrete pump actuation + jog click is bracketed with a flex take-up
+        # (before) + unload (after), sized per-pump from the compliance value
+        # measured on Calibration → Needle Location — so small volumes flow
+        # accurately and no residual pressure remains during moves.
+        self._backlash_chk = QCheckBox(
+            "Backlash compensation (remove residual pressure at pump start/stop)")
+        self._backlash_chk.setToolTip(
+            "Take-up on reversal + unload on stop, using each pump's calibrated "
+            "compliance (µL). Calibrate on Calibration → Needle Location; per-pump "
+            "values are on Workflows → Common Print Settings.")
+        self._backlash_chk.toggled.connect(self._on_backlash_toggled)
+        self._sync_backlash_chk()
+        pump_card.add_widget(self._backlash_chk)
 
         # The top band keeps the lion's share of vertical space; the
         # pump rack stays compact thanks to its own min/max height.
@@ -315,9 +381,32 @@ class JogControlPage(QWidget):
         self._xz_view.set_zero_offset_x(zero["x"])
         self._xz_view.set_zero_offset_z(zero.get("Z", 0.0))
 
+        # Needle positions (animate toward a jog/travel target via the display
+        # getters; see MEBP_v75x_JOG_MOTION_INTERPOLATION).
+        self._refresh_live_needles()
+
+        # Pump rack
+        self._refresh_pump_panel()
+
+        # Forward tick to the context panel (it owns its own readouts)
+        if self._context_widget is not None:
+            self._context_widget.on_status_update()
+
+    def _refresh_live_needles(self) -> None:
+        """Update the workspace + XZ needles from the DISPLAY getters, so they
+        glide toward a jog/travel destination instead of snapping. When no move
+        estimate is active the display getters return the raw poller cache, so
+        this is identical to the legacy behaviour."""
+        ctrl = self.controller
+        zero = ctrl.zero_position
+        get_xy = getattr(ctrl, "get_display_xy_position", None) or (
+            lambda: ctrl.get_xy_position(cached=True))
+        get_zp = getattr(ctrl, "get_display_zp_position", None) or (
+            lambda: ctrl.get_zp_position(cached=True))
+
         # XY position (stage-frame → zero-ref for the visualizations)
-        xy = ctrl.get_xy_position(cached=True)
-        if xy[0] is not None:
+        xy = get_xy()
+        if xy and xy[0] is not None:
             zx_um = xy[0] - zero["x"]
             zy_um = xy[1] - zero["y"]
             self._workspace_view.set_position(zx_um, zy_um)
@@ -327,8 +416,8 @@ class JogControlPage(QWidget):
             self._workspace_view.set_position(None, None)
 
         # Z position
-        zp = ctrl.get_zp_position(cached=True)
-        z_raw = ctrl.zp_logical_value(zp, "Z") if zp[0] is not None else None
+        zp = get_zp()
+        z_raw = ctrl.zp_logical_value(zp, "Z") if zp and zp[0] is not None else None
         if z_raw is not None:
             self._xz_view.set_position(zx_um, z_raw - zero["Z"])
         else:
@@ -337,12 +426,15 @@ class JogControlPage(QWidget):
         # XZ view: well under needle (drawn under the needle when over a well)
         self._update_xz_well_under_needle(zx_um, zy_um)
 
-        # Pump rack
-        self._refresh_pump_panel()
-
-        # Forward tick to the context panel (it owns its own readouts)
-        if self._context_widget is not None:
-            self._context_widget.on_status_update()
+    def on_motion_tick(self) -> None:
+        """v7.5.x: fast (~30 fps) display-only animation tick — fired by the
+        MainWindow only while a jog/travel motion estimate is live. Glides the
+        needles and forwards to the context panel's readouts."""
+        self._refresh_live_needles()
+        cw = self._context_widget
+        fn = getattr(cw, "on_motion_tick", None) if cw is not None else None
+        if callable(fn):
+            fn()
 
     def _update_xz_well_under_needle(
         self, zx_um: float | None, zy_um: float | None,
@@ -363,37 +455,60 @@ class JogControlPage(QWidget):
         self._xz_view.set_well_under_needle(None, None)
 
     def _refresh_pump_panel(self) -> None:
+        """v7.5.x: feed the pump rack the LIVE plunger fill (µL) derived from
+        the live plunger position via the controller's plunger calibration —
+        the same readout the Hardware Control Panel shows. (The old path fed a
+        static ``FluidColumn`` that is only mutated during a print/workflow, so
+        on the Jog page it never reflected the actual plunger position.)"""
         if self._hardware_config is None:
-            return
-        try:
-            from SupportClasses.PhysicalModels import (
-                PrintingMode, PumpLoadout,
-            )
-        except ImportError:
             return
 
         ctrl = self.controller
         zp = ctrl.get_zp_position(cached=True)
+        have_zp = bool(zp) and zp[0] is not None
 
-        loadouts: dict[str, PumpLoadout] = {}
+        fills: dict[str, dict | None] = {}
         for pid in ("P1", "P2", "P3"):
             pump_cfg = self._hardware_config.pumps.get(pid)
             if pump_cfg is None or not pump_cfg.is_configured:
+                fills[pid] = None  # → "not configured"
                 continue
-            p_raw = (ctrl.zp_logical_value(zp, pid)
-                     if zp[0] is not None else None)
-            position_mm = 0.0
-            if p_raw is not None:
-                position_mm = p_raw - ctrl.zero_position[pid]
-            loadouts[pid] = PumpLoadout(
-                pump_id=pid,
-                syringe=pump_cfg.syringe,
-                fluid_column=pump_cfg.fluid_column,
-                printing_mode=PrintingMode.INCREMENTAL,
-                current_position_mm=float(position_mm),
-            )
-        if loadouts:
-            self._pump_panel.update_from_workspace(loadouts)
+
+            p_raw = ctrl.zp_logical_value(zp, pid) if have_zp else None
+
+            calibrated = bool(
+                hasattr(ctrl, "is_pump_plunger_calibrated")
+                and ctrl.is_pump_plunger_calibrated(pid))
+
+            fill_uL = None
+            capacity_uL = None
+            if calibrated and p_raw is not None:
+                try:
+                    fill_uL = ctrl.raw_to_pump_fill_uL(pid, p_raw)
+                    capacity_uL = ctrl.pump_capacity_uL(pid)
+                except Exception:
+                    fill_uL = capacity_uL = None
+
+            # Raw Marlin plunger position (mm) — the live fallback readout for
+            # an un-calibrated pump, and the "raw" tooltip value for a
+            # calibrated one. Kept in the RAW frame (no zero-ref subtraction) to
+            # match the embedded Hardware Control Panel's pump readout, which
+            # sits on the same screen. (None when the board isn't answering.)
+            raw_mm = p_raw
+
+            ink_spec = getattr(
+                getattr(pump_cfg, "fluid_column", None), "ink_spec", None)
+
+            fills[pid] = {
+                "fill_uL": fill_uL,
+                "capacity_uL": capacity_uL,
+                "raw_mm": raw_mm,
+                "syringe": pump_cfg.syringe,
+                "ink_spec": ink_spec,
+                "calibrated": calibrated and fill_uL is not None,
+            }
+
+        self._pump_panel.update_live_fills(fills)
 
     # ════════════════════════════════════════════════════════════════
     #  HARDWARE CONFIG + CALIBRATION
@@ -552,8 +667,15 @@ class JogControlPage(QWidget):
     # ── v7.5.x: stitched-plate mosaic overlay ──────────────────────
 
     def _jog_plate_key(self) -> str:
-        key = (getattr(self._plate, "format", None)
-               if getattr(self, "_plate", None) is not None else None)
+        # v7.5.x: the per-plate stores (mosaic/template) are keyed by the
+        # authoritative identity (active_plate_key) — a plate TYPE shares its
+        # base format's geometry, so self._plate.format alone (= the base int)
+        # would collide across types of one format. Prefer active_plate_key.
+        hw = getattr(self, "_hardware_config", None)
+        key = getattr(hw, "active_plate_key", None) if hw is not None else None
+        if key is None:
+            key = (getattr(self._plate, "format", None)
+                   if getattr(self, "_plate", None) is not None else None)
         return str(key) if key is not None else "plate"
 
     def _load_mosaic_overlay(self) -> None:
@@ -573,6 +695,17 @@ class JogControlPage(QWidget):
                 return
             img = store.load_image(key)
             extent = store.get_extent_um(key)
+            # v7.5.x: composite the saved single-well mosaics onto the plate
+            # mosaic (toggleable; display-only — the stored files are separate).
+            cb = getattr(self, "_wellscan_check", None)
+            if (img is not None and extent is not None
+                    and (cb is None or cb.isChecked())):
+                try:
+                    from SupportClasses.MosaicStore import composite_with_wells
+                    img, extent = composite_with_wells(
+                        store, key, img, tuple(extent))
+                except Exception as e:
+                    logger.debug(f"Jog: well-scan composite skipped: {e}")
             pm = pixmap_from_bgr(img)
             self._workspace_view.set_mosaic_overlay(
                 pm, tuple(extent) if extent else None)
@@ -653,6 +786,11 @@ class JogControlPage(QWidget):
         the needle was DOWN. The shortcut is removed; ``safe_travel_to`` is a
         near-no-op when the needle is already retracted, so always using it is
         safe.
+
+        v7.5.x FREEZE FIX: ``safe_travel_to`` is BLOCKING — a needle-down
+        retract does 10-60+ s of M400 + arrival waits. Running it inline on the
+        GUI thread froze the app ("program freezes when I jog to another well
+        with the needle down"); it is now dispatched to a worker thread.
         """
         if not self.controller.is_xy_connected:
             return
@@ -678,8 +816,10 @@ class JogControlPage(QWidget):
                 x_um_zr / 1000.0, y_um_zr / 1000.0, from_zero_ref=True)
             return
 
-        self.controller.safe_travel_to(
-            stage_x, stage_y, safe_z_mm=self._safe_z, target_z_mm=None)
+        if self._travel_worker.start(
+                self.controller, stage_x, stage_y,
+                safe_z_mm=self._safe_z, target_z_mm=None):
+            self._set_travelling(True)
 
     def _on_workspace_well_clicked(self, well_name: str) -> None:
         logger.debug("Workspace: well clicked %s", well_name)
@@ -747,11 +887,36 @@ class JogControlPage(QWidget):
             f"{current_z_zr:.2f} mm" if current_z_zr is not None else "none",
         )
 
-        self.controller.safe_travel_to(
-            stage_x, stage_y,
-            safe_z_mm=self._safe_z,
-            target_z_mm=current_z_zr,
-        )
+        # v7.5.x FREEZE FIX: dispatch the blocking safe_travel_to to a worker
+        # thread (see _on_workspace_position_clicked).
+        if self._travel_worker.start(
+                self.controller, stage_x, stage_y,
+                safe_z_mm=self._safe_z, target_z_mm=current_z_zr):
+            self._set_travelling(True)
+
+    def _set_travelling(self, busy: bool) -> None:
+        """Visual busy cue while a click-to-travel is in flight (GUI stays live).
+
+        A busy cursor over the workspace is enough — the busy-guard in
+        :class:`SafeTravelWorker` already prevents queued re-clicks, and the
+        needle marker jumps to the destination when the (poller-suspended) move
+        completes.
+        """
+        try:
+            self._workspace_view.setCursor(
+                Qt.CursorShape.WaitCursor if busy
+                else Qt.CursorShape.ArrowCursor)
+        except Exception:
+            pass
+
+    def _on_travel_finished(self, ok: bool) -> None:
+        """Worker-thread safe_travel_to finished (queued back to the GUI thread)."""
+        self._set_travelling(False)
+        if not ok:
+            logger.warning(
+                "Click-to-travel did not confirm (Z retract / XY arrival "
+                "timed out, or the ZP board is not connected). The needle may "
+                "not have moved — check the connection and try again.")
 
     # ════════════════════════════════════════════════════════════════
     #  KEYBOARD SHORTCUTS

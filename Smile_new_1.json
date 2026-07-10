@@ -1,0 +1,34 @@
+{
+  "schema_version": "7.2.3",
+  "metadata": {
+    "name": "Smile_new_1",
+    "description": "",
+    "modified": "2026-06-30T23:42:21.811805+00:00"
+  },
+  "objects": {
+    "Smile new": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\Smile_new_1.csv",
+        "csv_path": "config\\prints\\Smile_new_1.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 72,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "auto_layout": false,
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}
