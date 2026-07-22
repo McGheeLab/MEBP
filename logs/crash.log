@@ -65,3 +65,15 @@ Current thread 0x00008b0c (most recent call first):
   File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 196 in run_gui
   File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 323 in main
   File "c:\Users\mcghe\OneDrive\Documents\GitHub\ME3B-Pluck-Place\Pick and Place V2\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x80010108
+
+Thread 0x00004cc4 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010012
+
+Thread 0x00004cc4 (most recent call first):
+  <no Python frame>
+Windows fatal exception: code 0x80010108
+
+Thread 0x00005190 (most recent call first):
+  <no Python frame>

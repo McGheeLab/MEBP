@@ -48,6 +48,7 @@ from gui.dialogs.workflow_settings_dialog import (
 from gui.pages.workflows._fluorescence_overlay import (
     load_plate_fluor_overlay, plate_key_of,
 )
+from gui.pages.workflows._reagent_prep import resolve_pickup_well
 
 from SupportClasses.PickAndPlaceManager import (
     OperationQueue, OperationType, PickPlaceExecutor, PickPlaceOperation,
@@ -495,8 +496,8 @@ class SpheroidPickupWorkflowPage(QWidget):
         sec.add("xy_timeout", "XY timeout", self._xy_timeout, 30.0)
 
         # ── Common — Pump (global) ──
-        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
-        self._g_prime = self._dspin(0.0, 10.0, 0.25, " s", 2, 0.05)
+        self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
+        self._g_prime = self._dspin(0.0, 30.0, 0.25, " s", 2, 0.05)
         sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
         sec.add_note(
             "Global pump values (edited here or on the Common Print Settings "
@@ -628,7 +629,8 @@ class SpheroidPickupWorkflowPage(QWidget):
             role = (itype if itype in self._SERVICE_ROLES
                     else name_l if name_l in self._SERVICE_ROLES else None)
             if role and role not in out:
-                out[role] = wells[0]
+                # Prefer a real sub-well over a flattened rosette parent.
+                out[role] = resolve_pickup_well(wells, self._plate)
         return out
 
     def _resolve_service_positions(self):

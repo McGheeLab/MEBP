@@ -23,6 +23,37 @@ from __future__ import annotations
 SERVICE_ROLES = ("waste", "oil", "wash", "buffer")
 
 
+def resolve_pickup_well(wells, plate=None):
+    """Choose the reagent PICKUP well from an ``ink_locations`` list.
+
+    ``ink_locations`` is append-only, so a well pinned to a plain well that
+    later became a rosette leaves a stale, now-flattened PARENT name (e.g.
+    ``"A2"``) in the list — usually at index 0. A flattened rosette parent is
+    NOT a real pickup well: it is absent from the compiled ``plate.well_names``
+    yet the calibrated ``well_positions`` map re-adds it at the sub-well
+    CENTROID, so a naive ``wells[0]`` silently dips at the rosette centre
+    instead of the intended sub-well.
+
+    Prefer the first well that is a real (leaf) well in ``plate.well_names``
+    (which excludes rosette parents — the same check the Well-Setup seed path
+    uses). Fall back to the first entry when no plate is available or nothing
+    qualifies → byte-identical legacy behaviour on non-rosette plates.
+    """
+    if not wells:
+        return None
+    valid = None
+    if plate is not None:
+        try:
+            valid = set(plate.well_names)
+        except Exception:
+            valid = None
+    if valid:
+        for w in wells:
+            if w in valid:
+                return w
+    return wells[0]
+
+
 def needle_volume_uL(hw_config) -> float:
     """One needle's internal bore volume (µL) from the configured needle.
 
@@ -38,12 +69,13 @@ def needle_volume_uL(hw_config) -> float:
         return 0.0
 
 
-def service_well_names(hw_config) -> dict[str, str]:
+def service_well_names(hw_config, plate=None) -> dict[str, str]:
     """role → well name, read from Hardware Setup reagent locations.
 
     A well is matched to a role by the assigned ink's ``ink_type`` (or, as a
-    fallback, an ink literally named waste/oil/wash/buffer). The first well
-    assigned to each role wins.
+    fallback, an ink literally named waste/oil/wash/buffer). The first *real*
+    well assigned to each role wins — a flattened rosette parent is skipped in
+    favour of a sub-well when ``plate`` is supplied (see ``resolve_pickup_well``).
     """
     out: dict[str, str] = {}
     if hw_config is None:
@@ -60,18 +92,19 @@ def service_well_names(hw_config) -> dict[str, str]:
         role = (itype if itype in SERVICE_ROLES
                 else name_l if name_l in SERVICE_ROLES else None)
         if role and role not in out:
-            out[role] = wells[0]
+            out[role] = resolve_pickup_well(wells, plate)
     return out
 
 
-def resolve_service_positions(hw_config, well_positions):
+def resolve_service_positions(hw_config, well_positions, plate=None):
     """Return ``(positions, missing)``.
 
     ``positions`` maps each resolvable role → absolute stage µm (from the
     calibrated ``well_positions``); ``missing`` lists the roles whose well is
-    either unassigned or not present in the calibrated well map.
+    either unassigned or not present in the calibrated well map. Pass ``plate``
+    (the compiled ``WellPlate``) so a rosette parent resolves to a real sub-well.
     """
-    names = service_well_names(hw_config)
+    names = service_well_names(hw_config, plate)
     wells = well_positions or {}
     positions: dict[str, tuple[float, float]] = {}
     for role in SERVICE_ROLES:

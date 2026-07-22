@@ -52,7 +52,7 @@ from gui.pages.workflows._fluorescence_overlay import (
 )
 from gui.pages.workflows._reagent_prep import (
     SERVICE_ROLES, service_well_names, resolve_service_positions,
-    needle_volume_uL,
+    needle_volume_uL, resolve_pickup_well,
 )
 
 from SupportClasses.PickAndPlaceManager import (
@@ -445,8 +445,8 @@ class CellTargetingWorkflowPage(QWidget):
         sec.add("xy_timeout", "XY timeout", self._xy_timeout, 30.0)
 
         # ── Common — Pump (global) ──
-        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
-        self._g_prime = self._dspin(0.0, 10.0, 0.25, " s", 2, 0.05)
+        self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
+        self._g_prime = self._dspin(0.0, 30.0, 0.25, " s", 2, 0.05)
         sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
         sec.add_note(
             "Global pump values (edited here or on the Common Print Settings "
@@ -556,7 +556,8 @@ class CellTargetingWorkflowPage(QWidget):
         if not ink or self._hw_config is None:
             return None
         wells = (getattr(self._hw_config, "ink_locations", {}) or {}).get(ink) or []
-        return wells[0] if wells else None
+        # Prefer a real sub-well over a flattened rosette parent (e.g. "A2").
+        return resolve_pickup_well(wells, self._plate)
 
     def _reagent_source_pos(self) -> tuple[float, float] | None:
         wn = self._reagent_source_well()
@@ -605,8 +606,8 @@ class CellTargetingWorkflowPage(QWidget):
             # Prep + clean off. The after-pickup wash still needs the wash well.
             if self._wash_after_pickup_check.isChecked():
                 positions, _missing = resolve_service_positions(
-                    self._hw_config, self._well_positions)
-                names = service_well_names(self._hw_config)
+                    self._hw_config, self._well_positions, self._plate)
+                names = service_well_names(self._hw_config, self._plate)
                 if "wash" not in positions:
                     self._prep_status.setText(
                         "⚠ Wash-after-pickup needs a wash well assigned + "
@@ -634,8 +635,8 @@ class CellTargetingWorkflowPage(QWidget):
             return
         needle_uL = needle_volume_uL(self._hw_config)
         _positions, missing = resolve_service_positions(
-            self._hw_config, self._well_positions)
-        names = service_well_names(self._hw_config)
+            self._hw_config, self._well_positions, self._plate)
+        names = service_well_names(self._hw_config, self._plate)
         if needle_uL <= 0:
             self._prep_status.setText(
                 "⚠ Needle inner Ø / length not set (Hardware Setup → Needle).")
@@ -1150,7 +1151,7 @@ class CellTargetingWorkflowPage(QWidget):
         needle_uL = 0.0
         if prep_enabled or clean_enabled or wash_after_pickup:
             service_positions, missing = resolve_service_positions(
-                self._hw_config, self._well_positions)
+                self._hw_config, self._well_positions, self._plate)
             service_z = self._plate_offset_to_zref(float(self._service_z.value()))
             if service_z is None:
                 self._status.setText(

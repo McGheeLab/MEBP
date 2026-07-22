@@ -72,7 +72,17 @@ class SafetyLimits:
     # Speed/feedrate limits
     max_xy_speed: float = 10_000.0     # µm/s
     max_z_feedrate: float = 500.0      # mm/min
-    max_pump_feedrate: float = 200.0   # mm/min
+    max_pump_feedrate: float = 200.0   # mm/min (global default / fallback)
+
+    # v7.5.x: per-pump max plunger feedrate (mm/min). Each pump may hold a
+    # different syringe, so the same mm/min plunger speed maps to a DIFFERENT
+    # volumetric rate (µL/s). ``0.0`` means "inherit the global
+    # ``max_pump_feedrate``" (back-compat: a config saved before this change has
+    # no per-pump keys → all fall back to the single value). Auto-persisted via
+    # ``to_dict``/``from_dict``.
+    max_pump_feedrate_p1: float = 0.0
+    max_pump_feedrate_p2: float = 0.0
+    max_pump_feedrate_p3: float = 0.0
 
     # v7.1: Per-pump max flow rate limits (µL/s) — P8.28
     # Computed from FlowPhysics based on needle/syringe/ink combo.
@@ -140,14 +150,55 @@ class SafetyLimits:
             logger.warning(f"Z feedrate clamped: {feedrate:.0f} → {clamped:.0f} mm/min")
         return clamped
 
-    def clamp_pump_feedrate(self, feedrate: float) -> float:
-        """Clamp pump feedrate to maximum allowed."""
+    def clamp_pump_feedrate(self, feedrate: float, pump: str = "P1") -> float:
+        """Clamp a pump plunger feedrate (mm/min) to the per-pump maximum.
+
+        v7.5.x: the ceiling is per-pump (``pump_feedrate_max``) because each pump
+        may hold a different syringe; falls back to the global
+        ``max_pump_feedrate`` when no per-pump override is set.
+        """
         if not self.enabled or feedrate is None:
             return feedrate
-        clamped = min(feedrate, self.max_pump_feedrate)
+        max_fr = self.pump_feedrate_max(pump)
+        clamped = min(feedrate, max_fr)
         if clamped != feedrate:
-            logger.warning(f"Pump feedrate clamped: {feedrate:.0f} → {clamped:.0f} mm/min")
+            logger.warning(
+                f"{pump} feedrate clamped: {feedrate:.0f} → {clamped:.0f} mm/min")
         return clamped
+
+    # ── v7.5.x: per-pump max plunger feedrate (mm/min) ───────────
+
+    def pump_feedrate_max(self, pump: str = "P1") -> float:
+        """Per-pump max plunger feedrate (mm/min).
+
+        Returns the pump's own override when set (> 0), else the global
+        ``max_pump_feedrate``.
+        """
+        attr = self._pump_feedrate_attr(pump)
+        if attr:
+            try:
+                v = float(getattr(self, attr, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                v = 0.0
+            if v > 0:
+                return v
+        return float(self.max_pump_feedrate)
+
+    def set_pump_feedrate_max(self, pump: str, feedrate_mm_min: float) -> None:
+        """Set a pump's per-pump max plunger feedrate (mm/min). ``0`` clears the
+        override so the pump inherits the global ``max_pump_feedrate``."""
+        attr = self._pump_feedrate_attr(pump)
+        if attr:
+            setattr(self, attr, float(feedrate_mm_min))
+            logger.info(f"{pump} max plunger feedrate = {feedrate_mm_min:.0f} mm/min")
+
+    def _pump_feedrate_attr(self, pump: str) -> str | None:
+        """Attribute name for a pump's per-pump max feedrate."""
+        return {
+            "P1": "max_pump_feedrate_p1",
+            "P2": "max_pump_feedrate_p2",
+            "P3": "max_pump_feedrate_p3",
+        }.get(pump)
 
     # ── v7.1: Flow Rate Clamping (P8.29) ─────────────────────────
 

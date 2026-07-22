@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from SupportClasses.FluorescenceMosaicStore import (
-    FluorescenceMosaicStore, CHANNELS, default_color, well_key,
+    FluorescenceMosaicStore, CHANNELS, default_color, well_key, channel_number,
 )
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -54,10 +54,25 @@ class TestFluorescenceMosaicStore(unittest.TestCase):
         self.ext = (1000.0, 2000.0, 1600.0, 2400.0)
 
     def test_channels_and_default_colors(self):
-        self.assertEqual(CHANNELS, ("DAPI", "FITC", "mCherry", "Cy5"))
+        self.assertEqual(
+            CHANNELS, ("DAPI", "FITC", "mCherry", "Cy5", "Bright Field"))
         for ch in CHANNELS:
             c = default_color(ch)
             self.assertEqual(len(c), 3)
+
+    def test_bright_field_channel(self):
+        """Bright Field is surfaced as channel 5 with a grayscale/white seed."""
+        self.assertIn("Bright Field", CHANNELS)
+        self.assertEqual(default_color("Bright Field"), (255, 255, 255))
+
+    def test_channel_numbers(self):
+        """The pre-scan prompt shows each channel's microscope number."""
+        self.assertEqual(channel_number("DAPI"), 1)
+        self.assertEqual(channel_number("FITC"), 2)
+        self.assertEqual(channel_number("mCherry"), 3)
+        self.assertEqual(channel_number("Cy5"), 4)
+        self.assertEqual(channel_number("Bright Field"), 5)
+        self.assertIsNone(channel_number("nonexistent"))
 
     def test_well_key(self):
         self.assertEqual(well_key("24", "A1"), "24|A1")
@@ -230,7 +245,8 @@ class TestWorkflowRegistrationAndPage(unittest.TestCase):
             controller=Ctrl(), settings=object(), camera_manager=None)
         pg.set_hardware_config(HW())
         self.assertEqual(
-            pg._selected_channels(), ["DAPI", "FITC", "mCherry", "Cy5"])
+            pg._selected_channels(),
+            ["DAPI", "FITC", "mCherry", "Cy5", "Bright Field"])
         # Unchecking a channel removes it from the capture set.
         pg._channel_checks["FITC"].setChecked(False)
         self.assertNotIn("FITC", pg._selected_channels())

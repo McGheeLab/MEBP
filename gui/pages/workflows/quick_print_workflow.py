@@ -52,7 +52,7 @@ from gui.dialogs.workflow_settings_dialog import (
 )
 from gui.pages.workflows._reagent_prep import (
     SERVICE_ROLES, service_well_names, resolve_service_positions,
-    needle_volume_uL,
+    needle_volume_uL, resolve_pickup_well,
 )
 
 try:
@@ -591,7 +591,7 @@ class QuickPrintWorkflowPage(QWidget):
         # which seeds from the global prime time — so only settle here. Pressure
         # relief / compliance is now per-pump µL on the Common Print Settings
         # page, not a global proxied here.)
-        self._g_settle = self._dspin(0.0, 10.0, 0.0, " s", 2, 0.05)
+        self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
         sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
         sec.add_note(
             "Global pump values (edited here or on the Common Print Settings "
@@ -1311,7 +1311,8 @@ class QuickPrintWorkflowPage(QWidget):
         if not ink or self._hw_config is None:
             return None
         wells = (getattr(self._hw_config, "ink_locations", {}) or {}).get(ink) or []
-        return wells[0] if wells else None
+        # Prefer a real sub-well over a flattened rosette parent (e.g. "A2").
+        return resolve_pickup_well(wells, self._plate)
 
     def _ink_source_pos(self) -> tuple[float, float] | None:
         """(x_um, y_um) absolute stage µm of the selected ink's source well,
@@ -1629,7 +1630,7 @@ class QuickPrintWorkflowPage(QWidget):
         over = (remedy == "waste_oil")
         role = "waste" if over else "oil"
         positions, _missing = resolve_service_positions(
-            self._hw_config, self._well_positions)
+            self._hw_config, self._well_positions, self._plate)
         service_z = self._plate_offset_to_zref(
             float(self._service_z_spin.value()))
         if role not in positions or service_z is None or self._safe_z is None:
@@ -1752,8 +1753,8 @@ class QuickPrintWorkflowPage(QWidget):
         if self._prep_check.isChecked():
             nv = needle_volume_uL(self._hw_config)
             _positions, missing = resolve_service_positions(
-                self._hw_config, self._well_positions)
-            names = service_well_names(self._hw_config)
+                self._hw_config, self._well_positions, self._plate)
+            names = service_well_names(self._hw_config, self._plate)
             if nv <= 0:
                 msgs.append("⚠ Prep on: needle inner Ø/length not set "
                             "(Hardware Setup → Needle).")
@@ -1772,7 +1773,7 @@ class QuickPrintWorkflowPage(QWidget):
         if postclean_on:
             nv = needle_volume_uL(self._hw_config)
             positions, _m = resolve_service_positions(
-                self._hw_config, self._well_positions)
+                self._hw_config, self._well_positions, self._plate)
             cl_need = [r for r in ("waste", "wash", "oil") if r not in positions]
             if nv <= 0:
                 msgs.append("⚠ Clean-after on: needle inner Ø/length not set.")
@@ -2136,7 +2137,8 @@ class QuickPrintWorkflowPage(QWidget):
                 warns.append(f"{pump} has no syringe")
                 continue
             wl = locs.get(mapped) or []
-            if not wl or wl[0] not in wells:
+            wn = resolve_pickup_well(wl, self._plate)
+            if not wn or wn not in wells:
                 warns.append(f"“{mapped}” well not calibrated")
         return warns
 
@@ -2224,7 +2226,7 @@ class QuickPrintWorkflowPage(QWidget):
         # Service wells are required for the between-ink swaps (waste/wash/
         # buffer) and prep (oil).
         service_positions, missing = resolve_service_positions(
-            self._hw_config, self._well_positions)
+            self._hw_config, self._well_positions, self._plate)
         need = [r for r in ("waste", "oil", "wash", "buffer")
                 if r not in service_positions]
         if need:
@@ -2259,7 +2261,8 @@ class QuickPrintWorkflowPage(QWidget):
             ink_name = self._ink_map.get(iid)
             pump = hw.get_pump_for_ink(ink_name)
             wl = locs.get(ink_name) or []
-            ink_pos = wells.get(wl[0]) if wl else None
+            wn = resolve_pickup_well(wl, self._plate)
+            ink_pos = wells.get(wn) if wn else None
             segments = self._group_segments(sub, pump)
             if not segments or ink_pos is None:
                 continue
@@ -2409,6 +2412,15 @@ class QuickPrintWorkflowPage(QWidget):
         pm.on_state_changed = _st
         self._pm = pm
         pm.load_job(job)
+        # Close the start-race: PrintManager.abort() is gated on RUNNING/PAUSED
+        # and start() clears the abort flag, so an Abort requested in the window
+        # between `self._pm = pm` and this group reaching RUNNING would be a
+        # no-op for this group (it would run to completion, then the run halts
+        # only at the next-group check). Honor a sticky abort request before we
+        # start this group's print at all.
+        if self._multi_abort_requested:
+            self._pm = None
+            raise AbortException()
         pm.start()
         done.wait()
         self._pm = None
@@ -2523,7 +2535,7 @@ class QuickPrintWorkflowPage(QWidget):
                         "(Hardware Setup → Needle), or turn Prep off.")
                     return
                 service_positions, missing = resolve_service_positions(
-                    self._hw_config, self._well_positions)
+                    self._hw_config, self._well_positions, self._plate)
                 if missing:
                     self._status.setText(
                         "Prep needs these reagent wells assigned + calibrated: "
@@ -2569,7 +2581,7 @@ class QuickPrintWorkflowPage(QWidget):
                     "(Hardware Setup → Needle), or turn it off.")
                 return
             cl_positions, _cl_missing = resolve_service_positions(
-                self._hw_config, self._well_positions)
+                self._hw_config, self._well_positions, self._plate)
             cl_need = [r for r in ("waste", "wash", "oil")
                        if r not in cl_positions]
             if cl_need:

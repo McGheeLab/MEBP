@@ -71,22 +71,40 @@ except ImportError:   # pragma: no cover - cv2/numpy always present in this proj
 
 _DEFAULT_PATH = Path("config/hardware/fluorescence_mosaics.json")
 
-# The standard fluorescence channels surfaced in the workflow UI, with their
-# default display pseudo-colours (RGB 0-255). The operator can override any
-# colour per capture; this is just the seed.
-CHANNELS: tuple[str, ...] = ("DAPI", "FITC", "mCherry", "Cy5")
+# The standard filter cubes surfaced in the workflow UI, with their default
+# display pseudo-colours (RGB 0-255). The operator can override any colour per
+# capture; this is just the seed. DAPI/FITC/mCherry/Cy5 are excitation channels
+# 1-4; "Bright Field" is the microscope's non-excitation channel 5 (channel 6 is
+# also brightfield but is not surfaced as a separate option).
+CHANNELS: tuple[str, ...] = ("DAPI", "FITC", "mCherry", "Cy5", "Bright Field")
 
 DEFAULT_CHANNEL_COLORS: dict[str, tuple[int, int, int]] = {
     "DAPI": (60, 120, 255),     # blue
     "FITC": (0, 230, 0),        # green
     "mCherry": (255, 40, 40),   # red
     "Cy5": (255, 0, 230),       # magenta / far-red
+    "Bright Field": (255, 255, 255),  # grayscale / white (non-fluorescent)
+}
+
+# Microscope hardware channel number (1-based) for each filter cube, shown in
+# the pre-scan "set the filter" prompt so the operator knows which turret
+# position to select. Channels 5 & 6 are both brightfield; only 5 is surfaced.
+CHANNEL_NUMBERS: dict[str, int] = {
+    "DAPI": 1, "FITC": 2, "mCherry": 3, "Cy5": 4, "Bright Field": 5,
 }
 
 
 def default_color(channel: str) -> tuple[int, int, int]:
     """Default display pseudo-colour (RGB) for a channel name."""
     return DEFAULT_CHANNEL_COLORS.get(channel, (220, 220, 220))
+
+
+def channel_number(channel: str):
+    """Microscope hardware channel number (1-based) for a channel name.
+
+    Returns ``None`` for an unknown channel (the prompt then omits the number).
+    """
+    return CHANNEL_NUMBERS.get(channel)
 
 
 def _safe_token(value) -> str:

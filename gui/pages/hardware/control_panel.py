@@ -568,20 +568,38 @@ class HardwareControlPanel(QWidget):
             "Z", self.spin_z_pct, self.lbl_z_resolved,
             tooltip="Maximum Z feedrate (mm/min) — the 100% anchor everywhere."))
 
-        self.spin_p_pct = self._max_spin(
-            maximum=100_000.0, decimals=0, step=10.0, unit="mm/min")
-        self.lbl_p_resolved = self._resolved_label()
-        self.lbl_p_resolved.setVisible(False)
-        outer.addLayout(self._labeled_pct(
-            "Pump", self.spin_p_pct, self.lbl_p_resolved,
-            tooltip="Maximum pump plunger feedrate (mm/min)."))
+        # v7.5.x: pump max rate is PER-PUMP (each pump may hold a different
+        # syringe, so the same mm/min plunger feedrate maps to a different
+        # µL/s). One row per pump: a mm/min spin (the firmware plunger unit,
+        # edited primary) + a live µL/s secondary readout derived from that
+        # pump's syringe. Unconfigured pumps are hidden in
+        # _seed_pump_max_from_controller.
+        from PySide6.QtWidgets import QWidget as _QWidget
+        self.spin_p_max_pumps: dict[str, "QDoubleSpinBox"] = {}
+        self.lbl_p_max_uL: dict[str, QLabel] = {}
+        self.row_p_max_pumps: dict[str, QWidget] = {}
+        for pid in ("P1", "P2", "P3"):
+            spin = self._max_spin(
+                maximum=100_000.0, decimals=0, step=10.0, unit="mm/min")
+            uL_lbl = self._resolved_label()
+            row_lay = self._labeled_pct(
+                pid, spin, uL_lbl,
+                tooltip=(f"Maximum {pid} plunger feedrate (mm/min). The µL/s "
+                         f"equivalent — via this pump's syringe — is shown "
+                         f"beside it."))
+            row_w = _QWidget()
+            row_w.setLayout(row_lay)
+            outer.addWidget(row_w)
+            self.spin_p_max_pumps[pid] = spin
+            self.lbl_p_max_uL[pid] = uL_lbl
+            self.row_p_max_pumps[pid] = row_w
+            spin.valueChanged.connect(
+                lambda _v=None, p=pid: self._on_pump_max_changed(p))
 
         self.spin_xy_pct.valueChanged.connect(
             lambda: self._on_speed_pct_changed("xy"))
         self.spin_z_pct.valueChanged.connect(
             lambda: self._on_speed_pct_changed("z"))
-        self.spin_p_pct.valueChanged.connect(
-            lambda: self._on_speed_pct_changed("p"))
         return wrap
 
     def _resolved_label(self) -> QLabel:
@@ -754,10 +772,8 @@ class HardwareControlPanel(QWidget):
         resolvers so this panel reflects the stored ceilings."""
         if not hasattr(self, "spin_xy_pct"):
             return
-        p_max, _unit = self._pump_speed_anchor()   # mm/min in Hardware Setup mode
         for spin, val in ((self.spin_xy_pct, self._max_xy_speed_um_s()),
-                          (self.spin_z_pct, self._max_z_feedrate_mm_min()),
-                          (self.spin_p_pct, p_max)):
+                          (self.spin_z_pct, self._max_z_feedrate_mm_min())):
             try:
                 v = float(val)
             except (TypeError, ValueError):
@@ -770,6 +786,117 @@ class HardwareControlPanel(QWidget):
             except (TypeError, ValueError):
                 pass
             spin.blockSignals(False)
+        self._seed_pump_max_from_controller()
+
+    # ── v7.5.x: per-pump max feedrate (mm/min) + µL/s readout ────
+
+    def _configured_pump_ids(self) -> list[str]:
+        """Configured pump ids from the controller's hardware config; falls back
+        to all three so the section is never empty when no config is present."""
+        ctrl = self._controller
+        hw = getattr(ctrl, "_hardware_config", None) if ctrl is not None else None
+        if hw is not None:
+            try:
+                ids = list(getattr(hw, "configured_pump_ids", []) or [])
+                if ids:
+                    return ids
+            except Exception:
+                pass
+        return ["P1", "P2", "P3"]
+
+    def _seed_pump_max_from_controller(self) -> None:
+        """Seed each per-pump max-feedrate spin (mm/min) from the controller and
+        hide pumps that aren't configured."""
+        pumps = getattr(self, "spin_p_max_pumps", None)
+        if not pumps:
+            return
+        ctrl = self._controller
+        configured = set(self._configured_pump_ids())
+        for pid, spin in pumps.items():
+            row = self.row_p_max_pumps.get(pid)
+            show = pid in configured
+            if row is not None:
+                row.setVisible(show)
+            if not show:
+                continue
+            mm_min = 200.0
+            if ctrl is not None and hasattr(ctrl, "get_pump_max_feedrate_mm_min"):
+                try:
+                    mm_min = float(ctrl.get_pump_max_feedrate_mm_min(pid))
+                except Exception:
+                    mm_min = 200.0
+            elif self._settings is not None:
+                try:
+                    mm_min = float(self._settings.get(
+                        f"safety_limits.max_pump_feedrate_{pid.lower()}", 0.0)) \
+                        or float(self._settings.get(
+                            "safety_limits.max_pump_feedrate", 200.0))
+                except (TypeError, ValueError):
+                    mm_min = 200.0
+            if mm_min <= 0:
+                mm_min = 200.0
+            spin.blockSignals(True)
+            try:
+                spin.setValue(mm_min)
+            except (TypeError, ValueError):
+                pass
+            spin.blockSignals(False)
+            self._update_pump_max_uL(pid)
+
+    def _update_pump_max_uL(self, pump: str) -> None:
+        """Refresh a pump's µL/s secondary readout from its current mm/min spin
+        value and its configured syringe. Shows '—' when no syringe."""
+        lbl = getattr(self, "lbl_p_max_uL", {}).get(pump)
+        spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
+        if lbl is None or spin is None:
+            return
+        mm_min = float(spin.value())
+        uL_s = None
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "pump_feedrate_mm_min_to_uL_s"):
+            try:
+                uL_s = ctrl.pump_feedrate_mm_min_to_uL_s(pump, mm_min)
+            except Exception:
+                uL_s = None
+        try:
+            if uL_s is not None:
+                lbl.setText(f"= {float(uL_s):.3f} µL/s")
+            else:
+                lbl.setText("= — µL/s")
+        except (TypeError, ValueError):
+            lbl.setText("= — µL/s")
+
+    def _on_pump_max_changed(self, pump: str) -> None:
+        """A per-pump max-feedrate spin changed: persist it, refresh the µL/s
+        readout, and fan the change out so every %-of-max surface re-anchors."""
+        spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
+        if spin is None:
+            return
+        self._speed_user_edited["p"] = True
+        self._write_pump_max(pump, float(spin.value()))
+        self._update_pump_max_uL(pump)
+
+    def _write_pump_max(self, pump: str, value: float) -> None:
+        """Write ``value`` (mm/min) as ``pump``'s per-pump max plunger feedrate to
+        the controller + settings, then broadcast the speed-limit change."""
+        ctrl = self._controller
+        s = self._settings
+        if ctrl is not None and hasattr(ctrl, "set_pump_max_feedrate_mm_min"):
+            try:
+                ctrl.set_pump_max_feedrate_mm_min(pump, value)
+            except Exception as e:
+                logger.debug(f"set_pump_max_feedrate_mm_min({pump}) failed: {e}")
+        if s is not None:
+            try:
+                s.set(f"safety_limits.max_pump_feedrate_{pump.lower()}", value)
+                s.save()
+            except Exception:
+                pass
+        if ctrl is not None and hasattr(ctrl, "notify_speed_limits_changed"):
+            try:
+                ctrl.notify_speed_limits_changed()
+            except Exception as e:
+                logger.debug(f"notify_speed_limits_changed failed: {e}")
 
     def _write_axis_max(self, group: str, value: float) -> None:
         """Max mode (Hardware Setup): write ``value`` as the axis's max speed to
@@ -1225,12 +1352,14 @@ class HardwareControlPanel(QWidget):
                 logger.warning(f"jog {pump} {distance:g}% failed: {e}")
             self._force_refresh_positions()
             return
-        # Hardware Setup mm jog — speed = the legacy raw-plunger feedrate.
-        # Max mode: the spin holds the absolute mm/min ceiling directly; percent
-        # mode (legacy / tests): % of the anchor.
+        # Hardware Setup mm jog — speed = the raw-plunger feedrate.
+        # Max mode: the PER-PUMP mm/min spin holds the absolute ceiling for this
+        # pump directly; percent mode (legacy / tests): % of the anchor.
         feed, _ = self._pump_speed_anchor()           # mm/min
         if getattr(self, "_speed_as_max", False):
-            feed = max(1.0, self.spin_p_pct.value())
+            spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
+            feed = max(1.0, float(spin.value())) if spin is not None \
+                else max(1.0, feed)
         else:
             feed = self.spin_p_pct.value() / 100.0 * feed
         bypass = self._bypass_safety

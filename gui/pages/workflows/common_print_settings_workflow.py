@@ -137,13 +137,13 @@ class CommonPrintSettingsWorkflowPage(QWidget):
         self._body.addWidget(pump)
         self._add_row(
             pump, "pump_settle_time_s", "Dwell after syringe moves",
-            self._dspin(0.0, 10.0, 0.05, 2, " s"),
+            self._dspin(0.0, 30.0, 0.05, 2, " s"),
             "Settle dwell held before AND after every discrete pump move "
             "(aspirate / dispense / prep) so the fluid settles before the "
             "workflow advances.")
         self._add_row(
             pump, "pump_prime_time_s", "Prime time",
-            self._dspin(0.0, 10.0, 0.05, 2, " s"),
+            self._dspin(0.0, 30.0, 0.05, 2, " s"),
             "Pre-flow lead-in printing workflows use to prime the needle "
             "(prime volume = flow × time).")
 

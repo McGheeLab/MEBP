@@ -1436,10 +1436,13 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._update_button_state()
             return
         channel = self._capture_queue[self._capture_index]
+        num = fms.channel_number(channel)
+        ch_label = (f"{channel} channel ({num})" if num is not None
+                    else f"{channel} channel")
         resp = QMessageBox.information(
             self, "Set filter",
             f"Set the microscope filter / illumination for the "
-            f"{channel} channel, focus if needed, then click OK to scan.\n\n"
+            f"{ch_label}, focus if needed, then click OK to scan.\n\n"
             f"(Cancel stops the capture.)",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Ok)

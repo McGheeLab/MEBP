@@ -1,0 +1,67 @@
+{
+  "schema_version": "1.0",
+  "name": "PCR 0.2",
+  "description": "",
+  "units": "mm",
+  "outline": {
+    "kind": "circle",
+    "width": 15.6,
+    "height": 15.6,
+    "radius": 7.8,
+    "polygon": [],
+    "origin_point": 1
+  },
+  "entities": {
+    "1": {
+      "type": "Point",
+      "id": 1,
+      "construction": false,
+      "fixed": true,
+      "x": 0.0,
+      "y": 0.0
+    },
+    "2": {
+      "type": "Point",
+      "id": 2,
+      "construction": false,
+      "fixed": false,
+      "x": 2.946001279590531,
+      "y": -2.7164427383237366
+    },
+    "3": {
+      "type": "Well",
+      "id": 3,
+      "construction": false,
+      "fixed": false,
+      "name": "a",
+      "center": 2,
+      "diameter": 6.0,
+      "well_depth_mm": 10.67,
+      "bottom_z_offset": 0.0,
+      "group": null,
+      "naming_scheme": "MANUAL",
+      "rosette_design": null,
+      "rosette_rotation_deg": 0.0,
+      "rim_height_mm": 4.0,
+      "ink_z_mm": 1.0
+    }
+  },
+  "constraints": [
+    {
+      "id": 1,
+      "kind": "ground",
+      "refs": [
+        1
+      ],
+      "value": null,
+      "weight": 1.0,
+      "snapshot": null,
+      "mode": "center"
+    }
+  ],
+  "a1_offset_x": 14.38,
+  "a1_offset_y": 11.24,
+  "well_depth_default_mm": 10.67,
+  "_next_entity_id": 4,
+  "_next_constraint_id": 2
+}

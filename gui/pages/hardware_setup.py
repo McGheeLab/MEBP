@@ -844,7 +844,7 @@ class HardwareSetupPage(ModePage):
 
         timing_lay.addWidget(QLabel("Settle time:"), 0, 0)
         self._pump_settle_spin = QDoubleSpinBox()
-        self._pump_settle_spin.setRange(0.0, 10.0)
+        self._pump_settle_spin.setRange(0.0, 30.0)
         self._pump_settle_spin.setDecimals(2)
         self._pump_settle_spin.setSingleStep(0.05)
         self._pump_settle_spin.setSuffix(" s")
@@ -858,7 +858,7 @@ class HardwareSetupPage(ModePage):
 
         timing_lay.addWidget(QLabel("Prime time:"), 1, 0)
         self._pump_prime_spin = QDoubleSpinBox()
-        self._pump_prime_spin.setRange(0.0, 10.0)
+        self._pump_prime_spin.setRange(0.0, 30.0)
         self._pump_prime_spin.setDecimals(2)
         self._pump_prime_spin.setSingleStep(0.05)
         self._pump_prime_spin.setSuffix(" s")
@@ -2930,6 +2930,15 @@ class HardwareSetupPage(ModePage):
                 f"hard-capped on all pumps; bounds the max print speed")
         else:
             lbl.setText("Max safe pump flow: — (configure the needle bore)")
+        # v7.5.x: a syringe/pump change alters each pump's per-pump max-rate
+        # µL/s equivalent — re-seed the control panel's per-pump speed rows so a
+        # newly-configured pump appears and its µL/s readout tracks the syringe.
+        cp = getattr(self, "_control_panel", None)
+        if cp is not None and hasattr(cp, "refresh_speed_limits"):
+            try:
+                cp.refresh_speed_limits()
+            except Exception:
+                pass
 
     # ── v7.5.x: Plate TYPE (product) selection ────────────────────────
 
@@ -3357,6 +3366,13 @@ class HardwareSetupPage(ModePage):
             "Clear reagent", "trash", object_name="dangerBtn")
         btn_clear_ink.clicked.connect(self._loc_clear_ink)
         loc_btns.addWidget(btn_clear_ink)
+        btn_clear_all = icon_button(
+            "Clear all wells", "trash", object_name="dangerBtn")
+        btn_clear_all.setToolTip(
+            "Remove every reagent → well assignment (fresh ink landscape); "
+            "also wipes stale/hidden entries.")
+        btn_clear_all.clicked.connect(self._loc_clear_all)
+        loc_btns.addWidget(btn_clear_all)
         loc_btns.addStretch()
         loc_lay.addLayout(loc_btns)
 
@@ -3566,6 +3582,30 @@ class HardwareSetupPage(ModePage):
         self._refresh_loc_colors()
         self._refresh_loc_summary()
         self._on_loc_ink_changed()  # re-highlight (now empty)
+        self._on_config_changed()
+
+    def _loc_clear_all(self):
+        """Clear EVERY reagent's pinned wells — a fresh-start reset.
+
+        Wipes the whole ``ink_locations`` map, including any stale/hidden
+        entries (e.g. a flattened-rosette parent no longer shown in the
+        picker), so a new ink landscape starts with no residual members.
+        """
+        if not self._config.ink_locations:
+            return
+        if QMessageBox.question(
+            self, "Clear all reagent locations",
+            "Remove ALL reagent → well assignments?\n\n"
+            "This wipes every reagent's pinned wells — including any stale or "
+            "hidden entries (e.g. a rosette parent no longer shown) — so you "
+            "can set up a fresh ink landscape. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        self._config.clear_all_ink_locations()
+        self._refresh_loc_colors()
+        self._refresh_loc_summary()
+        self._on_loc_ink_changed()  # clear the highlight
         self._on_config_changed()
 
     # ════════════════════════════════════════════════════════════════

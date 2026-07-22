@@ -166,12 +166,14 @@ class TestMovePumpSettle(unittest.TestCase):
 
     def test_settle_true_brackets_and_waits(self):
         # settle=0.2; vol=2 µL at 10 µL/s → completion wait = 2/10 + 0.1 = 0.3.
+        # v7.5.x: the pre-move settle was dropped — a non-compensated settled
+        # move now dwells only AFTER it drains (completion wait, then a single
+        # post-move settle).
         c = _ctrl(settle=0.2)
         sleeps = self._run(c, settle=True)
-        self.assertEqual(len(sleeps), 3)            # pre, complete, post
-        self.assertAlmostEqual(sleeps[0], 0.2)      # pre-move settle
-        self.assertAlmostEqual(sleeps[1], 0.3)      # completion wait
-        self.assertAlmostEqual(sleeps[2], 0.2)      # post-move settle
+        self.assertEqual(len(sleeps), 2)            # complete, post
+        self.assertAlmostEqual(sleeps[0], 0.3)      # completion wait
+        self.assertAlmostEqual(sleeps[1], 0.2)      # post-move settle
         self.assertEqual(len(c.pump_moves), 1)
 
     def test_settle_true_zero_dwell_still_waits_for_completion(self):
@@ -275,13 +277,15 @@ class TestMovePumpSettleM400Confirm(unittest.TestCase):
         self.assertEqual(len(c.zp_stage.flush_calls), 1)
 
     def test_settle_dwell_still_brackets_flush_path(self):
-        # The pre/post settle dwell is still applied around the M400 drain.
+        # v7.5.x: the pre-move settle was dropped; a non-compensated settled move
+        # now dwells only AFTER the M400 drain (a single post-move settle, no
+        # pre-move and no mid sleep — flush confirms so no fallback sleep).
         c = _ctrl_with_zp(settle=0.2, flush_result=True)
         sleeps = []
         with mock.patch("SupportClasses.StageController.time.sleep",
                         side_effect=sleeps.append):
             c.move_pump_uL("P1", 2.0, rate_uL_s=10.0, settle=True)
-        self.assertEqual(sleeps, [0.2, 0.2])          # pre + post, no mid sleep
+        self.assertEqual(sleeps, [0.2])               # post-move only
         self.assertEqual(len(c.zp_stage.flush_calls), 1)
 
     def test_flush_drain_timeout_capped_at_backstop(self):

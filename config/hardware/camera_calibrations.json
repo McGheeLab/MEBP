@@ -41,9 +41,9 @@
       "hw_controls": {
         "auto_exposure": false,
         "exposure_us": 50000,
-        "exposure_gain_pct": 2152,
+        "exposure_gain_pct": 3435,
         "gamma": 64,
-        "brightness": -17,
+        "brightness": 22,
         "contrast": 2,
         "resolution": [
           3664,

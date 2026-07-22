@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "fluorescence_mosaic",
   "name": "__last__",
-  "saved": "2026-07-08T15:26:00",
+  "saved": "2026-07-12T16:57:50",
   "values": {
     "target_px": 2500,
     "well_margin": 1.15

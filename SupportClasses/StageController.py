@@ -1184,6 +1184,14 @@ class PositionPoller:
         self._zp_pos: tuple = (None, None, None, None)
         self._suspended = False  # v7.3.4: pause polling during programmatic moves
 
+        # v7.5.x: XY travel odometer. ``on_xy_travel(dist_um)`` is fired for each
+        # poll sample with the straight-line XY distance from the previous
+        # sample, so ALL motion (jog + programmatic) is captured at one point.
+        # ``_last_odom_xy`` is the previous absolute-µm (x, y); reset to None on
+        # (re)connect/disconnect so we never diff across a coordinate re-frame.
+        self.on_xy_travel: Callable | None = None
+        self._last_odom_xy: tuple | None = None
+
         # v7.2.7: init _hardware_config
         self._hardware_config = None
 
@@ -1230,6 +1238,9 @@ class PositionPoller:
                 self._zp_pos = (None, None, None, None)
             # v7.5.x: fresh liveness window for any (re)connect/disconnect.
             self._zp_fail_count = 0
+            # v7.5.x: a new/changed XY stage means a new coordinate frame — drop
+            # the odometer's previous sample so we don't count a phantom jump.
+            self._last_odom_xy = None
 
     @property
     def xy_position(self) -> tuple:
@@ -1253,6 +1264,22 @@ class PositionPoller:
         if self._thread:
             self._thread.join(timeout=2.0)
 
+    def _accumulate_xy_travel(self, x_um: float, y_um: float) -> None:
+        """Fire ``on_xy_travel`` with the straight-line distance from the
+        previous poll sample. Best-effort — a callback error must never break
+        polling. Called from the poll thread with a fresh (x, y) in µm."""
+        prev = self._last_odom_xy
+        self._last_odom_xy = (x_um, y_um)
+        cb = self.on_xy_travel
+        if prev is None or cb is None:
+            return
+        try:
+            dist = math.hypot(x_um - prev[0], y_um - prev[1])
+            if dist > 0.0:
+                cb(dist)
+        except Exception as e:
+            logger.debug(f"XY odometer error: {e}")
+
     def _poll_loop(self) -> None:
         while self._running:
             if self._suspended:
@@ -1265,9 +1292,10 @@ class PositionPoller:
             if xy is not None:
                 try:
                     pos = xy.get_current_position()
-                    if pos[0] is not None:
+                    if pos[0] is not None and pos[1] is not None:
                         with self._lock:
                             self._xy_pos = pos
+                        self._accumulate_xy_travel(pos[0], pos[1])
                         if _dbg.is_enabled() and getattr(xy, 'simulate', False):
                             _dbg.log("POLL", pos_x=pos[0], pos_y=pos[1], pos_z=pos[2],
                                      note="simulated")
@@ -1418,6 +1446,9 @@ class StageController:
         # answering position queries (covers board power-off with USB still
         # attached, which the port-handle watchdog cannot see).
         self._pos_poller.on_zp_lost = lambda: self._handle_disconnect("ZP")
+        # v7.5.x: XY travel odometer for the calibration-usability pop-up —
+        # accumulate every poll-sample chord into the per-machine store.
+        self._pos_poller.on_xy_travel = self._note_xy_travel_um
         self._pos_poller.start()
 
         # v7.5.x: display-only motion interpolation. A jog/travel move is
@@ -2988,6 +3019,47 @@ class StageController:
         fallback. Delegates to :meth:`_pump_jog_max_native`."""
         return self._pump_jog_max_native()
 
+    # ── v7.5.x: per-pump max plunger feedrate (mm/min) + µL/s readout ──
+
+    def get_pump_max_feedrate_mm_min(self, pump: str = "P1") -> float:
+        """This pump's max plunger feedrate (mm/min) — its own override when set,
+        else the global ``safety_limits.max_pump_feedrate``."""
+        sl = self.safety_limits
+        if sl is not None and hasattr(sl, "pump_feedrate_max"):
+            try:
+                return float(sl.pump_feedrate_max(pump))
+            except Exception:
+                pass
+        if sl is not None:
+            try:
+                return float(getattr(sl, "max_pump_feedrate", 200.0))
+            except (TypeError, ValueError):
+                pass
+        return 200.0
+
+    def set_pump_max_feedrate_mm_min(self, pump: str, feedrate_mm_min: float) -> None:
+        """Set this pump's per-pump max plunger feedrate (mm/min)."""
+        sl = self.safety_limits
+        if sl is not None and hasattr(sl, "set_pump_feedrate_max"):
+            try:
+                sl.set_pump_feedrate_max(pump, feedrate_mm_min)
+            except Exception as e:
+                logger.debug(f"set_pump_max_feedrate_mm_min({pump}) failed: {e}")
+
+    def pump_feedrate_mm_min_to_uL_s(self, pump: str, mm_min: float) -> float | None:
+        """Convert a plunger feedrate (mm/min) to a volumetric rate (µL/s) via
+        this pump's configured syringe. None when the pump has no syringe."""
+        try:
+            return self._pump_mm_to_uL(pump, float(mm_min) / 60.0)
+        except (TypeError, ValueError):
+            return None
+
+    def pump_max_feedrate_uL_s(self, pump: str = "P1") -> float | None:
+        """This pump's max plunger feedrate expressed as a volumetric rate (µL/s)
+        via its configured syringe. None when the pump has no syringe."""
+        return self.pump_feedrate_mm_min_to_uL_s(
+            pump, self.get_pump_max_feedrate_mm_min(pump))
+
     def notify_speed_limits_changed(self) -> None:
         """Re-apply the per-axis anchors to the jog handlers and fan the change
         out to the GUI (via ``on_speed_limits_changed``) so every page re-reads
@@ -3418,6 +3490,15 @@ class StageController:
             if not cache or cache[0] is None:
                 return
             self._note_move_estimate_xy(cache[0] + dx_um, cache[1] + dy_um)
+        except Exception:
+            pass
+
+    def _note_xy_travel_um(self, dist_um: float) -> None:
+        """Forward a poll-sample XY travel chord (µm) to the calibration-status
+        odometer. Best-effort — never raise into the poll thread."""
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().add_xy_travel_um(dist_um)
         except Exception:
             pass
 
@@ -4628,7 +4709,7 @@ class StageController:
             return
         distance = distance * self.pump_dir_sign(pump)
         if feedrate and self.safety_limits.enabled and not bypass_safety:
-            feedrate = self.safety_limits.clamp_pump_feedrate(feedrate)
+            feedrate = self.safety_limits.clamp_pump_feedrate(feedrate, pump)
         if self.safety_limits.enabled and not bypass_safety:
             try:
                 pos = self.get_zp_position(cached=True)
@@ -4766,6 +4847,12 @@ class StageController:
         self._shutting_down = True
         self._watchdog.stop()
         self._pos_poller.stop()
+        # v7.5.x: persist any throttled XY-odometer accumulation before exit.
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().flush()
+        except Exception:
+            pass
         self.disconnect_xbox()
         self.disconnect_stages()
         self.processor.stop()
@@ -5002,55 +5089,53 @@ class StageController:
         c_uL = self.pump_relief_uL(pump) if do_comp else 0.0
         comp = do_comp and c_uL > 0 and volume_uL != 0
         comp_dir = 1.0 if volume_uL > 0 else -1.0
+        # Dwell duration + whether to block each sub-move for completion. The
+        # settle dwell fires on engagement state transitions — INTO engaged
+        # (after take-up) and INTO neutral (after unload) — and after a plain
+        # settled non-compensated move. It applies to any discrete actuation
+        # (settle=True) AND any compensated move, so a forced compensate=True
+        # move dwells + blocks even when settle=False.
+        settle_s = self.pump_settle_time_s() if (settle or comp) else 0.0
+        wait_complete = settle or comp
+
         if comp:
-            # TAKE-UP: load the flex in the fluid direction (no net fluid) so the
-            # commanded volume actually flows.
+            # TAKE-UP (neutral → engaged): load the flex in the fluid direction
+            # (no net fluid) so the commanded volume actually flows. settle=False
+            # so the recursion just issues the move; we block + dwell HERE so the
+            # drivetrain settles INTO the engaged state before the fluid move.
             logger.debug(f"move_pump_uL({pump}): backlash take-up "
                          f"{c_uL * comp_dir:+.4f} µL")
             self.move_pump_uL(pump, c_uL * comp_dir, rate_uL_s=rate_uL_s,
-                              settle=settle, compensate=False)
+                              settle=False, compensate=False)
+            self._finish_pump_submove(c_uL, rate_uL_s,
+                                      block=wait_complete, dwell_s=settle_s)
 
-        # v7.5.x: discrete-actuation settle. The dwell brackets the move so the
-        # fluid/pressure settles and the caller does not advance until the pump
-        # has finished. settle=False (streamed print path, manual jog) is a pure
-        # passthrough — unchanged behavior.
-        settle_s = self.pump_settle_time_s() if settle else 0.0
-        if settle_s > 0:
-            time.sleep(settle_s)               # pre-move settle
-
+        # MAIN fluid move (stays engaged / positive flow). Block so the caller
+        # (or the unload below) does not advance while the pump is still moving —
+        # e.g. a following safe_travel_to whose Z-retract M400 would otherwise
+        # have to absorb a still-running pump move and time out. No dwell here:
+        # the main move is not a neutral↔engaged transition.
         self.move_pump_relative(pump, distance_mm, feedrate_mm_min)
+        self._finish_pump_submove(volume_uL, rate_uL_s,
+                                  block=wait_complete, dwell_s=0.0)
 
-        if settle:
-            # Block until the move PHYSICALLY completes (the G0 returned on
-            # `ok` = admitted to the planner, not motion-complete) so the
-            # caller's next step — typically a safe_travel_to whose Z-retract
-            # M400 would otherwise have to absorb this still-running pump move
-            # and time out — does not start while the pump is still moving.
-            eff_rate = (abs(rate_uL_s) if rate_uL_s
-                        else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
-            move_s = abs(volume_uL) / max(eff_rate, 0.001) + 0.1
-            if self._wait_pump_move_complete(move_s) is None:
-                # No board confirmation available (older controller / fake
-                # without flush_moves) — fall back to an open-loop sleep of the
-                # FULL estimated duration (no 10 s truncation; that truncation
-                # is what left a long buffer aspirate running into the next
-                # M400 and aborted the run).
-                time.sleep(min(move_s, _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S))
-            if settle_s > 0:
-                time.sleep(settle_s)           # post-move settle
-
-        # v7.5.x: backlash / compliance UNLOAD. After the fluid move completes,
-        # release the stored flex by moving −c (opposite the fluid direction),
-        # leaving the tip pressure-neutral before the stage travels. Net fluid ≈
-        # the commanded volume (the take-up + unload cancel in net plunger
-        # travel). Recurses with compensate=False (base case). This subsumes the
-        # old direction-aware "pressure relief" (dispense-back after an aspirate /
-        # suck-back after a dispense).
         if comp:
+            # UNLOAD (engaged → neutral): release the stored flex by moving −c
+            # (opposite the fluid direction) so the tip is pressure-neutral, then
+            # dwell so the released flex equilibrates INTO the neutral state. Net
+            # fluid ≈ the commanded volume (take-up + unload cancel in net plunger
+            # travel). Subsumes the old direction-aware "pressure relief"
+            # (dispense-back after an aspirate / suck-back after a dispense).
             logger.debug(f"move_pump_uL({pump}): backlash unload "
                          f"{-c_uL * comp_dir:+.4f} µL")
             self.move_pump_uL(pump, -c_uL * comp_dir, rate_uL_s=rate_uL_s,
-                              settle=settle, compensate=False)
+                              settle=False, compensate=False)
+            self._finish_pump_submove(c_uL, rate_uL_s,
+                                      block=wait_complete, dwell_s=settle_s)
+        elif settle_s > 0:
+            # Plain settled move (no compensation): dwell after it drains so the
+            # caller does not advance until the pump has settled.
+            time.sleep(settle_s)
 
     def _wait_pump_move_complete(self, move_s: float) -> bool | None:
         """Block until the pump's in-flight move drains from Marlin's planner.
@@ -5085,6 +5170,26 @@ class StageController:
             return None
         finally:
             self.resume_position_poller()
+
+    def _finish_pump_submove(self, vol_uL: float, rate_uL_s: float | None,
+                             *, block: bool, dwell_s: float) -> None:
+        """Settle one just-issued pump sub-move (take-up / main / unload).
+
+        When ``block`` is True, wait for the sub-move to PHYSICALLY drain from
+        Marlin's planner (via :meth:`_wait_pump_move_complete`, falling back to
+        an open-loop sleep of the estimated duration when no board can confirm)
+        so the caller does not advance while the pump is still moving. Then, if
+        ``dwell_s > 0``, sleep the configured settle dwell so the drivetrain
+        equilibrates at its new neutral/engaged state before the next step.
+        """
+        if block:
+            eff_rate = (abs(rate_uL_s) if rate_uL_s
+                        else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
+            sub_s = abs(vol_uL) / max(eff_rate, 0.001) + 0.1
+            if self._wait_pump_move_complete(sub_s) is None:
+                time.sleep(min(sub_s, _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S))
+        if dwell_s > 0:
+            time.sleep(dwell_s)
 
     def get_pump_position_uL(self, pump: str) -> float | None:
         """

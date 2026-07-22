@@ -213,6 +213,8 @@ class StageHardwarePanel(QWidget):
         outer.addWidget(self._build_setup_jog_safety_group())
         outer.addWidget(self._build_override_position_group())
         outer.addWidget(self._build_zp_feedrates_group())
+        # v7.5.x: recalibration-reminder thresholds + calibration-status pop-up.
+        outer.addWidget(self._build_recal_reminders_group())
         # v7.4.2 hotfix: Axis Direction Flips section removed — direction
         # inversion now lives exclusively in steps_per_mm sign (see the
         # Stepper Calibration "Invert Axis Direction" button). axis_flip
@@ -489,6 +491,98 @@ class StageHardwarePanel(QWidget):
     # JogButtonArray (XY pad + Z buttons + pumps + step selectors) is
     # embedded here so the user can run the whole find-the-mechanical-
     # envelope workflow on one screen.
+
+    def _build_recal_reminders_group(self) -> QGroupBox:
+        """v7.5.x: recalibration-reminder thresholds (M distance / H hours) plus
+        a "Calibration status…" button. These drive the usability pop-up that
+        reports when XY / Z / P were last calibrated and warns when a threshold
+        is crossed. Owned by the per-machine ``CalibrationStatusStore`` (not
+        ``HardwareConfig``) since only the pop-up consumes them."""
+        grp = QGroupBox("Recalibration Reminders")
+        grp.setStyleSheet(SECTION_TITLE_STYLE)
+        outer = QVBoxLayout(grp)
+
+        info = QLabel(
+            "Warn me to recalibrate X/Y when the stage has traveled more than "
+            "<b>M</b> since the last XY calibration, or to update when it has "
+            "been more than <b>H</b> since a calibration. Set either to 0 to "
+            "turn that warning off.")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {COLORS['subtext0']};")
+        outer.addWidget(info)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(s(10))
+
+        self.spin_recal_travel_mm = QDoubleSpinBox()
+        self.spin_recal_travel_mm.setRange(0.0, 1_000_000.0)
+        self.spin_recal_travel_mm.setDecimals(0)
+        self.spin_recal_travel_mm.setSingleStep(100.0)
+        self.spin_recal_travel_mm.setSuffix(" mm")
+        self.spin_recal_travel_mm.setMinimumWidth(s(130))
+        self.spin_recal_travel_mm.setToolTip(
+            "M — XY travel since the last XY calibration that triggers a "
+            "“recalibrate X/Y” warning. 0 = off.")
+        form.addRow("XY travel limit (M):", self.spin_recal_travel_mm)
+
+        self.spin_recal_hours = QDoubleSpinBox()
+        self.spin_recal_hours.setRange(0.0, 100_000.0)
+        self.spin_recal_hours.setDecimals(1)
+        self.spin_recal_hours.setSingleStep(12.0)
+        self.spin_recal_hours.setSuffix(" h")
+        self.spin_recal_hours.setMinimumWidth(s(130))
+        self.spin_recal_hours.setToolTip(
+            "H — hours since a calibration that triggers an “update” "
+            "warning. 0 = off.")
+        form.addRow("Time limit (H):", self.spin_recal_hours)
+
+        outer.addLayout(form)
+
+        # Seed the spinboxes from the store's persisted thresholds.
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            m_mm, h_hours = get_store().get_thresholds()
+            self.spin_recal_travel_mm.setValue(float(m_mm))
+            self.spin_recal_hours.setValue(float(h_hours))
+        except Exception:
+            pass
+
+        row = QHBoxLayout()
+        btn_save = icon_button(
+            "Save Reminders", "save", object_name="successBtn",
+            tooltip="Persist the M / H thresholds used by the pop-up.")
+        btn_save.clicked.connect(self._apply_recal_reminders)
+        row.addWidget(btn_save)
+        btn_status = QPushButton("Calibration status…")
+        btn_status.setCursor(Qt.PointingHandCursor)
+        btn_status.setToolTip(
+            "Show when XY, Z and the pump were last calibrated, with any "
+            "recalibration warnings.")
+        btn_status.clicked.connect(self._show_calibration_status)
+        row.addWidget(btn_status)
+        row.addStretch()
+        outer.addLayout(row)
+
+        return grp
+
+    def _apply_recal_reminders(self) -> None:
+        """Persist the M / H recalibration thresholds to the store."""
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().set_thresholds(
+                m_mm=float(self.spin_recal_travel_mm.value()),
+                h_hours=float(self.spin_recal_hours.value()))
+        except Exception as e:
+            logger.warning(f"Save recalibration reminders failed: {e}")
+
+    def _show_calibration_status(self) -> None:
+        """Open the calibration-status pop-up on demand (always shows)."""
+        try:
+            from gui.dialogs.calibration_status_dialog import (
+                show_calibration_status)
+            show_calibration_status(self, force=True)
+        except Exception as e:
+            logger.warning(f"Calibration status dialog failed: {e}")
 
     def _build_setup_jog_safety_group(self) -> QGroupBox:
         grp = QGroupBox("Jog && Safety Limits")
@@ -2391,6 +2485,12 @@ class StageHardwarePanel(QWidget):
                 self._persist_active_profile()
             except Exception:
                 pass
+        # v7.5.x: record the Z-axis calibration time for the usability pop-up.
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().mark_calibrated("z")
+        except Exception:
+            pass
         try:
             self._refresh_jog_positions()
         except Exception:
@@ -2610,6 +2710,12 @@ class StageHardwarePanel(QWidget):
             s.save()
         except Exception as e:
             logger.warning(f"Pump plunger setup persist failed ({pump}): {e}")
+        # v7.5.x: record the pump (P) calibration time for the usability pop-up.
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().mark_calibrated("p")
+        except Exception:
+            pass
         try:
             self._persist_active_profile()
         except Exception:

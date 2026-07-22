@@ -69,6 +69,12 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
             lambda: StageController.get_max_pump_feedrate(c)
         c._pump_jog_max_native.side_effect = \
             lambda: StageController._pump_jog_max_native(c)
+        # v7.5.x: per-pump max feedrate (mm/min) + µL/s readout. safety_limits is
+        # a MagicMock here, so return the real global directly; no syringe → µL/s
+        # readout is '—'.
+        c.get_pump_max_feedrate_mm_min.side_effect = \
+            lambda pid="P1": float(c.safety_limits.max_pump_feedrate)
+        c.pump_feedrate_mm_min_to_uL_s.side_effect = lambda pid, mm: None
         c.get_jog_speed_state.return_value = {}
         return c
 
@@ -100,10 +106,11 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
         p, _ = self._panel(speed_as_max=True)
         self.assertEqual(p.spin_xy_pct.suffix().strip(), "µm/s")
         self.assertEqual(p.spin_z_pct.suffix().strip(), "mm/min")
-        self.assertEqual(p.spin_p_pct.suffix().strip(), "mm/min")
         self.assertAlmostEqual(p.spin_xy_pct.value(), 20000.0)
         self.assertAlmostEqual(p.spin_z_pct.value(), 600.0)
-        self.assertAlmostEqual(p.spin_p_pct.value(), 200.0)
+        # v7.5.x: pump max rate is now PER-PUMP (mm/min primary + µL/s readout).
+        self.assertEqual(p.spin_p_max_pumps["P1"].suffix().strip(), "mm/min")
+        self.assertAlmostEqual(p.spin_p_max_pumps["P1"].value(), 200.0)
 
     # 3 — editing XY max writes the shared source + persists + notifies
     def test_max_mode_edit_writes_source(self):
@@ -135,7 +142,7 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
     # 5b — max-mode pump jog is raw mm at the absolute feedrate
     def test_max_mode_pump_jog_absolute_feed(self):
         p, c = self._panel(speed_as_max=True, settings=_Settings())
-        p.spin_p_pct.setValue(150)
+        p.spin_p_max_pumps["P1"].setValue(150)
         p._on_jog_pump("P1", 0.1)
         self.assertTrue(c.move_pump_relative.called)
         self.assertFalse(c.move_pump_uL.called)

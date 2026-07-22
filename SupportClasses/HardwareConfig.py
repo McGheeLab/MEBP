@@ -547,15 +547,42 @@ class HardwareConfig:
                 self.ink_locations.pop(other, None)
 
         existing = [] if replace else list(self.ink_locations.get(ink_name, []))
-        merged = list(dict.fromkeys(existing + wells))
+        merged = self._drop_redundant_parents(
+            list(dict.fromkeys(existing + wells)))
         if merged:
             self.ink_locations[ink_name] = merged
         else:
             self.ink_locations.pop(ink_name, None)
 
+    @staticmethod
+    def _drop_redundant_parents(wells: list[str]) -> list[str]:
+        """Drop a flattened-rosette PARENT (e.g. ``"A2"``) from a reagent's
+        well list when a sub-well of it (``"A2.a"``) is also present.
+
+        Once a plain well becomes a rosette its bare parent name is no longer a
+        real pickup well (``compile()`` replaces it with ``A2.a/b/c``), but
+        ``ink_locations`` is append-only so the stale parent lingers — usually
+        at index 0 — and pickup then resolves to the sub-well *centroid* instead
+        of the intended sub-well. This is a pure string rule (a sub-well is any
+        name containing ``"."``), so it is plate-independent and safe across
+        plate switches: it only removes a parent that is redundant *within the
+        same list*, never a well merely absent from the current plate.
+        """
+        sub_parents = {w.split(".", 1)[0] for w in wells if "." in w}
+        return [w for w in wells if w not in sub_parents]
+
     def clear_ink_location(self, ink_name: str) -> None:
         """Remove all reagent-location wells for an ink."""
         self.ink_locations.pop(ink_name, None)
+
+    def clear_all_ink_locations(self) -> None:
+        """Remove EVERY reagent → well assignment (fresh ink landscape).
+
+        A hard reset that also wipes any stale/hidden entries (e.g. a
+        flattened-rosette parent no longer shown in the picker) so a new ink
+        landscape starts with no residual members.
+        """
+        self.ink_locations = {}
 
     def unassign_well(self, well_name: str) -> None:
         """Remove ``well_name`` from whichever ink currently owns it."""
@@ -585,7 +612,11 @@ class HardwareConfig:
         for ink_name, wells in self.ink_locations.items():
             if ink_name not in self.ink_library:
                 continue
-            clean = [w for w in dict.fromkeys(wells) if w]
+            # De-dupe + drop a redundant flattened-rosette parent (e.g. "A2"
+            # left over when a sub-well "A2.a" is also assigned). One-time
+            # migration on load: legacy ["A2", "A2.a"] → ["A2.a"].
+            clean = self._drop_redundant_parents(
+                [w for w in dict.fromkeys(wells) if w])
             if clean:
                 pruned[ink_name] = clean
         self.ink_locations = pruned

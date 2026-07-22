@@ -13054,6 +13054,33 @@ class CalibrationPage(QWidget):
         self.settings.save()
         logger.info("Calibration saved to settings (v7.2.7) [key=%s]",
                     archive_key)
+        # v7.5.x: record the XY calibration TIME for the usability pop-up. This
+        # one save funnel is reached by every XY teach path (auto-fit, manual
+        # warp, 3-well, click-rim) AND by Z-only saves — so stamp XY only when a
+        # real plate calibration is present AND the XY-defining data actually
+        # changed since the last stamp (a Z-reference save leaves the XY
+        # signature untouched, so it won't bump the XY time).
+        try:
+            if self._has_plate_calibration():
+                import json as _json
+                _xy_keys = ("taught_a1", "taught_corner", "offset_x",
+                            "offset_y", "rotation", "scale", "mosaic_affine",
+                            "plate_warp", "calibrated_positions")
+                _sig = _json.dumps(
+                    {k: cal_data.get(k) for k in _xy_keys},
+                    sort_keys=True, default=str)
+                if getattr(self, "_xy_cal_loaded", False):
+                    # First save after loading an EXISTING calibration — seed
+                    # the signature so a restore is not counted as a (re)teach.
+                    self._xy_cal_signature = _sig
+                    self._xy_cal_loaded = False
+                elif _sig != getattr(self, "_xy_cal_signature", None):
+                    self._xy_cal_signature = _sig
+                    from SupportClasses.CalibrationStatusStore import (
+                        get_store as _get_cal_status_store)
+                    _get_cal_status_store().mark_calibrated("xy")
+        except Exception as e:
+            logger.debug(f"XY calibration timestamp skipped: {e}")
         # v7.5.x: refresh the durable last-known-good snapshot (needle zero +
         # plate + Z + hardware fingerprint) so a future restart can offer to
         # restore the whole calibration as a unit. Gated on a real plate
@@ -13401,6 +13428,11 @@ class CalibrationPage(QWidget):
                 logger.debug(f"Could not restore mosaic affine: {e}")
 
         logger.info("Calibration loaded from settings (v7.2.7)")
+        # v7.5.x: mark that the XY calibration was RESTORED (not re-taught) so
+        # the next auto-save seeds the change-signature without stamping a new
+        # "last calibrated" time. Only when a real plate calibration loaded.
+        if self._has_plate_calibration():
+            self._xy_cal_loaded = True
         self._emit_calibration_data_changed()
 
     # ════════════════════════════════════════════════════════════════

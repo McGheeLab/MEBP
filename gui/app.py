@@ -170,6 +170,10 @@ class MainWindow(QMainWindow):
         # v7.5.x: once-per-session guard for the last-known calibration restore
         # prompt (needle zero + plate + Z) — see _maybe_prompt_calibration_restore.
         self._calibration_restore_prompted = False
+        # v7.5.x: once-per-session guard for the calibration-usability pop-up
+        # (XY/Z/P last-calibrated + recalibration warnings). See
+        # _maybe_show_calibration_status.
+        self._usability_prompted = False
         self.stage_connected.connect(self._on_stage_connected)
         self.controller.on_connect = self._emit_stage_connected
 
@@ -994,6 +998,13 @@ class MainWindow(QMainWindow):
         # opens mid-construction. See _maybe_prompt_calibration_restore.
         QTimer.singleShot(450, self._maybe_prompt_calibration_restore)
 
+        # v7.5.x: after the restore prompt, show the calibration-usability
+        # pop-up (when XY/Z/P were last calibrated + recalibration warnings) —
+        # but only if something needs attention. Deferred a little longer so it
+        # never stacks on top of the restore prompt. See
+        # _maybe_show_calibration_status.
+        QTimer.singleShot(900, self._maybe_show_calibration_status)
+
     # ════════════════════════════════════════════════════════════════
     #  v7.2.3: JOB PIPELINE & EXECUTION CONTROL WIRING
     # ════════════════════════════════════════════════════════════════
@@ -1322,6 +1333,18 @@ class MainWindow(QMainWindow):
                     recorder=pm.recorder,
                     exec_logger=pm.exec_logger,
                 )
+
+                # v7.5.x CRITICAL: register the hybrid executor on the
+                # PrintManager so Monitor → Abort (→ pm.abort()) reaches it.
+                # pm.abort() does `if self._trajectory_executor:
+                # self._trajectory_executor.abort()`; without this assignment
+                # that flag never gets set, so abort marked the run ABORTED but
+                # the executor thread kept printing the REST of the plan (every
+                # remaining well / step) — "abort only stopped the current task,
+                # not the whole print". HybridPlanExecutor polls its own
+                # _abort_flag between steps and per well, so this cancels the
+                # entire run at the next boundary.
+                pm._trajectory_executor = executor
 
                 # Estimate total print time
                 try:
@@ -2378,6 +2401,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _maybe_show_calibration_status(self) -> None:
+        """v7.5.x: once per session, show the calibration-usability pop-up —
+        but only when attention is needed (a recalibration threshold crossed,
+        or a type never calibrated). A clean setup is never interrupted; the
+        operator can still open it on demand via Hardware Setup → Device →
+        "Calibration status…". See gui/dialogs/calibration_status_dialog.py."""
+        if self._usability_prompted:
+            return
+        self._usability_prompted = True
+        try:
+            from gui.dialogs.calibration_status_dialog import (
+                show_calibration_status)
+            show_calibration_status(self, force=False)
+        except Exception as e:
+            logger.debug(f"calibration status pop-up skipped: {e}")
+
     def _maybe_prompt_calibration_restore(self) -> None:
         """v7.5.x: once per session, if the live calibration came up empty but
         a last-known-good snapshot exists, offer to restore it (needle zero +
@@ -2840,6 +2879,12 @@ class MainWindow(QMainWindow):
                 cal_page._save_calibration()
         except Exception as e:
             logger.debug(f"calibration snapshot flush on shutdown failed: {e}")
+        # v7.5.x: persist any throttled XY-travel odometer accumulation.
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store
+            get_store().flush()
+        except Exception as e:
+            logger.debug(f"calibration status flush on shutdown failed: {e}")
         self.settings.save()
 
     # ════════════════════════════════════════════════════════════════

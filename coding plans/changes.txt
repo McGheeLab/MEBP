@@ -12,3 +12,13 @@
 12) trying to detect cameras takes a very long time and stops the software from working
 13)  The well setup page needs to be redesigned. The selection actions needs to change so that nothing is shown until the well is assigned a role. 
 a) user selects the wells to be assigned a role, b) After the designation of the role, the options for that type of designation appear. (e.g. we assign well A1 : B2 to be print, then the Print list populates and we can choose the selected wells to be PIAR or some other print file. We can also choose the wells individually to change their assignement) After assignment, the well boarder will be recolored green to show its ready (red if not assigned) Selected wells are still outlined in purple
+
+
+
+
+Cason, 7.21
+-- Dwell should only be after pressure release 
+-- pump movement should have consistent units (e.g. mm/min)
+-- Add "usability" pop-up that communicates when the last calibration for XY, Z, and P was
+-- Sometimes abort requested only aborted the current task rather than the entire run; this should be fixed so abort cancels the whole print
+   [DONE 7.21] Root cause: Full Print's hybrid execution path created the HybridPlanExecutor as a local var and never registered it on the PrintManager, so Monitor->Abort (pm.abort()) couldn't reach its abort flag -> the executor ran the whole remaining plan. Fixed by assigning pm._trajectory_executor = executor in gui/app.py's hybrid branch. Also hardened the Quick Print multi-ink start-race (honor a sticky abort request before starting each ink group's print). Tests: tests/test_v75x_abort_cancels_whole_run.py.

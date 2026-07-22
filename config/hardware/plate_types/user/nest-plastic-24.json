@@ -7,10 +7,10 @@
   "bottom_material": "plastic",
   "well_depth_mm": null,
   "z_offsets": {
-    "top": -7.5400000000000045,
-    "bottom": 9.759999999999998,
-    "safe": -10.540000000000004,
-    "max": -26.54
+    "top": -9.060000000000002,
+    "bottom": 9.940000000000001,
+    "safe": -13.060000000000002,
+    "max": -30.06
   },
   "builtin": false
 }
