@@ -3589,6 +3589,18 @@ class StageController:
             return True
         return getattr(self.zp_stage, "serial", None) is not None
 
+    def set_led_brightness(self, level: int) -> bool:
+        """Set the illumination LED brightness (0-255) on the ZP board.
+
+        Guarded on the ZP connection: a no-op returning False when the board
+        is not connected. Forwards to ``ZPStageManager.set_led_brightness``
+        (fan-output PWM via M106). See CLAUDE.md — the LED is not a motion
+        axis; this is the only hardware entry point for illumination.
+        """
+        if self.zp_stage and self.is_zp_connected:
+            return self.zp_stage.set_led_brightness(level)
+        return False
+
     @property
     def simulate_xy(self) -> bool:
         """v7.4.2: True iff the currently-connected XY stage is a simulator.

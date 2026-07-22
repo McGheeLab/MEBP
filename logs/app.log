@@ -52467,3 +52467,180 @@ RuntimeError: group print PrintState.ERROR
 2026-07-22 09:58:19,630 [gui.app] DEBUG: [Tick] _update_status 0.4ms | widgets=6899 | tick#227800
 2026-07-22 09:59:22,225 [gui.app] DEBUG: [Tick] _update_status 0.3ms | widgets=6899 | tick#228000
 2026-07-22 10:00:31,371 [gui.app] DEBUG: [Tick] _update_status 0.3ms | widgets=6899 | tick#228200
+2026-07-22 13:20:25,086 [root] INFO: === app.log opened (level=INFO) ===
+2026-07-22 13:20:25,086 [SupportClasses.Processor] DEBUG: [Processor] Started
+2026-07-22 13:20:25,086 [SupportClasses.SerialUtils] DEBUG: ConnectionWatchdog started
+2026-07-22 13:20:25,086 [SupportClasses.Processor] DEBUG: [Processor] Registered handler for 'zero_needle_pos'
+2026-07-22 13:20:25,086 [SupportClasses.Processor] DEBUG: [Processor] Registered handler for 'debug'
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: Axis flips loaded: {'Z': False, 'P1': False, 'P2': False, 'P3': False}
+2026-07-22 13:20:25,087 [__main__] INFO: Safety limits loaded from settings (enabled=True)
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: StageController: user-Z up-direction sign = +1
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: StageController: P2 aspirate-direction sign = -1
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: StageController: P1 aspirate-direction sign = -1
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: Pump plunger convention restored: ['P1', 'P2']
+2026-07-22 13:20:25,087 [SupportClasses.StageController] INFO: Pump compliance/relief restored: {'P1': 0.7}
+2026-07-22 13:20:25,802 [gui.app] INFO: Restored hardware config: HardwareConfig('Standard Bioprinting Setup', needle=22G, plate=24, pumps=[P1=✓, P2=—, P3=—], channels={0: 'P1'})
+2026-07-22 13:20:25,806 [gui.widgets.camera_manager] INFO: CameraManager created 3 camera widgets
+2026-07-22 13:20:28,029 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\AzA_oultine_1.csv
+2026-07-22 13:20:28,030 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\AzA_oultine_pickup_mid_line.csv
+2026-07-22 13:20:28,031 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\BlockA.csv
+2026-07-22 13:20:28,032 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\Four_Circles_1.csv
+2026-07-22 13:20:28,033 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\M_Sketch_1.csv
+2026-07-22 13:20:28,034 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\M_Sketch_1_1.csv
+2026-07-22 13:20:28,034 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\MyPrint_1.csv
+2026-07-22 13:20:28,035 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\Sadah_A_Logo.csv
+2026-07-22 13:20:28,036 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\robot_face_1.csv
+2026-07-22 13:20:28,037 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\robot_face_2.csv
+2026-07-22 13:20:28,105 [gui.pages.print_builder] INFO: PrintBuilderPage initialized with 5 sub-pages
+2026-07-22 13:20:28,235 [gui.pages.print_objects] WARNING: auto_layout not available
+2026-07-22 13:20:28,265 [SupportClasses.PhysicalModels] INFO: Loaded 6 syringe specs from config/hardware/syringes.json
+2026-07-22 13:20:28,609 [gui.pages.printing_mode] INFO: PrintingModePage initialized with 3 sub-pages
+2026-07-22 13:20:28,636 [gui.pages.workflows_mode] INFO: WorkflowsModePage initialized with 10 workflows
+2026-07-22 13:20:28,636 [SupportClasses.PhysicalModels] INFO: Loaded 14 needle specs from config/hardware/needles.json
+2026-07-22 13:20:28,636 [SupportClasses.PhysicalModels] INFO: Loaded 6 syringe specs from config/hardware/syringes.json
+2026-07-22 13:20:28,636 [SupportClasses.PhysicalModels] INFO: Loaded 1 camera specs from config/hardware/cameras.json
+2026-07-22 13:20:29,289 [gui.pages.calibration] DEBUG: Initial calibration load skipped: 'NoneType' object has no attribute 'well_depth_mm'
+2026-07-22 13:20:29,296 [SupportClasses.ControllerProtocol] INFO: Found 2 controller protocol files in config/controllers
+2026-07-22 13:20:29,297 [SupportClasses.ControllerProtocol] INFO: Loaded controller protocol: Prior ProScan II from config/controllers/proscan_ii.json
+2026-07-22 13:20:29,297 [SupportClasses.ControllerProtocol] INFO: Loaded controller protocol: Prior ProScan III from config/controllers/proscan_iii.json
+2026-07-22 13:20:29,311 [gui.pages.hardware_setup] INFO: Hardware Setup: remembered camera setup found — auto-loading to restore source assignments + calibrations and start the cameras that were running when the setup was saved
+2026-07-22 13:20:29,315 [gui.pages.hardware_setup] INFO: Applying config to UI...
+2026-07-22 13:20:29,315 [gui.pages.hardware_setup] DEBUG:   Name: Standard Bioprinting Setup
+2026-07-22 13:20:29,331 [gui.pages.hardware_setup] DEBUG:   Plate: nest-plastic-24 (type=nest-plastic-24)
+2026-07-22 13:20:29,332 [gui.pages.hardware_setup] DEBUG:   Ink library: 2 printable inks — pump combos refreshed
+2026-07-22 13:20:29,332 [gui.pages.hardware_setup] DEBUG:   Rosette library: 0 rosettes
+2026-07-22 13:20:29,333 [gui.pages.hardware_setup] DEBUG:   Needle: 22G, 1 channel(s)
+2026-07-22 13:20:29,333 [gui.pages.hardware_setup] DEBUG:   P1: enabled=True, syringe=100µL, inks=['Inert GFP', 'Cy5 LLS'], mode=incremental
+2026-07-22 13:20:29,334 [gui.pages.hardware_setup] DEBUG:   P2: enabled=False, syringe=250µL, inks=[], mode=incremental
+2026-07-22 13:20:29,334 [gui.pages.hardware_setup] DEBUG:   P3: enabled=False, syringe=NoneµL, inks=[], mode=incremental
+2026-07-22 13:20:29,335 [gui.pages.hardware_setup] DEBUG:   Channel map: {0: 'P1'}
+2026-07-22 13:20:29,335 [gui.pages.hardware_setup] DEBUG:   Camera: Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA), mag=2.0×, scale=0.835
+2026-07-22 13:20:29,335 [gui.pages.hardware_setup] DEBUG:   Camera roles: [<CameraRole.NEEDLE_X: 'needle_x'>, <CameraRole.NEEDLE_Y: 'needle_y'>, <CameraRole.MICROSCOPE: 'microscope'>]
+2026-07-22 13:20:29,336 [gui.app] INFO: Hardware setup valid — all pages unlocked
+2026-07-22 13:20:29,336 [SupportClasses.StageController] DEBUG: P1: syringe=100µL
+2026-07-22 13:20:29,336 [SupportClasses.StageController] INFO: StageController: hardware config updated
+2026-07-22 13:20:29,336 [SupportClasses.SafetyLimits] INFO: P1 max flow rate set to 2811.295 µL/s
+2026-07-22 13:20:29,336 [SupportClasses.SafetyLimits] INFO: P1: max flow rate = 2811.295 µL/s (22G, L=50.8 mm, ref µ=1 cP)
+2026-07-22 13:20:29,336 [SupportClasses.StageController] INFO: StageController: adopted plate-type 'nest-plastic-24' Z offsets {'top': -9.060000000000002, 'bottom': 9.940000000000001, 'safe': -13.060000000000002, 'max': -30.06}
+2026-07-22 13:20:29,336 [gui.app] DEBUG: HW config → StageController
+2026-07-22 13:20:29,338 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:20:29,338 [gui.app] INFO: Hardware config updated: HardwareConfig('Standard Bioprinting Setup', needle=22G, plate=24, pumps=[P1=✓, P2=—, P3=—], channels={0: 'P1'})
+2026-07-22 13:20:29,338 [gui.pages.hardware_setup] INFO: Config restore complete
+2026-07-22 13:20:29,929 [SupportClasses.StageController] DEBUG: P1: syringe=100µL
+2026-07-22 13:20:29,929 [SupportClasses.StageController] INFO: StageController: hardware config updated
+2026-07-22 13:20:29,929 [SupportClasses.SafetyLimits] INFO: P1 max flow rate set to 2811.295 µL/s
+2026-07-22 13:20:29,929 [SupportClasses.SafetyLimits] INFO: P1: max flow rate = 2811.295 µL/s (22G, L=50.8 mm, ref µ=1 cP)
+2026-07-22 13:20:29,929 [SupportClasses.StageController] INFO: StageController: adopted plate-type 'nest-plastic-24' Z offsets {'top': -9.060000000000002, 'bottom': 9.940000000000001, 'safe': -13.060000000000002, 'max': -30.06}
+2026-07-22 13:20:29,929 [gui.app] DEBUG: HW config → StageController
+2026-07-22 13:20:29,930 [gui.pages.calibration] INFO: Calibration: plate synced to nest-plastic-24 from HardwareConfig
+2026-07-22 13:20:29,932 [gui.pages.calibration] INFO: Predicted 26 well positions from A1 + geometry
+2026-07-22 13:20:30,045 [SupportClasses.PlateWarpCalibrator] DEBUG: PlateWarp solved: mode=affine_tps n=23 mean_corr=2946.9µm max_corr=3264.2µm rms_resid=0.00µm
+2026-07-22 13:20:30,047 [gui.pages.calibration] INFO: Plate warp restored: mode=affine_tps, 23 points, meanΔ=2946.9µm
+2026-07-22 13:20:30,047 [gui.pages.calibration] INFO: Calibration loaded from settings (v7.2.7)
+2026-07-22 13:20:30,048 [gui.pages.calibration] DEBUG: Camera 2: applied 3.1192 µm/px (obj=2x, calibrated=True)
+2026-07-22 13:20:30,388 [gui.app] DEBUG: HW config → Page 1: Calibration
+2026-07-22 13:20:30,388 [gui.app] DEBUG: HW config → Page 2: Jog Control
+2026-07-22 13:20:30,406 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\AzA_oultine_1.csv
+2026-07-22 13:20:30,407 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\AzA_oultine_pickup_mid_line.csv
+2026-07-22 13:20:30,408 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\BlockA.csv
+2026-07-22 13:20:30,408 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\Four_Circles_1.csv
+2026-07-22 13:20:30,409 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\M_Sketch_1.csv
+2026-07-22 13:20:30,410 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\M_Sketch_1_1.csv
+2026-07-22 13:20:30,411 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\MyPrint_1.csv
+2026-07-22 13:20:30,411 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\Sadah_A_Logo.csv
+2026-07-22 13:20:30,413 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\robot_face_1.csv
+2026-07-22 13:20:30,414 [gui.pages.print_library] DEBUG: thumbnail trajectory build failed: CSV file not found: config\prints\robot_face_2.csv
+2026-07-22 13:20:30,425 [gui.app] DEBUG: HW config → Page 3: PrintBuilderPage
+2026-07-22 13:20:30,430 [SupportClasses.WellSetup] INFO: Plate changed to plate-24_Rosette in A2, all assignments reset
+2026-07-22 13:20:30,430 [gui.pages.print_setup_legacy] DEBUG: Workspace config propagated to all tabs
+2026-07-22 13:20:30,430 [gui.pages.print_workspace] INFO: Workspace updated from HardwareConfig
+2026-07-22 13:20:30,433 [gui.pages.print_objects] DEBUG: PrintObjects: refreshed ink options from config
+2026-07-22 13:20:30,433 [SupportClasses.WellSetup] INFO: Plate changed to nest-plastic-24, all assignments reset
+2026-07-22 13:20:30,434 [gui.pages.print_well_setup] INFO: Seeded 3 reagent location(s) from hardware config
+2026-07-22 13:20:30,442 [gui.app] DEBUG: HW config → Page 4: WorkflowsModePage
+2026-07-22 13:20:30,442 [gui.app] DEBUG: HW config → Page 5: SettingsPage
+2026-07-22 13:20:30,443 [gui.app] INFO: Print manager -> monitor wired via thread-safe signal bridge
+2026-07-22 13:20:31,119 [SupportClasses.StageController] INFO: StageController: min travel Z floor = 33.27 mm (clears plate inserts)
+2026-07-22 13:20:31,119 [SupportClasses.StageController] INFO: StageController: plate-bottom Z datum = 8.270 mm (zero-ref)
+2026-07-22 13:20:31,119 [SupportClasses.StageController] INFO: StageController: plate-top Z datum = 27.270 mm (zero-ref)
+2026-07-22 13:20:31,169 [gui.app] INFO: MainWindow initialized (v7.4.2)
+2026-07-22 13:20:31,502 [gui.widgets.camera_widget] INFO: Camera detection: found 0 camera(s) at indices []
+2026-07-22 13:20:31,582 [gui.widgets.toupcam_backend] INFO: ToupCam: toupcam.dll not found
+2026-07-22 13:20:31,583 [gui.widgets.camera_manager] INFO: CameraManager detected 1 sources
+2026-07-22 13:20:31,584 [gui.pages.hardware_setup] INFO: Hardware Setup: detected 1 live camera sources
+2026-07-22 13:20:31,717 [SupportClasses.GeometryEngine] WARNING: No syringe for pump Inert GFP, using zero extrusion
+2026-07-22 13:20:31,726 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:20:31,726 [gui.pages.calibration] INFO: Calibration saved to settings (v7.2.7) [key=nest-plastic-24]
+2026-07-22 13:20:31,729 [SupportClasses.CalibrationSnapshotStore] INFO: Calibration snapshot saved (2026-07-22T13:20:31) → config/hardware/last_calibration.json
+2026-07-22 13:20:43,262 [SupportClasses.ZPStage] INFO: ZP probe order: /dev/cu.debug-console(n/a), /dev/cu.alex-QC35(n/a), /dev/cu.Bluetooth-Incoming-Port(n/a)
+2026-07-22 13:20:43,262 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.debug-console
+2026-07-22 13:20:43,263 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.alex-QC35
+2026-07-22 13:20:43,263 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.Bluetooth-Incoming-Port
+2026-07-22 13:20:43,263 [SupportClasses.ZPStage] WARNING: No Marlin board found on any candidate port
+2026-07-22 13:20:43,263 [SupportClasses.StageController] ERROR: ZP connection failed: no Marlin board acquired (check USB / power / that no other program holds the port)
+2026-07-22 13:20:43,264 [gui.app] WARNING: ZP stage disconnected — refreshing status
+2026-07-22 13:21:31,410 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#200
+2026-07-22 13:22:20,916 [SupportClasses.ZPStage] INFO: ZP probe order: /dev/cu.debug-console(n/a), /dev/cu.alex-QC35(n/a), /dev/cu.Bluetooth-Incoming-Port(n/a)
+2026-07-22 13:22:20,918 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.debug-console
+2026-07-22 13:22:20,919 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.alex-QC35
+2026-07-22 13:22:20,920 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.Bluetooth-Incoming-Port
+2026-07-22 13:22:20,920 [SupportClasses.ZPStage] WARNING: No Marlin board found on any candidate port
+2026-07-22 13:22:20,920 [SupportClasses.StageController] ERROR: ZP connection failed: no Marlin board acquired (check USB / power / that no other program holds the port)
+2026-07-22 13:22:20,921 [gui.app] WARNING: ZP stage disconnected — refreshing status
+2026-07-22 13:22:31,407 [gui.app] DEBUG: [Tick] _update_status 2.0ms | widgets=5644 | tick#400
+2026-07-22 13:22:48,223 [SupportClasses.ZPStage] INFO: ZP probe order: /dev/cu.debug-console(n/a), /dev/cu.alex-QC35(n/a), /dev/cu.Bluetooth-Incoming-Port(n/a)
+2026-07-22 13:22:48,224 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.debug-console
+2026-07-22 13:22:48,225 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.alex-QC35
+2026-07-22 13:22:48,225 [SupportClasses.ZPStage] DEBUG: Skipping non-candidate port /dev/cu.Bluetooth-Incoming-Port
+2026-07-22 13:22:48,225 [SupportClasses.ZPStage] WARNING: No Marlin board found on any candidate port
+2026-07-22 13:22:48,225 [SupportClasses.StageController] ERROR: ZP connection failed: no Marlin board acquired (check USB / power / that no other program holds the port)
+2026-07-22 13:22:48,226 [gui.app] WARNING: ZP stage disconnected — refreshing status
+2026-07-22 13:23:31,399 [gui.app] DEBUG: [Tick] _update_status 1.9ms | widgets=5644 | tick#600
+2026-07-22 13:24:31,410 [gui.app] DEBUG: [Tick] _update_status 2.5ms | widgets=5644 | tick#800
+2026-07-22 13:25:31,414 [gui.app] DEBUG: [Tick] _update_status 2.7ms | widgets=5644 | tick#1000
+2026-07-22 13:26:31,411 [gui.app] DEBUG: [Tick] _update_status 2.6ms | widgets=5644 | tick#1200
+2026-07-22 13:27:31,414 [gui.app] DEBUG: [Tick] _update_status 2.9ms | widgets=5644 | tick#1400
+2026-07-22 13:28:31,413 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#1600
+2026-07-22 13:29:31,416 [gui.app] DEBUG: [Tick] _update_status 2.6ms | widgets=5644 | tick#1800
+2026-07-22 13:30:31,416 [gui.app] DEBUG: [Tick] _update_status 2.8ms | widgets=5644 | tick#2000
+2026-07-22 13:31:31,417 [gui.app] DEBUG: [Tick] _update_status 2.3ms | widgets=5644 | tick#2200
+2026-07-22 13:32:31,415 [gui.app] DEBUG: [Tick] _update_status 2.0ms | widgets=5644 | tick#2400
+2026-07-22 13:33:31,420 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#2600
+2026-07-22 13:34:31,420 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#2800
+2026-07-22 13:35:31,420 [gui.app] DEBUG: [Tick] _update_status 1.9ms | widgets=5644 | tick#3000
+2026-07-22 13:36:31,424 [gui.app] DEBUG: [Tick] _update_status 2.2ms | widgets=5644 | tick#3200
+2026-07-22 13:37:31,424 [gui.app] DEBUG: [Tick] _update_status 2.2ms | widgets=5644 | tick#3400
+2026-07-22 13:38:31,420 [gui.app] DEBUG: [Tick] _update_status 2.6ms | widgets=5644 | tick#3600
+2026-07-22 13:39:31,425 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#3800
+2026-07-22 13:40:31,423 [gui.app] DEBUG: [Tick] _update_status 2.2ms | widgets=5644 | tick#4000
+2026-07-22 13:41:31,421 [gui.app] DEBUG: [Tick] _update_status 3.0ms | widgets=5644 | tick#4200
+2026-07-22 13:42:31,430 [gui.app] DEBUG: [Tick] _update_status 2.1ms | widgets=5644 | tick#4400
+2026-07-22 13:43:31,430 [gui.app] DEBUG: [Tick] _update_status 2.3ms | widgets=5644 | tick#4600
+2026-07-22 13:44:31,430 [gui.app] DEBUG: [Tick] _update_status 1.9ms | widgets=5644 | tick#4800
+2026-07-22 13:45:31,429 [gui.app] DEBUG: [Tick] _update_status 2.2ms | widgets=5644 | tick#5000
+2026-07-22 13:46:31,430 [gui.app] DEBUG: [Tick] _update_status 2.6ms | widgets=5644 | tick#5200
+2026-07-22 13:47:31,435 [gui.app] DEBUG: [Tick] _update_status 2.2ms | widgets=5644 | tick#5400
+2026-07-22 13:48:14,913 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:14,920 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:14,920 [gui.pages.calibration] INFO: Calibration saved to settings (v7.2.7) [key=nest-plastic-24]
+2026-07-22 13:48:14,922 [SupportClasses.CalibrationSnapshotStore] INFO: Calibration snapshot saved (2026-07-22T13:48:14) → config/hardware/last_calibration.json
+2026-07-22 13:48:14,925 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:14,925 [gui.widgets.camera_manager] INFO: CameraManager shutdown complete
+2026-07-22 13:48:14,926 [SupportClasses.StageController] INFO: Shutting down StageController…
+2026-07-22 13:48:16,109 [SupportClasses.SerialUtils] DEBUG: ConnectionWatchdog stopped
+2026-07-22 13:48:16,205 [SupportClasses.StageController] INFO: Xbox controller disconnected
+2026-07-22 13:48:16,207 [SupportClasses.StageController] INFO: XY stage disconnected
+2026-07-22 13:48:16,208 [SupportClasses.StageController] INFO: ZP stage disconnected
+2026-07-22 13:48:16,278 [SupportClasses.Processor] DEBUG: [Processor] Stopped
+2026-07-22 13:48:16,279 [SupportClasses.StageController] INFO: Shutdown complete
+2026-07-22 13:48:16,298 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:16,301 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:16,301 [gui.pages.calibration] INFO: Calibration saved to settings (v7.2.7) [key=nest-plastic-24]
+2026-07-22 13:48:16,302 [SupportClasses.CalibrationSnapshotStore] INFO: Calibration snapshot saved (2026-07-22T13:48:16) → config/hardware/last_calibration.json
+2026-07-22 13:48:16,304 [SupportClasses.Settings] DEBUG: Settings saved to settings.json
+2026-07-22 13:48:16,305 [SupportClasses.StageController] INFO: Shutting down StageController…
+2026-07-22 13:48:16,305 [SupportClasses.SerialUtils] DEBUG: ConnectionWatchdog stopped
+2026-07-22 13:48:16,305 [SupportClasses.StageController] INFO: Xbox controller disconnected
+2026-07-22 13:48:16,305 [SupportClasses.StageController] INFO: XY stage disconnected
+2026-07-22 13:48:16,305 [SupportClasses.StageController] INFO: ZP stage disconnected
+2026-07-22 13:48:16,306 [SupportClasses.StageController] INFO: Shutdown complete

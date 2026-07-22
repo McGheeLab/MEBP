@@ -38,6 +38,7 @@ from gui.pages.hardware.control_panel import HardwareControlPanel
 from gui.scaling import s, sf, sp
 from gui.styles import COLORS
 from gui.widgets.components import Card
+from gui.widgets.illumination_control import IlluminationControl
 from gui.widgets.safe_travel_worker import SafeTravelWorker
 from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
@@ -95,6 +96,7 @@ class StandardJogContextPanel(QWidget):
     def set_controller(self, controller) -> None:
         self._controller = controller
         self._hw_panel.set_controller(controller)
+        self._illum.set_controller(controller)
 
     def set_settings(self, settings) -> None:
         self._settings = settings
@@ -130,6 +132,7 @@ class StandardJogContextPanel(QWidget):
     def on_status_update(self) -> None:
         """Forward MainWindow's ~300 ms tick into the inner panel."""
         self._hw_panel.on_status_update()
+        self._illum.on_status_update()
 
     def refresh_safety_limits(self) -> None:
         self._hw_panel.refresh_safety_limits()
@@ -167,7 +170,11 @@ class StandardJogContextPanel(QWidget):
         # 2) Absolute Go To (collapsible)
         layout.addWidget(self._build_goto_card())
 
-        # 3) Hardware Info (collapsible, read-only reference)
+        # 3) Illumination LED (collapsible) — microscope light on the ZP FAN0
+        #    output; same widget users can drop as a Custom-panel module.
+        layout.addWidget(self._build_illumination_card())
+
+        # 4) Hardware Info (collapsible, read-only reference)
         layout.addWidget(self._build_hardware_info_card())
 
         layout.addStretch(1)
@@ -225,6 +232,14 @@ class StandardJogContextPanel(QWidget):
         card.add_layout(btn_row)
         self._btn_go = btn_go
 
+        return card
+
+    # ── Illumination LED ───────────────────────────────────────────
+
+    def _build_illumination_card(self) -> Card:
+        card = Card("Illumination", collapsible=True)
+        self._illum = IlluminationControl(self._controller)
+        card.add_widget(self._illum)
         return card
 
     def _absolute_goto(self) -> None:

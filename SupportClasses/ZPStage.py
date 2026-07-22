@@ -1232,6 +1232,21 @@ class ZPStageManager:
         """Save current settings to printer EEPROM."""
         self.send_data("M500")
 
+    def set_led_brightness(self, level: int) -> bool:
+        """Set the illumination LED brightness (0-255).
+
+        The COB LED is wired to the board's FAN0 output (``PC6`` on an SKR Mini
+        E3), so we dim it with the fan G-code that stock Marlin already
+        supports -- no custom firmware required. ``S0`` turns it off. If the
+        board is later flashed with Case Light enabled, swap the line for
+        ``M355 S{1 if level > 0 else 0} P{level}``.
+
+        Returns whatever :meth:`send_data` reports (True on ``ok``); safe in
+        simulation, where the simulator acks the command as unrecognized.
+        """
+        level = max(0, min(255, int(level)))
+        return self.send_data(f"M106 P0 S{level}")
+
     def __repr__(self) -> str:
         mode = "SIM" if self.simulate else "HW"
         return f"ZPStageManager(mode={mode}, feedrate={self.feedrate})"

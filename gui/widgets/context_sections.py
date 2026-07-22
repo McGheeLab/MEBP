@@ -493,6 +493,39 @@ class HardwareInfoSection(QWidget):
         self._rows["plate"].setText(plate_text)
 
 
+# ── Illumination LED (drop-in module) ──────────────────────────────
+
+class IlluminationSection(QWidget):
+    """Standalone illumination-LED module (on/off toggle + brightness slider),
+    reusing the same widget embedded in the jog panel."""
+
+    def __init__(self, ctx: SectionContext, options: dict):
+        super().__init__()
+        self._ctx = ctx
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        # Lazy import to avoid pulling the widget in when this section is unused.
+        from gui.widgets.illumination_control import IlluminationControl
+        self._ctrl = IlluminationControl(ctx.controller)
+        # Restore persisted UI state (does not command hardware).
+        if isinstance(options, dict):
+            if "level" in options:
+                try:
+                    self._ctrl.set_value(int(options["level"]))
+                except Exception:
+                    pass
+            if options.get("on"):
+                self._ctrl.set_on(True)
+        lay.addWidget(self._ctrl)
+
+    def on_status_update(self) -> None:
+        try:
+            self._ctrl.on_status_update()
+        except Exception:
+            pass
+
+
 # ── Register the built-in catalog ──────────────────────────────────
 
 register_section("camera", SectionSpec("Live camera", "📷", CameraSection))
@@ -502,3 +535,5 @@ register_section("positions", SectionSpec(
 register_section("jog", SectionSpec("Jog controls", "🕹️", JogSection))
 register_section("hardware_info", SectionSpec(
     "Hardware info", "ℹ️", HardwareInfoSection))
+register_section("illumination", SectionSpec(
+    "Illumination LED", "💡", IlluminationSection))

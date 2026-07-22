@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "saved_at": "2026-07-21T19:38:55",
+  "saved_at": "2026-07-22T13:48:16",
   "fingerprint": {
     "device": "ME3B V3",
     "axis_map": {
@@ -58,11 +58,11 @@
     "plate_bottom_z": 8.270000000000003,
     "plate_flip_180": true,
     "mosaic_affine": {
-      "rotation_deg": 0.02348990227747518,
+      "rotation_deg": 0.023489902277479123,
       "scale": 0.9967042377870612,
       "translation_um": [
-        3204.343353937919,
-        898.6930385491993
+        3204.343353937932,
+        898.6930385491978
       ],
       "center_um": [
         0.0,

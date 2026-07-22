@@ -5682,3 +5682,64 @@
 09:57:18.917 STATS txns=199250 ok=199242 fail=8 reset=0 avg=14.4ms max=40951.3ms
 09:58:40.123 STATS txns=199500 ok=199492 fail=8 reset=0 avg=14.4ms max=40951.3ms
 10:00:01.380 STATS txns=199750 ok=199742 fail=8 reset=0 avg=14.4ms max=40951.3ms
+13:18:04.563 === ZP serial trace opened (mode=summary, pid=52683) at 2026-07-22T13:18:04 ===
+13:18:04.563 ANOMALY M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:04.563 ---- recent ZP transactions (anomaly: M400 -> timeout) [2] ----
+13:18:04.563     +   0.000s  G0 X1                                    ok             0.0ms rx=1 busy=0
+13:18:04.563     +   2.000s  M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:04.563 ---- end recent ----
+13:18:05.564 ANOMALY M400                                     timeout     1000.1ms rx=0 busy=0 SILENT
+13:18:05.764 ANOMALY G0 X1                                    timeout      200.0ms rx=0 busy=0
+13:18:06.264 ANOMALY M114                                     timeout      500.0ms rx=0 busy=0
+13:18:06.264 ---- recent ZP transactions (anomaly: M114 -> timeout) [6] ----
+13:18:06.264     +   0.000s  G0 X1                                    ok             0.0ms rx=1 busy=0
+13:18:06.264     +   2.000s  M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:06.264     +   3.001s  M400                                     timeout     1000.1ms rx=0 busy=0 SILENT
+13:18:06.264     +   3.201s  G0 X1                                    timeout      200.0ms rx=0 busy=0
+13:18:06.264     +   3.201s  M114                                     ok             0.0ms rx=2 busy=0
+13:18:06.264     +   3.701s  M114                                     timeout      500.0ms rx=0 busy=0
+13:18:06.264 ---- end recent ----
+13:18:06.265 EVENT board_reset line='start'
+13:18:06.265 ---- recent ZP transactions (event: board_reset) [10] ----
+13:18:06.265     +   0.000s  G0 X1                                    ok             0.0ms rx=1 busy=0
+13:18:06.265     +   2.000s  M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.001s  M400                                     timeout     1000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.201s  G0 X1                                    timeout      200.0ms rx=0 busy=0
+13:18:06.265     +   3.201s  M114                                     ok             0.0ms rx=2 busy=0
+13:18:06.265     +   3.701s  M114                                     timeout      500.0ms rx=0 busy=0
+13:18:06.265     +   3.702s  G90                                      ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G0 X10.0000 F300                         ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G91                                      ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G0 F600.0 X1.5000                        ok             0.0ms rx=1 busy=0
+13:18:06.265 ---- end recent ----
+13:18:06.265 ANOMALY G0 X1                                    reset          0.5ms rx=1 busy=0
+13:18:06.265 ---- recent ZP transactions (anomaly: G0 X1 -> reset) [11] ----
+13:18:06.265     +   0.000s  G0 X1                                    ok             0.0ms rx=1 busy=0
+13:18:06.265     +   2.000s  M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.001s  M400                                     timeout     1000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.201s  G0 X1                                    timeout      200.0ms rx=0 busy=0
+13:18:06.265     +   3.201s  M114                                     ok             0.0ms rx=2 busy=0
+13:18:06.265     +   3.701s  M114                                     timeout      500.0ms rx=0 busy=0
+13:18:06.265     +   3.702s  G90                                      ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G0 X10.0000 F300                         ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G91                                      ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G0 F600.0 X1.5000                        ok             0.0ms rx=1 busy=0
+13:18:06.265     +   3.702s  G0 X1                                    reset          0.5ms rx=1 busy=0
+13:18:06.265 ---- end recent ----
+13:18:06.265 ANOMALY G0 X1                                    error          0.0ms rx=1 busy=0
+13:18:06.265 ---- recent ZP transactions (anomaly: G0 X1 -> error) [13] ----
+13:18:06.265     +   0.000s  G0 X1                                    ok             0.0ms rx=1 busy=0
+13:18:06.265     +   2.000s  M400                                     timeout     2000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.001s  M400                                     timeout     1000.1ms rx=0 busy=0 SILENT
+13:18:06.265     +   3.201s  G0 X1                                    timeout      200.0ms rx=0 busy=0
+13:18:06.266     +   3.201s  M114                                     ok             0.0ms rx=2 busy=0
+13:18:06.266     +   3.701s  M114                                     timeout      500.0ms rx=0 busy=0
+13:18:06.266     +   3.702s  G90                                      ok             0.0ms rx=1 busy=0
+13:18:06.266     +   3.702s  G0 X10.0000 F300                         ok             0.0ms rx=1 busy=0
+13:18:06.266     +   3.702s  G91                                      ok             0.0ms rx=1 busy=0
+13:18:06.266     +   3.702s  G0 F600.0 X1.5000                        ok             0.0ms rx=1 busy=0
+13:18:06.266     +   3.702s  G0 X1                                    reset          0.5ms rx=1 busy=0
+13:18:06.266     +   3.703s  G0 X50                                   ok             0.0ms rx=2 busy=1
+13:18:06.266     +   3.703s  G0 X1                                    error          0.0ms rx=1 busy=0
+13:18:06.266 ---- end recent ----
+13:18:06.566 ANOMALY G0 X1                                    timeout      300.0ms rx=0 busy=0
