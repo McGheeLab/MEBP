@@ -570,29 +570,42 @@ class MainWindow(QMainWindow):
         self._context_splitter.setStretchFactor(0, 0)  # left context: fixed
         self._context_splitter.setStretchFactor(1, 1)   # content: stretches
         self._context_splitter.setStretchFactor(2, 0)  # right context: fixed
-        # v7.4.x: the left context panel is a *bounded sidebar*, not a free
-        # splitter pane. The three knobs that make dragging behave:
+        # v7.5.x: the left context panel is a *bounded sidebar*, not a free
+        # splitter pane. The knobs that make dragging behave:
         #
-        #   • slot 0 non-collapsible + a minimum width  → it can't be dragged
-        #     shut (the old "bugs out and collapses").
-        #   • slot 1 (content) stays collapsible        → on a narrow window
-        #     it can yield width instead of fighting the panel ("bugs out
-        #     when I expand").
-        #   • a *dynamic maximum width* on slot 0 (see _update_context_panel_
-        #     bounds, refreshed on every resize) keeps the panel from growing
-        #     far enough to push content past its collapse threshold — which
-        #     is what produced the "snaps to mid / full open" jump. Qt honors
-        #     maximumWidth during the drag, so the handle smoothly *stops* at
-        #     the bound instead of snapping.
+        #   • slot 0 non-collapsible + a modest minimum width → it can't be
+        #     dragged shut. The minimum is small (s(260)) because the panel
+        #     content is now **responsive** (see StandardJogContextPanel /
+        #     JogButtonArray): its buttons + text scale to fit and wrap, so the
+        #     panel is genuinely usable when narrow instead of clipping buttons.
+        #     It still OPENS at the comfortable LEFT_BOX_WIDTH (see
+        #     _apply_saved_context_width) — the small min just lets the user drag
+        #     it narrow.
+        #   • slot 1 (content) is also non-collapsible → it yields width by
+        #     shrinking (its own children scroll/clip) instead of snapping shut,
+        #     which is what produced the "snaps to mid / full open" jump. With
+        #     both panes non-collapsible, Qt simply *stops* the drag handle when
+        #     the content pane reaches its own minimum — no dynamic-maximum race,
+        #     no snap.
+        #   • a light *dynamic maximum width* on slot 0 (see _update_context_
+        #     panel_bounds, refreshed on every resize) keeps a small content
+        #     reserve so the panel can't swallow the whole window.
         #
-        # The right pane (slot 2) is shown/hidden explicitly per page.
+        # The right pane (slot 2) is shown/hidden explicitly per page and stays
+        # collapsible.
         self._context_splitter.setChildrenCollapsible(True)
         self._context_splitter.setCollapsible(0, False)
-        self.ui_extraLeftBox.setMinimumWidth(s(340))
+        self._context_splitter.setCollapsible(1, False)
+        # Small minimum — the panel content is fully proportional (every item
+        # takes a %% of the width), so it fits itself to any width ≥ this. It
+        # still OPENS at the comfortable LEFT_BOX_WIDTH.
+        self.ui_extraLeftBox.setMinimumWidth(s(100))
         self._context_splitter.setHandleWidth(s(4))
-        # Reserve at least this much for the content pane when sizing the
-        # left panel, so content never approaches its collapse threshold.
-        self._content_reserve_px = s(460)
+        # Reserve at least this much for the content pane when sizing the left
+        # panel. Smaller than the panel's own minimum: with content now
+        # non-collapsible, Qt stops the drag at content's real minimum, so this
+        # only needs to keep the panel from consuming the entire window.
+        self._content_reserve_px = s(240)
         # Remember the dragged/restored panel width across hide/show. Track it
         # live as the user drags so a page-switch (which hides the panel)
         # preserves whatever they last set.
@@ -716,8 +729,10 @@ class MainWindow(QMainWindow):
             logger.debug("restore common_print_settings failed: %s", e)
         self._common_print_settings.add_listener(self._on_common_setting_changed)
 
-        # v7.3.3: Shared camera manager for all pages
-        self._camera_manager = CameraManager(max_cameras=3)
+        # v7.3.3: Shared camera manager for all pages.
+        # v7.5.x: slot count follows MAX_LIVE_CAMERAS (4 — incl. the
+        # Monitor overview camera) via CameraManager's default.
+        self._camera_manager = CameraManager()
 
         # v7.3.3: Mode pages wrap sub-pages internally
         self._print_builder = PrintBuilderPage(self.controller, self.settings)  # v7.5.x
@@ -1636,29 +1651,32 @@ class MainWindow(QMainWindow):
     #  HARDWARE CONFIG MANAGEMENT
     # ════════════════════════════════════════════════════════════════
 
-    # v7.4.8: extra clearance (mm) added above the tallest insert when
-    # computing the travel-Z floor, so the needle never grazes a tube top.
-    INSERT_CLEARANCE_MARGIN_MM = 3.0
-
     def _update_insert_clearance(self, cal_page) -> None:
-        """Recompute + push the plate-wide insert clearance floor.
+        """Fast Move Z is authoritative for travel height — no auto floor.
 
-        Floor = plate_top_z + tallest insert rim + margin (zero-ref mm).
-        Pushed to the controller so every `safe_travel_to` retract clears
-        the tallest tube. Cleared (None) when the plate has no inserts.
+        v7.5.x (operator decision, 2026-07-27: "when I set the Fast Move Z
+        that is THE Z, and I'm already accounting for the top of the rosette
+        inserts"): the operator sets the Fast Move / safe travel Z with the
+        tallest insert already cleared, so the app no longer computes an
+        ADDITIONAL tube-clearance floor and stacks it on top of that Z (which
+        would double-count and silently raise the retract above the assigned
+        Fast Move Z).
+
+        This disarms the floor (``set_min_travel_z(None)``) — clearing any
+        value a previous config push left armed — so every ``safe_travel_to``
+        / ``ensure_retracted_to`` retracts to exactly the assigned safe Z and
+        never silently raises above it.
+
+        The floor MACHINERY (``StageController.set_min_travel_z`` +
+        ``apply_insert_floor``) is left intact but disarmed — nothing in the
+        app arms it now. Re-enable here if a future workflow ever needs an
+        automatic clearance independent of the operator's Fast Move Z.
         """
         ctrl = getattr(self, "controller", None)
         if ctrl is None or not hasattr(ctrl, "set_min_travel_z"):
             return
         try:
-            plate, _positions, _safe = cal_page.get_calibration_data()
-            top_z = cal_page.get_z_references().get("plate_top_z")
-            max_rim = getattr(plate, "max_rim_height_mm", 0.0) if plate else 0.0
-            if plate is not None and max_rim > 0.0 and top_z is not None:
-                ctrl.set_min_travel_z(
-                    top_z + max_rim + self.INSERT_CLEARANCE_MARGIN_MM)
-            else:
-                ctrl.set_min_travel_z(None)
+            ctrl.set_min_travel_z(None)
         except Exception as e:
             logger.debug(f"_update_insert_clearance failed: {e}")
 
@@ -2030,7 +2048,8 @@ class MainWindow(QMainWindow):
         self._update_context_panel_bounds()
         sizes = sp.sizes()
         right_w = sizes[2] if len(sizes) == 3 else 0
-        min_left = self.ui_extraLeftBox.minimumWidth() or s(340)
+        min_left = (self.ui_extraLeftBox.minimumWidth()
+                    or s(AppSettings.LEFT_BOX_WIDTH))
         saved = getattr(self, "_context_panel_width",
                         s(AppSettings.LEFT_BOX_WIDTH))
         target = max(min_left, saved)
@@ -2052,11 +2071,13 @@ class MainWindow(QMainWindow):
     def _update_context_panel_bounds(self) -> None:
         """Recompute the left context panel's maximum drag width.
 
-        The panel may grow only until the content pane would be squeezed
-        below ``_content_reserve_px`` (accounting for a visible right pane).
-        Capping the *maximum width* lets Qt stop the drag handle at the
-        bound during the drag, so it never reaches the point where the
-        collapsible content pane snaps shut.
+        The panel may grow until the content pane would be squeezed below
+        ``_content_reserve_px`` (accounting for a visible right pane), but never
+        below its own (small) minimum. The panel content is responsive, so a
+        narrow panel fits its buttons by scaling/wrapping rather than clipping;
+        this cap only keeps the panel from swallowing the whole window when
+        dragged wide. With both panes non-collapsible, Qt also stops the drag at
+        the content pane's own minimum.
         """
         sp = getattr(self, "_context_splitter", None)
         if sp is None:
@@ -2069,8 +2090,8 @@ class MainWindow(QMainWindow):
             sizes = sp.sizes()
             if len(sizes) == 3:
                 right_w = sizes[2]
-        min_left = self.ui_extraLeftBox.minimumWidth() or s(340)
-        reserve = getattr(self, "_content_reserve_px", s(460))
+        min_left = self.ui_extraLeftBox.minimumWidth() or s(AppSettings.LEFT_BOX_WIDTH)
+        reserve = getattr(self, "_content_reserve_px", s(240))
         max_left = max(min_left, total - right_w - reserve)
         self.ui_extraLeftBox.setMaximumWidth(max_left)
 

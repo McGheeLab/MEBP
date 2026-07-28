@@ -62,6 +62,15 @@ except ImportError:
     ToupCamBackend = None
     logger.info("ToupCam backend not available")
 
+# v7.5.x: Try to import Andor SDK3 backend (ANDOR Zyla sCMOS via pylablib).
+# Guarded/lazy exactly like ToupCam — importing never loads the SDK DLLs.
+try:
+    from gui.widgets.andor_backend import AndorBackend, ANDOR_AVAILABLE
+except ImportError:
+    ANDOR_AVAILABLE = False
+    AndorBackend = None
+    logger.info("Andor backend not available")
+
 # v7.3.0: Try to import SimulatedCamera backend
 try:
     from SupportClasses.SimulatedCamera import SimulatedCamera
@@ -71,7 +80,8 @@ except ImportError:
     SimulatedCamera = None
 
 # v7.3-camera: Unified availability flag
-CAMERA_AVAILABLE = CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE) or SIM_AVAILABLE
+CAMERA_AVAILABLE = (CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE)
+                    or bool(ANDOR_AVAILABLE) or SIM_AVAILABLE)
 
 
 
@@ -129,7 +139,7 @@ def detect_cameras(max_index: int = 4) -> list[int]:
 
 def detect_toupcam_cameras() -> list[dict]:
     """v7.3-camera: Detect ToupTek/Bestscope cameras.
-    
+
     Returns list of dicts with 'id' and 'displayname' keys.
     """
     if not TOUPCAM_AVAILABLE or ToupCamBackend is None:
@@ -138,6 +148,20 @@ def detect_toupcam_cameras() -> list[dict]:
         return ToupCamBackend.enumerate()
     except Exception as e:
         logger.warning(f"ToupCam detection error: {e}")
+        return []
+
+
+def detect_andor_cameras() -> list[dict]:
+    """v7.5.x: Detect ANDOR SDK3 cameras (Zyla sCMOS).
+
+    Returns list of dicts with 'id' (serial) and 'displayname' keys.
+    """
+    if not ANDOR_AVAILABLE or AndorBackend is None:
+        return []
+    try:
+        return AndorBackend.enumerate()
+    except Exception as e:
+        logger.warning(f"Andor detection error: {e}")
         return []
 
 
@@ -189,6 +213,13 @@ class CameraWidget(QWidget):
     # is "left edge" or "right edge".
     pixel_clicked = Signal(float, float)
 
+    # v7.5.x: internal — carries the result of an async device open from the
+    # worker thread back to the GUI thread (queued connection). The blocking
+    # cv2.VideoCapture / ToupCam / Andor open runs off the GUI thread (see
+    # start_async) so it can't freeze the UI at startup; this signal marshals
+    # the opened handle back so the display QTimer is started on the GUI thread.
+    _open_result = Signal(object)  # dict payload
+
     def __init__(
         self,
         camera_label: str = "Camera",
@@ -217,7 +248,25 @@ class CameraWidget(QWidget):
 
         # v7.3-camera: ToupCam backend state
         self._toupcam = None
-        self._backend_type = "opencv"  # "opencv" or "toupcam"
+        # v7.5.x: Andor SDK3 backend state (ANDOR Zyla sCMOS)
+        self._andor = None
+        self._backend_type = "opencv"  # "opencv" | "toupcam" | "andor" | "simulated"
+
+        # v7.5.x: async-open state (see start_async). ``_open_token`` supersedes
+        # an in-flight open when stop()/another start happens; ``_opening`` marks
+        # an open in progress so re-entrant start calls are ignored.
+        self._open_token = 0
+        self._opening = False
+        self._pending_on_done = None
+        self._open_result.connect(self._on_open_result)
+
+        # v7.5.x: mirrored-view flag. When True the frame is flipped
+        # horizontally at the SOURCE (in _grab_frame, before the raw cache) so
+        # the whole pipeline — the displayed feed AND the cached raw frame used
+        # for detection / mosaic / click-mapping — sees an un-mirrored image.
+        # This corrects a physically-mirrored camera so what the operator sees
+        # is NOT mirrored, and downstream code needs no further mirror handling.
+        self._mirrored = False
 
         # v7.3.0: Thread-safe frame buffer for detection workers
         self._current_frame = None        # Latest BGR numpy array (or None)
@@ -430,7 +479,8 @@ class CameraWidget(QWidget):
                     ds_cams = []
                 opencv_indices = detect_cameras()
             probe = {"opencv": opencv_indices, "dshow": ds_cams,
-                     "toupcam": detect_toupcam_cameras()}
+                     "toupcam": detect_toupcam_cameras(),
+                     "andor": detect_andor_cameras()}
 
         # OpenCV cameras — v7.5.x: label with the DirectShow friendly name
         # + USB port tag (e.g. "Teslong Camera (port 6&29d1719c&2)") so two
@@ -456,6 +506,12 @@ class CameraWidget(QWidget):
             name = tc_dev.get('displayname', 'ToupCam')
             dev_id = tc_dev.get('id', '')
             self.camera_combo.addItem(f"TC: {name}", ("toupcam", dev_id))
+
+        # Andor SDK3 cameras (v7.5.x — ANDOR Zyla sCMOS)
+        for an_dev in (probe.get("andor") or []):
+            name = an_dev.get('displayname', 'Andor Zyla')
+            dev_id = an_dev.get('id', '')
+            self.camera_combo.addItem(f"Andor: {name}", ("andor", dev_id))
 
         # v7.3.0: Simulated camera
         if SIM_AVAILABLE:
@@ -490,6 +546,9 @@ class CameraWidget(QWidget):
             if backend_type == "toupcam":
                 self._start_toupcam(identifier)
                 return
+            elif backend_type == "andor":
+                self._start_andor(identifier)
+                return
             elif backend_type == "simulated":
                 self._start_simulated(identifier)
                 return
@@ -500,6 +559,153 @@ class CameraWidget(QWidget):
         # Legacy: plain integer index (backward compat)
         if isinstance(cam_data, int) and cam_data >= 0:
             self.start_with_index(cam_data)
+
+    def start_async(self, on_done=None):
+        """Open the camera WITHOUT blocking the GUI thread.
+
+        The blocking device open (``cv2.VideoCapture`` / ToupCam / Andor — each
+        can take several seconds) runs on a daemon thread; when it completes the
+        opened handle is marshalled back to the GUI thread via ``_open_result``,
+        which assigns it and starts the display QTimer (``_on_open_result``).
+        This is the fix for "the camera boot-up freezes the UI" at startup.
+
+        ``on_done(success: bool)`` (optional) is invoked on the GUI thread once
+        the camera is running or the open failed. The cheap simulated backend and
+        the unavailable/already-running cases complete synchronously.
+        """
+        if not CAMERA_AVAILABLE or self._running or self._opening:
+            if on_done:
+                on_done(self._running)
+            return
+
+        # Lazy detection on first start (mirrors start()). Combos are normally
+        # already populated by the CameraManager, so this is a no-op at startup.
+        if not getattr(self, "_cameras_detected", False):
+            self.refresh_cameras()
+
+        cam_data = self.camera_combo.currentData()
+        if cam_data is None or cam_data == -1:
+            self.video_label.setText("No camera available")
+            if on_done:
+                on_done(False)
+            return
+
+        # Resolve backend + identifier.
+        if isinstance(cam_data, tuple) and len(cam_data) == 2:
+            backend_type, identifier = cam_data
+        elif isinstance(cam_data, int) and cam_data >= 0:
+            backend_type, identifier = "opencv", cam_data
+        else:
+            # Unknown shape — fall back to the synchronous path.
+            self.start()
+            if on_done:
+                on_done(self._running)
+            return
+
+        # Simulated backend opens instantly — no worker thread needed.
+        if backend_type == "simulated":
+            self._start_simulated(identifier)
+            if on_done:
+                on_done(self._running)
+            return
+
+        self._opening = True
+        self._open_token += 1
+        token = self._open_token
+        self._pending_on_done = on_done
+        self.video_label.setText(f"{self._camera_label} — opening…")
+
+        def _worker():
+            payload = {"token": token, "backend": backend_type,
+                       "identifier": identifier, "handle": None, "meta": None}
+            try:
+                if backend_type == "opencv":
+                    cap = cv2.VideoCapture(
+                        int(identifier), getattr(cv2, "CAP_DSHOW", 700))
+                    if cap.isOpened():
+                        payload["handle"] = cap
+                    else:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                elif (backend_type == "toupcam" and TOUPCAM_AVAILABLE
+                      and ToupCamBackend is not None):
+                    tc = ToupCamBackend()
+                    if tc.open(identifier):
+                        payload["handle"] = tc
+                        payload["meta"] = tc.get_resolution()
+                elif (backend_type == "andor" and ANDOR_AVAILABLE
+                      and AndorBackend is not None):
+                    an = AndorBackend()
+                    if an.open(identifier):
+                        payload["handle"] = an
+                        payload["meta"] = an.get_resolution()
+            except Exception as exc:
+                logger.warning(
+                    f"{self._camera_label}: async camera open failed: {exc}")
+                payload["handle"] = None
+            # Marshal back to the GUI thread (queued — receiver lives there).
+            self._open_result.emit(payload)
+
+        threading.Thread(
+            target=_worker, daemon=True,
+            name=f"CamOpen-{self._camera_label}").start()
+
+    def _on_open_result(self, payload):
+        """GUI-thread continuation of start_async: adopt the opened handle and
+        start the display timer, or report failure. Discards a stale result if
+        stop()/another start superseded this open while it was in flight."""
+        on_done = self._pending_on_done
+        self._pending_on_done = None
+        self._opening = False
+        backend = payload.get("backend")
+        handle = payload.get("handle")
+
+        # Superseded (stop() or another start bumped the token) or something else
+        # already started this widget → release the just-opened handle and bail.
+        if payload.get("token") != self._open_token or self._running:
+            self._release_handle(backend, handle)
+            if on_done:
+                on_done(self._running)
+            return
+
+        if handle is None:
+            self.video_label.setText(f"Failed to open {backend} camera")
+            if on_done:
+                on_done(False)
+            return
+
+        if backend == "opencv":
+            self._capture = handle
+            self._camera_index = payload.get("identifier", self._camera_index)
+        elif backend == "toupcam":
+            self._toupcam = handle
+        elif backend == "andor":
+            self._andor = handle
+        self._backend_type = backend
+        self._running = True
+        self._timer.start(int(1000 / self._fps))
+        if hasattr(self, "btn_start"):
+            self.btn_start.setText("⏹ Stop" if backend == "opencv" else "⏹")
+        meta = payload.get("meta")
+        if meta:
+            logger.info(f"{self._camera_label}: {backend} started "
+                        f"({meta[0]}x{meta[1]}) at {self._fps} FPS")
+        else:
+            logger.info(f"{self._camera_label}: {backend} started "
+                        f"at {self._fps} FPS")
+        if on_done:
+            on_done(True)
+
+    def _release_handle(self, backend, handle):
+        """Best-effort release of an opened-but-discarded backend handle."""
+        if handle is None:
+            return
+        try:
+            handle.release()  # cv2.VideoCapture / ToupCam / Andor all expose it
+        except Exception:
+            pass
 
     def start_with_index(self, camera_index: int):
         """Start the camera feed with a specific device index."""
@@ -527,6 +733,11 @@ class CameraWidget(QWidget):
 
     def stop(self):
         """Stop the camera feed."""
+        # v7.5.x: supersede any async open still in flight (its _on_open_result
+        # will see the bumped token, release the handle, and bail) so a stop
+        # during startup can't leave a camera streaming after we think it's off.
+        self._open_token += 1
+        self._opening = False
         self._timer.stop()
         self._running = False
         if self._capture:
@@ -543,6 +754,15 @@ class CameraWidget(QWidget):
             except Exception:
                 pass
             self._toupcam = None
+        # v7.5.x: release the Andor SDK3 stream (stops acquisition + reader
+        # thread), same rationale as the ToupCam release above.
+        an = getattr(self, '_andor', None)
+        if an is not None:
+            try:
+                an.release()
+            except Exception:
+                pass
+            self._andor = None
         self._backend_type = "opencv"
         # v7.3.0: Clear simulated camera reference
         if hasattr(self, '_simulated_camera'):
@@ -573,6 +793,25 @@ class CameraWidget(QWidget):
         if hasattr(self, 'btn_start'):
             self.btn_start.setText("\u23f9")
         logger.info(f"{self._camera_label}: ToupCam started ({w}x{h}) at {self._fps} FPS")
+
+    def _start_andor(self, device_id: str):
+        """v7.5.x: Start an ANDOR SDK3 (Zyla) camera feed."""
+        if not ANDOR_AVAILABLE or AndorBackend is None or self._running:
+            return
+
+        self._andor = AndorBackend()
+        if not self._andor.open(device_id):
+            self.video_label.setText("Failed to open Andor camera")
+            self._andor = None
+            return
+
+        w, h = self._andor.get_resolution()
+        self._running = True
+        self._backend_type = "andor"
+        self._timer.start(int(1000 / self._fps))
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setText("\u23f9")
+        logger.info(f"{self._camera_label}: Andor started ({w}x{h}) at {self._fps} FPS")
 
     def _start_simulated(self, mode: str = "microscope"):
         """v7.3.0: Start the simulated microscope camera."""
@@ -648,6 +887,22 @@ class CameraWidget(QWidget):
         if hasattr(self, "_lbl_gamma"):
             self._lbl_gamma.setText(f"{self._gamma:.2f}")
 
+    def set_mirrored(self, value: bool):
+        """v7.5.x: store the camera's mirrored-view flag.
+
+        Flag ONLY — the frame is NOT flipped here. Orientation (mirror +
+        rotation) is applied per consumer: the DISPLAY via
+        ``CameraFeedView.set_view_orientation`` (so what the operator sees is
+        un-mirrored), click→stage via ``CameraManager.pixel_to_stage_offset``,
+        and the mosaic via ``MosaicBuilder``. Keeping frames raw here lets the
+        mosaic re-blend against a *changing* orientation (the interactive
+        mosaic-orientation adjustment)."""
+        self._mirrored = bool(value)
+
+    @property
+    def mirrored(self) -> bool:
+        return bool(getattr(self, "_mirrored", False))
+
     def image_correction(self) -> dict:
         """Snapshot of the current correction as a plain dict (for persistence)."""
         return {
@@ -702,6 +957,16 @@ class CameraWidget(QWidget):
                 "brightness": {"range": tc.HW_RANGES["brightness"]},
                 "contrast": {"range": tc.HW_RANGES["contrast"]},
             }
+        elif backend == "andor" and getattr(self, "_andor", None) is not None:
+            an = self._andor
+            caps.update(source="andor", controllable=True, resolution=True,
+                        device_name=getattr(an, "_device_id", "Andor Zyla"))
+            # The Zyla exposes only exposure as a hardware control; omitting the
+            # other keys makes the settings dialog auto-hide them. Software
+            # brightness/contrast/gamma (display-only) still apply.
+            caps["controls"] = {
+                "exposure_us": {"range": an.get_exposure_time_range()},
+            }
         elif backend == "opencv" and self._capture is not None:
             caps.update(source="opencv", controllable=True, resolution=True,
                         device_name=f"OpenCV #{self._camera_index}")
@@ -732,6 +997,10 @@ class CameraWidget(QWidget):
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             d = self._toupcam.get_settings()
             d["source"] = "toupcam"
+            return d
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            d = self._andor.get_settings()
+            d["source"] = "andor"
             return d
         if backend == "opencv" and self._capture is not None:
             cap = self._capture
@@ -771,6 +1040,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.set_auto_exposure(bool(enabled))
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.set_auto_exposure(bool(enabled))
         if backend == "opencv" and self._capture is not None:
             # DirectShow: 0.75 = auto, 0.25 = manual.
             return bool(self._capture.set(
@@ -781,6 +1052,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.put_exposure_time(microseconds)
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.put_exposure_time(microseconds)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_EXPOSURE, microseconds))
         return False
@@ -789,6 +1062,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.put_exposure_gain(percent)
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.put_exposure_gain(percent)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_GAIN, percent))
         return False
@@ -797,6 +1072,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.put_gamma(value)
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.put_gamma(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_GAMMA, value))
         return False
@@ -805,6 +1082,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.put_brightness(value)
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.put_brightness(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_BRIGHTNESS, value))
         return False
@@ -813,6 +1092,8 @@ class CameraWidget(QWidget):
         backend = getattr(self, "_backend_type", "opencv")
         if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
             return self._toupcam.put_contrast(value)
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            return self._andor.put_contrast(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_CONTRAST, value))
         return False
@@ -842,6 +1123,20 @@ class CameraWidget(QWidget):
                 f"(eSize {idx}){'' if ok else ' [FAILED]'} — µm/px calibration "
                 f"may need redoing")
             return actual if ok else None
+        if backend == "andor" and getattr(self, "_andor", None) is not None:
+            res = self._andor.get_resolution_list()
+            if not res:
+                return None
+            target_area = int(width) * int(height)
+            idx = min(range(len(res)),
+                      key=lambda i: abs(res[i][0] * res[i][1] - target_area))
+            ok = self._andor.set_resolution_index(idx)
+            actual = self._andor.get_resolution()
+            logger.info(
+                f"{self._camera_label}: capture resolution -> {actual} "
+                f"(eSize {idx}){'' if ok else ' [FAILED]'} — µm/px calibration "
+                f"may need redoing")
+            return actual if ok else None
         if backend == "opencv" and self._capture is not None:
             self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
             self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
@@ -865,7 +1160,7 @@ class CameraWidget(QWidget):
         src = st.get("source", "none")
         head = f"{prefix}{self._camera_label}: hardware settings — source = {src}"
         lines = [head]
-        if src in ("toupcam", "opencv"):
+        if src in ("toupcam", "opencv", "andor"):
             lines.append(f"  device       : {st.get('device_id', '?')}")
             lines.append(f"  resolution   : {st.get('resolution')}"
                          + (f"  (eSize {st.get('eSize')})"
@@ -899,6 +1194,12 @@ class CameraWidget(QWidget):
                 self.stop()
                 return
             ret, frame = tc.read()
+        elif backend == 'andor':
+            an = getattr(self, '_andor', None)
+            if an is None or not an.isOpened():
+                self.stop()
+                return
+            ret, frame = an.read()
         else:
             if not self._capture or not self._capture.isOpened():
                 self.stop()
@@ -915,7 +1216,10 @@ class CameraWidget(QWidget):
         except ImportError:
             return
 
-        # v7.3.0: Store raw BGR frame for detection workers (thread-safe)
+        # v7.3.0: Store raw BGR frame for detection workers (thread-safe).
+        # Frames are kept RAW — orientation (mirror + rotation) is applied per
+        # consumer (display / click-mapping / mosaic), so the mosaic can re-blend
+        # against a changing orientation. See set_mirrored.
         with self._frame_lock:
             self._current_frame = frame.copy()
             self._frame_seq += 1
@@ -1065,6 +1369,11 @@ class CameraWidget(QWidget):
                 if tc is None or not tc.isOpened():
                     return None
                 ret, frame = tc.read()
+            elif backend == 'andor':
+                an = getattr(self, '_andor', None)
+                if an is None or not an.isOpened():
+                    return None
+                ret, frame = an.read()
             else:
                 if not self._capture or not self._capture.isOpened():
                     return None
@@ -1080,9 +1389,9 @@ class CameraWidget(QWidget):
             f = _read_once()
             if f is not None:
                 last = f
-            # ToupCam returns the same cached frame back-to-back; give the async
-            # callback a moment to deliver a newer one.
-            if backend == 'toupcam':
+            # ToupCam / Andor return the same buffered frame back-to-back; give
+            # the async callback / reader thread a moment to deliver a newer one.
+            if backend in ('toupcam', 'andor'):
                 time.sleep(0.02)
 
         final = _read_once()

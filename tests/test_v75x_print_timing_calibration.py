@@ -132,13 +132,22 @@ class TestRegistrationAndGate(_QtBase):
         self.assertFalse(page._running())
         self.assertIn("Safe Z", page._status.text())
 
-    def test_refuses_without_camera(self):
+    def test_refuses_without_camera_in_camera_mode(self):
+        # Only the 'Microscope camera' detector requires the camera. Select it,
+        # then with no camera_manager the preflight must refuse.
         page = TimingCalibrationWorkflowPage(_GateCtrl(), settings=None)
         page._safe_z = 5.0
         page._plate = object()                 # so center resolves
+        page._detector_combo.setCurrentIndex(1)   # 'Microscope camera'
         page._on_start()                       # camera_manager is None
         self.assertFalse(page._running())
-        self.assertIn("microscope camera", page._status.text())
+        self.assertIn("microscope", page._status.text().lower())
+
+    def test_default_detector_is_encoder_no_camera_required(self):
+        # The default 'Stage position' detector needs no camera — the preflight
+        # must NOT bounce on a missing camera (it clears the camera gate).
+        page = TimingCalibrationWorkflowPage(_GateCtrl(), settings=None)
+        self.assertEqual(page._detector_mode(), "encoder")
 
 
 # ── 4. Plot widgets ───────────────────────────────────────────────────
@@ -250,6 +259,7 @@ class TestWorkerSweep(_QtBase):
         page._safe_z = 5.0
         page._plate = object()
         page._optical_cam_idx = 0
+        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
         results = []
         finished = []
         page._bridge.result.connect(lambda d: results.append(d))
@@ -281,6 +291,7 @@ class TestWorkerSweep(_QtBase):
         page._safe_z = 5.0
         page._plate = object()
         page._optical_cam_idx = 0
+        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
         page._stop.set()
         finished = []
         page._bridge.finished.connect(lambda ok, m: finished.append((ok, m)))
@@ -380,6 +391,7 @@ class TestTopSpeed(_QtBase):
         page._safe_z = 5.0
         page._plate = object()
         page._optical_cam_idx = 0
+        page._detector_combo.setCurrentIndex(1)   # camera detector (patched _FrameMotion)
         results = []
         finished = []
         page._bridge.result.connect(lambda d: results.append(d))

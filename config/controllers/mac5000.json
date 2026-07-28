@@ -1,0 +1,121 @@
+{
+    "controller_name": "Ludl MAC 5000",
+    "manufacturer": "Ludl Electronic Products",
+    "protocol_version": "HLC",
+    "controller_family": "ludl",
+    "communication": {
+        "line_terminator_tx": "\\r",
+        "line_terminator_rx": "\\r",
+        "default_baud_rate": 9600,
+        "byte_size": 8,
+        "stop_bits": 2,
+        "timeout_s": 0.5,
+        "encoding": "ascii",
+        "notes": "LEP MAC 5000 High-Level (ASCII) mode: 9600-8-N-2, null-modem, CR terminator. MAC 6000 supports up to 115200 and the same ASCII commands. BENCH-VERIFY stop bits (2 for classic MAC 5000 per Micro-Manager Ludl.cpp; newer/ASI firmware uses 1) and the response terminator (CR on classic LEP, CR+LF on ASI-flavored firmware — the reader stops on either)."
+    },
+    "command_mode_init_hex": "FF41",
+    "detection": {
+        "wake_command": null,
+        "wake_delay_ms": 100,
+        "firmware_query": "WHERE X Y",
+        "identify_tokens": [
+            ":A",
+            ":N",
+            "MAC5000"
+        ],
+        "response_pattern": "^:[AN]",
+        "notes": "Detection probes with 'WHERE X Y' (reply ':A <x> <y>' matches ^:[AN]) rather than 'VER' — real HW (MAC5000 Interface v5.100 on COM5) answers VER with 'Version no. : 5.100 MAC5000 Interface with USB', which is NOT ':'-prefixed and would fail the match. command_mode_init_hex 0xFF41 forces ASCII/high-level mode first (MAC 5000 boots in low-level binary). The 'MAC5000' token also matches the VER string as a fallback. Confirmed on real HW 2026-07-22: 9600-8-N-2 + FF41."
+    },
+    "response_semantics": {
+        "ack_success_token": ":A",
+        "ack_error_pattern": "^:N\\s*-?(\\d+)"
+    },
+    "position_parse": {
+        "format": "whitespace",
+        "axis_order": [
+            "x",
+            "y"
+        ],
+        "strip_tokens": [],
+        "ack_prefix": ":A",
+        "regex": null
+    },
+    "speed_model": "absolute",
+    "speed_units": "counts_per_s",
+    "speed_per_axis": true,
+    "accel_model": "absolute",
+    "accel_units": "ramp_index",
+    "commands": {
+        "position_query": {
+            "cmd": "WHERE X Y",
+            "response": ":A {x} {y}"
+        },
+        "move_absolute": {
+            "cmd": "MOVE X={x} Y={y}",
+            "response": ":A"
+        },
+        "move_relative": {
+            "cmd": "MOVREL X={dx} Y={dy}",
+            "response": ":A"
+        },
+        "set_velocity": null,
+        "set_max_speed": {
+            "cmd": "SPEED X={sx} Y={sy}",
+            "response": ":A"
+        },
+        "get_max_speed": {
+            "cmd": "SPEED {axis}?",
+            "response": ":A {value}"
+        },
+        "set_acceleration": {
+            "cmd": "ACCEL X={accel} Y={accel}",
+            "response": ":A"
+        },
+        "get_acceleration": {
+            "cmd": "ACCEL {axis}?",
+            "response": ":A {value}"
+        },
+        "set_jerk": null,
+        "set_home": {
+            "cmd": "HERE X=0 Y=0",
+            "response": ":A"
+        },
+        "stop": {
+            "cmd": "HALT",
+            "response": ":A"
+        },
+        "firmware_version": {
+            "cmd": "VER",
+            "response": ":A {version}"
+        },
+        "motion_status": {
+            "cmd": "/",
+            "response": "{state}"
+        },
+        "stage_type": null
+    },
+    "parameters": {
+        "speed_range": [
+            85,
+            2764800
+        ],
+        "acceleration_range": [
+            1,
+            255
+        ],
+        "jerk_range": null,
+        "position_units": "counts",
+        "xy_position_scale": 10.0,
+        "position_range_x": [
+            -130000,
+            130000
+        ],
+        "position_range_y": [
+            -85000,
+            85000
+        ],
+        "max_speed": 50000,
+        "acceleration": 1,
+        "notes": "BENCH-TUNABLE DEFAULTS. xy_position_scale = stage wire-counts per micron (~10 = 0.1 µm/count default; MEASURE per stage — leadscrew/microstep dependent; confirmed correct-magnitude on real HW 2026-07-22, 10 counts/µm not yet bench-verified against a physical distance). speed_units 'counts_per_s' (pulses/sec, LEP) — if the unit expects mm/s (ASI-flavored firmware) it will run wildly off, switch to 'um_per_s'. speed_range clamps counts/s (85..2,764,800 per Micro-Manager). max_speed is the µm/s fast-travel ceiling. 'set_velocity' (continuous vector jog — ASI's VECTOR/VE command) was tested LIVE against a real MAC 5000 on 2026-07-22 and is NOT recognized (':N -1', unknown command) — confirmed this firmware genuinely has no continuous-velocity primitive. Xbox STICK jog therefore runs through XYStage._jog_pulse (a pulsed relative-move fallback: integrates the commanded velocity over wall-clock time, fires a MOVREL once the accumulated delta clears one wire count) instead of a true continuous VS-style jog; click/arrow (point-to-point) jog always worked and is unaffected. ACCEL: a unitless 1-255 RAMP-TIME index — CONFIRMED EMPIRICALLY BACKWARDS from typical 'more acceleration = faster' intuition: LOWER is FASTER/snappier (a 200 µm test move settled in 0.61s at ACCEL=1 vs 0.88s at ACCEL=255, same SPEED). Default LOW (near 1) for responsive jog/print motion; do NOT 'max it out' expecting speed."
+    }
+}

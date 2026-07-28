@@ -117,7 +117,9 @@ class _FakeExecutor:
     def run_post_clean(self):
         CALLS.append(("swap", self.prep_bore))
 
-    def aspirate_ink(self, well_pos, volume_uL, *, bore, z_mm, rate_uL_s=None):
+    def aspirate_ink(self, well_pos, volume_uL, *, bore, z_mm, rate_uL_s=None,
+                     prime_uL=0.0, prime_rate_uL_s=None, orbit=False,
+                     orbit_diameter_mm=1.0, orbit_speed_mm_s=2.0):
         CALLS.append(("aspirate", bore, well_pos, round(float(volume_uL), 4)))
 
     def run_print_cleanup(self):

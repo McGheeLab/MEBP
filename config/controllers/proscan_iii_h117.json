@@ -1,0 +1,115 @@
+{
+    "controller_name": "Prior ProScan III (H117 stage, STAGE-based detect)",
+    "manufacturer": "Prior Scientific",
+    "protocol_version": "III-alt-detect",
+    "communication": {
+        "line_terminator_tx": "\\r\\n",
+        "line_terminator_rx": "\\r\\n",
+        "default_baud_rate": 115200,
+        "baud_rates": [
+            115200,
+            38400,
+            9600
+        ],
+        "byte_size": 8,
+        "stop_bits": 1,
+        "timeout_s": 1.0,
+        "encoding": "ascii",
+        "notes": "v7.5.x: real-hardware variant for a Prior ProScan III unit (ME3B V3) identifying as 'H117P1N4/F' via STAGE (the '/F' = Hardware Rev F, confirmed to support 115200 -- Rev F/USB-FTDI boards only, per Prior's 'ProScan III Communication Speed' technical note). This unit was found on 2026-07-23 sitting at the 9600 factory/fail-safe default (no DIP switch exists for baud on ProScan -- confirmed absent from the full official manual -- it's a firmware/EEPROM setting, changed via the documented BAUD,<code> command: 96/19/38/115 for 9600/19200/38400/115200), then bumped live to 115200 (the max) via BAUD,115 and verified. Prior's manual documents that a changed baud reverts to the 9600 default if the port sits idle across TWO power cycles -- baud_rates lists all 3 realistic states (115200 preferred, then 38400, then 9600) so detection self-heals through that reversion without operator intervention; see ControllerProtocol.baud_rate_candidates."
+    },
+    "detection": {
+        "wake_command": "STAGE",
+        "wake_delay_ms": 300,
+        "firmware_query": "STAGE",
+        "identify_tokens": [
+            "STAGE =",
+            "MICROSTEPS"
+        ],
+        "notes": "v7.5.x: this unit's 'V' (firmware_version) query returns a bare 'R' ack instead of a version string (confirmed live, isolated, generous-timeout probes at BOTH 9600 and 38400 -- not a baud/timing artifact, a genuine firmware behavior), so proscan_iii.json's V-based detection can never match it at any baud. 'STAGE' reliably returns a rich multi-line descriptor ('STAGE = H117P1N4/F\\rTYPE = 25\\r...') that IS a genuine, distinctive Prior signature -- used here as both the wake (drains/settles the link before the real query) and the actual detection query. wake_delay_ms raised to 300 (from proscan_iii.json's 100) because the full multi-line reply must have COMPLETELY arrived before the wake-step read+reset, or trailing bytes contaminate the following detection query -- confirmed empirically: a 300ms post-DTR settle alone produced a truncated/spurious 'R' on the first STAGE call, a ~600ms total settle produced the clean full reply every time. response_pattern intentionally omitted (multi-line reply; tokens are enough and safer than a regex across only the first captured line).",
+        "response_pattern": null
+    },
+    "response_semantics": {
+        "ack_success_token": "R",
+        "ack_error_pattern": "^E,\\s*(-?\\d+)"
+    },
+    "commands": {
+        "position_query": {
+            "cmd": "P",
+            "response": "{x},{y},{z}"
+        },
+        "move_absolute": {
+            "cmd": "G {x},{y}",
+            "response": "R"
+        },
+        "move_relative": {
+            "cmd": "GR {dx},{dy}",
+            "response": "R"
+        },
+        "set_velocity": {
+            "cmd": "VS,{vx},{vy}",
+            "response": "R"
+        },
+        "set_max_speed": {
+            "cmd": "SMS,{speed}",
+            "response": "R"
+        },
+        "get_max_speed": {
+            "cmd": "SMS",
+            "response": "{value}"
+        },
+        "set_acceleration": {
+            "cmd": "SAS,{accel}",
+            "response": "R"
+        },
+        "get_acceleration": {
+            "cmd": "SAS",
+            "response": "{value}"
+        },
+        "set_jerk": {
+            "cmd": "SCS,{jerk}",
+            "response": "R"
+        },
+        "set_home": {
+            "cmd": "Z",
+            "response": "R"
+        },
+        "stop": {
+            "cmd": "I",
+            "response": "R"
+        },
+        "firmware_version": {
+            "cmd": "V",
+            "response": "R"
+        },
+        "stage_type": {
+            "cmd": "STAGE",
+            "response": "{type}"
+        }
+    },
+    "parameters": {
+        "speed_range": [
+            1,
+            100
+        ],
+        "acceleration_range": [
+            1,
+            100
+        ],
+        "jerk_range": [
+            1,
+            100
+        ],
+        "position_units": "microns",
+        "xy_position_scale": 1.0,
+        "position_range_x": [
+            -100000,
+            100000
+        ],
+        "position_range_y": [
+            -100000,
+            100000
+        ],
+        "max_speed": 50000,
+        "acceleration": 100000
+    }
+}

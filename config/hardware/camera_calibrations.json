@@ -79,11 +79,117 @@
     },
     "simulated:microscope": {
       "autostart": true
+    },
+    "andor:VSC-07863": {
+      "autostart": true,
+      "hw_controls": {
+        "exposure_us": 1008,
+        "resolution": [
+          1024,
+          1024
+        ]
+      },
+      "name": "Andor Zyla",
+      "image_correction": {
+        "brightness": -26,
+        "contrast": 1.0,
+        "gamma": 1.0
+      },
+      "um_per_px": 3.227061,
+      "date": "2026-07-27",
+      "rotation_deg": 0.5,
+      "mirrored": true
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&1d85a11e&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "image_correction": {
+        "brightness": 0,
+        "contrast": 1.0,
+        "gamma": 1.0
+      },
+      "name": "Teslong Camera",
+      "hw_controls": {
+        "exposure_gain_pct": 1.0,
+        "gamma": 84.0,
+        "brightness": 0.0,
+        "contrast": 2.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "autostart": true,
+      "um_per_px": 2.468365,
+      "rotation_deg": 0.0,
+      "date": "2026-07-27"
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "image_correction": {
+        "brightness": 0,
+        "contrast": 1.0,
+        "gamma": 1.0
+      },
+      "name": "Teslong Camera",
+      "hw_controls": {
+        "exposure_gain_pct": 1.0,
+        "gamma": 84.0,
+        "brightness": 0.0,
+        "contrast": 2.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "autostart": true,
+      "um_per_px": 2.591296,
+      "rotation_deg": 1.5,
+      "date": "2026-07-27"
+    },
+    "dshow:\\\\?\\usb#vid_32e4&pid_0577&mi_00#6&1d5a0258&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "hw_controls": {
+        "exposure_gain_pct": 110.0,
+        "gamma": 110.0,
+        "brightness": 0.0,
+        "contrast": 0.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "name": "HD USB Camera",
+      "image_correction": {
+        "brightness": 0,
+        "contrast": 1.0,
+        "gamma": 1.0
+      },
+      "autostart": false
+    },
+    "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&7edc02c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
+      "rotation_deg": 0.0,
+      "name": "Teslong Camera",
+      "date": "2026-07-28",
+      "um_per_px": 2.249557,
+      "image_correction": {
+        "brightness": 0,
+        "contrast": 1.0,
+        "gamma": 1.0
+      },
+      "hw_controls": {
+        "exposure_gain_pct": 1.0,
+        "gamma": 84.0,
+        "brightness": 0.0,
+        "contrast": 2.0,
+        "resolution": [
+          640,
+          480
+        ]
+      },
+      "autostart": true
     }
   },
   "assignments": {
-    "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
-    "microscope": "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13"
+    "needle_x": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "needle_y": "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&7edc02c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+    "microscope": "andor:VSC-07863",
+    "monitor": "dshow:\\\\?\\usb#vid_32e4&pid_0577&mi_00#6&1d5a0258&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global"
   }
 }

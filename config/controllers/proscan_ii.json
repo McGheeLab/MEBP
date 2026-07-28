@@ -22,6 +22,10 @@
         "response_pattern": "^-?\\d+,-?\\d+",
         "notes": "v7.2.8-fix: Use P (position query) for detection. V returns E,4 on ProScan II. COMP returns 0/1 which doesn't match the response_pattern. P always works and returns comma-separated numbers that match the pattern."
     },
+    "response_semantics": {
+        "ack_success_token": "R",
+        "ack_error_pattern": "^E,\\s*(-?\\d+)"
+    },
     "commands": {
         "position_query": {
             "cmd": "P",
@@ -43,9 +47,17 @@
             "cmd": "SMS,{speed}",
             "response": "R"
         },
+        "get_max_speed": {
+            "cmd": "SMS",
+            "response": "{value}"
+        },
         "set_acceleration": {
             "cmd": "SAS,{accel}",
             "response": "R"
+        },
+        "get_acceleration": {
+            "cmd": "SAS",
+            "response": "{value}"
         },
         "set_jerk": null,
         "set_home": {

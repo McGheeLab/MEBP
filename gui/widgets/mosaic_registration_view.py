@@ -64,6 +64,13 @@ class MosaicRegistrationView(QGraphicsView):
         self._ky: float = 1.0
         self._opacity: float = 0.6
         self._zoom: float = 1.0
+        # v7.5.x: display the tiles in the SAME plate-display frame as the full
+        # plate view (JogWorkspaceView rotates the mosaic 180° when
+        # ``plate_flip_180``). Without this the calibration view shows the STAGE
+        # frame while the full mosaic shows the PLATE frame, so an orientation
+        # tuned here looked "upside down" / on the wrong side there. Applied as a
+        # whole-view 180° rotation (re-asserted in ``fit``).
+        self._flip_180: bool = False
         self._fitted_once: bool = False
         self._placeholder = None
         self._show_placeholder("Build a calibration mosaic to see it here.")
@@ -181,12 +188,30 @@ class MosaicRegistrationView(QGraphicsView):
 
     # ── Zoom / pan ─────────────────────────────────────────────────
 
+    def set_flip_180(self, flip: bool) -> None:
+        """Show the tiles in the plate-display frame (180° whole-view rotation),
+        matching JogWorkspaceView when ``plate_flip_180`` — so what the operator
+        orients here is exactly what the full mosaic shows."""
+        flip = bool(flip)
+        if flip == self._flip_180:
+            return
+        self._flip_180 = flip
+        self._fitted_once = False
+        self.fit()
+
     def fit(self) -> None:
         br = self._scene.itemsBoundingRect()
         if br.isEmpty():
             return
         self.resetTransform()
         self._zoom = 1.0
+        if self._flip_180:
+            # Rotate about the view centre so the fitted content stays centred.
+            self.setTransformationAnchor(
+                QGraphicsView.ViewportAnchor.AnchorViewCenter)
+            self.rotate(180)
+            self.setTransformationAnchor(
+                QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.fitInView(br, Qt.AspectRatioMode.KeepAspectRatio)
         self._fitted_once = True
 

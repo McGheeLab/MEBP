@@ -41,6 +41,7 @@ from PySide6.QtGui import QPainter, QPen, QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QSpinBox, QDoubleSpinBox, QFrame, QSizePolicy, QPlainTextEdit, QSplitter,
+    QComboBox,
 )
 
 from gui.styles import COLORS
@@ -133,6 +134,73 @@ class _FrameMotion:
                     return int(cam.frame_count_value())
         except Exception:
             pass
+        return None
+
+
+class _EncoderMotion:
+    """Stillness detector driven by the STAGE'S OWN reported position — the
+    CAMERA-FREE detector. Drop-in for ``_FrameMotion`` (same available/reset/
+    metric interface), so every measurement (top speed, settle sweep) works with
+    no microscope.
+
+    ``metric()`` = |Δposition| in µm since the previous call. At rest the Prior's
+    reported position is constant (≈ 0 µm/poll); while moving it changes by
+    hundreds of µm/poll — a far cleaner still/moving signal than frame
+    differencing, and immune to focus/texture/lighting. Each call is one direct
+    ``get_xy_position(cached=False)`` query; the position poller is suspended for
+    the duration of a run, so these queries are uncontended.
+    """
+
+    # Physical still/moving thresholds for the position-delta metric (µm per
+    # poll). The metric is ABSOLUTE distance, so these are fixed — unlike the
+    # camera's arbitrary units, no scene calibration is needed (and the camera's
+    # scene calibration is exactly what made the settle sweep fail: on a short
+    # segment its 'peak' caught one poll spanning the whole move and set the
+    # threshold too high, so the sweep's smaller per-poll motions never cleared
+    # it and every measurement timed out). At any real jog/print speed a poll
+    # moves tens–hundreds of µm, while at-rest jitter is ≤ a couple of counts, so
+    # a 3 µm still-threshold separates them with huge margin.
+    STILL_UM = 3.0
+    MOTION_UM = 60.0     # nominal "clearly moving" peak (display/log only)
+
+    def __init__(self, controller):
+        self._ctrl = controller
+        self._prev = None
+
+    def fixed_threshold(self):
+        """(floor, peak, still_thresh) in the metric's µm units — used INSTEAD of
+        the scene-relative ``_calibrate_threshold`` for this physical detector."""
+        return (0.0, self.MOTION_UM, self.STILL_UM)
+
+    def available(self) -> bool:
+        c = self._ctrl
+        return (c is not None and getattr(c, "is_xy_connected", False)
+                and hasattr(c, "get_xy_position"))
+
+    def reset(self) -> None:
+        self._prev = None
+
+    def _read(self):
+        try:
+            p = self._ctrl.get_xy_position(cached=False)
+        except Exception:
+            return None
+        if not p or p[0] is None or p[1] is None:
+            return None
+        return (float(p[0]), float(p[1]))
+
+    def metric(self):
+        p = self._read()
+        if p is None:
+            return None
+        if self._prev is None:      # first sample after reset — no delta yet
+            self._prev = p
+            return None
+        d = math.hypot(p[0] - self._prev[0], p[1] - self._prev[1])
+        self._prev = p
+        return d
+
+    def frame_count(self):
         return None
 
 
@@ -579,6 +647,21 @@ class TimingCalibrationWorkflowPage(QWidget):
         return (self._start_xy_mm if self._start_xy_mm is not None
                 else self._print_center_mm())
 
+    def _detector_mode(self) -> str:
+        """'encoder' (stage-position, camera-free — default) or 'camera'."""
+        w = getattr(self, "_detector_combo", None)
+        try:
+            return w.currentData() or "encoder"
+        except Exception:
+            return "encoder"
+
+    def _make_tracker(self):
+        """The stillness detector for this run — the stage's own position
+        (camera-free) or the microscope, per the Detector selector."""
+        if self._detector_mode() == "camera":
+            return _FrameMotion(self._camera_manager, self._optical_cam_idx)
+        return _EncoderMotion(self._controller)
+
     def _build_main_area(self) -> QWidget:
         split = QSplitter(Qt.Horizontal)
         left = QSplitter(Qt.Vertical)
@@ -662,6 +745,21 @@ class TimingCalibrationWorkflowPage(QWidget):
         row = QHBoxLayout(frame)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(s(10))
+        # Detector: how "the stage has stopped moving" is sensed. Default =
+        # the stage's OWN reported position (no camera needed) — the right
+        # choice when the microscope isn't a good motion sensor on this rig.
+        row.addWidget(QLabel("Detector:"))
+        self._detector_combo = QComboBox()
+        self._detector_combo.addItem("Stage position (no camera)", "encoder")
+        self._detector_combo.addItem("Microscope camera", "camera")
+        self._detector_combo.setToolTip(
+            "How stage motion / stillness is measured.\n"
+            "Stage position = poll the Prior's own reported position (camera-"
+            "free; rest ≈ 0 µm, motion ≈ hundreds of µm per poll).\n"
+            "Microscope camera = frame-difference (needs a well-textured, "
+            "in-focus, well-lit view).")
+        self._detector_combo.setMinimumWidth(s(170))
+        row.addWidget(self._detector_combo)
         self._start_btn = QPushButton("Start sweep")
         self._start_btn.setToolTip(
             "Segment settle-delay sweep — measures the per-segment phase lag.")
@@ -674,10 +772,24 @@ class TimingCalibrationWorkflowPage(QWidget):
             "(makes commanded speed real). Do this FIRST.")
         self._speed_btn.clicked.connect(self._on_measure_speed)
         row.addWidget(self._speed_btn)
+        self._comms_btn = QPushButton("Check comms rate")
+        self._comms_btn.setToolTip(
+            "Measure the closed-loop control cadence WHILE the stage is moving "
+            "(send-velocity + read-position per cycle). This is the loop rate "
+            "the velocity-following print can run at — it sets the max stable "
+            "print speed. Needle stays retracted; net motion ~0.")
+        self._comms_btn.clicked.connect(self._on_check_comms)
+        row.addWidget(self._comms_btn)
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._on_stop)
         row.addWidget(self._stop_btn)
+        self._challenge_btn = QPushButton("XY Printing Challenge…")
+        self._challenge_btn.setToolTip(
+            "Open the path-following bench: drive challenge shapes in each print "
+            "mode, compare actual vs ideal path, and tune per-mode parameters.")
+        self._challenge_btn.clicked.connect(self._open_challenge)
+        row.addWidget(self._challenge_btn)
         row.addStretch(1)
         self._status = QLabel("")
         self._status.setStyleSheet(
@@ -711,6 +823,11 @@ class TimingCalibrationWorkflowPage(QWidget):
         if self._context_widget is not None and hasattr(
                 self._context_widget, "on_status_update"):
             self._context_widget.on_status_update()
+        # The Start/Measure buttons gate on live XY+ZP connection; re-evaluate
+        # each tick so they enable as soon as the hardware connects (they were
+        # only refreshed on construction / calibration-data pushes before, so a
+        # connect made after opening this page left the button stuck greyed).
+        self._update_button_state()
 
     def set_settings(self, settings) -> None:
         self._settings = settings
@@ -746,6 +863,9 @@ class TimingCalibrationWorkflowPage(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._start_live_feed()
+        # Re-evaluate button gating on entry — the connection state may have
+        # changed since the page was built.
+        self._update_button_state()
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -905,6 +1025,10 @@ class TimingCalibrationWorkflowPage(QWidget):
         self._start_btn.setEnabled(connected and not running)
         if hasattr(self, "_speed_btn"):
             self._speed_btn.setEnabled(connected and not running)
+        if hasattr(self, "_comms_btn"):
+            # comms probe only needs the XY stage (ZP only to confirm retract)
+            xy_ok = getattr(self._controller, "is_xy_connected", False)
+            self._comms_btn.setEnabled(xy_ok and not running)
         self._stop_btn.setEnabled(running)
 
     def _gather_config(self) -> _TimingConfig:
@@ -935,12 +1059,19 @@ class TimingCalibrationWorkflowPage(QWidget):
                 "No start location — calibrate a plate (for plate centre), or "
                 "jog the stage and press 'Use current position'.")
             return None
-        self._optical_cam_idx = self._start_microscope_camera()
-        if self._optical_cam_idx is None or self._camera_manager is None:
-            self._status.setText(
-                "This measurement needs the microscope camera — start it on "
-                "Hardware Setup → Cameras first.")
-            return None
+        # The camera is only needed for the 'Microscope camera' detector; the
+        # default 'Stage position' detector measures motion from the stage's own
+        # reported position, so it needs no camera at all.
+        if self._detector_mode() == "camera":
+            self._optical_cam_idx = self._start_microscope_camera()
+            if self._optical_cam_idx is None or self._camera_manager is None:
+                self._status.setText(
+                    "The 'Microscope camera' detector needs the microscope — "
+                    "start it on Hardware Setup → Cameras, or switch Detector to "
+                    "'Stage position (no camera)'.")
+                return None
+        else:
+            self._optical_cam_idx = None
         return self._gather_config()
 
     def _launch(self, target, cfg, status_msg):
@@ -974,6 +1105,88 @@ class TimingCalibrationWorkflowPage(QWidget):
         cfg = self._preflight()
         if cfg is not None:
             self._launch(self._run_top_speed, cfg, "Measuring XY top speed…")
+
+    def _on_check_comms(self):
+        """Measure the closed-loop control cadence under motion (comms rate)."""
+        if self._running():
+            return
+        ctrl = self._controller
+        if not getattr(ctrl, "is_xy_connected", False):
+            self._status.setText("Connect the XY stage first.")
+            return
+        if self._safe_z is None and getattr(ctrl, "is_zp_connected", False):
+            self._status.setText(
+                "No Safe Z calibrated — set it on Calibration → Needle Offset "
+                "first (the needle stays retracted for the measurement).")
+            return
+        if not hasattr(ctrl, "measure_control_loop_rate"):
+            self._status.setText("This controller can't measure the comms rate.")
+            return
+        # No camera / start-location needed — this is a pure comms + motion probe.
+        self._launch(self._run_comms_check, self._gather_config(),
+                     "Measuring closed-loop comms rate (stage moving)…")
+
+    def _run_comms_check(self, _cfg) -> None:
+        """Worker: retract the needle, run the interleaved send-velocity +
+        read-position probe under motion, store + report the loop period."""
+        ctrl = self._controller
+        try:
+            # Needle retracted for the whole probe (it never descends).
+            if self._safe_z is not None and hasattr(ctrl, "ensure_retracted_to"):
+                ctrl.ensure_retracted_to(float(self._safe_z))
+            self._log_t("Probing control-loop cadence under motion…")
+            res = ctrl.measure_control_loop_rate(iterations=40)
+            if not isinstance(res, dict) or res.get("error"):
+                msg = (res or {}).get("error", "no result") \
+                    if isinstance(res, dict) else "no result"
+                self._bridge.finished.emit(False, f"Comms check failed: {msg}")
+                return
+            hz = res.get("control_hz", 0.0)
+            per = res.get("avg_period_ms", 0.0)
+            self._log_t(
+                f"loop {per:.1f} ms/cycle → {hz:.1f} Hz  "
+                f"(read {res.get('avg_read_ms', 0):.1f} + "
+                f"cmd {res.get('avg_cmd_ms', 0):.1f} ms)")
+            self._log_t(
+                f"min/max {res.get('min_period_ms', 0):.0f}/"
+                f"{res.get('max_period_ms', 0):.0f} ms · "
+                f"moved={res.get('moved')} · "
+                f"excursion {res.get('max_excursion_um', 0):.0f} µm")
+            # Persist + derive the max stable velocity-follow speed.
+            store = get_store()
+            store.set_control_loop_ms(per)
+            v = store.stable_velocity_speed_mm_s()
+            look = store.get_mode_params("velocity").get("lookahead_mm", 0.6)
+            if v is not None:
+                self._log_t(
+                    f"→ max stable velocity-follow speed ≈ {v:.2f} mm/s "
+                    f"(lookahead {look:.2f} mm, ×2 safety)")
+                if not res.get("moved"):
+                    self._log_t(
+                        "⚠ stage did not visibly move — result is comms-only; "
+                        "check SMS / that the stage is free to move.")
+                self._bridge.finished.emit(
+                    True, f"Comms {hz:.0f} Hz ({per:.0f} ms) · "
+                    f"max stable ≈ {v:.2f} mm/s")
+            else:
+                self._bridge.finished.emit(
+                    True, f"Comms {hz:.0f} Hz ({per:.0f} ms/cycle)")
+        except Exception as e:
+            logger.exception("Comms-rate check error")
+            self._bridge.finished.emit(False, f"Comms check error: {e}")
+
+    def _open_challenge(self):
+        """Open the XY Printing Challenge bench (path-following compare + tune)."""
+        try:
+            from gui.dialogs.xy_challenge_dialog import XYChallengeDialog
+        except Exception as e:
+            self._status.setText(f"Challenge unavailable: {e}")
+            return
+        dlg = XYChallengeDialog(
+            self._controller, safe_z=self._safe_z,
+            start_xy_mm=self._resolve_start_mm(), parent=self)
+        self._challenge_dlg = dlg          # keep a reference so it isn't GC'd
+        dlg.show()
 
     def _on_stop(self):
         self._stop.set()
@@ -1101,6 +1314,29 @@ class TimingCalibrationWorkflowPage(QWidget):
         thresh = floor + max((peak - floor) * 0.3, 0.0)
         return (floor, peak, thresh)
 
+    def _encoder_threshold(self, ctrl, tracker, cx, cy):
+        """Still/moving threshold for the STAGE-POSITION detector: measure only
+        the at-rest jitter (no move — the move-peak is exactly what made the
+        camera threshold fragile on short segments) and place the threshold
+        safely above it. The metric is absolute µm, so real motion (tens–hundreds
+        of µm/poll) always clears this by a wide margin. Returns (floor, peak,
+        still_thresh) in µm/poll."""
+        ctrl.move_xy_absolute(cx, cy, from_zero_ref=True)
+        if hasattr(ctrl, "wait_for_xy_arrival"):
+            ctrl.wait_for_xy_arrival(cx, cy, tolerance_mm=0.1, timeout_s=15.0)
+        tracker.reset()
+        self._dwell(tracker, 1.5)                    # let open-loop drain finish
+        rest = self._dwell(tracker, 1.0)             # sample at-rest jitter
+        if rest:
+            srt = sorted(rest)
+            floor = srt[min(len(srt) - 1, int(len(srt) * 0.9))]   # 90th pct
+        else:
+            floor = 0.0
+        still_um = getattr(tracker, "STILL_UM", 3.0)
+        motion_um = getattr(tracker, "MOTION_UM", 60.0)
+        thresh = max(still_um, floor * 3.0, floor + 3.0)
+        return (floor, motion_um, thresh)
+
     # ── worker thread ─────────────────────────────────────────────
 
     def _run(self, cfg: _TimingConfig) -> None:
@@ -1109,9 +1345,12 @@ class TimingCalibrationWorkflowPage(QWidget):
         if center is None:
             self._bridge.finished.emit(False, "No start location — aborted.")
             return
-        tracker = _FrameMotion(self._camera_manager, self._optical_cam_idx)
+        tracker = self._make_tracker()
         if not tracker.available():
-            self._bridge.finished.emit(False, "Microscope camera unavailable.")
+            self._bridge.finished.emit(
+                False, "Motion detector unavailable — connect the XY stage "
+                "(stage-position detector) or start the microscope (camera "
+                "detector).")
             return
 
         cx, cy = center
@@ -1152,28 +1391,41 @@ class TimingCalibrationWorkflowPage(QWidget):
             if had_wd:
                 ctrl.suspend_zp_watchdog()
 
-            # Derive the still/moving threshold from the actual scene via a
-            # test move (see _calibrate_threshold) — robust to scene contrast.
-            cal = self._calibrate_threshold(ctrl, tracker, cx, cy, seg, seg_time)
-            if cal is None:
-                self._bridge.finished.emit(
-                    False, "No camera frames — is the microscope running?")
-                return
-            floor, peak, still_thresh = cal
+            # Threshold: a physical detector (the stage-position encoder) uses a
+            # FIXED µm threshold — its metric is absolute distance, so no scene
+            # calibration is needed (and scene calibration is what made this
+            # sweep fail on short segments). The camera derives it from the scene
+            # via a test move.
+            _fixed = getattr(tracker, "fixed_threshold", None)
+            if _fixed is not None:
+                floor, peak, still_thresh = self._encoder_threshold(
+                    ctrl, tracker, cx, cy)
+                self._log_t(
+                    f"Stage-position detector: rest jitter {floor:.1f} → still "
+                    f"threshold {still_thresh:.1f} µm/poll (no scene calibration).")
+            else:
+                cal = self._calibrate_threshold(
+                    ctrl, tracker, cx, cy, seg, seg_time)
+                if cal is None:
+                    self._bridge.finished.emit(
+                        False, "No camera frames — is the microscope running?")
+                    return
+                floor, peak, still_thresh = cal
+                self._log_t(
+                    f"Calibration: rest noise {floor:.2f}, motion peak "
+                    f"{peak:.2f} → still threshold {still_thresh:.2f}.")
+                # If a real move doesn't move the frames clearly above the rest
+                # noise, the camera can't see the motion — abort with guidance
+                # rather than report a bogus 0 ms.
+                if (peak - floor) < max(floor * 0.5, 0.5):
+                    self._bridge.finished.emit(
+                        False, f"Camera not detecting stage motion (rest "
+                        f"{floor:.2f} ≈ move {peak:.2f}) — check the microscope "
+                        f"is focused on a TEXTURED region, well-lit, and running "
+                        f"at a usable FPS.")
+                    return
             self._strip.set_threshold(still_thresh)
             self._bridge.stats.emit({"thresh": f"{still_thresh:.2f}"})
-            self._log_t(
-                f"Calibration: rest noise {floor:.2f}, motion peak {peak:.2f} "
-                f"→ still threshold {still_thresh:.2f}.")
-            # If a real move doesn't move the frames clearly above the rest
-            # noise, the camera can't see the motion — abort with guidance
-            # rather than report a bogus 0 ms.
-            if (peak - floor) < max(floor * 0.5, 0.5):
-                self._bridge.finished.emit(
-                    False, f"Camera not detecting stage motion (rest {floor:.2f} "
-                    f"≈ move {peak:.2f}) — check the microscope is focused on a "
-                    f"TEXTURED region, well-lit, and running at a usable FPS.")
-                return
 
             for n in range(1, cfg.max_segments + 1):
                 if self._stop.is_set():
@@ -1267,9 +1519,12 @@ class TimingCalibrationWorkflowPage(QWidget):
         if center is None:
             self._bridge.finished.emit(False, "No start location — aborted.")
             return
-        tracker = _FrameMotion(self._camera_manager, self._optical_cam_idx)
+        tracker = self._make_tracker()
         if not tracker.available():
-            self._bridge.finished.emit(False, "Microscope camera unavailable.")
+            self._bridge.finished.emit(
+                False, "Motion detector unavailable — connect the XY stage "
+                "(stage-position detector) or start the microscope (camera "
+                "detector).")
             return
 
         cx, cy = center
@@ -1307,22 +1562,31 @@ class TimingCalibrationWorkflowPage(QWidget):
             if had_wd:
                 ctrl.suspend_zp_watchdog()
 
-            cal = self._calibrate_threshold(
-                ctrl, tracker, cx, cy, (dists[0], 0.0), dists[0] / 5.0)
-            if cal is None:
-                self._bridge.finished.emit(
-                    False, "No camera frames — is the microscope running?")
-                return
-            floor, peak, still_thresh = cal
+            _fixed = getattr(tracker, "fixed_threshold", None)
+            if _fixed is not None:
+                floor, peak, still_thresh = self._encoder_threshold(
+                    ctrl, tracker, cx, cy)
+                self._log_t(
+                    f"Stage-position detector: rest jitter {floor:.1f} → still "
+                    f"threshold {still_thresh:.1f} µm/poll.")
+            else:
+                cal = self._calibrate_threshold(
+                    ctrl, tracker, cx, cy, (dists[0], 0.0), dists[0] / 5.0)
+                if cal is None:
+                    self._bridge.finished.emit(
+                        False, "No camera frames — is the microscope running?")
+                    return
+                floor, peak, still_thresh = cal
+                self._log_t(
+                    f"Calibration: rest {floor:.2f}, motion peak {peak:.2f} "
+                    f"→ still threshold {still_thresh:.2f}.")
+                if (peak - floor) < max(floor * 0.5, 0.5):
+                    self._bridge.finished.emit(
+                        False, "Camera not detecting stage motion — check "
+                        "focus / texture / lighting / FPS.")
+                    return
             self._strip.set_threshold(still_thresh)
             self._bridge.stats.emit({"thresh": f"{still_thresh:.2f}"})
-            self._log_t(f"Calibration: rest {floor:.2f}, motion peak {peak:.2f} "
-                        f"→ still threshold {still_thresh:.2f}.")
-            if (peak - floor) < max(floor * 0.5, 0.5):
-                self._bridge.finished.emit(
-                    False, "Camera not detecting stage motion — check focus / "
-                    "texture / lighting / FPS.")
-                return
 
             for d in dists:
                 if self._stop.is_set():

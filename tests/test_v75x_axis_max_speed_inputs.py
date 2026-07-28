@@ -15,6 +15,7 @@ Covered (offscreen GUI smoke on the shared HardwareControlPanel):
 """
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +23,23 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from SupportClasses.StageController import StageController
+
+
+def _wait_for(predicate, timeout_s=2.0):
+    """v7.5.x: pump jog moves now run on a daemon thread (see
+    ``HardwareControlPanel._on_jog_pump``) so the GUI thread — and every
+    QTimer-driven camera feed — can't freeze while a backlash-compensated
+    move drains via blocking M400s. Spin the Qt event loop (delivering the
+    queued completion signal) until ``predicate()`` is true or timeout."""
+    from PySide6.QtWidgets import QApplication
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    QApplication.processEvents()
+    return predicate()
 
 
 class _Settings:
@@ -137,6 +155,9 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
         p, c = self._panel(speed_as_max=True, settings=_Settings())
         p.spin_xy_pct.setValue(40000)
         p._on_jog_xy(10.0, 0.0)
+        # v7.5.x: XY jog now runs the speed-set + move on a worker thread (so it
+        # can't freeze the camera feed) — wait for the backgrounded call.
+        self.assertTrue(_wait_for(lambda: c.xy_stage.set_velocity.called))
         c.xy_stage.set_velocity.assert_called_with(40000)
 
     # 5b — max-mode pump jog is raw mm at the absolute feedrate
@@ -144,7 +165,7 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
         p, c = self._panel(speed_as_max=True, settings=_Settings())
         p.spin_p_max_pumps["P1"].setValue(150)
         p._on_jog_pump("P1", 0.1)
-        self.assertTrue(c.move_pump_relative.called)
+        self.assertTrue(_wait_for(lambda: c.move_pump_relative.called))
         self.assertFalse(c.move_pump_uL.called)
         self.assertEqual(c.move_pump_relative.call_args.kwargs["feedrate"], 150.0)
 

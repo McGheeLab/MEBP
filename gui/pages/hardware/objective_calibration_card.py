@@ -289,6 +289,13 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_remove = QPushButton("Remove Selected")
         self._btn_remove.setObjectName("dangerBtn")
         self._btn_remove.setEnabled(False)
+        self._btn_autocal = QPushButton("Auto-calibrate scale + FOV…")
+        self._btn_autocal.setObjectName("accentBtn")
+        self._btn_autocal.setToolTip(
+            "Move the stage a large known distance and track a feature across "
+            "the frame to derive µm/px AND the camera's field-of-view in "
+            "microns, anchored to the camera's actual captured resolution.")
+        self._btn_autocal.setEnabled(False)
         self._btn_calibrate = QPushButton("Calibrate Selected…")
         self._btn_calibrate.setObjectName("accentBtn")
         self._btn_calibrate.setEnabled(False)
@@ -297,6 +304,7 @@ class ObjectiveCalibrationCard(QGroupBox):
         btn_row.addWidget(self._btn_add)
         btn_row.addWidget(self._btn_remove)
         btn_row.addStretch(1)
+        btn_row.addWidget(self._btn_autocal)
         btn_row.addWidget(self._btn_calibrate)
         btn_row.addWidget(self._btn_clear)
         active_lay.addLayout(btn_row)
@@ -309,6 +317,7 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_add.clicked.connect(self._on_add_clicked)
         self._btn_remove.clicked.connect(self._on_remove_clicked)
         self._btn_calibrate.clicked.connect(self._on_calibrate_clicked)
+        self._btn_autocal.clicked.connect(self._on_autocal_scale_fov_clicked)
         self._btn_orient.clicked.connect(self._on_calibrate_orientation_clicked)
         self._btn_clear.clicked.connect(self._on_clear_clicked)
 
@@ -497,6 +506,7 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_add.setEnabled(True)
         self._btn_remove.setEnabled(has_selection)
         self._btn_calibrate.setEnabled(has_microscope and has_selection)
+        self._btn_autocal.setEnabled(has_microscope and has_selection)
         # Orientation is objective-independent → only needs a microscope camera.
         self._btn_orient.setEnabled(has_microscope)
         if has_microscope and has_selection:
@@ -613,14 +623,15 @@ class ObjectiveCalibrationCard(QGroupBox):
         rotation_deg = dlg.result_rotation_deg
 
         # Persist per-objective (µm/px is objective-specific) and push live.
-        config = self._config_getter()
-        resolution = (
-            tuple(config.camera_config.active_resolution)
-            if config is not None else (0, 0)
-        )
+        # v7.5.x: stamp the camera's ACTUAL captured resolution (the real pixels
+        # off the sensor), NOT config.active_resolution which can be stale — a
+        # wrong stamp is exactly what made the mosaic FOV "assume a resolution".
+        resolution = self._true_capture_resolution(cam_idx)
         self._store.set_calibration(
             cam_key, objective, um_per_px, resolution, rotation_deg=rotation_deg,
         )
+        # A fresh µm/px supersedes any stale "Store FOV/spacing" learned value.
+        self._clear_stale_mosaic_fov(cam_idx, objective)
         if self._camera_manager is not None:
             try:
                 self._camera_manager.set_um_per_px(
@@ -636,6 +647,164 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._refresh_objective_note()
         self._refresh_orientation_readout()
         self.calibration_changed.emit()
+
+    def _true_capture_resolution(self, cam_idx: int) -> tuple:
+        """The camera's ACTUAL captured (w, h) — the real pixels off the sensor.
+
+        v7.5.x: µm/px must be stamped with the resolution it was measured at so
+        the mosaic can rescale to whatever the live feed runs at. Reading the
+        LIVE frame shape (authoritative) instead of ``config.active_resolution``
+        (which can be stale/assumed) is the fix for the FOV that "assumes a
+        camera resolution". Falls back to the HW settings, then the config."""
+        mgr = self._camera_manager
+        try:
+            frame = mgr.cameras[cam_idx].get_current_frame()
+            if frame is not None and getattr(frame, "shape", None):
+                return (int(frame.shape[1]), int(frame.shape[0]))
+        except Exception:
+            pass
+        try:
+            if hasattr(mgr, "get_hw_settings"):
+                hw = mgr.get_hw_settings(cam_idx)
+                res = hw.get("resolution") if isinstance(hw, dict) else None
+                if res and len(res) >= 2 and res[0] and res[1]:
+                    return (int(res[0]), int(res[1]))
+        except Exception:
+            pass
+        config = self._config_getter()
+        try:
+            return tuple(config.camera_config.active_resolution)
+        except Exception:
+            return (0, 0)
+
+    def _on_autocal_scale_fov_clicked(self) -> None:
+        """v7.5.x: auto-calibrate µm/px AND the camera's FOV extent by tracking a
+        feature across a large stage move, anchored to the ACTUAL captured
+        resolution. Persists per-objective (so the mosaic picks it up) and pushes
+        live, exactly like ``_on_calibrate_clicked`` but with the better
+        large-baseline measurement + true resolution + FOV report."""
+        cam_idx = self._microscope_idx()
+        if cam_idx is None:
+            return
+        cam_key = self._camera_key()
+        if not cam_key:
+            QMessageBox.warning(
+                self, "Auto-calibrate",
+                "No camera identity is set for the microscope slot. Pick a "
+                "camera model on the Microscope Camera Setup card first.")
+            return
+        objective = (self._selected_objective_name()
+                     or self._current_objective_name())
+        if not objective:
+            return
+        controller = self._controller_getter()
+        if controller is None or not getattr(controller, "xy_stage", None):
+            QMessageBox.warning(
+                self, "Auto-calibrate",
+                "Stage controller not connected — this calibration moves the "
+                "stage to measure µm/px. Connect hardware first.")
+            return
+        if self._camera_manager is None or not self._camera_manager.is_running(cam_idx):
+            QMessageBox.warning(
+                self, "Auto-calibrate",
+                f"Start the microscope camera (Cam {cam_idx + 1}) first.")
+            return
+
+        try:
+            from gui.dialogs.scale_fov_calibration_dialog import (
+                ScaleFovCalibrationDialog)
+        except Exception as exc:
+            logger.warning(f"Scale/FOV dialog unavailable: {exc}")
+            QMessageBox.warning(self, "Auto-calibrate",
+                                "Scale/FOV calibration dialog unavailable.")
+            return
+        # Clear any stale "Store FOV/spacing" learned value up front — BEFORE the
+        # dialog — so it doesn't shadow the new measurement AND so a fresh
+        # correction the operator makes in the Verify step (which writes a new
+        # learned value) survives (clearing after would wipe it).
+        self._clear_stale_mosaic_fov(cam_idx, objective)
+        dlg = ScaleFovCalibrationDialog(
+            self._camera_manager, controller, cam_idx=cam_idx,
+            align_key=self._mosaic_align_key(cam_idx, objective),
+            objective=objective, cam_key=cam_key, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        um_per_px = dlg.result_um_per_px
+        if um_per_px is None or um_per_px <= 0:
+            return
+        rotation_deg = dlg.result_rotation_deg
+        # v7.5.x: the FULL camera→stage orientation MEASURED from the two-axis
+        # move (rotation AND handedness/mirror). A mirror can't be a rotation, so
+        # a mirrored/180° microscope was invisible to the old rotation-only
+        # estimate and the operator had to guess flip-X/flip-Y — landing "upside
+        # down" and the full mosaic placing tiles on the wrong side. Now measured.
+        flip_x = dlg.result_flip_x
+        flip_y = dlg.result_flip_y
+        # The dialog measured the resolution directly (frame.shape) — the real
+        # captured pixels. Fall back to the live read only if absent.
+        resolution = dlg.result_resolution or self._true_capture_resolution(cam_idx)
+
+        self._store.set_calibration(
+            cam_key, objective, um_per_px, resolution, rotation_deg=rotation_deg)
+        # NOTE: the stale learned value was cleared BEFORE the dialog — do NOT
+        # clear it here, or a correction made in the Verify step (which writes a
+        # fresh learned value that should win) would be wiped.
+        if self._camera_manager is not None:
+            try:
+                self._camera_manager.set_um_per_px(
+                    cam_idx, um_per_px, resolution=resolution)
+                if rotation_deg is not None:
+                    self._camera_manager.set_rotation_deg(cam_idx, rotation_deg)
+                # Push the measured handedness so the live view, the mosaic
+                # (_orient_tile) and click-mapping all use it — ONE orientation.
+                if flip_x is not None:
+                    self._camera_manager.set_mirrored(cam_idx, bool(flip_x))
+                sfy = getattr(self._camera_manager, "set_flip_y", None)
+                if flip_y is not None and callable(sfy):
+                    sfy(cam_idx, bool(flip_y))
+            except Exception as exc:
+                logger.debug(f"autocal: push to manager — {exc}")
+        # Persist rotation + handedness per camera identity (ground truth the
+        # full-plate mosaic reads; restored on slot assignment).
+        try:
+            from SupportClasses.CameraCalibrationStore import (
+                get_store as _cam_store)
+            ident = None
+            cid = getattr(self._camera_manager, "camera_identity", None)
+            if callable(cid):
+                ident = cid(cam_idx)
+            if ident and ident[0]:
+                st = _cam_store()
+                nm = ident[1] if len(ident) > 1 else ""
+                if rotation_deg is not None:
+                    st.set_rotation(ident[0], float(rotation_deg), name=nm)
+                if flip_x is not None:
+                    st.set_mirrored(ident[0], bool(flip_x), name=nm)
+                sfy = getattr(st, "set_flip_y", None)
+                if flip_y is not None and callable(sfy):
+                    sfy(ident[0], bool(flip_y), name=nm)
+        except Exception as exc:
+            logger.debug(f"autocal: orientation persist — {exc}")
+
+        if self._current_objective_name() == objective:
+            self.um_per_px_committed.emit(cam_idx, um_per_px)
+        self._refresh_table()
+        self._refresh_objective_note()
+        self._refresh_orientation_readout()
+        self.calibration_changed.emit()
+        fov = dlg.result_fov_um or (0.0, 0.0)
+        flips = ([("flip X")] if flip_x else []) + ([("flip Y")] if flip_y else [])
+        flip_txt = ", ".join(flips) if flips else "none"
+        QMessageBox.information(
+            self, "Auto-calibrate scale + FOV",
+            f"Saved for {objective}:\n\n"
+            f"µm/px = {um_per_px:.4f}  @ {resolution[0]}×{resolution[1]} px\n"
+            f"Field of view = {fov[0]:.0f} × {fov[1]:.0f} µm\n"
+            f"Rotation vs stage = "
+            f"{('%.1f°' % rotation_deg) if rotation_deg is not None else '—'}\n"
+            f"Camera axis flips (measured from stage motion) = {flip_txt}\n\n"
+            "Mosaics now size their tiles from this FOV and orient them with the "
+            "measured rotation + flips — so tiles land on the correct side.")
 
     def _on_calibrate_orientation_clicked(self) -> None:
         """Measure the camera's rotation vs the stage axes (does NOT change
@@ -695,11 +864,31 @@ class ObjectiveCalibrationCard(QGroupBox):
                     name=(ident[1] if len(ident) > 1 else ""))
         except Exception as exc:
             logger.debug(f"orientation: persist per identity — {exc}")
-        # The mount rotation is a property of the CAMERA, not the objective —
-        # sync it into EVERY objective that has a µm/px calibration for this
-        # camera, so a later objective swap (_push_stored_um_per_px_to_manager
-        # pushes the per-objective rotation) can't push a STALE rotation back
-        # over this fresh measurement.
+        # Sync the fresh rotation into every per-objective calibration and
+        # refresh the readout (shared with the Hardware Setup per-slot
+        # rotation calibration — see adopt_camera_rotation).
+        self.adopt_camera_rotation(float(rotation_deg))
+        self.calibration_changed.emit()
+        QMessageBox.information(
+            self, "Calibrate orientation",
+            f"Camera rotation vs stage measured: {rotation_deg:.1f}°.\n\n"
+            "Live-view clicks (re-anchor, well fits) now map in the corrected "
+            "direction. A previously scanned mosaic is unaffected — the rotation "
+            "only changes the click→stage mapping, not the stored image.",
+        )
+
+    def adopt_camera_rotation(self, rotation_deg: float) -> None:
+        """v7.5.x: adopt a freshly-measured camera→stage rotation.
+
+        Called by the card's own "Calibrate orientation…" AND by the
+        per-slot rotation calibration on the Camera Detection & Assignment
+        card when the calibrated slot holds the MICROSCOPE role. The mount
+        rotation is a property of the CAMERA, not the objective — sync it
+        into EVERY objective that has a µm/px calibration for this camera,
+        so a later objective swap (_push_stored_um_per_px_to_manager pushes
+        the per-objective rotation) can't push a STALE rotation back over
+        this fresh measurement. Then refresh the readout.
+        """
         try:
             cam_key = self._camera_key()
             if cam_key:
@@ -712,16 +901,7 @@ class ObjectiveCalibrationCard(QGroupBox):
                             rotation_deg=float(rotation_deg))
         except Exception as exc:
             logger.debug(f"orientation: sync per-objective — {exc}")
-
         self._refresh_orientation_readout()
-        self.calibration_changed.emit()
-        QMessageBox.information(
-            self, "Calibrate orientation",
-            f"Camera rotation vs stage measured: {rotation_deg:.1f}°.\n\n"
-            "Live-view clicks (re-anchor, well fits) now map in the corrected "
-            "direction. A previously scanned mosaic is unaffected — the rotation "
-            "only changes the click→stage mapping, not the stored image.",
-        )
 
     def _refresh_orientation_readout(self) -> None:
         """Show the current camera→stage rotation (from the live manager)."""
@@ -790,3 +970,35 @@ class ObjectiveCalibrationCard(QGroupBox):
             return ""
         item = self._table.item(row, 0)
         return item.text() if item is not None else ""
+
+    def _mosaic_align_key(self, cam_idx: int, objective: str) -> str:
+        """The MosaicAlignmentStore key the mosaic build uses for this camera +
+        objective — MUST match ``CalibrationPage._ploc_camera_objective_key``
+        (``{camera_identity}|{objective}`` or ``{objective}``)."""
+        ident = None
+        try:
+            cid = getattr(self._camera_manager, "camera_identity", None)
+            if callable(cid):
+                r = cid(cam_idx)
+                if r:
+                    ident = r[0]
+        except Exception:
+            ident = None
+        obj = objective or "default"
+        return f"{ident}|{obj}" if ident else str(obj)
+
+    def _clear_stale_mosaic_fov(self, cam_idx: int, objective: str) -> None:
+        """v7.5.x: a fresh µm/px calibration supersedes any "Store FOV/spacing"
+        learned value the mosaic build PREFERS over the objective calibration.
+        Clear it so the mosaic uses THIS calibration — otherwise the stale
+        learned FOV shadows the recalibration (operator report: "the calibration
+        did not correctly assign the values to the mosaic, it was still wrong")."""
+        try:
+            from SupportClasses.MosaicAlignmentStore import get_store
+            get_store().clear(self._mosaic_align_key(cam_idx, objective))
+            logger.info(
+                "Cleared stale mosaic FOV/alignment for "
+                f"'{self._mosaic_align_key(cam_idx, objective)}' — fresh "
+                "calibration now drives the mosaic.")
+        except Exception as exc:
+            logger.debug(f"clear stale mosaic FOV skipped: {exc}")

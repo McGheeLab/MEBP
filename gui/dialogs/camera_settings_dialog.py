@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
     QCheckBox, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox,
@@ -42,6 +42,11 @@ except Exception:  # pragma: no cover
 
 class CameraSettingsDialog(QDialog):
     """Modeless hardware-settings panel for one camera slot."""
+
+    # v7.5.x: (cam_idx, width, height) — emitted when the DEVICE capture
+    # resolution actually changes, so the "Microscope Camera Setup" block can
+    # update its `active_resolution` (the block was pulling a stale resolution).
+    resolution_applied = Signal(int, int, int)
 
     def __init__(self, manager, cam_idx: int, identity_getter=None,
                  parent=None):
@@ -293,6 +298,17 @@ class CameraSettingsDialog(QDialog):
             return
         actual = self._mgr.set_capture_resolution(self._cam_idx, data[0], data[1])
         logger.info(f"Cam {self._cam_idx + 1}: resolution set -> {actual}")
+        # Broadcast the applied resolution so the camera-setup block updates its
+        # active_resolution (and any µm/px consumer rescales) — ground truth.
+        try:
+            if actual and len(actual) >= 2 and actual[0] and actual[1]:
+                self.resolution_applied.emit(
+                    int(self._cam_idx), int(actual[0]), int(actual[1]))
+            else:
+                self.resolution_applied.emit(
+                    int(self._cam_idx), int(data[0]), int(data[1]))
+        except Exception:
+            pass
         self._persist()
         # Re-read (eSize / exposure ranges can shift with resolution).
         self.reload()
@@ -395,7 +411,7 @@ class CameraSettingsDialog(QDialog):
         lines = [f"source = {src}"]
         if name:
             lines.append(f"device = {name}")
-        if src in ("toupcam", "opencv"):
+        if src in ("toupcam", "opencv", "andor"):
             lines.append(f"resolution    = {st.get('resolution')}"
                          + (f"  (eSize {st.get('eSize')})"
                             if st.get("eSize") is not None else ""))

@@ -1268,6 +1268,36 @@ class SettingsPage(QWidget):
                 f"{rate_results.get('max_command_hz', 0):.0f} Hz"
             )
 
+    def _sync_active_device_profile_controller(self, ctrl_json) -> None:
+        """Re-save the active device profile FILE from current settings.
+
+        Mirrors ``StageHardwarePanel._persist_active_profile`` — this page
+        doesn't otherwise touch device-profile JSON files, but
+        ``controller.controller_json`` is dual-homed (also mirrored into
+        ``DeviceProfile.xy_controller_json``), so a change here must be
+        written through to the profile file too, or a later explicit
+        profile Load will silently reassert whatever controller was saved in
+        it last. Best-effort — never raises, no-op if there's no active
+        profile.
+        """
+        if self.settings is None:
+            return
+        active = self.settings.get("device_profile.active")
+        if not active:
+            return
+        try:
+            from gui.pages.hardware.device_profile import DeviceProfile, list_profiles
+            for name, path in list_profiles():
+                if name == active:
+                    profile = DeviceProfile.from_settings(self.settings, name=active)
+                    profile.save(path)
+                    logger.info(
+                        f"Active device profile '{active}' re-saved with "
+                        f"controller_json={ctrl_json!r}")
+                    break
+        except Exception as e:
+            logger.warning(f"Failed to sync active device profile controller: {e}")
+
     def _apply_settings(self):
         """Apply UI values to controller and persist.
 
@@ -1369,6 +1399,19 @@ class SettingsPage(QWidget):
         # P8.23: Controller protocol selection
         ctrl_data = self.combo_controller.currentData()
         self.settings.set("controller.controller_json", ctrl_data)
+        # v7.5.x: push to the live controller so the next XY (re)connect uses the
+        # chosen protocol (Prior / Ludl MAC 5000). Takes effect on reconnect.
+        if self.controller is not None and hasattr(
+                self.controller, "set_controller_json"):
+            self.controller.set_controller_json(ctrl_data)
+        # v7.5.x BUGFIX: also sync the ACTIVE device profile file, not just
+        # settings.json. Without this, the next explicit profile Load (a
+        # normal action, e.g. on Hardware Setup → Device) reads the profile's
+        # OLD, un-synced xy_controller_json straight off disk and silently
+        # reverts this choice — "I switch the XY type but it keeps looking
+        # for the old controller." Mirrors
+        # stage_panel.StageHardwarePanel._persist_active_profile.
+        self._sync_active_device_profile_controller(ctrl_data)
 
         # Unit conversion factor
         if hasattr(self, 'spin_um_factor'):

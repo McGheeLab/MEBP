@@ -36,6 +36,7 @@ from gui.pages.hardware.device_profile import (
 )
 from gui.widgets.icons import icon, icon_button, set_button_icon
 from gui.widgets.jog_button_array import JogButtonArray
+from gui.widgets.reorderable_sections import ReorderableSectionList
 from SupportClasses.ZPStage import AXIS_MAP as _DEFAULT_AXIS_MAP
 from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
@@ -98,6 +99,7 @@ class StageHardwarePanel(QWidget):
         self._settings = settings
         if settings is not None:
             self._load_from_settings()
+            self._restore_section_layout()
 
     def set_controller(self, controller):
         """Inject StageController for the zero-calibration jog row.
@@ -199,27 +201,49 @@ class StageHardwarePanel(QWidget):
         )
         outer.addWidget(banner)
 
-        # v7.4.1: Device profile picker — sits at the top because choosing
-        # a profile populates all the groups below
-        outer.addWidget(self._build_device_profile_group())
-
+        # v7.5.x: every configuration section below is a collapsible,
+        # user-reorderable card (ReorderableSectionList) so the operator can
+        # promote the sections they reach for often and fold the rest away.
+        # The order + collapsed state are persisted per-machine to settings
+        # (see _persist_section_layout / _restore_section_layout). Default
+        # order preserves the historical top-to-bottom layout.
+        #
         # v7.4.2: Connect Hardware + Full Jog Pad + Live Position were
         # moved to the persistent HardwareControlPanel on the left edge
         # of Hardware Setup (always visible across sub-pages). The Device
         # sub-page now only carries the *configuration* sections.
-        outer.addWidget(self._build_axis_mapping_group())
-        outer.addWidget(self._build_xy_cal_group())
-        outer.addWidget(self._build_steps_cal_group())
-        outer.addWidget(self._build_setup_jog_safety_group())
-        outer.addWidget(self._build_override_position_group())
-        outer.addWidget(self._build_zp_feedrates_group())
-        # v7.5.x: recalibration-reminder thresholds + calibration-status pop-up.
-        outer.addWidget(self._build_recal_reminders_group())
+        #
         # v7.4.2 hotfix: Axis Direction Flips section removed — direction
         # inversion now lives exclusively in steps_per_mm sign (see the
         # Stepper Calibration "Invert Axis Direction" button). axis_flip
         # is force-zeroed on every Apply to keep the two mechanisms from
         # ever fighting each other.
+        self._section_list = ReorderableSectionList()
+        _sections = [
+            ("device_profile", "Device Profile",
+             self._build_device_profile_group()),
+            ("axis_mapping", "Axis Mapping",
+             self._build_axis_mapping_group()),
+            ("xy_cal", "XY Stage Calibration",
+             self._build_xy_cal_group()),
+            ("steps_cal", "ZP Stage Calibration",
+             self._build_steps_cal_group()),
+            ("jog_safety", "Jog & Safety Limits",
+             self._build_setup_jog_safety_group()),
+            ("override_pos", "Override / Sync Axis Position",
+             self._build_override_position_group()),
+            ("zp_feedrates", "ZP Stage Feedrates (% of Z max)",
+             self._build_zp_feedrates_group()),
+            ("recal_reminders", "Recalibration Reminders",
+             self._build_recal_reminders_group()),
+        ]
+        for _key, _title, _widget in _sections:
+            self._section_list.add_section(_key, _title, _widget)
+        self._section_list.order_changed.connect(
+            lambda *_a: self._persist_section_layout())
+        self._section_list.collapsed_changed.connect(
+            lambda *_a: self._persist_section_layout())
+        outer.addWidget(self._section_list)
 
         # v7.4.2 polish: Apply / Reset bottom action row — right-aligned,
         # primary apply, danger reset.
@@ -243,6 +267,39 @@ class StageHardwarePanel(QWidget):
         outer.addLayout(btn_row)
 
         outer.addStretch()
+
+    # ── v7.5.x: collapsible / reorderable section layout ─────────
+
+    def _persist_section_layout(self) -> None:
+        """Save the current section order + collapsed state to settings.
+
+        Per-machine UI preference (which sections sit where and which are
+        folded); it does not affect hardware behavior. Guarded so it is a
+        no-op before settings are injected."""
+        if self._settings is None or not hasattr(self, "_section_list"):
+            return
+        try:
+            self._settings.set("device_page_layout.order",
+                               self._section_list.order())
+            self._settings.set("device_page_layout.collapsed",
+                               self._section_list.collapsed_states())
+            self._settings.save()
+        except Exception as e:
+            logger.warning(f"persist device-page section layout failed: {e}")
+
+    def _restore_section_layout(self) -> None:
+        """Apply the persisted section order + collapsed state (if any)."""
+        if self._settings is None or not hasattr(self, "_section_list"):
+            return
+        try:
+            order = self._settings.get("device_page_layout.order")
+            if isinstance(order, list) and order:
+                self._section_list.set_order(order)
+            collapsed = self._settings.get("device_page_layout.collapsed")
+            if isinstance(collapsed, dict) and collapsed:
+                self._section_list.apply_collapsed_states(collapsed)
+        except Exception as e:
+            logger.warning(f"restore device-page section layout failed: {e}")
 
     # ── v7.4.1: Device profile picker ────────────────────────────
 
@@ -1323,17 +1380,40 @@ class StageHardwarePanel(QWidget):
         outer = QVBoxLayout(grp)
 
         info = QLabel(
-            "Configure XY motion characteristics (ProScan). Velocity "
-            "and acceleration are stored in the device profile and "
+            "Configure the XY controller type and motion characteristics. "
+            "Velocity and acceleration are stored in the device profile and "
             "pushed to the controller on Save. The Units verification "
-            "test (below) is report-only — ProScan moves natively in "
-            "µm at 1:1, so a discrepancy means a mechanical issue, "
-            "not a software fix."
+            "test (below) is report-only."
         )
         info.setWordWrap(True)
         info.setStyleSheet(
             f"color: {COLORS['subtext0']}; ")
         outer.addWidget(info)
+
+        # ── XY controller type (per-machine) ───────────────────
+        # v7.5.x: which XY controller this machine uses. Persisted into the
+        # global controller.controller_json key on Save (device profile → global
+        # → auto-detect). Applies on the next XY reconnect.
+        ctrl_row = QHBoxLayout()
+        ctrl_row.addWidget(QLabel("XY controller:"))
+        self.cmb_xy_controller = QComboBox()
+        self.cmb_xy_controller.setMinimumWidth(s(200))
+        self.cmb_xy_controller.setToolTip(
+            "The XY stage controller for THIS machine (Prior ProScan, Ludl "
+            "MAC 5000, …). Saved with the device profile; takes effect on the "
+            "next XY reconnect. 'Auto-Detect' identifies the controller at "
+            "connect.")
+        self._populate_xy_controller_combo()
+        self.cmb_xy_controller.currentIndexChanged.connect(
+            self._on_xy_controller_changed)
+        ctrl_row.addWidget(self.cmb_xy_controller, 1)
+        outer.addLayout(ctrl_row)
+
+        self.lbl_xy_controller_hint = QLabel("")
+        self.lbl_xy_controller_hint.setWordWrap(True)
+        self.lbl_xy_controller_hint.setStyleSheet(
+            f"color: {COLORS['subtext0']}; ")
+        outer.addWidget(self.lbl_xy_controller_hint)
 
         # ── Velocity / acceleration / jerk ─────────────────────
         form = QFormLayout()
@@ -1346,9 +1426,11 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_velocity.setValue(100)
         self.spin_xy_velocity.setMinimumWidth(s(120))
         self.spin_xy_velocity.setToolTip(
-            "ProScan SMS — max velocity as a percentage of the "
-            "controller's hardware ceiling. Default 100%.")
-        form.addRow("Velocity (% max):", self.spin_xy_velocity)
+            "Max velocity as a percentage of the controller's top speed "
+            "(Prior SMS, or a fraction of the measured ceiling for Ludl). "
+            "Default 100%.")
+        self._lbl_xy_velocity = QLabel("Velocity (% max):")
+        form.addRow(self._lbl_xy_velocity, self.spin_xy_velocity)
 
         self.spin_xy_acceleration = QDoubleSpinBox()
         self.spin_xy_acceleration.setRange(1, 100)
@@ -1356,8 +1438,10 @@ class StageHardwarePanel(QWidget):
         self.spin_xy_acceleration.setValue(50)
         self.spin_xy_acceleration.setMinimumWidth(s(120))
         self.spin_xy_acceleration.setToolTip(
-            "ProScan SAS — acceleration as a percentage. Default 50.")
-        form.addRow("Acceleration:", self.spin_xy_acceleration)
+            "Acceleration. Prior SAS = percentage 1-100; Ludl ACCEL = a "
+            "1-255 ramp index (lower = snappier). Default 50.")
+        self._lbl_xy_acceleration = QLabel("Acceleration:")
+        form.addRow(self._lbl_xy_acceleration, self.spin_xy_acceleration)
 
         self.spin_xy_jerk = QDoubleSpinBox()
         self.spin_xy_jerk.setRange(0, 100)
@@ -1371,6 +1455,56 @@ class StageHardwarePanel(QWidget):
         form.addRow("Jerk (optional):", self.spin_xy_jerk)
 
         outer.addLayout(form)
+
+        # ── v7.5.x: Live stage state — read directly from hardware ────
+        # Motivated by a real incident: a bad command silently corrupted ONE
+        # axis's SPEED register on a Ludl MAC 5000 while the other stayed
+        # normal, and there was no way to SEE that divergence from the app —
+        # only ad-hoc bench scripts caught it. This surfaces the stage's
+        # ACTUAL current velocity/acceleration, independent of whatever the
+        # device profile/software thinks is configured.
+        live_grp = QGroupBox("Live Stage State (read from hardware)")
+        live_grp.setStyleSheet(SECTION_TITLE_STYLE)
+        live_outer = QVBoxLayout(live_grp)
+        live_info = QLabel(
+            "Query the CONNECTED stage's actual velocity/acceleration "
+            "registers on demand — independent of the values above. Ludl "
+            "shows X and Y separately since they are genuinely independent "
+            "per-axis registers and CAN diverge; Prior has one shared value."
+        )
+        live_info.setWordWrap(True)
+        live_info.setStyleSheet(f"color: {COLORS['subtext0']}; ")
+        live_outer.addWidget(live_info)
+
+        live_grid = QFormLayout()
+        live_grid.setHorizontalSpacing(s(10))
+        self.lbl_xy_live_speed_x = QLabel("—")
+        self.lbl_xy_live_speed_y = QLabel("—")
+        self.lbl_xy_live_accel_x = QLabel("—")
+        self.lbl_xy_live_accel_y = QLabel("—")
+        self._lbl_xy_live_speed_x_row = QLabel("Velocity (X):")
+        self._lbl_xy_live_speed_y_row = QLabel("Velocity (Y):")
+        self._lbl_xy_live_accel_x_row = QLabel("Acceleration (X):")
+        self._lbl_xy_live_accel_y_row = QLabel("Acceleration (Y):")
+        live_grid.addRow(self._lbl_xy_live_speed_x_row, self.lbl_xy_live_speed_x)
+        live_grid.addRow(self._lbl_xy_live_speed_y_row, self.lbl_xy_live_speed_y)
+        live_grid.addRow(self._lbl_xy_live_accel_x_row, self.lbl_xy_live_accel_x)
+        live_grid.addRow(self._lbl_xy_live_accel_y_row, self.lbl_xy_live_accel_y)
+        live_outer.addLayout(live_grid)
+
+        live_btn_row = QHBoxLayout()
+        btn_xy_read_stage = icon_button(
+            "Read from stage", "refresh",
+            tooltip="Query the connected stage's current velocity/"
+                    "acceleration directly (no motion; read-only).")
+        btn_xy_read_stage.clicked.connect(self._read_xy_stage_state)
+        live_btn_row.addWidget(btn_xy_read_stage)
+        self.lbl_xy_live_status = QLabel("")
+        self.lbl_xy_live_status.setWordWrap(True)
+        self.lbl_xy_live_status.setStyleSheet(f"color: {COLORS['subtext0']}; ")
+        live_btn_row.addWidget(self.lbl_xy_live_status, 1)
+        live_outer.addLayout(live_btn_row)
+        outer.addWidget(live_grp)
 
         # ── Units verification workflow ────────────────────────
         verify_grp = QGroupBox("Units verification (report only)")
@@ -1443,6 +1577,202 @@ class StageHardwarePanel(QWidget):
         outer.addLayout(save_row)
         return grp
 
+    def _populate_xy_controller_combo(self) -> None:
+        """Fill the XY-controller combo: Auto / Default / one per protocol JSON.
+
+        Mirrors settings_page._populate_controller_combo so the same choices
+        appear per-machine on the Device page.
+        """
+        from SupportClasses.ControllerProtocol import (
+            ControllerProtocol, discover_controller_files,
+        )
+        cmb = self.cmb_xy_controller
+        cmb.blockSignals(True)
+        cmb.clear()
+        cmb.addItem("Auto-Detect", "auto")
+        cmb.addItem("Default (ProScan III)", None)
+        for fp in discover_controller_files():
+            try:
+                proto = ControllerProtocol.load(fp)
+                cmb.addItem(proto.controller_name, str(fp))
+            except Exception:
+                cmb.addItem(f"⚠ {fp.stem}", str(fp))
+        cmb.blockSignals(False)
+
+    def _select_xy_controller(self, value) -> None:
+        """Select the combo entry whose data == value ('auto' / path / None)."""
+        cmb = self.cmb_xy_controller
+        idx = cmb.findData(value)
+        if idx < 0 and isinstance(value, str):
+            # Match by resolved path (settings may store a normalized string).
+            for i in range(cmb.count()):
+                d = cmb.itemData(i)
+                if isinstance(d, str) and Path(d) == Path(value):
+                    idx = i
+                    break
+        if idx < 0:
+            idx = cmb.findData("auto")
+        cmb.blockSignals(True)
+        cmb.setCurrentIndex(max(0, idx))
+        cmb.blockSignals(False)
+        self._relabel_xy_cal_for_json(cmb.currentData())
+
+    def _relabel_xy_cal_for_json(self, controller_json) -> None:
+        """Relabel/re-range the velocity+accel spinboxes for the selected model.
+
+        Percentage model (Prior): Velocity 1-100 %, Acceleration 1-100 (higher
+        = faster ramp, the usual convention).
+        Absolute model (Ludl): Velocity stays % of the measured top speed;
+        Acceleration becomes a 1-255 ramp-TIME index. v7.5.x: bench-confirmed
+        on a real MAC 5000 (2026-07-22) that this is BACKWARDS from the usual
+        convention — LOWER is FASTER (a 200 µm test move settled in 0.61s at
+        ACCEL=1 vs 0.88s at ACCEL=255, same SPEED). Only the accel RANGE
+        differs, so a value round-trips through the device profile either way.
+        """
+        family = "prior"
+        accel_max = 100
+        hint = ""
+        self._xy_accel_family_default = 50
+        if isinstance(controller_json, str) and controller_json not in ("auto", ""):
+            try:
+                from SupportClasses.ControllerProtocol import ControllerProtocol
+                proto = ControllerProtocol.load(controller_json)
+                family = proto.family
+                rng = proto.get_acceleration_range()
+                if rng:
+                    accel_max = int(rng[1])
+                if proto.accel_model == "absolute":
+                    self._lbl_xy_acceleration.setText(
+                        "Acceleration (ramp 1-255, LOWER = faster):")
+                else:
+                    self._lbl_xy_acceleration.setText("Acceleration:")
+                if family == "ludl":
+                    self._xy_accel_family_default = 1
+                    hint = (
+                        "Ludl MAC 5000: Velocity is a % of the measured top "
+                        "speed. Acceleration is a 1-255 RAMP-TIME index — "
+                        "bench-confirmed BACKWARDS from the usual convention: "
+                        "LOWER is FASTER/snappier (255 is the SLOWEST setting, "
+                        "not the fastest). Default to a low value (~1-10); do "
+                        "not 'max it out' expecting speed. Units (µm/count, "
+                        "speed units) are tuned on the bench — see "
+                        "config/controllers/mac5000.json. Change takes effect "
+                        "on the next XY reconnect.")
+            except Exception as e:
+                logger.debug("relabel XY cal failed: %s", e)
+        else:
+            self._lbl_xy_acceleration.setText("Acceleration:")
+        # Apply accel range without dropping the current value below it.
+        cur = self.spin_xy_acceleration.value()
+        self.spin_xy_acceleration.setRange(1, accel_max)
+        self.spin_xy_acceleration.setValue(min(cur, accel_max) if cur else cur)
+        self.lbl_xy_controller_hint.setText(hint)
+        # v7.5.x: Prior has ONE shared velocity/acceleration value (querying
+        # "axis" is meaningless — the command template ignores it) — hide the
+        # redundant Y row rather than show an identical duplicate. Ludl's X/Y
+        # registers are genuinely independent (can diverge — see the group's
+        # motivating incident), so both rows show for it.
+        per_axis = (family == "ludl")
+        if hasattr(self, "_lbl_xy_live_speed_y_row"):
+            self._lbl_xy_live_speed_y_row.setVisible(per_axis)
+            self.lbl_xy_live_speed_y.setVisible(per_axis)
+            self._lbl_xy_live_accel_y_row.setVisible(per_axis)
+            self.lbl_xy_live_accel_y.setVisible(per_axis)
+            self._lbl_xy_live_speed_x_row.setText(
+                "Velocity (X):" if per_axis else "Velocity:")
+            self._lbl_xy_live_accel_x_row.setText(
+                "Acceleration (X):" if per_axis else "Acceleration:")
+
+    def _on_xy_controller_changed(self, *_args) -> None:
+        """Combo change: relabel and note that a reconnect is required.
+
+        v7.5.x BUGFIX: this previously persisted only to ``settings.json``,
+        NOT to the active device profile FILE (``_persist_active_profile``),
+        unlike "Save XY Calibration" — so the on-disk profile kept the OLD
+        controller. The next time that profile was loaded (a normal action,
+        not just a stale-cache accident), its stale ``xy_controller_json``
+        silently overwrote the fresh choice, making the switch look like it
+        "didn't take" / "kept looking for" the old controller. Both persist
+        paths must agree, so this now calls ``_persist_active_profile()`` too.
+        """
+        data = self.cmb_xy_controller.currentData()
+        self._relabel_xy_cal_for_json(data)
+        # Persist immediately so it survives even without a full XY-cal Save,
+        # and push to the controller for the next connect.
+        s = self._settings
+        if s is not None:
+            s.set("controller.controller_json", data)
+            try:
+                s.save()
+            except Exception:
+                pass
+            # Keep the active device profile FILE in sync — see docstring.
+            self._persist_active_profile()
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_controller_json"):
+            ctrl.set_controller_json(data)
+        if self._controller is not None and self._controller.is_xy_connected:
+            base = self.lbl_xy_cal_status
+            base.setText("XY controller changed — reconnect the XY stage to "
+                         "apply.")
+
+    def _read_xy_stage_state(self) -> None:
+        """Query the connected stage's CURRENT velocity/acceleration directly.
+
+        Read-only — no motion, no settings written. Best-effort per axis;
+        any query that fails (unsupported/unconnected/malformed reply) shows
+        'unavailable' for that field rather than raising. A MISMATCH between
+        X and Y (Ludl only — Prior has one shared value) is flagged, since
+        that divergence is exactly what a bad command can silently cause.
+        """
+        ctrl = self._controller
+        xy = getattr(ctrl, "xy_stage", None) if ctrl is not None else None
+        if xy is None:
+            self.lbl_xy_live_status.setText("XY stage not connected.")
+            for lbl in (self.lbl_xy_live_speed_x, self.lbl_xy_live_speed_y,
+                        self.lbl_xy_live_accel_x, self.lbl_xy_live_accel_y):
+                lbl.setText("—")
+            return
+        try:
+            speed_x = xy.get_speed_readback("X")
+            speed_y = xy.get_speed_readback("Y")
+            accel_x = xy.get_acceleration_readback("X")
+            accel_y = xy.get_acceleration_readback("Y")
+        except Exception as e:
+            self.lbl_xy_live_status.setText(f"Read failed: {e}")
+            return
+        self.lbl_xy_live_speed_x.setText(speed_x["display"])
+        self.lbl_xy_live_speed_y.setText(speed_y["display"])
+        self.lbl_xy_live_accel_x.setText(accel_x["display"])
+        self.lbl_xy_live_accel_y.setText(accel_y["display"])
+
+        family = xy.protocol.family if xy.protocol else "prior"
+        warn = ""
+        if family == "ludl":
+            if (speed_x["raw"] is not None and speed_y["raw"] is not None
+                    and speed_x["raw"] != speed_y["raw"]):
+                warn += " ⚠ X/Y velocity MISMATCH."
+                self.lbl_xy_live_speed_x.setStyleSheet(f"color: {COLORS['yellow']};")
+                self.lbl_xy_live_speed_y.setStyleSheet(f"color: {COLORS['yellow']};")
+            else:
+                self.lbl_xy_live_speed_x.setStyleSheet("")
+                self.lbl_xy_live_speed_y.setStyleSheet("")
+            if (accel_x["raw"] is not None and accel_y["raw"] is not None
+                    and accel_x["raw"] != accel_y["raw"]):
+                warn += " ⚠ X/Y acceleration MISMATCH."
+                self.lbl_xy_live_accel_x.setStyleSheet(f"color: {COLORS['yellow']};")
+                self.lbl_xy_live_accel_y.setStyleSheet(f"color: {COLORS['yellow']};")
+            else:
+                self.lbl_xy_live_accel_x.setStyleSheet("")
+                self.lbl_xy_live_accel_y.setStyleSheet("")
+        any_unavailable = any(
+            d["raw"] is None for d in (speed_x, speed_y, accel_x, accel_y)
+            if family == "ludl" or d is speed_x or d is accel_x)
+        status = "Read from stage." + warn
+        if any_unavailable:
+            status += " (some fields unavailable — see tooltip/logs.)"
+        self.lbl_xy_live_status.setText(status)
+
     def _xy_verify_command_move(self) -> None:
         ctrl = self._controller
         if ctrl is None or not ctrl.is_xy_connected:
@@ -1483,6 +1813,15 @@ class StageHardwarePanel(QWidget):
         s.set("device_profile.xy_velocity_pct", vel)
         s.set("device_profile.xy_acceleration", acc)
         s.set("device_profile.xy_jerk", jerk)
+        # v7.5.x: persist the per-machine XY controller choice into the global
+        # key (device profile → global → auto) + push to the controller for the
+        # next connect.
+        if hasattr(self, "cmb_xy_controller"):
+            ctrl_json = self.cmb_xy_controller.currentData()
+            s.set("controller.controller_json", ctrl_json)
+            if self._controller is not None and hasattr(
+                    self._controller, "set_controller_json"):
+                self._controller.set_controller_json(ctrl_json)
         # Push to the controller if the XY stage is live
         ctrl = self._controller
         if ctrl is not None and ctrl.xy_stage is not None:
@@ -2920,10 +3259,21 @@ class StageHardwarePanel(QWidget):
                 v = saved_accel.get(ax, defaults.get(ax, 1000.0))
                 sp_w.setValue(float(v))
         if hasattr(self, 'spin_xy_velocity'):
+            # v7.5.x: restore the XY controller selection FIRST so the accel
+            # range/labels match the model before the value is applied.
+            if hasattr(self, 'cmb_xy_controller'):
+                self._populate_xy_controller_combo()
+                self._select_xy_controller(s.get("controller.controller_json"))
             self.spin_xy_velocity.setValue(
                 float(s.get("device_profile.xy_velocity_pct") or 100))
+            # v7.5.x: fall back to a family-aware default (Prior 50 / Ludl 1 —
+            # set by _relabel_xy_cal_for_json, called just above via
+            # _select_xy_controller) rather than a flat 50 for every family,
+            # since 50/255 is nowhere near Ludl's bench-confirmed "low = fast"
+            # sweet spot.
+            fallback_accel = getattr(self, "_xy_accel_family_default", 50)
             self.spin_xy_acceleration.setValue(
-                float(s.get("device_profile.xy_acceleration") or 50))
+                float(s.get("device_profile.xy_acceleration") or fallback_accel))
             saved_jerk = s.get("device_profile.xy_jerk")
             self.spin_xy_jerk.setValue(float(saved_jerk) if saved_jerk else 0)
 
@@ -3425,6 +3775,13 @@ class StageHardwarePanel(QWidget):
             profile.apply_to_settings(self._settings)
             self._settings.set("device_profile.active", profile.profile_name)
             self._settings.save()
+            # v7.5.x: the profile may select a per-machine XY controller (written
+            # into controller.controller_json by apply_to_settings). Push it so
+            # the next XY connect uses the right protocol (Prior / Ludl).
+            ctrl = self._controller
+            if ctrl is not None and hasattr(ctrl, "set_controller_json"):
+                ctrl.set_controller_json(
+                    self._settings.get("controller.controller_json"))
         # Refresh widget values from the (now updated) settings
         self._load_from_settings()
         self.lbl_profile_status.setText(

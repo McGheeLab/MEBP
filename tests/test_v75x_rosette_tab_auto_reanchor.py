@@ -763,6 +763,83 @@ class TestRosetteTab(_CalBase):
         self.assertEqual(calls, [("B2", True)])
 
 
+class TestRosetteLiveSelect(_CalBase):
+    """No-scan flow: pick each sub-well centre from the live feed."""
+
+    def _prep(self):
+        page = self._make_page()
+        page._plate = _FakeRosettePlate()
+        page._predicted_positions = {
+            "A1.a": (1000.0, 2000.0),
+            "A1.b": (1100.0, 2000.0),
+            "A1.c": (1200.0, 2000.0),
+        }
+        page._calibrated_positions = None
+        page._refresh_ploc_view = lambda: None
+        page.controller.get_xy_position.return_value = (10000.0, 20000.0)
+        mgr = MagicMock()
+        mgr.is_um_per_px_calibrated.return_value = True
+        mgr.pixel_to_stage_offset.return_value = (5.0, -3.0)
+        page._camera_manager = mgr
+        fv = MagicMock()
+        fv.cam_idx = 0
+        fv.image_size = (640, 480)
+        page._rosette_live_view = fv
+        page._ploc_live_cam_idx = 0
+        page._rosette_refresh_wells()
+        return page
+
+    def test_full_flow_confirm_skip(self):
+        page = self._prep()
+        self.assertEqual(page._rosette_well_combo.currentData(), "A1")
+        with patch("gui.pages.calibration.QMessageBox"):
+            page._rosette_start_live_select()
+            self.assertTrue(page._rosette_live_active)
+            self.assertEqual(
+                page._rosette_live_subwells, ["A1.a", "A1.b", "A1.c"])
+            self.assertFalse(page._rosette_live_box.isHidden())
+
+            # Click captures a pending centre (abs stage µm = pos + offset).
+            page._rosette_on_live_click(100.0, 90.0)
+            self.assertEqual(page._rosette_live_pending, (10005.0, 19997.0))
+            self.assertTrue(page._rosette_live_confirm.isEnabled())
+
+            page._rosette_live_confirm_next()
+            self.assertEqual(
+                page._calibrated_positions["A1.a"], (10005.0, 19997.0))
+            self.assertEqual(page._reference_markers["A1.a"], (10005.0, 19997.0))
+            self.assertEqual(page._rosette_live_idx, 1)
+            self.assertIsNone(page._rosette_live_pending)
+
+            # Skip the second sub-well.
+            page._rosette_live_skip_well()
+            self.assertEqual(page._rosette_live_idx, 2)
+            self.assertNotIn("A1.b", page._calibrated_positions)
+
+            # Confirm the last one → auto-finishes the flow.
+            page._rosette_on_live_click(50.0, 50.0)
+            page._rosette_live_confirm_next()
+
+        self.assertFalse(page._rosette_live_active)
+        self.assertTrue(page._rosette_live_box.isHidden())
+        self.assertIn("A1.c", page._calibrated_positions)
+        self.assertEqual(len(page._rosette_live_results), 2)
+        self.assertTrue(page._rosette_btn_live.isEnabled())
+
+    def test_click_noop_when_inactive(self):
+        page = self._prep()
+        page._rosette_on_live_click(100.0, 100.0)
+        self.assertIsNone(getattr(page, "_rosette_live_pending", None))
+
+    def test_gate_requires_um_per_px(self):
+        page = self._prep()
+        page._camera_manager.is_um_per_px_calibrated.return_value = False
+        with patch("gui.pages.calibration.QMessageBox") as mb:
+            page._rosette_start_live_select()
+        self.assertFalse(getattr(page, "_rosette_live_active", False))
+        mb.warning.assert_called_once()
+
+
 class TestOverlayCirclesOnly(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

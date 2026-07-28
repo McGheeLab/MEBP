@@ -457,12 +457,38 @@ class QuickPrintWorkflowPage(QWidget):
             "the plate bottom; larger = higher. Clamped so it never goes below.")
         self._printz_spin.valueChanged.connect(
             lambda *_: self._refresh_setup_status())
+        # v7.5.x: print-path MOTION MODE (A/B on hardware). The XY trajectory
+        # during ink laydown can be driven three ways — pick per-run:
+        #   • open_loop — the ORIGINAL streamed path (each segment fire-and-forget,
+        #     paced by a timed sleep). Correct when the stage tracks the commanded
+        #     speed; on a stage that runs slower than commanded it lags/smears.
+        #   • velocity  — CLOSED-LOOP: polls real position + re-commands a velocity
+        #     vector toward a carrot ahead of real progress (immune to a wrong
+        #     speed calibration; needs a continuous-velocity stage, e.g. Prior VS).
+        #   • confirm   — stop-and-go: wait for arrival + drain the pump each
+        #     segment. Correct but slow.
+        self._motion_mode_combo = QComboBox()
+        self._motion_mode_combo.setMinimumWidth(s(150))
+        self._motion_mode_combo.addItem("Open-loop velocity (streamed vectors)", "open_loop")
+        self._motion_mode_combo.addItem("Velocity (closed-loop)", "velocity")
+        self._motion_mode_combo.addItem("Confirmed per-segment (point-to-point)", "confirm")
+        self._motion_mode_combo.setToolTip(
+            "How the XY stage traces the print path.\n"
+            "Open-loop velocity = stream a continuous velocity vector along the "
+            "path (feed-forward, no position reads; smooth/continuous motion, "
+            "but no drift correction).\n"
+            "Velocity = closed-loop position feedback (same continuous motion, "
+            "plus it polls position and corrects drift; robust to a wrong speed "
+            "calibration).\n"
+            "Confirmed = move to each point and wait for arrival (accurate but "
+            "stop-and-go).")
         sec = dlg.add_section("Print")
         sec.add("pump", "Pump / bore", self._pump_combo, "P1")
         sec.add("extrusion_mod", "Extrusion modifier (×)",
                 self._extrusion_mod_spin, 1.0)
         sec.add("speed_pct", "Print speed", self._speed_pct_spin, 25.0)
         sec.add("printz", "Height above bottom", self._printz_spin, 0.2)
+        sec.add("motion_mode", "Motion mode", self._motion_mode_combo, "open_loop")
 
         # ── Ink ──
         self._ink_combo = QComboBox()
@@ -484,10 +510,55 @@ class QuickPrintWorkflowPage(QWidget):
             "Added to the pickup; flushed to waste in the post-print reset.")
         self._ink_padding_spin.valueChanged.connect(
             lambda *_: self._refresh_setup_status())
+        # ── Tip prime (aspirate extra, dispense back) ──
+        # Aspirate an EXTRA prime volume beyond the print pickup, then dispense
+        # that same amount back into the ink well. This advances ink to the very
+        # tip and purges the air gap so the ink is ready to deposit; net retained
+        # volume is unchanged. When on, the pickup runs WITHOUT compliance
+        # compensation (the compliance is primed by this dispense-back).
+        self._ink_prime_check = QCheckBox(
+            "Prime tip (aspirate extra, then dispense back into the well)")
+        self._ink_prime_check.setChecked(False)
+        self._ink_prime_check.setToolTip(
+            "Before printing: aspirate an extra volume, then dispense the same "
+            "amount back into the ink well. Advances ink to the tip and purges "
+            "the air gap so the ink is ready to deposit. While active, the ink "
+            "pickup skips backlash/compliance compensation (it is already primed "
+            "by the dispense-back).")
+        self._ink_prime_check.toggled.connect(
+            lambda *_: (self._refresh_setup_status(),
+                        self._update_settings_summary()))
+        self._ink_prime_spin = self._dspin(
+            0.0, 100.0, 2.0, " µL", 2, 0.1,
+            "Extra volume aspirated then dispensed back into the ink well to "
+            "prime the tip. Net retained volume is unchanged.")
+        # ── Granular anti-clog circular pickup ──
+        self._orbit_check = QCheckBox("Circular pickup for granular inks")
+        self._orbit_check.setChecked(True)
+        self._orbit_check.setToolTip(
+            "Orbit the needle in a small circle while aspirating an ink whose "
+            "subtype is 'granular material', so the granules behave more "
+            "fluid-like and don't clog the bore.")
+        self._orbit_all_check = QCheckBox("Force circular pickup for all inks")
+        self._orbit_all_check.setChecked(False)
+        self._orbit_all_check.setToolTip(
+            "Apply the circular pickup orbit to every ink, not just granular ones.")
+        self._orbit_dia_spin = self._dspin(
+            0.1, 10.0, 1.0, " mm", 2, 0.1,
+            "Diameter of the circle the needle orbits while picking up.")
+        self._orbit_speed_spin = self._dspin(
+            0.1, 50.0, 2.0, " mm/s", 1, 0.5,
+            "Tangential speed of the needle along the pickup orbit circle.")
         sec = dlg.add_section("Ink pickup")
         sec.add("ink", "Ink", self._ink_combo, "")
         sec.add("ink_z", "Ink dip Z (↑ bottom)", self._ink_z_spin, 0.50)
         sec.add("ink_padding", "Ink padding (µL)", self._ink_padding_spin, 0.0)
+        sec.add_check("ink_prime", self._ink_prime_check, False)
+        sec.add("ink_prime_uL", "Prime volume (µL)", self._ink_prime_spin, 2.0)
+        sec.add_check("orbit_granular", self._orbit_check, True)
+        sec.add_check("orbit_all", self._orbit_all_check, False)
+        sec.add("orbit_dia", "Orbit diameter (mm)", self._orbit_dia_spin, 1.0)
+        sec.add("orbit_speed", "Orbit speed (mm/s)", self._orbit_speed_spin, 2.0)
 
         # ── Ink mapping (multi-ink sketch) ──
         # When the loaded print is a sketch that uses ≥2 abstract inks, map each
@@ -1869,6 +1940,15 @@ class QuickPrintWorkflowPage(QWidget):
         )
         return resp == QMessageBox.StandardButton.Yes
 
+    def _motion_mode(self) -> str:
+        """Selected print-path motion mode: 'open_loop' (default), 'velocity',
+        or 'confirm'. Getattr-safe for a partially-built page / tests."""
+        w = getattr(self, "_motion_mode_combo", None)
+        try:
+            return w.currentData() or "open_loop"
+        except Exception:
+            return "open_loop"
+
     def _build_settings(self, pump: str | None = None) -> PrintSettings:
         # Print speed % scales the XY traverse AND the pump flow together.
         # ``pump`` overrides which pump the flow/prime are stamped for (used by
@@ -1903,6 +1983,41 @@ class QuickPrintWorkflowPage(QWidget):
             print_speed_mm_s=print_speed_mm_s,
             travel_speed_mm_s=travel_speed_mm_s,
         )
+        # v7.5.x: print-path motion mode (operator-selectable, A/B on hardware).
+        # open_loop = original streamed path; velocity = closed-loop follower;
+        # confirm = stop-and-go per segment. Default open_loop = the behaviour
+        # that worked on the other setup.
+        _mode = self._motion_mode()
+        settings.velocity_follow = (_mode == "velocity")
+        settings.confirm_each_segment = (_mode == "confirm")
+        # open_loop now = OPEN-LOOP velocity streaming (feed-forward velocity
+        # vectors along the path), NOT point-to-point moves (that's confirm).
+        settings.velocity_open_loop = (_mode == "open_loop")
+        # v7.5.x: stamp the per-mode path-following params tuned by the XY
+        # Printing Challenge (PrintTimingCalibrationStore) so the real print uses
+        # them. Best-effort; defaults preserve legacy behaviour.
+        try:
+            from SupportClasses.PrintTimingCalibrationStore import get_store
+            _tc = get_store()
+            settings.pace_correction = _tc.get_mode_params(
+                "open_loop").get("pace_correction", 1.0)
+            _cf = _tc.get_mode_params("confirm")
+            settings.segment_settle_tol_um = _cf.get("settle_tol_um", 0.0)
+            settings.confirm_corner_angle_deg = _cf.get("corner_angle_deg", 0.0)
+            _v = _tc.get_mode_params("velocity")
+            settings.vel_lookahead_mm = _v.get("lookahead_mm", 0.0)
+            settings.vel_control_hz = _v.get("control_hz", 0.0)
+            settings.vel_decel_mm = _v.get("decel_mm", 0.0)
+            settings.vel_corner_angle_deg = _v.get("corner_angle_deg", 0.0)
+            settings.vel_corner_speed_factor = _v.get("corner_speed_factor", 0.0)
+            settings.vel_pid_kp = _v.get("pid_kp", 0.0)
+            settings.vel_pid_kd = _v.get("pid_kd", 0.0)
+            # machine-measured calibration → grounds the follower's rate/speed cap
+            settings.xy_max_speed_um_s = _tc.get_xy_max_speed_um_s() or 0.0
+            settings.control_loop_ms = _tc.get_control_loop_ms() or 0.0
+            settings.phase_lag_s = _tc.get_phase_lag_s() or 0.0
+        except Exception:
+            pass
         # v7.5.x: stamp the reference-vector up-direction (print_z_height above
         # is already polarity-correct via controller.print_height_to_zref).
         try:
@@ -2195,6 +2310,32 @@ class QuickPrintWorkflowPage(QWidget):
         return (dispensed + prime + self._needle_dead_volume_uL()
                 + self._ink_padding_uL())
 
+    def _ink_pickup_kwargs(self, ink_name) -> dict:
+        """Resolve the tip-prime + granular-orbit kwargs for ``aspirate_ink``
+        given the ink being picked up. Prime is a global µL setting; the orbit
+        auto-applies to inks whose subtype is 'granular material' (or every ink
+        when the force-all override is ticked). Guarded for the ``__new__``
+        partial pages used in tests."""
+        prime_uL = 0.0
+        if getattr(self, "_ink_prime_check", None) is not None and \
+                self._ink_prime_check.isChecked():
+            prime_uL = float(self._ink_prime_spin.value())
+        lib = (getattr(self._hw_config, "ink_library", {}) or {}
+               if self._hw_config else {})
+        spec = lib.get(ink_name)
+        is_gran = ((getattr(spec, "ink_subtype", "") or "").strip().lower()
+                   == "granular material")
+        orbit = False
+        if getattr(self, "_orbit_check", None) is not None:
+            orbit = (self._orbit_all_check.isChecked()
+                     or (self._orbit_check.isChecked() and is_gran))
+        dia = (float(self._orbit_dia_spin.value())
+               if getattr(self, "_orbit_dia_spin", None) is not None else 1.0)
+        spd = (float(self._orbit_speed_spin.value())
+               if getattr(self, "_orbit_speed_spin", None) is not None else 2.0)
+        return {"prime_uL": prime_uL, "orbit": orbit,
+                "orbit_diameter_mm": dia, "orbit_speed_mm_s": spd}
+
     @staticmethod
     def _segments_length_mm(segments) -> float:
         total = 0.0
@@ -2273,6 +2414,8 @@ class QuickPrintWorkflowPage(QWidget):
                 "segments": segments, "well": well, "center": center,
                 "settings": self._build_settings(pump=pump),
                 "pickup_uL": self._pickup_uL_for_length(length),
+                # Resolve prime/orbit kwargs on the GUI thread (reads widgets).
+                "pickup_kwargs": self._ink_pickup_kwargs(ink_name),
             })
         if len(groups) < 2:
             self._status.setText(
@@ -2295,6 +2438,15 @@ class QuickPrintWorkflowPage(QWidget):
             lines.append(f"  • Pick up ~{g['pickup_uL']:.3f} µL of "
                          f"“{g['ink_name']}” ({g['pump']}) → print")
         lines.append("    (waste → wash → buffer between inks)")
+        if self._ink_prime_check.isChecked():
+            lines.append(
+                f"  • Prime the tip (+{self._ink_prime_spin.value():.2f} µL "
+                "aspirated & dispensed back; no compliance comp)")
+        if self._orbit_all_check.isChecked() or self._orbit_check.isChecked():
+            lines.append(
+                f"  • Circular pickup ({self._orbit_dia_spin.value():.2f} mm) "
+                + ("for all inks" if self._orbit_all_check.isChecked()
+                   else "for granular inks"))
         if cleanup:
             lines.append("  • Clean the needle at the end")
         lines += ["", "Hardware set up correctly and ready to start?"]
@@ -2355,7 +2507,7 @@ class QuickPrintWorkflowPage(QWidget):
                         f"Picking up {g['pickup_uL']:.3f} µL of {g['ink_name']}…")
                     executor.aspirate_ink(
                         g["ink_pos"], g["pickup_uL"], bore=g["pump"],
-                        z_mm=g["ink_dip_z"])
+                        z_mm=g["ink_dip_z"], **g.get("pickup_kwargs", {}))
                     self._run_group_job_blocking(g)
                 if cleanup:
                     executor.run_print_cleanup()
@@ -2664,6 +2816,10 @@ class QuickPrintWorkflowPage(QWidget):
             if starting_oil is None:
                 return  # operator cancelled, or the remedy well isn't set up
 
+        # Resolve tip-prime + granular-orbit kwargs on the GUI thread (reads
+        # widgets); reused in the confirm dialog note and the off-thread worker.
+        pickup_kwargs = self._ink_pickup_kwargs(ink)
+
         # ── "Confirm all is setup" dialog — when there's a preamble or a
         # post-print cleanup (both are significant automated routines). ──
         if preamble or cleanup_enabled:
@@ -2674,6 +2830,14 @@ class QuickPrintWorkflowPage(QWidget):
                 lines.append(
                     f"  • Pick up ~{pickup_uL:.3f} µL of “{ink}” from "
                     f"{self._ink_source_well()}")
+                if pickup_kwargs["prime_uL"] > 0:
+                    lines.append(
+                        f"      + prime the tip (+{pickup_kwargs['prime_uL']:.2f} "
+                        "µL aspirated & dispensed back; no compliance comp)")
+                if pickup_kwargs["orbit"]:
+                    lines.append(
+                        f"      + circular pickup "
+                        f"({pickup_kwargs['orbit_diameter_mm']:.2f} mm)")
             lines.append(f"  • Print “{obj_label}” in well {well}")
             if cleanup_enabled:
                 lines.append(
@@ -2755,7 +2919,8 @@ class QuickPrintWorkflowPage(QWidget):
                         bridge.progress.emit(
                             0, 0, f"Picking up {pickup_uL:.3f} µL of {ink}…")
                         executor.aspirate_ink(
-                            ink_pos, pickup_uL, bore=pump, z_mm=ink_dip_z)
+                            ink_pos, pickup_uL, bore=pump, z_mm=ink_dip_z,
+                            **pickup_kwargs)
                 ok = self._preposition_for_print(start_zref_mm, travel_z)
             except AbortException:
                 err = "aborted"

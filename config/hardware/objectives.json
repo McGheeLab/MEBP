@@ -73,7 +73,28 @@
         "date": "2026-06-17",
         "rotation_deg": -179.99
       }
-    }
+    },
+    "Andor Zyla 4.2P (USB3)": {
+      "4x": {
+        "measured_um_per_px": 3.227061,
+        "resolution": [
+          1024,
+          1024
+        ],
+        "date": "2026-07-27",
+        "rotation_deg": 0.5
+      },
+      "10x": {
+        "measured_um_per_px": 1.320118,
+        "resolution": [
+          2048,
+          2048
+        ],
+        "date": "2026-07-27",
+        "rotation_deg": 0.825
+      }
+    },
+    "TestCamProp": {}
   },
   "description": "Standard microscope objectives and per-camera empirical \u00b5m/px calibrations.",
   "notes": "Calibrations are keyed by camera model name then objective name. measured_um_per_px is the empirically measured scale via stage-motion phase correlation. resolution records the active frame size at calibration time."

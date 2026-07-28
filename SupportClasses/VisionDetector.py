@@ -1748,6 +1748,66 @@ def find_template(frame: np.ndarray, patch: np.ndarray
         return None
 
 
+def select_trackable_patch(
+    frame: np.ndarray,
+    patch_frac: float = 0.20,
+    margin_frac: float = 0.22,
+) -> "tuple[float, float, np.ndarray] | None":
+    """Pick a high-texture square patch to track across a large stage move.
+
+    v7.5.x: powers the stage-motion scale + FOV auto-calibration. Scores a
+    coarse grid of candidate patches (within the central region, away from the
+    borders so the feature survives the move) by grayscale variance and returns
+    the most textured one as ``(cx, cy, patch_bgr)`` — the patch CENTRE in frame
+    pixels plus the cropped patch — or None when the frame is too small /
+    featureless. A near-flat winner (variance below a floor) still returns; the
+    caller gates the eventual template match on confidence.
+    """
+    if frame is None:
+        return None
+    try:
+        fh, fw = frame.shape[:2]
+    except Exception:
+        return None
+    if fh < 32 or fw < 32:
+        return None
+    gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if frame.ndim == 3 else frame)
+    ph = max(16, int(round(min(fh, fw) * float(patch_frac))))
+    pw = ph
+    if ph >= fh or pw >= fw:
+        ph = pw = max(16, min(fh, fw) // 3)
+        if ph >= fh or pw >= fw:
+            return None
+    mx = int(round(fw * float(margin_frac)))
+    my = int(round(fh * float(margin_frac)))
+    x_lo, x_hi = mx + pw // 2, fw - mx - pw // 2
+    y_lo, y_hi = my + ph // 2, fh - my - ph // 2
+    if x_hi < x_lo or y_hi < y_lo:            # margins ate the whole frame
+        x_lo, x_hi = pw // 2, fw - pw // 2
+        y_lo, y_hi = ph // 2, fh - ph // 2
+    step_x = max(1, pw // 2)
+    step_y = max(1, ph // 2)
+    best = None                                # (variance, cx, cy)
+    cy = y_lo
+    while cy <= y_hi:
+        cx = x_lo
+        while cx <= x_hi:
+            x0, y0 = cx - pw // 2, cy - ph // 2
+            sub = gray[y0:y0 + ph, x0:x0 + pw]
+            v = float(sub.var())
+            if best is None or v > best[0]:
+                best = (v, cx, cy)
+            cx += step_x
+        cy += step_y
+    if best is None:
+        return None
+    _v, cx, cy = best
+    x0, y0 = cx - pw // 2, cy - ph // 2
+    patch = frame[y0:y0 + ph, x0:x0 + pw].copy()
+    return (float(cx), float(cy), patch)
+
+
 def detect_rim_point_near_center(
     frame: np.ndarray,
     canny_low: int = 50,

@@ -454,7 +454,8 @@ class _FakeCtrl:
         self.zero_position = {"x": 0.0, "y": 0.0, "Z": 0.0}
         self.poller_suspended = False
 
-    def safe_travel_to(self, x, y, safe_z_mm=None, target_z_mm=None):
+    def safe_travel_to(self, x, y, safe_z_mm=None, target_z_mm=None,
+                       apply_insert_floor=True):
         self.moves.append((x, y, safe_z_mm, target_z_mm, "safe"))
         self._last = (x, y)
 
@@ -548,6 +549,27 @@ class TestMosaicWorker(unittest.TestCase):
         worker.stop()      # pre-stopped → loop exits immediately
         worker.run()
         self.assertEqual(len(ctrl.moves), 0)
+
+    def test_worker_does_not_double_orient(self):
+        # v7.5.x regression: the coarse per-tile "frame_orient" (rot180/flip) is
+        # RETIRED — tile orientation is applied ONCE by the builder's calibrated
+        # _orient_tile (rotation + flip X + flip Y from the ground-truth store).
+        # A stale mosaic_scan.frame_orient="rot180" double-oriented the WHOLE-plate
+        # scan (builder _orient_tile + coarse rot180) while the calibration dialog
+        # (built with settings={} → "none") came out right — the exact
+        # "calibration correct, full plate wrong" report.
+        from gui.pages.calibration import _MosaicScanWorker
+        from SupportClasses.MosaicBuilder import MosaicBuilder
+        frame = np.zeros((60, 80, 3), dtype=np.uint8)
+        frame[5, 5] = (255, 255, 255)          # off-centre marker
+        builder = MosaicBuilder(frame_size_px=(80, 60), micron_per_pixel=10.0)
+        worker = _MosaicScanWorker(
+            _FakeCtrl(), _FakeCam(frame), builder, [(0, 0)], safe_z=0.0,
+            expected_d_px=0.0, min_dist_px=1.0, frame_orient="rot180")
+        # The stale coarse setting is IGNORED (not stored, not applied).
+        self.assertEqual(worker._frame_orient, "none")
+        out = worker._orient_frame(frame)       # retired → identity no-op
+        self.assertTrue(np.array_equal(out, frame))
 
     def test_worker_aborts_on_sustained_no_frames(self):
         # A camera that never delivers frames → the worker aborts (failed)
@@ -714,6 +736,7 @@ class TestMosaicSettings(_CalBase):
                   "detect_param2": 25, "detect_tol_pct": 50,
                   "frame_orient": "rot180", "fov_um": 2200, "spacing_um": 1500,
                   "register": False, "max_shift_um": 120,
+                  "reg_method": "phase",
                   "cal_cols": 5, "cal_rows": 5}
         dlg = MosaicScanSettingsDialog(custom)
         self.assertEqual(dlg.values(), custom)

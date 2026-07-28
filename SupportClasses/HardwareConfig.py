@@ -92,6 +92,10 @@ class CameraRole(str, Enum):
     the plate, so MICROSCOPE serves both purposes. Legacy ``"plate"``
     role strings migrate to MICROSCOPE in ``from_dict``.
 
+    v7.5.x: MONITOR added — a camera resting on the stage that overviews
+    the entire operation (needle, plate, and stage motion at once).
+    Informational/live-view only; no workflow gates on it.
+
     All non-UNASSIGNED roles are enforced as singletons by
     `HardwareConfig.set_camera_role()` — assigning a role to a new slot
     clears it from any other slot.
@@ -100,6 +104,7 @@ class CameraRole(str, Enum):
     NEEDLE_X = "needle_x"     # Side cam looking down the X axis (sees Y/Z)
     NEEDLE_Y = "needle_y"     # Side cam looking down the Y axis (sees X/Z)
     MICROSCOPE = "microscope" # Behind an objective lens, viewing the plate
+    MONITOR = "monitor"       # Rests on the stage, overviews the operation
 
 
 # v7.4.x: roles that may only be held by a single camera slot at a time.
@@ -107,14 +112,17 @@ SINGLETON_CAMERA_ROLES: frozenset[CameraRole] = frozenset({
     CameraRole.NEEDLE_X,
     CameraRole.NEEDLE_Y,
     CameraRole.MICROSCOPE,
+    CameraRole.MONITOR,
 })
 
 
 # Maximum live cameras tracked simultaneously by CameraManager (v7.3.3).
-# Kept in sync with the `max_cams = 3` constant used by the Hardware
-# Setup mini-cards. Bumping this means bumping the default
-# `camera_roles` list length below.
-MAX_LIVE_CAMERAS = 3
+# The Hardware Setup mini-cards, CameraManager's default slot count, and
+# the default `camera_roles` list length below all derive from this.
+# v7.5.x: 3 → 4 to host the MONITOR overview camera. `from_dict` pads
+# shorter legacy `camera_roles` lists with UNASSIGNED, so old configs
+# migrate without touching settings.json.
+MAX_LIVE_CAMERAS = 4
 
 
 # ═══════════════════════════════════════════════════════════════════

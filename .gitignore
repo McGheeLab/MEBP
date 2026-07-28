@@ -20,6 +20,7 @@ print_resume.json
 current_button_mapping.json
 print_records/
 config/sim_xy_state.json
+config/sim_xy_state_ludl.json
 config/sim_zp_state.json
 xy_debug_*.csv
 

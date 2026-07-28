@@ -53,6 +53,7 @@ class TestTabOrder(_Base):
             "Needle Location",
             "Pump Compliance",
             "Plate Location",
+            "Rosettes",
             "Plate Z Auto-Cal",
             "Custom",
         ])
@@ -70,7 +71,7 @@ class TestTabOrder(_Base):
         # was merged into Needle Location; Pump Compliance now sits at index 1.
         self.assertFalse(hasattr(page, "_zoff_tab_index"))
         self.assertEqual(page._compcal_tab_index, 1)
-        self.assertEqual(page._zauto_tab_index, 3)
+        self.assertEqual(page._zauto_tab_index, 4)
         self.assertEqual(
             page._workflow_tabs.tabText(page._compcal_tab_index),
             "Pump Compliance")

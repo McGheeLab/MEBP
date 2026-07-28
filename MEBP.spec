@@ -43,6 +43,10 @@ datas = [
     (str(PROJECT_ROOT / 'config' / 'xy_diagnostic_profile.json'), 'config'),
     # Reference images
     (str(PROJECT_ROOT / 'PrintImages'), 'PrintImages'),
+    # ANDOR Zyla SDK3 runtime DLLs (atcore.dll + companions). Bundled so the
+    # Andor backend (gui/widgets/andor_backend.py) can find them at runtime;
+    # _find_andor_dll_dir() looks in DLLs/zyla dlls/ first.
+    (str(PROJECT_ROOT / 'DLLs' / 'zyla dlls'), 'DLLs/zyla dlls'),
     # Default config (if present)
     (str(PROJECT_ROOT / 'Default.json'), '.'),
 ]
@@ -84,6 +88,19 @@ hiddenimports = [
     'SupportClasses.XYDebugLogger',
 ]
 
+# ── Optional: ANDOR Zyla backend (pylablib) ────────────────────────
+# pylablib is only present on rigs with an Andor camera. Collect it fully when
+# available so PyInstaller bundles its submodules/DLL loaders; skip silently
+# otherwise (the backend is lazily guarded — the app runs without it).
+try:
+    from PyInstaller.utils.hooks import collect_all as _collect_all
+    _pll_datas, _pll_bin, _pll_hidden = _collect_all('pylablib')
+    datas += _pll_datas
+    hiddenimports += _pll_hidden
+    _extra_binaries = _pll_bin
+except Exception:
+    _extra_binaries = []
+
 # ── Excludes ───────────────────────────────────────────────────────
 excludes = [
     'tkinter',
@@ -101,9 +118,9 @@ excludes = [
     'torchaudio',
     'torchvision',
     'pyarrow',          # ~114 MB
-    'llvmlite',         # ~110 MB
-    'numba',
-    'pandas',           # ~18 MB
+    # NOTE: numba / llvmlite / pandas are intentionally NOT excluded — pylablib
+    # (the Andor Zyla SDK3 backend) imports all three eagerly, so the bundled
+    # Zyla path needs them present. They add ~150 MB to the bundle.
     'sklearn',          # ~16 MB
     'scikit-learn',
     'skimage',          # ~14 MB
@@ -130,7 +147,7 @@ excludes = [
 a = Analysis(
     [str(PROJECT_ROOT / 'main.py')],
     pathex=[str(PROJECT_ROOT)],
-    binaries=[],
+    binaries=_extra_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -20,11 +20,29 @@ Covered:
 """
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def _wait_for(predicate, timeout_s=2.0):
+    """v7.5.x: pump jog moves now run on a daemon thread (see
+    ``HardwareControlPanel._on_jog_pump``) so the GUI thread — and every
+    QTimer-driven camera feed — can't freeze while a backlash-compensated
+    move drains via blocking M400s. Spin the Qt event loop (delivering the
+    queued completion signal) until ``predicate()`` is true or timeout."""
+    from PySide6.QtWidgets import QApplication
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    QApplication.processEvents()
+    return predicate()
 
 from SupportClasses.SafetyLimits import (
     SafetyLimits, REFERENCE_VISCOSITY_CP,
@@ -284,14 +302,14 @@ class TestControlPanelModes(unittest.TestCase):
         p, c = self._panel(pump_action_labels=False)
         self.assertFalse(p._jog_array.pump_step_is_percent)
         p._on_jog_pump("P1", 0.1)
-        self.assertTrue(c.move_pump_relative.called)
+        self.assertTrue(_wait_for(lambda: c.move_pump_relative.called))
         self.assertFalse(c.move_pump_uL.called)
 
     def test_other_pages_pump_jog_is_percent_uL(self):
         p, c = self._panel(pump_action_labels=True)
         self.assertTrue(p._jog_array.pump_step_is_percent)
         p._on_jog_pump("P1", -10.0)            # signed % (aspirate)
-        self.assertTrue(c.move_pump_uL.called)
+        self.assertTrue(_wait_for(lambda: c.move_pump_uL.called))
         self.assertFalse(c.move_pump_relative.called)
         pump, vol = c.move_pump_uL.call_args[0][0], c.move_pump_uL.call_args[0][1]
         self.assertEqual(pump, "P1")

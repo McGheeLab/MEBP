@@ -4,12 +4,12 @@
     "nest-plastic-24": {
       "image": "reanchor_features/nest-plastic-24.png",
       "stage_um": [
-        95396.06622353352,
-        38170.04894115057
+        57212.21320328527,
+        17754.09173187193
       ],
-      "um_per_px": 0.778843,
-      "camobj": "toupcam:\\\\?\\usb#vid_0547&pid_1377#5&1abff3a4&0&13|2x",
-      "date": "2026-07-21"
+      "um_per_px": 3.227061,
+      "camobj": "andor:VSC-07863|4x",
+      "date": "2026-07-27"
     }
   }
 }

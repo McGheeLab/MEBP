@@ -99,13 +99,20 @@ class Card(QFrame):
             header.setSpacing(s(6))
 
             self._title_label = QLabel(title)
+            # v7.5.x: don't let a long title floor the card's width. An Ignored
+            # horizontal policy + tiny minimum means the title takes the space it
+            # can and elides/clips on a narrow panel instead of forcing a
+            # horizontal overflow — so cards in the responsive context panel
+            # shrink to fit their container.
+            from PySide6.QtWidgets import QSizePolicy as _QSP
+            self._title_label.setSizePolicy(_QSP.Ignored, _QSP.Preferred)
+            self._title_label.setMinimumWidth(s(1))
             self._title_label.setStyleSheet(
                 f"color: {COLORS['blue']};"
                 f"font-size: {sf(9) if compact else sf(10)}pt;"
                 f"font-weight: 600;"
             )
-            header.addWidget(self._title_label)
-            header.addStretch(1)
+            header.addWidget(self._title_label, 1)
 
             if collapsible:
                 self._toggle_btn = QPushButton("▾")

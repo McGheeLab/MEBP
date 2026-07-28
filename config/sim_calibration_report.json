@@ -1,19 +1,163 @@
 {
   "_description": "Simulator calibration report \u2014 measured metrics from sim and real hardware, with suggested parameter adjustments.",
-  "_generated": "2026-07-01T19:44:34.896270+00:00",
-  "_project_root": "C:\\Users\\mcghe\\OneDrive\\Documents\\GitHub\\ME3B-Pluck-Place\\Pick and Place V2\\MEBP",
+  "_generated": "2026-07-23T01:03:43.639905+00:00",
+  "_project_root": "C:\\Users\\mcghe\\OneDrive\\Documents\\GitHub\\MEBP",
   "hardware_detected": {
-    "real_xy": false,
-    "real_zp": false
+    "real_xy": true,
+    "real_zp": true
   },
   "metrics": {
-    "xy_sim_absolute_move_settle_time_ms": {
+    "xy_real_absolute_move_settle_time_ms": {
+      "n": 4,
+      "mean": 171.4603,
+      "median": 183.8321,
+      "stdev": 29.7952,
+      "min": 127.0654,
+      "max": 191.1117
+    },
+    "xy_real_gr_cmd_latency_ms": {
+      "n": 10,
+      "mean": 0.1419,
+      "median": 0.1287,
+      "stdev": 0.0422,
+      "min": 0.0889,
+      "max": 0.232
+    },
+    "xy_real_position_cmd_latency_ms": {
+      "n": 10,
+      "mean": 0.1702,
+      "median": 0.1461,
+      "stdev": 0.0519,
+      "min": 0.1023,
+      "max": 0.276
+    },
+    "xy_real_position_query_latency_ms": {
+      "n": 30,
+      "mean": 59.2177,
+      "median": 59.5992,
+      "stdev": 2.2891,
+      "min": 47.2139,
+      "max": 60.5859
+    },
+    "xy_real_query_rate_hz": {
       "n": 1,
-      "mean": 400.1016,
-      "median": 400.1016,
+      "mean": 25.1592,
+      "median": 25.1592,
       "stdev": 0.0,
-      "min": 400.1016,
-      "max": 400.1016
+      "min": 25.1592,
+      "max": 25.1592
+    },
+    "xy_real_relative_move_accuracy_um": {
+      "n": 1,
+      "mean": 0.0,
+      "median": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "xy_real_send_command_latency_ms": {
+      "n": 30,
+      "mean": 0.1609,
+      "median": 0.1258,
+      "stdev": 0.085,
+      "min": 0.0782,
+      "max": 0.402
+    },
+    "xy_real_setting_cmd_latency_ms": {
+      "n": 20,
+      "mean": 0.1447,
+      "median": 0.1368,
+      "stdev": 0.0348,
+      "min": 0.0954,
+      "max": 0.2365
+    },
+    "xy_real_status_cmd_latency_ms": {
+      "n": 10,
+      "mean": 0.152,
+      "median": 0.1509,
+      "stdev": 0.0195,
+      "min": 0.1252,
+      "max": 0.1817
+    },
+    "xy_real_sustained_5s_rate_hz": {
+      "n": 1,
+      "mean": 12.5039,
+      "median": 12.5039,
+      "stdev": 0.0,
+      "min": 12.5039,
+      "max": 12.5039
+    },
+    "xy_real_velocity_cmd_latency_ms": {
+      "n": 10,
+      "mean": 0.1718,
+      "median": 0.1664,
+      "stdev": 0.0215,
+      "min": 0.138,
+      "max": 0.2127
+    },
+    "xy_real_velocity_mode_drift_after_stop_um": {
+      "n": 1,
+      "mean": 0.0,
+      "median": 0.0,
+      "stdev": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "xy_real_vs_0_0_latency_ms": {
+      "n": 5,
+      "mean": 0.1512,
+      "median": 0.1478,
+      "stdev": 0.0257,
+      "min": 0.1173,
+      "max": 0.1891
+    },
+    "xy_real_vs_1000_0_latency_ms": {
+      "n": 5,
+      "mean": 0.1529,
+      "median": 0.1448,
+      "stdev": 0.0263,
+      "min": 0.1253,
+      "max": 0.1917
+    },
+    "xy_real_vs_100_0_latency_ms": {
+      "n": 5,
+      "mean": 0.1969,
+      "median": 0.2341,
+      "stdev": 0.0561,
+      "min": 0.1184,
+      "max": 0.2399
+    },
+    "xy_real_vs_5000_0_latency_ms": {
+      "n": 5,
+      "mean": 0.1587,
+      "median": 0.1396,
+      "stdev": 0.0397,
+      "min": 0.1232,
+      "max": 0.2205
+    },
+    "xy_real_vs_500_500_latency_ms": {
+      "n": 5,
+      "mean": 0.2029,
+      "median": 0.2144,
+      "stdev": 0.0456,
+      "min": 0.1432,
+      "max": 0.2506
+    },
+    "xy_real_vs_alternation_latency_ms": {
+      "n": 10,
+      "mean": 0.141,
+      "median": 0.133,
+      "stdev": 0.0403,
+      "min": 0.0994,
+      "max": 0.243
+    },
+    "xy_sim_absolute_move_settle_time_ms": {
+      "n": 5,
+      "mean": 240.4776,
+      "median": 171.5711,
+      "stdev": 170.2204,
+      "min": 151.5369,
+      "max": 544.4552
     },
     "xy_sim_accumulated_move_error_um": {
       "n": 1,
@@ -25,46 +169,46 @@
     },
     "xy_sim_gr_cmd_latency_ms": {
       "n": 20,
-      "mean": 29.9007,
-      "median": 19.9769,
-      "stdev": 47.2568,
-      "min": 14.0868,
-      "max": 228.9274
+      "mean": 23.3825,
+      "median": 19.8956,
+      "stdev": 14.158,
+      "min": 13.9627,
+      "max": 77.9455
     },
     "xy_sim_position_cmd_latency_ms": {
       "n": 20,
-      "mean": 6.2018,
-      "median": 6.1299,
-      "stdev": 0.275,
-      "min": 5.9367,
-      "max": 7.0921
+      "mean": 6.1002,
+      "median": 6.0842,
+      "stdev": 0.1626,
+      "min": 5.8149,
+      "max": 6.5391
     },
     "xy_sim_position_query_latency_ms": {
-      "n": 1,
-      "mean": 0.0005,
-      "median": 0.0005,
-      "stdev": 0.0,
-      "min": 0.0005,
-      "max": 0.0005
+      "n": 31,
+      "mean": 0.0007,
+      "median": 0.0006,
+      "stdev": 0.0007,
+      "min": 0.0004,
+      "max": 0.0044
     },
     "xy_sim_query_rate_during_move_hz": {
       "n": 1,
-      "mean": 661375.7175,
-      "median": 661375.7175,
+      "mean": 2702702.8507,
+      "median": 2702702.8507,
       "stdev": 0.0,
-      "min": 661375.7175,
-      "max": 661375.7175
+      "min": 2702702.8507,
+      "max": 2702702.8507
     },
     "xy_sim_query_rate_hz": {
-      "n": 1,
-      "mean": 1845020.2528,
-      "median": 1845020.2528,
-      "stdev": 0.0,
-      "min": 1845020.2528,
-      "max": 1845020.2528
+      "n": 2,
+      "mean": 2794027.1,
+      "median": 2794027.1,
+      "stdev": 468066.3752,
+      "min": 2463054.192,
+      "max": 3125000.0079
     },
     "xy_sim_relative_move_accuracy_um": {
-      "n": 2,
+      "n": 3,
       "mean": 0.0,
       "median": 0.0,
       "stdev": 0.0,
@@ -72,143 +216,143 @@
       "max": 0.0
     },
     "xy_sim_send_command_latency_ms": {
-      "n": 100,
-      "mean": 7.1935,
-      "median": 7.1332,
-      "stdev": 0.3189,
-      "min": 6.6365,
-      "max": 8.7188
+      "n": 130,
+      "mean": 6.7714,
+      "median": 7.0581,
+      "stdev": 0.7096,
+      "min": 5.2205,
+      "max": 7.9083
     },
     "xy_sim_send_command_rate_hz": {
       "n": 1,
-      "mean": 139.0143,
-      "median": 139.0143,
+      "mean": 140.0464,
+      "median": 140.0464,
       "stdev": 0.0,
-      "min": 139.0143,
-      "max": 139.0143
+      "min": 140.0464,
+      "max": 140.0464
     },
     "xy_sim_setting_cmd_latency_ms": {
       "n": 40,
-      "mean": 3.2659,
-      "median": 3.1845,
-      "stdev": 0.2952,
-      "min": 2.8883,
-      "max": 4.221
+      "mean": 3.1283,
+      "median": 3.1033,
+      "stdev": 0.196,
+      "min": 2.7213,
+      "max": 3.5897
     },
     "xy_sim_sine_0.1hz_max_um": {
       "n": 1,
-      "mean": 156.2167,
-      "median": 156.2167,
+      "mean": 147.349,
+      "median": 147.349,
       "stdev": 0.0,
-      "min": 156.2167,
-      "max": 156.2167
+      "min": 147.349,
+      "max": 147.349
     },
     "xy_sim_sine_0.1hz_rms_um": {
       "n": 1,
-      "mean": 102.1999,
-      "median": 102.1999,
+      "mean": 98.4155,
+      "median": 98.4155,
       "stdev": 0.0,
-      "min": 102.1999,
-      "max": 102.1999
+      "min": 98.4155,
+      "max": 98.4155
     },
     "xy_sim_sine_0.2hz_max_um": {
       "n": 1,
-      "mean": 146.1702,
-      "median": 146.1702,
+      "mean": 143.9081,
+      "median": 143.9081,
       "stdev": 0.0,
-      "min": 146.1702,
-      "max": 146.1702
+      "min": 143.9081,
+      "max": 143.9081
     },
     "xy_sim_sine_0.2hz_rms_um": {
       "n": 1,
-      "mean": 99.7619,
-      "median": 99.7619,
+      "mean": 97.433,
+      "median": 97.433,
       "stdev": 0.0,
-      "min": 99.7619,
-      "max": 99.7619
+      "min": 97.433,
+      "max": 97.433
     },
     "xy_sim_sine_0.5hz_max_um": {
       "n": 1,
-      "mean": 145.9907,
-      "median": 145.9907,
+      "mean": 147.1371,
+      "median": 147.1371,
       "stdev": 0.0,
-      "min": 145.9907,
-      "max": 145.9907
+      "min": 147.1371,
+      "max": 147.1371
     },
     "xy_sim_sine_0.5hz_rms_um": {
       "n": 1,
-      "mean": 98.1035,
-      "median": 98.1035,
+      "mean": 97.4329,
+      "median": 97.4329,
       "stdev": 0.0,
-      "min": 98.1035,
-      "max": 98.1035
+      "min": 97.4329,
+      "max": 97.4329
     },
     "xy_sim_sine_1.0hz_max_um": {
       "n": 1,
-      "mean": 157.7371,
-      "median": 157.7371,
+      "mean": 159.0893,
+      "median": 159.0893,
       "stdev": 0.0,
-      "min": 157.7371,
-      "max": 157.7371
+      "min": 159.0893,
+      "max": 159.0893
     },
     "xy_sim_sine_1.0hz_rms_um": {
       "n": 1,
-      "mean": 103.0748,
-      "median": 103.0748,
+      "mean": 100.5184,
+      "median": 100.5184,
       "stdev": 0.0,
-      "min": 103.0748,
-      "max": 103.0748
+      "min": 100.5184,
+      "max": 100.5184
     },
     "xy_sim_small_move_settle_ms": {
       "n": 10,
-      "mean": 126.014,
-      "median": 87.0202,
-      "stdev": 80.1927,
-      "min": 81.8689,
-      "max": 297.4271
+      "mean": 108.3408,
+      "median": 100.5465,
+      "stdev": 26.2039,
+      "min": 81.3483,
+      "max": 154.5036
     },
     "xy_sim_status_cmd_latency_ms": {
       "n": 20,
-      "mean": 2.6751,
-      "median": 2.5922,
-      "stdev": 0.1834,
-      "min": 2.4974,
-      "max": 3.0771
+      "mean": 2.5986,
+      "median": 2.602,
+      "stdev": 0.1013,
+      "min": 2.3061,
+      "max": 2.8101
     },
     "xy_sim_sustained_5s_rate_hz": {
       "n": 1,
-      "mean": 1785418.3215,
-      "median": 1785418.3215,
+      "mean": 3720790.0605,
+      "median": 3720790.0605,
       "stdev": 0.0,
-      "min": 1785418.3215,
-      "max": 1785418.3215
+      "min": 3720790.0605,
+      "max": 3720790.0605
     },
     "xy_sim_velocity_cmd_latency_ms": {
       "n": 20,
-      "mean": 3.8858,
-      "median": 3.8253,
-      "stdev": 0.3142,
-      "min": 3.4208,
-      "max": 4.4729
+      "mean": 3.6352,
+      "median": 3.632,
+      "stdev": 0.1842,
+      "min": 3.1968,
+      "max": 3.9537
     },
     "xy_sim_velocity_command_latency_ms": {
       "n": 50,
-      "mean": 5.4096,
-      "median": 5.2875,
-      "stdev": 0.3928,
-      "min": 4.9779,
-      "max": 6.7743
+      "mean": 5.2527,
+      "median": 5.1349,
+      "stdev": 0.2682,
+      "min": 4.9014,
+      "max": 6.3564
     },
     "xy_sim_velocity_command_rate_hz": {
       "n": 1,
-      "mean": 184.8566,
-      "median": 184.8566,
+      "mean": 190.3778,
+      "median": 190.3778,
       "stdev": 0.0,
-      "min": 184.8566,
-      "max": 184.8566
+      "min": 190.3778,
+      "max": 190.3778
     },
     "xy_sim_velocity_mode_drift_after_stop_um": {
-      "n": 1,
+      "n": 2,
       "mean": 0.0,
       "median": 0.0,
       "stdev": 0.0,
@@ -217,139 +361,217 @@
     },
     "xy_sim_vs_0_0_latency_ms": {
       "n": 10,
-      "mean": 3.6924,
-      "median": 3.5912,
-      "stdev": 0.2256,
-      "min": 3.5225,
-      "max": 4.2288
+      "mean": 3.6019,
+      "median": 3.5438,
+      "stdev": 0.1767,
+      "min": 3.417,
+      "max": 4.062
     },
     "xy_sim_vs_1000_0_latency_ms": {
       "n": 10,
-      "mean": 4.6037,
-      "median": 4.5919,
-      "stdev": 0.1183,
-      "min": 4.4278,
-      "max": 4.8187
+      "mean": 4.6323,
+      "median": 4.5742,
+      "stdev": 0.1716,
+      "min": 4.48,
+      "max": 5.0064
     },
     "xy_sim_vs_100_0_latency_ms": {
       "n": 10,
-      "mean": 4.2695,
-      "median": 4.2742,
-      "stdev": 0.275,
-      "min": 3.9425,
-      "max": 4.772
+      "mean": 4.0416,
+      "median": 4.0577,
+      "stdev": 0.111,
+      "min": 3.7464,
+      "max": 4.1467
     },
     "xy_sim_vs_5000_0_latency_ms": {
       "n": 10,
-      "mean": 4.7543,
-      "median": 4.5992,
-      "stdev": 0.471,
-      "min": 4.3877,
-      "max": 5.8098
+      "mean": 4.6792,
+      "median": 4.6222,
+      "stdev": 0.1812,
+      "min": 4.5198,
+      "max": 5.0606
     },
     "xy_sim_vs_500_500_latency_ms": {
       "n": 10,
-      "mean": 4.945,
-      "median": 4.8935,
-      "stdev": 0.3445,
-      "min": 4.5462,
-      "max": 5.5634
+      "mean": 4.7243,
+      "median": 4.6437,
+      "stdev": 0.287,
+      "min": 4.3492,
+      "max": 5.3844
     },
     "xy_sim_vs_alternation_latency_ms": {
       "n": 20,
-      "mean": 4.6519,
-      "median": 4.7236,
-      "stdev": 0.2825,
-      "min": 3.9309,
-      "max": 5.0567
+      "mean": 4.3434,
+      "median": 4.3157,
+      "stdev": 0.2836,
+      "min": 3.9965,
+      "max": 5.0531
+    },
+    "zp_real_g90_latency_ms": {
+      "n": 5,
+      "mean": 61.098,
+      "median": 61.0353,
+      "stdev": 0.1151,
+      "min": 60.9959,
+      "max": 61.2535
+    },
+    "zp_real_g91_latency_ms": {
+      "n": 5,
+      "mean": 61.4568,
+      "median": 61.4463,
+      "stdev": 0.2394,
+      "min": 61.0908,
+      "max": 61.7407
+    },
+    "zp_real_gcode_round_trip_ms": {
+      "n": 10,
+      "mean": 112.1473,
+      "median": 112.2328,
+      "stdev": 0.2148,
+      "min": 111.7671,
+      "max": 112.3692
+    },
+    "zp_real_m114_latency_ms": {
+      "n": 5,
+      "mean": 61.6206,
+      "median": 61.6526,
+      "stdev": 0.3739,
+      "min": 61.0749,
+      "max": 62.1292
+    },
+    "zp_real_m115_latency_ms": {
+      "n": 5,
+      "mean": 65.0917,
+      "median": 65.3589,
+      "stdev": 0.9596,
+      "min": 63.4729,
+      "max": 66.0401
+    },
+    "zp_real_position_query_latency_ms": {
+      "n": 10,
+      "mean": 1.2228,
+      "median": 1.1834,
+      "stdev": 0.1066,
+      "min": 1.1156,
+      "max": 1.4312
+    },
+    "zp_real_query_rate_hz": {
+      "n": 1,
+      "mean": 9.7202,
+      "median": 9.7202,
+      "stdev": 0.0,
+      "min": 9.7202,
+      "max": 9.7202
+    },
+    "zp_real_relative_move_accuracy_mm": {
+      "n": 1,
+      "mean": 1.0,
+      "median": 1.0,
+      "stdev": 0.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "zp_real_sustained_5s_rate_hz": {
+      "n": 1,
+      "mean": 9.6679,
+      "median": 9.6679,
+      "stdev": 0.0,
+      "min": 9.6679,
+      "max": 9.6679
     },
     "zp_sim_accumulated_move_error_mm": {
       "n": 1,
-      "mean": 0.007,
-      "median": 0.007,
+      "mean": 0.0087,
+      "median": 0.0087,
       "stdev": 0.0,
-      "min": 0.007,
-      "max": 0.007
+      "min": 0.0087,
+      "max": 0.0087
     },
     "zp_sim_g90_latency_ms": {
       "n": 10,
-      "mean": 33.3713,
-      "median": 33.4325,
-      "stdev": 0.316,
-      "min": 32.7311,
-      "max": 33.7368
+      "mean": 33.2141,
+      "median": 33.1807,
+      "stdev": 0.3067,
+      "min": 32.8258,
+      "max": 33.7349
     },
     "zp_sim_g91_latency_ms": {
       "n": 10,
-      "mean": 33.4873,
-      "median": 33.507,
-      "stdev": 0.1369,
-      "min": 33.229,
-      "max": 33.6732
+      "mean": 33.0743,
+      "median": 33.18,
+      "stdev": 0.245,
+      "min": 32.7412,
+      "max": 33.4168
     },
     "zp_sim_gcode_round_trip_ms": {
-      "n": 30,
-      "mean": 33.3539,
-      "median": 33.323,
-      "stdev": 0.2961,
-      "min": 32.6172,
-      "max": 34.0184
+      "n": 50,
+      "mean": 33.0833,
+      "median": 33.049,
+      "stdev": 0.3875,
+      "min": 32.2153,
+      "max": 34.4332
     },
     "zp_sim_m114_latency_ms": {
       "n": 10,
-      "mean": 33.2841,
-      "median": 33.2685,
-      "stdev": 0.4924,
-      "min": 32.5321,
-      "max": 34.4981
+      "mean": 33.2308,
+      "median": 33.1506,
+      "stdev": 0.3127,
+      "min": 32.8532,
+      "max": 33.7875
     },
     "zp_sim_m115_latency_ms": {
       "n": 10,
-      "mean": 33.2807,
-      "median": 33.2113,
-      "stdev": 0.3137,
-      "min": 32.8974,
-      "max": 33.8009
+      "mean": 33.1945,
+      "median": 33.1746,
+      "stdev": 0.2964,
+      "min": 32.7853,
+      "max": 33.5651
     },
     "zp_sim_position_query_latency_ms": {
-      "n": 1,
-      "mean": 13.011,
-      "median": 13.011,
-      "stdev": 0.0,
-      "min": 13.011,
-      "max": 13.011
+      "n": 21,
+      "mean": 12.8399,
+      "median": 12.8504,
+      "stdev": 0.2136,
+      "min": 12.3015,
+      "max": 13.1202
     },
     "zp_sim_query_rate_during_move_hz": {
       "n": 1,
-      "mean": 76.7337,
-      "median": 76.7337,
+      "mean": 77.7968,
+      "median": 77.7968,
       "stdev": 0.0,
-      "min": 76.7337,
-      "max": 76.7337
+      "min": 77.7968,
+      "max": 77.7968
     },
     "zp_sim_query_rate_hz": {
-      "n": 1,
-      "mean": 76.8578,
-      "median": 76.8578,
-      "stdev": 0.0,
-      "min": 76.8578,
-      "max": 76.8578
+      "n": 2,
+      "mean": 77.8835,
+      "median": 77.8835,
+      "stdev": 0.4319,
+      "min": 77.5781,
+      "max": 78.1889
     },
     "zp_sim_relative_move_accuracy_mm": {
-      "n": 4,
-      "mean": 0.0007,
-      "median": 0.0003,
-      "stdev": 0.0008,
+      "n": 5,
+      "mean": 0.0009,
+      "median": 0.0004,
+      "stdev": 0.0009,
       "min": 0.0002,
-      "max": 0.0019
+      "max": 0.002
     },
     "zp_sim_sustained_5s_rate_hz": {
       "n": 1,
-      "mean": 76.8438,
-      "median": 76.8438,
+      "mean": 77.9987,
+      "median": 77.9987,
       "stdev": 0.0,
-      "min": 76.8438,
-      "max": 76.8438
+      "min": 77.9987,
+      "max": 77.9987
+    },
+    "xy_api_asymmetry": {
+      "send_command_return": {
+        "sim": "str",
+        "real": "None (async write; read via get_current_position)"
+      }
     },
     "xy_sim_sine_tracking": {
       "amplitude_um": 300.0,
@@ -364,20 +586,20 @@
     "zp_sim_move_F100": {
       "feedrate": 100,
       "target_mm": 2.0,
-      "actual_mm": 1.23,
-      "elapsed_ms": 653.1
+      "actual_mm": 1.222,
+      "elapsed_ms": 652.5
     },
     "zp_sim_move_F200": {
       "feedrate": 200,
       "target_mm": 2.0,
-      "actual_mm": 1.975,
-      "elapsed_ms": 652.7
+      "actual_mm": 1.972,
+      "elapsed_ms": 653.2
     },
     "zp_sim_move_F500": {
       "feedrate": 500,
       "target_mm": 2.0,
       "actual_mm": 2.003,
-      "elapsed_ms": 652.6
+      "elapsed_ms": 652.7
     }
   },
   "parameter_mapping": {
@@ -573,8 +795,80 @@
   },
   "recommendations": [
     {
-      "parameter": "N/A",
-      "action": "No real hardware was connected \u2014 report contains sim-only baselines. Re-run with MEBP_TEST_REAL_XY=1 and/or MEBP_TEST_REAL_ZP=1 to generate tuning recommendations."
+      "severity": "CRITICAL",
+      "parameter": "Serial communication bug detected",
+      "metric": "xy_real_position_query_latency_ms",
+      "measured_ms": 59.2,
+      "expected_max_ms": 50.0,
+      "action": "\u26a0 xy_real_position_query_latency_ms = 59ms \u2014 this is 1\u00d7 slower than expected. This is almost certainly a SOFTWARE BUG, not real hardware behavior. XY get_current_position() is likely using readline() which blocks on the full serial timeout. ProScan II terminates with CR (\\r), not LF (\\n). Fix: replace readline() with read_until(b'\\r') + short timeout in XYStage.py. See patch_v725_hw_comms.py. ALL tuning recommendations below are INVALID until this is fixed."
+    },
+    {
+      "severity": "INFO",
+      "action": "Fix the serial communication bug(s) above, then re-run the test suite. Tuning recommendations below are based on buggy measurements and should be IGNORED."
+    },
+    {
+      "parameter": "config/xy_diagnostic_profile.json \u2192 simulator_derived_constants.processing_time_position_s",
+      "current_sim_latency_ms": 0.0,
+      "measured_real_latency_ms": 59.22,
+      "ratio_sim_to_real": 0.0,
+      "suggested_processing_time_s": 0.0551,
+      "action": "Sim is faster than real by 100%. Update processing_time_position_s to 0.0551 s."
+    },
+    {
+      "parameter": "XY simulator processing times (all command types)",
+      "measured_sim_rate_hz": 2794027.1,
+      "measured_real_rate_hz": 25.2,
+      "action": "Sim rate is 2794027.1 Hz vs real 25.2 Hz. Adjust processing times proportionally: multiply all by 0.000."
+    },
+    {
+      "parameter": "XYStageSimulator MAX_SPEED_UM_S, MAX_ACCEL_UM_S2",
+      "sim_settle_ms": 240.5,
+      "real_settle_ms": 171.5,
+      "action": "Sim settles in 240ms vs real 171ms. Increase MAX_SPEED_UM_S/MAX_ACCEL_UM_S2 to match."
+    },
+    {
+      "parameter": "ZPStageSimulator(communication_delay, processing_time_per_command)",
+      "current_sim_latency_ms": 12.8,
+      "measured_real_latency_ms": 1.2,
+      "suggested_communication_delay_s": 0.0007,
+      "suggested_processing_time_s": 0.0005,
+      "action": "ZP sim latency=13ms vs real=1ms. Set communication_delay=0.0007s, processing_time_per_command=0.0005s."
+    },
+    {
+      "parameter": "ZPStageSimulator kp, acceleration_rate",
+      "sim_mean_error_mm": 0.0009,
+      "real_mean_error_mm": 1.0,
+      "action": "ZP sim error=0.001mm vs real=1.000mm. Adjust kp and acceleration_rate."
+    },
+    {
+      "parameter": "PROCESSING_TIMES['position']",
+      "sim_ms": 6.1,
+      "real_ms": 0.17,
+      "action": "XY position cmd: sim=6.1ms vs real=0.2ms. Ratio=35.84."
+    },
+    {
+      "parameter": "PROCESSING_TIMES['velocity']",
+      "sim_ms": 3.64,
+      "real_ms": 0.17,
+      "action": "XY velocity cmd: sim=3.6ms vs real=0.2ms. Ratio=21.16."
+    },
+    {
+      "parameter": "PROCESSING_TIMES['setting']",
+      "sim_ms": 3.13,
+      "real_ms": 0.14,
+      "action": "XY setting cmd: sim=3.1ms vs real=0.1ms. Ratio=21.62."
+    },
+    {
+      "parameter": "XY sustained polling rate",
+      "sim_hz": 3720790.1,
+      "real_hz": 12.5,
+      "action": "XY sustained 5s: sim=3720790.1Hz vs real=12.5Hz."
+    },
+    {
+      "parameter": "ZP sustained polling rate",
+      "sim_hz": 78.0,
+      "real_hz": 9.7,
+      "action": "ZP sustained 5s: sim=78.0Hz vs real=9.7Hz."
     }
   ]
 }

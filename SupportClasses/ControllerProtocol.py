@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +57,67 @@ class ControllerProtocol:
         self._timeout = comm.get("timeout_s", 1.0)
         self._encoding = comm.get("encoding", "ascii")
 
+        # --- v7.5.x: extended semantics for non-Prior XY controllers (LEP MAC 5000) ---
+        # Every field below is OPTIONAL; when absent the getter returns the value that
+        # reproduces the historic hardcoded Prior behavior, so proscan_ii.json /
+        # proscan_iii.json (which set none of them) stay byte-for-byte identical.
+        self._family = str(config.get("controller_family", "prior")).lower()
+
+        # Raw command-mode init bytes (e.g. Ludl "FF41" = 0xFF 0x41 forces ASCII /
+        # high-level mode). Written verbatim at connect with NO line terminator.
+        self._command_mode_init_bytes = self._parse_init_bytes(
+            config.get("command_mode_init_hex"))
+
+        # Ack / error semantics. Prior writes reply with a bare "R"; Ludl replies ":A"
+        # on success and ":N -<code>" on error.
+        rs = config.get("response_semantics", {}) or {}
+        self._ack_success_token = rs.get("ack_success_token", "R")
+        err_pat = rs.get("ack_error_pattern")
+        try:
+            self._ack_error_re = re.compile(err_pat) if err_pat else None
+        except re.error:
+            logger.error(f"Invalid ack_error_pattern: {err_pat!r}")
+            self._ack_error_re = None
+
+        # Position-response parsing. Prior default = comma CSV, strip a trailing "R",
+        # axes x,y,z. Ludl WHERE → ":A <x> <y>" (whitespace, 2 axes, ":A" prefix).
+        pp = config.get("position_parse", {}) or {}
+        self._position_parse = {
+            "format": pp.get("format", "csv"),
+            "axis_order": list(pp.get("axis_order", ["x", "y", "z"])),
+            "strip_tokens": list(pp.get("strip_tokens", ["R"])),
+            "ack_prefix": pp.get("ack_prefix"),
+            "regex": pp.get("regex"),
+        }
+
+        # Speed / acceleration models. Prior = percentage of max (SMS/SAS 1-100);
+        # Ludl = absolute per-axis (SPEED counts/s, ACCEL 1-255 ramp index).
+        self._speed_model = str(config.get("speed_model", "percentage")).lower()
+        self._speed_units = config.get("speed_units")
+        self._speed_per_axis = bool(config.get("speed_per_axis", False))
+        self._accel_model = str(config.get("accel_model", "percentage")).lower()
+        self._accel_units = config.get("accel_units")
+
     @staticmethod
     def _parse_terminator(term_str: str) -> bytes:
         """Parse escaped terminator string from JSON to bytes."""
         # Handle JSON-escaped sequences like "\\r\\n" → b"\r\n"
         return term_str.encode("utf-8").decode("unicode_escape").encode("ascii")
+
+    @staticmethod
+    def _parse_init_bytes(hex_str: Any) -> bytes | None:
+        """Parse a hex string like "FF41" (or "0xFF 0x41") into raw bytes.
+
+        Returns None when absent/blank/invalid so callers can skip the write.
+        """
+        if not hex_str:
+            return None
+        try:
+            cleaned = "".join(str(hex_str).split()).replace("0x", "").replace("0X", "")
+            return bytes.fromhex(cleaned)
+        except ValueError:
+            logger.error(f"Invalid command_mode_init_hex: {hex_str!r}")
+            return None
 
     @classmethod
     def load(cls, filepath: str | Path) -> ControllerProtocol:
@@ -121,6 +178,28 @@ class ControllerProtocol:
         return self._baud_rate
 
     @property
+    def baud_rate_candidates(self) -> list[int]:
+        """Baud rates to try, in order, during detection on each port.
+
+        v7.5.x: added after a real Prior ProScan III unit was found sitting
+        at a non-default baud (Prior's own manual documents that a changed
+        baud setting silently reverts to 9600 if the port sits idle across
+        TWO power cycles — a real, expected failure mode, not a one-off).
+        Optional ``communication.baud_rates`` (a list, highest/preferred
+        first) enables retrying several rates per port; absent ⇒ the single
+        ``default_baud_rate`` (current behavior, byte-identical for every
+        protocol that doesn't declare it — Prior II/III, Ludl unaffected).
+        """
+        comm = self._config.get("communication", {})
+        rates = comm.get("baud_rates")
+        if rates:
+            try:
+                return [int(r) for r in rates]
+            except (TypeError, ValueError):
+                logger.error(f"Invalid communication.baud_rates: {rates!r}")
+        return [self._baud_rate]
+
+    @property
     def byte_size(self) -> int:
         return self._byte_size
 
@@ -135,6 +214,77 @@ class ControllerProtocol:
     @property
     def encoding(self) -> str:
         return self._encoding
+
+    # --- v7.5.x: family + wire semantics (Prior-safe defaults) ---
+
+    @property
+    def family(self) -> str:
+        """Controller family: 'prior' (default) or 'ludl'.
+
+        Drives the simulator choice and the coarse semantic branches in XYStage.
+        """
+        return self._family
+
+    @property
+    def command_mode_init_bytes(self) -> bytes | None:
+        """Raw bytes to write (no terminator) once at connect, or None.
+
+        Used by the LEP MAC 5000 to force ASCII/high-level mode (0xFF 0x41).
+        """
+        return self._command_mode_init_bytes
+
+    @property
+    def ack_success_token(self) -> str:
+        """Token that marks a successful ack ('R' for Prior, ':A' for Ludl)."""
+        return self._ack_success_token
+
+    def match_ack_error(self, response: str | None) -> "re.Match | None":
+        """Return the regex match if `response` is an error ack, else None."""
+        if not response or self._ack_error_re is None:
+            return None
+        return self._ack_error_re.match(response.strip())
+
+    def get_position_parse(self) -> dict:
+        """Position-response parse spec (a copy, Prior defaults filled in)."""
+        return dict(self._position_parse)
+
+    @property
+    def speed_model(self) -> str:
+        """'percentage' (Prior SMS 1-100) or 'absolute' (Ludl SPEED counts/s)."""
+        return self._speed_model
+
+    @property
+    def speed_units(self) -> str | None:
+        """Absolute-speed units, e.g. 'counts_per_s' or 'um_per_s' (None for percentage)."""
+        return self._speed_units
+
+    @property
+    def speed_is_per_axis(self) -> bool:
+        """True when the set_max_speed template takes {sx}/{sy} instead of {speed}."""
+        return self._speed_per_axis
+
+    @property
+    def accel_model(self) -> str:
+        """'percentage' (Prior SAS 1-100) or 'absolute' (Ludl ACCEL 1-255)."""
+        return self._accel_model
+
+    @property
+    def accel_units(self) -> str | None:
+        return self._accel_units
+
+    @property
+    def position_scale(self) -> float:
+        """Stage wire-units per micron.
+
+        Prior = 1.0 (native µm, so multiplying/dividing is a no-op). Ludl = counts
+        per µm (≈10). Applied ONLY inside XYStage on the send/read boundary; every
+        layer above XYStage stays µm-native.
+        """
+        try:
+            v = self.get_parameter("xy_position_scale")
+            return float(v) if v else 1.0
+        except (TypeError, ValueError):
+            return 1.0
 
     # --- Command Formatting ---
 

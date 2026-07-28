@@ -165,6 +165,76 @@ class CameraCalibrationStore:
             f"= {rotation_deg if rotation_deg is None else round(rotation_deg, 2)}"
             f"° vs stage [{identity[:48]}…]")
 
+    def get_mirrored(self, identity: str) -> bool:
+        """Whether the camera's view is mirrored (horizontal flip), or False.
+
+        A mirror flips image handedness — which the rotation alone cannot
+        express — so it is stored as its own sibling of ``rotation_deg``.
+        Absent key ⇒ not mirrored (legacy entries stay byte-identical)."""
+        if not identity:
+            return False
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return False
+        return bool(entry.get("mirrored", False))
+
+    def set_mirrored(self, identity: str, mirrored: bool,
+                     name: str = "") -> None:
+        """Store/replace ONLY a camera's mirrored-view flag.
+
+        Independent of µm/px + rotation (the mount/optics handedness is a
+        property of the physical camera). Kept in the same identity entry,
+        preserving any ``um_per_px`` / ``rotation_deg`` / ``image_correction``
+        siblings. Stored only when True so an un-mirrored camera's entry is
+        unchanged (``False`` pops the key)."""
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        if mirrored:
+            entry["mirrored"] = True
+        else:
+            entry.pop("mirrored", None)
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera mirror saved: {entry.get('name', '?')} "
+            f"mirrored={bool(mirrored)} [{identity[:48]}…]")
+
+    def get_flip_y(self, identity: str) -> bool:
+        """Whether the camera's view is flipped vertically (flip Y), or False.
+        Sibling of ``mirrored`` (flip X); absent key ⇒ not flipped."""
+        if not identity:
+            return False
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return False
+        return bool(entry.get("flip_y", False))
+
+    def set_flip_y(self, identity: str, flip_y: bool, name: str = "") -> None:
+        """Store/replace ONLY a camera's vertical-flip (flip Y) flag — sibling of
+        ``mirrored``/``rotation_deg``. Stored only when True (``False`` pops the
+        key so legacy entries stay byte-identical)."""
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        if flip_y:
+            entry["flip_y"] = True
+        else:
+            entry.pop("flip_y", None)
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera flip-Y saved: {entry.get('name', '?')} "
+            f"flip_y={bool(flip_y)} [{identity[:48]}…]")
+
     def clear_calibration(self, identity: str) -> None:
         try:
             del self._data["cameras"][identity]

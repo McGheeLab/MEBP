@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QFrame, QToolButton,
     QButtonGroup, QPushButton, QLabel, QCheckBox, QComboBox, QDoubleSpinBox,
     QSpinBox, QScrollArea, QGroupBox, QSizePolicy, QMessageBox, QLineEdit,
-    QColorDialog,
+    QColorDialog, QGridLayout, QApplication,
 )
 
 from gui.styles import COLORS, build_section_title_style
@@ -167,6 +167,7 @@ class SketchPage(QWidget):
         self._canvas.sketch_changed.connect(self._on_sketch_changed)
         self._canvas.selection_changed.connect(self._on_selection_changed)
         self._canvas.fill_result.connect(self._on_fill_result)
+        self._canvas.constraints_changed.connect(self._refresh_constraints_card)
 
         # v7.5.x: centre pane = XY drawing canvas (top) over an XZ side-profile
         # (bottom), resizable against each other via a vertical splitter. The
@@ -357,6 +358,8 @@ class SketchPage(QWidget):
         v.addWidget(self._build_well_card())
         # Abstract-ink manager (persistent) — the sketch's pump-agnostic inks.
         v.addWidget(self._build_inks_card())
+        # Parametric constraints (persistent) — buttons + list + DOF status.
+        v.addWidget(self._build_constraints_card())
         # Print sequence panel (persistent) — color-coded sections + moves.
         v.addWidget(self._build_sequence_card())
         # Per-shape / print properties (rebuilt on selection).
@@ -594,6 +597,211 @@ class SketchPage(QWidget):
             return (ink.name or f"Ink {ink_id}",
                     ink.color or PUMP_HEX[(int(ink_id) - 1) % len(PUMP_HEX)])
         return f"Ink {ink_id}", PUMP_HEX[(int(ink_id) - 1) % len(PUMP_HEX)]
+
+    # ── Parametric constraints card ───────────────────────────────
+
+    # (label, kind, tooltip) — enabled per-selection via can_add_constraint.
+    _CONSTRAINT_BUTTONS = [
+        ("Join", "coincident",
+         "Weld the nearest anchor pair (endpoints / corners / centers) of the "
+         "two selected shapes together"),
+        ("Point on", "point_on",
+         "Keep a point of one selected shape riding ON the other selected "
+         "line / circle"),
+        ("Tangent", "tangent",
+         "Line + circle or two circles: keep them tangent"),
+        ("Horizontal", "horizontal",
+         "Level the selected line(s) — or align two shapes' centers "
+         "horizontally"),
+        ("Vertical", "vertical",
+         "Plumb the selected line(s) — or align two shapes' centers "
+         "vertically"),
+        ("Parallel", "parallel", "Keep two selected lines parallel"),
+        ("Perpendicular", "perpendicular",
+         "Keep two selected lines at 90°"),
+        ("Concentric", "concentric",
+         "Two circles / ellipses / rects share a center"),
+        ("Equal length", "equal_length",
+         "Two selected lines keep equal length"),
+        ("Equal radius", "equal_radius",
+         "Two selected circles keep equal radius"),
+        ("Distance", "distance",
+         "Drive the distance between two shapes (or a line's length) to a "
+         "typed value"),
+        ("Radius", "radius",
+         "Drive the selected circle's radius to a typed value"),
+        ("Lock", "fix",
+         "Pin the selected shape(s) in place (click again to unlock)"),
+    ]
+
+    def _build_constraints_card(self) -> QGroupBox:
+        """Persistent card: DOF status, snap→constraint auto-capture toggle,
+        constraint-creation buttons (enabled per selection), and the list of
+        existing constraints (dimensions editable, each deletable)."""
+        grp = self._group("Constraints")
+        lay = grp.layout()
+
+        self._dof_lbl = QLabel("")
+        self._dof_lbl.setWordWrap(True)
+        self._dof_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
+        lay.addWidget(self._dof_lbl)
+
+        self._auto_capture_chk = QCheckBox("Capture joins while drawing")
+        self._auto_capture_chk.setToolTip(
+            "When drawing snaps onto an existing vertex, keep them joined "
+            "with a coincident constraint (edge snaps on lines/circles become "
+            "point-on). Off = snap stays a one-time positioning aid.")
+        self._auto_capture_chk.setChecked(True)
+        self._auto_capture_chk.toggled.connect(
+            lambda on: self._canvas.set_auto_constrain(bool(on)))
+        lay.addWidget(self._auto_capture_chk)
+
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(s(4))
+        self._constraint_btns: dict[str, QPushButton] = {}
+        for n, (label, kind, tip) in enumerate(self._CONSTRAINT_BUTTONS):
+            b = QPushButton(label)
+            b.setToolTip(tip)
+            b.setEnabled(False)
+            b.clicked.connect(lambda _=False, k=kind: self._add_constraint(k))
+            self._constraint_btns[kind] = b
+            grid.addWidget(b, n // 3, n % 3)
+        lay.addWidget(grid_host)
+
+        self._constraints_host = QWidget()
+        self._constraints_layout = QVBoxLayout(self._constraints_host)
+        self._constraints_layout.setContentsMargins(0, 0, 0, 0)
+        self._constraints_layout.setSpacing(s(3))
+        lay.addWidget(self._constraints_host)
+
+        self._refresh_constraints_card()
+        return grp
+
+    def _add_constraint(self, kind: str):
+        ok, msg = self._canvas.add_constraint_for_selection(kind)
+        if ok:
+            self._status_ok(f"✓ {msg}")
+        else:
+            self._status_warn(f"⚠ {msg}")
+        self._refresh_constraints_card()
+
+    def _refresh_constraint_buttons(self):
+        if not hasattr(self, "_constraint_btns"):
+            return
+        for kind, b in self._constraint_btns.items():
+            b.setEnabled(self._canvas.can_add_constraint(kind))
+
+    _DOF_TEXT = {
+        "well_determined": ("Fully constrained", "green"),
+        "under_determined": ("{dof} DOF free", "subtext0"),
+        "inconsistent": ("⚠ Conflicting constraints — highlighted red",
+                         "red"),
+        "empty": ("", "subtext0"),
+    }
+
+    def _refresh_dof_label(self):
+        if not hasattr(self, "_dof_lbl"):
+            return
+        sk = self._canvas.sketch()
+        if not getattr(sk, "constraints", None):
+            self._dof_lbl.setText(
+                "Select shapes and add constraints — geometry re-solves live "
+                "as you drag.")
+            self._dof_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
+            return
+        rep = self._canvas.last_solve_report()
+        if rep is None:
+            self._dof_lbl.setText(f"{len(sk.constraints)} constraint(s)")
+            self._dof_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
+            return
+        status = getattr(rep.status, "value", str(rep.status))
+        text, color = self._DOF_TEXT.get(status, ("", "subtext0"))
+        text = text.format(dof=rep.dof)
+        self._dof_lbl.setText(
+            f"{len(sk.constraints)} constraint(s) · {text}" if text
+            else f"{len(sk.constraints)} constraint(s)")
+        self._dof_lbl.setStyleSheet(
+            f"color: {COLORS.get(color, COLORS['subtext0'])}; "
+            f"font-size: {_sf(9)}pt;")
+
+    def _refresh_constraints_card(self):
+        if not hasattr(self, "_constraints_layout"):
+            return
+        self._refresh_dof_label()
+        self._refresh_constraint_buttons()
+        # Don't yank the row widgets out from under a value spinbox the user
+        # is currently typing in (the debounced preview would rebuild them).
+        focus = QApplication.focusWidget()
+        if focus is not None and self._constraints_host.isAncestorOf(focus):
+            return
+        while self._constraints_layout.count():
+            it = self._constraints_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        for c in getattr(self._canvas.sketch(), "constraints", []):
+            self._constraints_layout.addWidget(self._constraint_row(c))
+
+    _CONSTRAINT_LABELS = {
+        "coincident": "◉ Join", "point_on": "◎ Point-on",
+        "tangent": "T Tangent", "horizontal": "— Horizontal",
+        "vertical": "| Vertical", "parallel": "∥ Parallel",
+        "perpendicular": "⊥ Perpendicular", "concentric": "◎ Concentric",
+        "equal_length": "= Equal length", "equal_radius": "= Equal radius",
+        "distance": "↔ Distance", "radius": "R Radius", "fix": "🔒 Lock",
+    }
+
+    def _format_constraint(self, c) -> str:
+        sk = self._canvas.sketch()
+        parts = []
+        for sid, _anchor in c.refs:
+            i = sk.shape_index_by_id(int(sid))
+            sh = sk.shape_by_id(int(sid))
+            parts.append(f"{getattr(sh, 'kind', '?')} #{i + 1}"
+                         if sh is not None else "?")
+        label = self._CONSTRAINT_LABELS.get(c.kind, c.kind)
+        mode = f" ({c.mode})" if getattr(c, "mode", "") else ""
+        return f"{label}{mode} — {' · '.join(parts)}"
+
+    def _constraint_row(self, c) -> QWidget:
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(s(4))
+        lbl = QPushButton(self._format_constraint(c))
+        lbl.setFlat(True)
+        lbl.setCursor(Qt.PointingHandCursor)
+        lbl.setToolTip("Click to select the constrained shapes")
+        lbl.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; "
+            f"color: {COLORS['text']}; font-size: {_sf(9)}pt; "
+            f"text-align: left; padding: {s(2)}px; }}"
+            f"QPushButton:hover {{ color: {COLORS['blue']}; }}")
+        lbl.clicked.connect(
+            lambda _=False, cid=c.id:
+            self._canvas.select_constraint_shapes(cid))
+        h.addWidget(lbl, 1)
+        if c.value is not None:                    # driven dimension → editable
+            spin = self._dspin(float(c.value), 0.0, 1000.0, 0.1)
+            spin.setFixedWidth(s(84))
+            spin.valueChanged.connect(
+                lambda v, cid=c.id:
+                self._canvas.set_constraint_value(cid, float(v)))
+            h.addWidget(spin)
+        delete = QPushButton("✕")
+        delete.setObjectName("flatBtn")
+        delete.setFixedSize(s(20), s(20))
+        delete.setToolTip("Delete this constraint")
+        delete.clicked.connect(
+            lambda _=False, cid=c.id: self._canvas.remove_constraint(cid))
+        h.addWidget(delete)
+        return row
 
     def _seq_section_row(self, number: int, item: dict) -> QWidget:
         """A COLLAPSIBLE, content-sized section block: a coloured header (click
@@ -934,18 +1142,10 @@ class SketchPage(QWidget):
         # print time, in Quick Print's ink-mapping step).
         self._field_row(lay, "Ink", self._make_ink_combo(sh))
 
-        # Over-closure toggle (closed-loop outlines only): continue past the
-        # seam by ~the needle radius so the loop fully closes.
+        # Closure overlap (closed-loop outlines only): continue PAST the seam so
+        # the deposited ink fully closes — by one needle Ø or a typed distance.
         if self._shape_is_closed_loop(sh):
-            overlap = QCheckBox("Overlap closure (over-close the seam)")
-            overlap.setChecked(bool(getattr(sh, "overlap_closure", False)))
-            overlap.setToolTip(
-                "Continue printing past the closure point by about the needle "
-                "radius. As the needle re-enters the start it pushes deposited "
-                "ink aside; the overshoot makes the loop close fully.")
-            overlap.toggled.connect(
-                lambda v: self._set(sh, "overlap_closure", v))
-            lay.addWidget(overlap)
+            self._build_closure_overlap_row(lay, sh)
 
         # Print-start control (continuity): outline shapes only (not fills).
         if sh.kind in ("line", "circle", "ellipse", "rect", "polygon") \
@@ -968,6 +1168,29 @@ class SketchPage(QWidget):
             reset_start.setEnabled(custom)
             reset_start.clicked.connect(self._reset_start_point)
             lay.addWidget(reset_start)
+
+        # Print-END control: OPEN shapes only — drag the red ■ marker to trim
+        # where printing stops (with the start marker, prints a sub-segment).
+        # Closed shapes use the closure-overlap row above for their end.
+        if sh.kind in ("line", "polygon") and not sh.filled \
+                and not self._shape_is_closed_loop(sh):
+            has_end = getattr(sh, "end_point", None) is not None
+            end_lbl = QLabel(
+                "Print end: " + ("custom" if has_end else "default (far end)"))
+            end_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {_sf(9)}pt;")
+            lay.addWidget(end_lbl)
+            end_hint = QLabel(
+                "Drag the red ■ marker on the canvas to trim where this shape "
+                "stops printing.")
+            end_hint.setWordWrap(True)
+            end_hint.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {_sf(8)}pt;")
+            lay.addWidget(end_hint)
+            reset_end = QPushButton("Reset end point")
+            reset_end.setEnabled(has_end)
+            reset_end.clicked.connect(self._reset_end_point)
+            lay.addWidget(reset_end)
 
         delete = QPushButton("Delete shape")
         delete.setObjectName("dangerBtn")
@@ -1199,6 +1422,7 @@ class SketchPage(QWidget):
         if self._building:
             return
         setattr(shape, attr, value)
+        self._canvas.solve_after_edit()    # re-satisfy constraints (no-op if none)
         self._canvas.update()
         self._schedule_preview()
 
@@ -1207,6 +1431,7 @@ class SketchPage(QWidget):
             return
         x, y = shape.points[idx]
         shape.points[idx] = (value, y) if axis == 0 else (x, value)
+        self._canvas.solve_after_edit()    # re-satisfy constraints (no-op if none)
         self._canvas.update()
         self._schedule_preview()
 
@@ -1302,6 +1527,63 @@ class SketchPage(QWidget):
         self._canvas.clear_start_point(idx)
         self._rebuild_props()          # refresh the custom/default label + button
 
+    def _reset_end_point(self):
+        """Clear an OPEN shape's custom print end (back to the far endpoint)."""
+        idx = self._canvas.selected_index()
+        if idx < 0:
+            return
+        self._canvas.clear_end_point(idx)
+        self._rebuild_props()
+
+    # ── Closure overlap ───────────────────────────────────────────
+
+    _OVERLAP_MODES = [("None", "none"), ("Needle Ø", "needle"),
+                      ("Custom distance", "distance")]
+
+    def _build_closure_overlap_row(self, lay, sh: SketchShape):
+        """Closure-overlap control for a closed loop: a mode combo (None /
+        Needle Ø / Custom distance) + a distance spin shown for Custom. The end
+        marker on the canvas is the same value — dragging it sets the distance."""
+        combo = QComboBox()
+        for label, data in self._OVERLAP_MODES:
+            combo.addItem(label, data)
+        mode = getattr(sh, "overlap_mode", "none") or "none"
+        idx = combo.findData(mode)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.setToolTip(
+            "Continue printing PAST the seam so the deposited ink fully closes "
+            "(on re-entry the needle pushes ink aside). 'Needle Ø' overshoots "
+            "one needle outer diameter; 'Custom distance' overshoots the typed "
+            "mm. Drag the red ■ marker on the canvas to set it graphically.")
+        spin = self._dspin(max(float(getattr(sh, "overlap_distance_mm", 0.0)),
+                               0.0), 0.0, 100.0, 0.1)
+        spin.setVisible(mode == "distance")
+        spin.valueChanged.connect(
+            lambda v, s=sh: self._set(s, "overlap_distance_mm", float(v)))
+        combo.currentIndexChanged.connect(
+            lambda _i, c=combo, s=sh, sp=spin:
+            self._on_overlap_mode_changed(s, c.currentData(), sp))
+        self._field_row(lay, "Closure overlap", combo)
+        self._field_row(lay, "Distance", spin)
+
+    def _on_overlap_mode_changed(self, sh, mode, spin):
+        if self._building:
+            return
+        mode = mode or "none"
+        sh.overlap_mode = mode
+        # Seed a visible default when switching to Custom so the end marker
+        # appears off the seam (else it sits exactly on the start flag).
+        if mode == "distance" and float(getattr(sh, "overlap_distance_mm",
+                                                 0.0)) <= 0.0:
+            seed = self._needle_od_mm if self._needle_od_mm > 0 else 0.5
+            sh.overlap_distance_mm = round(float(seed), 3)
+        spin.blockSignals(True)
+        spin.setValue(float(getattr(sh, "overlap_distance_mm", 0.0)))
+        spin.setVisible(mode == "distance")
+        spin.blockSignals(False)
+        self._canvas.update()
+        self._schedule_preview()
+
     def _on_overlap_travel_toggled(self, checked: bool):
         self._set_sketch("overlap_travel_enabled", bool(checked))
         self._refresh_sequence()
@@ -1340,6 +1622,7 @@ class SketchPage(QWidget):
 
     def _on_selection_changed(self, _index):
         self._rebuild_props()
+        self._refresh_constraint_buttons()
 
     def _on_fill_result(self, ok: bool):
         if ok:
@@ -1361,6 +1644,7 @@ class SketchPage(QWidget):
     def _recompute_preview(self):
         sk = self._canvas.sketch()
         self._refresh_sequence()           # keep the sequence panel in sync
+        self._refresh_constraints_card()   # constraints list + DOF status
         try:
             result = compile_to_trajectory(sk, self._needle, self._syringe)
         except Exception as e:
@@ -1705,6 +1989,9 @@ class SketchPage(QWidget):
             self._needle_od_mm = float(od)
             self._canvas.sketch().line_spacing_mm = float(od)
             self._canvas.set_default_line_width(float(od))
+        # Feed the outer Ø so a "needle Ø" closure-overlap marker matches what
+        # the compiler extrudes.
+        self._canvas.set_needle_od(self._needle_od_mm)
         # The shaded print-thickness band is 1× = needle INNER Ø (the deposited
         # bead reference the operator asked for), scaled by the multiplier.
         idv = getattr(self._needle, "id_mm", 0.0) if self._needle else 0.0

@@ -28,10 +28,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from gui.pages.hardware.control_panel import HardwareControlPanel
@@ -105,6 +105,41 @@ class StandardJogContextPanel(QWidget):
     def set_hardware_config(self, config) -> None:
         self._hardware_config = config
         self._refresh_hardware_info()
+
+    def minimumSizeHint(self):  # noqa: N802 (Qt override)
+        """v7.5.x: report a small minimum WIDTH so the context-panel scroll area
+        can drive this panel to the ~100 px minimum. Every section is
+        proportional (stretch-driven, tiny minimums), so content scrunches to
+        fit rather than flooring the width. Height is left to the real layout."""
+        h = super().minimumSizeHint().height()
+        return QSize(s(96), h)
+
+    def _apply_responsive_fonts(self, *, force: bool = False) -> None:
+        """v7.5.x: scale this panel's own sections' fonts by the width %% (Go-To,
+        Hardware Info, Illumination). The embedded HardwareControlPanel + jog
+        array scale themselves, so their subtree is skipped."""
+        w = self.width()
+        if w <= 0:
+            return
+        from gui.widgets.responsive import (
+            container_scale, quantize, scale_descendant_fonts)
+        factor = quantize(container_scale(w, s(440), 0.45, 1.12))
+        if not force and abs(factor - getattr(self, "_font_factor", -1.0)) < 1e-6:
+            return
+        self._font_factor = factor
+        try:
+            scale_descendant_fonts(
+                self, factor, skip_subtrees=[getattr(self, "_hw_panel", None)])
+        except Exception as exc:
+            logger.debug(f"context font scale failed: {exc}")
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt override)
+        super().resizeEvent(event)
+        self._apply_responsive_fonts()
+
+    def showEvent(self, event):  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        self._apply_responsive_fonts(force=True)
 
     def set_calibration_data(self, plate, well_positions, safe_z) -> None:
         self._plate = plate
@@ -188,23 +223,32 @@ class StandardJogContextPanel(QWidget):
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(s(6))
         grid.setVerticalSpacing(s(4))
+        # v7.5.x: the spin column takes the width proportionally so the card
+        # fits a narrow panel (the spins scrunch instead of flooring the width).
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+
+        def _fluid_spin(spin):
+            spin.setMinimumWidth(s(30))
+            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            return spin
 
         grid.addWidget(QLabel("X"), 0, 0)
-        self._goto_x = QDoubleSpinBox()
+        self._goto_x = _fluid_spin(QDoubleSpinBox())
         self._goto_x.setRange(-999_999, 999_999)
         self._goto_x.setDecimals(1)
         self._goto_x.setSuffix(" µm")
         grid.addWidget(self._goto_x, 0, 1)
 
         grid.addWidget(QLabel("Y"), 1, 0)
-        self._goto_y = QDoubleSpinBox()
+        self._goto_y = _fluid_spin(QDoubleSpinBox())
         self._goto_y.setRange(-999_999, 999_999)
         self._goto_y.setDecimals(1)
         self._goto_y.setSuffix(" µm")
         grid.addWidget(self._goto_y, 1, 1)
 
         grid.addWidget(QLabel("Z"), 2, 0)
-        self._goto_z = QDoubleSpinBox()
+        self._goto_z = _fluid_spin(QDoubleSpinBox())
         self._goto_z.setRange(-100.0, 100.0)
         self._goto_z.setDecimals(3)
         self._goto_z.setSuffix(" mm")
@@ -336,21 +380,25 @@ class StandardJogContextPanel(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(s(6))
         lbl = QLabel(label_text)
+        # v7.5.x: no font-size in QSS so the width-based font scaler can rescale
+        # it (text shrinks with the panel width instead of clipping).
         lbl.setStyleSheet(
             f"color: {COLORS['subtext0']};"
-            f"font-size: {sf(9)}pt;"
             f"font-weight: 600;"
         )
-        lbl.setMinimumWidth(s(86))
-        row.addWidget(lbl)
+        # v7.5.x: proportional — the name column takes ~40%% and elides on a
+        # narrow panel instead of flooring the row width.
+        lbl.setMinimumWidth(s(36))
+        lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        row.addWidget(lbl, 2)
         value_lbl = QLabel(value_text)
         value_lbl.setStyleSheet(
             f"color: {COLORS['text']};"
-            f"font-size: {sf(9)}pt;"
             f"font-family: Consolas, Menlo, monospace;"
         )
         value_lbl.setWordWrap(True)
-        row.addWidget(value_lbl, stretch=1)
+        value_lbl.setMinimumWidth(s(1))
+        row.addWidget(value_lbl, stretch=3)
         card.add_layout(row)
         return value_lbl
 

@@ -23,6 +23,10 @@
         "notes": "v7.2.8: Removed bare 'E' token (matched ProScan II error codes). Send STAGE first to wake, then V to get firmware string. response_pattern excludes E,N error format.",
         "response_pattern": "^(?!E,\\d).*(?:ProScan|\\d+\\.\\d+)"
     },
+    "response_semantics": {
+        "ack_success_token": "R",
+        "ack_error_pattern": "^E,\\s*(-?\\d+)"
+    },
     "commands": {
         "position_query": {
             "cmd": "P",
@@ -44,9 +48,17 @@
             "cmd": "SMS,{speed}",
             "response": "R"
         },
+        "get_max_speed": {
+            "cmd": "SMS",
+            "response": "{value}"
+        },
         "set_acceleration": {
             "cmd": "SAS,{accel}",
             "response": "R"
+        },
+        "get_acceleration": {
+            "cmd": "SAS",
+            "response": "{value}"
         },
         "set_jerk": {
             "cmd": "SCS,{jerk}",

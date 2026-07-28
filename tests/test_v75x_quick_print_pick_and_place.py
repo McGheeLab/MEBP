@@ -274,7 +274,9 @@ class _FakeExecutor:
     def run_prep(self):
         self.prep_ran = True
 
-    def aspirate_ink(self, well_pos, volume_uL, *, bore, z_mm, rate_uL_s=None):
+    def aspirate_ink(self, well_pos, volume_uL, *, bore, z_mm, rate_uL_s=None,
+                     prime_uL=0.0, prime_rate_uL_s=None, orbit=False,
+                     orbit_diameter_mm=1.0, orbit_speed_mm_s=2.0):
         self.aspirate_calls.append(
             {"well_pos": well_pos, "volume_uL": volume_uL, "bore": bore,
              "z_mm": z_mm})

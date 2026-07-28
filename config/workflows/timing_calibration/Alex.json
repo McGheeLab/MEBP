@@ -1,0 +1,14 @@
+{
+  "_format": "mebp-workflow-settings",
+  "workflow_id": "timing_calibration",
+  "name": "Alex",
+  "saved": "2026-07-27T17:49:40",
+  "values": {
+    "maxn": 8,
+    "seg": 1.0,
+    "speed": 5.0,
+    "reps": 2,
+    "still": 0.35,
+    "topdist": 10.0
+  }
+}

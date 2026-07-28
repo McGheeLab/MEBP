@@ -131,6 +131,27 @@ class PrintCommand:
         return f"PrintCommand({self.type.value}, {self.params}, '{self.label}')"
 
 
+# ── Arc-length path math for velocity-following printing (pure, testable) ──
+# The velocity follower (PrintManager._execute_print_path_velocity) parametrizes
+# the toolpath by ARC LENGTH, not wall-clock time: the "carrot" the stage chases
+# is placed a fixed lookahead distance ahead of the stage's ACTUAL measured
+# progress along the path. So a stage that runs slower than commanded simply
+# advances the carrot slower — it can NEVER accumulate lag/run ahead (the failure
+# mode of the open-loop time-paced path), and the pump deposits volume in
+# proportion to real distance travelled, so the bead stays correct at any speed.
+
+# v7.5.x: the arc-length helpers now live in SupportClasses/VelocityControl.py
+# (their canonical home, shared with the XY-Challenge bench so the tuned control
+# law is identical). Re-exported here so existing
+# ``from SupportClasses.PrintManager import polyline_arclength, …`` imports keep
+# working unchanged.
+from SupportClasses.VelocityControl import (   # noqa: E402
+    polyline_arclength, point_at_arclength, tangent_at_arclength,
+    project_on_polyline,
+)
+from SupportClasses import VelocityControl as _velctl   # noqa: E402
+
+
 @dataclass
 class PrintSettings:
     """Print job settings."""
@@ -210,6 +231,99 @@ class PrintSettings:
     service_xy_speed_mm_s: float = 50.0     # XY speed for service moves (waste/wash/ink)
     auto_pump_rate_uL_s: float = 0.0        # print pump rate from extrusion physics
     service_pump_rate_uL_s: float = 5.0     # service pump rate (max for gauge)
+
+    # v7.5.x: CONFIRMED per-segment printing. The default PRINT_PATH is streamed
+    # OPEN-LOOP — each segment's XY move is fire-and-forget, paced only by a
+    # time.sleep(seg_len/print_speed). On a stage whose real throughput is slower
+    # than the commanded speed (e.g. Prior SMS% mis-calibrated, or short accel-
+    # dominated segments), the physical stage falls PROGRESSIVELY behind the
+    # commanded stream (observed lag grew to ~6-10 mm across a ~10 mm print) while
+    # the pump keeps extruding on the fast software schedule → the deposited
+    # pattern smears/distorts. When True, _execute_print_path instead WAITS for
+    # the stage to physically arrive (± _SEGMENT_SETTLE_TOL_UM) and drains the
+    # pump board (M400) after EACH segment, so the stream can never outrun the
+    # stage and geometry stays correct at any speed (trade-off: the print runs at
+    # the stage's true throughput, which may be slower). Set by Quick Print.
+    confirm_each_segment: bool = False
+
+    # v7.5.x: CLOSED-LOOP velocity-following printing (preferred over the
+    # stop-and-go confirm_each_segment). Instead of streaming discrete moves, a
+    # real-time control loop continuously polls the stage's ACTUAL position and
+    # re-commands a velocity vector (Prior ``VS``) toward a carrot placed a fixed
+    # lookahead ahead of the stage's real progress ALONG the path (pure pursuit,
+    # arc-length parametrized). The stage therefore moves smoothly/continuously,
+    # position feedback corrects any drift, the carrot can never run ahead of a
+    # slow stage (no accumulating lag), and the pump deposits volume in
+    # proportion to real distance travelled (bead correct at any speed). Requires
+    # a stage with a continuous-velocity command (Prior ``VS`` /
+    # ``send_velocity_xy``); when unavailable it falls back to the discrete path.
+    # See PrintManager._execute_print_path_velocity. Set by Quick Print.
+    velocity_follow: bool = False
+
+    # v7.5.x: OPEN-LOOP velocity streaming ("open_loop" motion mode). The
+    # controller is fed a continuous velocity vector along the path TANGENT,
+    # updated as the path direction changes, with the target advancing by
+    # wall-clock time at the commanded speed — i.e. it "just updates the
+    # velocity vector needed" rather than moving to prescribed points (that is
+    # the confirm_each_segment mode). No position feedback (feed-forward):
+    # smooth continuous velocity for even ink laydown, but no drift correction
+    # and no runaway guard (the closed-loop velocity_follow adds those). The
+    # pump deposits ∝ the time-based target advance. Requires a continuous-
+    # velocity command (Prior ``VS`` / ``send_velocity_xy``); when unavailable
+    # it falls back to the discrete point-stream path. See
+    # PrintManager._execute_print_path_open_velocity. Set by Quick Print.
+    velocity_open_loop: bool = False
+
+    # v7.5.x: per-mode path-following parameters, tuned by the XY Printing
+    # Challenge and stamped from PrintTimingCalibrationStore by Quick Print.
+    # Defaults preserve legacy behaviour (open-loop: no pace change; confirm +
+    # velocity: 0 → the executor's class-constant tuning), so a job that doesn't
+    # set them behaves exactly as before.
+    #  • open-loop: multiply each segment's XY pacing sleep by this so the loop
+    #    paces to the stage's MEASURED effective speed (>1 for a slow stage).
+    pace_correction: float = 1.0
+    #  • confirmed per-segment: arrival tolerance (µm). 0 = class default.
+    segment_settle_tol_um: float = 0.0
+    #  • velocity follower pure-pursuit tuning. 0 = class defaults.
+    vel_lookahead_mm: float = 0.0
+    vel_control_hz: float = 0.0
+    vel_decel_mm: float = 0.0
+
+    # v7.5.x: MACHINE-MEASURED calibration consumed by the closed-loop velocity
+    # follower (stamped from PrintTimingCalibrationStore by Quick Print; 0 =
+    # unmeasured → the follower falls back to safety_limits / class constants).
+    #  • xy_max_speed_um_s: true top speed at 100% SMS — sets SMS + the VS clamp
+    #    so commanded velocity is achievable AND not clamped below it.
+    #  • control_loop_ms: measured closed-loop period → control rate + the dead-
+    #    time speed cap (v ≤ lookahead/(loop·safety)) that kills the overshoot
+    #    limit-cycle ("back-and-forth").
+    #  • phase_lag_s: measured stage lag behind commands → widens the dead-time
+    #    used for the speed cap / minimum lookahead.
+    xy_max_speed_um_s: float = 0.0
+    control_loop_ms: float = 0.0
+    phase_lag_s: float = 0.0
+
+    # v7.5.x: XY controller acceleration % applied before a velocity-mode path
+    # (was read via getattr with an 80 fallback; now a declared field).
+    xy_accel_pct: float = 80.0
+
+    # v7.5.x: velocity-follower corner-aware speed scheduling + cross-track PID.
+    #  • vel_corner_angle_deg: turn angle (deg) that counts as a corner to slow
+    #    into. 0 = class default.
+    #  • vel_corner_speed_factor: fraction of print speed allowed AT a sharp
+    #    corner (0..1). 0 = class default (no extra corner slowdown beyond the
+    #    factor default).
+    #  • vel_pid_kp / vel_pid_kd: cross-track PID gains (perpendicular pull back
+    #    onto the path). 0 = pure pursuit (legacy).
+    vel_corner_angle_deg: float = 0.0
+    vel_corner_speed_factor: float = 0.0
+    vel_pid_kp: float = 0.0
+    vel_pid_kd: float = 0.0
+
+    # v7.5.x: confirmed-per-segment — turn angle that counts as a corner. The
+    # executor waits/drains ONLY at corners (straight edges stream). 0 = class
+    # default.
+    confirm_corner_angle_deg: float = 0.0
 
     def get_retract_uL(self, pump: str) -> float:
         """Get retract amount for a pump in µL (v7.2). Falls back to legacy mm value."""
@@ -2027,6 +2141,36 @@ class PrintManager:
     # regardless of segment sampling.
     _PATH_PUMP_EMIT_MIN_UL = 0.001
 
+    # v7.5.x (confirmed per-segment printing): position tolerance (µm) for the
+    # per-segment XY arrival wait when ``settings.confirm_each_segment`` is set.
+    # A segment is considered "arrived" once the stage is within this of the
+    # commanded point. Loose enough that the Prior's settle jitter doesn't burn
+    # the timeout, tight relative to a bead (needle IDs are hundreds of µm).
+    _SEGMENT_SETTLE_TOL_UM = 40
+
+    # v7.5.x: velocity-following control-loop tuning (see PrintSettings.
+    # velocity_follow / _execute_print_path_velocity).
+    _VEL_CONTROL_HZ = 25.0        # control-loop rate (poll + re-command velocity)
+    _VEL_LOOKAHEAD_MM = 0.6       # pure-pursuit carrot distance ahead of progress
+    _VEL_DECEL_MM = 1.5           # ramp speed down over the last this-much of path
+    _VEL_ARRIVE_TOL_UM = 40       # "arrived at the end" position tolerance
+    _VEL_STALE_S = 1.0            # no fresh position for this long → stop (safety)
+    _VEL_MAX_CROSS_TRACK_MM = 3.0  # perpendicular error over this = runaway → abort
+    _VEL_RUNAWAY_TICKS = 8        # consecutive over-threshold ticks before aborting
+    # Cap how far the arc-length projection may advance per tick to the
+    # physically-plausible distance (print_speed × real dt × this). This stops
+    # the projection SNAPPING to a nearby-but-later loop of a spiral / self-
+    # intersecting path (which teleports the carrot → runaway). It stays far
+    # below one loop's circumference (loops are a full revolution apart in arc
+    # length) yet well above the true per-tick advance.
+    _VEL_SNAP_GUARD = 6.0
+    _VEL_MAX_SNAP_MM = 1.5        # absolute ceiling on per-tick s advance (mm)
+    # v7.5.x: corner-aware speed scheduling defaults (used when settings don't
+    # override). corner_angle = turn angle counted as a corner; corner_speed_
+    # factor = fraction of print speed allowed at the sharpest (180°) corner.
+    _VEL_CORNER_ANGLE_DEG = 30.0
+    _VEL_CORNER_SPEED_FACTOR = 0.4
+
     def __init__(self, controller):
         """
         Args:
@@ -3130,8 +3274,49 @@ class PrintManager:
         flow_rate_uL_s = cmd.params.get("flow_rate_uL_s", None)
         flow_rate = cmd.params.get("flow_rate", 0.01)
         use_uL = flow_rate_uL_s is not None
+        # v7.5.x: confirmed per-segment printing — wait for the stage to
+        # physically arrive (and drain the pump board) after each segment so the
+        # open-loop stream can never outrun the stage. See PrintSettings.
+        confirm_each_segment = bool(getattr(settings, "confirm_each_segment", False))
 
         if len(points) < 2:
+            return
+
+        # v7.5.x: confirmed-per-segment now stops (wait-for-arrival + pump drain)
+        # ONLY at real CORNERS, not at every sampled node. The incoming `points`
+        # is a fine polyline; waiting at each collinear node made straight edges
+        # crawl (stop-and-go). Precompute which vertices are corners (turn angle
+        # over the threshold) so a star stops at its 10 tips and streams the
+        # straight edges between them. The last point is always a stop.
+        _confirm_corners = None
+        if confirm_each_segment:
+            _cc_angle = getattr(settings, "confirm_corner_angle_deg", 0) or 30.0
+            try:
+                _confirm_corners = _velctl.corner_flags(points, _cc_angle)
+            except Exception:
+                _confirm_corners = None
+
+        # v7.5.x: CLOSED-LOOP velocity following (preferred). Continuously polls
+        # the real position and re-commands a velocity vector toward a carrot
+        # ahead of the stage's ACTUAL progress — so a slow stage can't lag and
+        # the pump tracks real distance. Requires a continuous-velocity command
+        # (Prior VS via send_velocity_xy); otherwise fall through to the discrete
+        # path below.
+        if (bool(getattr(settings, "velocity_follow", False))
+                and hasattr(ctrl, "send_velocity_xy")
+                and getattr(ctrl, "is_xy_connected", False)):
+            self._execute_print_path_velocity(cmd)
+            return
+
+        # v7.5.x: OPEN-LOOP velocity streaming ("open_loop" mode). Feed a
+        # continuous velocity vector along the path tangent (no position reads,
+        # no point-to-point moves — that's confirm_each_segment). Requires a
+        # continuous-velocity command; otherwise fall through to the discrete
+        # point-stream path below.
+        if (bool(getattr(settings, "velocity_open_loop", False))
+                and hasattr(ctrl, "send_velocity_xy")
+                and getattr(ctrl, "is_xy_connected", False)):
+            self._execute_print_path_open_velocity(cmd)
             return
 
         # v7.2.7: Set stage speed before print path
@@ -3149,6 +3334,7 @@ class PrintManager:
             lg.log("path_start", n_points=len(points), pump=pump,
                    flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
                    speed_mm_s=round(_spd, 3),
+                   confirm_each_segment=confirm_each_segment,
                    **PrintExecutionLogger._path_stats(points))
         _path_t0 = time.monotonic()
         _planned_s = 0.0
@@ -3264,8 +3450,39 @@ class PrintManager:
             pump_move_s = 0.0
             if use_uL and flow_rate_uL_s and flow_rate_uL_s > 0 and _seg_vol_uL > 0:
                 pump_move_s = _seg_vol_uL / flow_rate_uL_s
-            _sleep_s = max(move_time, pump_move_s, 0.05)
-            time.sleep(_sleep_s)
+            # v7.5.x: pace the XY component by the tuned correction (>1 for a
+            # stage that runs slower than commanded, so the loop doesn't outrun
+            # the stage → pump stays locked to the needle). Default 1.0 = legacy.
+            _pace = getattr(settings, "pace_correction", 1.0) or 1.0
+            _sleep_s = max(move_time * _pace, pump_move_s, 0.05)
+            # v7.5.x: in confirm mode, a node is a STOP only if it's a real corner
+            # (or the last point). Straight-edge nodes stream (a short sleep like
+            # the open path) so a star prints one continuous move per edge and
+            # stops only at its corners — not a crawl at every sampled node.
+            _is_stop_node = confirm_each_segment and (
+                i == len(points) - 1
+                or _confirm_corners is None      # detection failed → stop each
+                or (i < len(_confirm_corners) and _confirm_corners[i]))
+            if _is_stop_node:
+                # CLOSED-LOOP pacing at the corner: block until the stage
+                # physically reaches this vertex, then drain the pump board,
+                # before issuing the next edge. The stream therefore cannot
+                # accumulate lag along the edge just traced. Timeout is generous
+                # (the stage may be several × slower than move_time/pump_move_s
+                # imply); a persistent timeout is logged by _wait_for_xy_settle.
+                _seg_settle_to = max(_sleep_s * 4.0 + 2.0, 3.0)
+                _seg_tol = (getattr(settings, "segment_settle_tol_um", 0) or 0) \
+                    or self._SEGMENT_SETTLE_TOL_UM
+                self._wait_for_xy_settle(
+                    x2, y2, timeout=_seg_settle_to, tolerance=_seg_tol)
+                # Drain the pump board too so its dispense completes in step with
+                # the stage and its planner buffer can never back up.
+                if getattr(ctrl, "is_zp_connected", False):
+                    _zp = getattr(ctrl, "zp_stage", None)
+                    if _zp is not None and hasattr(_zp, "flush_moves"):
+                        _zp.flush_moves(timeout_s=10.0)
+            else:
+                time.sleep(_sleep_s)
 
             # v7.5.x exec log: one line per segment. drift_s = how far the
             # loop's wall clock has run ahead of its own sleep schedule
@@ -3297,7 +3514,11 @@ class PrintManager:
             # it's near-instant when the buffer is shallow (or ZP has no queued
             # moves, e.g. a dry/low-flow print) and only waits when motion is
             # genuinely backed up — exactly when we need it to.
-            if (i % self._PATH_BARRIER_EVERY == 0
+            # Runs on STREAMED nodes only (open-loop, and confirm's straight-edge
+            # nodes that didn't just drain at a stop-node) so a long streamed
+            # edge in either mode can't saturate the buffer.
+            if (not _is_stop_node
+                    and i % self._PATH_BARRIER_EVERY == 0
                     and getattr(ctrl, "is_zp_connected", False)):
                 _zp = getattr(ctrl, "zp_stage", None)
                 if _zp is not None and hasattr(_zp, "flush_moves"):
@@ -3352,6 +3573,467 @@ class PrintManager:
             lg.log("path_end",
                    wall_s=round(time.monotonic() - _path_t0, 3),
                    planned_s=round(_planned_s, 3))
+
+    def _execute_print_path_open_velocity(self, cmd: PrintCommand):
+        """OPEN-LOOP velocity-streaming print path (see PrintSettings.
+        velocity_open_loop).
+
+        Feed-forward: a target advances ALONG the path by wall-clock time at the
+        commanded speed, and each tick commands a continuous velocity vector
+        (Prior ``VS``) pointed along the path TANGENT at the target — "just
+        updating the velocity vector needed" to trace the path. There is NO
+        position feedback (that is the closed-loop ``velocity_follow`` mode) and
+        NO point-to-point stepping (that is ``confirm_each_segment``). The stage
+        therefore moves continuously (even ink laydown) but drift is not
+        corrected. The pump deposits volume ∝ the time-based target advance.
+
+        Because there is no feedback, there is no runaway guard — the direction
+        must be correct (same ``VS`` frame as every other mode). Bounded by a
+        wall-time cap and ALWAYS stops the stage (``VS 0,0``) on exit; an
+        end-of-path settle drains XY so the retract/next step stays in sync.
+        """
+        ctrl = self.controller
+        settings = self.job.settings
+        raw_pts = cmd.params.get("points", [])
+        pump = cmd.params.get("pump", self._active_pump)
+        flow_rate_uL_s = cmd.params.get("flow_rate_uL_s", None)
+        flow_rate = cmd.params.get("flow_rate", 0.01)
+        use_uL = flow_rate_uL_s is not None
+        lg = self.exec_logger
+
+        pts = [(float(raw_pts[0][0]), float(raw_pts[0][1]))]
+        for p in raw_pts[1:]:
+            if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-9:
+                pts.append((float(p[0]), float(p[1])))
+        if len(pts) < 2:
+            return
+        cum = polyline_arclength(pts)
+        total = cum[-1]
+
+        print_speed = getattr(settings, 'print_speed_mm_s', 0) or \
+            max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+        print_speed = max(0.05, float(print_speed))
+        # pace_correction (>1) trims the MOTION speed down to a stage that can't
+        # hold the full commanded velocity; it stretches the wall time but NOT
+        # the deposited volume — vol_per_mm uses the COMMANDED speed (matching
+        # the closed-loop follower + the legacy open-loop path), so the bead is
+        # the same width at any pace, just laid down slower.
+        _pace = getattr(settings, "pace_correction", 1.0) or 1.0
+        eff_speed = max(0.05, print_speed / max(1.0, _pace))
+        vol_per_mm = (flow_rate_uL_s / print_speed) if (
+            use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+
+        max_um_s = 50000.0
+        sl = getattr(ctrl, 'safety_limits', None)
+        try:
+            _m = float(getattr(sl, 'max_xy_speed', 0) or 0)
+            if _m > 0:
+                max_um_s = _m
+        except Exception:
+            pass
+        xy = getattr(ctrl, 'xy_stage', None)
+        try:
+            if xy is not None and hasattr(xy, 'set_acceleration'):
+                xy.set_acceleration(getattr(settings, 'xy_accel_pct', 80) or 80)
+            if xy is not None and hasattr(xy, 'set_speed_mm_s'):
+                xy.set_speed_mm_s(max_um_s / 1000.0)   # SMS 100% so VS can reach
+        except Exception:
+            pass
+
+        # Move to the path start (confirmed) before streaming velocity.
+        if lg:
+            lg.log("xy_cmd", context="openvel_path_start",
+                   **lg.xy_cmd_fields(ctrl, pts[0][0], pts[0][1]))
+        ctrl.move_xy_absolute(pts[0][0], pts[0][1], from_zero_ref=True)
+        self._wait_for_xy_settle(pts[0][0], pts[0][1], timeout=5.0)
+
+        if lg:
+            lg.log("path_start", n_points=len(pts), pump=pump,
+                   flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
+                   speed_mm_s=round(eff_speed, 3), mode="open_velocity",
+                   **PrintExecutionLogger._path_stats(pts))
+
+        _ctrl_hz = getattr(settings, "vel_control_hz", 0) or self._VEL_CONTROL_HZ
+        _decel = getattr(settings, "vel_decel_mm", 0) or self._VEL_DECEL_MM
+        dt = 1.0 / max(_ctrl_hz, 1.0)
+        _t0 = time.monotonic()
+        s_prev = 0.0
+        pending_uL = 0.0
+        n_ticks = 0
+        max_wall = total / eff_speed * 4.0 + 15.0
+
+        try:
+            while True:
+                _tick = time.monotonic()
+                if self._abort_flag.is_set():
+                    if lg:
+                        lg.log("path_end", mode="open_velocity", aborted=True,
+                               s_mm=round(s_prev, 3),
+                               wall_s=round(_tick - _t0, 3))
+                    return
+                if (getattr(self, "_zp_connected_at_start", False)
+                        and not getattr(ctrl, "is_zp_connected", True)):
+                    logger.error("OPENVEL_PATH: ZP disconnected mid-path — stopping")
+                    if lg:
+                        lg.log("path_end", mode="open_velocity",
+                               zp_disconnect=True, s_mm=round(s_prev, 3),
+                               wall_s=round(_tick - _t0, 3))
+                    return
+                if _tick - _t0 > max_wall:
+                    logger.warning("OPENVEL_PATH: wall-time cap at s=%.2f/%.2f mm",
+                                   s_prev, total)
+                    break
+
+                # Target advances by wall-clock time at the commanded speed.
+                elapsed = _tick - _t0
+                s_tgt = min(eff_speed * elapsed, total)
+                ds = s_tgt - s_prev
+
+                # Deposit pump ∝ the target advance (feed-forward).
+                if ds > 0:
+                    if vol_per_mm > 0:
+                        pending_uL += ds * vol_per_mm
+                        if pending_uL > self._PATH_PUMP_EMIT_MIN_UL:
+                            self._emit_pump(ctrl, pump, pending_uL,
+                                            flow_rate_uL_s, settings)
+                            pending_uL = 0.0
+                    elif not use_uL and flow_rate:
+                        self._emit_pump(ctrl, pump, ds * flow_rate, None, settings)
+
+                # Velocity vector along the path tangent at the target, ramping
+                # down over the last _decel for a cleaner (open-loop) stop.
+                tx, ty = tangent_at_arclength(pts, cum, s_tgt)
+                speed = eff_speed
+                remaining = total - s_tgt
+                if remaining < _decel:
+                    speed *= max(0.1, remaining / _decel)
+                vx = speed * tx * 1000.0    # mm/s → µm/s
+                vy = speed * ty * 1000.0
+                vmag = math.hypot(vx, vy)
+                if vmag > max_um_s and vmag > 0:
+                    vx *= max_um_s / vmag
+                    vy *= max_um_s / vmag
+                ctrl.send_velocity_xy(vx, vy)
+
+                n_ticks += 1
+                if lg and (n_ticks % 5 == 0):
+                    lg.log("openvel_sample", s_mm=round(s_tgt, 3),
+                           tot_mm=round(total, 3),
+                           vx=round(vx, 0), vy=round(vy, 0))
+
+                s_prev = s_tgt
+                if s_tgt >= total:
+                    break
+                _elapsed = time.monotonic() - _tick
+                if _elapsed < dt:
+                    time.sleep(dt - _elapsed)
+        finally:
+            try:
+                ctrl.send_velocity_xy(0.0, 0.0)
+            except Exception:
+                pass
+
+        if pending_uL > 0 and vol_per_mm > 0:
+            self._emit_pump(ctrl, pump, pending_uL, flow_rate_uL_s, settings)
+
+        # Feed-forward can't guarantee the EXACT end position (no feedback +
+        # the stage coasts after VS 0,0), so land precisely on the endpoint with
+        # a final positioning move and drain XY, so the Z retract / next command
+        # starts in sync. This is termination, not the control method.
+        ctrl.move_xy_absolute(pts[-1][0], pts[-1][1], from_zero_ref=True)
+        self._wait_for_xy_settle(pts[-1][0], pts[-1][1], timeout=10.0)
+        self._print_pump_suckback("deposit", pump)
+        if lg:
+            lg.log("path_end", mode="open_velocity",
+                   wall_s=round(time.monotonic() - _t0, 3),
+                   s_mm=round(s_prev, 3))
+
+    def _execute_print_path_velocity(self, cmd: PrintCommand):
+        """CLOSED-LOOP velocity-following print path (see PrintSettings.
+        velocity_follow).
+
+        A real-time control loop (~_VEL_CONTROL_HZ) that, every tick:
+          1. polls the stage's ACTUAL position (direct, non-cached),
+          2. projects it onto the toolpath → real arc-length progress ``s``,
+          3. deposits pump volume in proportion to the REAL ``Δs`` travelled
+             (so the bead is correct no matter how fast/slow the stage moved),
+          4. places a "carrot" a fixed lookahead ahead of ``s`` and commands a
+             velocity vector (Prior ``VS``) toward it at the print speed,
+             ramping down over the last ``_VEL_DECEL_MM`` for a clean stop.
+
+        Because the carrot is tied to the stage's real progress (arc-length
+        parametrized, pure pursuit) it can NEVER run ahead of a slow stage — the
+        open-loop time-paced path's failure mode — and position feedback pulls
+        the stage back onto the path each tick. Always stops the stage (``VS
+        0,0``) on every exit. A large sustained cross-track error (e.g. a VS sign
+        inversion sending the stage the wrong way) trips a runaway guard →
+        RuntimeError → the outer loop aborts + retracts to safe Z.
+        """
+        ctrl = self.controller
+        settings = self.job.settings
+        raw_pts = cmd.params.get("points", [])
+        pump = cmd.params.get("pump", self._active_pump)
+        flow_rate_uL_s = cmd.params.get("flow_rate_uL_s", None)
+        flow_rate = cmd.params.get("flow_rate", 0.01)
+        use_uL = flow_rate_uL_s is not None
+        lg = self.exec_logger
+
+        # De-dup consecutive coincident points (zero-length segments break the
+        # projection's segment math and add nothing).
+        pts = [(float(raw_pts[0][0]), float(raw_pts[0][1]))]
+        for p in raw_pts[1:]:
+            if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-9:
+                pts.append((float(p[0]), float(p[1])))
+        if len(pts) < 2:
+            return
+        cum = polyline_arclength(pts)
+        total = cum[-1]
+
+        print_speed = getattr(settings, 'print_speed_mm_s', 0) or \
+            max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+        print_speed = max(0.05, float(print_speed))
+        vol_per_mm = (flow_rate_uL_s / print_speed) if (
+            use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+
+        # v7.5.x: pursuit + corner + PID tuning — tuned by the XY Printing
+        # Challenge and stamped on the settings by Quick Print; 0/absent → class
+        # defaults (kp/kd 0 = pure pursuit, legacy behaviour).
+        _lookahead = getattr(settings, "vel_lookahead_mm", 0) or self._VEL_LOOKAHEAD_MM
+        _decel = getattr(settings, "vel_decel_mm", 0) or self._VEL_DECEL_MM
+        _kp = float(getattr(settings, "vel_pid_kp", 0.0) or 0.0)
+        _kd = float(getattr(settings, "vel_pid_kd", 0.0) or 0.0)
+        _corner_ang = getattr(settings, "vel_corner_angle_deg", 0) \
+            or self._VEL_CORNER_ANGLE_DEG
+        _corner_fac = getattr(settings, "vel_corner_speed_factor", 0) \
+            or self._VEL_CORNER_SPEED_FACTOR
+
+        # v7.5.x: ground the loop rate + VS ceiling + dead-time SPEED CAP in the
+        # MACHINE-MEASURED calibration (control-loop period, true max speed, phase
+        # lag) stamped by Quick Print. 0/absent → safety-envelope / class-constant
+        # fallbacks (legacy). The dead-time cap stops the stage travelling more
+        # than a safe fraction of the lookahead per control period → kills the
+        # pure-pursuit overshoot limit-cycle ("back-and-forth").
+        sl = getattr(ctrl, 'safety_limits', None)
+        _fallback_max = 50000.0
+        try:
+            _m = float(getattr(sl, 'max_xy_speed', 0) or 0)
+            if _m > 0:
+                _fallback_max = _m
+        except Exception:
+            pass
+        _res = _velctl.resolve_control(
+            print_speed_mm_s=print_speed, lookahead_mm=_lookahead,
+            xy_max_speed_um_s=getattr(settings, "xy_max_speed_um_s", 0.0),
+            control_loop_ms=getattr(settings, "control_loop_ms", 0.0),
+            phase_lag_s=getattr(settings, "phase_lag_s", 0.0),
+            default_control_hz=self._VEL_CONTROL_HZ,
+            fallback_max_um_s=_fallback_max)
+        max_um_s = _res["max_um_s"]
+        _ctrl_hz = _res["control_hz"]
+        speed_cap = _res["speed_cap_mm_s"]
+
+        # Corner-aware speed-limit profile along the path (slow into sharp turns).
+        speed_limit_at, _corners = _velctl.plan_speed_limits(
+            pts, cum, print_speed, corner_angle_deg=_corner_ang,
+            corner_speed_factor=_corner_fac, decel_mm=_decel)
+
+        # Set SMS to the (measured) max so VS isn't capped below the commanded
+        # velocity; brisk accel so VS actually reaches it.
+        xy = getattr(ctrl, 'xy_stage', None)
+        try:
+            if xy is not None and hasattr(xy, 'set_acceleration'):
+                xy.set_acceleration(
+                    getattr(settings, 'xy_accel_pct', 80) or 80)
+            if xy is not None and hasattr(xy, 'set_speed_mm_s'):
+                xy.set_speed_mm_s(max_um_s / 1000.0)
+        except Exception:
+            pass
+
+        zero = getattr(ctrl, 'zero_position', {})
+
+        def read_pos():
+            try:
+                p = ctrl.get_xy_position(cached=False)
+            except Exception:
+                return None
+            if not p or p[0] is None or p[1] is None:
+                return None
+            return ((p[0] - zero.get('x', 0)) / 1000.0,
+                    (p[1] - zero.get('y', 0)) / 1000.0)
+
+        # Move to the path start (confirmed) before opening the loop.
+        if lg:
+            lg.log("xy_cmd", context="vel_path_start",
+                   **lg.xy_cmd_fields(ctrl, pts[0][0], pts[0][1]))
+        ctrl.move_xy_absolute(pts[0][0], pts[0][1], from_zero_ref=True)
+        self._wait_for_xy_settle(pts[0][0], pts[0][1], timeout=5.0)
+
+        if lg:
+            lg.log("path_start", n_points=len(pts), pump=pump,
+                   flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
+                   speed_mm_s=round(print_speed, 3), mode="velocity",
+                   n_corners=len(_corners), speed_cap=round(speed_cap, 3),
+                   ctrl_hz=round(_ctrl_hz, 1), kp=_kp, kd=_kd,
+                   **PrintExecutionLogger._path_stats(pts))
+
+        dt = 1.0 / max(_ctrl_hz, 1.0)
+        arrive_tol_mm = self._VEL_ARRIVE_TOL_UM / 1000.0
+        state = _velctl.PursuitState()
+        _t0 = time.monotonic()
+        s_prev = 0.0
+        pending_uL = 0.0
+        last_pos_t = _t0
+        runaway = 0
+        n_ticks = 0
+        max_wall = total / print_speed * 6.0 + 15.0
+
+        try:
+            while True:
+                _tick = time.monotonic()
+
+                if self._abort_flag.is_set():
+                    if lg:
+                        lg.log("path_end", mode="velocity", aborted=True,
+                               s_mm=round(s_prev, 3),
+                               wall_s=round(_tick - _t0, 3))
+                    return
+                # Mid-path ZP drop → stop (do not drag the needle dry).
+                if (getattr(self, "_zp_connected_at_start", False)
+                        and not getattr(ctrl, "is_zp_connected", True)):
+                    logger.error("VEL_PATH: ZP disconnected mid-path — stopping")
+                    if lg:
+                        lg.log("path_end", mode="velocity", zp_disconnect=True,
+                               s_mm=round(s_prev, 3),
+                               wall_s=round(_tick - _t0, 3))
+                    return
+                if _tick - _t0 > max_wall:
+                    logger.warning("VEL_PATH: wall-time cap hit at s=%.2f/%.2f mm",
+                                   s_prev, total)
+                    break
+
+                pos = read_pos()
+                if pos is None:
+                    # No fresh position — hold last velocity briefly; stop if it
+                    # persists (safety: never drive blind).
+                    if _tick - last_pos_t > self._VEL_STALE_S:
+                        ctrl.send_velocity_xy(0.0, 0.0)
+                        if lg:
+                            lg.log("vel_stall", s_mm=round(s_prev, 3),
+                                   held_s=round(_tick - last_pos_t, 2))
+                        # keep looping; a truly dead link trips ZP/abort paths
+                    time.sleep(dt)
+                    continue
+                dt_real = max(1e-3, _tick - last_pos_t)
+                last_pos_t = _tick
+
+                # Bound the projection's forward search + the s advance to the
+                # physically-plausible distance this tick, so a spiral/self-
+                # intersecting path can't snap the projection to a later loop.
+                max_ds = min(self._VEL_MAX_SNAP_MM,
+                             max(0.15, print_speed * dt_real * self._VEL_SNAP_GUARD))
+
+                # End-of-path decel folded into the per-tick speed cap (on top of
+                # the resolved dead-time cap + corner-limit inside pursuit_step).
+                remaining = total - s_prev
+                _cap = speed_cap
+                if remaining < _decel:
+                    # ramp from the EFFECTIVE (possibly dead-time-capped) speed,
+                    # not the raw commanded print_speed, so a capped run still
+                    # slows to a clean stop at the endpoint (no endpoint dither).
+                    _cap = min(_cap, max(0.1, remaining / _decel)
+                               * min(print_speed, speed_cap))
+
+                # One pure-pursuit + cross-track-PID tick (shared control law).
+                vx, vy, s, cross = _velctl.pursuit_step(
+                    pos, pts, cum, state, lookahead=_lookahead,
+                    speed_cap_mm_s=_cap, speed_limit_at=speed_limit_at,
+                    dt=dt_real, max_ds=max_ds, kp=_kp, kd=_kd)
+                ds = s - s_prev
+
+                # Clamp VS magnitude to the (measured) safety ceiling.
+                vmag = math.hypot(vx, vy)
+                if vmag > max_um_s and vmag > 0:
+                    vx *= max_um_s / vmag
+                    vy *= max_um_s / vmag
+
+                # Runaway guard: sustained large perpendicular error ⇒ the stage
+                # is not on the path (e.g. VS sign inverted) → abort safely.
+                if cross > self._VEL_MAX_CROSS_TRACK_MM:
+                    runaway += 1
+                    if runaway >= self._VEL_RUNAWAY_TICKS:
+                        ctrl.send_velocity_xy(0.0, 0.0)
+                        raise RuntimeError(
+                            f"velocity-follow runaway: cross-track "
+                            f"{cross:.2f} mm > {self._VEL_MAX_CROSS_TRACK_MM} mm "
+                            f"for {runaway} ticks (check VS direction / sign)")
+                else:
+                    runaway = 0
+
+                # Deposit pump volume ∝ real distance travelled (non-blocking).
+                if ds > 0:
+                    if vol_per_mm > 0:
+                        pending_uL += ds * vol_per_mm
+                        if pending_uL > self._PATH_PUMP_EMIT_MIN_UL:
+                            self._emit_pump(ctrl, pump, pending_uL,
+                                            flow_rate_uL_s, settings)
+                            pending_uL = 0.0
+                    elif not use_uL and flow_rate:
+                        self._emit_pump(ctrl, pump, ds * flow_rate, None, settings)
+
+                # Arrived?
+                dist_end = math.hypot(pos[0] - pts[-1][0], pos[1] - pts[-1][1])
+                if s >= total - 1e-6 and dist_end <= arrive_tol_mm:
+                    break
+
+                ctrl.send_velocity_xy(vx, vy)
+
+                n_ticks += 1
+                if lg and (n_ticks % 5 == 0):
+                    lg.log("vel_sample", s_mm=round(s, 3), tot_mm=round(total, 3),
+                           cross_um=round(cross * 1000.0, 1),
+                           x_mm=round(pos[0], 4), y_mm=round(pos[1], 4),
+                           vx=round(vx, 0), vy=round(vy, 0))
+
+                s_prev = s
+                _elapsed = time.monotonic() - _tick
+                if _elapsed < dt:
+                    time.sleep(dt - _elapsed)
+        finally:
+            # ALWAYS stop the stage, however we leave the loop.
+            try:
+                ctrl.send_velocity_xy(0.0, 0.0)
+            except Exception:
+                pass
+
+        # Flush residual pump volume + confirm the stage has settled at the end.
+        if pending_uL > 0 and vol_per_mm > 0:
+            self._emit_pump(ctrl, pump, pending_uL, flow_rate_uL_s, settings)
+        self._wait_for_xy_settle(pts[-1][0], pts[-1][1], timeout=10.0,
+                                 tolerance=self._VEL_ARRIVE_TOL_UM)
+        self._print_pump_suckback("deposit", pump)
+        if lg:
+            lg.log("path_end", mode="velocity",
+                   wall_s=round(time.monotonic() - _t0, 3),
+                   s_mm=round(min(s_prev, total), 3), tot_mm=round(total, 3))
+
+    def _emit_pump(self, ctrl, pump, uL, flow_rate_uL_s, settings):
+        """Emit a single (non-blocking) pump dispense of ``uL`` µL for the
+        velocity follower — µL path when available, else the legacy axis-map
+        relative move. Never blocks the control loop (no M400)."""
+        if uL <= 0:
+            return
+        try:
+            if hasattr(ctrl, 'move_pump_uL'):
+                ctrl.move_pump_uL(pump, uL, flow_rate_uL_s)
+            else:
+                _axis_map = getattr(ctrl.zp_stage, 'axis_map', AXIS_MAP) \
+                    if getattr(ctrl, 'zp_stage', None) else AXIS_MAP
+                mapped = _axis_map.get(pump, AXIS_MAP.get(pump))
+                if mapped and getattr(ctrl, 'zp_stage', None):
+                    ctrl.zp_stage.move_relative(
+                        {mapped: uL * 0.3}, settings.pump_feedrate)
+        except Exception as e:
+            logger.debug(f"velocity pump emit skipped: {e}")
 
     def _wait_for_xy_settle(self, target_x, target_y, timeout=3.0, tolerance=50):
         """

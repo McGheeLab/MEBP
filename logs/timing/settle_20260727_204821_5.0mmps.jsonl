@@ -1,0 +1,6 @@
+{"event": "config", "kind": "settle_delay_sweep", "max_segments": 8, "seg_len_mm": 0.7, "speed_mm_s": 5.0, "seg_time_s": 0.14, "repeats": 2, "still_window_s": 0.35}
+{"event": "point", "N": 3, "delay_s": 0.03635319999739295, "reps": 1, "delays_s": [0.0364]}
+{"event": "point", "N": 4, "delay_s": 0.06810519999999087, "reps": 1, "delays_s": [0.0681]}
+{"event": "point", "N": 6, "delay_s": 0.035173299998859875, "reps": 1, "delays_s": [0.0352]}
+{"event": "point", "N": 8, "delay_s": 0.035306199999467935, "reps": 1, "delays_s": [0.0353]}
+{"event": "fit", "slope_s_per_seg": -0.002946, "intercept_s": 0.0592}

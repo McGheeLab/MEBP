@@ -179,6 +179,10 @@ class ContextPanelHost(QWidget):
             wrapper.setObjectName("contextScrollArea")
             wrapper.setWidgetResizable(True)
             wrapper.setFrameShape(QFrame.NoFrame)
+            # v7.5.x: the panel content is responsive (fits the width), so a
+            # horizontal scrollbar must NEVER appear — the content scrunches to
+            # fit instead. Vertical scrolling stays available for tall panels.
+            wrapper.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             wrapper.setWidget(widget)
             self._native_stack.addWidget(wrapper)
             self._native_wrappers[key] = wrapper

@@ -86,6 +86,14 @@ class SketchShape:
 
     kind: str = "circle"
 
+    # v7.5.x: stable per-shape identity for PARAMETRIC CONSTRAINTS. 0 means
+    # "unassigned" (the legacy state); ids are handed out lazily by
+    # ``Sketch.ensure_shape_ids()`` the first time a constraint is created, so
+    # a sketch that never uses constraints serializes byte-identically to
+    # legacy. Constraints MUST reference shapes by id, never list index — the
+    # print-order optimizer reorders the shape list.
+    id: int = 0
+
     # Center-based shapes (circle / ellipse / rect)
     cx: float = 0.0
     cy: float = 0.0
@@ -120,18 +128,31 @@ class SketchShape:
     # (print continuity control). None = the geometric default (circle → angle
     # 0, rect → first corner, line → points[0]). When set, the compiler starts a
     # closed shape at the nearest ring vertex (rolling the seam) and an open
-    # shape at the nearest endpoint (choosing which end leads) — so a shape can
-    # be made to start exactly where the previous one ended and weld into one
-    # continuous bead. Set manually (drag the start marker) or by the path
-    # optimizer. Does NOT change the deposited geometry, only the entry/exit.
+    # shape at the nearest point along the path (the trim-START; see
+    # ``end_point``). Set manually (drag the green start marker) or by the path
+    # optimizer. For a closed shape this only moves the seam (deposited geometry
+    # unchanged); for an OPEN shape it can trim where printing begins.
     start_point: tuple[float, float] | None = None
 
-    # v7.5.x: (closed-loop outlines only) when True the compiler continues the
-    # printed path PAST the closure point by ~the needle OUTER radius, so the
-    # seam over-closes. As the needle re-enters the start it pushes deposited
-    # ink aside; without the overshoot the loop doesn't fully close. No effect
-    # on open paths (nothing to close) or filled shapes (raster).
-    overlap_closure: bool = False
+    # v7.5.x: (OPEN shapes — line / open polygon only) world-mm anchor for where
+    # printing ENDS. With ``start_point`` it selects a SUB-SEGMENT of the drawn
+    # path (trims both ends; direction start→end). None = the far end (so a
+    # start-only shape reduces to the legacy "choose the leading endpoint"). For
+    # CLOSED shapes the end is driven by the overlap fields below, not this.
+    end_point: tuple[float, float] | None = None
+
+    # v7.5.x: (CLOSED-loop outlines only) closure OVERLAP — after the loop
+    # returns to its seam the compiler continues along the path PAST the seam so
+    # the deposited ink fully closes (on re-entry the needle pushes ink aside;
+    # the overshoot makes it close). ``overlap_mode``:
+    #   "none"     → no overlap (default; legacy-identical serialization).
+    #   "needle"   → overshoot one needle OUTER Ø (fallback: one bead width).
+    #   "distance" → overshoot ``overlap_distance_mm``.
+    # (Replaces the retired boolean ``overlap_closure``, which overshot the
+    # needle RADIUS; a legacy ``overlap_closure: true`` migrates → "needle" in
+    # from_dict.) No effect on open paths / filled shapes.
+    overlap_mode: str = "none"
+    overlap_distance_mm: float = 0.0
 
     # v7.5.x: (set by the OPTIMIZER only) when not None, the compiler reaches
     # this shape's start by RETRACING along the previously-printed bead from
@@ -154,25 +175,40 @@ class SketchShape:
         if self.start_point is not None:
             d["start_point"] = [float(self.start_point[0]),
                                 float(self.start_point[1])]
-        if self.overlap_closure:               # only when on → legacy-identical
-            d["overlap_closure"] = True
+        if self.end_point is not None:         # OPEN-shape trim end
+            d["end_point"] = [float(self.end_point[0]),
+                              float(self.end_point[1])]
+        if self.overlap_mode and self.overlap_mode != "none":
+            d["overlap_mode"] = str(self.overlap_mode)
+            if self.overlap_mode == "distance":
+                d["overlap_distance_mm"] = float(self.overlap_distance_mm)
         if self.retrace_from is not None:      # only when the optimizer set it
             d["retrace_from"] = [float(self.retrace_from[0]),
                                  float(self.retrace_from[1])]
+        if self.id:                            # only once constraints assigned ids
+            d["id"] = int(self.id)
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "SketchShape":
         sp = d.get("start_point")
         start_point = (float(sp[0]), float(sp[1])) if sp else None
+        ep = d.get("end_point")
+        end_point = (float(ep[0]), float(ep[1])) if ep else None
         rf = d.get("retrace_from")
         retrace_from = (float(rf[0]), float(rf[1])) if rf else None
+        # Overlap: prefer the new mode; migrate a legacy overlap_closure bool.
+        overlap_mode = d.get("overlap_mode")
+        if overlap_mode is None:
+            overlap_mode = "needle" if bool(d.get("overlap_closure", False)) \
+                else "none"
         ink_id = d.get("ink_id")
         if ink_id is None:                      # legacy: pump_index → ink_id
             ink_id = int(d.get("pump_index", 0)) + 1
         else:
             ink_id = int(ink_id)
         return cls(
+            id=int(d.get("id", 0)),
             kind=d.get("kind", "circle"),
             cx=float(d.get("cx", 0.0)), cy=float(d.get("cy", 0.0)),
             radius=float(d.get("radius", 5.0)),
@@ -187,9 +223,105 @@ class SketchShape:
             z_offset_mm=float(d.get("z_offset_mm", 0.0)),
             no_print=bool(d.get("no_print", False)),
             start_point=start_point,
-            overlap_closure=bool(d.get("overlap_closure", False)),
+            end_point=end_point,
+            overlap_mode=str(overlap_mode),
+            overlap_distance_mm=float(d.get("overlap_distance_mm", 0.0)),
             retrace_from=retrace_from,
         )
+
+    def overlap_amount_mm(self, needle_od: float = 0.0,
+                          bead: float = 0.4) -> float:
+        """Closure overshoot (mm) for a CLOSED loop, resolved from the mode.
+
+        ``needle`` mode = one needle OUTER Ø (fallback: one bead width when the
+        Ø is unknown); ``distance`` = the typed value; ``none`` = 0. Callers
+        gate on ``_is_closed_outline`` + ``not filled`` — an open / filled
+        shape has nothing to over-close."""
+        mode = getattr(self, "overlap_mode", "none")
+        if mode == "distance":
+            return max(0.0, float(self.overlap_distance_mm))
+        if mode == "needle":
+            od = float(needle_od or 0.0)
+            return od if od > 0 else max(float(bead), 0.0)
+        return 0.0
+
+
+# v7.5.x: parametric-constraint kinds understood by the sketch solver
+# (SupportClasses.SketchConstraintSolver). ``drag_ghost`` is transient (held
+# by the solver during an interactive drag, never stored on the sketch).
+SKETCH_CONSTRAINT_KINDS = (
+    "coincident",       # two anchor points share a position
+    "concentric",       # two centers share a position
+    "horizontal",       # two points share a y (a line: its endpoints)
+    "vertical",         # two points share an x
+    "parallel",         # two lines' directions are parallel
+    "perpendicular",    # two lines' directions are perpendicular
+    "equal_length",     # two lines have equal length
+    "equal_radius",     # two circles have equal radius
+    "tangent",          # line↔circle or circle↔circle tangency
+    "distance",         # two points at a driven distance (dimension)
+    "radius",           # a circle at a driven radius (dimension)
+    "point_on",         # an anchor point lies on a curve (line / circle)
+    "fix",              # lock a shape's DOFs in place
+)
+
+
+@dataclass
+class SketchConstraint:
+    """One parametric constraint between shape anchors (v7.5.x).
+
+    ``refs`` is a list of ``[shape_id, anchor]`` pairs. ``shape_id`` is the
+    stable :attr:`SketchShape.id` (NEVER a list index — the optimizer reorders
+    the list). ``anchor`` names a point or the entity itself:
+
+    - ``"center"``      — circle / ellipse / rect / travel center
+    - ``"p{k}"``        — line / polygon vertex ``k`` (``p0``, ``p1``, …)
+    - ``"c0".."c3"``    — rect corners (TL, TR, BR, BL)
+    - ``"shape"``       — the whole entity (parallel / tangent / fix / curves)
+
+    ``value`` drives dimensions (``distance`` mm, ``radius`` mm). ``mode``
+    disambiguates ``tangent`` between two circles (``"external"`` /
+    ``"internal"``, chosen from the geometry when the constraint is created).
+    Constraints are design-time only — they position geometry in the editor
+    and never affect the compiled trajectory of the shapes as placed.
+    """
+
+    id: int = 0
+    kind: str = ""
+    refs: list = field(default_factory=list)     # [[shape_id, anchor], ...]
+    value: float | None = None
+    mode: str = ""
+    weight: float = 1.0
+
+    def to_dict(self) -> dict:
+        d = {
+            "id": int(self.id),
+            "kind": str(self.kind),
+            "refs": [[int(sid), str(anchor)] for sid, anchor in self.refs],
+        }
+        if self.value is not None:
+            d["value"] = float(self.value)
+        if self.mode:
+            d["mode"] = str(self.mode)
+        if self.weight != 1.0:
+            d["weight"] = float(self.weight)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SketchConstraint":
+        v = d.get("value")
+        return cls(
+            id=int(d.get("id", 0)),
+            kind=str(d.get("kind", "")),
+            refs=[[int(r[0]), str(r[1])] for r in d.get("refs", [])
+                  if isinstance(r, (list, tuple)) and len(r) >= 2],
+            value=None if v is None else float(v),
+            mode=str(d.get("mode", "")),
+            weight=float(d.get("weight", 1.0)),
+        )
+
+    def shape_ids(self) -> set[int]:
+        return {int(sid) for sid, _ in self.refs}
 
 
 @dataclass
@@ -197,6 +329,14 @@ class Sketch:
     """A full drawing plus the parameters needed to compile a trajectory."""
 
     shapes: list[SketchShape] = field(default_factory=list)
+
+    # v7.5.x: parametric constraints between shapes (see SketchConstraint).
+    # Empty for every legacy sketch → serialized only when non-empty, keeping
+    # legacy dicts byte-identical. ``_next_shape_id``/``_next_constraint_id``
+    # are monotonic allocators (never recycled), derived on load.
+    constraints: list[SketchConstraint] = field(default_factory=list)
+    _next_shape_id: int = 1
+    _next_constraint_id: int = 1
 
     # v7.5.x: abstract inks the sketch uses (ordered; unlimited count). The
     # sketch is pump-AGNOSTIC — each shape references one of these by
@@ -335,6 +475,82 @@ class Sketch:
             for i in ids]
         self._next_ink_id = max(ids) + 1
 
+    # ── Parametric constraints (v7.5.x) ───────────────────────────
+
+    def ensure_shape_ids(self) -> None:
+        """Assign a stable id to every shape that lacks one (id 0). Called
+        lazily the first time a constraint is created — sketches that never
+        use constraints keep all ids 0 and serialize byte-identically to
+        legacy. Collision-safe against explicitly loaded ids."""
+        used = {int(s.id) for s in self.shapes if getattr(s, "id", 0)}
+        nxt = max(self._next_shape_id, max(used) + 1 if used else 1)
+        for s in self.shapes:
+            if not getattr(s, "id", 0):
+                s.id = nxt
+                nxt += 1
+        self._next_shape_id = nxt
+
+    def shape_by_id(self, sid: int) -> "SketchShape | None":
+        for s in self.shapes:
+            if getattr(s, "id", 0) == int(sid):
+                return s
+        return None
+
+    def shape_index_by_id(self, sid: int) -> int:
+        for i, s in enumerate(self.shapes):
+            if getattr(s, "id", 0) == int(sid):
+                return i
+        return -1
+
+    def add_constraint(self, kind: str, refs: list, value: float | None = None,
+                       mode: str = "") -> "SketchConstraint":
+        """Append a constraint. ``refs`` = [[shape_id, anchor], ...] — shape
+        ids must already be assigned (call :meth:`ensure_shape_ids` first)."""
+        c = SketchConstraint(id=self._next_constraint_id, kind=str(kind),
+                             refs=[[int(sid), str(a)] for sid, a in refs],
+                             value=value, mode=str(mode or ""))
+        self._next_constraint_id += 1
+        self.constraints.append(c)
+        return c
+
+    def remove_constraint(self, cid: int) -> bool:
+        for i, c in enumerate(self.constraints):
+            if c.id == int(cid):
+                self.constraints.pop(i)
+                return True
+        return False
+
+    def constraint_by_id(self, cid: int) -> "SketchConstraint | None":
+        for c in self.constraints:
+            if c.id == int(cid):
+                return c
+        return None
+
+    def constraints_referencing(self, sid: int) -> list["SketchConstraint"]:
+        sid = int(sid)
+        return [c for c in self.constraints if sid in c.shape_ids()]
+
+    def prune_constraints(self) -> int:
+        """Drop constraints whose referenced shapes no longer exist (or whose
+        vertex anchor exceeds the shape's current vertex count). Returns the
+        number removed — call after deleting shapes."""
+        live = {int(s.id) for s in self.shapes if getattr(s, "id", 0)}
+
+        def ok(c: SketchConstraint) -> bool:
+            for sid, anchor in c.refs:
+                sh = self.shape_by_id(sid) if int(sid) in live else None
+                if sh is None:
+                    return False
+                a = str(anchor)
+                if a.startswith("p") and a[1:].isdigit():
+                    if int(a[1:]) >= len(sh.points):
+                        return False
+            return True
+
+        before = len(self.constraints)
+        self.constraints = [c for c in self.constraints if ok(c)]
+        return before - len(self.constraints)
+
     def to_dict(self) -> dict:
         d = {
             "shapes": [s.to_dict() for s in self.shapes],
@@ -365,6 +581,9 @@ class Sketch:
             d["overlap_travel_pause_pump"] = bool(self.overlap_travel_pause_pump)
             d["overlap_travel_speed_factor"] = \
                 float(self.overlap_travel_speed_factor)
+        # Emit constraints only when any exist → legacy dicts byte-identical.
+        if self.constraints:
+            d["constraints"] = [c.to_dict() for c in self.constraints]
         return d
 
     @classmethod
@@ -401,6 +620,13 @@ class Sketch:
             d.get("overlap_travel_pause_pump", True))
         sk.overlap_travel_speed_factor = float(
             d.get("overlap_travel_speed_factor", 1.0))
+        sk.constraints = [SketchConstraint.from_dict(c)
+                          for c in d.get("constraints", [])]
+        # Re-derive the monotonic allocators from what was loaded.
+        sk._next_shape_id = max(
+            (int(getattr(s, "id", 0)) for s in sk.shapes), default=0) + 1
+        sk._next_constraint_id = max(
+            (c.id for c in sk.constraints), default=0) + 1
         return sk
 
     def copy(self) -> "Sketch":
@@ -554,6 +780,11 @@ def backtrace_shape(shape: "SketchShape", *, z_offset: float = 0.0,
     ``print_on_return=False`` makes it a move-only (non-extruding) pass.
     """
     c = copy.deepcopy(shape)
+    # A back-trace copy is a NEW shape: it must not inherit the source's
+    # stable constraint id (two shapes sharing an id would corrupt constraint
+    # references). It starts unconstrained; ensure_shape_ids() assigns a fresh
+    # id if a constraint later references it.
+    c.id = 0
     # Accumulate onto the source's own offset (so back-tracing a back-trace
     # stacks), but clamp to the same ±40 mm range the UI spin allows so
     # repeatedly back-tracing a result can't run the offset (and the resulting
@@ -619,6 +850,97 @@ def reorder_path_to_start(path, start_xy, closed: bool) -> np.ndarray:
     i = int(np.argmin(d))
     rolled = np.roll(core, -i, axis=0)
     return np.vstack([rolled, rolled[0]])
+
+
+def _cumlen(arr: np.ndarray) -> np.ndarray:
+    """Cumulative arc length at each vertex of an Nx2 polyline (``[0]==0``)."""
+    if len(arr) < 2:
+        return np.zeros(len(arr), dtype=np.float64)
+    seg = np.hypot(np.diff(arr[:, 0]), np.diff(arr[:, 1]))
+    return np.concatenate([[0.0], np.cumsum(seg)])
+
+
+def _project_arclen(arr: np.ndarray, cum: np.ndarray, xy) -> float:
+    """Arc-length position of the point on the polyline nearest ``xy``."""
+    x, y = float(xy[0]), float(xy[1])
+    best_s, best_d = 0.0, None
+    for i in range(len(arr) - 1):
+        ax, ay = arr[i]
+        bx, by = arr[i + 1]
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 <= 1e-12 else max(0.0, min(
+            1.0, ((x - ax) * dx + (y - ay) * dy) / L2))
+        px, py = ax + t * dx, ay + t * dy
+        d = math.hypot(px - x, py - y)
+        if best_d is None or d < best_d:
+            best_d = d
+            best_s = float(cum[i] + t * math.hypot(dx, dy))
+    return best_s
+
+
+def _point_at_arclen(arr: np.ndarray, cum: np.ndarray, s: float):
+    """Interpolate the polyline point at arc length ``s`` (clamped to ends)."""
+    L = float(cum[-1])
+    s = max(0.0, min(L, float(s)))
+    i = int(np.searchsorted(cum, s, side="right")) - 1
+    i = max(0, min(i, len(arr) - 2))
+    seg = float(cum[i + 1] - cum[i])
+    t = 0.0 if seg <= 1e-12 else (s - cum[i]) / seg
+    ax, ay = arr[i]
+    bx, by = arr[i + 1]
+    return (float(ax + t * (bx - ax)), float(ay + t * (by - ay)))
+
+
+def _subpath_arclen(arr: np.ndarray, cum: np.ndarray, s0: float,
+                    s1: float) -> np.ndarray:
+    """The polyline from arc length ``s0`` to ``s1`` (reversed when s1<s0).
+
+    Interpolated endpoints at exactly ``s0``/``s1`` plus every interior vertex
+    strictly between them. ``s0=0``→``s1=L`` returns the original path
+    unchanged (and its reverse for ``L``→``0``) so a full-range trim is a
+    byte-identical no-op.
+    """
+    L = float(cum[-1])
+    a = max(0.0, min(L, float(s0)))
+    b = max(0.0, min(L, float(s1)))
+    lo, hi = (a, b) if a <= b else (b, a)
+    pts = [_point_at_arclen(arr, cum, lo)]
+    for i in range(len(arr)):
+        if lo + 1e-9 < float(cum[i]) < hi - 1e-9:
+            pts.append((float(arr[i, 0]), float(arr[i, 1])))
+    pts.append(_point_at_arclen(arr, cum, hi))
+    out = np.asarray(pts, dtype=np.float64)
+    return out[::-1].copy() if a > b else out
+
+
+def trim_open_path(path, start_xy, end_xy) -> np.ndarray:
+    """Trim an OPEN polyline to the sub-segment between two anchors.
+
+    ``start_xy`` / ``end_xy`` (world mm, either may be None) are projected onto
+    the path; the returned polyline runs from the start projection to the end
+    projection (in that direction). ``end_xy=None`` → the FAR extreme relative
+    to the start (so a start-only shape reproduces the legacy "lead with the
+    nearer endpoint" flip exactly — byte-identical). Both None or degenerate →
+    the path unchanged.
+    """
+    arr = np.asarray(path, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) < 2:
+        return arr
+    if start_xy is None and end_xy is None:
+        return arr
+    cum = _cumlen(arr)
+    L = float(cum[-1])
+    if L <= 1e-9:
+        return arr
+    s_start = _project_arclen(arr, cum, start_xy) if start_xy is not None else 0.0
+    if end_xy is not None:
+        s_end = _project_arclen(arr, cum, end_xy)
+    else:                                       # far extreme → legacy flip
+        s_end = L if s_start <= L / 2.0 else 0.0
+    if abs(s_end - s_start) < 1e-9:             # degenerate → don't collapse
+        return arr
+    return _subpath_arclen(arr, cum, s_start, s_end)
 
 
 def extend_closed_path(path, overshoot: float) -> np.ndarray:
@@ -786,11 +1108,20 @@ def _shape_paths(shape: SketchShape, sketch: Sketch) -> list[np.ndarray]:
     ``region`` rasters and ``travel`` markers are never reordered.
     """
     paths = _shape_paths_raw(shape, sketch)
+    if shape.kind not in _START_REORDER_KINDS or shape.filled:
+        return paths
     sp = getattr(shape, "start_point", None)
-    if (sp is not None and shape.kind in _START_REORDER_KINDS
-            and not shape.filled):
-        closed = _is_closed_outline(shape)
-        paths = [reorder_path_to_start(p, sp, closed)
+    ep = getattr(shape, "end_point", None)
+    if _is_closed_outline(shape):
+        # Closed loop: the start rolls the seam; the end is handled by the
+        # closure overlap (extend_closed_path), NOT here.
+        if sp is not None:
+            paths = [reorder_path_to_start(p, sp, True)
+                     if p is not None and len(p) >= 2 else p for p in paths]
+    elif sp is not None or ep is not None:
+        # Open path: start + end anchors trim it to a sub-segment (end unset →
+        # legacy "lead with the nearer endpoint" flip).
+        paths = [trim_open_path(p, sp, ep)
                  if p is not None and len(p) >= 2 else p for p in paths]
     return paths
 
@@ -940,16 +1271,15 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
     # change between connected shapes cannot weld — it needs an ink replacement
     # (pen-up). In multi mode the compiler welds across channels (legacy).
     single = sketch.is_single_needle(needle)
-    # Over-closure overshoot for closed loops with overlap_closure on = the
-    # needle OUTER radius (it pushes ink aside on re-entry); fall back to ½ bead
-    # when the needle Ø is unknown.
+    # Closure overlap for closed loops = the per-shape amount
+    # (shape.overlap_amount_mm): needle mode → one needle OUTER Ø, distance mode
+    # → the typed value. The needle Ø is resolved once here.
     _od = 0.0
     if needle is not None:
         try:
             _od = float(getattr(needle, "od_mm", 0.0) or 0.0)
         except (TypeError, ValueError):
             _od = 0.0
-    overlap_overshoot = (_od / 2.0) if _od > 0 else (bead / 2.0)
 
     # Travel Z clears the tallest printed pass — including any positive
     # per-shape height offset (a back-trace return pass sits at layer Z +
@@ -1057,10 +1387,12 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
             z = max(0.0, z_layer + float(getattr(shape, "z_offset_mm", 0.0)
                                          or 0.0))
             do_print = not bool(getattr(shape, "no_print", False))
-            # Over-closure: continue a closed loop past its seam by the needle
-            # radius (opt-in, closed outlines only).
-            overlap = (bool(getattr(shape, "overlap_closure", False))
-                       and _is_closed_outline(shape) and not shape.filled)
+            # Closure overlap: continue a closed loop past its seam by the
+            # per-shape amount (needle Ø / typed distance; closed unfilled only).
+            overlap_mm = (shape.overlap_amount_mm(_od, bead)
+                          if (_is_closed_outline(shape) and not shape.filled)
+                          else 0.0)
+            overlap = overlap_mm > 0.0
             paths = _shape_paths(shape, sketch)
             first_shape_pass = True
             for path in paths:
@@ -1091,7 +1423,7 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
                 # Over-closure overshoot is appended AFTER any flip so it always
                 # continues past the final closure point in the print direction.
                 if overlap:
-                    path = extend_closed_path(path, overlap_overshoot)
+                    path = extend_closed_path(path, overlap_mm)
                 sx, sy = float(path[0][0]), float(path[0][1])
                 # Retrace along the previous bead instead of lifting: when the
                 # optimizer marked this shape (retrace_from) and its start is
@@ -1481,7 +1813,6 @@ def plan_print_sections(sketch: Sketch, needle=None,
             _od = float(getattr(needle, "od_mm", 0.0) or 0.0)
         except (TypeError, ValueError):
             _od = 0.0
-    overshoot = (_od / 2.0) if _od > 0 else (bead / 2.0)
     items: list[dict] = []
     cur: dict | None = None
     last_end = None
@@ -1519,8 +1850,9 @@ def plan_print_sections(sketch: Sketch, needle=None,
         z = max(0.0, sketch.z_start_mm
                 + float(getattr(sh, "z_offset_mm", 0.0) or 0.0))
         length = _paths_length(paths)
-        overlap = (bool(getattr(sh, "overlap_closure", False))
-                   and _is_closed_outline(sh) and not sh.filled)
+        overlap_mm = (sh.overlap_amount_mm(_od, bead)
+                      if (_is_closed_outline(sh) and not sh.filled) else 0.0)
+        overlap = overlap_mm > 0.0
 
         # Mirror the compiler's weld decision (incl. the far-end flip on pass 0).
         # An ink change blocks a weld only in single mode AND for a printing
@@ -1539,7 +1871,7 @@ def plan_print_sections(sketch: Sketch, needle=None,
             connects = d_start <= tol
         # Over-closure extends the printed exit past the seam (closed loops).
         if overlap:
-            exit_path = extend_closed_path(exit_path, overshoot)
+            exit_path = extend_closed_path(exit_path, overlap_mm)
         exit_pt = (float(exit_path[-1, 0]), float(exit_path[-1, 1]))
 
         if connects:

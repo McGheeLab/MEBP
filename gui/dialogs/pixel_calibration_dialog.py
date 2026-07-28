@@ -34,7 +34,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QDoubleSpinBox, QPushButton,
-    QDialogButtonBox, QGroupBox, QMessageBox, QWidget,
+    QDialogButtonBox, QGroupBox, QMessageBox, QWidget, QCheckBox,
 )
 
 from gui.styles import COLORS
@@ -125,6 +125,17 @@ class PixelCalibrationDialog(QDialog):
         # stage direction (deg from +X), fed to the needle-centering aligner.
         self.result_rotation_deg: float | None = None
 
+        # v7.5.x: the camera's current view orientation, so the calibration feed
+        # shows the corrected upright/un-mirrored view and the Mirror-view
+        # checkbox seeds from it. Measurement runs on RAW frames, so the mirror
+        # is display-only and cannot corrupt the µm/px result.
+        try:
+            vo = getattr(camera_manager, "view_orientation", None)
+            self._view_mir, self._view_rot = (
+                vo(cam_idx) if callable(vo) else (False, 0.0))
+        except Exception:
+            self._view_mir, self._view_rot = False, 0.0
+
         self.setWindowTitle("Calibrate µm/px")
         self.setMinimumWidth(s(900))
         self.setMinimumHeight(s(520))
@@ -152,8 +163,16 @@ class PixelCalibrationDialog(QDialog):
                 # calibration, and changing capture resolution mid-measurement
                 # would change the effective µm/px and corrupt the result.
                 enable_settings=False,
+                # Keep this calibration view consistent with the live/mosaic
+                # views by tracking the camera's saved orientation.
+                auto_orient=True,
             )
             self._feed.setMinimumSize(s(480), s(380))
+            # Show the corrected upright/un-mirrored view (display-only).
+            try:
+                self._feed.set_view_orientation(self._view_mir, self._view_rot)
+            except Exception:
+                pass
             outer.addWidget(self._feed, stretch=1)
         else:
             self._feed = None
@@ -224,6 +243,17 @@ class PixelCalibrationDialog(QDialog):
         self._spin_settle.setDecimals(0)
         form.addRow("Settlement time:", self._spin_settle)
 
+        # v7.5.x: mirror the camera output in this view (display-only; the raw
+        # frame the measurement uses is untouched). Persisted to the camera so
+        # the live feed / mosaics / click-mapping stay consistent.
+        self._chk_mirror = QCheckBox("Camera shows a mirrored image")
+        self._chk_mirror.setToolTip(
+            "Flip the displayed feed left↔right so what you see is not "
+            "mirrored. Saved as the camera's mirror flag.")
+        self._chk_mirror.setChecked(bool(self._view_mir))
+        self._chk_mirror.toggled.connect(self._on_mirror_toggled)
+        form.addRow("Mirror view:", self._chk_mirror)
+
         side.addWidget(settings_grp)
 
         # Status label
@@ -278,6 +308,30 @@ class PixelCalibrationDialog(QDialog):
         btn_layout.addWidget(self._btn_box)
 
         side.addLayout(btn_layout)
+
+    def _on_mirror_toggled(self, on: bool) -> None:
+        """Toggle the camera's mirror flag: correct the displayed feed live and
+        persist it per camera identity (matches the Hardware Setup checkbox)."""
+        mgr = self._camera_manager
+        on = bool(on)
+        self._view_mir = on
+        try:
+            mgr.set_mirrored(self._cam_idx, on)
+        except Exception:
+            pass
+        if self._feed is not None:
+            try:
+                self._feed.set_view_orientation(on, self._view_rot)
+            except Exception:
+                pass
+        try:
+            ident = mgr.camera_identity(self._cam_idx)
+            if ident and ident[0]:
+                from SupportClasses.CameraCalibrationStore import get_store
+                nm = ident[1] if len(ident) > 1 else ""
+                get_store().set_mirrored(ident[0], on, name=nm)
+        except Exception as e:
+            logger.debug(f"mirror persist skipped: {e}")
 
     def _group_style(self) -> str:
         return (

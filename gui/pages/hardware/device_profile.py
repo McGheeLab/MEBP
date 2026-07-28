@@ -67,6 +67,17 @@ class DeviceProfile:
     xy_velocity_pct: Optional[int] = None
     xy_acceleration: Optional[int] = None
     xy_jerk: Optional[int] = None
+    # v7.5.x: which XY controller this machine uses. A controller-protocol JSON
+    # path (e.g. "config/controllers/mac5000.json"), "auto" (detect), or None
+    # (inherit the global controller.controller_json setting). Persisted into the
+    # SAME global key on apply, so selecting a machine profile picks its stage
+    # (precedence: device profile → global setting → auto-detect at connect).
+    xy_controller_json: Optional[str] = None
+    # v7.5.x: measured/known true XY top speed (µm/s), family-neutral. Home for
+    # the "Measure top speed" result; re-applied at connect via
+    # StageController → XYStage.set_max_speed_um_s so mm/s conversions are
+    # correct for both Prior (SMS %) and Ludl (absolute) stages.
+    xy_max_speed_um_s: Optional[float] = None
     # v7.5.x: unified Z convention (see MEBP_v75x_Z_AXIS_CONVENTION_RETHINK).
     # The Z setup derives the user-facing up-direction from the captured
     # bottom/top extremes; +1 = user_Z grows with raw Z, -1 = user_Z grows as
@@ -129,6 +140,8 @@ class DeviceProfile:
             "xy_velocity_pct": self.xy_velocity_pct,
             "xy_acceleration": self.xy_acceleration,
             "xy_jerk": self.xy_jerk,
+            "xy_controller_json": self.xy_controller_json,
+            "xy_max_speed_um_s": self.xy_max_speed_um_s,
             "z_up_sign": self.z_up_sign,
             "plate_flip_180": self.plate_flip_180,
             "needle_cam_z": self.needle_cam_z,
@@ -154,6 +167,8 @@ class DeviceProfile:
             xy_velocity_pct=data.get("xy_velocity_pct"),
             xy_acceleration=data.get("xy_acceleration"),
             xy_jerk=data.get("xy_jerk"),
+            xy_controller_json=data.get("xy_controller_json"),
+            xy_max_speed_um_s=data.get("xy_max_speed_um_s"),
             z_up_sign=data.get("z_up_sign"),
             plate_flip_180=data.get("plate_flip_180"),
             needle_cam_z=data.get("needle_cam_z"),
@@ -202,6 +217,8 @@ class DeviceProfile:
             xy_velocity_pct=settings.get("device_profile.xy_velocity_pct"),
             xy_acceleration=settings.get("device_profile.xy_acceleration"),
             xy_jerk=settings.get("device_profile.xy_jerk"),
+            xy_controller_json=settings.get("controller.controller_json"),
+            xy_max_speed_um_s=settings.get("device_profile.xy_max_speed_um_s"),
             z_up_sign=settings.get("device_profile.z_up_sign"),
             plate_flip_180=settings.get("device_profile.plate_flip_180"),
             needle_cam_z=settings.get("device_profile.needle_cam_z"),
@@ -245,6 +262,13 @@ class DeviceProfile:
             settings.set("device_profile.xy_acceleration", self.xy_acceleration)
         if self.xy_jerk is not None:
             settings.set("device_profile.xy_jerk", self.xy_jerk)
+        # v7.5.x: write the per-machine XY controller into the SAME global key
+        # the Settings-page dropdown uses, so a loaded profile overrides the
+        # global default. None ⇒ leave the global setting untouched (inherit).
+        if self.xy_controller_json is not None:
+            settings.set("controller.controller_json", self.xy_controller_json)
+        if self.xy_max_speed_um_s is not None:
+            settings.set("device_profile.xy_max_speed_um_s", self.xy_max_speed_um_s)
         if self.z_up_sign is not None:
             settings.set("device_profile.z_up_sign", self.z_up_sign)
         if self.plate_flip_180 is not None:

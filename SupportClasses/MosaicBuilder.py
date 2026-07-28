@@ -189,6 +189,129 @@ def _phase_correlate_overlap(
     return float(shift[0]), float(shift[1]), confidence
 
 
+def _register_overlap_cv2(
+    a_gray: np.ndarray,
+    b_gray: np.ndarray,
+) -> "tuple[float, float, float] | None":
+    """Sub-pixel shift to ADD to tile B's position so its overlap aligns onto
+    tile A's, plus a [0, 1] confidence (phase-correlation peak).
+
+    v7.5.x: the stronger pairwise estimator behind ``optimize_registration``.
+    Improvements over ``_phase_correlate_overlap``:
+      * CLAHE-normalises both crops first, so illumination gradients /
+        vignetting between tiles don't bias the FFT peak (a real failure mode
+        when the stage moves under uneven lighting);
+      * uses OpenCV ``phaseCorrelate``'s actual cross-power response peak as the
+        confidence (a true match-sharpness metric, unlike skimage's
+        ``1 - |error|``), so the weighted global solve trusts good overlaps and
+        ignores ambiguous ones.
+    Returns None when either crop is too small or too flat to register. cv2 is a
+    hard dependency of the builder, so this always runs (skimage may be absent).
+    """
+    if cv2 is None or a_gray is None or b_gray is None:
+        return None
+    if a_gray.shape != b_gray.shape:
+        return None
+    h, w = a_gray.shape[:2]
+    if h < 12 or w < 12:
+        return None
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        a = clahe.apply(a_gray)
+        b = clahe.apply(b_gray)
+    except Exception:
+        a, b = a_gray, b_gray
+    af = a.astype(np.float64)
+    bf = b.astype(np.float64)
+    # A flat overlap (uniform colour) can't be registered — phase correlation on
+    # it returns noise. Skip so it neither fails nor injects a bogus shift.
+    if af.std() < _REGISTER_MIN_STD or bf.std() < _REGISTER_MIN_STD:
+        return None
+    try:
+        win = cv2.createHanningWindow((w, h), cv2.CV_64F)
+        (dx, dy), resp = cv2.phaseCorrelate(af, bf, win)
+    except Exception:
+        return None
+    conf = float(max(0.0, min(1.0, resp)))
+    # cv2.phaseCorrelate(a, b) returns B's displacement w.r.t. A; the correction
+    # to ADD to B's position to bring its content back onto A is the NEGATIVE of
+    # that. (Sign locked by test ``test_optimize_registration_corrects_injected_error``.)
+    return (-float(dx), -float(dy), conf)
+
+
+def _register_overlap_fourier_mellin(
+    a_gray: np.ndarray,
+    b_gray: np.ndarray,
+) -> "tuple[float, float, float, float, float] | None":
+    """Recover ``(dx, dy, rotation_deg, scale, conf)`` to align B onto A using
+    the **Fourier-Mellin transform** — a stronger registration than plain
+    translation-only phase correlation (operator: "the registration to detect a
+    frame's translation is very bad … explore better methods, e.g. Fourier-
+    Mellin").
+
+    The FFT magnitude is translation-INVARIANT, so resampling it into log-polar
+    coordinates turns a **rotation** into a row shift and a **scale** into a
+    column shift, which a phase correlation recovers. B is then de-rotated /
+    de-scaled and phase-correlated with A for the residual **translation**. This
+    tolerates rotation + modest scale drift (and, with the CLAHE pre-pass,
+    illumination gradients) — exactly the cases where the plain estimator loses
+    lock. For adjacent mosaic tiles (same camera → rotation≈0, scale≈1) it
+    reduces to a robust translation estimate.
+
+    ``(dx, dy)`` is the correction to ADD to B's position (same convention as
+    ``_register_overlap_cv2``). Returns None when the crops are too small/flat.
+    Signs locked by ``test_fourier_mellin_recovers_rotation_scale``.
+    """
+    if cv2 is None or a_gray is None or b_gray is None:
+        return None
+    if a_gray.shape != b_gray.shape:
+        return None
+    h, w = a_gray.shape[:2]
+    if h < 32 or w < 32:
+        return None
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        A = clahe.apply(a_gray)
+        B = clahe.apply(b_gray)
+    except Exception:
+        A, B = a_gray, b_gray
+    Af = A.astype(np.float64)
+    Bf = B.astype(np.float64)
+    if Af.std() < _REGISTER_MIN_STD or Bf.std() < _REGISTER_MIN_STD:
+        return None
+    try:
+        win = cv2.createHanningWindow((w, h), cv2.CV_64F)
+
+        def _logmag(x):
+            f = np.fft.fftshift(np.fft.fft2(x * win))
+            return np.log1p(np.abs(f))
+
+        ma, mb = _logmag(Af), _logmag(Bf)
+        center = (w / 2.0, h / 2.0)
+        maxr = float(min(center))
+        if maxr < 8:
+            return None
+        flags = cv2.INTER_LINEAR + cv2.WARP_POLAR_LOG
+        lpa = cv2.warpPolar(ma, (w, h), center, maxr, flags).astype(np.float64)
+        lpb = cv2.warpPolar(mb, (w, h), center, maxr, flags).astype(np.float64)
+        # Log-polar phase correlation: angle → rows (y), log-radius → cols (x).
+        (d_col, d_row), rs_resp = cv2.phaseCorrelate(lpa, lpb, win)
+        # rows span [0, 360°) over h; scale s shifts col by (w/ln(maxr))·ln(s).
+        rotation_deg = ((d_row * 360.0 / float(h) + 180.0) % 360.0) - 180.0
+        log_base = math.log(maxr) if maxr > 1.0 else 1.0
+        scale = math.exp(d_col * log_base / float(w))
+        if not (0.5 < scale < 2.0):        # implausible for a mosaic → ignore
+            scale = 1.0
+        # De-rotate + de-scale B toward A, then translation-correlate.
+        m_aff = cv2.getRotationMatrix2D(center, rotation_deg, scale)
+        b_corr = cv2.warpAffine(Bf, m_aff, (w, h), flags=cv2.INTER_LINEAR)
+        (dx, dy), t_resp = cv2.phaseCorrelate(Af, b_corr * win, win)
+    except Exception:
+        return None
+    conf = float(max(0.0, min(1.0, t_resp)))
+    return (-float(dx), -float(dy), float(rotation_deg), float(scale), conf)
+
+
 def _build_neighbor_graph(
     n_tiles: int,
     grid_cols: int,
@@ -383,7 +506,32 @@ class MosaicBuilder:
         register_mode: str = "global",
         initial_shift_um: tuple[float, float] = (0.0, 0.0),
         retain_frames: bool = True,
+        frame_rotation_deg: float = 0.0,
+        frame_mirrored: bool = False,
+        frame_flip_y: bool = False,
+        retain_for_reorient: bool = False,
+        registration_method: str = "fourier_mellin",
     ):
+        # v7.5.x: ``frame_rotation_deg`` / ``frame_mirrored`` — the camera's
+        # calibrated orientation vs the stage axes. Each tile is oriented
+        # (mirror then ``R(θ)``) into the STAGE frame before it is placed, so the
+        # finished composite's pixel axes equal the stage axes and a click on the
+        # mosaic back-projects to the correct stage XY (the raw ``extent+px/scale``
+        # map every consumer uses becomes geometrically correct). A mirror
+        # reverses handedness — rotation alone can't fix it. Defaults (0°, False)
+        # → the tile is placed unchanged (byte-identical to legacy). See
+        # ``_orient_tile``. Frames reach the builder RAW (orientation is applied
+        # per consumer), so the builder owns the mosaic orientation.
+        #   ``retain_for_reorient`` keeps the small canvas-res *pre-orient* tiles
+        # so ``set_frame_orientation`` + ``reblend_reoriented`` can re-render the
+        # whole mosaic with a NEW orientation (the interactive fix-orientation
+        # tool) without re-scanning.
+        self._frame_rotation_deg = float(frame_rotation_deg or 0.0)
+        self._frame_mirrored = bool(frame_mirrored)   # flip X
+        self._frame_flip_y = bool(frame_flip_y)        # flip Y (vertical)
+        self._retain_for_reorient = bool(retain_for_reorient)
+        # Each: (resized_raw_bgr, px, py, tile_w, tile_h) at canvas resolution.
+        self._reorient_tiles: list = []
         # v7.5.x: ``retain_frames`` — when False, each tile's raw frame is freed
         # immediately after it is blended into the incremental composite
         # (``stitch_incremental``). A long full-plate scan (hundreds of tiles ×
@@ -411,6 +559,11 @@ class MosaicBuilder:
         # applications (e.g. a drifting/open-loop stage) but is NOT used by the
         # plate mosaic scan.
         self._register = bool(register)
+        # v7.5.x: pairwise registration method for optimize_registration:
+        # "fourier_mellin" (rotation+scale+translation, most robust) |
+        # "phase" (translation-only phase correlation) | "off" (manual/stage-
+        # only — no auto-registration; the operator aligns by hand).
+        self._registration_method = str(registration_method or "fourier_mellin")
         self._max_shift_um = float(max_shift_um)
         self._register_mode = (
             "per_tile" if str(register_mode) == "per_tile" else "global")
@@ -513,7 +666,11 @@ class MosaicBuilder:
                 continue
             left = (rec.stage_x_um - fov_w_um / 2.0 - ox) * scale
             top = (rec.stage_y_um - fov_h_um / 2.0 - oy) * scale
-            out.append((rec.frame, left, top, w, h))
+            # v7.5.x: orient each tile (calibrated mirror + rotation) so a
+            # per-tile registration view shows what the mosaic will look like.
+            # No-op at (0°, unmirrored). Re-call after set_frame_orientation to
+            # re-render for the interactive fix-orientation tool.
+            out.append((self._orient_tile(rec.frame), left, top, w, h))
         return out
 
     def _normalize_full(self):
@@ -846,7 +1003,20 @@ class MosaicBuilder:
         display cache is already complete (updated incrementally per tile), so
         the global shift (applied via ``canvas_extent_um``) is unaffected. After
         this, ``stitch_incremental`` / ``build_mosaic`` are no-ops until re-init.
+
+        v7.5.x: skipped when ``retain_for_reorient`` is set — the interactive
+        fix-orientation tool needs the accumulators to ``reblend_reoriented``.
+        Call ``free_reorient`` to release them once the adjustment is done.
         """
+        if self._retain_for_reorient:
+            return
+        self._composite = None
+        self._weight_sum = None
+
+    def free_reorient(self) -> None:
+        """v7.5.x: release the re-orientation buffers (retained tiles + the
+        float64 accumulators) once the fix-orientation adjustment is done."""
+        self._reorient_tiles = []
         self._composite = None
         self._weight_sum = None
 
@@ -931,6 +1101,53 @@ class MosaicBuilder:
             f"µm (median of {len(self._measured_shifts)} overlaps)")
         return self._global_shift_um
 
+    def _orient_tile(self, tile: np.ndarray) -> np.ndarray:
+        """v7.5.x: orient a tile from CAMERA-pixel axes into STAGE axes.
+
+        Applies the camera's calibrated mirror (horizontal flip) then rotation
+        θ about the tile centre, matching ``CameraManager.pixel_to_stage_offset``
+        (mirror ``dx→−dx`` then ``R(θ)``) and ``CameraFeedView.set_view_orientation``.
+        The tile centre is invariant, so the tile stays pinned at its
+        stage-derived canvas position while its content is oriented to align
+        with the stage axes — making the composite a stage-aligned orthophoto.
+
+        No-op fast path when unmirrored and |θ| < 0.05° (byte-identical to the
+        legacy raw placement). Rotation keeps the same tile W×H (content rotates
+        about the centre; for a large non-axis angle the corners clip — the
+        mapping stays geometrically correct, only peripheral coverage is lost,
+        which the scan overlap covers). NOTE: the rotation SIGN / mirror axis
+        match ``pixel_to_stage_offset`` by construction; verify on real hardware
+        (a mis-signed θ would orient the mosaic the wrong way).
+        """
+        theta = self._frame_rotation_deg
+        mir = self._frame_mirrored                 # flip X (horizontal)
+        fy = getattr(self, "_frame_flip_y", False)  # flip Y (vertical)
+        if (not mir and not fy and abs(theta) < 0.05) or cv2 is None:
+            return tile
+        h, w = tile.shape[:2]
+        cx = (w - 1) / 2.0
+        cy = (h - 1) / 2.0
+        t = math.radians(theta)
+        c, s = math.cos(t), math.sin(t)
+        mx = -1.0 if mir else 1.0
+        my = -1.0 if fy else 1.0
+        # Linear part A = R(θ)·diag(mx, my); forward (src→dst) affine that holds
+        # the centre fixed. warpAffine (no INVERSE flag) maps src→dst. Matches
+        # pixel_to_stage_offset (flip X on dx, flip Y on dy, then R(θ)) and the
+        # CameraFeedView display transform — ONE unified orientation.
+        a00, a01 = c * mx, -s * my
+        a10, a11 = s * mx, c * my
+        M = np.array([
+            [a00, a01, cx - (a00 * cx + a01 * cy)],
+            [a10, a11, cy - (a10 * cx + a11 * cy)],
+        ], dtype=np.float64)
+        try:
+            return cv2.warpAffine(
+                tile, M, (w, h), flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        except Exception:
+            return tile
+
     def _blend_tile_to_composite(self, rec: FrameRecord):
         """Blend a single tile into the composite canvas with feathering."""
         if self._composite is None or self._weight_sum is None:
@@ -958,6 +1175,22 @@ class MosaicBuilder:
         except Exception:
             return
 
+        # v7.5.x: retain the small PRE-orient canvas-res tile so the interactive
+        # fix-orientation tool (set_frame_orientation + reblend_reoriented) can
+        # re-render the whole mosaic with a NEW orientation without re-scanning.
+        if self._retain_for_reorient:
+            try:
+                self._reorient_tiles.append(
+                    (resized.copy(), int(px), int(py),
+                     int(tile_w), int(tile_h)))
+            except Exception:
+                pass
+
+        # v7.5.x: orient the tile from camera-pixel axes into stage axes
+        # (calibrated mirror + rotation) so the composite is stage-aligned and
+        # mosaic clicks back-project to the correct XY. No-op at (0°, unmirrored).
+        resized = self._orient_tile(resized)
+
         # v7.5.x: registration. Measure this tile's overlap misalignment, then
         # either (global, default) record it for ONE uniform shift finalized
         # later — trusting the accurate stage for relative placement — or
@@ -979,6 +1212,18 @@ class MosaicBuilder:
             except Exception as e:
                 logger.debug(f"Overlap registration skipped: {e}")
 
+        self._accumulate_oriented_tile(resized, px, py, tile_w, tile_h)
+
+        # Store refined position on canvas
+        rec.refined_x_px = float(px + tile_w / 2.0)
+        rec.refined_y_px = float(py + tile_h / 2.0)
+
+    def _accumulate_oriented_tile(self, oriented, px, py, tile_w, tile_h):
+        """Feather-blend an already-oriented, canvas-res tile into the composite
+        at (px, py). Shared by ``_blend_tile_to_composite`` and
+        ``reblend_reoriented``."""
+        if self._composite is None or self._weight_sum is None:
+            return
         # Get feather weights (resize if dimensions don't match)
         if (self._feather_weights is not None
                 and self._feather_weights.shape == (tile_h, tile_w)):
@@ -1004,7 +1249,7 @@ class MosaicBuilder:
             return
 
         # Accumulate weighted pixel values
-        tile_crop = resized[sy1:sy2, sx1:sx2].astype(np.float64)
+        tile_crop = oriented[sy1:sy2, sx1:sx2].astype(np.float64)
         w_crop = weights[sy1:sy2, sx1:sx2]
 
         for c in range(3):
@@ -1016,13 +1261,186 @@ class MosaicBuilder:
             region_ws = self._weight_sum[y1:y2, x1:x2]
             mask = region_ws > 0
             for c in range(3):
-                ch = self._composite[y1:y2, x1:x2, c].copy()
-                ch[mask] = (ch[mask] / region_ws[mask]).clip(0, 255)
-                self._display_cache[y1:y2, x1:x2, c] = ch.astype(np.uint8)
+                ch2 = self._composite[y1:y2, x1:x2, c].copy()
+                ch2[mask] = (ch2[mask] / region_ws[mask]).clip(0, 255)
+                self._display_cache[y1:y2, x1:x2, c] = ch2.astype(np.uint8)
 
-        # Store refined position on canvas
-        rec.refined_x_px = float(px + tile_w / 2.0)
-        rec.refined_y_px = float(py + tile_h / 2.0)
+    # ── v7.5.x: interactive re-orientation ─────────────────────────
+
+    def set_frame_orientation(self, rotation_deg: float = 0.0,
+                              mirrored: bool = False,
+                              flip_y: bool = False) -> None:
+        """Set the per-tile orientation used by ``_orient_tile`` /
+        ``reblend_reoriented`` (rotation, flip X = ``mirrored``, flip Y)."""
+        self._frame_rotation_deg = float(rotation_deg or 0.0)
+        self._frame_mirrored = bool(mirrored)
+        self._frame_flip_y = bool(flip_y)
+
+    def reblend_reoriented(self):
+        """Re-render the whole composite from the retained pre-orient tiles with
+        the CURRENT orientation (``set_frame_orientation``). Returns the new
+        composite (BGR uint8) or None. Requires ``retain_for_reorient=True``."""
+        if (self._composite is None or self._weight_sum is None
+                or not self._reorient_tiles):
+            return self.composite
+        # Zero the accumulators + display cache (same canvas), then re-blend.
+        self._composite[...] = 0.0
+        self._weight_sum[...] = 0.0
+        if self._display_cache is not None:
+            self._display_cache[...] = 0
+        for (resized, px, py, tw, th) in self._reorient_tiles:
+            try:
+                self._accumulate_oriented_tile(
+                    self._orient_tile(resized), px, py, tw, th)
+            except Exception as e:
+                logger.debug(f"reblend tile skipped: {e}")
+        return self.composite
+
+    def has_reorient_tiles(self) -> bool:
+        return bool(self._reorient_tiles)
+
+    # ── v7.5.x: full pairwise + global-optimize registration ───────
+
+    def optimize_registration(self, *, min_overlap_frac: float = 0.10,
+                              min_conf: float = 0.12, min_edges: int = 1,
+                              method: str = None):
+        """Register EVERY overlapping tile pair, solve globally-consistent tile
+        positions (least-squares), and re-blend at the optimized positions.
+
+        v7.5.x (operator: "we need a better image registration algorithm — the
+        current feature detection doesn't work great when moving the stage").
+        The open-loop stitch places tiles purely by stage position and applies
+        only ONE global median shift; that drifts when the stage backlashes or
+        the FOV is slightly off. This measures each overlap with a CLAHE +
+        Hanning phase correlation (illumination-gradient tolerant, real
+        cross-power peak as confidence — the weak point of the plain estimator)
+        and feeds a weighted global least-squares solve
+        (``_global_optimize_positions``) so residuals are shared consistently
+        across the whole grid rather than accumulating.
+
+        Safety: each tile's correction is BOUNDED to the trusted stage placement
+        (``_max_shift_px``) — a single bad match cannot fling a tile — and a
+        degenerate solve (too few confident overlaps) is a NO-OP that keeps the
+        open-loop composite. Operates on the retained canvas-res tiles
+        (``retain_for_reorient``), so memory stays bounded and no re-scan or raw
+        frames are needed. Returns ``(composite, n_edges, max_correction_px)``.
+        """
+        method = str(method or getattr(self, "_registration_method",
+                                        "fourier_mellin"))
+        if method == "off":
+            # Manual / stage-only mode — no auto-registration; the operator
+            # aligns the mosaic by hand (the trusted stage placement stands).
+            return self.composite, 0, 0.0
+        tiles = self._reorient_tiles
+        if (cv2 is None or not tiles or self._composite is None
+                or self._weight_sum is None):
+            return self.composite, 0, 0.0
+        n = len(tiles)
+        if n < 2:
+            return self.composite, 0, 0.0
+        nominal = np.array([[float(t[1]), float(t[2])] for t in tiles],
+                           dtype=float)
+        grays: list = []
+        for (tile, _px, _py, _tw, _th) in tiles:
+            try:
+                grays.append(
+                    cv2.cvtColor(self._orient_tile(tile), cv2.COLOR_BGR2GRAY))
+            except Exception:
+                grays.append(None)
+        edges: list = []
+        offsets: list = []
+        confs: list = []
+        rot_samples: list = []
+        scale_samples: list = []
+        use_fm = (str(method) == "fourier_mellin")
+        for i in range(n):
+            gi = grays[i]
+            if gi is None:
+                continue
+            xi, yi, wi, hi = (int(tiles[i][1]), int(tiles[i][2]),
+                              int(tiles[i][3]), int(tiles[i][4]))
+            for j in range(i + 1, n):
+                gj = grays[j]
+                if gj is None:
+                    continue
+                xj, yj, wj, hj = (int(tiles[j][1]), int(tiles[j][2]),
+                                  int(tiles[j][3]), int(tiles[j][4]))
+                ox1, oy1 = max(xi, xj), max(yi, yj)
+                ox2, oy2 = min(xi + wi, xj + wj), min(yi + hi, yj + hj)
+                ow, oh = ox2 - ox1, oy2 - oy1
+                if ow < 12 or oh < 12:
+                    continue
+                if ow * oh < min_overlap_frac * min(wi * hi, wj * hj):
+                    continue
+                a = gi[oy1 - yi:oy2 - yi, ox1 - xi:ox2 - xi]
+                b = gj[oy1 - yj:oy2 - yj, ox1 - xj:ox2 - xj]
+                if a.shape != b.shape or a.size == 0:
+                    continue
+                dxr = dyr = conf = None
+                if use_fm:
+                    fm = _register_overlap_fourier_mellin(a, b)
+                    if fm is not None:
+                        dxr, dyr, rot_ij, scale_ij, conf = fm
+                        rot_samples.append(rot_ij)
+                        scale_samples.append(scale_ij)
+                if conf is None:            # FM off / failed → plain phase corr
+                    pc = _register_overlap_cv2(a, b)
+                    if pc is not None:
+                        dxr, dyr, conf = pc
+                if conf is None or conf < min_conf:
+                    continue
+                offsets.append(((xj - xi) + dxr, (yj - yi) + dyr))
+                edges.append((i, j, 'p'))
+                confs.append(conf)
+        # Diagnostic: the median tile-to-tile rotation/scale should be ~0°/~1;
+        # a large value flags a camera µm/px / rotation calibration that is off
+        # (the operator can then recalibrate or correct it manually).
+        if rot_samples:
+            self._measured_rotation_deg = float(np.median(rot_samples))
+            self._measured_scale = float(np.median(scale_samples))
+            if (abs(self._measured_rotation_deg) > 1.0
+                    or abs(self._measured_scale - 1.0) > 0.03):
+                logger.info(
+                    "Mosaic registration residual (Fourier-Mellin): median "
+                    f"rotation {self._measured_rotation_deg:.2f}°, scale "
+                    f"{self._measured_scale:.4f} — a large value means the "
+                    "camera rotation/µm-px calibration is off.")
+        if len(edges) < max(1, int(min_edges)):
+            return self.composite, len(edges), 0.0
+        opt = _global_optimize_positions(
+            n, nominal, edges, offsets, confs, min_confidence=min_conf)
+        # Bound each tile to its trusted stage placement — a bad solve degrades
+        # to (at worst) the open-loop position, never a wild throw.
+        bound = max(4.0, self._max_shift_px())
+        opt = np.clip(opt, nominal - bound, nominal + bound)
+        max_corr = float(np.abs(opt - nominal).max()) if opt.size else 0.0
+        self._reblend_at_positions(opt)
+        self._optimized_positions = opt
+        logger.info(
+            f"Mosaic global optimize: {len(edges)} overlaps registered, "
+            f"max per-tile correction {max_corr:.1f}px")
+        return self.composite, len(edges), max_corr
+
+    def _reblend_at_positions(self, positions) -> np.ndarray | None:
+        """Re-blend every retained canvas-res tile at the given (N, 2) top-left
+        pixel positions. Shares the zero-then-accumulate pattern with
+        ``reblend_reoriented`` (which re-blends at the ORIGINAL positions)."""
+        if self._composite is None or self._weight_sum is None:
+            return self.composite
+        self._composite[...] = 0.0
+        self._weight_sum[...] = 0.0
+        if self._display_cache is not None:
+            self._display_cache[...] = 0
+        for (resized, _px, _py, tw, th), pos in zip(
+                self._reorient_tiles, positions):
+            try:
+                self._accumulate_oriented_tile(
+                    self._orient_tile(resized),
+                    int(round(float(pos[0]))), int(round(float(pos[1]))),
+                    int(tw), int(th))
+            except Exception as e:
+                logger.debug(f"reblend-at tile skipped: {e}")
+        return self.composite
 
     # ── Full stitching with registration + global optimization ─────
 

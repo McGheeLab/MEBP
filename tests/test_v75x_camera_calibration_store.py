@@ -267,6 +267,10 @@ class TestSaveLoadCameraSetup(unittest.TestCase):
             self.running[i] = True
             self.started.append(i)
         mgr.start = _start
+        # v7.5.x: the startup auto-start (_start_saved_cameras) now opens OFF the
+        # GUI thread via start_async to avoid freezing the UI. Stub it with the
+        # same synchronous fake so the test intercepts the real code path.
+        mgr.start_async = _start
 
         # Assign sources to slots 0 and 1.
         for i in (0, 1):
@@ -381,13 +385,19 @@ class TestMicroscopeResolutionOnStart(unittest.TestCase):
         pg._on_camera_started_hw(0)
         self.assertEqual(self.res_calls, [(0, 916, 686)])
 
-    def test_hw_controls_resolution_takes_precedence(self):
+    def test_active_resolution_is_single_source_for_microscope(self):
+        # v7.5.x: the microscope resolution has ONE source of truth —
+        # camera_config.active_resolution. A per-identity hw_controls resolution
+        # must NOT override it (the camera is driven to active_resolution as
+        # ground truth), so a stale per-identity value can't diverge from the
+        # "Microscope Camera Setup" block.
         pg, mgr = self._page()
         self.CCS.get_store().set_hw_controls(
             "toupcam:TC", {"resolution": [1832, 1374]})
         pg._on_camera_started_hw(0)
-        # _apply_hw_controls applied the stored res; the spec fallback was skipped.
-        self.assertEqual(self.res_calls, [(0, 1832, 1374)])
+        # active_resolution (916×686) wins; the hw_controls resolution is ignored
+        # for the microscope.
+        self.assertEqual(self.res_calls, [(0, 916, 686)])
 
     def test_non_microscope_start_does_not_apply_spec_resolution(self):
         pg, mgr = self._page()

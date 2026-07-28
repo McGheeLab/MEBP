@@ -20,9 +20,9 @@ import copy
 import math
 from enum import Enum, auto
 
-from PySide6.QtCore import Qt, QPointF, QRectF, Signal
+from PySide6.QtCore import Qt, QPointF, QRectF, Signal, QTimer
 from PySide6.QtGui import (
-    QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
+    QPainter, QPen, QColor, QBrush, QPolygonF, QCursor, QFont,
 )
 from PySide6.QtWidgets import QWidget, QSizePolicy
 
@@ -30,6 +30,8 @@ from gui.styles import COLORS
 from gui.scaling import s
 from SupportClasses.SketchTrajectory import (
     Sketch, SketchShape, compute_fill_region, backtrace_shape,
+    _shape_paths, _cumlen, _project_arclen, _point_at_arclen,
+    _is_closed_outline,
 )
 
 
@@ -63,6 +65,7 @@ class SketchCanvas(QWidget):
     selection_changed = Signal(int)   # selected shape index, or -1
     tool_changed = Signal(object)     # Tool
     fill_result = Signal(bool)        # paint-bucket success / not-enclosed
+    constraints_changed = Signal()    # constraint added / removed / re-valued
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -97,6 +100,10 @@ class SketchCanvas(QWidget):
         # the page to needle inner Ø × extrusion multiplier; 0 = fall back to
         # the fill pitch (``line_spacing_mm``).
         self._bead_width_mm = 0.0
+        # Needle OUTER Ø (mm), pushed by the page from the hardware config; used
+        # only to size a "needle Ø" closure-overlap marker so it matches what
+        # the compiler extrudes. 0 = unknown → falls back to the bead width.
+        self._needle_od_mm = 0.0
 
         # Interaction state
         # _mode: 'draw' | 'move' | 'resize' | 'pan' | 'poly'
@@ -122,6 +129,24 @@ class SketchCanvas(QWidget):
         self._redo: list[dict] = []
         self._undo_cap = 50
 
+        # ── Parametric constraints (v7.5.x) ──
+        self._auto_constrain = True        # snap → capture coincident/point_on
+        self._snap_hit = None              # ("vertex"|"edge", shape_idx, anchor)
+        self._draw_start_hit = None        # snap hit at draw-press time
+        self._poly_hits: list = []         # per-vertex snap hits (polygon tool)
+        self._last_report = None           # last SolveReport (page DOF label)
+        # Live constrained-drag state: mode "ghost" (anchor chases the cursor
+        # via a drag_ghost pin) or "plain" (size-handle edits re-solve without
+        # a pin). Solves are throttled to ~30 fps via _solve_timer.
+        self._cdrag = None                 # active SketchConstraintSolver
+        self._cdrag_mode = None            # "ghost" | "plain"
+        self._cdrag_pending = None         # latest ghost target (world mm)
+        self._cdrag_anchor_start = None    # dragged anchor pos at grab
+        self._solve_timer = QTimer(self)
+        self._solve_timer.setSingleShot(True)
+        self._solve_timer.setInterval(33)
+        self._solve_timer.timeout.connect(self._flush_cdrag)
+
     # ── Model access ──────────────────────────────────────────────
 
     def sketch(self) -> Sketch:
@@ -137,6 +162,9 @@ class SketchCanvas(QWidget):
         self._selection = set()
         self._undo.clear()
         self._redo.clear()
+        self._cdrag = None
+        self._cdrag_mode = None
+        self._last_report = None
         self.selection_changed.emit(-1)
         self.update()
 
@@ -188,7 +216,9 @@ class SketchCanvas(QWidget):
     def set_tool(self, tool: Tool):
         self._tool = tool
         self._poly_pts = []
+        self._poly_hits = []
         self._mode = None
+        self._end_cdrag()                  # never leak a live constrained drag
         if tool != Tool.SELECT:
             self._set_selection(set())
         self.tool_changed.emit(tool)
@@ -338,15 +368,430 @@ class SketchCanvas(QWidget):
         self.update()
 
     def delete_selected(self):
-        """Delete every selected shape (supports multi-selection)."""
+        """Delete every selected shape (supports multi-selection). Constraints
+        referencing a deleted shape are pruned with it."""
         if not self._selection:
             return
         self._snapshot()
         for i in sorted(self._selection, reverse=True):
             if 0 <= i < len(self._sketch.shapes):
                 self._sketch.shapes.pop(i)
+        pruned = self._sketch.prune_constraints()
         self._set_selection(set())
+        if pruned:
+            self.solve_constraints()
+            self.constraints_changed.emit()
         self.sketch_changed.emit()
+        self.update()
+
+    # ── Parametric constraints (v7.5.x) ───────────────────────────
+
+    def _make_solver(self):
+        from SupportClasses.SketchConstraintSolver import SketchConstraintSolver
+        return SketchConstraintSolver(self._sketch)
+
+    def has_constraints(self) -> bool:
+        return bool(getattr(self._sketch, "constraints", None))
+
+    def last_solve_report(self):
+        return self._last_report
+
+    def set_auto_constrain(self, on: bool):
+        """Toggle snap→constraint auto-capture (coincident on vertex snaps,
+        point-on for line/circle edge snaps)."""
+        self._auto_constrain = bool(on)
+
+    def auto_constrain(self) -> bool:
+        return self._auto_constrain
+
+    def solve_constraints(self):
+        """Run the solver once from the current geometry (no drag pin). Used
+        after typed edits / constraint changes / deletions."""
+        if not self.has_constraints():
+            self._last_report = None
+            return None
+        self._last_report = self._make_solver().solve()
+        self.update()
+        return self._last_report
+
+    def solve_after_edit(self):
+        """Public hook for the page's typed-geometry edits: re-satisfy the
+        constraints starting from the edited state."""
+        return self.solve_constraints()
+
+    def _shape_constrained(self, idx: int) -> bool:
+        if not (0 <= idx < len(self._sketch.shapes)):
+            return False
+        sid = getattr(self._sketch.shapes[idx], "id", 0)
+        return bool(sid) and bool(self._sketch.constraints_referencing(sid))
+
+    def _shape_fixed(self, idx: int) -> bool:
+        if not (0 <= idx < len(self._sketch.shapes)):
+            return False
+        sid = getattr(self._sketch.shapes[idx], "id", 0)
+        return bool(sid) and any(
+            c.kind == "fix" and int(sid) in c.shape_ids()
+            for c in self._sketch.constraints)
+
+    @staticmethod
+    def _anchor_world(sh: SketchShape, anchor: str) -> tuple[float, float]:
+        """Plain-python anchor resolution (mirrors the solver's smooth one)."""
+        a = str(anchor)
+        if a.startswith("p") and a[1:].isdigit():
+            k = int(a[1:])
+            if k < len(sh.points):
+                return (float(sh.points[k][0]), float(sh.points[k][1]))
+        if a.startswith("c") and a[1:].isdigit() and sh.kind == "rect":
+            k = int(a[1:])
+            sx = -1.0 if k in (0, 3) else 1.0
+            sy = -1.0 if k in (0, 1) else 1.0
+            return (sh.cx + sx * sh.width / 2.0, sh.cy + sy * sh.height / 2.0)
+        if a == "mid" and sh.kind == "line" and len(sh.points) >= 2:
+            return ((sh.points[0][0] + sh.points[1][0]) / 2.0,
+                    (sh.points[0][1] + sh.points[1][1]) / 2.0)
+        if sh.kind in ("line", "polygon") and sh.points:   # centroid fallback
+            n = len(sh.points)
+            return (sum(p[0] for p in sh.points) / n,
+                    sum(p[1] for p in sh.points) / n)
+        return (float(sh.cx), float(sh.cy))
+
+    @staticmethod
+    def _drag_anchor_for(sh: SketchShape) -> str:
+        """Canonical anchor a whole-shape move drag pins: keeps orientation
+        free so H/V/parallel constraints stay in charge of it."""
+        if sh.kind == "line":
+            return "mid"
+        if sh.kind == "polygon":
+            return "centroid"
+        return "center"
+
+    @staticmethod
+    def _join_candidates(sh: SketchShape) -> list[str]:
+        """Anchors considered when auto-resolving a Join / nearest-pair
+        coincident between two selected shapes."""
+        if sh.kind == "line":
+            return ["p0", "p1"]
+        if sh.kind == "polygon":
+            return [f"p{k}" for k in range(len(sh.points))]
+        if sh.kind == "rect":
+            return ["center", "c0", "c1", "c2", "c3"]
+        if sh.kind == "region":
+            return []
+        return ["center"]
+
+    @classmethod
+    def _center_anchor(cls, sh: SketchShape) -> str:
+        return "centroid" if sh.kind in ("line", "polygon") else "center"
+
+    def can_add_constraint(self, kind: str) -> bool:
+        ok, _ = self._resolve_constraint(kind, dry_run=True)
+        return ok
+
+    def add_constraint_for_selection(self, kind: str):
+        """Create constraint(s) of ``kind`` from the current selection (see
+        ``_resolve_constraint`` for the per-kind selection rules). Returns
+        ``(ok, message)``; on success the sketch is solved + signals fire."""
+        ok, payload = self._resolve_constraint(kind, dry_run=False)
+        if not ok:
+            return False, payload
+        self.sketch_changed.emit()
+        self.constraints_changed.emit()
+        self.update()
+        return True, payload
+
+    def _resolve_constraint(self, kind: str, dry_run: bool):
+        """Shared feasibility check + creation. Returns ``(ok, msg)``."""
+        sel = sorted(self._selection)
+        shapes = [self._sketch.shapes[i] for i in sel
+                  if 0 <= i < len(self._sketch.shapes)]
+        if any(sh.kind == "region" for sh in shapes):
+            return False, "Baked fill regions can't be constrained"
+        lines = [sh for sh in shapes if sh.kind == "line"
+                 and len(sh.points) >= 2]
+        circles = [sh for sh in shapes if sh.kind == "circle"]
+        centerish = [sh for sh in shapes
+                     if sh.kind in ("circle", "ellipse", "rect")]
+
+        def commit(builder):
+            if dry_run:
+                return True, ""
+            self._snapshot()
+            self._sketch.ensure_shape_ids()
+            msg = builder()
+            self.solve_constraints()
+            return True, msg
+
+        if kind in ("horizontal", "vertical"):
+            if lines:
+                def build():
+                    for ln in lines:
+                        self._sketch.add_constraint(
+                            kind, [[ln.id, "p0"], [ln.id, "p1"]])
+                    return f"{kind.capitalize()} on {len(lines)} line(s)"
+                return commit(build)
+            if len(shapes) == 2:
+                def build():
+                    self._sketch.add_constraint(kind, [
+                        [shapes[0].id, self._center_anchor(shapes[0])],
+                        [shapes[1].id, self._center_anchor(shapes[1])]])
+                    return f"{kind.capitalize()} between centers"
+                return commit(build)
+            return False, "Select line(s) or two shapes"
+
+        if kind in ("parallel", "perpendicular", "equal_length"):
+            if len(shapes) == 2 and len(lines) == 2:
+                def build():
+                    self._sketch.add_constraint(kind, [
+                        [lines[0].id, "shape"], [lines[1].id, "shape"]])
+                    return kind.replace("_", " ").capitalize()
+                return commit(build)
+            return False, "Select exactly two lines"
+
+        if kind == "equal_radius":
+            if len(shapes) == 2 and len(circles) == 2:
+                def build():
+                    self._sketch.add_constraint(kind, [
+                        [circles[0].id, "shape"], [circles[1].id, "shape"]])
+                    return "Equal radius"
+                return commit(build)
+            return False, "Select exactly two circles"
+
+        if kind == "concentric":
+            if len(shapes) == 2 and len(centerish) == 2:
+                def build():
+                    self._sketch.add_constraint(kind, [
+                        [centerish[0].id, "center"],
+                        [centerish[1].id, "center"]])
+                    return "Concentric"
+                return commit(build)
+            return False, "Select two circles / ellipses / rects"
+
+        if kind == "tangent":
+            pair_ok = (len(shapes) == 2
+                       and ((len(lines) == 1 and len(circles) == 1)
+                            or len(circles) == 2))
+            if pair_ok:
+                def build():
+                    from SupportClasses.SketchConstraintSolver import (
+                        tangent_mode_for)
+                    mode = (tangent_mode_for(circles[0], circles[1])
+                            if len(circles) == 2 else "")
+                    self._sketch.add_constraint("tangent", [
+                        [shapes[0].id, "shape"], [shapes[1].id, "shape"]],
+                        mode=mode)
+                    return f"Tangent{f' ({mode})' if mode else ''}"
+                return commit(build)
+            return False, "Select a line + circle, or two circles"
+
+        if kind == "distance":
+            if len(shapes) == 1 and len(lines) == 1:
+                ln = lines[0]
+
+                def build():
+                    d = math.dist(ln.points[0], ln.points[1])
+                    self._sketch.add_constraint(
+                        "distance", [[ln.id, "p0"], [ln.id, "p1"]],
+                        value=round(d, 3))
+                    return f"Length dimension {d:.2f} mm"
+                return commit(build)
+            if len(shapes) == 2:
+                def build():
+                    a1 = self._center_anchor(shapes[0])
+                    a2 = self._center_anchor(shapes[1])
+                    d = math.dist(self._anchor_world(shapes[0], a1),
+                                  self._anchor_world(shapes[1], a2))
+                    self._sketch.add_constraint(
+                        "distance", [[shapes[0].id, a1], [shapes[1].id, a2]],
+                        value=round(d, 3))
+                    return f"Distance dimension {d:.2f} mm"
+                return commit(build)
+            return False, "Select one line or two shapes"
+
+        if kind == "radius":
+            if len(shapes) == 1 and len(circles) == 1:
+                def build():
+                    c = circles[0]
+                    self._sketch.add_constraint(
+                        "radius", [[c.id, "shape"]],
+                        value=round(float(c.radius), 3))
+                    return f"Radius dimension {c.radius:.2f} mm"
+                return commit(build)
+            return False, "Select exactly one circle"
+
+        if kind == "coincident":                    # Join: nearest anchor pair
+            if len(shapes) == 2:
+                ca = self._join_candidates(shapes[0])
+                cb = self._join_candidates(shapes[1])
+                if ca and cb:
+                    def build():
+                        best = None
+                        for a in ca:
+                            pa = self._anchor_world(shapes[0], a)
+                            for b in cb:
+                                pb = self._anchor_world(shapes[1], b)
+                                d = math.dist(pa, pb)
+                                if best is None or d < best[0]:
+                                    best = (d, a, b)
+                        _, a, b = best
+                        self._sketch.add_constraint("coincident", [
+                            [shapes[0].id, a], [shapes[1].id, b]])
+                        return f"Joined {a} ↔ {b}"
+                    return commit(build)
+            return False, "Select exactly two shapes"
+
+        if kind == "point_on":
+            if len(shapes) == 2:
+                curves = [sh for sh in shapes if sh.kind in ("line", "circle")]
+                if len(curves) == 1:
+                    curve = curves[0]
+                    other = shapes[0] if shapes[1] is curve else shapes[1]
+                elif (len(curves) == 2
+                        and {curves[0].kind, curves[1].kind}
+                        == {"line", "circle"}):
+                    # line + circle: convention — the circle is the curve, the
+                    # line contributes its nearest endpoint.
+                    curve = curves[0] if curves[0].kind == "circle" \
+                        else curves[1]
+                    other = curves[0] if curve is curves[1] else curves[1]
+                else:
+                    return False, "Ambiguous — use Join or Tangent instead"
+                cands = self._join_candidates(other)
+                if cands:
+                    def build():
+                        ref = self._anchor_world(curve, "center") \
+                            if curve.kind == "circle" else self._anchor_world(
+                                curve, "mid")
+                        a = min(cands, key=lambda an: math.dist(
+                            self._anchor_world(other, an), ref))
+                        self._sketch.add_constraint("point_on", [
+                            [other.id, a], [curve.id, "shape"]])
+                        return f"{a} on {curve.kind}"
+                    return commit(build)
+            return False, "Select a shape + the line/circle it should ride"
+
+        if kind == "fix":
+            if shapes:
+                all_fixed = all(self._shape_fixed(i) for i in sel)
+
+                def build():
+                    if all_fixed:                   # toggle OFF
+                        ids = {sh.id for sh in shapes}
+                        self._sketch.constraints = [
+                            c for c in self._sketch.constraints
+                            if not (c.kind == "fix"
+                                    and c.shape_ids() & ids)]
+                        return "Unlocked"
+                    # NOTE: iterate selection INDICES — SketchShape is a
+                    # dataclass, so list.index(sh) matches by VALUE and two
+                    # identical shapes would alias to the first.
+                    for i in sel:
+                        if not self._shape_fixed(i):
+                            self._sketch.add_constraint(
+                                "fix", [[self._sketch.shapes[i].id, "shape"]])
+                    return "Locked in place"
+                return commit(build)
+            return False, "Select shape(s) to lock"
+
+        return False, f"Unknown constraint '{kind}'"
+
+    def remove_constraint(self, cid: int):
+        if self._sketch.constraint_by_id(cid) is None:
+            return
+        self._snapshot()
+        self._sketch.remove_constraint(cid)
+        self.solve_constraints()
+        self.sketch_changed.emit()
+        self.constraints_changed.emit()
+        self.update()
+
+    def set_constraint_value(self, cid: int, value: float):
+        c = self._sketch.constraint_by_id(cid)
+        if c is None or c.value is None:
+            return
+        self._snapshot()
+        c.value = float(value)
+        self.solve_constraints()
+        self.sketch_changed.emit()
+        self.update()
+
+    def select_constraint_shapes(self, cid: int):
+        c = self._sketch.constraint_by_id(cid)
+        if c is None:
+            return
+        idxs = {self._sketch.shape_index_by_id(sid) for sid in c.shape_ids()}
+        self._set_selection({i for i in idxs if i >= 0})
+
+    def _maybe_add_snap_constraint(self, new_idx: int, anchor: str, hit):
+        """Auto-capture: a committed endpoint that SNAPPED onto another
+        shape's vertex becomes a coincident constraint; onto a line/circle
+        edge becomes point_on. De-duplicated; no-op when disabled."""
+        if not self._auto_constrain or hit is None:
+            return False
+        hit_kind, j, hit_anchor = hit
+        if j == new_idx or not (0 <= j < len(self._sketch.shapes)):
+            return False
+        target = self._sketch.shapes[j]
+        if hit_kind == "edge" and target.kind not in ("line", "circle"):
+            return False
+        self._sketch.ensure_shape_ids()
+        new_sh = self._sketch.shapes[new_idx]
+        if hit_kind == "vertex":
+            kind, refs = "coincident", [[new_sh.id, anchor],
+                                        [target.id, hit_anchor]]
+        else:
+            kind, refs = "point_on", [[new_sh.id, anchor],
+                                      [target.id, "shape"]]
+        # Dedup: identical (kind, refs-set) already present → skip.
+        want = {(int(s), str(a)) for s, a in refs}
+        for c in self._sketch.constraints:
+            if c.kind == kind and {(int(s), str(a))
+                                   for s, a in c.refs} == want:
+                return False
+        self._sketch.add_constraint(kind, refs)
+        return True
+
+    def _begin_cdrag_ghost(self, idx: int, anchor: str):
+        """Start a live constrained drag: the anchor chases the cursor via a
+        weight-1000 ghost pin while the rest of the system relaxes."""
+        sh = self._sketch.shapes[idx]
+        self._cdrag = self._make_solver()
+        self._cdrag_mode = "ghost"
+        self._cdrag_anchor_start = self._anchor_world(sh, anchor)
+        self._cdrag_pending = None
+        self._last_report = self._cdrag.begin_drag(
+            sh.id, anchor, self._cdrag_anchor_start)
+
+    def _queue_cdrag(self, target=None):
+        """Throttled (~30 fps) solve while dragging."""
+        if target is not None:
+            self._cdrag_pending = (float(target[0]), float(target[1]))
+        if not self._solve_timer.isActive():
+            self._solve_timer.start()
+
+    def _flush_cdrag(self):
+        if self._cdrag is None:
+            return
+        if self._cdrag_mode == "ghost":
+            if self._cdrag_pending is None:
+                return
+            self._last_report = self._cdrag.update_drag(self._cdrag_pending)
+        else:                                   # "plain": size-handle edits
+            self._last_report = self._cdrag.solve()
+        self.update()
+
+    def _end_cdrag(self):
+        if self._cdrag is None:
+            return
+        if self._cdrag_mode == "ghost":
+            if self._cdrag_pending is not None:
+                self._cdrag.update_drag(self._cdrag_pending)
+            self._last_report = self._cdrag.end_drag()
+        else:
+            self._last_report = self._cdrag.solve()
+        self._cdrag = None
+        self._cdrag_mode = None
+        self._cdrag_pending = None
+        self._solve_timer.stop()
         self.update()
 
     # ── Coordinate transforms ─────────────────────────────────────
@@ -361,24 +806,31 @@ class SketchCanvas(QWidget):
 
     def _snap(self, p: QPointF, exclude: int = -1) -> QPointF:
         # Object/border snap takes priority over grid snap. Snap targets are
-        # vertices/centers (exact) and the nearest point on each border.
+        # vertices/centers (exact) and the nearest point on each border. The
+        # matched target's provenance is recorded in ``_snap_hit`` so a commit
+        # can auto-capture a coincident / point_on constraint from it.
         self._snap_marker = None
+        self._snap_hit = None
         if self._osnap:
             tol = s(_HIT_PX + 2) / self._scale
             best = None
             best_d = tol
+            best_hit = None
             # Vertices/centers first (tight), then edges.
-            for vx, vy in self._snap_vertices(exclude):
+            for vx, vy, i, anchor in self._snap_vertices(exclude):
                 d = math.hypot(vx - p.x(), vy - p.y())
                 if d < best_d:
                     best_d, best = d, QPointF(vx, vy)
+                    best_hit = ("vertex", i, anchor)
             if best is None:
-                for ex, ey in self._snap_edges(p, exclude):
+                for ex, ey, i in self._snap_edges(p, exclude):
                     d = math.hypot(ex - p.x(), ey - p.y())
                     if d < best_d:
                         best_d, best = d, QPointF(ex, ey)
+                        best_hit = ("edge", i, None)
             if best is not None:
                 self._snap_marker = best
+                self._snap_hit = best_hit
                 return best
         if self._snap_mm > 0:
             return QPointF(round(p.x() / self._snap_mm) * self._snap_mm,
@@ -386,26 +838,31 @@ class SketchCanvas(QWidget):
         return p
 
     def _snap_vertices(self, exclude: int):
-        """Exact snap points: corners, endpoints, polygon vertices, centers."""
+        """Exact snap points with provenance: ``(x, y, shape_idx, anchor)`` —
+        corners, endpoints, polygon vertices, centers. The anchor string uses
+        the constraint vocabulary ("center", "p{k}", "c0".."c3")."""
         out = []
         for i, sh in enumerate(self._sketch.shapes):
             if i == exclude or sh.kind == "region":
                 continue
             if sh.kind == "travel":
-                out.append((sh.cx, sh.cy))
+                out.append((sh.cx, sh.cy, i, "center"))
                 continue
             if sh.kind in ("circle", "ellipse", "rect"):
-                out.append((sh.cx, sh.cy))
+                out.append((sh.cx, sh.cy, i, "center"))
             if sh.kind == "rect":
                 hw, hh = sh.width / 2, sh.height / 2
-                out += [(sh.cx - hw, sh.cy - hh), (sh.cx + hw, sh.cy - hh),
-                        (sh.cx + hw, sh.cy + hh), (sh.cx - hw, sh.cy + hh)]
+                out += [(sh.cx - hw, sh.cy - hh, i, "c0"),
+                        (sh.cx + hw, sh.cy - hh, i, "c1"),
+                        (sh.cx + hw, sh.cy + hh, i, "c2"),
+                        (sh.cx - hw, sh.cy + hh, i, "c3")]
             elif sh.kind in ("line", "polygon"):
-                out += list(sh.points)
+                out += [(px, py, i, f"p{k}")
+                        for k, (px, py) in enumerate(sh.points)]
         return out
 
     def _snap_edges(self, p: QPointF, exclude: int):
-        """Nearest point on each shape's border to ``p``."""
+        """Nearest point on each shape's border to ``p`` → ``(x, y, idx)``."""
         x, y = p.x(), p.y()
         out = []
         for i, sh in enumerate(self._sketch.shapes):
@@ -415,25 +872,26 @@ class SketchCanvas(QWidget):
                 dx, dy = x - sh.cx, y - sh.cy
                 d = math.hypot(dx, dy) or 1.0
                 out.append((sh.cx + sh.radius * dx / d,
-                            sh.cy + sh.radius * dy / d))
+                            sh.cy + sh.radius * dy / d, i))
             elif sh.kind == "ellipse":
                 ang = math.atan2((y - sh.cy), (x - sh.cx))
                 out.append((sh.cx + sh.rx * math.cos(ang),
-                            sh.cy + sh.ry * math.sin(ang)))
+                            sh.cy + sh.ry * math.sin(ang), i))
             elif sh.kind == "rect":
                 hw, hh = sh.width / 2, sh.height / 2
                 cxv = min(max(x, sh.cx - hw), sh.cx + hw)
                 cyv = min(max(y, sh.cy - hh), sh.cy + hh)
                 # project onto nearest edge
                 out.append((sh.cx - hw if abs(x - (sh.cx - hw)) <
-                            abs(x - (sh.cx + hw)) else sh.cx + hw, cyv))
+                            abs(x - (sh.cx + hw)) else sh.cx + hw, cyv, i))
                 out.append((cxv, sh.cy - hh if abs(y - (sh.cy - hh)) <
-                            abs(y - (sh.cy + hh)) else sh.cy + hh))
+                            abs(y - (sh.cy + hh)) else sh.cy + hh, i))
             elif sh.kind in ("line", "polygon") and len(sh.points) >= 2:
                 pts = sh.points + ([sh.points[0]] if sh.kind == "polygon"
                                    and len(sh.points) >= 3 else [])
                 for j in range(len(pts) - 1):
-                    out.append(_nearest_on_seg(x, y, *pts[j], *pts[j + 1]))
+                    nx, ny = _nearest_on_seg(x, y, *pts[j], *pts[j + 1])
+                    out.append((nx, ny, i))
         return out
 
     def _content_bounds(self):
@@ -535,6 +993,8 @@ class SketchCanvas(QWidget):
                 sh = self._sketch.shapes[i]
                 self._transform_shape(sh, copy.deepcopy(sh), None,
                                       (cx, cy), float(factor))
+        if any(self._shape_constrained(i) for i in self._selection):
+            self.solve_constraints()       # re-satisfy after the group edit
         self.sketch_changed.emit()
         self.update()
 
@@ -559,6 +1019,7 @@ class SketchCanvas(QWidget):
         for i, sh in enumerate(self._sketch.shapes):
             self._draw_shape(p, sh, selected=(i in self._selection))
 
+        self._draw_constraint_glyphs(p)
         self._draw_selection_overlay(p)
         self._draw_in_progress(p)
 
@@ -764,6 +1225,10 @@ class SketchCanvas(QWidget):
             # set WHERE the shape begins printing, snapping to existing lines.
             if self._shape_supports_start(sh):
                 self._draw_start_marker(p, sh)
+            # Draggable print-END marker: OPEN shapes get a trim-end handle;
+            # CLOSED loops get the closure-overlap handle (once overlap is on).
+            if self._shape_supports_end(sh):
+                self._draw_end_marker(p, sh)
 
     def _draw_handles(self, p: QPainter, sh: SketchShape):
         p.setBrush(QBrush(QColor(COLORS.get("blue", "#89b4fa"))))
@@ -798,6 +1263,27 @@ class SketchCanvas(QWidget):
         p.setPen(QPen(QColor(COLORS.get("crust", "#11111b")), s(1)))
         p.drawPolygon(tri)
 
+    def _draw_end_marker(self, p: QPainter, sh: SketchShape):
+        """Red print-END marker: a dot on the effective end + a leader to a
+        small square flag offset outward. OPEN shapes → trim end; CLOSED loops
+        → the closure-overlap handle. Drag it (see ``_set_end_from_drag``)."""
+        red = QColor(COLORS.get("red", "#f38ba8"))
+        ew_world = self._effective_end_world(sh)
+        ew = self._w2s(ew_world.x(), ew_world.y())
+        m = self._end_marker_screen(sh)
+        p.setPen(QPen(red, s(1.2)))
+        p.setBrush(Qt.NoBrush)
+        p.drawLine(ew, m)
+        p.setBrush(QBrush(red))
+        p.setPen(QPen(red, s(1)))
+        p.drawEllipse(ew, s(3), s(3))
+        r = s(5)
+        fill = QColor(red)
+        fill.setAlpha(210)
+        p.setBrush(QBrush(fill))
+        p.setPen(QPen(QColor(COLORS.get("crust", "#11111b")), s(1)))
+        p.drawRect(QRectF(m.x() - r, m.y() - r, 2 * r, 2 * r))
+
     def _draw_selection_overlay(self, p: QPainter):
         """Group bounding box + resize handle (2+ selected) and the marquee
         rubber-band while a lasso drag is in progress."""
@@ -825,6 +1311,92 @@ class SketchCanvas(QWidget):
             p.setPen(QPen(blue, s(1.2), Qt.DashLine))
             p.setBrush(QBrush(fill))
             p.drawRect(QRectF(a, b))
+
+    # ── Constraint glyphs ─────────────────────────────────────────
+
+    _GLYPH_TEXT = {
+        "horizontal": "H", "vertical": "V", "parallel": "∥",
+        "perpendicular": "⊥", "equal_length": "=", "equal_radius": "=R",
+        "tangent": "T", "fix": "🔒",
+    }
+
+    def _draw_constraint_glyphs(self, p: QPainter):
+        """Badges + dimension labels for every constraint. Conflicting
+        constraints (from the last solve report) render red."""
+        constraints = getattr(self._sketch, "constraints", None)
+        if not constraints:
+            return
+        conflicts = set(getattr(self._last_report, "conflicts", []) or [])
+        teal = QColor(COLORS.get("teal", "#94e2d5"))
+        red = QColor(COLORS.get("red", "#f38ba8"))
+        for c in constraints:
+            col = red if c.id in conflicts else teal
+            anchors = []
+            for sid, anchor in c.refs:
+                sh = self._sketch.shape_by_id(sid)
+                if sh is None:
+                    break
+                a = str(anchor)
+                if a == "shape":               # label at the entity's middle
+                    a = "mid" if sh.kind == "line" else "center"
+                anchors.append(self._anchor_world(sh, a))
+            if len(anchors) < len(c.refs) or not anchors:
+                continue
+            mx = sum(a[0] for a in anchors) / len(anchors)
+            my = sum(a[1] for a in anchors) / len(anchors)
+            mid = self._w2s(mx, my)
+
+            if c.kind in ("coincident", "point_on"):
+                pt = self._w2s(*anchors[0])
+                p.setPen(QPen(col, s(1.4)))
+                p.setBrush(Qt.NoBrush)
+                r = s(4 if c.kind == "coincident" else 5)
+                p.drawEllipse(pt, r, r)
+                continue
+            if c.kind == "concentric":
+                pt = self._w2s(*anchors[0])
+                p.setPen(QPen(col, s(1.2)))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(pt, s(3), s(3))
+                p.drawEllipse(pt, s(6), s(6))
+                continue
+            if c.kind == "distance" and c.value is not None:
+                if len(anchors) >= 2:
+                    a0 = self._w2s(*anchors[0])
+                    a1 = self._w2s(*anchors[1])
+                    lead = QColor(col)
+                    lead.setAlpha(140)
+                    p.setPen(QPen(lead, s(1), Qt.DashLine))
+                    p.drawLine(a0, a1)
+                self._draw_glyph_pill(p, mid, f"↔ {c.value:.2f}", col)
+                continue
+            if c.kind == "radius" and c.value is not None:
+                sh = self._sketch.shape_by_id(int(c.refs[0][0]))
+                if sh is not None:
+                    pos = self._w2s(sh.cx + sh.radius * 0.7071,
+                                    sh.cy - sh.radius * 0.7071)
+                    self._draw_glyph_pill(p, pos, f"R {c.value:.2f}", col)
+                continue
+            text = self._GLYPH_TEXT.get(c.kind)
+            if text:
+                self._draw_glyph_pill(p, mid, text, col)
+
+    def _draw_glyph_pill(self, p: QPainter, pos: QPointF, text: str,
+                         col: QColor):
+        font = QFont(p.font())
+        font.setPixelSize(s(10))
+        p.setFont(font)
+        fm = p.fontMetrics()
+        wpx = fm.horizontalAdvance(text) + s(8)
+        hpx = fm.height() + s(2)
+        rect = QRectF(pos.x() - wpx / 2, pos.y() - hpx / 2, wpx, hpx)
+        bg = QColor(COLORS.get("surface0", "#313244"))
+        bg.setAlpha(220)
+        p.setPen(QPen(col, s(1)))
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(rect, s(4), s(4))
+        p.setPen(col)
+        p.drawText(rect, Qt.AlignCenter, text)
 
     @staticmethod
     def _handle_points(sh: SketchShape) -> dict:
@@ -916,11 +1488,13 @@ class SketchCanvas(QWidget):
             self._place_travel(w)
         elif self._tool == Tool.POLYGON:
             self._poly_pts.append((w.x(), w.y()))
+            self._poly_hits.append(self._snap_hit)   # per-vertex provenance
             self._mode = "poly"
             self.update()
         else:
             self._mode = "draw"
             self._draw_start = w
+            self._draw_start_hit = self._snap_hit    # snap provenance at press
             self._draw_cur = w
             self.update()
 
@@ -962,12 +1536,26 @@ class SketchCanvas(QWidget):
             return
 
         if self._mode == "move" and self._move_orig is not None:
-            self._apply_move(self._snap(raw, exclude=self._selected))
+            w = self._snap(raw, exclude=self._selected)
+            if self._cdrag_mode == "ghost" and self._move_anchor is not None \
+                    and self._cdrag_anchor_start is not None:
+                # Constrained: the pinned anchor chases anchor_start + drag Δ.
+                self._queue_cdrag((
+                    self._cdrag_anchor_start[0] + w.x() - self._move_anchor.x(),
+                    self._cdrag_anchor_start[1] + w.y() - self._move_anchor.y()))
+            else:
+                self._apply_move(w)
             self.update()
             return
 
         if self._mode == "resize":
-            self._apply_resize(self._snap(raw, exclude=self._selected))
+            w = self._snap(raw, exclude=self._selected)
+            if self._cdrag_mode == "ghost":
+                self._queue_cdrag((w.x(), w.y()))   # endpoint chases cursor
+            else:
+                self._apply_resize(w)
+                if self._cdrag_mode == "plain":     # size edit → re-solve live
+                    self._queue_cdrag()
             self.update()
             return
 
@@ -994,20 +1582,37 @@ class SketchCanvas(QWidget):
         if self._mode in ("move", "resize"):
             # A start-point drag changes the shape's custom/default state, so
             # nudge the properties panel to rebuild (via selection_changed).
-            was_start = (self._mode == "resize" and self._resize_kind == "start")
+            was_start = (self._mode == "resize"
+                         and self._resize_kind in ("start", "end"))
+            # Auto-capture: an endpoint drag that ends ON another shape's
+            # vertex/edge becomes a persistent coincident / point_on.
+            captured = False
+            if (self._mode == "resize" and self._resize_kind in ("p0", "p1")
+                    and self._snap_hit is not None and self._selected >= 0):
+                captured = self._maybe_add_snap_constraint(
+                    self._selected, self._resize_kind, self._snap_hit)
             self._mode = None
             self._move_orig = None
             self._resize_kind = None
+            self._end_cdrag()
+            if captured:
+                self.solve_constraints()
+                self.constraints_changed.emit()
             self.sketch_changed.emit()
             if was_start:
                 self.selection_changed.emit(self._selected)
             return
 
         if self._mode in ("gmove", "gresize"):
+            moved = set(self._group_orig or {})
             self._mode = None
             self._group_orig = None
             self._group_anchor = None
             self._group_ref = None
+            # A group transform can disturb constrained members — re-satisfy
+            # once on release (per-frame group solving is deferred).
+            if any(self._shape_constrained(i) for i in moved):
+                self.solve_constraints()
             self.sketch_changed.emit()
             return
 
@@ -1023,7 +1628,9 @@ class SketchCanvas(QWidget):
             self.delete_selected()
         elif k == Qt.Key_Escape:
             self._poly_pts = []
+            self._poly_hits = []
             self._mode = None
+            self._end_cdrag()              # never leak a live constrained drag
             self.clear_selection()
             self.update()
         elif k in (Qt.Key_Return, Qt.Key_Enter):
@@ -1055,11 +1662,26 @@ class SketchCanvas(QWidget):
                     self._mode = "resize"
                     self._resize_kind = "start"
                     return
+                if (self._shape_supports_end(sh)
+                        and self._end_handle_at(sh, screen_pos)):
+                    self._snapshot()
+                    self._mode = "resize"
+                    self._resize_kind = "end"
+                    return
                 kind = self._handle_at(sh, screen_pos)
                 if kind is not None:
                     self._snapshot()
                     self._mode = "resize"
                     self._resize_kind = kind
+                    # Constrained shape → live solve while the handle drags:
+                    # endpoint handles pin that anchor (ghost); size handles
+                    # re-solve around the direct edit (plain).
+                    if self._shape_constrained(self._selected):
+                        if kind in ("p0", "p1"):
+                            self._begin_cdrag_ghost(self._selected, kind)
+                        elif kind in ("r", "rxry", "wh"):
+                            self._cdrag = self._make_solver()
+                            self._cdrag_mode = "plain"
                     return
 
         # 3) Hit-test shapes (topmost first).
@@ -1078,6 +1700,13 @@ class SketchCanvas(QWidget):
             self._mode = "move"
             self._move_anchor = w
             self._move_orig = copy.deepcopy(self._sketch.shapes[idx])
+            # Constrained shape → the move becomes a live solve: a ghost pins
+            # the shape's canonical drag anchor to the cursor while connected
+            # geometry follows (~30 fps). A LOCKED (fix) shape's ghost is
+            # ignored by the solver → dragging it moves nothing (correct).
+            if self._shape_constrained(idx):
+                self._begin_cdrag_ghost(
+                    idx, self._drag_anchor_for(self._sketch.shapes[idx]))
             return
 
         # 4) Empty space → marquee (lasso) rubber-band select.
@@ -1229,22 +1858,23 @@ class SketchCanvas(QWidget):
                     bd, best = dd, (nx, ny)
             return best
         if k == "line" and len(sh.points) >= 2:
-            p0, p1 = sh.points[0], sh.points[1]
-            return p0 if (math.hypot(p0[0] - x, p0[1] - y)
-                          <= math.hypot(p1[0] - x, p1[1] - y)) else p1
+            # Nearest point ALONG the segment (not just an endpoint) so the
+            # start/end markers can trim an open line anywhere.
+            return _nearest_on_seg(x, y, *sh.points[0], *sh.points[1])
         if k == "polygon" and sh.points:
             if len(sh.points) >= 3:
                 pts = list(sh.points) + [sh.points[0]]
-                best, bd = None, None
-                for j in range(len(pts) - 1):
-                    nx, ny = _nearest_on_seg(x, y, *pts[j], *pts[j + 1])
-                    dd = math.hypot(nx - x, ny - y)
-                    if bd is None or dd < bd:
-                        bd, best = dd, (nx, ny)
-                return best
-            p0, p1 = sh.points[0], sh.points[-1]
-            return p0 if (math.hypot(p0[0] - x, p0[1] - y)
-                          <= math.hypot(p1[0] - x, p1[1] - y)) else p1
+            elif len(sh.points) >= 2:
+                pts = list(sh.points)            # open polyline
+            else:
+                return (sh.points[0][0], sh.points[0][1])
+            best, bd = None, None
+            for j in range(len(pts) - 1):
+                nx, ny = _nearest_on_seg(x, y, *pts[j], *pts[j + 1])
+                dd = math.hypot(nx - x, ny - y)
+                if bd is None or dd < bd:
+                    bd, best = dd, (nx, ny)
+            return best if best is not None else (sh.cx, sh.cy)
         return (sh.cx, sh.cy)
 
     def _effective_start_world(self, sh: SketchShape) -> QPointF:
@@ -1289,6 +1919,125 @@ class SketchCanvas(QWidget):
         sh.start_point = None
         self.sketch_changed.emit()
         self.update()
+
+    def clear_end_point(self, index: int):
+        """Reset an OPEN shape's print end to the default (far endpoint)."""
+        if not (0 <= index < len(self._sketch.shapes)):
+            return
+        sh = self._sketch.shapes[index]
+        if getattr(sh, "end_point", None) is None:
+            return
+        self._snapshot()
+        sh.end_point = None
+        self.sketch_changed.emit()
+        self.update()
+
+    # ── Print start/end markers (v7.5.x) ──────────────────────────
+
+    @staticmethod
+    def _shape_supports_end(sh: SketchShape) -> bool:
+        """Which shapes show a draggable END marker: any unfilled outline —
+        OPEN shapes (line / open polygon) get a trim-end handle; CLOSED loops
+        get the closure-overlap handle, but only once overlap is enabled."""
+        if sh.filled or sh.kind not in (
+                "line", "circle", "ellipse", "rect", "polygon"):
+            return False
+        if _is_closed_outline(sh):
+            return getattr(sh, "overlap_mode", "none") not in ("", "none")
+        return True
+
+    def _closed_ring(self, sh: SketchShape):
+        """First (rolled-to-seam) closed pass as an Nx2 array + its cumulative
+        arc lengths — the ring the overlap handle rides. None if unavailable."""
+        try:
+            for arr in _shape_paths(sh, self._sketch):
+                # _shape_paths returns Nx2 numpy arrays.
+                if arr is not None and getattr(arr, "ndim", 0) == 2 \
+                        and len(arr) >= 2:
+                    return arr, _cumlen(arr)
+        except Exception:
+            pass
+        return None, None
+
+    def _effective_end_world(self, sh: SketchShape) -> QPointF:
+        """Where the shape's print actually ENDS.
+
+        OPEN: the resolved ``end_point``, else the endpoint FARTHER from the
+        effective start (the default far extreme). CLOSED: the seam advanced by
+        the closure-overlap arc length along the rolled ring."""
+        if _is_closed_outline(sh):
+            arr, cum = self._closed_ring(sh)
+            if arr is None:
+                return self._effective_start_world(sh)
+            amt = sh.overlap_amount_mm(self._needle_od(), self._bead_ref())
+            x, y = _point_at_arclen(arr, cum, max(0.0, amt))
+            return QPointF(x, y)
+        ep = getattr(sh, "end_point", None)
+        if ep is not None:
+            return QPointF(*self._resolve_start_on_shape(sh, ep))
+        # Default: the far end relative to the start.
+        sw = self._effective_start_world(sh)
+        if sh.kind == "line" and len(sh.points) >= 2:
+            p0, p1 = sh.points[0], sh.points[1]
+        elif sh.kind == "polygon" and len(sh.points) >= 2:
+            p0, p1 = sh.points[0], sh.points[-1]
+        else:
+            return sw
+        d0 = math.hypot(p0[0] - sw.x(), p0[1] - sw.y())
+        d1 = math.hypot(p1[0] - sw.x(), p1[1] - sw.y())
+        far = p1 if d1 >= d0 else p0
+        return QPointF(far[0], far[1])
+
+    def set_needle_od(self, od_mm: float):
+        """Push the needle OUTER Ø (mm) so a 'needle Ø' closure-overlap marker
+        matches what the compiler extrudes. 0 / unknown → bead-width fallback."""
+        self._needle_od_mm = max(0.0, float(od_mm or 0.0))
+        self.update()
+
+    def _needle_od(self) -> float:
+        return float(getattr(self, "_needle_od_mm", 0.0) or 0.0)
+
+    def _bead_ref(self) -> float:
+        return max(float(getattr(self._sketch, "line_spacing_mm", 0.4)
+                         or 0.4), 1e-3)
+
+    def _end_marker_screen(self, sh: SketchShape) -> QPointF:
+        """Screen position of the end flag — the effective end pushed outward
+        from the shape centre (like the start flag) so it never sits on a
+        handle; for a closed loop at tiny overlap this separates it from the
+        seam flag."""
+        ew = self._effective_end_world(sh)
+        bb = self._shape_bbox(sh)
+        base = self._w2s(ew.x(), ew.y())
+        if bb is None:
+            return base
+        cx, cy = (bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0
+        dx, dy = ew.x() - cx, ew.y() - cy
+        L = math.hypot(dx, dy)
+        if L < 1e-9:
+            dx, dy, L = -1.0, 1.0, math.sqrt(2.0)
+        off = s(_HANDLE_PX) * 2.2
+        return QPointF(base.x() + dx / L * off, base.y() + dy / L * off)
+
+    def _end_handle_at(self, sh: SketchShape, screen_pos: QPointF) -> bool:
+        c = self._end_marker_screen(sh)
+        tol = s(_HIT_PX) + s(_HANDLE_PX)
+        return math.hypot(c.x() - screen_pos.x(),
+                          c.y() - screen_pos.y()) <= tol
+
+    def _set_end_from_drag(self, sh: SketchShape, w: QPointF):
+        """Apply an end-marker drag: OPEN → trim-end anchor; CLOSED → set the
+        closure overlap = arc length from the seam to the cursor along the
+        ring (switches the shape to explicit 'distance' mode)."""
+        if _is_closed_outline(sh):
+            arr, cum = self._closed_ring(sh)
+            if arr is None:
+                return
+            samt = _project_arclen(arr, cum, (w.x(), w.y()))
+            sh.overlap_mode = "distance"
+            sh.overlap_distance_mm = round(max(0.0, float(samt)), 3)
+        else:
+            sh.end_point = (w.x(), w.y())
 
     def optimize(self, needle=None):
         """Reorder shapes + set start points to minimize print discontinuities
@@ -1369,6 +2118,10 @@ class SketchCanvas(QWidget):
             # resolve it onto the shape's own outline.
             sh.start_point = (w.x(), w.y())
             return
+        if k == "end":
+            # OPEN → trim-end anchor; CLOSED → closure-overlap arc length.
+            self._set_end_from_drag(sh, w)
+            return
         if k == "r":
             sh.radius = max(0.1, math.hypot(w.x() - sh.cx, w.y() - sh.cy))
         elif k == "rxry":
@@ -1421,9 +2174,39 @@ class SketchCanvas(QWidget):
         if sh is not None:
             self._snapshot()
             self._sketch.shapes.append(sh)
+            new_idx = len(self._sketch.shapes) - 1
+            # Auto-capture: endpoints that were drawn SNAPPED onto existing
+            # geometry become persistent constraints (joins stay joined).
+            end_hit = self._snap_hit
+            captured = False
+            if self._tool == Tool.LINE:
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, "p0", self._draw_start_hit)
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, "p1", end_hit)
+            elif self._tool == Tool.CIRCLE:
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, "center", self._draw_start_hit)
+            elif self._tool == Tool.RECT:
+                # Which corner the press/release points are depends on the
+                # drag direction: (left,top)→c0 (right,top)→c1
+                # (right,bottom)→c2 (left,bottom)→c3; b is a's diagonal.
+                a_corner = {(True, True): "c0", (False, True): "c1",
+                            (False, False): "c2", (True, False): "c3"}[
+                    (a.x() <= b.x(), a.y() <= b.y())]
+                b_corner = {"c0": "c2", "c1": "c3",
+                            "c2": "c0", "c3": "c1"}[a_corner]
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, a_corner, self._draw_start_hit)
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, b_corner, end_hit)
+            self._draw_start_hit = None
             # Select the new shape via the canonical setter so BOTH _selection
             # (highlight + handles) and _selected (props panel) stay in sync.
             self._set_selection({len(self._sketch.shapes) - 1})
+            if captured:
+                self.solve_constraints()
+                self.constraints_changed.emit()
             self.sketch_changed.emit()
         self.update()
 
@@ -1448,7 +2231,9 @@ class SketchCanvas(QWidget):
 
     def _commit_polygon(self):
         pts = list(self._poly_pts)
+        hits = list(self._poly_hits)
         self._poly_pts = []
+        self._poly_hits = []
         self._mode = None
         self._draw_cur = None
         if len(pts) >= 2:
@@ -1458,7 +2243,15 @@ class SketchCanvas(QWidget):
                              color=self._active_ink_color(),
                              line_width_mm=self._default_line_width)
             self._sketch.shapes.append(sh)
+            new_idx = len(self._sketch.shapes) - 1
+            captured = False
+            for k, hit in enumerate(hits[:len(pts)]):
+                captured |= self._maybe_add_snap_constraint(
+                    new_idx, f"p{k}", hit)
             self._set_selection({len(self._sketch.shapes) - 1})
+            if captured:
+                self.solve_constraints()
+                self.constraints_changed.emit()
             self.sketch_changed.emit()
         self.update()
 

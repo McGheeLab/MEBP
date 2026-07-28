@@ -8,7 +8,7 @@ duplicating detection, creation, or control logic.
 Usage::
 
     # In app.py (create once)
-    manager = CameraManager(max_cameras=3)
+    manager = CameraManager()  # slot count defaults to MAX_LIVE_CAMERAS
 
     # In any page
     manager.detect_cameras()
@@ -53,6 +53,13 @@ except ImportError:
     def detect_toupcam_cameras():
         return []
 
+# v7.5.x: default slot count follows the app-wide constant (3 → 4 for the
+# MONITOR overview camera) instead of a locally-hardcoded 3.
+try:
+    from SupportClasses.HardwareConfig import MAX_LIVE_CAMERAS
+except ImportError:
+    MAX_LIVE_CAMERAS = 4
+
 
 class CameraManager(QObject):
     """Central owner of all CameraWidget instances.
@@ -68,7 +75,7 @@ class CameraManager(QObject):
     camera_started = Signal(int)     # camera index
     camera_stopped = Signal(int)     # camera index
 
-    def __init__(self, max_cameras: int = 3, parent=None):
+    def __init__(self, max_cameras: int = MAX_LIVE_CAMERAS, parent=None):
         super().__init__(parent)
         self._max_cameras = max_cameras
         self._cameras: list[CameraWidget] = []
@@ -100,6 +107,16 @@ class CameraManager(QObject):
         # maps to the camera's lateral image axis, from the µm/px calibration.
         # None = not measured (needle aligner falls back to nominal mounting).
         self._rotation_deg: list[Optional[float]] = [None] * max_cameras
+        # v7.5.x: per-slot mirrored-view flag (horizontal flip). A mirror
+        # reverses image handedness, which rotation alone cannot express;
+        # flip-x + arbitrary rotation together span every camera orientation.
+        # Default False = identity click→stage mapping (legacy behaviour).
+        self._mirrored: list[bool] = [False] * max_cameras
+        # v7.5.x: per-slot VERTICAL flip (flip Y). Independent of the horizontal
+        # flip (``_mirrored`` = flip X); together with rotation they span every
+        # orientation as R(θ)·diag(sx, sy). Applied to the live display, the
+        # mosaic tiles, and the click→stage mapping — ONE unified system.
+        self._flip_y: list[bool] = [False] * max_cameras
 
         # Create camera widgets (headless — no built-in controls)
         if CAMERA_AVAILABLE and CameraWidget is not None:
@@ -163,6 +180,11 @@ class CameraManager(QObject):
         from gui.widgets.camera_widget import (
             detect_cameras as _probe_opencv, detect_toupcam_cameras,
         )
+        try:
+            from gui.widgets.camera_widget import detect_andor_cameras
+        except ImportError:
+            def detect_andor_cameras():
+                return []
         # DirectShow identity map (Windows; [] elsewhere) — also the labels.
         try:
             from gui.widgets.camera_identity import enumerate_directshow_cameras
@@ -177,7 +199,13 @@ class CameraManager(QObject):
         except Exception as exc:
             logger.debug(f"ToupCam enumeration skipped: {exc}")
             toupcam = []
-        probe = {"opencv": opencv_indices, "dshow": ds_cams, "toupcam": toupcam}
+        try:
+            andor = detect_andor_cameras()
+        except Exception as exc:
+            logger.debug(f"Andor enumeration skipped: {exc}")
+            andor = []
+        probe = {"opencv": opencv_indices, "dshow": ds_cams,
+                 "toupcam": toupcam, "andor": andor}
 
         # Use the first camera widget's refresh to populate from the inventory
         first = self._cameras[0]
@@ -281,13 +309,44 @@ class CameraManager(QObject):
     # ── Start / Stop ──────────────────────────────────────────────
 
     def start(self, cam_idx: int):
-        """Start camera at given index."""
+        """Start camera at given index (synchronous — blocks until the device is
+        open). Callers that need a frame immediately after (e.g. the mosaic
+        scan's ``get_current_frame`` / ``capture_fresh_frame``) rely on this.
+        For the startup auto-start, use ``start_async`` to avoid freezing the UI.
+        """
         if cam_idx < 0 or cam_idx >= len(self._cameras):
             return
         cam = self._cameras[cam_idx]
-        if not getattr(cam, '_running', False):
-            cam.start()
+        if getattr(cam, '_running', False) or getattr(cam, '_opening', False):
+            return
+        cam.start()
+        if getattr(cam, '_running', False):
             self.camera_started.emit(cam_idx)
+
+    def start_async(self, cam_idx: int):
+        """Start camera at given index WITHOUT blocking the GUI thread.
+
+        v7.5.x: the multi-second device open runs on a worker thread (see
+        ``CameraWidget.start_async``); ``camera_started`` is emitted from the
+        completion callback once the camera is actually running, so consumers
+        (preview state, hw-control restore) see the same signal as the sync path.
+        Used by the startup auto-start of saved cameras — the "camera boot-up
+        freezes the UI" bug. Falls back to the synchronous ``start`` on an older
+        widget without ``start_async``.
+        """
+        if cam_idx < 0 or cam_idx >= len(self._cameras):
+            return
+        cam = self._cameras[cam_idx]
+        if getattr(cam, '_running', False) or getattr(cam, '_opening', False):
+            return
+        if hasattr(cam, 'start_async'):
+            cam.start_async(
+                on_done=lambda ok, i=cam_idx: (
+                    self.camera_started.emit(i) if ok else None))
+        else:
+            cam.start()
+            if getattr(cam, '_running', False):
+                self.camera_started.emit(cam_idx)
 
     def stop(self, cam_idx: int):
         """Stop camera at given index."""
@@ -399,9 +458,13 @@ class CameraManager(QObject):
         return False
 
     def get_rotation_deg(self, cam_idx: int) -> Optional[float]:
-        """In-plane rotation (deg) measured for a slot, or None if unmeasured."""
-        if 0 <= cam_idx < self._max_cameras:
-            return self._rotation_deg[cam_idx]
+        """In-plane rotation (deg) measured for a slot, or None if unmeasured.
+
+        ``getattr``-guarded so lightweight ``__new__`` test doubles that omit
+        ``_rotation_deg`` never raise (mirrors ``get_mirrored`` / ``_widget``)."""
+        rot = getattr(self, "_rotation_deg", None)
+        if rot is not None and 0 <= cam_idx < len(rot):
+            return rot[cam_idx]
         return None
 
     def set_rotation_deg(self, cam_idx: int, value: Optional[float]):
@@ -409,6 +472,69 @@ class CameraManager(QObject):
         if 0 <= cam_idx < self._max_cameras:
             self._rotation_deg[cam_idx] = (
                 None if value is None else float(value))
+
+    def get_mirrored(self, cam_idx: int) -> bool:
+        """Whether the slot's view is mirrored (horizontal flip). Default False.
+
+        v7.5.x: delegates to the owning ``CameraWidget`` (which persists the
+        flag across stop/start and applies the flip at the frame source),
+        falling back to the local ``_mirrored`` cache for slots without a
+        widget / lightweight test doubles."""
+        cam = self._widget(cam_idx)
+        if cam is not None:
+            return bool(getattr(cam, "mirrored", False))
+        mir = getattr(self, "_mirrored", None)
+        if mir is not None and 0 <= cam_idx < len(mir):
+            return bool(mir[cam_idx])
+        return False
+
+    def set_mirrored(self, cam_idx: int, value: bool):
+        """Set the mirrored-view flag for a slot.
+
+        Delegates to the ``CameraWidget`` (which holds the flag; the frame is
+        NOT flipped there — orientation is applied per consumer), and keeps the
+        local cache in sync for no-widget slots / test doubles."""
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "set_mirrored"):
+            cam.set_mirrored(bool(value))
+        mir = getattr(self, "_mirrored", None)
+        if mir is not None and 0 <= cam_idx < len(mir):
+            mir[cam_idx] = bool(value)
+
+    def get_flip_y(self, cam_idx: int) -> bool:
+        """Whether the slot's view is flipped vertically (flip Y). Default False.
+        ``getattr``-guarded for lightweight ``__new__`` test doubles."""
+        fy = getattr(self, "_flip_y", None)
+        if fy is not None and 0 <= cam_idx < len(fy):
+            return bool(fy[cam_idx])
+        return False
+
+    def set_flip_y(self, cam_idx: int, value: bool):
+        """Set the vertical-flip (flip Y) flag for a slot."""
+        fy = getattr(self, "_flip_y", None)
+        if fy is not None and 0 <= cam_idx < len(fy):
+            fy[cam_idx] = bool(value)
+
+    def view_orientation(self, cam_idx: int) -> tuple[bool, float]:
+        """v7.5.x: ``(mirrored, rotation_deg)`` for a slot — the camera's
+        calibrated orientation, for correcting the DISPLAY (CameraFeedView) and
+        the mosaic. ``rotation_deg`` defaults to 0.0 when unmeasured.
+
+        NOTE: this 2-tuple is kept for back-compat; ``flip Y`` is a separate
+        field (``get_flip_y``) so callers must fetch it too. Prefer
+        ``full_orientation`` for all three at once."""
+        rot = self.get_rotation_deg(cam_idx)
+        return (bool(self.get_mirrored(cam_idx)),
+                float(rot) if rot is not None else 0.0)
+
+    def full_orientation(self, cam_idx: int) -> tuple[bool, bool, float]:
+        """v7.5.x: ``(flip_x, flip_y, rotation_deg)`` — the camera's full
+        calibrated orientation (flip_x == mirrored). ONE unified system applied
+        to the live display, the mosaic, and the click→stage mapping."""
+        rot = self.get_rotation_deg(cam_idx)
+        return (bool(self.get_mirrored(cam_idx)),
+                bool(self.get_flip_y(cam_idx)),
+                float(rot) if rot is not None else 0.0)
 
     def get_magnification(self, cam_idx: int) -> float:
         """Get objective magnification for a camera."""
@@ -429,8 +555,9 @@ class CameraManager(QObject):
     # /source-change), so these just delegate to it.
 
     def _widget(self, cam_idx: int):
-        if 0 <= cam_idx < len(self._cameras):
-            return self._cameras[cam_idx]
+        cams = getattr(self, "_cameras", None)
+        if cams and 0 <= cam_idx < len(cams):
+            return cams[cam_idx]
         return None
 
     def get_brightness(self, cam_idx: int) -> int:
@@ -560,6 +687,12 @@ class CameraManager(QObject):
         uncalibrated cameras are unaffected. The DISPLAYED frame is intentionally
         left un-rotated — only the click→stage mapping is corrected.
 
+        v7.5.x: frames are RAW (orientation is applied per consumer — the
+        display via ``CameraFeedView``, the mosaic via ``MosaicBuilder``), so
+        this maps a raw-frame click: mirror (``dx→−dx``) then ``R(θ)``. The
+        ``CameraFeedView`` click handler reports raw-frame pixel coords even
+        when its display is flipped/rotated, so the two stay consistent.
+
         Sign convention: ``θ = get_rotation_deg`` follows PixelCalibrationDialog's
         ``plus_column_direction_deg`` (the stage-plane angle, CCW from +X, that a
         stage move traces to +image-column). Inverting that measurement gives the
@@ -578,6 +711,17 @@ class CameraManager(QObject):
         cy = image_h / 2.0
         dx_px = px_x - cx
         dy_px = px_y - cy
+        # Mirrored view → horizontal parity flip BEFORE scaling/rotation
+        # (getattr-guarded for test doubles; None/False → no-op).
+        get_mir = getattr(self, "get_mirrored", None)
+        if callable(get_mir) and get_mir(cam_idx):
+            dx_px = -dx_px
+        # v7.5.x: vertical flip (flip Y) → parity flip on dy, BEFORE scale/rotate
+        # (getattr-guarded; False → no-op). Same diag(sx, sy) the display + mosaic
+        # apply, so a click on the live view maps to the correct stage XY.
+        get_fy = getattr(self, "get_flip_y", None)
+        if callable(get_fy) and get_fy(cam_idx):
+            dy_px = -dy_px
         dx_um = dx_px * um_per_px
         dy_um = dy_px * um_per_px
         # Apply the calibrated camera→stage rotation (getattr-guarded for test

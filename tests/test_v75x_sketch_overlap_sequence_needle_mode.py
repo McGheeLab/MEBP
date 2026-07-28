@@ -82,31 +82,44 @@ class TestOverlapClosureCompile(unittest.TestCase):
     def _sk(self, shapes):
         return Sketch(shapes=shapes, line_spacing_mm=0.4)
 
-    def test_overlap_adds_needle_radius_of_path(self):
+    def test_overlap_needle_adds_full_diameter_of_path(self):
+        # v7.5.x: "needle" overlap now overshoots one full needle OUTER Ø
+        # (the operator asked for "needle diameter"; the retired overlap_closure
+        # bool used the radius).
         n = _needle()
         base = compile_to_trajectory(
             self._sk([SketchShape(kind="circle", cx=0, cy=0, radius=5)]), n)
         ov = compile_to_trajectory(
             self._sk([SketchShape(kind="circle", cx=0, cy=0, radius=5,
-                                  overlap_closure=True)]), n)
+                                  overlap_mode="needle")]), n)
         self.assertAlmostEqual(ov.total_length_mm - base.total_length_mm,
-                               n.od_mm / 2.0, places=2)
+                               n.od_mm, places=2)
 
-    def test_overlap_falls_back_to_half_bead_without_needle(self):
+    def test_overlap_needle_falls_back_to_one_bead_without_needle(self):
         base = compile_to_trajectory(
             self._sk([SketchShape(kind="rect", cx=0, cy=0,
                                   width=10, height=10)]), None)
         ov = compile_to_trajectory(
             self._sk([SketchShape(kind="rect", cx=0, cy=0, width=10, height=10,
-                                  overlap_closure=True)]), None)
+                                  overlap_mode="needle")]), None)
         self.assertAlmostEqual(ov.total_length_mm - base.total_length_mm,
-                               0.4 / 2.0, places=2)
+                               0.4, places=2)
+
+    def test_overlap_distance_adds_typed_amount(self):
+        base = compile_to_trajectory(
+            self._sk([SketchShape(kind="circle", cx=0, cy=0, radius=5)]), None)
+        ov = compile_to_trajectory(
+            self._sk([SketchShape(kind="circle", cx=0, cy=0, radius=5,
+                                  overlap_mode="distance",
+                                  overlap_distance_mm=2.5)]), None)
+        self.assertAlmostEqual(ov.total_length_mm - base.total_length_mm,
+                               2.5, places=2)
 
     def test_overlap_noop_on_open_line(self):
         a = compile_to_trajectory(self._sk([_line(0, 0, 10, 0)]), _needle())
         b = compile_to_trajectory(
             self._sk([SketchShape(kind="line", points=[(0, 0), (10, 0)],
-                                  overlap_closure=True)]), _needle())
+                                  overlap_mode="needle")]), _needle())
         self.assertAlmostEqual(a.total_length_mm, b.total_length_mm, places=6)
 
     def test_overlap_noop_on_filled(self):
@@ -115,18 +128,25 @@ class TestOverlapClosureCompile(unittest.TestCase):
                                   filled=True)]), _needle())
         b = compile_to_trajectory(
             self._sk([SketchShape(kind="circle", cx=0, cy=0, radius=5,
-                                  filled=True, overlap_closure=True)]),
+                                  filled=True, overlap_mode="needle")]),
             _needle())
         self.assertAlmostEqual(a.total_length_mm, b.total_length_mm, places=6)
 
 
 class TestOverlapSerialize(unittest.TestCase):
 
-    def test_roundtrip_and_omitted_when_false(self):
-        on = SketchShape(kind="circle", overlap_closure=True)
-        self.assertTrue(SketchShape.from_dict(on.to_dict()).overlap_closure)
-        self.assertNotIn("overlap_closure",
-                         SketchShape(kind="circle").to_dict())
+    def test_roundtrip_and_omitted_when_none(self):
+        on = SketchShape(kind="circle", overlap_mode="distance",
+                         overlap_distance_mm=1.5)
+        rt = SketchShape.from_dict(on.to_dict())
+        self.assertEqual(rt.overlap_mode, "distance")
+        self.assertAlmostEqual(rt.overlap_distance_mm, 1.5)
+        self.assertNotIn("overlap_mode", SketchShape(kind="circle").to_dict())
+
+    def test_legacy_overlap_closure_migrates_to_needle(self):
+        rt = SketchShape.from_dict({"kind": "circle", "overlap_closure": True})
+        self.assertEqual(rt.overlap_mode, "needle")
+        self.assertNotIn("overlap_closure", rt.to_dict())
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -249,10 +269,13 @@ class TestReviewFixes(unittest.TestCase):
 
     def test_plan_mirrors_overlap_extended_exit(self):
         # Finding 2: a shape sitting at a closed loop's over-closure end welds in
-        # the plan only when overlap_closure is on (the exit extends past seam).
+        # the plan only when the closure overlap is on (the exit extends past
+        # the seam). Use a 0.36 mm distance overlap so the exit lands exactly at
+        # ``pt`` (independent of the needle Ø).
         pt = _line(4.987, 0.359, 4.987, 5.0, 0)  # ~0.36 mm arc past the seam
         ov = Sketch(shapes=[SketchShape(kind="circle", cx=0, cy=0, radius=5,
-                                        overlap_closure=True), pt],
+                                        overlap_mode="distance",
+                                        overlap_distance_mm=0.36), pt],
                     line_spacing_mm=0.4)
         no = Sketch(shapes=[SketchShape(kind="circle", cx=0, cy=0, radius=5),
                             pt], line_spacing_mm=0.4)
@@ -355,20 +378,22 @@ class TestPage(unittest.TestCase):
         rows[1].click()                            # 2nd section (shape 1)
         self.assertEqual(p._canvas.selected_indices(), [1])
 
-    def test_overlap_checkbox_only_for_closed_loops(self):
-        from PySide6.QtWidgets import QCheckBox
+    def test_closure_overlap_combo_only_for_closed_loops(self):
+        from PySide6.QtWidgets import QComboBox
+
+        def has_overlap_combo(page):
+            return any(cb.findData("needle") >= 0
+                       for cb in page._props_host.findChildren(QComboBox))
         p = self._page(_Cfg())
-        # Circle → overlap checkbox present.
+        # Circle → closure-overlap combo present.
         p._canvas.set_sketch(Sketch(shapes=[SketchShape(kind="circle",
                                                         cx=0, cy=0, radius=5)]))
         p._canvas.set_selected(0)
-        self.assertTrue(any("Overlap closure" in c.text()
-                            for c in p._props_host.findChildren(QCheckBox)))
-        # Line → no overlap checkbox.
+        self.assertTrue(has_overlap_combo(p))
+        # Line → no closure-overlap combo (open shape).
         p._canvas.set_sketch(Sketch(shapes=[_line(0, 0, 10, 0)]))
         p._canvas.set_selected(0)
-        self.assertFalse(any("Overlap closure" in c.text()
-                             for c in p._props_host.findChildren(QCheckBox)))
+        self.assertFalse(has_overlap_combo(p))
 
     def test_shape_is_closed_loop(self):
         from gui.pages.print_builder_sketch import SketchPage

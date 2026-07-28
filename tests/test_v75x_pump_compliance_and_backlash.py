@@ -263,6 +263,34 @@ class TestComplianceCalCard(unittest.TestCase):
         self.assertTrue(hasattr(page, "_compcal_btn_start"))
         self.assertEqual(page._compcal_phase, "prep")
 
+    def test_step_move_is_raw_no_settle_no_comp(self):
+        # The compliance step is the MEASURAND: it must issue a raw pump
+        # move — settle=False (no settle dwell) AND compensate=False (no
+        # backlash bracketing) — and wait for move completion itself so the
+        # busy-guard holds until the pump physically stops.
+        import time as _time
+        from PySide6.QtWidgets import QApplication
+        page = self._page(self._cal_ctrl())
+        ctrl = page.controller
+        calls, waits = [], []
+        ctrl.move_pump_uL = (
+            lambda pump, vol, rate_uL_s=None, **kw:
+                calls.append((pump, vol, rate_uL_s, dict(kw))))
+        ctrl._wait_pump_move_complete = (
+            lambda s: (waits.append(s), True)[1])
+        page._compcal_step_move(+1.0)
+        deadline = _time.monotonic() + 5.0
+        while page._compcal_busy and _time.monotonic() < deadline:
+            QApplication.processEvents()
+            _time.sleep(0.005)
+        QApplication.processEvents()
+        self.assertFalse(page._compcal_busy)
+        self.assertEqual(len(calls), 1)
+        _pump, _vol, _rate, kw = calls[0]
+        self.assertIs(kw.get("settle"), False)
+        self.assertIs(kw.get("compensate"), False)
+        self.assertEqual(len(waits), 1)  # completion drained in the worker
+
     def test_start_zeroes_counters(self):
         page = self._page(self._cal_ctrl())
         page._compcal_dispensed_uL = 1.5
@@ -396,10 +424,10 @@ class TestCalibrationTabRestructure(unittest.TestCase):
         self.assertEqual(
             titles,
             ["Needle Location", "Pump Compliance", "Plate Location",
-             "Plate Z Auto-Cal", "Custom"])
+             "Rosettes", "Plate Z Auto-Cal", "Custom"])
         self.assertNotIn("Needle Offset Calibration", titles)
         self.assertEqual(page._compcal_tab_index, 1)
-        self.assertEqual(page._zauto_tab_index, 3)
+        self.assertEqual(page._zauto_tab_index, 4)
         self.assertFalse(hasattr(page, "_zoff_tab_index"))
 
     def test_needle_offset_merged_into_needle_location(self):

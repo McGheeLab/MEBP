@@ -45,6 +45,7 @@ MOSAIC_SCAN_DEFAULTS: dict = {
     "spacing_um": 0,          # explicit grid spacing (µm); 0 = auto (FOV·(1−ov))
     "register": True,         # align tiles by phase correlation while stitching
     "max_shift_um": 0,        # bound on the per-tile alignment shift (µm); 0=auto
+    "reg_method": "fourier_mellin",  # pairwise registration method (see below)
     "cal_cols": 5,            # calibration mosaic grid columns
     "cal_rows": 5,            # calibration mosaic grid rows
 }
@@ -55,6 +56,13 @@ FRAME_ORIENT_OPTIONS = [
     ("rot180", "Rotate 180°"),
     ("fliph", "Flip horizontal"),
     ("flipv", "Flip vertical"),
+]
+
+# Pairwise registration method: stored value → display label.
+REG_METHOD_OPTIONS = [
+    ("fourier_mellin", "Fourier-Mellin (auto — rotation + scale + shift)"),
+    ("phase", "Phase correlation (auto — shift only)"),
+    ("off", "Off — manual / stage only"),
 ]
 
 
@@ -193,6 +201,15 @@ class MosaicScanSettingsDialog(QDialog):
         # ── Stitch alignment (registration) ─────────────────────────
         reg_box = QGroupBox("Stitch alignment")
         reg_form = QFormLayout(reg_box)
+        self._add_combo_row(
+            reg_form, "reg_method", "Registration method",
+            REG_METHOD_OPTIONS,
+            "How overlapping tiles are aligned after the scan. "
+            "Fourier-Mellin recovers rotation + scale + shift (most robust); "
+            "Phase correlation recovers shift only; Off does no auto-alignment "
+            "— the tiles are placed by the (accurate) stage and you correct by "
+            "hand with the manual-align sliders. Use Off as a backup when the "
+            "auto registration misbehaves.")
         self._add_check_row(
             reg_form, "register", "Global alignment",
             "Trust the (accurate) stage for relative tile placement, then "

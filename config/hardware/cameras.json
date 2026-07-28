@@ -13,6 +13,19 @@
       ],
       "interface": "USB 3.0",
       "notes": "10MP CMOS, 1/2.3 inch sensor, VID_0547 PID_1377"
+    },
+    "ZYLA-4.2P": {
+      "name": "Andor Zyla 4.2P (USB3)",
+      "sensor_pixel_size_um": 6.5,
+      "max_resolution": [2048, 2048],
+      "preview_resolutions": [
+        [1024, 1024],
+        [512, 512],
+        [256, 256],
+        [2048, 2048]
+      ],
+      "interface": "USB 3.0",
+      "notes": "ANDOR ZYLA-4.2P-USB3-2V3 sCMOS, 6.5 um pixel, mono 16-bit. Preview resolutions are on-sensor binning presets (2x2/4x4/8x8/1x1). BINNED 1024x1024 is listed FIRST on purpose: it is the default live-preview mode — full 2048x2048 (1x1) is heavy for a live feed (large frames + ~840MB ring buffer). Driven via Andor SDK3 (pylablib); see gui/widgets/andor_backend.py."
     }
   }
 }

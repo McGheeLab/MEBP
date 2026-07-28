@@ -620,29 +620,29 @@ class _MosaicScanWorker(QThread):
         self._settle_ms = max(0, int(settle_ms))
         self._detect_param2 = float(detect_param2)
         self._detect_tolerance = float(detect_tolerance)
-        # Per-tile transform to align the camera frame with the stage axes when
-        # the camera is mounted rotated/mirrored (else neighbouring tiles don't
-        # line up). "none" | "rot180" | "fliph" | "flipv".
-        self._frame_orient = str(frame_orient or "none")
+        # v7.5.x: RETIRED. Tile orientation is now applied by the builder's
+        # calibrated ``_orient_tile`` (rotation + flip X + flip Y, MEASURED from
+        # stage motion and read from the per-camera ground-truth store). The old
+        # coarse "rot180/fliph/flipv" per-tile dropdown STACKED on top of that —
+        # e.g. a stale ``frame_orient="rot180"`` double-rotated the WHOLE-plate
+        # scan while the calibration dialog (built with settings={} → "none")
+        # came out right, the exact "calibration correct, full plate wrong"
+        # report. The param is kept for construction back-compat but no longer
+        # applied (``_orient_frame`` is a no-op); the builder owns orientation.
+        self._frame_orient = "none"
         self._stop = False
 
     def stop(self):
         self._stop = True
 
     def _orient_frame(self, frame):
-        """Apply the configured camera-mount transform to a captured frame."""
-        if frame is None or self._frame_orient == "none":
-            return frame
-        try:
-            import cv2
-            if self._frame_orient == "rot180":
-                return cv2.rotate(frame, cv2.ROTATE_180)
-            if self._frame_orient == "fliph":
-                return cv2.flip(frame, 1)
-            if self._frame_orient == "flipv":
-                return cv2.flip(frame, 0)
-        except Exception:
-            pass
+        """RETIRED (v7.5.x) — returns the frame unchanged.
+
+        Tile orientation is now applied ONCE by the builder's calibrated
+        ``_orient_tile`` (rotation + flip X + flip Y from the ground-truth store).
+        Applying a coarse per-tile transform here as well double-oriented the
+        full-plate mosaic. Kept as a no-op so any lingering caller is harmless.
+        """
         return frame
 
     def _grab_post_move_frame(self):
@@ -705,8 +705,14 @@ class _MosaicScanWorker(QThread):
                         # First tile: full safe travel — retract Z to safe AND
                         # confirm, then XY. Establishes the constant safe Z (the
                         # page also pre-retracts before the worker starts).
+                        # v7.5.x: apply_insert_floor=False — the scan images
+                        # from overhead at the operator's assigned safe Z and
+                        # NEVER descends, so the tube-clearance floor (which
+                        # would otherwise raise/clamp the retract above the
+                        # assigned safe Z on a rosette plate) is not applied.
                         self._controller.safe_travel_to(
-                            tx, ty, safe_z_mm=self._safe_z, target_z_mm=None)
+                            tx, ty, safe_z_mm=self._safe_z, target_z_mm=None,
+                            apply_insert_floor=False)
                     else:
                         # Z is already at safe and never changes during the
                         # raster (the microscope images from overhead), so do a
@@ -751,7 +757,10 @@ class _MosaicScanWorker(QThread):
                     sy = xy[1] if xy and xy[1] is not None else ty
                 except Exception:
                     sx, sy = tx, ty
-                frame = self._orient_frame(frame)
+                # v7.5.x: DO NOT coarse-orient here — the builder applies the
+                # calibrated (rotation, flip X, flip Y) per tile via _orient_tile.
+                # Orienting the raw frame first double-oriented the mosaic (a stale
+                # frame_orient="rot180" was the "full plate wrong" bug).
                 self._builder.add_raster_frame(frame, sx, sy, index=idx)
                 self._builder.stitch_incremental()
                 comp = self._builder.composite
@@ -763,6 +772,21 @@ class _MosaicScanWorker(QThread):
             if self._stop:
                 # Cancelled — the GUI already cleaned up; emit nothing.
                 return
+
+            # v7.5.x: FULL pairwise + global least-squares registration over the
+            # retained canvas-res tiles, re-blending at globally-consistent
+            # positions (stage-drift / backlash tolerant). Best-effort — a
+            # degenerate solve is a no-op that keeps the open-loop composite.
+            try:
+                if (hasattr(self._builder, "optimize_registration")
+                        and self._builder.has_reorient_tiles()):
+                    _c, _n_edges, _corr = self._builder.optimize_registration()
+                    if _n_edges:
+                        logger.info(
+                            f"Mosaic registration: {_n_edges} overlaps, "
+                            f"max correction {_corr:.1f}px")
+            except Exception as e:
+                logger.debug(f"Mosaic global optimize skipped: {e}")
 
             # Aggregate the per-overlap measurements into ONE global alignment
             # shift (median, bounded) applied uniformly via canvas_extent_um —
@@ -805,7 +829,15 @@ class _MosaicScanWorker(QThread):
             # overlay/save step (which fixes the post-build lag from memory
             # pressure). Best-effort — never block the result.
             try:
-                self._builder.free_accumulators()
+                # v7.5.x: this scan retained canvas-res tiles for the global
+                # optimize — free them AND the accumulators now (free_reorient),
+                # keeping only the finished uint8 display cache. Falls back to
+                # free_accumulators when the builder didn't retain tiles.
+                if getattr(self._builder, "has_reorient_tiles",
+                           lambda: False)():
+                    self._builder.free_reorient()
+                else:
+                    self._builder.free_accumulators()
             except Exception:
                 pass
             self.finished_ok.emit(
@@ -943,9 +975,12 @@ class _AutoReanchorWorker(QThread):
         try:
             ok = True
             try:
+                # v7.5.x: imaging-height re-anchor travel — honor the exact
+                # assigned safe Z (skip the tube-clearance floor; never descends).
                 ok = self._controller.safe_travel_to(
                     self._target_um[0], self._target_um[1],
-                    safe_z_mm=self._safe_z, target_z_mm=None)
+                    safe_z_mm=self._safe_z, target_z_mm=None,
+                    apply_insert_floor=False)
             except Exception as e:
                 self.failed.emit(f"travel failed: {e}")
                 return
@@ -1507,6 +1542,9 @@ class CalibrationPage(QWidget):
                     except Exception as e:
                         logger.debug(
                             f"PlateZAutoCal: live view rebind failed: {e}")
+            # v7.5.x: correct the microscope feed for its calibrated
+            # mirror + rotation (upright, un-mirrored view).
+            self._ploc_apply_feed_orientation()
 
         # v7.5.x: push the permanent reference markers (taught well centres)
         # to the plate view (zero-ref µm) and the live microscope overlay
@@ -2562,15 +2600,27 @@ class CalibrationPage(QWidget):
         def _worker():
             ok = True
             try:
-                # compensate=False: we are MEASURING the compliance, so the
-                # calibration move must not itself apply backlash comp.
-                ctrl.move_pump_uL(pump, vol, rate_uL_s=rate,
-                                  settle=True, compensate=False)
-            except TypeError:
+                # compensate=False + settle=False: we are MEASURING the
+                # compliance, so the calibration move must not itself apply
+                # backlash comp or the settle dwell — a raw plunger step is
+                # the measurand.
                 try:
+                    ctrl.move_pump_uL(pump, vol, rate_uL_s=rate,
+                                      settle=False, compensate=False)
+                except TypeError:
+                    # Older/fake controller without the kwargs.
                     ctrl.move_pump_uL(pump, vol, rate_uL_s=rate)
+                # settle=False also skips the completion block, so wait for
+                # the move to drain here (the busy-guard / done signal must
+                # not fire while the pump is still moving).
+                est_s = step / max(rate, 0.001) + 0.1
+                wait = getattr(ctrl, "_wait_pump_move_complete", None)
+                try:
+                    confirmed = wait(est_s) if callable(wait) else None
                 except Exception:
-                    ok = False
+                    confirmed = None
+                if confirmed is None:
+                    time.sleep(min(est_s, 30.0))
             except Exception:
                 ok = False
             self._compcal_bridge.done.emit(ok, pump)
@@ -3696,11 +3746,12 @@ class CalibrationPage(QWidget):
         outer.setSpacing(s(8))
 
         intro = QLabel(
-            "Calibrate rosette SUB-WELL locations from a single-well mosaic. "
-            "Plate-level mapping (Plate Location tab) places only the MAIN "
-            "wells; here you scan one rosette-assigned well at high "
-            "resolution, click the pattern centre, and refine each sub-well. "
-            "Requires the plate map (run Plate Location first).")
+            "Calibrate rosette SUB-WELL locations. Plate-level mapping (Plate "
+            "Location tab) places only the MAIN wells. Either scan one "
+            "rosette-assigned well at high resolution and map its sub-wells on "
+            "the mosaic, OR skip the scan and pick each sub-well centre "
+            "directly from the live feed. Requires the plate map (run Plate "
+            "Location first).")
         intro.setWordWrap(True)
         intro.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {scaled_font_size(9)}pt;")
@@ -3738,7 +3789,49 @@ class CalibrationPage(QWidget):
         self._rosette_status.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {scaled_font_size(9)}pt;")
         grid.addWidget(self._rosette_status, 2, 0, 1, 2)
+        # v7.5.x: no-scan alternative — pick each sub-well centre from the live
+        # feed directly (jog it under the crosshair, click, confirm).
+        self._rosette_btn_live = QPushButton(
+            "Select centers from live feed (no scan)")
+        self._rosette_btn_live.setToolTip(
+            "Skip the mosaic scan: jog the stage so each sub-well is centered "
+            "in the live microscope view, click its centre, and confirm. "
+            "Records each sub-well's calibrated position directly.")
+        self._rosette_btn_live.clicked.connect(self._rosette_start_live_select)
+        grid.addWidget(self._rosette_btn_live, 3, 0, 1, 2)
         outer.addWidget(box)
+
+        # Live-feed manual sub-well centering flow (hidden until started).
+        self._rosette_live_box = QGroupBox("Live-feed sub-well centering")
+        lv = QVBoxLayout(self._rosette_live_box)
+        lv.setContentsMargins(s(8), s(6), s(8), s(6))
+        lv.setSpacing(s(6))
+        self._rosette_live_hint = QLabel("")
+        self._rosette_live_hint.setWordWrap(True)
+        self._rosette_live_hint.setStyleSheet(
+            f"color: {COLORS['text']}; font-size: {scaled_font_size(9)}pt;")
+        lv.addWidget(self._rosette_live_hint)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(s(6))
+        self._rosette_live_confirm = QPushButton("Confirm && Next")
+        self._rosette_live_confirm.setToolTip(
+            "Save the clicked centre for this sub-well and move to the next.")
+        self._rosette_live_confirm.clicked.connect(
+            self._rosette_live_confirm_next)
+        self._rosette_live_skip = QPushButton("Skip well")
+        self._rosette_live_skip.setToolTip(
+            "Leave this sub-well uncalibrated and move to the next.")
+        self._rosette_live_skip.clicked.connect(self._rosette_live_skip_well)
+        self._rosette_live_cancel = QPushButton("Finish / Cancel")
+        self._rosette_live_cancel.setToolTip(
+            "End the flow (already-confirmed sub-wells are kept).")
+        self._rosette_live_cancel.clicked.connect(self._rosette_live_finish)
+        btn_row.addWidget(self._rosette_live_confirm)
+        btn_row.addWidget(self._rosette_live_skip)
+        btn_row.addWidget(self._rosette_live_cancel)
+        lv.addLayout(btn_row)
+        self._rosette_live_box.setVisible(False)
+        outer.addWidget(self._rosette_live_box)
         outer.addStretch(1)
 
         scroll = QScrollArea()
@@ -3759,6 +3852,8 @@ class CalibrationPage(QWidget):
             label="Microscope feed — starts when this tab is shown "
                   "(or start it on the Cameras tab)",
         )
+        # v7.5.x: live click → sub-well centre (no-scan flow only).
+        self._rosette_live_view.clicked.connect(self._rosette_on_live_click)
         live_lay.addWidget(self._rosette_live_view, stretch=1)
         split.addWidget(live_group)
         split.setStretchFactor(0, 0)
@@ -3887,6 +3982,243 @@ class CalibrationPage(QWidget):
             self._camera_manager.start(cam_idx)
         except Exception as e:
             logger.debug(f"Rosettes: live camera start failed: {e}")
+
+    # ── v7.5.x: no-scan live-feed sub-well centering ──────────────────
+    def _rosette_start_live_select(self) -> None:
+        """Begin the no-scan flow: for each sub-well of the selected rosette,
+        the stage travels (retract-first) to its predicted centre, the operator
+        jogs it exactly under the crosshair and clicks its centre in the live
+        feed, then Confirm records that sub-well's calibrated position — no
+        mosaic scan involved."""
+        if self._ploc_running or getattr(self, "_ploc_mosaic_running", False):
+            QMessageBox.information(
+                self, "Rosettes",
+                "Another operation is already running on this tab.")
+            return
+        if getattr(self, "_rosette_live_active", False):
+            return
+        combo = getattr(self, "_rosette_well_combo", None)
+        parent = combo.currentData() if combo is not None else None
+        if not parent:
+            QMessageBox.information(
+                self, "Rosettes",
+                "No rosette wells in the active plate. Add a rosette to a "
+                "well in the plate designer (Hardware Setup → Plate) first.")
+            return
+        try:
+            subs = [w.name for w in self._plate.get_all_wells()
+                    if getattr(w, "is_subwell", False)
+                    and getattr(w, "parent_well", None) == parent]
+        except Exception:
+            subs = []
+        if not subs:
+            QMessageBox.information(
+                self, "Rosettes", f"{parent} has no sub-wells to calibrate.")
+            return
+        # A live-camera click → stage µm needs a calibrated microscope µm/px.
+        mgr = self._camera_manager
+        cam_idx = getattr(self, "_ploc_live_cam_idx", 0)
+        if mgr is None or not (
+                hasattr(mgr, "is_um_per_px_calibrated")
+                and mgr.is_um_per_px_calibrated(cam_idx)):
+            QMessageBox.warning(
+                self, "Rosettes",
+                "The microscope camera has no µm/px calibration — calibrate the "
+                "objective (Hardware Setup → Cameras) before selecting centres "
+                "from the live feed.")
+            return
+        # Safety: a retract-first hop to each sub-well needs a known Safe Z.
+        if (getattr(self.controller, "is_zp_connected", False)
+                and getattr(self, "_safe_z", None) is None):
+            QMessageBox.warning(
+                self, "Rosettes",
+                "Set the Fast Move (Safe) Z on the Needle Offset tab first so "
+                "the needle can retract before traveling between sub-wells.")
+            return
+        # Positions are needed to travel to each sub-well's predicted centre.
+        if not (self._calibrated_positions or self._predicted_positions):
+            try:
+                self._compute_predicted_positions()
+            except Exception:
+                pass
+        self._rosette_ensure_live_camera()
+        self._rosette_live_active = True
+        self._rosette_live_parent = parent
+        self._rosette_live_subwells = subs
+        self._rosette_live_idx = 0
+        self._rosette_live_results = {}
+        self._rosette_live_pending = None
+        self._rosette_live_box.setVisible(True)
+        for b in (getattr(self, "_rosette_btn_scan", None),
+                  getattr(self, "_rosette_btn_map", None),
+                  getattr(self, "_rosette_btn_live", None)):
+            if b is not None:
+                b.setEnabled(False)
+        if combo is not None:
+            combo.setEnabled(False)
+        self._rosette_live_goto_current()
+
+    def _rosette_live_goto_current(self) -> None:
+        """Travel (retract-first) to the current sub-well's predicted centre so
+        the operator starts near it, then refresh the hint/buttons."""
+        subs = getattr(self, "_rosette_live_subwells", [])
+        idx = getattr(self, "_rosette_live_idx", 0)
+        if idx >= len(subs):
+            self._rosette_live_finish()
+            return
+        self._rosette_live_pending = None
+        try:
+            self._rosette_live_view.set_overlay_vector(None, None)
+        except Exception:
+            pass
+        name = subs[idx]
+        # Resolve a predicted centre to start near: prefer any known position
+        # for this sub-well (calibrated first, then geometry-predicted) before
+        # falling back to _predict_well_xy (whose parent-relative geometry leg
+        # can't resolve a flattened rosette sub-well).
+        pos = None
+        for d in (self._calibrated_positions, self._predicted_positions):
+            if d and name in d:
+                pos = d[name]
+                break
+        if pos is None:
+            try:
+                pos = self._predict_well_xy(name)
+            except Exception:
+                pos = None
+        if pos is not None:
+            try:
+                self._ploc_safe_goto(float(pos[0]), float(pos[1]))
+            except Exception as e:
+                logger.warning(
+                    f"Rosettes: travel to {name} failed ({e}); jog manually.")
+        self._rosette_live_update_hint()
+
+    def _rosette_live_update_hint(self) -> None:
+        hint = getattr(self, "_rosette_live_hint", None)
+        if hint is None:
+            return
+        subs = getattr(self, "_rosette_live_subwells", [])
+        idx = getattr(self, "_rosette_live_idx", 0)
+        done = len(getattr(self, "_rosette_live_results", {}))
+        if idx >= len(subs):
+            hint.setText("All sub-wells done.")
+            return
+        name = subs[idx]
+        base = (f"Sub-well {name}  ({idx + 1}/{len(subs)}, {done} saved). "
+                f"Jog it under the crosshair and click its centre in the "
+                f"live feed.")
+        if getattr(self, "_rosette_live_pending", None) is not None:
+            base = (f"Sub-well {name}  ({idx + 1}/{len(subs)}, {done} saved) — "
+                    f"centre captured. Click “Confirm & Next” to save, or "
+                    f"click again in the live feed to re-pick.")
+        hint.setText(base)
+        confirm = getattr(self, "_rosette_live_confirm", None)
+        if confirm is not None:
+            confirm.setEnabled(
+                getattr(self, "_rosette_live_pending", None) is not None)
+
+    def _rosette_on_live_click(self, px_x: float, px_y: float) -> None:
+        """Live-feed click during the no-scan flow → capture the sub-well centre
+        in absolute stage µm (pending until Confirm). No-op otherwise."""
+        if not getattr(self, "_rosette_live_active", False):
+            return
+        mgr = self._camera_manager
+        view = getattr(self, "_rosette_live_view", None)
+        if mgr is None or view is None:
+            return
+        img_w, img_h = view.image_size
+        if not img_w or not img_h:
+            return
+        cam_idx = getattr(self, "_ploc_live_cam_idx", 0)
+        dx_um, dy_um = mgr.pixel_to_stage_offset(
+            cam_idx, px_x, px_y, img_w, img_h)
+        xy = self.controller.get_xy_position(cached=False)
+        if xy is None or xy[0] is None:
+            QMessageBox.warning(
+                self, "Rosettes", "Could not read current stage position.")
+            return
+        # get_xy_position is absolute stage µm (same frame as _predict_well_xy /
+        # move_xy_absolute_um); the click offset is added directly.
+        sx = float(xy[0]) + dx_um
+        sy = float(xy[1]) + dy_um
+        self._rosette_live_pending = (sx, sy)
+        try:
+            view.set_overlay_vector(
+                px_x - img_w / 2.0, px_y - img_h / 2.0, "✓")
+        except Exception:
+            pass
+        self._rosette_live_update_hint()
+
+    def _rosette_live_confirm_next(self) -> None:
+        """Record the pending centre for the current sub-well, then advance."""
+        pending = getattr(self, "_rosette_live_pending", None)
+        subs = getattr(self, "_rosette_live_subwells", [])
+        idx = getattr(self, "_rosette_live_idx", 0)
+        if pending is None or idx >= len(subs):
+            return
+        name = subs[idx]
+        cx, cy = float(pending[0]), float(pending[1])
+        self._rosette_live_results[name] = (cx, cy)
+        # Merge into the calibration exactly like the mosaic sub-well mapping:
+        # calibrated position + permanent reference marker + affine teach point.
+        if self._calibrated_positions is None:
+            self._calibrated_positions = {}
+        self._calibrated_positions[name] = (cx, cy)
+        self._ploc_well_results[name] = (cx, cy)
+        self._reference_markers[name] = (cx, cy)
+        logger.info(
+            f"Rosettes: live-feed centre {name} → ({cx:.1f}, {cy:.1f}) µm")
+        self._rosette_live_pending = None
+        self._rosette_live_idx += 1
+        try:
+            self._emit_calibration_data_changed()
+        except Exception:
+            pass
+        self._rosette_live_goto_current()
+
+    def _rosette_live_skip_well(self) -> None:
+        """Leave the current sub-well uncalibrated and advance."""
+        if not getattr(self, "_rosette_live_active", False):
+            return
+        self._rosette_live_pending = None
+        self._rosette_live_idx = getattr(self, "_rosette_live_idx", 0) + 1
+        self._rosette_live_goto_current()
+
+    def _rosette_live_finish(self) -> None:
+        """End the no-scan flow; already-confirmed sub-wells are kept/saved."""
+        self._rosette_live_active = False
+        self._rosette_live_pending = None
+        box = getattr(self, "_rosette_live_box", None)
+        if box is not None:
+            box.setVisible(False)
+        try:
+            self._rosette_live_view.set_overlay_vector(None, None)
+        except Exception:
+            pass
+        combo = getattr(self, "_rosette_well_combo", None)
+        if combo is not None:
+            combo.setEnabled(True)
+        btn = getattr(self, "_rosette_btn_live", None)
+        if btn is not None:
+            btn.setEnabled(True)
+        n = len(getattr(self, "_rosette_live_results", {}))
+        if n:
+            # Persist immediately (debounced autosave also fires via the emit).
+            try:
+                self._save_calibration()
+            except Exception:
+                pass
+            try:
+                self._refresh_ploc_view()
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "Rosettes",
+                f"Saved {n} sub-well centre(s) for "
+                f"{getattr(self, '_rosette_live_parent', '')} from the live "
+                f"feed.")
+        self._rosette_refresh_wells()
 
     def _build_plate_z_autocal_tab(self) -> QWidget:
         """Workflow tab (after Plate Location): focus-based per-well Z-bottom
@@ -5541,8 +5873,22 @@ class CalibrationPage(QWidget):
             if self._ploc_live_view.cam_idx != cam_idx:
                 self._ploc_live_view.set_camera(cam_idx)
             self._camera_manager.start(cam_idx)
+            self._ploc_apply_feed_orientation()
         except Exception as e:
             logger.debug(f"PlateLocation: live camera start failed: {e}")
+
+    def _ploc_apply_feed_orientation(self) -> None:
+        """v7.5.x: correct the live microscope feed for the camera's calibrated
+        mirror + rotation so the operator sees an upright, un-mirrored view
+        (clicks are inverted back to raw coords, so mapping is unaffected)."""
+        lv = getattr(self, "_ploc_live_view", None)
+        if lv is None or not hasattr(lv, "set_view_orientation"):
+            return
+        rot, mir, fy = self._ploc_microscope_frame_orientation()
+        try:
+            lv.set_view_orientation(mir, rot, fy)
+        except Exception as e:
+            logger.debug(f"PlateLocation: feed orientation failed: {e}")
 
     def _ploc_confirm_objective(self, cam_idx: int, um_per_px: float) -> bool:
         """Make the operator confirm the objective in use matches the one
@@ -5567,8 +5913,13 @@ class CalibrationPage(QWidget):
         cal_note = ""
         try:
             from SupportClasses.ObjectiveCalibration import get_store
-            model = self._get_camera_model_for_idx(cam_idx)
-            cal = get_store().get_calibration(model, obj_name)
+            # Use the SAME key the objective card WRITES and the mosaic FOV READS
+            # (camera_spec.name), NOT the extracted model token — else a freshly
+            # stored calibration is missed and this warns falsely (operator: "I
+            # literally just calibrated it with the same camera and objective").
+            spec2 = getattr(cam_cfg, "camera_spec", None) if cam_cfg else None
+            model = str(getattr(spec2, "name", "") or "")
+            cal = get_store().get_calibration(model, obj_name) if model else None
             if cal:
                 cal_note = (
                     f"\nStored calibration: "
@@ -6113,6 +6464,67 @@ class CalibrationPage(QWidget):
                 return None
         return None
 
+    def _ploc_microscope_frame_orientation(self):
+        """v7.5.x: the microscope camera's calibrated ``(rotation_deg, flip_x,
+        flip_y)`` vs the stage axes, for orienting mosaic tiles into the stage
+        frame — the SAME unified orientation the live feed applies via
+        ``CameraFeedView.set_view_orientation`` and clicks via
+        ``pixel_to_stage_offset``. ``flip_x`` == the mirror flag.
+
+        Returns ``(0.0, False, False)`` when unknown so the mosaic build is a
+        no-op (byte-identical legacy placement).
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        cam_idx = self._ploc_microscope_cam_idx()
+        if mgr is None or cam_idx is None:
+            return 0.0, False, False
+        # Per-field precedence: the PERSISTED per-identity CameraCalibrationStore
+        # value (what the operator set on the camera slot / correction) is GROUND
+        # TRUTH — it survives navigating away from the Hardware Setup page, unlike
+        # the live manager which can come up UN-SYNCED. The live manager fills any
+        # field the store lacks.
+        rot_store = mir_store = fy_store = None
+        try:
+            ident = mgr.camera_identity(cam_idx)
+            if ident and ident[0]:
+                from SupportClasses.CameraCalibrationStore import get_store
+                entry = get_store().get_calibration(ident[0])
+                if entry:
+                    if entry.get("rotation_deg") is not None:
+                        rot_store = float(entry["rotation_deg"])
+                    if "mirrored" in entry:
+                        mir_store = bool(entry["mirrored"])
+                    if "flip_y" in entry:
+                        fy_store = bool(entry["flip_y"])
+        except Exception:
+            pass
+        rot_mgr = mir_mgr = fy_mgr = None
+        try:
+            r = mgr.get_rotation_deg(cam_idx)
+            rot_mgr = float(r) if r is not None else None
+        except Exception:
+            rot_mgr = None
+        try:
+            mir_mgr = bool(mgr.get_mirrored(cam_idx))
+        except Exception:
+            mir_mgr = None
+        try:
+            gfy = getattr(mgr, "get_flip_y", None)
+            fy_mgr = bool(gfy(cam_idx)) if callable(gfy) else None
+        except Exception:
+            fy_mgr = None
+        rot = (rot_store if rot_store is not None
+               else (rot_mgr if rot_mgr is not None else 0.0))
+        mir = (mir_store if mir_store is not None
+               else (mir_mgr if mir_mgr is not None else False))
+        fy = (fy_store if fy_store is not None
+              else (fy_mgr if fy_mgr is not None else False))
+        logger.info(
+            f"Mosaic orientation: rotation {rot:.1f}°, flip_x {mir}, "
+            f"flip_y {fy} (rotation from "
+            f"{'store' if rot_store is not None else 'manager'})")
+        return float(rot), bool(mir), bool(fy)
+
     def _ploc_microscope_um_per_px(self, frame_w, fallback):
         """µm/px for the microscope at the CURRENT capture width.
 
@@ -6365,19 +6777,37 @@ class CalibrationPage(QWidget):
         target_px = int(cfg.get("target_px", 3000))
         align_store = self._ploc_mosaic_align_store()
         align_key = self._ploc_camera_objective_key()
-        # Effective µm/px: explicit FOV override > LEARNED (Quick FOV calibration
-        # or a prior mosaic for this camera+objective) > camera µm/px. The
-        # learned value sizes tiles correctly so the live registration has very
-        # little to correct.
+        # Effective µm/px: explicit FOV override > LEARNED "Store FOV/spacing"
+        # refinement > the camera/objective calibration. v7.5.x — BOTH the
+        # learned value and the objective value are now rescaled to THIS scan's
+        # frame width (µm/px ∝ 1/width) so the FOV matches the real pixels; and
+        # a fresh objective/scale calibration CLEARS the learned value (see
+        # ObjectiveCalibrationCard), so a re-calibration is no longer shadowed by
+        # a stale "Store FOV/spacing" value — the operator's #2 complaint.
         fov_um = float(cfg.get("fov_um", 0) or 0)
         if fov_um > 0 and fw > 0:
             eff_um_per_px = fov_um / fw
         else:
-            learned = (align_store.get_um_per_px(align_key)
-                       if align_store is not None else None)
-            # Resolution-scaled objective µm/px (fixes the FOV when the camera's
-            # capture resolution differs from the objective-calibration one).
-            cam_um = self._ploc_microscope_um_per_px(fw, um_per_px)
+            # Camera/objective µm/px, resolution-rescaled; the fallback is the
+            # manager's resolution-aware value (not the raw stored one) so it is
+            # correct even when the objective-store read misses.
+            try:
+                eff_fallback = float(
+                    self._camera_manager.effective_um_per_px(cam_idx, fw))
+                if not (eff_fallback > 0):
+                    eff_fallback = um_per_px
+            except Exception:
+                eff_fallback = um_per_px
+            cam_um = self._ploc_microscope_um_per_px(fw, eff_fallback)
+            # A manual "Store FOV/spacing" refinement overrides ONLY when present,
+            # rescaled from the resolution it was captured at.
+            learned = None
+            if align_store is not None:
+                lv = align_store.get_um_per_px(align_key)
+                if lv and lv > 0:
+                    lres = align_store.get_resolution(align_key)
+                    learned = (lv * float(lres[0]) / float(fw)
+                               if (lres and lres[0] and fw > 0) else lv)
             eff_um_per_px = learned if (learned and learned > 0) else cam_um
         # Pre-seed the learned global-registration shift so the mosaic is
         # registered from the first tile; finalize refines it.
@@ -6403,15 +6833,41 @@ class CalibrationPage(QWidget):
         spacing_um = float(cfg.get("spacing_um", 0) or 0)
         register = bool(cfg.get("register", True))
         max_shift_um = float(cfg.get("max_shift_um", 0) or 0)
+        # v7.5.x: pairwise registration method — "fourier_mellin" (default,
+        # rotation+scale+translation) | "phase" | "off" (manual/stage-only).
+        reg_method = str(cfg.get("reg_method", "fourier_mellin") or
+                         "fourier_mellin")
+        # v7.5.x: orient tiles into the stage frame using the microscope
+        # camera's calibrated rotation + flip X (mirror) + flip Y (all applied
+        # per-tile by MosaicBuilder._orient_tile), so the composite is
+        # stage-aligned and mosaic clicks back-project to the correct XY.
+        # (0°, no flips → no-op.)
+        frame_rot, frame_mir, frame_fy = \
+            self._ploc_microscope_frame_orientation()
         builder = MosaicBuilder(
             frame_size_px=(fw, fh), micron_per_pixel=eff_um_per_px,
             overlap=overlap_frac, target_mosaic_px=target_px,
             register=register, max_shift_um=max_shift_um,
             initial_shift_um=init_shift,
+            frame_rotation_deg=frame_rot, frame_mirrored=frame_mir,
+            frame_flip_y=frame_fy,
             # v7.5.x: full-plate scan can be hundreds of tiles — free each raw
             # frame after it's blended so RAM stays bounded (this path consumes
             # only the live ``.composite`` display cache, never re-blends).
-            retain_frames=False)
+            retain_frames=False,
+            # v7.5.x: keep the SMALL canvas-res tiles so the post-scan
+            # optimize_registration (full pairwise + global least-squares) can
+            # re-blend at globally-consistent positions. Freed right after
+            # (free_reorient) — bounded memory, unlike retaining raw frames.
+            retain_for_reorient=True,
+            registration_method=reg_method)
+        # Confirm exactly what the scan applied (operator diagnostic for "the
+        # scan didn't apply the rotations and scales needed").
+        logger.info(
+            f"Mosaic scan applying: resolution {fw}x{fh}px · µm/px "
+            f"{eff_um_per_px:.4f} · FOV {fw * eff_um_per_px:.0f}x"
+            f"{fh * eff_um_per_px:.0f}µm · rotation {frame_rot:.1f}° · mirror "
+            f"{frame_mir} · registration '{reg_method}'")
         # Raster spaced by the camera FOV at the configured overlap, or by the
         # explicit grid spacing when set.
         step = spacing_um if spacing_um > 0 else None
@@ -6477,11 +6933,14 @@ class CalibrationPage(QWidget):
         self._ploc_ensure_live_camera()
 
         # One-time pre-scan retract so the raster never drags a lowered needle.
+        # v7.5.x: apply_insert_floor=False — retract to exactly the assigned
+        # safe Z (imaging height, never descends), not the tube-clearance floor.
         try:
             if hasattr(self.controller, "ensure_retracted_to"):
                 self.controller.ensure_retracted_to(
                     self._safe_z if getattr(self, "_safe_z", None) is not None
-                    else 0.0)
+                    else 0.0,
+                    apply_insert_floor=False)
         except Exception as e:
             logger.warning(f"Mosaic scan: pre-scan retract failed: {e}")
 
@@ -6504,7 +6963,10 @@ class CalibrationPage(QWidget):
         fresh_timeout_s = float(cfg.get("fresh_timeout_s", 2.5))
         detect_param2 = float(cfg.get("detect_param2", 30))
         detect_tol = float(cfg.get("detect_tol_pct", 35)) / 100.0
-        frame_orient = str(cfg.get("frame_orient", "none"))
+        # v7.5.x: the coarse per-tile "frame_orient" (rot180/flip) is RETIRED —
+        # the builder already orients each tile with the calibrated rotation +
+        # flip X + flip Y (frame_rot/frame_mir/frame_fy above). Reading it here
+        # too double-oriented the whole-plate scan (a stale "rot180").
 
         # Re-arm the single-well flags now that every gate has passed — the
         # finish handler routes on them (see the snapshot+clear at the top).
@@ -6522,7 +6984,7 @@ class CalibrationPage(QWidget):
             expected_d_px, min_dist_px,
             fresh_frames=fresh_frames, fresh_timeout_s=fresh_timeout_s,
             settle_ms=settle_ms, detect_param2=detect_param2,
-            detect_tolerance=detect_tol, frame_orient=frame_orient)
+            detect_tolerance=detect_tol)
         self._ploc_mosaic_worker.progress.connect(
             self._ploc_on_mosaic_progress)
         self._ploc_mosaic_worker.tile.connect(self._ploc_on_mosaic_tile)
@@ -11264,11 +11726,17 @@ class CalibrationPage(QWidget):
         except ImportError:
             return
 
-        # Create per-well MosaicBuilder with 50% overlap for good stitching
+        # Create per-well MosaicBuilder with 50% overlap for good stitching.
+        # v7.5.x: rotate tiles into the stage frame (calibrated rotation) so this
+        # per-well mosaic maps correctly too. (Mirror corrected at the source.)
+        frame_rot, frame_mir, frame_fy = \
+            self._ploc_microscope_frame_orientation()
         self._well_scan_builder = MosaicBuilder(
             frame_size_px=(fw, fh),
             micron_per_pixel=um_per_px,
             overlap=0.50,
+            frame_rotation_deg=frame_rot, frame_mirrored=frame_mir,
+            frame_flip_y=frame_fy,
         )
         self._well_scan_positions = self._well_scan_builder.generate_raster_positions(
             well_bounds, overlap=0.50)

@@ -75,9 +75,11 @@ class TestCameraRolePersistence(unittest.TestCase):
         cfg.set_camera_role(1, CameraRole.NEEDLE_Y)
         cfg.set_camera_role(2, CameraRole.MICROSCOPE)
         data = cfg.to_dict()
-        self.assertEqual(
-            data["camera_roles"], ["needle_x", "needle_y", "microscope"]
-        )
+        # v7.5.x: MAX_LIVE_CAMERAS grew 3 → 4 (Monitor overview camera);
+        # extra slots serialize as "unassigned".
+        expected = ["needle_x", "needle_y", "microscope"]
+        expected += ["unassigned"] * (MAX_LIVE_CAMERAS - len(expected))
+        self.assertEqual(data["camera_roles"], expected)
         cfg2 = HardwareConfig.from_dict(data)
         self.assertEqual(cfg2.camera_roles, cfg.camera_roles)
 

@@ -22,8 +22,9 @@ before this move (v7.4.2: a952e33 et al.).
 from __future__ import annotations
 
 import logging
+import threading
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
@@ -122,6 +123,16 @@ class HardwareControlPanel(QWidget):
 
     _PHYSICAL_TO_INDEX = {"X": 0, "Y": 1, "Z": 2, "E": 3}
 
+    # v7.5.x: emitted (queued, from the pump-jog worker thread) when a pump
+    # jog move finishes, so the GUI-thread slot can safely refresh widgets.
+    _pump_jog_done = Signal()
+
+    # v7.5.x: emitted (queued, from an XY/Z jog worker thread) with the freshly
+    # read (xy, zp) positions so the GUI-thread slot updates the readout without
+    # doing any blocking serial I/O on the GUI thread (which froze the camera
+    # feed while jogging). Either value may be None if that read failed.
+    _stage_jog_done = Signal(object, object)
+
     def __init__(self, parent: QWidget | None = None, *,
                  show_connect: bool = True,
                  bypass_safety: bool = True,
@@ -169,6 +180,20 @@ class HardwareControlPanel(QWidget):
         # settings arrive. Seed once; preserve a manual edit thereafter.
         self._speeds_seeded = False
         self._speed_user_edited = {"xy": False, "z": False, "p": False}
+        # v7.5.x: a pump jog move (esp. with backlash compensation, which
+        # brackets take-up/main/unload with blocking M400 drains + settle
+        # dwells) runs on a daemon thread — see ``_on_jog_pump`` — so it can't
+        # freeze the Qt event loop (and with it, every QTimer-driven camera
+        # feed) for the seconds it can take on real hardware.
+        self._pump_jog_busy = False
+        self._pump_jog_done.connect(self._on_pump_jog_done)
+        # v7.5.x: XY / Z incremental jog also runs off the GUI thread (the move
+        # + the fresh position read are blocking serial round-trips that froze
+        # the camera feed). Per-axis busy guards drop overlapping clicks rather
+        # than queuing blocking moves behind the shared serial channel.
+        self._xy_jog_busy = False
+        self._z_jog_busy = False
+        self._stage_jog_done.connect(self._on_stage_jog_done)
         self._build_ui()
 
     # ── Public API ──────────────────────────────────────────────
@@ -189,6 +214,40 @@ class HardwareControlPanel(QWidget):
         # the percent spinboxes + resolved labels from the controller.
         self.refresh_speed_limits()
 
+    def minimumSizeHint(self):  # noqa: N802 (Qt override)
+        """v7.5.x: report a small minimum WIDTH so the context-panel scroll area
+        can drive this panel down to a narrow width (the operator wants a 100 px
+        minimum). Every row is proportional (stretch-driven with tiny minimums),
+        so the content fits/scrunches at any width; this just removes the
+        text-based floor that would otherwise keep the panel wide. Height is left
+        to the real layout so nothing is vertically clipped."""
+        from PySide6.QtCore import QSize
+        h = super().minimumSizeHint().height()
+        return QSize(s(96), h)
+
+    def _apply_responsive_fonts(self, *, force: bool = False) -> None:
+        """v7.5.x: scale every control's font by the width %% so the panel is
+        genuinely *sized to fit* — text shrinks with the width instead of
+        clipping. The nested JogButtonArray scales itself, so it's skipped."""
+        w = self.width()
+        if w <= 0:
+            return
+        from gui.widgets.responsive import (
+            container_scale, quantize, scale_descendant_fonts)
+        factor = quantize(container_scale(w, s(440), 0.45, 1.12))
+        if not force and abs(factor - getattr(self, "_font_factor", -1.0)) < 1e-6:
+            return
+        self._font_factor = factor
+        try:
+            scale_descendant_fonts(
+                self, factor, skip_subtrees=[getattr(self, "_jog_array", None)])
+        except Exception as exc:  # never let a resize raise
+            logger.debug(f"panel font scale failed: {exc}")
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt override)
+        super().resizeEvent(event)
+        self._apply_responsive_fonts()
+
     def showEvent(self, event):  # noqa: N802 (Qt override)
         """Re-read the common max + shared jog-% whenever the panel is shown,
         so a max changed while this page was hidden is reflected on entry."""
@@ -197,6 +256,10 @@ class HardwareControlPanel(QWidget):
         except Exception:
             pass
         super().showEvent(event)
+        # v7.5.x: also (re)apply the width-based font scale on show, so the
+        # panel is sized-to-fit even if it's mounted at its final width without
+        # a distinct resize event.
+        self._apply_responsive_fonts(force=True)
 
     def refresh_safety_limits(self) -> None:
         """v7.4.2: External hook — call after the user saves new safety
@@ -426,6 +489,9 @@ class HardwareControlPanel(QWidget):
                 "approaches a limit.")
         warn_text = QLabel(text)
         warn_text.setWordWrap(True)
+        # v7.5.x: tiny min so the (wrapping) banner can shrink with the panel
+        # instead of flooring its width.
+        warn_text.setMinimumWidth(s(1))
         warn_text.setStyleSheet(f"color: {accent};")
         warn_lay.addWidget(warn_text, 1)
         lay.addWidget(warn)
@@ -448,6 +514,10 @@ class HardwareControlPanel(QWidget):
         self.btn_refresh = icon_button(
             "Refresh Positions", "refresh",
             tooltip="Force a fresh position read from each connected stage.")
+        # v7.5.x: let the button shrink (Ignored h-policy + small min) so it
+        # doesn't force the panel wide; its label clips gracefully when narrow.
+        self.btn_refresh.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.btn_refresh.setMinimumWidth(s(40))
         self.btn_refresh.clicked.connect(self._force_refresh_positions)
         lay.addWidget(self.btn_refresh)
 
@@ -471,6 +541,7 @@ class HardwareControlPanel(QWidget):
             return self._build_max_speed_controls(wrap, outer)
 
         heading = QLabel("Jog speed (% of max)")
+        heading.setWordWrap(True)   # wrap so the section fits a narrow panel
         heading.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-weight: 600; "
             f"letter-spacing: 0.4px;")
@@ -543,6 +614,7 @@ class HardwareControlPanel(QWidget):
         ``spin_*_pct`` attribute names (they hold absolute values here) so the
         shared handlers/refresh paths work with a ``_speed_as_max`` branch."""
         heading = QLabel("Max speed (per axis)")
+        heading.setWordWrap(True)   # wrap so the section fits a narrow panel
         heading.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-weight: 600; "
             f"letter-spacing: 0.4px;")
@@ -604,23 +676,34 @@ class HardwareControlPanel(QWidget):
 
     def _resolved_label(self) -> QLabel:
         lbl = QLabel("—")
+        # v7.5.x: no font-size in the QSS so the width-based font scaler
+        # (scale_descendant_fonts) can rescale it; family/colour stay in QSS.
         lbl.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-family: monospace; "
-            f"font-size: {sf(8.5)}pt;")
-        lbl.setMinimumWidth(s(80))
+            f"color: {COLORS['subtext0']}; font-family: monospace;")
+        # v7.5.x: tiny minimum + Ignored h-policy so the row shrinks to fit a
+        # narrow panel; it takes a %% of the width via its stretch factor.
+        lbl.setMinimumWidth(s(20))
+        lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         return lbl
 
     def _labeled_pct(self, name: str, spin, resolved: QLabel,
                      tooltip: str = "") -> QHBoxLayout:
         row = QHBoxLayout()
-        row.setSpacing(s(6))
+        row.setSpacing(s(4))
         row.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(name)
         lbl.setStyleSheet(f"color: {COLORS['text']}; font-weight: 500;")
-        lbl.setMinimumWidth(s(22))
-        row.addWidget(lbl)
-        row.addWidget(spin)
-        row.addWidget(resolved, 1)
+        lbl.setMinimumWidth(s(16))
+        # v7.5.x: proportional row — the spin + resolved value each take a %% of
+        # the panel width so the row fits down to the 100 px minimum.
+        try:
+            spin.setMinimumWidth(s(24))
+            spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        except Exception:
+            pass
+        row.addWidget(lbl, 0)
+        row.addWidget(spin, 3)
+        row.addWidget(resolved, 2)
         if tooltip:
             spin.setToolTip(tooltip)
             lbl.setToolTip(tooltip)
@@ -992,10 +1075,10 @@ class HardwareControlPanel(QWidget):
         # limits) + numeric value + unit. The bar visualises how close
         # the stage is to its recorded min/max envelope.
         grid = QGridLayout()
-        grid.setHorizontalSpacing(s(8))
+        grid.setHorizontalSpacing(s(5))
         grid.setVerticalSpacing(s(6))
         grid.setColumnStretch(0, 0)
-        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(1, 1)   # bar absorbs the slack
         grid.setColumnStretch(2, 0)
         grid.setColumnStretch(3, 0)
 
@@ -1010,16 +1093,22 @@ class HardwareControlPanel(QWidget):
         ]):
             ax_lbl = QLabel(f"<b>{axis}</b>")
             ax_lbl.setStyleSheet(f"color: {COLORS['text']};")
-            ax_lbl.setMinimumWidth(s(22))
+            ax_lbl.setMinimumWidth(s(14))
             grid.addWidget(ax_lbl, r, 0)
             bar = PositionBar()
+            # Let the bar shrink freely so the row fits a narrow panel.
+            bar.setMinimumWidth(s(10))
+            bar.setSizePolicy(QSizePolicy.Ignored, bar.sizePolicy().verticalPolicy())
             grid.addWidget(bar, r, 1)
             self.bar_pos[axis] = bar
             val = QLabel("—")
             val.setStyleSheet(
                 f"color: {COLORS['text']}; font-family: monospace;")
             val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val.setMinimumWidth(s(70))
+            # v7.5.x: tiny min + Ignored policy so the numeric readout scrunches
+            # (right-aligned, shows the low-order digits) on a narrow panel.
+            val.setMinimumWidth(s(20))
+            val.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             grid.addWidget(val, r, 2)
             unit_lbl = QLabel(unit)
             unit_lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
@@ -1266,51 +1355,109 @@ class HardwareControlPanel(QWidget):
     def _on_jog_xy(self, dx_um: float, dy_um: float) -> None:
         if self._controller is None:
             return
+        # v7.5.x: run the XY move + speed-set + fresh read OFF the GUI thread —
+        # each is a blocking serial round-trip that otherwise freezes the camera
+        # feed (a QTimer on the GUI thread) while jogging. Overlapping clicks are
+        # dropped (busy guard) instead of queuing behind the serial channel.
+        if self._xy_jog_busy:
+            return
         # v7.5.x: jog speed = % of the single calibrated XY max. Resolve the
-        # absolute µm/s now and push it to ProScan before the move. Floored at
-        # ≥1 so a zero/unset max can never command F0 (Marlin planner stall).
-        # In max mode (Hardware Setup) the spin already holds absolute µm/s.
+        # absolute µm/s now (reads the GUI spin) and push it inside the worker.
+        # Floored at ≥1 so a zero/unset max can never command F0.
         if getattr(self, "_speed_as_max", False):
             xy_um_s = max(1.0, self.spin_xy_pct.value())
         else:
             xy_um_s = max(1.0, self.spin_xy_pct.value() / 100.0
                           * self._max_xy_speed_um_s())
-        self._apply_xy_speed(xy_um_s)
         bypass = self._bypass_safety
-        try:
-            self._controller.move_xy_relative_um(
-                dx_um, dy_um, bypass_safety=bypass)
-        except Exception as e:
-            logger.warning(f"jog XY ({dx_um}, {dy_um}) failed: {e}")
-        self._force_refresh_positions()
+        ctrl = self._controller
+
+        def _move():
+            self._apply_xy_speed(xy_um_s)
+            ctrl.move_xy_relative_um(dx_um, dy_um, bypass_safety=bypass)
+
+        self._run_stage_jog("_xy_jog_busy", _move,
+                            f"jog XY ({dx_um}, {dy_um})")
 
     def _on_jog_z(self, dz_mm: float) -> None:
         if self._controller is None:
             return
+        if self._z_jog_busy:
+            return
         # v7.5.x: jog speed = % of the single calibrated Z max feedrate.
         # Floored at ≥1 mm/min so an unset max can never command F0.
-        # In max mode (Hardware Setup) the spin already holds absolute mm/min.
         if getattr(self, "_speed_as_max", False):
             feed = max(1.0, self.spin_z_pct.value())
         else:
             feed = max(1.0, self.spin_z_pct.value() / 100.0
                        * self._max_z_feedrate_mm_min())
         bypass = self._bypass_safety
-        # dz_mm is a HEIGHT-frame delta (+ = up); route through
-        # move_z_user_relative so "up" follows the taught z_up_sign.
+        ctrl = self._controller
+
+        def _move():
+            # dz_mm is a HEIGHT-frame delta (+ = up); route through
+            # move_z_user_relative so "up" follows the taught z_up_sign.
+            try:
+                ctrl.move_z_user_relative(
+                    dz_mm, feedrate=feed, bypass_safety=bypass)
+            except TypeError:
+                ctrl.move_z_user_relative(dz_mm, bypass_safety=bypass)
+
+        self._run_stage_jog("_z_jog_busy", _move, f"jog Z {dz_mm}")
+
+    def _run_stage_jog(self, busy_attr: str, move_fn, label: str) -> None:
+        """v7.5.x: run an XY/Z jog move on a daemon thread, then read the fresh
+        positions there too, and hand them back to the GUI thread via
+        ``_stage_jog_done`` — so no blocking serial I/O happens on the GUI thread
+        (which was freezing the camera feed during a jog)."""
+        setattr(self, busy_attr, True)
+        ctrl = self._controller
+
+        def _worker():
+            xy = zp = None
+            try:
+                move_fn()
+            except Exception as e:
+                logger.warning(f"{label} failed: {e}")
+            # Fresh reads on THIS thread (serial access is lock-protected), so
+            # the GUI thread never blocks on the round-trip.
+            try:
+                xy = ctrl.get_xy_position(cached=False)
+            except Exception:
+                xy = None
+            try:
+                zp = ctrl.get_zp_position(cached=False)
+            except Exception:
+                zp = None
+            setattr(self, busy_attr, False)
+            self._stage_jog_done.emit(xy, zp)
+
+        threading.Thread(target=_worker, name="StageJog", daemon=True).start()
+
+    def _on_stage_jog_done(self, xy, zp) -> None:
+        """GUI-thread continuation of an XY/Z jog: update the readout from the
+        worker-read positions (no serial I/O here). Falls back to the cached
+        display values if a read failed."""
         try:
-            self._controller.move_z_user_relative(
-                dz_mm, feedrate=feed, bypass_safety=bypass)
-        except TypeError:
-            self._controller.move_z_user_relative(dz_mm, bypass_safety=bypass)
+            if xy is None or zp is None:
+                xy, zp = self._display_xy(), self._display_zp()
+            self._update_position_displays(xy, zp)
         except Exception as e:
-            logger.warning(f"jog Z {dz_mm} failed: {e}")
-        self._force_refresh_positions()
+            logger.debug(f"stage jog display refresh failed: {e}")
 
     def _on_jog_pump(self, pump: str, distance: float) -> None:
         if self._controller is None:
             return
         ctrl = self._controller
+        # v7.5.x: a pump move (esp. backlash-compensated: take-up + main +
+        # unload, each drained via a blocking M400 + a settle dwell) can take
+        # seconds on real hardware. Refuse to overlap a second jog on top of
+        # one already in flight rather than queuing it behind the shared
+        # serial channel.
+        if self._pump_jog_busy:
+            logger.debug(f"pump jog already in flight — ignoring {pump} "
+                         f"{distance:g}")
+            return
         # v7.5.x: %/µL pages drive the plunger by a % of the syringe volume;
         # Hardware Setup (raw arrows) keeps the mm path for plunger calibration.
         if self._pump_action_labels:
@@ -1340,37 +1487,53 @@ class HardwareControlPanel(QWidget):
                     comp_on = bool(_bce())
                 except Exception:
                     comp_on = False
-            try:
-                ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate,
-                                  compensate=comp_on)
-            except TypeError:
+
+            def _move():
                 try:
-                    ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate)
+                    ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate,
+                                      compensate=comp_on)
                 except TypeError:
-                    ctrl.move_pump_uL(pump, volume_uL)
-            except Exception as e:
-                logger.warning(f"jog {pump} {distance:g}% failed: {e}")
-            self._force_refresh_positions()
-            return
-        # Hardware Setup mm jog — speed = the raw-plunger feedrate.
-        # Max mode: the PER-PUMP mm/min spin holds the absolute ceiling for this
-        # pump directly; percent mode (legacy / tests): % of the anchor.
-        feed, _ = self._pump_speed_anchor()           # mm/min
-        if getattr(self, "_speed_as_max", False):
-            spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
-            feed = max(1.0, float(spin.value())) if spin is not None \
-                else max(1.0, feed)
+                    try:
+                        ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate)
+                    except TypeError:
+                        ctrl.move_pump_uL(pump, volume_uL)
         else:
-            feed = self.spin_p_pct.value() / 100.0 * feed
-        bypass = self._bypass_safety
-        try:
-            self._controller.move_pump_relative(
-                pump, distance, feedrate=feed, bypass_safety=bypass)
-        except TypeError:
-            self._controller.move_pump_relative(
-                pump, distance, bypass_safety=bypass)
-        except Exception as e:
-            logger.warning(f"jog {pump} {distance} failed: {e}")
+            # Hardware Setup mm jog — speed = the raw-plunger feedrate.
+            # Max mode: the PER-PUMP mm/min spin holds the absolute ceiling for
+            # this pump directly; percent mode (legacy / tests): % of anchor.
+            feed, _ = self._pump_speed_anchor()           # mm/min
+            if getattr(self, "_speed_as_max", False):
+                spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
+                feed = max(1.0, float(spin.value())) if spin is not None \
+                    else max(1.0, feed)
+            else:
+                feed = self.spin_p_pct.value() / 100.0 * feed
+            bypass = self._bypass_safety
+
+            def _move():
+                try:
+                    ctrl.move_pump_relative(
+                        pump, distance, feedrate=feed, bypass_safety=bypass)
+                except TypeError:
+                    ctrl.move_pump_relative(
+                        pump, distance, bypass_safety=bypass)
+
+        self._pump_jog_busy = True
+
+        def _worker() -> None:
+            try:
+                _move()
+            except Exception as e:
+                logger.warning(f"jog {pump} {distance:g} failed: {e}")
+            finally:
+                # Cross-thread: delivered as a queued call to the GUI thread.
+                self._pump_jog_done.emit()
+
+        threading.Thread(target=_worker, name="PumpJog", daemon=True).start()
+
+    def _on_pump_jog_done(self) -> None:
+        """GUI-thread continuation once a background pump jog finishes."""
+        self._pump_jog_busy = False
         self._force_refresh_positions()
 
     # ── Position refresh ────────────────────────────────────────

@@ -194,10 +194,32 @@ needle-location-quick-move / needle-offset-z-side-view / plate-location-z-side-v
 `pump_compliance_calibration` rewritten for the own-tab + 5-step + Reset flow; PDF
 regenerated.
 
+## Addendum (2026-07-24) — calibration steps are RAW moves (no settle, no comp)
+
+Operator: "when doing the calibrate compliance, do not use the settle time or
+the compensation when doing the pump motion." The step move already passed
+`compensate=False` (the calibration measures the compliance, so it must not
+apply comp itself) but still ran `settle=True`, which brackets the move with
+the global `pump_settle_time_s` dwell. `_compcal_step_move`'s worker now calls
+`move_pump_uL(..., settle=False, compensate=False)` — a raw plunger step, the
+true measurand. Because `settle=False` also skips `move_pump_uL`'s internal
+completion block, the worker drains the move itself via
+`StageController._wait_pump_move_complete(est_s)` (M400, poller suspended;
+open-loop sleep fallback when unavailable) before emitting the done signal, so
+the busy-guard still holds until the pump physically stops. The kwargs
+`TypeError` fallback (older/fake controller) is scoped to the move call only so
+a wait-helper signature mismatch can't re-issue (double) the move. New test
+`test_step_move_is_raw_no_settle_no_comp` locks the kwargs + the worker-side
+completion wait; also fixed the stale `test_tabs_restructured` expectation
+(the concurrent Rosettes tab at index 3 → `_zauto_tab_index == 4`). Suite: 31
+green.
+
 ## Status
 
-`[~]` Code + tests complete — 2026-07-09 (calibration-UX refactor 2026-07-09b).
+`[~]` Code + tests complete — 2026-07-09 (calibration-UX refactor 2026-07-09b;
+raw-step addendum 2026-07-24).
 **Needs real-HW verification on ME3B V1** (Pump Compliance tab: droplet visible in
 the live side view; dispense → Start (zeroes) → aspirate → Finish (c=A/2) → Save;
 Reset retries; saved µL shows on Common Print Settings and the jog backlash toggle
-applies it; Needle Location tab also shows the reference-Z heights).
+applies it; Needle Location tab also shows the reference-Z heights; step moves
+run with no settle dwell and no comp bracketing).

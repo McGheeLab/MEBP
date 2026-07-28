@@ -56,6 +56,7 @@ from PySide6.QtGui import QFont, QColor, QStandardItem
 
 from SupportClasses.HardwareConfig import (
     HardwareConfig, PumpChannelConfig, CameraConfig, CameraRole,
+    MAX_LIVE_CAMERAS,
 )
 from SupportClasses.PhysicalModels import (
     NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert, CameraSpec,
@@ -77,6 +78,53 @@ CONFIG_HARDWARE_DIR = Path(__file__).resolve().parent.parent.parent / "config" /
 
 # v7.3.0: Nikon Ti2-U objective magnifications available on the microscope
 NIKON_TI2U_OBJECTIVES = [1.0, 2.0, 4.0, 10.0, 20.0]
+
+# ── v7.5.x: per-camera rotation-vs-stage nominals ─────────────────────
+# Every camera carries a calibrated in-plane rotation relative to the
+# stage axes (CameraManager.get/set_rotation_deg, measured by the
+# stage-motion PixelCalibrationDialog). The NOMINAL mount depends on the
+# role: the microscope views along Z, so its rotation is in the stage XY
+# plane (axis-aligned nominal); the needle side cameras are mounted at
+# ~45° to the stage X/Y axes; the monitor overview camera rests on the
+# stage (axis-aligned nominal). The nominal/Δ shown on the slot cards is
+# a sanity hint ONLY — motion always uses the calibrated θ itself.
+_AXIS_ALIGNED_NOMINALS = (0.0, 90.0, 180.0, -90.0)
+_DIAGONAL_NOMINALS = (45.0, 135.0, -45.0, -135.0)
+
+
+def role_nominal_rotations(role) -> tuple[float, ...]:
+    """Nominal mount rotations (deg, vs stage axes) for a camera role."""
+    if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
+        return _DIAGONAL_NOMINALS
+    return _AXIS_ALIGNED_NOMINALS
+
+
+def _wrap_deg(angle: float) -> float:
+    """Wrap an angle to (-180, 180]."""
+    a = (float(angle) + 180.0) % 360.0 - 180.0
+    return 180.0 if a == -180.0 else a
+
+
+def nominal_rotation_delta(theta_deg: float, role) -> tuple[float, float]:
+    """(nearest_nominal, signed_delta) of a measured rotation vs the
+    role's nominal mount set. ``theta = nominal + delta`` (mod 360)."""
+    best_nom, best_delta = 0.0, _wrap_deg(theta_deg)
+    for nom in role_nominal_rotations(role):
+        d = _wrap_deg(theta_deg - nom)
+        if abs(d) < abs(best_delta):
+            best_nom, best_delta = nom, d
+    return best_nom, best_delta
+
+
+def role_rotation_hint(role) -> str:
+    """One-line description of the expected mount orientation per role."""
+    if role == CameraRole.MICROSCOPE:
+        return "views along Z — rotation is in the stage XY plane (nominal 0°)"
+    if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
+        return "side view, mounted ~45° to the stage X/Y axes (nominal ±45°)"
+    if role == CameraRole.MONITOR:
+        return "overview camera on the stage (nominal axis-aligned)"
+    return "rotation vs the stage X/Y axes"
 
 
 
@@ -1073,7 +1121,7 @@ class HardwareSetupPage(ModePage):
         detect_row.setSpacing(s(10))
         self._btn_detect_live_cams = icon_button(
             "Detect Cameras", "search", object_name="accentBtn",
-            tooltip="Scan for available cameras (OpenCV, ToupCam, Simulated)")
+            tooltip="Scan for available cameras (OpenCV, ToupCam, Andor, Simulated)")
         self._btn_detect_live_cams.setMinimumWidth(s(170))
         self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
         detect_row.addWidget(self._btn_detect_live_cams)
@@ -1097,26 +1145,62 @@ class HardwareSetupPage(ModePage):
         # v7.5.x: per-slot image-correction control strip (brightness/contrast/
         # gamma sliders), built lazily under each preview in _ensure_camera_previews.
         self._live_cam_correction: list = []
+        # v7.5.x: per-slot holder in the controls column where the image-
+        # correction strip is mounted lazily (kept OUT of the preview holder so
+        # the live feed gets the full preview area).
+        self._live_cam_correction_holders: list[QWidget] = []
+        # v7.5.x: per-slot rotation-vs-stage readout + calibrate button.
+        self._live_cam_rot_labels: list[QLabel] = []
+        self._live_cam_rot_btns: list[QPushButton] = []
+        # v7.5.x: per-slot orientation controls (ONE unified system applied to
+        # the live view + mosaic + click-mapping): flip X (mirror), flip Y, and
+        # a custom rotation spin.
+        self._live_cam_mirror_checks: list[QCheckBox] = []
+        self._live_cam_flip_y_checks: list[QCheckBox] = []
+        self._live_cam_rot_spins: list = []
         self._cam_preview_signals_wired = False
 
         from gui.styles import build_glass_panel_style
         assign_glass = build_glass_panel_style("camMiniCard")
-        max_cams = 3  # CameraManager default; updated via set_camera_manager.
+        max_cams = MAX_LIVE_CAMERAS  # one mini-card per CameraManager slot
         for i in range(max_cams):
             row = QFrame()
             row.setObjectName("camMiniCard")
             row.setStyleSheet(assign_glass)
-            rl = QGridLayout(row)
-            rl.setContentsMargins(s(14), s(12), s(14), s(12))
-            rl.setHorizontalSpacing(s(12))
-            rl.setVerticalSpacing(s(8))
-            rl.setColumnStretch(0, 0)
-            rl.setColumnStretch(1, 0)
-            rl.setColumnStretch(2, 1)
-            rl.setColumnStretch(3, 0)
-            rl.setColumnStretch(4, 0)
+            # v7.5.x: two-column card — a LARGE live preview on the left and a
+            # tidy controls column on the right. Previously everything (source,
+            # role, start, rotation, flips, and the image-correction sliders)
+            # was stacked in one narrow grid with the preview squeezed into a
+            # height-capped holder shared with the correction sliders, so the
+            # live feed rendered tiny. Splitting them gives the feed real
+            # estate while keeping each card's height compact.
+            card = QHBoxLayout(row)
+            card.setContentsMargins(s(14), s(12), s(14), s(12))
+            card.setSpacing(s(14))
 
-            # Cam N pill (uses the accent color so it reads as a chip).
+            # ── LEFT: live preview (hidden until the camera is running) ──────
+            # No height cap here anymore — CameraFeedView respects the camera's
+            # aspect ratio (heightForWidth), so it fills this column cleanly.
+            preview = QWidget()
+            preview.setVisible(False)
+            pv_lay = QVBoxLayout(preview)
+            pv_lay.setContentsMargins(0, 0, 0, 0)
+            pv_lay.setSpacing(0)
+            preview.setMinimumWidth(s(300))
+            preview.setMinimumHeight(s(240))
+            preview.setMaximumHeight(s(420))
+            card.addWidget(preview, 3)
+            self._live_cam_preview_holders.append(preview)
+            self._live_cam_previews.append(None)
+            self._live_cam_correction.append(None)
+
+            # ── RIGHT: controls column ──────────────────────────────────────
+            controls = QWidget()
+            cl = QVBoxLayout(controls)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(s(8))
+
+            # Header: Cam N pill + role badge.
             cam_pill = QLabel(f"Cam {i + 1}")
             cam_pill.setAlignment(Qt.AlignCenter)
             cam_pill.setMinimumWidth(s(54))
@@ -1131,33 +1215,36 @@ class HardwareSetupPage(ModePage):
                 f"  font-weight: 700;"
                 f"}}"
             )
-            rl.addWidget(cam_pill, 0, 0, 2, 1, Qt.AlignVCenter)
+            role_badge = StatusBadge("Unassigned", variant="pending")
+            self._live_cam_role_badges.append(role_badge)
+            hdr = QHBoxLayout()
+            hdr.setSpacing(s(8))
+            hdr.addWidget(cam_pill, 0, Qt.AlignVCenter)
+            hdr.addStretch(1)
+            hdr.addWidget(role_badge, 0, Qt.AlignVCenter)
+            cl.addLayout(hdr)
 
-            rl.addWidget(self._field_label("Source"), 0, 1)
+            # Source picker.
             src = QComboBox()
             src.addItem("— None —", None)
-            src.setMinimumWidth(s(220))
-            rl.addWidget(src, 0, 2)
+            src.setMinimumWidth(s(160))
             self._live_cam_source_combos.append(src)
-            # Applying the chosen source to the shared CameraManager so a
-            # Start below opens *this* slot's selected camera. The combo was
-            # previously display-only (never wired to set_source).
             src.currentIndexChanged.connect(
                 lambda _idx, cam_i=i: self._on_live_cam_source_changed(cam_i)
             )
+            src_row = QHBoxLayout()
+            src_row.setSpacing(s(8))
+            src_row.addWidget(self._field_label("Source"))
+            src_row.addWidget(src, 1)
+            cl.addLayout(src_row)
 
-            # Role badge — lives in column 3 and tracks the combo's
-            # current selection. Empty/Unassigned variant by default.
-            role_badge = StatusBadge("Unassigned", variant="pending")
-            rl.addWidget(role_badge, 0, 3, 2, 1, Qt.AlignVCenter)
-            self._live_cam_role_badges.append(role_badge)
-
-            rl.addWidget(self._field_label("Role"), 1, 1)
+            # Role picker.
             role_combo = QComboBox()
             role_combo.addItem("Unassigned", CameraRole.UNASSIGNED)
             role_combo.addItem("Microscope", CameraRole.MICROSCOPE)
             role_combo.addItem("Needle X-view", CameraRole.NEEDLE_X)
             role_combo.addItem("Needle Y-view", CameraRole.NEEDLE_Y)
+            role_combo.addItem("Monitor (overview)", CameraRole.MONITOR)
             role_combo.setToolTip(
                 "Workflow role for this camera slot. All non-Unassigned "
                 "roles are singletons — assigning one here automatically "
@@ -1166,39 +1253,121 @@ class HardwareSetupPage(ModePage):
             role_combo.currentIndexChanged.connect(
                 lambda idx_combo, cam_i=i: self._on_live_cam_role_changed(cam_i)
             )
-            rl.addWidget(role_combo, 1, 2)
             self._live_cam_role_combos.append(role_combo)
+            role_row = QHBoxLayout()
+            role_row.setSpacing(s(8))
+            role_row.addWidget(self._field_label("Role"))
+            role_row.addWidget(role_combo, 1)
+            cl.addLayout(role_row)
 
-            # Start/Stop toggle (col 4) — powers this slot's camera on/off
-            # via the shared CameraManager. Disabled until a source is picked.
+            # Start/Stop toggle.
             start_btn = QPushButton("▶ Start")
             start_btn.setObjectName("accentBtn")
             start_btn.setEnabled(False)
-            start_btn.setMinimumWidth(s(104))
             start_btn.setToolTip(
-                "Start/stop this camera so you can verify the live feed below "
-                "and run its calibration."
+                "Start/stop this camera so you can verify the live feed and "
+                "run its calibration."
             )
             start_btn.clicked.connect(
                 lambda _checked=False, cam_i=i: self._on_toggle_camera(cam_i)
             )
-            rl.addWidget(start_btn, 0, 4, 2, 1, Qt.AlignVCenter)
             self._live_cam_start_btns.append(start_btn)
+            cl.addWidget(start_btn)
 
-            # Collapsible live preview (row 2, full width) — hidden until the
-            # camera is running. Filled with a CameraFeedView lazily once the
-            # CameraManager is available (set_camera_manager).
-            preview = QWidget()
-            preview.setVisible(False)
-            pv_lay = QVBoxLayout(preview)
-            pv_lay.setContentsMargins(0, s(8), 0, 0)
-            pv_lay.setSpacing(0)
-            preview.setMinimumHeight(s(170))
-            preview.setMaximumHeight(s(260))
-            rl.addWidget(preview, 2, 0, 1, 5)
-            self._live_cam_preview_holders.append(preview)
-            self._live_cam_previews.append(None)
-            self._live_cam_correction.append(None)
+            # ── Orientation & calibration sub-group ─────────────────────────
+            orient_caption = QLabel("Orientation & calibration")
+            orient_caption.setStyleSheet(
+                f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+                f"font-size: {sf(9)}pt; font-weight: 700;")
+            cl.addWidget(orient_caption)
+
+            # Rotation-vs-stage readout + calibrate button.
+            rot_lbl = QLabel("Rotation vs stage: not calibrated")
+            rot_lbl.setWordWrap(True)
+            rot_lbl.setStyleSheet(
+                f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+                f"font-size: {scaled_font_size(9)}pt;"
+            )
+            self._live_cam_rot_labels.append(rot_lbl)
+            cl.addWidget(rot_lbl)
+
+            rot_btn = QPushButton("⟳ Rotation…")
+            rot_btn.setEnabled(False)
+            rot_btn.setToolTip(
+                "Calibrate this camera's rotation relative to the stage "
+                "axes: the stage moves a known direction and the dialog "
+                "measures the image displacement. Rotation only — the "
+                "camera's µm/px calibration is untouched. Requires the "
+                "camera running and the XY stage connected."
+            )
+            rot_btn.clicked.connect(
+                lambda _checked=False, cam_i=i:
+                self._on_calibrate_slot_rotation(cam_i)
+            )
+            self._live_cam_rot_btns.append(rot_btn)
+            cl.addWidget(rot_btn)
+
+            # Flip X / Flip Y — a mirror reverses image handedness (which a
+            # rotation alone cannot express), so each is a separate declaration
+            # applied to the live view, the mosaic, and the click→stage mapping.
+            mirror_cb = QCheckBox("⇄ Flip X axis")
+            mirror_cb.setEnabled(False)
+            mirror_cb.setToolTip(
+                "Flip this camera horizontally (mirror the X axis). Applied to "
+                "the live view, the mosaic, and the click→stage mapping (one "
+                "unified orientation)."
+            )
+            mirror_cb.toggled.connect(
+                lambda checked, cam_i=i: self._on_toggle_mirror(cam_i, checked)
+            )
+            self._live_cam_mirror_checks.append(mirror_cb)
+
+            flip_y_cb = QCheckBox("⇅ Flip Y axis")
+            flip_y_cb.setEnabled(False)
+            flip_y_cb.setToolTip(
+                "Flip this camera vertically (mirror the Y axis). Applied to the "
+                "live view, the mosaic, and the click→stage mapping."
+            )
+            flip_y_cb.toggled.connect(
+                lambda checked, cam_i=i: self._on_toggle_flip_y(cam_i, checked)
+            )
+            self._live_cam_flip_y_checks.append(flip_y_cb)
+            flip_row = QHBoxLayout()
+            flip_row.setSpacing(s(10))
+            flip_row.addWidget(mirror_cb)
+            flip_row.addWidget(flip_y_cb)
+            flip_row.addStretch(1)
+            cl.addLayout(flip_row)
+
+            # Custom in-plane rotation spin.
+            rot_spin = QDoubleSpinBox()
+            rot_spin.setRange(-180.0, 180.0)
+            rot_spin.setSingleStep(1.0)
+            rot_spin.setDecimals(1)
+            rot_spin.setEnabled(False)
+            rot_spin.setToolTip(
+                "Custom in-plane rotation applied to the live view, the mosaic, "
+                "and the click→stage mapping.")
+            rot_spin.valueChanged.connect(
+                lambda v, cam_i=i: self._on_slot_rotation_spin(cam_i, v))
+            self._live_cam_rot_spins.append(rot_spin)
+            rot_spin_row = QHBoxLayout()
+            rot_spin_row.setSpacing(s(4))
+            rot_spin_row.addWidget(QLabel("Rotation °:"))
+            rot_spin_row.addWidget(rot_spin, 1)
+            cl.addLayout(rot_spin_row)
+
+            # Holder for the image-correction strip (mounted lazily once the
+            # CameraManager arrives, so the feed can be previewed first).
+            corr_holder = QWidget()
+            corr_lay = QVBoxLayout(corr_holder)
+            corr_lay.setContentsMargins(0, 0, 0, 0)
+            corr_lay.setSpacing(0)
+            self._live_cam_correction_holders.append(corr_holder)
+            cl.addWidget(corr_holder)
+
+            cl.addStretch(1)
+            card.addWidget(controls, 2)
 
             self._live_cam_rows_container.addWidget(row)
 
@@ -1584,6 +1753,8 @@ class HardwareSetupPage(ModePage):
             return ("Needle X", "warn")
         if role == CameraRole.NEEDLE_Y:
             return ("Needle Y", "warn")
+        if role == CameraRole.MONITOR:
+            return ("Monitor", "info")
         return ("Unassigned", "pending")
 
     # ════════════════════════════════════════════════════════════════
@@ -1712,20 +1883,72 @@ class HardwareSetupPage(ModePage):
         self._on_config_changed()
 
     def _maybe_apply_resolution_to_device(self):
-        """Drive the live microscope camera to the spec-combo resolution."""
+        """Drive the live microscope camera to the SINGLE source of truth —
+        ``camera_config.active_resolution`` (the "Microscope Camera Setup"
+        block). The camera reads it as ground truth; the spec combo is only a
+        fallback if the config has none."""
         mgr = getattr(self, "_camera_manager", None)
         if mgr is None:
             return
         mic_idx = self._config.camera_for_role(CameraRole.MICROSCOPE)
         if mic_idx is None or not mgr.is_running(mic_idx):
             return
-        data = self.cam_resolution_combo.currentData()
-        if not data:
+        # v7.5.x: active_resolution is THE source; fall back to the combo only if
+        # it is unset, so there is one authoritative resolution.
+        cam_cfg = getattr(self._config, "camera_config", None)
+        res = getattr(cam_cfg, "active_resolution", None) if cam_cfg else None
+        if not (res and len(res) >= 2 and res[0] and res[1]):
+            data = self.cam_resolution_combo.currentData()
+            res = tuple(data) if data else None
+        if not res:
             return
-        actual = mgr.set_capture_resolution(mic_idx, int(data[0]), int(data[1]))
+        actual = mgr.set_capture_resolution(mic_idx, int(res[0]), int(res[1]))
         logger.info(
-            f"Microscope capture resolution requested {tuple(data)} -> "
-            f"device adopted {actual}")
+            f"Microscope resolution (source of truth = active_resolution) "
+            f"{tuple(res)} -> device adopted {actual}")
+
+    def _on_slot_resolution_changed(self, cam_idx: int, w: int, h: int) -> None:
+        """v7.5.x: the DEVICE capture resolution changed (via the camera
+        settings gear on a slot preview). If it's the microscope slot, update
+        the "Microscope Camera Setup" block's ``active_resolution`` + the
+        resolution combo so the block reflects the TRUE current resolution — it
+        was pulling a stale value, so µm/px stamping / mosaic FOV used the wrong
+        pixel count (operator report #1)."""
+        try:
+            mic_idx = self._config.camera_for_role(CameraRole.MICROSCOPE)
+        except Exception:
+            mic_idx = None
+        if mic_idx is None or int(cam_idx) != int(mic_idx):
+            return
+        try:
+            cam_cfg = getattr(self._config, "camera_config", None)
+            if cam_cfg is not None:
+                cam_cfg.active_resolution = (int(w), int(h))
+        except Exception:
+            pass
+        combo = getattr(self, "cam_resolution_combo", None)
+        if combo is not None:
+            try:
+                combo.blockSignals(True)
+                idx = -1
+                for k in range(combo.count()):
+                    d = combo.itemData(k)
+                    if d and tuple(d) == (int(w), int(h)):
+                        idx = k
+                        break
+                if idx < 0:
+                    combo.addItem(f"{w} × {h}", (int(w), int(h)))
+                    idx = combo.count() - 1
+                combo.setCurrentIndex(idx)
+            except Exception:
+                pass
+            finally:
+                combo.blockSignals(False)
+        try:
+            self._update_camera_info_labels()
+        except Exception:
+            pass
+        logger.info(f"Camera-setup block resolution synced to device: {w}×{h}")
 
     def _on_camera_override_toggled(self, checked: bool):
         """Toggle between computed and custom micron/pixel scale."""
@@ -1815,6 +2038,85 @@ class HardwareSetupPage(ModePage):
                         widgets["umpx"].setText("—")
                 widgets["calibrate"].setEnabled(True)
                 widgets["hint"].setVisible(False)
+
+        # v7.5.x: a role change also changes the slot's nominal-mount hint
+        # (microscope XY-plane vs needle ±45° vs monitor), and a needle µm/px
+        # calibration may have carried a fresh rotation — resync the strips.
+        self._refresh_slot_rotation_displays()
+
+    def _refresh_slot_rotation_displays(self):
+        """v7.5.x: sync each slot's 'Rotation vs stage' readout with the live
+        CameraManager rotation and the slot's role (which sets the
+        nominal-mount hint + the Δ-from-nominal sanity figure), plus the
+        mirrored-view checkbox state."""
+        mgr = getattr(self, "_camera_manager", None)
+        for i, lbl in enumerate(getattr(self, "_live_cam_rot_labels", [])):
+            role = (
+                self._config.camera_roles[i]
+                if i < len(self._config.camera_roles)
+                else CameraRole.UNASSIGNED
+            )
+            hint = role_rotation_hint(role)
+            theta = None
+            mirrored = False
+            if mgr is not None:
+                try:
+                    theta = mgr.get_rotation_deg(i)
+                except Exception:
+                    theta = None
+                try:
+                    mirrored = bool(mgr.get_mirrored(i))
+                except Exception:
+                    mirrored = False
+            mir_txt = "  · mirrored view" if mirrored else ""
+            if theta is None:
+                lbl.setText(
+                    f"Rotation vs stage: not calibrated — {hint}{mir_txt}")
+                lbl.setStyleSheet(
+                    f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+                    f"font-size: {scaled_font_size(9)}pt;"
+                )
+            else:
+                nom, delta = nominal_rotation_delta(float(theta), role)
+                lbl.setText(
+                    f"Rotation vs stage: {float(theta):.1f}°  "
+                    f"(Δ {delta:+.1f}° from nominal {nom:g}°) — {hint}{mir_txt}"
+                )
+                lbl.setStyleSheet(
+                    f"color: {COLORS['green']}; "
+                    f"font-size: {scaled_font_size(9)}pt;"
+                )
+            # Sync the mirror checkbox without re-triggering its handler.
+            if i < len(getattr(self, "_live_cam_mirror_checks", [])):
+                cb = self._live_cam_mirror_checks[i]
+                if cb.isChecked() != mirrored:
+                    cb.blockSignals(True)
+                    cb.setChecked(mirrored)
+                    cb.blockSignals(False)
+            # Sync the flip-Y checkbox + custom-rotation spin from the manager.
+            flip_y = False
+            if mgr is not None:
+                try:
+                    gfy = getattr(mgr, "get_flip_y", None)
+                    flip_y = bool(gfy(i)) if callable(gfy) else False
+                except Exception:
+                    flip_y = False
+            if i < len(getattr(self, "_live_cam_flip_y_checks", [])):
+                fcb = self._live_cam_flip_y_checks[i]
+                if fcb.isChecked() != flip_y:
+                    fcb.blockSignals(True)
+                    fcb.setChecked(flip_y)
+                    fcb.blockSignals(False)
+            if i < len(getattr(self, "_live_cam_rot_spins", [])):
+                sp = self._live_cam_rot_spins[i]
+                cur = float(theta) if theta is not None else 0.0
+                if abs(sp.value() - cur) > 1e-6:
+                    sp.blockSignals(True)
+                    sp.setValue(cur)
+                    sp.blockSignals(False)
+            # v7.5.x: apply the unified orientation to the slot's live PREVIEW so
+            # the operator SEES the corrected view (idempotent — no-op if same).
+            self._push_slot_view_orientation(i)
 
     # ── Live Camera Sources (v7.3.3) ─────────────────────────────
 
@@ -1923,11 +2225,20 @@ class HardwareSetupPage(ModePage):
                     parent=holder,
                 )
                 holder.layout().addWidget(fv, stretch=1)
+                try:
+                    fv.resolution_changed.connect(
+                        self._on_slot_resolution_changed)
+                except Exception:
+                    pass
                 self._live_cam_previews[i] = fv
-                # v7.5.x: image-correction sliders beneath the live preview.
-                if i < len(self._live_cam_correction) and self._live_cam_correction[i] is None:
+                # v7.5.x: image-correction sliders live in the controls column
+                # (their own holder) — NOT inside the preview holder — so the
+                # live feed keeps the full preview area.
+                if (i < len(self._live_cam_correction)
+                        and self._live_cam_correction[i] is None
+                        and i < len(self._live_cam_correction_holders)):
                     strip = self._build_correction_strip(i)
-                    holder.layout().addWidget(strip)
+                    self._live_cam_correction_holders[i].layout().addWidget(strip)
             except Exception as exc:
                 logger.warning(f"failed to build camera preview {i}: {exc}")
 
@@ -2186,6 +2497,22 @@ class HardwareSetupPage(ModePage):
             btn.setText("⏹ Stop" if running else "▶ Start")
             if i < len(self._live_cam_preview_holders):
                 self._live_cam_preview_holders[i].setVisible(running)
+            # v7.5.x: rotation calibration needs a live feed (the stage-motion
+            # dialog watches the image); the controller gate is re-checked in
+            # the click handler with a clear message.
+            if i < len(getattr(self, "_live_cam_rot_btns", [])):
+                self._live_cam_rot_btns[i].setEnabled(running)
+            # v7.5.x: the flip flags + custom rotation are declarations (no live
+            # feed needed) — enabled once the slot has a source to persist to.
+            if i < len(getattr(self, "_live_cam_mirror_checks", [])):
+                self._live_cam_mirror_checks[i].setEnabled(has_source)
+            if i < len(getattr(self, "_live_cam_flip_y_checks", [])):
+                self._live_cam_flip_y_checks[i].setEnabled(has_source)
+            if i < len(getattr(self, "_live_cam_rot_spins", [])):
+                self._live_cam_rot_spins[i].setEnabled(has_source)
+        # Rotation values + mirror flag restore on source assignment — keep the
+        # readouts/checkboxes in sync with the manager on the same triggers.
+        self._refresh_slot_rotation_displays()
 
     def set_controller(self, controller):
         """v7.3.3: Receive StageController for pixel calibration.
@@ -2294,6 +2621,19 @@ class HardwareSetupPage(ModePage):
                 mgr.set_rotation_deg(cam_idx, float(rot))
             except Exception as exc:
                 logger.debug(f"restore rotation slot {cam_idx}: {exc}")
+        # v7.5.x: restore the mirrored-view (flip X) flag (also independent of
+        # µm/px).
+        try:
+            mgr.set_mirrored(cam_idx, bool(entry.get("mirrored", False)))
+        except Exception as exc:
+            logger.debug(f"restore mirror slot {cam_idx}: {exc}")
+        # v7.5.x: restore the flip-Y flag.
+        try:
+            sfy = getattr(mgr, "set_flip_y", None)
+            if callable(sfy):
+                sfy(cam_idx, bool(entry.get("flip_y", False)))
+        except Exception as exc:
+            logger.debug(f"restore flip_y slot {cam_idx}: {exc}")
         if entry.get("um_per_px") is None:
             return False
         try:
@@ -2349,8 +2689,12 @@ class HardwareSetupPage(ModePage):
         # stop_all, which does NOT route there, so the flag survives.
         try:
             if cam_idx == self._config.camera_for_role(CameraRole.MICROSCOPE):
-                if not (hw and hw.get("resolution")):
-                    self._maybe_apply_resolution_to_device()
+                # v7.5.x: ALWAYS drive the microscope to active_resolution (the
+                # single source of truth) on start, so the camera reads it as
+                # ground truth. Previously this was gated on hw_controls having
+                # no resolution, which let a stale per-identity resolution win
+                # and diverge from the setup block.
+                self._maybe_apply_resolution_to_device()
                 if identity is not None:
                     from SupportClasses.CameraCalibrationStore import get_store
                     get_store().set_autostart(identity[0], True)
@@ -2376,10 +2720,20 @@ class HardwareSetupPage(ModePage):
             mgr.set_hw_auto_exposure(cam_idx, auto)
         res = hw.get("resolution")
         if res:
+            # v7.5.x: the MICROSCOPE resolution has ONE source of truth
+            # (active_resolution), applied on start — don't let a per-identity
+            # hw_controls resolution compete for it (non-microscope cameras keep
+            # their per-identity resolution).
             try:
-                mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
-            except Exception as exc:
-                logger.debug(f"restore resolution failed: {exc}")
+                is_mic = (cam_idx
+                          == self._config.camera_for_role(CameraRole.MICROSCOPE))
+            except Exception:
+                is_mic = False
+            if not is_mic:
+                try:
+                    mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
+                except Exception as exc:
+                    logger.debug(f"restore resolution failed: {exc}")
         # Restore manual exposure/gain UNLESS auto-exposure is explicitly on.
         # (When auto is unknown/None — e.g. an OpenCV cam — we still restore the
         # saved exposure so "reload exactly" holds; there's no auto state to
@@ -2397,6 +2751,249 @@ class HardwareSetupPage(ModePage):
             mgr.set_hw_brightness(cam_idx, hw["brightness"])
         if hw.get("contrast") is not None:
             mgr.set_hw_contrast(cam_idx, hw["contrast"])
+
+    def _on_calibrate_slot_rotation(self, cam_idx: int):
+        """v7.5.x: measure THIS slot's camera rotation relative to the stage.
+
+        Launches the stage-motion PixelCalibrationDialog and commits ONLY
+        the measured rotation (``result_rotation_deg``) — the camera's
+        µm/px is deliberately untouched (the needle cards / objective
+        calibration own that, with their own commit policies). The nominal
+        mount per role: microscope views along Z so its rotation is in the
+        stage XY plane; needle cameras sit at ~45° to the X/Y axes; the
+        monitor overview camera is nominally axis-aligned.
+        """
+        from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
+        from PySide6.QtWidgets import QDialog, QMessageBox
+
+        mgr = getattr(self, "_camera_manager", None)
+        ctrl = getattr(self, "_controller", None)
+        if mgr is None:
+            QMessageBox.warning(
+                self, "Calibrate rotation", "Camera manager not available.")
+            return
+        if ctrl is None or not getattr(ctrl, "xy_stage", None):
+            QMessageBox.warning(
+                self, "Calibrate rotation",
+                "Stage controller not connected — rotation calibration moves "
+                "the stage to measure the camera's orientation. Connect "
+                "hardware first.",
+            )
+            return
+        if not mgr.is_running(cam_idx):
+            QMessageBox.warning(
+                self, "Calibrate rotation",
+                f"Start Cam {cam_idx + 1} before calibrating so the dialog "
+                "can watch the live feed.",
+            )
+            return
+
+        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        rotation_deg = dlg.result_rotation_deg
+        if rotation_deg is None:
+            QMessageBox.information(
+                self, "Calibrate rotation",
+                "No rotation was measured (move too small / low confidence). "
+                "Try a larger stage move along a clear feature.",
+            )
+            return
+        self._apply_slot_rotation(cam_idx, float(rotation_deg))
+        role = (
+            self._config.camera_roles[cam_idx]
+            if cam_idx < len(self._config.camera_roles)
+            else CameraRole.UNASSIGNED
+        )
+        nom, delta = nominal_rotation_delta(float(rotation_deg), role)
+        QMessageBox.information(
+            self, "Calibrate rotation",
+            f"Cam {cam_idx + 1} rotation vs stage: {float(rotation_deg):.1f}° "
+            f"(Δ {delta:+.1f}° from the nominal {nom:g}° mount).\n\n"
+            f"This camera {role_rotation_hint(role)}.",
+        )
+
+    def _apply_slot_rotation(self, cam_idx: int, rotation_deg: float):
+        """v7.5.x: commit a measured camera→stage rotation for a slot.
+
+        Pushes it live (``CameraManager.set_rotation_deg`` — corrects the
+        click→stage mapping immediately) and persists it rotation-only per
+        device identity (``CameraCalibrationStore.set_rotation`` preserves
+        any µm/px / image-correction / hw-control siblings). When the slot
+        holds the MICROSCOPE role, the fresh rotation is also synced into
+        every per-objective calibration via the objective card, so a later
+        objective swap can't push a stale rotation back over it.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            mgr.set_rotation_deg(cam_idx, float(rotation_deg))
+        except Exception as exc:
+            logger.debug(f"slot rotation: push to manager — {exc}")
+        identity = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_rotation(
+                    identity[0], float(rotation_deg),
+                    name=(identity[1] if len(identity) > 1 else ""))
+            except Exception as exc:
+                logger.warning(f"slot rotation: store write failed — {exc}")
+        if (cam_idx == self._config.camera_for_role(CameraRole.MICROSCOPE)
+                and hasattr(self, "_objective_cal_card")):
+            try:
+                self._objective_cal_card.adopt_camera_rotation(
+                    float(rotation_deg))
+            except Exception as exc:
+                logger.debug(f"slot rotation: objective sync — {exc}")
+        if hasattr(self, "_needle_cards"):
+            self._refresh_role_derived_displays()  # also resyncs the strips
+        else:
+            self._refresh_slot_rotation_displays()  # pushes the preview orient
+        logger.info(
+            f"Camera {cam_idx + 1} rotation vs stage set to "
+            f"{float(rotation_deg):.2f}° "
+            f"(identity={identity[0] if identity else '?'})"
+        )
+
+    def _push_slot_view_orientation(self, cam_idx: int) -> None:
+        """v7.5.x: mirror/rotate the slot's live PREVIEW (CameraFeedView) so the
+        operator SEES the corrected (un-mirrored, upright) view the moment they
+        set the flag. The raw frame is unchanged — CameraFeedView flips/rotates
+        only the shown pixmap and inverts clicks back to raw coords."""
+        previews = getattr(self, "_live_cam_previews", None)
+        if not previews or cam_idx < 0 or cam_idx >= len(previews):
+            return
+        view = previews[cam_idx]
+        if view is None or not hasattr(view, "set_view_orientation"):
+            return
+        mgr = getattr(self, "_camera_manager", None)
+        mir, fy, rot = False, False, 0.0
+        if mgr is not None:
+            try:
+                fo = getattr(mgr, "full_orientation", None)
+                if callable(fo):
+                    mir, fy, rot = fo(cam_idx)
+                else:
+                    vo = getattr(mgr, "view_orientation", None)
+                    if callable(vo):
+                        mir, rot = vo(cam_idx)
+            except Exception:
+                mir, fy, rot = False, False, 0.0
+        try:
+            view.set_view_orientation(mir, rot, fy)
+        except Exception as exc:
+            logger.debug(f"slot preview orientation ({cam_idx}): {exc}")
+
+    def _on_toggle_mirror(self, cam_idx: int, checked: bool):
+        """v7.5.x: user toggled the slot's 'Mirrored view' checkbox."""
+        self._apply_slot_mirror(cam_idx, bool(checked))
+
+    def _apply_slot_mirror(self, cam_idx: int, mirrored: bool):
+        """v7.5.x: commit a slot's mirrored-view flag.
+
+        Pushes it live (``CameraManager.set_mirrored`` — the click→stage
+        mapping flips horizontally immediately) and persists it per device
+        identity (``CameraCalibrationStore.set_mirrored``, preserving any
+        µm/px / rotation / image-correction siblings). Independent of the
+        rotation calibration: a mirror is a handedness flip, not a rotation.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            mgr.set_mirrored(cam_idx, bool(mirrored))
+        except Exception as exc:
+            logger.debug(f"slot mirror: push to manager — {exc}")
+        identity = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_mirrored(
+                    identity[0], bool(mirrored),
+                    name=(identity[1] if len(identity) > 1 else ""))
+            except Exception as exc:
+                logger.warning(f"slot mirror: store write failed — {exc}")
+        # Refresh the readout + checkbox AND mirror the live preview so the
+        # operator sees the un-mirrored view immediately (via the shared
+        # _refresh_slot_rotation_displays → _push_slot_view_orientation).
+        self._refresh_slot_rotation_displays()
+        logger.info(
+            f"Camera {cam_idx + 1} mirrored-view set to {bool(mirrored)} "
+            f"(identity={identity[0] if identity else '?'})"
+        )
+
+    def _on_toggle_flip_y(self, cam_idx: int, checked: bool):
+        """v7.5.x: user toggled the slot's 'Flip Y axis' checkbox."""
+        self._apply_slot_flip_y(cam_idx, bool(checked))
+
+    def _apply_slot_flip_y(self, cam_idx: int, flip_y: bool):
+        """v7.5.x: commit a slot's vertical-flip (flip Y) flag — pushes it live
+        (mosaic + click mapping + display) and persists per identity. Sibling of
+        the mirror (flip X)."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            sfy = getattr(mgr, "set_flip_y", None)
+            if callable(sfy):
+                sfy(cam_idx, bool(flip_y))
+        except Exception as exc:
+            logger.debug(f"slot flip_y: push to manager — {exc}")
+        identity = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_flip_y(
+                    identity[0], bool(flip_y),
+                    name=(identity[1] if len(identity) > 1 else ""))
+            except Exception as exc:
+                logger.warning(f"slot flip_y: store write failed — {exc}")
+        self._refresh_slot_rotation_displays()
+        logger.info(f"Camera {cam_idx + 1} flip-Y set to {bool(flip_y)}")
+
+    def _on_slot_rotation_spin(self, cam_idx: int, value: float):
+        """v7.5.x: user typed a custom rotation on the slot's Rotation spin."""
+        self._apply_slot_rotation_value(cam_idx, float(value))
+
+    def _apply_slot_rotation_value(self, cam_idx: int, rot: float):
+        """v7.5.x: commit a slot's custom rotation (deg) — pushes live (mosaic +
+        click mapping + display) and persists per identity."""
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            mgr.set_rotation_deg(cam_idx, float(rot))
+        except Exception as exc:
+            logger.debug(f"slot rotation: push to manager — {exc}")
+        identity = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_rotation(
+                    identity[0], float(rot),
+                    name=(identity[1] if len(identity) > 1 else ""))
+            except Exception as exc:
+                logger.warning(f"slot rotation: store write failed — {exc}")
+        self._refresh_slot_rotation_displays()
+        logger.info(f"Camera {cam_idx + 1} rotation set to {float(rot):.1f}°")
 
     def _on_calibrate_needle(self, role: CameraRole):
         """Launch the stage-motion µm/px calibration for a needle camera.
@@ -2555,7 +3152,7 @@ class HardwareSetupPage(ModePage):
             if running:                            # hw controls only read live
                 try:
                     st = mgr.get_hw_settings(i)
-                    if st.get("source") in ("toupcam", "opencv"):
+                    if st.get("source") in ("toupcam", "opencv", "andor"):
                         store.set_hw_controls(key, {
                             "auto_exposure": st.get("auto_exposure"),
                             "exposure_us": st.get("exposure_us"),
@@ -2639,7 +3236,13 @@ class HardwareSetupPage(ModePage):
             try:
                 self._restore_calibration_for_slot(i)
                 self._remember_assignment(i)
-                mgr.start(i)
+                # v7.5.x: open OFF the GUI thread — the blocking device open of
+                # each saved camera used to freeze the UI at startup. Falls back
+                # to the synchronous start on an older manager.
+                if hasattr(mgr, "start_async"):
+                    mgr.start_async(i)
+                else:
+                    mgr.start(i)
                 started += 1
             except Exception as exc:
                 logger.debug(f"auto-start camera slot {i} failed: {exc}")

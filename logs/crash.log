@@ -77,3 +77,1744 @@ Windows fatal exception: code 0x80010108
 
 Thread 0x00005190 (most recent call first):
   <no Python frame>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00006828 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002a98 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000c3c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00002dcc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004fc0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004764 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004944 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x0000060c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x0000040c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002460 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000037f4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003684 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00005d2c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000019c4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000494c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00001598 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00002fb8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000593c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000332c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000037b0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00005a34 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005cb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002568 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x0000776c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004388 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000043d4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000043a8 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000046c4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x0000639c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000480c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006468 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00001f14 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004500 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006540 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000047dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000025c4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00000cc4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002bb0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005f54 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000045ec (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00001164 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001704 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006170 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000041e0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00003160 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001218 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001558 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003204 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00007140 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003ec4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 454 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000046dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 215 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 749 in _wait_for_next_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\interface\camera.py", line 263 in wait_for_frame
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\interface.py", line 666 in wrapped
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 407 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007894 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006cf0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000822c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006828 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 843 in _paint_mosaic_overlay
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\jog_workspace_view.py", line 695 in paintEvent
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 196 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 323 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 330 in <module>
+Windows fatal exception: code 0x80010012
+
+Current thread 0x0000303c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x0000303c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00007eb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00007eb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00001ce0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00001ce0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00006ec0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00006ec0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010108
+
+Thread 0x0000521c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 33 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x0000521c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x0000521c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x000032c0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x000032c0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00006804 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00006804 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00003ac0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x00003ac0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x000070cc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: code 0x80010012
+
+Current thread 0x000070cc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 152 in _append
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 143 in log_record
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\console_log.py", line 210 in emit
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1026 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1736 in callHandlers
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1680 in handle
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1664 in _log
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\logging\__init__.py", line 1507 in debug
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\comtypes\_post_coinit\unknwn.py", line 43 in _shutdown
+Windows fatal exception: access violation
+
+Thread 0x00005384 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\utils\ctypes_wrap.py", line 276 in wrapped_func
+  File "<string>", line 1 in <lambda>
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 259 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 234 in __init__
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 736 in _read_identity
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 763 in _index_for_id
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 317 in open
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 641 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00001f98 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000469c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000292c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000e58 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007b70 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004934 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x800705aa
+
+Thread 0x00007024 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007778 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006ff4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000292c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000e58 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007b70 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004934 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x800705aa
+
+Thread 0x00007024 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 550 in _loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007778 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 863 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006ff4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1127 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000292c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000e58 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007b70 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004934 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00003c1c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 246 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000acc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d7c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001590 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003900 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: access violation
+
+Thread 0x000010e0 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\utils\ctypes_wrap.py", line 276 in wrapped_func
+  File "<string>", line 1 in <lambda>
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 259 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 234 in __init__
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 736 in _read_identity
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 763 in _index_for_id
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 317 in open
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 641 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00000848 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000acc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003d7c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001590 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003900 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00001e30 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 246 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001bb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000025a0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000c2c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00005a3c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: access violation
+
+Thread 0x0000265c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\utils\ctypes_wrap.py", line 276 in wrapped_func
+  File "<string>", line 1 in <lambda>
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 259 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 234 in __init__
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 736 in _read_identity
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 763 in _index_for_id
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 317 in open
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 641 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000029f0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001bb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000025a0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000c2c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005a3c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00001348 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 246 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002ba8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000016e8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005718 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00005754 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: access violation
+
+Thread 0x00000ffc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\utils\ctypes_wrap.py", line 276 in wrapped_func
+  File "<string>", line 1 in <lambda>
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 259 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 234 in __init__
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 736 in _read_identity
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 763 in _index_for_id
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\andor_backend.py", line 317 in open
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 641 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00005468 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002b4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 623 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002ba8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000016e8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005718 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005754 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004bb4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 246 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001630 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003e68 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000898 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003fd0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004830 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 246 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005074 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001ae4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003900 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00005bcc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00005b40 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000516c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000392c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001534 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00004fa4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x0000567c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006320 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006324 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006318 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00006308 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00000dcc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000026b4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000055dc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000022c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000010a0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004f4c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000da4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005f50 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004bdc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00005928 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00001f5c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000014dc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006024 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002258 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00002c44 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00000690 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000dcc (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004ab4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003cc4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00004ad0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x0000605c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000166c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004b9c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001724 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00004d28 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x00004530 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005b98 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003c9c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004434 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00000d6c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x0000600c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000053c8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000641c (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000696c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003478 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>
+Windows fatal exception: code 0x8001010d
+
+Thread 0x000071d8 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_widget.py", line 115 in detect_cameras
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\gui\widgets\camera_manager.py", line 251 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000048e4 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\StageController.py", line 1341 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000072e0 (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003b5c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000050ac (most recent call first):
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 251 in run_gui
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 378 in main
+  File "c:\Users\mcghe\OneDrive\Documents\GitHub\MEBP\main.py", line 385 in <module>

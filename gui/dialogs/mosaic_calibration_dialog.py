@@ -52,14 +52,32 @@ class MosaicCalibrationDialog(QDialog):
                  align_key, store, settings, center_um, frame_size,
                  um_per_px_camera, plate=None, well_positions=None,
                  safety_limits=None, zero_offset=(0.0, 0.0),
-                 needle_od_um=None, parent=None):
+                 needle_od_um=None, cam_key=None, objective=None,
+                 plate_flip_180=None, parent=None):
         super().__init__(parent)
         self._controller = controller
         self._mgr = camera_manager
         self._cam_idx = cam_idx
+        # v7.5.x: render the tiles in the SAME plate-display frame as the full
+        # plate view (JogWorkspaceView rotates the mosaic 180° when
+        # plate_flip_180), so an orientation tuned here is WYSIWYG vs the full
+        # mosaic. Resolve from the controller when not passed explicitly.
+        if plate_flip_180 is None:
+            try:
+                pf = getattr(controller, "plate_flip_180", None)
+                plate_flip_180 = bool(pf()) if callable(pf) else False
+            except Exception:
+                plate_flip_180 = False
+        self._plate_flip_180 = bool(plate_flip_180)
         self._safe_z = safe_z
         self._align_key = align_key
         self._store = store
+        # v7.5.x: when the objective identity is known, a correction here
+        # (Store FOV/spacing) also writes the objective store + live manager so
+        # the corrected µm/px is GROUND TRUTH everywhere (mosaic + click mapping
+        # + restore), not just the mosaic-alignment learned value.
+        self._cam_key = cam_key
+        self._objective = objective
         self._settings = dict(settings or {})
         self._center_um = center_um            # (cx, cy) abs µm — "plate centre"
         self._fw, self._fh = frame_size
@@ -74,6 +92,24 @@ class MosaicCalibrationDialog(QDialog):
         except Exception:
             self._zero_offset = (0.0, 0.0)
         self._needle_od_um = needle_od_um
+
+        # v7.5.x: camera orientation (flip X = mirror, flip Y, rotation). The
+        # operator flips/rotates the scanned images here until the mosaic reads
+        # correctly, then it saves as the camera's calibration. Seeded from the
+        # camera's current calibration (all three via full_orientation).
+        self._orient_mir, self._orient_fy, self._orient_rot = False, False, 0.0
+        try:
+            fo = getattr(camera_manager, "full_orientation", None)
+            if callable(fo):
+                self._orient_mir, self._orient_fy, self._orient_rot = \
+                    fo(cam_idx)
+            else:
+                vo = getattr(camera_manager, "view_orientation", None)
+                if callable(vo):
+                    self._orient_mir, self._orient_rot = vo(cam_idx)
+        except Exception:
+            self._orient_mir, self._orient_fy, self._orient_rot = \
+                False, False, 0.0
 
         self._worker = None
         self._builder = None
@@ -219,6 +255,61 @@ class MosaicCalibrationDialog(QDialog):
         self._set_align_enabled(False)
         root.addWidget(self._align_box)
 
+        # ── Camera orientation (flip / rotate the images) ──────────────
+        # A mirrored / rotated camera makes the mosaic read wrong. Flip / rotate
+        # the images here until it looks right, then Apply to save it as the
+        # camera's mirror + rotation (used by the live feed, future mosaics, and
+        # click-mapping). Since this is a small single-well mosaic it's fast.
+        self._orient_box = QGroupBox("Camera orientation (flip / rotate images)")
+        obl = QVBoxLayout(self._orient_box)
+        obl.setContentsMargins(s(8), s(4), s(8), s(4))
+        obl.setSpacing(s(4))
+        oh = QLabel(
+            "Flip / rotate the images until the mosaic reads correctly, then "
+            "Apply to save it to the camera.")
+        oh.setWordWrap(True)
+        oh.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 8pt;")
+        obl.addWidget(oh)
+        orow1 = QHBoxLayout()
+        orow1.setSpacing(s(4))
+        self._o_fliph = QPushButton("⇄ Flip X axis")
+        self._o_fliph.setToolTip("Flip the camera left↔right (mirror the X axis) "
+                                 "— use if the mosaic is mirrored across X.")
+        self._o_fliph.clicked.connect(self._orient_flip_h)
+        self._o_flipv = QPushButton("⇅ Flip Y axis")
+        self._o_flipv.setToolTip("Flip the camera top↔bottom (mirror the Y axis) "
+                                 "— use if the mosaic is mirrored across Y.")
+        self._o_flipv.clicked.connect(self._orient_flip_v)
+        self._o_ccw = QPushButton("⟲ 90°")
+        self._o_ccw.clicked.connect(lambda: self._orient_rotate(-90.0))
+        self._o_cw = QPushButton("⟳ 90°")
+        self._o_cw.clicked.connect(lambda: self._orient_rotate(90.0))
+        for b in (self._o_fliph, self._o_flipv, self._o_ccw, self._o_cw):
+            orow1.addWidget(b)
+        obl.addLayout(orow1)
+        orow2 = QHBoxLayout()
+        orow2.setSpacing(s(4))
+        orow2.addWidget(QLabel("Rotation °"))
+        self._o_fine = QDoubleSpinBox()
+        self._o_fine.setRange(-180.0, 180.0)
+        self._o_fine.setSingleStep(0.5)
+        self._o_fine.setDecimals(1)
+        self._o_fine.blockSignals(True)
+        self._o_fine.setValue(float(self._orient_rot))
+        self._o_fine.blockSignals(False)
+        self._o_fine.valueChanged.connect(self._orient_fine_changed)
+        orow2.addWidget(self._o_fine, 1)
+        self._o_reset = QPushButton("Reset")
+        self._o_reset.clicked.connect(self._orient_reset)
+        orow2.addWidget(self._o_reset)
+        obl.addLayout(orow2)
+        self._o_apply = QPushButton("Apply to camera setup")
+        self._o_apply.setObjectName("accentBtn")
+        self._o_apply.clicked.connect(self._orient_apply_to_camera)
+        obl.addWidget(self._o_apply)
+        self._orient_box.setEnabled(False)   # enabled after a build
+        root.addWidget(self._orient_box)
+
         self._status = QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color: {COLORS['subtext0']};")
@@ -247,6 +338,11 @@ class MosaicCalibrationDialog(QDialog):
                 MosaicRegistrationView)
             self._view = MosaicRegistrationView()
             self._view.setMinimumSize(s(360), s(260))
+            # Show tiles in the plate-display frame → WYSIWYG vs the full mosaic.
+            try:
+                self._view.set_flip_180(self._plate_flip_180)
+            except Exception:
+                pass
             mp.addWidget(self._view, stretch=1)
         except Exception as e:
             logger.debug(f"Mosaic registration view unavailable: {e}")
@@ -422,7 +518,13 @@ class MosaicCalibrationDialog(QDialog):
         builder = MosaicBuilder(
             frame_size_px=(self._fw, self._fh), micron_per_pixel=eff,
             overlap=overlap, target_mosaic_px=1800,
-            register=True, max_shift_um=max_shift_um, initial_shift_um=prior)
+            register=True, max_shift_um=max_shift_um, initial_shift_um=prior,
+            # v7.5.x: apply the camera's current mirror + rotation so the tiles
+            # read the way the operator will adjust them (retained frames let
+            # tile_images_px re-orient on each flip/rotate).
+            frame_rotation_deg=float(self._orient_rot),
+            frame_mirrored=bool(self._orient_mir),
+            frame_flip_y=bool(self._orient_fy))
         grid = builder.generate_raster_positions(
             bounds, overlap=overlap, step_x_um=step_x, step_y_um=step_y)
         if env is not None:
@@ -472,6 +574,7 @@ class MosaicCalibrationDialog(QDialog):
         self._align_clear_btn.setEnabled(not running)
         if running:
             self._set_align_enabled(False)
+            self._orient_box.setEnabled(False)
 
     # ── Manual global registration (slide mosaic onto wells by eye) ──
 
@@ -589,15 +692,155 @@ class MosaicCalibrationDialog(QDialog):
                 self._store.set_um_per_px(key, corr, source="quick_fov")
             except Exception as e:
                 logger.warning(f"FOV store failed: {e}")
+        # v7.5.x: propagate as GROUND TRUTH — push to the live manager (click
+        # mapping via effective_um_per_px) and, when the objective is known, the
+        # objective store (mosaic fallback + restore across sessions). So a
+        # correction here takes effect EVERYWHERE, not just as the mosaic
+        # learned value.
+        self._propagate_um_per_px(corr)
         # Reflect into the FOV field so "Apply to full mosaic" carries it.
         self._spin_fov.blockSignals(True)
         self._spin_fov.setValue(max(0, min(self._spin_fov.maximum(), fov)))
         self._spin_fov.blockSignals(False)
         self._status.setText(
             f"Stored effective µm/px {corr:.3f} for '{key}' (FOV {fov} µm). "
-            f"Full mosaics will use it so the overlap is correct.")
+            f"Applied everywhere (mosaic + live view).")
         logger.info(f"Calibration FOV stored: key='{key}' µm/px={corr:.4f} "
                     f"fov={fov}µm")
+
+    def _propagate_um_per_px(self, corr: float) -> None:
+        """Push a corrected µm/px to every consumer so it is ground truth."""
+        if not corr or corr <= 0:
+            return
+        res = (int(self._fw), int(self._fh))
+        try:
+            self._mgr.set_um_per_px(self._cam_idx, float(corr), resolution=res)
+        except Exception as e:
+            logger.debug(f"propagate µm/px to manager: {e}")
+        if self._cam_key and self._objective:
+            try:
+                from SupportClasses.ObjectiveCalibration import (
+                    get_store as _objs)
+                rot = None
+                try:
+                    rot = self._mgr.get_rotation_deg(self._cam_idx)
+                except Exception:
+                    rot = None
+                _objs().set_calibration(
+                    str(self._cam_key), str(self._objective), float(corr), res,
+                    rotation_deg=rot)
+            except Exception as e:
+                logger.debug(f"propagate µm/px to objective store: {e}")
+
+    # ── Camera orientation (flip / rotate the images) ──────────────
+
+    def _orient_set(self, rot: float, flip_x: bool, flip_y: bool) -> None:
+        """Set the working orientation (flip X, flip Y, rotation — normalised),
+        re-orient the tiles, and push + PERSIST live so every consumer (full
+        mosaic, live view, click mapping) uses it at once."""
+        rot = ((float(rot) + 180.0) % 360.0) - 180.0
+        if rot == -180.0:
+            rot = 180.0
+        self._orient_rot = rot
+        self._orient_mir = bool(flip_x)
+        self._orient_fy = bool(flip_y)
+        if abs(self._o_fine.value() - rot) > 1e-6:
+            self._o_fine.blockSignals(True)
+            self._o_fine.setValue(rot)
+            self._o_fine.blockSignals(False)
+        # Re-orient the displayed tiles.
+        b = self._builder
+        if b is not None and hasattr(b, "set_frame_orientation"):
+            try:
+                b.set_frame_orientation(rot, self._orient_mir, self._orient_fy)
+                self._show_tiles()
+            except Exception as e:
+                logger.debug(f"orientation re-show: {e}")
+        # Push live to the camera (feed correction + clicks + future scans).
+        try:
+            self._mgr.set_mirrored(self._cam_idx, self._orient_mir)
+            self._mgr.set_rotation_deg(self._cam_idx, rot)
+            sfy = getattr(self._mgr, "set_flip_y", None)
+            if callable(sfy):
+                sfy(self._cam_idx, self._orient_fy)
+        except Exception:
+            pass
+        # v7.5.x: PERSIST immediately (per identity) so the FULL-PLATE mosaic
+        # applies it when it places each tile — no separate "Apply" needed.
+        self._persist_orientation(rot, self._orient_mir, self._orient_fy)
+        self._status.setText(
+            f"Orientation: flip X {'on' if self._orient_mir else 'off'}, "
+            f"flip Y {'on' if self._orient_fy else 'off'}, rotation {rot:.1f}° "
+            f"— saved (mosaic + live view).")
+
+    def _persist_orientation(self, rot: float, flip_x: bool,
+                             flip_y: bool) -> None:
+        """Persist the working orientation to the per-identity ground-truth
+        store so every consumer (full mosaic, live feed, click mapping) uses it."""
+        try:
+            ident = self._mgr.camera_identity(self._cam_idx)
+        except Exception:
+            ident = None
+        if not (ident and ident[0]):
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            nm = ident[1] if len(ident) > 1 else ""
+            st = get_store()
+            st.set_rotation(ident[0], float(rot), name=nm)
+            st.set_mirrored(ident[0], bool(flip_x), name=nm)
+            sfy = getattr(st, "set_flip_y", None)
+            if callable(sfy):
+                sfy(ident[0], bool(flip_y), name=nm)
+        except Exception as e:
+            logger.debug(f"persist orientation: {e}")
+
+    def _orient_rotate(self, delta: float) -> None:
+        self._orient_set(self._orient_rot + delta, self._orient_mir,
+                         self._orient_fy)
+
+    def _orient_flip_h(self) -> None:
+        # Flip X axis: toggle the horizontal flip (independent of flip Y).
+        self._orient_set(self._orient_rot, not self._orient_mir,
+                         self._orient_fy)
+
+    def _orient_flip_v(self) -> None:
+        # Flip Y axis: toggle the vertical flip (independent of flip X).
+        self._orient_set(self._orient_rot, self._orient_mir,
+                         not self._orient_fy)
+
+    def _orient_fine_changed(self, val: float) -> None:
+        self._orient_set(val, self._orient_mir, self._orient_fy)
+
+    def _orient_reset(self) -> None:
+        """Back to the camera's currently-saved orientation."""
+        mir, fy, rot = False, False, 0.0
+        try:
+            fo = getattr(self._mgr, "full_orientation", None)
+            if callable(fo):
+                mir, fy, rot = fo(self._cam_idx)
+            else:
+                vo = getattr(self._mgr, "view_orientation", None)
+                if callable(vo):
+                    mir, rot = vo(self._cam_idx)
+        except Exception:
+            mir, fy, rot = False, False, 0.0
+        self._orient_set(rot, mir, fy)
+
+    def _orient_apply_to_camera(self) -> None:
+        """Confirm the working orientation is saved (it is already pushed +
+        persisted live by ``_orient_set``)."""
+        from PySide6.QtWidgets import QMessageBox
+        mir, fy, rot = self._orient_mir, self._orient_fy, self._orient_rot
+        self._persist_orientation(rot, mir, fy)
+        self._status.setText(
+            f"Saved to the camera — flip X {'on' if mir else 'off'}, "
+            f"flip Y {'on' if fy else 'off'}, rotation {rot:.1f}°.")
+        QMessageBox.information(
+            self, "Camera orientation",
+            f"Saved to the camera — flip X {'on' if mir else 'off'}, "
+            f"flip Y {'on' if fy else 'off'}, rotation {rot:.1f}°.\n\nThe live "
+            "feed, mosaics, and click-mapping now use it.")
 
     # ── Worker signals ─────────────────────────────────────────────
 
@@ -639,9 +882,12 @@ class MosaicCalibrationDialog(QDialog):
             self._result_ext = (tuple(float(v) for v in extent)
                                  if extent is not None else None)
         self._show_tiles()
-        self._builder = None
+        # v7.5.x: keep the builder alive (retained frames) so the Camera-
+        # orientation controls can re-orient the tiles (flip/rotate → re-show).
+        # Freed on stop / fail / close.
         if self._view is not None and self._view.has_content():
             self._set_align_enabled(True)
+            self._orient_box.setEnabled(True)
 
         # Auto registration still records the residual GLOBAL SHIFT (separate
         # from the FOV/spacing); keep it unless a manual_align lock is in force.
@@ -673,6 +919,7 @@ class MosaicCalibrationDialog(QDialog):
         self._worker = None
         self._builder = None
         self._set_running(False)
+        self._orient_box.setEnabled(False)
         self._status.setText(f"Calibration failed: {msg}")
 
     # ── Lifecycle ──────────────────────────────────────────────────
@@ -694,6 +941,7 @@ class MosaicCalibrationDialog(QDialog):
                 pass
         self._set_running(False)
         self._builder = None
+        self._orient_box.setEnabled(False)
         self._status.setText("Calibration stopped.")
 
     def closeEvent(self, event):

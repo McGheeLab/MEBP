@@ -159,8 +159,31 @@
       "n_points": 8,
       "runs": 1,
       "last_updated": "2026-06-22T10:50:57"
+    },
+    "5.00|0.70": {
+      "speed_mm_s": 5.0,
+      "seg_len_mm": 0.7,
+      "intercept_s": 0.16343,
+      "slope_s_per_seg": 0.009777,
+      "n_points": 8,
+      "runs": 2,
+      "last_updated": "2026-07-28T10:40:24"
+    }
+  },
+  "path_tuning": {
+    "open_loop": {
+      "pace_correction": 3.0
+    },
+    "confirm": {
+      "settle_tol_um": 40.0
+    },
+    "velocity": {
+      "lookahead_mm": 1.0,
+      "control_hz": 25.0,
+      "decel_mm": 1.5
     }
   },
   "enabled": true,
-  "xy_max_speed_um_s": 22281.941527858107
+  "xy_max_speed_um_s": 5945.611449038091,
+  "control_loop_ms": 31.75
 }

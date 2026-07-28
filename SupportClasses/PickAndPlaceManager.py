@@ -1495,7 +1495,8 @@ class PickPlaceExecutor:
     # ── Ink pickup (Quick Print: "pick the ink we will need") ─────
 
     def aspirate_ink(self, well_pos, volume_uL, *, bore, z_mm,
-                     rate_uL_s=None):
+                     rate_uL_s=None, prime_uL=0.0, prime_rate_uL_s=None,
+                     orbit=False, orbit_diameter_mm=1.0, orbit_speed_mm_s=2.0):
         """Safe-travel to an ink reagent well and aspirate ``volume_uL``.
 
         Used by Quick Print's "pick the ink we will need for the print" step:
@@ -1509,6 +1510,25 @@ class PickPlaceExecutor:
             bore: Pump/bore to aspirate with (e.g. "P1").
             z_mm: Dip Z at the ink well (zero-ref mm).
             rate_uL_s: Aspirate flow rate (µL/s); defaults to ``prep_rate_uL_s``.
+            prime_uL: v7.5.x TIP PRIME. Aspirate this EXTRA volume beyond
+                ``volume_uL`` and then immediately DISPENSE the same amount back
+                into the ink well. This advances ink to the very tip and purges
+                the air gap, so the ink is ready to deposit the moment printing
+                starts — net retained volume stays ``volume_uL``. 0 = disabled
+                (legacy). When priming, the whole pickup step runs WITHOUT
+                backlash/compliance compensation (``compensate=False``): the
+                drivetrain compliance is already primed by this dispense-back, so
+                bracketing the pickup with take-up/unload would fight it.
+            prime_rate_uL_s: Flow rate for the extra aspirate + dispense-back
+                (µL/s); defaults to the aspirate ``rate``.
+            orbit: v7.5.x GRANULAR ANTI-CLOG. When True, orbit the needle in a
+                small circle (``orbit_diameter_mm``) around the well centre WHILE
+                the pump aspirates/dispenses, so granular material behaves more
+                fluid-like and does not clog the bore. In-well motion (needle
+                already at dip Z) — exempt from retract-before-XY, same class as
+                the wash jiggle.
+            orbit_diameter_mm: Orbit circle diameter (mm). Default 1 mm.
+            orbit_speed_mm_s: Tangential orbit speed along the circle (mm/s).
 
         Abort-aware and ZP-down-guarded — delegates the move to ``_safe_move_to``
         (which raises :class:`AbortException` if the ZP board has dropped, so we
@@ -1518,18 +1538,108 @@ class PickPlaceExecutor:
         ``finally`` handles end-at-safe-Z via :meth:`_retract_to_safe_z`.
         """
         self._check_abort()
+        cx, cy = float(well_pos[0]), float(well_pos[1])
         target = PickPlaceTarget(
-            target_id="ink_well",
-            x_um=float(well_pos[0]), y_um=float(well_pos[1]),
-            well_name="__ink__",
+            target_id="ink_well", x_um=cx, y_um=cy, well_name="__ink__",
         )
         self._safe_move_to(target, target_z_mm=z_mm)
         self._check_abort()
         vol = float(volume_uL or 0.0)
-        if vol > 0:
-            rate = rate_uL_s if rate_uL_s is not None else self.prep_rate_uL_s
-            _settled_pump_move(self.controller, bore, -vol, rate_uL_s=rate,
-                               compensate=None)
+        prime = max(0.0, float(prime_uL or 0.0))
+        if vol <= 0 and prime <= 0:
+            return  # travel-only (needle already loaded, no prime)
+
+        rate = rate_uL_s if rate_uL_s is not None else self.prep_rate_uL_s
+        p_rate = prime_rate_uL_s if prime_rate_uL_s is not None else rate
+        # Prime mode owns the compliance decision for the WHOLE pickup step: skip
+        # comp (compensate=False) so the take-up/unload bracket does not fight the
+        # dispense-back priming. Without prime, keep the legacy auto behaviour
+        # (None = comp iff the global backlash toggle is on).
+        compensate = False if prime > 0 else None
+
+        stop = self._orbit_xy((cx, cy), orbit_diameter_mm, orbit_speed_mm_s) \
+            if orbit else None
+        try:
+            aspirate_total = vol + prime  # >0 (guarded above)
+            if aspirate_total > 0:
+                _settled_pump_move(self.controller, bore, -aspirate_total,
+                                   rate_uL_s=rate, compensate=compensate)
+                self._check_abort()
+            if prime > 0:
+                # Dispense the extra back INTO the ink well (+ = dispense).
+                _settled_pump_move(self.controller, bore, prime,
+                                   rate_uL_s=p_rate, compensate=compensate)
+        finally:
+            if stop is not None:
+                self._stop_orbit(stop, (cx, cy))
+
+    # ── Anti-clog circular pickup orbit (granular inks) ───────────
+
+    _ORBIT_POINTS_PER_REV = 24
+
+    def _orbit_xy(self, center_um, diameter_mm, speed_mm_s):
+        """Start a background daemon thread that orbits the needle in a circle
+        around ``center_um`` (absolute stage µm) while a blocking pump move runs
+        on the caller's thread. Returns a ``threading.Event`` to stop it (via
+        :meth:`_stop_orbit`), or ``None`` when the orbit is a no-op.
+
+        The XY (Prior) and pump (ZP/Marlin) buses are independent, so the two
+        move concurrently. Points are stepped with ``move_xy_absolute_um`` (the
+        same template as ``calibration._ploc_multi_edge_fit``); the loop cycles
+        the circle until the stop event OR ``_abort_flag`` is set. In-well motion
+        only (needle already at dip Z), so retract-before-XY does not apply."""
+        r_um = max(0.0, float(diameter_mm) * 0.5) * 1000.0
+        speed = max(1e-3, float(speed_mm_s))
+        ctrl = self.controller
+        if r_um <= 0.0 or not hasattr(ctrl, "move_xy_absolute_um"):
+            return None
+        cx, cy = float(center_um[0]), float(center_um[1])
+        n = self._ORBIT_POINTS_PER_REV
+        # Tangential speed → per-point dwell. Circumference = π·d (mm).
+        step_dwell = max(0.01, (math.pi * float(diameter_mm) / speed) / n)
+        stop = threading.Event()
+
+        def _loop():
+            i = 0
+            while not stop.is_set() and not self._abort_flag.is_set():
+                th = 2.0 * math.pi * (i % n) / n
+                try:
+                    ctrl.move_xy_absolute_um(cx + r_um * math.cos(th),
+                                             cy + r_um * math.sin(th))
+                except Exception:
+                    return  # a serial hiccup must not kill the pickup
+                i += 1
+                stop.wait(step_dwell)
+
+        t = threading.Thread(target=_loop, name="InkPickupOrbit", daemon=True)
+        t.start()
+        stop._orbit_thread = t  # keep a handle for the join in _stop_orbit
+        return stop
+
+    def _stop_orbit(self, stop, center_um):
+        """Stop the orbit thread, re-centre over the well, and wait for arrival
+        so the subsequent retract starts from the known well centre (mirrors
+        :meth:`_do_wash`'s recentre). Best-effort — never raises."""
+        try:
+            stop.set()
+            t = getattr(stop, "_orbit_thread", None)
+            if t is not None:
+                t.join(timeout=5.0)
+        except Exception:
+            pass
+        ctrl = self.controller
+        cx, cy = float(center_um[0]), float(center_um[1])
+        try:
+            ctrl.move_xy_absolute_um(cx, cy)
+            zero = getattr(ctrl, "zero_position", {}) or {}
+            zx = float(zero.get("x", 0.0))
+            zy = float(zero.get("y", 0.0))
+            if hasattr(ctrl, "wait_for_xy_arrival"):
+                ctrl.wait_for_xy_arrival(
+                    (cx - zx) / 1000.0, (cy - zy) / 1000.0,
+                    timeout_s=self.xy_timeout_s)
+        except Exception:
+            pass
 
     # ── Trypsin Cell Pickup ──────────────────────────────────────
 

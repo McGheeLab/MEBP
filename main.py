@@ -149,6 +149,50 @@ def run_headless(controller: StageController, settings: Settings):
         controller.shutdown()
 
 
+def _apply_dark_palette(app) -> None:
+    """Pin a Catppuccin-Mocha dark palette on the QApplication.
+
+    The dark look is a QSS (``gui/styles.py::build_theme``), but the QSS only
+    styles the widgets it names — it does NOT cover QGraphicsView / QScrollArea
+    viewports or leave a base-widget background, so those fall back to the Qt
+    palette. With no palette set, Fusion follows the OS theme, and a light-mode
+    OS makes the palette Base white → white viewports/panels on many pages.
+    Setting the palette here decouples the app's dark theme from the OS theme;
+    the QSS still wins wherever it sets an explicit per-widget background.
+    """
+    try:
+        from PySide6.QtGui import QPalette, QColor
+    except Exception:
+        return
+    pal = QPalette()
+    win = QColor("#1e1e2e")       # base    — window / general surface
+    base = QColor("#181825")      # mantle  — text-entry + VIEWPORT background
+    alt = QColor("#313244")       # surface0
+    text = QColor("#cdd6f4")      # text
+    dim = QColor("#a6adc8")       # subtext0 (placeholder)
+    disabled = QColor("#6c7086")  # overlay0
+    pal.setColor(QPalette.Window, win)
+    pal.setColor(QPalette.WindowText, text)
+    pal.setColor(QPalette.Base, base)
+    pal.setColor(QPalette.AlternateBase, alt)
+    pal.setColor(QPalette.ToolTipBase, win)
+    pal.setColor(QPalette.ToolTipText, text)
+    pal.setColor(QPalette.Text, text)
+    pal.setColor(QPalette.Button, alt)
+    pal.setColor(QPalette.ButtonText, text)
+    pal.setColor(QPalette.BrightText, QColor("#f38ba8"))
+    pal.setColor(QPalette.Link, QColor("#89b4fa"))
+    pal.setColor(QPalette.Highlight, QColor("#cba6f7"))
+    pal.setColor(QPalette.HighlightedText, win)
+    try:
+        pal.setColor(QPalette.PlaceholderText, dim)
+    except Exception:
+        pass  # PlaceholderText only exists on Qt 5.12+/Qt6
+    for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, role, disabled)
+    app.setPalette(pal)
+
+
 def run_gui(controller: StageController, settings: Settings):
     """Run the full GUI application."""
     try:
@@ -173,6 +217,17 @@ def run_gui(controller: StageController, settings: Settings):
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
         app.setStyle(fusion)
+
+    # v7.5.x: pin a dark palette to match the dark QSS. Fusion follows the
+    # OS/system palette when none is set, so on a LIGHT-mode OS (or after a Qt
+    # dark-mode change) the palette Base is white — and EVERY widget the QSS
+    # doesn't explicitly background-fill renders white: QScrollArea + QGraphicsView
+    # viewports (several calibration/plate/projection views set no background
+    # brush) and transparent panels that bottom out at Base. This was surfacing
+    # as "multiple pages have a white background." A dark palette makes those
+    # default to the theme's dark surfaces regardless of the OS theme; the QSS
+    # still overrides per-widget wherever it sets an explicit background.
+    _apply_dark_palette(app)
 
     from SupportClasses.PrintRecorder import PrintRecorder
     recorder = PrintRecorder()

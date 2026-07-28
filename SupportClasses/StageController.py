@@ -1599,6 +1599,21 @@ class StageController:
 
     # ── Connection Management ─────────────────────────────────────
 
+    def set_controller_json(self, controller_json) -> None:
+        """v7.5.x: set which XY controller protocol to use on the NEXT connect.
+
+        ``controller_json`` is a protocol-JSON path (e.g.
+        ``config/controllers/mac5000.json``), ``"auto"`` (detect), or ``None``
+        (default). The live XY stage is (re)built from this in ``connect_stages``
+        (``XYStageManager(controller_json=...)``), so a change takes effect on
+        the next XY (re)connect — no restart. Called by the device-profile load
+        and the Settings-page controller dropdown so the per-machine profile
+        wins, falling back to the global setting, then auto-detect.
+        """
+        self.controller_json = controller_json
+        logger.info("XY controller protocol set to %r (applies on next XY connect)",
+                    controller_json)
+
     def _handle_debug(self, *args, **kwargs) -> None:
         """v7.2.6: debug handler — logs Xbox worker debug messages."""
         msg = kwargs.get("message", "") or (args[0] if args else "")
@@ -1632,10 +1647,18 @@ class StageController:
         zp_just_connected = False
         if xy and self.xy_stage is None:
             # v7.2.8: connection error handling
+            # v7.5.x: never let the XY detection scan OPEN the ZP/Marlin port —
+            # opening a port asserts DTR and auto-resets an Arduino/Marlin board.
+            # Exclude the live ZP port (if connected) and the last-known-good ZP
+            # port (persisted), so connecting a Prior/Ludl XY controller can't
+            # reset the ZP board regardless of connect order.
+            xy_exclude = [p for p in (
+                self.zp_connected_port, self._preferred_zp_port) if p]
             try:
                 self.xy_stage = XYStageManager(
                     simulate=sim_xy,
                     controller_json=self.controller_json,
+                    exclude_ports=xy_exclude,
                 )
             except (ConnectionError, ImportError, OSError) as e:
                 logger.error(f"XY stage connection failed: {e}")
@@ -4399,7 +4422,8 @@ class StageController:
     def ensure_retracted_to(self, safe_z_zero_ref_mm: float,
                             tol_mm: float = 0.1,
                             timeout_s: float = 15.0,
-                            feedrate_mm_min: float | None = None) -> bool:
+                            feedrate_mm_min: float | None = None,
+                            apply_insert_floor: bool = True) -> bool:
         """Guarantee the needle is retracted to >= ``safe_z`` before XY travel.
 
         Raises the needle (in the HEIGHT frame) to at least ``safe_z``
@@ -4408,6 +4432,15 @@ class StageController:
         (polarity-aware), it returns immediately without motion, so a
         misconfigured/too-low target can never cause a crash-down. Honors the
         plate-insert clearance floor (:meth:`set_min_travel_z`).
+
+        v7.5.x: ``apply_insert_floor`` (default True) — when False the
+        tube-clearance floor is skipped and the retract goes to exactly the
+        requested ``safe_z``. Used by the calibration MOSAIC SCAN / mapping
+        travel, which stays at the operator-assigned imaging safe Z the whole
+        time (never descends into a well), so the tube-clearance floor is
+        unnecessary there and was surprising the operator by raising the
+        retract above their assigned safe Z. Print / pick-place travel keeps
+        the floor (default True).
 
         Returns True if the needle is confirmed at/above the height (or there is
         no ZP stage), False if the retract move timed out.
@@ -4419,7 +4452,8 @@ class StageController:
         # Floor the retract so the needle clears the tallest insert/tube.
         # Compare in the height frame (polarity-safe).
         floor = getattr(self, "_min_travel_z_mm", None)
-        if floor is not None and self.z_height_of(floor) > self.z_height_of(target):
+        if (apply_insert_floor and floor is not None
+                and self.z_height_of(floor) > self.z_height_of(target)):
             target = float(floor)
 
         # Already at/above the target height? No motion — never descend.
@@ -4528,6 +4562,7 @@ class StageController:
         fast_xy_speed_mm_s: float = 50.0,
         z_timeout_s: float = 15.0,
         xy_timeout_s: float = 30.0,
+        apply_insert_floor: bool = True,
     ) -> bool:
         """Safe 3-step travel: raise Z → wait → fast XY → wait → lower Z.
 
@@ -4560,8 +4595,11 @@ class StageController:
         # Both values are zero-referenced mm. v7.5.x: compare in the HEIGHT
         # frame (polarity-safe) so the floor still raises — not lowers — the
         # needle on ZDIR=-1 machines where larger raw Z = lower needle.
+        # v7.5.x: apply_insert_floor=False skips it for imaging-height mosaic
+        # scan / mapping travel (needle never descends there), so that flow
+        # honors the operator's exact assigned safe Z.
         min_travel_z = getattr(self, "_min_travel_z_mm", None)
-        if min_travel_z is not None and \
+        if apply_insert_floor and min_travel_z is not None and \
                 self.z_height_of(min_travel_z) > self.z_height_of(safe_z_mm):
             logger.info(
                 f"safe_travel_to: raising safe Z {safe_z_mm:.2f} → "
@@ -4848,6 +4886,153 @@ class StageController:
             f"max_hz={result['max_command_hz']}, "
             f"controller={controller_name}"
         )
+        return result
+
+    def measure_control_loop_rate(
+        self,
+        *,
+        iterations: int = 40,
+        speed_um_s: float = 2000.0,
+        amplitude_um: float = 600.0,
+        on_progress=None,
+    ) -> dict:
+        """Measure the achievable CLOSED-LOOP control cadence — the period of
+        one interleaved *(send a motion command + read a fresh position)* cycle
+        WHILE the stage is actively moving.
+
+        This is distinct from :meth:`test_command_rate` (which only polls, no
+        motion). The velocity-following print path issues exactly this cycle —
+        ``send_velocity_xy`` then ``get_xy_position(cached=False)`` — every tick,
+        so the period measured here is the loop_period that GOVERNS how fast the
+        stage can print before the pure-pursuit controller goes unstable
+        (``v_max ≈ lookahead / (loop_period × safety)``). A controller that
+        streams motion commands can respond to reads more slowly while moving
+        than while idle, which is why this measures under real motion.
+
+        ⚠ SAFETY: the caller MUST have the needle retracted to a safe Z. The
+        stage oscillates within ``±amplitude_um`` of its current X position
+        (velocity reversed each time the bound is crossed) so net displacement
+        is ~0; XY-only, no Z motion; the velocity is ALWAYS stopped (VS 0,0) and
+        the stage returned to its start on exit; the position poller is
+        suspended for the duration. Falls back gracefully on a controller with
+        no continuous-velocity command (the command still exercises whatever
+        motion primitive ``send_velocity_xy`` maps to — e.g. the Ludl pulsed
+        jog).
+
+        Returns a dict with ``avg/min/max_period_ms``, ``control_hz``,
+        ``avg_read_ms``, ``avg_cmd_ms``, ``moved``, ``max_excursion_um`` — or
+        ``{"error": ...}`` if the stage isn't ready.
+        """
+        xy = self.xy_stage
+        if xy is None or not self.is_xy_connected:
+            return {"error": "XY stage not connected"}
+
+        p0 = self.get_xy_position(cached=False)
+        if not p0 or p0[0] is None or p0[1] is None:
+            return {"error": "could not read stage position"}
+        start_x, start_y = float(p0[0]), float(p0[1])
+
+        # Clamp the probe speed to the safety envelope so a slow loop can't run
+        # the stage away between reads.
+        v = abs(float(speed_um_s))
+        try:
+            cap = float(getattr(self.safety_limits, "max_xy_speed", 0) or 0)
+            if cap > 0:
+                v = min(v, cap)
+        except Exception:
+            pass
+        v = max(v, 100.0)
+        amp = max(50.0, abs(float(amplitude_um)))
+
+        # Raise SMS enough that the commanded VS isn't capped below the probe
+        # speed (so the stage actually moves → a realistic "while moving" cycle).
+        try:
+            if hasattr(xy, "set_acceleration"):
+                xy.set_acceleration(80)
+            if hasattr(xy, "set_speed_mm_s"):
+                xy.set_speed_mm_s(max(v / 1000.0 * 1.5, 3.0))
+        except Exception:
+            pass
+
+        read_ms: list = []
+        cmd_ms: list = []
+        loop_ms: list = []
+        direction = 1.0
+        max_excursion = 0.0
+        moved = False
+
+        self.suspend_position_poller()
+        try:
+            for i in range(max(1, int(iterations))):
+                t_loop = time.monotonic()
+                # 1) a MOTION command (the thing that makes this "while moving")
+                t_c = time.monotonic()
+                try:
+                    self.send_velocity_xy(direction * v, 0.0)
+                except Exception:
+                    break
+                cmd_ms.append((time.monotonic() - t_c) * 1000.0)
+                # 2) a fresh position read (closed-loop feedback)
+                t_r = time.monotonic()
+                p = self.get_xy_position(cached=False)
+                read_ms.append((time.monotonic() - t_r) * 1000.0)
+                loop_ms.append((time.monotonic() - t_loop) * 1000.0)
+
+                if p and p[0] is not None:
+                    dx = float(p[0]) - start_x
+                    if abs(dx) > max_excursion:
+                        max_excursion = abs(dx)
+                    if abs(dx) > 20.0:
+                        moved = True
+                    # reverse before running past the bound
+                    if direction > 0 and dx >= amp:
+                        direction = -1.0
+                    elif direction < 0 and dx <= -amp:
+                        direction = 1.0
+                else:
+                    # blind — don't keep driving
+                    break
+                if on_progress is not None:
+                    try:
+                        on_progress(i + 1)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                self.send_velocity_xy(0.0, 0.0)
+            except Exception:
+                pass
+            try:
+                self.move_xy_absolute_um(start_x, start_y)
+            except Exception:
+                pass
+            self.resume_position_poller()
+
+        if not loop_ms:
+            return {"error": "no samples collected"}
+
+        def _stats(a):
+            return (sum(a) / len(a), min(a), max(a)) if a else (0.0, 0.0, 0.0)
+
+        avg_loop, min_loop, max_loop = _stats(loop_ms)
+        avg_read = _stats(read_ms)[0]
+        avg_cmd = _stats(cmd_ms)[0]
+        result = {
+            "iterations": len(loop_ms),
+            "avg_period_ms": round(avg_loop, 2),
+            "min_period_ms": round(min_loop, 2),
+            "max_period_ms": round(max_loop, 2),
+            "avg_read_ms": round(avg_read, 2),
+            "avg_cmd_ms": round(avg_cmd, 2),
+            "control_hz": round(1000.0 / avg_loop, 1) if avg_loop > 0 else 0.0,
+            "moved": moved,
+            "max_excursion_um": round(max_excursion, 1),
+        }
+        logger.info(
+            "Control-loop rate: %.1f Hz (%.1f ms/cycle: read %.1f + cmd %.1f), "
+            "moved=%s, excursion=%.0f µm",
+            result["control_hz"], avg_loop, avg_read, avg_cmd,
+            moved, max_excursion)
         return result
 
     # ── Shutdown ──────────────────────────────────────────────────

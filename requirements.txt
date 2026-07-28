@@ -1,0 +1,27 @@
+# Core application dependencies
+PySide6==6.11.1
+pyserial==3.5
+pygame==2.6.1
+numpy==2.4.6   # capped <2.5 by numba (pulled via pylablib for the Andor Zyla backend)
+scipy==1.18.0
+opencv-python==5.0.0.93
+Pillow==12.3.0
+pandas==3.0.3
+scikit-image==0.26.0
+
+# Windows camera identity (DirectShow enumeration) - Windows only
+comtypes==1.4.16; sys_platform == "win32"
+pygrabber==0.2; sys_platform == "win32"
+
+# ANDOR Zyla (SDK3) microscope camera backend — Windows rigs with an Andor sCMOS.
+# pylablib drives the camera; it pulls numba + llvmlite (JIT acceleration), and
+# numba caps numpy to <2.5 (hence the numpy==2.4.6 pin above). Requires the Andor
+# SDK3 runtime DLLs (atcore.dll + companions) in DLLs/zyla dlls/ (vendored) or an
+# Andor SDK3 / Solis install. The backend (gui/widgets/andor_backend.py) is
+# lazily guarded, so the app still runs if pylablib/DLLs are absent.
+pylablib>=1.4.3; sys_platform == "win32"
+numba>=0.60; sys_platform == "win32"
+llvmlite>=0.43; sys_platform == "win32"
+
+# Packaging (build_exe.py)
+pyinstaller==6.21.0
