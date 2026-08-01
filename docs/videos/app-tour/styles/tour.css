@@ -1,0 +1,179 @@
+/* App-tour layout. Palette tokens come from styles/mocha.css, which is
+   GENERATED from gui/styles.py by tools_export_theme_tokens.py — never
+   hand-write a hex value in here. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 1920px;
+  height: 1080px;
+  overflow: hidden;
+  background: #000;
+}
+
+/* Roboto is the renderer's bundled font. Naming a system font here (e.g.
+   Segoe UI) makes the renderer alias it to Roboto anyway, so preview and
+   render would disagree — name the target directly. */
+body {
+  font-family: Roboto, sans-serif;
+  color: var(--mocha-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+#root { position: relative; width: 1920px; height: 1080px; }
+
+.clip { position: absolute; }
+
+/* ── Screenshot scenes ──────────────────────────────────────────── */
+
+.scene { inset: 0; }
+
+/* Real app capture. The grabs are 2880x1620 — exactly 16:9 — so they fill
+   the frame with no crop. Produced by tools_capture_app_screens.py. */
+.shot {
+  position: absolute;
+  inset: 0;
+  width: 1920px;
+  height: 1080px;
+  display: block;
+}
+
+/* Spotlight: the ring is the element, and its huge spread box-shadow dims
+   everything OUTSIDE it. One element does both jobs, so there is never a
+   separate scrim to keep in sync.
+   Size/position are static per step (width/height are not on the animatable
+   allowlist); steps cross-fade on opacity instead. */
+.spot {
+  position: absolute;
+  border: 3px solid var(--mocha-mauve);
+  border-radius: 12px;
+  box-shadow: 0 0 0 9999px rgba(17, 17, 27, 0.82);
+  opacity: 0;
+  z-index: 2;
+}
+
+.callout-card {
+  position: absolute;
+  z-index: 3;
+  max-width: 660px;
+  background: var(--mocha-surface0);
+  border-left: 4px solid var(--mocha-mauve);
+  border-radius: 0 14px 14px 0;
+  padding: 20px 26px;
+  font-size: 25px;
+  line-height: 1.42;
+  opacity: 0;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+.callout-card .k { color: var(--mocha-mauve); font-weight: 700; }
+.callout-card strong { font-weight: 700; }
+
+.step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px; height: 34px;
+  border-radius: 9px;
+  background: var(--mocha-mauve);
+  color: var(--mocha-crust);
+  font-size: 17px; font-weight: 800;
+  margin-bottom: 12px;
+}
+
+/* Persistent orientation chip, bottom-left of a screenshot scene */
+.scene-chip {
+  position: absolute;
+  left: 40px;
+  bottom: 36px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--mocha-crust);
+  border: 1px solid var(--mocha-surface1);
+  border-radius: 12px;
+  padding: 12px 22px;
+  opacity: 0;
+}
+.scene-chip-num {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: var(--mocha-mauve);
+  color: var(--mocha-crust);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; font-weight: 800;
+}
+.scene-chip-name { font-size: 24px; font-weight: 700; }
+.scene-chip-q { font-size: 22px; color: var(--mocha-subtext0); font-style: italic; }
+
+/* ── Typographic card scenes (title / spine / recap) ────────────── */
+
+.card {
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.card-inner {
+  position: absolute;
+  inset: 0;
+  background: var(--mocha-crust);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.kicker {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--mocha-mauve);
+  margin-bottom: 26px;
+}
+
+.big-title { font-size: 112px; font-weight: 800; letter-spacing: -2px; }
+
+.sub {
+  font-size: 33px;
+  color: var(--mocha-subtext0);
+  margin-top: 20px;
+}
+
+.rule {
+  width: 132px; height: 4px;
+  border-radius: 2px;
+  background: var(--mocha-mauve);
+  margin: 38px 0;
+}
+
+.spine { display: flex; flex-direction: column; gap: 15px; text-align: left; }
+
+.spine-row { display: flex; align-items: center; gap: 20px; }
+
+.spine-num {
+  width: 36px; height: 36px; flex: 0 0 36px;
+  border-radius: 9px;
+  background: var(--mocha-surface0);
+  color: var(--mocha-mauve);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px; font-weight: 700;
+}
+.spine-name { width: 310px; flex: 0 0 310px; font-size: 30px; font-weight: 700; }
+.spine-q { font-size: 27px; color: var(--mocha-subtext0); font-style: italic; }
+
+.foot {
+  font-size: 25px;
+  color: var(--mocha-subtext0);
+  line-height: 1.45;
+  max-width: 1180px;
+  margin-top: 44px;
+  text-align: center;
+}
+.foot strong { color: var(--mocha-text); font-weight: 600; }

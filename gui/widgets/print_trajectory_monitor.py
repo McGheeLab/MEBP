@@ -51,6 +51,10 @@ from gui.styles import COLORS
 _BREADCRUMB_MAX = 24            # ghost-trail length (matches JogWorkspaceView)
 _EXECUTED_MAX = 6000           # cap the persistent executed polyline
 _NEEDLE_MIN_PX = 4.0
+
+# v7.6: value-overlay ramp (low → high), reusing the theme's semantic colours
+# so it reads the same way as the geometry-panel deviation ramp.
+_OVERLAY_BUCKETS = ("blue", "green", "yellow", "peach", "red")
 _MIN_SPAN_UM = 500.0           # smallest framed extent (so a dot doesn't blow up)
 _FIT_FILL = 0.86               # fraction of the content rect the path fills
 
@@ -84,6 +88,21 @@ class PrintTrajectoryMonitorView(QWidget):
 
         # Planned toolpath: one polyline per object/segment (zero-ref µm).
         self._segments: list[list[tuple[float, float]]] = []
+        # v7.5.x: SIMULATED stage path (XYPathSimulator on the saved stage
+        # characteristics) — what the machine is predicted to actually draw.
+        self._predicted: list[list[tuple[float, float]]] = []
+        self._predicted_note: str = ""
+        #: v7.7: the prediction as a number, shown beside the live deviation.
+        self._predicted_p95_um: float | None = None
+        # v7.6: optional value overlay on the predicted path (XY speed / flow
+        # rate / tracking error / elapsed time), one value per predicted point.
+        self._overlay_mode: str | None = None
+        self._overlay_vals: list[list[float]] = []
+        self._overlay_unit: str = ""
+        self._overlay_vmin: float = 0.0
+        self._overlay_vmax: float = 1.0
+        # v7.5.x: live print progress (arc-length projection onto the plan).
+        self._prog: dict | None = None
         # Optional well boundary (centre zero-ref µm, radius µm).
         self._well_center_um: tuple[float, float] | None = None
         self._well_radius_um: float = 0.0
@@ -114,8 +133,90 @@ class PrintTrajectoryMonitorView(QWidget):
             if pts:
                 cleaned.append(pts)
         self._segments = cleaned
+        self._rebuild_progress_index()
         self._recompute_bbox()
         self.update()
+
+    def set_predicted_path(
+        self, segments: list[list[tuple[float, float]]] | None,
+        note: str = "",
+        predicted_p95_um: float | None = None,
+    ) -> None:
+        """v7.5.x: the SIMULATED stage path for this plan (zero-ref µm, one
+        polyline per printing segment) — from ``XYPathSimulator`` driving the
+        machine's saved characteristics with the current velocity tuning.
+        ``note`` is a short caption (e.g. "sim: p95 84 µm"); ``None`` clears.
+
+        v7.7: ``predicted_p95_um`` is the same prediction as a NUMBER, so the
+        live readout can show it beside the measured deviation during the print
+        (the caption itself is replaced by the progress line while recording, so
+        without this the operator loses the prediction exactly when it becomes
+        comparable)."""
+        cleaned: list[list[tuple[float, float]]] = []
+        for seg in (segments or []):
+            pts = [(float(x), float(y)) for (x, y) in seg]
+            if len(pts) >= 2:
+                cleaned.append(pts)
+        self._predicted = cleaned
+        self._predicted_note = str(note or "")
+        try:
+            self._predicted_p95_um = (None if predicted_p95_um is None
+                                      else float(predicted_p95_um))
+        except (TypeError, ValueError):
+            self._predicted_p95_um = None
+        # A new prediction invalidates the old per-point values (the mode is
+        # owned by the page and re-applied straight after).
+        self._overlay_vals = []
+        self._recompute_bbox()
+        self.update()
+
+    def set_overlay(self, mode: str | None,
+                    per_segment_point_values: list | None = None,
+                    unit_label: str = "",
+                    vmin: float | None = None,
+                    vmax: float | None = None) -> None:
+        """v7.6: colour the PREDICTED path by a per-point quantity.
+
+        ``per_segment_point_values`` mirrors the predicted path's structure —
+        one list of values per predicted segment, one value per point. Modes are
+        free-form strings (``"speed"``, ``"flow"``, ``"error"``, ``"time"``);
+        ``None`` (or a mismatched value count) falls back to the plain dashed
+        render, never a crash. ``vmin``/``vmax`` default to the data range.
+
+        The planned path (blue) and the executed trace (green) are untouched —
+        the overlay is about what the SIMULATION predicts, so it belongs to the
+        predicted geometry only.
+        """
+        if not mode or not per_segment_point_values:
+            self._overlay_mode = None
+            self._overlay_vals = []
+            self._overlay_unit = ""
+            self.update()
+            return
+        vals: list[list[float]] = []
+        for seq in per_segment_point_values:
+            try:
+                vals.append([float(v) for v in seq])
+            except (TypeError, ValueError):
+                vals.append([])
+        flat = [v for seq in vals for v in seq]
+        if not flat:
+            self._overlay_mode = None
+            self._overlay_vals = []
+            self.update()
+            return
+        self._overlay_mode = str(mode)
+        self._overlay_vals = vals
+        self._overlay_unit = str(unit_label or "")
+        lo = float(vmin) if vmin is not None else min(flat)
+        hi = float(vmax) if vmax is not None else max(flat)
+        if hi <= lo:
+            hi = lo + 1e-9
+        self._overlay_vmin, self._overlay_vmax = lo, hi
+        self.update()
+
+    def overlay_mode(self) -> str | None:
+        return self._overlay_mode
 
     def set_well_boundary(
         self, center_um: tuple[float, float] | None, radius_um: float
@@ -166,6 +267,7 @@ class PrintTrajectoryMonitorView(QWidget):
                 self._executed.append((x_um, y_um))
                 if len(self._executed) > _EXECUTED_MAX:
                     del self._executed[0:len(self._executed) - _EXECUTED_MAX]
+                self._advance_progress(x_um, y_um)
         self._needle_x_um = x_um
         self._needle_y_um = y_um
         self.update()
@@ -179,7 +281,67 @@ class PrintTrajectoryMonitorView(QWidget):
         start, or when the well/object selection changes)."""
         self._executed.clear()
         self._breadcrumbs.clear()
+        self._rebuild_progress_index()
         self.update()
+
+    # ── Live progress (arc-length projection onto the plan) ──────────
+
+    def _rebuild_progress_index(self) -> None:
+        """Per-segment cumulative arc lengths + a fresh monotone cursor."""
+        try:
+            from SupportClasses import VelocityControl as VC
+        except Exception:                                # pragma: no cover
+            self._prog = None
+            return
+        segs = [seg for seg in self._segments if len(seg) >= 2]
+        if not segs:
+            self._prog = None
+            return
+        cums = [VC.polyline_arclength(seg) for seg in segs]
+        self._prog = {
+            "segs": segs, "cums": cums,
+            "total_um": sum(c[-1] for c in cums),
+            "seg": 0, "seg_i": 0, "s": 0.0,      # cursor (µm, monotone)
+            "done_um": 0.0, "dev_um": None,
+        }
+
+    def _advance_progress(self, x_um: float, y_um: float) -> None:
+        """Project the live position onto the plan with a forward-only cursor
+        (same projection primitive the follower itself uses)."""
+        pr = self._prog
+        if pr is None:
+            return
+        try:
+            from SupportClasses import VelocityControl as VC
+            seg = pr["segs"][pr["seg"]]
+            cum = pr["cums"][pr["seg"]]
+            s_raw, seg_i, cross = VC.project_on_polyline(
+                (x_um, y_um), seg, cum, pr["seg_i"], 2000.0)
+            pr["s"] = max(pr["s"], s_raw)
+            pr["seg_i"] = seg_i
+            pr["dev_um"] = cross
+            # segment finished (within 100 µm of its end) → advance when the
+            # needle is nearer the NEXT segment's start than this one's end
+            if (pr["seg"] < len(pr["segs"]) - 1
+                    and pr["s"] >= cum[-1] - 100.0):
+                nxt = pr["segs"][pr["seg"] + 1][0]
+                end = seg[-1]
+                d_next = ((x_um - nxt[0]) ** 2 + (y_um - nxt[1]) ** 2)
+                d_end = ((x_um - end[0]) ** 2 + (y_um - end[1]) ** 2)
+                if d_next < d_end:
+                    pr["done_um"] += cum[-1]
+                    pr["seg"] += 1
+                    pr["seg_i"] = 0
+                    pr["s"] = 0.0
+        except Exception:                                # pragma: no cover
+            return
+
+    def progress_fraction(self) -> float | None:
+        """Printed arc length ÷ planned arc length (0..1), or ``None``."""
+        pr = self._prog
+        if pr is None or pr["total_um"] <= 0:
+            return None
+        return min(1.0, (pr["done_um"] + pr["s"]) / pr["total_um"])
 
     # ── Framing / coordinate mapping ───────────────────────────────
 
@@ -187,6 +349,10 @@ class PrintTrajectoryMonitorView(QWidget):
         xs: list[float] = []
         ys: list[float] = []
         for seg in self._segments:
+            for x, y in seg:
+                xs.append(x)
+                ys.append(y)
+        for seg in self._predicted:
             for x, y in seg:
                 xs.append(x)
                 ys.append(y)
@@ -265,6 +431,7 @@ class PrintTrajectoryMonitorView(QWidget):
         p.setClipRect(self._content_rect())
         self._paint_well_boundary(p)
         self._paint_planned(p)
+        self._paint_predicted(p)
         self._paint_executed(p)
         self._paint_breadcrumbs(p)
         self._paint_needle(p)
@@ -323,6 +490,44 @@ class PrintTrajectoryMonitorView(QWidget):
             p.setBrush(QBrush(_qc('blue', 150)))
             for x, y in seg:
                 p.drawEllipse(self._um_to_px(x, y), dot_r, dot_r)
+
+    def _overlay_color(self, t: float) -> QColor:
+        """5-bucket ramp over the normalised value (low → high)."""
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        idx = min(len(_OVERLAY_BUCKETS) - 1,
+                  int(t * len(_OVERLAY_BUCKETS)))
+        return _qc(_OVERLAY_BUCKETS[idx], 235)
+
+    def _paint_predicted(self, p: QPainter) -> None:
+        """v7.5.x: dashed peach — the simulated stage path for this plan.
+        v7.6: when an overlay is active, drawn as solid per-point segments
+        coloured by that quantity instead."""
+        if not self._predicted:
+            return
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        span = self._overlay_vmax - self._overlay_vmin
+        for i, seg in enumerate(self._predicted):
+            vals = (self._overlay_vals[i]
+                    if (self._overlay_mode and i < len(self._overlay_vals))
+                    else None)
+            if vals is not None and len(vals) == len(seg) and len(seg) >= 2:
+                width = max(1.0, s(1.8))
+                for k in range(len(seg) - 1):
+                    tm = ((vals[k] + vals[k + 1]) / 2.0
+                          - self._overlay_vmin) / (span or 1e-9)
+                    pen = QPen(self._overlay_color(tm), width)
+                    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    p.setPen(pen)
+                    p.drawLine(self._um_to_px(*seg[k]),
+                               self._um_to_px(*seg[k + 1]))
+                continue
+            # plain (or mismatched values) → the dashed prediction
+            pen = QPen(_qc('peach', 210), max(1.0, s(1.2)),
+                       Qt.PenStyle.DashLine)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.drawPolyline(QPolygonF([self._um_to_px(x, y) for (x, y) in seg]))
 
     def _paint_executed(self, p: QPainter) -> None:
         if len(self._executed) < 2:
@@ -389,6 +594,31 @@ class PrintTrajectoryMonitorView(QWidget):
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             text,
         )
+        # centre: live print progress while recording; else the sim caption
+        mid = ""
+        if self._recording:
+            frac = self.progress_fraction()
+            if frac is not None:
+                pr = self._prog
+                done_mm = (pr["done_um"] + pr["s"]) / 1000.0
+                mid = (f"print {frac * 100.0:.0f}% · "
+                       f"{done_mm:.1f}/{pr['total_um'] / 1000.0:.1f} mm")
+                if pr.get("dev_um") is not None:
+                    mid += f" · dev {pr['dev_um']:.0f} µm"
+                    # v7.7: keep the prediction alongside the measurement so
+                    # the two are comparable AS THE PRINT RUNS.
+                    if getattr(self, "_predicted_p95_um", None) is not None:
+                        mid += f" (pred {self._predicted_p95_um:.0f})"
+        elif self._predicted_note:
+            mid = self._predicted_note
+        if mid:
+            p.setPen(QPen(_qc('peach' if not self._recording else 'subtext0')))
+            p.drawText(
+                band,
+                int(Qt.AlignmentFlag.AlignHCenter
+                    | Qt.AlignmentFlag.AlignVCenter),
+                mid,
+            )
         if self._recording:
             p.setPen(QPen(_qc('green')))
             p.drawText(
@@ -396,3 +626,27 @@ class PrintTrajectoryMonitorView(QWidget):
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
                 "● recording",
             )
+        elif self._overlay_mode and self._overlay_vals:
+            # v7.6 overlay legend (right side — the slot "● recording" uses, so
+            # they never collide).
+            self._paint_overlay_legend(p, band)
+
+    def _paint_overlay_legend(self, p: QPainter, band: QRectF) -> None:
+        label = (f"{self._overlay_mode} {self._overlay_vmin:.3g}–"
+                 f"{self._overlay_vmax:.3g}"
+                 + (f" {self._overlay_unit}" if self._overlay_unit else ""))
+        fm = p.fontMetrics()
+        text_w = fm.horizontalAdvance(label)
+        sw, sh = s(10), s(7)
+        ramp_w = sw * len(_OVERLAY_BUCKETS)
+        x = band.right() - text_w - ramp_w - s(6)
+        y = band.center().y() - sh / 2.0
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, name in enumerate(_OVERLAY_BUCKETS):
+            p.setBrush(QBrush(_qc(name, 235)))
+            p.drawRect(QRectF(x + i * sw, y, sw, sh))
+        p.setPen(QPen(_qc('subtext0')))
+        p.drawText(QRectF(x + ramp_w + s(4), band.top(),
+                          text_w + s(2), band.height()),
+                   int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter), label)

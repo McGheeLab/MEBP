@@ -638,9 +638,20 @@ class TestReentrancyAndShutdown(_CalBase):
 # ── Bounds clipping + overlap + preview ────────────────────────────
 
 class TestBoundsAndOverlap(_CalBase):
-    def test_overlap_is_25_percent(self):
+    def test_overlap_has_exactly_one_home(self):
+        """v7.5.x: the dead ``_PLOC_MOSAIC_OVERLAP`` class constant is gone.
+
+        It was a fourth value for the tile overlap that nothing read, alongside
+        the configured setting, the calibration dialog's own default and a
+        hardcoded 0.50 in the legacy per-well scan. Overlap now lives only in
+        ``mosaic_scan.overlap_pct`` and is resolved by MosaicCalibration.
+        """
         from gui.pages.calibration import CalibrationPage
-        self.assertAlmostEqual(CalibrationPage._PLOC_MOSAIC_OVERLAP, 0.25)
+        from SupportClasses.MosaicCalibration import (
+            SCAN_DEFAULTS, RECOMMENDED_OVERLAP_FRAC)
+        self.assertFalse(hasattr(CalibrationPage, "_PLOC_MOSAIC_OVERLAP"))
+        self.assertEqual(SCAN_DEFAULTS["overlap_pct"], 25)
+        self.assertAlmostEqual(RECOMMENDED_OVERLAP_FRAC, 0.25)
 
     def test_clip_bounds_to_envelope(self):
         page = self._make_page()
@@ -731,10 +742,12 @@ class TestMosaicSettings(_CalBase):
     def test_dialog_round_trip_and_defaults(self):
         from gui.dialogs.mosaic_settings_dialog import (
             MosaicScanSettingsDialog, MOSAIC_SCAN_DEFAULTS)
+        # v7.5.x: frame_orient / fov_um / spacing_um are RETIRED (orientation and
+        # scale are measured in one place — see MOSAIC_SCAN_DEFAULTS' note), so
+        # they are no longer part of the round-trip.
         custom = {"overlap_pct": 40, "settle_ms": 500, "fresh_frames": 6,
                   "fresh_timeout_s": 4.0, "target_px": 4000,
                   "detect_param2": 25, "detect_tol_pct": 50,
-                  "frame_orient": "rot180", "fov_um": 2200, "spacing_um": 1500,
                   "register": False, "max_shift_um": 120,
                   "reg_method": "phase",
                   "cal_cols": 5, "cal_rows": 5}
@@ -742,6 +755,29 @@ class TestMosaicSettings(_CalBase):
         self.assertEqual(dlg.values(), custom)
         dlg.set_values(MOSAIC_SCAN_DEFAULTS)
         self.assertEqual(dlg.values(), MOSAIC_SCAN_DEFAULTS)
+
+    def test_retired_keys_are_not_offered_or_resurrected(self):
+        """v7.5.x REGRESSION: the retired override keys must not reappear.
+
+        ``frame_orient`` double-oriented the mosaic (and only the fluorescence
+        scan honoured it, so the same camera produced two orientations);
+        ``fov_um`` / ``spacing_um`` overrode every measured value from a hidden
+        submenu. A stale settings.json may still carry them — they must be
+        ignored, not round-tripped back out.
+        """
+        from gui.dialogs.mosaic_settings_dialog import (
+            MosaicScanSettingsDialog, MOSAIC_SCAN_DEFAULTS, merged_settings)
+        for key in ("frame_orient", "fov_um", "spacing_um"):
+            self.assertNotIn(key, MOSAIC_SCAN_DEFAULTS)
+        stale = {"frame_orient": "rot180", "fov_um": 2200, "spacing_um": 1500,
+                 "overlap_pct": 5}
+        self.assertNotIn("frame_orient", merged_settings(stale))
+        self.assertNotIn("fov_um", merged_settings(stale))
+        dlg = MosaicScanSettingsDialog(stale)
+        out = dlg.values()
+        self.assertNotIn("frame_orient", out)
+        self.assertNotIn("fov_um", out)
+        self.assertNotIn("spacing_um", out)
 
     def test_settings_dialog_preserves_undisplayed_keys(self):
         # Opening Settings + OK must not drop keys it has no control for
@@ -752,23 +788,14 @@ class TestMosaicSettings(_CalBase):
         self.assertEqual(out["cal_cols"], 7)
         self.assertEqual(out["cal_rows"], 9)
 
-    def test_frame_orient_transforms_tile(self):
-        from gui.pages.calibration import _MosaicScanWorker
-        from SupportClasses.MosaicBuilder import MosaicBuilder
-        b = MosaicBuilder(frame_size_px=(80, 60), micron_per_pixel=10.0)
-        # Distinct corners so a 180° rotation is detectable.
-        frame = np.zeros((4, 6, 3), dtype=np.uint8)
-        frame[0, 0] = 255            # top-left marker
-        w = _MosaicScanWorker(_FakeCtrl(), _FakeCam(frame), b, [(0, 0)], 0.0,
-                              40.0, 20.0, frame_orient="rot180")
-        self.assertEqual(w._frame_orient, "rot180")
-        out = w._orient_frame(frame)
-        self.assertEqual(int(out[-1, -1, 0]), 255)   # marker now bottom-right
-        self.assertEqual(int(out[0, 0, 0]), 0)
-        # "none" is a passthrough.
-        w2 = _MosaicScanWorker(_FakeCtrl(), _FakeCam(frame), b, [(0, 0)], 0.0,
-                               40.0, 20.0, frame_orient="none")
-        self.assertIs(w2._orient_frame(frame), frame)
+    # v7.5.x: ``test_frame_orient_transforms_tile`` DELETED. It asserted the
+    # retired coarse per-tile transform still applied
+    # (``w._frame_orient == "rot180"``, ``_orient_frame`` rotating the frame) and
+    # so directly contradicted its own sibling
+    # ``TestMosaicWorker.test_worker_does_not_double_orient``, which pins the
+    # correct behaviour: the worker forces "none" and orientation is applied ONCE
+    # by the builder's calibrated ``_orient_tile``. It had been failing silently
+    # because ``TestManualAlignPage`` hangs alphabetically before this class.
 
     def test_worker_stores_timing_and_detect_params(self):
         from gui.pages.calibration import _MosaicScanWorker
@@ -1704,7 +1731,13 @@ class TestCalibrationDialogManualAlign(unittest.TestCase):
 
     def test_store_corrected_um_per_px_and_fov(self):
         # Spreading the tiles (k>1) to align overlaps → assumed FOV was too big →
-        # corrected µm/px = assumed / k. Stored as um_per_px; FOV field updated.
+        # corrected µm/px = assumed / k, stored as um_per_px.
+        #
+        # v7.5.x: the corrected value is NO LONGER also written into a ``fov_um``
+        # spin. That field's only purpose was to carry the number into
+        # ``mosaic_scan`` as a standing override of the camera calibration; the
+        # correction now propagates via _propagate_um_per_px (live manager +
+        # objective store), which is what the mosaics and click mapping read.
         from SupportClasses.MosaicAlignmentStore import MosaicAlignmentStore
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -1715,9 +1748,9 @@ class TestCalibrationDialogManualAlign(unittest.TestCase):
         dlg._align_dx.setValue(25)        # +25% → kx=1.25
         dlg._align_dy.setValue(25)        # +25% → ky=1.25 → k=1.25
         dlg._store_manual_align()
-        # corrected = 10.0 / 1.25 = 8.0 µm/px; FOV = 80 px * 8.0 = 640 µm.
+        # corrected = 10.0 / 1.25 = 8.0 µm/px.
         self.assertAlmostEqual(store.get_um_per_px("camX|10x"), 8.0, places=3)
-        self.assertEqual(dlg._spin_fov.value(), 640)
+        self.assertFalse(hasattr(dlg, "_spin_fov"))
         # Idempotent.
         dlg._store_manual_align()
         self.assertAlmostEqual(store.get_um_per_px("camX|10x"), 8.0, places=3)
@@ -2011,12 +2044,20 @@ class TestWellMappingAutoDetect(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         wts._store_singleton = wts.WellTrainingStore(Path(tmp.name))
         self.addCleanup(lambda: setattr(wts, "_store_singleton", None))
-        plate = WellPlate.from_format(24)           # 4×6
-        img = _synthetic_plate(4, 6, r=40, pitch=120, margin=90)
+        plate = WellPlate.from_format(24)           # 4×6, Ø15.6 mm @ 19.3 mm
+        # v7.5.x: the auto-detector is MODEL-DRIVEN — it looks for wells of
+        # the size and spacing the plate definition states, at the mosaic's
+        # own scale. So the synthetic image has to be geometrically consistent
+        # with the plate (it previously was not: 40 px wells 120 px apart under
+        # a scale that made the plate 390 px wells 965 px apart).
+        scale = 0.006                                # px per µm
+        pitch_px = int(round(19300.0 * scale))       # 116
+        r_px = int(round(15600.0 / 2.0 * scale))     # 47
+        img = _synthetic_plate(4, 6, r=r_px, pitch=pitch_px, margin=90)
         h, w = img.shape[:2]
         dlg = MosaicWellMappingDialog(
-            plate, img, (0.0, 0.0, w / 0.05, h / 0.05), 0.05,
-            um_per_px=20.0, plate_key="24")
+            plate, img, (0.0, 0.0, w / scale, h / scale), scale,
+            um_per_px=1.0 / scale, plate_key="24")
         # Auto-detect ran on open → all 24 wells already placed.
         self.assertEqual(len(dlg._well_items), 24)
         dlg._on_confirm()

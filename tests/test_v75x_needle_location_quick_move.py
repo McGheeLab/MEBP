@@ -4,8 +4,10 @@ v7.5.x — Needle Location quick-move button.
 A "Go to needle location" button on the Calibration → Needle Location tab drives
 the stage to the saved approximate needle position (retract Z → XY → lower to the
 needle-cam Z) so the needle re-enters both side cameras, ready to re-center. The
-position is captured on Center & Save and via a manual "Set current as location"
-button, persisted in the device profile (absolute Prior stage µm).
+position is captured on Center & Save and via the manual "Set current as needle
+center" button (v7.5.x: upgraded to record the FULL needle center — origin,
+quick-move XY, and the needle-cam Z fiducial), persisted in the device profile
+(absolute Prior stage µm).
 
 These tests call the real (unbound) CalibrationPage methods with duck-typed stubs
 so no Qt widget / camera / event loop is needed. `QMessageBox` is patched so the
@@ -24,13 +26,21 @@ class _FakeMB:
     """Stand-in for QMessageBox in headless tests."""
     Yes = 1
     No = 0
+
+    class StandardButton:
+        Yes = 1
+        No = 0
+
     info = 0
     warned = 0
     critical_n = 0
+    questions = 0
+    question_response = 1  # StandardButton.Yes
 
     @classmethod
     def reset(cls):
-        cls.info = cls.warned = cls.critical_n = 0
+        cls.info = cls.warned = cls.critical_n = cls.questions = 0
+        cls.question_response = cls.StandardButton.Yes
 
     @classmethod
     def information(cls, *a, **k):
@@ -43,6 +53,11 @@ class _FakeMB:
     @classmethod
     def critical(cls, *a, **k):
         cls.critical_n += 1
+
+    @classmethod
+    def question(cls, *a, **k):
+        cls.questions += 1
+        return cls.question_response
 
 
 class _FakeBtn:
@@ -149,17 +164,27 @@ class TestStoreAndUI(_MBPatch):
 
 
 class TestSetCurrent(_MBPatch):
+    """v7.5.x: "Set current as needle center" — the manual button now records
+    the FULL needle center (origin + quick-move XY + needle-cam Z fiducial)
+    behind a confirm prompt, sharing ``_needle_loc_record_origin_here`` with
+    Center & Save."""
+
     def _stub(self, xy, **over):
         stub = SimpleNamespace(
             controller=SimpleNamespace(
                 get_xy_position=lambda cached=False: xy,
                 zero_position={"x": 0.0, "y": 0.0}),
             settings=_FakeSettings(),
+            _xy_position_scale=1.0,
             _needle_loc_xy_um=None,
+            _needle_origin_um=None,
             _needle_loc_btn_goto=_FakeBtn(),
             _needle_loc_goto_label=_FakeLabel(),
+            _needle_loc_origin_label=_FakeLabel(),
+            _emit_calibration_data_changed=lambda: None,
         )
         _bind(stub, "_needle_loc_set_current",
+              "_needle_loc_record_origin_here",
               "_needle_loc_store_xy", "_needle_loc_update_goto_ui")
         for k, v in over.items():
             setattr(stub, k, v)
@@ -172,6 +197,51 @@ class TestSetCurrent(_MBPatch):
         self.assertEqual(
             stub.settings.store["device_profile.needle_loc_xy_um"],
             [1234.0, 5678.0])
+
+    def test_records_needle_origin(self):
+        # The button now wires into the needle CENTER: origin recorded
+        # (zero-referenced) + label painted + calibration-data emit.
+        emitted = []
+        stub = self._stub(
+            (11000.0, 12000.0, 0.0),
+            controller=SimpleNamespace(
+                get_xy_position=lambda cached=False: (11000.0, 12000.0, 0.0),
+                zero_position={"x": 1000.0, "y": 2000.0}),
+            _emit_calibration_data_changed=lambda: emitted.append(1))
+        stub._needle_loc_set_current()
+        self.assertEqual(stub._needle_origin_um, (10000.0, 10000.0))
+        self.assertIn("needle_origin_um", stub._needle_loc_origin_label.text)
+        self.assertEqual(emitted, [1])
+        self.assertEqual(_FakeMB.questions, 1)
+
+    def test_records_needle_cam_z_fiducial(self):
+        cam_z = []
+        saved = _FakeSettings()
+        stub = self._stub(
+            (500.0, 600.0, 0.0),
+            settings=saved,
+            controller=SimpleNamespace(
+                get_xy_position=lambda cached=False: (500.0, 600.0, 0.0),
+                zero_position={"x": 0.0, "y": 0.0},
+                capture_current_z_raw=lambda: -59.14,
+                set_needle_cam_z_from_raw=lambda raw: (
+                    cam_z.append(raw) or 29.81)),
+            _zoff_lbl_needle_cam=_FakeLabel())
+        stub._needle_loc_set_current()
+        self.assertEqual(cam_z, [-59.14])
+        self.assertEqual(
+            saved.store["device_profile.needle_cam_z"], 29.81)
+        self.assertIn("29.81", stub._zoff_lbl_needle_cam.text)
+
+    def test_decline_confirm_makes_no_changes(self):
+        _FakeMB.question_response = _FakeMB.StandardButton.No
+        stub = self._stub((1234.0, 5678.0, 0.0))
+        stub._needle_loc_set_current()
+        self.assertEqual(_FakeMB.questions, 1)
+        self.assertIsNone(stub._needle_loc_xy_um)
+        self.assertIsNone(stub._needle_origin_um)
+        self.assertNotIn(
+            "device_profile.needle_loc_xy_um", stub.settings.store)
 
     def test_warns_and_skips_when_no_controller(self):
         stub = self._stub((1.0, 2.0, 0.0), controller=None)

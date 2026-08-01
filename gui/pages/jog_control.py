@@ -150,6 +150,35 @@ class JogControlPage(QWidget):
         if self._context_widget is not None:
             self._context_widget.set_settings(settings)
         self._sync_backlash_chk()
+        self._restore_custom_z_locations()
+
+    # ── v7.5.x: custom Z locations (XZ side view) ──────────────────
+
+    def _restore_custom_z_locations(self) -> None:
+        """Restore the operator's custom Z tags (raw zero-ref mm) from
+        settings.json into the XZ side view. Programmatic set — does not
+        re-emit custom_z_changed, so no save loop."""
+        view = getattr(self, "_xz_view", None)
+        if self._settings is None or view is None:
+            return
+        try:
+            values = self._settings.get("jog.custom_z_mm") or []
+            view.set_custom_z_locations(
+                [float(v) for v in values])
+        except Exception as exc:
+            logger.debug("Jog: custom Z restore failed: %s", exc)
+
+    def _on_custom_z_changed(self, values: list) -> None:
+        """Persist the custom Z tag list whenever the operator adds or
+        removes one on the XZ side view."""
+        if self._settings is None:
+            return
+        try:
+            self._settings.set(
+                "jog.custom_z_mm", [float(v) for v in values])
+            self._settings.save()
+        except Exception as exc:
+            logger.debug("Jog: custom Z persist failed: %s", exc)
 
     # ── v7.5.x: backlash / compliance compensation toggle ──────────
 
@@ -268,6 +297,7 @@ class JogControlPage(QWidget):
                 camera_manager=self._camera_manager,
                 cam_idx=self._resolve_microscope_cam_idx(),
                 show_crosshair=True,
+                auto_orient=True,   # v7.5.x: calibrated orientation everywhere
                 label="Microscope feed — starts on this page",
             )
             cam_widget: QWidget = self._camera_view
@@ -288,6 +318,12 @@ class JogControlPage(QWidget):
         self._xz_view.set_safety_limits(self.controller.safety_limits)
         self._xz_view.go_to_z_requested.connect(
             self._on_go_to_z_requested)
+        # v7.5.x: custom Z locations — drag on the Z axis to tag a height
+        # (live mm readout, release to set), or click the red current-Z
+        # line to tag the needle's current height. Jog-page-only feature;
+        # persisted per machine in settings.json (jog.custom_z_mm).
+        self._xz_view.set_custom_z_enabled(True)
+        self._xz_view.custom_z_changed.connect(self._on_custom_z_changed)
 
         xz_card = Card("Side View (XZ)", flush=True)
         xz_card.add_widget(self._xz_view)
@@ -516,17 +552,25 @@ class JogControlPage(QWidget):
 
     def set_hardware_config(self, config) -> None:
         self._hardware_config = config
-        # Push needle metadata into the visualizations
+        # Push needle metadata into the visualizations.
+        # v7.6 FIX: this read `needle.outer_diameter_um`, an attribute NeedleSpec
+        # has never had, inside a swallowing except — so the workspace and XZ
+        # views were always handed None and drew a default needle. Prefer the
+        # ORIFICE OD (the pulled tip is what approaches the plate) and the full
+        # barrel + tip length.
         od = None
         length_mm = None
         if config is not None and getattr(config, 'needle', None) is not None:
+            n = config.needle
             try:
-                od = float(config.needle.outer_diameter_um)
-            except (AttributeError, TypeError, ValueError):
+                od = float(getattr(n, "orifice_od_um", None)
+                           or getattr(n, "od_um", 0.0) or 0.0) or None
+            except (TypeError, ValueError):
                 pass
             try:
-                length_mm = float(config.needle.length_mm)
-            except (AttributeError, TypeError, ValueError):
+                length_mm = float(getattr(n, "total_length_mm", None)
+                                  or getattr(n, "length_mm", 0.0) or 0.0) or None
+            except (TypeError, ValueError):
                 pass
         self._workspace_view.set_needle(od)
         self._xz_view.set_needle(od, length_mm)

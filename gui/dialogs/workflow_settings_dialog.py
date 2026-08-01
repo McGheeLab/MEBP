@@ -32,7 +32,7 @@ import logging
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QScrollArea,
@@ -66,6 +66,24 @@ def widget_value(w: QWidget):
             token["data"] = data
         return token
     return None
+
+
+def connect_widget_changed(w: QWidget, slot) -> bool:
+    """v7.7: connect a config widget's "value changed by the user" signal to
+    ``slot``. Returns False for a widget type we don't recognise.
+
+    Used by ``notify_on_field_change`` so a page's ``on_change`` genuinely means
+    "some setting changed" — previously a field with no hand-written handler
+    edited silently and the page's derived readouts went stale."""
+    if isinstance(w, QCheckBox):
+        w.toggled.connect(slot)
+    elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+        w.valueChanged.connect(slot)
+    elif isinstance(w, QComboBox):
+        w.currentIndexChanged.connect(slot)
+    else:
+        return False
+    return True
 
 
 def set_widget_value(w: QWidget, val) -> bool:
@@ -142,10 +160,22 @@ class SettingsSection:
         ``key`` is the persistence key; ``default`` is what Reset restores.
         """
         self._dialog._register(key, widget, default)
-        row = FormRow(label, widget, help_text=help)
+        # v7.7: fall back to the widget's own tooltip as the row's help text.
+        # Every field here already carries a written explanation as a tooltip;
+        # without this the top-bar Help toggle had nothing to reveal (no caller
+        # passed `help=`). Visibility is unchanged by default — only an explicit
+        # `help=` shows immediately; the toggle governs the rest.
+        help_text = help
+        if not help_text:
+            try:
+                help_text = widget.toolTip() or None
+            except Exception:
+                help_text = None
+        row = FormRow(label, widget, help_text=help_text)
         if help:
             row.set_help_visible(True)
         self._card.add_widget(row)
+        self._dialog._note_help_row(row)
         return widget
 
     def add_check(self, key: str, checkbox: QCheckBox, default: bool,
@@ -234,7 +264,20 @@ class WorkflowSettingsDialog(QDialog):
 
     def __init__(self, workflow_id: str, title: str, *,
                  parent: QWidget | None = None,
-                 on_change: Optional[Callable[[], None]] = None):
+                 on_change: Optional[Callable[[], None]] = None,
+                 migrate: Optional[Callable[[dict], dict]] = None,
+                 notify_on_field_change: bool = False):
+        """``migrate``: v7.6 — optional adapter applied to every loaded value
+        dict (last-used, saved profile, imported file) before the widgets are
+        set, so a renamed/rescaled setting can be carried forward instead of
+        silently reverting to its default. See
+        ``QuickPrintWorkflowPage._migrate_legacy_settings`` (speed % → mm/s).
+
+        ``notify_on_field_change``: v7.7 — when True, EVERY registered field
+        fires ``on_change`` (debounced, and suppressed during a bulk apply), so
+        a page's derived readouts cannot go stale because someone added a field
+        without also hand-wiring a handler. Opt-in, so the other workflows keep
+        their existing notify-on-load-only behaviour exactly."""
         super().__init__(parent)
         self.setWindowTitle(f"{title} — Settings")
         self.setModal(False)
@@ -242,9 +285,23 @@ class WorkflowSettingsDialog(QDialog):
         self._title = title
         self._store = WorkflowSettingsStore(workflow_id)
         self._on_change = on_change
+        self._migrate = migrate
+        self._notify_on_field_change = bool(notify_on_field_change)
+        # Debounce so dragging a spinbox coalesces into one notification (the
+        # page's on_change can kick a prediction worker).
+        self._change_timer = QTimer(self)
+        self._change_timer.setSingleShot(True)
+        self._change_timer.setInterval(150)
+        self._change_timer.timeout.connect(self._emit_change)
 
         self._fields: dict[str, tuple[QWidget, object]] = {}
         self._order: list[str] = []
+        #: v7.7: FormRows built by this dialog, registered with the MainWindow's
+        #: Help toggle (see _note_help_row).
+        self._help_rows: list = []
+        #: v7.7: optional page state that isn't a widget (see set_extra_state).
+        self._extra_get = None
+        self._extra_set = None
         # Combos whose saved value couldn't be applied yet because the combo was
         # empty at load time (hardware-populated). Resolved by resolve_pending()
         # once set_hardware_config repopulates them.
@@ -472,15 +529,80 @@ class WorkflowSettingsDialog(QDialog):
 
     # ── Field registry ────────────────────────────────────────────
 
+    def register_external(self, key: str, widget: QWidget, default) -> None:
+        """v7.7: persist a widget that lives on the PAGE, not in this dialog.
+
+        A widget has exactly one parent, so a control promoted to the page cannot
+        also be laid out inside a settings section. Registering it here keeps it
+        in the saved profile / last-used / import / export paths (and, with
+        ``notify_on_field_change``, keeps it notifying) while the page owns its
+        placement. Used for Quick Print's two driving parameters, which belong in
+        front of the operator rather than three scrolls into a popout.
+        """
+        self._register(key, widget, default)
+
     def _register(self, key: str, widget: QWidget, default) -> None:
         if key in self._fields:
             logger.warning("Duplicate settings key '%s' for %s",
                            key, self._workflow_id)
         self._fields[key] = (widget, default)
         self._order.append(key)
+        if self._notify_on_field_change:
+            connect_widget_changed(widget, self._schedule_change)
+
+    def _note_help_row(self, row) -> None:
+        """v7.7: collect the dialog's FormRows and register them with the
+        MainWindow so the top-bar Help toggle reveals their help text. Walks up
+        the parent chain to find the window (the dialog is a child of the page);
+        best-effort — a dialog with no MainWindow ancestor just keeps its rows
+        toggle-less, exactly as before."""
+        self._help_rows.append(row)
+        w = self.parent()
+        seen = 0
+        while w is not None and seen < 12:
+            reg = getattr(w, "register_form_row", None)
+            if callable(reg):
+                try:
+                    reg(row)
+                except Exception as exc:
+                    logger.debug("register_form_row failed: %s", exc)
+                return
+            w = w.parent()
+            seen += 1
+
+    def _schedule_change(self, *_) -> None:
+        """Debounced ``on_change``. No-op during a bulk apply/reset (those emit
+        once themselves) so loading a profile doesn't fire once per field."""
+        if self._applying:
+            return
+        self._change_timer.start()
+
+    #: v7.7: reserved key under which a page's non-widget state rides along with
+    #: the field values, so it is saved/loaded/exported by every existing path.
+    EXTRA_KEY = "__extra__"
+
+    def set_extra_state(self, getter, setter) -> None:
+        """v7.7: persist page state that isn't a registered widget.
+
+        ``getter() -> dict`` is called whenever settings are collected (Save,
+        Save As, Export, auto-save-last); ``setter(dict)`` is called on every
+        apply (last-used, profile, import). Used by Quick Print for the
+        multi-ink abstract→configured ink mapping, which is a rebuilt-per-object
+        set of combos rather than a fixed field, and was therefore lost on every
+        restart."""
+        self._extra_get = getter
+        self._extra_set = setter
 
     def collect(self) -> dict:
-        return {k: widget_value(w) for k, (w, _d) in self._fields.items()}
+        out = {k: widget_value(w) for k, (w, _d) in self._fields.items()}
+        if self._extra_get is not None:
+            try:
+                extra = self._extra_get()
+                if isinstance(extra, dict) and extra:
+                    out[self.EXTRA_KEY] = extra
+            except Exception as exc:
+                logger.debug("extra state getter failed: %s", exc)
+        return out
 
     # ── Common Print Settings links ───────────────────────────────
 
@@ -556,6 +678,13 @@ class WorkflowSettingsDialog(QDialog):
     def apply(self, values: dict, *, reapply_combos: bool = False) -> None:
         if not isinstance(values, dict):
             return
+        # v7.6: every load path funnels through here, so one migrate hook
+        # upgrades last-used, saved profiles and imported files alike.
+        if self._migrate is not None:
+            try:
+                values = self._migrate(dict(values)) or values
+            except Exception:
+                logger.debug("settings migration failed", exc_info=True)
         self._applying = True
         try:
             for key, (widget, _default) in self._fields.items():
@@ -575,6 +704,15 @@ class WorkflowSettingsDialog(QDialog):
                 else:
                     self._pending.pop(key, None)
             self._migrate_common_links(values)
+            # v7.7: hand back the page's non-widget state (inside _applying, so
+            # restoring it can't fire a change notification per item).
+            if self._extra_set is not None:
+                extra = values.get(self.EXTRA_KEY)
+                if isinstance(extra, dict):
+                    try:
+                        self._extra_set(extra)
+                    except Exception as exc:
+                        logger.debug("extra state setter failed: %s", exc)
         finally:
             self._applying = False
         self._resync_common_links()
@@ -784,12 +922,33 @@ def build_locations_widget(controller, hw_config, well_positions, *,
         length_mm = getattr(needle, "length_mm", None)
         ivol = getattr(needle, "internal_volume_uL", None)
         area = getattr(needle, "cross_section_area_mm2", None)
-        lay.addWidget(_kv_row("Gauge", f"{gauge}G" if gauge else "—"))
-        lay.addWidget(_kv_row("Inner / outer Ø",
-                              f"{_fmt(idv, ' µm', 0)} / {_fmt(odv, ' µm', 0)}"))
-        lay.addWidget(_kv_row("Length", _fmt(length_mm, " mm", 2)))
-        lay.addWidget(_kv_row("1 needle (bore volume)", _fmt(ivol, " µL", 4)))
-        lay.addWidget(_kv_row("Bore cross-section", _fmt(area, " mm²", 5)))
+        if getattr(needle, "has_tip", False):
+            # v7.6: a pulled glass capillary is two stages in series — the tip
+            # sets the bead and the flow ceiling, the barrel holds the volume.
+            lay.addWidget(_kv_row("Needle", "pulled glass capillary"))
+            lay.addWidget(_kv_row("Barrel Ø (in / out)",
+                                  f"{_fmt(idv, ' µm', 0)} / {_fmt(odv, ' µm', 0)}"))
+            lay.addWidget(_kv_row("Barrel length", _fmt(length_mm, " mm", 2)))
+            tip_od = getattr(needle, "tip_od_um", None)
+            tip_txt = _fmt(getattr(needle, "tip_id_um", None), " µm", 1)
+            if tip_od:
+                tip_txt = f"{tip_txt} / {_fmt(tip_od, ' µm', 0)}"
+            lay.addWidget(_kv_row("Tip Ø (in / out)", tip_txt))
+            lay.addWidget(_kv_row("Tip length",
+                                  _fmt(getattr(needle, "tip_length_mm", None), " mm", 2)))
+            lay.addWidget(_kv_row("Tip cross-section", _fmt(area, " mm²", 6)))
+            lay.addWidget(_kv_row(
+                "Volume (barrel / tip / total)",
+                f"{_fmt(getattr(needle, 'barrel_volume_uL', None), '', 4)} / "
+                f"{_fmt(getattr(needle, 'tip_volume_uL', None), '', 5)} / "
+                f"{_fmt(ivol, ' µL', 4)}"))
+        else:
+            lay.addWidget(_kv_row("Gauge", f"{gauge}G" if gauge else "—"))
+            lay.addWidget(_kv_row("Inner / outer Ø",
+                                  f"{_fmt(idv, ' µm', 0)} / {_fmt(odv, ' µm', 0)}"))
+            lay.addWidget(_kv_row("Length", _fmt(length_mm, " mm", 2)))
+            lay.addWidget(_kv_row("1 needle (bore volume)", _fmt(ivol, " µL", 4)))
+            lay.addWidget(_kv_row("Bore cross-section", _fmt(area, " mm²", 5)))
 
     # ── Pumps & inks ──
     lay.addWidget(_subheader("Pumps"))

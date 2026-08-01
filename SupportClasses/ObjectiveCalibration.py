@@ -240,6 +240,20 @@ class ObjectiveCalibrationStore:
             .get(camera_name, {})
         )
 
+    def all_calibrations(self) -> dict:
+        """Every stored calibration as ``{camera_name: {objective: dict}}``.
+
+        v7.5.x: used by the ``CameraCalibrationStore`` v1.2 migration to recover
+        the resolution a legacy µm/px was measured at (this store has always
+        recorded ``resolution``; the camera store had not).
+        """
+        return {
+            cam: dict(cals)
+            for cam, cals in self._data
+            .get("camera_objective_calibrations", {}).items()
+            if isinstance(cals, dict)
+        }
+
 
 # ── Module-level singleton ─────────────────────────────────────────────────
 

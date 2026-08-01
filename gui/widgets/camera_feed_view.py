@@ -23,6 +23,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -36,6 +37,29 @@ from PySide6.QtGui import (
 from gui.styles import COLORS
 
 logger = logging.getLogger(__name__)
+
+
+def view_transform_coeffs(mirrored: bool, flip_y: bool, rot_deg: float
+                          ) -> tuple[float, float, float, float]:
+    """Pure ``(m11, m12, m21, m22)`` of the view display transform.
+
+    The display applies ``A = R(θ)·diag(mx, my)`` (flips first, then
+    rotation) as a Qt ROW-VECTOR transform ``p' = p·T`` (``T = Aᵀ``), so a
+    raw image vector ``(dx, dy)`` renders as::
+
+        dx' = dx*m11 + dy*m21
+        dy' = dx*m12 + dy*m22
+
+    This is the single sign-convention anchor shared by ``_orient_qimage``
+    and the roll calibration (``view_roll_from_displacement``) — tests
+    compose the two to pin that a measured motion vector displays level.
+    Importable without Qt side effects (pure math).
+    """
+    t = math.radians(float(rot_deg))
+    c, s = math.cos(t), math.sin(t)
+    mx = -1.0 if mirrored else 1.0
+    my = -1.0 if flip_y else 1.0
+    return (c * mx, s * mx, -s * my, c * my)
 
 
 class CameraFeedView(QWidget):
@@ -168,6 +192,24 @@ class CameraFeedView(QWidget):
         except Exception:
             pass
 
+    def set_throttled(self, on: bool) -> None:
+        """v7.6: forward a display-rate throttle to the underlying camera
+        widget (halves the GUI-thread grab rate during a print so the live
+        position sampling isn't starved). No-op when the widget is absent or
+        doesn't support it."""
+        try:
+            widget = getattr(self, "_connected_cam", None)
+            if widget is None:
+                mgr = getattr(self, "_manager", None)
+                getter = getattr(mgr, "_widget", None)
+                if callable(getter):
+                    widget = getter(self._cam_idx)
+            fn = getattr(widget, "set_throttled", None)
+            if callable(fn):
+                fn(bool(on))
+        except Exception:
+            pass
+
     def set_view_orientation(self, mirrored: bool = False,
                              rotation_deg: float = 0.0,
                              flip_y: bool = False) -> None:
@@ -208,16 +250,13 @@ class CameraFeedView(QWidget):
         if ((not self._view_mirror and not fy and abs(self._view_rot_deg) < 0.05)
                 or self._edge_pick_mode):
             return q_img, None
-        import math
         from PySide6.QtGui import QTransform
-        t = math.radians(self._view_rot_deg)
-        c, s = math.cos(t), math.sin(t)
-        mx = -1.0 if self._view_mirror else 1.0
-        my = -1.0 if fy else 1.0
         # Linear map A = R(θ)·diag(mx, my) as a Qt row-vector transform (p' = p·T),
         # matching MosaicBuilder._orient_tile. Qt fits + offsets the result; the
         # true matrix (incl. that offset) inverts clicks / maps overlays.
-        base = QTransform(c * mx, s * mx, -s * my, c * my, 0.0, 0.0)
+        m11, m12, m21, m22 = view_transform_coeffs(
+            self._view_mirror, fy, self._view_rot_deg)
+        base = QTransform(m11, m12, m21, m22, 0.0, 0.0)
         try:
             disp = q_img.transformed(base, Qt.SmoothTransformation)
             true_xf = QImage.trueMatrix(base, q_img.width(), q_img.height())

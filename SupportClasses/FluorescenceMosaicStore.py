@@ -34,6 +34,7 @@ Metadata layout::
               "image": "fluor_mosaics/24_A1_DAPI.png",  # relative to config dir
               "color": [0, 0, 255],          # display pseudo-colour, RGB 0-255
               "extent_um": [min_x, min_y, max_x, max_y],   # absolute stage µm
+              "shift_um": [dx, dy],          # registration shift baked into extent
               "um_per_px": 0.92, "mosaic_scale": 0.31,
               "frames": 36, "exposure_us": 0, "date": "2026-06-22"
             },
@@ -42,6 +43,15 @@ Metadata layout::
         }
       }
     }
+
+⚠ ``extent_um`` is DISPLAY-REGISTERED: ``MosaicBuilder.canvas_extent_um`` adds
+the global registration shift to it while the tile PIXELS stay in the trusted
+raw stage frame. So any px → stage-µm back-projection must use
+``extent[:2] − shift_um`` (see :meth:`get_shift_um`, and ``MosaicStore.save``
+which documents the same contract). Entries written before v7.8 have no
+``shift_um`` key — :meth:`has_shift` reports False for those, and their pixel →
+stage mapping cannot be trusted for MOTION (a diameter measured on them is
+still fine; a translation does not change a length).
 
 Colours are stored RGB (matching the channel swatches in the UI / QColor) and
 converted to BGR only when blending with OpenCV. This module has ZERO GUI
@@ -121,7 +131,10 @@ class FluorescenceMosaicStore:
     """Load/save per-(plate, well) multi-channel fluorescence mosaics."""
 
     def __init__(self, path: Path = _DEFAULT_PATH):
-        self._path = Path(path)
+        # An env override lets tests isolate the store so automated runs never
+        # read or write the repo's config/hardware (mirrors the other stores).
+        env = os.environ.get("MEBP_FLUOR_MOSAIC_PATH")
+        self._path = Path(env) if env else Path(path)
         self._img_dir = self._path.parent / "fluor_mosaics"
         self._data: dict = {"version": "1.0", "wells": {}}
         self._load()
@@ -169,6 +182,7 @@ class FluorescenceMosaicStore:
         mosaic_scale: float = 0.0,
         frames: int = 0,
         exposure_us: float = 0.0,
+        shift_um: tuple[float, float] = (0.0, 0.0),
     ) -> bool:
         """Persist one channel's stitched single-well mosaic.
 
@@ -177,6 +191,14 @@ class FluorescenceMosaicStore:
         (``MosaicBuilder.canvas_extent_um``). ``color_rgb`` is the display
         pseudo-colour (defaults to the channel's standard colour). Returns True
         on a successful image + metadata write.
+
+        ``shift_um`` (v7.8) records the global registration shift BAKED INTO
+        ``extent_um`` (``MosaicBuilder._global_shift_um``): the extent is
+        display-registered (shifted) while tile PIXELS sit in the trusted raw
+        stage frame, so any px → stage-µm back-projection must use
+        ``extent[:2] − shift_um``. Persisting it is what makes a store-loaded
+        mosaic safe to drive the stage from. Legacy entries lack the key →
+        :meth:`get_shift_um` returns (0, 0) and :meth:`has_shift` False.
         """
         if not _CV2 or image_bgr is None:
             logger.warning("FluorescenceMosaicStore.save_channel: no cv2 / empty image")
@@ -197,6 +219,10 @@ class FluorescenceMosaicStore:
         if color_rgb is None:
             color_rgb = default_color(channel)
         ex = [float(v) for v in extent_um]
+        try:
+            sh = [float(shift_um[0]), float(shift_um[1])]
+        except (TypeError, ValueError, IndexError):
+            sh = [0.0, 0.0]
         wells = self._data.setdefault("wells", {})
         entry = wells.setdefault(wkey, {
             "plate_key": str(plate_key),
@@ -212,6 +238,7 @@ class FluorescenceMosaicStore:
             "image": f"fluor_mosaics/{fname}",
             "color": [int(c) for c in color_rgb],
             "extent_um": ex,
+            "shift_um": sh,
             "um_per_px": float(um_per_px),
             "mosaic_scale": float(mosaic_scale),
             "frames": int(frames),
@@ -221,7 +248,7 @@ class FluorescenceMosaicStore:
         self._save_meta()
         logger.info(
             f"FluorescenceMosaicStore: saved {plate_key}/{well_name}/{channel} "
-            f"({fname}, extent={ex})")
+            f"({fname}, extent={ex}, shift={sh})")
         return True
 
     def set_channel_color(self, plate_key, well_name, channel: str,
@@ -286,6 +313,81 @@ class FluorescenceMosaicStore:
             if isinstance(ex, (list, tuple)) and len(ex) == 4:
                 return tuple(float(v) for v in ex)
         return None
+
+    def get_shift_um(self, plate_key, well_name, channel=None) -> tuple:
+        """Global registration shift baked into the stored extent, ``(0, 0)``
+        for legacy entries. Back-projection frame = ``extent[:2] − shift``.
+
+        Mirrors ``MosaicStore.get_shift_um`` deliberately — the two stores hold
+        the same contract and must not drift. ``channel=None`` reads the first
+        stored channel (all channels of a well share one raster grid).
+        """
+        for ch in self._channels_for(plate_key, well_name, channel):
+            sh = ch.get("shift_um")
+            if isinstance(sh, (list, tuple)) and len(sh) >= 2:
+                try:
+                    return (float(sh[0]), float(sh[1]))
+                except (TypeError, ValueError):
+                    return (0.0, 0.0)
+        return (0.0, 0.0)
+
+    def has_shift(self, plate_key, well_name, channel=None) -> bool:
+        """True when the registration shift was RECORDED for this mosaic.
+
+        Distinct from ``get_shift_um() == (0, 0)``, which is also what a legacy
+        entry returns: only a recorded shift makes the pixel → stage mapping
+        trustworthy enough to command motion from. Callers that drive the stage
+        must gate on this, not on the shift's value.
+        """
+        for ch in self._channels_for(plate_key, well_name, channel):
+            sh = ch.get("shift_um")
+            if isinstance(sh, (list, tuple)) and len(sh) >= 2:
+                return True
+        return False
+
+    def _channels_for(self, plate_key, well_name, channel=None) -> list[dict]:
+        """Channel dicts to consult: the named one, else every stored channel."""
+        well = self.get_well(plate_key, well_name)
+        if not well:
+            return []
+        channels = well.get("channels", {})
+        if channel is not None:
+            ch = channels.get(str(channel))
+            return [ch] if isinstance(ch, dict) else []
+        return [c for c in channels.values() if isinstance(c, dict)]
+
+    def get_mosaic_scale(self, plate_key, well_name, channel=None):
+        """Stored mosaic px-per-µm for a channel (or None).
+
+        Pair it with :meth:`get_extent_um` from the SAME channel — the two are
+        only mutually consistent per channel.
+        """
+        for ch in self._channels_for(plate_key, well_name, channel):
+            val = ch.get("mosaic_scale")
+            try:
+                scale = float(val)
+            except (TypeError, ValueError):
+                continue
+            if scale > 0:
+                return scale
+        return None
+
+    def get_um_per_px(self, plate_key, well_name, channel=None):
+        """Stored camera µm/px for a channel (or None)."""
+        for ch in self._channels_for(plate_key, well_name, channel):
+            val = ch.get("um_per_px")
+            try:
+                eff = float(val)
+            except (TypeError, ValueError):
+                continue
+            if eff > 0:
+                return eff
+        return None
+
+    def get_objective(self, plate_key, well_name) -> str:
+        """Objective the well was scanned with ("" when unknown)."""
+        well = self.get_well(plate_key, well_name)
+        return str(well.get("objective", "")) if well else ""
 
     def has(self, plate_key, well_name) -> bool:
         return bool(self.list_channels(plate_key, well_name))
@@ -441,9 +543,16 @@ def _tint_gray(image_bgr, color_rgb):
 _store_singleton: Optional[FluorescenceMosaicStore] = None
 
 
-def get_store() -> FluorescenceMosaicStore:
-    """Process-wide singleton (lazy)."""
+def get_store(path=None) -> FluorescenceMosaicStore:
+    """Process-wide singleton (lazy).
+
+    An explicit ``path`` re-creates the singleton against that file — the hook
+    tests use for isolation (``MEBP_FLUOR_MOSAIC_PATH`` does the same for the
+    default construction).
+    """
     global _store_singleton
-    if _store_singleton is None:
+    if path is not None:
+        _store_singleton = FluorescenceMosaicStore(Path(path))
+    elif _store_singleton is None:
         _store_singleton = FluorescenceMosaicStore()
     return _store_singleton

@@ -97,9 +97,52 @@ class PrintTimingCalibrationStore:
         # corner_angle_deg = turn angle that counts as a corner;
         # corner_speed_factor = fraction of print speed allowed AT a sharp
         # corner (0..1; lower = slower/tighter through corners).
+        # ── Stage-1/3 additions: EVERY new key defaults to 0 (= off), so an
+        # existing calibration file that holds only the seven legacy keys loads
+        # and fills the rest with zeros → byte-identical legacy behaviour, no
+        # migration. See VelocityControl.resolve_control / pursuit_step.
+        #
+        # Speed decoupling (the fix for "the tuner just slows everything down"):
+        #   lead_time_frac     — share of the dead time compensated by prediction
+        #   min_lookahead_frac — size the lookahead FROM speed × dead time, so
+        #                        lookahead stops BEING the speed knob
+        #   max_speed_frac     — clamp to a fraction of the measured top speed
+        #   hold_speed         — 1 = pin straight-line speed; corners are then
+        #                        the only modulation ("slow only at corners")
+        # Control-law robustness:
+        #   normal_bound_frac / min_forward_frac — bound the cross-track command
+        #                        so it can never overwhelm forward motion
+        #   d_filter_hz, pid_ki, i_limit_mm_s
+        #   reacquire_*        — recover instead of deadlocking when off-path
+        #   stall_* / dither_* — detect "commanding speed but not progressing"
+        #   lateral_accel_mm_s2 / decel_accel_mm_s2 / profile_sample_mm
+        #   max_cross_track_mm / runaway_ticks — operator-tightenable guards
+        #   jerk_pct           — Prior SCS S-curve limit (0 = don't touch)
         "velocity": {"lookahead_mm": 0.6, "control_hz": 25.0, "decel_mm": 1.5,
                      "corner_angle_deg": 30.0, "corner_speed_factor": 0.4,
-                     "pid_kp": 0.0, "pid_kd": 0.0},
+                     "pid_kp": 0.0, "pid_kd": 0.0,
+                     # speed decoupling
+                     "lead_time_frac": 0.0, "min_lookahead_frac": 0.0,
+                     "max_speed_frac": 0.0, "hold_speed": 0.0,
+                     "deadtime_safety": 0.0,
+                     # cross-track command shaping
+                     "normal_bound_frac": 0.0, "min_forward_frac": 0.0,
+                     "d_filter_hz": 0.0, "pid_ki": 0.0, "i_limit_mm_s": 0.0,
+                     # re-acquire
+                     "reacquire_cross_mm": 0.0, "reacquire_ticks": 0.0,
+                     "reacquire_window_mm": 0.0, "reacquire_speed_frac": 0.0,
+                     "reacquire_max_s": 0.0, "reacquire_back_step_mm": 0.0,
+                     # stall / dither
+                     "stall_ds_frac": 0.0, "stall_ticks": 0.0,
+                     "dither_ratio_max": 0.0, "dither_min_mm": 0.0,
+                     # prediction
+                     "lead_max_mm": 0.0, "vel_filter_hz": 0.0,
+                     # speed profile
+                     "lateral_accel_mm_s2": 0.0, "decel_accel_mm_s2": 0.0,
+                     "profile_sample_mm": 0.0,
+                     # guards + hardware
+                     "max_cross_track_mm": 0.0, "runaway_ticks": 0.0,
+                     "jerk_pct": 0.0},
     }
 
     # Default print resolution element (µm) — the smallest feature the system can
@@ -187,9 +230,25 @@ class PrintTimingCalibrationStore:
                     value_ms, (1000.0 / value_ms) if value_ms else 0.0)
 
     def get_phase_lag_s(self) -> Optional[float]:
-        """A representative stage phase lag (s) = mean ``intercept_s`` over the
-        measured ``by_phase`` settle-sweep entries, or None if none measured.
-        The velocity follower widens its dead-time speed cap by this."""
+        """LEGACY phase-lag estimate (s) = mean ``intercept_s`` over the measured
+        ``by_phase`` settle-sweep entries, or None if none measured.
+
+        ⚠ This is a **settle time**, not a command→motion **dead time**, and it
+        should not be what steers the velocity follower's speed cap. It is an
+        optically-measured "how long until the frames stop changing" intercept:
+        on ME3B V1 the five entries are 0.1215, −0.1200, 0.5766, −0.2360, 0.1634
+        s — two are physically impossible negatives, and the dominant 0.5766 s is
+        a **single-point fit of one run**. Their mean (0.2872 s) is 90 % of the
+        dead-time budget and caps prints at 0.31 mm/s on a 5.9 mm/s stage.
+
+        ``slope_s_per_seg`` is NOT a substitute: it is seconds *per segment* (a
+        discrete-streaming lag), a different unit entirely.
+
+        Prefer :meth:`get_velocity_dead_time_s`, which is measured by stepping the
+        velocity command and timing the position response — the quantity the
+        pure-pursuit stability limit actually depends on. This method is kept as
+        the fallback for machines that have not run that probe yet.
+        """
         entries = self._data.get("by_phase", {})
         vals = []
         for e in entries.values() if isinstance(entries, dict) else []:
@@ -200,6 +259,58 @@ class PrintTimingCalibrationStore:
             except (TypeError, ValueError, AttributeError):
                 continue
         return (sum(vals) / len(vals)) if vals else None
+
+    # ── purpose-measured velocity dead time (preferred over phase lag) ──
+
+    def get_velocity_dead_time_s(self) -> Optional[float]:
+        """Measured command→motion transport delay (s), or None if unmeasured.
+
+        Produced by ``XYDeadTime.measure_velocity_dead_time``: from rest, send a
+        velocity command and time the first real displacement. Unlike
+        :meth:`get_phase_lag_s` this is the quantity the follower's stability
+        limit depends on, and it is measured without a camera.
+        """
+        v = self._data.get("velocity_dead_time_s")
+        try:
+            return float(v) if v else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_velocity_dead_time_s(self, value_s: float, *, n: int = 0,
+                                 spread_s: float = 0.0,
+                                 tau_s: Optional[float] = None) -> None:
+        """Store the measured dead time (plus its provenance, so a later reader
+        can judge how much to trust it — the lesson of the by_phase table)."""
+        self._data["velocity_dead_time_s"] = float(value_s)
+        meta = {"n": int(n), "spread_s": float(spread_s),
+                "last_updated": datetime.now().isoformat(timespec="seconds")}
+        if tau_s is not None:
+            meta["tau_s"] = float(tau_s)
+        self._data["velocity_dead_time_meta"] = meta
+        self.save()
+        logger.info("Velocity dead time measured/stored: %.1f ms "
+                    "(n=%d, spread %.1f ms).",
+                    value_s * 1000.0, n, spread_s * 1000.0)
+
+    def get_velocity_dead_time_meta(self) -> dict:
+        m = self._data.get("velocity_dead_time_meta")
+        return dict(m) if isinstance(m, dict) else {}
+
+    def effective_dead_time_s(self) -> tuple:
+        """``(dead_time_s, source)`` — the value the follower should use and where
+        it came from: ``"measured"`` (the step-response probe), ``"phase_lag"``
+        (the legacy by_phase mean), or ``"unmeasured"``.
+
+        Exists so the UI can say WHICH number is capping the speed rather than
+        leaving the operator to guess.
+        """
+        dt = self.get_velocity_dead_time_s()
+        if dt and dt > 0:
+            return (dt, "measured")
+        lag = self.get_phase_lag_s()
+        if lag and lag > 0:
+            return (lag, "phase_lag")
+        return (0.0, "unmeasured")
 
     def get_resolution_element_um(self) -> float:
         """The print resolution element (µm) = smallest resolvable feature ≈ the

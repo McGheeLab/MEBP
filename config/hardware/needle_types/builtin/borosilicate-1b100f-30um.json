@@ -1,0 +1,16 @@
+{
+  "id": "borosilicate-1b100f-30um",
+  "display_name": "Borosilicate 1B100F-4 · 30 µm tip",
+  "manufacturer": "WPI",
+  "model": "1B100F-4",
+  "barrel_id_um": 580.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 100.0,
+  "tip_id_um": 30.0,
+  "tip_length_mm": 5.0,
+  "tip_od_um": null,
+  "tip_profile": "cylinder",
+  "puller_program": "P-1000: HEAT ramp+5, PULL 55, VEL 60, TIME 200 (1-line)",
+  "notes": "Standard filamented borosilicate blank. Tip Ø is nominal — measure under the scope and save a user preset if your pull differs.",
+  "builtin": true
+}

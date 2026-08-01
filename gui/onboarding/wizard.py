@@ -383,7 +383,9 @@ class OnboardingWizard(QDialog):
         self._config.plate_format = int(self._plate_combo.currentData())
         needle_spec = self._needle_catalog.get(gauge)
         if needle_spec is not None:
-            self._config.needle = needle_spec
+            # COPY — assigning the catalog's own instance aliased it, so any
+            # later edit to config.needle mutated the shared catalog entry.
+            self._config.needle = NeedleSpec.from_dict(needle_spec.to_dict())
         self._stack.setCurrentIndex(3)
 
     # ── Step 4: Pumps & Inks (deep-link) ─────────────────────────
@@ -548,6 +550,13 @@ def should_show_onboarding(settings) -> bool:
     """
     needle_gauge = settings.get("workspace.needle_gauge")
     if needle_gauge:
+        return False
+    # v7.6: `workspace.needle_gauge` is only ever written by this wizard, and a
+    # pulled glass capillary has no gauge at all — so an operator who configures
+    # a capillary on the Needle page and never saves a setup file would be shown
+    # the wizard on every launch. A configured needle of ANY type means setup
+    # happened (this key mirrors HardwareConfig.to_dict).
+    if settings.get("hardware_config.needle"):
         return False
     # Also check the hardware_config last_config_file — if a saved
     # config exists, the user probably already completed setup once.

@@ -69,10 +69,29 @@
           "frames": 252,
           "exposure_us": 0.0,
           "date": "2026-07-02"
+        },
+        "Bright Field": {
+          "image": "fluor_mosaics/nest-plastic-24_D5_Bright_Field.png",
+          "color": [
+            255,
+            255,
+            255
+          ],
+          "extent_um": [
+            18320.484467918977,
+            -1652.255232,
+            39564.99493191898,
+            18690.39275131527
+          ],
+          "um_per_px": 3.227061,
+          "mosaic_scale": 0.1176774585715396,
+          "frames": 36,
+          "exposure_us": 0.0,
+          "date": "2026-07-29"
         }
       },
       "objective": "4x",
-      "date": "2026-07-02"
+      "date": "2026-07-29"
     },
     "nest-plastic-24|A5": {
       "plate_key": "nest-plastic-24",
@@ -196,10 +215,29 @@
           "frames": 63,
           "exposure_us": 0.0,
           "date": "2026-07-08"
+        },
+        "Bright Field": {
+          "image": "fluor_mosaics/nest-plastic-24_C6_Bright_Field.png",
+          "color": [
+            255,
+            255,
+            255
+          ],
+          "extent_um": [
+            -957.4654266204766,
+            16666.141873849196,
+            20287.04503737952,
+            37910.6523378492
+          ],
+          "um_per_px": 3.227061,
+          "mosaic_scale": 0.11767745857153963,
+          "frames": 36,
+          "exposure_us": 0.0,
+          "date": "2026-07-29"
         }
       },
-      "objective": "2x",
-      "date": "2026-07-08"
+      "objective": "4x",
+      "date": "2026-07-29"
     },
     "nest-plastic-24|A4": {
       "plate_key": "nest-plastic-24",

@@ -103,10 +103,16 @@ class CameraManager(QObject):
         # unknown (no rescale; the stored value is used as-is).
         self._um_per_px_res: list[Optional[tuple[int, int]]] = (
             [None] * max_cameras)
-        # v7.5.x: per-slot in-plane rotation (deg) — the stage direction that
-        # maps to the camera's lateral image axis, from the µm/px calibration.
-        # None = not measured (needle aligner falls back to nominal mounting).
+        # v7.5.x: per-slot in-plane rotation (deg) — the camera's DISPLAY
+        # orientation correction. For the needle side cams this is the small
+        # sensor roll (deviation from parallel), NOT the ±45° mount direction.
+        # None = not measured.
         self._rotation_deg: list[Optional[float]] = [None] * max_cameras
+        # v7.5.x (rotated rig): per-slot column→stage MOUNT direction (deg CCW
+        # from stage +X) — the needle cameras sit symmetric about +X at ±45°.
+        # Consumed ONLY by the two-camera needle aligner; never by the display.
+        # None = not measured (the aligner refuses rather than guess).
+        self._column_dir_deg: list[Optional[float]] = [None] * max_cameras
         # v7.5.x: per-slot mirrored-view flag (horizontal flip). A mirror
         # reverses image handedness, which rotation alone cannot express;
         # flip-x + arbitrary rotation together span every camera orientation.
@@ -321,6 +327,10 @@ class CameraManager(QObject):
             return
         cam.start()
         if getattr(cam, '_running', False):
+            # v7.5.x: adopt this physical camera's persisted calibration as soon
+            # as it is running, so µm/px + orientation are available to EVERY
+            # consumer without first visiting the Hardware Setup page.
+            self.restore_calibration_from_store(cam_idx)
             self.camera_started.emit(cam_idx)
 
     def start_async(self, cam_idx: int):
@@ -342,10 +352,12 @@ class CameraManager(QObject):
         if hasattr(cam, 'start_async'):
             cam.start_async(
                 on_done=lambda ok, i=cam_idx: (
-                    self.camera_started.emit(i) if ok else None))
+                    (self.restore_calibration_from_store(i),
+                     self.camera_started.emit(i)) if ok else None))
         else:
             cam.start()
             if getattr(cam, '_running', False):
+                self.restore_calibration_from_store(cam_idx)
                 self.camera_started.emit(cam_idx)
 
     def stop(self, cam_idx: int):
@@ -473,6 +485,26 @@ class CameraManager(QObject):
             self._rotation_deg[cam_idx] = (
                 None if value is None else float(value))
 
+    def get_column_dir_deg(self, cam_idx: int) -> Optional[float]:
+        """Column→stage mount direction (deg CCW from stage +X) for a slot,
+        or None if unmeasured.
+
+        v7.5.x (rotated rig): the needle side cameras' mount direction (±45°
+        about +X, measured by the stage-motion µm/px calibration) — consumed
+        ONLY by the two-camera needle aligner, never by the display (that is
+        ``get_rotation_deg``, the sensor roll). ``getattr``-guarded for
+        lightweight ``__new__`` test doubles."""
+        cd = getattr(self, "_column_dir_deg", None)
+        if cd is not None and 0 <= cam_idx < len(cd):
+            return cd[cam_idx]
+        return None
+
+    def set_column_dir_deg(self, cam_idx: int, value: Optional[float]):
+        """Set (or clear, with None) the column→stage mount direction."""
+        cd = getattr(self, "_column_dir_deg", None)
+        if cd is not None and 0 <= cam_idx < len(cd):
+            cd[cam_idx] = None if value is None else float(value)
+
     def get_mirrored(self, cam_idx: int) -> bool:
         """Whether the slot's view is mirrored (horizontal flip). Default False.
 
@@ -535,6 +567,59 @@ class CameraManager(QObject):
         return (bool(self.get_mirrored(cam_idx)),
                 bool(self.get_flip_y(cam_idx)),
                 float(rot) if rot is not None else 0.0)
+
+    def restore_calibration_from_store(self, cam_idx: int) -> bool:
+        """Push the persisted per-identity calibration into this slot.
+
+        v7.5.x. Previously the ONLY thing that did this was
+        ``HardwareSetupPage._restore_calibration_for_slot`` — which runs on the
+        Hardware Setup page. Until the operator visited that page,
+        ``get_rotation_deg`` / ``get_flip_y`` returned ``None`` / ``False``, so a
+        mosaic built from the Calibration page or a workflow was placed with NO
+        calibrated orientation. (The full-plate scan papered over this by reading
+        the store directly; the calibration dialog and the fluorescence scan did
+        not, which is a large part of why the three mosaics disagreed.)
+
+        Living on the manager means every consumer sees calibrated values
+        regardless of navigation order. Safe to call repeatedly; returns True if
+        an entry was found. Fields absent from the store are left untouched, so
+        this never downgrades a freshly-measured live value to a stale one.
+        """
+        if not (0 <= cam_idx < self._max_cameras):
+            return False
+        try:
+            identity = self.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if not identity or not identity[0]:
+            return False
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            store = get_store()
+            entry = store.get_calibration(identity[0])
+        except Exception as exc:
+            logger.debug(f"restore_calibration_from_store({cam_idx}): {exc}")
+            return False
+        if not entry:
+            return False
+        try:
+            if entry.get("um_per_px") is not None:
+                self.set_um_per_px(
+                    cam_idx, float(entry["um_per_px"]),
+                    resolution=store.get_um_per_px_resolution(identity[0]))
+            if entry.get("rotation_deg") is not None:
+                self.set_rotation_deg(cam_idx, float(entry["rotation_deg"]))
+            if entry.get("column_dir_deg") is not None:
+                self.set_column_dir_deg(
+                    cam_idx, float(entry["column_dir_deg"]))
+            if "mirrored" in entry:
+                self.set_mirrored(cam_idx, bool(entry["mirrored"]))
+            if "flip_y" in entry:
+                self.set_flip_y(cam_idx, bool(entry["flip_y"]))
+        except Exception as exc:
+            logger.debug(f"restore_calibration_from_store({cam_idx}): {exc}")
+            return False
+        return True
 
     def get_magnification(self, cam_idx: int) -> float:
         """Get objective magnification for a camera."""
@@ -658,6 +743,22 @@ class CameraManager(QObject):
         cam = self._widget(cam_idx)
         return bool(cam and cam.set_hw_contrast(value))
 
+    # Andor (Zyla) mono16→8-bit display scaling — no-ops on other backends.
+    def set_hw_andor_auto_scale(self, cam_idx: int, enabled: bool) -> bool:
+        cam = self._widget(cam_idx)
+        return bool(cam and hasattr(cam, "set_hw_andor_auto_scale")
+                    and cam.set_hw_andor_auto_scale(enabled))
+
+    def set_hw_andor_scale_lo(self, cam_idx: int, counts) -> bool:
+        cam = self._widget(cam_idx)
+        return bool(cam and hasattr(cam, "set_hw_andor_scale_lo")
+                    and cam.set_hw_andor_scale_lo(counts))
+
+    def set_hw_andor_scale_hi(self, cam_idx: int, counts) -> bool:
+        cam = self._widget(cam_idx)
+        return bool(cam and hasattr(cam, "set_hw_andor_scale_hi")
+                    and cam.set_hw_andor_scale_hi(counts))
+
     def set_capture_resolution(self, cam_idx: int, width: int, height: int):
         cam = self._widget(cam_idx)
         if cam is not None and hasattr(cam, "set_capture_resolution"):
@@ -734,6 +835,47 @@ class CameraManager(QObject):
         c, s = math.cos(t), math.sin(t)
         return (dx_um * c - dy_um * s,
                 dx_um * s + dy_um * c)
+
+    def stage_offset_to_pixel(self, cam_idx: int, dx_um: float, dy_um: float,
+                              image_w: int, image_h: int) -> tuple:
+        """EXACT inverse of :meth:`pixel_to_stage_offset`.
+
+        A stage offset from the camera centre (µm) → the frame pixel that shows
+        it. Lives here, immediately beside the forward map, so an overlay can
+        project a target back onto the live image through the same mirror / flip
+        / rotation the click path applies — drawing a marker with the naive
+        identity ``dx_um / µm_per_px + w/2`` puts it in the wrong place on any
+        rotated or mirrored camera, which stops being cosmetic the moment the
+        operator has to click or resize the thing they see.
+
+        Reduces to the identity mapping at θ=0 with no flips, exactly as the
+        forward direction does.
+        """
+        eff = getattr(self, "effective_um_per_px", None)
+        um_per_px = (eff(cam_idx, image_w) if callable(eff)
+                     else self.get_um_per_px(cam_idx))
+        if not um_per_px:
+            return (image_w / 2.0, image_h / 2.0)
+
+        dx, dy = float(dx_um), float(dy_um)
+        # Undo the calibrated rotation first: R(-θ).
+        get_rot = getattr(self, "get_rotation_deg", None)
+        theta = get_rot(cam_idx) if callable(get_rot) else None
+        if theta:
+            t = math.radians(float(theta))
+            c, s = math.cos(t), math.sin(t)
+            dx, dy = (dx * c + dy * s, -dx * s + dy * c)
+
+        dx_px = dx / um_per_px
+        dy_px = dy / um_per_px
+        # Parity flips are self-inverse and commute with the scaling above.
+        get_mir = getattr(self, "get_mirrored", None)
+        if callable(get_mir) and get_mir(cam_idx):
+            dx_px = -dx_px
+        get_fy = getattr(self, "get_flip_y", None)
+        if callable(get_fy) and get_fy(cam_idx):
+            dy_px = -dy_px
+        return (dx_px + image_w / 2.0, dy_px + image_h / 2.0)
 
     # ── Cleanup ───────────────────────────────────────────────────
 

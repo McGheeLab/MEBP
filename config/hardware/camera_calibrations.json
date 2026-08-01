@@ -1,5 +1,5 @@
 {
-  "version": "1.0",
+  "version": "1.2",
   "cameras": {
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&2&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "um_per_px": 5.703728,
@@ -21,7 +21,11 @@
           480
         ]
       },
-      "autostart": true
+      "autostart": true,
+      "um_per_px_resolution": [
+        640,
+        480
+      ]
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#7&b643b4c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "um_per_px": 5.272355,
@@ -50,7 +54,11 @@
           2748
         ]
       },
-      "autostart": true
+      "autostart": true,
+      "um_per_px_resolution": [
+        3664,
+        2748
+      ]
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&306e9dcb&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "um_per_px": 5.585643,
@@ -72,7 +80,11 @@
           480
         ]
       },
-      "autostart": true
+      "autostart": true,
+      "um_per_px_resolution": [
+        640,
+        480
+      ]
     },
     "toupcam:\\\\?\\usb#vid_0547&pid_13a9#6&2c564b76&0&2": {
       "autostart": true
@@ -96,9 +108,9 @@
         "gamma": 1.0
       },
       "um_per_px": 3.227061,
-      "date": "2026-07-27",
-      "rotation_deg": 0.5,
-      "mirrored": true
+      "date": "2026-07-30",
+      "rotation_deg": 180.0,
+      "flip_y": true
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&1d85a11e&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "image_correction": {
@@ -120,7 +132,11 @@
       "autostart": true,
       "um_per_px": 2.468365,
       "rotation_deg": 0.0,
-      "date": "2026-07-27"
+      "date": "2026-07-27",
+      "um_per_px_resolution": [
+        640,
+        480
+      ]
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#6&29d1719c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "image_correction": {
@@ -140,9 +156,13 @@
         ]
       },
       "autostart": true,
-      "um_per_px": 2.591296,
-      "rotation_deg": 1.5,
-      "date": "2026-07-27"
+      "um_per_px": 6.062382,
+      "date": "2026-07-29",
+      "column_dir_deg": 0.0,
+      "um_per_px_resolution": [
+        640,
+        480
+      ]
     },
     "dshow:\\\\?\\usb#vid_32e4&pid_0577&mi_00#6&1d5a0258&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
       "hw_controls": {
@@ -164,10 +184,9 @@
       "autostart": false
     },
     "dshow:\\\\?\\usb#vid_f007&pid_a999&mi_00#8&7edc02c&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global": {
-      "rotation_deg": 0.0,
       "name": "Teslong Camera",
-      "date": "2026-07-28",
-      "um_per_px": 2.249557,
+      "date": "2026-07-29",
+      "um_per_px": 5.998047,
       "image_correction": {
         "brightness": 0,
         "contrast": 1.0,
@@ -183,7 +202,12 @@
           480
         ]
       },
-      "autostart": true
+      "autostart": true,
+      "column_dir_deg": 0.0,
+      "um_per_px_resolution": [
+        640,
+        480
+      ]
     }
   },
   "assignments": {

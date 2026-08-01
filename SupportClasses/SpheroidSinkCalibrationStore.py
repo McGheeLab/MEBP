@@ -19,9 +19,16 @@ sinking right as the needle arrives (``lift* = lift_for_time(target_sink)``), so
 spheroid never sinks out inside the well and arrives at the tip for a minimal-excess
 release.
 
-**One curve for all** spheroids (assumed roughly uniform). The curve ``t(lift)`` is
-a property of the spheroid + fluid, NOT the needle — volume↔lift always uses the
-*current* bore area, so a needle change doesn't invalidate the curve (it only warns).
+**One curve for all** spheroids (assumed roughly uniform). For a plain cannula the
+curve ``t(lift)`` is a property of the spheroid + fluid rather than the needle —
+volume↔lift uses the *current* bore area, so a gauge change only warns.
+
+⚠ **v7.6 — that no longer holds for a pulled glass capillary.** Sink velocity is
+governed by wall drag, which differs by orders of magnitude between a 250 µm tip
+and a 1 mm barrel, and the volume↔lift relation itself becomes piecewise at the
+tip length. A curve is therefore valid ONLY for the tip geometry it was measured
+in: a change in ``tip_id_um`` or ``tip_length_mm`` INVALIDATES it and sink timing
+must be re-calibrated, which is why those dimensions are stored alongside.
 
 Data file: ``config/hardware/spheroid_sink_calibration.json``::
 
@@ -217,8 +224,19 @@ class SpheroidSinkCalibrationStore:
                   *, bore_area_mm2: Optional[float] = None,
                   needle_gauge: Optional[int] = None,
                   needle_id_um: Optional[float] = None,
-                  spheroid_diameter_um: Optional[float] = None) -> None:
-        """Replace the stored curve with these ``(lift_mm, sink_s)`` samples."""
+                  spheroid_diameter_um: Optional[float] = None,
+                  needle_type: Optional[str] = None,
+                  tip_id_um: Optional[float] = None,
+                  tip_length_mm: Optional[float] = None,
+                  tip_area_mm2: Optional[float] = None,
+                  tip_profile: Optional[str] = None) -> None:
+        """Replace the stored curve with these ``(lift_mm, sink_s)`` samples.
+
+        The ``tip_*`` provenance (v7.6) is written only when supplied, so a
+        straight-needle calibration produces exactly the JSON entry it always
+        did. It exists so a pulled-tip change can invalidate the curve — see
+        the module docstring.
+        """
         clean = SinkCurve(samples).to_samples()
         entry: dict = {
             "samples": clean,
@@ -232,6 +250,17 @@ class SpheroidSinkCalibrationStore:
             entry["needle_id_um"] = round(float(needle_id_um), 3)
         if spheroid_diameter_um is not None:
             entry["spheroid_diameter_um"] = round(float(spheroid_diameter_um), 3)
+        # v7.6 pulled-capillary provenance — omitted entirely for a cannula.
+        if needle_type is not None:
+            entry["needle_type"] = str(needle_type)
+        if tip_id_um is not None:
+            entry["tip_id_um"] = round(float(tip_id_um), 3)
+        if tip_length_mm is not None:
+            entry["tip_length_mm"] = round(float(tip_length_mm), 4)
+        if tip_area_mm2 is not None:
+            entry["tip_area_mm2"] = round(float(tip_area_mm2), 8)
+        if tip_profile is not None:
+            entry["tip_profile"] = str(tip_profile)
         self._data["curve"] = entry
         self.save()
         logger.info(

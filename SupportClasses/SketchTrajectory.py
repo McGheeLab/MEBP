@@ -35,6 +35,10 @@ from SupportClasses.GeometryEngine import (
     generate_circular_meander_fill,
     generate_elliptical_meander_fill,
 )
+from SupportClasses.PhysicalModels import (
+    needle_orifice_area_mm2,
+    needle_orifice_od_mm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1243,15 +1247,16 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
     # layer_height (which is only the Z step between stacked layers). The
     # multiplier scales HOW MUCH is deposited, never the toolpath geometry.
     # NOTE: the Sketch page's shaded thickness band is a display WIDTH
-    # (inner Ø × mult); the baked VOLUME here is bore AREA × mult — width vs
-    # area differ by design (mirrors Quick Print, which shows no band). When no
-    # needle is supplied (bore unknown) fall back to bead × layer_height × mult
-    # so the no-syringe preview stays monotonic and previewable.
+    # (orifice Ø × mult); the baked VOLUME here is orifice AREA × mult — width
+    # vs area differ by design (mirrors Quick Print, which shows no band). When
+    # no needle is supplied (bore unknown) fall back to bead × layer_height ×
+    # mult so the no-syringe preview stays monotonic and previewable.
+    # v7.6: "bore" is the ORIFICE — the pulled tip when present, else the barrel.
     mult = max(float(getattr(sketch, "extrusion_multiplier", 1.0)), 0.0)
     vol_per_mm = bead * sketch.layer_height_mm * mult
     if needle is not None:
         try:
-            _area = float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
+            _area = float(needle_orifice_area_mm2(needle) or 0.0)
             if _area > 0:
                 vol_per_mm = _area * mult
         except (TypeError, ValueError):
@@ -1272,12 +1277,13 @@ def compile_to_trajectory(sketch: Sketch, needle=None, syringe=None
     # (pen-up). In multi mode the compiler welds across channels (legacy).
     single = sketch.is_single_needle(needle)
     # Closure overlap for closed loops = the per-shape amount
-    # (shape.overlap_amount_mm): needle mode → one needle OUTER Ø, distance mode
-    # → the typed value. The needle Ø is resolved once here.
+    # (shape.overlap_amount_mm): needle mode → one ORIFICE OUTER Ø (the pulled
+    # tip when present — the seam has to close over the bead actually laid
+    # down), distance mode → the typed value. Resolved once here.
     _od = 0.0
     if needle is not None:
         try:
-            _od = float(getattr(needle, "od_mm", 0.0) or 0.0)
+            _od = float(needle_orifice_od_mm(needle) or 0.0)
         except (TypeError, ValueError):
             _od = 0.0
 
@@ -1810,7 +1816,7 @@ def plan_print_sections(sketch: Sketch, needle=None,
     _od = 0.0
     if needle is not None:
         try:
-            _od = float(getattr(needle, "od_mm", 0.0) or 0.0)
+            _od = float(needle_orifice_od_mm(needle) or 0.0)
         except (TypeError, ValueError):
             _od = 0.0
     items: list[dict] = []

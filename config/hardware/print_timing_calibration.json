@@ -175,15 +175,28 @@
       "pace_correction": 3.0
     },
     "confirm": {
-      "settle_tol_um": 40.0
+      "settle_tol_um": 40.0,
+      "corner_angle_deg": 30.0
     },
     "velocity": {
-      "lookahead_mm": 1.0,
+      "lookahead_mm": 0.2,
       "control_hz": 25.0,
-      "decel_mm": 1.5
+      "decel_mm": 0.3,
+      "pid_kp": 2.0,
+      "pid_kd": 0.0,
+      "corner_speed_factor": 0.2,
+      "corner_angle_deg": 30.0
     }
   },
   "enabled": true,
   "xy_max_speed_um_s": 5945.611449038091,
-  "control_loop_ms": 31.75
+  "control_loop_ms": 31.75,
+  "resolution_element_um": 30.0,
+  "velocity_dead_time_s": 0.06721379633129744,
+  "velocity_dead_time_meta": {
+    "n": 5,
+    "spread_s": 0.0005457936576320641,
+    "last_updated": "2026-07-28T14:52:42",
+    "tau_s": 0.028093754102814894
+  }
 }

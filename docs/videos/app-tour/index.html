@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en" data-resolution="landscape">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>MEBP — Where Everything Lives</title>
+
+    <!--
+      ══ SOURCES ═════════════════════════════════════════════════════════
+      The screenshots in screens/ are REAL captures of the app running in
+      simulation, produced by tools_capture_app_screens.py. Re-run it after
+      any UI change and the video updates with it.
+
+      Every claim on screen is checked against live code, NOT README.md
+      (whose Usage section still documents the retired 7-page nav):
+
+        sidebar pages + order ...... gui/app.py:1974
+        page gating ................ gui/app.py:1878   (HW Setup AND Settings
+                                     stay enabled; only pages 2–5 lock)
+        HW Setup sub-pages ......... gui/pages/hardware_setup.py:1857-1873
+        Device jog bypasses limits . gui/pages/hardware/stage_panel.py:1021
+        Microscope Go rotates ...... microscope_setup_panel.py:589-595
+        calibration tabs + why ..... gui/pages/calibration.py:10994-11028
+        jog cockpit layout ......... gui/pages/jog_control.py:1-32
+        Print Builder sub-pages .... gui/pages/print_builder.py:184-188
+        workflow tiles + enabled ... gui/pages/workflows/workflow_picker.py:40-120
+
+      Palette: styles/mocha.css is GENERATED from gui/styles.py by
+      tools_export_theme_tokens.py. Do not hand-edit it.
+
+      Spotlight geometry is expressed in % of the frame so it stays correct
+      if the capture resolution changes.
+      ════════════════════════════════════════════════════════════════════
+    -->
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <link rel="stylesheet" href="styles/mocha.css" />
+    <link rel="stylesheet" href="styles/tour.css" />
+  </head>
+
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="95"
+      data-width="1920"
+      data-height="1080"
+    >
+      <!-- ══ S0 · title card (0–5) ══════════════════════════════════ -->
+      <div id="s0" class="clip card" data-start="0" data-duration="5" data-track-index="9">
+        <div class="card-inner" id="s0-inner">
+          <!-- Not expanding the acronym: CLAUDE.md says "Microscope-Enabled",
+               README.md says "Multi-Extrusion". Unresolved in the repo. -->
+          <div class="kicker" id="s0-kicker">The Bioprinting Platform</div>
+          <div class="big-title" id="s0-title">Where everything lives</div>
+          <div class="sub" id="s0-sub">A ninety-second tour of the app</div>
+        </div>
+      </div>
+
+      <!-- ══ S1 · the spine (5–14) ═════════════════════════════════ -->
+      <div id="s1" class="clip card" data-start="5" data-duration="9" data-track-index="1">
+        <div class="card-inner">
+          <div class="kicker" id="s1-kicker">Six pages. Six different questions.</div>
+          <div class="rule" id="s1-rule"></div>
+          <div class="spine">
+            <div class="spine-row s1-row"><div class="spine-num">1</div><div class="spine-name">Hardware Setup</div><div class="spine-q">What machine do I have?</div></div>
+            <div class="spine-row s1-row"><div class="spine-num">2</div><div class="spine-name">Calibration</div><div class="spine-q">Where is everything?</div></div>
+            <div class="spine-row s1-row"><div class="spine-num">3</div><div class="spine-name">Jog Control</div><div class="spine-q">Move it by hand.</div></div>
+            <div class="spine-row s1-row"><div class="spine-num">4</div><div class="spine-name">Print Builder</div><div class="spine-q">What am I making?</div></div>
+            <div class="spine-row s1-row"><div class="spine-num">5</div><div class="spine-name">Workflows</div><div class="spine-q">Do the job.</div></div>
+            <div class="spine-row s1-row"><div class="spine-num">6</div><div class="spine-name">Settings</div><div class="spine-q">Preferences.</div></div>
+          </div>
+          <div class="foot" id="s1-foot">
+            Learn them in that order — it is the order the app
+            <strong>unlocks</strong> them in. Until Hardware Setup validates,
+            pages 2 to 5 stay locked.
+          </div>
+        </div>
+      </div>
+
+      <!-- ══ S2 · Hardware Setup (14–28) ═══════════════════════════ -->
+      <div id="s2" class="clip scene" data-start="14" data-duration="14" data-track-index="2">
+        <img id="shot-s2" class="shot" src="screens/hardware-device.png" alt="" />
+
+        <div class="scene-chip s2-chip">
+          <div class="scene-chip-num">1</div>
+          <div class="scene-chip-name">Hardware Setup</div>
+          <div class="scene-chip-q">What machine do I have?</div>
+        </div>
+
+        <!-- step 1 — the ten sub-pages across the top -->
+        <div class="spot s2-spot1" style="left:27.0%; top:4.6%; width:49.5%; height:5.2%"></div>
+        <div class="callout-card s2-call1" style="left:27.0%; top:13%; max-width:800px">
+          <div class="step-num">1</div>
+          Ten sub-pages describe your machine. The order is
+          <span class="k">dependency order, not alphabetical</span> — each
+          one's options are built from the ones to its left
+          (<span class="k">Rosette → Ink → Needle → Pump</span>).
+        </div>
+
+        <!-- step 2 — connect the hardware -->
+        <div class="spot s2-spot2" style="left:4.0%; top:9.2%; width:21.8%; height:17.6%"></div>
+        <div class="callout-card s2-call2" style="left:29%; top:11%">
+          <div class="step-num">2</div>
+          Start here: <span class="k">Connect Hardware</span>. Each row has
+          <strong>Connect</strong> for the real device and
+          <strong>Simulate</strong> to work without it.
+        </div>
+
+        <!-- step 3 — the safety exception -->
+        <div class="spot s2-spot3" style="left:5.0%; top:32.4%; width:20.6%; height:10.4%"></div>
+        <div class="callout-card s2-call3" style="left:29%; top:31%">
+          <div class="step-num">3</div>
+          Read this one. The Device jog pad
+          <span class="k">bypasses the soft limits</span> on purpose, so you
+          can find the mechanical extremes — which also means nothing will
+          stop you here.
+        </div>
+      </div>
+
+      <!-- ══ S3 · Calibration (28–45) ══════════════════════════════ -->
+      <div id="s3" class="clip scene" data-start="28" data-duration="17" data-track-index="3">
+        <img id="shot-s3" class="shot" src="screens/calibration-plate-location.png" alt="" />
+
+        <div class="scene-chip s3-chip">
+          <div class="scene-chip-num">2</div>
+          <div class="scene-chip-name">Calibration</div>
+          <div class="scene-chip-q">Where is everything?</div>
+        </div>
+
+        <!-- step 1 — the tab order is load-bearing -->
+        <div class="spot s3-spot1" style="left:27.0%; top:9.6%; width:37.4%; height:3.4%"></div>
+        <div class="callout-card s3-call1" style="left:27.0%; top:15%; max-width:900px">
+          <div class="step-num">1</div>
+          Work these left to right — the order is load-bearing.
+          <span class="k">Plate Location</span> retracts to the Safe Z between
+          wells, so Safe Z must already exist: that is why the reference Z
+          heights live on <span class="k">Needle Location</span>, before it.
+        </div>
+
+        <!-- step 2 — the mosaic workflow -->
+        <div class="spot s3-spot2" style="left:82.6%; top:26.2%; width:15.6%; height:18.2%"></div>
+        <div class="callout-card s3-call2" style="left:41%; top:29%; max-width:600px">
+          <div class="step-num">2</div>
+          The recommended path, top to bottom:
+          <span class="k">Calibrate mosaic scan</span> once per camera and
+          objective, then <span class="k">Mosaic scan</span> — Map wells opens
+          by itself when it finishes.
+        </div>
+
+        <!-- step 3 — the Safe badge -->
+        <div class="spot s3-spot3" style="left:73.8%; top:32.2%; width:6.0%; height:2.6%"></div>
+        <div class="callout-card s3-call3" style="left:36%; top:39%; max-width:620px">
+          <div class="step-num">3</div>
+          Click the green <span class="k">Safe</span> badge any time to retract
+          the needle to the Fast Move Z before it travels.
+        </div>
+      </div>
+
+      <!-- ══ S4 · Jog Control (45–58) ══════════════════════════════ -->
+      <div id="s4" class="clip scene" data-start="45" data-duration="13" data-track-index="4">
+        <img id="shot-s4" class="shot" src="screens/jog.png" alt="" />
+
+        <div class="scene-chip s4-chip">
+          <div class="scene-chip-num">3</div>
+          <div class="scene-chip-name">Jog Control</div>
+          <div class="scene-chip-q">Move it by hand.</div>
+        </div>
+
+        <!-- step 1 — click the workspace to travel -->
+        <div class="spot s4-spot1" style="left:27.0%; top:4.6%; width:37.8%; height:66.6%"></div>
+        <div class="callout-card s4-call1" style="left:66%; top:16%; max-width:600px">
+          <div class="step-num">1</div>
+          The main area holds <span class="k">no controls</span> — only live
+          state. Click anywhere on the plate to travel there. It
+          <strong>snaps to wells</strong> unless you switch to Free.
+        </div>
+
+        <!-- step 2 — the Z side view -->
+        <div class="spot s4-spot2" style="left:87.8%; top:4.6%; width:11.7%; height:69.6%"></div>
+        <div class="callout-card s4-call2" style="left:50%; top:30%; max-width:600px">
+          <div class="step-num">2</div>
+          The side view is your needle height. The
+          <span class="k">Max</span>, <span class="k">Safe</span> and
+          <span class="k">Plate</span> badges are clickable — that is the
+          quickest way to retract.
+        </div>
+
+        <!-- step 3 — the pumps -->
+        <div class="spot s4-spot3" style="left:27.0%; top:75.2%; width:72.6%; height:18.8%"></div>
+        <div class="callout-card s4-call3" style="left:30%; top:50%; max-width:640px">
+          <div class="step-num">3</div>
+          All three syringes, live. They read
+          <span class="k">calibrate plunger for µL</span> until you run the
+          plunger setup on Hardware Setup → Pump.
+        </div>
+      </div>
+
+      <!-- ══ S5 · Print Builder (58–67) ════════════════════════════ -->
+      <div id="s5" class="clip scene" data-start="58" data-duration="9" data-track-index="5">
+        <img id="shot-s5" class="shot" src="screens/print-builder-sketch.png" alt="" />
+
+        <div class="scene-chip s5-chip">
+          <div class="scene-chip-num">4</div>
+          <div class="scene-chip-name">Print Builder</div>
+          <div class="scene-chip-q">What am I making?</div>
+        </div>
+
+        <!-- Print Builder's sub-nav is a VERTICAL icon column (Sketch · Image
+             Import · Prints · Hardware · Print Settings), unlike Hardware
+             Setup's horizontal tab strip. -->
+        <div class="spot s5-spot1" style="left:3.2%; top:4.4%; width:3.3%; height:24.8%"></div>
+        <div class="callout-card s5-call1" style="left:9.5%; top:6%; max-width:860px">
+          <div class="step-num">1</div>
+          <span class="k">Sketch</span> — draw it.
+          <span class="k">Image Import</span> — trace it.
+          <span class="k">Prints</span> — the library of everything you have
+          made. This page <strong>authors</strong>; it does not print.
+        </div>
+      </div>
+
+      <!-- ══ S6 · Workflows (67–80) ════════════════════════════════ -->
+      <div id="s6" class="clip scene" data-start="67" data-duration="13" data-track-index="6">
+        <img id="shot-s6" class="shot" src="screens/workflows-picker.png" alt="" />
+
+        <div class="scene-chip s6-chip">
+          <div class="scene-chip-num">5</div>
+          <div class="scene-chip-name">Workflows</div>
+          <div class="scene-chip-q">Do the job.</div>
+        </div>
+
+        <div class="spot s6-spot1" style="left:35.9%; top:27.2%; width:31.2%; height:13.0%"></div>
+        <div class="callout-card s6-call1" style="left:35.9%; top:43%; max-width:640px">
+          <div class="step-num">1</div>
+          Start with <span class="k">Quick Print</span> — one object, one well,
+          no setup. It is how you dial in printing conditions before
+          committing a whole plate.
+        </div>
+
+        <div class="spot s6-spot2" style="left:67.5%; top:27.2%; width:31.2%; height:13.0%"></div>
+        <div class="callout-card s6-call2" style="left:46%; top:43%; max-width:640px">
+          <div class="step-num">2</div>
+          Then <span class="k">Full Print</span>: objects and wells, the run
+          with live monitoring, and the results review — the complete job.
+        </div>
+      </div>
+
+      <!-- ══ S7 · the left panel (80–88) ═══════════════════════════ -->
+      <div id="s7" class="clip scene" data-start="80" data-duration="8" data-track-index="7">
+        <!-- Deliberately the CALIBRATION capture, not the Jog one: showing the
+             identical panel on a different page is the whole point. It also
+             avoids reusing jog.png, which trips duplicate_media_discovery_risk
+             (duplicate media can render blank). -->
+        <img id="shot-s7" class="shot" src="screens/calibration-needle-location.png" alt="" />
+
+        <div class="spot s7-spot1" style="left:2.8%; top:0.5%; width:23.6%; height:97.5%"></div>
+        <div class="callout-card s7-call1" style="left:30%; top:22%; max-width:700px">
+          <div class="step-num">★</div>
+          The part people miss: this panel <strong>follows you</strong>. That
+          is the same jog panel you just saw on Jog Control — here it is again
+          on <span class="k">Calibration</span>, and it appears inside every
+          jog-capable workflow too.
+        </div>
+
+        <div class="spot s7-spot2" style="left:3.3%; top:4.1%; width:6.5%; height:2.9%"></div>
+        <div class="callout-card s7-call2" style="left:30%; top:55%; max-width:700px">
+          <div class="step-num">★</div>
+          Two views, one panel: <span class="k">Jog</span> is the built-in set,
+          <span class="k">Custom</span> is the one you compose yourself.
+        </div>
+      </div>
+
+      <!-- ══ S8 · recap (88–95) ════════════════════════════════════ -->
+      <div id="s8" class="clip card" data-start="88" data-duration="7" data-track-index="9">
+        <div class="card-inner">
+          <div class="kicker" id="s8-kicker">The whole map</div>
+          <div class="rule" id="s8-rule"></div>
+          <div class="spine">
+            <div class="spine-row s8-row"><div class="spine-num">1</div><div class="spine-name">Hardware Setup</div><div class="spine-q">What machine do I have?</div></div>
+            <div class="spine-row s8-row"><div class="spine-num">2</div><div class="spine-name">Calibration</div><div class="spine-q">Where is everything?</div></div>
+            <div class="spine-row s8-row"><div class="spine-num">3</div><div class="spine-name">Jog Control</div><div class="spine-q">Move it by hand.</div></div>
+            <div class="spine-row s8-row"><div class="spine-num">4</div><div class="spine-name">Print Builder</div><div class="spine-q">What am I making?</div></div>
+            <div class="spine-row s8-row"><div class="spine-num">5</div><div class="spine-name">Workflows</div><div class="spine-q">Do the job.</div></div>
+            <div class="spine-row s8-row"><div class="spine-num">6</div><div class="spine-name">Settings</div><div class="spine-q">Preferences.</div></div>
+          </div>
+          <div class="foot" id="s8-sub">Start at the top. Work down.</div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+
+      // Every tween is fully specified (fromTo) with immediateRender:false, so
+      // nothing mutates a later scene's elements at page load and each frame is
+      // reproducible from its time alone regardless of seek order.
+      const IR = false;
+
+      function rise(sel, t, opts) {
+        const o = opts || {};
+        tl.fromTo(
+          sel,
+          { opacity: 0, y: o.y === undefined ? 22 : o.y },
+          {
+            opacity: 1, y: 0,
+            duration: o.d || 0.55,
+            ease: "power3.out",
+            stagger: o.stagger || 0,
+            immediateRender: IR,
+          },
+          t
+        );
+      }
+
+      function fade(sel, t, from, to, d) {
+        tl.fromTo(
+          sel,
+          { opacity: from },
+          { opacity: to, duration: d || 0.35, ease: "none", immediateRender: IR },
+          t
+        );
+      }
+
+      // One teaching step: the spotlight ring (whose box-shadow dims the rest
+      // of the frame) plus its callout. Steps are strictly sequential — two
+      // overlapping spotlights would double-darken the scrim.
+      function step(spotSel, callSel, tIn, tOut) {
+        fade(spotSel, tIn, 0, 1, 0.4);
+        rise(callSel, tIn + 0.15, { y: 16, d: 0.45 });
+        if (tOut !== null) {
+          fade(spotSel, tOut, 1, 0, 0.3);
+          fade(callSel, tOut, 1, 0, 0.3);
+        }
+      }
+
+      /* ── S0 · title (0–5) ────────────────────────────────────── */
+      rise("#s0-kicker", 0.3, { y: 14 });
+      rise("#s0-title", 0.6, { y: 40, d: 0.8 });
+      rise("#s0-sub", 1.2, { y: 20 });
+      fade("#s0-inner", 4.45, 1, 0, 0.55);
+
+      /* ── S1 · the spine (5–14) ───────────────────────────────── */
+      rise("#s1-kicker", 5.3, { y: 16 });
+      rise("#s1-rule", 5.55, { y: 0 });
+      rise(".s1-row", 5.9, { stagger: 0.1, y: 18 });
+      rise("#s1-foot", 11.0);
+
+      /* ── S2 · Hardware Setup (14–28) ─────────────────────────── */
+      rise(".s2-chip", 14.2, { y: 14 });
+      step(".s2-spot1", ".s2-call1", 14.5, 19.0);
+      step(".s2-spot2", ".s2-call2", 19.4, 22.9);
+      step(".s2-spot3", ".s2-call3", 23.3, 27.6);
+
+      /* ── S3 · Calibration (28–45) ────────────────────────────── */
+      rise(".s3-chip", 28.2, { y: 14 });
+      step(".s3-spot1", ".s3-call1", 28.5, 34.6);
+      step(".s3-spot2", ".s3-call2", 35.0, 39.8);
+      step(".s3-spot3", ".s3-call3", 40.2, 44.6);
+
+      /* ── S4 · Jog Control (45–58) ────────────────────────────── */
+      rise(".s4-chip", 45.2, { y: 14 });
+      step(".s4-spot1", ".s4-call1", 45.5, 49.6);
+      step(".s4-spot2", ".s4-call2", 50.0, 53.8);
+      step(".s4-spot3", ".s4-call3", 54.2, 57.6);
+
+      /* ── S5 · Print Builder (58–67) ──────────────────────────── */
+      rise(".s5-chip", 58.2, { y: 14 });
+      step(".s5-spot1", ".s5-call1", 58.5, 66.6);
+
+      /* ── S6 · Workflows (67–80) ──────────────────────────────── */
+      rise(".s6-chip", 67.2, { y: 14 });
+      step(".s6-spot1", ".s6-call1", 67.5, 73.4);
+      step(".s6-spot2", ".s6-call2", 73.8, 79.6);
+
+      /* ── S7 · the left panel (80–88) ─────────────────────────── */
+      step(".s7-spot1", ".s7-call1", 80.3, 84.2);
+      step(".s7-spot2", ".s7-call2", 84.6, 87.6);
+
+      /* ── S8 · recap (88–95) ──────────────────────────────────── */
+      rise("#s8-kicker", 88.3, { y: 14 });
+      rise("#s8-rule", 88.55, { y: 0 });
+      rise(".s8-row", 88.9, { stagger: 0.09, y: 16 });
+      rise("#s8-sub", 91.4, { y: 18 });
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

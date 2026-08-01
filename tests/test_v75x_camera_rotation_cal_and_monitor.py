@@ -189,12 +189,27 @@ class TestSlotRotationStrip(_PageHarness):
         self.assertIn("not calibrated", self.pg._live_cam_rot_labels[0].text())
         self.assertIn("45", self.pg._live_cam_rot_labels[0].text())  # hint
 
-        self.mgr.set_rotation_deg(0, 44.5)
+        # v7.5.x (rotated rig): a needle cam's Δ-vs-nominal readout tracks the
+        # MOUNT direction (column_dir_deg); rotation_deg is the display roll,
+        # shown separately.
+        self.mgr.set_column_dir_deg(0, 44.5)
+        self.mgr.set_rotation_deg(0, 1.2)
         self.pg._refresh_slot_rotation_displays()
         txt = self.pg._live_cam_rot_labels[0].text()
         self.assertIn("44.5°", txt)
-        self.assertIn("45", txt)      # nearest nominal
-        self.assertIn("-0.5", txt)    # Δ from nominal
+        self.assertIn("45", txt)          # nearest nominal
+        self.assertIn("-0.5", txt)        # Δ from nominal
+        self.assertIn("roll +1.2°", txt)  # display roll shown separately
+
+    def test_needle_roll_never_gets_nominal_delta(self):
+        # A needle cam with ONLY a roll must not present the roll as a
+        # rotation-vs-stage with a Δ-from-±45 sanity figure.
+        self.pg._config.set_camera_role(0, CameraRole.NEEDLE_X)
+        self.mgr.set_rotation_deg(0, 44.5)  # roll only (no mount measured)
+        self.pg._refresh_slot_rotation_displays()
+        txt = self.pg._live_cam_rot_labels[0].text()
+        self.assertIn("mount: not calibrated", txt)
+        self.assertIn("roll +44.5°", txt)
 
     def test_readout_hint_tracks_role(self):
         self.mgr.set_rotation_deg(2, 1.2)

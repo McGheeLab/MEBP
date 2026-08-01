@@ -1,0 +1,16 @@
+{
+  "id": "borosilicate-1b100f-50um",
+  "display_name": "Borosilicate 1B100F-4 · 50 µm tip",
+  "manufacturer": "WPI",
+  "model": "1B100F-4",
+  "barrel_id_um": 580.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 100.0,
+  "tip_id_um": 50.0,
+  "tip_length_mm": 4.0,
+  "tip_od_um": null,
+  "tip_profile": "cylinder",
+  "puller_program": "P-1000: HEAT ramp+5, PULL 40, VEL 50, TIME 200 (1-line)",
+  "notes": "Coarser pull than the 30 µm recipe — roughly 7x the flow ceiling, easier on shear-sensitive cells.",
+  "builtin": true
+}

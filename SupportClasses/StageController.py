@@ -212,6 +212,32 @@ def _shorten_only_delta(cur: float, requested: float,
     return raw
 
 
+# v7.9: Marlin's own notion of a move's LENGTH, which is what its feedrate
+# applies to. ``Planner::_populate_block`` sets ``block->millimeters`` to the
+# Cartesian norm of the X/Y/Z deltas — the E delta does NOT contribute — unless
+# no Cartesian axis moves at all, in which case the length IS the E distance.
+# The block then takes ``millimeters / F`` seconds, so each axis travels its own
+# delta in that time:  v_i = F · |Δ_i| / millimeters.
+#
+# This matters for a COORDINATED multi-pump move: on a machine that maps a pump
+# onto E (ME3B V1: P3 → E), an E-mapped pump moving alongside an X/Y/Z-mapped
+# one runs at |Δ_E|/|Δ_xyz| × F — which can EXCEED the commanded vector rate.
+# ``move_pumps_uL`` divides by this length when sizing the vector feedrate, so
+# every axis's real speed is bounded by its own ceiling regardless of mapping.
+_MARLIN_CARTESIAN_LETTERS = ("X", "Y", "Z")
+
+
+def _marlin_move_length_mm(deltas: dict[str, float]) -> float:
+    """Length (mm) Marlin's feedrate applies to for a ``G0`` over *deltas*
+    (``{physical_letter: mm}``). See ``_MARLIN_CARTESIAN_LETTERS`` above."""
+    cart = [float(d) for a, d in deltas.items()
+            if str(a).upper() in _MARLIN_CARTESIAN_LETTERS]
+    if any(d for d in cart):
+        return math.sqrt(math.fsum(d * d for d in cart))
+    # No Cartesian component → Marlin uses the extruder distance as the length.
+    return math.fsum(abs(float(d)) for d in deltas.values())
+
+
 def compute_pump_budget(moves_uL, start_fill_uL: float, capacity_uL: float,
                         *, extra_min_fill_uL: float | None = None,
                         tol_uL: float = 1e-3) -> dict:
@@ -1252,6 +1278,32 @@ class PositionPoller:
         with self._lock:
             return self._zp_pos
 
+    def note_xy(self, pos: tuple) -> None:
+        """v7.6: back-fill the XY cache from an out-of-band DIRECT read.
+
+        ``StageController.get_xy_position(cached=False)`` calls this on every
+        successful read, which keeps the cache live even while polling is
+        SUSPENDED — the print path suspends the poller for the whole
+        ``PRINT_PATH`` command but reads position itself at 25–31 Hz, so before
+        this the GUI's cached reads froze for the entire print (needle marker
+        stuck, progress dead) despite fresher truth existing one thread away.
+
+        Deliberately does NOT touch the travel odometer (``_last_odom_xy`` /
+        ``on_xy_travel``) or the ZP liveness counters — those stay
+        poll-thread-only so distance accounting cannot be double-counted.
+        """
+        if not pos or pos[0] is None or pos[1] is None:
+            return
+        with self._lock:
+            self._xy_pos = tuple(pos)
+
+    def note_zp(self, pos: tuple) -> None:
+        """v7.6: ZP twin of :meth:`note_xy` (Z + pump cache back-fill)."""
+        if not pos or pos[0] is None:
+            return
+        with self._lock:
+            self._zp_pos = tuple(pos)
+
     def start(self) -> None:
         self._running = True
         self._thread = threading.Thread(
@@ -1559,6 +1611,20 @@ class StageController:
         # is running. `_print_floor_active` is armed only during print
         # execution (by PrintManager) so it never blocks calibration / jog.
         self._plate_bottom_z_zref: float | None = None
+        # v7.5.x: the plate bottom is a flat but TILTED plane. `_plate_bottom_z_zref`
+        # above is the scalar taught at ONE point; `_plate_z_plane` optionally adds
+        # the measured gradient about that point so plate-bottom Z is known at any
+        # (x, y). The plane is an ANCHORED GRADIENT whose anchor IS the taught
+        # scalar, so a zero/absent plane degrades to the scalar exactly (see
+        # SupportClasses/PlateZPlane.py). `_plate_bottom_anchor_xy_um` records where
+        # the scalar was taught; `_plate_footprint_bbox_um` bounds where the plane
+        # may be trusted (extrapolating a tilt far past the taught region is how a
+        # tilt fit becomes a crash).
+        self._plate_z_plane = None
+        self._plate_bottom_anchor_xy_um: tuple[float, float] | None = None
+        self._plate_footprint_bbox_um: tuple[float, float, float, float] | None = None
+        self._plate_tilt_enabled: bool = False
+        self._plate_bottom_z_source: str | None = None
         # v7.5.x: plate-top Z datum (zero-ref mm). With the plate bottom it
         # forms the reference vector that derives the print-Z up-direction
         # (see `print_z_dir`), so print offsets are polarity-correct without a
@@ -2454,23 +2520,330 @@ class StageController:
 
     # ── v7.5.x: plate-bottom Z datum + print-time "don't punch through" ──
 
-    def set_plate_bottom_z(self, z_zero_ref_mm: float | None) -> None:
+    def set_plate_bottom_z(self, z_zero_ref_mm: float | None,
+                           at_xy_um: tuple | None = None,
+                           source: str | None = None) -> None:
         """Set the calibrated plate-bottom Z (zero-ref mm), or None to clear.
 
         This is the deepest the needle may go during a print. Pushed from the
         Calibration page's ``plate_bottom_z`` reference. Setting it does NOT by
         itself enforce anything — the floor is only applied while a print is
         running (see :meth:`set_print_floor_active`).
+
+        ``at_xy_um`` (v7.5.x, optional) records WHERE this scalar was measured,
+        in absolute stage µm. That makes the scalar the anchor of a tilt plane
+        (:meth:`set_plate_z_plane`) instead of a plate-wide constant of unknown
+        provenance. ``source`` is one of ``"taught"`` / ``"estimated"`` /
+        ``"restored"``: a needle-cam or plate-type *estimate* anchoring a plane
+        would propagate its error across the whole plate, so it is recorded and
+        surfaced rather than silently trusted. Both are optional and omitting
+        them leaves behaviour identical to before.
         """
         self._plate_bottom_z_zref = (None if z_zero_ref_mm is None
                                      else float(z_zero_ref_mm))
+        if at_xy_um is not None:
+            try:
+                self._plate_bottom_anchor_xy_um = (float(at_xy_um[0]),
+                                                   float(at_xy_um[1]))
+            except (TypeError, ValueError, IndexError):
+                self._plate_bottom_anchor_xy_um = None
+        if source is not None:
+            self._plate_bottom_z_source = str(source)
         if self._plate_bottom_z_zref is not None:
             logger.info(f"StageController: plate-bottom Z datum = "
                         f"{self._plate_bottom_z_zref:.3f} mm (zero-ref)")
 
     def get_plate_bottom_z(self) -> float | None:
-        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated."""
+        """Calibrated plate-bottom Z (zero-ref mm), or None if uncalibrated.
+
+        Deliberately the ANCHOR scalar — never the plane evaluated at the plate
+        centre or at the last known XY. This is the number the operator taught
+        and reads back on the Calibration page, in the jog context panel, on the
+        XZ side view and in the readiness report; redefining it would silently
+        change every displayed value and log line. Callers that want a position-
+        aware answer ask :meth:`plate_bottom_z_at_um`; callers that want the tilt
+        story ask :meth:`plate_bottom_z_extremes_zref`.
+        """
         return self._plate_bottom_z_zref
+
+    def get_plate_bottom_anchor_xy_um(self) -> tuple | None:
+        """Where the plate-bottom scalar was measured (absolute stage µm)."""
+        return getattr(self, "_plate_bottom_anchor_xy_um", None)
+
+    def get_plate_bottom_z_source(self) -> str | None:
+        """Provenance of the plate-bottom scalar: taught / estimated / restored."""
+        return getattr(self, "_plate_bottom_z_source", None)
+
+    # ── v7.5.x: plate-bottom Z PLANE (tilt) ────────────────────────────
+    #
+    # The plate bottom is flat but tilted; on this machine the measured tilt is
+    # ~1.15 mm across a 24-well plate's row span, i.e. several times a typical
+    # 0.1–0.5 mm print height. The scalar datum above cannot express that, so a
+    # print at the far side of the plate was either crashing into glass or
+    # printing in mid air depending on the sign.
+    #
+    # Everything here degrades EXACTLY to the scalar when no plane is active, so
+    # an install that has not run the new calibration sees bit-identical Z.
+
+    def set_plate_footprint_bbox_um(self, bbox_um: tuple | None) -> None:
+        """Region over which a tilt plane may be trusted (absolute stage µm).
+
+        ``(x0, y0, x1, y1)``. Queries outside it fall back to the scalar rather
+        than extrapolating a tilt measured elsewhere.
+        """
+        if bbox_um is None:
+            self._plate_footprint_bbox_um = None
+            return
+        try:
+            self._plate_footprint_bbox_um = (float(bbox_um[0]), float(bbox_um[1]),
+                                             float(bbox_um[2]), float(bbox_um[3]))
+        except (TypeError, ValueError, IndexError):
+            self._plate_footprint_bbox_um = None
+
+    def get_plate_footprint_bbox_um(self) -> tuple | None:
+        """The trusted tilt region, or the plane's own taught bbox, else None."""
+        box = getattr(self, "_plate_footprint_bbox_um", None)
+        if box is not None:
+            return box
+        plane = getattr(self, "_plate_z_plane", None)
+        if plane is not None:
+            try:
+                return plane.points_bbox_um()
+            except Exception:
+                return None
+        return None
+
+    def set_plate_tilt_enabled(self, enabled: bool) -> None:
+        """Operator switch for using the tilt plane in print-Z resolution."""
+        self._plate_tilt_enabled = bool(enabled)
+
+    def set_plate_z_plane(self, plane) -> tuple[bool, str]:
+        """Install a measured plate-bottom tilt plane. ``(accepted, reason)``.
+
+        The plane is stored either way (so the UI can explain a refusal) but is
+        only *used* when it validates. A rejected plane is exactly equivalent to
+        having no plane at all: the scalar remains the sole datum.
+
+        Validation is what makes trusting a measured plane safe. In particular
+        the epoch check catches the real failure already on disk here — a saved
+        plane whose intercept disagreed with the taught plate bottom by 5.5 mm
+        because the two were measured in different needle-zero epochs.
+        """
+        from SupportClasses.PlateZPlane import (
+            PLANE_FRAME, PlateZPlane as _PZP, DEFAULT_RESIDUAL_TOL_MM,
+            tilt_is_plausible,
+        )
+        if plane is None:
+            self._plate_z_plane = None
+            return (True, "")
+        if isinstance(plane, dict):
+            plane = _PZP.from_dict(plane)
+            if plane is None:
+                return (False, "plane payload is not in the stage frame")
+
+        ok, why = self._validate_plate_z_plane(
+            plane, PLANE_FRAME, DEFAULT_RESIDUAL_TOL_MM, tilt_is_plausible)
+        try:
+            from dataclasses import replace as _replace
+            plane = _replace(plane, status=("active" if ok else "rejected"),
+                             reject_reason=("" if ok else why))
+        except Exception:
+            pass
+        self._plate_z_plane = plane
+        if ok:
+            logger.info("StageController: plate Z plane ACTIVE — %s",
+                        getattr(plane, "describe", lambda: "")())
+        else:
+            logger.warning(
+                "StageController: plate Z plane REJECTED (%s) — using the "
+                "single taught plate-bottom Z (no tilt correction)", why)
+        return (ok, why)
+
+    def _validate_plate_z_plane(self, plane, expect_frame: str,
+                                resid_tol_mm: float,
+                                tilt_is_plausible) -> tuple[bool, str]:
+        """Decide whether a plane may drive print Z. ``(ok, reason)``."""
+        if getattr(plane, "frame", None) != expect_frame:
+            return (False, "plane is not in the stage frame "
+                           "(legacy plate-local plane — re-teach the plate Z)")
+        if getattr(plane, "degenerate", False):
+            return (False, "gradient underdetermined (collinear touch points)")
+        n = int(getattr(plane, "num_points", 0) or 0)
+        if n < 3:
+            return (False, f"only {n} touch point(s) — need ≥3")
+
+        scalar = self._plate_bottom_z_zref
+        if scalar is None:
+            return (False, "no taught plate-bottom Z to anchor against")
+
+        # Epoch: the plane's Z values live in the zero-ref frame that existed
+        # when it was measured. A Set Z Zero since then invalidates them.
+        zero_z = float(self.zero_position.get("Z", 0.0) or 0.0)
+        fit_zero = getattr(plane, "zero_z_mm_at_fit", None)
+        if fit_zero is not None and abs(float(fit_zero) - zero_z) > 0.01:
+            return (False,
+                    f"needle zero changed since the plate plane was measured "
+                    f"({float(fit_zero):.3f} → {zero_z:.3f} mm)")
+
+        # Orientation: a 180° remount invalidates the taught XY the points were
+        # measured at, hence the plane.
+        cur_flip = (self.plate_flip_180()
+                    if hasattr(self, "plate_flip_180") else None)
+        p_flip = getattr(plane, "plate_flip_180", None)
+        if p_flip is not None and cur_flip is not None and bool(p_flip) != bool(cur_flip):
+            return (False, "plate orientation changed since the plane was measured")
+
+        # Anchor agreement. Zero by construction for a plane whose anchor is the
+        # taught touch-off, so this catches a LATER manual re-teach of the scalar.
+        try:
+            at_anchor = plane.z_zref_mm_at_stage_um(plane.x0_um, plane.y0_um)
+        except Exception:
+            return (False, "plane could not be evaluated")
+        if abs(at_anchor - float(scalar)) > 0.05:
+            return (False,
+                    f"plane anchor {at_anchor:.3f} mm disagrees with the taught "
+                    f"plate bottom {float(scalar):.3f} mm")
+
+        ok, why = tilt_is_plausible(
+            getattr(plane, "sx_mm_per_mm", 0.0),
+            getattr(plane, "sy_mm_per_mm", 0.0),
+            bbox_um=self.get_plate_footprint_bbox_um())
+        if not ok:
+            return (False, why)
+
+        # Quality. At exactly 3 points the anchored fit is exact and R² is
+        # identically 1.0, so it proves nothing — such a plane is allowed but
+        # the UI labels it unverified. Redundancy is where residuals mean
+        # something, and the hold-out is the only real evidence.
+        if n >= 4:
+            rmax = float(getattr(plane, "residual_max_mm", 0.0) or 0.0)
+            if rmax > resid_tol_mm:
+                return (False,
+                        f"max residual {rmax * 1000.0:.0f} µm exceeds "
+                        f"{resid_tol_mm * 1000.0:.0f} µm")
+        hold = getattr(plane, "holdout_error_mm", None)
+        if hold is not None and float(hold) > resid_tol_mm:
+            return (False,
+                    f"hold-out error {float(hold) * 1000.0:.0f} µm exceeds "
+                    f"{resid_tol_mm * 1000.0:.0f} µm — one touch point looks wrong")
+        return (True, "")
+
+    def get_plate_z_plane(self):
+        """The stored plane whatever its status (so the UI can explain it)."""
+        return getattr(self, "_plate_z_plane", None)
+
+    def active_plate_z_plane(self):
+        """The plane ONLY if it validated — otherwise None.
+
+        Every consumer gates on this, so the print target and the print floor can
+        never disagree about whether the tilt is real.
+        """
+        plane = getattr(self, "_plate_z_plane", None)
+        if plane is None or getattr(plane, "status", "") != "active":
+            return None
+        return plane
+
+    def plate_tilt_enabled(self) -> bool:
+        """True when a validated plane exists AND the operator enabled it."""
+        return bool(getattr(self, "_plate_tilt_enabled", False)
+                    and self.active_plate_z_plane() is not None)
+
+    def plate_bottom_z_at_um(self, x_stage_um: float | None,
+                            y_stage_um: float | None) -> float | None:
+        """Plate-bottom Z (zero-ref mm) at an absolute stage µm position.
+
+        Falls back to the taught scalar — i.e. to exactly today's behaviour —
+        when the tilt is not enabled, the position is unknown, or the position is
+        outside the taught region.
+        """
+        scalar = self._plate_bottom_z_zref
+        if x_stage_um is None or y_stage_um is None:
+            return scalar
+        plane = self.active_plate_z_plane()
+        if plane is None or not getattr(self, "_plate_tilt_enabled", False):
+            return scalar
+        try:
+            if not plane.is_inside(x_stage_um, y_stage_um,
+                                   bbox_um=self.get_plate_footprint_bbox_um()):
+                return scalar
+            return plane.z_zref_mm_at_stage_um(x_stage_um, y_stage_um)
+        except Exception as e:                       # never break a motion path
+            logger.debug("plate_bottom_z_at_um failed (%s) — using the scalar", e)
+            return scalar
+
+    def plate_bottom_z_at_zref_mm(self, x_zref_mm: float | None,
+                                  y_zref_mm: float | None) -> float | None:
+        """Plate-bottom Z (zero-ref mm) at a ZERO-REF mm XY position.
+
+        Convenience for the print path, which works in zero-ref mm. This is the
+        only place the zero-ref-mm → absolute-µm conversion is written.
+        """
+        if x_zref_mm is None or y_zref_mm is None:
+            return self._plate_bottom_z_zref
+        zx = float(self.zero_position.get("x", 0) or 0)
+        zy = float(self.zero_position.get("y", 0) or 0)
+        return self.plate_bottom_z_at_um(float(x_zref_mm) * 1000.0 + zx,
+                                         float(y_zref_mm) * 1000.0 + zy)
+
+    def plate_bottom_z_extremes_zref(self, footprint_um: tuple | None = None
+                                     ) -> tuple | None:
+        """``(shallowest, deepest)`` plate-bottom Z over the plate, zero-ref mm.
+
+        Compared in the ZDIR-scaled HEIGHT frame, so "shallowest" means highest
+        physically on both polarities. Used for the operator-facing tilt readout
+        and the pre-print advisory — NOT for the runtime floor.
+        """
+        plane = self.active_plate_z_plane()
+        scalar = self._plate_bottom_z_zref
+        if plane is None:
+            return None if scalar is None else (scalar, scalar)
+        box = footprint_um if footprint_um is not None \
+            else self.get_plate_footprint_bbox_um()
+        if box is None:
+            return None if scalar is None else (scalar, scalar)
+        try:
+            return plane.extremes_zref(box, self.print_z_dir())
+        except Exception:
+            return None if scalar is None else (scalar, scalar)
+
+    def plate_z_tilt_span_mm(self) -> float | None:
+        """Total plate-bottom variation across the plate (mm), or None."""
+        plane = self.active_plate_z_plane()
+        box = self.get_plate_footprint_bbox_um()
+        if plane is None or box is None:
+            return None
+        try:
+            return plane.span_mm(box)
+        except Exception:
+            return None
+
+    def plate_z_plane_for_job(self) -> dict | None:
+        """The plane as a job-stampable dict in ZERO-REF mm XY, or None.
+
+        THE single stamp source. Print jobs carry per-machine facts (``z_up_sign``,
+        ``plate_axis_sign``, ``well_positions_mm``) frozen at build time so a run
+        is reproducible from the job — and so a re-teach between build and run
+        cannot silently change a resumed print's Z. The tilt plane follows the
+        same rule. Returns None unless the tilt is enabled AND validated, which
+        is what keeps this a no-op for installs that have not recalibrated.
+        """
+        plane = self.active_plate_z_plane()
+        if plane is None or not getattr(self, "_plate_tilt_enabled", False):
+            return None
+        zx = float(self.zero_position.get("x", 0) or 0)
+        zy = float(self.zero_position.get("y", 0) or 0)
+        try:
+            return {
+                "x0_mm": (plane.x0_um - zx) / 1000.0,
+                "y0_mm": (plane.y0_um - zy) / 1000.0,
+                "z0_zref_mm": float(plane.z0_zref_mm),
+                "sx_mm_per_mm": float(plane.sx_mm_per_mm),
+                "sy_mm_per_mm": float(plane.sy_mm_per_mm),
+                "plane_id": (plane.fitted_at or ""),
+            }
+        except Exception as e:
+            logger.debug("plate_z_plane_for_job failed (%s)", e)
+            return None
 
     def set_plate_top_z(self, z_zero_ref_mm: float | None) -> None:
         """Set the calibrated plate-top Z (zero-ref mm), or None to clear.
@@ -2489,6 +2862,55 @@ class StageController:
         """Calibrated plate-top Z (zero-ref mm), or None if uncalibrated."""
         return getattr(self, "_plate_top_z_zref", None)
 
+    # ── v7.5.x: needle ↔ microscope-camera-centre offset ───────────────
+    #
+    # Every live-view click→target path in the app implicitly assumes the needle
+    # sits exactly under the camera crosshair. It does not, so each such target is
+    # off by this vector (easily 0.5–3 mm for a side-mounted objective). Measured
+    # once during the plate-Z touch-off, when the needle is confirmed on the glass
+    # and the operator clicks its tip.
+    #
+    # ONE function owns the sign so no consumer can re-derive it wrongly.
+
+    def set_needle_camera_offset_um(self, dx_um: float | None,
+                                    dy_um: float | None = None) -> None:
+        """Record the needle's offset from the microscope camera centre (stage µm).
+
+        Pass ``None`` to clear. The offset means
+        ``(needle stage position) − (camera crosshair stage position)``.
+        """
+        if dx_um is None:
+            self._needle_cam_offset_um = None
+            return
+        try:
+            self._needle_cam_offset_um = (float(dx_um), float(dy_um or 0.0))
+        except (TypeError, ValueError):
+            self._needle_cam_offset_um = None
+
+    def get_needle_camera_offset_um(self) -> tuple | None:
+        """The needle's offset from the microscope camera centre (stage µm)."""
+        return getattr(self, "_needle_cam_offset_um", None)
+
+    def needle_target_xy_for_feature_um(self, feature_x_um: float,
+                                       feature_y_um: float) -> tuple:
+        """Stage XY to command so the NEEDLE lands on a feature seen in the view.
+
+        ``feature_*`` is the feature's absolute stage position — normally
+        ``current_xy + CameraManager.pixel_to_stage_offset(click)``. Returns the
+        feature position unchanged when no offset has been measured, so callers
+        can adopt this unconditionally and behave exactly as today until the
+        calibration has run.
+
+        Use this for click-to-PICK (put the needle on the thing). Do NOT use it
+        for click-to-CENTRE (put the thing under the crosshair, for imaging or
+        mosaic work) — that wants the raw feature position.
+        """
+        off = self.get_needle_camera_offset_um()
+        if not off:
+            return (float(feature_x_um), float(feature_y_um))
+        return (float(feature_x_um) - float(off[0]),
+                float(feature_y_um) - float(off[1]))
+
     def print_z_dir(self) -> float:
         """Up-direction sign for print-Z math, derived from the calibrated
         plate-bottom→plate-top reference vector.
@@ -2506,34 +2928,49 @@ class StageController:
         """Arm/disarm the plate-bottom floor (armed only during printing)."""
         self._print_floor_active = bool(active)
 
-    def print_height_to_zref(self, height_above_bottom_mm: float) -> float | None:
+    def print_height_to_zref(self, height_above_bottom_mm: float,
+                             x_zref_mm: float | None = None,
+                             y_zref_mm: float | None = None) -> float | None:
         """Height above the plate bottom (mm) → zero-ref Z, or None if the
-        plate bottom is not yet calibrated."""
-        if self._plate_bottom_z_zref is None:
+        plate bottom is not yet calibrated.
+
+        v7.5.x: pass the target's ZERO-REF mm XY to resolve the plate bottom from
+        the measured tilt plane at that position. Called with no XY — as every
+        pre-existing caller does — it uses the scalar datum and is byte-identical
+        to before.
+        """
+        pb = (self._plate_bottom_z_zref if x_zref_mm is None
+              else self.plate_bottom_z_at_zref_mm(x_zref_mm, y_zref_mm))
+        if pb is None:
             return None
-        return plate_relative_to_zref(self._plate_bottom_z_zref,
-                                      float(height_above_bottom_mm),
+        return plate_relative_to_zref(pb, float(height_above_bottom_mm),
                                       zdir=self.print_z_dir())
 
-    def zref_to_print_height(self, z_zero_ref_mm: float) -> float | None:
+    def zref_to_print_height(self, z_zero_ref_mm: float,
+                             x_zref_mm: float | None = None,
+                             y_zref_mm: float | None = None) -> float | None:
         """Zero-ref Z (mm) → height above the plate bottom (mm), or None."""
-        if self._plate_bottom_z_zref is None:
+        pb = (self._plate_bottom_z_zref if x_zref_mm is None
+              else self.plate_bottom_z_at_zref_mm(x_zref_mm, y_zref_mm))
+        if pb is None:
             return None
-        return zref_to_plate_relative(self._plate_bottom_z_zref,
-                                      float(z_zero_ref_mm),
+        return zref_to_plate_relative(pb, float(z_zero_ref_mm),
                                       zdir=self.print_z_dir())
 
-    def print_floor_violation(self, z_zero_ref_mm: float) -> bool:
+    def print_floor_violation(self, z_zero_ref_mm: float,
+                              x_zref_mm: float | None = None,
+                              y_zref_mm: float | None = None) -> bool:
         """True if a zero-ref Z would put the needle *below* the plate bottom.
 
         Used for the early warning before a print starts. Returns False when
         the plate bottom is uncalibrated (nothing to compare against).
         """
-        if self._plate_bottom_z_zref is None:
+        pb = (self._plate_bottom_z_zref if x_zref_mm is None
+              else self.plate_bottom_z_at_zref_mm(x_zref_mm, y_zref_mm))
+        if pb is None:
             return False
         return zref_to_plate_relative(
-            self._plate_bottom_z_zref, float(z_zero_ref_mm),
-            zdir=self.print_z_dir()) < -1e-6
+            pb, float(z_zero_ref_mm), zdir=self.print_z_dir()) < -1e-6
 
     def _apply_print_floor_raw(self, raw_z: float) -> float:
         """Clamp a *raw* Marlin Z so the needle never goes deeper than the
@@ -3209,12 +3646,26 @@ class StageController:
 
 
     def get_xy_position(self, cached: bool = True) -> tuple:
-        """Get XY position. cached=True returns polled value (non-blocking)."""
+        """Get XY position. cached=True returns polled value (non-blocking).
+
+        v7.6: a successful DIRECT read also back-fills the poller cache
+        (:meth:`PositionPoller.note_xy`), so every cached reader — the status
+        bar, the Quick Print trajectory monitor, the context panels — stays
+        live even while the poller is suspended (which the print path does for
+        the whole ``PRINT_PATH`` command while reading position itself at
+        25–31 Hz). Odometer/liveness accounting is untouched.
+        """
         if cached:
             return self._pos_poller.xy_position
         if self.xy_stage:
             try:
-                return self.xy_stage.get_current_position()
+                pos = self.xy_stage.get_current_position()
+                if pos and pos[0] is not None:
+                    try:
+                        self._pos_poller.note_xy(pos)
+                    except Exception:
+                        pass                    # never break a read on a stub
+                return pos
             except Exception as e:
                 logger.debug(f"XY direct query error: {e}")
         return (None, None, None)
@@ -3289,11 +3740,17 @@ class StageController:
     def wait_for_z_arrival(
         self, target_z_mm: float,
         tolerance_mm: float = 0.05, timeout_s: float = 10.0,
+        abort_event=None,
     ) -> bool:
         """Block until Z axis reaches target position (zero-ref mm).
 
         v7.2.9: Companion to wait_for_xy_arrival for hybrid execution.
         Returns True if position reached within tolerance, False on timeout.
+
+        v7.6 ``abort_event`` (optional): when set, return False within one
+        poll interval instead of waiting out the timeout (callers distinguish
+        "aborted" from "timed out" via ``abort_event.is_set()``). Default
+        None = byte-identical.
         """
         import time
         import math
@@ -3321,6 +3778,9 @@ class StageController:
         read_fail_streak = 0
         read_fail_limit = 5  # ~0.75 s of consecutive silence at poll_interval
         while time.monotonic() < deadline:
+            if abort_event is not None and abort_event.is_set():
+                logger.info("wait_for_z_arrival: abort_event set — returning")
+                return False
             pos = self.get_zp_position(cached=False)
             if getattr(self.zp_stage, "_last_position_read_ok", True):
                 read_fail_streak = 0
@@ -4368,7 +4828,8 @@ class StageController:
                                   target_zref_mm: float,
                                   fast_feedrate_mm_min: float | None,
                                   timeout_s: float,
-                                  tol_mm: float = 0.1) -> bool:
+                                  tol_mm: float = 0.1,
+                                  abort_event=None) -> bool:
         """Move Z to ``target_zref_mm`` (zero-ref) and CONFIRM arrival, running
         the first ``_retract_slow_dist_mm`` of a *lift* slowly.
 
@@ -4414,16 +4875,24 @@ class StageController:
             pass
         zp = self.zp_stage
         if zp is not None and hasattr(zp, "flush_moves"):
-            if not zp.flush_moves(timeout_s=eff_timeout):
+            try:
+                confirmed = zp.flush_moves(timeout_s=eff_timeout,
+                                           abort_event=abort_event)
+            except TypeError:       # fake/older flush without abort_event
+                confirmed = zp.flush_moves(timeout_s=eff_timeout)
+            if not confirmed:
                 return False
         return self.wait_for_z_arrival(float(target_zref_mm),
-                                       tolerance_mm=tol_mm, timeout_s=eff_timeout)
+                                       tolerance_mm=tol_mm,
+                                       timeout_s=eff_timeout,
+                                       abort_event=abort_event)
 
     def ensure_retracted_to(self, safe_z_zero_ref_mm: float,
                             tol_mm: float = 0.1,
                             timeout_s: float = 15.0,
                             feedrate_mm_min: float | None = None,
-                            apply_insert_floor: bool = True) -> bool:
+                            apply_insert_floor: bool = True,
+                            abort_event=None) -> bool:
         """Guarantee the needle is retracted to >= ``safe_z`` before XY travel.
 
         Raises the needle (in the HEIGHT frame) to at least ``safe_z``
@@ -4444,6 +4913,12 @@ class StageController:
 
         Returns True if the needle is confirmed at/above the height (or there is
         no ZP stage), False if the retract move timed out.
+
+        v7.6 ``abort_event``: forwarded to the confirm waits so a *travel*
+        retract can unwind quickly during an abort. ⚠ The SAFETY retract of
+        record (``PrintManager._retract_to_safe_z`` and the pick&place
+        executor's finally) deliberately passes **None** — that retract must
+        always run to completion.
         """
         if not self.is_zp_connected:
             return True
@@ -4477,7 +4952,8 @@ class StageController:
         self._pos_poller.suspend()
         try:
             ok = self._retract_z_slow_then_fast(
-                cur_zref, target, _retract_fr, timeout_s, tol_mm=tol_mm)
+                cur_zref, target, _retract_fr, timeout_s, tol_mm=tol_mm,
+                abort_event=abort_event)
             if not ok:
                 logger.error("ensure_retracted_to: Z retract not confirmed at "
                              "travel height — needle may not be at travel Z")
@@ -4563,6 +5039,7 @@ class StageController:
         z_timeout_s: float = 15.0,
         xy_timeout_s: float = 30.0,
         apply_insert_floor: bool = True,
+        abort_event=None,
     ) -> bool:
         """Safe 3-step travel: raise Z → wait → fast XY → wait → lower Z.
 
@@ -4584,11 +5061,23 @@ class StageController:
             fast_xy_speed_mm_s: XY travel speed in mm/s.
             z_timeout_s: Max seconds to wait for Z arrival.
             xy_timeout_s: Max seconds to wait for XY arrival.
+            abort_event: v7.6 — optional ``threading.Event``. When set, the
+                confirm waits return at once and the sequence stops WITHOUT
+                starting the next step (so an abort can't launch a fresh XY
+                travel or Z descent). The safety ordering is unchanged: XY
+                still never starts unless the retract was confirmed.
 
         Returns:
             True if all moves completed successfully, False if any timed out.
         """
         ok = True
+
+        def _aborting() -> bool:
+            return abort_event is not None and abort_event.is_set()
+
+        if _aborting():
+            logger.info("safe_travel_to: abort_event already set — no motion")
+            return False
 
         # v7.4.8: floor the retract height so the needle clears the
         # tallest insert/tube on the plate (set via set_min_travel_z()).
@@ -4628,7 +5117,7 @@ class StageController:
                         _cur_zref = None
                 if not self._retract_z_slow_then_fast(
                         _cur_zref, safe_z_mm, self._zp_retract_feedrate,
-                        z_timeout_s, tol_mm=0.1):
+                        z_timeout_s, tol_mm=0.1, abort_event=abort_event):
                     logger.error("safe_travel_to: Z retract not confirmed at safe "
                                  "height — ABORTING, will not start XY move")
                     return False
@@ -4653,6 +5142,10 @@ class StageController:
                 return False
 
             # Step 2: Fast XY travel and WAIT for arrival
+            if _aborting():
+                logger.info("safe_travel_to: abort during the retract — "
+                            "not starting the XY travel")
+                return False
             if self.is_xy_connected:
                 if hasattr(self, 'xy_stage') and self.xy_stage:
                     if hasattr(self.xy_stage, 'set_speed_mm_s'):
@@ -4680,6 +5173,10 @@ class StageController:
             # insert feedrate. Emit-only — the two confirm layers below are
             # preserved (the helper does NOT M400/wait). The poller is already
             # suspended for the whole sequence, so the cur-Z read is race-free.
+            if _aborting():
+                logger.info("safe_travel_to: abort before the Z descent — "
+                            "leaving the needle retracted")
+                return False
             if self.is_zp_connected and target_z_mm is not None:
                 _cur_zref3 = None
                 if float(getattr(self, "_descend_slow_dist_mm", 0.0) or 0.0) > 0:
@@ -4800,6 +5297,76 @@ class StageController:
         if not self.xy_stage:
             return
         self.xy_stage.move_stage_at_velocity(vx, vy)
+
+    # ── v7.6: hard abort — kill ALL motion with bounded latency ────
+
+    def abort_all_motion(self, reason: str = "") -> dict:
+        """Immediately stop every axis: XY, Z and the pumps.
+
+        Best-effort, callable from ANY thread (including the GUI thread — it
+        never blocks for more than ~2.5 s and never raises), and idempotent, so
+        several abort routes may all call it.
+
+        Sequence:
+          1. **XY** — ``XYStage.stop_stage()`` (Prior ``I``, immediate) then
+             ``send_velocity_xy(0, 0)`` so a standing ``VS`` cannot resume
+             motion after the stop.
+          2. **ZP** — ``ZPStage.quickstop()`` (Marlin ``M410``), which kills Z
+             **and** the pumps together. Bounded: it raw-writes when the serial
+             lock is held by an in-flight ``M400`` (see that method).
+          3. **Re-sync** — ``ZPStage.resync_position()``: an aborted move loses
+             position accuracy, so the cached coordinates must be refreshed
+             before anything trusts them.
+
+        Deliberately NOT M112 (``emergency_stop``): that KILLS Marlin and needs
+        a board reset, so it stays reserved for the operator's Escape-key hard
+        E-stop. This is the routine-abort path — the board stays alive so the
+        needle can still be retracted afterwards.
+
+        Returns a diagnostic dict (also logged) — the caller decides what to do
+        next; retracting the needle is the caller's job (the print thread's
+        ``finally`` does it, raise-only).
+        """
+        out = {"reason": reason, "xy_stopped": False, "vs_zeroed": False,
+               "zp_quickstop": False, "resync_ok": False,
+               "emergency_parser": getattr(self.zp_stage, "emergency_parser",
+                                           None)}
+        xy = getattr(self, "xy_stage", None)
+        if xy is not None:
+            try:
+                stop = getattr(xy, "stop_stage", None)
+                if callable(stop):
+                    stop()
+                    out["xy_stopped"] = True
+            except Exception as e:
+                logger.error(f"abort_all_motion: XY stop_stage failed: {e}")
+            try:
+                self.send_velocity_xy(0.0, 0.0)
+                out["vs_zeroed"] = True
+            except Exception as e:
+                logger.error(f"abort_all_motion: VS zero failed: {e}")
+        zp = getattr(self, "zp_stage", None)
+        if zp is not None:
+            try:
+                qs = getattr(zp, "quickstop", None)
+                if callable(qs):
+                    out["zp_quickstop"] = bool(qs())
+            except Exception as e:
+                logger.error(f"abort_all_motion: ZP quickstop failed: {e}")
+            if out["zp_quickstop"]:
+                try:
+                    rs = getattr(zp, "resync_position", None)
+                    if callable(rs):
+                        rs()
+                        out["resync_ok"] = True
+                except Exception as e:
+                    logger.error(f"abort_all_motion: ZP resync failed: {e}")
+        logger.warning(f"ABORT ALL MOTION ({reason or 'no reason given'}): {out}")
+        if not out["zp_quickstop"] and zp is not None:
+            logger.error(
+                "abort_all_motion: ZP motion was NOT stopped — queued Z/pump "
+                "moves will run to completion")
+        return out
 
     def get_position_with_timestamp(self) -> dict:
         """
@@ -5199,6 +5766,7 @@ class StageController:
     def move_pump_uL(
         self, pump: str, volume_uL: float, rate_uL_s: float | None = None,
         *, settle: bool = False, compensate: bool | None = None,
+        abort_event=None,
     ) -> None:
         """
         Move a pump by a specified volume in µL.
@@ -5244,10 +5812,19 @@ class StageController:
                 the streamed print path (``settle=False`` per-segment) and manual
                 jog untouched; volume-balanced pick&place micro-captures pass
                 ``compensate=False`` to keep their exact nL net-zero balance.
+            abort_event: v7.6 — optional ``threading.Event``. When set, the
+                blocking drain/settle waits return at once (so an abort unwinds
+                in ~one readline instead of up to 180 s per sub-move) and the
+                remaining backlash sub-moves are SKIPPED — nothing new is
+                commanded once an abort is in flight. Default None =
+                byte-identical.
 
         Raises:
             ValueError: If pump has no syringe configured
         """
+        def _aborting() -> bool:
+            return abort_event is not None and abort_event.is_set()
+
         if not self._hardware_config:
             raise ValueError("No hardware config — complete Hardware Setup first")
 
@@ -5303,19 +5880,32 @@ class StageController:
             logger.debug(f"move_pump_uL({pump}): backlash take-up "
                          f"{c_uL * comp_dir:+.4f} µL")
             self.move_pump_uL(pump, c_uL * comp_dir, rate_uL_s=rate_uL_s,
-                              settle=False, compensate=False)
+                              settle=False, compensate=False,
+                              abort_event=abort_event)
             self._finish_pump_submove(c_uL, rate_uL_s,
-                                      block=wait_complete, dwell_s=settle_s)
+                                      block=wait_complete, dwell_s=settle_s,
+                                      abort_event=abort_event)
 
         # MAIN fluid move (stays engaged / positive flow). Block so the caller
         # (or the unload below) does not advance while the pump is still moving —
         # e.g. a following safe_travel_to whose Z-retract M400 would otherwise
         # have to absorb a still-running pump move and time out. No dwell here:
         # the main move is not a neutral↔engaged transition.
+        # v7.6: an abort raised during the take-up must not command the fluid
+        # move — the whole point is to stop adding motion.
+        if _aborting():
+            logger.info(f"move_pump_uL({pump}): abort_event set — "
+                        f"skipping the remaining sub-moves")
+            return
         self.move_pump_relative(pump, distance_mm, feedrate_mm_min)
         self._finish_pump_submove(volume_uL, rate_uL_s,
-                                  block=wait_complete, dwell_s=0.0)
+                                  block=wait_complete, dwell_s=0.0,
+                                  abort_event=abort_event)
 
+        if comp and _aborting():
+            logger.info(f"move_pump_uL({pump}): abort_event set — "
+                        f"skipping the backlash unload")
+            return
         if comp:
             # UNLOAD (engaged → neutral): release the stored flex by moving −c
             # (opposite the fluid direction) so the tip is pressure-neutral, then
@@ -5326,15 +5916,282 @@ class StageController:
             logger.debug(f"move_pump_uL({pump}): backlash unload "
                          f"{-c_uL * comp_dir:+.4f} µL")
             self.move_pump_uL(pump, -c_uL * comp_dir, rate_uL_s=rate_uL_s,
-                              settle=False, compensate=False)
+                              settle=False, compensate=False,
+                              abort_event=abort_event)
             self._finish_pump_submove(c_uL, rate_uL_s,
-                                      block=wait_complete, dwell_s=settle_s)
-        elif settle_s > 0:
+                                      block=wait_complete, dwell_s=settle_s,
+                                      abort_event=abort_event)
+        elif settle_s > 0 and not _aborting():
             # Plain settled move (no compensation): dwell after it drains so the
             # caller does not advance until the pump has settled.
             time.sleep(settle_s)
 
-    def _wait_pump_move_complete(self, move_s: float) -> bool | None:
+    def move_pumps_uL(
+        self, volumes_uL: dict[str, float], rate_uL_s: float | None = None,
+        *, settle: bool = False, abort_event=None,
+    ) -> bool:
+        """Move SEVERAL pumps **simultaneously** in one coordinated Marlin move.
+
+        Volume signs follow :meth:`move_pump_uL` exactly (``+`` = DISPENSE,
+        ``−`` = ASPIRATE) and each pump keeps its own calibrated direction
+        (:meth:`pump_dir_sign`), its own µL→mm scale, its own soft-limit
+        envelope and its own flow ceiling.
+
+        ── Why this is NOT "call move_pump_uL twice" ──────────────────────
+        Two calls emit two ``G0`` blocks and Marlin executes blocks in ORDER, so
+        the bores would silently run one after another — the opposite of the
+        intent. Three further hazards make the naive version actively unsafe:
+        ``_wait_pump_move_complete``'s M400 drains *every* queued move while
+        sizing its timeout for ONE of them (spurious timeouts); the poller
+        suspend is a plain bool, NOT refcounted, so whichever caller finishes
+        first re-enables the poller under the other (→ the v7.5.x false
+        "ZP disconnected"); and ``ZPStage._serial_lock`` is held across the whole
+        write→``ok`` transaction anyway, so the two calls serialise on the bus.
+        One ``G0`` naming several axes is a single planner block: every named
+        axis starts and stops together. That is the same primitive the Xbox ZP
+        jog loop has driven on real hardware since v7.5.x (one ``move_relative``
+        with a combined feedrate over Z + all three pumps).
+
+        ── ONE FEEDRATE FOR THE WHOLE VECTOR — read before reusing ────────
+        A coordinated move has a single feedrate applied to the move VECTOR, so
+        axis *i* runs at ``F · |Δ_i| / L`` (``L`` = the move length Marlin's
+        feedrate applies to — see :func:`_marlin_move_length_mm`). **You cannot
+        give one bore 0.5 µL/s and another 5.0 µL/s in the same simultaneous
+        move.** All axes necessarily take the same time. That is exactly right
+        for needle prep — every used bore doing the same thing at once — and
+        WRONG for anything asymmetric (the cell-removal slow-push / fast-pull,
+        per-bore dwell sequences): those stay sequential single-pump moves.
+
+        Because the axes share a duration, the vector rate is set by the most
+        constrained axis: ``F = min_i(f_i · L / |Δ_i|)``, where ``f_i`` is pump
+        *i*'s own permitted plunger feedrate (mm/min) after the per-pump flow
+        clamp. Every other axis then runs BELOW its own ceiling — the safe
+        direction. A fine bore whose ceiling is low therefore drags the whole
+        vector down; over-pressuring a pulled glass tip is not a trade we make
+        for speed.
+
+        Backlash / compliance compensation is deliberately **NOT** applied: the
+        take-up/unload bracket is per-axis-and-direction and ill-defined when
+        one bore dispenses while another aspirates. Same convention the
+        volume-balanced pick&place captures already use (``compensate=False``).
+        A caller that needs compensation must issue sequential single-pump
+        moves.
+
+        Args:
+            volumes_uL: ``{pump_id: µL}``, e.g. ``{"P1": -5.0, "P2": -5.0}``.
+                Entries that are ``None``/``0`` are ignored.
+            rate_uL_s: Flow rate in µL/s applied to EVERY pump (the vector is
+                sized so no pump exceeds it or its own ceiling). ``None`` ⇒ no
+                explicit feedrate, exactly like :meth:`move_pump_uL`, which
+                leaves Marlin on ``ZPStage.feedrate``; pass a rate for prep.
+            settle: As :meth:`move_pump_uL` — block until the coordinated move
+                has physically drained, then dwell ``pump_settle_time_s``.
+            abort_event: Optional ``threading.Event``; forwarded to the drain
+                wait so an abort unwinds promptly.
+
+        Returns:
+            True when the coordinated move was commanded — or when there was
+            genuinely nothing to move (a clean no-op: every volume zero, or
+            every delta shortened below one Marlin step, both logged). False
+            when the move was REFUSED (no ZP board, or ``abort_event`` already
+            set): nothing moved, so the caller must not assume the volumes were
+            delivered. Anything the soft-limit clamp shortens away is logged
+            with requested-vs-delivered µL rather than silently assumed.
+
+        Raises:
+            ValueError: no hardware config; a named pump has no syringe (same
+                contract as :meth:`move_pump_uL` — naming an unconfigured pump
+                is a caller bug, not a runtime condition); a named pump has no
+                axis mapping on this machine; or two named pumps map onto the
+                SAME Marlin motor (their deltas would collide in the one
+                ``G0``, silently dropping one bore).
+        """
+        if not self._hardware_config:
+            raise ValueError("No hardware config — complete Hardware Setup first")
+
+        requested = {p: float(v) for p, v in (volumes_uL or {}).items()
+                     if v is not None and float(v) != 0.0}
+        if not requested:
+            # Nothing asked for. Never fall through to a bare "G0 F…" with no
+            # axes — Marlin would treat it as a zero-length move.
+            logger.debug("move_pumps_uL: no non-zero volumes — no-op")
+            return True
+
+        zp = getattr(self, "zp_stage", None)
+        if zp is None or not self.is_zp_connected:
+            logger.warning(
+                f"move_pumps_uL: ZP not connected — refusing "
+                f"{{{', '.join(f'{p}:{v:+.3f} µL' for p, v in requested.items())}}}")
+            return False
+        if abort_event is not None and abort_event.is_set():
+            # v7.6 principle (see move_pump_uL): nothing NEW is commanded once an
+            # abort is in flight. Refuse rather than emit-then-skip-the-wait, so
+            # the caller cannot assume these volumes were delivered.
+            logger.info("move_pumps_uL: abort_event set — commanding nothing")
+            return False
+
+        limits = getattr(self, "safety_limits", None)
+        limits_on = bool(getattr(limits, "enabled", False))
+        # Cached ZP position for the soft-limit clamp — read ONCE so every axis
+        # is clamped against the same frame (and we don't add serial traffic).
+        try:
+            pos = self.get_zp_position(cached=True)
+        except Exception:
+            pos = None
+
+        deltas: dict[str, float] = {}        # physical letter → raw mm
+        per_axis_feed: dict[str, float] = {} # physical letter → own max mm/min
+        by_letter: dict[str, str] = {}       # physical letter → pump id
+        delivered: dict[str, float] = {}     # pump id → µL actually commanded
+        for pump, volume_uL in requested.items():
+            pump_cfg = self._hardware_config.pumps.get(pump)
+            if not pump_cfg or not pump_cfg.is_configured:
+                raise ValueError(f"{pump}: No syringe configured")
+            letter = _axis_letter(zp, pump)
+            if letter is None:
+                # Skipping would silently under-deliver a prep volume. Refuse.
+                raise ValueError(
+                    f"move_pumps_uL: {pump} has no axis mapping on this machine")
+            if letter in deltas:
+                # Two pumps mapped onto the same motor: their deltas would
+                # collide in the one G0. Refuse rather than silently drop one.
+                raise ValueError(
+                    f"move_pumps_uL: {pump} and {by_letter[letter]} both map to "
+                    f"Marlin '{letter}' — cannot move them independently")
+
+            # µL → mm of dispense intent, then the calibration-owned raw sign
+            # (identical chain to move_pump_uL → move_pump_relative).
+            dir_sign = self.pump_dir_sign(pump)
+            raw_mm = pump_cfg.uL_to_mm(volume_uL) * dir_sign
+
+            # Per-pump flow ceiling, then µL/s → mm/min, then the per-pump
+            # plunger-feedrate ceiling. This is the fastest THIS axis may run.
+            feed_mm_min = None
+            if rate_uL_s is not None:
+                eff_rate = abs(float(rate_uL_s))
+                if limits_on:
+                    eff_rate = abs(limits.clamp_flow_rate(eff_rate, pump))
+                feed_mm_min = pump_cfg.feedrate_uL_s_to_mm_min(eff_rate)
+                if limits_on:
+                    feed_mm_min = limits.clamp_pump_feedrate(feed_mm_min, pump)
+
+            # Absolute-raw soft-limit clamp, shorten-only (see
+            # _shorten_only_delta — an out-of-bounds cached position must never
+            # synthesise a large opposite-direction move).
+            if limits_on and pos and pos[0] is not None:
+                try:
+                    idx = _axis_index(zp, pump)
+                    if idx is not None and idx < len(pos) and pos[idx] is not None:
+                        cur = pos[idx]
+                        raw_mm = _shorten_only_delta(
+                            cur, raw_mm, limits.clamp_pump(cur + raw_mm, pump))
+                except Exception:
+                    pass
+
+            deltas[letter] = raw_mm
+            by_letter[letter] = pump
+            if feed_mm_min is not None:
+                # NO floor here. Marlin's "never emit F ≤ 0" floor belongs on the
+                # VECTOR feedrate (applied once, below) — NOT on a per-axis
+                # ceiling. In a coordinated move an axis legitimately runs slower
+                # than 1 mm/min while the vector runs far faster, so flooring the
+                # ceiling would raise it and let that bore exceed its own flow
+                # limit (a 0.09 mm/min pulled-glass tip alongside a fast bore
+                # would be driven at 1.0 mm/min = 11×). Over-pressuring a glass
+                # tip is not a trade we make for speed.
+                per_axis_feed[letter] = max(float(feed_mm_min), 0.0)
+            # Honest accounting: report what the CLAMP left, not what was asked.
+            delivered[pump] = (pump_cfg.mm_to_uL(raw_mm / dir_sign)
+                               if dir_sign else 0.0)
+
+        # ZPStage.move_relative drops sub-resolution deltas (< 1e-4 mm = 0.1 µm,
+        # below one Marlin step). Drop them HERE too so the feedrate maths and
+        # the move length see the same axes the board will, and so an all-tiny
+        # request is a no-op instead of a bare G0.
+        active = {a: d for a, d in deltas.items() if abs(d) >= 1e-4}
+        dropped = [by_letter[a] for a in deltas if a not in active]
+        if dropped:
+            # Report what was asked vs what the board will actually receive —
+            # a soft-limit clamp to nothing and a genuinely sub-step request
+            # both land here, and neither must be silently assumed delivered.
+            logger.warning(
+                "move_pumps_uL: below one Marlin step after clamping, NOT "
+                "delivered: "
+                + ", ".join(f"{p} requested {requested[p]:+.4f} µL → "
+                            f"{delivered.get(p, 0.0):+.6f} µL"
+                            for p in dropped))
+            for p in dropped:
+                delivered.pop(p, None)
+        # A PARTIAL shortening (0.9 mm → 0.6 mm against the envelope) under-
+        # delivers a prep volume just as silently, and SafetyLimits' own warning
+        # only names raw mm. Report requested-vs-delivered µL for those too, so
+        # the promise made in the docstring holds for every clamped axis, not
+        # just the ones shortened all the way to nothing.
+        short = [p for p, v in delivered.items()
+                 if abs(v - requested[p]) > 1e-4]
+        if short:
+            logger.warning(
+                "move_pumps_uL: soft-limit SHORTENED, less delivered than "
+                "requested: "
+                + ", ".join(f"{p} requested {requested[p]:+.4f} µL → "
+                            f"{delivered[p]:+.4f} µL" for p in short))
+        if not active:
+            return True
+
+        # Vector feedrate: the most constrained axis sets the pace (see the
+        # docstring's derivation). F = min_i(f_i · L / |Δ_i|).
+        length_mm = _marlin_move_length_mm(active)
+        feedrate = None
+        bound_by = None
+        if per_axis_feed and length_mm > 0:
+            for a, d in active.items():
+                f_axis = per_axis_feed.get(a)
+                if f_axis is None:
+                    continue
+                cap = f_axis * length_mm / abs(d)
+                if feedrate is None or cap < feedrate:
+                    feedrate, bound_by = cap, by_letter[a]
+            if feedrate is not None:
+                feedrate = max(feedrate, 1.0)
+
+        logger.debug(
+            "move_pumps_uL: "
+            + ", ".join(f"{by_letter[a]}({a}) {delivered.get(by_letter[a], 0.0):+.3f} µL "
+                        f"→ {d:+.5f} mm" for a, d in active.items())
+            + f" | vector {length_mm:.5f} mm"
+            + (f" @ {feedrate:.1f} mm/min (bound by {bound_by})"
+               if feedrate else " @ board default feedrate"))
+
+        self.zp_stage.move_relative(active, feedrate)
+        for a, d in active.items():
+            # Display-only motion estimator, per logical axis (as the
+            # single-pump path does in move_pump_relative). It wants THIS axis's
+            # own speed, which in a coordinated move is F·|Δ|/L — not the vector
+            # feedrate (that would over-state every axis and show the move
+            # finishing early; with two equal bores it is 1.41× optimistic).
+            axis_fr = (feedrate * abs(d) / length_mm
+                       if feedrate and length_mm > 0 else feedrate)
+            self._note_move_estimate_axis_rel(by_letter[a], d, axis_fr)
+
+        if settle:
+            # The coordinated duration is L/F — equivalently the LONGEST of the
+            # individual axis durations, since F was sized by the binding axis.
+            # Derive it from the vector, not from any one pump's volume/rate.
+            if feedrate:
+                move_s = length_mm / (feedrate / 60.0) + 0.1
+            else:
+                eff_rate = (abs(float(rate_uL_s)) if rate_uL_s
+                            else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
+                move_s = (max((abs(v) for v in delivered.values()), default=0.0)
+                          / max(eff_rate, 0.001) + 0.1)
+            self._finish_pump_submove(
+                0.0, rate_uL_s, block=True,
+                dwell_s=self.pump_settle_time_s(),
+                abort_event=abort_event, est_s=move_s)
+        return True
+
+    def _wait_pump_move_complete(self, move_s: float,
+                                 abort_event=None) -> bool | None:
         """Block until the pump's in-flight move drains from Marlin's planner.
 
         Confirms motion-complete via M400 (``ZPStage.flush_moves``) — the same
@@ -5361,7 +6218,11 @@ class StageController:
                         _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S)
         self.suspend_position_poller()
         try:
-            return bool(flush(timeout_s=timeout_s))
+            try:
+                return bool(flush(timeout_s=timeout_s,
+                                  abort_event=abort_event))
+            except TypeError:       # fake/older flush without abort_event
+                return bool(flush(timeout_s=timeout_s))
         except Exception as e:                  # never let a confirm failure crash a prep
             logger.warning(f"_wait_pump_move_complete: flush_moves error: {e}")
             return None
@@ -5369,7 +6230,8 @@ class StageController:
             self.resume_position_poller()
 
     def _finish_pump_submove(self, vol_uL: float, rate_uL_s: float | None,
-                             *, block: bool, dwell_s: float) -> None:
+                             *, block: bool, dwell_s: float,
+                             abort_event=None, est_s: float | None = None) -> None:
         """Settle one just-issued pump sub-move (take-up / main / unload).
 
         When ``block`` is True, wait for the sub-move to PHYSICALLY drain from
@@ -5378,14 +6240,46 @@ class StageController:
         so the caller does not advance while the pump is still moving. Then, if
         ``dwell_s > 0``, sleep the configured settle dwell so the drivetrain
         equilibrates at its new neutral/engaged state before the next step.
+
+        v7.6 ``abort_event``: forwarded to the drain wait; when set the
+        open-loop fallback sleep is chunked + interruptible and the settle
+        dwell is skipped.
+
+        v7.9 ``est_s``: explicit duration estimate (s) for the drain wait. A
+        COORDINATED multi-pump move (:meth:`move_pumps_uL`) has ONE vector
+        feedrate, so its duration cannot be derived from any single pump's
+        volume/rate pair — the caller computes it from the move vector and
+        passes it here. ``None`` (default) ⇒ derive from ``vol_uL``/``rate_uL_s``
+        exactly as before (byte-identical for every existing caller).
         """
-        if block:
+        aborted = abort_event is not None and abort_event.is_set()
+        if block and not aborted:
             eff_rate = (abs(rate_uL_s) if rate_uL_s
                         else _PUMP_SETTLE_FALLBACK_RATE_UL_S)
-            sub_s = abs(vol_uL) / max(eff_rate, 0.001) + 0.1
-            if self._wait_pump_move_complete(sub_s) is None:
-                time.sleep(min(sub_s, _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S))
-        if dwell_s > 0:
+            sub_s = (float(est_s) if est_s is not None
+                     else abs(vol_uL) / max(eff_rate, 0.001) + 0.1)
+            if self._wait_pump_move_complete(sub_s,
+                                             abort_event=abort_event) is None:
+                total = min(sub_s, _PUMP_MOVE_DRAIN_TIMEOUT_CAP_S)
+                if abort_event is None:
+                    # No abort channel → the legacy single open-loop sleep
+                    # (byte-identical; regression-locked by the pump-settle
+                    # suite, which counts sleep calls).
+                    time.sleep(total)
+                else:
+                    # Chunked so an abort interrupts the wait. Bounded by a
+                    # fixed chunk COUNT, not the wall clock, so a patched /
+                    # no-op sleep cannot spin.
+                    chunk = 0.1
+                    for _ in range(int(total / chunk) + 1):
+                        if abort_event.is_set():
+                            return
+                        time.sleep(min(chunk, total))
+                        total -= chunk
+                        if total <= 0:
+                            break
+            aborted = abort_event is not None and abort_event.is_set()
+        if dwell_s > 0 and not aborted:
             time.sleep(dwell_s)
 
     def get_pump_position_uL(self, pump: str) -> float | None:

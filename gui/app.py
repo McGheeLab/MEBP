@@ -137,6 +137,10 @@ class MainWindow(QMainWindow):
         # v7.2: Hardware configuration
         self._hardware_config: HardwareConfig | None = None
 
+        # Tutorial walkthrough recorder — constructed lazily on first arm, so
+        # a normal session never installs the event filter.
+        self._action_recorder = None
+
         # XY position scale factor (stage readout units per µm, 1.0 for ProScan)
         self._xy_position_scale: float = self._resolve_xy_position_scale()
         self._protocol_checked = False
@@ -492,6 +496,19 @@ class MainWindow(QMainWindow):
         self._help_toggle = HelpToggle()
         self._help_toggle.toggled.connect(self._on_help_toggled)
         top_bar_layout.addWidget(self._help_toggle)
+
+        # Tutorial action recorder — captures what you DO, as material for
+        # a walkthrough video. Inert until armed; see docs/videos/DIRECTING.md.
+        self._rec_btn = QPushButton("● REC")
+        self._rec_btn.setObjectName("recToggle")
+        self._rec_btn.setCheckable(True)
+        self._rec_btn.setCursor(Qt.PointingHandCursor)
+        self._rec_btn.setToolTip(
+            "Record a tutorial walkthrough.\n"
+            "While recording, press F9 to mark a step that matters.")
+        self._rec_btn.setStyleSheet(self._rec_button_qss(False))
+        self._rec_btn.clicked.connect(self._on_toggle_recording)
+        top_bar_layout.addWidget(self._rec_btn)
 
         # Connection dots
         conn_frame = QFrame()
@@ -2252,6 +2269,62 @@ class MainWindow(QMainWindow):
                 logger.debug(f"FormRow.set_help_visible failed: {e}")
         self.help_mode_changed.emit(on)
 
+    # ── Tutorial action recorder ─────────────────────────────────
+
+    def _rec_button_qss(self, active: bool) -> str:
+        """Idle it reads as a quiet secondary control; armed it is
+        unmistakably red, because leaving it running by accident wastes a
+        take and fills the disk with screenshots."""
+        if active:
+            return (f"QPushButton#recToggle {{ background: {COLORS['red']};"
+                    f" color: {COLORS['crust']}; border: none;"
+                    f" border-radius: {s(6)}px; padding: {s(5)}px {s(12)}px;"
+                    f" font-size: {scaled_font_size(9)}pt; font-weight: 700; }}")
+        return (f"QPushButton#recToggle {{ background: transparent;"
+                f" color: {COLORS['overlay0']};"
+                f" border: 1px solid {COLORS['surface1']};"
+                f" border-radius: {s(6)}px; padding: {s(5)}px {s(12)}px;"
+                f" font-size: {scaled_font_size(9)}pt; }}"
+                f"QPushButton#recToggle:hover {{ color: {COLORS['red']};"
+                f" border-color: {COLORS['red']}; }}")
+
+    def _on_toggle_recording(self):
+        """Arm/disarm the walkthrough recorder from the top bar."""
+        try:
+            if self._action_recorder is None:
+                from gui.action_recorder import ActionRecorder
+                self._action_recorder = ActionRecorder(self)
+                self._action_recorder.step_recorded.connect(
+                    self._on_recorder_step)
+
+            rec = self._action_recorder
+            if rec.armed:
+                path = rec.stop()
+                self._rec_btn.setChecked(False)
+                self._rec_btn.setText("● REC")
+                self._rec_btn.setStyleSheet(self._rec_button_qss(False))
+                self.console.log(
+                    f"Recording stopped — {rec.step_count} step(s) → {path}",
+                    "success")
+                self.console.log(
+                    "Build a tutorial from it:  python "
+                    "tools_build_tour_from_tape.py \"%s\"" % path, "info")
+            else:
+                session = rec.start()
+                self._rec_btn.setChecked(True)
+                self._rec_btn.setText("● REC 0")
+                self._rec_btn.setStyleSheet(self._rec_button_qss(True))
+                self.console.log(
+                    f"Recording walkthrough → {session}  "
+                    f"(F9 marks a step that matters)", "warning")
+        except Exception as e:
+            logger.error("recorder toggle failed: %s", e, exc_info=True)
+            self._rec_btn.setChecked(False)
+            self._rec_btn.setStyleSheet(self._rec_button_qss(False))
+
+    def _on_recorder_step(self, count: int):
+        self._rec_btn.setText(f"● REC {count}")
+
     def register_form_row(self, row):
         """Register a FormRow so the top-bar Help toggle controls it.
 
@@ -2922,6 +2995,14 @@ class MainWindow(QMainWindow):
         if self.recorder and self.recorder.is_recording:
             self.recorder.stop_recording()
 
+        # Flush an armed walkthrough tape — otherwise closing mid-recording
+        # loses the whole take.
+        try:
+            if self._action_recorder is not None and self._action_recorder.armed:
+                self._action_recorder.stop()
+        except Exception as e:
+            logger.debug("action recorder shutdown failed: %s", e)
+
         # Shut down any background threads owned by pages
         for page in self._page_widgets:
             if hasattr(page, '_shutdown_detection_worker'):
@@ -2934,6 +3015,14 @@ class MainWindow(QMainWindow):
         # v7.3.3: Stop all cameras
         if hasattr(self, '_camera_manager'):
             self._camera_manager.shutdown()
+
+        # v7.5.x: release the microscope body (COM / Micro-Manager) and stop its
+        # worker thread. Best-effort — a wedged turret must not block the close.
+        try:
+            from SupportClasses.MicroscopeControl import shutdown_microscope
+            shutdown_microscope()
+        except Exception as e:
+            logger.debug(f"microscope shutdown failed: {e}")
 
         self.controller.shutdown()
         event.accept()

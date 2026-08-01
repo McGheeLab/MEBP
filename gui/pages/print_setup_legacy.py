@@ -1625,6 +1625,23 @@ class PrintSetupPage(QWidget):
         # and the generate path) pick it up.
         self._apply_plate_relative_print_z(s)
 
+        # v7.5.x (XY-Challenge upgrade): inherit the XY motion calibration.
+        #
+        # This path previously stamped NONE of it — not the tuned follower
+        # parameters, not the measured loop period, top speed or dead time — so a
+        # bench calibration session had literally no effect on a Full Print. The
+        # same shared stamper Quick Print uses is called here so "the best print
+        # settings apply to all prints" is actually true.
+        #
+        # Only fills the calibration fields; every print-geometry choice above is
+        # untouched, and an uncalibrated machine keeps the legacy defaults.
+        try:
+            from SupportClasses.PrintTimingCalibrationStore import get_store
+            from SupportClasses import XYAutoCalibration as _AC
+            _AC.stamp_print_settings(s, get_store())
+        except Exception:
+            pass
+
         return s
 
     # ════════════════════════════════════════════════════════════════

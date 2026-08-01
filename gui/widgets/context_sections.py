@@ -112,7 +112,8 @@ class CameraSection(QWidget):
         cam_idx = self._resolve_cam_idx()
         self._view = CameraFeedView(
             ctx.camera_manager, cam_idx=cam_idx,
-            show_crosshair=True, enable_settings=True)
+            show_crosshair=True, enable_settings=True,
+            auto_orient=True)   # v7.5.x: calibrated orientation everywhere
         self._view.setMinimumHeight(s(200))
         lay.addWidget(self._view)
 
@@ -455,14 +456,21 @@ class HardwareInfoSection(QWidget):
         needle_text = "Not configured"
         if hw is not None and getattr(hw, "needle", None) is not None:
             n = hw.needle
-            parts = [f"{n.gauge}G"] if getattr(n, "gauge", None) else []
-            if getattr(n, "outer_diameter_um", None):
-                parts.append(f"OD {n.outer_diameter_um:.0f} µm")
-            if getattr(n, "inner_diameter_um", None):
-                parts.append(f"ID {n.inner_diameter_um:.0f} µm")
-            if getattr(n, "length_mm", None):
-                parts.append(f"L {n.length_mm:.1f} mm")
-            needle_text = " · ".join(parts) if parts else "Configured"
+            # v7.6 FIX: this read `outer_diameter_um`/`inner_diameter_um`, names
+            # NeedleSpec has never had, so OD/ID were silently dropped and only
+            # the gauge ever showed. Shared formatter covers both needle types.
+            summary = getattr(n, "summary_line", None)
+            if callable(summary):
+                needle_text = summary()
+            else:
+                parts = [f"{n.gauge}G"] if getattr(n, "gauge", None) else []
+                if getattr(n, "od_um", None):
+                    parts.append(f"OD {n.od_um:.0f} µm")
+                if getattr(n, "id_um", None):
+                    parts.append(f"ID {n.id_um:.0f} µm")
+                if getattr(n, "length_mm", None):
+                    parts.append(f"L {n.length_mm:.1f} mm")
+                needle_text = " · ".join(parts) if parts else "Configured"
         self._rows["needle"].setText(needle_text)
 
         for pid in ("P1", "P2", "P3"):
@@ -526,6 +534,33 @@ class IlluminationSection(QWidget):
             pass
 
 
+# ── Microscope body (drop-in module) ───────────────────────────────
+
+class MicroscopeSection(QWidget):
+    """Standalone Nikon Ti body module — filter cubes, focus, objectives.
+
+    Reuses the same widget embedded in the jog panel, and the same shared
+    ``MicroscopeController``, so both surfaces show one consistent state."""
+
+    def __init__(self, ctx: SectionContext, options: dict):
+        super().__init__()
+        self._ctx = ctx
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        # Lazy import: keeps the microscope driver stack out of the import graph
+        # when this section is unused.
+        from gui.widgets.microscope_panel import MicroscopePanel
+        self._panel = MicroscopePanel()
+        lay.addWidget(self._panel)
+
+    def on_status_update(self) -> None:
+        try:
+            self._panel.on_status_update()
+        except Exception:
+            pass
+
+
 # ── Register the built-in catalog ──────────────────────────────────
 
 register_section("camera", SectionSpec("Live camera", "📷", CameraSection))
@@ -537,3 +572,5 @@ register_section("hardware_info", SectionSpec(
     "Hardware info", "ℹ️", HardwareInfoSection))
 register_section("illumination", SectionSpec(
     "Illumination LED", "💡", IlluminationSection))
+register_section("microscope", SectionSpec(
+    "Microscope (cubes / focus / objectives)", "🔬", MicroscopeSection))

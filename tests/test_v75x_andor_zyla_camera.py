@@ -55,6 +55,8 @@ class FakeAndorCam:
         self._res = [(1024, 1024), (512, 512), (256, 256), (2048, 2048)]
         self._esize = 0
         self._exposure_us = 30000
+        self._auto_scale = True
+        self._lo, self._hi = 0, 65535
         self.released = False
         self._frame = frame if frame is not None else np.full(
             (1024, 1024, 3), 40, dtype=np.uint8)
@@ -96,6 +98,28 @@ class FakeAndorCam:
     def get_exposure_time_range(self):
         return (100, 30000000, 30000)
 
+    # display scaling (mono16 -> 8-bit display conversion, v7.5.x)
+    def get_display_auto_scale(self):
+        return self._auto_scale
+
+    def set_display_auto_scale(self, enabled):
+        self._auto_scale = bool(enabled)
+        return True
+
+    def get_display_levels(self):
+        return (self._lo, self._hi)
+
+    def put_display_black(self, v):
+        self._lo = int(v)
+        return True
+
+    def put_display_white(self, v):
+        self._hi = int(v)
+        return True
+
+    def get_display_level_range(self):
+        return (0, 65535, 65535)
+
     # unsupported ISP controls -> None / False (Zyla has none)
     def get_exposure_gain(self): return None
     def put_exposure_gain(self, v): return False
@@ -116,6 +140,9 @@ class FakeAndorCam:
             "exposure_gain_pct": None, "auto_exposure": None,
             "exposure_range_us": self.get_exposure_time_range(),
             "gain_range_pct": None,
+            "andor_auto_scale": self._auto_scale,
+            "andor_scale_lo": self._lo,
+            "andor_scale_hi": self._hi,
             "resolution": self._res[self._esize],
             "eSize": self._esize,
             "resolutions": list(self._res),

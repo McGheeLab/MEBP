@@ -10,7 +10,7 @@ Operator flow (one op per picked removal→placement pair):
        Print / Spheroid Pick & Place.
     2. Load the needle with a cell-release reagent (e.g. trypsin) assigned to a
        reagent well.
-    3. Travel to the cell-removal location and lower to the removal Z (a small
+    3. Travel to the cell-removal location and lower to a removal Z (a small
        height — default 0.1 mm — off the plate bottom).
     4. SLOWLY push in a small column of reagent (needle inner area × push depth).
     5. Wait a user-defined incubation time.
@@ -22,6 +22,29 @@ Steps 1 and 8 bracket the whole loop (run once each by the executor); steps 2–
 run per picked pair. The reagent well + service wells are inherited from
 Hardware Setup → Ink (Reagent Locations); all Z heights are expressed as a
 height above the calibrated plate bottom and resolved polarity-safely.
+
+── v7.9: TWO TABS ────────────────────────────────────────────────────
+
+The operator asked for the page to split in two (2026-08-01):
+
+    "the setup page is where we will do most of the options and establishment of
+    what and how to do everything, then the other page is used as a viewer for
+    the work being done"
+
+* **Setup** — :class:`CellTargetingSetupPanel`: the per-bore program table (one
+  row per bore of the assembly: pump · role · target type · push parameters),
+  the target types, the trypsin bore's reagent well, and the assembly-wide run
+  parameters promoted out of the ⚙ popout so they sit in front of the operator.
+* **Well Survey / Viewer** — a live INSTANCE of the Fluorescence Mosaic page
+  (``embedded=True``), plus the live picker and the XY / XZ views. The same
+  "re-home, don't rewrite" pattern the Spheroid survey tab uses, so there is
+  exactly ONE single-well mosaic scan implementation in the app.
+
+Embedding a second stage driver is what makes :meth:`_stage_busy` mandatory: the
+scan worker toggles ``suspend_position_poller``, which is a plain bool and NOT
+refcounted, so whichever of the two finishes first would re-enable the poller
+underneath the other — the v7.5.x false ZP-disconnect. Every motion entry point on
+this page therefore routes through it.
 """
 
 from __future__ import annotations
@@ -34,12 +57,13 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox,
     QComboBox, QFrame, QSizePolicy, QSplitter, QMessageBox, QCheckBox, QSpinBox,
+    QTabWidget,
 )
 
 from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card
-from gui.widgets.live_target_picker import LiveTargetPicker
+from gui.widgets.live_target_picker import LiveTargetPicker, PROV_MOSAIC
 from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.workspace_target_view import WorkspaceTargetView
@@ -54,10 +78,16 @@ from gui.pages.workflows._reagent_prep import (
     SERVICE_ROLES, service_well_names, resolve_service_positions,
     needle_volume_uL, resolve_pickup_well,
 )
+from gui.pages.workflows.cell_targeting_setup_panel import (
+    CellTargetingSetupPanel,
+)
 
+from SupportClasses.PhysicalModels import (
+    needle_bore_at, needle_orifice_area_mm2,
+)
 from SupportClasses.PickAndPlaceManager import (
-    OperationQueue, OperationType, PickPlaceExecutor, PickPlaceOperation,
-    CellRemovalConfig,
+    BoreRole, OperationQueue, OperationType, PickPlaceExecutor,
+    PickPlaceOperation, CellRemovalConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -109,6 +139,12 @@ class CellTargetingWorkflowPage(QWidget):
         # Left context panel — lazy, identical lifecycle to JogControlPage
         self._context_widget: StandardJogContextPanel | None = None
 
+        # v7.9: the embedded Fluorescence Mosaic page (the viewer tab) and the
+        # last point clicked on its mosaic (ABSOLUTE stage µm).
+        self._scan_page = None
+        self._setup_panel: CellTargetingSetupPanel | None = None
+        self._mosaic_point_um: tuple[float, float] | None = None
+
         self._executor: Optional[PickPlaceExecutor] = None
         self._exec_thread: Optional[threading.Thread] = None
         self._bridge = _ExecutorBridge()
@@ -125,8 +161,16 @@ class CellTargetingWorkflowPage(QWidget):
         self._travel_worker = SafeTravelWorker(self)
         self._travel_worker.finished.connect(self._on_travel_finished)
 
-        # Comprehensive settings popout (scrollable, saveable). Built eagerly so
-        # config widgets exist for _current_config() / _on_start() + the tests.
+        # v7.9: every config widget is created EAGERLY and up front, before either
+        # surface lays one out, so `_current_config()` / `_on_start()` and the
+        # `__new__`-partial page tests can read them without showing anything.
+        self._create_config_widgets()
+
+        # Comprehensive settings popout (scrollable, saveable). It keeps the
+        # advanced + Common-linked fields; the primary ones are laid out on the
+        # Setup tab and registered here via `register_external` (v7.7), so a
+        # setting has exactly ONE editing surface but still rides along with the
+        # saved profile.
         self._settings_dialog = WorkflowSettingsDialog(
             "cell_targeting", "Cell Targeting & Removal",
             parent=self, on_change=self._on_settings_changed)
@@ -138,51 +182,21 @@ class CellTargetingWorkflowPage(QWidget):
 
         outer.addLayout(self._build_header())
 
-        # Main horizontal split:
-        #   LEFT  — LiveTargetPicker (pick = removal locations, place = placements)
-        #   RIGHT — vertical split: WorkspaceTargetView (top) + XZSideView (bottom)
-        main_split = QSplitter(Qt.Horizontal, self)
-        main_split.setChildrenCollapsible(False)
+        self._tabs = QTabWidget(self)
+        self._tabs.addTab(self._build_setup_tab(), "Setup")
+        self._tabs.addTab(self._build_viewer_tab(), "Well Survey / Viewer")
+        outer.addWidget(self._tabs, stretch=1)
 
-        self._picker = LiveTargetPicker(controller, camera_manager)
-        self._picker.picks_changed.connect(self._on_targets_changed)
-        self._picker.places_changed.connect(self._on_targets_changed)
-        main_split.addWidget(self._picker)
-
-        right = QSplitter(Qt.Vertical, self)
-        right.setChildrenCollapsible(False)
-
-        self._workspace_view = WorkspaceTargetView()
-        try:
-            self._workspace_view.set_safety_limits(controller.safety_limits)
-        except Exception:
-            pass
-        self._workspace_view.position_clicked.connect(
-            self._on_workspace_position_clicked)
-        self._workspace_view.fast_travel_requested.connect(
-            self._on_workspace_fast_travel_requested)
-        ws_card = Card("XY Workspace", flush=True)
-        ws_card.add_widget(self._workspace_view)
-        right.addWidget(ws_card)
-
-        self._xz_view = XZSideView()
-        try:
-            self._xz_view.set_safety_limits(controller.safety_limits)
-        except Exception:
-            pass
-        self._xz_view.go_to_z_requested.connect(self._on_go_to_z_requested)
-        xz_card = Card("Side View (XZ)", flush=True)
-        xz_card.add_widget(self._xz_view)
-        right.addWidget(xz_card)
-
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 2)
-        main_split.addWidget(right)
-        main_split.setStretchFactor(0, 1)
-        main_split.setStretchFactor(1, 1)
-        outer.addWidget(main_split, stretch=1)
-
+        # The run row stays OUTSIDE the tabs so Start / Abort and the status line
+        # are reachable from either one (the v7.7 Quick Print zone pattern).
         outer.addWidget(self._build_run_row())
+
+        # Promoted fields are registered after the Setup tab has laid them out,
+        # and the bore table rides along through the extra-state hook — both
+        # BEFORE load_last(), or a restored profile would have nowhere to land.
+        self._register_promoted_fields(self._settings_dialog)
+        self._settings_dialog.set_extra_state(
+            self._collect_extra_state, self._apply_extra_state)
 
         # Periodic position refresh so the workspace + XZ tracks the stage.
         from PySide6.QtCore import QTimer
@@ -196,6 +210,7 @@ class CellTargetingWorkflowPage(QWidget):
         self._settings_dialog.load_last()
         self._refresh_reagent_status()
         self._refresh_prep_status()
+        self._refresh_trypsin_status()
         self._update_settings_summary()
 
     # ── UI construction ───────────────────────────────────────────
@@ -238,8 +253,8 @@ class CellTargetingWorkflowPage(QWidget):
         settings_btn = QPushButton("⚙ Settings")
         settings_btn.setCursor(Qt.PointingHandCursor)
         settings_btn.setToolTip(
-            "Open the full, saveable settings for this workflow (reagent, "
-            "push/pull, dwell, speeds, prep/clean, locations).")
+            "Open the full, saveable settings for this workflow (profiles, prep "
+            "sub-parameters, motion timeouts, global pump values, locations).")
         settings_btn.clicked.connect(self._open_settings)
         row.addWidget(settings_btn)
         return row
@@ -260,6 +275,178 @@ class CellTargetingWorkflowPage(QWidget):
                 "No fluorescence mosaic captured for this plate yet "
                 "(run the Fluorescence Mosaic workflow).")
 
+    # ── Setup tab (v7.9) ──────────────────────────────────────────
+
+    def _build_setup_tab(self) -> QWidget:
+        """The primary establishment surface.
+
+        The panel owns the per-bore table / target types / trypsin reagent; the
+        assembly-wide fields below are created by this page (so `_current_config`
+        can read them without the tab being shown) and merely LAID OUT here.
+        """
+        panel = CellTargetingSetupPanel(self)
+        panel.programs_changed.connect(self._on_programs_changed)
+        self._setup_panel = panel
+
+        grp = panel.add_group("Heights (above the calibrated plate bottom)")
+        grp.add("Removal Z (↑ bottom)", self._removal_z)
+        grp.add("Place Z (↑ bottom)", self._place_z)
+
+        grp = panel.add_group("Cell-release reagent")
+        grp.add("Pump / bore (fallback)", self._bore)
+        grp.add("Cell-release reagent", self._reagent_combo)
+        grp.add("Reagent dip Z (↑ bottom)", self._reagent_z)
+        grp.add_widget(self._reagent_status)
+
+        grp = panel.add_group("Reagent push / pull")
+        grp.add("Push depth", self._push_depth)
+        grp.add("Pull (×)", self._pull_mult)
+        grp.add("Dwell (incubation)", self._dwell)
+        grp.add("Push flow (slow)", self._push_speed)
+        grp.add("Pull flow (fast)", self._pull_speed)
+        grp.add_widget(self._volume_label)
+
+        grp = panel.add_group("Needle prep / clean")
+        grp.add_widget(self._prep_check)
+        grp.add_widget(self._clean_check)
+        grp.add_widget(self._wash_after_pickup_check)
+        grp.add_note(
+            "The prep sub-parameters (service dip Z, flows, needle multiples, "
+            "wash mechanics) are shared with Common Print Settings and live in "
+            "⚙ Settings.")
+        grp.add_widget(self._prep_status)
+
+        panel.finalize()
+        return panel
+
+    def _on_programs_changed(self) -> None:
+        """A per-bore role / pump / target type / push parameter changed."""
+        # Which bore ASPIRATES sets the orifice the reagent column is metered
+        # through, so the push/pull readout has to follow a role change too —
+        # it also re-runs the reagent status line.
+        self._refresh_volume_label()
+        self._refresh_trypsin_status()
+        self._update_settings_summary()
+        self._update_button_state()
+
+    # ── Viewer tab (v7.9) ─────────────────────────────────────────
+
+    def _build_viewer_tab(self) -> QWidget:
+        """Scan the well, then watch the work.
+
+        The left half is a real INSTANCE of the Fluorescence Mosaic page
+        (``embedded=True`` drops only its back-button header), so a change to the
+        single-well scan workflow shows up here automatically and the two cannot
+        diverge — the pattern ``SpheroidPickupWorkflowPage`` and
+        ``FullPrintWorkflowPage`` both use.
+        """
+        from gui.pages.workflows.fluorescence_mosaic_workflow import (
+            FluorescenceMosaicWorkflowPage)
+
+        wrap = QWidget(self)
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(s(6))
+
+        vsplit = QSplitter(Qt.Vertical, wrap)
+        vsplit.setChildrenCollapsible(False)
+
+        top = QSplitter(Qt.Horizontal, vsplit)
+        top.setChildrenCollapsible(False)
+
+        scan_wrap = QWidget(top)
+        scan_layout = QVBoxLayout(scan_wrap)
+        scan_layout.setContentsMargins(0, 0, 0, 0)
+        scan_layout.setSpacing(s(4))
+        self._scan_page = FluorescenceMosaicWorkflowPage(
+            self._controller, self._settings, self._camera_manager,
+            embedded=True)
+        # A scan finishing OR a well change loads a different mosaic, so the
+        # point picked off the previous one must not stay armed — it would send
+        # the stage to a coordinate from another well.
+        self._scan_page.mosaic_ready.connect(self._on_mosaic_ready)
+        scan_layout.addWidget(self._scan_page, stretch=1)
+        scan_layout.addWidget(self._build_mosaic_point_row())
+        top.addWidget(scan_wrap)
+
+        self._picker = LiveTargetPicker(self._controller, self._camera_manager)
+        self._picker.picks_changed.connect(self._on_targets_changed)
+        self._picker.places_changed.connect(self._on_targets_changed)
+        top.addWidget(self._picker)
+        top.setStretchFactor(0, 3)
+        top.setStretchFactor(1, 2)
+        vsplit.addWidget(top)
+
+        bottom = QSplitter(Qt.Horizontal, vsplit)
+        bottom.setChildrenCollapsible(False)
+
+        self._workspace_view = WorkspaceTargetView()
+        try:
+            self._workspace_view.set_safety_limits(self._controller.safety_limits)
+        except Exception:
+            pass
+        self._workspace_view.position_clicked.connect(
+            self._on_workspace_position_clicked)
+        self._workspace_view.fast_travel_requested.connect(
+            self._on_workspace_fast_travel_requested)
+        ws_card = Card("XY Workspace", flush=True)
+        ws_card.add_widget(self._workspace_view)
+        bottom.addWidget(ws_card)
+
+        self._xz_view = XZSideView()
+        try:
+            self._xz_view.set_safety_limits(self._controller.safety_limits)
+        except Exception:
+            pass
+        self._xz_view.go_to_z_requested.connect(self._on_go_to_z_requested)
+        xz_card = Card("Side View (XZ)", flush=True)
+        xz_card.add_widget(self._xz_view)
+        bottom.addWidget(xz_card)
+        vsplit.addWidget(bottom)
+
+        vsplit.setStretchFactor(0, 3)
+        vsplit.setStretchFactor(1, 2)
+        layout.addWidget(vsplit)
+
+        # Interactive-items mode frees the left button for scene clicks and moves
+        # panning to the middle button — the same trade the spheroid survey makes.
+        try:
+            view = self._scan_page.mosaic_view()
+            view.set_interactive_items(True)
+            view.scene_clicked.connect(self._on_mosaic_scene_clicked)
+        except Exception as exc:
+            logger.debug("mosaic view wiring failed: %s", exc)
+        return wrap
+
+    def _build_mosaic_point_row(self) -> QFrame:
+        frame = QFrame(self)
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(s(8))
+        self._mosaic_point_lbl = QLabel("Click the mosaic to pick a point.")
+        self._mosaic_point_lbl.setWordWrap(True)
+        self._mosaic_point_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        row.addWidget(self._mosaic_point_lbl, stretch=1)
+
+        self._mosaic_goto_btn = QPushButton("⤵ Go to point")
+        self._mosaic_goto_btn.setEnabled(False)
+        self._mosaic_goto_btn.setToolTip(
+            "Retract the needle, then travel to the clicked mosaic point "
+            "(absolute stage µm).")
+        self._mosaic_goto_btn.clicked.connect(self._on_mosaic_goto)
+        row.addWidget(self._mosaic_goto_btn)
+
+        self._mosaic_pick_btn = QPushButton("＋ Add as removal target")
+        self._mosaic_pick_btn.setEnabled(False)
+        self._mosaic_pick_btn.setToolTip(
+            "Add the clicked mosaic point to the removal list. A mosaic position "
+            "is a SEARCH HINT — go there and click the object on the live view "
+            "to confirm it before running.")
+        self._mosaic_pick_btn.clicked.connect(self._on_mosaic_add_pick)
+        row.addWidget(self._mosaic_pick_btn)
+        return frame
+
     # ── Settings popout ───────────────────────────────────────────
 
     def _open_settings(self):
@@ -271,6 +458,7 @@ class CellTargetingWorkflowPage(QWidget):
         self._refresh_volume_label()
         self._refresh_reagent_status()
         self._refresh_prep_status()
+        self._refresh_trypsin_status()
         self._update_settings_summary()
         self._update_button_state()
 
@@ -280,9 +468,12 @@ class CellTargetingWorkflowPage(QWidget):
         try:
             push, pull = self._push_pull_uL()
             prep = "prep on" if self._prep_check.isChecked() else "prep off"
+            tryp = self._program_for_role(BoreRole.PUSH_REAGENT)
+            extra = (f" · trypsin bore {tryp.bore_index + 1}"
+                     if tryp is not None else "")
             self._settings_summary.setText(
                 f"push {push:.3g}/pull {pull:.3g} µL · dwell "
-                f"{self._dwell.value():.0f}s · {prep}")
+                f"{self._dwell.value():.0f}s · {prep}{extra}")
         except Exception:
             pass
 
@@ -309,7 +500,13 @@ class CellTargetingWorkflowPage(QWidget):
             sb.setToolTip(tip)
         return sb
 
-    def _build_settings_dialog(self, dlg: WorkflowSettingsDialog):
+    def _create_config_widgets(self) -> None:
+        """Create EVERY config widget, before either surface lays one out.
+
+        Split out of ``_build_settings_dialog`` in v7.9 so the primary fields can
+        be laid out on the Setup tab (a widget has one parent) while still being
+        registered with the dialog for persistence. Nothing here is parented yet.
+        """
         # ── Removal & placement heights ──
         self._removal_z = self._dspin(
             0.0, 20.0, 0.10, " mm", 2, 0.05,
@@ -317,13 +514,13 @@ class CellTargetingWorkflowPage(QWidget):
         self._place_z = self._dspin(
             0.0, 20.0, 0.50, " mm", 2, 0.05,
             "Needle height above the plate bottom when dispensing extracted cells.")
-        sec = dlg.add_section("Removal & placement heights")
-        sec.add("removal_z", "Removal Z (↑ bottom)", self._removal_z, 0.10)
-        sec.add("place_z", "Place Z (↑ bottom)", self._place_z, 0.50)
 
         # ── Pump & reagent ──
         self._bore = QComboBox()
         self._bore.setMinimumWidth(s(110))
+        self._bore.setToolTip(
+            "Pump feeding the aspirating bore. Used when the per-bore table "
+            "above names no pump for the aspirating bore.")
         self._bore.currentIndexChanged.connect(self._on_bore_changed)
         self._reagent_combo = QComboBox()
         self._reagent_combo.setMinimumWidth(s(180))
@@ -336,15 +533,10 @@ class CellTargetingWorkflowPage(QWidget):
         self._reagent_z = self._dspin(
             0.0, 30.0, 0.50, " mm", 2, 0.1,
             "Needle dip height above the plate bottom when aspirating reagent.")
-        sec = dlg.add_section("Pump & cell-release reagent")
-        sec.add("bore", "Pump / bore", self._bore, "P1")
-        sec.add("reagent", "Cell-release reagent", self._reagent_combo, "")
-        sec.add("reagent_z", "Reagent dip Z (↑ bottom)", self._reagent_z, 0.50)
         self._reagent_status = QLabel("")
         self._reagent_status.setWordWrap(True)
         self._reagent_status.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        sec.add_widget(self._reagent_status)
 
         # ── Push / pull mechanics ──
         self._push_depth = self._dspin(
@@ -362,16 +554,9 @@ class CellTargetingWorkflowPage(QWidget):
             0.01, 50.0, 0.5, " µL/s", 2, 0.1, "Slow flow used to push reagent in.")
         self._pull_speed = self._dspin(
             0.01, 50.0, 5.0, " µL/s", 2, 0.5, "Fast flow used to pull cells up.")
-        sec = dlg.add_section("Reagent push / pull")
-        sec.add("push_depth", "Push depth", self._push_depth, 0.10)
-        sec.add("pull_mult", "Pull (×)", self._pull_mult, 2.0)
-        sec.add("dwell", "Dwell (incubation)", self._dwell, 60.0)
-        sec.add("push_speed", "Push flow (slow)", self._push_speed, 0.5)
-        sec.add("pull_speed", "Pull flow (fast)", self._pull_speed, 5.0)
         self._volume_label = QLabel("V = —")
         self._volume_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        sec.add_widget(self._volume_label)
 
         # ── Needle prep / clean ──
         self._prep_check = QCheckBox("Prep needle (waste → oil → wash → buffer)")
@@ -410,13 +595,61 @@ class CellTargetingWorkflowPage(QWidget):
         self._post_dispense = self._dspin(
             0.0, 20.0, 1.0, "", 1, 0.5,
             "Needles of residual dispensed to waste during the post-clean.")
-        sec = dlg.add_section("Needle prep / clean")
-        sec.add_check("prep", self._prep_check, True)
-        sec.add_check("clean", self._clean_check, True)
-        sec.add_check("wash_after_pickup", self._wash_after_pickup_check, True)
+        self._prep_status = QLabel("")
+        self._prep_status.setWordWrap(True)
+        self._prep_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+
+        # ── Motion & timeouts ──
+        self._intra_retract = self._dspin(
+            0.0, 20.0, 1.0, " mm", 2, 0.1, "Short Z retract for moves within one well.")
+        self._z_timeout = self._dspin(
+            1.0, 120.0, 15.0, " s", 0, 1.0, "Z move arrival timeout.")
+        self._xy_timeout = self._dspin(
+            1.0, 240.0, 30.0, " s", 0, 1.0, "XY move arrival timeout.")
+
+        # ── Common — Pump (global) ──
+        self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
+        self._g_prime = self._dspin(0.0, 30.0, 0.25, " s", 2, 0.05)
+
+    #: Fields laid out on the Setup tab. Registered with the settings dialog via
+    #: ``register_external`` so they are saved / loaded / imported / exported
+    #: exactly as before — the keys are unchanged, so an existing last-used file
+    #: keeps loading.
+    _PROMOTED_DEFAULTS = (
+        ("removal_z", "_removal_z", 0.10),
+        ("place_z", "_place_z", 0.50),
+        ("bore", "_bore", "P1"),
+        ("reagent", "_reagent_combo", ""),
+        ("reagent_z", "_reagent_z", 0.50),
+        ("push_depth", "_push_depth", 0.10),
+        ("pull_mult", "_pull_mult", 2.0),
+        ("dwell", "_dwell", 60.0),
+        ("push_speed", "_push_speed", 0.5),
+        ("pull_speed", "_pull_speed", 5.0),
+        ("prep", "_prep_check", True),
+        ("clean", "_clean_check", True),
+        ("wash_after_pickup", "_wash_after_pickup_check", True),
+    )
+
+    def _register_promoted_fields(self, dlg: WorkflowSettingsDialog) -> None:
+        for key, attr, default in self._PROMOTED_DEFAULTS:
+            dlg.register_external(key, getattr(self, attr), default)
+
+    def _build_settings_dialog(self, dlg: WorkflowSettingsDialog):
+        """The ⚙ popout: profiles + the advanced / Common-linked fields.
+
+        The primary fields are NOT here — they are on the Setup tab (see
+        ``_PROMOTED_DEFAULTS``). Everything that remains either needs the
+        Common Print Settings override machinery (which is a dialog row) or is an
+        advanced knob the operator sets once.
+        """
+        # ── Needle prep / clean sub-parameters (Common-linked) ──
+        sec = dlg.add_section("Needle prep / clean — shared sub-parameters")
         sec.add_note(
-            "Prep values are shared defaults from Common Print Settings — tick "
-            "Override to set a workflow-specific value.")
+            "The prep / clean / wash toggles are on the Setup tab. These values "
+            "are shared defaults from Common Print Settings — tick Override to "
+            "set a workflow-specific value.")
         sec.add_common("service_z", "Service dip Z (↑ bottom)", self._service_z, 0.50)
         sec.add_common("prep_rate", "Prep / clean flow", self._prep_rate, 1.0)
         sec.add_common("oil_needles", "Oil (needles)", self._oil_needles, 1.0)
@@ -426,27 +659,14 @@ class CellTargetingWorkflowPage(QWidget):
         sec.add_common("wash_xy_amp", "Wash XY jiggle", self._wash_xy_amp, 200.0)
         sec.add_common("wash_dwell", "Wash settle", self._wash_dwell, 0.3)
         sec.add("post_dispense", "Clean dispense (needles)", self._post_dispense, 1.0)
-        self._prep_status = QLabel("")
-        self._prep_status.setWordWrap(True)
-        self._prep_status.setStyleSheet(
-            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
-        sec.add_widget(self._prep_status)
 
         # ── Motion & timeouts ──
-        self._intra_retract = self._dspin(
-            0.0, 20.0, 1.0, " mm", 2, 0.1, "Short Z retract for moves within one well.")
-        self._z_timeout = self._dspin(
-            1.0, 120.0, 15.0, " s", 0, 1.0, "Z move arrival timeout.")
-        self._xy_timeout = self._dspin(
-            1.0, 240.0, 30.0, " s", 0, 1.0, "XY move arrival timeout.")
         sec = dlg.add_section("Motion & timeouts (advanced)")
         sec.add("intra_retract", "Intra-well retract", self._intra_retract, 1.0)
         sec.add("z_timeout", "Z timeout", self._z_timeout, 15.0)
         sec.add("xy_timeout", "XY timeout", self._xy_timeout, 30.0)
 
         # ── Common — Pump (global) ──
-        self._g_settle = self._dspin(0.0, 30.0, 0.0, " s", 2, 0.05)
-        self._g_prime = self._dspin(0.0, 30.0, 0.25, " s", 2, 0.05)
         sec = dlg.add_section("Common — Pump (global, shared by all workflows)")
         sec.add_note(
             "Global pump values (edited here or on the Common Print Settings "
@@ -469,11 +689,35 @@ class CellTargetingWorkflowPage(QWidget):
             if reagent:
                 extras.append(("Cell-release reagent",
                                f"{reagent} ← {well or '(no well)'}"))
+            tryp = self._trypsin_reagent()
+            if tryp:
+                extras.append(("Trypsin bore reagent",
+                               f"{tryp} ← "
+                               f"{self._trypsin_source_well() or '(no well)'}"))
         except Exception:
             pass
         return build_locations_widget(
             self._controller, self._hw_config, self._well_positions,
             z_references=self._z_references, safe_z=self._safe_z, extras=extras)
+
+    # ── Non-widget settings state (v7.9) ──────────────────────────
+
+    def _collect_extra_state(self) -> dict:
+        """The per-bore program table, for the profile.
+
+        The table is rebuilt whenever the needle changes, so it cannot be a
+        registered field (``widget_value`` handles only the four fixed widget
+        types) — it would silently vanish on every restart. This is the hook
+        added in v7.7 for exactly that, following the Quick Print multi-ink
+        mapping precedent.
+        """
+        panel = self._setup_panel
+        return panel.to_state() if panel is not None else {}
+
+    def _apply_extra_state(self, state) -> None:
+        panel = self._setup_panel
+        if panel is not None:
+            panel.apply_state(state)
 
     def _on_prep_toggled(self, *_):
         prep_clean = self._prep_check.isChecked() or self._clean_check.isChecked()
@@ -545,26 +789,33 @@ class CellTargetingWorkflowPage(QWidget):
             if idx >= 0:
                 self._reagent_combo.setCurrentIndex(idx)
         self._reagent_combo.blockSignals(False)
+        # The trypsin bore draws from the same reagent library.
+        if self._setup_panel is not None:
+            self._setup_panel.set_reagent_choices(reagents)
 
     def _selected_reagent(self) -> str | None:
         if not hasattr(self, "_reagent_combo"):
             return None
         return self._reagent_combo.currentData() or None
 
-    def _reagent_source_well(self) -> str | None:
-        ink = self._selected_reagent()
+    def _well_for_ink(self, ink: str | None) -> str | None:
         if not ink or self._hw_config is None:
             return None
         wells = (getattr(self._hw_config, "ink_locations", {}) or {}).get(ink) or []
         # Prefer a real sub-well over a flattened rosette parent (e.g. "A2").
         return resolve_pickup_well(wells, self._plate)
 
-    def _reagent_source_pos(self) -> tuple[float, float] | None:
-        wn = self._reagent_source_well()
+    def _pos_for_well(self, well: str | None) -> tuple[float, float] | None:
         wells = self._well_positions or {}
-        if wn and wn in wells:
-            return wells[wn]
+        if well and well in wells:
+            return wells[well]
         return None
+
+    def _reagent_source_well(self) -> str | None:
+        return self._well_for_ink(self._selected_reagent())
+
+    def _reagent_source_pos(self) -> tuple[float, float] | None:
+        return self._pos_for_well(self._reagent_source_well())
 
     def _refresh_reagent_status(self):
         if not hasattr(self, "_reagent_status"):
@@ -593,9 +844,85 @@ class CellTargetingWorkflowPage(QWidget):
             return
         push, _pull = self._push_pull_uL()
         self._reagent_status.setText(
-            f"✓ Reagent “{ink}” ← {well} · load ~{push:.4f} µL on the {self._bore_id()} bore")
+            f"✓ Reagent “{ink}” ← {well} · load ~{push:.4f} µL on the "
+            f"{self._aspirate_pump_id()} bore")
         self._reagent_status.setStyleSheet(
             f"color: {COLORS['green']}; font-size: {sf(9)}pt;")
+
+    # ── Trypsin bore (v7.9) ───────────────────────────────────────
+
+    def _program_for_role(self, role: BoreRole):
+        panel = self._setup_panel
+        return panel.program_for_role(role) if panel is not None else None
+
+    def _aspirate_pump_id(self) -> str:
+        """Pump feeding the aspirating bore — the table wins, the combo backs it."""
+        prog = self._program_for_role(BoreRole.ASPIRATE_TARGET)
+        if prog is not None and prog.pump_id:
+            return prog.pump_id
+        return self._bore_id()
+
+    def _trypsin_reagent(self) -> str:
+        panel = self._setup_panel
+        return panel.trypsin_reagent_name() if panel is not None else ""
+
+    def _trypsin_source_well(self) -> str | None:
+        return self._well_for_ink(self._trypsin_reagent() or None)
+
+    def _trypsin_source_pos(self) -> tuple[float, float] | None:
+        return self._pos_for_well(self._trypsin_source_well())
+
+    def _refresh_trypsin_status(self):
+        panel = self._setup_panel
+        if panel is None:
+            return
+        prog = self._program_for_role(BoreRole.PUSH_REAGENT)
+        if prog is None:
+            panel.set_trypsin_status(
+                "No bore is pushing reagent — the single-bore sequence runs "
+                "(load, push, incubate, pull, dispense).")
+            return
+        if not prog.pump_id:
+            panel.set_trypsin_status(
+                f"⚠ Bore {prog.bore_index + 1} pushes reagent but names no pump.",
+                "peach")
+            return
+        ink = self._trypsin_reagent()
+        if not ink:
+            panel.set_trypsin_status(
+                f"⚠ Bore {prog.bore_index + 1} ({prog.pump_id}) needs a reagent "
+                "to load — choose one.", "peach")
+            return
+        well = self._trypsin_source_well()
+        if well is None:
+            panel.set_trypsin_status(
+                f"⚠ “{ink}” has no reagent location (Hardware Setup → Ink).",
+                "peach")
+            return
+        if self._trypsin_source_pos() is None:
+            panel.set_trypsin_status(
+                f"⚠ Reagent well {well} is not in the calibrated plate — run "
+                "Plate Location.", "peach")
+            return
+        vol = self._trypsin_push_uL()
+        panel.set_trypsin_status(
+            f"✓ Bore {prog.bore_index + 1} ({prog.pump_id}) ← “{ink}” at {well} "
+            f"· push {vol:.5f} µL @ {prog.rate_uL_s:.2f} µL/s · lead "
+            f"{prog.lead_time_s:.1f}s", "green")
+
+    def _trypsin_push_uL(self) -> float:
+        """The resolved trypsin push volume — the config's own arithmetic.
+
+        Asking ``CellRemovalConfig`` rather than recomputing it here is what keeps
+        the readout and the executed move from ever disagreeing (the v7.7 lesson
+        where a warning and the commanded flow read two different bore areas).
+        """
+        cfg = self._current_config()
+        needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
+        try:
+            return float(cfg.compute_trypsin_volume_uL(needle))
+        except Exception:
+            return 0.0
 
     # ── Prep / clean service-well resolution (inherit from HW setup) ──
 
@@ -729,6 +1056,21 @@ class CellTargetingWorkflowPage(QWidget):
         self._settings = settings
         if self._context_widget is not None:
             self._context_widget.set_settings(settings)
+        # The embedded scan page keeps its own settings reference (its scan knobs
+        # read it). The spheroid host omits this forward; the omission is a bug,
+        # not a convention, so it is not copied here.
+        self._forward_to_scan_page("set_settings", settings)
+
+    def showEvent(self, event):
+        # The measured bore offsets are written onto the live needle by the
+        # Calibration page on each hardware-config push, which can land after
+        # this page built its table — re-read them on the way in.
+        if self._setup_panel is not None:
+            try:
+                self._setup_panel.refresh_offsets()
+            except Exception as exc:
+                logger.debug("bore offset refresh failed: %s", exc)
+        super().showEvent(event)
 
     def hideEvent(self, event):
         try:
@@ -736,11 +1078,38 @@ class CellTargetingWorkflowPage(QWidget):
                 self._settings_dialog.hide()
         except Exception:
             pass
+        # PERSIST ON THE WAY OUT. ``WorkflowSettingsDialog`` auto-saves last-used
+        # from its OWN hideEvent/closeEvent, which was sufficient while the popout
+        # was the only editing surface — touching a setting implied opening it.
+        # v7.9 promoted 13 fields onto the Setup tab and put the bore program
+        # table there, so the normal workflow never opens the popout and nothing
+        # was written at all: a session's whole Setup tab (and its bore roles)
+        # came back at defaults. Same moment the dialog would have saved, so the
+        # semantics are unchanged; ``save_last`` is idempotent and swallows its
+        # own errors, so the double call after the hide above is harmless.
+        try:
+            self._settings_dialog.save_last()
+        except Exception as exc:
+            logger.debug("save_last on hide failed: %s", exc)
+        # ⚠ The embedded scan page is deliberately NOT hidden here. It is a CHILD
+        # WIDGET, and an explicit ``hide()`` STICKS: Qt will not re-show an
+        # explicitly-hidden child when its parent is shown again, so the whole
+        # Well Survey / Viewer tab came back BLANK on every return to this page —
+        # which would make decision D4's live embedded instance a one-visit
+        # feature. Qt already delivers a hide event to a *visible* child when its
+        # parent hides (verified offscreen), and that event is what stops the
+        # scan page's camera and tucks its own modeless dialog away; the child is
+        # then re-shown automatically. Nothing extra is needed.
+        # (``SpheroidPickupWorkflowPage`` carries the same explicit hide and has
+        # the same symptom — fixing it there is its own change.)
         super().hideEvent(event)
 
     # ── Common Print Settings hook ────────────────────────────────
 
     def set_common_print_settings(self, common):
+        # The embedded fluorescence page defines no set_common_print_settings, so
+        # there is deliberately no hasattr-guarded forward here (the spheroid host
+        # has one and it has always been dead code).
         if getattr(self, "_settings_dialog", None) is not None:
             self._settings_dialog.set_common(common)
 
@@ -749,15 +1118,18 @@ class CellTargetingWorkflowPage(QWidget):
     def set_hardware_config(self, hw_config):
         self._hw_config = hw_config
         # Refresh bore options from pump ids
-        self._bore.blockSignals(True)
-        previous = self._bore.currentText()
-        self._bore.clear()
+        pump_ids: list[str] = []
         if hw_config is not None and hasattr(hw_config, "pumps"):
             for pid, pcfg in hw_config.pumps.items():
                 enabled = getattr(pcfg, "enabled", True)
                 configured = getattr(pcfg, "is_configured", True)
                 if enabled and configured:
-                    self._bore.addItem(pid)
+                    pump_ids.append(pid)
+        self._bore.blockSignals(True)
+        previous = self._bore.currentText()
+        self._bore.clear()
+        for pid in pump_ids:
+            self._bore.addItem(pid)
         if self._bore.count() == 0:
             self._bore.addItem("P1")
         idx = self._bore.findText(previous)
@@ -767,15 +1139,24 @@ class CellTargetingWorkflowPage(QWidget):
 
         # Push to the shared live picker + workspace/XZ needle size
         self._picker.set_hardware_config(hw_config)
+        needle = getattr(hw_config, "needle", None) if hw_config else None
         try:
-            needle = getattr(hw_config, "needle", None) if hw_config else None
-            od_um = float(getattr(needle, "od_mm", 0.0) or 0.0) * 1000.0
-            length_mm = float(getattr(needle, "length_mm", 0.0) or 0.0)
+            # v7.6: the ORIFICE OD is what approaches the plate (the pulled tip
+            # on a capillary), and the needle is barrel + tip long.
+            od_um = float(getattr(needle, "orifice_od_um", None)
+                          or getattr(needle, "od_um", 0.0) or 0.0)
+            length_mm = float(getattr(needle, "total_length_mm", None)
+                              or getattr(needle, "length_mm", 0.0) or 0.0)
             if od_um > 0:
                 self._workspace_view.set_needle(od_um)
                 self._xz_view.set_needle(od_um, length_mm or None)
         except Exception as e:
             logger.debug("workspace/xz set_needle failed: %s", e)
+
+        # v7.9: the per-bore table IS the assembly, so it rebuilds here.
+        if self._setup_panel is not None:
+            self._setup_panel.set_pump_ids(pump_ids)
+            self._setup_panel.set_needle(needle)
 
         if self._context_widget is not None:
             self._context_widget.set_hardware_config(hw_config)
@@ -786,11 +1167,24 @@ class CellTargetingWorkflowPage(QWidget):
             self._settings_dialog.resolve_pending()
         except Exception:
             pass
+        self._forward_to_scan_page("set_hardware_config", hw_config)
         self._refresh_reagent_status()
         self._refresh_prep_status()
+        self._refresh_trypsin_status()
         self._refresh_volume_label()
         self._update_button_state()
         self._update_settings_summary()
+
+    def _forward_to_scan_page(self, method: str, *args) -> None:
+        """Relay a host push to the embedded scan page, best-effort."""
+        page = self._scan_page
+        fn = getattr(page, method, None) if page is not None else None
+        if not callable(fn):
+            return
+        try:
+            fn(*args)
+        except Exception as exc:
+            logger.debug("scan page %s failed: %s", method, exc)
 
     # ── Calibration data routing (mirror of JogControlPage) ──────
 
@@ -817,6 +1211,10 @@ class CellTargetingWorkflowPage(QWidget):
         # Reagent + service-well resolution depends on the calibrated positions.
         self._refresh_reagent_status()
         self._refresh_prep_status()
+        self._refresh_trypsin_status()
+        # The viewer tab's scan + well geometry come from the same calibration.
+        self._forward_to_scan_page(
+            "set_calibration_data", plate, well_positions, safe_z)
 
     def set_z_references(self, refs: dict) -> None:
         if not isinstance(refs, dict):
@@ -837,6 +1235,7 @@ class CellTargetingWorkflowPage(QWidget):
         # Plate-bottom datum affects the resolvable reagent/service dip Z.
         self._refresh_reagent_status()
         self._refresh_prep_status()
+        self._forward_to_scan_page("set_z_references", self._z_references)
 
     def _wells_in_zero_ref(self) -> dict[str, tuple[float, float]]:
         if not self._well_positions:
@@ -911,16 +1310,68 @@ class CellTargetingWorkflowPage(QWidget):
 
     # ── Workspace + XZ click handlers (mirror of JogControlPage) ──
 
-    def _travel_blocked_by_run(self) -> bool:
-        """True (+ shows a hint) if a workflow run is active — don't launch a
-        manual click-to-travel on top of the executor thread (both drive the
-        stage and toggle the non-refcounted poller suspend). Abort the run
-        first. The Jog page owns no executor and needs no such guard."""
+    def _stage_busy(self) -> bool:
+        """True (+ shows a hint) when something else is already driving the stage.
+
+        Consulted by EVERY entry point that can move the stage — Start, both
+        workspace clicks, and the mosaic Go-to. Two drivers on one serial channel
+        is bad enough, but the embedded mosaic scan worker also toggles
+        ``suspend_position_poller``, which is NOT refcounted: whichever finishes
+        first re-enables the poller underneath the other.
+        """
         t = getattr(self, "_exec_thread", None)
         if t is not None and t.is_alive():
             self._status.setText("Busy running — abort first to move manually.")
             return True
+        page = getattr(self, "_scan_page", None)
+        if page is not None:
+            try:
+                scanning = bool(page.is_scanning())
+            except Exception:
+                scanning = False
+            if scanning:
+                self._status.setText(
+                    "A mosaic scan is running — wait for it or abort it first.")
+                return True
         return False
+
+    # Kept as an alias: the old name reads better at the two workspace-click
+    # sites and is what the existing tests reference.
+    def _travel_blocked_by_run(self) -> bool:
+        return self._stage_busy()
+
+    def _travel_to_absolute(self, x_um_abs: float, y_um_abs: float) -> bool:
+        """Retract to safe Z, then travel to an ABSOLUTE stage µm point.
+
+        Deliberately separate from :meth:`_on_workspace_position_clicked`, which
+        receives ZERO-REF µm and adds ``controller.zero_position`` — sharing one
+        handler between the two frames would add the zero twice and put the move
+        millimetres away. Note the parameter names.
+
+        Goes through ``SafeTravelWorker`` with ``target_z_mm=None``, so the needle
+        retracts and WAITS before any XY motion and never descends on arrival.
+        """
+        if not getattr(self._controller, "is_xy_connected", False):
+            self._status.setText("XY stage not connected.")
+            return False
+        if self._stage_busy():
+            return False
+        if not getattr(self._controller, "is_zp_connected", False):
+            # Without the ZP board safe_travel_to silently skips its retract, so
+            # the stage would drive XY with the needle possibly down.
+            self._status.setText(
+                "ZP (Z + pump) board not connected — it is what retracts the "
+                "needle before travel. Reconnect it first.")
+            return False
+        if self._safe_z is None:
+            self._status.setText(
+                "No safe Z configured — set it on the Calibration page before "
+                "travelling.")
+            return False
+        self._travel_worker.start(
+            self._controller, x_um_abs, y_um_abs,
+            safe_z_mm=self._safe_z, target_z_mm=None)
+        return True
 
     def _on_workspace_position_clicked(
         self, x_um_zr: float, y_um_zr: float
@@ -928,7 +1379,7 @@ class CellTargetingWorkflowPage(QWidget):
         """Click-to-travel from the XY workspace (zero-ref µm)."""
         if not getattr(self._controller, "is_xy_connected", False):
             return
-        if self._travel_blocked_by_run():
+        if self._stage_busy():
             return
 
         zero = self._controller.zero_position
@@ -963,7 +1414,7 @@ class CellTargetingWorkflowPage(QWidget):
         """Right-click → Fast travel here: retract Z, travel XY, restore Z."""
         if not getattr(self._controller, "is_xy_connected", False):
             return
-        if self._travel_blocked_by_run():
+        if self._stage_busy():
             return
 
         if self._safe_z is None:
@@ -1004,17 +1455,170 @@ class CellTargetingWorkflowPage(QWidget):
         """Z-reference badge in the XZ view → move_z_absolute (zero-ref mm)."""
         if not getattr(self._controller, "is_zp_connected", False):
             return
+        # The 4th motion entry point on this page, and the one that was still
+        # unguarded: the embedded mosaic scan drives Z through safe_travel_to, so
+        # commanding an absolute Z underneath it puts two drivers on the serial
+        # channel (and on the non-refcounted poller suspend).
+        if self._stage_busy():
+            return
         try:
             self._controller.move_z_absolute(z_mm, from_zero_ref=True)
         except Exception as exc:
             logger.warning("Go-to-Z failed: %s", exc)
 
+    # ── Mosaic point (viewer tab) ─────────────────────────────────
+
+    def _mosaic_context(self):
+        page = self._scan_page
+        if page is None:
+            return None
+        try:
+            return page.mosaic_context(None)
+        except Exception as exc:
+            logger.debug("mosaic_context failed: %s", exc)
+            return None
+
+    def _mosaic_can_command_motion(self) -> bool:
+        """True only when this mosaic's pixel→stage mapping is trustworthy.
+
+        No context ⇒ False, matching ``SpheroidSurveyPanel.can_command_motion``:
+        an unrecorded registration shift is bounded only by ~20 % of the FOV
+        width, which at 10× is larger than a cell, and cell removal descends to
+        ~0.1 mm off the glass.
+        """
+        ctx = self._mosaic_context()
+        return bool(ctx and ctx.get("has_shift") and ctx.get("mosaic_scale"))
+
+    def _mosaic_shift_bound_text(self, ctx) -> str:
+        """The mapping error bound in the operator's own units, when derivable."""
+        try:
+            eff = float((ctx or {}).get("um_per_px") or 0.0)
+            image = (ctx or {}).get("image")
+            if eff > 0 and image is not None:
+                return f" (up to about ±{0.2 * float(image.shape[1]) * eff:.0f} µm)"
+        except Exception:
+            pass
+        return ""
+
+    def _on_mosaic_ready(self, well: str) -> None:
+        """A different mosaic is loaded — drop the picked point."""
+        self._mosaic_point_um = None
+        ctx = self._mosaic_context()
+        if ctx is None:
+            self._mosaic_point_lbl.setText(
+                f"No mosaic stored for {well or 'this well'} — scan it first.")
+        else:
+            self._mosaic_point_lbl.setText(
+                f"Mosaic loaded for {ctx.get('well') or well} — click it to pick "
+                f"a point.")
+        self._mosaic_point_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self._refresh_mosaic_point_buttons()
+        self._update_button_state()
+
+    def _on_mosaic_scene_clicked(self, point) -> None:
+        """A click on the embedded mosaic — records a point, never moves."""
+        ctx = self._mosaic_context()
+        if ctx is None:
+            self._mosaic_point_um = None
+            self._mosaic_point_lbl.setText(
+                "No mosaic stored for the selected well — scan it first.")
+            self._refresh_mosaic_point_buttons()
+            return
+        scale = float(ctx.get("mosaic_scale") or 0.0)
+        if scale <= 0:
+            self._mosaic_point_um = None
+            self._mosaic_point_lbl.setText(
+                "This mosaic has no usable px/µm scale — re-scan the well.")
+            self._refresh_mosaic_point_buttons()
+            return
+        from SupportClasses.SpheroidDetector import back_project_px
+        try:
+            x_um, y_um = back_project_px(
+                (float(point.x()), float(point.y())),
+                ctx["extent_um"], scale, ctx.get("shift_um") or (0.0, 0.0))
+        except Exception as exc:
+            logger.debug("back-projection failed: %s", exc)
+            return
+        self._mosaic_point_um = (x_um, y_um)
+        text = f"Mosaic point: {x_um:.0f}, {y_um:.0f} µm (stage)"
+        if not ctx.get("has_shift"):
+            text += ("  ⚠ this saved mosaic predates registration-shift "
+                     "recording, so its pixel→stage mapping may be off"
+                     + self._mosaic_shift_bound_text(ctx)
+                     + " — re-scan the well before travelling here.")
+            self._mosaic_point_lbl.setStyleSheet(
+                f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+        else:
+            self._mosaic_point_lbl.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        self._mosaic_point_lbl.setText(text)
+        self._refresh_mosaic_point_buttons()
+
+    def _refresh_mosaic_point_buttons(self) -> None:
+        ok = (self._mosaic_point_um is not None
+              and self._mosaic_can_command_motion())
+        self._mosaic_goto_btn.setEnabled(ok)
+        self._mosaic_pick_btn.setEnabled(ok)
+
+    def _on_mosaic_goto(self) -> None:
+        """Travel to the clicked mosaic point (ABSOLUTE stage µm)."""
+        pt = self._mosaic_point_um
+        if pt is None or not self._mosaic_can_command_motion():
+            return
+        if self._travel_to_absolute(float(pt[0]), float(pt[1])):
+            self._status.setText(
+                "Travelling… then click the object on the live view to confirm "
+                "its position.")
+
+    def _on_mosaic_add_pick(self) -> None:
+        """Add the clicked mosaic point to the removal list as a search hint."""
+        pt = self._mosaic_point_um
+        if pt is None or not self._mosaic_can_command_motion():
+            return
+        self._picker.add_pick(float(pt[0]), float(pt[1]),
+                              provenance=PROV_MOSAIC)
+        self._status.setText(
+            "Added a removal target from the mosaic. Its position is a search "
+            "hint — go there and click the object on the live view to confirm "
+            "it, then add a placement for it.")
+
     # ── config helpers ────────────────────────────────────────────
 
+    def _aspirate_bore_index(self) -> int:
+        """Which bore of the assembly pulls the cell up (0 = the datum bore)."""
+        prog = self._program_for_role(BoreRole.ASPIRATE_TARGET)
+        try:
+            return int(prog.bore_index) if prog is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
     def _needle_area_mm2(self) -> float:
+        """Orifice area (mm²) of the bore that ASPIRATES.
+
+        It has to be the SAME bore ``CellRemovalConfig.compute_release_volume_uL``
+        resolves, because that is the passage the executor meters the reagent
+        column through. Reading the flat ``cross_section_area_mm2`` — which by
+        v7.6's fail-safe rule resolves BORE 0 — made the readout, the
+        ``release_volume_uL`` backstop and the Start gate disagree with the
+        executed move by the bore-area ratio as soon as a bore other than the
+        datum aspirated: measured **4.00×** on a 200 µm / 100 µm backpack. That is
+        the v7.7 failure where a warning and the commanded flow read two
+        different bore areas, and the reason ``_trypsin_push_uL`` asks the config.
+
+        Falls back to the flat value for any needle-like stub that cannot resolve
+        a bore, so a single-bore assembly is bit-identical (verified).
+        """
         needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
         if needle is None:
             return 0.0
+        try:
+            area = float(needle_orifice_area_mm2(
+                needle_bore_at(needle, self._aspirate_bore_index())))
+            if area > 0:
+                return area
+        except (TypeError, ValueError, AttributeError):
+            pass
         try:
             return float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1027,9 +1631,19 @@ class CellTargetingWorkflowPage(QWidget):
         return push, pull
 
     def _current_config(self) -> CellRemovalConfig:
+        """Build the executor config from the promoted fields + the bore table.
+
+        The per-bore table supplies the ROLE-derived wiring: which bore aspirates
+        (its index, and its pump for the reagent load) and whether a SEPARATE bore
+        pushes reagent (decision D5), with that row's own push volume / flow /
+        lead time. With no table (no needle configured, or a `__new__`-partial
+        page) every trypsin field stays at its default off/zero, which is the
+        byte-identical pre-v7.9 single-bore sequence.
+        """
         push, _pull = self._push_pull_uL()
-        return CellRemovalConfig(
-            reagent_bore=self._bore_id(),
+        asp = self._program_for_role(BoreRole.ASPIRATE_TARGET)
+        kwargs = dict(
+            reagent_bore=self._aspirate_pump_id(),
             release_depth_mm=float(self._push_depth.value()),
             release_volume_uL=push,   # resolved from the needle (display + backstop)
             extract_multiplier=float(self._pull_mult.value()),
@@ -1038,7 +1652,20 @@ class CellTargetingWorkflowPage(QWidget):
             pull_speed_uL_s=float(self._pull_speed.value()),
             removal_z_offset_mm=float(self._removal_z.value()),
             place_z_offset_mm=float(self._place_z.value()),
+            aspirate_bore_index=(asp.bore_index if asp is not None else 0),
         )
+        tryp = self._program_for_role(BoreRole.PUSH_REAGENT)
+        if tryp is not None and tryp.pump_id:
+            kwargs.update(
+                trypsin_enabled=True,
+                trypsin_bore=tryp.pump_id,
+                trypsin_bore_index=tryp.bore_index,
+                trypsin_depth_mm=float(tryp.depth_mm),
+                trypsin_volume_uL=float(tryp.volume_uL),
+                trypsin_push_rate_uL_s=float(tryp.rate_uL_s),
+                trypsin_lead_time_s=float(tryp.lead_time_s),
+            )
+        return CellRemovalConfig(**kwargs)
 
     def _plate_offset_to_zref(self, offset_mm: float) -> float | None:
         """Height above the calibrated plate bottom (mm) → zero-ref Z (mm),
@@ -1075,22 +1702,82 @@ class CellTargetingWorkflowPage(QWidget):
             self._refresh_reagent_status()
 
     def _update_button_state(self, *_):
-        balanced = self._picker.is_balanced()
+        # The picker + run row are built after the Setup tab, and a settings
+        # restore can fire a change notification in between — so tolerate a
+        # half-built page rather than crashing construction.
+        picker = getattr(self, "_picker", None)
+        if picker is None or not hasattr(self, "_start_btn"):
+            return
+        balanced = picker.is_balanced()
         has_bore = self._bore.count() > 0
         running = self._exec_thread is not None and self._exec_thread.is_alive()
-        self._start_btn.setEnabled(balanced and has_bore and not running)
+        # A mosaic scan is also driving the stage (and the non-refcounted poller
+        # suspend), so Start must wait for it — see _stage_busy.
+        page = getattr(self, "_scan_page", None)
+        scanning = False
+        if page is not None:
+            try:
+                scanning = bool(page.is_scanning())
+            except Exception:
+                scanning = False
+        self._start_btn.setEnabled(
+            balanced and has_bore and not running and not scanning)
         self._abort_btn.setEnabled(running)
 
-    # ── Start / Abort ─────────────────────────────────────────────
+    # ── Start gates ───────────────────────────────────────────────
+
+    def _mosaic_shift_refusal(self) -> str | None:
+        """Refuse the run when a target's position came from an unshifted mosaic.
+
+        ``FluorescenceMosaicStore.has_shift`` distinguishes "recorded as zero"
+        from "never recorded"; a pre-v7.8 mosaic has no recorded registration
+        shift and its pixel→stage error is bounded only by ~20 % of the FOV width
+        (hundreds of µm at 10× — larger than a cell). Cell removal descends to
+        ~0.1 mm off the glass, so such a position must never command motion.
+
+        In v7.8 this gate was GUI-visual only; here it blocks Start. A target the
+        operator clicked on the LIVE view carries no mosaic provenance and is
+        therefore never affected.
+        """
+        picker = self._picker
+        try:
+            targets = list(picker.picks()) + list(picker.places())
+            from_mosaic = [t for t in targets
+                           if picker.provenance(t.target_id) == PROV_MOSAIC]
+        except Exception:
+            return None
+        if not from_mosaic:
+            return None
+        if self._mosaic_can_command_motion():
+            return None
+        ctx = self._mosaic_context()
+        ids = ", ".join(t.target_id for t in from_mosaic[:4])
+        if len(from_mosaic) > 4:
+            ids += ", …"
+        return (
+            f"{len(from_mosaic)} target(s) ({ids}) came from a mosaic whose "
+            f"registration shift was never recorded, so their pixel→stage "
+            f"mapping may be off{self._mosaic_shift_bound_text(ctx)} — larger "
+            f"than a cell. Re-scan the well, or go to each one and click it on "
+            f"the live view to confirm its position, before running.")
 
     def _on_start(self):
-        if self._exec_thread is not None and self._exec_thread.is_alive():
+        # ONE busy check for every stage driver — the executor thread AND the
+        # embedded mosaic scan, which also drives the stage and toggles the
+        # non-refcounted poller suspend. _update_button_state greys Start out too,
+        # but a race or a programmatic call must not get through either.
+        if self._stage_busy():
             return
 
         if not self._picker.is_balanced():
             self._status.setText(
                 "Each removal needs a paired placement — pick and place counts "
                 "must match.")
+            return
+
+        refusal = self._mosaic_shift_refusal()
+        if refusal:
+            self._status.setText(refusal)
             return
 
         pairs = self._picker.pairs()
@@ -1141,6 +1828,30 @@ class CellTargetingWorkflowPage(QWidget):
                 "Plate bottom Z is not calibrated — can't resolve the reagent "
                 "dip Z.")
             return
+
+        # A dedicated pushing bore must have something to load, or the executor
+        # would raise mid-run with the needle already in the well.
+        trypsin_pos = None
+        if cfg.trypsin_enabled:
+            if not self._trypsin_reagent():
+                self._status.setText(
+                    f"Bore {cfg.trypsin_bore_index + 1} is set to push reagent — "
+                    "choose the reagent it loads on the Setup tab, or set that "
+                    "bore to Idle.")
+                return
+            trypsin_pos = self._trypsin_source_pos()
+            if trypsin_pos is None:
+                self._status.setText(
+                    f"The pushing bore's reagent “{self._trypsin_reagent()}” has "
+                    "no calibrated reagent well — assign it (Hardware Setup → "
+                    "Ink) and run Plate Location.")
+                return
+            if self._trypsin_push_uL() <= 0:
+                self._status.setText(
+                    f"Bore {cfg.trypsin_bore_index + 1}'s push volume resolves "
+                    "to 0 µL — set an explicit volume or a push depth with that "
+                    "bore's geometry on Hardware Setup → Needle.")
+                return
 
         # Prep / clean / wash-after-pickup inputs + gates (shared service wells).
         prep_enabled = self._prep_check.isChecked()
@@ -1194,6 +1905,11 @@ class CellTargetingWorkflowPage(QWidget):
         executor.place_z_mm = place_z       # placement height
         executor.reagent_well_pos = reagent_pos
         executor.reagent_dip_z_mm = reagent_dip_z
+        # The dedicated pushing bore's own reagent well. Goes through
+        # set_well_positions (never a direct dict mutation — _well_positions is a
+        # CLASS-level default, so mutating it in place would leak across runs).
+        if trypsin_pos is not None:
+            executor.set_well_positions({cfg.trypsin_well_key: trypsin_pos})
         # Advanced motion / timeout knobs (always applied).
         executor.intra_well_retract_mm = float(self._intra_retract.value())
         executor.z_timeout_s = float(self._z_timeout.value())
@@ -1241,8 +1957,14 @@ class CellTargetingWorkflowPage(QWidget):
             bridge.finished.emit(ok)
 
         n = len(pairs)
+        # Surface the per-bore advisories at the moment of the run — an unmeasured
+        # bore offset does not fail loudly, it just lands 100-500 µm out.
+        notes = []
+        if self._setup_panel is not None:
+            notes = self._setup_panel.validation_notes()
+        note_text = ("  ⚠ " + "  ⚠ ".join(notes)) if notes else ""
         self._status.setText(
-            f"Running {n} cell removal{'s' if n > 1 else ''}…")
+            f"Running {n} cell removal{'s' if n > 1 else ''}…{note_text}")
         self._exec_thread = threading.Thread(
             target=worker, name="CellRemovalExecutor", daemon=True)
         self._exec_thread.start()

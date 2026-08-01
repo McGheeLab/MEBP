@@ -26,7 +26,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 # Import physical models — these are the foundation layer
-from .PhysicalModels import NeedleSpec, SyringeSpec, InkSpec
+from .PhysicalModels import (
+    NeedleSpec, SyringeSpec, InkSpec,
+    needle_flow_segments, needle_orifice_area_mm2, needle_orifice_id_m,
+    needle_particle_ratio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,12 @@ class FlowSafetyResult:
     # Overall
     is_safe: bool = True
     warnings: list[str] = field(default_factory=list)
+
+    # Which bore stage dominates the pressure drop (v7.6; "" for a single-stage
+    # needle whose only segment is the barrel). Appended last so positional
+    # construction is unaffected.
+    limiting_segment: str = ""
+    tip_pressure_fraction: float = 0.0
 
     @property
     def pressure_kPa(self) -> float:
@@ -231,24 +241,78 @@ def wall_shear_stress(
     return (32 * viscosity_Pa_s * flow_rate_m3_s) / (math.pi * diameter_m ** 3)
 
 
+def needle_resistance_factor(needle) -> float:
+    """Σ K over the bore's segments (m⁻³).
+
+    Series hydraulic resistance is additive at constant Q, so the total
+    resistance is R = 128·µ/π · ΣK. For a pulled capillary the tip term
+    dominates by (D_barrel/D_tip)⁴ — six orders of magnitude at 1 mm → 30 µm.
+    """
+    total = 0.0
+    for seg in needle_flow_segments(needle):
+        k = seg.resistance_factor
+        if not math.isfinite(k):
+            return float("inf")
+        total += k
+    return total
+
+
+def needle_hydraulic_resistance(needle, viscosity_Pa_s: float) -> float:
+    """Total series resistance R (Pa·s/m³) such that ΔP = R·Q."""
+    if viscosity_Pa_s <= 0:
+        return float("inf")
+    return (128.0 * viscosity_Pa_s / math.pi) * needle_resistance_factor(needle)
+
+
+def needle_pressure_drop_Pa(needle, viscosity_Pa_s: float, flow_rate_m3_s: float) -> float:
+    """Segment-aware pressure drop across the whole bore.
+
+    Reduces exactly to Hagen-Poiseuille for a single straight cylinder.
+    """
+    R = needle_hydraulic_resistance(needle, viscosity_Pa_s)
+    return float("inf") if not math.isfinite(R) else R * flow_rate_m3_s
+
+
+def limiting_flow_segment(needle) -> tuple[str, float]:
+    """Which bore stage dominates the pressure drop, and the TIP's share of it.
+
+    Returns ``(limiting_segment_name, tip_fraction)``. ``tip_fraction`` is the
+    pulled tip's share of the total resistance and is 0.0 for a single-stage
+    needle (which has no tip at all), so it reads as "how much of the pressure
+    drop the pull is responsible for".
+    """
+    factors = [(s.name, s.resistance_factor) for s in needle_flow_segments(needle)]
+    finite = [(n, k) for n, k in factors if math.isfinite(k)]
+    total = sum(k for _, k in finite)
+    if not factors:
+        return ("", 0.0)
+    name = max(factors, key=lambda item: item[1])[0]
+    if total <= 0:
+        return (name, 0.0)
+    tip_k = sum(k for n, k in finite if n == "tip")
+    return (name, tip_k / total)
+
+
 def classify_granular_regime(needle: NeedleSpec, ink: InkSpec) -> tuple[GranularRegime, float]:
     """
     Classify granular/cell flow regime through needle.
 
-    Uses the ratio of needle inner diameter to maximum particle diameter:
+    Uses the ratio of the needle's ORIFICE inner diameter (the pulled tip when
+    present) to the maximum particle diameter — a particle jams at the
+    constriction, not in the bulk barrel:
     - No particles: pure liquid
-    - Free flow: needle_ID > 4× particle diameter
-    - Intermittent: 1× < needle_ID < 4× particle diameter (risk of clogging)
-    - Jamming: needle_ID < 1× particle diameter (pick-and-place only)
+    - Free flow: orifice_ID > 4× particle diameter
+    - Intermittent: 1× < orifice_ID < 4× particle diameter (risk of clogging)
+    - Jamming: orifice_ID < 1× particle diameter (pick-and-place only)
 
     Returns:
-        (regime, ratio) where ratio = needle_ID / particle_diameter
+        (regime, ratio) where ratio = orifice_ID / particle_diameter
     """
     particle_d = ink.max_particle_diameter_um
     if particle_d <= 0:
         return GranularRegime.NO_PARTICLES, 0.0
 
-    ratio = needle.id_um / particle_d
+    ratio = needle_particle_ratio(needle, particle_d)
 
     if ratio >= 4.0:
         return GranularRegime.FREE_FLOW, ratio
@@ -264,23 +328,52 @@ def max_safe_flow_rate_uL_s(
     pressure_limit_Pa: float = DEFAULT_PRESSURE_LIMIT_PA,
 ) -> float:
     """
-    Calculate maximum flow rate that stays below pressure limit.
+    Calculate maximum flow rate that stays below the pressure limit across the
+    WHOLE bore.
 
-    Rearranging Hagen-Poiseuille:
-    Q_max = (ΔP_max × π × d⁴) / (128 × µ × L)
+    Q_max = ΔP_max / R_total,  where R_total = 128·µ/π · Σ Kᵢ
+
+    v7.6: the bore may be two stages in series (bulk barrel + pulled tip).
+    Resistances add, and because K ∝ L/d⁴ a 30 µm tip 3 mm long dominates a
+    1 mm barrel by ~10⁶× — so the ceiling is set almost entirely by the tip,
+    which is the physically correct and the safe answer for a glass tip that
+    shatters under over-pressure.
 
     Returns:
         Maximum safe flow rate in µL/s
     """
-    d = needle.id_m
-    if d <= 0 or ink.viscosity_Pa_s <= 0:
+    mu = ink.viscosity_Pa_s
+    if mu <= 0:
         return 0.0
 
-    length_m = needle.length_mm / 1000.0
-    q_max_m3_s = (pressure_limit_Pa * math.pi * d ** 4) / (128 * ink.viscosity_Pa_s * length_m)
+    segs = needle_flow_segments(needle)
 
-    # Convert m³/s → µL/s (1 m³ = 1e9 µL)
-    return q_max_m3_s * 1e9
+    # --- Bit-exact legacy fast path -------------------------------------
+    # One straight cylinder: evaluate the ORIGINAL expression in the ORIGINAL
+    # operand order so every straight-hypodermic ceiling stays float-identical
+    # to pre-v7.6 — not merely almost-equal. The ceiling is stored and compared
+    # downstream (SafetyLimits.set_max_flow_rate, Quick Print's speed chain,
+    # print records), so a last-ULP drift would propagate. Do not "simplify".
+    if len(segs) == 1 and not segs[0].is_taper:
+        d = getattr(needle, "id_m", None)
+        if not isinstance(d, (int, float)):
+            d = segs[0].d_in_um * 1e-6
+        length_mm = getattr(needle, "length_mm", None)
+        if not isinstance(length_mm, (int, float)):
+            length_mm = segs[0].length_mm
+        if d <= 0:
+            return 0.0
+        length_m = length_mm / 1000.0
+        if length_m <= 0:
+            return 0.0
+        q_max_m3_s = (pressure_limit_Pa * math.pi * d ** 4) / (128 * mu * length_m)
+        return q_max_m3_s * 1e9
+
+    # --- General series path --------------------------------------------
+    R = needle_hydraulic_resistance(needle, mu)
+    if not math.isfinite(R) or R <= 0:
+        return 0.0
+    return (pressure_limit_Pa / R) * 1e9
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +428,8 @@ def extrusion_flow_rate(
     Calculate required extrusion flow rate from the deposited bead geometry.
 
     v7.5.x (F-1) — ONE bead model everywhere: the deposited bead is a stream the
-    size of the needle's **inner bore**, optionally scaled by an extrusion
+    size of the needle's **orifice** (the pulled tip when present, else the
+    inner bore — v7.6), optionally scaled by an extrusion
     ``modifier`` (the operator's "line thickness" lever). This matches Quick
     Print's auto-flow (``bore_area × modifier``); it replaces the legacy
     ``outer-Ø × layer_height`` rectangular approximation. ``layer_height`` no
@@ -349,16 +443,17 @@ def extrusion_flow_rate(
 
     Args:
         print_speed_mm_s: Linear travel speed (mm/s)
-        needle: Needle specification (uses the INNER bore)
+        needle: Needle specification (uses the ORIFICE — the pulled tip when
+            present, else the inner bore)
         layer_height_mm: Deprecated — ignored (kept so older positional callers
             don't break); pass the modifier instead.
-        extrusion_modifier: Bead thickness multiplier (1.0 = a pure bore-sized
-            stream).
+        extrusion_modifier: Bead thickness multiplier (1.0 = a pure
+            orifice-sized stream).
 
     Returns:
         Required flow rate in µL/s (1 mm³ = 1 µL)
     """
-    return print_speed_mm_s * needle.cross_section_area_mm2 * extrusion_modifier
+    return print_speed_mm_s * needle_orifice_area_mm2(needle) * extrusion_modifier
 
 
 def extrusion_pump_speed(
@@ -419,18 +514,25 @@ def calculate_flow_safety(
     warnings = []
 
     # --- Unit conversions to SI ---
-    d_m = needle.id_m                                 # diameter (m)
-    L_m = needle.length_mm / 1000.0                    # length (m)
+    # v7.6: Reynolds and wall shear are worst at the narrowest section, so they
+    # use the ORIFICE (the pulled tip when present); the pressure drop is a path
+    # integral and sums every segment. For a straight needle the orifice IS the
+    # bore and the segment sum IS the single cylinder, so nothing changes.
+    d_m = needle_orifice_id_m(needle)                  # orifice diameter (m)
+    segs = needle_flow_segments(needle)
+    L_m = sum(s.length_m for s in segs)                # total wetted length (m)
     mu = ink.viscosity_Pa_s                            # viscosity (Pa·s)
     rho = ink.density_g_mL * 1000.0                    # density (kg/m³)
     Q_m3_s = requested_flow_rate_uL_s * 1e-9          # flow rate (m³/s)
 
-    # Cross-sectional area of needle bore
+    # Cross-sectional area at the orifice → peak mean velocity
     A_m2 = math.pi * (d_m / 2) ** 2                    # m²
 
-    # --- 1. Pressure drop (Hagen-Poiseuille) ---
+    result.limiting_segment, result.tip_pressure_fraction = limiting_flow_segment(needle)
+
+    # --- 1. Pressure drop (series Hagen-Poiseuille) ---
     if d_m > 0 and mu > 0 and L_m > 0:
-        pressure = hagen_poiseuille_pressure(mu, L_m, Q_m3_s, d_m)
+        pressure = needle_pressure_drop_Pa(needle, mu, Q_m3_s)
         result.pressure_at_requested_rate_Pa = pressure
 
         if pressure > pressure_limit_Pa:

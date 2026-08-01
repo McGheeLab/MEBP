@@ -70,6 +70,10 @@ RESOLUTION_PRESETS = [
 # unusable value. A middling exposure so the operator sees *something*.
 _DEFAULT_EXPOSURE_S = 0.03
 
+# Display-level range for the mono-16 sensor (black/white points used when the
+# per-frame auto-scale is turned OFF).
+_LEVEL_MAX = 65535
+
 
 # ════════════════════════════════════════════════════════════════════
 #  DLL Discovery
@@ -296,6 +300,14 @@ class AndorBackend:
         self._h = 0
         self._eSize = 0
         self._device_id = ""
+        # Display scaling (mono-16 -> 8-bit conversion for the live view).
+        # auto=True reproduces the historical per-frame percentile auto-scale
+        # (the display brightness "chases" the scene); auto=False freezes the
+        # mapping at fixed black/white levels in sensor counts.
+        self._auto_scale = True
+        self._scale_lo = 0
+        self._scale_hi = _LEVEL_MAX
+        self._last_auto_levels: "tuple[float, float] | None" = None
 
     # ── Lifecycle ─────────────────────────────────────────────────
     def open(self, device_id: str, resolution_index: int | None = None) -> bool:
@@ -428,7 +440,22 @@ class AndorBackend:
                 continue
             if raw is None:
                 continue
-            bgr = _mono_to_bgr8(raw)
+            with self._lock:
+                auto = self._auto_scale
+                manual_levels = (self._scale_lo, self._scale_hi)
+            levels = None
+            if auto:
+                # Per-frame percentile auto-scale; remember the levels so a
+                # switch to manual freezes the CURRENT look instead of jumping.
+                arr = np.asarray(raw) if _NP_AVAILABLE else None
+                if arr is not None and arr.ndim >= 2 and arr.dtype != np.uint8:
+                    plane = arr if arr.ndim == 2 else arr[..., 0]
+                    levels = _auto_levels(plane)
+                    with self._lock:
+                        self._last_auto_levels = levels
+            else:
+                levels = manual_levels
+            bgr = _mono_to_bgr8(raw, levels=levels)
             if bgr is None:
                 continue
             with self._lock:
@@ -567,7 +594,7 @@ class AndorBackend:
                     f"{'' if (ok and started) else ' [partial]'}")
         return ok and started
 
-    # ── Hardware controls (exposure only) ─────────────────────────
+    # ── Hardware controls (exposure + display scaling) ────────────
     def get_exposure_time(self):
         """Current exposure time in microseconds, or None."""
         cam = self._cam
@@ -606,6 +633,70 @@ class AndorBackend:
                     int(round(cur * 1e6)))
         except Exception:
             return None
+
+    # ── Display scaling (mono-16 → 8-bit display conversion) ──────
+    # The Zyla has NO ISP auto-gain; what LOOKS like the camera auto-adjusting
+    # is this backend's per-frame percentile auto-scale in the mono16→BGR8
+    # display conversion. These controls make that behaviour an option: auto
+    # ON = per-frame normalize (historical default), auto OFF = fixed
+    # black/white levels in raw sensor counts (0..65535).
+
+    def get_display_auto_scale(self) -> bool:
+        with self._lock:
+            return bool(self._auto_scale)
+
+    def set_display_auto_scale(self, enabled: bool) -> bool:
+        """Toggle per-frame auto-scaling of the displayed image.
+
+        Turning auto OFF seeds the manual black/white levels from the levels
+        the last auto-scaled frame used, so the image freezes at its current
+        appearance rather than jumping to an arbitrary mapping.
+        """
+        enabled = bool(enabled)
+        with self._lock:
+            if not enabled and self._auto_scale and self._last_auto_levels:
+                lo, hi = self._last_auto_levels
+                self._scale_lo = max(0, min(_LEVEL_MAX - 1, int(round(lo))))
+                self._scale_hi = max(self._scale_lo + 1,
+                                     min(_LEVEL_MAX, int(round(hi))))
+            self._auto_scale = enabled
+        logger.info(f"Andor display auto-scale -> {enabled}"
+                    + ("" if enabled else
+                       f" (levels {self._scale_lo}..{self._scale_hi})"))
+        return True
+
+    def get_display_levels(self) -> tuple:
+        """(black_level, white_level) in raw sensor counts."""
+        with self._lock:
+            return (int(self._scale_lo), int(self._scale_hi))
+
+    def put_display_black(self, counts) -> bool:
+        """Set the manual black level (counts mapping to display 0)."""
+        try:
+            v = int(round(float(counts)))
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            self._scale_lo = max(0, min(_LEVEL_MAX - 1, v))
+            if self._scale_hi <= self._scale_lo:
+                self._scale_hi = self._scale_lo + 1
+        return True
+
+    def put_display_white(self, counts) -> bool:
+        """Set the manual white level (counts mapping to display 255)."""
+        try:
+            v = int(round(float(counts)))
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            self._scale_hi = max(1, min(_LEVEL_MAX, v))
+            if self._scale_lo >= self._scale_hi:
+                self._scale_lo = self._scale_hi - 1
+        return True
+
+    def get_display_level_range(self) -> tuple:
+        """(min, max, default_white) for the level sliders."""
+        return (0, _LEVEL_MAX, _LEVEL_MAX)
 
     # The Zyla exposes none of these ToupTek ISP controls. Report None so the
     # settings dialog hides them; software correction still works display-side.
@@ -648,6 +739,7 @@ class AndorBackend:
         Same shape as ToupCamBackend.get_settings(); unsupported controls are
         None so the dialog hides them.
         """
+        lo, hi = self.get_display_levels()
         return {
             "brightness": None,
             "contrast": None,
@@ -657,6 +749,9 @@ class AndorBackend:
             "auto_exposure": None,
             "exposure_range_us": self.get_exposure_time_range(),
             "gain_range_pct": None,
+            "andor_auto_scale": self.get_display_auto_scale(),
+            "andor_scale_lo": lo,
+            "andor_scale_hi": hi,
             "resolution": self.get_resolution(),
             "eSize": self.get_eSize(),
             "resolutions": self.get_resolution_list(),
@@ -668,11 +763,28 @@ class AndorBackend:
 #  Helpers
 # ════════════════════════════════════════════════════════════════════
 
-def _mono_to_bgr8(frame) -> "np.ndarray | None":
+def _auto_levels(arr) -> "tuple[float, float]":
+    """1–99 percentile (lo, hi) of a 2-D plane, from a DECIMATED sample.
+
+    Percentile sorts, so doing it on the full 4.2M-px frame every tick is
+    costly; the sample bounds the cost while the scale is applied full-frame.
+    """
+    step = max(1, int(max(arr.shape) // 512))
+    sample = arr[::step, ::step]
+    try:
+        lo, hi = np.percentile(sample, (1.0, 99.0))
+    except Exception:
+        lo, hi = float(arr.min()), float(arr.max())
+    return float(lo), float(hi)
+
+
+def _mono_to_bgr8(frame, levels=None) -> "np.ndarray | None":
     """Convert a mono (2-D) uint16/uint8 frame to an 8-bit BGR image.
 
-    Uses a per-frame 1–99 percentile auto-scale so dim (e.g. fluorescence)
-    scenes remain visible. Already-BGR frames pass through unchanged.
+    ``levels=(lo, hi)`` maps those raw counts to display 0..255 (fixed manual
+    scaling); ``levels=None`` keeps the per-frame 1–99 percentile auto-scale so
+    dim (e.g. fluorescence) scenes remain visible. Already-BGR frames pass
+    through unchanged.
     """
     if not _NP_AVAILABLE or frame is None:
         return None
@@ -694,16 +806,10 @@ def _mono_to_bgr8(frame) -> "np.ndarray | None":
     if arr.dtype == np.uint8:
         gray8 = arr
     else:
-        # Auto-scale range from a DECIMATED sample (percentile sorts, so doing it
-        # on the full 4.2M-px frame every tick is costly); the scale itself is
-        # then applied to the full frame.
-        step = max(1, int(max(arr.shape) // 512))
-        sample = arr[::step, ::step]
-        try:
-            lo, hi = np.percentile(sample, (1.0, 99.0))
-        except Exception:
-            lo, hi = float(arr.min()), float(arr.max())
-        lo, hi = float(lo), float(hi)
+        if levels is not None:
+            lo, hi = float(levels[0]), float(levels[1])
+        else:
+            lo, hi = _auto_levels(arr)
         if not (hi > lo):
             hi = lo + 1.0
         f = arr.astype(np.float32)

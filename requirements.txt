@@ -23,5 +23,14 @@ pylablib>=1.4.3; sys_platform == "win32"
 numba>=0.60; sys_platform == "win32"
 llvmlite>=0.43; sys_platform == "win32"
 
+# Motorized microscope body (Nikon Ti Eclipse) — OPTIONAL.
+# Only the "micromanager" backend of SupportClasses/MicroscopeControl.py needs
+# this; the import is guarded, so the app runs fine without it (the Nikon SDK
+# and simulated backends are unaffected). Deps are just numpy, which is already
+# pinned above. NOTE: pymmcore is the MMCore engine only — driving a real Ti
+# ALSO needs Micro-Manager's device adapters AND Nikon's own driver/SDK, which
+# Micro-Manager's adapter wraps rather than replaces (see micro-manager.org/NikonTI).
+pymmcore==12.5.0.75.0
+
 # Packaging (build_exe.py)
 pyinstaller==6.21.0

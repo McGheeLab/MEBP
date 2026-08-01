@@ -41,6 +41,45 @@ logger = logging.getLogger(__name__)
 REFERENCE_VISCOSITY_CP = 1.0
 
 
+def _reference_flow_ceiling(bore_like) -> float | None:
+    """Hagen–Poiseuille flow ceiling (µL/s) for ONE bore, at the fixed
+    :data:`REFERENCE_VISCOSITY_CP`.
+
+    ``bore_like`` may be a whole ``NeedleSpec`` (which resolves bore 0) or a
+    single ``NeedleBore`` — the two are duck-compatible, and a ``NeedleBore``
+    hits ``max_safe_flow_rate_uL_s``'s bit-exact single-cylinder fast path with
+    the SAME operands (``id_m`` / ``length_mm``), so a single-bore needle's
+    ceiling is unchanged to the last ULP. That matters: the ceiling is stored
+    and compared downstream (Quick Print's speed chain, print records).
+
+    Returns ``None`` — never 0.0 — when there is nothing valid to derive from,
+    so the caller LEAVES an existing ceiling alone rather than widening it to
+    0 = "no limit enforced".
+    """
+    if bore_like is None:
+        return None
+    # A duck-typed stub / MagicMock has no usable bore, and `id_m > 0` on one
+    # raises; require a real number so the gate is total.
+    d = getattr(bore_like, "id_m", None)
+    if not isinstance(d, (int, float)) or isinstance(d, bool) or d <= 0:
+        return None
+    try:
+        # Imported lazily: FlowPhysics imports PhysicalModels, and keeping this
+        # module free of SupportClasses imports at load time is deliberate.
+        from .FlowPhysics import (
+            max_safe_flow_rate_uL_s, DEFAULT_PRESSURE_LIMIT_PA,
+        )
+        from .PhysicalModels import InkSpec
+        ref_ink = InkSpec(name="__reference__",
+                          viscosity_cP=REFERENCE_VISCOSITY_CP)
+        c = max_safe_flow_rate_uL_s(bore_like, ref_ink,
+                                    DEFAULT_PRESSURE_LIMIT_PA)
+    except Exception as e:
+        logger.warning(f"needle-derived flow ceiling failed: {e}")
+        return None
+    return float(c) if c and c > 0 else None
+
+
 @dataclass
 class SafetyLimits:
     """Software endstops for XY, Z, and pump axes."""
@@ -370,27 +409,58 @@ class SafetyLimits:
         # v7.5.x: per-pump max flow ceiling = a NEEDLE-DERIVED flow rate (µL/s)
         # from needle inner-diameter + length via Hagen–Poiseuille, using the
         # fixed REFERENCE_VISCOSITY_CP (ink-independent). Replaces the old coarse
-        # gauge→flow lookup table. One value per needle → applied to every
-        # configured pump. A missing/degenerate needle leaves the existing
-        # ceilings UNTOUCHED (never widened to 0 = "no limit").
+        # gauge→flow lookup table. A missing/degenerate needle leaves the
+        # existing ceilings UNTOUCHED (never widened to 0 = "no limit").
+        #
+        # v7.9: the ceiling is derived PER PUMP from THAT PUMP'S OWN BORE. Each
+        # bore of a multi-bore assembly has its own pump, i.e. N independent
+        # pressure sources — a 22G bore and a 30 µm pulled tip on the same
+        # backpack differ by ~2000× in Q_max, so one shared ceiling would let the
+        # narrow bore be driven far over-pressure and shatter a glass tip.
+        # (Deliberately NOT 1/R = Σ1/R_i: that is one source feeding N parallel
+        # branches, which is not this plumbing.)
+        #
+        # Resolving "which bore feeds this pump" MUST use the same authority the
+        # rest of the config uses — `HardwareConfig.resolved_bore_pump_map`,
+        # which prefers the bores' own `pump_id` and falls back to the stored
+        # map. Asking only the bores would leave the exact hole this change
+        # exists to close: a backpack whose bores are not wired up yet but whose
+        # MAP says P2 feeds a 30 µm pulled tip validates clean, and P2 would
+        # inherit the 22 G bore's ceiling — measured 7071× over-pressure.
+        #
+        # A pump that NEITHER authority claims falls back to the NARROWEST bore
+        # on a multi-bore assembly (the fail-safe direction: too slow is
+        # recoverable, over-pressure shatters glass) and to the assembly value
+        # otherwise — bit-identical to pre-v7.9 for every single-bore needle,
+        # since bore 0 mirrors the flat fields, and unchanged for a synthesized
+        # multi-bore needle, whose bores are all identical.
         needle = getattr(hardware_config, "needle", None)
         gauge = getattr(needle, "gauge", None) if needle else None
-        ceiling = None
-        if needle is not None:
+        ceiling = _reference_flow_ceiling(needle)
+
+        # Only an EXPLICIT bore list is heterogeneous; a pre-v7.9 needle
+        # synthesizes identical bores, so neither branch below can change it.
+        # Require a real sequence: a duck-typed stub hands back something
+        # unindexable (or, for a plain Mock, uniterable), and this must degrade
+        # to "single-bore" rather than raise — it is called on every config push.
+        from .PhysicalModels import needle_bore_for_pump
+        raw_bores = getattr(needle, "bores", None) if needle is not None else None
+        explicit_bores = list(raw_bores) if isinstance(raw_bores, (list, tuple)) else []
+        if len(explicit_bores) >= 2:
+            per_bore = [c for c in (_reference_flow_ceiling(b)
+                                    for b in explicit_bores) if c is not None]
+            if per_bore:
+                narrowest = min(per_bore)
+                if ceiling is None or narrowest < ceiling:
+                    ceiling = narrowest
+            bore_map = {}
             try:
-                from .FlowPhysics import (
-                    max_safe_flow_rate_uL_s, DEFAULT_PRESSURE_LIMIT_PA,
-                )
-                from .PhysicalModels import InkSpec
-                ref_ink = InkSpec(name="__reference__",
-                                  viscosity_cP=REFERENCE_VISCOSITY_CP)
-                if getattr(needle, "id_m", 0) and needle.id_m > 0:
-                    c = max_safe_flow_rate_uL_s(needle, ref_ink,
-                                                DEFAULT_PRESSURE_LIMIT_PA)
-                    if c and c > 0:
-                        ceiling = float(c)
-            except Exception as e:
-                logger.warning(f"needle-derived flow ceiling failed: {e}")
+                bore_map = hardware_config.resolved_bore_pump_map()
+            except Exception as e:                      # duck-typed stub
+                logger.debug(f"resolved_bore_pump_map unavailable: {e}")
+        else:
+            bore_map = {}
+
         if ceiling is None:
             logger.warning(
                 "Pump max flow ceiling NOT updated (no needle / invalid bore / "
@@ -401,15 +471,44 @@ class SafetyLimits:
             if pump_cfg is None or not pump_cfg.is_configured:
                 continue
 
-            # Set the needle-derived flow-rate ceiling (same for every pump on
-            # this needle). Skip when no valid ceiling so an existing limit isn't
-            # clobbered.
-            if ceiling is not None:
-                self.set_max_flow_rate(pid, ceiling)
-                length_mm = getattr(needle, "length_mm", 0.0)
+            # Resolve this pump's own bore; `ceiling` is the fallback for a pump
+            # neither authority claims — the assembly value on every pre-v7.9
+            # setup, the narrowest bore on a heterogeneous assembly.
+            pump_ceiling, source = ceiling, f"{gauge}G"
+            bore = needle_bore_for_pump(needle, pid) if needle is not None else None
+            if bore is None and bore_map:
+                # The bores did not claim it, but the config's map did.
+                for k, mapped in bore_map.items():
+                    try:
+                        idx, want = int(k), str(mapped).strip().upper()
+                    except (TypeError, ValueError):
+                        continue
+                    if want == pid and 0 <= idx < len(explicit_bores):
+                        bore = explicit_bores[idx]
+                        break
+            if bore is not None:
+                bore_ceiling = _reference_flow_ceiling(bore)
+                if bore_ceiling is not None:
+                    pump_ceiling = bore_ceiling
+                    source = (getattr(bore, "summary_line", lambda: "")()
+                              or f"{getattr(bore, 'gauge', None)}G")
+                else:
+                    logger.warning(
+                        f"{pid}: bore is unusable for a flow ceiling "
+                        f"(invalid geometry) — using the fallback value.")
+
+            # Skip when no valid ceiling so an existing limit isn't clobbered.
+            if pump_ceiling is not None:
+                self.set_max_flow_rate(pid, pump_ceiling)
+                # A duck-typed needle may hand back a non-numeric length; a
+                # format crash here would abort the whole limits derivation.
+                length_mm = getattr(bore if bore is not None else needle,
+                                    "length_mm", 0.0)
+                if not isinstance(length_mm, (int, float)):
+                    length_mm = 0.0
                 logger.info(
-                    f"{pid}: max flow rate = {ceiling:.3f} µL/s "
-                    f"({gauge}G, L={length_mm:.1f} mm, "
+                    f"{pid}: max flow rate = {pump_ceiling:.3f} µL/s "
+                    f"({source}, L={length_mm:.1f} mm, "
                     f"ref µ={REFERENCE_VISCOSITY_CP:g} cP)")
 
             # Set pump travel limits from syringe stroke length — UNLESS the

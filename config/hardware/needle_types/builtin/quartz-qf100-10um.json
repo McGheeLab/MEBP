@@ -1,0 +1,16 @@
+{
+  "id": "quartz-qf100-10um",
+  "display_name": "Quartz QF100-70-10 · 10 µm tip (tapered)",
+  "manufacturer": "Sutter",
+  "model": "QF100-70-10",
+  "barrel_id_um": 700.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 100.0,
+  "tip_id_um": 10.0,
+  "tip_length_mm": 8.0,
+  "tip_od_um": 18.0,
+  "tip_profile": "cone",
+  "puller_program": "P-2000 (quartz): HEAT 750, FIL 4, VEL 40, DEL 150, PUL 165",
+  "notes": "Long tapered quartz pull — modelled as a cone, so the resistance is integrated along the taper rather than assuming the full length at the 10 um orifice.",
+  "builtin": true
+}

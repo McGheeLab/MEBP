@@ -49,6 +49,10 @@ AXIS_MAP: dict[str, str] = {
 
 AXIS_MAP_REVERSE: dict[str, str] = {v: k for k, v in AXIS_MAP.items()}
 
+# Marlin fan index (M106 P<n>) the microscope illumination LED is wired to.
+# FAN0 on the SKR Mini E3 (PC6). Not a motion axis — see CLAUDE.md.
+_LED_FAN_INDEX = 0
+
 
 class ZPStageManager:
     """
@@ -188,6 +192,16 @@ class ZPStageManager:
         # an 'ok'. A reset means Marlin lost its position counter — callers /
         # the reconnect+restore flow must re-declare position before trusting it.
         self._board_reset_detected: bool = False
+
+        # v7.6 hard abort: does this firmware execute M410/M112 the moment the
+        # bytes ARRIVE (EMERGENCY_PARSER) rather than when the planner reaches
+        # them? Parsed from the M115 capability report at connect:
+        #   True  — "Cap:EMERGENCY_PARSER:1" seen → quickstop() is immediate.
+        #   False — "Cap:EMERGENCY_PARSER:0" seen → M410 queues behind the
+        #           planner (quickstop degrades to "no early stop").
+        #   None  — capability report absent/disabled → unknown, verify on the
+        #           bench. Every abort logs this so aborts are self-describing.
+        self.emergency_parser: Optional[bool] = None
 
         # v7.5.x flow-control telemetry — the Stress Test workflow reads these
         # to validate the 'ok' handshake under sustained load (commands issued
@@ -449,6 +463,31 @@ class ZPStageManager:
                         accumulated += str(chunk)
                 if "FIRMWARE_NAME" in accumulated:
                     logger.info(f"ZP probe: {port} answered M115 (Marlin OK)")
+                    # v7.6: the Cap: lines follow FIRMWARE_NAME — read a short
+                    # extra window so the EMERGENCY_PARSER capability (whether
+                    # M410/M112 execute on ARRIVAL, the hard-abort latency
+                    # question) is captured before returning the handle.
+                    cap_deadline = time.monotonic() + 0.6
+                    while (time.monotonic() < cap_deadline
+                           and "\nok" not in accumulated
+                           and not accumulated.rstrip().endswith("ok")):
+                        extra = ser.read(512)
+                        if extra:
+                            accumulated += extra.decode(
+                                "utf-8", errors="replace")
+                        else:
+                            time.sleep(0.02)
+                    if "Cap:EMERGENCY_PARSER:1" in accumulated:
+                        self.emergency_parser = True
+                    elif "Cap:EMERGENCY_PARSER:0" in accumulated:
+                        self.emergency_parser = False
+                    elif "Cap:" in accumulated:
+                        # capability report present but no EMERGENCY_PARSER
+                        # line → treat as not supported
+                        self.emergency_parser = False
+                    logger.info(
+                        f"ZP firmware EMERGENCY_PARSER: {self.emergency_parser}"
+                        f" (None = capability report absent — bench-verify)")
                     try:
                         ser.reset_output_buffer()
                     except Exception:
@@ -1089,8 +1128,17 @@ class ZPStageManager:
             self._last_position_read_ok = False
         return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
 
-    def flush_moves(self, timeout_s: float = 15.0) -> bool:
+    def flush_moves(self, timeout_s: float = 15.0, abort_event=None) -> bool:
         """Block until Marlin confirms all queued moves are physically complete.
+
+        v7.6 ``abort_event`` (optional ``threading.Event``): checked once per
+        read iteration — when set, the wait returns False immediately (tracer
+        outcome ``"aborted"``) instead of blocking out the full timeout. The
+        move itself keeps executing on the board unless something (e.g.
+        ``quickstop``) kills it; this only frees the CALLING THREAD so an abort
+        can unwind in ~one readline timeout instead of 10–180 s. Callers that
+        pass the event distinguish "aborted" from "timed out" by re-checking
+        ``abort_event.is_set()``. Default None = behaviour byte-identical.
 
         Sends M400 (Wait for Moves to Finish). Marlin only responds with 'ok'
         after every buffered move has executed. This is more reliable than
@@ -1143,6 +1191,14 @@ class ZPStageManager:
                                  note=str(e)[:60])
                 return False
             while time.monotonic() < deadline:
+                if abort_event is not None and abort_event.is_set():
+                    _zp_tracer().txn(
+                        "M400", outcome="aborted", rx_count=rx_count,
+                        busy_count=busy_count,
+                        latency_ms=(time.monotonic() - _t0) * 1000.0)
+                    logger.info("flush_moves: abort_event set — returning "
+                                "without waiting for the M400 ok")
+                    return False
                 try:
                     line = self.serial.readline().decode(
                         "utf-8", errors="replace").strip()
@@ -1228,6 +1284,88 @@ class ZPStageManager:
         self.send_data("M112")
         logger.warning("ZP emergency stop sent")
 
+    def quickstop(self, lock_timeout_s: float = 0.25) -> bool:
+        """v7.6 hard abort: immediately kill all ZP motion (Z + pumps) with
+        Marlin M410 (Quickstop). BOUNDED — never waits more than
+        ``lock_timeout_s`` for the serial lock. Returns True if the command
+        was written.
+
+        Unlike M112 (``emergency_stop``) the board stays alive — no reset
+        needed — but the aborted move loses position accuracy, so callers MUST
+        follow with :meth:`resync_position` before trusting coordinates.
+
+        Two paths:
+          • **Lock acquired** (normal): write ``M410`` under the lock, no
+            ok-read (reading would re-create the blocking problem; the stray
+            'ok' is absorbed by ``resync_position``'s double read).
+          • **Lock contended** — an in-flight ``flush_moves`` M400 or
+            ``_read_until_ok`` may hold ``_serial_lock`` for 10–180 s. Then we
+            RAW-WRITE ``\\nM410\\n`` without the lock. This is safe because the
+            holder wrote its command microseconds after acquiring and has been
+            in its READ loop since (the write side of the port is idle); the
+            leading newline terminates any hypothetical partial line (worst
+            case one ``echo:Unknown command``); and the OS queues each
+            ``write()`` whole. Self-healing: with EMERGENCY_PARSER firmware the
+            M410 executes as the bytes arrive → motion stops → the in-flight
+            M400 completes → the blocked wait gets its real 'ok' and releases
+            the lock. The abort actively un-sticks the very wait that was
+            blocking it.
+
+        ⚠ Firmware caveat: without EMERGENCY_PARSER (``self.emergency_parser``
+        False/None — parsed from M115 at connect) M410 is a QUEUED command and
+        executes only when the planner reaches it — quickstop degrades to "no
+        early stop" (never worse than the pre-v7.6 behaviour). Bench-verify on
+        each board.
+        """
+        if self.simulate or self.serial is None:
+            return True
+        got_lock = False
+        try:
+            got_lock = self._serial_lock.acquire(timeout=max(0.0, lock_timeout_s))
+        except TypeError:                       # fake locks without timeout=
+            try:
+                got_lock = self._serial_lock.acquire(False)
+            except Exception:
+                got_lock = False
+        try:
+            payload = b"M410\n" if got_lock else b"\nM410\n"
+            try:
+                self.serial.write(payload)
+                self.serial.flush()
+                _zp_tracer().tx("M410" + ("" if got_lock else " (raw/no-lock)"))
+                logger.warning(
+                    f"ZP quickstop (M410) sent "
+                    f"{'under lock' if got_lock else 'RAW — lock contended'}; "
+                    f"EMERGENCY_PARSER={self.emergency_parser}")
+                return True
+            except Exception as e:
+                logger.error(f"ZP quickstop write failed: {e}")
+                return False
+        finally:
+            if got_lock:
+                try:
+                    self._serial_lock.release()
+                except Exception:
+                    pass
+
+    def resync_position(self) -> tuple:
+        """v7.6: re-read the firmware's position after a :meth:`quickstop`.
+
+        M410 aborts moves mid-block, so the previously cached position is
+        stale and one stray 'ok' (from the unanswered M410) may sit in the RX
+        stream. Reading TWICE makes it benign: the first M114 transaction may
+        terminate early on the stale 'ok'; the second is clean and sets
+        ``_last_position_read_ok``. Returns the final position tuple.
+        """
+        try:
+            self.get_current_position()
+        except Exception:
+            pass
+        try:
+            return self.get_current_position()
+        except Exception:
+            return (self.x_pos, self.y_pos, self.z_pos, self.e_pos)
+
     def save_settings(self) -> None:
         """Save current settings to printer EEPROM."""
         self.send_data("M500")
@@ -1241,11 +1379,16 @@ class ZPStageManager:
         board is later flashed with Case Light enabled, swap the line for
         ``M355 S{1 if level > 0 else 0} P{level}``.
 
+        The header is named once, in ``_LED_FAN_INDEX`` -- change that constant
+        if the LED is ever rewired. Marlin acks an unassigned ``P`` index with
+        ``ok`` and does nothing, so a wrong index fails SILENTLY (dark LED, the
+        app reports success); verify on a terminal before suspecting software.
+
         Returns whatever :meth:`send_data` reports (True on ``ok``); safe in
         simulation, where the simulator acks the command as unrecognized.
         """
         level = max(0, min(255, int(level)))
-        return self.send_data(f"M106 P0 S{level}")
+        return self.send_data(f"M106 P{_LED_FAN_INDEX} S{level}")
 
     def __repr__(self) -> str:
         mode = "SIM" if self.simulate else "HW"

@@ -124,6 +124,26 @@ class CameraSettingsDialog(QDialog):
         self._gain_label, self._gain_sld, self._gain_val = self._make_slider(
             "Gain (%)", 0, 1000, 100, self._on_gain_changed)
 
+        # Andor (Zyla) display scaling — the mono-16 sensor is normalized to
+        # 8-bit for display; auto = per-frame percentile scaling (the image
+        # "auto-adjusts" to the scene), manual = fixed black/white levels.
+        self._ascale_chk = QCheckBox("Auto display scaling (per-frame)")
+        self._ascale_chk.setToolTip(
+            "The Zyla's 16-bit image is normalized for display. Checked: each "
+            "frame is auto-scaled to its own 1–99 percentile, so brightness "
+            "follows the scene. Unchecked: a fixed black/white level mapping — "
+            "the current look is frozen and the sliders below take over.")
+        self._ascale_chk.toggled.connect(self._on_ascale_toggled)
+        self._add_grid_row(QLabel(""), self._ascale_chk)
+        self._blk_label, self._blk_sld, self._blk_val = self._make_slider(
+            "Black level", 0, 65535, 0, self._on_scale_lo_changed)
+        self._blk_label.setToolTip(
+            "Raw sensor counts shown as black (display 0). Manual mode only.")
+        self._wht_label, self._wht_sld, self._wht_val = self._make_slider(
+            "White level", 0, 65535, 65535, self._on_scale_hi_changed)
+        self._wht_label.setToolTip(
+            "Raw sensor counts shown as white (display 255). Manual mode only.")
+
         # Gamma / Brightness / Contrast sliders
         self._gamma_label, self._gamma_sld, self._gamma_val = self._make_slider(
             "Gamma", 20, 180, 100, self._on_gamma_changed)
@@ -230,6 +250,20 @@ class CameraSettingsDialog(QDialog):
                 "exposure_gain_pct", ctrls, st.get("exposure_gain_pct"),
                 self._gain_label, self._gain_sld, self._gain_val,
                 enabled=not (has_auto and auto_on))
+            # Andor (Zyla) display scaling — only offered when the backend
+            # reports the control (i.e. an Andor camera is live).
+            has_ascale = "andor_auto_scale" in ctrls
+            ascale_on = (st.get("andor_auto_scale") is True)
+            self._ascale_chk.setVisible(has_ascale)
+            self._ascale_chk.blockSignals(True)
+            self._ascale_chk.setChecked(ascale_on)
+            self._ascale_chk.blockSignals(False)
+            self._setup_slider("andor_scale_lo", ctrls, st.get("andor_scale_lo"),
+                               self._blk_label, self._blk_sld, self._blk_val,
+                               enabled=not ascale_on)
+            self._setup_slider("andor_scale_hi", ctrls, st.get("andor_scale_hi"),
+                               self._wht_label, self._wht_sld, self._wht_val,
+                               enabled=not ascale_on)
             # Gamma / brightness / contrast
             self._setup_slider("gamma", ctrls, st.get("gamma"),
                                self._gamma_label, self._gamma_sld, self._gamma_val)
@@ -333,6 +367,27 @@ class CameraSettingsDialog(QDialog):
         self._mgr.set_hw_exposure_gain(self._cam_idx, int(v))
         self._persist()
 
+    def _on_ascale_toggled(self, checked):
+        if self._loading or self._mgr is None:
+            return
+        self._mgr.set_hw_andor_auto_scale(self._cam_idx, checked)
+        self._persist()
+        # Turning auto OFF freezes the current auto levels into the manual
+        # black/white — re-read so the sliders show (and enable at) them.
+        self.reload()
+
+    def _on_scale_lo_changed(self, v):
+        if self._loading or self._mgr is None:
+            return
+        self._mgr.set_hw_andor_scale_lo(self._cam_idx, int(v))
+        self._persist()
+
+    def _on_scale_hi_changed(self, v):
+        if self._loading or self._mgr is None:
+            return
+        self._mgr.set_hw_andor_scale_hi(self._cam_idx, int(v))
+        self._persist()
+
     def _on_gamma_changed(self, v):
         if self._loading or self._mgr is None:
             return
@@ -360,6 +415,9 @@ class CameraSettingsDialog(QDialog):
         # auto-exposure on is the camera's default behavior.
         if "auto_exposure" in ctrls:
             self._mgr.set_hw_auto_exposure(self._cam_idx, True)
+        # Andor: per-frame display auto-scale is the historical default.
+        if "andor_auto_scale" in ctrls:
+            self._mgr.set_hw_andor_auto_scale(self._cam_idx, True)
         for key, setter in (
             ("gamma", self._mgr.set_hw_gamma),
             ("brightness", self._mgr.set_hw_brightness),
@@ -397,6 +455,9 @@ class CameraSettingsDialog(QDialog):
             "gamma": st.get("gamma"),
             "brightness": st.get("brightness"),
             "contrast": st.get("contrast"),
+            "andor_auto_scale": st.get("andor_auto_scale"),
+            "andor_scale_lo": st.get("andor_scale_lo"),
+            "andor_scale_hi": st.get("andor_scale_hi"),
             "resolution": list(st["resolution"]) if st.get("resolution") else None,
         }
         try:
@@ -420,6 +481,12 @@ class CameraSettingsDialog(QDialog):
                          + (f"   range {st.get('exposure_range_us')}"
                             if st.get("exposure_range_us") else ""))
             lines.append(f"gain          = {st.get('exposure_gain_pct')} %")
+            if src == "andor":
+                mode = ("auto (per-frame)" if st.get("andor_auto_scale")
+                        else "manual")
+                lines.append(f"display scale = {mode}   levels "
+                             f"{st.get('andor_scale_lo')}.."
+                             f"{st.get('andor_scale_hi')}")
             lines.append(f"gamma         = {st.get('gamma')}")
             lines.append(f"brightness    = {st.get('brightness')}")
             lines.append(f"contrast      = {st.get('contrast')}")

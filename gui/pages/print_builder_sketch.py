@@ -34,6 +34,9 @@ from SupportClasses.SketchTrajectory import (
     Sketch, SketchShape, compile_to_trajectory, plan_print_sections,
 )
 from SupportClasses.PrintFileManager import save_trajectory_as_print_object
+from SupportClasses.PhysicalModels import (
+    needle_orifice_area_mm2, needle_orifice_od_mm, needle_orifice_id_um,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +380,15 @@ class SketchPage(QWidget):
         # "Save changes" overwrites the print opened from the Library (only
         # visible while editing); "Send to Print Setup" always saves as new.
         # Both are PINNED below the scroll so they're always reachable.
+        self._printability_btn = QPushButton("🎯 Check printability")
+        self._printability_btn.setToolTip(
+            "Simulate this sketch's printing paths with the machine's "
+            "measured stage characteristics + current velocity tuning, and "
+            "mark where the stage is predicted to miss (corner rounding, "
+            "features finer than the tuning can track).")
+        self._printability_btn.clicked.connect(self._check_printability)
+        outer.addWidget(self._printability_btn)
+
         self._save_btn = QPushButton("Save changes")
         self._save_btn.setObjectName("primaryBtn")
         self._save_btn.clicked.connect(self._save_changes)
@@ -1672,6 +1684,27 @@ class SketchPage(QWidget):
         self._send_btn.setEnabled(True)
         self._update_bounds_warning(result.trajectory)
 
+    def _check_printability(self):
+        """Simulate the compiled sketch on the SAVED stage characteristics +
+        current velocity tuning and show where the stage is predicted to miss
+        (design-time only — no motion)."""
+        result = getattr(self, "_last_result", None)
+        if result is None or getattr(result, "is_empty", True):
+            self._recompute_preview()
+            result = getattr(self, "_last_result", None)
+        if result is None or getattr(result, "is_empty", True):
+            QMessageBox.information(self, "Printability",
+                                    "Draw a shape first.")
+            return
+        try:
+            from gui.dialogs.sketch_printability_dialog import (
+                SketchPrintabilityDialog)
+            dlg = SketchPrintabilityDialog(result.trajectory, parent=self)
+            dlg.show()
+        except Exception as e:
+            logger.warning(f"printability check failed to open: {e}")
+            QMessageBox.warning(self, "Printability", str(e))
+
     # ── Bake / send / save ────────────────────────────────────────
 
     def _compile_for_export(self):
@@ -1983,18 +2016,21 @@ class SketchPage(QWidget):
         # Per-channel ink name + colour for the sequence panel (pump→ink).
         self._build_channel_info(config)
 
-        # Fill, outline width and raster step all derive from the needle Ø.
-        od = getattr(self._needle, "od_mm", 0.0) if self._needle else 0.0
+        # Fill, outline width and raster step all derive from the needle's
+        # ORIFICE Ø (v7.6: the pulled tip on a capillary) — they have to match
+        # the bead actually laid down, not the bulk barrel.
+        od = needle_orifice_od_mm(self._needle) if self._needle else 0.0
         if od and od > 0:
             self._needle_od_mm = float(od)
             self._canvas.sketch().line_spacing_mm = float(od)
             self._canvas.set_default_line_width(float(od))
-        # Feed the outer Ø so a "needle Ø" closure-overlap marker matches what
-        # the compiler extrudes.
+        # Feed the orifice outer Ø so a "needle Ø" closure-overlap marker
+        # matches what the compiler extrudes.
         self._canvas.set_needle_od(self._needle_od_mm)
-        # The shaded print-thickness band is 1× = needle INNER Ø (the deposited
-        # bead reference the operator asked for), scaled by the multiplier.
-        idv = getattr(self._needle, "id_mm", 0.0) if self._needle else 0.0
+        # The shaded print-thickness band is 1× = the ORIFICE INNER Ø (the
+        # deposited bead reference the operator asked for), scaled by the
+        # multiplier.
+        idv = (needle_orifice_id_um(self._needle) / 1000.0) if self._needle else 0.0
         self._needle_id_mm = float(idv) if idv and idv > 0 else 0.0
         self._apply_bead_width()
 

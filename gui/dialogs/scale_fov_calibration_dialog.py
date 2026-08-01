@@ -148,12 +148,16 @@ class ScaleFovCalibrationDialog(QDialog):
 
     def __init__(self, camera_manager, controller, cam_idx: int = 0, *,
                  resolution_getter=None, safe_z=None, align_key=None,
-                 objective=None, cam_key=None, parent=None):
+                 objective=None, cam_key=None, scan_settings=None, parent=None):
         super().__init__(parent)
         self._mgr = camera_manager
         self._controller = controller
         self._cam_idx = cam_idx
         self._resolution_getter = resolution_getter
+        # v7.5.x: the REAL mosaic-scan settings, so the "verify with a mosaic"
+        # self-check builds the same way the actual scan will (it used to pass an
+        # empty dict and silently fall back to unrelated defaults).
+        self._scan_settings = dict(scan_settings) if scan_settings else {}
         # Objective identity for the self-check correction dialog, so its
         # corrections propagate as ground truth (mosaic + click mapping).
         self._align_key = align_key
@@ -390,26 +394,24 @@ class ScaleFovCalibrationDialog(QDialog):
             logger.debug(f"ScaleFov: default move seed skipped — {e}")
 
     def _on_mirror_toggled(self, on: bool):
-        mgr = self._mgr
+        """Flip the PREVIEW only — this checkbox tells the dialog what the
+        operator is looking at, so the feed reads correctly while measuring.
+
+        v7.5.x: it no longer PERSISTS the mirror (nor pushes it to the shared
+        manager). It used to write ``CameraCalibrationStore.set_mirrored`` the
+        instant it was ticked — so merely opening this dialog and toggling the
+        checkbox permanently changed the camera's stored calibration even if the
+        operator then pressed Cancel. The handedness is MEASURED from the two-axis
+        move (``derive_camera_stage_orientation`` → ``result_flip_x/_flip_y``) and
+        committed only when the calibration is accepted.
+        """
         on = bool(on)
         self._view_mir = on
-        try:
-            mgr.set_mirrored(self._cam_idx, on)
-        except Exception:
-            pass
         if self._feed is not None:
             try:
                 self._feed.set_view_orientation(on, self._view_rot)
             except Exception:
                 pass
-        try:
-            ident = mgr.camera_identity(self._cam_idx)
-            if ident and ident[0]:
-                from SupportClasses.CameraCalibrationStore import get_store
-                nm = ident[1] if len(ident) > 1 else ""
-                get_store().set_mirrored(ident[0], on, name=nm)
-        except Exception as e:
-            logger.debug(f"ScaleFov: mirror persist skipped — {e}")
 
     # ── Measurement state machine ─────────────────────────────────
 
@@ -657,10 +659,19 @@ class ScaleFovCalibrationDialog(QDialog):
         except Exception:
             store = None
 
+        # v7.5.x: pass the REAL scan settings, not ``{}``. An empty dict made the
+        # dialog fall back to its own defaults, so this "verify" step silently ran
+        # at 25 % overlap on a 5x5 grid regardless of what the operator had
+        # configured (3x3 here) — i.e. it verified something other than the scan
+        # it was supposed to be checking. ``fov_um`` / ``spacing_um`` are NOT
+        # forwarded: the freshly measured µm/px below must size the tiles.
+        verify_settings = dict(self._scan_settings or {})
+        verify_settings.pop("fov_um", None)
+        verify_settings.pop("spacing_um", None)
         dlg = MosaicCalibrationDialog(
             self._controller, self._mgr, self._cam_idx,
             safe_z=safe_z, align_key=self._align_key, store=store,
-            settings={}, center_um=(cx, cy), frame_size=(fw, fh),
+            settings=verify_settings, center_um=(cx, cy), frame_size=(fw, fh),
             um_per_px_camera=float(self.result_um_per_px),
             cam_key=self._cam_key, objective=self._objective, parent=self)
         dlg.exec()
@@ -694,6 +705,33 @@ class ScaleFovCalibrationDialog(QDialog):
             pass
         self._set_status(
             "Correction applied. Accept to save, or re-measure.", "green")
+
+    def build_test_mosaic(self, cal) -> None:
+        """Build the confirmation mosaic for a CANDIDATE calibration.
+
+        v7.5.x: the "final check with the new settings" (operator). Uses the
+        candidate's µm/px + orientation + overlap rather than anything stored —
+        the stores are deliberately not written until the operator accepts — and
+        routes through the same ``MosaicCalibrationDialog`` build machinery the
+        real scan uses, so what is confirmed is what will happen.
+
+        Safe: XY only, at the CURRENT height. ``_verify_mosaic`` passes
+        ``target_z_mm=None`` so the needle never descends.
+        """
+        self.result_um_per_px = float(cal.um_per_px)
+        if cal.live_resolution:
+            self.result_resolution = tuple(cal.live_resolution)
+        self.result_rotation_deg = float(cal.rotation_deg)
+        self.result_flip_x = bool(cal.flip_x)
+        self.result_flip_y = bool(cal.flip_y)
+        prev = dict(self._scan_settings or {})
+        try:
+            self._scan_settings = dict(prev)
+            self._scan_settings["overlap_pct"] = int(
+                round(cal.overlap_frac * 100))
+            self._verify_mosaic()
+        finally:
+            self._scan_settings = prev
 
     def _on_verify_progress(self, done, total):
         self._set_status(f"Self-check mosaic: {done}/{total} tiles…")

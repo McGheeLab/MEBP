@@ -45,13 +45,19 @@ class MeasurementCameraView(CameraFeedView):
     endpoints_changed = Signal()
 
     def __init__(self, camera_manager=None, cam_idx: int = 0,
-                 label: str = "", parent=None):
+                 label: str = "", auto_orient: bool = False, parent=None):
         # Crosshair would clutter the measurement line; suppress it.
+        # v7.5.x: ``auto_orient`` is now FORWARDED (it previously could not be set
+        # at all through this subclass), so a measurement view can show the
+        # camera's calibrated orientation like every other microscope feed.
+        # Default stays False — a measurement made on a transformed view must be
+        # opted into deliberately by the caller.
         super().__init__(
             camera_manager=camera_manager,
             cam_idx=cam_idx,
             show_crosshair=False,
             label=label,
+            auto_orient=auto_orient,
             # Measurement is itself a calibration step — no HW-settings gear
             # (a resolution change would invalidate the measurement).
             enable_settings=False,

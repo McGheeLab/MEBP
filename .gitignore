@@ -33,3 +33,10 @@ logs/prints/*.jsonl
 
 # Testing
 .pytest_cache/
+
+# HyperFrames tutorial videos — commit the composition + generated CSS,
+# ignore the toolchain, rendered MP4s and review snapshots.
+docs/videos/*/node_modules/
+docs/videos/*/out/
+docs/videos/*/snapshots/
+docs/videos/*/.hyperframes/

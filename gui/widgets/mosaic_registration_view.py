@@ -199,17 +199,40 @@ class MosaicRegistrationView(QGraphicsView):
         self._fitted_once = False
         self.fit()
 
+    def set_output_rotation(self, rotation_deg: float) -> None:
+        """Additional DISPLAY-ONLY whole-view rotation (0/90/180/270).
+
+        v7.5.x: the operator's whole-mosaic output rotation, composed with the
+        plate ``flip_180`` above so this preview shows the mosaic the same way up
+        as the finished one. Purely a ``QGraphicsView`` transform — scene
+        coordinates (and therefore any back-projection) are untouched.
+        """
+        try:
+            quad = int(round(float(rotation_deg) / 90.0)) % 4 * 90
+        except (TypeError, ValueError):
+            quad = 0
+        if quad == self.output_rotation():
+            return
+        self._output_rotation = quad
+        self._fitted_once = False
+        self.fit()
+
+    def output_rotation(self) -> int:
+        return int(getattr(self, "_output_rotation", 0) or 0)
+
     def fit(self) -> None:
         br = self._scene.itemsBoundingRect()
         if br.isEmpty():
             return
         self.resetTransform()
         self._zoom = 1.0
-        if self._flip_180:
+        # Plate-frame flip composed with the operator's output rotation.
+        total = ((180 if self._flip_180 else 0) + self.output_rotation()) % 360
+        if total:
             # Rotate about the view centre so the fitted content stays centred.
             self.setTransformationAnchor(
                 QGraphicsView.ViewportAnchor.AnchorViewCenter)
-            self.rotate(180)
+            self.rotate(total)
             self.setTransformationAnchor(
                 QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.fitInView(br, Qt.AspectRatioMode.KeepAspectRatio)

@@ -24,6 +24,7 @@ small QObject signal bridge so all UI updates land on the main thread.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 from typing import Optional
@@ -32,6 +33,7 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox,
     QComboBox, QFrame, QSizePolicy, QSplitter, QMessageBox, QCheckBox, QSpinBox,
+    QTabWidget,
 )
 
 from gui.styles import COLORS
@@ -113,6 +115,12 @@ class SpheroidPickupWorkflowPage(QWidget):
 
         self._executor: Optional[PickPlaceExecutor] = None
         self._exec_thread: Optional[threading.Thread] = None
+        # Survey-tab state (built in _build_survey_tab).
+        self._scan_page = None
+        self._survey = None
+        self._mosaic_overlay = None
+        self._crop_worker = None
+        self._pending_crop: Optional[dict] = None
         self._sink_calib_dialog = None  # lazy SinkDisengageCalibrationDialog
         self._bridge = _ExecutorBridge()
         self._bridge.op_started.connect(self._on_op_started)
@@ -142,6 +150,16 @@ class SpheroidPickupWorkflowPage(QWidget):
 
         outer.addLayout(self._build_header())
 
+        # Two tabs: the pick & place surface (unchanged), and the spheroid
+        # survey (scan → detect → curate → transfer).
+        self._tabs = QTabWidget(self)
+        outer.addWidget(self._tabs, stretch=1)
+
+        pick_tab = QWidget(self)
+        pick_layout = QVBoxLayout(pick_tab)
+        pick_layout.setContentsMargins(0, 0, 0, 0)
+        pick_layout.setSpacing(s(10))
+
         # Main horizontal split:
         #   LEFT  — LiveTargetPicker (shared camera + pick/place lists)
         #   RIGHT — vertical split: WorkspaceTargetView (top) + XZSideView (bottom)
@@ -151,6 +169,9 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._picker = LiveTargetPicker(controller, camera_manager)
         self._picker.picks_changed.connect(self._on_targets_changed)
         self._picker.places_changed.connect(self._on_targets_changed)
+        self._picker.target_changed.connect(self._on_target_changed)
+        self._picker.goto_requested.connect(self._on_target_goto)
+        self._picker.pick_added.connect(self._on_pick_added)
         main_split.addWidget(self._picker)
 
         right = QSplitter(Qt.Vertical, self)
@@ -184,9 +205,11 @@ class SpheroidPickupWorkflowPage(QWidget):
         main_split.addWidget(right)
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 1)
-        outer.addWidget(main_split, stretch=1)
+        pick_layout.addWidget(main_split, stretch=1)
+        pick_layout.addWidget(self._build_run_row())
+        self._tabs.addTab(pick_tab, "Pick && Place")
 
-        outer.addWidget(self._build_run_row())
+        self._tabs.addTab(self._build_survey_tab(), "Spheroid survey")
 
         # Periodic position refresh so the workspace + XZ tracks the stage.
         from PySide6.QtCore import QTimer
@@ -201,6 +224,212 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._settings_dialog.load_last()
         self._refresh_volume_label()
         self._on_prep_toggled()  # sets prep/clean widget enabled state + status
+
+    # ── Survey tab ────────────────────────────────────────────────
+
+    def _build_survey_tab(self) -> QWidget:
+        """Scan → detect → curate → transfer.
+
+        The left half is a real INSTANCE of the Fluorescence Mosaic page
+        (``embedded=True`` drops only its back-button header), so there is
+        exactly one single-well mosaic scan implementation in the app and this
+        tab tracks any change made to that page automatically. It is the same
+        "re-home, don't rewrite" pattern ``FullPrintWorkflowPage`` uses to host
+        ``PrintingModePage``.
+        """
+        from gui.pages.workflows.fluorescence_mosaic_workflow import (
+            FluorescenceMosaicWorkflowPage)
+        from gui.widgets.spheroid_mosaic_items import SpheroidOverlay
+        from gui.widgets.spheroid_survey_panel import SpheroidSurveyPanel
+
+        wrap = QWidget(self)
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        split = QSplitter(Qt.Horizontal, wrap)
+        split.setChildrenCollapsible(False)
+
+        self._scan_page = FluorescenceMosaicWorkflowPage(
+            self._controller, self._settings, self._camera_manager,
+            embedded=True)
+        self._scan_page.mosaic_ready.connect(self._on_mosaic_ready)
+        split.addWidget(self._scan_page)
+
+        self._survey = SpheroidSurveyPanel()
+        self._survey.set_context_provider(self._mosaic_context_for_channel)
+        self._survey.set_fit_badge_provider(self._fit_badge)
+        self._survey.goto_requested.connect(self._on_spheroid_goto)
+        self._survey.transfer_requested.connect(self._on_transfer_to_picks)
+        self._survey.crop_requested.connect(self._on_save_training_crop)
+        self._survey.selection_changed.connect(self._on_survey_selection)
+        self._survey.detections_changed.connect(self._refresh_mosaic_circles)
+        split.addWidget(self._survey)
+
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        layout.addWidget(split)
+
+        # Editable circles live on the embedded page's own mosaic view, so the
+        # operator surveys and edits in one place. Interactive-items mode frees
+        # the left button for the circles and moves panning to the middle button.
+        view = self._scan_page.mosaic_view()
+        view.set_interactive_items(True)
+        self._mosaic_overlay = SpheroidOverlay(view, parent=self)
+        view.scene_clicked.connect(self._mosaic_overlay.on_scene_press)
+        view.scene_dragged.connect(self._mosaic_overlay.on_scene_drag)
+        view.scene_released.connect(self._mosaic_overlay.on_scene_release)
+        self._mosaic_overlay.radius_changed.connect(
+            lambda tid, r: self._survey.apply_radius_px(tid, r, commit=False))
+        self._mosaic_overlay.radius_committed.connect(
+            lambda tid, r: self._survey.apply_radius_px(tid, r, commit=True))
+        self._mosaic_overlay.center_committed.connect(
+            self._survey.apply_center_px)
+        self._mosaic_overlay.circle_clicked.connect(
+            self._survey.select_detection)
+        self._mosaic_overlay.rim_fitted.connect(self._on_mosaic_rim_fitted)
+        self._mosaic_overlay.empty_clicked.connect(self._on_mosaic_empty_click)
+        return wrap
+
+    def _mosaic_context_for_channel(self, channel=None):
+        page = getattr(self, "_scan_page", None)
+        if page is None:
+            return None
+        return page.mosaic_context(channel)
+
+    def _on_mosaic_ready(self, _well: str):
+        """A scan finished, or a well change loaded a saved mosaic."""
+        ctx = self._mosaic_context_for_channel(None)
+        self._survey.set_mosaic_context(ctx)
+        self._refresh_mosaic_circles()
+
+    def _refresh_mosaic_circles(self):
+        """Redraw the editable circles from the survey panel's detections."""
+        overlay = getattr(self, "_mosaic_overlay", None)
+        if overlay is None:
+            return
+        entries = []
+        for det in self._survey.detections():
+            badge, _msg = self._fit_badge(det.diameter_um)
+            entries.append({
+                "det_id": det.det_id,
+                "cx": det.center_px[0], "cy": det.center_px[1],
+                "r": det.radius_px,
+                # Peach = fails the needle-fit rule; the same visual language the
+                # list and the run warnings use.
+                "color": COLORS["peach"] if badge else COLORS["green"],
+                "dashed": det.source == "user",
+                "label": f"{det.det_id} Ø{det.diameter_um:.0f}",
+            })
+        overlay.set_circles(entries)
+        sel = self._survey.selected_id()
+        if sel:
+            overlay.set_highlight(sel)
+
+    def _on_survey_selection(self, det_id: str):
+        overlay = getattr(self, "_mosaic_overlay", None)
+        if overlay is None:
+            return
+        overlay.set_highlight(det_id)
+        if det_id:
+            overlay.center_on(det_id)
+
+    def _on_mosaic_rim_fitted(self, cx_px: float, cy_px: float, r_px: float):
+        """3+ rim points on the mosaic → size the selected spheroid, or add one."""
+        sel = self._survey.selected_id()
+        if sel:
+            self._survey.apply_radius_px(sel, r_px, commit=True)
+            self._survey.apply_center_px(sel, cx_px, cy_px)
+            return
+        self._survey.add_manual(cx_px, cy_px, r_px)
+
+    def _on_mosaic_empty_click(self, cx_px: float, cy_px: float):
+        """A click on bare mosaic adds a hand-placed spheroid at the default Ø.
+
+        Detection can legitimately return nothing (a nuclear stain is puncta, not
+        a disc), so this path has to exist for the workflow to stay usable.
+        """
+        ctx = self._mosaic_context_for_channel(None)
+        if ctx is None or not ctx.get("mosaic_scale"):
+            return
+        from SupportClasses.SpheroidDetector import radius_px_for_diameter_um
+        r_px = radius_px_for_diameter_um(
+            float(self._diameter.value()), ctx["mosaic_scale"])
+        det_id = self._survey.add_manual(cx_px, cy_px, r_px)
+        if det_id:
+            self._survey.select_detection(det_id)
+            self._survey.set_status(
+                f"Added {det_id} by hand at Ø{self._diameter.value():.0f} µm — "
+                f"drag its handle or use rim points to size it.")
+
+    # ── Survey → picks ────────────────────────────────────────────
+
+    def _on_transfer_to_picks(self, entries: list):
+        """Copy the curated spheroids into the pick list.
+
+        Each is stamped ``PROV_MOSAIC``: its position came from a mosaic, so it
+        renders dashed until a live click on that spheroid confirms it. The
+        DIAMETER needs no such caveat — a length is translation-invariant, so the
+        registration shift cannot corrupt it.
+        """
+        from gui.widgets.live_target_picker import PROV_MOSAIC
+        added = 0
+        for e in entries or []:
+            self._picker.add_pick(
+                float(e["x_um"]), float(e["y_um"]),
+                size_um=float(e.get("diameter_um") or 0.0),
+                provenance=PROV_MOSAIC)
+            added += 1
+        if not added:
+            return
+        self._survey.set_status(
+            f"Transferred {added} spheroid(s) to the pick list. Their positions "
+            f"came from the mosaic — go to each one and click it on the live "
+            f"view to confirm before running.")
+        self._status.setText(
+            f"{added} spheroid(s) added as picks (mosaic positions — confirm on "
+            f"the live view). Add a place target for each.")
+        # Surface the pick list so the operator sees what landed there.
+        self._tabs.setCurrentIndex(0)
+
+    def _on_target_changed(self, _target_id: str):
+        self._refresh_target_overlays()
+        self._refresh_fit_summary()
+
+    def _on_target_goto(self, target_id: str):
+        """Row [Go to] on a pick/place list."""
+        t = self._picker.target_by_id(target_id)
+        if t is None:
+            return
+        self._travel_to_absolute(float(t.x_um), float(t.y_um))
+
+    def _on_pick_added(self, target_id: str, provenance: str):
+        """Bank a training crop for a spheroid the operator just selected.
+
+        Gated tightly on purpose, so an ordinary un-measured click behaves exactly
+        as it always has (no capture, no message):
+
+        * only a LIVE-derived pick — a transferred mosaic position is not
+          necessarily under the camera, and a crop of the wrong place labelled
+          with this diameter is worse than no crop at all;
+        * only one that carries a MEASURED diameter, which is the label;
+        * only when the operator has crops enabled.
+
+        The capture itself still self-refuses if the stage turns out not to be on
+        the spheroid (see ``SpheroidTrainingStore.refuse_crop_reason``).
+        """
+        from gui.widgets.live_target_picker import PROV_MOSAIC
+        if provenance == PROV_MOSAIC:
+            return
+        if not self._crop_enabled.isChecked():
+            return
+        t = self._picker.target_by_id(target_id)
+        if t is None:
+            return
+        diameter = float(getattr(t, "size_um", 0.0) or 0.0)
+        if diameter <= 0:
+            return
+        self._on_save_training_crop(
+            float(t.x_um), float(t.y_um), diameter, target_id)
 
     # ── UI construction ───────────────────────────────────────────
 
@@ -285,9 +514,13 @@ class SpheroidPickupWorkflowPage(QWidget):
                 extras.append("sink-timed")
             if self._disengage_enabled.isChecked():
                 extras.append("disengage")
+            if self._per_target_volume_enabled():
+                extras.append("per-Ø volume")
             extra = (" · " + "/".join(extras)) if extras else ""
+            diam = ("Ø measured" if self._per_target_volume_enabled()
+                    else f"Ø{self._diameter.value():.0f}µm")
             self._settings_summary.setText(
-                f"Ø{self._diameter.value():.0f}µm · "
+                f"{diam} · "
                 f"pick {self._pick_flow.value():.2g}/place "
                 f"{self._place_flow.value():.2g} µL/s · {prep}{extra}")
         except Exception:
@@ -321,18 +554,83 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._diameter = self._dspin(1.0, 5000.0, 200.0, " µm", 1, 10.0)
         self._bore = QComboBox()
         self._bore.setMinimumWidth(s(110))
-        self._safety = self._dspin(1.0, 5.0, 1.5, "", 2, 0.1)
+        # v7.8: range widened from 1.0–5.0 at the operator's request. Values
+        # below 1.0 aspirate LESS than the spheroid's own volume — allowed, but
+        # flagged, since the carrier column then cannot fully contain it.
+        self._safety = self._dspin(0.01, 10.0, 1.5, "", 2, 0.1)
+        self._per_target_volume = QCheckBox(
+            "Size each aspirate from that spheroid's measured Ø")
+        self._per_target_volume.setChecked(True)
+        self._per_target_volume.setToolTip(
+            "On: a pick with a measured diameter aspirates the volume computed "
+            "from ITS diameter (× the safety factor). Off: every pick uses the "
+            "default diameter below.\n"
+            "Volume scales as diameter cubed, so a 200 → 350 µm measurement is "
+            "a 5.4× volume change.")
         sec = dlg.add_section("Spheroid & bore")
-        sec.add("diameter", "Spheroid diameter", self._diameter, 200.0,
-                "Estimated spheroid diameter — sets the aspirate/dispense volume.")
+        sec.add("diameter", "Spheroid Ø (default / unmeasured)",
+                self._diameter, 200.0,
+                "Fallback diameter for a pick with no measured size — and the "
+                "diameter used for every pick when per-spheroid sizing is off.")
         sec.add("bore", "Pump / bore", self._bore, "P1",
                 "Which pump drives the aspirate + dispense.")
         sec.add("safety_factor", "Safety factor (×)", self._safety, 1.5,
-                "Volume multiplier on the computed spheroid volume.")
+                "Volume multiplier on the computed spheroid volume. Applied to "
+                "the per-spheroid volume too.")
+        sec.add_check("per_target_volume", self._per_target_volume, True)
         self._volume_label = QLabel("V = —")
         self._volume_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         sec.add_widget(self._volume_label)
+
+        # ── Needle fit (advisory) ──
+        # The operator's rule: needle ID at least 1.5× the spheroid Ø. This
+        # feeds NeedleSpec.spheroid_pickup_detail's `clearance` kwarg, whose
+        # ratio IS orifice_id_um / spheroid_um — so 1.5 here is exactly that
+        # rule. Advisory only: a deformable spheroid can squeeze through a
+        # slightly smaller orifice, so it warns and proceeds.
+        self._clearance = self._dspin(
+            1.0, 5.0, 1.5, "×", 2, 0.1,
+            "Warn when the needle orifice ID is less than this multiple of a "
+            "spheroid's diameter. Never blocks the run.")
+        sec = dlg.add_section("Needle fit (advisory)")
+        sec.add("needle_clearance", "Needle ID ≥ … × spheroid Ø",
+                self._clearance, 1.5)
+        self._fit_summary = QLabel("")
+        self._fit_summary.setWordWrap(True)
+        self._fit_summary.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        sec.add_widget(self._fit_summary)
+
+        # ── Training crops ──
+        self._crop_enabled = QCheckBox(
+            "Save a training crop when a spheroid is picked")
+        self._crop_enabled.setChecked(True)
+        self._crop_enabled.setToolTip(
+            "Bank a cropped microscope image of each selected spheroid as "
+            "future detector training data. Images only — nothing is trained.")
+        self._crop_pad = self._dspin(
+            0.0, 2.0, 0.25, "×", 2, 0.05,
+            "Context kept around the circle, as a fraction of its radius. A "
+            "zero-context crop is poor training data; too much pulls in a "
+            "neighbouring spheroid.")
+        self._crop_settle = self._ispin(
+            0, 5000, 300,
+            "Wait this long after the stage settles before capturing.")
+        self._crop_fresh = self._ispin(
+            1, 20, 3,
+            "Discard this many frames after the settle, so the capture is not "
+            "a stale buffered frame.")
+        sec = dlg.add_section("Training crops")
+        sec.add_check("crop_enabled", self._crop_enabled, True)
+        sec.add("crop_pad_frac", "Crop padding (× radius)", self._crop_pad, 0.25)
+        sec.add("crop_settle_ms", "Settle before capture", self._crop_settle, 300)
+        sec.add("crop_fresh_frames", "Fresh frames to wait", self._crop_fresh, 3)
+        self._crop_status = QLabel("")
+        self._crop_status.setWordWrap(True)
+        self._crop_status.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        sec.add_widget(self._crop_status)
 
         # ── Heights ──
         self._pick_z = self._dspin(
@@ -510,6 +808,14 @@ class SpheroidPickupWorkflowPage(QWidget):
         # ── Locations & Hardware (read-only) ──
         dlg.add_info_section()
         dlg.set_info_refresher(self._build_locations_panel)
+        # The detection band + the two live-view mode flags live on widgets that
+        # belong to the picker and the survey panel (built after this dialog), so
+        # they round-trip through the sanctioned extra-state hook rather than
+        # being duplicated here. DELIBERATELY excluded: the detected spheroid list
+        # itself — a restored coordinate from another plate would be a crash, and
+        # nothing here can prove the mosaic it came from is still the one loaded.
+        dlg.set_extra_state(self._collect_extra_state,
+                            self._apply_extra_state)
         dlg.finalize()
 
         # Signals (connected after all widgets exist so handlers find their labels)
@@ -520,13 +826,48 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._place_flow.valueChanged.connect(self._update_settings_summary)
         self._sink_timing_enabled.toggled.connect(self._update_settings_summary)
         self._disengage_enabled.toggled.connect(self._update_settings_summary)
+        self._per_target_volume.toggled.connect(self._update_settings_summary)
+        self._clearance.valueChanged.connect(self._refresh_fit_summary)
         self._refresh_volume_label()
         self._refresh_sink_status()
+        self._refresh_fit_summary()
 
     def _build_locations_panel(self):
         return build_locations_widget(
             self._controller, self._hw_config, self._well_positions,
             z_references=self._z_references, safe_z=self._safe_z)
+
+    # ── Non-widget settings state ─────────────────────────────────
+
+    def _collect_extra_state(self) -> dict:
+        """Detection parameters + the live-view mode flags, for the profile."""
+        state: dict = {}
+        survey = self._survey
+        if survey is not None:
+            state["det_min_diameter"] = float(survey._min_d.value())
+            state["det_max_diameter"] = float(survey._max_d.value())
+            state["det_restrict_to_well"] = bool(
+                survey._restrict_well.isChecked())
+        picker = getattr(self, "_picker", None)
+        if picker is not None:
+            state["measure_mode"] = bool(picker.measure_mode())
+        return state
+
+    def _apply_extra_state(self, state) -> None:
+        if not isinstance(state, dict):
+            return
+        survey = self._survey
+        if survey is not None:
+            if "det_min_diameter" in state:
+                survey._min_d.setValue(float(state["det_min_diameter"]))
+            if "det_max_diameter" in state:
+                survey._max_d.setValue(float(state["det_max_diameter"]))
+            if "det_restrict_to_well" in state:
+                survey._restrict_well.setChecked(
+                    bool(state["det_restrict_to_well"]))
+        picker = getattr(self, "_picker", None)
+        if picker is not None and "measure_mode" in state:
+            picker.set_measure_mode(bool(state["measure_mode"]))
 
     # Reagent roles the prep inherits from Hardware Setup → Ink (Reagent
     # Locations) by the assigned ink's ink_type.
@@ -561,15 +902,151 @@ class SpheroidPickupWorkflowPage(QWidget):
             return 0.0
 
     def _bore_area_mm2(self) -> float:
-        """Needle inner cross-section (mm²) — used for volume↔lift-height in the
-        sink-timing model. 0.0 if no needle is configured."""
+        """Needle NEAR-TIP cross-section (mm²) — used for volume↔lift-height in
+        the sink-timing model. 0.0 if no needle is configured.
+
+        v7.6: on a pulled capillary this is the tip area, because the first
+        millimetre of lift happens entirely inside the tip — that is what makes
+        the calibration staircase read correctly.
+        """
+        profile = self._bore_profile()
+        return profile.near_tip_area_mm2 if profile else 0.0
+
+    def _bore_profile(self):
+        """Full two-stage bore geometry for volume↔lift, or None with no needle."""
         needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
         if needle is None:
-            return 0.0
+            return None
         try:
-            return float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
+            from SupportClasses.PhysicalModels import needle_bore_profile
+            profile = needle_bore_profile(needle)
+            return profile if profile.is_usable() else None
         except Exception:
-            return 0.0
+            return None
+
+    def _needle_clearance(self) -> float:
+        """The operator's "needle ID ≥ N × spheroid Ø" factor (default 1.5)."""
+        spin = getattr(self, "_clearance", None)
+        try:
+            val = float(spin.value())
+        except (AttributeError, TypeError, ValueError):
+            return 1.5
+        return val if val > 0 else 1.5
+
+    def _spheroid_fit_detail(self, cfg) -> dict | None:
+        """Advisory check that the spheroid clears the needle orifice.
+
+        Returns the ``{status, ratio, message, severity}`` dict, or None when
+        the needle can't answer (no geometry, or an older NeedleSpec).
+
+        The ``clearance`` kwarg carries the operator's rule: the ratio computed
+        inside is ``orifice_id_um / spheroid_um``, so a clearance of 1.5 IS
+        "needle ID at least 1.5× the spheroid diameter".
+        """
+        needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
+        fn = getattr(needle, "spheroid_pickup_detail", None)
+        if not callable(fn):
+            return None
+        d_um = float(getattr(cfg, "spheroid_diameter_um", 0.0) or 0.0)
+        try:
+            vol = cfg.compute_volume_uL()
+        except Exception:
+            return None
+        try:
+            return fn(d_um, volume_uL=vol, clearance=self._needle_clearance())
+        except TypeError:
+            # An older NeedleSpec, or a duck-typed stub without the kwarg.
+            try:
+                return fn(d_um, volume_uL=vol)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _fit_badge(self, diameter_um: float) -> tuple[str, str]:
+        """``(badge, message)`` for one diameter — ``("", "")`` when it is fine.
+
+        Used to annotate a single list row, so the operator sees which spheroid
+        is the problem rather than a run-level warning naming none of them.
+        """
+        if not diameter_um or diameter_um <= 0:
+            return ("", "")
+        cfg = dataclasses.replace(self._current_config(),
+                                  spheroid_diameter_um=float(diameter_um))
+        detail = self._spheroid_fit_detail(cfg)
+        if not detail or detail.get("severity") != "warning":
+            return ("", "")
+        status = str(detail.get("status", ""))
+        ratio = detail.get("ratio")
+        badge = {"too_large": "⚠ too large",
+                 "tight": "⚠ tight",
+                 "past_tip": "⚠ past tip"}.get(status, "⚠")
+        if isinstance(ratio, (int, float)) and ratio:
+            badge = f"{badge} {float(ratio):.2f}×"
+        return (badge, str(detail.get("message", "")))
+
+    def _warn_spheroid_fits(self, cfgs) -> None:
+        """Log + surface non-blocking warnings for EVERY queued spheroid.
+
+        With per-spheroid sizing the run no longer has one diameter, so a single
+        check against one config would silently ignore the rest. Never prevents
+        the run (operator decision, per the advisory-only contract every needle
+        feasibility check in this app follows).
+        """
+        worst = ""
+        n_warn = 0
+        for cfg in cfgs:
+            detail = self._spheroid_fit_detail(cfg)
+            if not detail or detail.get("severity") != "warning":
+                continue
+            n_warn += 1
+            msg = str(detail.get("message", ""))
+            logger.warning("Spheroid pickup fit: %s", msg)
+            if not worst:
+                worst = msg
+        if not worst or not hasattr(self, "_status"):
+            return
+        total = len(list(cfgs))
+        suffix = (f"  ({n_warn} of {total} picks)" if total > 1 else "")
+        self._status.setText(f"⚠ {worst}{suffix}")
+
+    def _warn_spheroid_fit(self, cfg) -> None:
+        """Single-config shim over :meth:`_warn_spheroid_fits`."""
+        self._warn_spheroid_fits([cfg])
+
+    def _refresh_fit_summary(self) -> None:
+        """Aggregate needle-fit line in the settings popout.
+
+        States the actual limit in µm — "orifice 300 µm → max 200 µm spheroid" —
+        because a bare ratio does not tell the operator which spheroids to drop.
+        """
+        if not hasattr(self, "_fit_summary"):
+            return
+        needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
+        orifice = 0.0
+        try:
+            from SupportClasses.PhysicalModels import needle_orifice_id_um
+            orifice = float(needle_orifice_id_um(needle)) if needle else 0.0
+        except Exception:
+            orifice = 0.0
+        if orifice <= 0:
+            self._fit_summary.setText("Needle bore unknown — no fit check.")
+            return
+        clearance = self._needle_clearance()
+        max_um = orifice / clearance
+        picks = self._picker.picks() if hasattr(self, "_picker") else []
+        over = [t for t in picks
+                if float(getattr(t, "size_um", 0.0) or 0.0) > max_um]
+        text = (f"Orifice {orifice:.0f} µm at {clearance:.2f}× → spheroids up "
+                f"to {max_um:.0f} µm.")
+        if over:
+            text += (f"  ⚠ {len(over)} of {len(picks)} pick(s) exceed it: "
+                     + ", ".join(t.target_id for t in over[:6])
+                     + ("…" if len(over) > 6 else ""))
+        self._fit_summary.setText(text)
+        self._fit_summary.setStyleSheet(
+            f"color: {COLORS['peach'] if over else COLORS['subtext0']}; "
+            f"font-size: {sf(9)}pt;")
 
     def _refresh_sink_status(self):
         """Update the sink-curve status label in the settings popout."""
@@ -766,6 +1243,17 @@ class SpheroidPickupWorkflowPage(QWidget):
                 self._sink_calib_dialog.hide()
         except Exception:
             pass
+        # The embedded scan page owns its own modeless dialog (and a live camera)
+        # that must stop when this page goes away.
+        #
+        # v7.9: do NOT call self._scan_page.hide() here. It is a CHILD widget, so
+        # Qt already delivers it a hide event when this page hides — which is
+        # what stops the camera. An EXPLICIT hide() additionally sets the
+        # widget's own hidden flag, which STICKS: Qt then never re-shows it with
+        # the parent, so the survey tab came back permanently BLANK on the second
+        # visit. Verified: with the explicit call the child reports
+        # isHidden()==True after a re-show; without it the child still receives
+        # exactly one hide event and is auto re-shown.
         super().hideEvent(event)
 
     # ── Common Print Settings hook ────────────────────────────────
@@ -775,6 +1263,12 @@ class SpheroidPickupWorkflowPage(QWidget):
         re-sync to these defaults; the global pump fields mirror/edit them."""
         if getattr(self, "_settings_dialog", None) is not None:
             self._settings_dialog.set_common(common)
+        if self._scan_page is not None and hasattr(
+                self._scan_page, "set_common_print_settings"):
+            try:
+                self._scan_page.set_common_print_settings(common)
+            except Exception as exc:
+                logger.debug("scan page common settings failed: %s", exc)
 
     # ── hw_config hook ────────────────────────────────────────────
 
@@ -803,10 +1297,14 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._picker.set_hardware_config(hw_config)
         try:
             needle = getattr(hw_config, "needle", None) if hw_config else None
-            # NeedleSpec exposes od_mm / length_mm (the old "outer_diameter_mm"
+            # NeedleSpec exposes od_um / length_mm (the old "outer_diameter_mm"
             # name never existed, so the needle outline silently never drew).
-            od_um = float(getattr(needle, "od_mm", 0.0) or 0.0) * 1000.0
-            length_mm = float(getattr(needle, "length_mm", 0.0) or 0.0)
+            # v7.6: prefer the ORIFICE OD (the pulled tip approaches the plate)
+            # and the barrel+tip length.
+            od_um = float(getattr(needle, "orifice_od_um", None)
+                          or getattr(needle, "od_um", 0.0) or 0.0)
+            length_mm = float(getattr(needle, "total_length_mm", None)
+                              or getattr(needle, "length_mm", 0.0) or 0.0)
             if od_um > 0:
                 self._workspace_view.set_needle(od_um)
                 self._xz_view.set_needle(od_um, length_mm or None)
@@ -821,9 +1319,24 @@ class SpheroidPickupWorkflowPage(QWidget):
             self._settings_dialog.resolve_pending()
         except Exception:
             pass
+        self._forward_to_scan_page("set_hardware_config", hw_config)
         self._refresh_prep_status()
         self._update_button_state()
         self._update_settings_summary()
+        self._refresh_fit_summary()
+        if self._survey is not None:
+            self._survey.refresh_badges()
+
+    def _forward_to_scan_page(self, method: str, *args) -> None:
+        """Relay a host push to the embedded scan page, best-effort."""
+        page = self._scan_page
+        fn = getattr(page, method, None) if page is not None else None
+        if not callable(fn):
+            return
+        try:
+            fn(*args)
+        except Exception as exc:
+            logger.debug("scan page %s failed: %s", method, exc)
 
     # ── Calibration data routing (mirror of JogControlPage) ──────
 
@@ -851,6 +1364,9 @@ class SpheroidPickupWorkflowPage(QWidget):
                 self._workspace_view, plate_key_of(self._hw_config), visible=True)
         # Service-well resolution depends on the calibrated well positions.
         self._refresh_prep_status()
+        # The survey tab's scan + well geometry come from the same calibration.
+        self._forward_to_scan_page(
+            "set_calibration_data", plate, well_positions, safe_z)
 
     def set_z_references(self, refs: dict) -> None:
         if not isinstance(refs, dict):
@@ -868,6 +1384,7 @@ class SpheroidPickupWorkflowPage(QWidget):
                 self._context_widget.set_z_references(self._z_references)
             except Exception:
                 pass
+        self._forward_to_scan_page("set_z_references", self._z_references)
 
     def _wells_in_zero_ref(self) -> dict[str, tuple[float, float]]:
         if not self._well_positions:
@@ -895,16 +1412,21 @@ class SpheroidPickupWorkflowPage(QWidget):
         except Exception:
             zero = {"x": 0.0, "y": 0.0}
 
+        # 4-tuples: the workspace draws a measured spheroid at its true relative
+        # size (the 4th element is optional, so 3-tuple callers still work).
         picks_zr = [
-            (t.x_um - zero["x"], t.y_um - zero["y"], t.target_id)
+            (t.x_um - zero["x"], t.y_um - zero["y"], t.target_id,
+             float(getattr(t, "size_um", 0.0) or 0.0))
             for t in self._picker.picks()
         ]
         places_zr = [
-            (t.x_um - zero["x"], t.y_um - zero["y"], t.target_id)
+            (t.x_um - zero["x"], t.y_um - zero["y"], t.target_id,
+             float(getattr(t, "size_um", 0.0) or 0.0))
             for t in self._picker.places()
         ]
         self._workspace_view.set_pick_targets(picks_zr)
         self._workspace_view.set_place_targets(places_zr)
+        self._refresh_fit_summary()
 
     # ── Stage position indicator refresh ─────────────────────────
 
@@ -947,16 +1469,233 @@ class SpheroidPickupWorkflowPage(QWidget):
 
     # ── Workspace + XZ click handlers (mirror of JogControlPage) ──
 
-    def _travel_blocked_by_run(self) -> bool:
-        """True (+ shows a hint) if a workflow run is active — don't launch a
-        manual click-to-travel on top of the executor thread (both drive the
-        stage and toggle the non-refcounted poller suspend). Abort the run
-        first. The Jog page owns no executor and needs no such guard."""
+    def _stage_busy(self) -> bool:
+        """True (+ shows a hint) when something else is already driving the stage.
+
+        Consulted by EVERY entry point that can move the stage — Start, the two
+        workspace clicks, a row's Go to, and a survey Go to. Two drivers on one
+        serial channel is bad enough, but the mosaic scan worker also toggles
+        ``suspend_position_poller``, which is NOT refcounted: whichever finishes
+        first re-enables the poller underneath the other.
+        """
         t = getattr(self, "_exec_thread", None)
         if t is not None and t.is_alive():
             self._status.setText("Busy running — abort first to move manually.")
             return True
+        page = getattr(self, "_scan_page", None)
+        if page is not None and page.is_scanning():
+            self._status.setText(
+                "A mosaic scan is running — wait for it or abort it first.")
+            return True
+        worker = getattr(self, "_crop_worker", None)
+        if worker is not None and worker.isRunning():
+            return True
         return False
+
+    # Kept as an alias: the old name reads better at the two workspace-click
+    # sites and is what the existing tests reference.
+    def _travel_blocked_by_run(self) -> bool:
+        return self._stage_busy()
+
+    def _travel_to_absolute(self, x_um_abs: float, y_um_abs: float) -> bool:
+        """Retract to safe Z, then travel to an ABSOLUTE stage µm point.
+
+        Deliberately separate from ``_on_workspace_position_clicked``, which
+        receives ZERO-REF µm and adds ``controller.zero_position`` — sharing one
+        handler between the two frames would add the zero twice and put the move
+        millimetres away. Note the parameter names.
+
+        Goes through ``SafeTravelWorker`` with ``target_z_mm=None``, so the needle
+        retracts and WAITS before any XY motion and never descends on arrival.
+        """
+        if not getattr(self._controller, "is_xy_connected", False):
+            self._status.setText("XY stage not connected.")
+            return False
+        if self._stage_busy():
+            return False
+        if not getattr(self._controller, "is_zp_connected", False):
+            # Without the ZP board safe_travel_to silently skips its retract, so
+            # the stage would drive XY with the needle possibly down.
+            self._status.setText(
+                "ZP (Z + pump) board not connected — it is what retracts the "
+                "needle before travel. Reconnect it first.")
+            return False
+        if self._safe_z is None:
+            self._status.setText(
+                "No safe Z configured — set it on the Calibration page before "
+                "travelling.")
+            return False
+        self._travel_worker.start(
+            self._controller, x_um_abs, y_um_abs,
+            safe_z_mm=self._safe_z, target_z_mm=None)
+        return True
+
+    def _on_spheroid_goto(self, x_um_abs: float, y_um_abs: float):
+        """Survey [Go to] — travel to a detected spheroid (absolute stage µm)."""
+        if self._travel_to_absolute(x_um_abs, y_um_abs):
+            self._survey.set_status(
+                "Travelling… then click the spheroid on the live view to "
+                "confirm its position.")
+
+    # ── Training crops ────────────────────────────────────────────
+
+    def _on_save_training_crop(self, x_um: float, y_um: float,
+                               diameter_um: float, det_id: str):
+        """Bank a cropped image of one spheroid as future training data.
+
+        The capture runs on a worker thread (settling + waiting for fresh frames
+        would otherwise stall the event loop and freeze every camera feed), and
+        the crop is taken from the RAW frame — never the display pixmap, which
+        carries our own crosshair and target rings.
+        """
+        from gui.widgets.spheroid_crop_worker import SpheroidCropWorker
+        worker = getattr(self, "_crop_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        cam = self._microscope_widget()
+        if cam is None:
+            self._crop_message("No microscope camera to capture from.")
+            return
+        eff = self._live_um_per_px()
+        if not eff:
+            self._crop_message(
+                "The camera has no µm/px calibration, so a crop could not be "
+                "scaled. Calibrate the objective first.")
+            return
+        self._pending_crop = {
+            "x_um": float(x_um), "y_um": float(y_um),
+            "diameter_um": float(diameter_um), "det_id": str(det_id),
+        }
+        self._crop_worker = SpheroidCropWorker(
+            cam, self._read_stage_xy_um, eff,
+            settle_ms=int(self._crop_settle.value()),
+            fresh_frames=int(self._crop_fresh.value()))
+        self._crop_worker.captured.connect(self._on_crop_captured)
+        self._crop_worker.failed.connect(
+            lambda msg: self._crop_message(f"Crop failed: {msg}"))
+        self._crop_message("Capturing a fresh frame…")
+        self._crop_worker.start()
+
+    def _crop_message(self, text: str) -> None:
+        """Report a crop outcome on both surfaces that could be in view."""
+        if self._survey is not None:
+            self._survey.set_status(text)
+        if hasattr(self, "_crop_status"):
+            self._crop_status.setText(text)
+
+    def _on_crop_captured(self, frame, stage_um, um_per_px: float):
+        from SupportClasses import SpheroidTrainingStore as sts
+        pending = getattr(self, "_pending_crop", None) or {}
+        target = (pending.get("x_um", 0.0), pending.get("y_um", 0.0))
+        diameter = float(pending.get("diameter_um") or 0.0)
+        try:
+            h, w = frame.shape[:2]
+        except Exception:
+            self._crop_message("Crop failed: unreadable frame.")
+            return
+        radius_px = (diameter / 2.0) / um_per_px if um_per_px else 0.0
+        refusal = sts.refuse_crop_reason(
+            target, stage_um, um_per_px, (w, h), radius_px,
+            pad_frac=float(self._crop_pad.value()))
+        if refusal:
+            self._crop_message(f"Not saved — {refusal}")
+            return
+        centre = sts.target_center_px(target, stage_um, um_per_px, (w, h))
+        rect = sts.crop_rect_for_circle(centre, radius_px, (w, h),
+                                        pad_frac=float(self._crop_pad.value()))
+        crop = sts.crop_from_frame(frame, rect)
+        if crop is None:
+            self._crop_message("Not saved — the crop window was empty.")
+            return
+        det = self._survey.detection(pending.get("det_id", ""))
+        source = sts.SOURCE_AUTO
+        if det is not None:
+            source = (sts.SOURCE_MANUAL if det.source == "user"
+                      else (sts.SOURCE_REDRAWN if det.user_edited
+                            else sts.SOURCE_AUTO))
+        ctx = self._mosaic_context_for_channel(None) or {}
+        rel = sts.get_store().add_crop(
+            crop, diameter_um=diameter, radius_px=radius_px,
+            um_per_px=um_per_px,
+            center_px_in_crop=rect.center_px_in_crop,
+            crop_origin_px=(rect.x0, rect.y0), frame_wh=(w, h),
+            stage_um=stage_um, well=str(ctx.get("well") or ""),
+            plate_key=str(ctx.get("plate_key") or ""),
+            objective=str(ctx.get("objective") or ""),
+            channel=str(ctx.get("channel") or ""),
+            detection_source=source,
+            user_edited=bool(det.user_edited) if det is not None else False,
+            clipped=rect.clipped, pad_frac=float(self._crop_pad.value()),
+            target_id=str(pending.get("det_id") or ""))
+        if not rel:
+            self._crop_message("Crop failed to write — see the log.")
+            return
+        store = sts.get_store()
+        self._crop_message(
+            f"Saved training crop {rel} (Ø{diameter:.0f} µm) — "
+            f"{store.count()} sample(s), {store.total_bytes() / 1e6:.1f} MB.")
+
+    def _microscope_widget(self):
+        """The live microscope CameraWidget, or None."""
+        mgr = self._camera_manager
+        if mgr is None:
+            return None
+        try:
+            cams = mgr.cameras
+        except Exception:
+            return None
+        idx = 0
+        if self._hw_config is not None:
+            try:
+                from SupportClasses.HardwareConfig import CameraRole
+                resolved = self._hw_config.camera_for_role(CameraRole.MICROSCOPE)
+                if resolved is not None:
+                    idx = int(resolved)
+            except Exception:
+                idx = 0
+        return cams[idx] if 0 <= idx < len(cams) else None
+
+    def _live_um_per_px(self) -> float:
+        """Effective µm/px for the CURRENT live frame width, or 0.0."""
+        mgr = self._camera_manager
+        cam = self._microscope_widget()
+        if mgr is None or cam is None:
+            return 0.0
+        width = 0
+        try:
+            frame = cam.get_current_frame()
+            if frame is not None:
+                width = int(frame.shape[1])
+        except Exception:
+            width = 0
+        try:
+            eff = getattr(mgr, "effective_um_per_px", None)
+            idx = getattr(cam, "cam_idx", 0)
+            if callable(eff) and width:
+                return float(eff(self._microscope_index(), width))
+            return float(mgr.get_um_per_px(self._microscope_index()))
+        except Exception:
+            return 0.0
+
+    def _microscope_index(self) -> int:
+        if self._hw_config is None:
+            return 0
+        try:
+            from SupportClasses.HardwareConfig import CameraRole
+            idx = self._hw_config.camera_for_role(CameraRole.MICROSCOPE)
+            return int(idx) if idx is not None else 0
+        except Exception:
+            return 0
+
+    def _read_stage_xy_um(self):
+        """Absolute stage XY in µm (for the crop worker's snapshot)."""
+        try:
+            pos = self._controller.get_xy_position(cached=False)
+        except Exception:
+            return None
+        if pos is None or pos[0] is None or pos[1] is None:
+            return None
+        return (float(pos[0]), float(pos[1]))
 
     def _on_workspace_position_clicked(
         self, x_um_zr: float, y_um_zr: float
@@ -1082,6 +1821,74 @@ class SpheroidPickupWorkflowPage(QWidget):
             release_volume_uL=float(self._release_vol.value()),
         )
 
+    _MAX_TARGET_DIAMETER_UM = 5000.0
+
+    def _per_target_volume_enabled(self) -> bool:
+        chk = getattr(self, "_per_target_volume", None)
+        try:
+            return bool(chk.isChecked())
+        except AttributeError:
+            return False
+
+    def _effective_diameter_um(self, target) -> float:
+        """A target's measured diameter, or 0.0 when it has none.
+
+        ``PickPlaceTarget.size_um`` has serialized since v7.3.3 but nothing wrote
+        it before v7.8, so a hand-edited or restored value is clamped to a sane
+        band — it now changes an aspirate VOLUME, which scales as diameter cubed.
+        """
+        if not self._per_target_volume_enabled():
+            return 0.0
+        try:
+            d = float(getattr(target, "size_um", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if d <= 0:
+            return 0.0
+        return min(d, self._MAX_TARGET_DIAMETER_UM)
+
+    def _config_for_pick(self, base_cfg, pick):
+        """``base_cfg`` for an unmeasured pick, else a copy sized from its Ø.
+
+        Returning the SAME OBJECT when nothing was measured is what keeps the
+        built queue byte-identical to the pre-v7.8 single-config queue.
+        """
+        d = self._effective_diameter_um(pick)
+        if not d or abs(d - float(base_cfg.spheroid_diameter_um)) < 1e-9:
+            return base_cfg
+        return dataclasses.replace(base_cfg, spheroid_diameter_um=d)
+
+    def _warn_release_residual(self, cfgs) -> None:
+        """Warn when a fixed release volume meets varying aspirate volumes.
+
+        With ``release_enabled`` the dispense is a fixed ``release_volume_uL``
+        while a per-spheroid aspirate now varies with diameter cubed, so the
+        retained residual differs per pick and ACCUMULATES across the queue —
+        potentially past the needle's own internal volume. Advisory; the operator
+        may well want it (that is what the release volume is for).
+        """
+        if not hasattr(self, "_status"):
+            return
+        cfgs = list(cfgs)
+        if not cfgs or not getattr(cfgs[0], "release_enabled", False):
+            return
+        release = float(getattr(cfgs[0], "release_volume_uL", 0.0) or 0.0)
+        if release <= 0:
+            return
+        retained = sum(max(0.0, c.compute_volume_uL() - release) for c in cfgs)
+        if retained <= 0:
+            return
+        capacity = self._needle_volume_uL()
+        msg = (f"Release volume is fixed at {release:.4f} µL, so ~{retained:.4f} "
+               f"µL is retained across {len(cfgs)} pick(s)")
+        if capacity and capacity > 0:
+            msg += f" against a {capacity:.3f} µL needle"
+            if retained > capacity:
+                logger.warning("Spheroid run: %s — post-clean will be needed.", msg)
+                self._status.setText(f"⚠ {msg} — run the post-clean.")
+                return
+        logger.info("Spheroid run: %s.", msg)
+
     def _plate_offset_to_zref(self, offset_mm: float) -> float | None:
         """Height above the calibrated plate bottom (mm) → zero-ref Z (mm),
         polarity-correct. Returns None if the plate bottom isn't calibrated."""
@@ -1112,19 +1919,37 @@ class SpheroidPickupWorkflowPage(QWidget):
     def _refresh_volume_label(self):
         cfg = self._current_config()
         v = cfg.compute_volume_uL()
-        self._volume_label.setText(f"V = {v:.4f} µL  (×{cfg.safety_factor:.2f})")
+        text = f"V = {v:.4f} µL  (×{cfg.safety_factor:.2f})"
+        if self._per_target_volume_enabled():
+            text += " — for an unmeasured pick"
+        if cfg.safety_factor < 1.0:
+            # Allowed (the operator asked for the wider range) but worth saying:
+            # the carrier column is then smaller than the spheroid itself.
+            text += "  ⚠ below 1× the spheroid's own volume"
+        self._volume_label.setText(text)
+        self._refresh_fit_summary()
 
     def _update_button_state(self, *_):
         balanced = self._picker.is_balanced()
         has_bore = self._bore.count() > 0
         running = self._exec_thread is not None and self._exec_thread.is_alive()
-        self._start_btn.setEnabled(balanced and has_bore and not running)
+        # A mosaic scan is also driving the stage (and the non-refcounted poller
+        # suspend), so Start must wait for it — see _stage_busy.
+        page = getattr(self, "_scan_page", None)
+        scanning = page is not None and page.is_scanning()
+        self._start_btn.setEnabled(
+            balanced and has_bore and not running and not scanning)
         self._abort_btn.setEnabled(running)
 
     # ── Start / Abort ─────────────────────────────────────────────
 
     def _on_start(self):
-        if self._exec_thread is not None and self._exec_thread.is_alive():
+        # ONE busy check for every stage driver — the executor thread (which used
+        # to be checked here alone, and silently) AND a mosaic scan, which also
+        # drives the stage and toggles the non-refcounted poller suspend.
+        # _update_button_state greys Start out too, but a race or a programmatic
+        # call must not get through either, and now it says why.
+        if self._stage_busy():
             return
 
         if not self._picker.is_balanced():
@@ -1162,8 +1987,13 @@ class SpheroidPickupWorkflowPage(QWidget):
                 "Calibration page so the pick/place heights can be resolved.")
             return
 
-        # Sink-timing model: resolve the bore area + calibrated curve and gate on
-        # them so the executor doesn't silently fall back to the fixed carrier.
+        # (The per-spheroid fit advisory runs once the per-pair configs are built,
+        # further down — with per-spheroid sizing there is no single diameter to
+        # check here.)
+
+        # Sink-timing model: resolve the bore geometry + calibrated curve and
+        # gate on them so the executor doesn't silently fall back to the fixed
+        # carrier.
         bore_area = self._bore_area_mm2()
         sink_curve = None
         if cfg.sink_timing_enabled:
@@ -1217,16 +2047,34 @@ class SpheroidPickupWorkflowPage(QWidget):
                     "service dip Z for prep / clean.")
                 return
 
+        # One config PER PAIR, so a measured spheroid is aspirated with the
+        # volume computed from ITS OWN diameter (× the safety factor, which
+        # replace() preserves). PickPlaceOperation.config is already per-op and
+        # _planned_aspirate_uL reads only cfg.compute_volume_uL(), so this needs
+        # no executor change.
+        #
+        # An unmeasured pick keeps the SAME config OBJECT as before, so with
+        # per-spheroid sizing off — or every size_um still 0 — the queue is
+        # byte-identical to the pre-v7.8 single-config queue.
         queue = OperationQueue()
+        per_op_cfgs: list = []
         for pick, place in pairs:
+            cfg_i = self._config_for_pick(cfg, pick)
+            per_op_cfgs.append(cfg_i)
             op = PickPlaceOperation(
                 op_id=PickPlaceOperation.make_id(),
                 op_type=OperationType.SPHEROID_PICKUP,
                 source_target=pick,
                 dest_target=place,
-                config=cfg,
+                config=cfg_i,
             )
             queue.add(op)
+
+        # Does each spheroid physically fit the orifice? ADVISORY only — a
+        # deformable spheroid can squeeze through a slightly smaller tip, so we
+        # warn per pick and proceed rather than blocking the run.
+        self._warn_spheroid_fits(per_op_cfgs)
+        self._warn_release_residual(per_op_cfgs)
 
         executor = PickPlaceExecutor(self._controller, self._hw_config)
         executor.safe_z_mm = float(self._safe_z)
@@ -1235,6 +2083,9 @@ class SpheroidPickupWorkflowPage(QWidget):
         # Sink-timing model inputs (bore area + calibrated curve). No-op unless
         # cfg.sink_timing_enabled (gated above); harmless to set otherwise.
         executor.bore_area_mm2 = bore_area
+        # Two-stage geometry so volume↔lift stays correct once a spheroid
+        # leaves a pulled tip and enters the wide barrel.
+        executor.bore_profile = self._bore_profile()
         executor.sink_curve = sink_curve
         # Advanced motion / timeout knobs (always applied).
         executor.intra_well_retract_mm = float(self._intra_retract.value())

@@ -252,11 +252,19 @@ class HardwareSummaryWidget(QWidget):
             n = config.needle
             ch_str = (f" | {n.num_channels} channel(s)"
                       if hasattr(n, 'num_channels') and n.num_channels > 1 else "")
-            len_str = (f" | {n.length_inches}\""
-                       if hasattr(n, 'length_inches') else "")
-            self._needle_label.setText(
-                f"{n.gauge}G — ID: {n.id_um} µm, OD: {n.od_um} µm, "
-                f"Wall: {n.wall_um} µm{len_str}{ch_str}")
+            if getattr(n, "has_tip", False):
+                # v7.6: a pulled capillary is two stages; show both.
+                self._needle_label.setText(
+                    f"Pulled glass capillary — barrel: ID {n.id_um:.0f} µm, "
+                    f"OD {n.od_um:.0f} µm, {n.length_mm:.1f} mm | tip: "
+                    f"ID {n.tip_id_um:.1f} µm, {float(n.tip_length_mm):.2f} mm"
+                    f"{ch_str}")
+            else:
+                len_str = (f" | {n.length_inches}\""
+                           if hasattr(n, 'length_inches') else "")
+                self._needle_label.setText(
+                    f"{n.gauge}G — ID: {n.id_um} µm, OD: {n.od_um} µm, "
+                    f"Wall: {n.wall_um} µm{len_str}{ch_str}")
         else:
             self._needle_label.setText("Not selected")
 

@@ -1,0 +1,16 @@
+{
+  "id": "capillary-100-_m-tip",
+  "display_name": "Capillary 100 \u00b5m tip",
+  "manufacturer": "",
+  "model": "",
+  "barrel_id_um": 500.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 65.0,
+  "tip_id_um": 100.0,
+  "tip_length_mm": 5.0,
+  "tip_od_um": 120.0,
+  "tip_profile": "cone",
+  "puller_program": "",
+  "notes": "",
+  "builtin": false
+}

@@ -161,8 +161,12 @@ class TestStorePersistAndAutoRestore(unittest.TestCase):
             c.setCurrentIndex(c.count() - 1)
             c.blockSignals(False)
             pg._remember_assignment(i)
-        pg.set_calibrated_um_per_px(0, 5.54, rotation_deg=45.0)
-        pg.set_calibrated_um_per_px(1, 5.49, rotation_deg=-45.0)
+        # v7.5.x (rotated rig): the needle-card commit passes the DISPLAY
+        # roll as rotation_deg and the ±45° mount direction separately.
+        pg.set_calibrated_um_per_px(
+            0, 5.54, rotation_deg=1.2, column_dir_deg=45.0)
+        pg.set_calibrated_um_per_px(
+            1, 5.49, rotation_deg=-0.8, column_dir_deg=-45.0)
 
         # Loading a hardware-setup file (no camera cal) must NOT wipe the store.
         pg.set_config(HardwareConfig())
@@ -181,10 +185,12 @@ class TestStorePersistAndAutoRestore(unittest.TestCase):
 
         self.assertTrue(mgr2.is_um_per_px_calibrated(0))
         self.assertAlmostEqual(mgr2.get_um_per_px(0), 5.54, places=6)
-        self.assertEqual(mgr2.get_rotation_deg(0), 45.0)
+        self.assertEqual(mgr2.get_rotation_deg(0), 1.2)
+        self.assertEqual(mgr2.get_column_dir_deg(0), 45.0)
         self.assertTrue(mgr2.is_um_per_px_calibrated(1))
         self.assertAlmostEqual(mgr2.get_um_per_px(1), 5.49, places=6)
-        self.assertEqual(mgr2.get_rotation_deg(1), -45.0)
+        self.assertEqual(mgr2.get_rotation_deg(1), -0.8)
+        self.assertEqual(mgr2.get_column_dir_deg(1), -45.0)
 
 
 class TestAutoDetectOnShow(unittest.TestCase):

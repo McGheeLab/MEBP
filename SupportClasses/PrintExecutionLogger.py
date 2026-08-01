@@ -382,3 +382,40 @@ class PrintExecutionLogger:
             return out
         except Exception:
             return {}
+
+    #: Cap on how many path points a `path_start` record carries (see
+    #: :meth:`path_points`). 5000 points ≈ 150 kB of JSON — enough to reproduce
+    #: any real toolpath's geometry for scoring without bloating the log.
+    MAX_LOGGED_PATH_POINTS = 5000
+
+    @staticmethod
+    def path_points(points, max_points: int | None = None) -> dict:
+        """v7.7: the printed path itself, so a SAVED log can be scored against
+        its ideal later.
+
+        Until now a log recorded only ``n_points`` and the bbox/segment stats, so
+        reopening a finished run gave no way to compute deviation — the report
+        could show the executed trace but not how far off it was. Long paths are
+        decimated uniformly, always keeping the exact first and last point (they
+        anchor the arc length), and ``decimated_from`` records the original count
+        so a consumer knows the geometry is approximate.
+
+        Returns ``{}`` on any problem — the caller splats it into the record, so
+        an older/odd path simply omits the field and readers must tolerate that.
+        """
+        cap = int(max_points or PrintExecutionLogger.MAX_LOGGED_PATH_POINTS)
+        try:
+            pts = [(round(float(p[0]), 4), round(float(p[1]), 4))
+                   for p in points]
+        except (TypeError, ValueError, IndexError):
+            return {}
+        if len(pts) < 2:
+            return {}
+        if len(pts) <= cap:
+            return {"points": [list(p) for p in pts]}
+        step = (len(pts) + cap - 1) // cap
+        kept = pts[::step]
+        if kept[-1] != pts[-1]:
+            kept.append(pts[-1])
+        return {"points": [list(p) for p in kept],
+                "decimated_from": len(pts)}

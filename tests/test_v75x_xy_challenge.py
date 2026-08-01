@@ -20,6 +20,7 @@ from SupportClasses import XYChallenge as XC
 from SupportClasses.PrintTimingCalibrationStore import (
     PrintTimingCalibrationStore, get_store)
 from SupportClasses.PrintManager import PrintSettings
+from tests.support.store_fixture import use_temp_store
 
 
 # ── 1. Shapes + error metric (pure) ──────────────────────────────────
@@ -75,16 +76,46 @@ class TestStoreModeParams(unittest.TestCase):
         p = os.path.join(tempfile.mkdtemp(), "tc.json")
         return PrintTimingCalibrationStore(p), p
 
+    #: the seven original velocity keys and their values — these must never move
+    LEGACY_VELOCITY_DEFAULTS = {
+        "lookahead_mm": 0.6, "control_hz": 25.0, "decel_mm": 1.5,
+        "corner_angle_deg": 30.0, "corner_speed_factor": 0.4,
+        "pid_kp": 0.0, "pid_kd": 0.0}
+
     def test_defaults(self):
         s, _ = self._store()
-        self.assertEqual(s.get_mode_params("velocity"), {
-            "lookahead_mm": 0.6, "control_hz": 25.0, "decel_mm": 1.5,
-            "corner_angle_deg": 30.0, "corner_speed_factor": 0.4,
-            "pid_kp": 0.0, "pid_kd": 0.0})
+        v = s.get_mode_params("velocity")
+        for k, want in self.LEGACY_VELOCITY_DEFAULTS.items():
+            self.assertEqual(v[k], want, msg=k)
         self.assertEqual(s.get_mode_params("open_loop"),
                          {"pace_correction": 1.0})
         self.assertEqual(s.get_mode_params("confirm"),
                          {"settle_tol_um": 40.0, "corner_angle_deg": 30.0})
+
+    def test_every_new_velocity_key_defaults_to_off(self):
+        """The XY-Challenge upgrade adds ~25 velocity knobs. All of them MUST
+        default to 0 so an uncalibrated machine — and any existing calibration
+        file holding only the seven legacy keys — behaves exactly as before."""
+        s, _ = self._store()
+        v = s.get_mode_params("velocity")
+        new = set(v) - set(self.LEGACY_VELOCITY_DEFAULTS)
+        self.assertTrue(new, "expected the new tuning keys to be present")
+        for k in sorted(new):
+            self.assertEqual(v[k], 0.0, msg=f"{k} must default to 0 (off)")
+
+    def test_legacy_only_file_merges_to_off(self):
+        """A pre-upgrade calibration file must load with no migration."""
+        import json
+        s, path = self._store()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"version": "1.0", "path_tuning": {
+                "velocity": dict(self.LEGACY_VELOCITY_DEFAULTS,
+                                 lookahead_mm=0.2, pid_kp=4.0)}}, fh)
+        v = PrintTimingCalibrationStore(path).get_mode_params("velocity")
+        self.assertEqual(v["lookahead_mm"], 0.2)      # stored value kept
+        self.assertEqual(v["pid_kp"], 4.0)
+        self.assertEqual(v["hold_speed"], 0.0)        # new keys filled off
+        self.assertEqual(v["normal_bound_frac"], 0.0)
 
     def test_set_merges_and_persists(self):
         s, path = self._store()
@@ -106,6 +137,29 @@ class TestStoreModeParams(unittest.TestCase):
         s.set_mode_params("nope", {"x": 1})              # must not raise
 
 
+class TestStoreSingletonNotLeaked(unittest.TestCase):
+    """Guard against the leak this suite used to have.
+
+    ``get_store()`` is a process-wide singleton. A test that swaps the module
+    global and fails to restore it silently redirects every LATER test in the
+    process at a temp dir. ``use_temp_store`` restores via ``addCleanup``; this
+    test proves the restore actually happens.
+    """
+
+    def test_use_temp_store_restores_previous_global(self):
+        from SupportClasses import PrintTimingCalibrationStore as TCS
+        before = TCS._store
+
+        class _Inner(unittest.TestCase):
+            def runTest(inner):
+                st = use_temp_store(inner)
+                self.assertIs(TCS._store, st)
+                self.assertIsNot(TCS._store, before)
+
+        _Inner().run(unittest.TestResult())               # runs cleanups
+        self.assertIs(TCS._store, before)                 # restored
+
+
 # ── 3. PrintSettings plumbing + Quick Print stamping ──────────────────
 
 class TestSettingsPlumbing(unittest.TestCase):
@@ -119,36 +173,30 @@ class TestSettingsPlumbing(unittest.TestCase):
 
     def test_quick_print_stamps_tuned_params(self):
         # A tuned store value must flow onto PrintSettings via _build_settings.
-        from SupportClasses import PrintTimingCalibrationStore as TCS
-        d = tempfile.mkdtemp()
-        store = TCS.PrintTimingCalibrationStore(os.path.join(d, "tc.json"))
+        store = use_temp_store(self)                      # get_store() → our store
         store.set_mode_params("velocity", {"lookahead_mm": 0.35})
         store.set_mode_params("open_loop", {"pace_correction": 2.0})
-        orig = TCS._store
-        TCS._store = store                               # get_store() → our store
-        try:
-            from gui.pages.workflows import quick_print_workflow as qpw
-            page = qpw.QuickPrintWorkflowPage.__new__(qpw.QuickPrintWorkflowPage)
 
-            class _C:
-                def print_z_dir(self): return 1.0
-                def plate_axis_sign(self): return (1.0, 1.0)
-                def default_travel_z(self, z, margin_mm=10.0): return z + margin_mm
-            page._controller = _C()
-            page._safe_z = 40.0
-            page._resolved_print_kinematics = lambda: (2.5, 0.4, 0.1)
-            page._resolve_print_z = lambda: 21.0
-            page._pump = lambda: "P1"
-            page._travel_speed = None
-            page._line_retract_spin = None
-            page._line_z_speed_spin = None
-            page._line_xy_speed_spin = None
-            page._motion_mode = lambda: "velocity"
-            s = page._build_settings()
-            self.assertAlmostEqual(s.vel_lookahead_mm, 0.35)
-            self.assertAlmostEqual(s.pace_correction, 2.0)
-        finally:
-            TCS._STORE = orig
+        from gui.pages.workflows import quick_print_workflow as qpw
+        page = qpw.QuickPrintWorkflowPage.__new__(qpw.QuickPrintWorkflowPage)
+
+        class _C:
+            def print_z_dir(self): return 1.0
+            def plate_axis_sign(self): return (1.0, 1.0)
+            def default_travel_z(self, z, margin_mm=10.0): return z + margin_mm
+        page._controller = _C()
+        page._safe_z = 40.0
+        page._resolved_print_kinematics = lambda: (2.5, 0.4, 0.1)
+        page._resolve_print_z = lambda: 21.0
+        page._pump = lambda: "P1"
+        page._travel_speed = None
+        page._line_retract_spin = None
+        page._line_z_speed_spin = None
+        page._line_xy_speed_spin = None
+        page._motion_mode = lambda: "velocity"
+        s = page._build_settings()
+        self.assertAlmostEqual(s.vel_lookahead_mm, 0.35)
+        self.assertAlmostEqual(s.pace_correction, 2.0)
 
 
 # ── 4. The three mode drivers (with fake stages) ──────────────────────

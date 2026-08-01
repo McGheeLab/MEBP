@@ -76,6 +76,16 @@ def setup_logging(verbose=False):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
+    # v7.5.x: silence third-party DEBUG firehoses. ``comtypes`` logs ~10 lines
+    # per COM call, and the microscope panel polls the Ti's COM object model
+    # about once a second — that alone wrote ~35 000 lines (several MB) during a
+    # 4-minute mosaic scan, rotating app.log every few minutes and burying the
+    # app's own diagnostics. WARNING keeps real COM errors.
+    for _noisy in ("comtypes", "comtypes.client", "comtypes.client._generate",
+                   "comtypes.client._managing", "comtypes._post_coinit",
+                   "comtypes._post_coinit.unknwn", "PIL", "matplotlib"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     console = logging.StreamHandler()
     console.setLevel(level)
     console.setFormatter(fmt)

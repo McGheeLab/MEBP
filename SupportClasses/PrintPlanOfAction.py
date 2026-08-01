@@ -1225,14 +1225,24 @@ def validate_well_setup(hw_config, well_model, plan=None):
 
     # 4. Pump-needle mapping
     if hw_config is not None and hw_config.needle is not None:
-        num_ch = hw_config.needle.num_channels
+        # v7.9: ask for the RESOLVED bore→pump map, not the stored one. On a
+        # multi-bore assembly each NeedleBore carries its own pump_id and
+        # ``num_channels`` is reconciled to the bore count, so reading the stored
+        # map here reported a spurious "N bores but 0 mapped" on every plan the
+        # moment the Needle card started emitting a bore list. The resolver falls
+        # back to the stored map for every pre-v7.9 needle, so single-bore
+        # behaviour is unchanged.
+        needle = hw_config.needle
+        num_bores = getattr(needle, "bore_count", None) or needle.num_channels
         enabled = hw_config.enabled_pump_ids
-        if num_ch > 0 and enabled:
-            mapped = hw_config.needle_channel_pump_map
-            if len(mapped) != num_ch:
+        if num_bores > 0 and enabled:
+            resolver = getattr(hw_config, "resolved_bore_pump_map", None)
+            mapped = (resolver() if callable(resolver)
+                      else hw_config.needle_channel_pump_map)
+            if len(mapped) != num_bores:
                 issues.append(
-                    f"Needle has {num_ch} channel(s) but "
-                    f"{len(mapped)} mapped")
+                    f"Needle has {num_bores} bore(s) but "
+                    f"{len(mapped)} mapped to a pump")
 
     # 5. Syringe capacity
     if plan is not None and hw_config is not None:

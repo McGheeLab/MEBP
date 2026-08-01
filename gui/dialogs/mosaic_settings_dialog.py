@@ -40,9 +40,6 @@ MOSAIC_SCAN_DEFAULTS: dict = {
     "target_px": 3000,        # stitched mosaic long-edge resolution (px)
     "detect_param2": 30,      # HoughCircles accumulator threshold
     "detect_tol_pct": 35,     # well-radius tolerance (%)
-    "frame_orient": "none",   # per-tile camera-mount transform (see below)
-    "fov_um": 0,              # camera FOV width (µm); 0 = auto from µm/px
-    "spacing_um": 0,          # explicit grid spacing (µm); 0 = auto (FOV·(1−ov))
     "register": True,         # align tiles by phase correlation while stitching
     "max_shift_um": 0,        # bound on the per-tile alignment shift (µm); 0=auto
     "reg_method": "fourier_mellin",  # pairwise registration method (see below)
@@ -50,13 +47,25 @@ MOSAIC_SCAN_DEFAULTS: dict = {
     "cal_rows": 5,            # calibration mosaic grid rows
 }
 
-# Camera-mount tile transforms: stored value → display label.
-FRAME_ORIENT_OPTIONS = [
-    ("none", "None"),
-    ("rot180", "Rotate 180°"),
-    ("fliph", "Flip horizontal"),
-    ("flipv", "Flip vertical"),
-]
+# v7.5.x — REMOVED, and they must not come back here:
+#
+#   frame_orient ("Tile orientation (camera mount)") — a coarse
+#       none/rot180/fliph/flipv per-tile transform predating the MEASURED
+#       camera->stage orientation. It STACKED on top of the calibrated
+#       ``MosaicBuilder._orient_tile``, and because only the fluorescence scan
+#       still honoured it, the same camera produced two differently-oriented
+#       mosaics (the plate scan applied rotation + flip_y; fluorescence applied
+#       the coarse rot180 and LOST the flip). Orientation now has exactly one
+#       home: the per-camera calibration store, via SupportClasses/
+#       MosaicCalibration.
+#
+#   fov_um / spacing_um — µm/px and grid-step overrides that sat ABOVE every
+#       measured value in the precedence, forever, from a hidden Advanced
+#       submenu. They are why a freshly calibrated camera could keep scanning at
+#       an old scale. The measured FOV now sizes the tiles and the step.
+#
+# Existing settings.json files may still carry these keys; they are simply
+# ignored (``merged_settings`` only copies keys present in the defaults).
 
 # Pairwise registration method: stored value → display label.
 REG_METHOD_OPTIONS = [
@@ -178,19 +187,9 @@ class MosaicScanSettingsDialog(QDialog):
             ras_form, "overlap_pct", "Tile overlap",
             self._int_spin(5, 50, " %"),
             "Raster step = camera FOV × (1 − overlap). Higher overlap = more "
-            "tiles but more robust stitching. (Ignored if Grid spacing is set.)")
-        self._add_row(
-            ras_form, "fov_um", "Camera FOV width",
-            self._int_spin(0, 50000, " µm"),
-            "Real width of the camera field of view in µm. 0 = auto (frame "
-            "width × calibrated µm/px). Set this if the auto FOV is wrong — it "
-            "sizes each tile AND the auto grid spacing, so tiles tile correctly.")
-        self._add_row(
-            ras_form, "spacing_um", "Grid spacing",
-            self._int_spin(0, 50000, " µm"),
-            "Explicit distance between tile centres (stage µm). 0 = auto "
-            "(FOV × (1 − overlap)). Set this to dial coverage/overlap directly "
-            "when the FOV-derived spacing doesn't match the stage.")
+            "tiles but more robust stitching. Below ~15% a small µm/px error "
+            "opens gaps between tiles and registration has too little shared "
+            "texture to lock onto; 25% is recommended.")
         self._add_row(
             ras_form, "target_px", "Mosaic resolution",
             self._int_spin(1000, 8000, " px"),
@@ -241,17 +240,19 @@ class MosaicScanSettingsDialog(QDialog):
             "known well radius and still count.")
         root.addWidget(det_box)
 
-        # ── Tile orientation (camera mount) ─────────────────────────
-        orient_box = QGroupBox("Tile orientation (camera mount)")
-        orient_form = QFormLayout(orient_box)
-        self._add_combo_row(
-            orient_form, "frame_orient", "Rotate / flip each tile",
-            FRAME_ORIENT_OPTIONS,
-            "Use ONLY if the stitched tiles don't line up (the camera is "
-            "mounted rotated or mirrored relative to the stage). Rotates / "
-            "flips each captured frame so it matches stage motion. Leave at "
-            "None if tiles already align.")
-        root.addWidget(orient_box)
+        # ── Where orientation and scale live now ────────────────────
+        # The old "Tile orientation (camera mount)" combo and the
+        # "Camera FOV width" / "Grid spacing" overrides lived here. They are gone
+        # (see the note by MOSAIC_SCAN_DEFAULTS): orientation and µm/px are
+        # MEASURED, in one place, and this dialog must not offer a second way to
+        # set them.
+        note = QLabel(
+            "Camera orientation (mirror / axis direction / rotation) and pixel "
+            "size are measured in Hardware Setup → Cameras → Mosaic & Camera "
+            "Calibration, and apply to every mosaic and live view.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {COLORS['subtext0']};")
+        root.addWidget(note)
 
         # ── Buttons ─────────────────────────────────────────────────
         btn_row = QHBoxLayout()

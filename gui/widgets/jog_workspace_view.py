@@ -418,6 +418,35 @@ class JogWorkspaceView(QWidget):
         self._mosaic_visible = bool(visible)
         self.update()
 
+    def mosaic_output_rotation(self) -> int:
+        """The DISPLAY-ONLY whole-mosaic output rotation in degrees (0/90/180/270).
+
+        v7.5.x (operator: *"we need the ability to rotate the entire mosaic to
+        ensure the output of the mosaic is the correct way up and down"*).
+
+        ⚠ Display only, by design. Mosaic tiles are placed at trusted raw stage
+        positions, and every consumer back-projects
+        ``stage = (extent - shift) + px/scale`` to derive well centres for
+        MOTION. Rotating the stored composite or its extent would reintroduce the
+        class of bug that once drove the stage millimetres off target, so this is
+        applied at paint time and nowhere else.
+        """
+        return int(getattr(self, "_mosaic_output_rotation", 0) or 0)
+
+    def set_mosaic_output_rotation(self, rotation_deg: float) -> None:
+        """Set the display-only whole-mosaic output rotation (snapped to 90°)."""
+        try:
+            quad = int(round(float(rotation_deg) / 90.0)) % 4 * 90
+        except (TypeError, ValueError):
+            quad = 0
+        if quad == self.mosaic_output_rotation():
+            return
+        self._mosaic_output_rotation = quad
+        # The cached scaled+rotated pixmap is keyed on this — drop it.
+        self._mosaic_scaled_cache = None
+        self._mosaic_cache_key = None
+        self.update()
+
     def set_wells_visible(self, visible: bool) -> None:
         """Show/hide the idealized well grid (paint-only; snapping is
         unaffected)."""
@@ -838,12 +867,18 @@ class JogWorkspaceView(QWidget):
         # then blits the pre-rendered pixmap with no per-frame scale/transform.
         tw = max(1, int(round(rect.width())))
         th = max(1, int(round(rect.height())))
-        key = (tw, th, bool(self._flip_180), id(self._mosaic_pixmap))
+        out_rot = self.mosaic_output_rotation()
+        key = (tw, th, bool(self._flip_180), out_rot, id(self._mosaic_pixmap))
         if key != self._mosaic_cache_key or self._mosaic_scaled_cache is None:
             scaled = self._mosaic_pixmap.scaled(
                 tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            if self._flip_180:
-                scaled = scaled.transformed(QTransform().rotate(180))
+            # Compose the plate-frame 180° display flip with the operator's
+            # whole-mosaic output rotation. Both are DISPLAY-ONLY: the stored
+            # composite and its extent are untouched, so the back-projection
+            # every consumer uses to derive well centres for MOTION is unaffected.
+            total = (180 if self._flip_180 else 0) + int(out_rot)
+            if total % 360:
+                scaled = scaled.transformed(QTransform().rotate(total % 360))
             self._mosaic_scaled_cache = scaled
             self._mosaic_cache_key = key
         p.save()

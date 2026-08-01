@@ -819,10 +819,20 @@ class TestMosaicOrientationGroundTruth(unittest.TestCase):
 
 
 class TestOrientationPersistsImmediately(unittest.TestCase):
-    """The correction dialog's flip/rotate must persist to the per-identity store
-    IMMEDIATELY (not only on a separate Apply) so the full mosaic applies it when
-    it places each tile — operator: "when I run the mosaic it is not flipping the
-    x axis"."""
+    """v7.5.x: the correction dialog's flip/rotate is now SESSION-ONLY.
+
+    It used to persist to the per-identity store on every click, with no
+    confirmation, which made it a second always-live editor of the three fields
+    the one calibration owns — so a camera's stored orientation could change from
+    a dialog the operator was only looking through. Orientation is now measured
+    (mirror + axis directions + rotation together, from stage motion) in Hardware
+    Setup → Cameras → Mosaic & Camera Calibration and committed there once, after
+    the confirming test mosaic.
+
+    The explicit "Apply to camera setup" button REMAINS the escape hatch for the
+    documented case where the measured handedness comes out inverted on a
+    particular camera build — that path is asserted here too.
+    """
 
     class _Mgr:
         def view_orientation(self, i):
@@ -859,20 +869,40 @@ class TestOrientationPersistsImmediately(unittest.TestCase):
             Path(tempfile.mkdtemp()) / "cam.json")
         return CCS
 
-    def test_flip_x_persists_mirror_to_store(self):
+    def test_flip_x_does_not_persist_on_its_own(self):
         CCS = self._fresh_store()
         d = self._dlg()
         d._orient_flip_h()                       # "Flip X axis"
-        entry = CCS.get_store().get_calibration("IDMOS")
-        self.assertIsNotNone(entry)
-        self.assertTrue(entry.get("mirrored"))
+        # Working state updated for the preview…
+        self.assertTrue(d._orient_mir)
+        # …but NOTHING written to the per-identity store.
+        self.assertIsNone(CCS.get_store().get_calibration("IDMOS"))
 
-    def test_rotate_persists_rotation_to_store(self):
+    def test_rotate_does_not_persist_on_its_own(self):
         CCS = self._fresh_store()
         d = self._dlg()
         d._orient_rotate(90.0)
+        self.assertAlmostEqual(d._orient_rot, 90.0)
+        self.assertIsNone(CCS.get_store().get_calibration("IDMOS"))
+
+    def test_explicit_apply_still_persists(self):
+        """The manual-override escape hatch must keep working."""
+        from PySide6.QtWidgets import QMessageBox
+        CCS = self._fresh_store()
+        d = self._dlg()
+        d._orient_flip_h()
+        d._orient_rotate(90.0)
+        # _orient_apply_to_camera ends in a modal confirmation, which would block
+        # the test run — stub it for the duration.
+        orig = QMessageBox.information
+        QMessageBox.information = staticmethod(lambda *a, **k: None)
+        try:
+            d._orient_apply_to_camera()
+        finally:
+            QMessageBox.information = orig
         entry = CCS.get_store().get_calibration("IDMOS")
         self.assertIsNotNone(entry)
+        self.assertTrue(entry.get("mirrored"))
         self.assertAlmostEqual(float(entry.get("rotation_deg")), 90.0)
 
 

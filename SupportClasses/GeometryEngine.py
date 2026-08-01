@@ -33,7 +33,10 @@ from typing import Any
 
 import numpy as np
 
-from .PhysicalModels import NeedleSpec, SyringeSpec, InkSpec
+from .PhysicalModels import (
+    NeedleSpec, SyringeSpec, InkSpec,
+    needle_orifice_area_mm2, needle_orifice_od_mm,
+)
 from .FlowPhysics import extrusion_flow_rate, flow_rate_to_pump_speed
 
 logger = logging.getLogger(__name__)
@@ -257,7 +260,12 @@ def line_spacing(needle: NeedleSpec, overlap_fraction: float = 0.0) -> float:
     """
     Calculate line spacing for multi-pass fills.
 
-    spacing = needle_OD × (1 - overlap_fraction)
+    spacing = orifice_OD × (1 - overlap_fraction)
+
+    v7.6: uses the ORIFICE outer Ø (the pulled tip when present) — the raster
+    pitch has to match the bead actually laid down, not the bulk barrel. On a
+    capillary the barrel OD would give a pitch ~30× too coarse and fills would
+    come out as disconnected stripes.
 
     Args:
         needle: Needle specification
@@ -266,7 +274,7 @@ def line_spacing(needle: NeedleSpec, overlap_fraction: float = 0.0) -> float:
     Returns:
         Line spacing in mm
     """
-    return needle.od_mm * (1.0 - overlap_fraction)
+    return needle_orifice_od_mm(needle) * (1.0 - overlap_fraction)
 
 
 def _path_length(points: np.ndarray) -> float:
@@ -359,16 +367,17 @@ def compute_pump_positions(
 
     Args:
         distances: Cumulative path distances (mm) — N-length array
-        needle: Needle specification (uses the INNER bore)
+        needle: Needle specification (uses the ORIFICE — the pulled tip when
+            present, else the inner bore)
         syringe: Syringe specification
         layer_height_mm: Deprecated — ignored (kept for positional callers).
-        extrusion_modifier: Bead thickness multiplier (1.0 = pure bore stream).
+        extrusion_modifier: Bead thickness multiplier (1.0 = pure orifice stream).
 
     Returns:
         N-length array of cumulative pump positions (mm)
     """
-    # Volume per mm of travel = inner-bore cross-section × modifier (µL/mm).
-    volume_per_mm = needle.cross_section_area_mm2 * extrusion_modifier
+    # Volume per mm of travel = orifice cross-section × modifier (µL/mm).
+    volume_per_mm = needle_orifice_area_mm2(needle) * extrusion_modifier
     # Total volume along path
     volumes_uL = distances * volume_per_mm
     # Convert to pump plunger travel
@@ -382,12 +391,13 @@ def compute_total_volume(
     extrusion_modifier: float = 1.0,
 ) -> float:
     """
-    Compute total ink volume for a path (v7.5.x F-1: inner-bore × modifier).
+    Compute total ink volume for a path (v7.5.x F-1: orifice area × modifier;
+    v7.6: the orifice is the pulled tip when present, else the inner bore).
 
     Returns:
         Volume in µL
     """
-    return path_length_mm * needle.cross_section_area_mm2 * extrusion_modifier
+    return path_length_mm * needle_orifice_area_mm2(needle) * extrusion_modifier
 
 
 # ---------------------------------------------------------------------------

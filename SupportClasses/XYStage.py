@@ -491,9 +491,22 @@ class XYStageManager:
 
     # ── Command Interface (P8.18, P8.19, P8.20) ──────────────────
 
-    def send_command(self, command: str) -> "Optional[str]":
+    def send_command(self, command: str,
+                     drain_ack: bool = False) -> "Optional[str]":
         """Send a raw command to the stage.
+
         v7.2.6: XY serial lock — prevents PositionPoller/JogHandler contention.
+
+        Args:
+            drain_ack: read and discard the controller's ack (under
+                ``_serial_lock``, so the write+drain is atomic). Required for any
+                command the controller answers but whose reply nobody reads —
+                otherwise the stale ack is consumed by the NEXT read. The Prior
+                ProScan answers a bare ``R`` to *everything*, so this matters for
+                the parameter setters (SMS/SAS/SCS). Default False preserves the
+                historic fire-and-forget behaviour for callers that already drain
+                (``move_stage_at_velocity``) or hold the lock themselves
+                (``get_current_position``).
         """
         if self.spo is None:
             logger.error("XY stage not initialised -- command ignored")
@@ -507,7 +520,12 @@ class XYStageManager:
                 encoded = f"{command}\r\n".encode("ascii")
             # v7.2.8s2: lock is acquired by caller (get_current_position etc.)
             # for atomic write+read. Bare writes (VS, G) don't need response.
-            self.spo.write(encoded)
+            if drain_ack:
+                with self._serial_lock:
+                    self.spo.write(encoded)
+                    self._drain_ack(timeout=0.05)
+            else:
+                self.spo.write(encoded)
             return None
         except (Exception,) as e:
             logger.error(f"XY send_command error: {e}")
@@ -543,6 +561,29 @@ class XYStageManager:
             logger.warning(f"No protocol loaded and no fallback for '{command_name}'")
             return None
 
+        # ⚠ v7.5.x INVESTIGATION NOTE — do NOT naively drain the ack here.
+        #
+        # The Prior ProScan answers a bare ``R`` to every command including the
+        # parameter setters (SMS/SAS), and that unread ``R`` IS observably consumed
+        # by the next position query:
+        #
+        #     set_speed_mm_s: 5.9 mm/s = SMS 100%
+        #     Failed to parse XY position: Expected 3 values, got 1: R
+        #
+        # (from the operator's own app log, and reproduced on ME3B V1: six
+        # absolute moves landed to 0.7 µm, then the first read after
+        # `set_speed_mm_s` returned None).
+        #
+        # BUT adding `write + _drain_ack` under `_serial_lock` here made things
+        # WORSE on real hardware — every subsequent position read came back EMPTY
+        # rather than stale, i.e. the Prior stopped answering `P` at all. So the
+        # interaction is more subtle than a missing drain (timing, lock nesting
+        # with the poller, or the detection-time setters) and needs a bench
+        # investigation with a raw serial trace before it is changed.
+        #
+        # Left at the historic fire-and-forget write deliberately. The callers
+        # that must not be corrupted should re-read, or drain explicitly the way
+        # `move_stage_at_velocity` does.
         return self.send_command(cmd)
 
     # ── v7.5.x: family-neutral wire helpers ───────────────────────

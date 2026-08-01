@@ -451,27 +451,31 @@ class TestAutoFlow(_QtBase):
             gs.return_value.get_xy_max_speed_um_s.return_value = 60000.0
             self.assertAlmostEqual(page._xy_max_mm_s(), 20.0)
 
-    def test_scales_both_speed_and_flow(self):
+    def test_flow_follows_the_top_speed(self):
+        # v7.6 CONTRACT CHANGE: the speed is an absolute mm/s ("top speed"),
+        # not a % of the measured max — so the flow follows the resolved speed
+        # instead of both scaling off one percentage.
         page = self._flow_page(area=0.01, xy_um_s=20000.0)
-        page._speed_pct_spin.setValue(50)
+        page._top_speed_spin.setValue(10.0)
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = None
             s = page._build_settings()
-        self.assertAlmostEqual(s.print_speed_mm_s, 10.0)    # 50% × 20 mm/s
-        self.assertAlmostEqual(s.pump_rate_uL_s, 0.1)       # 50% × 0.2 µL/s
+        self.assertAlmostEqual(s.print_speed_mm_s, 10.0)    # honoured exactly
+        self.assertAlmostEqual(s.pump_rate_uL_s, 0.1)       # area × speed
         self.assertAlmostEqual(s.get_pump_rate(page._pump()), 0.1)
 
-    def test_bead_volume_per_mm_is_bore_area_invariant_to_pct(self):
+    def test_bead_volume_per_mm_is_bore_area_invariant_to_speed(self):
         page = self._flow_page(area=0.01, xy_um_s=20000.0)
         with patch("SupportClasses.PrintTimingCalibrationStore.get_store") as gs:
             gs.return_value.get_xy_max_speed_um_s.return_value = None
-            page._speed_pct_spin.setValue(25)
+            page._top_speed_spin.setValue(5.0)
             sp1, fl1, _ = page._resolved_print_kinematics()
-            page._speed_pct_spin.setValue(80)
+            page._top_speed_spin.setValue(16.0)
             sp2, fl2, _ = page._resolved_print_kinematics()
         self.assertGreater(sp2, sp1)
         self.assertGreater(fl2, fl1)
-        # volume per mm == bore area (× modifier 1), independent of the % knob.
+        # volume per mm == bore area (× modifier 1), independent of the speed:
+        # changing the speed changes the TIME, never the bead.
         self.assertAlmostEqual(fl1 / sp1, 0.01, places=6)
         self.assertAlmostEqual(fl1 / sp1, fl2 / sp2, places=6)
 

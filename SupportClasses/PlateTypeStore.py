@@ -82,6 +82,14 @@ class PlateType:
     # Standard mm-BELOW-the-needle-cam-fiducial offsets to the plate features.
     z_offsets: dict = field(
         default_factory=lambda: {k: 0.0 for k in Z_OFFSET_KEYS})
+    # v7.5.x: how this product's wells LOOK to the microscope, for the mosaic
+    # well auto-detection (SupportClasses/PlateWellDetector.WellAppearance).
+    # A clear plastic plate shows a bright moulded rim; a black-bottom glass
+    # plate can read as a dark disc — same geometry, different edge polarity.
+    # Empty = auto-sense (the detector tries both and reports which won, which
+    # is what you then store here). Kept as a plain dict so this module stays
+    # free of any OpenCV/numpy import.
+    well_detection: dict = field(default_factory=dict)
     builtin: bool = False
 
     def __post_init__(self) -> None:
@@ -101,9 +109,11 @@ class PlateType:
         self.z_offsets = {
             k: float(src.get(k, 0.0) or 0.0) for k in Z_OFFSET_KEYS
         }
+        if not isinstance(self.well_detection, dict):
+            self.well_detection = {}
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "id": self.id,
             "base_format": self.base_format,
             "display_name": self.display_name,
@@ -114,6 +124,11 @@ class PlateType:
             "z_offsets": dict(self.z_offsets),
             "builtin": self.builtin,
         }
+        # Emit only when set, so every plate type written before v7.5.x
+        # round-trips byte-identically.
+        if self.well_detection:
+            out["well_detection"] = dict(self.well_detection)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict, *, builtin: bool = False) -> "PlateType":
@@ -126,6 +141,7 @@ class PlateType:
             bottom_material=data.get("bottom_material", ""),
             well_depth_mm=data.get("well_depth_mm"),
             z_offsets=data.get("z_offsets") or {},
+            well_detection=data.get("well_detection") or {},
             builtin=bool(data.get("builtin", builtin)),
         )
 

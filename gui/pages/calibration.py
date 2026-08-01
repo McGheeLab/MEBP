@@ -78,6 +78,26 @@ except ImportError:
     PIXEL_CAL_DIALOG_AVAILABLE = False
     PixelCalibrationDialog = None
 
+# v7.9: per-MOUNT bore offsets for a multi-bore needle assembly. Lives beside the
+# needle-location calibration (per-machine) because a fused assembly's rotation in
+# the holder is arbitrary — see the store's module docstring.
+try:
+    from SupportClasses.NeedleBoreCalibrationStore import (
+        get_store as _get_bore_cal_store,
+        offset_from_centred_positions,
+        z_offset_from_centred_heights,
+        build_fingerprint as _bore_cal_fingerprint,
+        fingerprint_diff as _bore_cal_fingerprint_diff,
+    )
+    BORE_CAL_AVAILABLE = True
+except ImportError:
+    BORE_CAL_AVAILABLE = False
+    _get_bore_cal_store = None
+    offset_from_centred_positions = None
+    z_offset_from_centred_heights = None
+    _bore_cal_fingerprint = None
+    _bore_cal_fingerprint_diff = None
+
 logger = logging.getLogger(__name__)
 
 # Optional camera support
@@ -631,6 +651,18 @@ class _MosaicScanWorker(QThread):
         # applied (``_orient_frame`` is a no-op); the builder owns orientation.
         self._frame_orient = "none"
         self._stop = False
+        # v7.5.x: runtime-discovered REACHABLE travel box (absolute µm), as
+        # [min_x, min_y, max_x, max_y]. Narrowed whenever the stage repeatedly
+        # fails to reach a commanded grid point — see _note_unreachable. The
+        # configured XY envelope (which sizes the whole-plate raster) is the
+        # OPERATOR'S recorded value and can be larger than the stage's real
+        # travel; without this the raster spends the full arrival timeout on
+        # every out-of-travel point and never finishes the first row.
+        self._reach = [float("-inf"), float("-inf"), float("inf"), float("inf")]
+        self._consec_stall = 0
+        # Read by the GUI after finished_ok to report a truncated scan.
+        self.unreachable_skipped = 0
+        self.reach_note = ""
 
     def stop(self):
         self._stop = True
@@ -676,6 +708,77 @@ class _MosaicScanWorker(QThread):
     # (camera stopped / crashed) rather than silently building a partial mosaic.
     _MAX_CONSEC_NONE = 8
 
+    # v7.5.x: a tile whose MEASURED stage position is further than this from the
+    # requested grid point was not reached — its frame shows somewhere else, so
+    # stitching it would blend a duplicate image at the wrong canvas spot.
+    _ARRIVE_TOL_UM = 150.0
+    # Consecutive not-reached tiles before we conclude the grid asks for travel
+    # the stage does not have (rather than a one-off comms/timing hiccup) and
+    # start skipping that region outright.
+    _MAX_CONSEC_STALL = 3
+    # Bounds for the per-move arrival wait (s). Sized from the move distance so
+    # an unreachable point costs ~1 short timeout instead of a flat 10 s.
+    _ARRIVE_TIMEOUT_MIN_S = 3.0
+    _ARRIVE_TIMEOUT_MAX_S = 20.0
+
+    def _xy_speed_um_s(self) -> float:
+        """Configured max XY speed (µm/s) — sizes the arrival timeout."""
+        try:
+            v = float(self._controller.safety_limits.max_xy_speed)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        return 5000.0
+
+    def _arrival_timeout_s(self, dist_um: float) -> float:
+        """Arrival wait sized to the move: 2x the ideal travel time + settle,
+        clamped. A flat 10 s per point turns an out-of-travel column into
+        minutes of dead waiting (the 'never gets past the first row' report)."""
+        try:
+            t = 2.0 * (float(dist_um) / self._xy_speed_um_s()) + 2.0
+        except Exception:
+            t = self._ARRIVE_TIMEOUT_MIN_S
+        return max(self._ARRIVE_TIMEOUT_MIN_S,
+                   min(self._ARRIVE_TIMEOUT_MAX_S, t))
+
+    def _read_xy_um(self):
+        """Fresh absolute stage XY (µm), or None when the read failed.
+
+        A failed/garbled read (the Prior returns a stale ``R`` ack) yields
+        ``(None, None, None)`` — reported as None so the caller falls back to
+        the commanded target rather than treating it as a stall.
+        """
+        try:
+            xy = self._controller.get_xy_position(cached=False)
+        except Exception:
+            return None
+        if not xy or xy[0] is None or xy[1] is None:
+            return None
+        return float(xy[0]), float(xy[1])
+
+    def _reachable(self, tx: float, ty: float) -> bool:
+        """False once the stage has proved it cannot travel this far."""
+        tol = self._ARRIVE_TOL_UM
+        return (self._reach[0] - tol <= tx <= self._reach[2] + tol
+                and self._reach[1] - tol <= ty <= self._reach[3] + tol)
+
+    def _note_unreachable(self, tx, ty, ax, ay) -> None:
+        """Narrow the reachable box from a confirmed stall.
+
+        Only the axis/direction that fell short is clipped, so a stage that is
+        merely short in +X keeps its full Y range (and vice versa).
+        """
+        tol = self._ARRIVE_TOL_UM
+        if tx > ax + tol:
+            self._reach[2] = min(self._reach[2], ax)
+        elif tx < ax - tol:
+            self._reach[0] = max(self._reach[0], ax)
+        if ty > ay + tol:
+            self._reach[3] = min(self._reach[3], ay)
+        elif ty < ay - tol:
+            self._reach[1] = max(self._reach[1], ay)
+
     def _suspend_poller(self):
         try:
             self._controller.suspend_position_poller()
@@ -697,9 +800,17 @@ class _MosaicScanWorker(QThread):
         try:
             total = len(self._positions)
             consecutive_none = 0
+            last_x, last_y = None, None
             for idx, (tx, ty) in enumerate(self._positions):
                 if self._stop:
                     break
+                # v7.5.x: don't command a point the stage has already proved it
+                # cannot reach — each one otherwise costs a full arrival wait
+                # and contributes nothing but a duplicate frame.
+                if not self._reachable(tx, ty):
+                    self.unreachable_skipped += 1
+                    self.progress.emit(idx + 1, total)
+                    continue
                 try:
                     if idx == 0:
                         # First tile: full safe travel — retract Z to safe AND
@@ -725,9 +836,13 @@ class _MosaicScanWorker(QThread):
                         self._controller.move_xy_absolute_um(tx, ty)
                         try:
                             zero = self._controller.zero_position
+                            dist = math.hypot(
+                                tx - (last_x if last_x is not None else tx),
+                                ty - (last_y if last_y is not None else ty))
                             self._controller.wait_for_xy_arrival(
                                 (tx - float(zero.get("x", 0.0))) / 1000.0,
-                                (ty - float(zero.get("y", 0.0))) / 1000.0)
+                                (ty - float(zero.get("y", 0.0))) / 1000.0,
+                                timeout_s=self._arrival_timeout_s(dist))
                         except Exception:
                             pass
                 except Exception as e:
@@ -735,6 +850,55 @@ class _MosaicScanWorker(QThread):
                         f"Mosaic worker: move to ({tx:.0f},{ty:.0f}) failed: {e}")
                 if self._stop:
                     break
+
+                # v7.5.x: confirm arrival from the MEASURED position, not from
+                # wait_for_xy_arrival's return value — that call is known to time
+                # out spuriously when a stale Prior 'R' ack desyncs the read, so
+                # the boolean alone would drop good tiles. A position that is
+                # genuinely short of the target means the frame in the camera
+                # shows somewhere else; stitching it stacks a duplicate image on
+                # the canvas and feeds the registration a bogus overlap.
+                measured = self._read_xy_um()
+                if measured is not None:
+                    last_x, last_y = measured
+                    off = math.hypot(measured[0] - tx, measured[1] - ty)
+                    if off > self._ARRIVE_TOL_UM:
+                        self._consec_stall += 1
+                        logger.warning(
+                            f"Mosaic worker: tile {idx} not reached — asked "
+                            f"({tx:.0f},{ty:.0f}) µm, stage at "
+                            f"({measured[0]:.0f},{measured[1]:.0f}) µm "
+                            f"(off {off:.0f} µm, {self._consec_stall} in a row)")
+                        if self._consec_stall >= self._MAX_CONSEC_STALL:
+                            # Repeated, not a hiccup: the raster is asking for
+                            # travel this stage does not have. Clip the grid to
+                            # what IS reachable and scan that, instead of
+                            # grinding through every remaining point.
+                            self._note_unreachable(
+                                tx, ty, measured[0], measured[1])
+                            if not self.reach_note:
+                                self.reach_note = (
+                                    f"the stage stopped at "
+                                    f"({measured[0] / 1000.0:.1f}, "
+                                    f"{measured[1] / 1000.0:.1f}) mm while the "
+                                    f"raster asked for "
+                                    f"({tx / 1000.0:.1f}, {ty / 1000.0:.1f}) mm")
+                                logger.warning(
+                                    "Mosaic worker: the XY travel available in "
+                                    "this session is smaller than the "
+                                    "configured envelope — " + self.reach_note +
+                                    ". Skipping the unreachable region. Either "
+                                    "the recorded envelope is too large, or the "
+                                    "stage origin has moved since it was "
+                                    "recorded (the Prior sets position 0 at "
+                                    "power-on wherever the stage is sitting, so "
+                                    "absolute coordinates only carry across a "
+                                    "power cycle if the stage starts from the "
+                                    "same place).")
+                        self.unreachable_skipped += 1
+                        self.progress.emit(idx + 1, total)
+                        continue
+                    self._consec_stall = 0
                 frame = self._grab_post_move_frame()
                 if frame is None:
                     # No fresh frame (camera stalled / timed out). Don't silently
@@ -751,12 +915,10 @@ class _MosaicScanWorker(QThread):
                     self.progress.emit(idx + 1, total)
                     continue
                 consecutive_none = 0
-                try:
-                    xy = self._controller.get_xy_position(cached=False)
-                    sx = xy[0] if xy and xy[0] is not None else tx
-                    sy = xy[1] if xy and xy[1] is not None else ty
-                except Exception:
-                    sx, sy = tx, ty
+                # Place the tile at the position measured for THIS move (read
+                # once, above) — re-querying here doubled the XY serial traffic
+                # per tile for the same number.
+                sx, sy = (measured if measured is not None else (tx, ty))
                 # v7.5.x: DO NOT coarse-orient here — the builder applies the
                 # calibrated (rotation, flip X, flip Y) per tile via _orient_tile.
                 # Orienting the raw frame first double-oriented the mosaic (a stale
@@ -772,6 +934,14 @@ class _MosaicScanWorker(QThread):
             if self._stop:
                 # Cancelled — the GUI already cleaned up; emit nothing.
                 return
+
+            if self.unreachable_skipped:
+                logger.warning(
+                    f"Mosaic scan: {self.unreachable_skipped} of {total} grid "
+                    f"points were outside the stage's real XY travel and were "
+                    f"skipped. Reachable box (mm): "
+                    f"x {self._reach[0] / 1000.0:.1f}..{self._reach[2] / 1000.0:.1f}, "
+                    f"y {self._reach[1] / 1000.0:.1f}..{self._reach[3] / 1000.0:.1f}")
 
             # v7.5.x: FULL pairwise + global least-squares registration over the
             # retained canvas-res tiles, re-blending at globally-consistent
@@ -1730,7 +1900,28 @@ class CalibrationPage(QWidget):
                         f"config ({len(cal_names)} wells vs {len(new_well_names)})."
                     )
                     self._calibrated_positions = None
-            if self.controller is not None:
+            # v7.5.x fix ("wells off the mosaic on every startup"): the
+            # envelope-centred seed below used to run UNCONDITIONALLY on
+            # every config push. With a live calibration that silently moved
+            # the predicted grid into the ENVELOPE frame, so a later
+            # Map-wells warp was fitted against it — while _load_calibration
+            # rebuilds predictions anchored at the TAUGHT A1 and re-applies
+            # the warp there. The frame mismatch shifted every well by the
+            # A1 prediction error (~0.7 mm on ME3B V1) after each restart
+            # until the operator re-mapped. Keep ONE frame: with a real
+            # calibration (same gate as recenter_default_plate), rebuild the
+            # predictions FROM the taught A1 (the load-time frame); seed the
+            # envelope-centred default only when nothing is calibrated.
+            _has_cal = (bool(self._calibrated_positions)
+                        or self._taught_a1 is not None
+                        or getattr(self, "_three_well_calibration", None)
+                        is not None)
+            if _has_cal and self._taught_a1 is not None:
+                try:
+                    self._compute_predicted_positions()
+                except Exception as e:
+                    logger.debug(f"A1-anchored well prediction skipped: {e}")
+            elif not _has_cal and self.controller is not None:
                 try:
                     # v7.5.x: centre the default plate on the XY safety
                     # envelope (not on zero) so it sits in the middle of the
@@ -1741,6 +1932,8 @@ class CalibrationPage(QWidget):
                             cx, cy, self._plate_axis_sign()))
                 except Exception as e:
                     logger.debug(f"geometry-only well prediction skipped: {e}")
+            # else: calibrated but no taught A1 — leave the predictions
+            # alone rather than moving the grid under a live/pending fit.
             logger.info(f"Calibration: plate synced to {key} from HardwareConfig")
 
             # v7.5.x: restore the INCOMING plate's archived calibration (taught
@@ -1757,13 +1950,13 @@ class CalibrationPage(QWidget):
             else:
                 self._loaded_cal_key = _new_cal_key
 
-        # Show needle info in calibration context panel
-        if hasattr(config, 'needle') and config.needle:
-            n = config.needle
-            needle_text = (f"Needle: {n.gauge}G | ID: {n.id_um:.0f} \u00b5m | "
-                           f"Length: {n.length_inches:.1f}\"")
-            if hasattr(self, 'ctx_lbl_needle_info'):
-                self.ctx_lbl_needle_info.setText(needle_text)
+        # v7.6: the old "show needle info in the calibration context panel" block
+        # lived here, but `ctx_lbl_needle_info` is created NOWHERE in the repo \u2014
+        # its hasattr guard was always False, so the text was built and thrown
+        # away, and it would have needed a second two-stage formatter. The needle
+        # readout the operator actually sees on this page comes from
+        # StandardJogContextPanel._refresh_hardware_info, which is the single
+        # owner (it uses NeedleSpec.summary_line).
 
         # v7.3.4: Sync objective selector and µm/px display for all camera slots
         # Use the objective stored in camera_config if available
@@ -1797,6 +1990,17 @@ class CalibrationPage(QWidget):
                 self._needle_loc_refresh_cameras()
             except Exception as e:
                 logger.debug(f"_needle_loc_refresh_cameras skipped: {e}")
+
+        # v7.9: a new config brings a new needle assembly, so push the measured
+        # per-bore mount offsets onto it (the store is the authority; the needle
+        # only carries them so the motion path can read them) and re-render the
+        # bore rows. Apply BEFORE the refresh so the rows show what is in force.
+        if hasattr(self, '_bore_cal_group'):
+            try:
+                self._bore_cal_apply_stored()
+                self._bore_cal_refresh()
+            except Exception as e:
+                logger.debug(f"bore-offset refresh skipped: {e}")
 
         # v7.4.4: keep the shared XY workspace view in sync with the
         # latest plate / needle / safety envelope.
@@ -2038,7 +2242,7 @@ class CalibrationPage(QWidget):
             lay = QVBoxLayout(slot)
             lay.setContentsMargins(0, 0, 0, 0)
             label = QLabel(
-                f"<b>{'X-view' if i == 0 else 'Y-view'}</b>"
+                f"<b>{'Needle cam 1' if i == 0 else 'Needle cam 2'}</b>"
             )
             label.setStyleSheet(f"color: {COLORS['blue']};")
             lay.addWidget(label)
@@ -2084,11 +2288,13 @@ class CalibrationPage(QWidget):
             "the needle re-enters both side views, ready to re-center.")
         self._needle_loc_btn_goto.clicked.connect(self._needle_loc_goto)
         goto_row.addWidget(self._needle_loc_btn_goto)
-        self._needle_loc_btn_set = QPushButton("Set current as location")
+        self._needle_loc_btn_set = QPushButton("Set current as needle center")
         self._needle_loc_btn_set.setToolTip(
-            "Capture the current stage XY as the approximate needle location. "
-            "Use this once on a fresh machine to seed the quick-move before the "
-            "first Center & Save (which then updates it automatically).")
+            "Manually record the CURRENT position as the needle center — "
+            "jog the needle tip onto both side-camera crosshairs first. "
+            "Records everything Center & Save records (needle origin, "
+            "quick-move XY, and the needle-cam Z fiducial) without the "
+            "camera-driven centering move.")
         self._needle_loc_btn_set.clicked.connect(self._needle_loc_set_current)
         goto_row.addWidget(self._needle_loc_btn_set)
         # v7.5.x: accept the last-known needle calibration WITHOUT re-centering
@@ -2119,10 +2325,10 @@ class CalibrationPage(QWidget):
         pick_grid.setHorizontalSpacing(s(8))
         pick_grid.setVerticalSpacing(s(4))
         for row, (key, label) in enumerate([
-            ("x_left", "X-view left edge:"),
-            ("x_right", "X-view right edge:"),
-            ("y_left", "Y-view left edge:"),
-            ("y_right", "Y-view right edge:"),
+            ("x_left", "Cam 1 left edge:"),
+            ("x_right", "Cam 1 right edge:"),
+            ("y_left", "Cam 2 left edge:"),
+            ("y_right", "Cam 2 right edge:"),
         ]):
             pick_grid.addWidget(QLabel(label), row, 0)
             v = QLabel("—")
@@ -2182,6 +2388,10 @@ class CalibrationPage(QWidget):
             f"color: {COLORS['subtext0']}; padding-top: {sp(6)};")
         wiz_lay.addWidget(self._needle_loc_origin_label)
 
+        # v7.9: per-bore mount offsets (hidden entirely for a single-bore needle,
+        # so every existing setup sees exactly the tab it saw before).
+        wiz_lay.addWidget(self._build_bore_offset_group())
+
         splitter.addWidget(wiz_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -2203,6 +2413,7 @@ class CalibrationPage(QWidget):
         self._needle_loc_refresh_cameras()
         self._needle_loc_update_ui()
         self._needle_loc_update_goto_ui()
+        self._bore_cal_refresh()
         return page
 
     # ════════════════════════════════════════════════════════════════
@@ -2389,7 +2600,8 @@ class CalibrationPage(QWidget):
         for i, slot in enumerate(self._compcal_cam_slots):
             slay = QVBoxLayout(slot)
             slay.setContentsMargins(0, 0, 0, 0)
-            label = QLabel(f"<b>{'X-view' if i == 0 else 'Y-view'}</b>")
+            label = QLabel(
+                f"<b>{'Needle cam 1' if i == 0 else 'Needle cam 2'}</b>")
             label.setStyleSheet(f"color: {COLORS['blue']};")
             slay.addWidget(label)
             placeholder = QLabel(
@@ -2791,7 +3003,7 @@ class CalibrationPage(QWidget):
                 roles_ok = False
         if not roles_ok:
             self._needle_loc_banner.setText(
-                "Assign Needle X-view and Needle Y-view roles to two "
+                "Assign Needle cam 1 and Needle cam 2 roles to two "
                 "live cameras in Hardware Setup → Cameras to enable "
                 "this workflow."
             )
@@ -2803,7 +3015,7 @@ class CalibrationPage(QWidget):
             self._needle_loc_banner.setText(
                 "Step 1 of 4: bring the needle into both camera views using "
                 "the jog controls on the left. Then click the needle's left "
-                "and right edges in the X-view, then the Y-view."
+                "and right edges in Needle cam 1, then Needle cam 2."
             )
             self._needle_loc_banner.setStyleSheet(
                 f"background-color: {COLORS['surface0']}; "
@@ -2860,10 +3072,10 @@ class CalibrationPage(QWidget):
         labels["y_right"].setText(_fmt(picks.y_view_right_px))
 
         step_texts = [
-            "Click the tip's BOTTOM-LEFT corner in X-view",
-            "Click the tip's BOTTOM-RIGHT corner in X-view",
-            "Click the tip's BOTTOM-LEFT corner in Y-view",
-            "Click the tip's BOTTOM-RIGHT corner in Y-view",
+            "Click the tip's BOTTOM-LEFT corner in Needle cam 1",
+            "Click the tip's BOTTOM-RIGHT corner in Needle cam 1",
+            "Click the tip's BOTTOM-LEFT corner in Needle cam 2",
+            "Click the tip's BOTTOM-RIGHT corner in Needle cam 2",
             "All corners picked — review then click Center & Save",
         ]
         self._needle_loc_step_label.setText(
@@ -2904,9 +3116,12 @@ class CalibrationPage(QWidget):
     def _needle_loc_camera_info(
         self, role: "CameraRole"
     ) -> tuple[float, int, float | None] | None:
-        """Return (um_per_px, frame_width_px, rotation_deg) for the camera
-        with `role`, or None if unresolvable. ``rotation_deg`` is None when
-        the camera's in-plane rotation has not been measured."""
+        """Return (um_per_px, frame_width_px, column_dir_deg) for the camera
+        with `role`, or None if unresolvable. ``column_dir_deg`` is the
+        camera's column→stage MOUNT direction (deg CCW from stage +X — ±45°
+        on the rotated rig, measured by the stage-motion µm/px calibration);
+        None when unmeasured. NOT the display ``rotation_deg`` (that is the
+        small sensor roll and must never enter the centering math)."""
         if CameraRole is None or self._camera_manager is None:
             return None
         hw = getattr(self, '_hardware_config', None)
@@ -2941,11 +3156,13 @@ class CalibrationPage(QWidget):
             frame_w = 0
         if um_per_px <= 0 or frame_w <= 0:
             return None
-        # v7.5.x: in-plane rotation (deg) measured during µm/px calibration —
-        # the stage direction that maps to this camera's lateral image axis.
-        # None when unmeasured (aligner falls back to the nominal mounting).
-        rotation_deg = self._camera_manager.get_rotation_deg(cam_idx)
-        return um_per_px, frame_w, rotation_deg
+        # v7.5.x (rotated rig): the column→stage MOUNT direction measured
+        # during the µm/px calibration — the stage direction that maps to this
+        # camera's lateral image axis. None when unmeasured (the offset
+        # compute REFUSES rather than guess which cam is +45° vs −45°).
+        gcd = getattr(self._camera_manager, "get_column_dir_deg", None)
+        column_dir_deg = gcd(cam_idx) if callable(gcd) else None
+        return um_per_px, frame_w, column_dir_deg
 
     def _needle_loc_compute_offset_um(self) -> tuple[float, float]:
         """Run the two-camera aligner; raises ValueError if not ready."""
@@ -2955,10 +3172,16 @@ class CalibrationPage(QWidget):
         y_info = self._needle_loc_camera_info(CameraRole.NEEDLE_Y)
         if x_info is None or y_info is None:
             raise ValueError("camera µm/px or frame size not available")
-        # v7.5.x: per-camera rotation → absolute column→stage direction angle
-        # for the aligner. The measured value IS that lateral direction (the
-        # move direction that produced clean lateral motion); pass it directly,
-        # or None to let the aligner use its nominal orthogonal mounting.
+        # v7.5.x (rotated rig): the cameras sit symmetric about stage +X at
+        # +45° and −45°, and WHICH cam looks along which direction is only
+        # known from the measured column_dir_deg. REFUSE when unmeasured —
+        # the old fallback (the aligner's legacy orthogonal 90°/0° mapping)
+        # would drive the stage the wrong way on this rig.
+        if x_info[2] is None or y_info[2] is None:
+            raise ValueError(
+                "needle-camera stage direction not calibrated — run "
+                "'Calibrate µm/px' (stage motion) for BOTH needle cameras in "
+                "Hardware Setup → Cameras")
         aligner = TwoCameraNeedleAligner(
             um_per_px_x_view=x_info[0],
             um_per_px_y_view=y_info[0],
@@ -3025,28 +3248,30 @@ class CalibrationPage(QWidget):
     def _needle_loc_offset_breakdown(self) -> str:
         """Compact per-camera column-offset string for the preview label.
 
-        ``X: col=+3.1px @135°  Y: col=−1.8px @45°`` — col is the needle center's
-        signed pixel offset from the frame center. On the crosshair both ≈ 0.
-        Returns '' if a view's clicks/µm-px aren't available.
+        ``Cam 1: col=+3.1px @+45°  Cam 2: col=−1.8px @−45°`` — col is the
+        needle center's signed pixel offset from the frame center; the angle
+        is the camera's measured column→stage mount direction. On the
+        crosshair both cols ≈ 0. Returns '' if a view's clicks/µm-px aren't
+        available.
         """
         picks = self._needle_loc_picks
         if picks is None:
             return ""
         parts = []
         for role, tag, lpx, rpx in (
-            (CameraRole.NEEDLE_X, "X",
+            (CameraRole.NEEDLE_X, "Cam 1",
              getattr(picks, "x_view_left_px", None),
              getattr(picks, "x_view_right_px", None)),
-            (CameraRole.NEEDLE_Y, "Y",
+            (CameraRole.NEEDLE_Y, "Cam 2",
              getattr(picks, "y_view_left_px", None),
              getattr(picks, "y_view_right_px", None)),
         ):
             info = self._needle_loc_camera_info(role)
             if info is None or lpx is None or rpx is None:
                 continue
-            _upp, frame_w, rot = info
+            _upp, frame_w, col_dir = info
             off_px = (lpx + rpx) / 2.0 - frame_w / 2.0
-            ang = "—" if rot is None else f"{rot:.0f}°"
+            ang = "—" if col_dir is None else f"{col_dir:+.0f}°"
             parts.append(f"{tag}: col={off_px:+.1f}px @{ang}")
         return "  ".join(parts)
 
@@ -3094,10 +3319,10 @@ class CalibrationPage(QWidget):
             picks = self._needle_loc_picks
             lines = ["[needle-loc] ── Center & Save diagnostics ──"]
             for role, name, lpx, rpx in (
-                (CameraRole.NEEDLE_X, "X-view",
+                (CameraRole.NEEDLE_X, "Needle cam 1",
                  getattr(picks, "x_view_left_px", None),
                  getattr(picks, "x_view_right_px", None)),
-                (CameraRole.NEEDLE_Y, "Y-view",
+                (CameraRole.NEEDLE_Y, "Needle cam 2",
                  getattr(picks, "y_view_left_px", None),
                  getattr(picks, "y_view_right_px", None)),
             ):
@@ -3106,14 +3331,14 @@ class CalibrationPage(QWidget):
                     lines.append(f"  {name}: info/clicks unavailable "
                                  f"(L={lpx}, R={rpx}, info={info})")
                     continue
-                upp, frame_w, rot = info
+                upp, frame_w, col_dir = info
                 mid = (lpx + rpx) / 2.0
                 off_px = mid - frame_w / 2.0
                 lines.append(
                     f"  {name}: L={lpx:.1f} R={rpx:.1f} mid={mid:.1f} px | "
                     f"width={frame_w} center={frame_w / 2.0:.1f} | "
                     f"col_offset={off_px:+.1f}px ({off_px * upp:+.1f}µm) | "
-                    f"um/px={upp:.4f} | angle={rot}")
+                    f"um/px={upp:.4f} | mount_dir={col_dir}")
             try:
                 xy = self.controller.get_xy_position(cached=False)
             except Exception:
@@ -3185,38 +3410,55 @@ class CalibrationPage(QWidget):
             except Exception as e:
                 logger.warning(f"NeedleLocation Z centering failed: {e}")
 
-        # Capture the post-move stage XY as the needle origin.
+        # Record the post-move position as the needle center.
+        self._needle_loc_record_origin_here()
+
+        # Reset for the next iteration.
+        self._needle_loc_reset()
+
+    def _needle_loc_record_origin_here(self) -> bool:
+        """Record the CURRENT stage position as the needle center.
+
+        The shared tail of Center & Save, also used by the manual
+        "Set current as needle center" button: captures the stage XY as
+        ``needle_origin_um`` (zero-ref µm), persists the absolute XY as the
+        quick-move needle location, and records the needle-cam Z fiducial.
+        Returns False when the stage position could not be read (nothing is
+        written); Z-fiducial capture stays best-effort.
+        """
         try:
             xy = self.controller.get_xy_position(cached=False)
         except Exception:
             xy = (None, None)
-        if xy and xy[0] is not None:
-            zero = self.controller.zero_position
-            origin_x_um = stage_to_um(xy[0] - zero.get("x", 0),
-                                      self._xy_position_scale)
-            origin_y_um = stage_to_um(xy[1] - zero.get("y", 0),
-                                      self._xy_position_scale)
-            self._needle_origin_um = (origin_x_um, origin_y_um)
+        if not xy or xy[0] is None:
+            return False
+        zero = self.controller.zero_position
+        origin_x_um = stage_to_um(xy[0] - zero.get("x", 0),
+                                  self._xy_position_scale)
+        origin_y_um = stage_to_um(xy[1] - zero.get("y", 0),
+                                  self._xy_position_scale)
+        self._needle_origin_um = (origin_x_um, origin_y_um)
+        if hasattr(self, "_needle_loc_origin_label"):
             self._needle_loc_origin_label.setText(
                 f"needle_origin_um: ({origin_x_um:.1f}, {origin_y_um:.1f}) µm"
             )
             self._needle_loc_origin_label.setStyleSheet(
                 f"color: {COLORS['green']}; padding-top: {sp(6)};")
-            try:
-                self._emit_calibration_data_changed()
-            except Exception:
-                pass
-            # v7.5.x: also persist the ABSOLUTE stage XY as the quick-move
-            # needle location so the operator can drive straight back here next
-            # session (the side cameras are fixed to the frame).
-            self._needle_loc_store_xy(xy[0], xy[1])
+        try:
+            self._emit_calibration_data_changed()
+        except Exception:
+            pass
+        # v7.5.x: also persist the ABSOLUTE stage XY as the quick-move
+        # needle location so the operator can drive straight back here next
+        # session (the side cameras are fixed to the frame).
+        self._needle_loc_store_xy(xy[0], xy[1])
 
-        # v7.5.x: capture the needle-tip-camera Z fiducial. The edge clicks
-        # select the tip's bottom corners, so once centered (incl. the optional
-        # Z move above) the needle sits at a repeatable Z. Record it (user
-        # frame) so the plate Z references can be PRE-FILLED from the standard
-        # offsets. The Z move is a small centering delta still in flight, so this
-        # is an approximate fiducial; refine via "Estimate plate Z" if needed.
+        # v7.5.x: capture the needle-tip-camera Z fiducial. The needle tip is
+        # at the crosshairs (camera-centered by Center & Save, or hand-jogged
+        # there before the manual button), so it sits at a repeatable Z.
+        # Record it (user frame) so the plate Z references can be PRE-FILLED
+        # from the standard offsets. Approximate fiducial; refine via
+        # "Estimate plate Z" if needed.
         try:
             raw_z = self.controller.capture_current_z_raw()
             if raw_z is not None:
@@ -3232,9 +3474,409 @@ class CalibrationPage(QWidget):
                         f"color: {COLORS['green']}; font-size: 9pt;")
         except Exception as e:
             logger.debug(f"needle-cam Z capture skipped: {e}")
+        return True
 
-        # Reset for the next iteration.
+    # ════════════════════════════════════════════════════════════════
+    #  v7.9: per-BORE mount offsets (multi-bore needle assemblies)
+    # ════════════════════════════════════════════════════════════════
+    #
+    # Everything above teaches ONE needle position. A backpack / triple has
+    # several lumens fused ~100-500 µm apart (decision D7) — WIDER than a cell —
+    # so "put bore 2 on that target" is meaningless until each bore's offset from
+    # the datum bore is known. That is what this section measures: the operator
+    # jogs each bore's tip onto the two side-camera crosshairs in turn and
+    # confirms; the offset is the difference of the recorded stage positions.
+    #
+    # NO STAGE MOTION HAPPENS HERE. The operator drives with the jog controls and
+    # these buttons only READ the stage, which is why the retract-before-XY rule
+    # is satisfied trivially rather than by a gate that could be got wrong. The
+    # existing "⤵ Go to needle location" is still the way to get back into frame.
+
+    def _build_bore_offset_group(self) -> QGroupBox:
+        """The per-bore offset group (populated by :meth:`_bore_cal_refresh`)."""
+        box = QGroupBox("Bore mount offsets (multi-bore assembly)")
+        box.setStyleSheet(SECTION_TITLE_STYLE)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(s(8), s(10), s(8), s(8))
+        lay.setSpacing(s(6))
+
+        intro = QLabel(
+            "Jog each bore's tip onto the crosshairs in BOTH side cameras, then "
+            "confirm that bore. Bore 1 is the datum — confirming it records the "
+            "needle origin, exactly as 'Set current as needle center' does. "
+            "Re-measure after ANY needle change or re-seat: a fused assembly's "
+            "rotation in the holder is arbitrary, so the offsets are a property "
+            "of this mounting, not of the needle type.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        lay.addWidget(intro)
+
+        self._bore_cal_status = QLabel("—")
+        self._bore_cal_status.setWordWrap(True)
+        self._bore_cal_status.setStyleSheet(f"color: {COLORS['subtext0']};")
+        lay.addWidget(self._bore_cal_status)
+
+        # Per-bore rows get rebuilt on every refresh (the bore COUNT changes with
+        # the configured assembly), so they live in their own container.
+        self._bore_cal_rows_host = QWidget()
+        self._bore_cal_rows_lay = QVBoxLayout(self._bore_cal_rows_host)
+        self._bore_cal_rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._bore_cal_rows_lay.setSpacing(s(4))
+        lay.addWidget(self._bore_cal_rows_host)
+
+        btn_row = QHBoxLayout()
+        self._bore_cal_btn_clear = QPushButton("Clear measured offsets")
+        self._bore_cal_btn_clear.setToolTip(
+            "Forget every measured bore offset — do this after re-seating or "
+            "swapping the needle assembly, since a re-seat changes the offsets "
+            "and software cannot detect it.")
+        self._bore_cal_btn_clear.clicked.connect(self._bore_cal_clear)
+        btn_row.addWidget(self._bore_cal_btn_clear)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self._bore_cal_group = box
+        self._bore_cal_row_widgets: list[QWidget] = []
+        box.setVisible(False)     # shown only for a genuine multi-bore assembly
+        return box
+
+    # ── model access ─────────────────────────────────────────────
+
+    def _bore_cal_needle(self):
+        """The live ``NeedleSpec``, or None when nothing is configured."""
+        hw = getattr(self, "_hardware_config", None)
+        return getattr(hw, "needle", None) if hw is not None else None
+
+    def _bore_cal_bore_count(self) -> int:
+        needle = self._bore_cal_needle()
+        if needle is None:
+            return 0
+        try:
+            return int(needle.bore_count)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def _bore_cal_store(self):
+        """The per-machine bore-offset store, or None when unavailable."""
+        if not BORE_CAL_AVAILABLE:
+            return None
+        try:
+            return _get_bore_cal_store()
+        except Exception as e:      # pragma: no cover — defensive
+            logger.debug(f"bore-offset store unavailable: {e}")
+            return None
+
+    def _bore_cal_gate(self) -> tuple[bool, str]:
+        """``(ok, why_not)`` for taking a bore measurement.
+
+        Refuses CLEARLY rather than silently measuring nothing — a capture that
+        looked successful but recorded a garbage offset would drive the needle a
+        confidently-wrong few hundred µm on every run.
+        """
+        if not BORE_CAL_AVAILABLE:
+            return False, "The bore-offset calibration store is unavailable."
+        if self._bore_cal_bore_count() <= 1:
+            return False, ("No multi-bore assembly is configured. Set the needle "
+                           "form and per-bore geometry on Hardware Setup → Needle "
+                           "first.")
+        if self.controller is None or not self.controller.is_xy_connected:
+            return False, ("Connect the XY stage — the offset is measured from the "
+                           "stage position at each centring.")
+        # Both side cameras must be live AND µm/px-calibrated: the operator needs
+        # both crosshairs to centre against, and the residual refinement below
+        # reads the same calibration Center & Save does.
+        if CameraRole is None:
+            return False, "Camera roles are unavailable."
+        missing = [label for label, role in (
+            ("Needle cam 1", CameraRole.NEEDLE_X),
+            ("Needle cam 2", CameraRole.NEEDLE_Y),
+        ) if self._needle_loc_camera_info(role) is None]
+        if missing:
+            return False, (
+                f"{' and '.join(missing)} not ready — assign the role in "
+                "Hardware Setup → Cameras, start the camera, and run "
+                "'Calibrate µm/px' for it.")
+        return True, ""
+
+    # ── refresh ──────────────────────────────────────────────────
+
+    def _bore_cal_refresh(self) -> None:
+        """Rebuild the per-bore rows + status from the live needle and the store.
+
+        Hides the whole group for a single-bore needle, so the Needle Location tab
+        is byte-identical for every pre-v7.9 setup.
+        """
+        if not hasattr(self, "_bore_cal_group"):
+            return
+        n_bores = self._bore_cal_bore_count()
+        self._bore_cal_group.setVisible(n_bores > 1)
+        if n_bores <= 1:
+            return
+
+        # Drop the previous rows (bore count may have changed).
+        for w in getattr(self, "_bore_cal_row_widgets", []):
+            try:
+                self._bore_cal_rows_lay.removeWidget(w)
+                w.setParent(None)
+                w.deleteLater()
+            except Exception:
+                pass
+        self._bore_cal_row_widgets = []
+
+        needle = self._bore_cal_needle()
+        store = self._bore_cal_store()
+        ok, why = self._bore_cal_gate()
+        # Whether the stored measurements belong to THIS assembly. Resolved before
+        # the rows so a row can say "not in use" instead of quietly printing an
+        # offset the executor is (correctly) refusing to apply.
+        stale = []
+        if ok and store is not None:
+            stale = _bore_cal_fingerprint_diff(store.get_fingerprint(),
+                                               _bore_cal_fingerprint(needle))
+
+        for k in range(n_bores):
+            row_w = QWidget()
+            row = QHBoxLayout(row_w)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(s(6))
+            rec = store.get_bore(k) if store is not None else None
+            # Geometry from the needle, offset from the STORE (the authority) —
+            # deliberately NOT assembly_summary_lines(), which also prints the
+            # offset and would print it twice.
+            try:
+                text = f"Bore {k + 1} · {needle.bore(k).summary_line() or '—'}"
+            except Exception:
+                text = f"Bore {k + 1}"
+            if k == 0:
+                text += " · datum"
+            elif rec is None:
+                text += " · offset not measured"
+            else:
+                text += (f" · offset ({rec.offset_um[0]:+.0f}, "
+                         f"{rec.offset_um[1]:+.0f}) µm")
+                if rec.z_offset_mm:
+                    text += f", Z {rec.z_offset_mm:+.3f} mm"
+                text += " (not in use)" if stale else ""
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            # Green == this bore is ready to be targeted.
+            in_force = (k == 0) or (rec is not None and not stale)
+            colour = COLORS['green'] if in_force else COLORS['subtext0']
+            lbl.setStyleSheet(f"color: {colour}; font-size: 9pt;")
+            row.addWidget(lbl, stretch=1)
+            btn = QPushButton(f"Bore {k + 1} is on the crosshairs")
+            btn.setToolTip(
+                "Record the CURRENT stage position as this bore's centred "
+                "position. Bore 1 also records the needle origin."
+                if k == 0 else
+                "Record the CURRENT stage position as this bore's centred "
+                "position; its offset from bore 1 is the difference.")
+            btn.setEnabled(ok)
+            btn.clicked.connect(
+                lambda _checked=False, idx=k: self._bore_cal_capture(idx))
+            row.addWidget(btn)
+            self._bore_cal_rows_lay.addWidget(row_w)
+            self._bore_cal_row_widgets.append(row_w)
+
+        # ── status line ──────────────────────────────────────────
+        if not ok:
+            self._bore_cal_status.setText(f"⚠ {why}")
+            self._bore_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
+            return
+        if store is None:
+            return
+        if stale:
+            self._bore_cal_status.setText(
+                "⚠ The stored offsets were measured on a DIFFERENT assembly ("
+                + "; ".join(stale) + ") — they are not being used. Re-measure "
+                "every bore.")
+            self._bore_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
+            return
+        # Ignore any record beyond this assembly's bore count (a stale one from a
+        # bigger assembly) so the counts can never read "3 of 1 measured".
+        stored = set(store.measured_bore_indices())
+        measured = [k for k in range(1, n_bores) if k in stored]
+        pending = [k + 1 for k in range(1, n_bores) if k not in stored]
+        if 0 not in stored:
+            self._bore_cal_status.setText(
+                "Start with bore 1 (the datum) — every other bore's offset is "
+                "measured from it.")
+            self._bore_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
+        elif pending:
+            self._bore_cal_status.setText(
+                f"{len(measured)} of {n_bores - 1} offset(s) measured — still "
+                f"needed: bore {', '.join(str(p) for p in pending)}. An "
+                "unmeasured bore is treated as sitting exactly on the datum, so "
+                "it will miss its target by the real spacing.")
+            self._bore_cal_status.setStyleSheet(f"color: {COLORS['yellow']};")
+        else:
+            when = store.measured_at() or "—"
+            self._bore_cal_status.setText(
+                f"✓ All {n_bores - 1} bore offset(s) measured ({when}). "
+                "Re-measure after any needle change or re-seat.")
+            self._bore_cal_status.setStyleSheet(f"color: {COLORS['green']};")
+
+    def _bore_cal_apply_stored(self) -> int:
+        """Push the stored offsets onto the live needle so the executor uses them.
+
+        Called whenever a new hardware config arrives and after each measurement.
+        Refuses on a fingerprint mismatch (inside the store), so a swapped
+        assembly keeps zero offsets — which is the pre-v7.9 behaviour — instead of
+        inheriting another mount's geometry.
+        """
+        store = self._bore_cal_store()
+        needle = self._bore_cal_needle()
+        if store is None or needle is None:
+            return 0
+        try:
+            return store.apply_to_needle(needle)
+        except Exception as e:      # pragma: no cover — defensive
+            logger.debug(f"bore offsets not applied: {e}")
+            return 0
+
+    # ── measurement ──────────────────────────────────────────────
+
+    def _bore_cal_centred_position(self):
+        """``(stage_xy_um, z_user_mm)`` for the bore currently on the crosshairs.
+
+        The stage position as read, REFINED by the residual the two-camera aligner
+        computes from the four edge clicks when all four are present — the same
+        (dx, dy) Center & Save would move by, so the sign is the one already
+        established there. Without clicks the raw reading is used, which is why
+        the clicks are optional: they buy accuracy, they are not load-bearing.
+
+        The refinement is applied to EVERY bore identically, so it cancels out of
+        the difference and cannot bias an offset; what it removes is the operator's
+        hand-jog residual, which at a 100-500 µm spacing would otherwise be a few
+        percent of the answer.
+        """
+        xy = self.controller.get_xy_position(cached=False)
+        if not xy or xy[0] is None or xy[1] is None:
+            return None, None
+        sx, sy = float(xy[0]), float(xy[1])
+        if getattr(self, "_needle_loc_step", 0) >= 4:
+            try:
+                dx_um, dy_um = self._needle_loc_compute_offset_um()
+                sx += float(dx_um)
+                sy += float(dy_um)
+                logger.info("[bore-cal] refined by the edge picks: "
+                            f"dx={dx_um:+.1f} dy={dy_um:+.1f} µm")
+            except Exception as e:
+                logger.debug(f"[bore-cal] no XY refinement: {e}")
+        # Height frame (up = +) so the Z offset means "reaches lower" regardless
+        # of the machine's raw Z polarity.
+        z_user = None
+        try:
+            raw_z = self.controller.capture_current_z_raw()
+            if raw_z is not None:
+                z_user = float(self.controller.raw_to_user_z(raw_z))
+                if (getattr(self, "_needle_loc_step", 0) >= 4
+                        and self._needle_loc_z_center_chk.isChecked()):
+                    dz_um = self._needle_loc_compute_z_offset_um()
+                    if dz_um is not None:
+                        z_user += float(dz_um) / 1000.0
+        except Exception as e:
+            logger.debug(f"[bore-cal] Z reading skipped: {e}")
+        return (sx, sy), z_user
+
+    def _bore_cal_capture(self, bore_index: int) -> None:
+        """Record the current position as bore ``bore_index``'s centred position."""
+        ok, why = self._bore_cal_gate()
+        if not ok:
+            QMessageBox.warning(self, "Bore mount offsets", why)
+            return
+        store = self._bore_cal_store()
+        needle = self._bore_cal_needle()
+        if store is None or needle is None:
+            return
+
+        # Bore 1 IS the needle_origin_um datum, so confirming it overwrites the
+        # needle reference — the same write "Set current as needle center" makes,
+        # and it asks the same question rather than doing it silently.
+        if bore_index == 0:
+            resp = QMessageBox.question(
+                self, "Bore 1 (datum)",
+                "Record the CURRENT position as bore 1 — the datum?\n\n"
+                "Bore 1 defines the needle origin, so this overwrites the needle "
+                "reference (needle_origin_um, the saved quick-move XY and the "
+                "needle-cam Z fiducial) and every other bore's offset is measured "
+                "from it. Make sure bore 1's tip sits on both crosshairs.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+
+        stage_um, z_user = self._bore_cal_centred_position()
+        if stage_um is None:
+            QMessageBox.warning(self, "Bore mount offsets",
+                                "Could not read the stage position.")
+            return
+
+        if bore_index == 0:
+            # Reuse the existing datum recorder verbatim — it owns needle_origin_um,
+            # the quick-move XY and the needle-cam Z fiducial; duplicating any of
+            # that here would give two writers for one datum.
+            if not self._needle_loc_record_origin_here():
+                QMessageBox.warning(self, "Bore mount offsets",
+                                    "Could not read the stage position.")
+                return
+            # Measuring the datum re-bases every other bore, so the old offsets
+            # (taken against a different datum position) are meaningless.
+            store.clear()
+            store.set_bore(0, (0.0, 0.0), 0.0, stage_um=stage_um,
+                           z_user_mm=z_user, needle=needle)
+        else:
+            datum = store.get_bore(0)
+            if datum is None or datum.stage_um is None:
+                QMessageBox.warning(
+                    self, "Bore mount offsets",
+                    "Measure bore 1 (the datum) first — every other bore's "
+                    "offset is its distance from bore 1.")
+                return
+            offset = offset_from_centred_positions(datum.stage_um, stage_um)
+            dz = 0.0
+            if z_user is not None and datum.z_user_mm is not None:
+                dz = z_offset_from_centred_heights(datum.z_user_mm, z_user)
+            store.set_bore(bore_index, offset, dz, stage_um=stage_um,
+                           z_user_mm=z_user, needle=needle)
+            logger.info(
+                f"[bore-cal] bore {bore_index + 1}: offset "
+                f"({offset[0]:+.1f}, {offset[1]:+.1f}) µm, Z {dz:+.4f} mm "
+                f"(datum {datum.stage_um} → here {stage_um})")
+
+        self._bore_cal_apply_stored()
+        # Clear the edge picks so a later bore can never be refined by THIS
+        # bore's stale clicks (the same reset Center & Save ends with).
         self._needle_loc_reset()
+        self._bore_cal_refresh()
+
+    def _bore_cal_clear(self) -> None:
+        """Forget every measured offset (what a re-seat requires)."""
+        store = self._bore_cal_store()
+        if store is None:
+            return
+        resp = QMessageBox.question(
+            self, "Clear bore offsets",
+            "Forget every measured bore offset?\n\n"
+            "Do this after re-seating or swapping the needle assembly — the "
+            "offsets depend on how the assembly is rotated in the holder, which "
+            "software cannot detect. Until they are re-measured every bore is "
+            "treated as sitting on the datum.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        store.clear()
+        # Zero the live needle too, or the executor would keep using offsets the
+        # operator just declared invalid.
+        needle = self._bore_cal_needle()
+        for bore in (getattr(needle, "bores", None) or []):
+            try:
+                bore.offset_um = (0.0, 0.0)
+                bore.z_offset_mm = 0.0
+            except Exception:
+                pass
+        self._bore_cal_refresh()
 
     # ── v7.5.x: quick-move to the saved approximate needle location ──
 
@@ -3260,7 +3902,7 @@ class CalibrationPage(QWidget):
         if not loc:
             self._needle_loc_goto_label.setText(
                 "Saved needle location: not set — jog the needle into view + "
-                "'Set current as location', or run Center & Save once.")
+                "'Set current as needle center', or run Center & Save once.")
             return
         # Display zero-referenced µm to match the rest of the UI.
         zx = zy = 0.0
@@ -3274,23 +3916,38 @@ class CalibrationPage(QWidget):
             f"{loc[1] - zy:,.0f}) µm")
 
     def _needle_loc_set_current(self) -> None:
-        """Capture the current stage XY as the approximate needle location
-        (seeds the quick-move on a fresh machine before the first calibration)."""
+        """v7.5.x: manually record the CURRENT position as the needle center.
+
+        Previously this only seeded the quick-move XY; it now wires into the
+        needle center itself — the operator hand-jogs the needle tip onto
+        both side-camera crosshairs and clicks the button, which records
+        everything Center & Save records (``needle_origin_um``, the
+        quick-move XY, and the needle-cam Z fiducial) without the
+        camera-driven centering move.
+        """
         if self.controller is None:
             QMessageBox.warning(self, "Needle Location",
                                 "Stage controller not connected.")
             return
-        try:
-            xy = self.controller.get_xy_position(cached=False)
-        except Exception:
-            xy = (None, None)
-        if not xy or xy[0] is None:
+        resp = QMessageBox.question(
+            self, "Set needle center",
+            "Record the CURRENT position as the needle center?\n\n"
+            "This overwrites the needle origin (needle_origin_um), the saved "
+            "quick-move needle XY, and the needle-cam Z fiducial — the same "
+            "state Center & Save writes. Make sure the needle tip sits on "
+            "both side-camera crosshairs first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        if not self._needle_loc_record_origin_here():
             QMessageBox.warning(self, "Needle Location",
                                 "Could not read the stage position.")
             return
-        self._needle_loc_store_xy(xy[0], xy[1])
-        logger.info("[needle-loc] saved needle location (abs µm): "
-                    f"({xy[0]:.1f}, {xy[1]:.1f})")
+        loc = getattr(self, "_needle_loc_xy_um", None)
+        if loc:
+            logger.info("[needle-loc] manual needle center recorded "
+                        f"(abs µm): ({loc[0]:.1f}, {loc[1]:.1f})")
 
     def _needle_loc_use_last_known(self) -> None:
         """v7.5.x: accept the last-known needle calibration without re-centering.
@@ -3452,7 +4109,7 @@ class CalibrationPage(QWidget):
         if not loc:
             QMessageBox.information(self, "Needle Location",
                 "No saved needle location yet. Jog the needle into the side "
-                "cameras and click 'Set current as location', or run "
+                "cameras and click 'Set current as needle center', or run "
                 "'Center & Save' once.")
             return
         if self.controller is None:
@@ -3849,6 +4506,11 @@ class CalibrationPage(QWidget):
             camera_manager=self._camera_manager,
             cam_idx=getattr(self, "_ploc_live_cam_idx", 0),
             show_crosshair=True,
+            # v7.5.x: show the CALIBRATED orientation (mirror / axis direction /
+            # rotation). Highest priority of all the live views: clicks here
+            # become sub-well CENTRES, and CameraFeedView inverts clicks back to
+            # raw frame coords so pixel_to_stage_offset stays correct.
+            auto_orient=True,
             label="Microscope feed — starts when this tab is shown "
                   "(or start it on the Cameras tab)",
         )
@@ -4357,6 +5019,7 @@ class CalibrationPage(QWidget):
             camera_manager=self._camera_manager,
             cam_idx=getattr(self, "_ploc_live_cam_idx", 0),
             show_crosshair=True,
+            auto_orient=True,   # v7.5.x: calibrated orientation on every scope feed
             label="Microscope feed — starts when this tab is shown "
                   "(or start it on the Cameras tab)",
         )
@@ -5325,9 +5988,12 @@ class CalibrationPage(QWidget):
     # Reject a multi-edge / 3-point fit whose radius deviates this much
     # from the plate's known well radius (fractional).
     _PLOC_RADIUS_TOL = 0.50
-    # v7.5.x: full-plate mosaic raster overlap (fraction of the camera FOV).
-    # Grid spacing = FOV · (1 − overlap). 0.25 = 25% overlap.
-    _PLOC_MOSAIC_OVERLAP = 0.25
+    # v7.5.x: ``_PLOC_MOSAIC_OVERLAP`` REMOVED. It was a dead fourth value for the
+    # tile overlap (alongside the configured setting, the calibration dialog's own
+    # default and a hardcoded 0.50 in the legacy per-well scan) that nothing read.
+    # Overlap now has exactly one home: ``mosaic_scan.overlap_pct``, resolved by
+    # SupportClasses/MosaicCalibration and edited in ONE place — the Mosaic &
+    # Camera Calibration confirm step.
 
     # ── Plate-calibration workflow versions (v7.5.x) ─────────────────
     # The Mosaic tools are the default workflow; the per-well well-fit /
@@ -6525,6 +7191,36 @@ class CalibrationPage(QWidget):
             f"{'store' if rot_store is not None else 'manager'})")
         return float(rot), bool(mir), bool(fy)
 
+    def _ploc_mosaic_calibration(self, live_resolution):
+        """The ONE resolved mosaic calibration for the microscope camera.
+
+        v7.5.x: shared by the full-plate scan AND the rosette / single-well scan
+        (same code path), and resolved identically by the fluorescence workflow —
+        so "rosette, full plate overview and fluorescence all have the exact same
+        behaviour" holds by construction rather than by three code paths happening
+        to agree. See ``SupportClasses/MosaicCalibration``.
+        """
+        try:
+            from SupportClasses.MosaicCalibration import resolve
+        except ImportError:
+            return None
+        hw = getattr(self, "_hardware_config", None)
+        cam_cfg = getattr(hw, "camera_config", None) if hw is not None else None
+        objective = (getattr(cam_cfg, "current_objective_name", None)
+                     if cam_cfg is not None else None)
+        spec = getattr(cam_cfg, "camera_spec", None) if cam_cfg else None
+        camera_name = getattr(spec, "name", None) if spec else None
+        try:
+            return resolve(
+                camera_manager=getattr(self, "_camera_manager", None),
+                cam_idx=self._ploc_microscope_cam_idx(),
+                camera_name=camera_name, objective=objective,
+                live_resolution=live_resolution,
+                scan_settings=getattr(self, "_mosaic_settings", None))
+        except Exception as exc:
+            logger.debug(f"mosaic calibration resolve failed: {exc}")
+            return None
+
     def _ploc_microscope_um_per_px(self, frame_w, fallback):
         """µm/px for the microscope at the CURRENT capture width.
 
@@ -6766,49 +7462,37 @@ class CalibrationPage(QWidget):
             return
 
         fh, fw = frame.shape[:2]
+        # v7.5.x: ONE resolver for every mosaic — see SupportClasses/
+        # MosaicCalibration. Replaces this path's own µm/px precedence (which had
+        # a hidden ``fov_um`` override on top and the learned "Store FOV/spacing"
+        # value shadowing the objective calibration the operator had just
+        # measured) and its own orientation lookup. The rosette / single-well scan
+        # shares this code, and the fluorescence scan now resolves identically, so
+        # all three mosaics are oriented and scaled the same by construction.
         try:
-            from SupportClasses.MosaicBuilder import MosaicBuilder
+            from SupportClasses.MosaicCalibration import (
+                build_mosaic_builder, refuse_reason, warnings_for)
         except ImportError:
             QMessageBox.warning(
-                self, "Mosaic scan", "MosaicBuilder unavailable.")
+                self, "Mosaic scan", "MosaicCalibration unavailable.")
             return
+        cal = self._ploc_mosaic_calibration((fw, fh))
+        if cal is None:
+            QMessageBox.warning(
+                self, "Mosaic scan", "Could not resolve the mosaic calibration.")
+            return
+        why = refuse_reason(cal)
+        if why:
+            QMessageBox.warning(self, "Mosaic scan", why)
+            return
+        for w in warnings_for(cal):
+            logger.warning(f"Mosaic scan: {w}")
         cfg = getattr(self, "_mosaic_settings", None) or {}
-        overlap_frac = float(cfg.get("overlap_pct", 25)) / 100.0
-        target_px = int(cfg.get("target_px", 3000))
+        overlap_frac = cal.overlap_frac
+        target_px = cal.target_px
+        eff_um_per_px = cal.um_per_px
         align_store = self._ploc_mosaic_align_store()
         align_key = self._ploc_camera_objective_key()
-        # Effective µm/px: explicit FOV override > LEARNED "Store FOV/spacing"
-        # refinement > the camera/objective calibration. v7.5.x — BOTH the
-        # learned value and the objective value are now rescaled to THIS scan's
-        # frame width (µm/px ∝ 1/width) so the FOV matches the real pixels; and
-        # a fresh objective/scale calibration CLEARS the learned value (see
-        # ObjectiveCalibrationCard), so a re-calibration is no longer shadowed by
-        # a stale "Store FOV/spacing" value — the operator's #2 complaint.
-        fov_um = float(cfg.get("fov_um", 0) or 0)
-        if fov_um > 0 and fw > 0:
-            eff_um_per_px = fov_um / fw
-        else:
-            # Camera/objective µm/px, resolution-rescaled; the fallback is the
-            # manager's resolution-aware value (not the raw stored one) so it is
-            # correct even when the objective-store read misses.
-            try:
-                eff_fallback = float(
-                    self._camera_manager.effective_um_per_px(cam_idx, fw))
-                if not (eff_fallback > 0):
-                    eff_fallback = um_per_px
-            except Exception:
-                eff_fallback = um_per_px
-            cam_um = self._ploc_microscope_um_per_px(fw, eff_fallback)
-            # A manual "Store FOV/spacing" refinement overrides ONLY when present,
-            # rescaled from the resolution it was captured at.
-            learned = None
-            if align_store is not None:
-                lv = align_store.get_um_per_px(align_key)
-                if lv and lv > 0:
-                    lres = align_store.get_resolution(align_key)
-                    learned = (lv * float(lres[0]) / float(fw)
-                               if (lres and lres[0] and fw > 0) else lv)
-            eff_um_per_px = learned if (learned and learned > 0) else cam_um
         # Pre-seed the learned global-registration shift so the mosaic is
         # registered from the first tile; finalize refines it.
         init_shift = (0.0, 0.0)
@@ -6829,28 +7513,11 @@ class CalibrationPage(QWidget):
                         f"(±{lim_x:.0f}, ±{lim_y:.0f}); treating as corrupt.")
                 else:
                     init_shift = s
-        # Manual grid spacing override (µm); 0 = auto (FOV × (1 − overlap)).
-        spacing_um = float(cfg.get("spacing_um", 0) or 0)
-        register = bool(cfg.get("register", True))
-        max_shift_um = float(cfg.get("max_shift_um", 0) or 0)
-        # v7.5.x: pairwise registration method — "fourier_mellin" (default,
-        # rotation+scale+translation) | "phase" | "off" (manual/stage-only).
-        reg_method = str(cfg.get("reg_method", "fourier_mellin") or
-                         "fourier_mellin")
-        # v7.5.x: orient tiles into the stage frame using the microscope
-        # camera's calibrated rotation + flip X (mirror) + flip Y (all applied
-        # per-tile by MosaicBuilder._orient_tile), so the composite is
-        # stage-aligned and mosaic clicks back-project to the correct XY.
-        # (0°, no flips → no-op.)
-        frame_rot, frame_mir, frame_fy = \
-            self._ploc_microscope_frame_orientation()
-        builder = MosaicBuilder(
-            frame_size_px=(fw, fh), micron_per_pixel=eff_um_per_px,
-            overlap=overlap_frac, target_mosaic_px=target_px,
-            register=register, max_shift_um=max_shift_um,
-            initial_shift_um=init_shift,
-            frame_rotation_deg=frame_rot, frame_mirrored=frame_mir,
-            frame_flip_y=frame_fy,
+        reg_method = cal.reg_method
+        frame_rot, frame_mir, frame_fy = (
+            cal.rotation_deg, cal.flip_x, cal.flip_y)
+        builder = build_mosaic_builder(
+            cal, initial_shift_um=init_shift,
             # v7.5.x: full-plate scan can be hundreds of tiles — free each raw
             # frame after it's blended so RAM stays bounded (this path consumes
             # only the live ``.composite`` display cache, never re-blends).
@@ -6859,18 +7526,16 @@ class CalibrationPage(QWidget):
             # optimize_registration (full pairwise + global least-squares) can
             # re-blend at globally-consistent positions. Freed right after
             # (free_reorient) — bounded memory, unlike retaining raw frames.
-            retain_for_reorient=True,
-            registration_method=reg_method)
+            retain_for_reorient=True)
         # Confirm exactly what the scan applied (operator diagnostic for "the
-        # scan didn't apply the rotations and scales needed").
-        logger.info(
-            f"Mosaic scan applying: resolution {fw}x{fh}px · µm/px "
-            f"{eff_um_per_px:.4f} · FOV {fw * eff_um_per_px:.0f}x"
-            f"{fh * eff_um_per_px:.0f}µm · rotation {frame_rot:.1f}° · mirror "
-            f"{frame_mir} · registration '{reg_method}'")
-        # Raster spaced by the camera FOV at the configured overlap, or by the
-        # explicit grid spacing when set.
-        step = spacing_um if spacing_um > 0 else None
+        # scan didn't apply the rotations and scales needed"), including where
+        # each value came from.
+        logger.info(f"Mosaic scan applying: {cal.describe()}")
+        logger.info(f"Mosaic scan provenance: {dict(cal.provenance)}")
+        # Raster spaced by the camera FOV at the configured overlap. The explicit
+        # ``spacing_um`` override was retired with ``fov_um`` — the measured FOV
+        # now sizes the step.
+        step = None
         grid = builder.generate_raster_positions(
             bounds, overlap=overlap_frac, step_x_um=step, step_y_um=step)
         # Belt-and-suspenders: drop any grid point outside the envelope so no
@@ -7025,7 +7690,30 @@ class CalibrationPage(QWidget):
             return
         self._ploc_mosaic_running = False
         self._ploc_mosaic_cleanup_ui()
+        # v7.5.x: capture the worker's reachability report BEFORE releasing it —
+        # a raster generated from an XY envelope larger than the stage's real
+        # travel silently produces a partial mosaic, which used to look like
+        # "the scan stalls after the first row".
+        _worker = self._ploc_mosaic_worker
+        _skipped = int(getattr(_worker, "unreachable_skipped", 0) or 0)
+        _reach_note = str(getattr(_worker, "reach_note", "") or "")
         self._ploc_mosaic_worker = None
+        if _skipped:
+            QMessageBox.warning(
+                self, "Mosaic scan — travel limit reached",
+                f"{_skipped} raster point(s) could not be reached and were "
+                f"skipped, so the mosaic covers only part of the plate.\n\n"
+                + (f"During the scan {_reach_note}.\n\n" if _reach_note else "")
+                + "The scan region is the configured XY travel envelope, so "
+                  "either that envelope is larger than the real travel "
+                  "(re-record it on Hardware Setup → Device → Record "
+                  "Min/Max), or the stage origin has moved since it was "
+                  "recorded — the Prior sets position 0 at power-on wherever "
+                  "the stage happens to be, so the saved absolute envelope "
+                  "and the taught well map only line up if the stage starts "
+                  "from the same place each time.\n\n"
+                  "Check that a known well still drives to the right spot "
+                  "before trusting this mosaic.")
         # Single-well scan → persist the well's mosaic separately, then map it
         # (rosette: sub-wells; plain well: pick the centre) — NOT the plate.
         parent = getattr(self, "_ploc_scan_subwell_parent", None)
@@ -10409,9 +11097,13 @@ class CalibrationPage(QWidget):
         # v7.2.7: Connect click-to-navigate
         if hasattr(self._cal_plate_view, 'well_clicked'):
             self._cal_plate_view.well_clicked.connect(self._navigate_to_well)
-        # v7.3.1: Connect double-click for per-well scanning
-        if hasattr(self._cal_plate_view, 'well_double_clicked'):
-            self._cal_plate_view.well_double_clicked.connect(self._start_well_scan)
+        # v7.5.x: the legacy per-well double-click scan (``_start_well_scan``) is
+        # NO LONGER REACHABLE. It was the last mosaic path that did not use the
+        # shared calibration: a hardcoded 3.34 µm/px fallback, a hardcoded 0.50
+        # overlap, and the legacy ``MosaicBuilder.build_mosaic`` whose local
+        # origin/scale desync from ``canvas_extent_um`` — so a mosaic built here
+        # back-projected wrong. Use "Scan well…" on the Plate Location tab, which
+        # goes through the same code as the full-plate scan.
 
         grp_layout.addWidget(self._cal_plate_view, stretch=1)
 
@@ -13481,13 +14173,18 @@ class CalibrationPage(QWidget):
         warp = getattr(self, '_plate_warp', None)
         if warp is not None and warp.n_points >= 2:
             cal_data["plate_warp"] = warp.to_dict()
-        # v7.5.x: persist EXPLICIT calibrated well positions (name→absolute
-        # stage µm) when they were set DIRECTLY with NO warp — i.e. by the
-        # "Re-derive wells from saved mosaic (ground truth)" action. These are
-        # the measured ground-truth centres; on load they ARE the calibration
-        # and suppress any warp/affine reconstruction. (Only written when no
-        # warp exists, so the normal taught/warp flow is byte-identical.)
-        if self._calibrated_positions and warp is None:
+        # v7.5.x: persist the EXPLICIT calibrated well positions (name →
+        # absolute stage µm) whenever they exist — with OR without a warp.
+        # Originally only the no-warp "Re-derive from saved mosaic" path
+        # wrote this key and a warp save relied on _load_calibration
+        # re-applying the warp to a RECOMPUTED predicted grid; that
+        # reproduces the mapping only when the fit-time and load-time
+        # prediction frames coincide, and a frame drift (the envelope
+        # re-seed fixed in set_hardware_config) shifted every well off the
+        # mosaic on each restart. Storing the positions themselves makes the
+        # restart byte-identical to what the operator saw at save time; on
+        # load they are authoritative and the warp is restored beside them.
+        if self._calibrated_positions:
             cal_data["calibrated_positions"] = {
                 n: [float(x), float(y)]
                 for n, (x, y) in self._calibrated_positions.items()
@@ -13778,13 +14475,16 @@ class CalibrationPage(QWidget):
                     continue
             self._reference_markers = restored
 
-        # v7.5.x: EXPLICIT calibrated well positions (name→absolute stage µm),
-        # stored directly with NO warp by the "Re-derive wells from saved
-        # mosaic (ground truth)" action. When present these ARE the calibration
-        # — they are the measured ground-truth centres and need no warp/affine,
-        # so they take precedence over and SUPPRESS the warp/affine
-        # reconstruction below (which would otherwise re-introduce a stale
-        # correction). Dropped by the orientation guard above on a flip.
+        # v7.5.x: EXPLICIT calibrated well positions (name→absolute stage µm)
+        # — written by the "Re-derive wells from saved mosaic (ground truth)"
+        # action AND (v7.5.x startup-offset fix) by every warp save. When
+        # present these ARE the calibration: the exact positions on screen at
+        # save time, so they take precedence over the warp/affine POSITION
+        # reconstruction below (re-evaluating the warp on a recomputed
+        # predicted grid shifts every well when the prediction frame drifted
+        # between fit and load). The warp OBJECT is still restored below when
+        # one was saved (re-anchor folds corrections into it). Dropped by the
+        # orientation guard above on a flip.
         explicit_cp = cal.get("calibrated_positions")
         if isinstance(explicit_cp, dict) and explicit_cp:
             restored_cp: dict[str, tuple[float, float]] = {}
@@ -13809,17 +14509,23 @@ class CalibrationPage(QWidget):
         # approximate mosaic_affine similarity below). Re-solves from the
         # stored control-point pairs so the exact-at-control-points correction
         # is reproduced rather than degrading to a similarity on restart.
-        # Skipped when explicit calibrated_positions were restored above.
+        # When explicit calibrated_positions were restored above they stay
+        # the authoritative positions — the warp object + affine mirror are
+        # still restored (re-anchor / labels need them), but the positions
+        # are only recomputed from the warp for legacy saves without the
+        # explicit dict.
         warp_data = cal.get("plate_warp")
-        if warp_data and self._predicted_positions and not self._calibrated_positions:
+        _explicit_cp = bool(self._calibrated_positions)
+        if warp_data and (self._predicted_positions or _explicit_cp):
             try:
                 from SupportClasses.PlateWarpCalibrator import PlateWarpCalibrator
                 from SupportClasses.MosaicBuilder import AffineCalibration
                 warp = PlateWarpCalibrator.from_dict(warp_data)
                 if warp.n_points >= 2:
                     self._plate_warp = warp
-                    self._calibrated_positions = warp.correct_positions(
-                        self._predicted_positions)
+                    if not _explicit_cp and self._predicted_positions:
+                        self._calibrated_positions = warp.correct_positions(
+                            self._predicted_positions)
                     rot, scl, (tx, ty) = warp.similarity_approx()
                     self._three_well_calibration = AffineCalibration(
                         rotation_deg=rot, scale=scl, translation_um=(tx, ty),

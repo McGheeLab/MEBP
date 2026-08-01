@@ -1,0 +1,21 @@
+{
+  "id": "fitc-single-positive",
+  "name": "FITC single-positive",
+  "color": "#a6e3a1",
+  "notes": "Bright in FITC only. \"Bright in ONE channel\" is authored as a positive clause PLUS a negative clause for the other channel -- that is what makes \"only that channel\" unambiguous.",
+  "signature_rule": {
+    "combinator": "all",
+    "clauses": [
+      {
+        "imaging_channel": "FITC",
+        "state": "positive"
+      },
+      {
+        "imaging_channel": "mCherry",
+        "state": "negative"
+      }
+    ]
+  },
+  "builtin": true,
+  "_note": "EXAMPLE. The signature rule is AUTHORED metadata only -- nothing evaluates it against an image yet (v7.9 decision D3). No thresholds are set, so the level is left to the future evaluator."
+}

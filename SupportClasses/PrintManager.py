@@ -187,6 +187,30 @@ class PrintSettings:
     # behaviour; uncalibrated jobs / tests unaffected). See
     # PrintTrajectoryPlanner.resolve_well_xy_mm.
     well_positions_mm: dict | None = None
+    # v7.5.x: the plate bottom is flat but TILTED. `print_z_height` above is the
+    # print Z resolved at ONE point (the taught plate-bottom anchor); this
+    # optional plane adds the measured gradient so each well prints at its OWN
+    # local plate bottom. Stamped at build time from
+    # StageController.plate_z_plane_for_job() — a job carries per-machine facts
+    # (see `z_up_sign` / `plate_axis_sign` / `well_positions_mm` above) so a run
+    # is reproducible from the job and a re-teach between build and run cannot
+    # silently change a RESUMED print's Z.
+    #
+    # Frame: XY in ZERO-REF mm (the frame the print path works in), Z in zero-ref
+    # mm, slopes mm/mm. Keys are `x0_mm`/`y0_mm` — deliberately NOT the live
+    # plane's `x0_um`/`y0_um`, so mixing the two forms raises instead of silently
+    # computing a 1000×-wrong offset. Evaluate ONLY via
+    # SupportClasses.PlateZPlane.job_plane_z_zref_mm.
+    #
+    # None (the default) = no tilt correction ⇒ every well uses `print_z_height`,
+    # byte-identical to the legacy plan.
+    plate_z_plane_zref_mm: dict | None = None
+    # v7.5.x: the operator's INTENT — desired height above the plate bottom (mm).
+    # Required alongside the plane: without it a per-well Z could only *shift*
+    # `print_z_height`, whereas with it each well's Z is computed exactly the way
+    # the anchor value was (local plate bottom + this height). None = unknown ⇒
+    # the plane is ignored and `print_z_height` is used as-is.
+    print_height_above_bottom_mm: float | None = None
     retract_amount: float = 0.0      # Pump retraction after path segment (legacy single-pump)
     prime_amount: float = 0.0        # Pump prime before path segment (legacy single-pump)
     dwell_after_move: float = 0.0    # Seconds to wait after travel moves
@@ -324,6 +348,64 @@ class PrintSettings:
     # executor waits/drains ONLY at corners (straight edges stream). 0 = class
     # default.
     confirm_corner_angle_deg: float = 0.0
+
+    # v7.5.x (XY-Challenge upgrade): the FULL velocity-follower tuning dict,
+    # copied verbatim from PrintTimingCalibrationStore's "velocity" bucket.
+    #
+    # One dict instead of ~25 more scalar fields: the individual named fields
+    # above stay as the fallback (so nothing that reads them breaks), but every
+    # NEW tunable arrives here, which means adding one needs no PrintSettings
+    # change at all. Safe by construction — PrintSettings already carries five
+    # dict fields with default_factory, save_print_progress JSON-dumps every
+    # field, and from_dict filters by field name.
+    #
+    # Empty = use the named fields / class defaults = legacy behaviour.
+    vel_tuning: dict = field(default_factory=dict)
+
+    # Prior SCS S-curve jerk limit (1..100), 0 = don't touch. Changing it
+    # invalidates the measured control_loop_ms / dead time / top speed, so it is
+    # stamped into the print log for attribution.
+    xy_jerk_pct: float = 0.0
+
+    # ── v7.6: feature-aware FEED PLAN (SupportClasses/XYFeedPlan.py) ──
+    #
+    # The velocity follower with ONE fixed tuning provably cannot hold a
+    # resolution element through a corner: pure pursuit cuts every corner by
+    # ≈0.4·lookahead (~220 µm measured on ME3B V1 at any speed-stable
+    # lookahead) and cannot turn a 180° reversal at all. The feed plan instead
+    # SPLITS the path at sharp corners/reversals, stops on those vertices, and
+    # sizes each section's lookahead/speed from its own curvature — which
+    # measured 18/18 geometry-panel shapes ≤ 30 µm on real hardware where the
+    # single tuning managed 0/18.
+    #
+    # All default 0/False = absent = the legacy single-tuning follower, so an
+    # unstamped or uncalibrated job is byte-identical.
+    feed_plan_enabled: bool = False        # velocity mode only
+    feed_plan_element_um: float = 0.0      # resolution element; 0 → 30 µm
+    feed_plan_corner_split_deg: float = 0.0  # 0 → XYFeedPlan.CORNER_SPLIT_DEG
+    #: v7.7 corner policy — "slow" (default) slows through corners and keeps the
+    #: pump advancing for the whole path; "stop" is the v7.6 sectioned plan that
+    #: halts on each sharp vertex. Both hold the resolution element in
+    #: simulation (within ~1 µm); "stop" is ~1.5–1.9× faster on corner-heavy
+    #: geometry, "slow" never interrupts deposition. A near-180° reversal stops
+    #: under either policy — a cusp cannot be traversed at any speed.
+    feed_plan_corner_policy: str = "slow"
+
+    def velocity_tuning(self) -> dict:
+        """The effective velocity-follower tuning: ``vel_tuning`` when stamped,
+        else the legacy named fields. One accessor so the print path and the
+        bench cannot read it differently."""
+        if isinstance(self.vel_tuning, dict) and self.vel_tuning:
+            return dict(self.vel_tuning)
+        return {
+            "lookahead_mm": self.vel_lookahead_mm,
+            "control_hz": self.vel_control_hz,
+            "decel_mm": self.vel_decel_mm,
+            "corner_angle_deg": self.vel_corner_angle_deg,
+            "corner_speed_factor": self.vel_corner_speed_factor,
+            "pid_kp": self.vel_pid_kp,
+            "pid_kd": self.vel_pid_kd,
+        }
 
     def get_retract_uL(self, pump: str) -> float:
         """Get retract amount for a pump in µL (v7.2). Falls back to legacy mm value."""
@@ -643,6 +725,43 @@ def _load_gcode_file(path: Path) -> PrintJob:
     )
 
 
+def well_print_z_zref_mm(settings, well_x_mm: float, well_y_mm: float,
+                         layer: int = 0) -> float:
+    """Print Z (zero-ref mm) for one well on one layer.
+
+    The plate bottom is flat but tilted, so the print Z that gives the intended
+    standoff differs from well to well. When the job carries a tilt plane AND the
+    operator's intended height above the plate bottom, each well's Z is derived
+    from that well's LOCAL plate bottom — computed exactly the way the anchor
+    value was, not as a fudge applied to it.
+
+    Without either (the default, and every legacy job) this returns
+    ``settings.print_z_height + z_up * layer * layer_height``, i.e. the existing
+    plan byte-for-byte.
+
+    ``well_x_mm`` / ``well_y_mm`` are the well centre in ZERO-REF mm — the frame
+    ``well_positions_mm`` and ``MOVE_XY`` already use.
+    """
+    z_up = getattr(settings, "z_up_sign", 1.0)
+    base = settings.print_z_height
+    plane = getattr(settings, "plate_z_plane_zref_mm", None)
+    height = getattr(settings, "print_height_above_bottom_mm", None)
+    if plane and height is not None:
+        try:
+            from SupportClasses.PlateZPlane import job_plane_z_zref_mm
+            from SupportClasses.StageController import plate_relative_to_zref
+            local_bottom = job_plane_z_zref_mm(plane, well_x_mm, well_y_mm)
+            base = plate_relative_to_zref(local_bottom, float(height),
+                                          zdir=z_up)
+        except Exception as e:
+            # A malformed stamped plane must never break a print — fall back to
+            # the plate-wide value the job already carries.
+            logger.warning("well_print_z_zref_mm: ignoring stamped plate plane "
+                           "(%s) — using print_z_height", e)
+            base = settings.print_z_height
+    return base + z_up * layer * settings.layer_height
+
+
 def _parse_gcode_params(parts: list[str]) -> dict:
     """Parse G-code parameters like 'X10.5 Y20 Z0.1' into a dict."""
     params = {}
@@ -735,6 +854,12 @@ def build_well_plate_job(
         ))
 
         for well_idx, (well_name, well_x, well_y) in enumerate(well_positions):
+            # v7.5.x: resolve THIS well's print Z. With a stamped tilt plane the
+            # value tracks the well's local plate bottom; without one it is
+            # exactly `z_height` (the plate-wide layer value computed above), so
+            # the emitted plan is byte-identical to the legacy one.
+            well_z_height = well_print_z_zref_mm(settings, well_x, well_y, layer)
+
             # Determine pump for this well (pump_sequence overrides)
             well_pump = active_pump
             if pump_sequence and len(pump_sequence) > 0:
@@ -761,7 +886,7 @@ def build_well_plate_job(
             # `z_up * hop_mm` above the print Z (z_up = -1 on ME3B V1, so this
             # is genuinely "up"/away from the plate on either polarity).
             hop_mm = abs(getattr(settings, "intra_well_hop_z_mm", 1.0))
-            hop_z = z_height + z_up * hop_mm
+            hop_z = well_z_height + z_up * hop_mm
 
             # v7.5.x: optional FAST hop speeds (Quick Print "Line-move Z/XY
             # speed"). Apply ONLY to the inter-segment hop (lift → XY → lower),
@@ -818,9 +943,17 @@ def build_well_plate_job(
 
                 # Lower to print height. On an inter-segment hop (seg_idx > 0)
                 # use the FAST line-move Z feedrate for the descent too.
-                _move_z_params = {"z": z_height}
+                _move_z_params = {"z": well_z_height}
                 if seg_idx > 0 and _hop_z_fr is not None:
                     _move_z_params["feedrate_mm_min"] = _hop_z_fr
+                if getattr(settings, "plate_z_plane_zref_mm", None):
+                    # v7.5.x: tell the print-floor clamp WHICH XY this descent is
+                    # for, so it can resolve the floor from the tilt plane at this
+                    # well instead of a plate-wide scalar. Deterministic — it does
+                    # not depend on a cached position read. Emitted only when a
+                    # plane is stamped, so a legacy plan is unchanged.
+                    _move_z_params["floor_x_mm"] = well_x
+                    _move_z_params["floor_y_mm"] = well_y
                 commands.append(PrintCommand(
                     type=CommandType.MOVE_Z,
                     params=_move_z_params,
@@ -2187,6 +2320,12 @@ class PrintManager:
         self.on_progress: Optional[Callable] = None
         # State change callback: (new_state: PrintState)
         self.on_state_changed: Optional[Callable] = None
+        # v7.7: per-sample telemetry from the velocity/feed-plan follower, at the
+        # same ~5 Hz decimation the exec log already used (so the ~25 Hz control
+        # loop gains no work). Receives the `vel_sample` dict. MUST NOT BLOCK —
+        # the GUI wires this to a queued Qt signal and coalesces on its own
+        # timer. Exceptions are swallowed so a display bug can never stop a print.
+        self.on_vel_sample: Optional[Callable] = None
 
         # Thread control
         self._thread: Optional[threading.Thread] = None
@@ -2350,8 +2489,29 @@ class PrintManager:
         self._set_state(PrintState.RUNNING)
         logger.info("Print resumed")
 
+    #: v7.6: how long the abort worker waits for the print thread to unwind to
+    #: its ``finally`` (which does the confirmed raise-only retract) before
+    #: performing the backstop retract itself.
+    _ABORT_UNWIND_S = 20.0
+
     def abort(self):
-        """Abort the current print. Raises Z to travel height."""
+        """Abort the current print: kill ALL motion, then retract raise-only.
+
+        Returns to the caller (usually the GUI thread) immediately — the
+        motion kill and the retract run on a daemon worker.
+
+        v7.6 rework. Previously this method set flags and then issued a
+        fire-and-forget ``move_z_absolute(travel_z)`` **on the calling thread**,
+        which had two defects:
+          • it is not raise-only, so with the needle already above the travel
+            height the "safety" move DESCENDED (only soft-limit clamped);
+          • it took the ZP serial lock, so an abort during an in-flight M400
+            froze the GUI for 10–180 s.
+        Neither survives: the retract of record is now the print thread's
+        ``finally`` → ``_retract_to_safe_z`` (``ensure_retracted_to``,
+        polarity-safe, confirmed, never descends), and the worker only performs
+        a backstop retract if that thread provably fails to unwind.
+        """
         if self.state not in (PrintState.RUNNING, PrintState.PAUSED):
             return
         self._abort_flag.set()
@@ -2381,14 +2541,35 @@ class PrintManager:
         # Enhancement 6: Record abort to history
         self._record_history("aborted")
 
-        # Safety: raise Z to travel height
-        if self.controller.is_zp_connected and self.job:
-            try:
-                self.controller.move_z_absolute(
-                    self.job.settings.travel_z_height, from_zero_ref=True
-                )
-            except Exception as e:
-                logger.error(f"Failed to raise Z after abort: {e}")
+        # v7.6: kill motion + guarantee the retract, off the calling thread.
+        threading.Thread(target=self._abort_worker,
+                         name="print-abort-worker", daemon=True).start()
+
+    def _abort_worker(self):
+        """v7.6 daemon: stop every axis, then make sure the needle ends up
+        retracted however the print thread behaves."""
+        try:
+            res = self.controller.abort_all_motion("print_abort")
+            if self.exec_logger:
+                self.exec_logger.log("abort_motion_killed", **{
+                    k: v for k, v in (res or {}).items() if k != "reason"})
+            logger.warning(
+                "Abort: pump volume dispensed is now INDETERMINATE (a move was "
+                "cut mid-stroke) — re-check syringe fill before the next run")
+        except Exception:
+            logger.exception("abort_all_motion failed")
+
+        t = getattr(self, "_thread", None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=self._ABORT_UNWIND_S)
+            if t.is_alive():
+                # The print thread is wedged (e.g. still holding the ZP serial
+                # lock). Its finally has provably NOT run, so do the retract
+                # here — raise-only, and never with an abort event.
+                logger.error(
+                    f"Print thread did not unwind {self._ABORT_UNWIND_S:.0f}s "
+                    f"after abort — performing the backstop retract")
+                self._retract_to_safe_z("abort_backstop")
 
     # ── Internal ───────────────────────────────────────────────────
 
@@ -2692,11 +2873,49 @@ class PrintManager:
                 except Exception:
                     pass
             if hasattr(ctrl, "ensure_retracted_to"):
+                # ⚠ v7.6: deliberately NO abort_event here. This is the safety
+                # retract of record — it must run to completion even (indeed
+                # especially) when the abort flag is set.
                 ctrl.ensure_retracted_to(float(travel_z))
             else:  # older controller — best-effort raise (no confirm)
                 ctrl.move_z_absolute(float(travel_z), from_zero_ref=True)
         except Exception as e:
             logger.error("Final safe-Z retract (%s) failed: %s", context, e)
+
+    # ── v7.6: abort-aware wrappers for the blocking primitives ─────
+    #
+    # Each forwards this print's ``_abort_flag`` so an abort unwinds the print
+    # thread in ~one readline instead of 10–180 s, and degrades gracefully on a
+    # fake / older controller that doesn't accept the keyword. The SAFETY
+    # retract (``_retract_to_safe_z``) deliberately does NOT use these — it must
+    # always run to completion.
+
+    def _flush_moves(self, zp, timeout_s: float) -> bool:
+        try:
+            return bool(zp.flush_moves(timeout_s=timeout_s,
+                                       abort_event=self._abort_flag))
+        except TypeError:
+            return bool(zp.flush_moves(timeout_s=timeout_s))
+
+    def _wait_z(self, ctrl, z_mm: float, timeout_s: float) -> bool:
+        try:
+            return bool(ctrl.wait_for_z_arrival(float(z_mm),
+                                                timeout_s=timeout_s,
+                                                abort_event=self._abort_flag))
+        except TypeError:
+            return bool(ctrl.wait_for_z_arrival(float(z_mm),
+                                                timeout_s=timeout_s))
+
+    def _pump_uL(self, ctrl, pump, volume_uL, rate_uL_s=None, **kw):
+        """Abort-aware ``move_pump_uL`` — used for the DISCRETE actuations
+        (prime / retract / suck-back). The streamed print path's tiny
+        per-segment emissions stay on the plain call (they are non-blocking and
+        already abort-checked per segment/tick)."""
+        try:
+            return ctrl.move_pump_uL(pump, volume_uL, rate_uL_s,
+                                     abort_event=self._abort_flag, **kw)
+        except TypeError:
+            return ctrl.move_pump_uL(pump, volume_uL, rate_uL_s, **kw)
 
     def _execute_command(self, cmd: PrintCommand):
         """Execute a single print command."""
@@ -2824,9 +3043,12 @@ class PrintManager:
                     zp = getattr(ctrl, "zp_stage", None)
                     _m400_ok = True
                     if zp is not None and hasattr(zp, "flush_moves"):
-                        _m400_ok = zp.flush_moves(timeout_s=_confirm_to)
-                    if not _m400_ok or not ctrl.wait_for_z_arrival(
-                            float(z), timeout_s=_confirm_to):
+                        # v7.6: abort-aware — a print aborted during the
+                        # print-height confirm used to hold the thread here for
+                        # up to 120 s before the retract could run.
+                        _m400_ok = self._flush_moves(zp, _confirm_to)
+                    if not _m400_ok or not self._wait_z(ctrl, float(z),
+                                                        _confirm_to):
                         _z_confirmed = False
                 finally:
                     if _had_poller:
@@ -2876,8 +3098,10 @@ class PrintManager:
                 _settled = False
                 if hasattr(ctrl, 'move_pump_uL'):
                     try:
-                        ctrl.move_pump_uL(pump, amount_uL, rate_uL_s,
-                                          settle=True, compensate=False)
+                        # v7.6: abort-aware (this is the long one — a
+                        # multi-needle aspirate can drain for tens of seconds).
+                        self._pump_uL(ctrl, pump, amount_uL, rate_uL_s,
+                                      settle=True, compensate=False)
                         _settled = True
                     except TypeError:
                         # Older controller / fake without the settle/compensate kwarg.
@@ -3254,7 +3478,7 @@ class PrintManager:
                 return
             # This IS the explicit unload; move_pump_uL(settle=False) never
             # auto-brackets, so it won't recursively re-suck-back.
-            ctrl.move_pump_uL(pump, -r)   # ASPIRATE = suck-back
+            self._pump_uL(ctrl, pump, -r)   # ASPIRATE = suck-back (v7.6 abort-aware)
             if self.exec_logger:
                 self.exec_logger.log("pump_relief", context=context,
                                      uL=round(-r, 4), pump=pump)
@@ -3335,7 +3559,8 @@ class PrintManager:
                    flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
                    speed_mm_s=round(_spd, 3),
                    confirm_each_segment=confirm_each_segment,
-                   **PrintExecutionLogger._path_stats(points))
+                   **PrintExecutionLogger._path_stats(points),
+                   **PrintExecutionLogger.path_points(points))
         _path_t0 = time.monotonic()
         _planned_s = 0.0
         # v7.5.x (Finding C): residual pump volume that hasn't yet crossed the
@@ -3480,7 +3705,7 @@ class PrintManager:
                 if getattr(ctrl, "is_zp_connected", False):
                     _zp = getattr(ctrl, "zp_stage", None)
                     if _zp is not None and hasattr(_zp, "flush_moves"):
-                        _zp.flush_moves(timeout_s=10.0)
+                        self._flush_moves(_zp, 10.0)
             else:
                 time.sleep(_sleep_s)
 
@@ -3522,7 +3747,7 @@ class PrintManager:
                     and getattr(ctrl, "is_zp_connected", False)):
                 _zp = getattr(ctrl, "zp_stage", None)
                 if _zp is not None and hasattr(_zp, "flush_moves"):
-                    _bok = _zp.flush_moves(timeout_s=10.0)
+                    _bok = self._flush_moves(_zp, 10.0)
                     if lg and not _bok:
                         lg.log("path_barrier", i=i, ok=False)
 
@@ -3651,7 +3876,8 @@ class PrintManager:
             lg.log("path_start", n_points=len(pts), pump=pump,
                    flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
                    speed_mm_s=round(eff_speed, 3), mode="open_velocity",
-                   **PrintExecutionLogger._path_stats(pts))
+                   **PrintExecutionLogger._path_stats(pts),
+                   **PrintExecutionLogger.path_points(pts))
 
         _ctrl_hz = getattr(settings, "vel_control_hz", 0) or self._VEL_CONTROL_HZ
         _decel = getattr(settings, "vel_decel_mm", 0) or self._VEL_DECEL_MM
@@ -3769,6 +3995,19 @@ class PrintManager:
         inversion sending the stage the wrong way) trips a runaway guard →
         RuntimeError → the outer loop aborts + retracts to safe Z.
         """
+        # v7.6: the feature-aware feed plan supersedes the single-tuning loop
+        # when enabled AND the machine is characterised. It returns False —
+        # having issued NO motion — when it cannot run, so we fall through to
+        # the legacy loop below (which is byte-identical when the flag is off).
+        if getattr(self.job.settings, "feed_plan_enabled", False):
+            try:
+                if self._execute_print_path_feed_plan(cmd):
+                    return
+            except RuntimeError:
+                raise                       # runaway guard → outer loop aborts
+            except Exception as e:
+                logger.exception("feed-plan path failed — falling back: %s", e)
+
         ctrl = self.controller
         settings = self.job.settings
         raw_pts = cmd.params.get("points", [])
@@ -3821,16 +4060,41 @@ class PrintManager:
                 _fallback_max = _m
         except Exception:
             pass
+        # v7.5.x: the full tuning dict (store's "velocity" bucket). Every key
+        # defaults to 0 = legacy, so an uncalibrated machine is unchanged.
+        try:
+            _tune = settings.velocity_tuning()
+        except Exception:
+            _tune = {}
+
+        def _tv(key, default=0.0):
+            try:
+                return float(_tune.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+
         _res = _velctl.resolve_control(
             print_speed_mm_s=print_speed, lookahead_mm=_lookahead,
             xy_max_speed_um_s=getattr(settings, "xy_max_speed_um_s", 0.0),
             control_loop_ms=getattr(settings, "control_loop_ms", 0.0),
             phase_lag_s=getattr(settings, "phase_lag_s", 0.0),
             default_control_hz=self._VEL_CONTROL_HZ,
-            fallback_max_um_s=_fallback_max)
+            fallback_max_um_s=_fallback_max,
+            # Stage-1 speed decoupling — see VelocityControl.resolve_control.
+            # dead_time_s (measured by XYDeadTime) supersedes phase_lag_s, which
+            # is a settle time and on ME3B V1 caps prints at 0.31 mm/s.
+            dead_time_s=_tv("dead_time_s"),
+            lead_time_frac=_tv("lead_time_frac"),
+            min_lookahead_frac=_tv("min_lookahead_frac"),
+            max_speed_frac=_tv("max_speed_frac"),
+            hold_speed=bool(_tv("hold_speed")),
+            safety=(_tv("deadtime_safety") or 2.0))
         max_um_s = _res["max_um_s"]
         _ctrl_hz = _res["control_hz"]
         speed_cap = _res["speed_cap_mm_s"]
+        # The lookahead may have been RESOLVED upward from the dynamics, so the
+        # carrot must use the resolved value, not the requested one.
+        _lookahead = _res.get("lookahead_mm", _lookahead)
 
         # Corner-aware speed-limit profile along the path (slow into sharp turns).
         speed_limit_at, _corners = _velctl.plan_speed_limits(
@@ -3840,12 +4104,18 @@ class PrintManager:
         # Set SMS to the (measured) max so VS isn't capped below the commanded
         # velocity; brisk accel so VS actually reaches it.
         xy = getattr(ctrl, 'xy_stage', None)
+        _jerk = _tv("jerk_pct") or float(getattr(settings, "xy_jerk_pct", 0.0) or 0.0)
         try:
             if xy is not None and hasattr(xy, 'set_acceleration'):
                 xy.set_acceleration(
                     getattr(settings, 'xy_accel_pct', 80) or 80)
             if xy is not None and hasattr(xy, 'set_speed_mm_s'):
                 xy.set_speed_mm_s(max_um_s / 1000.0)
+            # Prior SCS S-curve limit — shapes corner overshoot. 0 = don't touch.
+            # ⚠ changing it invalidates the measured loop period / dead time /
+            # top speed, which is why it is logged with the run below.
+            if _jerk > 0 and xy is not None and hasattr(xy, 'set_jerk'):
+                xy.set_jerk(int(_jerk))
         except Exception:
             pass
 
@@ -3874,7 +4144,17 @@ class PrintManager:
                    speed_mm_s=round(print_speed, 3), mode="velocity",
                    n_corners=len(_corners), speed_cap=round(speed_cap, 3),
                    ctrl_hz=round(_ctrl_hz, 1), kp=_kp, kd=_kd,
-                   **PrintExecutionLogger._path_stats(pts))
+                   # v7.5.x: make every run self-describing so a slow print can
+                   # be diagnosed from its log alone — cap_reason names the term
+                   # that is binding (print_speed / dead_time / top_speed /
+                   # hold_speed), which is the question the operator kept asking.
+                   lookahead_resolved=round(_lookahead, 4),
+                   cap_reason=_res.get("cap_reason", ""),
+                   dead_time_s=round(_res.get("dead_time_s", 0.0), 4),
+                   lead_s=round(_res.get("lead_s", 0.0), 4),
+                   jerk_pct=_jerk, tuning=dict(_tune),
+                   **PrintExecutionLogger._path_stats(pts),
+                   **PrintExecutionLogger.path_points(pts))
 
         dt = 1.0 / max(_ctrl_hz, 1.0)
         arrive_tol_mm = self._VEL_ARRIVE_TOL_UM / 1000.0
@@ -4015,6 +4295,478 @@ class PrintManager:
             lg.log("path_end", mode="velocity",
                    wall_s=round(time.monotonic() - _t0, 3),
                    s_mm=round(min(s_prev, total), 3), tot_mm=round(total, 3))
+
+    # ── v7.6: feature-aware FEED PLAN print path ───────────────────
+
+    def _feed_plan_char(self, settings):
+        """The machine's measured dynamics, from the STAMPED settings (not the
+        global store) so the plan is reproducible from the job alone.
+
+        Returns None — meaning "fall back to the legacy follower" — unless the
+        machine is fully characterised (loop period + dead time + top speed).
+        """
+        try:
+            from SupportClasses.XYStageModel import StageCharacteristics
+        except Exception:                           # pragma: no cover
+            return None
+        try:
+            tune = settings.velocity_tuning()
+        except Exception:
+            tune = {}
+
+        def _f(v, default=0.0):
+            try:
+                return float(v or default)
+            except (TypeError, ValueError):
+                return default
+
+        char = StageCharacteristics(
+            dead_time_s=_f(tune.get("dead_time_s")),
+            tau_s=_f(tune.get("tau_s")),
+            top_speed_um_s=_f(getattr(settings, "xy_max_speed_um_s", 0.0)),
+            control_loop_ms=_f(getattr(settings, "control_loop_ms", 0.0)))
+        return char if char.is_complete() else None
+
+    def _execute_print_path_feed_plan(self, cmd: PrintCommand) -> bool:
+        """Print the path as a FEED PLAN: a sequence of feature-sized sections
+        with a full stop on every sharp corner / reversal.
+
+        Returns True when the path was printed here, False when the plan could
+        not be built (**no motion issued** — the caller falls back to the legacy
+        single-tuning follower and logs why).
+
+        Why sections: one fixed tuning cannot hold a resolution element through
+        a corner — pure pursuit cuts corners by ≈0.4·lookahead and cannot turn a
+        180° reversal at all. Each section here gets its own curvature-sized
+        lookahead and the speed that lookahead can sustain, and the plan stops
+        ON each split vertex (tight arrive + the lag-aware end taper), so the
+        corner error is the stage's own stopping accuracy (~8 µm) instead of a
+        lookahead-scaled cut.
+
+        Pump bookkeeping is GLOBAL across sections: deposition tracks the total
+        arc length travelled, so the volume laid down is
+        ``vol_per_mm × total_length`` regardless of where the splits fall, with
+        nothing deposited during the inter-section stops.
+        """
+        from SupportClasses import XYFeedPlan as _fp
+
+        ctrl = self.controller
+        settings = self.job.settings
+        raw_pts = cmd.params.get("points", [])
+        pump = cmd.params.get("pump", self._active_pump)
+        flow_rate_uL_s = cmd.params.get("flow_rate_uL_s", None)
+        flow_rate = cmd.params.get("flow_rate", 0.01)
+        use_uL = flow_rate_uL_s is not None
+        lg = self.exec_logger
+
+        if not raw_pts:
+            return False
+        pts = [(float(raw_pts[0][0]), float(raw_pts[0][1]))]
+        for p in raw_pts[1:]:
+            if math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) > 1e-9:
+                pts.append((float(p[0]), float(p[1])))
+        if len(pts) < 2:
+            return False
+
+        char = self._feed_plan_char(settings)
+        if char is None:
+            if lg:
+                lg.log("feed_plan_fallback", reason="machine_not_characterised")
+            logger.warning(
+                "feed plan requested but the machine is not characterised "
+                "(needs loop period + dead time + top speed) — using the "
+                "legacy velocity follower")
+            return False
+
+        print_speed = getattr(settings, 'print_speed_mm_s', 0) or \
+            max(getattr(settings, 'print_feedrate', 200), 1) / 60.0
+        print_speed = max(0.05, float(print_speed))
+        element_um = float(getattr(settings, "feed_plan_element_um", 0.0) or 0.0) \
+            or 30.0
+        split_deg = float(getattr(settings, "feed_plan_corner_split_deg", 0.0)
+                          or 0.0) or _fp.CORNER_SPLIT_DEG
+
+        # v7.7: "slow" is the default corner policy — slow through corners so the
+        # pump never stops mid-path. "stop" keeps the v6 sectioned plan.
+        policy = str(getattr(settings, "feed_plan_corner_policy", "slow")
+                     or "slow").lower()
+        if policy == "stop":
+            plan = _fp.build_plan(pts, char, target_speed_mm_s=print_speed,
+                                  element_um=element_um,
+                                  corner_split_deg=split_deg)
+        else:
+            plan = _fp.build_continuous_plan(
+                pts, char, target_speed_mm_s=print_speed,
+                element_um=element_um)
+        if not plan.sections:
+            if lg:
+                lg.log("feed_plan_fallback", reason="degenerate_plan")
+            return False
+
+        cum = polyline_arclength(pts)
+        total = cum[-1]
+        vol_per_mm = (flow_rate_uL_s / print_speed) if (
+            use_uL and flow_rate_uL_s and flow_rate_uL_s > 0) else 0.0
+
+        # SMS / accel / jerk exactly as the legacy path sets them.
+        try:
+            _tune = settings.velocity_tuning()
+        except Exception:
+            _tune = {}
+        _jerk = float(_tune.get("jerk_pct", 0) or 0) or \
+            float(getattr(settings, "xy_jerk_pct", 0.0) or 0.0)
+        xy = getattr(ctrl, 'xy_stage', None)
+        try:
+            if xy is not None and hasattr(xy, 'set_acceleration'):
+                xy.set_acceleration(getattr(settings, 'xy_accel_pct', 80) or 80)
+            if xy is not None and hasattr(xy, 'set_speed_mm_s'):
+                xy.set_speed_mm_s(char.top_speed_um_s / 1000.0)
+            if _jerk > 0 and xy is not None and hasattr(xy, 'set_jerk'):
+                xy.set_jerk(int(_jerk))
+        except Exception:
+            pass
+
+        # Move to the path start (confirmed) before opening any loop.
+        if lg:
+            lg.log("xy_cmd", context="feed_plan_start",
+                   **lg.xy_cmd_fields(ctrl, pts[0][0], pts[0][1]))
+        ctrl.move_xy_absolute(pts[0][0], pts[0][1], from_zero_ref=True)
+        self._wait_for_xy_settle(pts[0][0], pts[0][1], timeout=5.0)
+        if self._abort_flag.is_set():
+            return True                     # abort during the approach
+
+        _t0 = time.monotonic()
+        if lg:
+            lg.log("path_start", n_points=len(pts), pump=pump,
+                   flow_rate_uL_s=flow_rate_uL_s, flow_rate=flow_rate,
+                   speed_mm_s=round(print_speed, 3), mode="velocity",
+                   feed_plan=True, n_sections=len(plan.sections),
+                   n_stops=plan.n_stops,
+                   plan_est_s=round(plan.est_time_s, 1),
+                   corner_policy=policy, continuous=bool(plan.continuous),
+                   element_um=round(element_um, 1),
+                   budget_um=round(plan.deviation_budget_um, 1),
+                   jerk_pct=_jerk, tuning=dict(_tune),
+                   **PrintExecutionLogger._path_stats(pts),
+                   **PrintExecutionLogger.path_points(pts))
+
+        # ── GLOBAL pump bookkeeping across sections ────────────────
+        # base_s = arc length of all COMPLETED sections. Sections partition the
+        # path and share their split vertices, so base_s + s_section is the
+        # global progress; deposition on the monotone global delta can neither
+        # double-count at a boundary nor deposit during a stop dwell.
+        book = {"base_s": 0.0, "s_global": 0.0, "pending_uL": 0.0,
+                # v7.7: cumulative deposited volume (never reset), reported live.
+                "total_uL": 0.0}
+
+        def deposit(s_sec: float, sec_len: float):
+            """Advance the global volume bookkeeping. v7.7: returns the total µL
+            deposited so far (or None when this path deposits nothing), so the
+            live readout and the report can show dispensed-vs-planned without
+            re-deriving it."""
+            s_global = book["base_s"] + min(max(0.0, s_sec), sec_len)
+            ds = s_global - book["s_global"]
+            if ds <= 0:
+                return book["total_uL"] if vol_per_mm > 0 else None
+            book["s_global"] = s_global
+            if vol_per_mm > 0:
+                book["pending_uL"] += ds * vol_per_mm
+                book["total_uL"] += ds * vol_per_mm
+                if book["pending_uL"] > self._PATH_PUMP_EMIT_MIN_UL:
+                    self._emit_pump(ctrl, pump, book["pending_uL"],
+                                    flow_rate_uL_s, settings)
+                    book["pending_uL"] = 0.0
+                return book["total_uL"]
+            elif not use_uL and flow_rate:
+                self._emit_pump(ctrl, pump, ds * flow_rate, None, settings)
+            return None
+
+        n_done = 0
+        status = "arrived"
+        try:
+            for k, sec in enumerate(plan.sections):
+                if self._abort_flag.is_set():
+                    status = "aborted"
+                    break
+                # A section shorter than its own arrive tolerance cannot be
+                # "driven to" meaningfully — skip the motion, keep the volume
+                # exact by advancing the global cursor.
+                if sec.length_mm < max(2.0 * sec.arrive_mm, 0.02):
+                    if lg:
+                        lg.log("plan_section", index=k,
+                               n_sections=len(plan.sections),
+                               length_mm=round(sec.length_mm, 4),
+                               skipped=True)
+                    book["base_s"] += sec.length_mm
+                    continue
+
+                tuning = _fp.tuning_for(sec)
+                resolved = _velctl.resolve_control(
+                    print_speed_mm_s=sec.speed_mm_s,
+                    lookahead_mm=sec.lookahead_mm,
+                    xy_max_speed_um_s=char.top_speed_um_s,
+                    control_loop_ms=char.control_loop_ms,
+                    phase_lag_s=0.0,
+                    default_control_hz=self._VEL_CONTROL_HZ,
+                    fallback_max_um_s=char.top_speed_um_s or 50000.0,
+                    dead_time_s=char.dead_time_s,
+                    max_speed_frac=float(tuning.get("max_speed_frac", 0.9)),
+                    hold_speed=True,
+                    safety=float(tuning.get("deadtime_safety", 2.0)) or 2.0)
+                end_lag_s, end_floor = _fp.section_end_taper(char, sec)
+                if lg:
+                    lg.log("plan_section", index=k,
+                           n_sections=len(plan.sections),
+                           lookahead_mm=round(sec.lookahead_mm, 4),
+                           speed_mm_s=round(sec.speed_mm_s, 3),
+                           length_mm=round(sec.length_mm, 4),
+                           arrive_mm=sec.arrive_mm,
+                           min_radius_mm=(round(sec.min_radius_mm, 3)
+                                          if math.isfinite(sec.min_radius_mm)
+                                          else None),
+                           base_s_mm=round(book["base_s"], 4),
+                           end_lag_s=round(end_lag_s, 4),
+                           reason=sec.reason)
+
+                status = self._run_plan_section(
+                    sec, resolved=resolved, end_lag_s=end_lag_s,
+                    end_floor_frac=end_floor, deposit=deposit,
+                    sec_index=k, char=char)
+                book["base_s"] += sec.length_mm
+                book["s_global"] = max(book["s_global"], book["base_s"])
+                n_done += 1
+                if status != "arrived":
+                    break
+
+                # Inter-section STOP: the stage is already commanded to zero by
+                # the section's own exit; dwell so the residual coast decays and
+                # the next section starts from rest ON its start vertex. Chunked
+                # so an abort exits within ~50 ms.
+                if k < len(plan.sections) - 1:
+                    try:
+                        ctrl.send_velocity_xy(0.0, 0.0)
+                    except Exception:
+                        pass
+                    _end = time.monotonic() + self._PLAN_STOP_DWELL_S
+                    while time.monotonic() < _end:
+                        if self._abort_flag.is_set():
+                            status = "aborted"
+                            break
+                        time.sleep(0.05)
+                    if status == "aborted":
+                        break
+        finally:
+            try:
+                ctrl.send_velocity_xy(0.0, 0.0)
+            except Exception:
+                pass
+
+        if status == "arrived":
+            # Exactness top-up: fold any un-arrived residual (≤ the arrive
+            # tolerance per section) into the final emission so the deposited
+            # total is vol_per_mm × total for the plan path.
+            rem = total - book["s_global"]
+            if rem > 0 and vol_per_mm > 0:
+                book["pending_uL"] += rem * vol_per_mm
+        if book["pending_uL"] > 0 and vol_per_mm > 0:
+            self._emit_pump(ctrl, pump, book["pending_uL"], flow_rate_uL_s,
+                            settings)
+            book["pending_uL"] = 0.0
+
+        if status == "arrived":
+            self._wait_for_xy_settle(pts[-1][0], pts[-1][1], timeout=10.0,
+                                     tolerance=self._VEL_ARRIVE_TOL_UM)
+            self._print_pump_suckback("deposit", pump)
+        if lg:
+            lg.log("path_end", mode="velocity", feed_plan=True,
+                   status=status, aborted=(status == "aborted"),
+                   sections_done=n_done, n_sections=len(plan.sections),
+                   wall_s=round(time.monotonic() - _t0, 3),
+                   s_mm=round(min(book["s_global"], total), 3),
+                   tot_mm=round(total, 3))
+        return True
+
+    #: Settle dwell at an inter-section stop (s). Long enough for the residual
+    #: coast to decay so the next section starts from rest.
+    _PLAN_STOP_DWELL_S = 0.3
+
+    def _run_plan_section(self, sec, *, resolved, end_lag_s, end_floor_frac,
+                          deposit, sec_index, char) -> str:
+        """Drive ONE feed-plan section. Returns ``"arrived"`` / ``"aborted"`` /
+        ``"zp_disconnect"`` / ``"wall_cap"``.
+
+        The legacy per-tick body, parametrized per section: the section's own
+        lookahead + speed cap + arrive tolerance, a fresh ``PursuitState``, and
+        the lag-aware end taper that lands the stop ON the vertex. Every legacy
+        guard is retained (abort per tick, mid-path ZP drop, stale position,
+        bounded projection window, runaway → RuntimeError, VS clamp).
+        """
+        ctrl = self.controller
+        settings = self.job.settings
+        lg = self.exec_logger
+        pts = sec.pts
+        cum = polyline_arclength(pts)
+        total = cum[-1]
+        speed = max(0.05, float(sec.speed_mm_s))
+        speed_cap = resolved["speed_cap_mm_s"]
+        lookahead = resolved.get("lookahead_mm", sec.lookahead_mm)
+        max_um_s = resolved["max_um_s"]
+        dt = 1.0 / max(resolved["control_hz"], 1.0)
+        decel = max(0.15, min(0.5, sec.length_mm * 0.3))
+        arrive_mm = float(sec.arrive_mm)
+
+        # v7.7: a CONTINUOUS section carries arc-length profiles — corners inside
+        # it are slowed through, so the carrot and the speed both vary with s.
+        # A sectioned ("stop") plan has no sharp corners by construction, so its
+        # corner profile is a deliberate no-op (pursuit_step always calls it).
+        lookahead_at = getattr(sec, "lookahead_at", None)
+        speed_limit_at = getattr(sec, "speed_at", None)
+        if speed_limit_at is None:
+            speed_limit_at, _corners = _velctl.plan_speed_limits(
+                pts, cum, speed, corner_angle_deg=89.0, corner_speed_factor=1.0,
+                decel_mm=decel)
+        # The wall cap must be sized on the SLOWEST commanded point, or a corner
+        # crawl trips it. Kept separate from `speed`, which the end taper uses.
+        v_wall = speed
+        if speed_limit_at is not None and hasattr(speed_limit_at, "min_value"):
+            try:
+                v_wall = max(0.05, float(speed_limit_at.min_value()))
+            except Exception:
+                v_wall = speed
+
+        zero = getattr(ctrl, 'zero_position', {})
+
+        def read_pos():
+            try:
+                p = ctrl.get_xy_position(cached=False)
+            except Exception:
+                return None
+            if not p or p[0] is None or p[1] is None:
+                return None
+            return ((p[0] - zero.get('x', 0)) / 1000.0,
+                    (p[1] - zero.get('y', 0)) / 1000.0)
+
+        state = _velctl.PursuitState()
+        _t0 = time.monotonic()
+        last_pos_t = _t0
+        prev_pos = None
+        v_meas = 0.0
+        runaway = 0
+        n_ticks = 0
+        s_prev = 0.0
+        max_wall = sec.length_mm / v_wall * 8.0 + 10.0
+        try:
+            while True:
+                _tick = time.monotonic()
+                if self._abort_flag.is_set():
+                    return "aborted"
+                if (getattr(self, "_zp_connected_at_start", False)
+                        and not getattr(ctrl, "is_zp_connected", True)):
+                    logger.error("FEED_PLAN: ZP disconnected mid-path — stopping")
+                    return "zp_disconnect"
+                if _tick - _t0 > max_wall:
+                    logger.warning(
+                        "FEED_PLAN section %d: wall-time cap at s=%.2f/%.2f mm",
+                        sec_index, s_prev, total)
+                    return "wall_cap"
+
+                pos = read_pos()
+                if pos is None:
+                    if _tick - last_pos_t > self._VEL_STALE_S:
+                        ctrl.send_velocity_xy(0.0, 0.0)
+                        if lg:
+                            lg.log("vel_stall", sec=sec_index,
+                                   s_mm=round(s_prev, 3),
+                                   held_s=round(_tick - last_pos_t, 2))
+                    time.sleep(dt)
+                    continue
+                dt_real = max(1e-3, _tick - last_pos_t)
+                last_pos_t = _tick
+                if prev_pos is not None:
+                    v_meas = math.hypot(pos[0] - prev_pos[0],
+                                        pos[1] - prev_pos[1]) / dt_real
+                prev_pos = pos
+
+                max_ds = min(self._VEL_MAX_SNAP_MM,
+                             max(0.15, speed * dt_real * self._VEL_SNAP_GUARD))
+
+                # LAG-AWARE end taper: brake for where the stage WILL be when
+                # this command takes effect, using the MEASURED speed (during
+                # braking the actual speed exceeds the commanded one, so the
+                # commanded value under-predicts the flight distance). Without
+                # this the stop overshoots the vertex by ≈ v·lag (153 µm at
+                # 3 mm/s on ME3B V1) and the corner blows the element budget.
+                remaining = total - s_prev
+                _cap = speed_cap
+                if remaining < decel:
+                    rem_eff = remaining
+                    if end_lag_s > 0.0 and v_meas > 0.0:
+                        rem_eff = max(0.0, remaining - v_meas * end_lag_s)
+                    _cap = min(_cap, max(end_floor_frac, rem_eff / decel)
+                               * min(speed, speed_cap))
+
+                vx, vy, s, cross = _velctl.pursuit_step(
+                    pos, pts, cum, state, lookahead=lookahead,
+                    speed_cap_mm_s=_cap, speed_limit_at=speed_limit_at,
+                    dt=dt_real, max_ds=max_ds, kp=0.0, kd=0.0,
+                    lookahead_at=lookahead_at)
+
+                vmag = math.hypot(vx, vy)
+                if vmag > max_um_s and vmag > 0:
+                    vx *= max_um_s / vmag
+                    vy *= max_um_s / vmag
+
+                if cross > self._VEL_MAX_CROSS_TRACK_MM:
+                    runaway += 1
+                    if runaway >= self._VEL_RUNAWAY_TICKS:
+                        ctrl.send_velocity_xy(0.0, 0.0)
+                        raise RuntimeError(
+                            f"feed-plan runaway: cross-track {cross:.2f} mm > "
+                            f"{self._VEL_MAX_CROSS_TRACK_MM} mm for {runaway} "
+                            f"ticks (check VS direction / sign)")
+                else:
+                    runaway = 0
+
+                _dep_uL = deposit(s, sec.length_mm)
+
+                dist_end = math.hypot(pos[0] - pts[-1][0], pos[1] - pts[-1][1])
+                if s >= total - 1e-6 and dist_end <= arrive_mm:
+                    return "arrived"
+
+                ctrl.send_velocity_xy(vx, vy)
+
+                n_ticks += 1
+                # v7.7: the GUI's live readout and the post-print report both
+                # hang off THIS existing every-5th-tick branch (~5 Hz), so the
+                # ~25 Hz control loop gains no per-tick work. `v_meas` was
+                # already computed above and thrown away; `deposited_uL` is the
+                # executor's own global volume bookkeeping.
+                if n_ticks % 5 == 0 and (lg or self.on_vel_sample):
+                    _rec = {"sec": sec_index,
+                            "s_mm": round(s, 3), "tot_mm": round(total, 3),
+                            "cross_um": round(cross * 1000.0, 1),
+                            "x_mm": round(pos[0], 4), "y_mm": round(pos[1], 4),
+                            "vx": round(vx, 0), "vy": round(vy, 0),
+                            "v_meas_mm_s": round(v_meas, 4),
+                            "deposited_uL": (None if _dep_uL is None
+                                             else round(_dep_uL, 5))}
+                    if lg:
+                        lg.log("vel_sample", **_rec)
+                    if self.on_vel_sample is not None:
+                        try:
+                            self.on_vel_sample(_rec)
+                        except Exception as _e:      # never break the loop
+                            logger.debug("on_vel_sample failed: %s", _e)
+
+                s_prev = s
+                _elapsed = time.monotonic() - _tick
+                if _elapsed < dt:
+                    time.sleep(dt - _elapsed)
+        finally:
+            try:
+                ctrl.send_velocity_xy(0.0, 0.0)
+            except Exception:
+                pass
 
     def _emit_pump(self, ctrl, pump, uL, flow_rate_uL_s, settings):
         """Emit a single (non-blocking) pump dispense of ``uL`` µL for the

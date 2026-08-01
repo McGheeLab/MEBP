@@ -610,7 +610,7 @@
         },
         {
           "title": "(Optional) skip re-centering when nothing changed",
-          "detail": "If the needle, its mounting, and the side cameras are unchanged since last session, click '✓ Use last known location'. It restores the saved needle reference (needle zero + needle-cam Z + saved needle XY) read straight from settings, software-only — NO stage motion. Then verify with '⤵ Go to needle location' and only re-center if it looks off. On a brand-new machine, use 'Set current as location' once to seed the quick-move before the first Center & Save.",
+          "detail": "If the needle, its mounting, and the side cameras are unchanged since last session, click '✓ Use last known location'. It restores the saved needle reference (needle zero + needle-cam Z + saved needle XY) read straight from settings, software-only — NO stage motion. Then verify with '⤵ Go to needle location' and only re-center if it looks off. On a brand-new machine, jog the tip onto both crosshairs and use 'Set current as needle center' once to record the needle center manually before the first Center & Save.",
           "screenshot_ref": "needle-location-main"
         },
         {
@@ -663,10 +663,10 @@
           "recommendation": "Use to bring the needle back into the side cameras instead of hand-jogging."
         },
         {
-          "name": "Set current as location",
-          "what_it_does": "Captures the current stage XY as the approximate needle location (the quick-move target). Persisted per machine. Warns if the stage isn't connected or the position can't be read.",
+          "name": "Set current as needle center",
+          "what_it_does": "Manually records the CURRENT position as the needle center — everything Center & Save records (needle_origin_um, the quick-move XY, and the needle-cam Z fiducial) without the camera-driven centering move, behind a confirm dialog. Warns if the stage isn't connected or the position can't be read.",
           "default": "",
-          "recommendation": "Use once on a fresh machine to seed the quick-move before your first Center & Save."
+          "recommendation": "Jog the needle tip onto both side-camera crosshairs first, then click. Use as the manual alternative to Center & Save (e.g. when the cameras aren't calibrated yet)."
         },
         {
           "name": "✓ Use last known location",

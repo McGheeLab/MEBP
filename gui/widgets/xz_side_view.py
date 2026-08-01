@@ -24,6 +24,22 @@ Public API
     set_safe_z(safe_z_mm)
     set_position(x_um, z_mm)         # either can be None
     set_well_under_needle(diameter_mm, depth_mm)   # both None to clear
+
+Custom Z locations (v7.5.x, opt-in — Jog page only)
+---------------------------------------------------
+    set_custom_z_enabled(True)       # enables the gestures below
+    set_custom_z_locations(values)   # restore (raw zero-ref mm; no emit)
+    custom_z_locations()             # -> list[float]
+    add_custom_z(z) / remove_custom_z(z)
+
+With the feature enabled, click-dragging on the plot shows a floating mm
+readout tag and on release tags that Z as a custom location; a plain
+click ON the current-Z line tags the needle's current Z. Each custom
+location renders like a Z reference (dashed line + clickable ★ badge →
+``go_to_z_requested``) plus an ✕ remove button (right-click on the badge
+also removes). ``custom_z_changed(list)`` fires on every add/remove so
+the host page can persist. All values are raw zero-ref mm (the move
+frame); display goes through the ``_disp()`` sign like everything else.
 """
 
 from __future__ import annotations
@@ -53,6 +69,16 @@ class XZSideView(QWidget):
     # Fired when the user clicks one of the captured-Z badges.
     # The argument is the target Z in mm (zero-referenced).
     go_to_z_requested = Signal(float)
+
+    # v7.5.x: fired whenever the operator adds/removes a custom Z
+    # location. Argument = the full current list (raw zero-ref mm) so
+    # the host page can persist it. NOT fired by the programmatic
+    # set_custom_z_locations() restore (no save loop).
+    custom_z_changed = Signal(list)
+
+    # Two custom locations closer than this are considered the same
+    # (dedup tolerance for add_custom_z / match tolerance for remove).
+    CUSTOM_Z_TOL_MM = 0.005
 
     # Ordered list of Z-reference keys → (short label, accent color key)
     # Each labelled Z value the page sets via set_z_references gets a
@@ -106,6 +132,22 @@ class XZSideView(QWidget):
         }
         # Hit rects for the badges (populated in paint).
         self._z_ref_hit_rects: dict[str, tuple[QRectF, float]] = {}
+
+        # ── v7.5.x: custom Z locations (opt-in; Jog page) ──────────
+        # Values are raw zero-ref mm — the same frame as _z_refs and
+        # the go_to_z_requested emit, so the move contract holds on
+        # both Z polarities. Display converts via _disp().
+        self._custom_z_enabled = False
+        self._custom_z: list[float] = []
+        # (badge_rect, close_rect, z_raw) triples, populated in paint.
+        self._custom_hit_rects: list[tuple[QRectF, QRectF, float]] = []
+        # Drag-to-tag gesture state. A press inside the plot is only
+        # "pending" until the cursor moves past the threshold — a plain
+        # click is reserved for tagging the current-Z line.
+        self._drag_pending = False
+        self._drag_active = False
+        self._drag_press_pos: QPointF | None = None
+        self._drag_z_disp: float | None = None
 
         # Z-axis zoom — 1.0 means show the full safety range.
         # Larger values zoom in around `_z_zoom_center_mm` (or current
@@ -237,6 +279,76 @@ class XZSideView(QWidget):
             float(well_depth_mm) if well_depth_mm else None)
         self.update()
 
+    # ── v7.5.x: custom Z locations ─────────────────────────────────
+
+    def set_custom_z_enabled(self, enabled: bool) -> None:
+        """Enable the drag-to-tag / click-current-line gestures.
+
+        Off by default so the other XZSideView hosts (calibration +
+        workflow pages) keep their exact legacy mouse behaviour.
+        """
+        self._custom_z_enabled = bool(enabled)
+        if self._custom_z_enabled:
+            self.setToolTip(
+                "Drag on the Z axis to tag a custom Z location (mm readout "
+                "follows the cursor; release to set it).\n"
+                "Click the red current-Z line to tag the needle's current "
+                "height.\n"
+                "Click a ★ badge to move Z there · ✕ (or right-click the "
+                "badge) removes it.")
+        self.update()
+
+    def set_custom_z_locations(self, values) -> None:
+        """Restore custom Z locations (raw zero-ref mm).
+
+        Programmatic — does NOT emit ``custom_z_changed`` so a host
+        restoring from settings can't loop back into a save.
+        """
+        cleaned: list[float] = []
+        for v in (values or []):
+            try:
+                z = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not any(abs(z - c) <= self.CUSTOM_Z_TOL_MM for c in cleaned):
+                cleaned.append(z)
+        self._custom_z = sorted(cleaned)
+        self.update()
+
+    def custom_z_locations(self) -> list[float]:
+        """Current custom Z locations (raw zero-ref mm, sorted)."""
+        return list(self._custom_z)
+
+    def add_custom_z(self, z_raw_mm) -> bool:
+        """Add a custom location (raw zero-ref mm). Dedups within
+        ``CUSTOM_Z_TOL_MM``. Emits ``custom_z_changed`` on success."""
+        try:
+            z = float(z_raw_mm)
+        except (TypeError, ValueError):
+            return False
+        if any(abs(z - c) <= self.CUSTOM_Z_TOL_MM for c in self._custom_z):
+            return False
+        self._custom_z.append(z)
+        self._custom_z.sort()
+        self.update()
+        self.custom_z_changed.emit(list(self._custom_z))
+        return True
+
+    def remove_custom_z(self, z_raw_mm) -> bool:
+        """Remove the custom location matching ``z_raw_mm`` (within
+        tolerance). Emits ``custom_z_changed`` on success."""
+        try:
+            z = float(z_raw_mm)
+        except (TypeError, ValueError):
+            return False
+        for i, c in enumerate(self._custom_z):
+            if abs(z - c) <= self.CUSTOM_Z_TOL_MM:
+                del self._custom_z[i]
+                self.update()
+                self.custom_z_changed.emit(list(self._custom_z))
+                return True
+        return False
+
     # ── Coordinate scales ──────────────────────────────────────────
 
     def _zoom_strip_width(self) -> int:
@@ -330,6 +442,19 @@ class XZSideView(QWidget):
             return 1.0
         return (bounds[1] - bounds[0]) / rect.width()
 
+    def _px_to_z_disp(self, y_px: float) -> float | None:
+        """Inverse of :meth:`_z_to_px` — pixel row → Z in the DISPLAY
+        frame. Uses the zoomed visible bounds so dragging while zoomed
+        maps exactly; the input row is clamped into the plot."""
+        bounds = self._z_bounds_mm()
+        rect = self._content_rect()
+        if bounds is None or rect.height() <= 0:
+            return None
+        z_min, z_max = bounds
+        y = min(max(float(y_px), rect.top()), rect.bottom())
+        frac = (y - rect.top()) / max(1.0, rect.height())
+        return z_max - frac * (z_max - z_min)
+
     # ── Painting ───────────────────────────────────────────────────
 
     def paintEvent(self, _e):
@@ -359,6 +484,7 @@ class XZSideView(QWidget):
         self._paint_needle(p, rect)
         self._paint_readout(p, rect)
         self._paint_zoom_badge(p, rect)
+        self._paint_drag_ghost(p, rect)
 
         p.end()
 
@@ -439,8 +565,13 @@ class XZSideView(QWidget):
         Badges are right-anchored inside the plot rect and remember
         their hit rectangle so :meth:`mousePressEvent` can route clicks
         to :sig:`go_to_z_requested`.
+
+        v7.5.x: the operator's custom Z locations are painted in the
+        same pass (after the references) so they share the vertical
+        badge collision-nudge and read as one family.
         """
         self._z_ref_hit_rects.clear()
+        self._custom_hit_rects = []
 
         # Pre-compute badge sizing once per paint (consistent across
         # rows).
@@ -515,6 +646,102 @@ class XZSideView(QWidget):
             # Label
             p.setPen(QPen(accent))
             p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+        # ── v7.5.x: custom Z locations (same badge family, ★ + ✕) ──
+        accent = _qc('yellow')
+        close_d = badge_h * 0.8
+        for z_raw in self._custom_z:
+            z_disp = self._disp(z_raw)
+            z_y = self._z_to_px(z_disp)
+            if z_y < rect.top() - 1 or z_y > rect.bottom() + 1:
+                continue
+
+            line_pen = QPen(QColor(accent), 1.0, Qt.PenStyle.DashLine)
+            p.setPen(line_pen)
+            p.drawLine(QPointF(rect.left() + s(4), z_y),
+                       QPointF(rect.right() - s(4), z_y))
+
+            text = f"★ {z_disp:+.2f} mm"
+            text_w = metrics.horizontalAdvance(text)
+            badge_w = text_w + pad_x * 2
+            badge_x = rect.right() - badge_w - s(2)
+
+            # Same vertical collision-nudge as the Z-ref badges.
+            badge_cy = z_y
+            for prev_cy in placed:
+                if abs(badge_cy - prev_cy) < badge_h + s(2):
+                    if badge_cy >= prev_cy:
+                        badge_cy = prev_cy + badge_h + s(2)
+                    else:
+                        badge_cy = prev_cy - badge_h - s(2)
+            badge_cy = max(rect.top() + badge_h / 2,
+                           min(rect.bottom() - badge_h / 2, badge_cy))
+            placed.append(badge_cy)
+
+            badge_rect = QRectF(
+                badge_x, badge_cy - badge_h / 2, badge_w, badge_h)
+            close_rect = QRectF(
+                badge_rect.left() - close_d - s(4),
+                badge_cy - close_d / 2, close_d, close_d)
+            self._custom_hit_rects.append(
+                (badge_rect, close_rect, float(z_raw)))
+
+            if abs(badge_cy - z_y) > 1:
+                leader_pen = QPen(accent, 1.0, Qt.PenStyle.DotLine)
+                p.setPen(leader_pen)
+                p.drawLine(QPointF(close_rect.left() - s(2), badge_cy),
+                           QPointF(close_rect.left() - s(8), z_y))
+
+            # ✕ remove button (left of the badge)
+            p.setPen(QPen(_qc('red'), 1.0))
+            p.setBrush(QBrush(_qc('crust', 230)))
+            p.drawEllipse(close_rect)
+            close_font = p.font()
+            close_font.setPointSizeF(scaled_font_size(7))
+            close_font.setBold(True)
+            p.setFont(close_font)
+            p.setPen(QPen(_qc('red')))
+            p.drawText(close_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+            p.setFont(font)
+
+            # ★ badge pill (click → go to this Z)
+            p.setPen(QPen(accent, 1.0))
+            p.setBrush(QBrush(_qc('crust', 230)))
+            p.drawRoundedRect(badge_rect, badge_h / 2, badge_h / 2)
+            p.setPen(QPen(accent))
+            p.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_drag_ghost(self, p: QPainter, rect: QRectF) -> None:
+        """Floating readout while the operator drags on the Z axis:
+        a dashed line at the cursor Z + a tag with the location in mm
+        (display frame). Painted last so it rides above everything."""
+        if not self._drag_active or self._drag_z_disp is None:
+            return
+        z_y = self._z_to_px(self._drag_z_disp)
+        pen = QPen(_qc('yellow'), 1.4, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawLine(QPointF(rect.left() + s(2), z_y),
+                   QPointF(rect.right() - s(2), z_y))
+
+        # Tag pill just above the line, left-ish so it doesn't fight
+        # the right-anchored badges. Flips below near the top edge.
+        text = f"Z {self._drag_z_disp:+.3f} mm — release to tag"
+        font = p.font()
+        font.setPointSizeF(scaled_font_size(8))
+        font.setBold(True)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        pill_h = metrics.height() + s(3) * 2
+        tag_y = z_y - pill_h - s(4)
+        if tag_y < rect.top() + s(2):
+            tag_y = z_y + s(4)
+        self._draw_pill(
+            p,
+            QPointF(rect.left() + s(26), tag_y),
+            text,
+            _qc('yellow'),
+            _qc('crust', 230),
+        )
 
     def _paint_needle(self, p: QPainter, rect: QRectF) -> None:
         """Render the current Z as a red horizontal line spanning the plot.
@@ -884,9 +1111,30 @@ class XZSideView(QWidget):
         self.update()
         event.accept()
 
+    def _drag_threshold_px(self) -> float:
+        return float(s(4))
+
+    def _current_line_hit_px(self) -> float:
+        return float(s(6))
+
     def mouseMoveEvent(self, event) -> None:
-        # Use a pointing-hand cursor over the clickable badges
         pos = event.position()
+
+        # v7.5.x: live drag-to-tag — update the floating readout.
+        if self._drag_pending or self._drag_active:
+            if (self._drag_pending and self._drag_press_pos is not None
+                    and (pos - self._drag_press_pos).manhattanLength()
+                    > self._drag_threshold_px()):
+                self._drag_pending = False
+                self._drag_active = True
+            if self._drag_active:
+                self._drag_z_disp = self._px_to_z_disp(pos.y())
+                self.setCursor(Qt.SizeVerCursor)
+                self.update()
+            event.accept()
+            return
+
+        # Use a pointing-hand cursor over the clickable badges
         over_clickable = False
         if (self._reset_zoom_rect is not None
                 and self._reset_zoom_rect.contains(pos)
@@ -897,8 +1145,20 @@ class XZSideView(QWidget):
                 if rect.contains(pos):
                     over_clickable = True
                     break
-        self.setCursor(Qt.PointingHandCursor if over_clickable
-                       else Qt.ArrowCursor)
+            if not over_clickable:
+                for badge_rect, close_rect, _ in self._custom_hit_rects:
+                    if badge_rect.contains(pos) or close_rect.contains(pos):
+                        over_clickable = True
+                        break
+        if over_clickable:
+            self.setCursor(Qt.PointingHandCursor)
+        elif (self._custom_z_enabled
+                and self._safety_limits is not None
+                and self._content_rect().contains(pos)):
+            # Hint that the plot is draggable / clickable for tagging
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event) -> None:
@@ -913,13 +1173,66 @@ class XZSideView(QWidget):
                 self.update()
                 event.accept()
                 return
+        # v7.5.x: custom-location badges — ✕ removes; left-click on the
+        # ★ badge drives Z there; right-click on the badge also removes.
+        for badge_rect, close_rect, z_raw in list(self._custom_hit_rects):
+            if close_rect.contains(pos):
+                self.remove_custom_z(z_raw)
+                event.accept()
+                return
+            if badge_rect.contains(pos):
+                if event.button() == Qt.MouseButton.RightButton:
+                    self.remove_custom_z(z_raw)
+                else:
+                    self.go_to_z_requested.emit(float(z_raw))
+                event.accept()
+                return
         # Click one of the Z-reference badges to jump there
         for key, (rect, z_value) in self._z_ref_hit_rects.items():
             if rect.contains(pos):
                 self.go_to_z_requested.emit(float(z_value))
                 event.accept()
                 return
+        # v7.5.x: begin a drag-to-tag gesture inside the plot. Becomes
+        # a live drag once the cursor moves past the threshold; a plain
+        # click is resolved on release (current-Z line → tag current).
+        if (self._custom_z_enabled
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._safety_limits is not None
+                and self._content_rect().contains(pos)):
+            self._drag_pending = True
+            self._drag_active = False
+            self._drag_press_pos = QPointF(pos)
+            self._drag_z_disp = self._px_to_z_disp(pos.y())
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if not (self._drag_pending or self._drag_active):
+            super().mouseReleaseEvent(event)
+            return
+        was_drag = self._drag_active
+        press_pos = self._drag_press_pos
+        drag_disp = self._drag_z_disp
+        self._drag_pending = False
+        self._drag_active = False
+        self._drag_press_pos = None
+        self._drag_z_disp = None
+
+        if was_drag and drag_disp is not None:
+            # Dragged tag → commit at the dragged Z. Display → raw
+            # zero-ref: raw = disp × sign (sign ∈ {±1}).
+            self.add_custom_z(drag_disp * self._z_disp_sign)
+        elif press_pos is not None and self._z_mm is not None:
+            # Plain click — only meaningful ON the current-Z line:
+            # tag the needle's current location.
+            line_y = self._z_to_px(self._disp(self._z_mm))
+            if abs(press_pos.y() - line_y) <= self._current_line_hit_px():
+                self.add_custom_z(self._z_mm)
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+        event.accept()
 
     # ── Pill helper ───────────────────────────────────────────────
 

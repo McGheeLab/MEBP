@@ -39,6 +39,7 @@ from gui.scaling import s, sf, sp
 from gui.styles import COLORS
 from gui.widgets.components import Card
 from gui.widgets.illumination_control import IlluminationControl
+from gui.widgets.microscope_panel import MicroscopePanel
 from gui.widgets.safe_travel_worker import SafeTravelWorker
 from SupportClasses.StageController import z_raw_to_display, z_display_to_raw
 
@@ -168,6 +169,7 @@ class StandardJogContextPanel(QWidget):
         """Forward MainWindow's ~300 ms tick into the inner panel."""
         self._hw_panel.on_status_update()
         self._illum.on_status_update()
+        self._microscope.on_status_update()
 
     def refresh_safety_limits(self) -> None:
         self._hw_panel.refresh_safety_limits()
@@ -209,7 +211,12 @@ class StandardJogContextPanel(QWidget):
         #    output; same widget users can drop as a Custom-panel module.
         layout.addWidget(self._build_illumination_card())
 
-        # 4) Hardware Info (collapsible, read-only reference)
+        # 4) Microscope body (collapsible) — Nikon Ti filter cubes, focus and
+        #    objectives. Manual only for now; nothing in the print/workflow
+        #    paths drives these turrets.
+        layout.addWidget(self._build_microscope_card())
+
+        # 5) Hardware Info (collapsible, read-only reference)
         layout.addWidget(self._build_hardware_info_card())
 
         layout.addStretch(1)
@@ -284,6 +291,21 @@ class StandardJogContextPanel(QWidget):
         card = Card("Illumination", collapsible=True)
         self._illum = IlluminationControl(self._controller)
         card.add_widget(self._illum)
+        return card
+
+    # ── Microscope body (Nikon Ti) ─────────────────────────────────
+
+    def _build_microscope_card(self) -> Card:
+        """Filter cubes / focus / objectives.
+
+        The panel drives the shared ``MicroscopeController`` singleton, so every
+        page hosting this context panel observes and commands the same body over
+        one connection. It is independent of the stage ``controller`` — the
+        microscope talks over its own driver, not the ZP/XY serial links.
+        """
+        card = Card("Microscope", collapsible=True)
+        self._microscope = MicroscopePanel()
+        card.add_widget(self._microscope)
         return card
 
     def _absolute_goto(self) -> None:
@@ -408,16 +430,25 @@ class StandardJogContextPanel(QWidget):
         needle_text = "Not configured"
         if hw is not None and getattr(hw, "needle", None) is not None:
             n = hw.needle
-            parts = [f"{n.gauge}G"] if getattr(n, "gauge", None) else []
-            if getattr(n, "outer_diameter_um", None):
-                parts.append(f"OD {n.outer_diameter_um:.0f} µm")
-            if getattr(n, "inner_diameter_um", None):
-                parts.append(f"ID {n.inner_diameter_um:.0f} µm")
-            if getattr(n, "length_mm", None):
-                parts.append(f"L {n.length_mm:.1f} mm")
-            if getattr(n, "num_channels", 1) > 1:
-                parts.append(f"{n.num_channels}-channel")
-            needle_text = " · ".join(parts) if parts else "Configured"
+            # v7.6 FIX: this read `outer_diameter_um`/`inner_diameter_um`, names
+            # NeedleSpec has never had, so OD and ID were silently dropped and
+            # this panel — the needle readout on Jog, Calibration and all four
+            # pick & place workflows — only ever showed the gauge. One shared
+            # formatter now covers both needle types.
+            summary = getattr(n, "summary_line", None)
+            if callable(summary):
+                needle_text = summary()
+            else:
+                parts = [f"{n.gauge}G"] if getattr(n, "gauge", None) else []
+                if getattr(n, "od_um", None):
+                    parts.append(f"OD {n.od_um:.0f} µm")
+                if getattr(n, "id_um", None):
+                    parts.append(f"ID {n.id_um:.0f} µm")
+                if getattr(n, "length_mm", None):
+                    parts.append(f"L {n.length_mm:.1f} mm")
+                if getattr(n, "num_channels", 1) > 1:
+                    parts.append(f"{n.num_channels}-channel")
+                needle_text = " · ".join(parts) if parts else "Configured"
         self._lbl_info_needle.setText(needle_text)
 
         # Pumps (P1 / P2 / P3)

@@ -187,8 +187,10 @@ class MosaicCalibrationDialog(QDialog):
         form.addRow(QLabel("Settle after move"), self._spin_settle)
         self._spin_fresh = self._int_spin(1, 30, g.get("fresh_frames", 3))
         form.addRow(QLabel("Fresh frames to wait"), self._spin_fresh)
-        self._spin_fov = self._int_spin(0, 50000, g.get("fov_um", 0), " µm")
-        form.addRow(QLabel("Camera FOV width (0=auto)"), self._spin_fov)
+        # v7.5.x: the "Camera FOV width (0=auto)" override is GONE. It wrote
+        # ``mosaic_scan.fov_um``, which sat above every measured µm/px in the
+        # precedence — so a value dialed in here silently overrode the camera
+        # calibration for all later scans. The measured FOV sizes the tiles.
         self._spin_maxshift = self._int_spin(0, 5000, g.get("max_shift_um", 0),
                                              " µm")
         form.addRow(QLabel("Max alignment shift (0=auto)"), self._spin_maxshift)
@@ -424,16 +426,19 @@ class MosaicCalibrationDialog(QDialog):
     def _on_apply_settings(self):
         """Capture the current tuned settings to hand back to the full mosaic.
 
-        The grid columns/rows are calibration-only; the FOV / overlap / settle /
+        The grid columns/rows are calibration-only; the overlap / settle /
         fresh-frames / max-shift the operator dialed in here become the full
         mosaic's. The registration delta is already persisted per
         camera+objective and pre-applied automatically.
+
+        v7.5.x: ``fov_um`` is NOT handed back — the scale is measured, not tuned
+        here, and writing it into ``mosaic_scan`` gave every later scan a
+        permanent override of the camera calibration.
         """
         self._applied = {
             "overlap_pct": int(self._spin_overlap.value()),
             "settle_ms": int(self._spin_settle.value()),
             "fresh_frames": int(self._spin_fresh.value()),
-            "fov_um": int(self._spin_fov.value()),
             "max_shift_um": int(self._spin_maxshift.value()),
         }
         self._status.setText(
@@ -468,8 +473,9 @@ class MosaicCalibrationDialog(QDialog):
         cols = int(self._spin_cols.value())
         rows = int(self._spin_rows.value())
         overlap = float(self._spin_overlap.value()) / 100.0
-        fov_um = float(self._spin_fov.value())
-        eff = (fov_um / self._fw) if (fov_um > 0 and self._fw > 0) else self._um_camera
+        # v7.5.x: always the calibrated µm/px. The "Camera FOV width" override
+        # that used to be able to replace it here is gone.
+        eff = self._um_camera
         fov_w = self._fw * eff
         fov_h = self._fh * eff
         step_x = fov_w * (1.0 - overlap)
@@ -515,16 +521,32 @@ class MosaicCalibrationDialog(QDialog):
                     prior = s
             except Exception:
                 pass
-        builder = MosaicBuilder(
-            frame_size_px=(self._fw, self._fh), micron_per_pixel=eff,
-            overlap=overlap, target_mosaic_px=1800,
-            register=True, max_shift_um=max_shift_um, initial_shift_um=prior,
-            # v7.5.x: apply the camera's current mirror + rotation so the tiles
-            # read the way the operator will adjust them (retained frames let
-            # tile_images_px re-orient on each flip/rotate).
-            frame_rotation_deg=float(self._orient_rot),
-            frame_mirrored=bool(self._orient_mir),
-            frame_flip_y=bool(self._orient_fy))
+        # v7.5.x: build through the SHARED factory so this preview/verify mosaic
+        # is stitched exactly like the real scan. Previously it hardcoded
+        # ``target_mosaic_px=1800`` and never passed ``retain_for_reorient``,
+        # which silently disabled the caller's ``optimize_registration`` — so the
+        # operator tuned against a mosaic stitched by a WEAKER algorithm at a
+        # different resolution than the plate scan he then ran.
+        from SupportClasses.MosaicCalibration import (
+            MosaicCalibration, build_mosaic_builder)
+        from SupportClasses.MosaicCalibration import (
+            SCAN_DEFAULTS as _SCAN_DEFAULTS)
+        cal = MosaicCalibration(
+            um_per_px=eff, base_um_per_px=eff,
+            live_resolution=(self._fw, self._fh),
+            rotation_deg=float(self._orient_rot),
+            flip_x=bool(self._orient_mir), flip_y=bool(self._orient_fy),
+            overlap_frac=overlap,
+            target_px=int(self._settings.get(
+                "target_px", _SCAN_DEFAULTS["target_px"])),
+            register=True, max_shift_um=max_shift_um,
+            reg_method=str(self._settings.get(
+                "reg_method", _SCAN_DEFAULTS["reg_method"])))
+        builder = build_mosaic_builder(
+            cal, initial_shift_um=prior,
+            # Retain the raw frames: this dialog re-orients the shown tiles
+            # (tile_images_px) on every flip/rotate without re-scanning.
+            retain_frames=True, retain_for_reorient=True)
         grid = builder.generate_raster_positions(
             bounds, overlap=overlap, step_x_um=step_x, step_y_um=step_y)
         if env is not None:
@@ -554,8 +576,7 @@ class MosaicCalibrationDialog(QDialog):
             expected_d_px=0.0, min_dist_px=1.0,          # skip detection
             fresh_frames=int(self._spin_fresh.value()),
             fresh_timeout_s=float(self._settings.get("fresh_timeout_s", 2.5)),
-            settle_ms=int(self._spin_settle.value()),
-            frame_orient=str(self._settings.get("frame_orient", "none")))
+            settle_ms=int(self._spin_settle.value()))
         self._worker.progress.connect(self._on_progress)
         self._worker.tile.connect(self._on_tile)
         self._worker.finished_ok.connect(self._on_finished)
@@ -567,7 +588,7 @@ class MosaicCalibrationDialog(QDialog):
         self._btn_cancel.setEnabled(running)
         for w in (self._spin_cols, self._spin_rows, self._combo_center,
                   self._spin_overlap, self._spin_settle, self._spin_fresh,
-                  self._spin_fov, self._spin_maxshift):
+                  self._spin_maxshift):
             w.setEnabled(not running)
         # Clear-stored acts on the store, not the live overlay — usable whenever
         # not mid-build (even before the first mosaic exists).
@@ -698,10 +719,11 @@ class MosaicCalibrationDialog(QDialog):
         # correction here takes effect EVERYWHERE, not just as the mosaic
         # learned value.
         self._propagate_um_per_px(corr)
-        # Reflect into the FOV field so "Apply to full mosaic" carries it.
-        self._spin_fov.blockSignals(True)
-        self._spin_fov.setValue(max(0, min(self._spin_fov.maximum(), fov)))
-        self._spin_fov.blockSignals(False)
+        # v7.5.x: no longer reflected into a ``fov_um`` field — that field existed
+        # only to carry the value into ``mosaic_scan`` as a permanent override of
+        # the camera calibration. ``_propagate_um_per_px`` above already writes the
+        # correction to the live manager AND the objective store, which is what
+        # every mosaic and the click mapping actually read.
         self._status.setText(
             f"Stored effective µm/px {corr:.3f} for '{key}' (FOV {fov} µm). "
             f"Applied everywhere (mosaic + live view).")
@@ -735,9 +757,21 @@ class MosaicCalibrationDialog(QDialog):
     # ── Camera orientation (flip / rotate the images) ──────────────
 
     def _orient_set(self, rot: float, flip_x: bool, flip_y: bool) -> None:
-        """Set the working orientation (flip X, flip Y, rotation — normalised),
-        re-orient the tiles, and push + PERSIST live so every consumer (full
-        mosaic, live view, click mapping) uses it at once."""
+        """Set the working orientation and re-orient the DISPLAYED tiles.
+
+        v7.5.x: this no longer PERSISTS. It used to write the per-identity store
+        on every single flip/rotate click, with no confirmation — a second,
+        always-live editor of the same three fields the one calibration owns
+        ("Apply to camera setup" was purely cosmetic). That is how a camera's
+        stored orientation could change from a dialog the operator was only
+        looking through, and it is one of the "multiple surfaces" this rework
+        removes. Orientation is MEASURED by Hardware Setup → Cameras → Mosaic &
+        Camera Calibration and committed there, once, after the test mosaic.
+
+        The live push to the manager is kept: it is session-only, it is what makes
+        the preview and the tiles agree while the operator looks, and it is
+        overwritten by the next store→manager restore.
+        """
         rot = ((float(rot) + 180.0) % 360.0) - 180.0
         if rot == -180.0:
             rot = 180.0
@@ -765,13 +799,12 @@ class MosaicCalibrationDialog(QDialog):
                 sfy(self._cam_idx, self._orient_fy)
         except Exception:
             pass
-        # v7.5.x: PERSIST immediately (per identity) so the FULL-PLATE mosaic
-        # applies it when it places each tile — no separate "Apply" needed.
-        self._persist_orientation(rot, self._orient_mir, self._orient_fy)
         self._status.setText(
-            f"Orientation: flip X {'on' if self._orient_mir else 'off'}, "
-            f"flip Y {'on' if self._orient_fy else 'off'}, rotation {rot:.1f}° "
-            f"— saved (mosaic + live view).")
+            f"Orientation (this session only): flip X "
+            f"{'on' if self._orient_mir else 'off'}, flip Y "
+            f"{'on' if self._orient_fy else 'off'}, rotation {rot:.1f}°. "
+            f"To SAVE an orientation, run Hardware Setup → Cameras → "
+            f"Mosaic & Camera Calibration — it measures it from stage motion.")
 
     def _persist_orientation(self, rot: float, flip_x: bool,
                              flip_y: bool) -> None:
@@ -828,8 +861,15 @@ class MosaicCalibrationDialog(QDialog):
         self._orient_set(rot, mir, fy)
 
     def _orient_apply_to_camera(self) -> None:
-        """Confirm the working orientation is saved (it is already pushed +
-        persisted live by ``_orient_set``)."""
+        """EXPLICITLY save the working orientation to the camera.
+
+        v7.5.x: this is now the only way an orientation set in this dialog is
+        persisted — ``_orient_set`` no longer writes on every click. It remains as
+        an escape hatch for the documented case where the measured handedness
+        comes out inverted on a particular camera build and the operator needs one
+        manual flip; the normal route is the measured calibration in Hardware
+        Setup → Cameras.
+        """
         from PySide6.QtWidgets import QMessageBox
         mir, fy, rot = self._orient_mir, self._orient_fy, self._orient_rot
         self._persist_orientation(rot, mir, fy)

@@ -57,6 +57,7 @@ from SupportClasses.PhysicalModels import (
     PrintingMode,
     RosetteInsert,
     CameraSpec,
+    needle_bore_count,
     load_needle_catalog,
     load_syringe_catalog,
     load_camera_catalog,
@@ -96,15 +97,42 @@ class CameraRole(str, Enum):
     the entire operation (needle, plate, and stage motion at once).
     Informational/live-view only; no workflow gates on it.
 
+    v7.5.x (rotated rig): the two needle side cameras are now mounted
+    **symmetric about the stage +X axis at +45° and −45°** and are
+    interchangeable — which camera looks along which direction is
+    determined by the stage-motion µm/px calibration (measured
+    ``column_dir_deg``), not by the role. The roles are therefore
+    presented to the operator as "Needle cam 1" / "Needle cam 2"
+    (see ``needle_role_label``); the enum VALUES stay ``needle_x`` /
+    ``needle_y`` because they are serialized in saved configs and the
+    camera-calibration store's role→identity assignments.
+
     All non-UNASSIGNED roles are enforced as singletons by
     `HardwareConfig.set_camera_role()` — assigning a role to a new slot
     clears it from any other slot.
     """
     UNASSIGNED = "unassigned"
-    NEEDLE_X = "needle_x"     # Side cam looking down the X axis (sees Y/Z)
-    NEEDLE_Y = "needle_y"     # Side cam looking down the Y axis (sees X/Z)
+    NEEDLE_X = "needle_x"     # Needle cam 1 — side cam, ±45° about +X
+    NEEDLE_Y = "needle_y"     # Needle cam 2 — side cam, ±45° about +X
     MICROSCOPE = "microscope" # Behind an objective lens, viewing the plate
     MONITOR = "monitor"       # Rests on the stage, overviews the operation
+
+
+def needle_role_label(role: "CameraRole") -> str:
+    """Operator-facing display name for a camera role.
+
+    The two needle side cameras are physically interchangeable (symmetric
+    ±45° about stage +X), so they are shown as numbered cams rather than
+    the historical X-view/Y-view framing. Enum values are unchanged.
+    """
+    if role == CameraRole.NEEDLE_X:
+        return "Needle cam 1"
+    if role == CameraRole.NEEDLE_Y:
+        return "Needle cam 2"
+    try:
+        return str(role.value).replace("_", " ").title()
+    except Exception:
+        return str(role)
 
 
 # v7.4.x: roles that may only be held by a single camera slot at a time.
@@ -446,11 +474,21 @@ class HardwareConfig:
     # ── Buffer ink ────────────────────────────────────────────────
     buffer_ink_name: str | None = None
 
-    # ── v7.2.4: Needle channel → pump mapping ────────────────────
+    # ── v7.2.4: Needle bore → pump mapping ───────────────────────
     needle_channel_pump_map: dict[int, str] = field(default_factory=dict)
-    # Maps channel index (0-based) → pump_id
-    # Single-channel needle: {0: "P1"}
-    # Multi-channel: {0: "P1", 1: "P2", 2: "P3"}
+    # Maps BORE index (0-based) → pump_id
+    # Single-bore needle: {0: "P1"}
+    # Multi-bore: {0: "P1", 1: "P2", 2: "P3"}
+    #
+    # ⚠ The key name is FROZEN (it is in every saved setup on disk) but the word
+    # "channel" in it is the banned overloaded term — this is a BORE index. The
+    # base is 0, unlike the deprecated 1-based NeedleSpec.channel_pump_map.
+    #
+    # v7.9: for a genuinely multi-bore assembly the authority is
+    # NeedleBore.pump_id (position in the list IS the index, so there is no base
+    # to get wrong) and this dict is DERIVED from it — see
+    # `resolved_bore_pump_map`. A single-bore config's hand-set map is never
+    # touched, because there is nothing on the bore to derive it from.
 
     # ── v7.2.8: Ink swap strategy for single-pump multi-ink ──────
     ink_swap_strategy: InkSwapStrategy = field(default_factory=InkSwapStrategy)
@@ -681,6 +719,96 @@ class HardwareConfig:
     #  VALIDATION (v7.2.4 enhanced — S3.3)
     # ══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _needle_bore_issues(needle) -> list[str]:
+        """Geometry issues for every bore of ``needle`` (v7.9).
+
+        On a SINGLE-bore assembly the messages are byte-identical to the v7.6
+        strings — no "Bore 1:" prefix, same wording, same order — because those
+        exact strings are asserted and shown to the operator. The prefix appears
+        only once there is more than one bore to disambiguate.
+
+        Two bores claiming the same pump is flagged here rather than in the
+        bore→pump map section: on a multi-bore assembly the bores' ``pump_id``
+        IS the authority (the map is derived from it), so a collision there can
+        never be repaired by editing the map.
+        """
+        issues: list[str] = []
+
+        # A duck-typed stub (or a MagicMock) may not implement bores_resolved —
+        # treat it as its own single bore, which is exactly the legacy shape.
+        try:
+            bores = list(needle.bores_resolved())
+        except Exception:
+            bores = []
+        if not bores:
+            bores = [needle]
+        multi = len(bores) > 1
+
+        for k, b in enumerate(bores):
+            p = f"Bore {k + 1}: " if multi else ""
+            b_id = getattr(b, "id_um", 0.0) or 0.0
+            b_od = getattr(b, "od_um", 0.0) or 0.0
+            # A NeedleBore stores mm; NeedleSpec stores inches. Both expose
+            # `length_mm`, so read that and keep the message in mm either way.
+            b_len = getattr(b, "length_mm", 0.0) or 0.0
+
+            if getattr(b, "needle_type", "hypodermic") == "pulled_capillary":
+                t_id = getattr(b, "tip_id_um", None)
+                t_len = getattr(b, "tip_length_mm", None)
+                t_od = getattr(b, "tip_od_um", None)
+                if b_id <= 0:
+                    issues.append(
+                        f"{p}Capillary barrel inner Ø must be greater than 0 µm")
+                if not t_id or t_id <= 0:
+                    issues.append(
+                        f"{p}Capillary tip inner Ø must be greater than 0 µm")
+                elif b_id and t_id > b_id:
+                    issues.append(
+                        f"{p}Capillary tip inner Ø ({t_id:.1f} µm) cannot exceed "
+                        f"the barrel inner Ø ({b_id:.0f} µm)")
+                if not t_len or t_len <= 0:
+                    issues.append(
+                        f"{p}Capillary pulled-tip length must be greater than 0 mm")
+                if b_len <= 0:
+                    issues.append(
+                        f"{p}Capillary barrel length must be greater than 0 mm")
+                if b_od and b_id and b_od <= b_id:
+                    issues.append(
+                        f"{p}Capillary barrel outer Ø must exceed its inner Ø")
+                if t_od and t_id and t_od <= t_id:
+                    issues.append(
+                        f"{p}Capillary tip outer Ø must exceed its inner Ø")
+            elif not getattr(b, "gauge", None):
+                # Unchanged legacy wording — the operator's next action is to
+                # pick a gauge, so piling dimension errors on top is noise.
+                issues.append(f"{p}No needle gauge selected")
+            else:
+                # v7.9: a gauge alone no longer implies sane dimensions, because
+                # a backpack's bores are entered per bore rather than pulled
+                # wholesale from one catalog entry.
+                if b_id <= 0:
+                    issues.append(f"{p}Needle inner Ø must be greater than 0 µm")
+                if b_od and b_id and b_od <= b_id:
+                    issues.append(f"{p}Needle outer Ø must exceed its inner Ø")
+                if b_len <= 0:
+                    issues.append(f"{p}Needle length must be greater than 0 mm")
+
+        # Two bores fed by one pump is unbuildable — the pump can only push one
+        # volume, so whichever bore was addressed second would be driven blind.
+        claimed: dict[str, list[int]] = {}
+        for k, b in enumerate(bores):
+            pid = getattr(b, "pump_id", None)
+            if pid:
+                claimed.setdefault(str(pid).strip().upper(), []).append(k + 1)
+        for pid, which in claimed.items():
+            if len(which) > 1:
+                issues.append(
+                    f"{pid} feeds more than one bore: "
+                    f"{', '.join(str(i) for i in which)}")
+
+        return issues
+
     def validate(self) -> tuple[bool, list[str]]:
         """
         Check if the hardware setup is complete enough to proceed.
@@ -689,9 +817,15 @@ class HardwareConfig:
         """
         issues = []
 
-        # Needle
-        if self.needle is None:
+        # Needle (v7.6: hypodermic gauge OR pulled glass capillary;
+        # v7.9: validated PER BORE — a backpack may fuse bores of different
+        # sizes, and a pulled capillary is no longer restricted to one bore
+        # because the FORM and the taper are orthogonal axes.)
+        n = self.needle
+        if n is None:
             issues.append("No needle gauge selected")
+        else:
+            issues.extend(self._needle_bore_issues(n))
 
         # Pumps — at least one enabled with syringe
         configured_pumps = [p for p in self.pumps.values() if p.is_configured]
@@ -726,38 +860,43 @@ class HardwareConfig:
         elif self.plate_format not in PLATE_DEFINITIONS:
             issues.append(f"Invalid plate format: {self.plate_format}")
 
-        # Needle channel-pump mapping
+        # Needle bore→pump mapping. v7.9: read the RESOLVED map, so a multi-bore
+        # assembly whose bores declare their own pumps is not reported as
+        # "0 mapped" (the stored mirror may not have been written yet), and
+        # `bore_count` via the duck-safe accessor so a needle-like stub with no
+        # `num_channels` cannot raise here.
         if self.needle is not None:
-            num_channels = self.needle.num_channels
+            n_bores = needle_bore_count(self.needle)
+            bore_map = self.resolved_bore_pump_map()
             enabled_ids = self.enabled_pump_ids
 
-            if num_channels > 0:
+            if n_bores > 0:
                 if not enabled_ids:
                     issues.append(
-                        f"Needle has {num_channels} channel(s) but "
+                        f"Needle has {n_bores} bore(s) but "
                         f"no pumps are enabled")
-                elif len(self.needle_channel_pump_map) != num_channels:
+                elif len(bore_map) != n_bores:
                     issues.append(
-                        f"Needle has {num_channels} channel(s) but "
-                        f"{len(self.needle_channel_pump_map)} mapped")
+                        f"Needle has {n_bores} bore(s) but "
+                        f"{len(bore_map)} mapped")
                 else:
                     # Check mapped pumps are enabled
-                    for ch_idx, pump_id in self.needle_channel_pump_map.items():
+                    for bore_idx, pump_id in bore_map.items():
                         if pump_id not in enabled_ids:
                             issues.append(
-                                f"Channel {ch_idx + 1} → {pump_id} "
+                                f"Bore {bore_idx + 1} → {pump_id} "
                                 f"but {pump_id} is not enabled")
 
                     # Check uniqueness
                     mapped_pumps: dict[str, list[int]] = {}
-                    for ch_idx, pump_id in self.needle_channel_pump_map.items():
-                        mapped_pumps.setdefault(pump_id, []).append(ch_idx)
-                    for pump_id, channels in mapped_pumps.items():
-                        if len(channels) > 1:
-                            ch_strs = [str(c + 1) for c in channels]
+                    for bore_idx, pump_id in bore_map.items():
+                        mapped_pumps.setdefault(pump_id, []).append(bore_idx)
+                    for pump_id, bores in mapped_pumps.items():
+                        if len(bores) > 1:
+                            which = [str(b + 1) for b in bores]
                             issues.append(
-                                f"{pump_id} mapped to multiple channels: "
-                                f"{', '.join(ch_strs)}")
+                                f"{pump_id} mapped to multiple bores: "
+                                f"{', '.join(which)}")
 
         return (len(issues) == 0, issues)
 
@@ -838,15 +977,73 @@ class HardwareConfig:
         self.pumps[pump].printing_mode = mode
 
     # ══════════════════════════════════════════════════════════════
-    #  v7.2.4: NEEDLE CHANNEL MAP HELPERS (S3.2)
+    #  v7.2.4: NEEDLE BORE → PUMP MAP HELPERS (S3.2)
     # ══════════════════════════════════════════════════════════════
+
+    def resolved_bore_pump_map(self) -> dict[int, str]:
+        """The truthful bore-index → pump_id map (0-based).
+
+        For a genuinely multi-bore assembly (``needle.bores`` explicitly set)
+        each bore carries its OWN ``pump_id``, so the map is DERIVED from the
+        bore list — position in the list is the index. Otherwise the stored
+        ``needle_channel_pump_map`` is returned unchanged.
+
+        Deliberately conservative in two ways, both to protect operator data:
+
+        * Only ``needle.bores`` being *explicitly set* counts as multi-bore.
+          A pre-v7.9 needle synthesizes its bores from the flat fields and they
+          carry no ``pump_id``, so deriving there would empty a hand-set map.
+        * Even for a multi-bore assembly, a bore list where NO bore claims a
+          pump falls back to the stored map — mid-migration the bores may not
+          have been wired up yet, and emptying the map would break the very
+          assignment the operator made in the UI.
+
+        Derived ids are NORMALIZED (stripped + upper-cased) exactly as
+        ``NeedleSpec.bore_for_pump`` normalizes its lookup — otherwise a bore
+        storing ``"p1"`` resolves fine for the flow ceiling yet lands in this map
+        verbatim, where every consumer compares against ``"P1"``: ``validate``
+        reports the enabled pump as "not enabled", the un-normalized id is
+        persisted by ``to_dict``, and ``PrintPlanOfAction``'s lookup misses.
+        The STORED map is still returned byte-for-byte as saved (normalizing it
+        would rewrite legacy files on load).
+        """
+        needle = self.needle
+        bores = getattr(needle, "bores", None) if needle is not None else None
+        if not bores or len(bores) < 2:
+            return dict(self.needle_channel_pump_map)
+        derived = {
+            k: str(b.pump_id).strip().upper()
+            for k, b in enumerate(bores)
+            if getattr(b, "pump_id", None)
+        }
+        return derived or dict(self.needle_channel_pump_map)
+
+    def sync_bore_pump_map_from_needle(self) -> bool:
+        """Replace the stored map with :meth:`resolved_bore_pump_map`.
+
+        Returns True when the stored map actually changed. Called on load so the
+        live field agrees with the bores that own it; a single-bore config is a
+        no-op.
+        """
+        derived = self.resolved_bore_pump_map()
+        if derived == self.needle_channel_pump_map:
+            return False
+        self.needle_channel_pump_map = derived
+        return True
 
     def set_channel_pump(self, channel_index: int, pump_id: str | None):
         """
-        Assign a pump to a needle channel.
+        Assign a pump to a needle bore.
+
+        .. deprecated:: 7.9
+            Zero call sites repo-wide. On a multi-bore assembly the authority is
+            ``NeedleBore.pump_id`` (see :meth:`resolved_bore_pump_map`), so
+            writing the map directly can be silently overridden. Set the bore's
+            ``pump_id`` instead. Kept only because a deletion is a separate
+            decision from this change.
 
         Args:
-            channel_index: 0-based channel index
+            channel_index: 0-based BORE index
             pump_id: Pump ID ("P1", "P2", "P3") or None to clear
         """
         if pump_id is None:
@@ -857,11 +1054,23 @@ class HardwareConfig:
             self.needle_channel_pump_map[channel_index] = pump_id
 
     def get_channel_pump(self, channel_index: int) -> str | None:
-        """Get pump ID assigned to a channel, or None."""
+        """Get pump ID assigned to a bore, or None.
+
+        .. deprecated:: 7.9
+            Zero call sites repo-wide. Reads the STORED map, which a multi-bore
+            assembly overrides — use ``needle.bore(k).pump_id`` (or
+            :meth:`resolved_bore_pump_map`) so a derived assignment is honored.
+        """
         return self.needle_channel_pump_map.get(channel_index)
 
     def clear_channel_map(self):
-        """Clear all channel-pump assignments."""
+        """Clear all bore→pump assignments.
+
+        .. deprecated:: 7.9
+            Zero call sites repo-wide. On a multi-bore assembly this clears only
+            the derived MIRROR — the bores keep their ``pump_id`` and the map
+            re-derives — so it does not do what its name promises.
+        """
         self.needle_channel_pump_map.clear()
 
     # ── v7.4.4: Camera role lookup ────────────────────────────────
@@ -901,10 +1110,15 @@ class HardwareConfig:
 
     def auto_assign_channels(self):
         """
-        Auto-assign channels to enabled pumps in order.
+        Auto-assign bores to enabled pumps in order.
 
-        Channel 0 → first enabled pump, channel 1 → second, etc.
-        Only assigns up to min(num_channels, num_enabled_pumps).
+        Bore 0 → first enabled pump, bore 1 → second, etc.
+        Only assigns up to min(bore_count, num_enabled_pumps).
+
+        .. deprecated:: 7.9
+            Zero call sites repo-wide, and it writes only the map — on a
+            multi-bore assembly the bores' own ``pump_id`` wins, so the result
+            can be silently discarded. Assign ``NeedleBore.pump_id`` instead.
         """
         if self.needle is None:
             return
@@ -930,7 +1144,13 @@ class HardwareConfig:
         return pumps[0] if pumps else None
 
     def get_channel_for_ink(self, ink_name: str) -> int | None:
-        """Get the needle channel index that carries the given ink, or None."""
+        """Get the needle BORE index that carries the given ink, or None.
+
+        .. deprecated:: 7.9
+            Zero call sites repo-wide. Reads the stored map rather than
+            :meth:`resolved_bore_pump_map`, so it can miss a derived multi-bore
+            assignment.
+        """
         pump_id = self.get_pump_for_ink(ink_name)
         if pump_id is None:
             return None
@@ -992,9 +1212,13 @@ class HardwareConfig:
                 name: r.to_dict() for name, r in self.rosette_library.items()
             },
             "buffer_ink_name": self.buffer_ink_name,
-            # v7.2.4: Channel mapping (serialize int keys as strings for JSON)
+            # v7.2.4: bore→pump map (serialize int keys as strings for JSON).
+            # v7.9: emitted from `resolved_bore_pump_map` so a multi-bore
+            # assembly's saved map agrees with the bores that own it. Pure — a
+            # single-bore config emits its stored map verbatim, byte-identically.
             "needle_channel_pump_map": {
-                str(ch): pid for ch, pid in self.needle_channel_pump_map.items()
+                str(ch): pid
+                for ch, pid in self.resolved_bore_pump_map().items()
             },
             # v7.2.8: Ink swap strategy
             "ink_swap_strategy": self.ink_swap_strategy.to_dict(),
@@ -1079,11 +1303,17 @@ class HardwareConfig:
 
         config.buffer_ink_name = data.get("buffer_ink_name")
 
-        # v7.2.4: Needle channel-pump map (JSON keys are strings → int)
+        # v7.2.4: Needle bore→pump map (JSON keys are strings → int)
         raw_map = data.get("needle_channel_pump_map", {})
         config.needle_channel_pump_map = {
             int(ch): pid for ch, pid in raw_map.items()
         }
+        # v7.9: a multi-bore assembly's bores own the mapping, so reconcile the
+        # live field once here — otherwise a stale saved map (e.g. written by an
+        # older build, or by the GUI before the bores were wired) would keep
+        # disagreeing with the bore that actually feeds each pump. A single-bore
+        # config is untouched.
+        config.sync_bore_pump_map_from_needle()
 
         # v7.2.8: Ink swap strategy
         if "ink_swap_strategy" in data:
@@ -1145,8 +1375,14 @@ class HardwareConfig:
         ch_map = ""
         if self.needle_channel_pump_map:
             ch_map = f", channels={self.needle_channel_pump_map}"
+        # v7.6: a pulled capillary has no gauge — never render "NoneG".
+        needle_txt = "?"
+        if self.needle is not None:
+            needle_txt = (getattr(self.needle, "display_label", None)
+                          or (f"{self.needle.gauge}G" if self.needle.gauge
+                              else "capillary"))
         return (
             f"HardwareConfig('{self.config_name}', "
-            f"needle={self.needle.gauge if self.needle else '?'}G, "
+            f"needle={needle_txt}, "
             f"plate={self.plate_format}, pumps=[{pumps}]{ch_map})"
         )

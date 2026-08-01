@@ -1,0 +1,25 @@
+{
+  "id": "fitc-mcherry-double-positive",
+  "name": "FITC / mCherry double-positive",
+  "color": "#f9e2af",
+  "notes": "\"Some brightness in both channels\" -- the operator's own first example. Both clauses carry a background-sigma threshold to show how a level is recorded when the operator does know one; leave the threshold out to let the evaluator choose.",
+  "signature_rule": {
+    "combinator": "all",
+    "clauses": [
+      {
+        "imaging_channel": "FITC",
+        "state": "positive",
+        "threshold": 3.0,
+        "metric": "background_sigma"
+      },
+      {
+        "imaging_channel": "mCherry",
+        "state": "positive",
+        "threshold": 3.0,
+        "metric": "background_sigma"
+      }
+    ]
+  },
+  "builtin": true,
+  "_note": "EXAMPLE. The signature rule is AUTHORED metadata only -- nothing evaluates it against an image yet (v7.9 decision D3). The 3-sigma-over-background level mirrors the floor already used by SpheroidDetector._threshold; it is a starting guess, not a measured value."
+}

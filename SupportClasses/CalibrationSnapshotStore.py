@@ -58,10 +58,34 @@ _FINGERPRINT_LABELS = {
     "device": "device profile",
     "plate_format": "plate format",
     "needle_gauge": "needle gauge",
+    "needle_type": "needle type",
+    "needle_bore_um": "needle bore",
+    "needle_tip_length_mm": "needle tip length",
+    "needle_form": "needle form",
+    "needle_bore_count": "needle bore count",
     "axis_map": "axis map",
     "steps_per_mm": "steps/mm",
     "plate_flip_180": "plate orientation",
 }
+
+
+def _bore_count(get) -> Optional[int]:
+    """How many bores the saved needle has, from a ``settings.get``.
+
+    ``bores`` is conditional-emit (present only for a genuine multi-bore
+    assembly), so this reads the list when it is there and otherwise falls back
+    to ``num_channels``, which is always emitted. Returns None only when there is
+    no needle section at all — an absent value must stay absent so
+    :meth:`fingerprint_diff`'s added-dimension rule applies.
+    """
+    bores = get("hardware_config.needle.bores")
+    if isinstance(bores, list) and bores:
+        return len(bores)
+    n = get("hardware_config.needle.num_channels")
+    try:
+        return max(1, int(n))
+    except (TypeError, ValueError):
+        return None
 
 
 class CalibrationSnapshotStore:
@@ -153,6 +177,27 @@ class CalibrationSnapshotStore:
             "plate_format": g("hardware_config.plate_format",
                               g("calibration.plate_format")),
             "needle_gauge": g("hardware_config.needle.gauge"),
+            # v7.6: a pulled glass capillary has NO gauge, so gauge alone would
+            # fingerprint every capillary identically and silently trust a stale
+            # calibration across a tip change. The bore (tip Ø when pulled) and
+            # the tip length identify it — and the tip length matters twice
+            # over, because a pulled needle is barrel + tip long, so changing it
+            # invalidates the plate-bottom Z touch-off exactly as changing the
+            # barrel length does.
+            "needle_type": g("hardware_config.needle.needle_type"),
+            "needle_bore_um": (g("hardware_config.needle.tip_id_um")
+                               or g("hardware_config.needle.id_um")),
+            "needle_tip_length_mm": g("hardware_config.needle.tip_length_mm"),
+            # v7.9: the ASSEMBLY, not just bore 0. Every dimension above
+            # describes ONE bore (they mirror the flat fields = bore 0), so
+            # swapping a single needle for a backpack — or a backpack for a
+            # triple — changes nothing they can see, while it changes the tip
+            # that touched off the plate bottom AND invalidates every measured
+            # bore mount offset (NeedleBoreCalibrationStore). Bore count falls
+            # back to num_channels, which every saved setup carries, so a
+            # pre-v7.9 config reports 1 rather than None.
+            "needle_form": g("hardware_config.needle.needle_form"),
+            "needle_bore_count": _bore_count(g),
             # v7.5.x: plate orientation — a change mirrors the well→stage
             # mapping, so a saved calibration must not be trusted across it.
             "plate_flip_180": g("device_profile.plate_flip_180"),
@@ -163,13 +208,19 @@ class CalibrationSnapshotStore:
         """Human-readable list of changed dimensions (empty ⇒ unchanged).
 
         A missing saved fingerprint (older snapshot) reports no diff so we
-        don't manufacture a scary warning from absent data.
+        don't manufacture a scary warning from absent data. Likewise a
+        dimension ADDED after the snapshot was written is skipped: it is absent
+        on the saved side and populated on the current side, which would
+        otherwise fire a bogus "needle bore: None → 210" for every user the
+        first time they launch a build that adds a dimension.
         """
         if not saved:
             return []
         current = current or {}
         diffs = []
         for key, label in _FINGERPRINT_LABELS.items():
+            if key not in saved:
+                continue          # dimension added after this snapshot
             s = saved.get(key)
             c = current.get(key)
             if s != c:

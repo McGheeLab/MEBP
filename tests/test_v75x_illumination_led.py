@@ -115,6 +115,13 @@ class TestZPSetLedBrightness(unittest.TestCase):
         _bare_zp(ser).set_led_brightness(200.7)
         self.assertEqual(ser.writes, ["M106 P0 S200"])
 
+    def test_fan_index_is_a_single_named_constant(self):
+        """The fan header is one constant, so moving the LED is a 1-line change."""
+        from SupportClasses.ZPStage import _LED_FAN_INDEX
+        ser = _ScriptedSerial()
+        _bare_zp(ser).set_led_brightness(64)
+        self.assertEqual(ser.writes, [f"M106 P{_LED_FAN_INDEX} S64"])
+
 
 # ── 2. StageController.set_led_brightness ─────────────────────────────────────
 

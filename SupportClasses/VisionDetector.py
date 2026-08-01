@@ -1441,37 +1441,33 @@ class TwoCameraEdgePicks:
 class TwoCameraNeedleAligner:
     """Compute the stage offset that recenters the needle in two cameras.
 
-    Mounting assumption: two side cameras mounted orthogonally to the
-    workspace.
-
-      * `NEEDLE_X` looks down the **X** axis. Its image columns map to
-        stage Y; rows map to stage Z.
-      * `NEEDLE_Y` looks down the **Y** axis. Its image columns map to
-        stage X; rows map to stage Z.
+    Current rig (v7.5.x): the two needle side cameras ("Needle cam 1" /
+    "Needle cam 2") are mounted **symmetric about the stage +X axis at
+    +45° and −45°**, and are interchangeable — which camera looks along
+    which direction is established by the stage-motion µm/px calibration
+    (the measured ``column_dir_deg``), which the GUI always passes in via
+    ``angle_x_view_deg`` / ``angle_y_view_deg``. Image rows map to stage
+    Z in both views regardless of the in-plane mount yaw.
 
     The user clicks the left and right visible edges of the needle in
     each camera. The midpoint of those two clicks is the needle's
     pixel-center along the column axis. The pixel offset from the
     frame's column center, scaled by that camera's µm/pixel, gives the
-    stage offset needed to bring the needle to the optical center.
+    needle's displacement along that camera's column→stage direction;
+    the recentering move solves the 2×2 system of both cameras'
+    projections (valid for ANY two non-parallel directions, ±45°
+    included).
 
-    Sign conventions follow the existing project convention: positive
-    pixel offset (center is right of frame center) → positive stage
-    offset along the mapped axis. Callers can pass per-axis sign flips
-    via `x_sign` / `y_sign` when the physical mounting reverses one
-    axis.
-
-    v7.5.x — rotated mountings: when the cameras are *not* mounted
-    orthogonally to the stage axes (e.g. at 45°), pass each camera's
-    column→stage **direction angle** via ``angle_x_view_deg`` /
-    ``angle_y_view_deg`` — the stage-plane angle (degrees CCW from stage
+    ``angle_*_view_deg`` is the stage-plane angle (degrees CCW from stage
     +X) that a positive column offset corresponds to. A positive column
     offset of ``off`` px means the needle is displaced from the optical
-    axis by ``off × µm/px`` along that direction; the recentering move is
-    the solution of the 2×2 system of both cameras' projections. With the
-    angles left as ``None`` the legacy orthogonal mapping is used
-    (x_view column → stage +Y = 90°, y_view column → stage +X = 0°), so
-    existing behavior is unchanged.
+    axis by ``off × µm/px`` along that direction. With the angles left as
+    ``None`` the LEGACY orthogonal mapping is used (x_view column →
+    stage +Y = 90°, y_view column → stage +X = 0°) — retained only for
+    back-compat/tests; the needle-location page refuses to run
+    uncalibrated rather than fall back to it, because on the ±45° rig it
+    drives the stage the wrong way. Callers can pass per-axis sign flips
+    via `x_sign` / `y_sign` when the physical mounting reverses one axis.
     """
 
     def __init__(
@@ -1710,6 +1706,18 @@ def fit_circle_to_points(points) -> "tuple[float, float, float] | None":
     if evals[0] <= 1e-6 * max(float(evals[1]), 1e-9):
         return None
     return NeedleDetector._fit_circle_kasa(arr)
+
+
+def fit_circle_robust(points) -> "tuple[float, float, float, float] | None":
+    """Public alias of :meth:`WellDetector._fit_circle_robust`.
+
+    Chord-robust circle fit (min-enclosing-circle seed + Taubin refits on
+    inliers) → ``(cx, cy, radius, inlier_fraction)`` or None for < 5 points.
+    Exposed so ``SpheroidDetector`` can reuse the fit without touching a private
+    name; the implementation is deliberately shared so the two detectors cannot
+    disagree about what a circle through a blob's contour is.
+    """
+    return WellDetector._fit_circle_robust(points)
 
 
 def find_template(frame: np.ndarray, patch: np.ndarray

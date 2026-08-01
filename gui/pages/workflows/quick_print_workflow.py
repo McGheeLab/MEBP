@@ -27,26 +27,36 @@ uniformly by the flow knob).
 
 from __future__ import annotations
 
+import bisect
 import copy
 import logging
+import math
+import re
 import threading
+import time
 from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox,
     QComboBox, QFrame, QSizePolicy, QMessageBox, QSplitter, QCheckBox, QSpinBox,
+    QButtonGroup, QStackedWidget, QScrollArea,
 )
 
 from gui.styles import COLORS
 from gui.scaling import s, sf
-from gui.widgets.components import Card
+from gui.widgets.components import Card, FormRow, StatusBadge
+from gui.pages.workflows.quick_print_report import QuickPrintReportPanel
 from gui.widgets.jog_well_plate import WellPlateNavigator
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.print_trajectory_monitor import PrintTrajectoryMonitorView
+# v7.6: the measured-calibration store is read by the two-parameter surface
+# (resolution default, stage-max cap, the machine-characterised gate), so it is
+# imported once here rather than locally at each site.
+from SupportClasses.PrintTimingCalibrationStore import get_store
 from gui.dialogs.workflow_settings_dialog import (
     WorkflowSettingsDialog, build_locations_widget,
 )
@@ -64,9 +74,24 @@ from SupportClasses.PrintManager import (
     PrintManager, PrintSettings, PrintState, build_well_plate_job,
 )
 from SupportClasses.PrintFileManager import PrintFileManager
+from SupportClasses.PhysicalModels import (
+    needle_orifice_area_mm2, needle_orifice_od_mm,
+)
 from SupportClasses.PickAndPlaceManager import PickPlaceExecutor, AbortException
 
 logger = logging.getLogger(__name__)
+
+
+#: v7.7: ``PrintManager._report_progress`` already prefixes "[i/total] " to its
+#: messages, so the page must not add a second counter. Matches (and strips) an
+#: existing prefix.
+_PROGRESS_PREFIX_RE = re.compile(r"^\[\d+/\d+\]\s*")
+
+# Smallest ink reserve worth calling a reserve (µL). A pulled glass capillary's
+# tip holds only a few nanolitres, which is below one pump step — the operator
+# has to supply the margin as ink padding instead, so we say so rather than
+# silently shipping a reserve that cannot do its job.
+_MIN_MEANINGFUL_RESERVE_UL = 0.05
 
 
 # Built-in simple shapes → object dicts fed through the same geometry pipeline
@@ -76,6 +101,55 @@ _SIMPLE_SHAPES = {
     "circle": "◯ Circle",
     "meander": "◉ Meander (filled disc)",
 }
+
+
+def _overlay_channels(sim_result, *, vol_per_mm: float,
+                      t_base: float = 0.0) -> tuple:
+    """v7.6: per-sample overlay channels for one simulated segment.
+
+    Returns ``(speed_mm_s, flow_uL_s, error_um, time_s)`` — four lists, each
+    one value per sample of ``sim_result.samples``, so they align 1:1 with the
+    predicted polyline the monitor draws.
+
+      • speed = |Δposition| / Δt between consecutive samples (the first sample
+        copies the second, so the lists match the point count),
+      • flow  = speed × volume-per-mm (what the pump must deliver there),
+      • error = |signed cross-track| from the run's ``cross_profile``, looked up
+        by arc length,
+      • time  = the sample's own timestamp, offset by ``t_base`` so multiple
+        segments form one continuous print clock.
+
+    Pure/module-level so the prediction worker can call it off the GUI thread.
+    """
+    samples = list(getattr(sim_result, "samples", None) or [])
+    n = len(samples)
+    if n == 0:
+        return [], [], [], []
+    times = [float(sm[2] if len(sm) > 2 and sm[2] is not None else 0.0)
+             for sm in samples]
+    speeds = [0.0] * n
+    for i in range(1, n):
+        dt = max(1e-6, times[i] - times[i - 1])
+        speeds[i] = math.hypot(samples[i][0] - samples[i - 1][0],
+                               samples[i][1] - samples[i - 1][1]) / dt
+    if n > 1:
+        speeds[0] = speeds[1]
+    flows = [v * max(0.0, vol_per_mm) for v in speeds]
+
+    # error: nearest cross-profile entry by arc length (profile is s-ordered)
+    prof = list(getattr(sim_result, "cross_profile", None) or [])
+    errors = [0.0] * n
+    if prof:
+        s_vals = [p[0] for p in prof]
+        s_acc = 0.0
+        for i in range(n):
+            if i:
+                s_acc += math.hypot(samples[i][0] - samples[i - 1][0],
+                                    samples[i][1] - samples[i - 1][1])
+            j = bisect.bisect_left(s_vals, s_acc)
+            j = min(max(j, 0), len(prof) - 1)
+            errors[i] = abs(float(prof[j][1]))
+    return speeds, flows, errors, [t_base + t for t in times]
 
 
 class _PrintBridge(QObject):
@@ -95,6 +169,16 @@ class _PrintBridge(QObject):
     # ink-swap sequence on one worker thread; this fires when it finishes
     # (empty string = ok, else the reason).
     multi_done = Signal(str)
+    # v7.5.x: background XYPathSimulator run for the planned path finished —
+    # (generation, predicted segments in zero-ref µm, caption text, overlays).
+    # v7.6: overlays = {mode: {values, unit, vmin, vmax}} for the optional
+    # speed / flow / error / time colouring of the predicted path.
+    predicted = Signal(int, object, str, object)
+    # v7.7: one telemetry record from the velocity/feed-plan follower (the
+    # `vel_sample` dict). Emitted from the print thread at the executor's
+    # existing ~5 Hz decimation; the slot only stores it, so a slow paint can
+    # never back-pressure the control loop.
+    vel_sample = Signal(object)
 
 
 class QuickPrintWorkflowPage(QWidget):
@@ -159,6 +243,13 @@ class QuickPrintWorkflowPage(QWidget):
         self._bridge.prepositioned.connect(self._on_prepositioned)
         self._bridge.cleanup_done.connect(self._on_cleanup_done)
         self._bridge.multi_done.connect(self._on_multi_done)
+        self._bridge.predicted.connect(self._on_predicted)
+        self._bridge.vel_sample.connect(self._on_vel_sample)
+        # v7.6: fast live-position sampling while a print runs (see
+        # _set_print_live); idle updates still ride the shared 300 ms app tick.
+        self._live_pos_timer = QTimer(self)
+        self._live_pos_timer.setInterval(self._LIVE_POS_MS)
+        self._live_pos_timer.timeout.connect(self._push_live_position)
 
         # v7.5.x: multi-ink (abstract-ink) print state. When the loaded object
         # is a sketch that uses ≥2 abstract inks, Quick Print maps each abstract
@@ -192,12 +283,41 @@ class QuickPrintWorkflowPage(QWidget):
         # cleanup runs on its own worker thread.
         self._post_print_ctx: dict | None = None
         self._cleanup_thread = None
+        # v7.7: the last progress message (so a terminal state can report WHY
+        # it ended instead of a generic line) and the last execution log (so it
+        # can be opened rather than merely named).
+        self._last_progress_msg: str = ""
+        self._last_log_path = None
+        # v7.7: the plan's own time estimate / stop count, stashed by
+        # _append_limit_warnings so the readiness checklist and the derived-facts
+        # line report them without re-planning; and the last evaluated readiness,
+        # which is the single source of truth for the Print button.
+        self._last_est_s = None
+        self._last_stops = None
+        self._readiness = None
+        self._predicted_p95_um = None
+        # v7.7: live-print accumulators (set by _set_print_live, fed by the
+        # executor's telemetry, rendered on the 10 Hz timer). None = not printing.
+        self._live: dict | None = None
+        self._last_path_len_mm = None
 
         # Comprehensive settings popout (scrollable, saveable). Built eagerly so
         # the config widgets exist for _build_settings() / _on_print() + tests.
         self._settings_dialog = WorkflowSettingsDialog(
             "quick_print", "Quick Print",
-            parent=self, on_change=self._on_settings_changed)
+            parent=self, on_change=self._on_settings_changed,
+            # v7.6: upgrade saved profiles from the old speed_pct knob.
+            migrate=self._migrate_legacy_settings,
+            # v7.7: every field notifies (debounced), so editing e.g. the
+            # pre-flow lead-in or the cleanup margin refreshes the numbers the
+            # readiness panel shows. Nine fields previously edited silently.
+            notify_on_field_change=True)
+        # v7.7: the abstract-ink → configured-ink mapping is rebuilt per object
+        # (so it can't be a fixed registered field) but it IS a real operator
+        # choice; ride it along with the profile instead of losing it on restart.
+        self._settings_dialog.set_extra_state(
+            lambda: {"ink_map_last": dict(self._ink_map_last)},
+            self._restore_extra_state)
         self._build_settings_dialog(self._settings_dialog)
 
         outer = QVBoxLayout(self)
@@ -205,10 +325,11 @@ class QuickPrintWorkflowPage(QWidget):
         outer.setSpacing(s(10))
 
         outer.addLayout(self._build_header())
-        outer.addWidget(self._build_object_row())
-        outer.addWidget(self._build_status_strip())
-
-        outer.addWidget(self._build_main_area(), stretch=1)
+        # v7.7: Setup → Run → Report. The object row and the readiness surface
+        # now live inside the Setup zone; the run row stays outside the stack so
+        # Print / Pause / Abort and the status line are reachable from any zone.
+        outer.addWidget(self._build_zone_strip())
+        outer.addWidget(self._build_zones(), stretch=1)
 
         outer.addWidget(self._build_run_row())
 
@@ -319,6 +440,10 @@ class QuickPrintWorkflowPage(QWidget):
         self._settings_dialog.activateWindow()
 
     def _on_settings_changed(self):
+        # v7.7: apply the measured stage-max cap here — after any profile load /
+        # legacy migration has written its value, so the migration is not
+        # pre-clamped (the method was dead code before).
+        self._update_top_speed_cap()
         self._refresh_setup_status()
         self._refresh_planned_path()
         self._update_settings_summary()
@@ -330,12 +455,16 @@ class QuickPrintWorkflowPage(QWidget):
         try:
             ink = self._selected_ink() or "(loaded)"
             prep = "prep on" if self._prep_check.isChecked() else "prep off"
+            speed, flow, _prime = self._resolved_print_kinematics()
             self._settings_summary.setText(
-                f"{self._pump()} · ~{self._auto_flow_100_uL_s():.3g} µL/s @ "
-                f"{self._speed_pct_spin.value():.0f}% (×{self._extrusion_modifier():g}) "
-                f"· ink {ink} · {prep}")
+                f"{self._pump()} · {speed:.2f} mm/s · {flow:.3g} µL/s "
+                f"(×{self._extrusion_modifier():g}) · "
+                f"res {self._resolution_um():.0f} µm · ink {ink} · {prep}")
         except Exception:
-            pass
+            # v7.7: was a silent `pass`, which left the PREVIOUS summary on
+            # screen with no hint it had gone stale.
+            logger.exception("Quick Print settings summary failed")
+            self._settings_summary.setText("settings summary unavailable — see log")
 
     @staticmethod
     def _dspin(lo, hi, val, suffix="", decimals=2, step=None, tip=""):
@@ -445,12 +574,40 @@ class QuickPrintWorkflowPage(QWidget):
             "thicker line. Scales the pump flow AND the ink pickup volume.")
         self._extrusion_mod_spin.valueChanged.connect(
             lambda *_: (self._refresh_setup_status(), self._update_settings_summary()))
-        self._speed_pct_spin = self._dspin(
-            1.0, 100.0, 25.0, " % max", 0, 5.0,
-            "Print speed as a % of the calibrated maximum XY speed; scales the "
-            "XY traverse (= % × XY max) and the pump flow together.")
-        self._speed_pct_spin.valueChanged.connect(
-            lambda *_: (self._refresh_setup_status(), self._update_settings_summary()))
+        # ── v7.6: THE TWO PARAMETERS everything else derives from ──
+        #
+        # Accuracy through a corner is bought with TIME (the feed plan stops on
+        # sharp corners and slows through curvature), so the operator states the
+        # trade directly: how fine must it be, and how fast may the stage go.
+        # Every other motion number — per-section lookahead, per-section speed,
+        # pump flow, corner stops, the time estimate — is derived from these.
+        self._top_speed_spin = self._dspin(
+            0.1, 20.0, 2.5, " mm/s", 2, 0.5,
+            "Top XY speed for this print. The run uses min(this, the measured "
+            "stage maximum, the needle's flow-limited maximum) — you are told "
+            "which one binds. Straights run at this speed; corners and tight "
+            "curves slow only as much as the resolution demands. Pump flow "
+            "follows automatically, so the bead stays bore-area × modifier per "
+            "mm at any speed.")
+        self._top_speed_spin.valueChanged.connect(
+            lambda *_: (self._refresh_setup_status(),
+                        self._update_settings_summary(),
+                        self._refresh_planned_path()))
+        try:
+            _default_res = float(get_store().get_resolution_element_um() or 30.0)
+        except Exception:
+            _default_res = 30.0
+        self._resolution_spin = self._dspin(
+            5.0, 500.0, _default_res, " µm", 0, 5.0,
+            "Resolution element: the feature size this print must hold. Drives "
+            "the corner-stop planning and the per-section lookahead — a finer "
+            "element means more corner stops and slower curves, so it COSTS "
+            "TIME (the estimate below shows how much). Asking for finer than "
+            "the machine's own stopping accuracy is flagged.")
+        self._resolution_spin.valueChanged.connect(
+            lambda *_: (self._refresh_setup_status(),
+                        self._update_settings_summary(),
+                        self._refresh_planned_path()))
         self._printz_spin = self._dspin(
             0.0, 40.0, 0.2, " mm", 2, 0.1,
             "Print height measured up from the calibrated plate bottom. 0 = at "
@@ -469,8 +626,13 @@ class QuickPrintWorkflowPage(QWidget):
         #     segment. Correct but slow.
         self._motion_mode_combo = QComboBox()
         self._motion_mode_combo.setMinimumWidth(s(150))
+        # v7.7: closed-loop velocity FIRST and default. Open-loop reads no
+        # position at all, so it has no prediction, no live deviation and no
+        # deviation in the report — every information surface added in v7.7 is
+        # inert in it.
+        self._motion_mode_combo.addItem("Velocity (closed-loop) — recommended",
+                                        "velocity")
         self._motion_mode_combo.addItem("Open-loop velocity (streamed vectors)", "open_loop")
-        self._motion_mode_combo.addItem("Velocity (closed-loop)", "velocity")
         self._motion_mode_combo.addItem("Confirmed per-segment (point-to-point)", "confirm")
         self._motion_mode_combo.setToolTip(
             "How the XY stage traces the print path.\n"
@@ -482,13 +644,27 @@ class QuickPrintWorkflowPage(QWidget):
             "calibration).\n"
             "Confirmed = move to each point and wait for arrival (accurate but "
             "stop-and-go).")
+        # v7.5.x: the trajectory monitor overlays a simulated prediction in
+        # velocity mode — refresh it when the mode changes.
+        self._motion_mode_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_planned_path())
         sec = dlg.add_section("Print")
         sec.add("pump", "Pump / bore", self._pump_combo, "P1")
         sec.add("extrusion_mod", "Extrusion modifier (×)",
                 self._extrusion_mod_spin, 1.0)
-        sec.add("speed_pct", "Print speed", self._speed_pct_spin, 25.0)
+        # v7.7: the two DRIVING parameters are promoted onto the Setup zone —
+        # they are the whole operator interface to the accuracy/time trade, and
+        # burying them in a popout made that trade invisible. They are still
+        # persisted with the profile via register_external (a widget has one
+        # parent, so it cannot also be laid out in this section).
+        dlg.register_external("top_speed", self._top_speed_spin, 2.5)
+        dlg.register_external("resolution", self._resolution_spin,
+                              self._resolution_spin.value())
+        sec.add_note("Top XY speed and Resolution are on the Setup zone of the "
+                     "page — they drive everything else and are saved with this "
+                     "profile.")
         sec.add("printz", "Height above bottom", self._printz_spin, 0.2)
-        sec.add("motion_mode", "Motion mode", self._motion_mode_combo, "open_loop")
+        sec.add("motion_mode", "Motion mode", self._motion_mode_combo, "velocity")
 
         # ── Ink ──
         self._ink_combo = QComboBox()
@@ -708,9 +884,198 @@ class QuickPrintWorkflowPage(QWidget):
         except Exception:
             return self._prime_default_s()
 
+    _OVERLAY_PILLS = (("none", "None"), ("speed", "XY speed"),
+                      ("flow", "Flow"), ("error", "Error"), ("time", "Time"))
+
+    def _build_overlay_pills(self) -> QWidget:
+        """v7.6: exclusive pills selecting what the SIMULATED path is coloured
+        by. View-only (not a saved setting) — the data comes from the same
+        prediction the monitor already shows."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(s(6), 0, s(6), s(2))
+        lay.setSpacing(s(4))
+        lbl = QLabel("Overlay:")
+        lbl.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(8)}pt;")
+        lay.addWidget(lbl)
+        self._overlay_group = QButtonGroup(row)
+        self._overlay_group.setExclusive(True)
+        for key, text in self._OVERLAY_PILLS:
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setChecked(key == "none")
+            b._overlay_key = key
+            b.setStyleSheet(f"font-size: {sf(8)}pt; padding: {s(2)}px {s(7)}px;")
+            self._overlay_group.addButton(b)
+            lay.addWidget(b)
+        self._overlay_group.buttonClicked.connect(
+            lambda _b: self._apply_overlay_mode())
+        lay.addStretch(1)
+        row.setToolTip(
+            "Colour the predicted stage path by XY speed, pump flow rate, "
+            "predicted tracking error, or elapsed time — so you can see WHERE "
+            "the plan slows down and why.")
+        return row
+
+    # ── v7.7: three zones — Setup → Run → Report ──────────────────
+    #
+    # The page used to be one flat surface where the four inline controls, a
+    # dense warning string and the live monitor all competed, while the
+    # parameters that drive the print sat in a popout and a finished print left
+    # nothing behind. The zones follow what the operator actually does: decide
+    # what to print and confirm the machine can do it, watch it happen, then
+    # read what happened. Widgets are PROMOTED and REGROUPED, not rewritten —
+    # every attribute name is unchanged so the partial-page tests still hold.
+    _ZONES = (("setup", "1 · Setup"), ("run", "2 · Run"),
+              ("report", "3 · Report"))
+
+    def _build_zone_strip(self) -> QWidget:
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(s(4))
+        self._zone_group = QButtonGroup(row)
+        self._zone_group.setExclusive(True)
+        self._zone_buttons: dict[str, QPushButton] = {}
+        for key, text in self._ZONES:
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.setChecked(key == "setup")
+            b.setCursor(Qt.PointingHandCursor)
+            b._zone_key = key
+            b.setStyleSheet(f"font-size: {sf(9)}pt; padding: {s(3)}px {s(12)}px;")
+            self._zone_group.addButton(b)
+            self._zone_buttons[key] = b
+            lay.addWidget(b)
+        self._zone_group.buttonClicked.connect(
+            lambda b: self.show_zone(getattr(b, "_zone_key", "setup")))
+        lay.addStretch(1)
+        return row
+
+    def show_zone(self, key: str) -> None:
+        """Switch zones. Safe to call before the UI exists (tests build partials)."""
+        stack = getattr(self, "_zone_stack", None)
+        if stack is None:
+            return
+        order = [k for k, _ in self._ZONES]
+        if key not in order:
+            return
+        stack.setCurrentIndex(order.index(key))
+        btn = getattr(self, "_zone_buttons", {}).get(key)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        # The camera and the plan preview only matter in Run; the report only
+        # needs building when it is looked at.
+        if key == "run":
+            self._refresh_planned_path()
+
+    def current_zone(self) -> str:
+        stack = getattr(self, "_zone_stack", None)
+        if stack is None:
+            return "setup"
+        order = [k for k, _ in self._ZONES]
+        idx = stack.currentIndex()
+        return order[idx] if 0 <= idx < len(order) else "setup"
+
+    def _build_zones(self) -> QWidget:
+        self._zone_stack = QStackedWidget()
+        self._zone_stack.addWidget(self._build_setup_zone())
+        self._zone_stack.addWidget(self._build_run_zone())
+        self._report_panel = QuickPrintReportPanel()
+        self._zone_stack.addWidget(self._report_panel)
+        return self._zone_stack
+
+    def _build_setup_zone(self) -> QWidget:
+        """What to print, where, and whether the machine can honour it."""
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(s(8))
+
+        ll.addWidget(self._build_object_row())
+
+        # The two driving parameters, in front of the operator at last.
+        param_card = Card("Print parameters — everything derives from these")
+        param_card.add_widget(FormRow(
+            "Top XY speed", self._top_speed_spin,
+            help_text=self._top_speed_spin.toolTip()))
+        param_card.add_widget(FormRow(
+            "Resolution", self._resolution_spin,
+            help_text=self._resolution_spin.toolTip()))
+        self._derived_lbl = QLabel("")
+        self._derived_lbl.setWordWrap(True)
+        self._derived_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        param_card.add_widget(self._derived_lbl)
+        ll.addWidget(param_card)
+
+        # Readiness checklist (Stage 1b fills it; the legacy one-line strip is
+        # kept underneath as the compact summary and for existing tests).
+        self._ready_card = Card("Readiness")
+        self._ready_host = QWidget()
+        self._ready_layout = QVBoxLayout(self._ready_host)
+        self._ready_layout.setContentsMargins(0, 0, 0, 0)
+        self._ready_layout.setSpacing(s(3))
+        self._ready_card.add_widget(self._ready_host)
+        ll.addWidget(self._ready_card)
+        ll.addWidget(self._build_status_strip())
+        ll.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(left)
+
+        # Where it prints — selection belongs with the rest of setup.
+        self._navigator = WellPlateNavigator()
+        # v7.7: the widget's default tooltip says "click to fast-travel", which
+        # is true on the Jog page but not here — a click only SELECTS the well
+        # the object will print in; nothing moves until Print.
+        self._navigator.setToolTip(
+            "Click a well to choose where the object prints. This does not move "
+            "the stage.")
+        self._navigator.well_clicked.connect(self._on_well_clicked)
+        nav_card = Card("Well — click to place the object", flush=True,
+                        compact=True)
+        nav_card.add_widget(self._navigator)
+
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.addWidget(scroll)
+        split.addWidget(nav_card)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([s(520), s(420)])
+        return split
+
+    def _build_run_zone(self) -> QWidget:
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(s(8))
+        lay.addWidget(self._build_main_area(), stretch=1)
+        lay.addWidget(self._build_run_info())
+        return holder
+
+    def _build_run_info(self) -> QWidget:
+        """Live numbers during the print (populated in Stage 3b from the
+        executor's ~5 Hz telemetry)."""
+        card = Card("Live", compact=True)
+        self._run_info_lbl = QLabel("Not printing.")
+        self._run_info_lbl.setWordWrap(True)
+        self._run_info_lbl.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
+            f"font-family: monospace;")
+        card.add_widget(self._run_info_lbl)
+        self._run_info_card = card
+        return card
+
     def _build_main_area(self) -> QSplitter:
-        """Vertical splitter: a top row of [trajectory monitor | live camera]
-        over the well-plate selector. All boundaries are user-resizable."""
+        """Horizontal splitter: [trajectory monitor | live camera].
+
+        v7.7: the well selector moved to the Setup zone (choosing a well is a
+        setup action), so this is the WATCH surface only.
+        """
         # ── Top row: trajectory monitor + live camera ──────────────
         self._traj_view = PrintTrajectoryMonitorView()
         if self._controller is not None and hasattr(
@@ -720,12 +1085,14 @@ class QuickPrintWorkflowPage(QWidget):
         traj_card = Card("Print plan — planned path · live trace · needle",
                          flush=True, compact=True)
         traj_card.add_widget(self._traj_view)
+        traj_card.add_widget(self._build_overlay_pills())
 
         if self._camera_manager is not None:
             self._camera_view = CameraFeedView(
                 camera_manager=self._camera_manager,
                 cam_idx=self._resolve_microscope_cam_idx(),
                 show_crosshair=True,
+                auto_orient=True,   # v7.5.x: calibrated orientation everywhere
                 label="Microscope feed — starts on this page",
             )
             cam_widget: QWidget = self._camera_view
@@ -744,22 +1111,7 @@ class QuickPrintWorkflowPage(QWidget):
         top_split.setStretchFactor(0, 3)
         top_split.setStretchFactor(1, 2)
         top_split.setSizes([s(560), s(440)])
-
-        # ── Bottom: well selector ──────────────────────────────────
-        self._navigator = WellPlateNavigator()
-        self._navigator.well_clicked.connect(self._on_well_clicked)
-        nav_card = Card("Well — click to place the object", flush=True,
-                        compact=True)
-        nav_card.add_widget(self._navigator)
-
-        main_split = QSplitter(Qt.Vertical)
-        main_split.setChildrenCollapsible(False)
-        main_split.addWidget(top_split)
-        main_split.addWidget(nav_card)
-        main_split.setStretchFactor(0, 3)
-        main_split.setStretchFactor(1, 2)
-        main_split.setSizes([s(420), s(300)])
-        return main_split
+        return top_split
 
     def _build_run_row(self) -> QFrame:
         frame = QFrame(self)
@@ -771,10 +1123,26 @@ class QuickPrintWorkflowPage(QWidget):
         self._print_btn.clicked.connect(self._on_print)
         row.addWidget(self._print_btn)
 
+        # v7.7: PrintManager.pause()/resume() existed but were unreachable.
+        self._pause_btn = QPushButton("Pause")
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setToolTip(
+            "Pause after the current command completes. The needle stays where "
+            "it is — use Abort if you need motion to stop now.")
+        self._pause_btn.clicked.connect(self._on_pause)
+        row.addWidget(self._pause_btn)
+
         self._abort_btn = QPushButton("Abort")
         self._abort_btn.setEnabled(False)
         self._abort_btn.clicked.connect(self._on_abort)
         row.addWidget(self._abort_btn)
+
+        # v7.7: the execution log was named in the status text but not openable.
+        self._log_btn = QPushButton("Open log")
+        self._log_btn.setEnabled(False)
+        self._log_btn.setToolTip("Open the JSONL execution log for the last run.")
+        self._log_btn.clicked.connect(self._on_open_log)
+        row.addWidget(self._log_btn)
 
         row.addStretch(1)
 
@@ -827,7 +1195,15 @@ class QuickPrintWorkflowPage(QWidget):
 
     def _push_live_position(self) -> None:
         """Feed the live needle XY (zero-ref µm) into the trajectory monitor —
-        the same conversion the Jog page uses (absolute stage µm − zero)."""
+        the same conversion the Jog page uses (absolute stage µm − zero).
+
+        v7.7: also repaints the live-numbers panel, so the executor's telemetry
+        is rendered at a fixed 10 Hz regardless of how fast it arrives.
+        """
+        try:
+            self._render_run_info()
+        except Exception:
+            pass
         if not hasattr(self, "_traj_view"):
             return
         try:
@@ -1306,19 +1682,129 @@ class QuickPrintWorkflowPage(QWidget):
         self._traj_view.set_well_boundary(
             (cx_um, cy_um) if radius_um > 0 else None, radius_um)
 
-        # Size the needle marker from the configured needle OD (best-effort).
+        # Size the needle marker from the configured needle's ORIFICE OD — what
+        # actually approaches the plate (best-effort).
         try:
             needle, _ = self._needle_and_syringe()
-            od_um = getattr(needle, "od_um", None)
-            if not od_um:
-                od_mm = getattr(needle, "od_mm", 0.0) or 0.0
-                od_um = float(od_mm) * 1000.0
+            od_um = needle_orifice_od_mm(needle) * 1000.0
             if od_um:
                 self._traj_view.set_needle(float(od_um))
         except Exception:
             pass
 
         self._traj_view.reset_live()
+        self._kick_prediction(segments, cx_um, cy_um)
+
+    # v7.5.x: simulate the plan on the SAVED stage characteristics (velocity
+    # mode) and overlay what the stage is predicted to actually draw.
+    # v7.6: the simulation now runs the FEED PLAN (same sections the print
+    # executes) and also produces the per-point overlay channels.
+    def _kick_prediction(self, segments, cx_um, cy_um) -> None:
+        self._pred_gen = getattr(self, "_pred_gen", 0) + 1
+        gen = self._pred_gen
+        self._traj_view.set_predicted_path(None)
+        if self._motion_mode() != "velocity" or not segments:
+            return
+        try:
+            from SupportClasses import XYFeedPlan as FP
+            from SupportClasses.XYStageModel import StageCharacteristics
+            from SupportClasses.PrintTimingCalibrationStore import get_store
+            store = get_store()
+            char = StageCharacteristics.from_store(store)
+            if not char.is_complete():
+                return
+            # Read every GUI value here — the worker must not touch widgets.
+            speed = float(self._resolved_print_kinematics()[0])
+            res_um = float(self._resolution_um())
+            vol_per_mm = (self._needle_cross_section_mm2()
+                          * self._extrusion_modifier())
+        except Exception:
+            return
+
+        def _work():
+            try:
+                pred, worst_p95, stops, est = [], 0.0, 0, 0.0
+                stalled = False
+                chans = {"speed": [], "flow": [], "error": [], "time": []}
+                t_base = 0.0
+                for seg in segments:
+                    if len(seg) < 2:
+                        continue
+                    pts = [(float(x), float(y)) for x, y in seg]
+                    plan = FP.build_plan(pts, char,
+                                         target_speed_mm_s=max(0.05, speed),
+                                         element_um=res_um)
+                    r = FP.simulate_plan(plan, char)
+                    pred.append([(cx_um + sm[0] * 1000.0,
+                                  cy_um + sm[1] * 1000.0) for sm in r.samples])
+                    sp, fl, er, tm = _overlay_channels(
+                        r, vol_per_mm=vol_per_mm, t_base=t_base)
+                    chans["speed"].append(sp)
+                    chans["flow"].append(fl)
+                    chans["error"].append(er)
+                    chans["time"].append(tm)
+                    t_base = tm[-1] if tm else t_base
+                    worst_p95 = max(worst_p95,
+                                    float(r.report.get("p95_um") or 0.0))
+                    stops += plan.n_stops
+                    est += plan.est_time_s
+                    stalled = stalled or not r.completed
+                note = (f"plan: {stops} stop{'' if stops == 1 else 's'} · "
+                        f"est {est:.0f} s · sim p95 {worst_p95:.0f} µm")
+                if stalled:
+                    note = "sim: ⚠ predicted to STALL — " + note
+                units = {"speed": "mm/s", "flow": "µL/s", "error": "µm",
+                         "time": "s"}
+                overlays = {}
+                for key, per_seg in chans.items():
+                    flat = [v for seq in per_seg for v in seq]
+                    if flat:
+                        overlays[key] = {"values": per_seg,
+                                         "unit": units[key],
+                                         "vmin": min(flat), "vmax": max(flat)}
+                # v7.7: carry the prediction as a NUMBER (reserved key, popped
+                # by _on_predicted) so the live readout can show it beside the
+                # measured deviation during the print. Kept inside the existing
+                # payload so the 4-arg `predicted` signal is unchanged.
+                overlays["_pred_p95_um"] = worst_p95
+                self._bridge.predicted.emit(gen, pred, note, overlays)
+            except Exception as e:                     # pragma: no cover
+                logger.debug("prediction sim failed: %s", e)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_predicted(self, gen: int, segments, note: str,
+                      overlays=None) -> None:
+        if gen != getattr(self, "_pred_gen", 0):
+            return                       # selection changed while simulating
+        p95 = None
+        if isinstance(overlays, dict):
+            p95 = overlays.pop("_pred_p95_um", None)
+        self._pred_overlays = overlays or {}
+        self._predicted_p95_um = p95
+        if hasattr(self, "_traj_view"):
+            self._traj_view.set_predicted_path(segments, note,
+                                               predicted_p95_um=p95)
+            self._apply_overlay_mode()
+
+    def _overlay_pill_mode(self) -> str:
+        group = getattr(self, "_overlay_group", None)
+        if group is None:
+            return "none"
+        btn = group.checkedButton()
+        return getattr(btn, "_overlay_key", "none") if btn else "none"
+
+    def _apply_overlay_mode(self) -> None:
+        """Push the selected overlay channel (or clear it) into the monitor."""
+        if not hasattr(self, "_traj_view"):
+            return
+        mode = self._overlay_pill_mode()
+        data = (getattr(self, "_pred_overlays", None) or {}).get(mode)
+        if mode == "none" or not data:
+            self._traj_view.set_overlay(None)
+            return
+        self._traj_view.set_overlay(mode, data["values"], data["unit"],
+                                    data.get("vmin"), data.get("vmax"))
 
     # ── Ink selection / override + pickup volume ──────────────────
 
@@ -1461,24 +1947,56 @@ class QuickPrintWorkflowPage(QWidget):
                 return z_feed_mm_min / 60.0
         return self._Z_MAX_FALLBACK_MM_S
 
-    def _print_speed_pct(self) -> float:
-        """Print speed fraction in [0.01, 1.0] from the % spin."""
+    def _top_speed_mm_s(self) -> float:
+        """v7.6 parameter 1 — the REQUESTED top XY speed (mm/s), before the
+        stage/flow limits are applied. See :meth:`_resolved_print_kinematics`."""
+        w = getattr(self, "_top_speed_spin", None)
         try:
-            return max(0.01, min(1.0, float(self._speed_pct_spin.value()) / 100.0))
+            return max(0.05, float(w.value())) if w is not None else 2.5
         except Exception:
-            return 0.25
+            return 2.5
 
-    def _needle_cross_section_mm2(self) -> float:
-        """Inner-bore cross-section (mm²) of the configured needle, or 0.0 when
-        no needle is configured. = π·(inner Ø / 2)²."""
+    def _resolution_um(self) -> float:
+        """v7.6 parameter 2 — the resolution element (µm) the print must hold.
+        Falls back to the machine's stored element, then 30 µm."""
+        w = getattr(self, "_resolution_spin", None)
+        try:
+            if w is not None:
+                return max(0.5, float(w.value()))
+        except Exception:
+            pass
+        try:
+            return float(get_store().get_resolution_element_um() or 30.0)
+        except Exception:
+            return 30.0
+
+    def _needle_orifice_area_mm2(self) -> float:
+        """Orifice cross-section (mm²) of the configured needle, or 0.0 when no
+        needle is configured. = π·(orifice Ø / 2)².
+
+        v7.6: the orifice is the pulled tip on a capillary, else the inner bore —
+        the bead is set by what leaves the tip, not by the bulk barrel.
+        """
         hw = getattr(self, "_hw_config", None)
         needle = getattr(hw, "needle", None) if hw else None
         if needle is None:
             return 0.0
         try:
-            return float(getattr(needle, "cross_section_area_mm2", 0.0) or 0.0)
+            return float(needle_orifice_area_mm2(needle) or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    def _needle_cross_section_mm2(self) -> float:
+        """Legacy name for :meth:`_needle_orifice_area_mm2`.
+
+        v7.7: a DELEGATING method, not a class-level alias. As an alias the two
+        names were the same function object, so overriding one of them (which
+        every partial-page test does) silently left the other pointing at the
+        real implementation — and the flow-ceiling warning, which read the other
+        name, quietly stopped firing. Delegation makes an override of either name
+        behave the way a reader expects.
+        """
+        return self._needle_orifice_area_mm2()
 
     def _extrusion_modifier(self) -> float:
         """Line-thickness multiplier on the auto-calculated extrusion (≥ 0)."""
@@ -1555,23 +2073,176 @@ class QuickPrintWorkflowPage(QWidget):
         return area * self._flow_limited_xy_max_mm_s() * self._extrusion_modifier()
 
     def _resolved_print_kinematics(self) -> tuple[float, float, float]:
-        """Apply the print-speed % to both axes and return
-        ``(print_speed_mm_s, flow_uL_s, prime_uL)``.
+        """Resolve the operator's TOP SPEED against the hardware limits and
+        return ``(print_speed_mm_s, flow_uL_s, prime_uL)``.
 
-        Flow@100% is AUTO-calculated (needle bore × flow-limited XY max ×
-        extrusion modifier, see :meth:`_auto_flow_100_uL_s`); both the XY
-        traverse (% × XY max) and the pump flow (% × flow@100%) scale by the same
-        % off the SAME flow-limited XY max, so the deposited volume-per-mm
-        (= bore area × modifier) is independent of the % — and the max print
-        speed is reduced whenever the needle's max safe flow would otherwise be
-        exceeded (so no air-ingesting over-pressure)."""
-        pct = self._print_speed_pct()
-        xy_max = self._flow_limited_xy_max_mm_s()
-        flow_100 = self._auto_flow_100_uL_s()
-        speed = pct * xy_max
-        flow = pct * flow_100
+        v7.6: the speed parameter is an absolute mm/s (it was a % of the
+        measured maximum). The resolved speed is
+
+            ``min(top_speed, measured stage max, needle flow-limited max)``
+
+        — and :meth:`_refresh_setup_status` names whichever term binds, instead
+        of clamping silently as before. The flow then FOLLOWS the speed
+        (``bore area × speed × modifier``), so the deposited volume-per-mm is
+        ``area × modifier`` at any speed: changing the speed changes how long
+        the print takes, never how thick the bead is.
+        """
+        requested = self._top_speed_mm_s()
+        # _flow_limited_xy_max_mm_s is already min(stage max, flow ceiling)
+        speed = min(requested, self._flow_limited_xy_max_mm_s())
+        speed = max(0.05, speed)
+        area = self._needle_cross_section_mm2()
+        if area > 0:
+            flow = area * speed * self._extrusion_modifier()
+        else:
+            # No needle configured (bore unknown) → keep the legacy fallback
+            # flow, scaled by how fast we ended up going.
+            xy = max(0.05, self._flow_limited_xy_max_mm_s())
+            flow = self._FLOW_FALLBACK_UL_S * min(1.0, speed / xy)
         prime = flow * self._preflow_s()
         return speed, flow, prime
+
+    def _migrate_legacy_settings(self, values: dict) -> dict:
+        """v7.6: carry a saved ``speed_pct`` (% of the flow-limited XY max)
+        forward into the absolute ``top_speed`` (mm/s) parameter, so existing
+        profiles keep printing at the speed they were saved with instead of
+        snapping to the new default."""
+        try:
+            if "top_speed" not in values and "speed_pct" in values:
+                pct = max(0.01, min(1.0, float(values["speed_pct"]) / 100.0))
+                anchor = self._flow_limited_xy_max_mm_s()
+                values["top_speed"] = round(
+                    max(0.1, min(20.0, pct * anchor)), 2)
+        except (TypeError, ValueError):
+            pass
+        return values
+
+    def _append_limit_warnings(self, msgs: list, requested: float,
+                               res_um: float) -> bool:
+        """v7.6: append the hardware-limit warnings + the time estimate.
+
+        Returns True if anything warrants the attention colour. Every message
+        names the limiting hardware term and what it costs, because the whole
+        point of the two-parameter surface is that the operator can see which
+        of their two asks the machine cannot honour.
+        """
+        warn = False
+        # Same accessor the resolved kinematics use (three sibling call sites),
+        # so the warning threshold and the flow actually commanded can never
+        # disagree about which area the bead is based on.
+        area = self._needle_cross_section_mm2()
+        mod = self._extrusion_modifier()
+
+        # (0) a pulled tip's ink reserve can be too small to hold the plug back
+        reserve_msg = self._reserve_warning()
+        if reserve_msg:
+            msgs.append(reserve_msg)
+            warn = True
+
+        # (a) the needle's flow ceiling — the pump physically cannot keep up
+        maxflow = self._max_pump_flow_uL_s()
+        if maxflow > 0 and area > 0 and mod > 0:
+            attain = maxflow / (area * mod)
+            if requested > attain * 1.001:
+                msgs.append(
+                    f"⚠ Top speed {requested:.2f} mm/s exceeds the needle's "
+                    f"flow ceiling ({maxflow:.3g} µL/s ≙ {attain:.2f} mm/s at "
+                    f"×{mod:g}) — auto-limited to {attain:.2f} mm/s.")
+                warn = True
+
+        # (b) the measured stage maximum. Only warn on a PLAUSIBLE measurement:
+        # an unconfigured/zero max would otherwise produce the nonsense
+        # "exceeds the measured stage max (0.00 mm/s)".
+        xy_max = self._xy_max_mm_s()
+        if xy_max >= 0.1 and requested > xy_max * 1.001:
+            msgs.append(
+                f"⚠ Top speed {requested:.2f} mm/s exceeds the measured stage "
+                f"max ({xy_max:.2f} mm/s) — auto-limited to {xy_max:.2f} mm/s.")
+            warn = True
+
+        # (c)/(d)/(e) plan-derived: the resolution floor, the calibration gate,
+        # and what this resolution costs in time.
+        try:
+            from SupportClasses import XYFeedPlan as _fp
+            from SupportClasses.XYStageModel import StageCharacteristics
+            char = StageCharacteristics.from_store(get_store())
+        except Exception as e:
+            # Logged, not silent: a swallowed error here hides the warnings the
+            # operator is relying on (it once hid a NameError for a whole run).
+            logger.warning("limit warnings unavailable: %s", e)
+            return warn
+
+        if not char.is_complete():
+            if self._motion_mode() == "velocity":
+                msgs.append(
+                    "⚠ Stage motion not characterised — run the one-click XY "
+                    "calibration (Timing Calibration) to enable feature-aware "
+                    "feed planning; printing with the legacy follower.")
+                warn = True
+            return warn
+
+        floor = _fp.min_attainable_resolution_um(char)
+        if floor > 0 and res_um < floor:
+            msgs.append(
+                f"⚠ Resolution {res_um:.0f} µm is finer than this machine can "
+                f"hold (~{floor:.0f} µm floor: stop tolerance + coast + "
+                f"encoder) — corners will exceed it.")
+            warn = True
+
+        # (e) the TIME cost of this resolution — the trade the operator is making
+        try:
+            segments = self._path_segments_for_selection()
+            n_pts = sum(len(seg) for seg in segments)
+            if segments and n_pts <= 20000:
+                # use the REQUESTED speed passed in (resolved against the
+                # hardware limits), not a second read of the spin
+                speed = min(requested, self._flow_limited_xy_max_mm_s())
+                est, stops = 0.0, 0
+                for seg in segments:
+                    if len(seg) < 2:
+                        continue
+                    plan = _fp.build_plan(
+                        [(float(x), float(y)) for x, y in seg], char,
+                        target_speed_mm_s=max(0.05, speed),
+                        element_um=res_um)
+                    est += plan.est_time_s
+                    stops += plan.n_stops
+                if est > 0:
+                    msgs.append(f"resolution {res_um:.0f} µm → est {est:.0f} s "
+                                f"({stops} corner stop"
+                                f"{'' if stops == 1 else 's'})")
+                    # v7.7: stash so the readiness checklist and the derived-facts
+                    # line can report the estimate without re-planning.
+                    self._last_est_s, self._last_stops = est, stops
+        except Exception:
+            pass
+        return warn
+
+    def _update_top_speed_cap(self) -> None:
+        """Cap the top-speed spin at the MEASURED stage maximum (only when a
+        real measurement exists — never at the fallback constant, which would
+        wrongly limit an uncalibrated machine)."""
+        spin = getattr(self, "_top_speed_spin", None)
+        if spin is None:
+            return
+        measured = 0.0
+        try:
+            getter = getattr(self._controller, "get_max_xy_speed_um_s", None)
+            if callable(getter):
+                measured = float(getter() or 0.0) / 1000.0
+        except Exception:
+            measured = 0.0
+        if measured <= 0:
+            try:
+                measured = float(
+                    get_store().get_xy_max_speed_um_s() or 0.0) / 1000.0
+            except Exception:
+                measured = 0.0
+        if measured > 0:
+            try:
+                spin.setMaximum(max(0.1, min(20.0, measured)))
+            except Exception:
+                pass
 
     def _compute_pickup_volume_uL(self) -> float:
         """Volume to aspirate at the ink well = what the print path dispenses
@@ -1605,12 +2276,43 @@ class QuickPrintWorkflowPage(QWidget):
         return dispensed + prime + reserve + self._ink_padding_uL()
 
     def _needle_dead_volume_uL(self) -> float:
-        """The needle bore's internal volume (µL) — the ink reserve kept behind
-        the deposit so the print never reaches the buffer/oil. 0 if no needle."""
+        """The ink reserve (µL) kept behind the deposit so the print never
+        reaches the buffer/oil. 0 if no needle.
+
+        v7.6: this is ``NeedleSpec.ink_reserve_volume_uL`` — the TIP volume on a
+        pulled capillary (the ink that actually sits in the working section;
+        reserving the whole 1 mm barrel would exceed a 25 µL syringe) and the
+        full bore volume on a straight needle, i.e. exactly the pre-v7.6 number.
+        ⚠ On a fine tip the reserve is very small; ``_reserve_warning`` surfaces
+        that so the operator can raise the ink padding instead.
+        """
+        needle = getattr(self._hw_config, "needle", None) if self._hw_config else None
+        reserve = getattr(needle, "ink_reserve_volume_uL", None)
+        if isinstance(reserve, (int, float)):
+            return float(reserve)
         try:
             return float(needle_volume_uL(self._hw_config) or 0.0)
         except Exception:
             return 0.0
+
+    def _reserve_warning(self) -> str:
+        """Non-blocking warning when the resolved ink reserve is too small to be
+        meaningful — i.e. a pulled tip holds far less than the deposit needs
+        behind it. Empty string when the reserve is fine."""
+        # getattr-safe on `self` too: this runs from _append_limit_warnings, and
+        # the page's own convention is that a partially-built page (tests build
+        # `__new__` partials) must degrade to "no warning", not raise.
+        hw = getattr(self, "_hw_config", None)
+        needle = getattr(hw, "needle", None) if hw else None
+        if not getattr(needle, "has_tip", False):
+            return ""
+        reserve = self._needle_dead_volume_uL()
+        padding = self._ink_padding_uL()
+        if reserve >= _MIN_MEANINGFUL_RESERVE_UL or padding >= _MIN_MEANINGFUL_RESERVE_UL:
+            return ""
+        return (f"⚠ Ink reserve is only {reserve * 1000:.2f} nL (the pulled tip's "
+                f"volume) — below one pump step. Raise the ink padding so the "
+                f"buffer plug can't reach the tip mid-print.")
 
     def _print_dispense_volume_uL(self) -> float:
         """Volume the print path itself DISPENSES (µL) = flow × print time,
@@ -1630,6 +2332,282 @@ class QuickPrintWorkflowPage(QWidget):
                 dy = seg[i][1] - seg[i - 1][1]
                 path_len_mm += (dx * dx + dy * dy) ** 0.5
         return flow * (path_len_mm / speed)
+
+    # ── v7.7: readiness checklist ─────────────────────────────────
+
+    def _readiness_context(self, est_s=None, stops=None):
+        """Gather the already-resolved numbers for ``PrintReadiness.evaluate``.
+
+        Everything here is individually try-wrapped: this runs on the status tick
+        against a possibly half-configured machine, and a readiness panel that
+        raises is worse than one that says "unknown".
+        """
+        from SupportClasses.PrintReadiness import ReadinessContext
+        ctrl = self._controller
+        ctx = ReadinessContext()
+
+        def _try(fn, default=None):
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        ctx.xy_connected = bool(getattr(ctrl, "is_xy_connected", False))
+        ctx.zp_connected = bool(getattr(ctrl, "is_zp_connected", False))
+        ctx.object_selected = bool(_try(
+            lambda: self._object_combo.currentData(), None))
+        ctx.object_label = _try(self._object_label, "") or ""
+        ctx.well = getattr(self, "_selected_well", None)
+        ctx.plate_available = getattr(self, "_plate", None) is not None
+        ctx.well_center_calibrated = _try(
+            lambda: (None if not ctx.well else
+                     ctx.well in (self._well_positions or {})), None)
+
+        ctx.safe_z = getattr(self, "_safe_z", None)
+        ctx.plate_bottom_z = _try(lambda: ctrl.get_plate_bottom_z(), None)
+        ctx.print_z_zref = _try(self._resolve_print_z, None)
+        if ctx.safe_z is None:
+            ctx.travel_z_synthesised = True
+            ctx.travel_z_zref = _try(
+                lambda: ctrl.default_travel_z(ctx.print_z_zref, margin_mm=10.0),
+                None)
+        else:
+            ctx.travel_z_zref = ctx.safe_z
+
+        # ── machine characterisation + its provenance ──
+        try:
+            from SupportClasses.XYStageModel import StageCharacteristics
+            char = StageCharacteristics.from_store(get_store())
+            ctx.char_complete = bool(char.is_complete())
+            ctx.char_missing = tuple(char.missing() or ())
+            ctx.char_measured_at = getattr(char, "measured_at", None)
+        except Exception:
+            char = None
+        try:
+            dt, src = get_store().effective_dead_time_s()
+            ctx.dead_time_s, ctx.dead_time_source = dt, str(src)
+        except Exception:
+            pass
+        ctx.motion_mode = _try(self._motion_mode, "") or ""
+        ctx.resolved_motion_mode = ctx.motion_mode
+
+        # ── calibration staleness ──
+        try:
+            from SupportClasses.CalibrationStatusStore import get_store as _cs
+            st = _cs()
+            ctx.xy_travel_since_cal_mm = float(
+                st.xy_travel_since_cal_um() or 0.0) / 1000.0
+            ctx.hours_since_xy_cal = st.hours_since("xy")
+            thr = st.thresholds()
+            ctx.xy_recal_travel_mm = float(thr[0]) if thr else None
+            ctx.recal_interval_hours = float(thr[1]) if thr else None
+        except Exception:
+            pass
+
+        # ── the two parameters, resolved ──
+        ctx.requested_speed_mm_s = _try(self._top_speed_mm_s, None)
+        kin = _try(self._resolved_print_kinematics, None)
+        if kin:
+            ctx.resolved_speed_mm_s, ctx.flow_uL_s, _p = kin
+        ctx.stage_max_mm_s = _try(self._xy_max_mm_s, None)
+        ctx.flow_ceiling_speed_mm_s = _try(self._flow_limited_xy_max_mm_s, None)
+        ctx.resolution_um = _try(self._resolution_um, None)
+        if char is not None:
+            try:
+                from SupportClasses import XYFeedPlan as _fp
+                floor = _fp.min_attainable_resolution_um(char)
+                ctx.resolution_floor_um = floor if floor > 0 else None
+            except Exception:
+                pass
+        ctx.est_time_s, ctx.n_corner_stops = est_s, stops
+
+        # ── geometry ──
+        segs = _try(self._path_segments_for_selection, []) or []
+        ctx.n_strokes = len(segs) or None
+        length = 0.0
+        rmax = 0.0
+        for seg in segs:
+            for i, (px, py) in enumerate(seg):
+                rmax = max(rmax, (px * px + py * py) ** 0.5)
+                if i:
+                    length += ((px - seg[i - 1][0]) ** 2
+                               + (py - seg[i - 1][1]) ** 2) ** 0.5
+        ctx.path_length_mm = length or None
+        # Stashed for the live panel, which needs the WHOLE path's length to
+        # state planned volume (a vel_sample's tot_mm is only its section).
+        self._last_path_len_mm = length or None
+        ctx.object_radius_mm = rmax or None
+        wr = _try(lambda: self._well_radius_um(ctx.well), None) if ctx.well else None
+        ctx.well_radius_mm = (wr / 1000.0) if wr else None
+
+        # ── needle / bead ──
+        hw = getattr(self, "_hw_config", None)
+        needle = getattr(hw, "needle", None) if hw else None
+        ctx.needle_configured = needle is not None and bool(
+            _try(self._needle_cross_section_mm2, 0.0))
+        ctx.needle_gauge = str(getattr(needle, "gauge", "") or "")
+        ctx.bore_id_um = _try(lambda: float(needle.id_um), None) if needle else None
+        area = _try(self._needle_cross_section_mm2, 0.0) or 0.0
+        mod = _try(self._extrusion_modifier, 1.0) or 1.0
+        if area > 0:
+            # An area-equivalent circular bead: Ø = 2·sqrt(A·mod/π).
+            ctx.bead_width_um = 2.0 * ((area * mod / 3.141592653589793) ** 0.5) * 1000.0
+
+        # ── fluidics (the full run budget is still verified at Print) ──
+        pump = _try(self._pump, "P1") or "P1"
+        ctx.pump = pump
+        ctx.pump_plunger_calibrated = _try(
+            lambda: bool(ctrl.is_pump_plunger_calibrated(pump)), None)
+        ctx.syringe_capacity_uL = _try(lambda: ctrl.pump_capacity_uL(pump), None)
+        ctx.syringe_fill_uL = _try(lambda: ctrl.pump_fill_uL(pump), None)
+        ctx.pickup_uL = _try(self._compute_pickup_volume_uL, None)
+        ctx.pickup_dispense_uL = _try(self._print_dispense_volume_uL, None)
+        ctx.pickup_dead_volume_uL = _try(self._needle_dead_volume_uL, None)
+        ctx.pickup_padding_uL = _try(self._ink_padding_uL, None)
+        if kin:
+            ctx.pickup_prime_uL = kin[2]
+
+        # ── ink: the bioprinting advisories that never ran ──
+        ink_name = _try(self._selected_ink, None)
+        ctx.ink_name = ink_name
+        if ink_name:
+            ctx.ink_well = _try(self._ink_source_well, None)
+            ctx.ink_well_calibrated = _try(
+                lambda: (ctx.ink_well in (self._well_positions or {}))
+                if ctx.ink_well else None, None)
+        ink = None
+        if ink_name and hw is not None:
+            ink = _try(lambda: (getattr(hw, "ink_library", {}) or {}).get(ink_name),
+                       None)
+        if ink is not None and needle is not None:
+            ctx.clog = _try(lambda: ink.flow_compatibility_detail(needle), None)
+            ctx.ink_particle_um = _try(
+                lambda: float(ink.max_particle_diameter_um or 0.0), None)
+            self._fill_flow_physics(ctx, needle, ink)
+
+        # ── prep / cleanup prerequisites ──
+        ctx.prep_enabled = bool(_try(lambda: self._prep_check.isChecked(), False))
+        ctx.cleanup_enabled = bool(
+            _try(lambda: self._postclean_check.isChecked(), False))
+        if ctx.prep_enabled or ctx.cleanup_enabled:
+            missing = _try(
+                lambda: resolve_service_positions(
+                    self._hw_config, self._well_positions, self._plate)[1],
+                ()) or ()
+            if ctx.prep_enabled:
+                ctx.prep_missing = tuple(missing)
+            if ctx.cleanup_enabled:
+                ctx.cleanup_missing = tuple(
+                    m for m in missing if m in ("waste", "wash", "oil"))
+        return ctx
+
+    def _fill_flow_physics(self, ctx, needle, ink) -> None:
+        """Wall shear vs the cell-viability limit, and the flow ceiling
+        recomputed with THIS ink's viscosity instead of the reference fluid the
+        enforced ceiling assumes."""
+        try:
+            from SupportClasses import FlowPhysics as FP
+        except Exception:
+            return
+        flow = ctx.flow_uL_s or 0.0
+        try:
+            visc = float(getattr(ink, "viscosity_Pa_s", 0.0) or 0.0)
+            d_m = float(needle.id_m)
+            if visc > 0 and d_m > 0 and flow > 0:
+                ctx.wall_shear_pa = FP.wall_shear_stress(
+                    visc, flow * 1e-9, d_m)          # µL/s → m³/s
+                ctx.shear_limit_pa = FP.DEFAULT_SHEAR_STRESS_LIMIT_PA
+        except Exception:
+            pass
+        try:
+            ctx.flow_ceiling_ink_uL_s = FP.max_safe_flow_rate_uL_s(needle, ink)
+            ctx.flow_ceiling_ref_uL_s = self._max_pump_flow_uL_s() or None
+        except Exception:
+            pass
+
+    def _render_readiness(self, ctx) -> "object":
+        """Evaluate + paint the checklist. Returns the Readiness so the button
+        state and the compact summary can use the SAME evaluation."""
+        from SupportClasses.PrintReadiness import evaluate, BLOCK, WARN, OK, INFO
+        readiness = evaluate(ctx)
+        host = getattr(self, "_ready_layout", None)
+        if host is None:
+            return readiness
+        while host.count():
+            it = host.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+        variant = {BLOCK: "err", WARN: "warn", OK: "ok", INFO: "info"}
+        for group, checks in readiness.by_group():
+            # Only groups that need attention are expanded by default; an all-OK
+            # group collapses to one line so the panel stays scannable.
+            attention = [c for c in checks if c.state in (BLOCK, WARN)]
+            hdr = QLabel(group)
+            hdr.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(8)}pt; "
+                f"font-weight: 600; letter-spacing: 1px;")
+            host.addWidget(hdr)
+            shown = checks if attention else checks[:0]
+            if not attention:
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(s(6))
+                rl.addWidget(StatusBadge("ok", variant="ok"))
+                lbl = QLabel(", ".join(c.label for c in checks))
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet(
+                    f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+                rl.addWidget(lbl, stretch=1)
+                host.addWidget(row)
+            for c in shown:
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(s(6))
+                rl.addWidget(StatusBadge(
+                    {BLOCK: "blocked", WARN: "check", OK: "ok",
+                     INFO: "fyi"}[c.state],
+                    variant=variant.get(c.state, "info")))
+                text = f"<b>{c.label}</b> — {c.detail}" if c.detail else \
+                    f"<b>{c.label}</b>"
+                if c.fix:
+                    text += (f" <span style='color:{COLORS['overlay0']}'>"
+                             f"({c.fix})</span>")
+                lbl = QLabel(text)
+                lbl.setWordWrap(True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setStyleSheet(
+                    f"color: {COLORS['text']}; font-size: {sf(9)}pt;")
+                rl.addWidget(lbl, stretch=1)
+                host.addWidget(row)
+        return readiness
+
+    def _render_derived(self, ctx) -> None:
+        """The facts the page computed and used to discard."""
+        lbl = getattr(self, "_derived_lbl", None)
+        if lbl is None:
+            return
+        bits = []
+        if ctx.resolved_speed_mm_s:
+            bits.append(f"{ctx.resolved_speed_mm_s:.2f} mm/s")
+        if ctx.flow_uL_s:
+            bits.append(f"{ctx.flow_uL_s:.3f} µL/s")
+        if ctx.bead_width_um:
+            bits.append(f"bead ~{ctx.bead_width_um:.0f} µm")
+        if ctx.path_length_mm:
+            n = ctx.n_strokes or 1
+            bits.append(f"{ctx.path_length_mm:.1f} mm in {n} stroke"
+                        f"{'' if n == 1 else 's'}")
+        if ctx.est_time_s:
+            bits.append(f"est {ctx.est_time_s:.0f} s")
+        if ctx.n_corner_stops:
+            bits.append(f"{ctx.n_corner_stops} corner stop"
+                        f"{'' if ctx.n_corner_stops == 1 else 's'}")
+        if ctx.print_z_zref is not None:
+            bits.append(f"print Z {ctx.print_z_zref:.3f} mm")
+        lbl.setText(" · ".join(bits) or "Pick an object and a well.")
 
     def _check_syringe_budget(self, pump, prep_enabled, ink_on, pickup_uL,
                               settings, cleanup_enabled, cleanup_ctx):
@@ -1797,10 +2775,16 @@ class QuickPrintWorkflowPage(QWidget):
             return
         msgs: list[str] = []
         warn = False
-        # Resolved print kinematics (speed % applied to both XY and the pump).
+        # v7.6: the two driving parameters, what they resolved to, and WHY —
+        # every limit that bites is named instead of silently clamping.
         try:
+            requested = self._top_speed_mm_s()
             speed, flow, _prime = self._resolved_print_kinematics()
-            msgs.append(f"Print: {speed:.1f} mm/s · {flow:.3f} µL/s")
+            res_um = self._resolution_um()
+            msgs.append(f"Print: {speed:.2f} mm/s · {flow:.3f} µL/s · "
+                        f"res {res_um:.0f} µm")
+            if self._append_limit_warnings(msgs, requested, res_um):
+                warn = True
         except Exception:
             pass
         ink = self._selected_ink()
@@ -1873,6 +2857,23 @@ class QuickPrintWorkflowPage(QWidget):
         self._setup_status.setText("   ".join(msgs))
         self._setup_status.setStyleSheet(
             f"color: {color}; font-size: {sf(9)}pt;")
+        # v7.7: the structured checklist replaces this run-on line as the primary
+        # surface (the line stays as the compact summary, and existing tests
+        # assert against it). Best-effort: a readiness failure must not stop the
+        # page refreshing.
+        try:
+            self._refresh_readiness(est_s=self._last_est_s,
+                                    stops=self._last_stops)
+        except Exception:
+            logger.exception("readiness refresh failed")
+
+    def _refresh_readiness(self, est_s=None, stops=None) -> None:
+        """Evaluate readiness once and use it for the checklist, the derived
+        facts and the Print button — one evaluation, three consumers."""
+        ctx = self._readiness_context(est_s=est_s, stops=stops)
+        self._readiness = self._render_readiness(ctx)
+        self._render_derived(ctx)
+        self._update_button_state()
 
     # ── Well center resolution (zero-ref mm) ──────────────────────
 
@@ -1945,9 +2946,9 @@ class QuickPrintWorkflowPage(QWidget):
         or 'confirm'. Getattr-safe for a partially-built page / tests."""
         w = getattr(self, "_motion_mode_combo", None)
         try:
-            return w.currentData() or "open_loop"
+            return w.currentData() or "velocity"
         except Exception:
-            return "open_loop"
+            return "velocity"
 
     def _build_settings(self, pump: str | None = None) -> PrintSettings:
         # Print speed % scales the XY traverse AND the pump flow together.
@@ -1996,26 +2997,22 @@ class QuickPrintWorkflowPage(QWidget):
         # v7.5.x: stamp the per-mode path-following params tuned by the XY
         # Printing Challenge (PrintTimingCalibrationStore) so the real print uses
         # them. Best-effort; defaults preserve legacy behaviour.
+        # v7.5.x: ONE shared stamper (XYAutoCalibration.stamp_print_settings) is
+        # used by BOTH print paths, so a bench tuning session reaches every print
+        # rather than only this one. Previously Full Print stamped none of it.
         try:
             from SupportClasses.PrintTimingCalibrationStore import get_store
-            _tc = get_store()
-            settings.pace_correction = _tc.get_mode_params(
-                "open_loop").get("pace_correction", 1.0)
-            _cf = _tc.get_mode_params("confirm")
-            settings.segment_settle_tol_um = _cf.get("settle_tol_um", 0.0)
-            settings.confirm_corner_angle_deg = _cf.get("corner_angle_deg", 0.0)
-            _v = _tc.get_mode_params("velocity")
-            settings.vel_lookahead_mm = _v.get("lookahead_mm", 0.0)
-            settings.vel_control_hz = _v.get("control_hz", 0.0)
-            settings.vel_decel_mm = _v.get("decel_mm", 0.0)
-            settings.vel_corner_angle_deg = _v.get("corner_angle_deg", 0.0)
-            settings.vel_corner_speed_factor = _v.get("corner_speed_factor", 0.0)
-            settings.vel_pid_kp = _v.get("pid_kp", 0.0)
-            settings.vel_pid_kd = _v.get("pid_kd", 0.0)
-            # machine-measured calibration → grounds the follower's rate/speed cap
-            settings.xy_max_speed_um_s = _tc.get_xy_max_speed_um_s() or 0.0
-            settings.control_loop_ms = _tc.get_control_loop_ms() or 0.0
-            settings.phase_lag_s = _tc.get_phase_lag_s() or 0.0
+            from SupportClasses import XYAutoCalibration as _AC
+            _AC.stamp_print_settings(settings, get_store())
+        except Exception:
+            pass
+        # v7.6: the feature-aware FEED PLAN — the second of the two driving
+        # parameters reaches the executor here. Only meaningful in closed-loop
+        # velocity mode; the executor itself falls back to the legacy follower
+        # when the machine is not characterised.
+        try:
+            settings.feed_plan_enabled = (self._motion_mode() == "velocity")
+            settings.feed_plan_element_um = float(self._resolution_um())
         except Exception:
             pass
         # v7.5.x: stamp the reference-vector up-direction (print_z_height above
@@ -2160,7 +3157,9 @@ class QuickPrintWorkflowPage(QWidget):
 
     def _rebuild_ink_mapping_ui(self) -> None:
         """Rebuild the per-abstract-ink → configured-ink mapping rows for the
-        loaded sketch (session state; not persisted)."""
+        loaded sketch. v7.7: the chosen mapping is remembered by ink NAME in
+        ``_ink_map_last``, which now rides along with the settings profile (see
+        ``WorkflowSettingsDialog.set_extra_state``), so it survives a restart."""
         if not hasattr(self, "_ink_map_layout"):
             return
         while self._ink_map_layout.count():
@@ -2214,6 +3213,16 @@ class QuickPrintWorkflowPage(QWidget):
             h.addWidget(combo, 1)
             self._ink_map_layout.addWidget(row)
             self._ink_map_combos[iid] = combo
+
+    def _restore_extra_state(self, extra: dict) -> None:
+        """v7.7: restore the remembered abstract-ink → configured-ink mapping
+        from the loaded profile, then rebuild the rows so they show it."""
+        remembered = extra.get("ink_map_last")
+        if isinstance(remembered, dict):
+            self._ink_map_last = {str(k): str(v)
+                                  for k, v in remembered.items() if v}
+            if hasattr(self, "_ink_map_layout"):
+                self._rebuild_ink_mapping_ui()
 
     def _on_ink_map_changed(self, ink_id: int, name: str, value) -> None:
         if value:
@@ -2585,6 +3594,7 @@ class QuickPrintWorkflowPage(QWidget):
         self._multi_thread = None
         self._multi_abort_requested = False
         self._pm = None
+        self._set_print_live(False)      # v7.6: stop the fast live sampling
         if err == "aborted":
             self._status.setText("Multi-ink print aborted — needle at safe Z.")
         elif err:
@@ -2724,7 +3734,8 @@ class QuickPrintWorkflowPage(QWidget):
             if self._safe_z is None:
                 self._status.setText(
                     "Post-print clean needs a Safe Z — set it on the "
-                    "Calibration page (or turn “Clean needle after print” off).")
+                    "Calibration page (or untick “Reset syringe to initial "
+                    "condition after print”).")
                 return
             cl_needle = needle_volume_uL(self._hw_config)
             if cl_needle <= 0:
@@ -3031,6 +4042,9 @@ class QuickPrintWorkflowPage(QWidget):
         bridge = self._bridge
         pm.on_progress = lambda c, t, m: bridge.progress.emit(int(c), int(t), str(m))
         pm.on_state_changed = lambda st: bridge.state.emit(st)
+        # v7.7: live telemetry from the follower (already decimated to ~5 Hz by
+        # the executor) → queued Qt signal → stored, rendered on the 10 Hz timer.
+        pm.on_vel_sample = lambda rec: bridge.vel_sample.emit(rec)
         self._pm = pm
         try:
             pm.load_job(job)
@@ -3044,9 +4058,9 @@ class QuickPrintWorkflowPage(QWidget):
             return
 
         # Begin recording the live executed path over the planned preview.
-        if hasattr(self, "_traj_view"):
-            self._traj_view.reset_live()
-            self._traj_view.set_recording(True)
+        self._set_print_live(True)
+        # v7.7: the operator's attention belongs on the Run zone now.
+        self.show_zone("run")
 
         log_path = getattr(getattr(pm, "exec_logger", None), "path", None)
         if log_path is not None:
@@ -3056,7 +4070,188 @@ class QuickPrintWorkflowPage(QWidget):
             self._status.setText(f"Printing “{obj_label}” at {well}…")
         self._update_button_state()
 
+    #: v7.6: live-position sampling period while a print runs (ms). The app's
+    #: shared 300 ms tick is fine for idle, but too coarse to draw a moving
+    #: needle — and it is starved by GUI-thread camera work.
+    _LIVE_POS_MS = 100
+
+    def _set_print_live(self, on: bool) -> None:
+        """v7.6: start/stop the fast live-position sampling for a running print.
+
+        The trajectory monitor used to FREEZE during every print: the print path
+        suspends the position poller, and the monitor read the (now stale) poller
+        cache through the 300 ms app tick. Two changes fix it —
+        ``get_xy_position(cached=False)`` now back-fills that cache from the
+        print loop's own 25–31 Hz reads (``PositionPoller.note_xy``), and this
+        timer samples it at 10 Hz so the needle actually moves on screen.
+        """
+        if hasattr(self, "_traj_view"):
+            if on:
+                self._traj_view.reset_live()
+            self._traj_view.set_recording(bool(on))
+        # v7.7: reset the live-numbers accumulators at the start of each print.
+        if on:
+            self._live = {"t0": time.monotonic(), "sample": None,
+                          "dev_max_um": 0.0, "devs": []}
+        elif getattr(self, "_run_info_lbl", None) is not None:
+            self._render_run_info(final=True)
+        timer = getattr(self, "_live_pos_timer", None)
+        if timer is None:
+            return
+        if on:
+            timer.start(self._LIVE_POS_MS)
+        else:
+            timer.stop()
+        # Ease GUI-thread camera work while the print needs the event loop.
+        try:
+            view = getattr(self, "_camera_view", None)
+            thr = getattr(view, "set_throttled", None)
+            if callable(thr):
+                thr(bool(on))
+        except Exception:
+            pass
+
+    def _on_vel_sample(self, rec) -> None:
+        """v7.7: one telemetry record from the follower (GUI thread, queued).
+
+        Only STORES it — the render happens on the existing 10 Hz timer, so a
+        slow paint can never back-pressure the ~25 Hz control loop that this
+        arrives from (already decimated to ~5 Hz by the executor).
+        """
+        live = getattr(self, "_live", None)
+        if live is None or not isinstance(rec, dict):
+            return
+        live["sample"] = rec
+        try:
+            dev = abs(float(rec.get("cross_um") or 0.0))
+        except (TypeError, ValueError):
+            return
+        live["dev_max_um"] = max(live.get("dev_max_um", 0.0), dev)
+        devs = live.setdefault("devs", [])
+        devs.append(dev)
+        if len(devs) > 4000:                 # bounded; a long print can't grow
+            del devs[:2000]
+
+    def _render_run_info(self, final: bool = False) -> None:
+        """Paint the live numbers. Called from the 10 Hz timer during a print."""
+        lbl = getattr(self, "_run_info_lbl", None)
+        if lbl is None:
+            return
+        live = getattr(self, "_live", None)
+        if live is None:
+            lbl.setText("Not printing.")
+            return
+        rec = live.get("sample") or {}
+        elapsed = time.monotonic() - float(live.get("t0") or 0.0)
+        element = 0.0
+        try:
+            element = float(self._resolution_um())
+        except Exception:
+            pass
+
+        # Progress + ETA, from the monitor's arc-length projection over the WHOLE
+        # planned path. Deliberately NOT from the record's s_mm/tot_mm: in a
+        # feed-plan run those are SECTION-local, so they would read ~100 % once
+        # per section.
+        frac = None
+        try:
+            frac = self._traj_view.progress_fraction()
+        except Exception:
+            frac = None
+
+        bits = []
+        if frac is not None:
+            eta = ""
+            if frac > 0.1 and elapsed > 1.0:
+                remain = elapsed * (1.0 - frac) / frac
+                eta = f" · {remain:.0f} s left"
+            bits.append(f"{frac * 100.0:5.1f}%  {elapsed:5.1f} s elapsed{eta}")
+        else:
+            bits.append(f"{elapsed:5.1f} s elapsed")
+
+        # Deviation against the operator's OWN resolution element — both numbers
+        # were in hand and were never compared.
+        devs = live.get("devs") or []
+        if devs:
+            ordered = sorted(devs)
+            p95 = ordered[min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))]
+            now = devs[-1]
+            verdict = "ok"
+            if element > 0:
+                verdict = ("ok" if p95 <= element else
+                           "OVER the element" if p95 <= 2 * element else
+                           "WELL OVER the element")
+            bits.append(f"deviation {now:5.1f} µm now · p95 {p95:5.1f} · "
+                        f"max {live.get('dev_max_um', 0.0):5.1f}"
+                        + (f"  (element {element:.0f} µm — {verdict})"
+                           if element > 0 else ""))
+
+        # Volume: what the pump has actually been commanded, vs the plan. The
+        # plan total uses the FULL path length (the record's tot_mm is the
+        # current section's length, not the print's).
+        dep = rec.get("deposited_uL")
+        if dep is not None:
+            planned = None
+            try:
+                _sp, flow, _pr = self._resolved_print_kinematics()
+                total_mm = getattr(self, "_last_path_len_mm", None)
+                if total_mm and _sp > 0:
+                    planned = flow / _sp * float(total_mm)
+            except Exception:
+                planned = None
+            line = f"dispensed {float(dep):7.4f} µL"
+            if planned:
+                line += f" of {planned:.4f} planned"
+            bits.append(line)
+
+        # Which section, and WHY it is slow there. In a feed plan the section
+        # count is stops + 1, but only when the plan actually reported stops —
+        # otherwise say nothing rather than "of 1".
+        sec = rec.get("sec")
+        if sec is not None:
+            n = None
+            stops = getattr(self, "_last_stops", None)
+            if isinstance(stops, int) and stops > 0:
+                n = stops + 1
+            line = f"section {int(sec) + 1}" + (f" of {n}" if n else "")
+            vm, vcmd = rec.get("v_meas_mm_s"), None
+            try:
+                vcmd = (float(rec.get("vx") or 0.0) ** 2
+                        + float(rec.get("vy") or 0.0) ** 2) ** 0.5 / 1000.0
+            except Exception:
+                vcmd = None
+            if vm is not None and vcmd:
+                line += f" · {float(vm):.2f} mm/s measured vs {vcmd:.2f} commanded"
+            bits.append(line)
+
+        if final:
+            bits.append("— print finished; see the Report zone.")
+        lbl.setText("\n".join(bits))
+
+    def _kick_abort_all_motion(self) -> None:
+        """v7.6: kill XY + Z + pump motion NOW, on a daemon thread so the GUI
+        never blocks (``abort_all_motion`` is bounded but touches serial).
+
+        Idempotent — ``PrintManager.abort()``'s own worker also calls it; a
+        second Prior ``I`` / ``VS 0,0`` / ``M410`` is harmless.
+        """
+        ctrl = self._controller
+        fn = getattr(ctrl, "abort_all_motion", None)
+        if not callable(fn):
+            return
+        def _work():
+            try:
+                fn("quick_print_abort")
+            except Exception as e:              # pragma: no cover
+                logger.warning("abort_all_motion failed: %s", e)
+        threading.Thread(target=_work, name="qp-abort-motion",
+                         daemon=True).start()
+
     def _on_abort(self):
+        # v7.6: whichever phase is live, stop physical motion immediately —
+        # the phase-specific flags below only stop the SOFTWARE from issuing
+        # more commands.
+        self._kick_abort_all_motion()
         # v7.5.x: a multi-ink run — set its sticky flag AND abort whichever
         # sub-step is live (the executor between/around prints, or the
         # PrintManager during one group's print).
@@ -3101,27 +4296,51 @@ class QuickPrintWorkflowPage(QWidget):
 
     def _on_progress(self, done: int, total: int, msg: str):
         # total <= 0 → a preamble sub-step (prep / pickup) with no count.
-        if total <= 0:
-            self._status.setText(msg)
+        # v7.7: PrintManager._report_progress ALREADY prefixes "[i/total] " to
+        # its own messages, so prefixing again produced "[14/57] [14/57] …".
+        # Only add the counter when the message doesn't already carry one.
+        text = msg if (total <= 0 or _PROGRESS_PREFIX_RE.match(msg)) \
+            else f"[{done}/{total}] {msg}"
+        # Remembered so a terminal state can report WHY it ended (the specific
+        # error / ZP-disconnect text arrives here and used to be overwritten by
+        # the generic "Error — see log.").
+        self._last_progress_msg = msg
+        self._status.setText(text)
+
+    def _terminal_status_text(self, st, cleanup_armed: bool) -> str:
+        """The operator-facing text for a finished print.
+
+        v7.7: an abort or error leaves real fluidic state behind — the needle
+        still holds ink/buffer because the cleanup routine is skipped, and a
+        pump move cut mid-stroke makes the dispensed volume indeterminate (a
+        fact ``PrintManager._abort_worker`` only wrote to the log file). Say so,
+        because the next run's volumes depend on it.
+        """
+        if st == PrintState.COMPLETED:
+            return "Done."
+        last = (self._last_progress_msg or "").strip()
+        # Strip any "[i/total] " counter so the reason reads cleanly.
+        last = _PROGRESS_PREFIX_RE.sub("", last)
+        if st == PrintState.ERROR:
+            head = f"Error: {last}" if last else "Error — see log."
         else:
-            self._status.setText(f"[{done}/{total}] {msg}")
+            head = "Aborted — needle retracted to safe Z."
+        notes = ["the dispensed volume is indeterminate (a pump move may have "
+                 "been cut mid-stroke) — re-check the syringe fill before the "
+                 "next run"]
+        if cleanup_armed:
+            notes.insert(0, "cleanup did NOT run, so the needle still holds "
+                            "ink/buffer")
+        return head + "  ⚠ " + "; ".join(notes) + "."
 
     def _on_state(self, st):
-        terminal = {
-            PrintState.COMPLETED: "Done.",
-            PrintState.ABORTED: "Aborted.",
-            PrintState.ERROR: "Error — see log.",
-        }
-        if st in terminal:
-            text = terminal[st]
+        if st in (PrintState.COMPLETED, PrintState.ABORTED, PrintState.ERROR):
             log_path = getattr(
                 getattr(self._pm, "exec_logger", None), "path", None)
-            if log_path is not None:
-                text += f"  Execution log: logs/prints/{log_path.name}"
+            self._last_log_path = log_path
             self._pm = None
             # Stop accumulating; keep the executed trace visible on the plan.
-            if hasattr(self, "_traj_view"):
-                self._traj_view.set_recording(False)
+            self._set_print_live(False)
             cleanup_ctx = self._post_print_ctx
             self._post_print_ctx = None
             if st == PrintState.COMPLETED and cleanup_ctx is not None:
@@ -3131,7 +4350,11 @@ class QuickPrintWorkflowPage(QWidget):
             else:
                 # Aborted / errored prints skip the cleanup (the print's own
                 # finally already left the needle at safe Z).
-                self._status.setText(text)
+                self._status.setText(self._terminal_status_text(
+                    st, cleanup_ctx is not None))
+            self._refresh_log_button()
+            # v7.7: a finished print goes somewhere instead of nowhere.
+            self._load_report(log_path)
         self._update_button_state()
 
     def _start_cleanup_worker(self, cleanup_ctx: dict) -> None:
@@ -3204,6 +4427,87 @@ class QuickPrintWorkflowPage(QWidget):
                 "Print done — needle cleaned (waste → wash → reset oil).")
         self._update_button_state()
 
+    def _on_pause(self):
+        """Toggle pause on the running print (v7.7 — previously unreachable)."""
+        pm = self._pm
+        if pm is None:
+            return
+        try:
+            if getattr(pm, "state", None) == PrintState.PAUSED:
+                pm.resume()
+                self._status.setText("Resumed.")
+            else:
+                pm.pause()
+                self._status.setText(
+                    "Pausing after the current command… (the needle stays put; "
+                    "use Abort to stop motion now)")
+        except Exception as e:
+            logger.exception("Quick Print pause/resume failed: %s", e)
+            self._status.setText(f"Pause failed: {e}")
+        self._update_button_state()
+
+    def _load_report(self, log_path) -> None:
+        """v7.7: build the Report zone from the run that just finished and show
+        it. The prediction is passed alongside so the report can put predicted
+        and measured side by side — the comparison that makes the simulator's
+        optimism visible instead of a private discovery.
+
+        Best-effort: a report that cannot be built must never disturb the
+        machine state a finished print left behind.
+        """
+        panel = getattr(self, "_report_panel", None)
+        if panel is None or log_path is None:
+            return
+        try:
+            predicted = {}
+            p95 = getattr(self, "_predicted_p95_um", None)
+            if p95 is not None:
+                predicted["p95_um"] = p95
+            ideal = self._ideal_path_mm()
+            ok = panel.load(log_path, ideal_pts=ideal, predicted=predicted,
+                            context={"object": self._object_label(),
+                                     "well": self._selected_well or ""})
+            if ok:
+                self.show_zone("report")
+        except Exception as exc:
+            logger.exception("could not build the print report: %s", exc)
+
+    def _ideal_path_mm(self) -> list | None:
+        """The printed toolpath in zero-ref mm — the same absolute frame the
+        executor logged, so the report can score against it."""
+        try:
+            segs = self._path_segments_for_selection()
+            cx, cy = self._well_center_zero_ref_mm(self._selected_well)
+        except Exception:
+            return None
+        pts = []
+        for seg in segs or []:
+            for (px, py) in seg:
+                pts.append((cx + float(px), cy + float(py)))
+        return pts if len(pts) >= 2 else None
+
+    def _object_label(self) -> str:
+        combo = getattr(self, "_object_combo", None)
+        try:
+            return combo.currentText() if combo is not None else ""
+        except Exception:
+            return ""
+
+    def _refresh_log_button(self):
+        if hasattr(self, "_log_btn"):
+            self._log_btn.setEnabled(self._last_log_path is not None)
+
+    def _on_open_log(self):
+        """Open the last run's execution log in the OS default handler."""
+        p = self._last_log_path
+        if p is None:
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(p))):
+            # No handler for .jsonl → reveal the containing folder instead.
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.parent)))
+
     def _update_button_state(self, *_):
         running = self._is_running()
         # v7.5.x: a pre-position move on the worker thread (or its pending
@@ -3221,9 +4525,29 @@ class QuickPrintWorkflowPage(QWidget):
         ready = (connected and self._selected_well is not None
                  and self._plate is not None
                  and bool(self._object_combo.currentData()))
+        # v7.7: the readiness model is the single source of truth when it has run.
+        # By construction its BLOCK states are exactly the four conditions above
+        # plus the one physically-impossible case (ink particles larger than the
+        # needle bore), so this cannot start refusing prints that used to be
+        # allowed — and a refusal can now SAY which precondition is missing.
+        readiness = getattr(self, "_readiness", None)
+        if readiness is not None:
+            ready = readiness.can_print()
+            blocking = readiness.blocking()
+            self._print_btn.setToolTip(
+                "Not ready — " + "; ".join(
+                    f"{c.label}: {c.detail}" for c in blocking)
+                if blocking else "Start the print.")
         self._print_btn.setEnabled(ready and not running and not positioning)
-        # Abort is live during a print AND during the preflight preamble (when
-        # there's an executor to interrupt); a plain preposition has nothing to
-        # abort, so gate the positioning case on an active executor.
-        self._abort_btn.setEnabled(
-            running or (positioning and self._active_executor is not None))
+        # v7.7: Abort is live during a print AND during ANY positioning phase.
+        # It used to be gated on `self._active_executor is not None`, which left
+        # it DEAD through a plain-print preposition — i.e. while the stage was
+        # physically travelling. `_on_abort` always calls abort_all_motion()
+        # first, which stops motion regardless of which phase we're in.
+        self._abort_btn.setEnabled(running or positioning)
+        paused = (self._pm is not None
+                  and getattr(self._pm, "state", None) == PrintState.PAUSED)
+        if hasattr(self, "_pause_btn"):
+            self._pause_btn.setEnabled(running or paused)
+            self._pause_btn.setText("Resume" if paused else "Pause")
+        self._refresh_log_button()

@@ -990,13 +990,55 @@ class MosaicWellMappingDialog(QDialog):
         self._update_banner()
         self._refresh_well_row()
 
-    def _auto_detect(self):
-        """Find ALL wells automatically (filled-disc detection + grid fit),
-        pre-place each at its detected centre — or the grid prediction for any
-        well that wasn't directly detected — then enter the per-well refine
-        queue. Leaves the guided corner workflow intact if detection can't
-        lock the grid."""
+    def _grid_pitch_mm(self) -> tuple[float, float]:
+        """(pitch_x, pitch_y) mm between adjacent wells.
+
+        Prefers the plate's own spacing; a custom ``from_wells`` plate that
+        carries none falls back to the median spacing of the nominal positions
+        so the detector still gets a real number.
+        """
+        px = float(getattr(self._plate, "well_spacing_x", 0.0) or 0.0)
+        py = float(getattr(self._plate, "well_spacing_y", 0.0) or 0.0)
+        if px > 0 and py > 0:
+            return px, py
         import numpy as np
+        xs = sorted({round(p[0], 3) for p in self._nominal_pos.values()})
+        ys = sorted({round(p[1], 3) for p in self._nominal_pos.values()})
+        dx = float(np.median(np.diff(xs))) if len(xs) > 1 else 0.0
+        dy = float(np.median(np.diff(ys))) if len(ys) > 1 else 0.0
+        return (px or dx or dy), (py or dy or dx)
+
+    def _well_appearance(self):
+        """Per-plate-type well-detection profile for the active plate.
+
+        The mapping key IS the plate type id (``active_plate_key``), so a
+        product that has been characterised carries its own profile; anything
+        else gets the auto-sensing default.
+        """
+        from SupportClasses.PlateWellDetector import WellAppearance
+        try:
+            from SupportClasses.PlateTypeStore import get_store
+            pt = get_store().get(str(self._plate_key))
+            if pt is not None:
+                return WellAppearance.for_plate_type(pt)
+        except Exception as e:
+            logger.debug(f"Plate-type appearance lookup skipped: {e}")
+        return WellAppearance()
+
+    def _auto_detect(self):
+        """Find ALL wells automatically and pre-place each one, then enter the
+        per-well refine queue.
+
+        v7.5.x: driven by ``SupportClasses.PlateWellDetector`` — a matched
+        filter at the well radius the plate definition already tells us, a
+        rows x cols lattice fit, and a per-well radial edge measurement. The
+        previous implementation called ``WellDetector.detect_filled_wells``
+        alone, which finds nothing at all on a clear plastic plate (the well is
+        a hole, not a bright blob) and so this button always reported "couldn't
+        find the grid" on exactly the plate the operator was scanning.
+
+        Leaves the guided 3-corner workflow armed whenever detection refuses.
+        """
         if self._rosette:
             return
         rows = int(getattr(self._plate, "rows", 0) or 0)
@@ -1004,21 +1046,30 @@ class MosaicWellMappingDialog(QDialog):
         if rows < 1 or cols < 1:
             self._status.setText("Plate grid unknown — use the 3-corner method.")
             return
+        d_mm = self._main_well_diameter_mm()
+        pitch_x, pitch_y = self._grid_pitch_mm()
+        if d_mm <= 0 or pitch_x <= 0:
+            self._status.setText(
+                "This plate has no well diameter/spacing — use the 3-corner "
+                "method.")
+            return
         try:
-            from SupportClasses.VisionDetector import WellDetector
-            dets = WellDetector.detect_filled_wells(self._image)
-            centers = [(d.center_px[0], d.center_px[1], d.radius_px)
-                       for d in dets]
-            aff, assign = WellDetector.fit_well_grid(
-                [(c[0], c[1]) for c in centers], rows, cols)
+            from SupportClasses.PlateWellDetector import detect_plate_wells
+            res = detect_plate_wells(
+                self._image, rows=rows, cols=cols, px_per_um=self._scale,
+                diameter_um=d_mm * 1000.0, pitch_x_um=pitch_x * 1000.0,
+                pitch_y_um=pitch_y * 1000.0,
+                appearance=self._well_appearance())
         except Exception as e:
+            logger.exception("Well auto-detect failed")
             self._status.setText(f"Auto-detect failed: {e}")
             return
-        if not assign or aff is None:
+        if not res.ok:
             self._status.setText(
-                "Auto-detect couldn't find the grid — click the 3 corner wells "
-                "instead.")
+                f"Auto-detect: {res.refuse_reason} Click the 3 corner wells "
+                f"instead.")
             return
+
         self._clear_all_markers()
         self._corner_clicks = {}
         grid_names = {}
@@ -1032,27 +1083,32 @@ class MosaicWellMappingDialog(QDialog):
                 grid_names[(w.row, w.col)] = w.name
         except Exception:
             pass
-        A, t = aff[:, :2], aff[:, 2]
-        n_det = 0
-        for i in range(rows):
-            for j in range(cols):
-                name = grid_names.get((i, j)) or f"{chr(ord('A') + i)}{j + 1}"
-                if (i, j) in assign:
-                    cx, cy, _r = centers[assign[(i, j)]]
-                    n_det += 1
-                else:
-                    p = A @ np.array([j, i]) + t
-                    cx, cy = float(p[0]), float(p[1])
-                self._place_marker(name, cx, cy, state="placed")
+        for w in res.wells:
+            name = (grid_names.get((w.row, w.col))
+                    or f"{chr(ord('A') + w.row)}{w.col + 1}")
+            # Draw each well at its MEASURED size, so the operator can see
+            # what was measured rather than a nominal ring drawn over it.
+            self._place_marker(name, w.center_px[0], w.center_px[1],
+                               r=w.radius_px, state="placed")
         self._phase = _Phase.REFINE
         self._queue = [n for n in self._map_names if n in self._well_items]
         self._qidx = 0
         self._btn_confirm.setEnabled(True)
-        n_fill = len(self._well_items) - n_det
+        n_fill = len(res.wells) - res.n_measured
         self._status.setText(
-            f"Auto-detected {n_det} wells"
-            + (f" (+{n_fill} filled from grid)" if n_fill else "")
-            + " — confirm/drag each, or Confirm all now.")
+            f"Auto-detected {res.n_measured} wells"
+            + (f" (+{n_fill} placed from the plate grid)" if n_fill else "")
+            + f" — Ø {res.measured_diameter_um / 1000.0:.2f} mm, rotation "
+              f"{res.rotation_deg:+.2f}°. Confirm/drag each, or Confirm all now."
+        )
+        for msg in res.warnings:
+            logger.warning(f"Well auto-detect: {msg}")
+        logger.info(
+            f"Well auto-detect: {res.summary()} | polarity={res.polarity} "
+            f"candidates={res.n_candidates} lattice_inliers="
+            f"{res.n_lattice_inliers} pitch="
+            f"{res.measured_pitch_x_um / 1000.0:.3f}x"
+            f"{res.measured_pitch_y_um / 1000.0:.3f}mm")
         self._update_banner()
         self._refresh_well_row()
 

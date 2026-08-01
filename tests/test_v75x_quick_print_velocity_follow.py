@@ -284,11 +284,23 @@ class TestQuickPrintEnablesVelocity(unittest.TestCase):
         self.assertTrue(s.confirm_each_segment)
         self.assertFalse(s.velocity_follow)
 
-    def test_open_loop_is_default(self):
-        # no selector present → default open_loop → neither flag set
-        s = self._page(None)._build_settings()
-        self.assertFalse(s.velocity_follow)
+    def test_closed_loop_velocity_is_the_default(self):
+        """v7.7: closed-loop velocity is the default motion mode.
+
+        Open-loop reads NO stage position during the path, so it has no
+        prediction, no live deviation and no deviation in the post-print report —
+        every information surface v7.7 added is inert in it.
+        """
+        s = self._page(None)._build_settings()     # no selector → the default
+        self.assertTrue(s.velocity_follow)
         self.assertFalse(s.confirm_each_segment)
+        self.assertFalse(s.velocity_open_loop)
+        self.assertTrue(s.feed_plan_enabled)
+
+    def test_open_loop_is_still_selectable(self):
+        s = self._page("open_loop")._build_settings()
+        self.assertTrue(s.velocity_open_loop)
+        self.assertFalse(s.velocity_follow)
 
     def test_defaults_are_false(self):
         s = PrintSettings()

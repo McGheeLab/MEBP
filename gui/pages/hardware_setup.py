@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QScrollArea, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QFormLayout, QDialogButtonBox,
     QCheckBox, QAbstractItemView, QListWidget, QListWidgetItem,
-    QSlider,
+    QSlider, QInputDialog,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QStandardItem
@@ -59,10 +59,18 @@ from SupportClasses.HardwareConfig import (
     MAX_LIVE_CAMERAS,
 )
 from SupportClasses.PhysicalModels import (
-    NeedleSpec, SyringeSpec, InkSpec, PrintingMode, RosetteInsert, CameraSpec,
+    NeedleSpec, NeedleBore, SyringeSpec, InkSpec, PrintingMode, RosetteInsert,
+    CameraSpec,
     load_needle_catalog, load_syringe_catalog, load_camera_catalog,
     WellRole, ROLE_COLORS, well_role_for_ink_type, ink_type_border_color,
     WELL_TYPES, INK_SUBTYPES, is_service_reagent,
+    NEEDLE_TYPE_HYPODERMIC, NEEDLE_TYPE_CAPILLARY,
+    TIP_PROFILE_CYLINDER, TIP_PROFILE_CONE,
+    NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK, NEEDLE_FORM_TRIPLE,
+    NEEDLE_FORM_BORE_COUNT,
+)
+from SupportClasses.NeedleTypeStore import (
+    NeedleType, get_store as get_needle_type_store, safe_id as safe_needle_type_id,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS, WellPlate
 from gui.styles import COLORS, SECTION_TITLE_STYLE
@@ -84,12 +92,16 @@ NIKON_TI2U_OBJECTIVES = [1.0, 2.0, 4.0, 10.0, 20.0]
 # stage axes (CameraManager.get/set_rotation_deg, measured by the
 # stage-motion PixelCalibrationDialog). The NOMINAL mount depends on the
 # role: the microscope views along Z, so its rotation is in the stage XY
-# plane (axis-aligned nominal); the needle side cameras are mounted at
-# ~45° to the stage X/Y axes; the monitor overview camera rests on the
-# stage (axis-aligned nominal). The nominal/Δ shown on the slot cards is
-# a sanity hint ONLY — motion always uses the calibrated θ itself.
+# plane (axis-aligned nominal); the needle side cameras are mounted
+# symmetric about the stage +X axis at +45° and −45° (which cam is which
+# comes from the measured column_dir_deg, not the role); the monitor
+# overview camera rests on the stage (axis-aligned nominal). The nominal/Δ
+# shown on the slot cards is a sanity hint ONLY — motion always uses the
+# measured angle itself. For needle cams the Δ is computed against the
+# MOUNT direction (column_dir_deg); their display rotation_deg is the
+# small sensor roll, nominal 0°.
 _AXIS_ALIGNED_NOMINALS = (0.0, 90.0, 180.0, -90.0)
-_DIAGONAL_NOMINALS = (45.0, 135.0, -45.0, -135.0)
+_DIAGONAL_NOMINALS = (45.0, -45.0, 135.0, -135.0)
 
 
 def role_nominal_rotations(role) -> tuple[float, ...]:
@@ -121,7 +133,8 @@ def role_rotation_hint(role) -> str:
     if role == CameraRole.MICROSCOPE:
         return "views along Z — rotation is in the stage XY plane (nominal 0°)"
     if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
-        return "side view, mounted ~45° to the stage X/Y axes (nominal ±45°)"
+        return ("side view, symmetric about stage +X at ±45° "
+                "(nominal mount ±45°, roll ≈ 0°)")
     if role == CameraRole.MONITOR:
         return "overview camera on the stage (nominal axis-aligned)"
     return "rotation vs the stage X/Y axes"
@@ -552,6 +565,72 @@ class PumpChannelWidget(QGroupBox):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Pulled-capillary geometry spin definitions (v7.9)
+# ═══════════════════════════════════════════════════════════════════
+# ONE table of (min, max, step, decimals, suffix, default, tooltip) shared by
+# the single-needle capillary card AND every per-bore row, so a backpack's
+# second bore can never end up with a different range, default or tooltip than
+# the first. Ranges are deliberately WIDER than the common band (10–100 µm tips,
+# 1–10 mm pulls, 100 mm blanks): a spin range that clips a legitimate outlier
+# corrupts the value silently, whereas ``validate()`` can warn.
+_CAP_SPIN_SPECS = {
+    "barrel_id": (50.0, 3000.0, 10.0, 1, " µm", 1000.0,
+                  "Bore of the glass blank before the pull."),
+    "barrel_od": (100.0, 4000.0, 10.0, 1, " µm", 1500.0,
+                  "Outside of the glass blank — drives the drawn needle width."),
+    "barrel_len": (1.0, 200.0, 1.0, 1, " mm", 100.0,
+                   "Bulk section only — the total needle length is barrel + tip."),
+    "tip_id": (0.5, 500.0, 1.0, 1, " µm", 30.0,
+               "The orifice. Sets the deposited feature size and dominates the "
+               "flow resistance (flow scales with diameter to the 4th power)."),
+    "tip_od": (0.0, 1000.0, 1.0, 1, " µm", 0.0,
+               "Leave at 0 if unknown — the drawn needle and clearance views then "
+               "fall back to the barrel's OD/ID ratio applied to the tip Ø."),
+    "tip_len": (0.1, 50.0, 0.1, 2, " mm", 5.0,
+                "Length of the pulled section."),
+}
+
+# Tip-profile combo entries, shared for the same anti-divergence reason.
+_TIP_PROFILE_ITEMS = (
+    ("Straight cylinder", TIP_PROFILE_CYLINDER),
+    ("Tapered cone", TIP_PROFILE_CONE),
+)
+_TIP_PROFILE_TOOLTIP = (
+    "Straight cylinder: the tip is a uniform tube of the tip Ø over its "
+    "length. Conservative (it over-estimates resistance vs a real "
+    "taper, so the flow ceiling errs low — the safe direction for glass).\n"
+    "Tapered cone: the tip narrows linearly from the barrel Ø to the tip "
+    "Ø, using the exact conical Poiseuille resistance."
+)
+
+
+def _make_cap_spin(key: str, on_change=None) -> QDoubleSpinBox:
+    """A capillary geometry spin box built from :data:`_CAP_SPIN_SPECS`."""
+    lo, hi, step, decimals, suffix, value, tip = _CAP_SPIN_SPECS[key]
+    sb = QDoubleSpinBox()
+    sb.setRange(lo, hi)
+    sb.setSingleStep(step)
+    sb.setDecimals(decimals)
+    sb.setSuffix(suffix)
+    sb.setValue(value)
+    sb.setToolTip(tip)
+    if on_change is not None:
+        sb.valueChanged.connect(on_change)
+    return sb
+
+
+def _make_tip_profile_combo(on_change=None) -> QComboBox:
+    """The tip-profile picker, identical everywhere it appears."""
+    combo = QComboBox()
+    for text, data in _TIP_PROFILE_ITEMS:
+        combo.addItem(text, data)
+    combo.setToolTip(_TIP_PROFILE_TOOLTIP)
+    if on_change is not None:
+        combo.currentIndexChanged.connect(on_change)
+    return combo
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Hardware Setup Page (v7.2.4)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -609,6 +688,19 @@ class HardwareSetupPage(ModePage):
 
         # v7.2.4: Channel mapping widgets (dynamic)
         self._channel_map_widgets: list[tuple[QLabel, QComboBox]] = []
+
+        # v7.9: per-bore geometry rows (one dict of widgets per bore) and the
+        # geometry of bores hidden by a form SHRINK. The cache is what makes
+        # Triple → Single → Triple non-destructive: the operator's bore 2/3
+        # geometry is held here rather than reconstructed from defaults.
+        self._bore_rows: list[dict] = []
+        self._bore_cache: dict[int, dict] = {}
+        # MEASURED mount offsets, remembered per bore index for the session and
+        # deliberately kept OUT of `_bore_cache`: they are owned by the Needle
+        # Location calibration, not by this page, so neither a geometry edit nor a
+        # form round-trip may drop them. Cleared on a config LOAD — the incoming
+        # setup's offsets (including their absence) are authoritative.
+        self._bore_offsets: dict[int, tuple[tuple[float, float], float]] = {}
 
         self._setup_ui()
 
@@ -683,6 +775,27 @@ class HardwareSetupPage(ModePage):
             f"QScrollArea {{ background-color: {_bg}; border: none; }}")
         stage_scroll.setWidget(self._stage_panel)
         self._sub_scrolls["stage"] = stage_scroll
+
+        # v7.5.x: dedicated Microscope sub-page — filter cubes, objectives and
+        # focus preferences for the motorized body. Hosts the SAME
+        # MicroscopeSetupPanel the jog card's ⚙ dialog wraps, so there is only
+        # one microscope setup surface.
+        from gui.pages.hardware.microscope_setup_panel import (
+            MicroscopeSetupPanel)
+        self._microscope_panel = MicroscopeSetupPanel()
+        micro_holder = QWidget()
+        micro_holder.setStyleSheet(f"background-color: {_bg};")
+        micro_lay = QVBoxLayout(micro_holder)
+        micro_lay.setSpacing(s(18))
+        micro_lay.setContentsMargins(s(20), s(20), s(20), s(20))
+        micro_lay.addWidget(self._microscope_panel)
+        micro_scroll = QScrollArea()
+        micro_scroll.setWidgetResizable(True)
+        micro_scroll.setFrameShape(QFrame.NoFrame)
+        micro_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {_bg}; border: none; }}")
+        micro_scroll.setWidget(micro_holder)
+        self._sub_scrolls["microscope"] = micro_scroll
 
         # v7.4.2: dedicated Xbox controller sub-page.
         from gui.pages.hardware.xbox_panel import XboxHardwarePanel
@@ -965,44 +1078,122 @@ class HardwareSetupPage(ModePage):
         needle_lay.setHorizontalSpacing(s(12))
         needle_lay.setVerticalSpacing(s(10))
 
-        needle_lay.addWidget(QLabel("Gauge:"), 0, 0)
+        # v7.9: the assembly FORM — how many needles are bound together. This is
+        # ORTHOGONAL to the needle TYPE below (one bore's taper): a backpack of
+        # two pulled capillaries needs both axes, which is exactly why the form
+        # must never be smuggled into `needle_type` (NeedleSpec.__post_init__
+        # silently rewrites an unknown needle_type to "hypodermic", so the whole
+        # assembly would vanish with no error).
+        needle_lay.addWidget(QLabel("Assembly form:"), 0, 0)
+        self._needle_form_combo = QComboBox()
+        self._needle_form_combo.addItem("Single needle (1 bore)", NEEDLE_FORM_SINGLE)
+        self._needle_form_combo.addItem("Backpack (2 bores)", NEEDLE_FORM_BACKPACK)
+        self._needle_form_combo.addItem("Triple (3 bores)", NEEDLE_FORM_TRIPLE)
+        self._needle_form_combo.setToolTip(
+            "How many needles are bound together in the mounted assembly.\n"
+            "Single: one bore — identical to every pre-v7.9 setup.\n"
+            "Backpack: two needles of DIFFERENT sizes bound together.\n"
+            "Triple: three needles fused together.\n"
+            "Each bore gets its own geometry, its own pump and its own flow "
+            "ceiling below. The form is independent of the needle TYPE (taper) — "
+            "a backpack of two pulled capillaries is a legitimate build.")
+        self._needle_form_combo.currentIndexChanged.connect(self._on_needle_form_changed)
+        needle_lay.addWidget(self._needle_form_combo, 0, 1, 1, 3)
+
+        # v7.6: needle TYPE picks which geometry block is shown below.
+        needle_lay.addWidget(QLabel("Needle type:"), 1, 0)
+        self._needle_type_combo = QComboBox()
+        self._needle_type_combo.addItem("Hypodermic (gauge)", NEEDLE_TYPE_HYPODERMIC)
+        self._needle_type_combo.addItem("Pulled glass capillary", NEEDLE_TYPE_CAPILLARY)
+        self._needle_type_combo.setToolTip(
+            "Hypodermic: one straight bore, geometry from the ASTM gauge catalog.\n"
+            "Pulled glass capillary: TWO flow stages — a wide barrel feeding a "
+            "narrow pulled tip. The tip sets the deposited feature size and "
+            "dominates the flow resistance; the barrel sets the held volume.")
+        self._needle_type_combo.currentIndexChanged.connect(self._on_needle_type_changed)
+        needle_lay.addWidget(self._needle_type_combo, 1, 1, 1, 3)
+
+        # v7.9: on a multi-bore assembly this block edits BORE 1 — the datum bore
+        # whose geometry every legacy reader of `needle.id_um` /
+        # `cross_section_area_mm2` sees (NeedleSpec mirrors bores[0] onto its flat
+        # fields). Bores 2..N are edited in the per-bore group below, so there is
+        # exactly ONE editor per bore and nothing to keep in sync.
+        self._needle_datum_note = QLabel(
+            "This block configures <b>Bore 1</b> (the calibrated datum bore).")
+        self._needle_datum_note.setWordWrap(True)
+        self._needle_datum_note.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
+        self._needle_datum_note.setVisible(False)
+        needle_lay.addWidget(self._needle_datum_note, 2, 0, 1, 4)
+
+        # ── Hypodermic row (the legacy widgets, unchanged) ──
+        self._hypo_row = QWidget()
+        hypo_lay = QHBoxLayout(self._hypo_row)
+        hypo_lay.setContentsMargins(0, 0, 0, 0)
+        hypo_lay.setSpacing(s(12))
+        hypo_lay.addWidget(QLabel("Gauge:"))
         self.gauge_combo = QComboBox()
         self.gauge_combo.addItem("— Select —", None)
         for gauge in sorted(self._needle_catalog.keys()):
             self.gauge_combo.addItem(f"{gauge}G", gauge)
         self.gauge_combo.currentIndexChanged.connect(self._on_needle_changed)
-        needle_lay.addWidget(self.gauge_combo, 0, 1)
-
-        needle_lay.addWidget(QLabel("Length:"), 0, 2)
+        hypo_lay.addWidget(self.gauge_combo)
+        hypo_lay.addSpacing(s(12))
+        hypo_lay.addWidget(QLabel("Length:"))
         self.length_combo = QComboBox()
         self.length_combo.addItem("1.0\"", 1.0)
         self.length_combo.addItem("1.5\"", 1.5)
         self.length_combo.addItem("2.0\"", 2.0)
         self.length_combo.currentIndexChanged.connect(self._on_config_changed)
-        needle_lay.addWidget(self.length_combo, 0, 3)
+        hypo_lay.addWidget(self.length_combo)
+        hypo_lay.addStretch(1)
+        needle_lay.addWidget(self._hypo_row, 3, 0, 1, 4)
 
-        needle_lay.addWidget(QLabel("Channels:"), 1, 0)
+        # ── Pulled glass capillary card ──
+        self._cap_row = self._build_capillary_card()
+        needle_lay.addWidget(self._cap_row, 4, 0, 1, 4)
+
+        # v7.9: the bore COUNT is derived from the assembly form — one number,
+        # one control. `channels_spin` is kept alive (hidden) as a mirror because
+        # `_rebuild_config`, `_rebuild_channel_map_rows` and
+        # `_update_channel_map_status` all read it and tests assert on it; the
+        # form combo is the only thing that writes it. Two independently editable
+        # controls for the same quantity is exactly how a count/geometry mismatch
+        # gets shipped.
         self.channels_spin = QSpinBox()
         self.channels_spin.setRange(1, 3)
         self.channels_spin.setValue(1)
+        self.channels_spin.setToolTip(
+            "Bores in the assembly — derived from the assembly form above.")
         self.channels_spin.valueChanged.connect(self._on_channels_changed)
-        needle_lay.addWidget(self.channels_spin, 1, 1)
+        self.channels_spin.setVisible(False)
+        needle_lay.addWidget(self.channels_spin, 5, 0)
 
         self.needle_info_label = QLabel("Select a needle gauge above")
+        self.needle_info_label.setWordWrap(True)
         self.needle_info_label.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
-        needle_lay.addWidget(self.needle_info_label, 2, 0, 1, 4)
+        needle_lay.addWidget(self.needle_info_label, 6, 0, 1, 4)
 
         self._sub_layouts["needle"].addWidget(needle_group)
 
-        # ── Section 6: Needle Channel → Pump Mapping (v7.2.4: NEW) ─
-        self.channel_map_group = QGroupBox("Needle Channel Assignment")
+        # ── Section 5b: per-bore geometry (v7.9) ──────────────────
+        # Hidden entirely for a single needle, so the Single form is visually
+        # and behaviourally identical to every pre-v7.9 setup.
+        self._sub_layouts["needle"].addWidget(self._build_bore_group())
+
+        # ── Section 6: Needle Bore → Pump Mapping (v7.2.4: NEW) ────
+        # v7.9: display strings say BORE — the widget/attribute names stay as
+        # they are (referenced across the page and asserted in tests), but the
+        # operator must not read "channel" here while `validate()` reports
+        # "Bore 2 → P3" about the very same row.
+        self.channel_map_group = QGroupBox("Needle Bore Assignment")
         self.channel_map_group.setStyleSheet(self._group_style())
         self._channel_map_layout = QVBoxLayout(self.channel_map_group)
 
         # Info label
         self.channel_map_info = QLabel(
-            "Each needle channel must be assigned to a unique enabled pump.")
+            "Each needle bore must be assigned to a unique enabled pump.")
         self.channel_map_info.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         self.channel_map_info.setWordWrap(True)
@@ -1025,6 +1216,12 @@ class HardwareSetupPage(ModePage):
 
         # Build initial channel rows
         self._rebuild_channel_map_rows()
+
+        # v7.6: apply the needle-type visibility now that BOTH the needle group
+        # and the bore-map rows exist (it rebuilds those rows, so it has to run
+        # after `_channel_rows_layout` is built). Visibility only — the full
+        # handler rebuilds the config, which needs widgets built later.
+        self._apply_needle_type_visibility()
 
         # ── Section 7a: Rosette Designer (v7.4.8) ─────────────────
         # Primary content of the Rosette sub-page: the plate layout with
@@ -1242,8 +1439,8 @@ class HardwareSetupPage(ModePage):
             role_combo = QComboBox()
             role_combo.addItem("Unassigned", CameraRole.UNASSIGNED)
             role_combo.addItem("Microscope", CameraRole.MICROSCOPE)
-            role_combo.addItem("Needle X-view", CameraRole.NEEDLE_X)
-            role_combo.addItem("Needle Y-view", CameraRole.NEEDLE_Y)
+            role_combo.addItem("Needle cam 1 (side)", CameraRole.NEEDLE_X)
+            role_combo.addItem("Needle cam 2 (side)", CameraRole.NEEDLE_Y)
             role_combo.addItem("Monitor (overview)", CameraRole.MONITOR)
             role_combo.setToolTip(
                 "Workflow role for this camera slot. All non-Unassigned "
@@ -1346,8 +1543,10 @@ class HardwareSetupPage(ModePage):
             rot_spin.setDecimals(1)
             rot_spin.setEnabled(False)
             rot_spin.setToolTip(
-                "Custom in-plane rotation applied to the live view, the mosaic, "
-                "and the click→stage mapping.")
+                "Custom DISPLAY rotation applied to the live view, the mosaic, "
+                "and the click→stage mapping. For the needle side cams this is "
+                "the small sensor roll — their ±45° mount direction is a "
+                "separate, measured value that never tilts the view.")
             rot_spin.valueChanged.connect(
                 lambda v, cam_i=i: self._on_slot_rotation_spin(cam_i, v))
             self._live_cam_rot_spins.append(rot_spin)
@@ -1483,9 +1682,11 @@ class HardwareSetupPage(ModePage):
         live_cam_lay.setSpacing(s(10))
 
         needle_intro = QLabel(
-            "Two side cameras look down the X and Y axes. Assign each a "
-            "camera in the section above; then run an independent stage-"
-            "motion µm/px calibration for each."
+            "Two interchangeable side cameras sit symmetric about the stage "
+            "+X axis at +45° and −45°. Assign each a camera in the section "
+            "above; then run an independent stage-motion µm/px calibration "
+            "for each — the calibration measures which camera looks along "
+            "which direction (and its small view roll)."
         )
         needle_intro.setWordWrap(True)
         needle_intro.setStyleSheet(
@@ -1501,8 +1702,8 @@ class HardwareSetupPage(ModePage):
         needle_row.setSpacing(s(12))
         self._needle_cards: dict[CameraRole, dict[str, QWidget]] = {}
         for role, title, axis_color in (
-            (CameraRole.NEEDLE_X, "Needle X-view", COLORS.get("peach", "#fab387")),
-            (CameraRole.NEEDLE_Y, "Needle Y-view", COLORS.get("sky", "#89dceb")),
+            (CameraRole.NEEDLE_X, "Needle cam 1", COLORS.get("peach", "#fab387")),
+            (CameraRole.NEEDLE_Y, "Needle cam 2", COLORS.get("sky", "#89dceb")),
         ):
             card = QFrame()
             card.setObjectName("camMiniCard")
@@ -1586,6 +1787,10 @@ class HardwareSetupPage(ModePage):
             lambda: self._config,
             parent=self,
             controller_getter=lambda: getattr(self, "_controller", None),
+            # v7.5.x: for the shared ``mosaic_scan`` section — the confirm step
+            # seeds and persists the tile overlap there (it belongs to the scan,
+            # not to one objective).
+            settings_getter=lambda: getattr(self, "_settings", None),
         )
         self._objective_cal_card.calibration_changed.connect(
             self._on_config_changed
@@ -1652,7 +1857,9 @@ class HardwareSetupPage(ModePage):
         self.add_sub_page("settings",  "Device",          self._sub_scrolls["stage"])
         self.add_sub_page("file-text", "Identity",        self._sub_scrolls["identity"])
         self._plate_sub_index = len(self._sub_pages)
-        self.add_sub_page("microscope","Plate",           self._sub_scrolls["plate"])
+        # v7.5.x: the plate is a GRID of wells; the microscope icon now names
+        # the actual microscope sub-page below.
+        self.add_sub_page("grid",      "Plate",           self._sub_scrolls["plate"])
         # v7.5.x: order the dependent setups left-to-right so each
         # section's options build on the ones to its left:
         # Rosette → Ink → Needle → Pump.
@@ -1662,6 +1869,7 @@ class HardwareSetupPage(ModePage):
         self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
         self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
         self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
+        self.add_sub_page("microscope","Microscope",      self._sub_scrolls["microscope"])
         self.add_sub_page("gamepad",   "Xbox Controller", self._sub_scrolls["xbox"])
 
         # v7.4.8: sync the rosette designer to the plate layout when the
@@ -1750,9 +1958,9 @@ class HardwareSetupPage(ModePage):
         if role == CameraRole.MICROSCOPE:
             return ("Microscope", "info")
         if role == CameraRole.NEEDLE_X:
-            return ("Needle X", "warn")
+            return ("Needle 1", "warn")
         if role == CameraRole.NEEDLE_Y:
-            return ("Needle Y", "warn")
+            return ("Needle 2", "warn")
         if role == CameraRole.MONITOR:
             return ("Monitor", "info")
         return ("Unassigned", "pending")
@@ -1779,19 +1987,45 @@ class HardwareSetupPage(ModePage):
     # ════════════════════════════════════════════════════════════════
 
     def _on_needle_changed(self):
-        gauge = self.gauge_combo.currentData()
-        if gauge and gauge in self._needle_catalog:
-            spec = self._needle_catalog[gauge]
+        if self._needle_type_combo.currentData() == NEEDLE_TYPE_CAPILLARY:
+            g = self._capillary_geometry()
+            b_vol = math.pi * (g["barrel_id_um"] / 2000.0) ** 2 * g["barrel_length_mm"]
+            if g["tip_profile"] == TIP_PROFILE_CONE:
+                d1, d2 = g["barrel_id_um"] / 1000.0, g["tip_id_um"] / 1000.0
+                t_vol = (math.pi * g["tip_length_mm"] / 12.0) * (
+                    d1 * d1 + d1 * d2 + d2 * d2)
+            else:
+                t_vol = math.pi * (g["tip_id_um"] / 2000.0) ** 2 * g["tip_length_mm"]
+            tip_od_txt = (f" / OD {g['tip_od_um']:.0f} µm"
+                          if g["tip_od_um"] else "")
             self.needle_info_label.setText(
-                f"ID: {spec.id_um} µm | OD: {spec.od_um} µm | "
-                f"Wall: {spec.wall_um} µm")
+                f"Barrel: ID {g['barrel_id_um']:.0f} µm / OD {g['barrel_od_um']:.0f} µm "
+                f"× {g['barrel_length_mm']:.1f} mm  ({b_vol:.3f} µL)\n"
+                f"Pulled tip: ID {g['tip_id_um']:.1f} µm{tip_od_txt} × "
+                f"{g['tip_length_mm']:.2f} mm  ({t_vol:.4f} µL)   ·   "
+                f"total held volume {b_vol + t_vol:.3f} µL")
+            self._sync_needle_preset_combo()
         else:
-            self.needle_info_label.setText("Select a needle gauge above")
+            gauge = self.gauge_combo.currentData()
+            if gauge and gauge in self._needle_catalog:
+                spec = self._needle_catalog[gauge]
+                self.needle_info_label.setText(
+                    f"ID: {spec.id_um} µm | OD: {spec.od_um} µm | "
+                    f"Wall: {spec.wall_um} µm")
+            else:
+                self.needle_info_label.setText("Select a needle gauge above")
         self._on_config_changed()
 
     def _on_channels_changed(self, value: int):
-        """v7.2.4 S3.9: Rebuild channel mapping rows when channel count changes."""
+        """v7.2.4 S3.9: Rebuild channel mapping rows when channel count changes.
+
+        v7.9: ``channels_spin`` is a hidden mirror of the assembly-form combo, so
+        this normally fires only if something writes the spin directly. Rebuild
+        the per-bore rows too so the count and the geometry can never diverge
+        even on that path.
+        """
         self._rebuild_channel_map_rows()
+        self._rebuild_bore_rows()
         self._on_config_changed()
 
     # ════════════════════════════════════════════════════════════════
@@ -1821,6 +2055,919 @@ class HardwareSetupPage(ModePage):
             name for name, ink in self._config.ink_library.items()
             if not is_service_reagent(name, getattr(ink, "ink_type", ""))
         ]
+
+    # ── v7.6: pulled glass capillary needle ───────────────────────────
+
+    def _build_capillary_card(self) -> QWidget:
+        """The two-stage geometry editor shown for a pulled glass capillary.
+
+        v7.9: the spin ranges/defaults/tooltips come from the module-level
+        ``_CAP_SPIN_SPECS`` table so this card and every per-bore row are
+        guaranteed identical (see that table's comment for why the ranges are
+        deliberately wider than the common band).
+        """
+        card = QWidget()
+        lay = QGridLayout(card)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setHorizontalSpacing(s(12))
+        lay.setVerticalSpacing(s(8))
+
+        def _spin(key):
+            return _make_cap_spin(key, self._on_needle_changed)
+
+        def _sub(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {COLORS.get('mauve', '#cba6f7')}; font-weight: 600;")
+            return lbl
+
+        # Barrel (bulk section)
+        lay.addWidget(_sub("Barrel (bulk)"), 0, 0, 1, 6)
+        lay.addWidget(QLabel("Inner Ø:"), 1, 0)
+        self._cap_barrel_id_spin = _spin("barrel_id")
+        lay.addWidget(self._cap_barrel_id_spin, 1, 1)
+        lay.addWidget(QLabel("Outer Ø:"), 1, 2)
+        self._cap_barrel_od_spin = _spin("barrel_od")
+        lay.addWidget(self._cap_barrel_od_spin, 1, 3)
+        lay.addWidget(QLabel("Length:"), 1, 4)
+        self._cap_barrel_len_spin = _spin("barrel_len")
+        lay.addWidget(self._cap_barrel_len_spin, 1, 5)
+
+        # Pulled tip
+        lay.addWidget(_sub("Pulled tip"), 2, 0, 1, 6)
+        lay.addWidget(QLabel("Inner Ø:"), 3, 0)
+        self._cap_tip_id_spin = _spin("tip_id")
+        lay.addWidget(self._cap_tip_id_spin, 3, 1)
+        lay.addWidget(QLabel("Outer Ø:"), 3, 2)
+        self._cap_tip_od_spin = _spin("tip_od")
+        lay.addWidget(self._cap_tip_od_spin, 3, 3)
+        lay.addWidget(QLabel("Length:"), 3, 4)
+        self._cap_tip_len_spin = _spin("tip_len")
+        lay.addWidget(self._cap_tip_len_spin, 3, 5)
+
+        lay.addWidget(QLabel("Tip profile:"), 4, 0)
+        self._cap_tip_profile_combo = _make_tip_profile_combo(self._on_needle_changed)
+        lay.addWidget(self._cap_tip_profile_combo, 4, 1, 1, 2)
+
+        # Preset row
+        lay.addWidget(QLabel("Preset:"), 5, 0)
+        self._needle_type_preset_combo = QComboBox()
+        self._needle_type_preset_combo.setToolTip(
+            "Saved pull recipes. Selecting one COPIES its geometry in — the "
+            "needle never references the preset afterwards, so editing or "
+            "deleting a preset can't change a saved setup or a calibration.")
+        lay.addWidget(self._needle_type_preset_combo, 5, 1, 1, 3)
+        self._needle_preset_save_btn = QPushButton("Save as needle type…")
+        self._needle_preset_save_btn.clicked.connect(self._save_current_as_needle_type)
+        lay.addWidget(self._needle_preset_save_btn, 5, 4)
+        self._needle_preset_del_btn = QPushButton("Delete")
+        self._needle_preset_del_btn.clicked.connect(self._delete_selected_needle_type)
+        lay.addWidget(self._needle_preset_del_btn, 5, 5)
+
+        self._refresh_needle_type_preset_combo()
+        # Connected AFTER the initial populate so seeding can't fire it.
+        self._needle_type_preset_combo.currentIndexChanged.connect(
+            self._on_needle_type_preset_selected)
+        return card
+
+    def _capillary_geometry(self) -> dict:
+        """The six live capillary values, as NeedleType/NeedleSpec kwargs."""
+        tip_od = float(self._cap_tip_od_spin.value())
+        return {
+            "barrel_id_um": float(self._cap_barrel_id_spin.value()),
+            "barrel_od_um": float(self._cap_barrel_od_spin.value()),
+            "barrel_length_mm": float(self._cap_barrel_len_spin.value()),
+            "tip_id_um": float(self._cap_tip_id_spin.value()),
+            "tip_length_mm": float(self._cap_tip_len_spin.value()),
+            "tip_od_um": (tip_od if tip_od > 0 else None),
+            "tip_profile": self._cap_tip_profile_combo.currentData()
+                           or TIP_PROFILE_CYLINDER,
+        }
+
+    def _refresh_needle_type_preset_combo(self, select_id: str | None = None) -> None:
+        """Rebuild the preset picker; '(custom)' plus every stored needle type."""
+        combo = getattr(self, "_needle_type_preset_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("(custom)", None)
+            for nt in get_needle_type_store().all():
+                combo.addItem(nt.label, nt.id)
+            idx = combo.findData(select_id) if select_id else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+        self._refresh_needle_preset_buttons()
+
+    def _refresh_needle_preset_buttons(self) -> None:
+        btn = getattr(self, "_needle_preset_del_btn", None)
+        if btn is None:
+            return
+        nt_id = self._needle_type_preset_combo.currentData()
+        nt = get_needle_type_store().get(nt_id) if nt_id else None
+        btn.setEnabled(bool(nt) and not nt.builtin)
+
+    def _on_needle_type_preset_selected(self) -> None:
+        """Stamp the chosen preset's geometry onto the live spin boxes."""
+        nt_id = self._needle_type_preset_combo.currentData()
+        nt = get_needle_type_store().get(nt_id) if nt_id else None
+        self._refresh_needle_preset_buttons()
+        if nt is None:
+            return
+        for spin, value in (
+            (self._cap_barrel_id_spin, nt.barrel_id_um),
+            (self._cap_barrel_od_spin, nt.barrel_od_um),
+            (self._cap_barrel_len_spin, nt.barrel_length_mm),
+            (self._cap_tip_id_spin, nt.tip_id_um),
+            (self._cap_tip_len_spin, nt.tip_length_mm),
+            (self._cap_tip_od_spin, nt.tip_od_um or 0.0),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(float(value or 0.0))
+            spin.blockSignals(False)
+        combo = self._cap_tip_profile_combo
+        combo.blockSignals(True)
+        idx = combo.findData(nt.tip_profile)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._on_needle_changed()
+
+    def _sync_needle_preset_combo(self) -> None:
+        """Flip the picker to '(custom)' as soon as the live geometry diverges
+        from the selected preset, so the combo never claims a recipe the needle
+        no longer matches."""
+        combo = getattr(self, "_needle_type_preset_combo", None)
+        if combo is None:
+            return
+        nt_id = combo.currentData()
+        if not nt_id:
+            return
+        nt = get_needle_type_store().get(nt_id)
+        if nt is not None and nt.matches(**self._capillary_geometry()):
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(0)          # "(custom)"
+        combo.blockSignals(False)
+        self._refresh_needle_preset_buttons()
+
+    def _save_current_as_needle_type(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Save needle type",
+            "Name for this pull recipe:",
+            text=f"Capillary {self._cap_tip_id_spin.value():g} µm tip")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        nt = NeedleType(
+            id=safe_needle_type_id(name.lower().replace(" ", "-")),
+            display_name=name,
+            **self._capillary_geometry(),
+        )
+        if not get_needle_type_store().save_user(nt):
+            QMessageBox.critical(self, "Save failed",
+                                 f"Could not save the needle type '{name}'.")
+            return
+        self._refresh_needle_type_preset_combo(select_id=nt.id)
+
+    def _delete_selected_needle_type(self) -> None:
+        nt_id = self._needle_type_preset_combo.currentData()
+        nt = get_needle_type_store().get(nt_id) if nt_id else None
+        if nt is None or nt.builtin:
+            return
+        if QMessageBox.question(
+                self, "Delete needle type",
+                f"Delete the saved needle type '{nt.label}'?\n\n"
+                "The needle currently configured keeps its geometry — a preset "
+                "is only a starting point.") != QMessageBox.Yes:
+            return
+        get_needle_type_store().delete_user(nt_id)
+        self._refresh_needle_type_preset_combo()
+
+    def _apply_needle_type_visibility(self):
+        """Show the geometry block for the selected needle type.
+
+        Pure UI state — safe to call during ``_setup_ui`` before the rest of the
+        page exists (unlike :meth:`_on_needle_type_changed`, which rebuilds the
+        whole config). v7.9: it no longer CLAMPS the bore count (see below), but
+        it still rebuilds the bore→pump rows, so it must run after
+        ``_channel_rows_layout`` exists.
+        """
+        cap = self._needle_type_combo.currentData() == NEEDLE_TYPE_CAPILLARY
+        self._hypo_row.setVisible(not cap)
+        self._cap_row.setVisible(cap)
+        # v7.9: a pulled capillary is NO LONGER clamped to one bore — the
+        # assembly FORM (how many needles are bound together) is orthogonal to
+        # one bore's taper, so a backpack of two pulled capillaries is a
+        # legitimate build. The count applies to either type.
+        self.channels_spin.setToolTip(
+            "Bores in the assembly: 1 = single needle, 2 = backpack, "
+            "3 = triple. Applies to hypodermic and pulled-capillary alike.")
+        self._rebuild_channel_map_rows()
+        # v7.9: bore 1's read-only summary in the per-bore group mirrors THIS
+        # block, so it has to follow a type switch.
+        self._rebuild_bore_rows()
+
+    def _on_needle_type_changed(self):
+        """Needle-type combo changed — re-apply visibility, then rebuild."""
+        self._apply_needle_type_visibility()
+        self._on_needle_changed()
+
+    # ── v7.9: assembly FORM + per-bore geometry ───────────────────────
+
+    def _form_bore_count(self) -> int:
+        """Bore count implied by the selected assembly form (1 for anything
+        unrecognised — the fail-safe direction, since a single bore is what every
+        legacy consumer already handles)."""
+        combo = getattr(self, "_needle_form_combo", None)
+        if combo is None:
+            return 1
+        return int(NEEDLE_FORM_BORE_COUNT.get(combo.currentData(), 1))
+
+    def _current_needle_form(self) -> str:
+        combo = getattr(self, "_needle_form_combo", None)
+        return (combo.currentData() if combo is not None else None) or NEEDLE_FORM_SINGLE
+
+    def _on_needle_form_changed(self):
+        """Assembly-form combo changed — resize the bore rows, then rebuild.
+
+        The form is the ONLY writer of ``channels_spin`` (see ``_setup_ui``), so
+        the count and the geometry rows can never disagree.
+        """
+        n = self._form_bore_count()
+        self.channels_spin.blockSignals(True)
+        self.channels_spin.setValue(n)
+        self.channels_spin.blockSignals(False)
+        self._rebuild_bore_rows()
+        self._rebuild_channel_map_rows()
+        self._on_needle_changed()
+
+    def _build_bore_group(self) -> QWidget:
+        """The per-bore geometry group — hidden entirely for a single needle."""
+        self._bore_group = QGroupBox("Bore Geometry (assembly)")
+        self._bore_group.setStyleSheet(self._group_style())
+        lay = QVBoxLayout(self._bore_group)
+        lay.setSpacing(s(8))
+
+        info = QLabel(
+            "One row per bore of the assembly. Bore 1 is the datum bore and is "
+            "configured in <b>Needle Configuration</b> above; bores 2–3 are "
+            "entered here — a backpack fuses needles of <i>different</i> sizes, "
+            "so each bore carries its own geometry, its own pump and its own "
+            "flow ceiling.")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
+        lay.addWidget(info)
+
+        self._bore_rows_widget = QWidget()
+        self._bore_rows_layout = QVBoxLayout(self._bore_rows_widget)
+        self._bore_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._bore_rows_layout.setSpacing(s(8))
+        lay.addWidget(self._bore_rows_widget)
+
+        # Mount-offset provenance. Read-only here BY DESIGN: a fused assembly's
+        # rotation in the holder is arbitrary, so the offsets are a per-MOUNT
+        # calibration that must be re-measured on every needle change or re-seat.
+        # Typing them here (or storing them in a preset library) is the
+        # CAMERA_CAL_PERSIST_STORE mistake.
+        self._bore_offset_note = QLabel(
+            "Mount offsets are <b>measured</b>, not typed — calibrate them on "
+            "<b>Calibration → Needle Location</b>. They are a per-mount "
+            "calibration (the assembly's rotation in the holder is arbitrary), so "
+            "re-measure after every needle change or re-seat. A bore whose offset "
+            "reads <b>not measured</b> will be positioned as if it sat exactly "
+            "where bore 1 does — off target by the real bore spacing "
+            "(~100–500 µm, larger than a cell).")
+        self._bore_offset_note.setWordWrap(True)
+        self._bore_offset_note.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
+        lay.addWidget(self._bore_offset_note)
+
+        self._bore_status = QLabel("")
+        self._bore_status.setWordWrap(True)
+        self._bore_status.setStyleSheet(f"padding: {sp(2)} {sp(4)};")
+        lay.addWidget(self._bore_status)
+
+        self._bore_group.setVisible(False)
+        return self._bore_group
+
+    def _build_bore_row(self, bore_index: int) -> dict:
+        """Widgets for one bore's row. ``bore_index`` is 0-based; the operator
+        sees "Bore N+1" — the numbering ``validate()`` already uses."""
+        row = QGroupBox(f"Bore {bore_index + 1}"
+                        + (" · datum" if bore_index == 0 else ""))
+        row.setStyleSheet(self._group_style())
+        grid = QGridLayout(row)
+        grid.setHorizontalSpacing(s(10))
+        grid.setVerticalSpacing(s(6))
+
+        on_change = partial(self._on_bore_row_changed, bore_index)
+
+        # ── line 0: label · pump · needle type ──
+        grid.addWidget(QLabel("Label:"), 0, 0)
+        label_edit = QLineEdit()
+        label_edit.setPlaceholderText("optional, e.g. trypsin")
+        label_edit.setToolTip(
+            "Operator name for this bore — shown wherever a bore has to be "
+            "picked (per-bore roles, logs).")
+        label_edit.textChanged.connect(on_change)
+        grid.addWidget(label_edit, 0, 1)
+
+        grid.addWidget(QLabel("Pump:"), 0, 2)
+        pump_combo = QComboBox()
+        pump_combo.setToolTip(
+            "The syringe pump that feeds this bore. Two bores cannot share a "
+            "pump — one pump can only push one volume, so the second bore would "
+            "be driven blind.")
+        # Populated by `_refresh_bore_pump_options`; signal wired after, so the
+        # populate can't re-enter the config rebuild.
+        grid.addWidget(pump_combo, 0, 3)
+
+        type_combo = QComboBox()
+        type_combo.addItem("Hypodermic (gauge)", NEEDLE_TYPE_HYPODERMIC)
+        type_combo.addItem("Pulled glass capillary", NEEDLE_TYPE_CAPILLARY)
+        type_combo.setToolTip(
+            "This BORE's taper — independent of every other bore's, and "
+            "independent of the assembly form.")
+        if bore_index == 0:
+            # Bore 1's taper is the top block's `_needle_type_combo`; showing a
+            # second control for it would be a divergence waiting to happen.
+            type_combo.setVisible(False)
+        else:
+            grid.addWidget(QLabel("Type:"), 0, 4)
+            grid.addWidget(type_combo, 0, 5)
+
+        # ── line 1: hypodermic geometry ──
+        hypo = QWidget()
+        hypo_lay = QHBoxLayout(hypo)
+        hypo_lay.setContentsMargins(0, 0, 0, 0)
+        hypo_lay.setSpacing(s(10))
+        hypo_lay.addWidget(QLabel("Gauge:"))
+        gauge_combo = QComboBox()
+        gauge_combo.addItem("— Select —", None)
+        for gauge in sorted(self._needle_catalog.keys()):
+            gauge_combo.addItem(f"{gauge}G", gauge)
+        hypo_lay.addWidget(gauge_combo)
+        hypo_lay.addSpacing(s(8))
+        hypo_lay.addWidget(QLabel("Length:"))
+        length_combo = QComboBox()
+        for inches in (1.0, 1.5, 2.0):
+            length_combo.addItem(f'{inches:g}"', inches)
+        hypo_lay.addWidget(length_combo)
+        hypo_lay.addStretch(1)
+        grid.addWidget(hypo, 1, 0, 1, 6)
+
+        # ── line 2: capillary geometry (same table as the single-needle card) ──
+        cap = QWidget()
+        cap_lay = QGridLayout(cap)
+        cap_lay.setContentsMargins(0, 0, 0, 0)
+        cap_lay.setHorizontalSpacing(s(10))
+        cap_lay.setVerticalSpacing(s(6))
+        cap_spins = {}
+        for col, (key, text) in enumerate((
+                ("barrel_id", "Barrel ID:"), ("barrel_od", "Barrel OD:"),
+                ("barrel_len", "Barrel L:"))):
+            cap_lay.addWidget(QLabel(text), 0, col * 2)
+            cap_spins[key] = _make_cap_spin(key, on_change)
+            cap_lay.addWidget(cap_spins[key], 0, col * 2 + 1)
+        for col, (key, text) in enumerate((
+                ("tip_id", "Tip ID:"), ("tip_od", "Tip OD:"),
+                ("tip_len", "Tip L:"))):
+            cap_lay.addWidget(QLabel(text), 1, col * 2)
+            cap_spins[key] = _make_cap_spin(key, on_change)
+            cap_lay.addWidget(cap_spins[key], 1, col * 2 + 1)
+        cap_lay.addWidget(QLabel("Tip profile:"), 2, 0)
+        profile_combo = _make_tip_profile_combo(on_change)
+        cap_lay.addWidget(profile_combo, 2, 1, 1, 3)
+        grid.addWidget(cap, 2, 0, 1, 6)
+
+        # ── line 3: read-only geometry echo (bore 1 only) + physics readout ──
+        geom_lbl = QLabel("")
+        geom_lbl.setWordWrap(True)
+        geom_lbl.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
+        grid.addWidget(geom_lbl, 3, 0, 1, 6)
+
+        flow_lbl = QLabel("")
+        flow_lbl.setWordWrap(True)
+        flow_lbl.setToolTip(
+            "This BORE's own Hagen–Poiseuille flow ceiling at the water "
+            "reference viscosity. It is per bore because bores differ by orders "
+            "of magnitude — applying a coarse bore's ceiling to a fine bore's "
+            "pump over-pressures it and shatters a pulled glass tip.")
+        flow_lbl.setStyleSheet(
+            f"color: {COLORS.get('green', '#a6e3a1')}; font-weight: 600;")
+        grid.addWidget(flow_lbl, 4, 0, 1, 6)
+
+        grid.setColumnStretch(5, 1)
+
+        # Signals wired LAST: `_rebuild_bore_rows` seeds these combos right after
+        # building the row, and a seed that re-entered `_on_config_changed` would
+        # persist a half-built assembly.
+        pump_combo.currentIndexChanged.connect(on_change)
+        type_combo.currentIndexChanged.connect(
+            partial(self._on_bore_type_changed, bore_index))
+        gauge_combo.currentIndexChanged.connect(on_change)
+        length_combo.currentIndexChanged.connect(on_change)
+
+        return {
+            "widget": row, "label": label_edit, "pump": pump_combo,
+            "type": type_combo, "hypo": hypo, "gauge": gauge_combo,
+            "length": length_combo, "cap": cap, "cap_spins": cap_spins,
+            "profile": profile_combo, "geom": geom_lbl, "flow": flow_lbl,
+        }
+
+    def _rebuild_bore_rows(self):
+        """Rebuild the per-bore rows for the selected form.
+
+        Existing geometry is PRESERVED across the rebuild, and geometry belonging
+        to bores the new form drops is parked in ``_bore_cache`` so
+        Triple → Single → Triple is non-destructive. Without that, the
+        ``_on_needle_form_changed`` → ``_rebuild_config`` that follows would
+        persist whatever the freshly-defaulted widgets happen to say — the same
+        silent-destruction shape the bore-count spin used to have.
+        """
+        if not hasattr(self, "_bore_rows_layout"):
+            return
+
+        n = self._form_bore_count()
+
+        if getattr(self, "_restoring", False):
+            # A config load is authoritative: a cache entry from the OUTGOING
+            # setup restored on top of it would silently graft one machine's bore
+            # onto another's assembly.
+            self._bore_cache.clear()
+        else:
+            # Snapshot every live row, then park the ones the new form drops. A
+            # row the operator never touched is not worth reporting as a loss, so
+            # only real content is parked.
+            for k in range(len(self._bore_rows)):
+                g = self._bore_row_geometry(k)
+                if not self._bore_geometry_is_pristine(g):
+                    self._bore_cache[k] = g
+        # A bore the new form KEEPS is restored below, so its cache entry is
+        # consumed; only the dropped ones stay parked (and are reported).
+        for k in range(len(self._bore_rows)):
+            self._bore_rows[k]["widget"].setParent(None)
+            self._bore_rows[k]["widget"].deleteLater()
+        self._bore_rows.clear()
+
+        for k in range(n):
+            row = self._build_bore_row(k)
+            self._bore_rows_layout.addWidget(row["widget"])
+            self._bore_rows.append(row)
+
+        self._refresh_bore_pump_options()
+        for k in range(n):
+            cached = self._bore_cache.pop(k, None)
+            if cached:
+                self._set_bore_row_geometry(k, cached)
+            self._apply_bore_row_visibility(k)
+
+        # Bore 1's editors live in the top block; only its label + pump are here.
+        if self._bore_rows:
+            self._bore_rows[0]["hypo"].setVisible(False)
+            self._bore_rows[0]["cap"].setVisible(False)
+
+        multi = n > 1
+        self._bore_group.setVisible(multi)
+        self._needle_datum_note.setVisible(multi)
+        # The per-bore rows are a strict superset of the bore→pump rows, and on a
+        # multi-bore assembly `NeedleBore.pump_id` is the authority, so showing
+        # both would give the operator two pickers for one decision. The map rows
+        # stay built (and mirrored) because `_rebuild_config` reads them.
+        if hasattr(self, "channel_map_group"):
+            self.channel_map_group.setVisible(not multi)
+        self._refresh_bore_readouts()
+
+    def _apply_bore_row_visibility(self, bore_index: int):
+        """Show the geometry block matching this bore's own needle type."""
+        if bore_index >= len(self._bore_rows) or bore_index == 0:
+            return
+        row = self._bore_rows[bore_index]
+        cap = row["type"].currentData() == NEEDLE_TYPE_CAPILLARY
+        row["hypo"].setVisible(not cap)
+        row["cap"].setVisible(cap)
+
+    def _on_bore_type_changed(self, bore_index: int, _idx: int = None):
+        self._apply_bore_row_visibility(bore_index)
+        self._on_bore_row_changed(bore_index)
+
+    def _on_bore_row_changed(self, bore_index: int, *_args):
+        """A per-bore widget changed."""
+        if getattr(self, "_restoring", False):
+            return
+        # The per-bore pump combo is the authority on a multi-bore assembly, so
+        # push it into the (now redundant) bore→pump rows before the rebuild
+        # reads them. One-directional, single point — no sync loop.
+        self._sync_channel_map_from_bores()
+        self._refresh_bore_readouts()
+        self._on_config_changed()
+
+    def _refresh_bore_pump_options(self):
+        """Re-populate every per-bore pump combo from the ENABLED pumps.
+
+        Seeded from the bore→pump map rows so an assembly that was mapped before
+        the per-bore editor existed keeps its assignments.
+        """
+        enabled = self._get_enabled_pump_ids()
+        for k, row in enumerate(self._bore_rows):
+            combo = row["pump"]
+            current = combo.currentData()
+            if not current:
+                current = self._mapped_pump_for_bore(k)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— Unassigned —", None)
+            for pid in enabled:
+                combo.addItem(pid, pid)
+            combo.blockSignals(False)
+            if current:
+                self._select_bore_pump(combo, current)
+
+    @staticmethod
+    def _select_bore_pump(combo: QComboBox, pump_id: str) -> None:
+        """Select ``pump_id`` in a per-bore pump combo, keeping it even when that
+        pump is not currently enabled.
+
+        A bore may legitimately claim a pump the Pump sub-page has not enabled yet
+        (a setup being filled in, or loaded pump-section-last). Dropping the
+        selection there would silently forget which bore that pump feeds — and
+        ``NeedleBore.pump_id`` is the AUTHORITY the per-pump flow ceiling resolves
+        through. Keeping it flagged instead makes ``validate()`` say
+        "Bore N → P3 but P3 is not enabled", which names the operator's next
+        action rather than losing their wiring.
+        """
+        idx = combo.findData(pump_id)
+        if idx < 0:
+            combo.blockSignals(True)
+            combo.addItem(f"{pump_id} (not enabled)", pump_id)
+            idx = combo.count() - 1
+            combo.blockSignals(False)
+        if combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def _mapped_pump_for_bore(self, bore_index: int) -> str | None:
+        """This bore's pump according to the bore→pump map rows, else the config."""
+        if bore_index < len(self._channel_map_widgets):
+            pid = self._channel_map_widgets[bore_index][1].currentData()
+            if pid:
+                return pid
+        cfg = getattr(self, "_config", None)
+        if cfg is not None:
+            return getattr(cfg, "needle_channel_pump_map", {}).get(bore_index)
+        return None
+
+    def _sync_channel_map_from_bores(self):
+        """Mirror the per-bore pump selections into the bore→pump map rows.
+
+        On a multi-bore assembly ``NeedleBore.pump_id`` is the authority — the
+        serialized ``needle_channel_pump_map`` is DERIVED from it by
+        ``HardwareConfig.resolved_bore_pump_map``. Keeping the map rows in step
+        means ``_rebuild_config``'s existing map capture stays truthful and the
+        operator never sees the two surfaces disagree.
+        """
+        if len(self._bore_rows) < 2:
+            return
+        for k, row in enumerate(self._bore_rows):
+            if k >= len(self._channel_map_widgets):
+                break
+            combo = self._channel_map_widgets[k][1]
+            want = row["pump"].currentData()
+            if combo.currentData() == want:
+                continue
+            idx = combo.findData(want)
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        self._update_channel_map_status()
+
+    def _reapply_saved_bore_pumps(self):
+        """Re-select each saved bore's pump once the ENABLED pump list is known.
+
+        Ordering fix, and the reason it is a separate pass: ``_apply_config_to_ui``
+        builds the bore rows in its needle section, which runs BEFORE the pump
+        widgets are restored — so ``_get_enabled_pump_ids()`` was still empty, every
+        per-bore pump combo held only "— Unassigned —", and
+        ``_set_bore_row_geometry``'s ``findData`` dropped the saved binding without
+        a word. Losing it is not cosmetic: ``NeedleBore.pump_id`` is the AUTHORITY
+        on a multi-bore assembly, so the per-PUMP flow ceiling loses the one link
+        that tells it which bore feeds which pump — and a fine bore's pump
+        inheriting a coarse bore's ceiling over-pressures it. The legacy map rows
+        never hit this because they are rebuilt after the pumps are up.
+        """
+        needle = getattr(getattr(self, "_config", None), "needle", None)
+        for k, bore in enumerate(list(getattr(needle, "bores", None) or [])):
+            if k >= len(self._bore_rows):
+                break
+            want = getattr(bore, "pump_id", None)
+            if not want:
+                continue
+            self._select_bore_pump(self._bore_rows[k]["pump"], want)
+
+    # ── per-bore geometry ↔ widgets ───────────────────────────────────
+
+    @staticmethod
+    def _bore_geometry_is_pristine(g: dict) -> bool:
+        """True when a row holds nothing the operator entered.
+
+        Only the fields that CARRY meaning count: the capillary spins always read
+        back their defaults, so comparing them would mark every untouched
+        hypodermic row as "configured" and turn the shrink warning into noise.
+        """
+        if not g:
+            return True
+        if g.get("label"):
+            return False
+        if g.get("pump_id"):
+            return False
+        if g.get("needle_type") == NEEDLE_TYPE_CAPILLARY:
+            return False
+        return g.get("gauge") is None
+
+    def _bore_row_geometry(self, bore_index: int) -> dict:
+        """The live values of one row, as plain data (cacheable / comparable)."""
+        if bore_index >= len(self._bore_rows):
+            return {}
+        row = self._bore_rows[bore_index]
+        g = {
+            "label": row["label"].text().strip(),
+            "pump_id": row["pump"].currentData(),
+            "needle_type": row["type"].currentData() or NEEDLE_TYPE_HYPODERMIC,
+            "gauge": row["gauge"].currentData(),
+            "length_inches": row["length"].currentData() or 1.0,
+            "tip_profile": row["profile"].currentData() or TIP_PROFILE_CYLINDER,
+        }
+        for key, spin in row["cap_spins"].items():
+            g[key] = float(spin.value())
+        return g
+
+    def _set_bore_row_geometry(self, bore_index: int, g: dict):
+        """Push cached/loaded values back into a row without firing handlers."""
+        if bore_index >= len(self._bore_rows) or not g:
+            return
+        row = self._bore_rows[bore_index]
+
+        def _blocked(widget, fn):
+            widget.blockSignals(True)
+            try:
+                fn()
+            finally:
+                widget.blockSignals(False)
+
+        _blocked(row["label"], lambda: row["label"].setText(g.get("label", "") or ""))
+        for combo_key, data in (("pump", g.get("pump_id")),
+                                ("type", g.get("needle_type")),
+                                ("gauge", g.get("gauge")),
+                                ("profile", g.get("tip_profile"))):
+            combo = row[combo_key]
+            idx = combo.findData(data)
+            if idx >= 0:
+                _blocked(combo, partial(combo.setCurrentIndex, idx))
+        length = g.get("length_inches")
+        if length is not None:
+            combo = row["length"]
+            idx = combo.findData(float(length))
+            if idx < 0:
+                # Same lesson as the single-needle card: a length outside the
+                # presets used to findData(-1) and be silently rewritten.
+                combo.blockSignals(True)
+                combo.addItem(f'{float(length):g}"', float(length))
+                idx = combo.count() - 1
+                combo.blockSignals(False)
+            _blocked(combo, partial(combo.setCurrentIndex, idx))
+        for key, spin in row["cap_spins"].items():
+            if key in g and g[key] is not None:
+                _blocked(spin, partial(spin.setValue, float(g[key])))
+
+    def _bore_zero_from_ui(self) -> NeedleBore:
+        """Bore 1 — geometry from the top block, label + pump from its own row.
+
+        The top block IS bore 1's editor: ``NeedleSpec.__post_init__`` mirrors
+        ``bores[0]`` onto the flat fields, so every legacy reader of
+        ``needle.id_um`` / ``cross_section_area_mm2`` keeps seeing this bore's
+        real numbers.
+        """
+        row = self._bore_rows[0] if self._bore_rows else None
+        label = row["label"].text().strip() if row else ""
+        pump = row["pump"].currentData() if row else None
+        if self._needle_type_combo.currentData() == NEEDLE_TYPE_CAPILLARY:
+            g = self._capillary_geometry()
+            b_id, b_od = g["barrel_id_um"], g["barrel_od_um"]
+            return NeedleBore(
+                id_um=b_id, od_um=b_od,
+                wall_um=max(0.0, (b_od - b_id) / 2.0),
+                length_mm=g["barrel_length_mm"], gauge=None,
+                needle_type=NEEDLE_TYPE_CAPILLARY,
+                tip_id_um=g["tip_id_um"], tip_length_mm=g["tip_length_mm"],
+                tip_od_um=g["tip_od_um"], tip_profile=g["tip_profile"],
+                pump_id=pump, label=label,
+            )
+        gauge = self.gauge_combo.currentData()
+        spec = self._needle_catalog.get(gauge) if gauge else None
+        return NeedleBore(
+            id_um=spec.id_um if spec else 0.0,
+            od_um=spec.od_um if spec else 0.0,
+            wall_um=spec.wall_um if spec else 0.0,
+            length_mm=float(self.length_combo.currentData() or 1.0) * 25.4,
+            gauge=gauge, pump_id=pump, label=label,
+        )
+
+    def _bore_from_row(self, bore_index: int) -> NeedleBore:
+        """Bore ``bore_index`` (≥ 1) from its editable row."""
+        g = self._bore_row_geometry(bore_index)
+        if g.get("needle_type") == NEEDLE_TYPE_CAPILLARY:
+            b_id, b_od = g["barrel_id"], g["barrel_od"]
+            tip_od = g.get("tip_od") or 0.0
+            return NeedleBore(
+                id_um=b_id, od_um=b_od,
+                wall_um=max(0.0, (b_od - b_id) / 2.0),
+                length_mm=g["barrel_len"], gauge=None,
+                needle_type=NEEDLE_TYPE_CAPILLARY,
+                tip_id_um=g["tip_id"], tip_length_mm=g["tip_len"],
+                tip_od_um=tip_od if tip_od > 0 else None,
+                tip_profile=g["tip_profile"],
+                pump_id=g["pump_id"], label=g["label"],
+            )
+        gauge = g.get("gauge")
+        spec = self._needle_catalog.get(gauge) if gauge else None
+        return NeedleBore(
+            id_um=spec.id_um if spec else 0.0,
+            od_um=spec.od_um if spec else 0.0,
+            wall_um=spec.wall_um if spec else 0.0,
+            length_mm=float(g.get("length_inches") or 1.0) * 25.4,
+            gauge=gauge, pump_id=g["pump_id"], label=g["label"],
+        )
+
+    def _bores_from_ui(self) -> list[NeedleBore] | None:
+        """The assembly's bores, or None for a single needle.
+
+        None is what keeps a single-bore needle byte-identical: ``to_dict``
+        emits ``bores`` only when the list was explicitly supplied AND holds more
+        than one bore.
+        """
+        n = self._form_bore_count()
+        if n <= 1 or len(self._bore_rows) < n:
+            return None
+        bores = [self._bore_zero_from_ui()]
+        bores.extend(self._bore_from_row(k) for k in range(1, n))
+        # Carry the MEASURED mount offsets through the rebuild — losing them on a
+        # geometry edit (or a form round-trip) would silently un-calibrate the
+        # assembly, and the error is a right-distance-wrong-place miss of
+        # 100–500 µm, larger than a cell.
+        self._absorb_live_bore_offsets()
+        for k, bore in enumerate(bores):
+            if k == 0:
+                continue        # datum — NeedleSpec pins bores[0] at the origin
+            off, dz = self._bore_offsets.get(k, ((0.0, 0.0), 0.0))
+            bore.offset_um = off
+            bore.z_offset_mm = dz
+        return bores
+
+    def _absorb_live_bore_offsets(self):
+        """Learn any measured offsets carried by the live needle spec.
+
+        The calibration writes offsets onto ``config.needle.bores``; picking them
+        up here means a later geometry edit rebuilds the spec WITHOUT dropping
+        them, whether the calibration re-pushed the whole config or mutated it in
+        place. Only non-zero values are learned — a zero is "not measured", which
+        must never overwrite a real measurement.
+        """
+        prev = getattr(getattr(self, "_config", None), "needle", None)
+        for k, b in enumerate(list(getattr(prev, "bores", None) or [])):
+            try:
+                off = tuple(float(v) for v in getattr(b, "offset_um", (0.0, 0.0)))
+                dz = float(getattr(b, "z_offset_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if len(off) == 2 and (off != (0.0, 0.0) or dz):
+                self._bore_offsets[k] = (off, dz)
+
+    def _bore_mount_offset(self, bore_index: int) -> tuple[tuple[float, float], float]:
+        """This bore's measured mount offset — ``((0, 0), 0.0)`` = not measured."""
+        if bore_index == 0:
+            return ((0.0, 0.0), 0.0)
+        return self._bore_offsets.get(bore_index, ((0.0, 0.0), 0.0))
+
+    # ── per-bore readouts ─────────────────────────────────────────────
+
+    @staticmethod
+    def _bore_flow_ceiling_uL_s(bore) -> float:
+        """This bore's own Hagen–Poiseuille ceiling at the water reference.
+
+        Per BORE, never per assembly: with one pump per bore there are N
+        independent pressure sources, so there is no assembly-level ceiling to
+        compute. Best-effort — never raises into a config rebuild.
+        """
+        try:
+            from SupportClasses.FlowPhysics import (
+                max_safe_flow_rate_uL_s, DEFAULT_PRESSURE_LIMIT_PA,
+            )
+            from SupportClasses.SafetyLimits import REFERENCE_VISCOSITY_CP
+            ref_ink = InkSpec(name="__reference__",
+                              viscosity_cP=REFERENCE_VISCOSITY_CP)
+            return float(max_safe_flow_rate_uL_s(
+                bore, ref_ink, DEFAULT_PRESSURE_LIMIT_PA) or 0.0)
+        except Exception as e:
+            logger.debug("per-bore flow ceiling compute failed: %s", e)
+            return 0.0
+
+    def _refresh_bore_readouts(self):
+        """Per-bore geometry echo, flow ceiling, measured offset and warnings."""
+        if not self._bore_rows or not hasattr(self, "_bore_status"):
+            return
+        n = len(self._bore_rows)
+        bores = []
+        for k in range(n):
+            try:
+                bores.append(self._bore_zero_from_ui() if k == 0
+                             else self._bore_from_row(k))
+            except Exception as e:      # never break a config rebuild
+                logger.debug("bore %d readout build failed: %s", k, e)
+                bores.append(None)
+
+        # Measured mount offsets are owned by the calibration, not this page.
+        self._absorb_live_bore_offsets()
+
+        claimed: dict[str, list[int]] = {}
+        for k, bore in enumerate(bores):
+            row = self._bore_rows[k]
+            if bore is None:
+                row["geom"].setText("—")
+                row["flow"].setText("")
+                continue
+            if k == 0:
+                row["geom"].setText(
+                    f"Geometry: configured above — {bore.summary_line() or '—'}")
+            else:
+                row["geom"].setText("")
+            # An empty QLabel still occupies a line, which puts a dead band in
+            # every editable row.
+            row["geom"].setVisible(bool(row["geom"].text()))
+
+            flow = self._bore_flow_ceiling_uL_s(bore)
+            bits = []
+            if flow > 0:
+                bits.append(f"Max safe flow {flow:.3g} µL/s")
+            else:
+                bits.append("Max safe flow — (geometry incomplete)")
+            bits.append(f"holds {bore.internal_volume_uL:.3f} µL")
+            if k == 0:
+                bits.append("mount offset: datum (0, 0)")
+            else:
+                (ox, oy), dz = self._bore_mount_offset(k)
+                if ox or oy or dz:
+                    bits.append(f"mount offset ({ox:+.0f}, {oy:+.0f}) µm"
+                                + (f", Z {dz:+.3f} mm" if dz else ""))
+                else:
+                    bits.append("mount offset: not measured")
+            row["flow"].setText(" · ".join(bits))
+
+            pid = bore.pump_id
+            if pid:
+                claimed.setdefault(str(pid).strip().upper(), []).append(k + 1)
+
+        # Report problems using the SAME rule the config validates with, so the
+        # page and `HardwareConfig.validate()` can never disagree.
+        issues: list[str] = []
+        try:
+            probe = NeedleSpec(needle_form=self._current_needle_form(),
+                               bores=[b for b in bores if b is not None])
+            issues = HardwareConfig._needle_bore_issues(probe)
+        except Exception as e:
+            logger.debug("per-bore validation probe failed: %s", e)
+        unassigned = [k + 1 for k, b in enumerate(bores)
+                      if b is not None and not b.pump_id]
+
+        if issues:
+            text = "⚠ " + " · ".join(issues)
+            colour = COLORS.get("red", "#f38ba8")
+        elif unassigned:
+            text = ("⚠ Bore(s) without a pump: "
+                    + ", ".join(str(i) for i in unassigned))
+            colour = COLORS.get("yellow", "#f9e2af")
+        else:
+            text = f"✓ {n} bore(s) configured, each with its own pump"
+            colour = COLORS.get("green", "#a6e3a1")
+
+        # A form SHRINK hides bores rather than deleting them. This is APPENDED
+        # rather than prioritised, because a data loss the operator is about to
+        # save must never be crowded out by a validation warning.
+        parked = sorted(k + 1 for k in self._bore_cache)
+        if parked:
+            text += ("\n⚠ Bore(s) " + ", ".join(str(i) for i in parked)
+                     + " are hidden by the current form. Their geometry is "
+                       "remembered while this page stays open and returns if you "
+                       "pick the larger form again — but it is NOT saved with the "
+                       "setup.")
+            colour = COLORS.get("yellow", "#f9e2af")
+
+        self._bore_status.setText(text)
+        self._bore_status.setStyleSheet(
+            f"color: {colour}; padding: {sp(2)} {sp(4)};")
 
     def _refresh_pump_ink_exclusions(self):
         """
@@ -2058,6 +3205,7 @@ class HardwareSetupPage(ModePage):
             )
             hint = role_rotation_hint(role)
             theta = None
+            column_dir = None
             mirrored = False
             if mgr is not None:
                 try:
@@ -2065,11 +3213,35 @@ class HardwareSetupPage(ModePage):
                 except Exception:
                     theta = None
                 try:
+                    gcd = getattr(mgr, "get_column_dir_deg", None)
+                    column_dir = gcd(i) if callable(gcd) else None
+                except Exception:
+                    column_dir = None
+                try:
                     mirrored = bool(mgr.get_mirrored(i))
                 except Exception:
                     mirrored = False
             mir_txt = "  · mirrored view" if mirrored else ""
-            if theta is None:
+            is_needle = role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y)
+            if is_needle and (column_dir is not None or theta is not None):
+                # v7.5.x (rotated rig): a needle cam carries TWO angles — the
+                # ±45° column→stage mount direction (aligner) and the small
+                # display roll. Δ-vs-nominal makes sense for the mount only.
+                if column_dir is not None:
+                    nom, delta = nominal_rotation_delta(
+                        float(column_dir), role)
+                    mount_txt = (f"mount {float(column_dir):.1f}° "
+                                 f"(Δ {delta:+.1f}° from nominal {nom:g}°)")
+                else:
+                    mount_txt = "mount: not calibrated"
+                roll_txt = (f"roll {float(theta):+.1f}°"
+                            if theta is not None else "roll —")
+                lbl.setText(f"{mount_txt} · {roll_txt} — {hint}{mir_txt}")
+                lbl.setStyleSheet(
+                    f"color: {COLORS['green'] if column_dir is not None else COLORS.get('subtext0', '#a6adc8')}; "
+                    f"font-size: {scaled_font_size(9)}pt;"
+                )
+            elif theta is None:
                 lbl.setText(
                     f"Rotation vs stage: not calibrated — {hint}{mir_txt}")
                 lbl.setStyleSheet(
@@ -2529,7 +3701,9 @@ class HardwareSetupPage(ModePage):
             self._control_panel.set_controller(controller)
 
     def set_calibrated_um_per_px(self, cam_idx: int, value: float,
-                                 rotation_deg: float | None = None):
+                                 rotation_deg: float | None = None,
+                                 column_dir_deg: float | None = None,
+                                 resolution: tuple[int, int] | None = None):
         """v7.3.3/v7.4.x: Apply a calibrated µm/px from any source.
 
         Writes through to `CameraManager.set_um_per_px` (the canonical
@@ -2538,19 +3712,48 @@ class HardwareSetupPage(ModePage):
         µm/px is sourced from `ObjectiveCalibrationStore` instead and
         does not flow through here.
 
-        v7.5.x: ``rotation_deg`` (the camera's in-plane lateral stage
-        direction, from the stage-motion calibration) is stored alongside
-        and fed to the needle-centering aligner. None leaves it untouched
-        (e.g. the microscope objective path, which doesn't measure it).
+        v7.5.x: ``rotation_deg`` is the camera's DISPLAY orientation (for
+        the needle side cams: the small sensor roll — deviation from
+        parallel). ``column_dir_deg`` is the column→stage MOUNT direction
+        (±45° about +X on the rotated rig), consumed only by the
+        needle-centering aligner. None leaves either untouched (e.g. the
+        microscope objective path, which measures neither).
+
+        ``resolution`` is the (w, h) frame size the µm/px was measured at.
+        µm/px ∝ 1/frame_width, so without it the value cannot be rescaled when
+        the camera later captures at a different resolution — and both the live
+        manager and the store treat it as unknown rather than assume it is valid
+        at whatever width happens to be running.
         """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is not None:
+            # Each push is guarded SEPARATELY: these are three independent
+            # quantities, and one failing must not silently drop the others.
+            # (Sharing one try meant a µm/px push failure also skipped
+            # ``column_dir_deg`` — the value the two-camera needle aligner
+            # REFUSES to run without.)
             try:
-                mgr.set_um_per_px(cam_idx, value)
-                if rotation_deg is not None:
-                    mgr.set_rotation_deg(cam_idx, rotation_deg)
+                mgr.set_um_per_px(cam_idx, value, resolution=resolution)
+            except TypeError:
+                # Manager predating the resolution kwarg.
+                try:
+                    mgr.set_um_per_px(cam_idx, value)
+                except Exception as exc:
+                    logger.debug(f"set_um_per_px({cam_idx}, {value}) — {exc}")
             except Exception as exc:
                 logger.debug(f"set_um_per_px({cam_idx}, {value}) — {exc}")
+            if rotation_deg is not None:
+                try:
+                    mgr.set_rotation_deg(cam_idx, rotation_deg)
+                except Exception as exc:
+                    logger.debug(f"set_rotation_deg({cam_idx}) — {exc}")
+            if column_dir_deg is not None:
+                try:
+                    scd = getattr(mgr, "set_column_dir_deg", None)
+                    if callable(scd):
+                        scd(cam_idx, column_dir_deg)
+                except Exception as exc:
+                    logger.debug(f"set_column_dir_deg({cam_idx}) — {exc}")
         # v7.5.x: persist keyed by the camera's stable device identity
         # (name + USB port) in a *per-machine* store — NOT in the hardware
         # config, which is swappable: loading a saved setup file would replace
@@ -2563,7 +3766,9 @@ class HardwareSetupPage(ModePage):
             try:
                 from SupportClasses.CameraCalibrationStore import get_store
                 get_store().set_calibration(
-                    key, float(value), rotation_deg=rotation_deg, name=name)
+                    key, float(value), rotation_deg=rotation_deg, name=name,
+                    column_dir_deg=column_dir_deg,
+                    um_per_px_resolution=resolution)
             except Exception as exc:
                 logger.warning(f"camera calibration store write failed: {exc}")
         if hasattr(self, "_needle_cards"):
@@ -2621,6 +3826,16 @@ class HardwareSetupPage(ModePage):
                 mgr.set_rotation_deg(cam_idx, float(rot))
             except Exception as exc:
                 logger.debug(f"restore rotation slot {cam_idx}: {exc}")
+        # v7.5.x (rotated rig): restore the needle-aligner mount direction —
+        # a separate quantity from the display rotation above.
+        cd = entry.get("column_dir_deg")
+        if cd is not None:
+            try:
+                scd = getattr(mgr, "set_column_dir_deg", None)
+                if callable(scd):
+                    scd(cam_idx, float(cd))
+            except Exception as exc:
+                logger.debug(f"restore column dir slot {cam_idx}: {exc}")
         # v7.5.x: restore the mirrored-view (flip X) flag (also independent of
         # µm/px).
         try:
@@ -2637,7 +3852,25 @@ class HardwareSetupPage(ModePage):
         if entry.get("um_per_px") is None:
             return False
         try:
-            mgr.set_um_per_px(cam_idx, float(entry["um_per_px"]))
+            # v7.5.x: restore the µm/px WITH the resolution it was measured at.
+            # Omitting it (as this did before) left CameraManager with no
+            # calibration resolution, so effective_um_per_px degraded to a
+            # passthrough and every restored camera scaled its mosaic by the
+            # raw value — a 2x error for an objective calibrated at 2048 px and
+            # running at 1024. None = genuinely unknown (pre-1.2 entry the
+            # migration could not recover) and stays unknown, not assumed.
+            res = None
+            try:
+                res = get_store().get_um_per_px_resolution(identity[0])
+            except Exception:
+                res = None
+            mgr.set_um_per_px(
+                cam_idx, float(entry["um_per_px"]), resolution=res)
+            if res is None:
+                logger.warning(
+                    f"Camera {cam_idx + 1} µm/px restored WITHOUT a measurement "
+                    f"resolution — it cannot be rescaled if the capture "
+                    f"resolution changes. Re-run the camera calibration.")
             return True
         except Exception as exc:
             logger.debug(f"restore calibration slot {cam_idx}: {exc}")
@@ -2751,17 +3984,33 @@ class HardwareSetupPage(ModePage):
             mgr.set_hw_brightness(cam_idx, hw["brightness"])
         if hw.get("contrast") is not None:
             mgr.set_hw_contrast(cam_idx, hw["contrast"])
+        # Andor (Zyla) display scaling. Auto flag FIRST — turning auto off
+        # seeds the levels from the last auto frame, so the stored manual
+        # levels must be applied after it to win.
+        ascale = hw.get("andor_auto_scale")
+        if isinstance(ascale, bool) and hasattr(mgr, "set_hw_andor_auto_scale"):
+            mgr.set_hw_andor_auto_scale(cam_idx, ascale)
+        if hw.get("andor_scale_lo") is not None and hasattr(mgr, "set_hw_andor_scale_lo"):
+            mgr.set_hw_andor_scale_lo(cam_idx, hw["andor_scale_lo"])
+        if hw.get("andor_scale_hi") is not None and hasattr(mgr, "set_hw_andor_scale_hi"):
+            mgr.set_hw_andor_scale_hi(cam_idx, hw["andor_scale_hi"])
 
     def _on_calibrate_slot_rotation(self, cam_idx: int):
         """v7.5.x: measure THIS slot's camera rotation relative to the stage.
 
         Launches the stage-motion PixelCalibrationDialog and commits ONLY
-        the measured rotation (``result_rotation_deg``) — the camera's
-        µm/px is deliberately untouched (the needle cards / objective
-        calibration own that, with their own commit policies). The nominal
-        mount per role: microscope views along Z so its rotation is in the
-        stage XY plane; needle cameras sit at ~45° to the X/Y axes; the
-        monitor overview camera is nominally axis-aligned.
+        the measured orientation — the camera's µm/px is deliberately
+        untouched (the needle cards / objective calibration own that, with
+        their own commit policies). The nominal mount per role: microscope
+        views along Z so its rotation is in the stage XY plane; the needle
+        side cameras sit symmetric about stage +X at ±45°; the monitor
+        overview camera is nominally axis-aligned.
+
+        v7.5.x (rotated rig): for a NEEDLE-role slot the measured stage
+        direction is the mount direction (→ ``column_dir_deg``, aligner
+        only) and only the sensor roll (deviation from parallel) becomes
+        the display ``rotation_deg`` — storing the ±45° mount as the
+        display rotation was what tilted the live view.
         """
         from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
         from PySide6.QtWidgets import QDialog, QMessageBox
@@ -2799,12 +4048,33 @@ class HardwareSetupPage(ModePage):
                 "Try a larger stage move along a clear feature.",
             )
             return
-        self._apply_slot_rotation(cam_idx, float(rotation_deg))
         role = (
             self._config.camera_roles[cam_idx]
             if cam_idx < len(self._config.camera_roles)
             else CameraRole.UNASSIGNED
         )
+        if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
+            # v7.5.x (rotated rig): for a needle side cam the measured stage
+            # direction is the ±45° MOUNT direction — aligner-only. Only the
+            # sensor roll (deviation of the measured vector from parallel)
+            # becomes the display rotation, so the live view stays level.
+            roll = dlg.result_view_roll_deg
+            self._apply_slot_rotation(
+                cam_idx, float(roll) if roll is not None else 0.0)
+            self._apply_slot_column_dir(cam_idx, float(rotation_deg))
+            nom, delta = nominal_rotation_delta(float(rotation_deg), role)
+            QMessageBox.information(
+                self, "Calibrate rotation",
+                f"Cam {cam_idx + 1} mount direction: "
+                f"{float(rotation_deg):.1f}° "
+                f"(Δ {delta:+.1f}° from the nominal {nom:g}° mount) · "
+                f"view roll {0.0 if roll is None else float(roll):+.1f}°.\n\n"
+                f"This camera {role_rotation_hint(role)}. The mount direction "
+                "drives the needle-centering math; only the roll tilts the "
+                "displayed view.",
+            )
+            return
+        self._apply_slot_rotation(cam_idx, float(rotation_deg))
         nom, delta = nominal_rotation_delta(float(rotation_deg), role)
         QMessageBox.information(
             self, "Calibrate rotation",
@@ -2858,6 +4128,47 @@ class HardwareSetupPage(ModePage):
         logger.info(
             f"Camera {cam_idx + 1} rotation vs stage set to "
             f"{float(rotation_deg):.2f}° "
+            f"(identity={identity[0] if identity else '?'})"
+        )
+
+    def _apply_slot_column_dir(self, cam_idx: int, column_dir_deg: float):
+        """v7.5.x (rotated rig): commit a needle camera's measured column→stage
+        MOUNT direction (deg CCW from stage +X).
+
+        Pushes it live (``CameraManager.set_column_dir_deg`` — the
+        needle-centering aligner reads it) and persists per device identity
+        (``CameraCalibrationStore.set_column_dir``, preserving all siblings).
+        Never touches the display orientation — that is ``rotation_deg``.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            scd = getattr(mgr, "set_column_dir_deg", None)
+            if callable(scd):
+                scd(cam_idx, float(column_dir_deg))
+        except Exception as exc:
+            logger.debug(f"slot column dir: push to manager — {exc}")
+        identity = None
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_column_dir(
+                    identity[0], float(column_dir_deg),
+                    name=(identity[1] if len(identity) > 1 else ""))
+            except Exception as exc:
+                logger.warning(f"slot column dir: store write failed — {exc}")
+        if hasattr(self, "_needle_cards"):
+            self._refresh_role_derived_displays()
+        else:
+            self._refresh_slot_rotation_displays()
+        logger.info(
+            f"Camera {cam_idx + 1} column→stage mount direction set to "
+            f"{float(column_dir_deg):.2f}° "
             f"(identity={identity[0] if identity else '?'})"
         )
 
@@ -2999,7 +4310,7 @@ class HardwareSetupPage(ModePage):
         """Launch the stage-motion µm/px calibration for a needle camera.
 
         The slot is resolved from the active role assignment so the
-        Needle X and Needle Y buttons each target their own camera
+        Needle cam 1 and Needle cam 2 buttons each target their own camera
         independently.
         """
         from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
@@ -3042,10 +4353,16 @@ class HardwareSetupPage(ModePage):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             result = dlg.result_um_per_px
             if result is not None:
-                # v7.5.x: also store the measured in-plane rotation (the move
-                # direction that produced clean lateral motion) for the aligner.
+                # v7.5.x (rotated rig): two DIFFERENT angles from one measure —
+                # the column→stage mount direction (±45° about +X) feeds the
+                # needle aligner (column_dir_deg), while only the sensor roll
+                # (deviation of the measured vector from parallel) becomes the
+                # display orientation (rotation_deg). Storing the mount angle
+                # as rotation was what tilted the live view ~45°.
                 self.set_calibrated_um_per_px(
-                    cam_idx, result, rotation_deg=dlg.result_rotation_deg)
+                    cam_idx, result,
+                    rotation_deg=dlg.result_view_roll_deg,
+                    column_dir_deg=dlg.result_rotation_deg)
                 logger.info(
                     f"Needle calibration applied: Cam {cam_idx + 1} "
                     f"({role.value}) = {result:.4f} µm/px"
@@ -3344,9 +4661,30 @@ class HardwareSetupPage(ModePage):
 
     def _rebuild_channel_map_rows(self):
         """
-        v7.2.4 S3.7: Build N rows for channel→pump assignment
-        based on current needle channel count.
+        v7.2.4 S3.7: Build N rows for bore→pump assignment
+        based on current needle bore count.
+
+        v7.9: existing per-bore selections are PRESERVED across the rebuild.
+        Without that, bumping the bore-count spin left every new combo on
+        "— Unassigned —", and the `_on_channels_changed` → `_rebuild_config`
+        that follows persists exactly what the combos say — silently destroying
+        the operator's assignments. Same preserve-and-restore shape as
+        :meth:`_refresh_channel_map_pump_options`.
         """
+        # Snapshot before the widgets are destroyed. While RESTORING a config the
+        # combos still hold the OUTGOING setup's assignments, so the incoming
+        # config's map is the only correct source — otherwise loading a setup
+        # would inherit stale bore→pump pairs for any index its map omits.
+        previous: dict[int, str] = {}
+        if not getattr(self, "_restoring", False):
+            previous = {
+                ch_idx: combo.currentData()
+                for ch_idx, (_lbl, combo) in enumerate(self._channel_map_widgets)
+                if combo.currentData()
+            }
+        if not previous and getattr(self, "_config", None) is not None:
+            previous = dict(getattr(self._config, "needle_channel_pump_map", {}))
+
         # Clear existing rows
         self._channel_map_widgets.clear()
         while self._channel_rows_layout.count():
@@ -3366,7 +4704,9 @@ class HardwareSetupPage(ModePage):
             if num_channels == 1:
                 label = QLabel("Bore →")
             else:
-                label = QLabel(f"Channel {ch_idx + 1} →")
+                # 0-based in code, displayed "Bore N+1" — matching the numbering
+                # `validate()` and the per-bore geometry messages already use.
+                label = QLabel(f"Bore {ch_idx + 1} →")
             label.setMinimumWidth(s(80))
             row_layout.addWidget(label)
 
@@ -3374,6 +4714,13 @@ class HardwareSetupPage(ModePage):
             combo.addItem("— Unassigned —", None)
             for pid in enabled_pumps:
                 combo.addItem(pid, pid)
+            # Restore this bore's previous pump before wiring the signal, so the
+            # restore itself can't re-enter `_on_config_changed`.
+            prev = previous.get(ch_idx)
+            if prev:
+                idx = combo.findData(prev)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
             combo.currentIndexChanged.connect(
                 partial(self._on_channel_map_changed, ch_idx))
             row_layout.addWidget(combo)
@@ -3405,12 +4752,38 @@ class HardwareSetupPage(ModePage):
                     combo.setCurrentIndex(idx)
             combo.blockSignals(False)
 
+        # v7.9: the per-bore rows carry their own pump picker on a multi-bore
+        # assembly — refresh it from the same enabled-pump list so the two
+        # surfaces can never offer different options.
+        self._refresh_bore_pump_options()
         self._update_channel_map_status()
 
     def _on_channel_map_changed(self, ch_idx: int, _combo_idx: int = None):
         """v7.2.4 S3.8: Handle channel mapping combo change."""
         self._update_channel_map_status()
+        # v7.9: a map row is still the pump editor for a SINGLE bore, so mirror
+        # it back into the per-bore row's combo (which is what the NeedleBore
+        # takes its pump_id from).
+        self._sync_bores_from_channel_map()
         self._on_config_changed()
+
+    def _sync_bores_from_channel_map(self):
+        """Mirror the bore→pump map rows into the per-bore pump combos.
+
+        The reverse of :meth:`_sync_channel_map_from_bores`, and deliberately
+        guarded to the SINGLE-bore case: on a multi-bore assembly the per-bore
+        combo is the authority, so copying back would let a stale map row
+        overwrite it.
+        """
+        if len(self._bore_rows) != 1 or not self._channel_map_widgets:
+            return
+        combo = self._bore_rows[0]["pump"]
+        want = self._channel_map_widgets[0][1].currentData()
+        idx = combo.findData(want)
+        if idx >= 0 and combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
 
     def _update_channel_map_status(self):
         """v7.2.4: Update channel mapping validation indicator."""
@@ -3436,11 +4809,11 @@ class HardwareSetupPage(ModePage):
                 f"color: {COLORS.get('red', '#f38ba8')}; ")
         elif not all_assigned:
             self.channel_map_status.setText(
-                f"⚠ {num_channels - len(assigned_pumps)} channel(s) unassigned")
+                f"⚠ {num_channels - len(assigned_pumps)} bore(s) unassigned")
             self.channel_map_status.setStyleSheet(
                 f"color: {COLORS.get('yellow', '#f9e2af')}; ")
         else:
-            self.channel_map_status.setText("✓ All channels assigned")
+            self.channel_map_status.setText("✓ All bores assigned")
             self.channel_map_status.setStyleSheet(
                 f"color: {COLORS.get('green', '#a6e3a1')}; ")
 
@@ -3505,13 +4878,18 @@ class HardwareSetupPage(ModePage):
         Mirrors ``SafetyLimits.update_from_hardware_config``: Hagen–Poiseuille
         Q_max from the configured needle bore + length at the fixed water
         reference viscosity (ink-independent). This is the ceiling every pump
-        move is hard-clamped to. Best-effort — never raises into config rebuild."""
+        move is hard-clamped to. Best-effort — never raises into config rebuild.
+
+        v7.6: a pulled capillary's barrel and tip are in SERIES, so the readout
+        names which stage sets the limit — normally the tip, by orders of
+        magnitude."""
         lbl = getattr(self, "_pump_maxflow_lbl", None)
         if lbl is None:
             return
         needle = getattr(self._config, "needle", None)
         flow = 0.0
         gauge = getattr(needle, "gauge", None) if needle else None
+        limiting = ""
         try:
             if needle is not None and getattr(needle, "id_m", 0) and needle.id_m > 0:
                 from SupportClasses.FlowPhysics import (
@@ -3523,14 +4901,24 @@ class HardwareSetupPage(ModePage):
                                   viscosity_cP=REFERENCE_VISCOSITY_CP)
                 flow = float(max_safe_flow_rate_uL_s(
                     needle, ref_ink, DEFAULT_PRESSURE_LIMIT_PA) or 0.0)
+                from SupportClasses.FlowPhysics import limiting_flow_segment
+                limiting = limiting_flow_segment(needle)[0]
         except Exception as e:
             logger.debug("max-flow display compute failed: %s", e)
             flow = 0.0
         if flow > 0:
-            g = f"{gauge}G, " if gauge else ""
-            lbl.setText(
-                f"Max safe pump flow ({g}water ref): {flow:.2f} µL/s — "
-                f"hard-capped on all pumps; bounds the max print speed")
+            if getattr(needle, "has_tip", False):
+                tip = getattr(needle, "orifice_id_um", 0.0)
+                lbl.setText(
+                    f"Max safe pump flow (capillary, {tip:.0f} µm tip, water ref): "
+                    f"{flow:.3g} µL/s — set by the {limiting or 'tip'} "
+                    f"(barrel + tip resist in series); hard-capped on all pumps; "
+                    f"bounds the max print speed")
+            else:
+                g = f"{gauge}G, " if gauge else ""
+                lbl.setText(
+                    f"Max safe pump flow ({g}water ref): {flow:.2f} µL/s — "
+                    f"hard-capped on all pumps; bounds the max print speed")
         else:
             lbl.setText("Max safe pump flow: — (configure the needle bore)")
         # v7.5.x: a syringe/pump change alters each pump's per-pump max-rate
@@ -3744,20 +5132,51 @@ class HardwareSetupPage(ModePage):
         else:
             self._config.plate_format = self.plate_combo.currentData() or 24
 
-        # Needle
-        gauge = self.gauge_combo.currentData()
-        if gauge and gauge in self._needle_catalog:
-            needle = self._needle_catalog[gauge]
+        # Needle (v7.6: hypodermic gauge OR pulled glass capillary;
+        # v7.9: plus the assembly FORM and, for a multi-bore assembly, the
+        # explicit per-bore list. `bores` stays None for a single needle, which
+        # is what keeps `to_dict()` byte-identical to every pre-v7.9 setup.)
+        bores = self._bores_from_ui()
+        needle_form = self._current_needle_form()
+        if self._needle_type_combo.currentData() == NEEDLE_TYPE_CAPILLARY:
+            g = self._capillary_geometry()
+            b_id, b_od = g["barrel_id_um"], g["barrel_od_um"]
             self._config.needle = NeedleSpec(
-                gauge=needle.gauge,
-                od_um=needle.od_um,
-                id_um=needle.id_um,
-                wall_um=needle.wall_um,
-                length_inches=self.length_combo.currentData() or 1.0,
+                gauge=None,                          # a capillary has no gauge
+                od_um=b_od,
+                id_um=b_id,                          # base fields == the BARREL
+                wall_um=max(0.0, (b_od - b_id) / 2.0),
+                # Stored as inches so `length_mm` and every barrel-length
+                # consumer keep working untouched.
+                length_inches=g["barrel_length_mm"] / 25.4,
+                # v7.9: no longer hardcoded to 1 — a capillary may be one bore
+                # of a backpack (the FORM and the taper are orthogonal axes).
                 num_channels=self.channels_spin.value(),
+                needle_type=NEEDLE_TYPE_CAPILLARY,
+                tip_id_um=g["tip_id_um"],
+                tip_length_mm=g["tip_length_mm"],
+                tip_od_um=g["tip_od_um"],
+                tip_profile=g["tip_profile"],
+                needle_type_id=self._needle_type_preset_combo.currentData() or None,
+                needle_form=needle_form,
+                bores=bores,
             )
         else:
-            self._config.needle = None
+            gauge = self.gauge_combo.currentData()
+            if gauge and gauge in self._needle_catalog:
+                needle = self._needle_catalog[gauge]
+                self._config.needle = NeedleSpec(
+                    gauge=needle.gauge,
+                    od_um=needle.od_um,
+                    id_um=needle.id_um,
+                    wall_um=needle.wall_um,
+                    length_inches=self.length_combo.currentData() or 1.0,
+                    num_channels=self.channels_spin.value(),
+                    needle_form=needle_form,
+                    bores=bores,
+                )
+            else:
+                self._config.needle = None
 
         # Pumps — resolve inks from library
         for pid, pw in self._pump_widgets.items():
@@ -4401,28 +5820,116 @@ class HardwareSetupPage(ModePage):
         self._refresh_reagent_locations()
 
         # ── 5. Needle Config ─────────────────────────────────────
+        n = self._config.needle
+        is_cap = bool(n is not None and getattr(
+            n, "needle_type", NEEDLE_TYPE_HYPODERMIC) == NEEDLE_TYPE_CAPILLARY)
+
+        self._needle_type_combo.blockSignals(True)
+        tidx = self._needle_type_combo.findData(
+            NEEDLE_TYPE_CAPILLARY if is_cap else NEEDLE_TYPE_HYPODERMIC)
+        self._needle_type_combo.setCurrentIndex(tidx if tidx >= 0 else 0)
+        self._needle_type_combo.blockSignals(False)
+
+        # v7.9: assembly FORM first — it drives the bore count, so the bore rows
+        # `_on_needle_type_changed()` rebuilds below already have the right shape.
+        # The count is read from the RESOLVED bores rather than `needle_form`, so
+        # a hand-edited file whose form and bore list disagree still restores
+        # every bore the operator actually saved.
+        n_bores = 1
+        if n is not None:
+            try:
+                n_bores = max(1, int(n.bore_count))
+            except Exception:
+                n_bores = max(1, int(getattr(n, "num_channels", 1) or 1))
+        form = getattr(n, "needle_form", NEEDLE_FORM_SINGLE) if n else NEEDLE_FORM_SINGLE
+        if NEEDLE_FORM_BORE_COUNT.get(form) != n_bores:
+            form = {1: NEEDLE_FORM_SINGLE, 2: NEEDLE_FORM_BACKPACK,
+                    3: NEEDLE_FORM_TRIPLE}.get(n_bores, NEEDLE_FORM_SINGLE)
+        self._needle_form_combo.blockSignals(True)
+        fidx = self._needle_form_combo.findData(form)
+        self._needle_form_combo.setCurrentIndex(fidx if fidx >= 0 else 0)
+        self._needle_form_combo.blockSignals(False)
+        # The bore count mirror. v7.9 also fixes a pre-existing gap: the count was
+        # only restored on the hypodermic branch below, so a saved capillary came
+        # back as one bore regardless of what was stored.
+        self.channels_spin.blockSignals(True)
+        self.channels_spin.setValue(n_bores)
+        self.channels_spin.blockSignals(False)
+
         self.gauge_combo.blockSignals(True)
-        if self._config.needle:
-            gidx = self.gauge_combo.findData(self._config.needle.gauge)
+        if n is not None and is_cap:
+            for spin, value in (
+                (self._cap_barrel_id_spin, n.id_um),
+                (self._cap_barrel_od_spin, n.od_um),
+                (self._cap_barrel_len_spin, n.length_mm),
+                (self._cap_tip_id_spin, getattr(n, "tip_id_um", 0.0) or 0.0),
+                (self._cap_tip_od_spin, getattr(n, "tip_od_um", None) or 0.0),
+                (self._cap_tip_len_spin, getattr(n, "tip_length_mm", 0.0) or 0.0),
+            ):
+                spin.blockSignals(True)
+                spin.setValue(float(value or 0.0))
+                spin.blockSignals(False)
+            combo = self._cap_tip_profile_combo
+            combo.blockSignals(True)
+            pidx = combo.findData(getattr(n, "tip_profile", TIP_PROFILE_CYLINDER))
+            combo.setCurrentIndex(pidx if pidx >= 0 else 0)
+            combo.blockSignals(False)
+            self._refresh_needle_type_preset_combo(
+                select_id=getattr(n, "needle_type_id", None))
+            logger.debug(
+                f"  Needle: pulled capillary, tip "
+                f"{getattr(n, 'tip_id_um', None)} µm")
+        elif n is not None:
+            gidx = self.gauge_combo.findData(n.gauge)
             if gidx >= 0:
                 self.gauge_combo.setCurrentIndex(gidx)
-            # Length
-            lidx = self.length_combo.findData(self._config.needle.length_inches)
-            if lidx >= 0:
-                self.length_combo.blockSignals(True)
-                self.length_combo.setCurrentIndex(lidx)
-                self.length_combo.blockSignals(False)
-            # Channels
-            self.channels_spin.blockSignals(True)
-            self.channels_spin.setValue(self._config.needle.num_channels)
-            self.channels_spin.blockSignals(False)
+            # Length. v7.6: a length not among the presets (e.g. 0.5") used to
+            # findData to -1 and be silently rewritten to 1.0" on the next save;
+            # add it instead so the stored value survives a round-trip.
+            self.length_combo.blockSignals(True)
+            lidx = self.length_combo.findData(n.length_inches)
+            if lidx < 0:
+                self.length_combo.addItem(f'{n.length_inches:g}"', n.length_inches)
+                lidx = self.length_combo.count() - 1
+            self.length_combo.setCurrentIndex(lidx)
+            self.length_combo.blockSignals(False)
             logger.debug(
-                f"  Needle: {self._config.needle.gauge}G, "
-                f"{self._config.needle.num_channels} channel(s)")
+                f"  Needle: {n.gauge}G, {n.num_channels} bore(s)")
         else:
             self.gauge_combo.setCurrentIndex(0)
         self.gauge_combo.blockSignals(False)
-        self._on_needle_changed()  # Update info label
+        # Visibility + bore-map rows; also refreshes the info label. Safe during
+        # restore — `_restoring` short-circuits `_on_config_changed`.
+        self._on_needle_type_changed()
+
+        # v7.9: per-bore geometry, now that the rows exist. Bore 1's geometry came
+        # from the flat fields above (it mirrors `bores[0]`), so only its label +
+        # pump are pushed here; bores 2..N get everything.
+        # The incoming setup's mount offsets are authoritative INCLUDING their
+        # absence — carrying the outgoing machine's over would place bores using
+        # another rig's calibration.
+        self._bore_offsets.clear()
+        saved_bores = list(getattr(n, "bores", None) or []) if n else []
+        for k, b in enumerate(saved_bores):
+            if k >= len(self._bore_rows):
+                break
+            g = {
+                "label": getattr(b, "label", "") or "",
+                "pump_id": getattr(b, "pump_id", None),
+                "needle_type": getattr(b, "needle_type", NEEDLE_TYPE_HYPODERMIC),
+                "gauge": getattr(b, "gauge", None),
+                "length_inches": (float(b.length_mm) / 25.4) if b.length_mm else 1.0,
+                "tip_profile": getattr(b, "tip_profile", TIP_PROFILE_CYLINDER),
+                "barrel_id": b.id_um,
+                "barrel_od": b.od_um,
+                "barrel_len": b.length_mm,
+                "tip_id": getattr(b, "tip_id_um", None),
+                "tip_od": getattr(b, "tip_od_um", None) or 0.0,
+                "tip_len": getattr(b, "tip_length_mm", None),
+            }
+            self._set_bore_row_geometry(k, g)
+            self._apply_bore_row_visibility(k)
+        self._refresh_bore_readouts()
 
         # ── 6. Pump Channels (ink combos now populated) ──────────
         for pid, pw in self._pump_widgets.items():
@@ -4488,6 +5995,22 @@ class HardwareSetupPage(ModePage):
                         f"not found in combo. Available: "
                         f"{[combo.itemData(i) for i in range(combo.count())]}")
         self._update_channel_map_status()
+        # v7.9: the per-bore pump combos were populated back in the needle section,
+        # when the pump enable checkboxes still held the OUTGOING setup's state, so
+        # the enabled-pump list was empty and every saved bore→pump binding was
+        # dropped. This is the first point where the pumps are known to be enabled,
+        # so re-offer them and re-apply what was saved — BEFORE the sync below,
+        # which mirrors the bore combos over the map rows and would otherwise
+        # propagate the loss to the legacy map as well.
+        self._refresh_bore_pump_options()
+        self._reapply_saved_bore_pumps()
+        # v7.9: on a multi-bore assembly the bores own the mapping, so let them
+        # have the last word over a stored map that may predate them.
+        self._sync_channel_map_from_bores()
+        self._sync_bores_from_channel_map()
+        # The readouts built in the needle section saw the unassigned combos, so
+        # the flow ceilings / duplicate-pump status need re-deriving.
+        self._refresh_bore_readouts()
         logger.debug(
             f"  Channel map: {self._config.needle_channel_pump_map}")
 

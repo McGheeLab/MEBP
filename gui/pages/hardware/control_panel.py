@@ -270,6 +270,10 @@ class HardwareControlPanel(QWidget):
 
     def on_status_update(self) -> None:
         """Refresh position labels + status badges. Called by MainWindow tick."""
+        # The microscope is a separate singleton, so its badge must refresh
+        # even before a StageController is injected (and its connect is
+        # asynchronous, so this tick is how the result becomes visible).
+        self._sync_microscope_badge()
         if self._controller is None:
             return
         try:
@@ -435,6 +439,33 @@ class HardwareControlPanel(QWidget):
         self.btn_disconnect_xbox = _disconnect_btn("Disconnect Xbox")
         self.btn_disconnect_xbox.clicked.connect(self._disconnect_xbox)
         btns.addWidget(self.btn_disconnect_xbox)
+        grid.addLayout(btns, row, 2)
+
+        # Microscope row — v7.5.x. The motorised body (turrets + focus) is
+        # hardware, so it is opened here with the stages rather than on the
+        # page that only assigns cube/objective names. Which DRIVER is used
+        # stays on Hardware Setup → Microscope; this row only opens the link.
+        row += 1
+        grid.addWidget(_name("Microscope"), row, 0)
+        self.badge_scope = StatusBadge("Not connected", "pending")
+        grid.addWidget(self.badge_scope, row, 1)
+        btns = QHBoxLayout()
+        btns.setSpacing(s(6))
+        btns.setContentsMargins(0, 0, 0, 0)
+        self.btn_connect_scope = _connect_btn("Connect", "plug")
+        self.btn_connect_scope.setToolTip(
+            "Open the microscope body using the driver saved on Hardware "
+            "Setup → Microscope.")
+        self.btn_connect_scope.clicked.connect(self._connect_microscope)
+        btns.addWidget(self.btn_connect_scope)
+        self.btn_simulate_scope = _simulate_btn(
+            "Use the microscope simulator instead of the real body. Does not "
+            "change the saved driver.")
+        self.btn_simulate_scope.clicked.connect(self._simulate_microscope)
+        btns.addWidget(self.btn_simulate_scope)
+        self.btn_disconnect_scope = _disconnect_btn("Disconnect microscope")
+        self.btn_disconnect_scope.clicked.connect(self._disconnect_microscope)
+        btns.addWidget(self.btn_disconnect_scope)
         grid.addLayout(btns, row, 2)
 
         card.add_layout(grid)
@@ -1312,7 +1343,92 @@ class HardwareControlPanel(QWidget):
             logger.warning(f"disconnect_xbox failed: {e}")
         self.badge_xbox.set_status("pending", "Not connected")
 
+    # ── Microscope body ─────────────────────────────────────────
+
+    @staticmethod
+    def _microscope():
+        """The shared microscope controller, or None if unavailable.
+
+        Imported lazily so a build missing the microscope module (or with a
+        broken optional dependency) still shows the rest of this panel.
+        """
+        try:
+            from SupportClasses.MicroscopeControl import get_microscope
+            return get_microscope()
+        except Exception as e:            # pragma: no cover - import guard
+            logger.warning(f"microscope controller unavailable: {e}")
+            return None
+
+    def _connect_microscope(self) -> None:
+        """Open the body with the driver saved on Hardware Setup → Microscope."""
+        self._open_microscope(None)
+
+    def _simulate_microscope(self) -> None:
+        """Open the software microscope — leaves the saved driver alone."""
+        self._open_microscope("simulated")
+
+    def _open_microscope(self, backend_name) -> None:
+        scope = self._microscope()
+        if scope is None:
+            self.badge_scope.set_status("err", "Unavailable")
+            return
+        self.badge_scope.set_status(
+            "info", "Starting simulator…" if backend_name == "simulated"
+            else "Connecting…")
+        try:
+            # Asynchronous: the worker thread owns the COM apartment, so the
+            # outcome arrives on a later tick via _sync_badges().
+            scope.connect(backend_name)
+        except Exception as e:
+            logger.warning(f"microscope connect failed: {e}")
+            self.badge_scope.set_status("err", f"Error: {e}")
+
+    def _disconnect_microscope(self) -> None:
+        scope = self._microscope()
+        if scope is None:
+            return
+        try:
+            scope.disconnect()
+        except Exception as e:
+            logger.warning(f"microscope disconnect failed: {e}")
+        self.badge_scope.set_status("pending", "Not connected")
+
+    def _sync_microscope_badge(self) -> None:
+        """v7.5.x: reflect the body's live state.
+
+        ``connect()`` is asynchronous, so the outcome lands here on a later
+        tick rather than at the click.
+        """
+        if not hasattr(self, 'badge_scope'):
+            return
+        scope = self._microscope()
+        if scope is None:
+            self.badge_scope.set_status("err", "Unavailable")
+            return
+        try:
+            state = scope.state()
+        except Exception:                 # pragma: no cover - defensive
+            return
+        if not state.connected:
+            # busy while disconnected == a connect is queued or running, so
+            # the transient label survives until the worker resolves it.
+            if state.busy:
+                self.badge_scope.set_status("info", "Connecting…")
+            elif state.error:
+                self.badge_scope.set_status("err", str(state.error)[:60])
+            else:
+                self.badge_scope.set_status("pending", "Not connected")
+        elif state.busy:
+            self.badge_scope.set_status("info", "Moving…")
+        elif state.backend == "simulated":
+            self.badge_scope.set_status("ok", "Simulated")
+        else:
+            self.badge_scope.set_status("ok", "Connected")
+
     def _sync_badges(self) -> None:
+        # The microscope is its own singleton, not part of StageController, so
+        # its badge syncs whether or not a stage controller has been injected.
+        self._sync_microscope_badge()
         if self._controller is None:
             return
         # v7.4.2: panel may be configured without the Connect group

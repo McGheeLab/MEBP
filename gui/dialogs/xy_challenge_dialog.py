@@ -38,6 +38,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QPainter, QPen, QColor
@@ -63,33 +64,128 @@ MODES = [("Open-loop velocity", "open_loop"),
          ("Confirmed per-segment", "confirm"),
          ("Velocity (closed-loop)", "velocity")]
 
-# Which param rows each mode shows (internal param keys).
-MODE_PARAMS = {
-    "open_loop": ["speed", "resolution_um", "pace", "control_hz", "decel"],
-    "confirm":   ["speed", "resolution_um", "tol_um", "corner_angle"],
-    "velocity":  ["speed", "resolution_um", "lookahead", "control_hz", "decel",
-                  "corner_angle", "corner_factor", "kp", "kd"],
-}
 
-# Coordinate-descent: ordered (store-param, grid) list swept per mode. The
-# internal _mode_params key is resolved via _PARAM_KEY.
+# ── ONE declarative parameter spec ────────────────────────────────────
+#
+# Every tunable used to be described in SEVEN parallel places (MODE_PARAMS, the
+# spin constructors, the `rows` layout list, _PARAM_KEY, _mode_params,
+# _apply_tuned, and _load/_save_params_to_store). Adding a knob meant editing
+# all seven and any omission failed silently. They are now GENERATED from this
+# single list, so a new knob is one row here.
+
+@dataclass(frozen=True)
+class ParamSpec:
+    """One tunable: its widget, its UI placement, its store binding, its grid."""
+    key: str                    # internal _mode_params key
+    attr: str                   # dialog attribute holding the spin
+    label: str                  # UI label
+    lo: float
+    hi: float
+    default: float
+    decimals: int
+    step: float
+    suffix: str
+    tip: str
+    modes: tuple                # UI modes that show this row
+    store_key: str = ""         # PATH_TUNING_DEFAULTS key ("" = not persisted)
+    store_modes: tuple = ()     # store buckets it persists into
+    grid: tuple = ()            # coordinate-descent grid (() = not swept)
+    grid_modes: tuple = ()      # modes that SWEEP it (default: store_modes)
+    kind: str = "mode"          # "mode" | "resolution" | "ui"
+
+    def swept_by(self, mode) -> bool:
+        return bool(self.grid) and mode in (self.grid_modes or self.store_modes)
+
+
+_ALL_MODES = ("open_loop", "confirm", "velocity")
+
+# NOTE on `corner_angle`: it persists into BOTH the confirm and velocity buckets
+# from a single widget. That is a real defect (tuning it under `confirm` silently
+# rewrites the velocity value) but it is TODAY's behaviour, and this refactor is
+# deliberately behaviour-preserving. It is fixed by the per-mode params model.
+PARAM_SPECS = (
+    ParamSpec("speed", "_speed_spin", "Speed:", 0.1, 50.0, 5.0, 2, 0.5, " mm/s",
+              "Path speed for the run (all modes).",
+              _ALL_MODES, kind="ui"),
+    ParamSpec("resolution_um", "_res_spin", "Resolution:",
+              1.0, 500.0, 30.0, 0, 1.0, " µm",
+              "Resolution element — smallest feature / acceptable path-deviation "
+              "tolerance. Drives robustness PASS/FAIL.",
+              _ALL_MODES, kind="resolution"),
+    ParamSpec("pace", "_pace_spin", "Pace ×:", 1.0, 4.0, 1.0, 2, 0.05, " ×",
+              "[open-loop] speed trim — divides the commanded velocity to match "
+              "a slow stage.",
+              ("open_loop",), store_key="pace_correction",
+              store_modes=("open_loop",),
+              grid=(1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)),
+    ParamSpec("tol_um", "_tol_spin", "Confirm tol:",
+              2.0, 200.0, 40.0, 0, 5.0, " µm",
+              "[confirm] arrival tolerance at a corner.",
+              ("confirm",), store_key="settle_tol_um", store_modes=("confirm",),
+              grid=(10.0, 20.0, 30.0, 45.0, 60.0, 90.0)),
+    ParamSpec("lookahead", "_look_spin", "Lookahead:",
+              0.1, 3.0, 0.6, 2, 0.05, " mm",
+              "[velocity] pure-pursuit lookahead (smaller = tighter corners, "
+              "more jitter).",
+              ("velocity",), store_key="lookahead_mm",
+              store_modes=("velocity",),
+              grid=(0.2, 0.35, 0.5, 0.65, 0.8, 1.0, 1.3)),
+    ParamSpec("control_hz", "_hz_spin", "Ctrl rate:",
+              5.0, 60.0, 25.0, 0, 1.0, " Hz",
+              "[open-loop/velocity] control-loop rate.",
+              ("open_loop", "velocity"), store_key="control_hz",
+              store_modes=("velocity",)),
+    ParamSpec("decel", "_decel_spin", "Decel:", 0.2, 6.0, 1.5, 1, 0.1, " mm",
+              "[open-loop/velocity] end-of-path ramp-down.",
+              ("open_loop", "velocity"), store_key="decel_mm",
+              store_modes=("velocity",)),
+    ParamSpec("corner_angle", "_corner_angle_spin", "Corner °:",
+              5.0, 90.0, 30.0, 0, 5.0, " °",
+              "Turn angle counted as a corner (slow into / stop at).",
+              ("confirm", "velocity"), store_key="corner_angle_deg",
+              store_modes=("confirm", "velocity"),
+              grid=(15.0, 25.0, 35.0, 50.0),
+              # Historically swept ONLY under `confirm`, even though the widget
+              # writes both buckets. Preserved verbatim.
+              grid_modes=("confirm",)),
+    ParamSpec("corner_factor", "_corner_fac_spin", "Corner speed:",
+              0.05, 1.0, 0.4, 2, 0.05, " ×",
+              "[velocity] fraction of speed allowed at the sharpest corner.",
+              ("velocity",), store_key="corner_speed_factor",
+              store_modes=("velocity",),
+              grid=(0.2, 0.3, 0.4, 0.55, 0.7)),
+    ParamSpec("kp", "_kp_spin", "PID Kp:", 0.0, 20.0, 0.0, 2, 0.1, "",
+              "[velocity] cross-track PID proportional gain (0 = pure pursuit). "
+              "The stability limit is π/(2L) for the machine's dead time L — see "
+              "the “PID from dead time” button, which computes it exactly.",
+              ("velocity",), store_key="pid_kp", store_modes=("velocity",),
+              # The old grid topped out at 4.0, but the correct gain for ME3B V1
+              # is ≈5.24 — the descent literally could not reach the right answer.
+              # Extended to straddle it.
+              grid=(0.0, 1.0, 2.0, 3.5, 5.0, 7.0, 9.0)),
+    ParamSpec("kd", "_kd_spin", "PID Kd:", 0.0, 2.0, 0.0, 3, 0.01, "",
+              "[velocity] cross-track PID derivative gain.",
+              ("velocity",), store_key="pid_kd", store_modes=("velocity",),
+              grid=(0.0, 0.02, 0.05, 0.1)),
+)
+
+_SPEC_BY_KEY = {p.key: p for p in PARAM_SPECS}
+_SPEC_BY_STORE_KEY = {p.store_key: p for p in PARAM_SPECS if p.store_key}
+
+# Which param rows each mode shows (internal param keys) — generated.
+MODE_PARAMS = {m: [p.key for p in PARAM_SPECS if m in p.modes]
+               for m in _ALL_MODES}
+
+# Coordinate-descent: ordered (store-param, grid) list swept per mode.
+# Order follows PARAM_SPECS declaration order, which reproduces the historical
+# per-mode sweep order.
 AUTOTUNE = {
-    "open_loop": [("pace_correction", [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0])],
-    "confirm":   [("settle_tol_um", [10.0, 20.0, 30.0, 45.0, 60.0, 90.0]),
-                  ("corner_angle_deg", [15.0, 25.0, 35.0, 50.0])],
-    "velocity":  [("lookahead_mm", [0.2, 0.35, 0.5, 0.65, 0.8, 1.0, 1.3]),
-                  ("corner_speed_factor", [0.2, 0.3, 0.4, 0.55, 0.7]),
-                  ("pid_kp", [0.0, 0.5, 1.0, 2.0, 4.0]),
-                  ("pid_kd", [0.0, 0.02, 0.05, 0.1])],
+    m: [(p.store_key, list(p.grid)) for p in PARAM_SPECS if p.swept_by(m)]
+    for m in _ALL_MODES
 }
 
-# store-param name → the _mode_params dict key
-_PARAM_KEY = {
-    "pace_correction": "pace", "settle_tol_um": "tol_um",
-    "corner_angle_deg": "corner_angle", "lookahead_mm": "lookahead",
-    "corner_speed_factor": "corner_factor", "pid_kp": "kp", "pid_kd": "kd",
-    "control_hz": "control_hz", "decel_mm": "decel",
-}
+# store-param name → the _mode_params dict key — generated.
+_PARAM_KEY = {p.store_key: p.key for p in PARAM_SPECS if p.store_key}
 
 
 class _Bridge(QObject):
@@ -217,6 +313,7 @@ class XYChallengeDialog(QDialog):
         self._build()
         self._load_params_from_store()
         self._refresh_param_visibility()
+        self.refresh_budget()
         self._bridge.status.connect(self._status.setText)
         self._bridge.log.connect(self._append_log)
         self._bridge.result.connect(self._on_result)
@@ -286,56 +383,30 @@ class XYChallengeDialog(QDialog):
         self._hint.setWordWrap(True)
         root.addWidget(self._hint)
 
-        # Per-mode params (each in a row widget, shown/hidden by mode)
-        self._speed_spin = self._dspin(0.1, 50.0, 5.0, 2, 0.5, " mm/s",
-                                       "Path speed for the run (all modes).")
-        self._res_spin = self._dspin(1.0, 500.0, 30.0, 0, 1.0, " µm",
-                                     "Resolution element — smallest feature / "
-                                     "acceptable path-deviation tolerance. Drives "
-                                     "robustness PASS/FAIL.")
-        self._pace_spin = self._dspin(1.0, 4.0, 1.0, 2, 0.05, " ×",
-                                      "[open-loop] speed trim — divides the "
-                                      "commanded velocity to match a slow stage.")
-        self._tol_spin = self._dspin(2.0, 200.0, 40.0, 0, 5.0, " µm",
-                                     "[confirm] arrival tolerance at a corner.")
-        self._look_spin = self._dspin(0.1, 3.0, 0.6, 2, 0.05, " mm",
-                                      "[velocity] pure-pursuit lookahead "
-                                      "(smaller = tighter corners, more jitter).")
-        self._hz_spin = self._dspin(5.0, 60.0, 25.0, 0, 1.0, " Hz",
-                                    "[open-loop/velocity] control-loop rate.")
-        self._decel_spin = self._dspin(0.2, 6.0, 1.5, 1, 0.1, " mm",
-                                       "[open-loop/velocity] end-of-path ramp-down.")
-        self._corner_angle_spin = self._dspin(5.0, 90.0, 30.0, 0, 5.0, " °",
-                                     "Turn angle counted as a corner (slow into / "
-                                     "stop at).")
-        self._corner_fac_spin = self._dspin(0.05, 1.0, 0.4, 2, 0.05, " ×",
-                                     "[velocity] fraction of speed allowed at the "
-                                     "sharpest corner.")
-        self._kp_spin = self._dspin(0.0, 20.0, 0.0, 2, 0.1, "",
-                                    "[velocity] cross-track PID proportional gain "
-                                    "(0 = pure pursuit).")
-        self._kd_spin = self._dspin(0.0, 2.0, 0.0, 3, 0.01, "",
-                                    "[velocity] cross-track PID derivative gain.")
-
+        # Per-mode params — widgets, layout and rows all GENERATED from
+        # PARAM_SPECS so there is exactly one place to add a knob.
         pg = QGridLayout()
         pg.setHorizontalSpacing(s(8))
         pg.setVerticalSpacing(s(4))
-        rows = [
-            ("speed", "Speed:", self._speed_spin),
-            ("resolution_um", "Resolution:", self._res_spin),
-            ("pace", "Pace ×:", self._pace_spin),
-            ("tol_um", "Confirm tol:", self._tol_spin),
-            ("lookahead", "Lookahead:", self._look_spin),
-            ("control_hz", "Ctrl rate:", self._hz_spin),
-            ("decel", "Decel:", self._decel_spin),
-            ("corner_angle", "Corner °:", self._corner_angle_spin),
-            ("corner_factor", "Corner speed:", self._corner_fac_spin),
-            ("kp", "PID Kp:", self._kp_spin),
-            ("kd", "PID Kd:", self._kd_spin),
-        ]
-        for i, (name, label, spin) in enumerate(rows):
-            pg.addWidget(self._param_row(name, label, spin), i // 3, i % 3)
+        for i, spec in enumerate(PARAM_SPECS):
+            spin = self._dspin(spec.lo, spec.hi, spec.default, spec.decimals,
+                               spec.step, spec.suffix, spec.tip)
+            setattr(self, spec.attr, spin)
+            pg.addWidget(self._param_row(spec.key, spec.label, spin),
+                         i // 3, i % 3)
         root.addLayout(pg)
+
+        # ── Speed budget: WHY the print runs at the speed it runs at ──
+        # The single most-asked question this dialog could not answer. The
+        # follower's speed is min(print_speed, lookahead/((loop+dead)·safety),
+        # top_speed·frac), and on ME3B V1 the middle term wins at 0.31 mm/s
+        # because a one-sample by_phase intercept inflates the dead time. This
+        # line spells out the arithmetic and names the binding term.
+        self._budget = QLabel("")
+        self._budget.setWordWrap(True)
+        self._budget.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+        root.addWidget(self._budget)
 
         # Overlay + log
         mid = QHBoxLayout()
@@ -351,6 +422,15 @@ class XYChallengeDialog(QDialog):
 
         # Buttons
         row = QHBoxLayout()
+        self._calibrate_btn = QPushButton("⚙ Calibrate XY (one click)")
+        self._calibrate_btn.setToolTip(
+            "Measure the comms rate, dead time and top speed, DERIVE every "
+            "follower parameter from them in closed form, verify on real shapes, "
+            "and apply the result to every print.\n\n"
+            "The stage is centred in its travel envelope first and every probe "
+            "excursion is checked to fit, so no test can reach a travel limit. "
+            "Needle stays retracted at Safe Z throughout (XY only).")
+        self._calibrate_btn.clicked.connect(lambda: self._launch("calibrate"))
         self._run_btn = QPushButton("Run")
         self._run_btn.setToolTip("Drive the shape in the selected mode; overlay "
                                  "actual vs ideal + report deviation.")
@@ -369,15 +449,37 @@ class XYChallengeDialog(QDialog):
         self._robust_btn.setToolTip("[velocity] Sweep shapes × sizes × speeds; "
                                     "PASS/FAIL each vs the resolution element.")
         self._robust_btn.clicked.connect(lambda: self._launch("robust"))
+        self._pid_calc_btn = QPushButton("PID from dead time")
+        self._pid_calc_btn.setToolTip(
+            "Derive the cross-track gains ANALYTICALLY from the measured dead "
+            "time — the plant is a pure integrator plus delay, so Ku = π/(2L) and "
+            "Tu = 4L exactly. Instant, no stage motion, and identical every time "
+            "you press it (the relay experiment is not).")
+        self._pid_calc_btn.clicked.connect(lambda: self._launch("pid_calc"))
+        self._deadtime_btn = QPushButton("Measure dead time")
+        self._deadtime_btn.setToolTip(
+            "Step the velocity command and time the position response → the "
+            "REAL command→motion dead time (no camera). This is what caps the "
+            "print speed; the legacy by_phase settle-time average currently "
+            "throttles this machine to a fraction of its measured top speed.")
+        self._deadtime_btn.clicked.connect(lambda: self._launch("deadtime"))
         self._save_btn = QPushButton("Save tuned params")
         self._save_btn.setToolTip("Persist the current parameters so the real "
                                   "print uses them.")
         self._save_btn.clicked.connect(self._save_params_to_store)
+        self._geometry_btn = QPushButton("📐 Geometry panel…")
+        self._geometry_btn.setToolTip(
+            "Ideal vs actual per shape × size — simulated from the measured "
+            "stage characteristics (instant, no motion) and/or driven on the "
+            "stage. Shows where geometry itself defeats the current tuning.")
+        self._geometry_btn.clicked.connect(self._open_geometry_panel)
         self._stop_btn = QPushButton("Stop")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(lambda: self._stop.set())
-        for b in (self._run_btn, self._cmp_btn, self._tune_btn, self._zn_btn,
-                  self._robust_btn, self._save_btn, self._stop_btn):
+        for b in (self._calibrate_btn, self._run_btn, self._cmp_btn,
+                  self._tune_btn, self._zn_btn, self._pid_calc_btn,
+                  self._robust_btn, self._deadtime_btn, self._save_btn,
+                  self._geometry_btn, self._stop_btn):
             row.addWidget(b)
         row.addStretch(1)
         root.addLayout(row)
@@ -386,8 +488,16 @@ class XYChallengeDialog(QDialog):
         self._status.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         root.addWidget(self._status)
-        self.resize(s(940), s(680))
+        self.resize(s(940), s(720))
         self._refresh_hint()
+        # Keep the speed-budget line live as the operator changes the inputs it
+        # depends on.
+        for _sp in (self._speed_spin, self._look_spin, self._hz_spin,
+                    self._corner_fac_spin):
+            try:
+                _sp.valueChanged.connect(lambda *_: self.refresh_budget())
+            except Exception:
+                pass
 
     def _refresh_hint(self):
         name = self._shape_combo.currentData()
@@ -406,74 +516,115 @@ class XYChallengeDialog(QDialog):
     def _append_log(self, msg):
         self._log.appendPlainText(msg)
 
-    # ── params ↔ store ────────────────────────────────────────────
-    def _load_params_from_store(self):
-        ol = self._store.get_mode_params("open_loop")
-        cf = self._store.get_mode_params("confirm")
-        ve = self._store.get_mode_params("velocity")
-        self._pace_spin.setValue(ol.get("pace_correction", 1.0))
-        self._tol_spin.setValue(cf.get("settle_tol_um", 40.0))
-        self._look_spin.setValue(ve.get("lookahead_mm", 0.6))
-        self._hz_spin.setValue(ve.get("control_hz", 25.0))
-        self._decel_spin.setValue(ve.get("decel_mm", 1.5))
-        self._corner_angle_spin.setValue(ve.get("corner_angle_deg", 30.0))
-        self._corner_fac_spin.setValue(ve.get("corner_speed_factor", 0.4))
-        self._kp_spin.setValue(ve.get("pid_kp", 0.0))
-        self._kd_spin.setValue(ve.get("pid_kd", 0.0))
+    # ── speed budget readout ──────────────────────────────────────
+    def refresh_budget(self):
+        """Explain the commanded speed: the arithmetic, the binding term, and —
+        when it is the dead time — WHICH stored measurement is responsible.
+
+        Also warns when the corner limits all sit above the cap, because in that
+        state ``min(cap, corner_limit)`` is always the cap and tuning
+        ``corner_speed_factor`` provably does nothing (the operator swept it and
+        correctly observed a completely flat result)."""
+        lbl = getattr(self, "_budget", None)
+        if lbl is None:
+            return
         try:
-            self._res_spin.setValue(self._store.get_resolution_element_um())
+            speed = float(self._speed_spin.value())
+            look = float(self._look_spin.value())
+            res = self._resolve(speed, look, max(5.0, self._hz_spin.value()))
+            loop_ms = float(self._store.get_control_loop_ms() or 0.0)
+            dead_total = float(res.get("dead_time_s", 0.0))
+            lag = max(0.0, dead_total - loop_ms / 1000.0)
+            _dt, src = self._store.effective_dead_time_s()
+            cap = res["speed_cap_mm_s"]
+            top = res["max_um_s"] / 1000.0
+            reason = res.get("cap_reason", "")
+
+            src_txt = {"measured": "measured step response",
+                       "phase_lag": "by_phase settle mean ⚠",
+                       "unmeasured": "unmeasured"}.get(src, src)
+            parts = [
+                f"Speed budget: commanded {cap:.2f} mm/s "
+                f"(asked {speed:.2f}) — limited by <b>{reason or 'n/a'}</b>.",
+                f"cap = lookahead {res.get('lookahead_mm', look):.2f} mm / "
+                f"((loop {loop_ms / 1000.0:.3f} s + dead {lag:.3f} s) × safety) "
+                f"· dead time from {src_txt} · stage top speed {top:.2f} mm/s.",
+            ]
+            if src == "phase_lag":
+                parts.append(
+                    "⚠ The dead time is the mean of the by_phase <i>settle</i> "
+                    "intercepts, not a transport delay — press "
+                    "“Measure dead time” for the real number.")
+            # Is corner tuning capable of doing anything at this cap?
+            csf = float(self._corner_fac_spin.value())
+            worst_corner = speed * csf            # a 180° reversal
+            if worst_corner > cap:
+                parts.append(
+                    f"⚠ Corner tuning is INERT here: the sharpest corner limit "
+                    f"is {worst_corner:.2f} mm/s, above the {cap:.2f} mm/s cap, "
+                    f"so min(cap, corner) is always the cap. Raise the cap "
+                    f"(measure the dead time / enable hold-speed) first.")
+            lbl.setText("<br>".join(parts))
         except Exception:
-            pass
+            lbl.setText("")
+
+    # ── params ↔ store (all four generated from PARAM_SPECS) ──────
+    def _spin_for(self, spec):
+        return getattr(self, spec.attr, None)
+
+    def _load_params_from_store(self):
+        cache = {m: self._store.get_mode_params(m) for m in _ALL_MODES}
+        for spec in PARAM_SPECS:
+            spin = self._spin_for(spec)
+            if spin is None:
+                continue
+            if spec.kind == "resolution":
+                try:
+                    spin.setValue(self._store.get_resolution_element_um())
+                except Exception:
+                    pass
+                continue
+            if not spec.store_key or not spec.store_modes:
+                continue
+            # Read from the LAST bucket it persists into, matching the historical
+            # precedence (corner_angle read from `velocity`, not `confirm`).
+            bucket = cache.get(spec.store_modes[-1], {})
+            spin.setValue(bucket.get(spec.store_key, spec.default))
 
     def _save_params_to_store(self):
-        self._store.set_mode_params(
-            "open_loop", {"pace_correction": self._pace_spin.value()})
-        self._store.set_mode_params("confirm", {
-            "settle_tol_um": self._tol_spin.value(),
-            "corner_angle_deg": self._corner_angle_spin.value()})
-        self._store.set_mode_params("velocity", {
-            "lookahead_mm": self._look_spin.value(),
-            "control_hz": self._hz_spin.value(),
-            "decel_mm": self._decel_spin.value(),
-            "corner_angle_deg": self._corner_angle_spin.value(),
-            "corner_speed_factor": self._corner_fac_spin.value(),
-            "pid_kp": self._kp_spin.value(),
-            "pid_kd": self._kd_spin.value()})
-        try:
-            self._store.set_resolution_element_um(self._res_spin.value())
-        except Exception:
-            pass
+        updates = {m: {} for m in _ALL_MODES}
+        for spec in PARAM_SPECS:
+            spin = self._spin_for(spec)
+            if spin is None:
+                continue
+            if spec.kind == "resolution":
+                try:
+                    self._store.set_resolution_element_um(spin.value())
+                except Exception:
+                    pass
+                continue
+            if not spec.store_key:
+                continue
+            for m in spec.store_modes:
+                updates[m][spec.store_key] = spin.value()
+        for m, vals in updates.items():
+            if vals:
+                self._store.set_mode_params(m, vals)
         self._status.setText("Saved tuned params — the real print will use them.")
 
     def _mode_params(self, mode):
-        return {
-            "speed": self._speed_spin.value(),
-            "resolution_um": self._res_spin.value(),
-            "pace": self._pace_spin.value(),
-            "tol_um": self._tol_spin.value(),
-            "lookahead": self._look_spin.value(),
-            "control_hz": self._hz_spin.value(),
-            "decel": self._decel_spin.value(),
-            "corner_angle": self._corner_angle_spin.value(),
-            "corner_factor": self._corner_fac_spin.value(),
-            "kp": self._kp_spin.value(),
-            "kd": self._kd_spin.value(),
-        }
+        out = {}
+        for spec in PARAM_SPECS:
+            spin = self._spin_for(spec)
+            if spin is not None:
+                out[spec.key] = spin.value()
+        return out
 
     def _apply_tuned(self, store_param, val):
         """Reflect a tuned value into its spin (GUI thread via the apply signal)."""
         try:
-            {
-                "pace_correction": self._pace_spin,
-                "settle_tol_um": self._tol_spin,
-                "corner_angle_deg": self._corner_angle_spin,
-                "lookahead_mm": self._look_spin,
-                "corner_speed_factor": self._corner_fac_spin,
-                "pid_kp": self._kp_spin,
-                "pid_kd": self._kd_spin,
-                "control_hz": self._hz_spin,
-                "decel_mm": self._decel_spin,
-            }[store_param].setValue(val)
+            spec = _SPEC_BY_STORE_KEY[store_param]
+            self._spin_for(spec).setValue(val)
         except Exception:
             pass
 
@@ -483,6 +634,16 @@ class XYChallengeDialog(QDialog):
 
     def _launch(self, action):
         if self._busy():
+            return
+        # "PID from dead time" is pure arithmetic over stored calibration — no
+        # stage motion at all — so it must not be gated on a connected stage.
+        if action == "pid_calc":
+            self._stop.clear()
+            self._set_running(True)
+            self._thread = threading.Thread(
+                target=self._worker_pid_analytic, name="XYChallenge",
+                daemon=True)
+            self._thread.start()
             return
         if not getattr(self._ctrl, "is_xy_connected", False):
             self._status.setText("Connect the XY stage first.")
@@ -499,18 +660,25 @@ class XYChallengeDialog(QDialog):
         self._set_running(True)
         target = {"run": self._worker_run, "compare": self._worker_compare,
                   "tune": self._worker_tune, "zn": self._worker_zn,
-                  "robust": self._worker_robustness}[action]
+                  "robust": self._worker_robustness,
+                  "deadtime": self._worker_deadtime,
+                  "pid_calc": self._worker_pid_analytic,
+                  "calibrate": self._worker_calibrate_all}[action]
         self._thread = threading.Thread(target=target, name="XYChallenge",
                                         daemon=True)
         self._thread.start()
 
     def _set_running(self, on):
-        for b in (self._run_btn, self._cmp_btn, self._tune_btn, self._save_btn):
+        for b in (self._calibrate_btn, self._run_btn, self._cmp_btn,
+                  self._tune_btn, self._save_btn, self._deadtime_btn,
+                  self._pid_calc_btn):
             b.setEnabled(not on)
         is_vel = (self._mode_combo.currentData() == "velocity")
         self._zn_btn.setEnabled(is_vel and not on)
         self._robust_btn.setEnabled(is_vel and not on)
         self._stop_btn.setEnabled(on)
+        if not on:
+            self.refresh_budget()
 
     # ── GUI-thread signal handlers ────────────────────────────────
     def _on_result(self, d):
@@ -588,18 +756,55 @@ class XYChallengeDialog(QDialog):
         """Ground the control params in the store's measured calibration (same
         resolve_control the real print uses)."""
         try:
+            v = self._store.get_mode_params("velocity")
+        except Exception:
+            v = {}
+
+        def _tv(key, default=0.0):
+            try:
+                return float(v.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+
+        # A purpose-measured dead time supersedes the by_phase settle time.
+        try:
+            dead_time_s, _src = self._store.effective_dead_time_s()
+            phase_lag = 0.0 if dead_time_s else (self._store.get_phase_lag_s() or 0.0)
+        except Exception:
+            dead_time_s, phase_lag = 0.0, 0.0
+
+        try:
+            # SAME call, SAME arguments as PrintManager._execute_print_path_velocity
+            # — this is what makes bench tuning transfer to the print.
             return VC.resolve_control(
                 print_speed_mm_s=speed, lookahead_mm=lookahead,
                 xy_max_speed_um_s=self._store.get_xy_max_speed_um_s() or 0.0,
                 control_loop_ms=self._store.get_control_loop_ms() or 0.0,
-                phase_lag_s=self._store.get_phase_lag_s() or 0.0,
+                phase_lag_s=phase_lag,
                 default_control_hz=default_hz,
-                fallback_max_um_s=self._max_um_s())
+                fallback_max_um_s=self._max_um_s(),
+                dead_time_s=dead_time_s,
+                lead_time_frac=_tv("lead_time_frac"),
+                min_lookahead_frac=_tv("min_lookahead_frac"),
+                max_speed_frac=_tv("max_speed_frac"),
+                hold_speed=bool(_tv("hold_speed")),
+                safety=(_tv("deadtime_safety") or 2.0))
         except Exception:
             return {"control_hz": default_hz, "max_um_s": self._max_um_s(),
-                    "speed_cap_mm_s": speed}
+                    "speed_cap_mm_s": speed, "lookahead_mm": lookahead,
+                    "dead_time_s": 0.0, "lead_s": 0.0, "cap_reason": ""}
 
-    def _set_sms(self, max_um):
+    def _open_geometry_panel(self):
+        try:
+            from gui.dialogs.xy_geometry_panel_dialog import (
+                GeometryPanelDialog)
+            dlg = GeometryPanelDialog(self._ctrl, safe_z=self._safe_z,
+                                      parent=self)
+            dlg.show()
+        except Exception as e:               # pragma: no cover
+            logger.warning(f"geometry panel failed to open: {e}")
+
+    def _set_sms(self, max_um, jerk_pct=0.0):
         xy = getattr(self._ctrl, "xy_stage", None)
         if xy is not None:
             try:
@@ -607,6 +812,9 @@ class XYChallengeDialog(QDialog):
                     xy.set_acceleration(80)
                 if hasattr(xy, "set_speed_mm_s"):
                     xy.set_speed_mm_s(max_um / 1000.0)
+                # Match the print path: 0 = don't touch.
+                if jerk_pct and hasattr(xy, "set_jerk"):
+                    xy.set_jerk(int(jerk_pct))
             except Exception:
                 pass
 
@@ -723,7 +931,16 @@ class XYChallengeDialog(QDialog):
         res = self._resolve(speed, lookahead, max(5.0, p.get("control_hz", 25.0)))
         max_um = res["max_um_s"]
         speed_cap = res["speed_cap_mm_s"]
-        self._set_sms(max_um)
+        # The lookahead may be RESOLVED upward from the dynamics (so it stops
+        # being the speed knob) — use the resolved value, exactly as the print
+        # path does, or the bench would carrot differently from the print.
+        lookahead = res.get("lookahead_mm", lookahead)
+        try:
+            _jerk = float(self._store.get_mode_params("velocity")
+                          .get("jerk_pct", 0.0) or 0.0)
+        except Exception:
+            _jerk = 0.0
+        self._set_sms(max_um, jerk_pct=_jerk)
         speed_limit_at, _corners = VC.plan_speed_limits(
             ideal, cum, speed, corner_angle_deg=p.get("corner_angle", 30.0),
             corner_speed_factor=p.get("corner_factor", 0.4), decel_mm=decel)
@@ -821,6 +1038,70 @@ class XYChallengeDialog(QDialog):
         finally:
             self._restore()
 
+    def _worker_deadtime(self):
+        """Measure the REAL command→motion dead time and store it.
+
+        This is the number that divides the achievable print speed. The legacy
+        source (``by_phase.intercept_s`` mean) is an optical SETTLE time — on
+        ME3B V1 it averages 0.287 s from data that includes two impossible
+        negatives and a single-point 0.577 s fit, capping prints at 0.31 mm/s on
+        a stage measured at 5.9 mm/s. Storing a measured value here makes every
+        subsequent print (and every tuning run) faster.
+
+        XY-only, needle stays retracted, stage always stopped and returned.
+        """
+        try:
+            from SupportClasses import XYDeadTime as DT
+            self._prep()
+            self._bridge.status.emit("Measuring dead time (XY only, needle "
+                                     "retracted)…")
+            r = DT.measure_velocity_dead_time(
+                self._ctrl, axis="diag", repeats=5,
+                stop_evt=self._stop,
+                on_progress=lambda m: self._bridge.log.emit(f"  {m}"))
+            if "error" in r:
+                self._bridge.finished.emit(False, f"Dead time: {r['error']}")
+                return
+
+            # Use the FOPDT apparent lag (dead time + part of the rise) — it is
+            # what a pure-pursuit loop actually experiences, and it is the more
+            # conservative of the two.
+            lag = max(r["apparent_lag_s"], r["dead_time_s"])
+            self._store.set_velocity_dead_time_s(
+                lag, n=r["n"], spread_s=r.get("apparent_lag_spread_s", 0.0),
+                tau_s=r.get("tau_s"))
+
+            loop_ms = self._store.get_control_loop_ms() or 0.0
+            look = float(self._look_spin.value())
+            stable = DT.stable_speed_mm_s(lag, loop_ms, look)
+            old_lag = self._store.get_phase_lag_s() or 0.0
+            old_stable = DT.stable_speed_mm_s(old_lag, loop_ms, look) if old_lag \
+                else None
+
+            self._bridge.log.emit(
+                f"  measured dead time {lag * 1000:.0f} ms "
+                f"(was using {old_lag * 1000:.0f} ms from by_phase)")
+            if stable:
+                gain = (f" — {stable / old_stable:.1f}× faster"
+                        if old_stable and old_stable > 0 else "")
+                self._bridge.log.emit(
+                    f"  stable speed at lookahead {look:.2f} mm: "
+                    f"{stable:.2f} mm/s{gain}")
+            cruise = r.get("cruise_um_s", 0.0)
+            if cruise:
+                stored = self._store.get_xy_max_speed_um_s() or 0.0
+                self._bridge.log.emit(
+                    f"  cruise cross-check {cruise:.0f} µm/s "
+                    f"(stored top speed {stored:.0f} µm/s)")
+            self._bridge.finished.emit(
+                True, f"Dead time {lag * 1000:.0f} ms stored"
+                      + (f" → stable speed {stable:.2f} mm/s" if stable else ""))
+        except Exception as e:
+            logger.exception("XY challenge dead-time error")
+            self._bridge.finished.emit(False, f"Error: {e}")
+        finally:
+            self._restore()
+
     def _worker_compare(self):
         try:
             self._prep()
@@ -893,13 +1174,279 @@ class XYChallengeDialog(QDialog):
         finally:
             self._restore()
 
-    def _worker_zn(self):
-        """Ziegler–Nichols relay tune of the velocity cross-track PID gains.
+    def _worker_calibrate_all(self):
+        """ONE-CLICK systematic XY calibration: measure → derive → verify → apply.
 
-        Drive a straight test line at low speed with pure-pursuit forward motion
-        plus a perpendicular RELAY velocity ±d that flips on the sign of the
-        cross-track error → a limit cycle. Measure its period Tu and amplitude a,
-        then Ku = 4d/(πa) (VelocityControl.relay_ultimate_gain) → ZN gains.
+        The sequence order is the whole point — every later step consumes an
+        earlier measurement, which is why running the individual buttons piecemeal
+        so easily produced an inconsistent set:
+
+            comms rate ─┐
+            dead time  ─┼→ derive every follower parameter in closed form
+            top speed  ─┘        ↓
+                              verify on real shapes, then apply to ALL prints
+
+        Almost nothing is searched. The lookahead is *solved* for the target
+        speed, the gains come from ``Ku = π/(2L)``, the decel from the dead-time
+        coast distance. Same machine measured twice ⇒ same settings.
+
+        SAFETY: the stage is driven to the MIDDLE of its travel envelope first and
+        every probe excursion is checked to fit with margin, so no test can reach
+        an extent (a clamped probe does not fail loudly — it silently measures the
+        clamp). XY-only throughout, needle retracted at Safe Z.
+        """
+        from SupportClasses import XYAutoCalibration as AC
+        from SupportClasses import XYDeadTime as DT
+        try:
+            self._prep()
+            target = max(0.05, float(self._speed_spin.value()))
+            res_um = float(self._res_spin.value())
+            policy = AC.CalibrationPolicy(target_speed_mm_s=target,
+                                          resolution_um=res_um)
+
+            # ── 0. envelope + centring ──
+            self._bridge.status.emit("Calibrating: centring the stage…")
+            self._bridge.log.emit("— One-click XY calibration —")
+            probe_um = 1500.0
+            fit = AC.check_fits(self._ctrl, probe_um)
+            if not fit["ok"] and fit["usable_um"] <= 0:
+                self._bridge.finished.emit(False, fit["reason"])
+                return
+            centered = AC.center_stage(self._ctrl, safe_z_mm=self._safe_z)
+            if not centered["ok"]:
+                self._bridge.finished.emit(
+                    False, f"Could not centre the stage: {centered['reason']}")
+                return
+            cx, cy = centered["center_um"]
+            self._bridge.log.emit(
+                f"  centred at ({cx:.0f}, {cy:.0f}) µm · usable excursion "
+                f"±{fit['usable_um']:.0f} µm — no test can reach a travel limit")
+
+            # ── 1. comms rate ──
+            if self._stop.is_set():
+                return
+            self._bridge.status.emit("Calibrating: comms rate…")
+            r = self._ctrl.measure_control_loop_rate(iterations=40)
+            if "error" in r:
+                self._bridge.finished.emit(False, f"Comms rate: {r['error']}")
+                return
+            self._store.set_control_loop_ms(r["avg_period_ms"])
+            self._bridge.log.emit(
+                f"  comms: {r['avg_period_ms']:.1f} ms "
+                f"({r['control_hz']:.1f} Hz){'' if r.get('moved') else ' ⚠ stage did not move'}")
+
+            # ── 2. dead time (already centred) ──
+            if self._stop.is_set():
+                return
+            self._bridge.status.emit("Calibrating: dead time…")
+            dt = DT.measure_velocity_dead_time(
+                self._ctrl, axis="diag", repeats=5, center_first=False,
+                max_travel_um=min(probe_um, max(200.0, fit["usable_um"])),
+                stop_evt=self._stop,
+                on_progress=lambda m: self._bridge.log.emit(f"  {m}"))
+            if "error" in dt:
+                self._bridge.finished.emit(False, f"Dead time: {dt['error']}")
+                return
+            lag = max(dt["apparent_lag_s"], dt["dead_time_s"])
+            self._store.set_velocity_dead_time_s(
+                lag, n=dt["n"], spread_s=dt.get("apparent_lag_spread_s", 0.0),
+                tau_s=dt.get("tau_s"))
+            self._bridge.log.emit(
+                f"  dead time: {lag * 1000:.0f} ms "
+                f"(±{dt.get('apparent_lag_spread_s', 0.0) * 1000:.1f}) · "
+                f"τ {dt.get('tau_s', 0.0) * 1000:.0f} ms")
+
+            # ── 3. derive ──
+            if self._stop.is_set():
+                return
+            self._bridge.status.emit("Calibrating: deriving settings…")
+            measured = AC.measured_from_store(
+                self._store,
+                declared_max_speed_um_s=self._protocol_max_speed_um_s())
+            if measured.cruise_um_s <= 0 and dt.get("cruise_um_s"):
+                measured.cruise_um_s = dt["cruise_um_s"]
+            if not measured.is_complete():
+                self._bridge.finished.emit(
+                    False, "Still need: " + ", ".join(measured.missing())
+                           + " — run “Measure top speed” on the Timing "
+                             "Calibration page, then retry.")
+                return
+            derived = AC.derive_settings(measured, policy)
+            if not derived.values:
+                self._bridge.finished.emit(
+                    False, "; ".join(w.message for w in derived.warnings))
+                return
+            self._bridge.log.emit("— derived settings (with reasons) —")
+            for line in derived.note_text():
+                self._bridge.log.emit(f"  {line}")
+            for w in derived.warnings:
+                mark = {"error": "✖", "warn": "⚠", "info": "·"}.get(w.level, "·")
+                self._bridge.log.emit(f"  {mark} {w.message}")
+            if any(w.level == "error" for w in derived.warnings):
+                self._bridge.finished.emit(False, "Derivation failed validation.")
+                return
+            AC.apply_to_store(self._store, derived)
+            for k in ("lookahead_mm", "control_hz", "decel_mm", "pid_kp",
+                      "pid_kd", "corner_speed_factor", "corner_angle_deg"):
+                if k in derived.values:
+                    self._bridge.apply.emit(k, float(derived.values[k]))
+
+            # ── 4. verify on real shapes ──
+            if self._stop.is_set():
+                self._bridge.finished.emit(
+                    True, "Stopped after applying — not verified.")
+                return
+            self._bridge.status.emit("Calibrating: verifying…")
+            size = AC.fit_shape_size_mm(self._ctrl, self._size_spin.value())
+            if size <= 0:
+                self._bridge.finished.emit(
+                    True, "Applied, but the envelope is too small to verify.")
+                return
+            params = self._mode_params("velocity")
+            params.update({
+                "lookahead": derived.values["lookahead_mm"],
+                "control_hz": derived.values["control_hz"],
+                "decel": derived.values["decel_mm"],
+                "kp": derived.values["pid_kp"],
+                "kd": derived.values["pid_kd"],
+                "corner_factor": derived.values["corner_speed_factor"],
+                "corner_angle": derived.values["corner_angle_deg"],
+                "speed": derived.summary["target_speed_mm_s"],
+            })
+            self._bridge.log.emit(
+                f"— verify at {params['speed']:.2f} mm/s on {size:.1f} mm shapes —")
+            results = []
+            for shape in ("Square", "Star"):
+                if self._stop.is_set():
+                    break
+                ideal = self._ideal_path(shape=shape, size=size)
+                t0 = time.monotonic()
+                actual = self._drive("velocity", ideal, params)
+                wall = time.monotonic() - t0
+                rep = XC.path_report(
+                    actual, ideal, commanded_speed_mm_s=params["speed"],
+                    resolution_um=res_um, wall_s=wall)
+                sc = XC.composite_score(rep)
+                results.append((shape, rep, sc))
+                self._bridge.result.emit({
+                    "mode": "velocity", "label": f"verify {shape}",
+                    "ideal": ideal, "actual": actual,
+                    "rms_um": rep["rms_um"], "max_um": rep["max_um"],
+                    "n": rep["n"], "wall_s": wall})
+                verdict = "PASS" if sc["pass"] else "FAIL " + ",".join(
+                    sc["fail_reasons"])
+                self._bridge.log.emit(
+                    f"  {shape:8s} p95 {rep['p95_um']:5.0f} µm · complete "
+                    f"{rep['completion_frac']:.3f} · dither "
+                    f"{rep['dither_ratio']:.2f} · {wall:.1f}s → {verdict}")
+
+            npass = sum(1 for _s, _r, sc in results if sc["pass"])
+            if results and npass == len(results):
+                self._bridge.finished.emit(
+                    True, f"Calibrated + verified ({npass}/{len(results)} shapes "
+                          f"≤ {res_um:.0f} µm). Applied to ALL prints.")
+            elif results:
+                worst = min(results, key=lambda t: t[2]["pass"])
+                self._bridge.finished.emit(
+                    True, f"Calibrated + applied, but verification "
+                          f"{npass}/{len(results)} passed — worst: "
+                          f"{worst[0]} ({', '.join(worst[2]['fail_reasons']) or 'deviation'}). "
+                          f"Try a lower target speed or a larger resolution "
+                          f"element.")
+            else:
+                self._bridge.finished.emit(True, "Calibrated + applied (stopped "
+                                                "before verification).")
+        except Exception as e:
+            logger.exception("XY one-click calibration error")
+            self._bridge.finished.emit(False, f"Error: {e}")
+        finally:
+            self._restore()
+
+    def _protocol_max_speed_um_s(self) -> float:
+        """The controller JSON's DECLARED max speed, for the measured-vs-declared
+        contrast (ME3B V1 declares 50000 µm/s and measures 5946 — 8.4×)."""
+        try:
+            xy = getattr(self._ctrl, "xy_stage", None)
+            proto = getattr(xy, "_protocol", None)
+            v = proto.get_parameter("max_speed") if proto else None
+            return float(v or 0.0)
+        except Exception:
+            return 0.0
+
+    def _worker_pid_analytic(self):
+        """Derive the cross-track PID gains from the MEASURED dead time.
+
+        This is the repeatable path, and it is what the ZN relay experiment was
+        trying to approximate all along. The cross-track plant is known in closed
+        form — a perpendicular velocity command integrates straight into
+        cross-track position, so from ``v_n`` to ``d`` it is a pure integrator
+        with transport delay — which fixes ``Ku = π/(2L)`` and ``Tu = 4L``
+        exactly (see ``VelocityControl.plant_ultimate_gain``). No oscillation to
+        mis-measure, no hardware time, and running it twice gives the same answer.
+
+        The operator's own relay run corroborates the model: it measured
+        ``Tu = 0.391 s`` against the predicted 0.396 s (~1 %). Only its amplitude —
+        and therefore ``Ku`` — was off.
+        """
+        try:
+            lag, src = self._store.effective_dead_time_s()
+            loop_ms = self._store.get_control_loop_ms() or 0.0
+            if not lag or not loop_ms:
+                self._bridge.finished.emit(
+                    False, "Measure the dead time and the comms rate first "
+                           "(the gains are derived from them).")
+                return
+            g = VC.pid_gains_from_dead_time(lag, loop_ms, use_kd=False)
+            if g["kp"] <= 0.0:
+                self._bridge.finished.emit(False, "Could not derive gains.")
+                return
+            self._bridge.log.emit(
+                f"— PID from measured dead time ({src}) —")
+            self._bridge.log.emit(
+                f"  L = dead {lag * 1000:.0f} ms + loop {loop_ms:.0f} ms "
+                f"= {g['L_s'] * 1000:.0f} ms")
+            self._bridge.log.emit(
+                f"  Ku = π/(2L) = {g['ku']:.2f}   Tu = 4L = {g['tu']:.3f} s")
+            self._bridge.log.emit(
+                f"  → Kp = {g['kp']:.3f}  Kd = 0 (D left off: differentiating a "
+                f"µm-quantised encoder at 25 Hz adds more noise than it removes)")
+            self._bridge.log.emit(
+                f"  stability limit is Kp < {g['kp_stability_limit']:.2f}; "
+                f"Ki stays 0 — the plant is already an integrator, so P alone has "
+                f"zero steady-state error and there is no lateral disturbance to "
+                f"reject.")
+            self._store.set_mode_params(
+                "velocity", {"pid_kp": round(g["kp"], 3), "pid_kd": 0.0})
+            self._bridge.apply.emit("pid_kp", round(g["kp"], 3))
+            self._bridge.apply.emit("pid_kd", 0.0)
+            self._bridge.finished.emit(
+                True, f"PID from dead time: Kp={g['kp']:.3f} Kd=0 (saved).")
+        except Exception as e:
+            logger.exception("XY challenge analytic PID error")
+            self._bridge.finished.emit(False, f"Error: {e}")
+
+    def _worker_zn(self):
+        """Ziegler–Nichols relay tune, used as a CROSS-CHECK of the analytic gains.
+
+        Drive a straight test line with pure-pursuit forward motion plus a
+        perpendicular RELAY velocity ±d that flips on the sign of the cross-track
+        error → a limit cycle. Measure its period Tu and amplitude a, then
+        ``Ku = 4d/(πa)``.
+
+        Three defects made the original version give a different answer every run:
+
+          1. **the switch had no hysteresis**, so near the line the sign chattered
+             on µm encoder quantisation, inserting many spurious tiny half-cycles;
+          2. **the amplitude was the MEAN over half-cycles**, which those spurious
+             cycles then dragged down — and since ``Ku ∝ 1/a``, an under-measured
+             amplitude inflates the gain. On ME3B V1 it reported ``Ku = 18.8``
+             against a physical maximum of 15.9;
+          3. **a single run**, with no repeat and no sanity check.
+
+        Now: a hysteresis deadband, the MEDIAN of per-cycle PEAK amplitudes with
+        the first cycles dropped as transient, repeated trials, and a physical
+        gate (``VelocityControl.relay_sanity``) that refuses a Ku the plant cannot
+        produce and falls back to the analytic gains.
         """
         try:
             if compute_zn_pid_gains is None:
@@ -914,7 +1461,13 @@ class XYChallengeDialog(QDialog):
             total = cum[-1]
             speed = max(0.3, min(self._speed_spin.value(), 3.0))
             relay_d = max(0.5, speed * 0.6)     # perpendicular relay (mm/s)
+            # Hysteresis: the switch must clear real motion, not encoder noise.
+            # Scaled off the resolution element so it tracks the machine.
+            hyst_mm = max(0.005, float(self._res_spin.value()) / 1000.0)
             self._bridge.status.emit("ZN relay: inducing oscillation…")
+            self._bridge.log.emit(
+                f"— ZN relay (d={relay_d:.2f} mm/s, hysteresis "
+                f"{hyst_mm * 1000:.0f} µm) —")
             self._set_sms(self._max_um_s())
             self._goto(*ideal[0])
             state = VC.PursuitState()
@@ -943,11 +1496,20 @@ class XYChallengeDialog(QDialog):
                 sN, state.seg_i, _c = VC.project_on_polyline(
                     pos, ideal, cum, state.seg_i, max_ds)
                 state.s = min(max(sN, state.s), state.s + max_ds)
-                # relay: perpendicular velocity opposing the cross sign
-                sign = 1 if cross > 0 else (-1 if cross < 0 else prev_sign)
-                if prev_sign != 0 and sign != prev_sign:
+                # Relay: perpendicular velocity opposing the cross sign, switched
+                # through a HYSTERESIS band. Without the band the sign chatters on
+                # µm encoder quantisation whenever the stage is near the line,
+                # manufacturing spurious tiny half-cycles that corrupt both the
+                # period and (fatally, since Ku ∝ 1/a) the amplitude.
+                if cross > hyst_mm:
+                    sign = 1
+                elif cross < -hyst_mm:
+                    sign = -1
+                else:
+                    sign = prev_sign            # inside the band: hold
+                if prev_sign != 0 and sign != prev_sign and sign != 0:
                     flips.append(tick)
-                    amps.append(cur_amp)
+                    amps.append(max(cur_amp, abs(cross)))
                     cur_amp = 0.0
                 prev_sign = sign
                 cur_amp = max(cur_amp, abs(cross))
@@ -972,26 +1534,73 @@ class XYChallengeDialog(QDialog):
                 self._ctrl.send_velocity_xy(0.0, 0.0)
             except Exception:
                 pass
-            # estimate Tu (2× mean half-period) + amplitude a
-            if len(flips) >= 4 and len(amps) >= 3:
+            # ── estimate Tu and the amplitude a ──
+            # Drop the first two cycles as start-up transient, then take the
+            # MEDIAN of the per-cycle PEAK amplitudes. The original code averaged
+            # every half-cycle amplitude including the partials, and because
+            # Ku ∝ 1/a any small spurious cycle inflated the gain.
+            def _median(vals):
+                v = sorted(vals)
+                if not v:
+                    return 0.0
+                m = len(v) // 2
+                return v[m] if len(v) % 2 else 0.5 * (v[m - 1] + v[m])
+
+            usable = amps[2:] if len(amps) > 4 else amps[1:]
+            if len(flips) >= 6 and len(usable) >= 3:
                 halfs = [flips[i + 1] - flips[i] for i in range(len(flips) - 1)]
-                tu = 2.0 * (sum(halfs) / len(halfs))
-                a = sum(amps[1:]) / len(amps[1:])   # skip the first partial
-                ku, tu = VC.relay_ultimate_gain(relay_d, a, tu)
-                gains = compute_zn_pid_gains(ku, tu, method="some_overshoot")
-                kp = round(max(0.0, gains["kp"]), 3)
-                kd = round(max(0.0, gains["kd"]), 4)
+                tu_raw = 2.0 * _median(halfs)
+                a = _median(usable)
+                ku, tu = VC.relay_ultimate_gain(relay_d, a, tu_raw)
+                self._bridge.log.emit(
+                    f"  {len(flips)} flips · amplitude median {a * 1000:.0f} µm "
+                    f"(spread {min(usable) * 1000:.0f}–{max(usable) * 1000:.0f}) "
+                    f"→ Ku={ku:.2f} Tu={tu:.3f}s")
+
+                # ── physical gate: is this Ku even possible for this plant? ──
+                lag, _src = self._store.effective_dead_time_s()
+                loop_ms = self._store.get_control_loop_ms() or 0.0
+                chk = VC.relay_sanity(ku, tu, lag, loop_ms)
+                analytic = VC.pid_gains_from_dead_time(lag, loop_ms, use_kd=False)
+                if chk["ku_limit"] > 0:
+                    self._bridge.log.emit(
+                        f"  physical maximum Ku = π/(2L) = {chk['ku_limit']:.2f}; "
+                        f"predicted Tu = {chk['tu_expected']:.3f}s "
+                        f"(measured/predicted: Ku {chk['ku_ratio']:.2f}×, "
+                        f"Tu {chk['tu_ratio']:.2f}×)")
+                if not chk["ok"] and analytic["kp"] > 0:
+                    self._bridge.log.emit(f"  ⚠ REJECTED: {chk['reason']}")
+                    self._bridge.log.emit(
+                        f"  → using the analytic gains from the measured dead "
+                        f"time instead: Kp={analytic['kp']:.3f}")
+                    kp = round(analytic["kp"], 3)
+                    kd = 0.0
+                    note = "relay rejected — analytic gains used"
+                else:
+                    gains = compute_zn_pid_gains(ku, tu, method="some_overshoot")
+                    kp = round(max(0.0, gains["kp"]), 3)
+                    # Kd stays 0 while the derivative is unfiltered.
+                    kd = 0.0
+                    note = "relay accepted"
+                    self._bridge.log.emit(
+                        f"  Kd left at 0 (unfiltered D on a µm-quantised encoder "
+                        f"at 25 Hz injects noise); Ki stays 0 — the plant is "
+                        f"already an integrator.")
+                # Never store a gain at or above the stability boundary.
+                if chk["ku_limit"] > 0 and kp >= chk["ku_limit"]:
+                    kp = round(0.33 * chk["ku_limit"], 3)
+                    self._bridge.log.emit(
+                        f"  clamped to Kp={kp} (was at/above the stability limit)")
                 self._store.set_mode_params("velocity",
                                             {"pid_kp": kp, "pid_kd": kd})
                 self._bridge.apply.emit("pid_kp", kp)
                 self._bridge.apply.emit("pid_kd", kd)
-                self._bridge.log.emit(
-                    f"  Ku={ku:.2f} Tu={tu:.2f}s → Kp={kp} Kd={kd}")
                 self._bridge.finished.emit(
-                    True, f"ZN: Kp={kp} Kd={kd} (saved).")
+                    True, f"ZN: Kp={kp} Kd={kd} ({note}).")
             else:
                 self._bridge.finished.emit(
-                    False, "ZN: not enough oscillation — raise speed / relay.")
+                    False, f"ZN: not enough oscillation ({len(flips)} flips) — "
+                           f"raise the speed/relay, or use “PID from dead time”.")
         except Exception as e:
             logger.exception("XY challenge ZN error")
             self._bridge.finished.emit(False, f"ZN error: {e}")

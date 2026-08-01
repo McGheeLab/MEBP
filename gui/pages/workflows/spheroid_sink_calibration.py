@@ -157,6 +157,7 @@ class SinkDisengageCalibrationDialog(QDialog):
                     self._page._camera_manager,
                     cam_idx=self._resolve_microscope_cam_idx(),
                     label="Microscope — watch the spheroid sink to the tip",
+                    auto_orient=True,   # v7.5.x: calibrated orientation
                     enable_settings=False)
             except Exception as e:
                 logger.debug("Sink calibration camera view unavailable: %s", e)
@@ -582,8 +583,17 @@ class SinkDisengageCalibrationDialog(QDialog):
                 [[l, t] for l, t in self._samples],
                 bore_area_mm2=self._page._bore_area_mm2(),
                 needle_gauge=getattr(needle, "gauge", None),
-                needle_id_um=getattr(needle, "id_um", None),
+                # The ORIFICE Ø — matches the area the staircase converted with.
+                needle_id_um=(getattr(needle, "orifice_id_um", None)
+                              or getattr(needle, "id_um", None)),
                 spheroid_diameter_um=float(self._page._diameter.value()),
+                # v7.6 pulled-tip provenance: a curve is only valid for the tip
+                # geometry it was measured in (see the store's module docstring).
+                needle_type=getattr(needle, "needle_type", None),
+                tip_id_um=getattr(needle, "tip_id_um", None),
+                tip_length_mm=getattr(needle, "tip_length_mm", None),
+                tip_profile=(getattr(needle, "tip_profile", None)
+                             if getattr(needle, "has_tip", False) else None),
             )
             self._set_status(f"Saved sink curve ({len(self._samples)} points).")
             try:

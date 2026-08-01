@@ -109,13 +109,19 @@ class ObjectiveCalibrationCard(QGroupBox):
         config_getter: Callable[[], object],
         parent: Optional[QWidget] = None,
         controller_getter: Optional[Callable[[], object]] = None,
+        settings_getter: Optional[Callable[[], object]] = None,
     ):
-        super().__init__("Objective Calibration Setup", parent)
+        super().__init__("Mosaic && Camera Calibration", parent)
         self._camera_manager = camera_manager
         self._config_getter = config_getter
         # v7.5.x: resolved lazily — the StageController may arrive after the
         # card is built. Used to drive the stage-motion µm/px dialog.
         self._controller_getter = controller_getter or (lambda: None)
+        # v7.5.x: the app Settings, for the shared ``mosaic_scan`` section (tile
+        # overlap lives with the SCAN, not per objective). Optional — absent just
+        # means the confirm step seeds overlap from the defaults and cannot
+        # persist a change to it.
+        self._settings_getter = settings_getter or (lambda: None)
         self._store = _get_store()
         self._loading = False
 
@@ -230,12 +236,12 @@ class ObjectiveCalibrationCard(QGroupBox):
             f"font-size: {scaled_font_size(9)}pt;"
         )
         orient_row.addWidget(self._lbl_orient, stretch=1)
+        # v7.5.x: hidden — rotation is measured by "Mosaic & Camera Calibration…"
+        # together with the mirror, axis directions and µm/px (they are one 2x2
+        # relationship, and measuring them separately is how they drifted apart).
+        # Kept as a widget so its handler and the existing tests still work.
         self._btn_orient = QPushButton("Calibrate orientation…")
-        self._btn_orient.setToolTip(
-            "Measure the camera's rotation relative to the stage axes by moving "
-            "the stage (does not change µm/px). This corrects the direction a "
-            "live-view click maps to on the stage — needed for accurate "
-            "re-anchor / well fits when the camera is mounted rotated.")
+        self._btn_orient.setVisible(False)
         orient_row.addWidget(self._btn_orient)
         active_lay.addLayout(orient_row)
 
@@ -289,16 +295,35 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._btn_remove = QPushButton("Remove Selected")
         self._btn_remove.setObjectName("dangerBtn")
         self._btn_remove.setEnabled(False)
-        self._btn_autocal = QPushButton("Auto-calibrate scale + FOV…")
+        # v7.5.x: THE one mosaic/camera calibration entry point. One stage-motion
+        # measurement covers all five ways a mosaic goes wrong — mirror, stage-vs-
+        # pixel axis direction, rotation about +Z, pixel size at the real capture
+        # resolution — then the confirm step adds tile overlap and the whole-mosaic
+        # output rotation, and gates the commit on a test mosaic.
+        self._btn_autocal = QPushButton("Mosaic && Camera Calibration…")
         self._btn_autocal.setObjectName("accentBtn")
         self._btn_autocal.setToolTip(
-            "Move the stage a large known distance and track a feature across "
-            "the frame to derive µm/px AND the camera's field-of-view in "
-            "microns, anchored to the camera's actual captured resolution.")
+            "The one place camera geometry is calibrated. Moves the stage in X "
+            "then Y and tracks a feature to MEASURE, together:\n"
+            "  • whether the camera is mirrored\n"
+            "  • which way stage +X / +Y run across the image\n"
+            "  • the camera's rotation about the Z axis\n"
+            "  • µm/px, stamped with the real captured resolution\n"
+            "then lets you set the tile overlap and the mosaic's output rotation "
+            "and confirm with a test mosaic before anything is saved.\n\n"
+            "The result is used by every mosaic (full plate, rosette, "
+            "fluorescence) and every microscope live view.")
         self._btn_autocal.setEnabled(False)
+        # v7.5.x: "Calibrate Selected…" (µm/px only) and "Calibrate orientation…"
+        # are RETIRED as separate surfaces — they measured subsets of what the one
+        # calibration above measures, wrote through different commit paths, and
+        # were a large part of why the operator had "multiple surfaces for
+        # calibrating mosaics". They remain as hidden widgets so the existing
+        # handlers, table gating and tests keep working unchanged.
         self._btn_calibrate = QPushButton("Calibrate Selected…")
         self._btn_calibrate.setObjectName("accentBtn")
         self._btn_calibrate.setEnabled(False)
+        self._btn_calibrate.setVisible(False)
         self._btn_clear = QPushButton("Clear Calibration")
         self._btn_clear.setEnabled(False)
         btn_row.addWidget(self._btn_add)
@@ -677,6 +702,121 @@ class ObjectiveCalibrationCard(QGroupBox):
         except Exception:
             return (0, 0)
 
+    def _confirm_calibration(self, cam_idx: int, dlg):
+        """Show the final check for a fresh measurement. Returns the confirmed
+        ``MosaicCalibration``, or None if the operator cancelled.
+
+        Builds the candidate directly from the dialog's measured results — NOT by
+        re-resolving from the stores, which have not been written yet. That is the
+        whole point: the operator sees and confirms the new numbers before they
+        can affect any mosaic or live view.
+        """
+        try:
+            from SupportClasses.MosaicCalibration import (
+                MosaicCalibration, SCAN_DEFAULTS, warnings_for)
+            from gui.dialogs.mosaic_calibration_confirm_dialog import (
+                MosaicCalibrationConfirmDialog)
+        except Exception as exc:
+            logger.warning(f"confirm dialog unavailable — {exc}")
+            return None
+        res = dlg.result_resolution or self._true_capture_resolution(cam_idx)
+        scan = dict(self._scan_settings() or {})
+        overlap_pct = float(scan.get(
+            "overlap_pct", SCAN_DEFAULTS["overlap_pct"]) or
+            SCAN_DEFAULTS["overlap_pct"])
+        candidate = MosaicCalibration(
+            um_per_px=float(dlg.result_um_per_px),
+            base_um_per_px=float(dlg.result_um_per_px),
+            calib_resolution=(tuple(res) if res and res[0] else None),
+            live_resolution=(tuple(res) if res and res[0] else None),
+            rotation_deg=float(dlg.result_rotation_deg or 0.0),
+            flip_x=bool(dlg.result_flip_x),
+            flip_y=bool(dlg.result_flip_y),
+            overlap_frac=max(0.05, min(0.60, overlap_pct / 100.0)),
+            target_px=int(scan.get("target_px", SCAN_DEFAULTS["target_px"])),
+            reg_method=str(scan.get("reg_method",
+                                    SCAN_DEFAULTS["reg_method"])),
+            settle_ms=int(scan.get("settle_ms", SCAN_DEFAULTS["settle_ms"])),
+            output_rotation_deg=self._stored_output_rotation(cam_idx),
+            provenance={"um_per_px": "this measurement",
+                        "rotation_deg": "this measurement"},
+        )
+        confirm = MosaicCalibrationConfirmDialog(
+            candidate, warnings=warnings_for(candidate),
+            tile_count_getter=self._estimate_plate_tiles,
+            test_mosaic_runner=lambda cal: dlg.build_test_mosaic(cal),
+            parent=self)
+        if confirm.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return confirm.result_calibration()
+
+    def _scan_settings(self) -> dict:
+        """The shared ``mosaic_scan`` settings section, or {}."""
+        getter = getattr(self, "_settings_getter", None)
+        try:
+            settings = getter() if callable(getter) else None
+            if settings is not None:
+                return dict(settings.get_section("mosaic_scan") or {})
+        except Exception as exc:
+            logger.debug(f"mosaic_scan settings unavailable: {exc}")
+        return {}
+
+    def _stored_output_rotation(self, cam_idx: int) -> float:
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            ident = self._camera_manager.camera_identity(cam_idx)
+            if ident and ident[0]:
+                return float(get_store().get_mosaic_output_rotation(ident[0]))
+        except Exception:
+            pass
+        return 0.0
+
+    def _estimate_plate_tiles(self, cal) -> int | None:
+        """Rough full-plate tile count, so the overlap choice is PRICED.
+
+        Raising overlap from 5% to 25% is the right call for stitch quality but it
+        costs scan time; showing the count makes that a visible trade instead of a
+        surprise.
+        """
+        try:
+            sx, sy = cal.spacing_um
+            if sx <= 0 or sy <= 0:
+                return None
+            # A standard plate footprint (~127.8 x 85.5 mm) is a good enough
+            # yardstick for an order-of-magnitude count.
+            import math
+            return int(math.ceil(127800.0 / sx) * math.ceil(85500.0 / sy))
+        except Exception:
+            return None
+
+    def _persist_mosaic_settings(self, cal, cam_idx: int) -> None:
+        """Write the confirmed overlap + output rotation.
+
+        Overlap belongs to the SCAN (shared ``mosaic_scan``); the output rotation
+        is display-only and belongs to the camera identity.
+        """
+        getter = getattr(self, "_settings_getter", None)
+        try:
+            settings = getter() if callable(getter) else None
+            if settings is not None:
+                section = dict(settings.get_section("mosaic_scan") or {})
+                section["overlap_pct"] = int(round(cal.overlap_frac * 100))
+                settings.set_section("mosaic_scan", section)
+                save = getattr(settings, "save", None)
+                if callable(save):
+                    save()
+        except Exception as exc:
+            logger.warning(f"overlap persist failed: {exc}")
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            ident = self._camera_manager.camera_identity(cam_idx)
+            if ident and ident[0]:
+                get_store().set_mosaic_output_rotation(
+                    ident[0], cal.output_rotation_deg,
+                    name=(ident[1] if len(ident) > 1 else ""))
+        except Exception as exc:
+            logger.warning(f"output-rotation persist failed: {exc}")
+
     def _on_autocal_scale_fov_clicked(self) -> None:
         """v7.5.x: auto-calibrate µm/px AND the camera's FOV extent by tracking a
         feature across a large stage move, anchored to the ACTUAL captured
@@ -726,11 +866,24 @@ class ObjectiveCalibrationCard(QGroupBox):
         dlg = ScaleFovCalibrationDialog(
             self._camera_manager, controller, cam_idx=cam_idx,
             align_key=self._mosaic_align_key(cam_idx, objective),
-            objective=objective, cam_key=cam_key, parent=self)
+            objective=objective, cam_key=cam_key,
+            # v7.5.x: the real scan settings, so the test/verify mosaic builds the
+            # way the actual scan will (it used to be handed an empty dict).
+            scan_settings=self._scan_settings(), parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         um_per_px = dlg.result_um_per_px
         if um_per_px is None or um_per_px <= 0:
+            return
+        # v7.5.x: FINAL CHECK BEFORE COMMIT (operator: "after settings are
+        # applied, there should be a final check with the new settings for
+        # confirmation"). The measurement becomes a CANDIDATE; the operator
+        # reviews it, sets the tile overlap and the whole-mosaic output rotation,
+        # builds a test mosaic through the shared build path, and only then is
+        # anything written. Cancel leaves the previous calibration byte-identical.
+        confirmed = self._confirm_calibration(cam_idx, dlg)
+        if confirmed is None:
+            logger.info("Mosaic & camera calibration cancelled — nothing saved.")
             return
         rotation_deg = dlg.result_rotation_deg
         # v7.5.x: the FULL camera→stage orientation MEASURED from the two-axis
@@ -786,6 +939,9 @@ class ObjectiveCalibrationCard(QGroupBox):
         except Exception as exc:
             logger.debug(f"autocal: orientation persist — {exc}")
 
+        # v7.5.x: the confirmed overlap (shared scan setting) + the display-only
+        # whole-mosaic output rotation (per camera identity).
+        self._persist_mosaic_settings(confirmed, cam_idx)
         if self._current_objective_name() == objective:
             self.um_per_px_committed.emit(cam_idx, um_per_px)
         self._refresh_table()

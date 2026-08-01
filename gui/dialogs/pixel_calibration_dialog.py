@@ -5,14 +5,17 @@ v7.3.3: Measures the actual µm/px ratio by moving the stage a known distance
 and correlating the resulting pixel displacement between two captured frames.
 
 v7.5.x: Live view + selectable move direction. The needle cameras are 90°
-apart from each other but the pair is mounted at ~45° to the stage X/Y axes,
-so a stage move in the wrong direction drives the needle *along the camera's
-optical axis* — it just goes in/out of focus and shows almost no lateral
-motion. The dialog now shows the live feed and overlays the detected
+apart from each other, mounted symmetric about the stage +X axis at +45° and
+−45°, so a stage move in the wrong direction drives the needle *along the
+camera's optical axis* — it just goes in/out of focus and shows almost no
+lateral motion. The dialog now shows the live feed and overlays the detected
 phase-correlation displacement as an arrow, and lets the operator pick the
 move direction (presets + free angle) until they get strong lateral motion.
-The accepted direction is reported as the camera's in-plane rotation
-(``result_rotation_deg``) for the needle-centering aligner.
+The accepted direction is reported as the camera's column→stage mount
+direction (``result_rotation_deg``) for the needle-centering aligner, and the
+measured vector's deviation from parallel as the sensor roll
+(``result_view_roll_deg``) for the display orientation — two different
+angles; only the roll may tilt the live view.
 
 Workflow:
     1. Capture frame at current position
@@ -98,6 +101,40 @@ def plus_column_direction_deg(commanded_deg: float, measured_dx_px: float,
     return ((angle + 180.0) % 360.0) - 180.0  # normalize to [−180, 180)
 
 
+def fold_parallel_deg(angle_deg: float) -> float:
+    """Fold an angle to (−90, 90] — its deviation from PARALLEL.
+
+    A displacement vector and its negation lie on the same line, so both
+    fold to the same roll (e.g. 179° → −1°, −135° → 45°).
+    """
+    r = float(angle_deg) % 180.0  # Python % is non-negative for float rhs>0
+    return r - 180.0 if r > 90.0 else r
+
+
+def view_roll_from_displacement(dx_px: float, dy_px: float,
+                                mirrored: bool = False,
+                                flip_y: bool = False) -> float:
+    """The ``set_view_orientation`` rotation (deg) that renders the measured
+    stage-motion displacement LEVEL (parallel to the image horizontal).
+
+    This is the needle side-camera's sensor ROLL — the deviation of the
+    drawn motion vector from parallel — which is the only rotation that
+    belongs on the DISPLAY. The full column→stage mount direction
+    (``plus_column_direction_deg``, ±45° on the current rig) feeds the
+    two-camera needle aligner instead and must never tilt the live view.
+
+    The display chain applies flips first, then R(θ)
+    (``camera_feed_view.view_transform_coeffs``), so the flips are applied
+    to the raw vector before measuring its angle; a raw vector at display
+    angle φ′ renders at φ′ + θ, hence θ = −fold(φ′). The sign is pinned by
+    a test composing this with ``view_transform_coeffs``.
+    """
+    dxf = -float(dx_px) if mirrored else float(dx_px)
+    dyf = -float(dy_px) if flip_y else float(dy_px)
+    phi = math.degrees(math.atan2(dyf, dxf))
+    return -fold_parallel_deg(phi)
+
+
 # Move-direction presets (stage-frame angle, degrees CCW from +X).
 _DIRECTION_PRESETS = [
     ("X →", 0.0),
@@ -124,6 +161,11 @@ class PixelCalibrationDialog(QDialog):
         # v7.5.x: the accepted move direction = the camera's in-plane lateral
         # stage direction (deg from +X), fed to the needle-centering aligner.
         self.result_rotation_deg: float | None = None
+        # v7.5.x (rotated rig): the sensor ROLL — deviation of the measured
+        # motion vector from parallel — the only rotation that belongs on the
+        # needle cameras' DISPLAY orientation (result_rotation_deg is the
+        # ±45° mount direction and must not tilt the live view).
+        self.result_view_roll_deg: float | None = None
 
         # v7.5.x: the camera's current view orientation, so the calibration feed
         # shows the corrected upright/un-mirrored view and the Mirror-view
@@ -192,10 +234,10 @@ class PixelCalibrationDialog(QDialog):
             "Move the stage a known distance and measure the pixel shift "
             "(phase correlation). The detected motion is drawn as a green "
             "arrow on the feed.\n\n"
-            "These cameras sit at ~45° to the X/Y axes — if a move just "
-            "changes focus with little arrow, the needle is moving along "
-            "the camera's optical axis. Pick the direction that gives the "
-            "longest arrow.")
+            "The needle cameras sit symmetric about +X at ±45° — if a move "
+            "just changes focus with little arrow, the needle is moving "
+            "along the camera's optical axis. Pick the direction that gives "
+            "the longest arrow.")
         instr.setWordWrap(True)
         instr.setMaximumWidth(s(340))
         instr.setStyleSheet(
@@ -310,28 +352,21 @@ class PixelCalibrationDialog(QDialog):
         side.addLayout(btn_layout)
 
     def _on_mirror_toggled(self, on: bool) -> None:
-        """Toggle the camera's mirror flag: correct the displayed feed live and
-        persist it per camera identity (matches the Hardware Setup checkbox)."""
-        mgr = self._camera_manager
+        """Flip the PREVIEW only, so the feed reads correctly while measuring.
+
+        v7.5.x: no longer persists (nor pushes to the shared manager). It used to
+        write ``CameraCalibrationStore.set_mirrored`` the moment it was ticked, so
+        opening this dialog and toggling the checkbox permanently altered the
+        camera's stored calibration even on Cancel. Orientation is committed only
+        by the calibration flow that owns it.
+        """
         on = bool(on)
         self._view_mir = on
-        try:
-            mgr.set_mirrored(self._cam_idx, on)
-        except Exception:
-            pass
         if self._feed is not None:
             try:
                 self._feed.set_view_orientation(on, self._view_rot)
             except Exception:
                 pass
-        try:
-            ident = mgr.camera_identity(self._cam_idx)
-            if ident and ident[0]:
-                from SupportClasses.CameraCalibrationStore import get_store
-                nm = ident[1] if len(ident) > 1 else ""
-                get_store().set_mirrored(ident[0], on, name=nm)
-        except Exception as e:
-            logger.debug(f"mirror persist skipped: {e}")
 
     def _group_style(self) -> str:
         return (
@@ -504,6 +539,18 @@ class PixelCalibrationDialog(QDialog):
         # auto-center bug. Resolve the sign from the measured displacement.
         self.result_rotation_deg = plus_column_direction_deg(
             self._spin_direction.value(), dx, dy)
+        # v7.5.x (rotated rig): the sensor roll = deviation of the measured
+        # vector from parallel, for the needle cameras' display orientation.
+        # Parity flips must match the display chain (flips first, then R(θ)).
+        flip_y = False
+        try:
+            gfy = getattr(self._camera_manager, "get_flip_y", None)
+            if callable(gfy):
+                flip_y = bool(gfy(self._cam_idx))
+        except Exception:
+            flip_y = False
+        self.result_view_roll_deg = view_roll_from_displacement(
+            dx, dy, mirrored=bool(self._view_mir), flip_y=flip_y)
 
         self._set_status(
             "Good lateral motion — Accept to use this µm/px and direction, "

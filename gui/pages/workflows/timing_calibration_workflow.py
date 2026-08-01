@@ -670,6 +670,7 @@ class TimingCalibrationWorkflowPage(QWidget):
                 self._camera_manager,
                 cam_idx=self._resolve_microscope_cam_idx(),
                 label="Microscope — frame-difference still detection",
+                auto_orient=True,   # v7.5.x: calibrated orientation
                 enable_settings=False)
         except Exception as e:
             logger.debug("Timing calibration camera view unavailable: %s", e)

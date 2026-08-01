@@ -234,6 +234,8 @@ class CameraWidget(QWidget):
         self._camera_index = 0
         self._show_crosshair = True
         self._fps = 15
+        # v7.6: set while a print needs the GUI event loop (see set_throttled).
+        self._throttled = False
         self._running = False
         self._camera_label = camera_label
         self._compact = compact
@@ -961,11 +963,18 @@ class CameraWidget(QWidget):
             an = self._andor
             caps.update(source="andor", controllable=True, resolution=True,
                         device_name=getattr(an, "_device_id", "Andor Zyla"))
-            # The Zyla exposes only exposure as a hardware control; omitting the
-            # other keys makes the settings dialog auto-hide them. Software
-            # brightness/contrast/gamma (display-only) still apply.
+            # The Zyla exposes exposure as its only true HARDWARE control
+            # (omitting the ToupTek ISP keys makes the settings dialog
+            # auto-hide them; software brightness/contrast/gamma still apply).
+            # The andor_* keys control the backend's mono16→8-bit DISPLAY
+            # scaling — the per-frame percentile auto-scale that makes the
+            # image look like it's auto-adjusting, plus fixed black/white
+            # levels for when it's turned off.
             caps["controls"] = {
                 "exposure_us": {"range": an.get_exposure_time_range()},
+                "andor_auto_scale": {"range": None},
+                "andor_scale_lo": {"range": an.get_display_level_range()},
+                "andor_scale_hi": {"range": an.get_display_level_range()},
             }
         elif backend == "opencv" and self._capture is not None:
             caps.update(source="opencv", controllable=True, resolution=True,
@@ -1098,6 +1107,27 @@ class CameraWidget(QWidget):
             return bool(self._capture.set(cv2.CAP_PROP_CONTRAST, value))
         return False
 
+    def set_hw_andor_auto_scale(self, enabled: bool) -> bool:
+        """Andor only: toggle the mono16→8-bit per-frame display auto-scale."""
+        if (getattr(self, "_backend_type", "") == "andor"
+                and getattr(self, "_andor", None) is not None):
+            return self._andor.set_display_auto_scale(bool(enabled))
+        return False
+
+    def set_hw_andor_scale_lo(self, counts) -> bool:
+        """Andor only: manual display black level (raw sensor counts)."""
+        if (getattr(self, "_backend_type", "") == "andor"
+                and getattr(self, "_andor", None) is not None):
+            return self._andor.put_display_black(counts)
+        return False
+
+    def set_hw_andor_scale_hi(self, counts) -> bool:
+        """Andor only: manual display white level (raw sensor counts)."""
+        if (getattr(self, "_backend_type", "") == "andor"
+                and getattr(self, "_andor", None) is not None):
+            return self._andor.put_display_white(counts)
+        return False
+
     def set_capture_resolution(self, width: int, height: int):
         """Reconfigure the *device* capture resolution. Returns actual (w,h).
 
@@ -1173,6 +1203,11 @@ class CameraWidget(QWidget):
             lines.append(f"  gamma        : {st.get('gamma')}")
             lines.append(f"  brightness   : {st.get('brightness')}")
             lines.append(f"  contrast     : {st.get('contrast')}")
+            if src == "andor":
+                lines.append(
+                    f"  display scale: "
+                    f"{'auto (per-frame)' if st.get('andor_auto_scale') else 'manual'}"
+                    f"  levels {st.get('andor_scale_lo')}..{st.get('andor_scale_hi')}")
         else:
             lines.append(f"  (no controllable camera backend — source={src})")
         text = "\n".join(lines)
@@ -1303,8 +1338,29 @@ class CameraWidget(QWidget):
 
     def _on_fps_spinner(self, value: int):
         self._fps = value
+        self._throttled = False
         if self._running:
             self._timer.setInterval(int(1000 / value))
+
+    def set_throttled(self, on: bool) -> None:
+        """v7.6: halve the display grab rate during time-critical work.
+
+        ``_grab_frame`` runs on the GUI thread (blocking backend read + colour
+        conversion + pixmap scaling), so at 15 FPS it can starve the event loop
+        — which is what made the live needle position stutter during prints.
+        Halving the rate while a print runs buys the loop back without stopping
+        the feed. Restores the configured FPS when turned off.
+        """
+        on = bool(on)
+        if on == bool(getattr(self, "_throttled", False)):
+            return
+        self._throttled = on
+        if self._running:
+            fps = max(1.0, self._fps / (2.0 if on else 1.0))
+            try:
+                self._timer.setInterval(int(1000 / fps))
+            except Exception:
+                pass
 
     # ── Frame Access (v7.3.0 — for detection workers) ────────────
 

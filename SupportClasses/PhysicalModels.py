@@ -21,7 +21,9 @@ from __future__ import annotations
 import json
 import logging
 import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import (
+    dataclass, field, asdict, fields as _dc_fields, replace as _dc_replace,
+)
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,40 @@ logger = logging.getLogger(__name__)
 DEFAULT_NEEDLES_JSON = "config/hardware/needles.json"
 DEFAULT_SYRINGES_JSON = "config/hardware/syringes.json"
 DEFAULT_CAMERAS_JSON = "config/hardware/cameras.json"
+
+# --- Needle types (v7.6) ---------------------------------------------------
+# A HYPODERMIC needle is one straight bore: geometry comes from the ASTM gauge
+# catalog and the whole needle is a single cylinder.
+# A PULLED_CAPILLARY is TWO flow stages in series — a wide bulk barrel feeding a
+# narrow pulled tip. The tip sets the deposited feature size and dominates the
+# flow resistance; the barrel sets the held volume.
+NEEDLE_TYPE_HYPODERMIC = "hypodermic"
+NEEDLE_TYPE_CAPILLARY = "pulled_capillary"
+NEEDLE_TYPES = (NEEDLE_TYPE_HYPODERMIC, NEEDLE_TYPE_CAPILLARY)
+
+# How the pulled section is modelled between the barrel bore and the orifice.
+TIP_PROFILE_CYLINDER = "cylinder"   # straight capillary of the tip Ø over its length
+TIP_PROFILE_CONE = "cone"           # linear taper from the barrel Ø down to the tip Ø
+TIP_PROFILES = (TIP_PROFILE_CYLINDER, TIP_PROFILE_CONE)
+
+# --- Needle FORM (v7.9) ----------------------------------------------------
+# How many bores the *assembly* has, and how they are arranged. This axis is
+# ORTHOGONAL to ``needle_type`` (which describes one bore's taper) — a backpack
+# of two pulled capillaries needs both. Do NOT smuggle a form into
+# ``needle_type``: ``NeedleSpec.__post_init__`` silently rewrites an unknown
+# needle_type to "hypodermic", so the whole assembly would vanish with no error.
+NEEDLE_FORM_SINGLE = "single"        # one bore — every needle before v7.9
+NEEDLE_FORM_BACKPACK = "backpack"    # two needles of DIFFERENT sizes bound together
+NEEDLE_FORM_TRIPLE = "triple"        # three needles fused together
+NEEDLE_FORMS = (NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK, NEEDLE_FORM_TRIPLE)
+
+# Nominal bore count per form. The authority is always ``len(bores_resolved())``;
+# this only seeds the GUI and validates what the operator selected.
+NEEDLE_FORM_BORE_COUNT = {
+    NEEDLE_FORM_SINGLE: 1,
+    NEEDLE_FORM_BACKPACK: 2,
+    NEEDLE_FORM_TRIPLE: 3,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -210,70 +246,921 @@ def ink_type_border_color(ink_type: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Needle bore geometry (v7.6)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FlowSegment:
+    """One axial stage of a needle bore, ordered barrel → tip.
+
+    ``d_in_um == d_out_um`` for a straight cylinder; they differ for a taper.
+    """
+    name: str
+    length_mm: float
+    d_in_um: float
+    d_out_um: float
+
+    @property
+    def is_taper(self) -> bool:
+        return abs(self.d_out_um - self.d_in_um) > 1e-9
+
+    @property
+    def length_m(self) -> float:
+        return self.length_mm / 1000.0
+
+    @property
+    def volume_uL(self) -> float:
+        """Bore volume of this stage (µL; 1 mm³ == 1 µL). A taper is a cone
+        frustum: V = (π·L/12)·(d1² + d1·d2 + d2²)."""
+        d1, d2 = self.d_in_um / 1000.0, self.d_out_um / 1000.0
+        if self.is_taper:
+            return (math.pi * self.length_mm / 12.0) * (d1 * d1 + d1 * d2 + d2 * d2)
+        return math.pi * (d1 / 2) ** 2 * self.length_mm
+
+    @property
+    def equivalent_area_mm2(self) -> float:
+        """Equal-VOLUME cylinder area (mm²) — lets a taper be used in the
+        closed-form lift↔volume conversion of :class:`BoreProfile`."""
+        return self.volume_uL / self.length_mm if self.length_mm > 0 else 0.0
+
+    @property
+    def resistance_factor(self) -> float:
+        """Hydraulic resistance factor K (m⁻³) with R = 128·µ/π · K.
+
+        cylinder: K = L / d⁴
+        cone:     K = (L/3)·(d1² + d1·d2 + d2²) / (d1³·d2³)
+
+        The cone form is the exact conical-Poiseuille result and reduces to the
+        cylinder form at d1 == d2 (3d²/d⁶ == 3/d⁴, the 1/3 cancelling).
+        """
+        d1, d2 = self.d_in_um * 1e-6, self.d_out_um * 1e-6
+        if d1 <= 0 or d2 <= 0:
+            return float("inf")
+        if self.is_taper:
+            return (self.length_m / 3.0) * (d1 * d1 + d1 * d2 + d2 * d2) / (d1 ** 3 * d2 ** 3)
+        return self.length_m / (d1 ** 4)
+
+
+@dataclass(frozen=True)
+class BoreProfile:
+    """Volume ↔ axial-lift conversion for a needle bore, measured UP from the tip.
+
+    The bore is a narrow tip stage (area A2, length L2) stacked under a wide
+    barrel (area A1). Something aspirated by V µL rises V/A2 while it is still
+    inside the tip, then far more slowly once it enters the barrel::
+
+        lift(V) = V/A2                      for V <= A2·L2
+                = L2 + (V - A2·L2)/A1       otherwise
+        V(h)    = h·A2                      for h <= L2
+                = A2·L2 + (h - L2)·A1       otherwise
+
+    With no tip stage (L2 == 0) both collapse to the single-area forms ``V/A1``
+    and ``h·A1`` — byte-identical to the pre-v7.6 scalar ``bore_area_mm2``
+    arithmetic.
+
+    A TAPERED tip is represented by its equal-VOLUME cylinder area
+    (:attr:`FlowSegment.equivalent_area_mm2`): exact in volume, monotone, and
+    closed-form invertible. The exact frustum inverse is a cubic, which is not
+    worth the numerics for a timing estimate — this is the single approximation
+    in the sink model and it is documented here, in one place.
+    """
+    barrel_area_mm2: float
+    tip_area_mm2: float = 0.0
+    tip_length_mm: float = 0.0
+
+    @property
+    def has_tip(self) -> bool:
+        return self.tip_area_mm2 > 0.0 and self.tip_length_mm > 0.0
+
+    @property
+    def tip_capacity_uL(self) -> float:
+        """Volume that fits inside the tip stage before reaching the barrel."""
+        return self.tip_area_mm2 * self.tip_length_mm if self.has_tip else 0.0
+
+    @property
+    def near_tip_area_mm2(self) -> float:
+        """The area governing the FIRST microlitre of lift — what a legacy
+        scalar ``bore_area_mm2`` should be replaced by."""
+        return self.tip_area_mm2 if self.has_tip else self.barrel_area_mm2
+
+    def is_usable(self) -> bool:
+        return self.near_tip_area_mm2 > 0.0
+
+    def lift_for_volume(self, volume_uL: float) -> float:
+        """Axial rise (mm) produced by aspirating ``volume_uL``."""
+        a_near = self.near_tip_area_mm2
+        if a_near <= 0.0:
+            return 0.0
+        v = max(0.0, float(volume_uL))
+        if not self.has_tip:
+            return v / a_near
+        cap = self.tip_capacity_uL
+        if v <= cap:
+            return v / self.tip_area_mm2
+        if self.barrel_area_mm2 <= 0.0:
+            return self.tip_length_mm
+        return self.tip_length_mm + (v - cap) / self.barrel_area_mm2
+
+    def volume_for_lift(self, lift_mm: float) -> float:
+        """Volume (µL) needed to produce an axial rise of ``lift_mm``."""
+        h = max(0.0, float(lift_mm))
+        if not self.has_tip:
+            return h * self.barrel_area_mm2
+        if h <= self.tip_length_mm:
+            return h * self.tip_area_mm2
+        return self.tip_capacity_uL + (h - self.tip_length_mm) * self.barrel_area_mm2
+
+    @classmethod
+    def from_area(cls, area_mm2: float) -> BoreProfile:
+        """Legacy single-area profile (backward-compat shim)."""
+        return cls(barrel_area_mm2=float(area_mm2 or 0.0))
+
+
+# ---------------------------------------------------------------------------
+# One bore of a needle assembly (v7.9)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NeedleBore:
+    """ONE lumen of a needle assembly, with its own geometry, pump and offsets.
+
+    Before v7.9 a needle was one bore and ``NeedleSpec``'s flat fields described
+    it. A **backpack** ("two needles of *different sizes* bound together") is
+    literally unrepresentable that way — there is nowhere to put the second
+    diameter — so geometry moves here, per bore, and ``NeedleSpec`` keeps its
+    flat fields as a mirror of **bore 0** for byte-identical legacy behaviour.
+
+    Fields mirror ``NeedleSpec``'s naming rule exactly:
+      * ``id_*`` / ``od_*`` / ``wall_um`` / ``length_mm`` are the **barrel**.
+      * ``orifice_*`` / :attr:`orifice_area_mm2` are the **exit hole** — the
+        pulled tip when present, else the barrel.
+
+    MOUNT OFFSETS (``offset_um``, ``z_offset_mm``) are a **per-mount
+    calibration, not a manufacturing constant**: a fused assembly's rotation
+    about Z in the holder is arbitrary, so they must be re-measured on every
+    needle change or re-seat. They are stored here so the motion path can
+    consume them, but the authority is ``NeedleBoreCalibrationStore``
+    (per-machine) — never a preset library, which is the
+    CAMERA_CAL_PERSIST_STORE lesson.
+
+    SIGN CONVENTION — fixed once, pinned by a round-trip test::
+
+        to place bore k on target T:  stage_xy = T - offset_um(k)
+        bore k currently sits at:     stage_xy + offset_um(k)
+        bore 0 is the datum:          offset_um(0) == (0.0, 0.0)
+
+    A mis-signed offset is a *right-distance-wrong-way* error — the same class
+    as the plate-orientation bugs recorded in CLAUDE.md.
+    """
+    # --- barrel geometry (same meaning as the NeedleSpec fields) ---
+    id_um: float = 0.0
+    od_um: float = 0.0
+    wall_um: float = 0.0
+    length_mm: float = 25.4
+    gauge: int | None = None
+
+    # --- optional pulled tip stage (same model as NeedleSpec) ---
+    needle_type: str = NEEDLE_TYPE_HYPODERMIC
+    tip_id_um: float | None = None
+    tip_length_mm: float | None = None
+    tip_od_um: float | None = None
+    tip_profile: str = TIP_PROFILE_CYLINDER
+
+    # --- assembly wiring ---
+    pump_id: str | None = None          # "P1"/"P2"/"P3"; None = unassigned
+    label: str = ""                     # operator display name for this bore
+
+    # --- per-MOUNT calibration (see the class docstring) ---
+    offset_um: tuple[float, float] = (0.0, 0.0)   # lateral offset from bore 0
+    z_offset_mm: float = 0.0            # + = this tip reaches LOWER than bore 0
+
+    def __post_init__(self):
+        nt = (self.needle_type or "").strip().lower() or NEEDLE_TYPE_HYPODERMIC
+        self.needle_type = nt if nt in NEEDLE_TYPES else NEEDLE_TYPE_HYPODERMIC
+        tp = (self.tip_profile or "").strip().lower() or TIP_PROFILE_CYLINDER
+        self.tip_profile = tp if tp in TIP_PROFILES else TIP_PROFILE_CYLINDER
+        for name in ("tip_id_um", "tip_length_mm", "tip_od_um"):
+            v = getattr(self, name)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = None
+            setattr(self, name, v if (v is not None and v > 0.0) else None)
+        # Normalize the offset to a 2-tuple of floats so consumers can unpack it
+        # unconditionally (it round-trips through JSON as a list).
+        try:
+            ox, oy = self.offset_um
+            self.offset_um = (float(ox), float(oy))
+        except (TypeError, ValueError):
+            self.offset_um = (0.0, 0.0)
+        try:
+            self.z_offset_mm = float(self.z_offset_mm)
+        except (TypeError, ValueError):
+            self.z_offset_mm = 0.0
+
+    # --- predicates -------------------------------------------------------
+    @property
+    def has_tip(self) -> bool:
+        return self.tip_id_um is not None and self.tip_length_mm is not None
+
+    @property
+    def is_capillary(self) -> bool:
+        return self.needle_type == NEEDLE_TYPE_CAPILLARY
+
+    # --- barrel -----------------------------------------------------------
+    @property
+    def id_mm(self) -> float:
+        return self.id_um / 1000.0
+
+    @property
+    def od_mm(self) -> float:
+        return self.od_um / 1000.0
+
+    @property
+    def id_m(self) -> float:
+        return self.id_um * 1e-6
+
+    @property
+    def barrel_area_mm2(self) -> float:
+        return math.pi * (self.id_mm / 2) ** 2
+
+    # --- orifice ----------------------------------------------------------
+    @property
+    def orifice_id_um(self) -> float:
+        return self.tip_id_um if self.has_tip else self.id_um
+
+    @property
+    def orifice_id_mm(self) -> float:
+        return self.orifice_id_um / 1000.0
+
+    @property
+    def orifice_area_mm2(self) -> float:
+        """The hole material passes through — this bore's own bead/column area."""
+        return math.pi * (self.orifice_id_mm / 2) ** 2
+
+    # Alias so a NeedleBore is duck-compatible with the ~30 call sites that read
+    # ``cross_section_area_mm2`` off a needle-like object.
+    @property
+    def cross_section_area_mm2(self) -> float:
+        return self.orifice_area_mm2
+
+    @property
+    def orifice_od_um(self) -> float:
+        if self.tip_od_um is not None:
+            return self.tip_od_um
+        if self.has_tip and self.id_um > 0:
+            return self.tip_id_um * (self.od_um / self.id_um)
+        return self.od_um
+
+    @property
+    def orifice_od_mm(self) -> float:
+        return self.orifice_od_um / 1000.0
+
+    # --- lengths + volumes ------------------------------------------------
+    @property
+    def tip_length_mm_or_zero(self) -> float:
+        return float(self.tip_length_mm) if self.has_tip else 0.0
+
+    @property
+    def total_length_mm(self) -> float:
+        return float(self.length_mm) + self.tip_length_mm_or_zero
+
+    @property
+    def internal_volume_uL(self) -> float:
+        """"One bore's worth" of fluid (µL) — barrel + tip.
+
+        This is what the prep multiples (waste/oil/buffer) are counted in, and
+        it is **per bore**: a backpack's two bores hold different volumes, so a
+        single scalar cannot size both.
+        """
+        return sum(seg.volume_uL for seg in self.flow_segments())
+
+    @property
+    def ink_reserve_volume_uL(self) -> float:
+        return (self.flow_segments()[-1].volume_uL if self.has_tip
+                else self.internal_volume_uL)
+
+    # --- segment geometry -------------------------------------------------
+    def flow_segments(self) -> list[FlowSegment]:
+        """This bore's axial stages, barrel first — same series model as
+        :meth:`NeedleSpec.flow_segments`."""
+        segs = [FlowSegment("barrel", float(self.length_mm), self.id_um, self.id_um)]
+        if self.has_tip:
+            d_in = self.id_um if self.tip_profile == TIP_PROFILE_CONE else self.tip_id_um
+            segs.append(FlowSegment("tip", float(self.tip_length_mm), d_in, self.tip_id_um))
+        return segs
+
+    def bore_profile(self) -> BoreProfile:
+        tip = next((s for s in self.flow_segments() if s.name == "tip"), None)
+        return BoreProfile(
+            barrel_area_mm2=self.barrel_area_mm2,
+            tip_area_mm2=tip.equivalent_area_mm2 if tip else 0.0,
+            tip_length_mm=tip.length_mm if tip else 0.0,
+        )
+
+    def resistance_factor(self) -> float:
+        """ΣK over this bore's stages, in SERIES (R = 128·µ/π · ΣK)."""
+        return sum(seg.resistance_factor for seg in self.flow_segments())
+
+    def summary_line(self) -> str:
+        parts = []
+        if self.label:
+            parts.append(self.label)
+        if self.is_capillary:
+            parts.append(f"barrel ID {self.id_um:.0f} µm")
+            if self.has_tip:
+                parts.append(f"tip ID {self.tip_id_um:.1f} µm")
+        else:
+            parts.append(f"{self.gauge}G" if self.gauge else "needle")
+            if self.id_um:
+                parts.append(f"ID {self.id_um:.0f} µm")
+        if self.pump_id:
+            parts.append(self.pump_id)
+        return " · ".join(parts)
+
+    def to_dict(self) -> dict:
+        """Serialize. Only non-default optional keys are emitted so a bore list
+        stays small and diffable."""
+        d = {
+            "id_um": self.id_um,
+            "od_um": self.od_um,
+            "wall_um": self.wall_um,
+            "length_mm": self.length_mm,
+        }
+        if self.gauge is not None:
+            d["gauge"] = self.gauge
+        if self.needle_type != NEEDLE_TYPE_HYPODERMIC:
+            d["needle_type"] = self.needle_type
+        for key in ("tip_id_um", "tip_length_mm", "tip_od_um"):
+            value = getattr(self, key)
+            if value is not None:
+                d[key] = value
+        if self.tip_profile != TIP_PROFILE_CYLINDER:
+            d["tip_profile"] = self.tip_profile
+        if self.pump_id:
+            d["pump_id"] = self.pump_id
+        if self.label:
+            d["label"] = self.label
+        if tuple(self.offset_um) != (0.0, 0.0):
+            d["offset_um"] = list(self.offset_um)
+        if self.z_offset_mm:
+            d["z_offset_mm"] = self.z_offset_mm
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> NeedleBore:
+        """Deserialize, ignoring unknown keys (forward-compat, same rule as
+        :meth:`NeedleSpec.from_dict`)."""
+        data = dict(data or {})
+        known = {f.name for f in _dc_fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            logger.debug("NeedleBore.from_dict: ignoring unknown key(s) %s", unknown)
+        kwargs = {k: v for k, v in data.items() if k in known}
+        if "offset_um" in kwargs:
+            try:
+                ox, oy = kwargs["offset_um"]
+                kwargs["offset_um"] = (float(ox), float(oy))
+            except (TypeError, ValueError):
+                kwargs.pop("offset_um")
+        return cls(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Needle Specification
 # ---------------------------------------------------------------------------
 
 @dataclass
 class NeedleSpec:
     """
-    Physical needle specification — loaded from needles.json.
+    Physical needle specification — hypodermic gauges load from needles.json;
+    pulled glass capillaries are entered on Hardware Setup → Needle.
 
     All dimensional values stored in micrometers (µm) internally.
     Convenience properties provide mm conversions for calculations.
+
+    TWO STAGES (v7.6). The base fields describe the **bulk barrel**; for a
+    straight hypodermic needle the barrel *is* the whole needle, so every
+    legacy number and every serialized key is unchanged. A pulled capillary
+    adds a narrow tip stage on the end of it.
+
+    NAMING RULE — read this before adding a call site:
+      * ``id_*`` / ``od_*`` / ``wall_*`` / ``length_mm`` are the **barrel** —
+        the dimensions the operator types and every legacy readout prints.
+      * ``cross_section_area_mm2`` is the **ORIFICE** area (the pulled tip when
+        present, else the barrel). Every consumer of it means "the bore the
+        material passes through", so this is the fail-safe default; anything
+        that genuinely wants the barrel says ``barrel_area_mm2``.
+      * ``orifice_*`` are explicit aliases for readable new code.
     """
-    gauge: int                          # 16–32+
-    od_um: float                        # Outer diameter (µm)
-    id_um: float                        # Inner diameter (µm)
-    wall_um: float                      # Wall thickness (µm)
-    length_inches: float = 1.0          # 1.0 or 2.0 (user-selected in GUI)
-    num_channels: int = 1               # 1 for single, up to 3 for multi-channel
+    gauge: int | None = None            # 16–32+ for a hypodermic; None for a capillary
+    od_um: float = 0.0                  # Barrel outer diameter (µm)
+    id_um: float = 0.0                  # Barrel inner diameter (µm)
+    wall_um: float = 0.0                # Barrel wall thickness (µm)
+    length_inches: float = 1.0          # Barrel length (user-selected in GUI)
+    num_channels: int = 1               # bore COUNT; == len(bores_resolved())
+    # ⚠ DEPRECATED, WRITE-ONLY, 1-BASED, NEVER READ (v7.9).
+    # Zero readers repo-wide. It is still emitted verbatim because four
+    # byte-identity tests assert the exact legacy key set, and because it exists
+    # in every saved setup on disk. Its index base CONTRADICTS the live 0-based
+    # HardwareConfig.needle_channel_pump_map. Use NeedleBore.pump_id instead —
+    # bores are a LIST, so position IS the index and there is no base to get
+    # wrong. Do not add a reader.
     channel_pump_map: dict | None = None  # e.g. {1: "P1", 2: "P2"}
+
+    # --- Pulled glass capillary (v7.6; all absent for a hypodermic) ---
+    needle_type: str = NEEDLE_TYPE_HYPODERMIC
+    tip_id_um: float | None = None      # D2 — orifice inner Ø (µm)
+    tip_length_mm: float | None = None  # L2 — pulled length (mm)
+    tip_od_um: float | None = None      # optional; falls back to the barrel OD/ID ratio
+    tip_profile: str = TIP_PROFILE_CYLINDER
+    needle_type_id: str | None = None   # preset provenance only; never resolved at load
+    label: str = ""                     # operator display name
+
+    # --- Multi-bore assembly (v7.9; both absent for every pre-v7.9 needle) ---
+    # ``needle_form`` is the assembly's form factor and is ORTHOGONAL to
+    # ``needle_type`` (one bore's taper). ``bores`` is the authority when
+    # present: bore 0 MIRRORS the flat fields above, so every legacy reader of
+    # ``id_um``/``cross_section_area_mm2``/… keeps getting bore 0's real number.
+    # ``None`` ⇒ synthesized from the flat fields, so ``bores_resolved()`` always
+    # returns at least one real bore and no consumer needs a None branch.
+    needle_form: str = NEEDLE_FORM_SINGLE
+    bores: list[NeedleBore] | None = None
 
     def __post_init__(self):
         if self.channel_pump_map is None:
             self.channel_pump_map = {1: "P1"}
 
+        nf = (self.needle_form or "").strip().lower() or NEEDLE_FORM_SINGLE
+        self.needle_form = nf if nf in NEEDLE_FORMS else NEEDLE_FORM_SINGLE
+
+        # Tolerate a list of plain dicts (a config loaded before from_dict ran,
+        # or a hand-edited file) so callers never have to pre-convert.
+        if self.bores is not None:
+            coerced = []
+            for b in self.bores:
+                if isinstance(b, NeedleBore):
+                    coerced.append(b)
+                elif isinstance(b, dict):
+                    coerced.append(NeedleBore.from_dict(b))
+            self.bores = coerced or None
+
+        if self.bores:
+            # bores is authoritative → mirror bore 0 back onto the flat fields so
+            # the ~30 legacy readers stay truthful, and reconcile the count.
+            b0 = self.bores[0]
+            self.gauge = b0.gauge if b0.gauge is not None else self.gauge
+            self.od_um = b0.od_um
+            self.id_um = b0.id_um
+            self.wall_um = b0.wall_um
+            self.length_inches = (float(b0.length_mm) / 25.4) if b0.length_mm else 0.0
+            self.needle_type = b0.needle_type
+            self.tip_id_um = b0.tip_id_um
+            self.tip_length_mm = b0.tip_length_mm
+            self.tip_od_um = b0.tip_od_um
+            self.tip_profile = b0.tip_profile
+            self.num_channels = len(self.bores)
+            # Bore 0 IS the needle_origin_um datum, by definition.
+            self.bores[0].offset_um = (0.0, 0.0)
+            self.bores[0].z_offset_mm = 0.0
+
+        # Normalize the enums to known values so downstream branches are total.
+        nt = (self.needle_type or "").strip().lower() or NEEDLE_TYPE_HYPODERMIC
+        self.needle_type = nt if nt in NEEDLE_TYPES else NEEDLE_TYPE_HYPODERMIC
+        tp = (self.tip_profile or "").strip().lower() or TIP_PROFILE_CYLINDER
+        self.tip_profile = tp if tp in TIP_PROFILES else TIP_PROFILE_CYLINDER
+
+        # Collapse unusable tip dimensions to None so `has_tip` is one clean
+        # predicate rather than a >0 check repeated at every call site.
+        for name in ("tip_id_um", "tip_length_mm", "tip_od_um"):
+            v = getattr(self, name)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                v = None
+            setattr(self, name, v if (v is not None and v > 0.0) else None)
+
+        # A tip wider than the barrel is physically odd but the maths is
+        # well-defined either way, so warn rather than silently discarding
+        # what the operator entered.
+        if self.has_tip and self.id_um > 0 and self.tip_id_um > self.id_um:
+            logger.warning(
+                "NeedleSpec: tip ID %.1f µm exceeds barrel ID %.1f µm — a pulled "
+                "tip should be narrower. Keeping the values as entered.",
+                self.tip_id_um, self.id_um)
+
+    # --- predicates ------------------------------------------------------
+    @property
+    def has_tip(self) -> bool:
+        """True when a second (pulled tip) flow stage is defined."""
+        return self.tip_id_um is not None and self.tip_length_mm is not None
+
+    @property
+    def is_capillary(self) -> bool:
+        return self.needle_type == NEEDLE_TYPE_CAPILLARY
+
+    # --- bores (v7.9) -----------------------------------------------------
+    @property
+    def is_multi_bore(self) -> bool:
+        return len(self.bores_resolved()) > 1
+
+    def bores_resolved(self) -> list[NeedleBore]:
+        """This assembly's bores — ALWAYS at least one, never None.
+
+        With ``bores`` set, that list is returned verbatim (bore 0 already
+        mirrors the flat fields). With ``bores`` absent — every pre-v7.9 needle —
+        ``num_channels`` identical bores are synthesized from the flat fields,
+        which is faithful to the legacy meaning of ``num_channels`` (a bare count
+        with all bores implicitly identical, since the GUI built every one of
+        them from ONE catalog gauge).
+
+        Callers never need a None branch, and a single-bore needle gets exactly
+        one bore whose geometry IS the needle's.
+        """
+        if self.bores:
+            return list(self.bores)
+        n = max(1, int(self.num_channels or 1))
+        proto = NeedleBore(
+            id_um=self.id_um,
+            od_um=self.od_um,
+            wall_um=self.wall_um,
+            length_mm=self.length_mm,
+            gauge=self.gauge,
+            needle_type=self.needle_type,
+            tip_id_um=self.tip_id_um,
+            tip_length_mm=self.tip_length_mm,
+            tip_od_um=self.tip_od_um,
+            tip_profile=self.tip_profile,
+            label=self.label,
+        )
+        if n == 1:
+            return [proto]
+        return [_dc_replace(proto) for _ in range(n)]
+
+    @property
+    def bore_count(self) -> int:
+        return len(self.bores_resolved())
+
+    def bore(self, bore_index: int = 0) -> NeedleBore:
+        """Bore ``bore_index`` (0-based, displayed as "Bore N+1").
+
+        Out-of-range clamps to a real bore rather than raising — a stale index
+        from a saved workflow profile must not abort a run, and clamping to bore
+        0 is the fail-safe direction (bore 0 is the calibrated datum).
+        """
+        bores = self.bores_resolved()
+        try:
+            k = int(bore_index)
+        except (TypeError, ValueError):
+            k = 0
+        if k < 0 or k >= len(bores):
+            logger.debug("NeedleSpec.bore: index %r out of range (have %d) — using bore 0",
+                         bore_index, len(bores))
+            k = 0
+        return bores[k]
+
+    def bore_for_pump(self, pump_id: str) -> NeedleBore | None:
+        """The bore fed by ``pump_id``, or None when no bore claims it.
+
+        This is the lookup the per-PUMP flow ceiling needs: each bore has its own
+        pump, so each pump gets its own ceiling from its own bore's geometry.
+        """
+        if not pump_id:
+            return None
+        want = str(pump_id).strip().upper()
+        for b in self.bores_resolved():
+            if b.pump_id and str(b.pump_id).strip().upper() == want:
+                return b
+        return None
+
+    def bore_index_for_pump(self, pump_id: str) -> int | None:
+        if not pump_id:
+            return None
+        want = str(pump_id).strip().upper()
+        for k, b in enumerate(self.bores_resolved()):
+            if b.pump_id and str(b.pump_id).strip().upper() == want:
+                return k
+        return None
+
+    def bore_offset_um(self, bore_index: int = 0) -> tuple[float, float]:
+        """Lateral offset of bore ``bore_index`` from bore 0 (the datum).
+
+        To place this bore on a target: ``stage_xy = target_xy - offset``.
+        """
+        return tuple(self.bore(bore_index).offset_um)
+
+    @property
+    def assembly_internal_volume_uL(self) -> float:
+        """TOTAL fluid held by EVERY bore (µL).
+
+        Deliberately separate from :attr:`internal_volume_uL`, which resolves
+        bore 0 — "1 needle's worth" for prep is per bore, and summing it would
+        silently inflate every prep multiple on a multi-bore assembly.
+        """
+        return sum(b.internal_volume_uL for b in self.bores_resolved())
+
+    @property
+    def max_bore_z_offset_mm(self) -> float:
+        """The largest ``z_offset_mm`` across the assembly (mm, + = reaches lower).
+
+        A descend must be planned against the LONGEST bore, or a bore that
+        protrudes further is driven into the glass while the datum bore sits at
+        its nominal clearance.
+        """
+        return max((b.z_offset_mm for b in self.bores_resolved()), default=0.0)
+
+    # --- barrel dimensions (meaning unchanged since v7.2) ----------------
     @property
     def length_mm(self) -> float:
-        """Needle length in millimeters."""
+        """Barrel length in millimeters (the whole needle when there is no tip)."""
         return self.length_inches * 25.4
 
     @property
     def id_mm(self) -> float:
-        """Inner diameter in millimeters."""
+        """Barrel inner diameter in millimeters."""
         return self.id_um / 1000.0
 
     @property
     def od_mm(self) -> float:
-        """Outer diameter in millimeters."""
+        """Barrel outer diameter in millimeters."""
         return self.od_um / 1000.0
 
     @property
     def wall_mm(self) -> float:
-        """Wall thickness in millimeters."""
+        """Barrel wall thickness in millimeters."""
         return self.wall_um / 1000.0
 
     @property
     def id_m(self) -> float:
-        """Inner diameter in meters (for flow physics)."""
+        """Barrel inner diameter in meters (for flow physics)."""
         return self.id_um * 1e-6
 
     @property
-    def cross_section_area_mm2(self) -> float:
-        """Inner cross-sectional area in mm²."""
+    def barrel_area_mm2(self) -> float:
+        """Barrel inner cross-sectional area in mm²."""
         return math.pi * (self.id_mm / 2) ** 2
 
     @property
+    def barrel_length_mm(self) -> float:
+        return self.length_mm
+
+    @property
+    def barrel_od_um(self) -> float:
+        return self.od_um
+
+    # --- orifice: the hole material actually leaves through ---------------
+    @property
+    def orifice_id_um(self) -> float:
+        """Inner Ø at the exit (µm). == ``id_um`` for a straight needle."""
+        return self.tip_id_um if self.has_tip else self.id_um
+
+    @property
+    def orifice_id_mm(self) -> float:
+        return self.orifice_id_um / 1000.0
+
+    @property
+    def orifice_id_m(self) -> float:
+        return self.orifice_id_um * 1e-6
+
+    @property
+    def cross_section_area_mm2(self) -> float:
+        """ORIFICE cross-sectional area in mm² — the deposited-bead area of the
+        F-1 one-bead model, and the bore area for pick & place volume columns.
+
+        For a straight needle this is the barrel bore, exactly as before v7.6.
+        Use :attr:`barrel_area_mm2` when you specifically mean the barrel.
+        """
+        return math.pi * (self.orifice_id_mm / 2) ** 2
+
+    @property
+    def orifice_area_mm2(self) -> float:
+        """Explicit alias of :attr:`cross_section_area_mm2`."""
+        return self.cross_section_area_mm2
+
+    @property
+    def orifice_od_um(self) -> float:
+        """Outer Ø at the exit (µm). ``tip_od_um`` when measured; else the
+        barrel's OD/ID ratio applied to the tip ID (a pull preserves wall
+        proportion reasonably well); else the barrel OD."""
+        if self.tip_od_um is not None:
+            return self.tip_od_um
+        if self.has_tip and self.id_um > 0:
+            return self.tip_id_um * (self.od_um / self.id_um)
+        return self.od_um
+
+    @property
+    def orifice_od_mm(self) -> float:
+        return self.orifice_od_um / 1000.0
+
+    # --- lengths + volumes ------------------------------------------------
+    @property
+    def tip_length_mm_or_zero(self) -> float:
+        return float(self.tip_length_mm) if self.has_tip else 0.0
+
+    @property
+    def total_length_mm(self) -> float:
+        """Barrel + tip (mm). A pulled needle is physically LONGER than its
+        barrel, so this — not ``length_mm`` — is what the Z touch-off depends on."""
+        return self.length_mm + self.tip_length_mm_or_zero
+
+    @property
+    def barrel_volume_uL(self) -> float:
+        """Barrel bore column (µL). Identical to the pre-v7.6
+        ``internal_volume_uL``."""
+        return self.barrel_area_mm2 * self.length_mm
+
+    @property
+    def tip_volume_uL(self) -> float:
+        """Pulled-tip bore volume (µL); 0.0 with no tip stage."""
+        if not self.has_tip:
+            return 0.0
+        L = float(self.tip_length_mm)
+        d2 = self.orifice_id_mm
+        if self.tip_profile == TIP_PROFILE_CONE:
+            d1 = self.id_mm
+            return (math.pi * L / 12.0) * (d1 * d1 + d1 * d2 + d2 * d2)
+        return math.pi * (d2 / 2) ** 2 * L
+
+    @property
     def internal_volume_uL(self) -> float:
-        """Internal bore volume (µL) — the needle modelled as a cylinder of its
-        inner diameter and length. ``1 mm³ == 1 µL``, so this is just
-        ``cross_section_area_mm2 × length_mm``. This is "1 needle's worth" of
-        fluid used by the pick & place prep (waste/oil/buffer volumes)."""
-        return self.cross_section_area_mm2 * self.length_mm
+        """TOTAL bore volume (µL) = barrel + tip. ``1 mm³ == 1 µL``.
+
+        This is "1 needle's worth" of fluid that the pick & place prep multiples
+        (waste/oil/buffer/wash) are counted in. Unchanged for a straight needle
+        because the tip term is then 0."""
+        return self.barrel_volume_uL + self.tip_volume_uL
+
+    @property
+    def ink_reserve_volume_uL(self) -> float:
+        """Ink kept BEHIND the deposit so a print never reaches the buffer/oil
+        plug (the Quick Print pickup reserve).
+
+        For a pulled capillary this is the TIP volume — the ink that actually
+        sits in the working section — rather than the whole barrel, which on a
+        1 mm blank would exceed a 25 µL syringe. For a straight needle there is
+        no tip, so it stays the full bore volume: exactly today's number.
+
+        ⚠ On a fine tip this is a very small number (a 30 µm × 3 mm tip holds
+        ~2 pL). Quick Print warns when the resolved reserve falls below one pump
+        step so the operator can raise the ink padding instead.
+        """
+        return self.tip_volume_uL if self.has_tip else self.internal_volume_uL
+
+    # --- segment geometry -------------------------------------------------
+    def flow_segments(self) -> list[FlowSegment]:
+        """Bore geometry as an ordered list of axial stages, barrel first.
+
+        straight needle  -> [barrel]                one cylinder
+        pulled/cylinder  -> [barrel, tip(D2, D2)]
+        pulled/cone      -> [barrel, tip(D1, D2)]   linear taper
+
+        THIS IS THE ONLY PLACE THE TAPER MODEL IS EXPRESSED — switching
+        ``tip_profile`` changes the physics with no downstream edits.
+        """
+        segs = [FlowSegment("barrel", self.length_mm, self.id_um, self.id_um)]
+        if self.has_tip:
+            d_in = self.id_um if self.tip_profile == TIP_PROFILE_CONE else self.tip_id_um
+            segs.append(FlowSegment("tip", float(self.tip_length_mm), d_in, self.tip_id_um))
+        return segs
+
+    def bore_profile(self) -> BoreProfile:
+        """Volume ↔ lift geometry for aspiration (spheroid sink timing)."""
+        tip = next((s for s in self.flow_segments() if s.name == "tip"), None)
+        return BoreProfile(
+            barrel_area_mm2=self.barrel_area_mm2,
+            tip_area_mm2=tip.equivalent_area_mm2 if tip else 0.0,
+            tip_length_mm=tip.length_mm if tip else 0.0,
+        )
+
+    def spheroid_pickup_detail(
+        self,
+        spheroid_diameter_um: float,
+        volume_uL: float | None = None,
+        clearance: float = 1.2,
+    ) -> dict:
+        """Can this needle aspirate a spheroid of this diameter, and will it
+        stay inside the calibrated tip?
+
+        Returns the same ``{status, ratio, message, severity}`` shape as
+        :meth:`InkSpec.flow_compatibility_detail`. Every severity is ADVISORY —
+        a deformable spheroid can squeeze through a slightly smaller orifice, so
+        the workflow warns and proceeds rather than blocking.
+        """
+        d_orifice = self.orifice_id_um
+        d_sph = float(spheroid_diameter_um or 0.0)
+        if d_sph <= 0 or d_orifice <= 0:
+            return {"status": "unknown", "ratio": 0.0, "severity": "info",
+                    "message": "Needle bore or spheroid diameter not set."}
+
+        ratio = d_orifice / d_sph
+        where = "pulled tip" if self.has_tip else "needle bore"
+        if ratio < 1.0:
+            return {
+                "status": "too_large", "ratio": ratio, "severity": "warning",
+                "message": (f"Spheroid {d_sph:.0f} µm is wider than the {where} "
+                            f"({d_orifice:.1f} µm) — it may not be aspirated at all."),
+            }
+        if ratio < clearance:
+            return {
+                "status": "tight", "ratio": ratio, "severity": "warning",
+                "message": (f"Spheroid {d_sph:.0f} µm barely clears the {where} "
+                            f"({d_orifice:.1f} µm) — expect wall contact, and the "
+                            f"sink curve will not match its calibration."),
+            }
+
+        # Does the planned aspirate lift it clean out of the tip?
+        if volume_uL is not None and self.has_tip:
+            profile = self.bore_profile()
+            lift = profile.lift_for_volume(volume_uL)
+            if lift > profile.tip_length_mm:
+                return {
+                    "status": "past_tip", "ratio": ratio, "severity": "warning",
+                    "message": (f"The planned {float(volume_uL):.4f} µL lifts the "
+                                f"spheroid {lift:.2f} mm — past the {profile.tip_length_mm:.2f} mm "
+                                f"tip and into the wide barrel, where the "
+                                f"tip-calibrated sink curve no longer applies."),
+                }
+
+        return {"status": "ok", "ratio": ratio, "severity": "info",
+                "message": f"Spheroid {d_sph:.0f} µm clears the {where} ({ratio:.1f}×)."}
+
+    # --- display ----------------------------------------------------------
+    @property
+    def display_label(self) -> str:
+        """Short identity for logs, readouts and repr — never prints "NoneG"."""
+        if self.label:
+            return self.label
+        if self.is_capillary or self.has_tip:
+            return f"Capillary {self.id_um:.0f} µm bore → {self.orifice_id_um:.1f} µm tip"
+        return f"{self.gauge}G" if self.gauge else "needle"
+
+    def summary_line(self) -> str:
+        """One-line geometry summary shared by every needle readout."""
+        if self.is_capillary or self.has_tip:
+            parts = [
+                "Capillary",
+                f"barrel OD {self.od_um:.0f} / ID {self.id_um:.0f} µm",
+                f"L {self.length_mm:.1f} mm",
+            ]
+            if self.has_tip:
+                tip_od = f"OD {self.orifice_od_um:.0f} / " if self.tip_od_um else ""
+                parts.append(f"tip {tip_od}ID {self.tip_id_um:.1f} µm")
+                parts.append(f"L {float(self.tip_length_mm):.2f} mm")
+        else:
+            parts = [f"{self.gauge}G" if self.gauge else "needle"]
+            if self.od_um:
+                parts.append(f"OD {self.od_um:.0f} µm")
+            if self.id_um:
+                parts.append(f"ID {self.id_um:.0f} µm")
+            parts.append(f"L {self.length_mm:.1f} mm")
+        # v7.9: an assembly reports its FORM and bore count. "channels" is the
+        # banned overloaded word (see the vocabulary table in the v7.9 plan) —
+        # nothing asserts this string, so it adopts the new vocabulary.
+        bores = self.bores_resolved()
+        if len(bores) > 1:
+            parts.append(f"{self.needle_form} · {len(bores)} bores")
+            distinct = {round(b.orifice_id_um, 3) for b in bores}
+            if len(distinct) > 1:
+                parts.append("ID " + "/".join(
+                    f"{b.orifice_id_um:.0f}" for b in bores) + " µm")
+        return " · ".join(parts)
+
+    def assembly_summary_lines(self) -> list[str]:
+        """One line per bore — for a readout that must show which pump feeds
+        which bore, and how far each is offset from the datum."""
+        out = []
+        for k, b in enumerate(self.bores_resolved()):
+            bits = [f"Bore {k + 1}", b.summary_line() or "—"]
+            ox, oy = b.offset_um
+            if k == 0:
+                bits.append("datum")
+            elif ox or oy:
+                bits.append(f"offset ({ox:+.0f}, {oy:+.0f}) µm")
+            else:
+                bits.append("offset not measured")
+            if b.z_offset_mm:
+                bits.append(f"Z {b.z_offset_mm:+.3f} mm")
+            out.append(" · ".join(bits))
+        return out
 
     def to_dict(self) -> dict:
-        """Serialize to dictionary."""
-        return {
+        """Serialize to dictionary.
+
+        The seven legacy keys are ALWAYS emitted, in their original order and
+        with nothing else, for a needle with no capillary fields — so every
+        existing saved setup and workspace round-trips byte-identically.
+
+        v7.9: ``needle_form`` and ``bores`` are conditional-emit — a single-bore
+        needle emits NEITHER, so all six real on-disk setups and the four
+        byte-identity assertions are untouched. ``bores`` is emitted only when
+        the list was explicitly supplied AND holds more than one bore; a
+        synthesized single bore carries no information the flat fields lack.
+        """
+        d = {
             "gauge": self.gauge,
             "od_um": self.od_um,
             "id_um": self.id_um,
@@ -282,11 +1169,283 @@ class NeedleSpec:
             "num_channels": self.num_channels,
             "channel_pump_map": self.channel_pump_map,
         }
+        if self.needle_type != NEEDLE_TYPE_HYPODERMIC:
+            d["needle_type"] = self.needle_type
+        for key in ("tip_id_um", "tip_length_mm", "tip_od_um", "needle_type_id"):
+            value = getattr(self, key)
+            if value is not None:
+                d[key] = value
+        if self.tip_profile != TIP_PROFILE_CYLINDER:
+            d["tip_profile"] = self.tip_profile
+        if self.label:
+            d["label"] = self.label
+        if self.needle_form != NEEDLE_FORM_SINGLE:
+            d["needle_form"] = self.needle_form
+        if self.bores and len(self.bores) > 1:
+            d["bores"] = [b.to_dict() for b in self.bores]
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> NeedleSpec:
-        """Deserialize from dictionary."""
-        return cls(**data)
+        """Deserialize from dictionary, ignoring unknown keys.
+
+        The pre-v7.6 ``cls(**data)`` raised TypeError on any unrecognised key,
+        which meant a config written by a newer build silently destroyed the
+        whole HardwareConfig load (it is caught by a broad ``except`` in
+        ``gui/app.py``). Filtering keeps old builds forward-compatible.
+        """
+        data = dict(data or {})
+        known = {f.name for f in _dc_fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            logger.debug("NeedleSpec.from_dict: ignoring unknown key(s) %s", unknown)
+        kwargs = {k: v for k, v in data.items() if k in known}
+        raw_bores = kwargs.get("bores")
+        if raw_bores:
+            # __post_init__ also tolerates dicts, but converting here keeps the
+            # constructed object fully typed even for a direct cls(**data) path.
+            kwargs["bores"] = [
+                b if isinstance(b, NeedleBore) else NeedleBore.from_dict(b)
+                for b in raw_bores if isinstance(b, (NeedleBore, dict))
+            ] or None
+        return cls(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Needle geometry accessors (duck-typing tolerant)
+# ---------------------------------------------------------------------------
+# Several call sites (and a number of tests) pass needle-LIKE objects that
+# expose only a couple of attributes — e.g. a stub with just gauge/id_m/
+# length_mm, or a MagicMock. Physics and geometry consumers must therefore go
+# through these free functions rather than touching properties directly.
+
+def _needle_num(needle, names: tuple[str, ...]) -> float | None:
+    """First attribute in ``names`` that reads back as a real positive number."""
+    for name in names:
+        try:
+            value = getattr(needle, name, None)
+        except Exception:
+            continue
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return None
+
+
+def needle_orifice_id_um(needle) -> float:
+    """Inner Ø at the exit (µm) for any needle-like object."""
+    value = _needle_num(needle, ("orifice_id_um", "tip_id_um", "id_um"))
+    if value is not None:
+        return value
+    id_m = _needle_num(needle, ("id_m",))
+    return id_m * 1e6 if id_m else 0.0
+
+
+def needle_orifice_id_m(needle) -> float:
+    """Inner Ø at the exit (m) for any needle-like object."""
+    return needle_orifice_id_um(needle) * 1e-6
+
+
+def needle_orifice_area_mm2(needle) -> float:
+    """Deposited-bead / bore-column cross-section (mm²) for any needle-like
+    object — the pulled tip when present, else the barrel bore."""
+    value = _needle_num(needle, ("orifice_area_mm2", "cross_section_area_mm2"))
+    if value is not None:
+        return value
+    d_mm = needle_orifice_id_um(needle) / 1000.0
+    return math.pi * (d_mm / 2) ** 2 if d_mm > 0 else 0.0
+
+
+def needle_orifice_od_mm(needle) -> float:
+    """Outer Ø at the exit (mm) — the line-spacing / bead-width reference."""
+    value = _needle_num(needle, ("orifice_od_mm", "od_mm"))
+    if value is not None:
+        return value
+    od_um = _needle_num(needle, ("orifice_od_um", "tip_od_um", "od_um"))
+    return od_um / 1000.0 if od_um else 0.0
+
+
+def needle_flow_segments(needle) -> list[FlowSegment]:
+    """Bore geometry for any needle-like object. Prefers ``flow_segments()``;
+    falls back to a single barrel cylinder built from whatever diameter and
+    length attributes exist."""
+    fn = getattr(needle, "flow_segments", None)
+    if callable(fn):
+        try:
+            segs = list(fn())
+            if segs:
+                return segs
+        except Exception:
+            logger.debug("needle_flow_segments: flow_segments() failed", exc_info=True)
+    id_um = _needle_num(needle, ("id_um",))
+    if id_um is None:
+        id_m = _needle_num(needle, ("id_m",))
+        id_um = id_m * 1e6 if id_m else 0.0
+    length_mm = _needle_num(needle, ("length_mm",)) or 0.0
+    return [FlowSegment("barrel", length_mm, id_um or 0.0, id_um or 0.0)]
+
+
+def needle_bore_profile(needle) -> BoreProfile:
+    """Volume ↔ lift geometry for any needle-like object."""
+    fn = getattr(needle, "bore_profile", None)
+    if callable(fn):
+        try:
+            profile = fn()
+            if isinstance(profile, BoreProfile):
+                return profile
+        except Exception:
+            logger.debug("needle_bore_profile: bore_profile() failed", exc_info=True)
+    return BoreProfile.from_area(needle_orifice_area_mm2(needle))
+
+
+def needle_particle_ratio(needle, particle_d_um: float) -> float:
+    """Orifice-to-particle ratio — the single clogging metric.
+
+    Uses the needle's ORIFICE Ø (the pulled tip when present) because that is
+    the constriction a cell or granule actually jams in.
+    """
+    if particle_d_um is None or particle_d_um <= 0:
+        return float("inf")
+    return needle_orifice_id_um(needle) / particle_d_um
+
+
+# ---------------------------------------------------------------------------
+# Per-bore accessors (v7.9, duck-typing tolerant)
+# ---------------------------------------------------------------------------
+# The single-valued functions above stay single-valued ON PURPOSE — ~30 call
+# sites pass MagicMocks and minimal stubs, and every one of them means "the bore
+# the material passes through", which resolves to BORE 0 (see the plan's
+# discussion of the v7.6 fail-safe redefinition). These indexed siblings are how
+# genuinely multi-bore code becomes explicit.
+#
+# A NeedleBore is itself duck-compatible with every function above (it exposes
+# orifice_area_mm2 / cross_section_area_mm2 / flow_segments() / bore_profile() /
+# id_um / od_mm / …), so `needle_orifice_area_mm2(needle_bore_at(n, k))` is the
+# general pattern and no function needed duplicating.
+
+def needle_bore_count(needle) -> int:
+    """How many bores this needle-like object has. 1 for anything that cannot
+    say — a stub or MagicMock is treated as a single bore, never as unknown."""
+    fn = getattr(needle, "bore_count", None)
+    if isinstance(fn, int):
+        return max(1, fn)
+    try:
+        bores = needle.bores_resolved()
+    except Exception:
+        bores = None
+    if bores:
+        return max(1, len(bores))
+    n = _needle_num(needle, ("num_channels",))
+    return max(1, int(n)) if n else 1
+
+
+def needle_bore_at(needle, bore_index: int = 0):
+    """The bore-like object for ``bore_index``, or ``needle`` itself.
+
+    Returning the needle for a single-bore/stub object is what lets every
+    existing single-valued accessor be reused unchanged: for a single-bore
+    needle the assembly IS bore 0.
+    """
+    fn = getattr(needle, "bore", None)
+    if callable(fn):
+        try:
+            bore = fn(bore_index)
+            if bore is not None:
+                return bore
+        except Exception:
+            logger.debug("needle_bore_at: bore(%r) failed", bore_index, exc_info=True)
+    return needle
+
+
+def needle_bore_for_pump(needle, pump_id: str):
+    """The bore fed by ``pump_id``, or None. Used by the per-PUMP flow ceiling."""
+    fn = getattr(needle, "bore_for_pump", None)
+    if callable(fn):
+        try:
+            return fn(pump_id)
+        except Exception:
+            logger.debug("needle_bore_for_pump: failed for %r", pump_id, exc_info=True)
+    return None
+
+
+def needle_bore_offset_um(needle, bore_index: int = 0) -> tuple[float, float]:
+    """Lateral offset (µm) of a bore from bore 0.
+
+    ``stage_xy = target_xy - offset`` places that bore on the target. Returns
+    (0, 0) for anything that cannot say, which is exactly the single-bore
+    behaviour — so the offset-aware motion path is a no-op on every existing
+    needle and can be enabled unconditionally.
+    """
+    fn = getattr(needle, "bore_offset_um", None)
+    if callable(fn):
+        try:
+            ox, oy = fn(bore_index)
+            return (float(ox), float(oy))
+        except Exception:
+            logger.debug("needle_bore_offset_um: failed for %r", bore_index, exc_info=True)
+    bore = needle_bore_at(needle, bore_index)
+    try:
+        ox, oy = getattr(bore, "offset_um", (0.0, 0.0))
+        return (float(ox), float(oy))
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+
+
+def needle_bore_z_offset_mm(needle, bore_index: int = 0) -> float:
+    """Axial offset (mm, + = reaches LOWER than bore 0) of one bore.
+
+    ⚠ Requires a REAL number, not merely something ``float()`` accepts. A
+    ``MagicMock`` implements ``__float__`` and returns **1.0**, so a duck-typed
+    coercion here would make every mock/stub needle claim its bore reaches 1 mm
+    lower than the datum — which ``_bore_z_mm`` would then apply as a 1 mm shift
+    to a descend planned 0.1 mm off the glass. A real ``NeedleBore`` always
+    stores a float, so the strict check costs nothing and the unknown case
+    correctly degrades to "no offset".
+    """
+    bore = needle_bore_at(needle, bore_index)
+    v = getattr(bore, "z_offset_mm", 0.0)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0.0
+    v = float(v)
+    return v if math.isfinite(v) else 0.0
+
+
+def needle_max_bore_z_offset_mm(needle) -> float:
+    """Largest z_offset across the assembly — what a DESCEND must be planned
+    against so a longer bore is not driven into the glass."""
+    v = getattr(needle, "max_bore_z_offset_mm", None)
+    if isinstance(v, (int, float)):
+        return float(v)
+    return max((needle_bore_z_offset_mm(needle, k)
+                for k in range(needle_bore_count(needle))), default=0.0)
+
+
+def needle_bore_internal_volume_uL(needle, bore_index: int = 0) -> float:
+    """"One bore's worth" of fluid (µL) for a specific bore.
+
+    Prep multiples are counted in this, and it is PER BORE — a backpack's two
+    bores hold different volumes, so the legacy scalar cannot size both.
+    """
+    bore = needle_bore_at(needle, bore_index)
+    v = _needle_num(bore, ("internal_volume_uL",))
+    if v is not None:
+        return v
+    segs = needle_flow_segments(bore)
+    return sum(s.volume_uL for s in segs)
+
+
+def default_fallback_needle() -> NeedleSpec:
+    """The 22G stand-in used when no needle is configured.
+
+    Deliberately a hypodermic: a silent capillary default would under-extrude by
+    ~190× and read as a hardware fault rather than a configuration gap.
+    """
+    return NeedleSpec(gauge=22, od_um=718, id_um=413, wall_um=152)
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +1520,8 @@ def load_needle_catalog(path: str | Path = DEFAULT_NEEDLES_JSON) -> dict[int, Ne
         catalog = {}
         for gauge_str, dims in data["needles"].items():
             gauge = int(gauge_str)
-            catalog[gauge] = NeedleSpec(gauge=gauge, **dims)
+            # via from_dict so the catalog tolerates keys a newer build added
+            catalog[gauge] = NeedleSpec.from_dict({**dims, "gauge": gauge})
         logger.info(f"Loaded {len(catalog)} needle specs from {path}")
         return catalog
     except (json.JSONDecodeError, KeyError) as e:
@@ -529,12 +1689,15 @@ class InkSpec:
         - "risk_clogging": 1× < needle ID < 4× particle diameter
         - "pick_and_place": needle ID < 1× particle diameter (single pickup only)
         - "compatible": no particles (pure liquid)
+
+        Uses the needle's ORIFICE Ø (the pulled tip when present) — a particle
+        jams at the constriction, not in the bulk barrel.
         """
         particle_d = self.max_particle_diameter_um
         if particle_d <= 0:
             return "compatible"
 
-        ratio = needle.id_um / particle_d
+        ratio = needle_particle_ratio(needle, particle_d)
         if ratio >= 4.0:
             return "free_flow"
         elif ratio >= 1.0:
@@ -547,22 +1710,25 @@ class InkSpec:
         Detailed compatibility info for GUI display.
 
         Returns dict with status, ratio, message, and severity.
+
+        Uses the needle's ORIFICE Ø (the pulled tip when present).
         """
+        label = getattr(needle, "display_label", None) or f"{getattr(needle, 'gauge', None)}G"
         particle_d = self.max_particle_diameter_um
         if particle_d <= 0:
             return {
                 "status": "compatible",
                 "ratio": float("inf"),
-                "message": f"{self.name} is a pure liquid — flows freely through {needle.gauge}G",
+                "message": f"{self.name} is a pure liquid — flows freely through {label}",
                 "severity": "ok",
             }
 
-        ratio = needle.id_um / particle_d
+        ratio = needle_particle_ratio(needle, particle_d)
         if ratio >= 4.0:
             return {
                 "status": "free_flow",
                 "ratio": round(ratio, 1),
-                "message": (f"{self.name} flows freely through {needle.gauge}G "
+                "message": (f"{self.name} flows freely through {label} "
                            f"(ID/particle = {ratio:.1f}×)"),
                 "severity": "ok",
             }
@@ -570,7 +1736,7 @@ class InkSpec:
             return {
                 "status": "risk_clogging",
                 "ratio": round(ratio, 1),
-                "message": (f"⚠️ {self.name} near jamming limit for {needle.gauge}G "
+                "message": (f"⚠️ {self.name} near jamming limit for {label} "
                            f"(ID/particle = {ratio:.1f}×, need >4×)"),
                 "severity": "warning",
             }
@@ -578,7 +1744,7 @@ class InkSpec:
             return {
                 "status": "pick_and_place",
                 "ratio": round(ratio, 1),
-                "message": (f"{self.name} too large for {needle.gauge}G "
+                "message": (f"{self.name} too large for {label} "
                            f"(ID/particle = {ratio:.1f}×) — pick-and-place only"),
                 "severity": "info",
             }

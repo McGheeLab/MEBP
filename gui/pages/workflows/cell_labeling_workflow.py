@@ -793,8 +793,12 @@ class CellLabelingWorkflowPage(QWidget):
         self._picker.set_hardware_config(hw_config)
         try:
             needle = getattr(hw_config, "needle", None) if hw_config else None
-            od_um = float(getattr(needle, "od_mm", 0.0) or 0.0) * 1000.0
-            length_mm = float(getattr(needle, "length_mm", 0.0) or 0.0)
+            # v7.6: the ORIFICE OD is what approaches the plate (the pulled tip
+            # on a capillary), and the needle is barrel + tip long.
+            od_um = float(getattr(needle, "orifice_od_um", None)
+                          or getattr(needle, "od_um", 0.0) or 0.0)
+            length_mm = float(getattr(needle, "total_length_mm", None)
+                              or getattr(needle, "length_mm", 0.0) or 0.0)
             if od_um > 0:
                 self._workspace_view.set_needle(od_um)
                 self._xz_view.set_needle(od_um, length_mm or None)

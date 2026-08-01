@@ -125,20 +125,23 @@ class TestQuickPrintPreflowSetting(unittest.TestCase):
         page._safe_z = 5.0
         return page
 
+    # v7.6 replaced the "% of max" speed knob with an absolute top speed in
+    # mm/s, so these pin the prime against the RESOLVED kinematics rather than
+    # driving a retired `_speed_pct_spin`. The invariant under test is unchanged:
+    # prime = flow × pre-flow seconds, dispensed at the print flow rate.
     def test_build_settings_sets_preflow_prime_at_flow_rate(self):
         page = self._page()
-        page._auto_flow_100_uL_s = lambda: 0.4   # auto flow (needle×speed×mod)
-        page._speed_pct_spin.setValue(100)  # Flow@100% = the resolved flow
+        page._resolved_print_kinematics = lambda: (
+            2.5, 0.4, 0.4 * page._preflow_s())
         s = page._build_settings()
         pump = page._pump()
-        # flow × 0.25 s of pre-flow, at the flow rate.
         self.assertAlmostEqual(s.prime_amounts_uL[pump], 0.4 * page._PREFLOW_S)
         self.assertAlmostEqual(s.pump_rates_uL_s[pump], 0.4)
 
     def test_preflow_scales_with_flow(self):
         page = self._page()
-        page._auto_flow_100_uL_s = lambda: 2.0
-        page._speed_pct_spin.setValue(100)
+        page._resolved_print_kinematics = lambda: (
+            2.5, 2.0, 2.0 * page._preflow_s())
         s = page._build_settings()
         pump = page._pump()
         self.assertAlmostEqual(s.prime_amounts_uL[pump], 2.0 * 0.25)

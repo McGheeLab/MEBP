@@ -26,13 +26,21 @@ from SupportClasses import XYChallenge as XC
 from SupportClasses.PrintTimingCalibrationStore import (
     PrintTimingCalibrationStore, get_store)
 from SupportClasses import PrintTimingCalibrationStore as TCS
+from tests.support.store_fixture import use_temp_store
 from SupportClasses.PrintManager import (
     PrintManager, PrintSettings, PrintCommand, CommandType)
 
 _app = QApplication.instance() or QApplication([])
 
 
-def _fresh_store():
+def _fresh_store(testcase=None):
+    """A throwaway store wired into ``get_store()``.
+
+    Pass the TestCase so the previous global is restored via ``addCleanup`` —
+    without it the swap leaks into every later test in the process.
+    """
+    if testcase is not None:
+        return use_temp_store(testcase)
     p = os.path.join(tempfile.mkdtemp(), "tc.json")
     st = PrintTimingCalibrationStore(p)
     TCS._store = st          # get_store() → this
@@ -55,12 +63,90 @@ class TestOverlayRoles(unittest.TestCase):
         self.assertEqual(ov._actuals, [])
 
 
+# ── 1b. PARAM_SPECS generates the lookup tables ──────────────────────
+
+class TestParamSpecGeneration(unittest.TestCase):
+    """The dialog used to describe every tunable in seven parallel places.
+    They are now generated from PARAM_SPECS; these are the values they had
+    before the refactor, so a bad spec row cannot silently change behaviour."""
+
+    def test_generated_tables_match_the_originals(self):
+        from gui.dialogs import xy_challenge_dialog as d
+        self.assertEqual(d.MODE_PARAMS, {
+            "open_loop": ["speed", "resolution_um", "pace", "control_hz",
+                          "decel"],
+            "confirm": ["speed", "resolution_um", "tol_um", "corner_angle"],
+            "velocity": ["speed", "resolution_um", "lookahead", "control_hz",
+                         "decel", "corner_angle", "corner_factor", "kp", "kd"],
+        })
+        # NOTE: `pid_kp` is the ONE grid deliberately changed from the original
+        # [0, 0.5, 1, 2, 4]. The analytically correct gain for ME3B V1 is π/(2L)
+        # × 0.33 ≈ 5.24, which sits ABOVE the old grid's maximum — the descent was
+        # structurally unable to reach the right answer. The new grid straddles it
+        # (see test_v75x_pid_from_dead_time.py). Everything else is unchanged.
+        self.assertEqual(d.AUTOTUNE, {
+            "open_loop": [("pace_correction",
+                           [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0])],
+            "confirm": [("settle_tol_um", [10.0, 20.0, 30.0, 45.0, 60.0, 90.0]),
+                        ("corner_angle_deg", [15.0, 25.0, 35.0, 50.0])],
+            "velocity": [("lookahead_mm", [0.2, 0.35, 0.5, 0.65, 0.8, 1.0, 1.3]),
+                         ("corner_speed_factor", [0.2, 0.3, 0.4, 0.55, 0.7]),
+                         ("pid_kp", [0.0, 1.0, 2.0, 3.5, 5.0, 7.0, 9.0]),
+                         ("pid_kd", [0.0, 0.02, 0.05, 0.1])],
+        })
+        self.assertEqual(d._PARAM_KEY, {
+            "pace_correction": "pace", "settle_tol_um": "tol_um",
+            "corner_angle_deg": "corner_angle", "lookahead_mm": "lookahead",
+            "corner_speed_factor": "corner_factor", "pid_kp": "kp",
+            "pid_kd": "kd", "control_hz": "control_hz", "decel_mm": "decel",
+        })
+
+    def test_every_spec_gets_a_widget_and_a_row(self):
+        from gui.dialogs.xy_challenge_dialog import XYChallengeDialog, PARAM_SPECS
+        _fresh_store(self)
+        dlg = XYChallengeDialog(
+            SimpleNamespace(is_xy_connected=False, is_zp_connected=False),
+            safe_z=None, start_xy_mm=(0.0, 0.0))
+        try:
+            for p in PARAM_SPECS:
+                self.assertIsNotNone(getattr(dlg, p.attr, None), msg=p.attr)
+                self.assertIn(p.key, dlg._param_rows, msg=p.key)
+            self.assertEqual(sorted(dlg._mode_params("velocity")),
+                             sorted(p.key for p in PARAM_SPECS))
+        finally:
+            dlg.close()
+
+    def test_params_round_trip_through_the_store(self):
+        from gui.dialogs.xy_challenge_dialog import XYChallengeDialog, PARAM_SPECS
+        _fresh_store(self)
+        dlg = XYChallengeDialog(
+            SimpleNamespace(is_xy_connected=False, is_zp_connected=False),
+            safe_z=None, start_xy_mm=(0.0, 0.0))
+        try:
+            want = {}
+            for p in PARAM_SPECS:
+                spin = getattr(dlg, p.attr)
+                spin.setValue(p.lo + (p.hi - p.lo) * 0.37)
+                want[p.key] = spin.value()
+            dlg._save_params_to_store()
+            for p in PARAM_SPECS:            # scramble, then reload
+                getattr(dlg, p.attr).setValue(p.default)
+            dlg._load_params_from_store()
+            for p in PARAM_SPECS:
+                if p.kind == "ui":           # speed is deliberately not persisted
+                    continue
+                self.assertAlmostEqual(getattr(dlg, p.attr).value(),
+                                       want[p.key], places=6, msg=p.key)
+        finally:
+            dlg.close()
+
+
 # ── 2. Per-mode param visibility ─────────────────────────────────────
 
 class TestParamVisibility(unittest.TestCase):
     def _dlg(self):
         from gui.dialogs.xy_challenge_dialog import XYChallengeDialog
-        _fresh_store()
+        _fresh_store(self)
         return XYChallengeDialog(
             SimpleNamespace(is_xy_connected=False, is_zp_connected=False),
             safe_z=None, start_xy_mm=(0.0, 0.0))
@@ -105,7 +191,7 @@ class TestCoordinateDescent(unittest.TestCase):
     so the tuner must converge to and PERSIST those per-param bests."""
 
     def test_tune_converges_and_persists_bests(self):
-        store = _fresh_store()
+        store = _fresh_store(self)
         from gui.dialogs.xy_challenge_dialog import XYChallengeDialog, _Bridge
         import threading
         dlg = XYChallengeDialog.__new__(XYChallengeDialog)

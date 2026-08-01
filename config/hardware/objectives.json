@@ -81,8 +81,8 @@
           1024,
           1024
         ],
-        "date": "2026-07-27",
-        "rotation_deg": 0.5
+        "date": "2026-07-30",
+        "rotation_deg": 180.0
       },
       "10x": {
         "measured_um_per_px": 1.320118,
@@ -90,8 +90,8 @@
           2048,
           2048
         ],
-        "date": "2026-07-27",
-        "rotation_deg": 0.825
+        "date": "2026-07-30",
+        "rotation_deg": 179.111
       }
     },
     "TestCamProp": {}

@@ -21,16 +21,22 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
 from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, Optional
+
+from SupportClasses.PhysicalModels import (
+    BoreProfile, needle_orifice_area_mm2, needle_bore_at, needle_bore_count,
+    needle_bore_offset_um, needle_bore_z_offset_mm,
+    needle_bore_internal_volume_uL,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _settled_pump_move(ctrl, pump, volume_uL, rate_uL_s=None, *,
-                       compensate=False):
+                       compensate=False, abort_event=None):
     """v7.5.x: discrete, blocking pump actuation with the controller's
     configured settle dwell (Hardware Setup → Pump). Every pick/place pump
     move is discrete (a clear next step follows), so it brackets the move
@@ -47,8 +53,21 @@ def _settled_pump_move(ctrl, pump, volume_uL, rate_uL_s=None, *,
       reagent-load aspirates (ink / oil / buffer) that DO want the residual
       needle vacuum bled before the next inter-well travel.
 
+    v7.6 ``abort_event``: forwarded so the blocking drain/settle waits return
+    at once on an abort — this is what makes an Abort during a long reagent
+    aspirate (up to ~180 s of M400 drain) responsive instead of finishing the
+    whole move first.
+
     Falls back cleanly on older controllers / fakes that lack the ``settle`` /
-    ``compensate`` kwargs."""
+    ``compensate`` / ``abort_event`` kwargs."""
+    if abort_event is not None:
+        try:
+            ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate_uL_s,
+                              settle=True, compensate=compensate,
+                              abort_event=abort_event)
+            return
+        except TypeError:
+            pass
     try:
         ctrl.move_pump_uL(pump, volume_uL, rate_uL_s=rate_uL_s,
                           settle=True, compensate=compensate)
@@ -94,7 +113,22 @@ class PickPlaceTarget:
 
     @staticmethod
     def from_dict(d: dict) -> PickPlaceTarget:
-        return PickPlaceTarget(**d)
+        """Deserialize, ignoring unknown keys.
+
+        v7.9: this was a bare ``PickPlaceTarget(**d)``, which raises TypeError on
+        any key the running build does not know — so a target dict written by a
+        NEWER build broke the load in an older one. That is exactly the
+        forward-compat hazard ``NeedleSpec.from_dict`` was hardened against in
+        v7.6, and it matters more now that v7.9 stamps per-bore and target-type
+        metadata alongside targets.
+        """
+        d = dict(d or {})
+        known = {f.name for f in _dc_fields(PickPlaceTarget)}
+        unknown = sorted(set(d) - known)
+        if unknown:
+            logger.debug("PickPlaceTarget.from_dict: ignoring unknown key(s) %s",
+                         unknown)
+        return PickPlaceTarget(**{k: v for k, v in d.items() if k in known})
 
 
 class OperationType(Enum):
@@ -111,6 +145,105 @@ class OperationStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+class BoreRole(Enum):
+    """What ONE bore of a multi-bore needle assembly does during a run (v7.9).
+
+    The operator's requirement was *"the user defines something for each pump
+    channel to go and do something"* — resolved (decision D6) as exactly ONE
+    role per bore plus that role's parameters, with the run ORDER derived from
+    the roles rather than authored as a step list. A fixed role set keeps the
+    table auditable and makes an unsafe program hard to express.
+    """
+    IDLE = "idle"                      # configured but unused this run
+    ASPIRATE_TARGET = "aspirate_target"  # pull the cell up into this bore
+    PUSH_REAGENT = "push_reagent"      # dose the target (e.g. the trypsin bore)
+    DISPENSE_PLACE = "dispense_place"   # deliver what was aspirated
+
+    @property
+    def is_active(self) -> bool:
+        return self is not BoreRole.IDLE
+
+
+#: Order the roles act in within one operation. Dose the cell first, let it
+#: release, then aspirate, then deliver — deriving this from the roles is what
+#: keeps a per-bore table from becoming a program the operator can misorder.
+BORE_ROLE_ORDER = (
+    BoreRole.PUSH_REAGENT,
+    BoreRole.ASPIRATE_TARGET,
+    BoreRole.DISPENSE_PLACE,
+)
+
+
+@dataclass
+class BoreProgram:
+    """One row of the per-bore setup table: which bore, fed by which pump, doing
+    what, to which class of object.
+
+    ``target_type_id`` is a user-defined **target type** (see
+    ``SupportClasses/TargetTypeStore``) — a class of object identified by its
+    fluorescent signature, e.g. "bright in FITC only" or "bright in both FITC
+    and mCherry". Per operator decision D3 the signature RULES are authored and
+    persisted now, but **nothing evaluates them against an image yet**; the
+    selection scheme is explicitly deferred. So today this field records intent
+    and drives which picked targets a bore services.
+
+    ``target_type_name``/``target_type_color`` are STAMPED copies, following
+    ``NeedleTypeStore``'s stamp-don't-reference rule: editing or deleting a
+    target type later must not mutate a saved run.
+    """
+    bore_index: int = 0
+    pump_id: str = ""
+    role: BoreRole = BoreRole.IDLE
+    target_type_id: str = ""
+    target_type_name: str = ""
+    target_type_color: str = ""
+    # Role parameters. Only the ones the role uses are read, so one flat set
+    # keeps the table (and its persistence) simple.
+    volume_uL: float = 0.0             # 0 ⇒ derive from the bore column × depth
+    depth_mm: float = 0.10
+    rate_uL_s: float = 0.5
+    lead_time_s: float = 0.0           # PUSH_REAGENT: wait before the aspirate
+    z_offset_mm: float = 0.10          # working height above the plate bottom
+
+    def to_dict(self) -> dict:
+        return {
+            "bore_index": self.bore_index,
+            "pump_id": self.pump_id,
+            "role": self.role.value,
+            "target_type_id": self.target_type_id,
+            "target_type_name": self.target_type_name,
+            "target_type_color": self.target_type_color,
+            "volume_uL": self.volume_uL,
+            "depth_mm": self.depth_mm,
+            "rate_uL_s": self.rate_uL_s,
+            "lead_time_s": self.lead_time_s,
+            "z_offset_mm": self.z_offset_mm,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> BoreProgram:
+        """Deserialize, ignoring unknown keys and an unrecognised role.
+
+        An unknown role degrades to IDLE rather than raising: a bore whose
+        purpose this build does not understand must do NOTHING, never guess.
+        """
+        d = dict(d or {})
+        known = {f.name for f in _dc_fields(cls)}
+        kwargs = {k: v for k, v in d.items() if k in known}
+        raw_role = kwargs.pop("role", BoreRole.IDLE)
+        if isinstance(raw_role, BoreRole):
+            role = raw_role
+        else:
+            try:
+                role = BoreRole(str(raw_role))
+            except ValueError:
+                logger.warning(
+                    "BoreProgram.from_dict: unknown role %r — treating this bore "
+                    "as IDLE so it performs no motion.", raw_role)
+                role = BoreRole.IDLE
+        return cls(role=role, **kwargs)
 
 
 # ── Operation Configs ────────────────────────────────────────────
@@ -252,16 +385,81 @@ class CellRemovalConfig:
     removal_z_offset_mm: float = 0.10    # at the cell-removal location (off glass)
     place_z_offset_mm: float = 0.50      # at the placing location
 
+    # ── v7.9: multi-bore assembly + a DEDICATED trypsin bore ─────────────
+    # Which bore of the assembly aspirates the cell. 0 = the calibrated datum
+    # bore, which is what every single-bore needle resolves to — so the default
+    # is byte-identical to the pre-v7.9 single-bore sequence.
+    aspirate_bore_index: int = 0
+    # A SEPARATE bore that pushes the cell-release reagent onto the cell just
+    # before the aspirate (operator decision D5). Because fused bores are
+    # laterally offset (~100-500 µm measured), the tool cannot have both bores
+    # over the cell at once: the executor parks the TRYPSIN bore on the target,
+    # pushes, then shifts XY so the ASPIRATE bore is on it, then pulls.
+    # ⚠ That intervening move is why aspiration CANNOT overlap the push.
+    # All default off/zero → the legacy single-bore path, unchanged.
+    trypsin_enabled: bool = False
+    trypsin_bore: str = ""               # pump id feeding the trypsin bore
+    trypsin_bore_index: int = 1          # which bore of the assembly it is
+    trypsin_well_key: str = "__trypsin__"   # service-well key for its reagent
+    # Push VOLUME — either an explicit µL or a bore-column depth (that bore's
+    # own orifice area × depth), mirroring release_depth_mm's model.
+    trypsin_depth_mm: float = 0.10
+    trypsin_volume_uL: float = 0.0       # >0 overrides the depth-derived volume
+    # Push RATE (⇒ push duration = volume / rate) and the LEAD TIME between the
+    # push finishing and the aspirate starting. Both are operator knobs (D2).
+    trypsin_push_rate_uL_s: float = 0.5
+    trypsin_lead_time_s: float = 0.0     # true no-op at 0.0 (_dwell returns at once)
+
+    def resolve_bore(self, needle, bore_index: int):
+        """The ``NeedleBore``-like object for one bore of the assembly.
+
+        Falls back to the needle itself (a single-bore assembly IS bore 0), so
+        every geometry read below works on a plain legacy NeedleSpec, on a
+        multi-bore assembly, and on the MagicMock stubs the tests pass.
+        """
+        if needle is None:
+            return None
+        return needle_bore_at(needle, bore_index)
+
+    def compute_trypsin_volume_uL(self, needle=None) -> float:
+        """Trypsin push volume (µL) for the dedicated trypsin bore.
+
+        An explicit ``trypsin_volume_uL`` wins; otherwise it is that bore's OWN
+        orifice column (``orifice_area_mm² × trypsin_depth_mm``). Using the
+        trypsin bore's own area — not the aspirating bore's — is the whole point
+        of a backpack: the two bores have different diameters, so one area cannot
+        size both moves.
+        """
+        if not self.trypsin_enabled:
+            return 0.0
+        if self.trypsin_volume_uL and float(self.trypsin_volume_uL) > 0:
+            return float(self.trypsin_volume_uL)
+        bore = self.resolve_bore(needle, self.trypsin_bore_index)
+        if bore is not None:
+            try:
+                area = float(needle_orifice_area_mm2(bore))
+                if area > 0:
+                    return area * float(self.trypsin_depth_mm)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        return 0.0
+
     def compute_release_volume_uL(self, needle=None) -> float:
         """Push (reagent-release) volume in µL.
 
         When a needle is supplied, the volume is the bore column
-        ``cross_section_area_mm² × release_depth_mm`` (1 mm³ == 1 µL). Otherwise
+        ``orifice_area_mm² × release_depth_mm`` (1 mm³ == 1 µL). Otherwise
         falls back to the pre-resolved ``release_volume_uL`` the GUI stamped in.
+
+        v7.6: the reagent column is extruded through the ORIFICE into the well,
+        so a pulled capillary uses its tip area. ⚠ That makes the volume tiny —
+        0.1 mm through a 30 µm tip is ~0.07 nL, below one pump microstep — so
+        the GUI warns rather than letting the move silently no-op.
         """
-        if needle is not None:
+        bore = self.resolve_bore(needle, self.aspirate_bore_index)
+        if bore is not None:
             try:
-                area = float(needle.cross_section_area_mm2)
+                area = float(needle_orifice_area_mm2(bore))
                 if area > 0:
                     return area * float(self.release_depth_mm)
             except (TypeError, ValueError, AttributeError):
@@ -330,12 +528,15 @@ class CellLabelingConfig:
         """Deposit (stain) volume in µL.
 
         When a needle is supplied, the volume is the bore column
-        ``cross_section_area_mm² × deposit_depth_mm`` (1 mm³ == 1 µL). Otherwise
+        ``orifice_area_mm² × deposit_depth_mm`` (1 mm³ == 1 µL). Otherwise
         falls back to the pre-resolved ``deposit_volume_uL`` the GUI stamped in.
+
+        v7.6: uses the ORIFICE area (the pulled tip when present) — see the
+        note on :meth:`CellRemovalConfig.compute_release_volume_uL`.
         """
         if needle is not None:
             try:
-                area = float(needle.cross_section_area_mm2)
+                area = float(needle_orifice_area_mm2(needle))
                 if area > 0:
                     return area * float(self.deposit_depth_mm)
             except (TypeError, ValueError, AttributeError):
@@ -534,6 +735,12 @@ class PickPlaceExecutor:
         # SinkCurve (SpheroidSinkCalibrationStore) or None → sink timing skipped.
         self.bore_area_mm2: float = 0.0
         self.sink_curve = None
+        # v7.6: full bore geometry for volume↔lift. A pulled capillary is a
+        # narrow tip stacked under a wide barrel, so the relation is PIECEWISE
+        # — once the spheroid clears the tip it barely rises at all. When None,
+        # ``bore_area_mm2`` is used as a single-area profile, which is
+        # arithmetically identical to the pre-v7.6 behaviour.
+        self.bore_profile: Optional[BoreProfile] = None
         # Fallbacks for the per-move travel-time estimate when the controller
         # can't report speeds (µm/s and mm/s).
         self._travel_xy_speed_fallback_um_s: float = 20000.0
@@ -559,6 +766,14 @@ class PickPlaceExecutor:
         # volumes are in multiples of one needle's internal bore volume.
         self.do_prep: bool = False
         self.prep_bore: str = "P1"           # pump/bore used for prep aspirate/dispense
+        # v7.9 — EVERY bore this run will use, conditioned SIMULTANEOUSLY.
+        # Operator decision D8: "only the bores this run uses. but the should be
+        # doing the same thing simultaneously". Empty ⇒ the legacy single-bore
+        # path on ``prep_bore`` alone, byte-identical to pre-v7.9.
+        # Each entry is {"pump_id": str, "bore_index": int}; the per-bore volume
+        # is that bore's OWN internal volume, because "1 needle's worth" differs
+        # between a backpack's two bores and one scalar cannot size both.
+        self.prep_bores: list[dict] = []
         self.needle_volume_uL: float = 0.0   # "1 needle's worth" (bore cylinder)
         self.oil_needles: float = 1.0        # dispensed to waste AND aspirated from oil
         self.buffer_needles: float = 1.0     # aspirated from the buffer well
@@ -815,24 +1030,48 @@ class PickPlaceExecutor:
                + abs(float(self.safe_z_mm) - float(place))) / z_v
         return xy_t + z_t + float(self._travel_overhead_s)
 
+    def _bore(self) -> Optional[BoreProfile]:
+        """Resolve the active bore geometry: the injected two-stage profile,
+        else the legacy single-area scalar, else None when neither is usable.
+
+        Returning None (rather than a zero-area profile) is what preserves the
+        "no bore ⇒ fixed carrier volume, no sink wait" contract.
+        """
+        profile = self.bore_profile
+        if profile is None:
+            area = float(self.bore_area_mm2 or 0.0)
+            profile = BoreProfile.from_area(area) if area > 0.0 else None
+        return profile if (profile is not None and profile.is_usable()) else None
+
+    def _lift_for_uL(self, volume_uL: float) -> float:
+        """Axial rise (mm) for an aspirated volume — piecewise across the tip."""
+        profile = self._bore()
+        return profile.lift_for_volume(volume_uL) if profile else 0.0
+
+    def _uL_for_lift(self, lift_mm: float) -> float:
+        """Volume (µL) needed for an axial rise — piecewise across the tip."""
+        profile = self._bore()
+        return profile.volume_for_lift(lift_mm) if profile else 0.0
+
     def _planned_aspirate_uL(self, cfg, source, dest):
         """Return ``(total_aspirate_uL, remaining_sink_wait_s)`` for a spheroid
         move. With the sink-timing model on (and a calibrated curve + known bore
-        area), size the aspirate so the spheroid finishes sinking as the needle
-        arrives — floored at the sphere-capture volume; the arrival wait is the
-        leftover sink time. Otherwise the fixed carrier volume with no wait."""
+        geometry), size the aspirate so the spheroid finishes sinking as the
+        needle arrives — floored at the sphere-capture volume; the arrival wait
+        is the leftover sink time. Otherwise the fixed carrier volume with no
+        wait."""
         carrier = cfg.compute_volume_uL()
         curve = self.sink_curve
-        area = float(self.bore_area_mm2 or 0.0)
+        bore = self._bore()
         if (not getattr(cfg, "sink_timing_enabled", False)
-                or curve is None or area <= 0.0 or dest is None):
+                or curve is None or bore is None or dest is None):
             return carrier, 0.0
         travel = self._estimate_travel_time_s(source, dest)
         margin = max(0.0, float(getattr(cfg, "travel_margin_s", 0.0)))
         lift = curve.lift_for_time(travel + margin)   # mm
-        timing_vol = lift * area                       # µL
+        timing_vol = self._uL_for_lift(lift)           # µL
         total = max(carrier, timing_vol)
-        total_sink = curve.time_for_lift(total / area) if area > 0 else 0.0
+        total_sink = curve.time_for_lift(self._lift_for_uL(total))
         remaining = max(0.0, total_sink - travel)
         return total, remaining
 
@@ -859,11 +1098,11 @@ class PickPlaceExecutor:
         # If the disengage pulse alone exceeds the planned volume, the spheroid is
         # lifted higher than planned → recompute the remaining sink wait for it.
         if (aspirate_total > total_vol and self.sink_curve is not None
-                and float(self.bore_area_mm2 or 0.0) > 0.0
+                and self._bore() is not None
                 and getattr(cfg, "sink_timing_enabled", False) and dest is not None):
             travel = self._estimate_travel_time_s(source, dest)
             wait_s = max(0.0, self.sink_curve.time_for_lift(
-                aspirate_total / self.bore_area_mm2) - travel)
+                self._lift_for_uL(aspirate_total)) - travel)
 
         # Pick / place use independent operating heights when supplied.
         pick_z = self.pick_z_mm if self.pick_z_mm is not None else self.operating_z_mm
@@ -886,18 +1125,18 @@ class PickPlaceExecutor:
         if disengage_on:
             lead = min(diseng, aspirate_total)
             self._set_sub_step(op, f"Disengage aspirate {lead:.4f} µL")
-            _settled_pump_move(self.controller, cfg.pickup_bore, -lead,
+            self._pump_move(cfg.pickup_bore, -lead,
                                rate_uL_s=cfg.disengage_rate_uL_s)
             self._check_abort()
             rest = aspirate_total - lead
             if rest > 1e-9:
                 self._set_sub_step(op, f"Aspirating {rest:.4f} µL")
-                _settled_pump_move(self.controller, cfg.pickup_bore, -rest,
+                self._pump_move(cfg.pickup_bore, -rest,
                                    rate_uL_s=cfg.pickup_speed_uL_s)
                 self._check_abort()
         else:
             self._set_sub_step(op, f"Aspirating {aspirate_total:.4f} µL")
-            _settled_pump_move(self.controller, cfg.pickup_bore, -aspirate_total,
+            self._pump_move(cfg.pickup_bore, -aspirate_total,
                                rate_uL_s=cfg.pickup_speed_uL_s)
             self._check_abort()
 
@@ -927,7 +1166,7 @@ class PickPlaceExecutor:
             dispense_vol = (float(cfg.release_volume_uL) if release_on
                             else aspirate_total)
             self._set_sub_step(op, f"Dispensing {dispense_vol:.4f} µL")
-            _settled_pump_move(self.controller, cfg.pickup_bore, dispense_vol,
+            self._pump_move(cfg.pickup_bore, dispense_vol,
                                rate_uL_s=cfg.release_speed_uL_s)
 
             # 4b. Optional place pause (let the spheroid release from the bore).
@@ -967,10 +1206,26 @@ class PickPlaceExecutor:
         dest = op.dest_target
         bore = cfg.reagent_bore
 
-        needle = (getattr(self.hw_config, "needle", None)
-                  if self.hw_config is not None else None)
+        needle = self._needle()
         push_uL = cfg.compute_release_volume_uL(needle)
         pull_uL = push_uL * float(cfg.extract_multiplier)
+
+        # v7.9: an optional DEDICATED trypsin bore, on a different pump, doses
+        # the cell just before the aspirate. Disabled ⇒ every branch below is
+        # skipped and the sequence is byte-identical to the single-bore version.
+        asp_bore_idx = int(cfg.aspirate_bore_index or 0)
+        tryp_on = bool(cfg.trypsin_enabled) and bool(cfg.trypsin_bore)
+        tryp_bore = cfg.trypsin_bore
+        tryp_bore_idx = int(cfg.trypsin_bore_index or 0)
+        tryp_uL = cfg.compute_trypsin_volume_uL(needle) if tryp_on else 0.0
+        if tryp_on and tryp_uL <= 0:
+            # A configured-but-unsized trypsin push would be a silent no-op that
+            # still costs two travels and a lead-time wait. Say so.
+            logger.warning(
+                "Cell removal: trypsin bore %s is enabled but its resolved push "
+                "volume is 0 µL (depth %.4f mm through bore %d) — skipping the "
+                "trypsin dose.", tryp_bore, cfg.trypsin_depth_mm, tryp_bore_idx + 1)
+            tryp_on = False
 
         # Pick / place use independent operating heights when supplied.
         removal_z = self.pick_z_mm if self.pick_z_mm is not None else self.operating_z_mm
@@ -978,38 +1233,99 @@ class PickPlaceExecutor:
 
         logger.info(
             "Cell removal: %s → %s, push=%.5f µL (slow %.2f µL/s), pull=%.5f µL "
-            "(fast %.2f µL/s), dwell=%.0fs, removal_z=%.3f place_z=%.3f mm",
+            "(fast %.2f µL/s), dwell=%.0fs, removal_z=%.3f place_z=%.3f mm, "
+            "aspirate bore %d%s",
             source.target_id, dest.target_id if dest else "N/A",
             push_uL, cfg.push_speed_uL_s, pull_uL, cfg.pull_speed_uL_s,
-            cfg.dwell_time_s, removal_z, place_z)
+            cfg.dwell_time_s, removal_z, place_z, asp_bore_idx + 1,
+            (f", trypsin bore {tryp_bore_idx + 1} ({tryp_bore}) "
+             f"{tryp_uL:.5f} µL @ {cfg.trypsin_push_rate_uL_s:.2f} µL/s, "
+             f"lead {cfg.trypsin_lead_time_s:.1f}s") if tryp_on else "")
+
+        # ── 0. Load the TRYPSIN bore from its own reagent well ───────────
+        # Done before the aspirating bore's reagent load so the assembly makes a
+        # single pass over the service wells.
+        if tryp_on:
+            self._set_sub_step(
+                op, f"Loading {tryp_uL:.4f} µL of trypsin into bore "
+                    f"{tryp_bore_idx + 1}")
+            if not self._safe_move_to_well(cfg.trypsin_well_key,
+                                           target_z_mm=self.reagent_dip_z_mm,
+                                           bore_index=tryp_bore_idx):
+                raise RuntimeError(
+                    f"Cell removal: trypsin well ({cfg.trypsin_well_key}) not "
+                    f"configured/resolved — refusing to run a trypsin bore with "
+                    f"nothing loaded.")
+            self._check_abort()
+            self._pump_move(tryp_bore, -tryp_uL,
+                            rate_uL_s=cfg.trypsin_push_rate_uL_s)
+            self._check_abort()
 
         # 1. Load the cell-release reagent from its well.
+        # v7.9 BUGFIX: the load was gated on `reagent_well_pos is not None` while
+        # the push at step 3 was gated only on `push_uL > 0`, so a run with no
+        # reagent well DISPENSED a volume it had never aspirated — an unbalanced
+        # pump and reagent that does not exist. `loaded` now gates both.
+        loaded = False
         if self.reagent_well_pos is not None and push_uL > 0:
             self._set_sub_step(
                 op, f"Loading {push_uL:.4f} µL of cell-release reagent")
             if not self._safe_move_to_well(
-                    "__reagent__", target_z_mm=self.reagent_dip_z_mm):
+                    "__reagent__", target_z_mm=self.reagent_dip_z_mm,
+                    bore_index=asp_bore_idx):
                 raise RuntimeError(
                     "Cell removal: reagent well not configured/resolved")
             self._check_abort()
-            _settled_pump_move(self.controller, bore, -push_uL,
+            self._pump_move(bore, -push_uL,
                                          rate_uL_s=cfg.push_speed_uL_s)
             self._check_abort()
+            loaded = True
+        elif push_uL > 0:
+            logger.warning(
+                "Cell removal: no reagent well resolved — skipping the %.5f µL "
+                "reagent push so the pump stays volume-balanced.", push_uL)
 
         # 1b. Rinse the needle exterior (wash off the reagent film) before we
         #     go deposit it — the aspirated reagent stays in the bore.
         if self.wash_after_pickup:
             self._wash_needle(op, "Washing needle after reagent pickup")
 
-        # 2. Travel to the cell-removal location (lower to the removal Z).
-        self._set_sub_step(op, f"Moving to removal target {source.target_id}")
-        self._safe_move_to(source, target_z_mm=removal_z)
-        self._check_abort()
+        # ── 2. Dose the cell with the dedicated trypsin bore ─────────────
+        # The TRYPSIN bore is parked on the target first; the aspirating bore is
+        # laterally offset and comes over the cell in step 2c.
+        if tryp_on:
+            self._set_sub_step(
+                op, f"Moving bore {tryp_bore_idx + 1} to target {source.target_id}")
+            self._safe_move_to(source, target_z_mm=removal_z,
+                               bore_index=tryp_bore_idx)
+            self._check_abort()
+
+            self._set_sub_step(op, f"Pushing {tryp_uL:.4f} µL of trypsin")
+            self._pump_move(tryp_bore, +tryp_uL,
+                            rate_uL_s=cfg.trypsin_push_rate_uL_s)
+            self._check_abort()
+
+            # 2c. Shift so the ASPIRATING bore is on the dosed cell. This move is
+            #     precisely why the aspirate cannot overlap the push (D5).
+            self._shift_to_bore(op, source, tryp_bore_idx, asp_bore_idx,
+                                removal_z)
+            self._check_abort()
+
+            # 2d. Lead time — the trypsin acts while the tool is already in
+            #     position. A true no-op at 0.0.
+            self._dwell(op, cfg.trypsin_lead_time_s, "Trypsin lead time")
+            self._check_abort()
+        else:
+            # 2. Travel to the cell-removal location (lower to the removal Z).
+            self._set_sub_step(op, f"Moving to removal target {source.target_id}")
+            self._safe_move_to(source, target_z_mm=removal_z,
+                               bore_index=asp_bore_idx)
+            self._check_abort()
 
         # 3. Slowly push the reagent in.
-        if push_uL > 0:
+        if loaded:
             self._set_sub_step(op, f"Releasing {push_uL:.4f} µL (slow)")
-            _settled_pump_move(self.controller, bore, +push_uL,
+            self._pump_move(bore, +push_uL,
                                          rate_uL_s=cfg.push_speed_uL_s)
             self._check_abort()
 
@@ -1020,20 +1336,21 @@ class PickPlaceExecutor:
         # 5. Quickly pull up the extraction volume (reagent + cells).
         if pull_uL > 0:
             self._set_sub_step(op, f"Extracting {pull_uL:.4f} µL (fast)")
-            _settled_pump_move(self.controller, bore, -pull_uL,
+            self._pump_move(bore, -pull_uL,
                                          rate_uL_s=cfg.pull_speed_uL_s)
             self._check_abort()
 
         # 6. Travel to the placing location (lower to the place Z).
         if dest:
             self._set_sub_step(op, f"Moving to placement {dest.target_id}")
-            self._safe_move_to(dest, target_z_mm=place_z)
+            self._safe_move_to(dest, target_z_mm=place_z,
+                               bore_index=asp_bore_idx)
             self._check_abort()
 
             # 7. Gently dispense the extracted cells.
             if pull_uL > 0:
                 self._set_sub_step(op, f"Dispensing {pull_uL:.4f} µL")
-                _settled_pump_move(self.controller, bore, +pull_uL,
+                self._pump_move(bore, +pull_uL,
                                              rate_uL_s=cfg.push_speed_uL_s)
 
         self._set_sub_step(op, "Complete")
@@ -1088,7 +1405,7 @@ class PickPlaceExecutor:
                 raise RuntimeError(
                     "Cell labeling: reagent well not configured/resolved")
             self._check_abort()
-            _settled_pump_move(self.controller, bore, -deposit_uL,
+            self._pump_move(bore, -deposit_uL,
                                rate_uL_s=cfg.aspirate_speed_uL_s)
             self._check_abort()
 
@@ -1105,7 +1422,7 @@ class PickPlaceExecutor:
         # 3. Slowly deposit the stain.
         if deposit_uL > 0:
             self._set_sub_step(op, f"Depositing {deposit_uL:.4f} µL (slow)")
-            _settled_pump_move(self.controller, bore, +deposit_uL,
+            self._pump_move(bore, +deposit_uL,
                                rate_uL_s=cfg.deposit_speed_uL_s)
             self._check_abort()
 
@@ -1116,7 +1433,7 @@ class PickPlaceExecutor:
         # 5. Slowly aspirate the stain (+ excess) back up.
         if aspirate_uL > 0:
             self._set_sub_step(op, f"Aspirating {aspirate_uL:.4f} µL (slow)")
-            _settled_pump_move(self.controller, bore, -aspirate_uL,
+            self._pump_move(bore, -aspirate_uL,
                                rate_uL_s=cfg.aspirate_speed_uL_s)
             self._check_abort()
 
@@ -1129,12 +1446,76 @@ class PickPlaceExecutor:
                     "Cell labeling: waste well not configured/resolved")
             self._check_abort()
             self._set_sub_step(op, f"Dispensing {aspirate_uL:.4f} µL to waste")
-            _settled_pump_move(self.controller, bore, +aspirate_uL,
+            self._pump_move(bore, +aspirate_uL,
                                rate_uL_s=cfg.deposit_speed_uL_s)
 
         self._set_sub_step(op, "Complete")
 
     # ── Prep routine (needle conditioning before the pick & place loop) ──
+
+    # ── Simultaneous multi-bore prep (v7.9, decision D8) ─────────────
+
+    def _prep_bore_plan(self) -> list[tuple[str, int, float]]:
+        """``[(pump_id, bore_index, one_bore_volume_uL)]`` for the bores to prep.
+
+        Empty ⇒ the caller uses the legacy single-``prep_bore`` path unchanged.
+
+        The volume is resolved PER BORE from that bore's own geometry: on a
+        backpack "1 needle's worth" of a 22G bore is ~6.8 µL and of a 30G bore
+        ~1.0 µL, so the single ``needle_volume_uL`` scalar cannot size both.
+        It falls back to that scalar for a bore whose geometry cannot be read.
+        """
+        entries = list(getattr(self, "prep_bores", None) or ())
+        if not entries:
+            return []
+        needle = self._needle()
+        fallback = float(self.needle_volume_uL or 0.0)
+        plan: list[tuple[str, int, float]] = []
+        seen: set[str] = set()
+        for e in entries:
+            pump = str((e or {}).get("pump_id") or "").strip().upper()
+            if not pump or pump in seen:
+                continue          # a pump cannot be driven twice in one move
+            seen.add(pump)
+            idx = int((e or {}).get("bore_index") or 0)
+            vol = 0.0
+            if needle is not None:
+                try:
+                    vol = float(needle_bore_internal_volume_uL(needle, idx))
+                except (TypeError, ValueError):
+                    vol = 0.0
+            plan.append((pump, idx, vol if vol > 0 else fallback))
+        return plan
+
+    def _prep_pump_move(self, plan, needles: float, sign: float, rate,
+                        *, compensate=False) -> None:
+        """Actuate every prepping bore at once: ONE coordinated Marlin move.
+
+        ``sign`` is ``+1`` to DISPENSE and ``-1`` to ASPIRATE (the
+        :meth:`move_pump_uL` convention). All bores do the SAME thing here, which
+        is what makes a coordinated move legitimate: a single ``G0`` carries one
+        VECTOR feedrate, so the bores cannot have independent rates — fine when
+        they are all aspirating buffer, and exactly why the slow-push/fast-pull
+        asymmetry of the removal sequence stays sequential.
+
+        Falls back to sequential per-bore moves when the controller predates
+        ``move_pumps_uL`` (older stand-ins and the test fakes), so behaviour
+        degrades to "correct but not simultaneous" rather than failing.
+        """
+        volumes = {pump: sign * vol * float(needles)
+                   for (pump, _idx, vol) in plan if vol > 0}
+        if not volumes:
+            return
+        mover = getattr(self.controller, "move_pumps_uL", None)
+        if callable(mover):
+            try:
+                mover(volumes, rate_uL_s=rate, settle=True,
+                      abort_event=self._abort_flag)
+                return
+            except TypeError:
+                pass              # older signature — fall through
+        for pump, dv in volumes.items():
+            self._pump_move(pump, dv, rate_uL_s=rate, compensate=compensate)
 
     def run_prep(self):
         """Condition the needle before picking, once, at the start of a run.
@@ -1158,31 +1539,56 @@ class PickPlaceExecutor:
         rate = self.prep_rate_uL_s
         sz = self.service_z_mm
 
+        # v7.9 (D8): condition EVERY bore this run uses, acting simultaneously.
+        # An empty plan is the legacy single-bore path, byte-identical.
+        plan = self._prep_bore_plan()
+        multi = len(plan) > 1
+        if plan:
+            logger.info(
+                "Prep conditioning %d bore(s) %s: %s",
+                len(plan),
+                "simultaneously" if multi else "",
+                ", ".join(f"bore {i + 1}/{p} @ {v:.4f} µL" for (p, i, v) in plan))
+
         def goto(key, label):
             self._check_abort()
             self._set_sub_step(prep_op, f"Prep: travel to {label}")
+            # All bores dip in the SAME service well. They are laterally offset
+            # by ~100-500 µm, which is negligible against a service well several
+            # mm across, so the assembly is positioned by its datum bore.
             if not self._safe_move_to_well(key, target_z_mm=sz):
                 raise RuntimeError(
                     f"Prep: {label} well not configured/resolved ({key})")
 
+        def actuate(needles, sign, label, compensate=False):
+            """One prep actuation across every prepping bore."""
+            if needles <= 0:
+                return
+            if plan:
+                self._set_sub_step(prep_op, label)
+                self._prep_bore_plan_guard(plan)
+                self._prep_pump_move(plan, needles, sign, rate,
+                                     compensate=compensate)
+            elif unit > 0:
+                self._set_sub_step(prep_op, label)
+                if compensate is False:
+                    self._pump_move(bore, sign * unit * needles, rate_uL_s=rate)
+                else:
+                    _settled_pump_move(self.controller, bore,
+                                       sign * unit * needles, rate_uL_s=rate,
+                                       compensate=compensate)
+            self._check_abort()
+
         # 1. Waste — dispense oil.
         goto("__waste__", "waste")
-        if unit > 0 and self.oil_needles > 0:
-            self._set_sub_step(
-                prep_op,
+        actuate(self.oil_needles, +1.0,
                 f"Prep: dispense {self.oil_needles:g} needle(s) of oil to waste")
-            _settled_pump_move(self.controller, 
-                bore, +unit * self.oil_needles, rate_uL_s=rate)
-            self._check_abort()
 
         # 2. Oil — aspirate fresh oil.
         goto("__oil__", "oil")
-        if unit > 0 and self.oil_needles > 0:
-            self._set_sub_step(
-                prep_op, f"Prep: aspirate {self.oil_needles:g} needle(s) of oil")
-            _settled_pump_move(self.controller,
-                bore, -unit * self.oil_needles, rate_uL_s=rate, compensate=None)
-            self._check_abort()
+        actuate(self.oil_needles, -1.0,
+                f"Prep: aspirate {self.oil_needles:g} needle(s) of oil",
+                compensate=None)
 
         # 3. Wash.
         goto("__wash__", "wash")
@@ -1191,14 +1597,27 @@ class PickPlaceExecutor:
 
         # 4. Buffer — aspirate buffer.
         goto("__buffer__", "buffer")
-        if unit > 0 and self.buffer_needles > 0:
-            self._set_sub_step(
-                prep_op,
-                f"Prep: aspirate {self.buffer_needles:g} needle(s) of buffer")
-            _settled_pump_move(self.controller,
-                bore, -unit * self.buffer_needles, rate_uL_s=rate, compensate=None)
+        actuate(self.buffer_needles, -1.0,
+                f"Prep: aspirate {self.buffer_needles:g} needle(s) of buffer",
+                compensate=None)
 
         self._set_sub_step(prep_op, "Prep complete")
+
+    def _prep_bore_plan_guard(self, plan) -> None:
+        """Warn once per run about a bore whose own volume could not be read.
+
+        A bore prepped with the wrong "1 needle's worth" is under- or
+        over-conditioned, which is a fluidics problem the operator can only see
+        if we say so.
+        """
+        if getattr(self, "_prep_volume_warned", False):
+            return
+        bad = [f"bore {i + 1}/{p}" for (p, i, v) in plan if v <= 0]
+        if bad:
+            logger.warning(
+                "Prep: could not resolve an internal volume for %s — those "
+                "bores will not be conditioned.", ", ".join(bad))
+        self._prep_volume_warned = True
 
     def run_post_clean(self):
         """Clean + reset the needle ONCE after the operation loop.
@@ -1211,14 +1630,19 @@ class PickPlaceExecutor:
                          the needle to a conditioned, buffer-loaded state
 
         Mirrors :meth:`run_prep` — same service wells, needle volume, dip Z,
-        ``prep_bore`` / ``prep_rate_uL_s``. Abort-aware; raises if a required
-        service well is unresolved (the GUI gates on this up front).
+        ``prep_bore`` / ``prep_rate_uL_s``, and (v7.9) the same simultaneous
+        multi-bore treatment via ``prep_bores``. This matters here specifically:
+        after a run that used a DEDICATED trypsin bore, that bore also holds
+        residual (whatever it did not push) that must be cleared — clearing
+        only ``prep_bore`` would leave it dirty. Abort-aware; raises if a
+        required service well is unresolved (the GUI gates on this up front).
         """
         clean_op = SimpleNamespace(op_id="CLEAN", sub_step="")
         unit = float(self.needle_volume_uL or 0.0)
         bore = self.prep_bore
         rate = self.prep_rate_uL_s
         sz = self.service_z_mm
+        plan = self._prep_bore_plan()
 
         def goto(key, label):
             self._check_abort()
@@ -1227,16 +1651,29 @@ class PickPlaceExecutor:
                 raise RuntimeError(
                     f"Clean: {label} well not configured/resolved ({key})")
 
+        def actuate(needles, sign, label, compensate=False):
+            if needles <= 0:
+                return
+            if plan:
+                self._set_sub_step(clean_op, label)
+                self._prep_bore_plan_guard(plan)
+                self._prep_pump_move(plan, needles, sign, rate,
+                                     compensate=compensate)
+            elif unit > 0:
+                self._set_sub_step(clean_op, label)
+                if compensate is False:
+                    self._pump_move(bore, sign * unit * needles, rate_uL_s=rate)
+                else:
+                    _settled_pump_move(self.controller, bore,
+                                       sign * unit * needles, rate_uL_s=rate,
+                                       compensate=compensate)
+            self._check_abort()
+
         # 1. Waste — dispense residual.
         goto("__waste__", "waste")
-        if unit > 0 and self.post_dispense_needles > 0:
-            self._set_sub_step(
-                clean_op,
+        actuate(self.post_dispense_needles, +1.0,
                 f"Clean: dispense {self.post_dispense_needles:g} needle(s) to "
                 f"waste")
-            _settled_pump_move(self.controller,
-                bore, +unit * self.post_dispense_needles, rate_uL_s=rate)
-            self._check_abort()
 
         # 2. Wash.
         goto("__wash__", "wash")
@@ -1245,12 +1682,9 @@ class PickPlaceExecutor:
 
         # 3. Buffer — reload buffer (reset).
         goto("__buffer__", "buffer")
-        if unit > 0 and self.buffer_needles > 0:
-            self._set_sub_step(
-                clean_op,
-                f"Clean: aspirate {self.buffer_needles:g} needle(s) of buffer")
-            _settled_pump_move(self.controller,
-                bore, -unit * self.buffer_needles, rate_uL_s=rate, compensate=None)
+        actuate(self.buffer_needles, -1.0,
+                f"Clean: aspirate {self.buffer_needles:g} needle(s) of buffer",
+                compensate=None)
 
         self._set_sub_step(clean_op, "Clean complete")
 
@@ -1281,13 +1715,13 @@ class PickPlaceExecutor:
             if not self._safe_move_to_well("__waste__", target_z_mm=sz):
                 raise RuntimeError(
                     "Oil prep: waste well not configured/resolved (__waste__)")
-            _settled_pump_move(self.controller, bore, +v, rate_uL_s=rate)
+            self._pump_move(bore, +v, rate_uL_s=rate)
         else:
             self._set_sub_step(op, f"Oil prep: aspirate {v:.3f} µL of oil")
             if not self._safe_move_to_well("__oil__", target_z_mm=sz):
                 raise RuntimeError(
                     "Oil prep: oil well not configured/resolved (__oil__)")
-            _settled_pump_move(self.controller, bore, -v, rate_uL_s=rate,
+            self._pump_move(bore, -v, rate_uL_s=rate,
                                compensate=None)
         self._check_abort()
 
@@ -1383,7 +1817,7 @@ class PickPlaceExecutor:
         if waste_uL > 1e-6:
             self._set_sub_step(
                 clean_op, f"Cleanup: dispense {waste_uL:.3f} µL to waste")
-            _settled_pump_move(self.controller, bore, +waste_uL, rate_uL_s=rate)
+            self._pump_move(bore, +waste_uL, rate_uL_s=rate)
             self._check_abort()
 
         # 2. Wash.
@@ -1414,7 +1848,7 @@ class PickPlaceExecutor:
             oil_uL = -unit * self.cleanup_oil_needles
         if abs(oil_uL) > 1e-6:
             self._set_sub_step(clean_op, f"Cleanup: reset oil ({oil_uL:+.3f} µL)")
-            _settled_pump_move(self.controller, bore, oil_uL, rate_uL_s=rate)
+            self._pump_move(bore, oil_uL, rate_uL_s=rate)
 
         self._set_sub_step(clean_op, "Cleanup complete")
 
@@ -1562,12 +1996,12 @@ class PickPlaceExecutor:
         try:
             aspirate_total = vol + prime  # >0 (guarded above)
             if aspirate_total > 0:
-                _settled_pump_move(self.controller, bore, -aspirate_total,
+                self._pump_move(bore, -aspirate_total,
                                    rate_uL_s=rate, compensate=compensate)
                 self._check_abort()
             if prime > 0:
                 # Dispense the extra back INTO the ink well (+ = dispense).
-                _settled_pump_move(self.controller, bore, prime,
+                self._pump_move(bore, prime,
                                    rate_uL_s=p_rate, compensate=compensate)
         finally:
             if stop is not None:
@@ -1687,7 +2121,7 @@ class PickPlaceExecutor:
             self._check_abort()
 
             # Aspirate trypsin
-            _settled_pump_move(self.controller, cfg.trypsin_bore, -cfg.trypsin_volume_uL,
+            self._pump_move(cfg.trypsin_bore, -cfg.trypsin_volume_uL,
                                          rate_uL_s=cfg.push_speed_uL_s)
             self._check_abort()
 
@@ -1698,7 +2132,7 @@ class PickPlaceExecutor:
 
         # 3. Dispense trypsin at target
         self._set_sub_step(op, "Dispensing trypsin")
-        _settled_pump_move(self.controller, cfg.trypsin_bore, cfg.trypsin_volume_uL,
+        self._pump_move(cfg.trypsin_bore, cfg.trypsin_volume_uL,
                                      rate_uL_s=cfg.push_speed_uL_s)
         self._check_abort()
 
@@ -1709,7 +2143,7 @@ class PickPlaceExecutor:
         # 5. Aspirate cells + trypsin
         extract_bore = cfg.extraction_bore if not cfg.single_bore else cfg.trypsin_bore
         self._set_sub_step(op, f"Extracting {cfg.extraction_volume_uL} µL")
-        _settled_pump_move(self.controller, extract_bore, -cfg.extraction_volume_uL,
+        self._pump_move(extract_bore, -cfg.extraction_volume_uL,
                                      rate_uL_s=cfg.pull_speed_uL_s)
         self._check_abort()
 
@@ -1721,14 +2155,14 @@ class PickPlaceExecutor:
 
             # 7. Dispense at destination
             self._set_sub_step(op, "Dispensing cells")
-            _settled_pump_move(self.controller, extract_bore, cfg.extraction_volume_uL,
+            self._pump_move(extract_bore, cfg.extraction_volume_uL,
                                          rate_uL_s=cfg.pull_speed_uL_s)
         elif cfg.dest_well:
             self._set_sub_step(op, f"Moving to dest well {cfg.dest_well}")
             self._safe_move_to_well(cfg.dest_well)
             self._check_abort()
             self._set_sub_step(op, "Dispensing cells")
-            _settled_pump_move(self.controller, extract_bore, cfg.extraction_volume_uL,
+            self._pump_move(extract_bore, cfg.extraction_volume_uL,
                                          rate_uL_s=cfg.pull_speed_uL_s)
 
         self._set_sub_step(op, "Complete")
@@ -1775,7 +2209,7 @@ class PickPlaceExecutor:
                 self._safe_move_to_well(dye.dye_well)
                 self._check_abort()
 
-                _settled_pump_move(self.controller, dye.bore, -dye.volume_uL,
+                self._pump_move(dye.bore, -dye.volume_uL,
                                              rate_uL_s=1.0)
                 self._check_abort()
 
@@ -1787,7 +2221,7 @@ class PickPlaceExecutor:
         # Deposit dye(s)
         for dye in cfg.dye_configs:
             self._set_sub_step(op, f"Depositing {dye.dye_name}")
-            _settled_pump_move(self.controller, dye.bore, dye.volume_uL,
+            self._pump_move(dye.bore, dye.volume_uL,
                                          rate_uL_s=1.0)
             self._check_abort()
 
@@ -1800,13 +2234,13 @@ class PickPlaceExecutor:
             # Use waste bore to aspirate spent dye (skip waste well travel)
             total_vol = sum(d.volume_uL for d in cfg.dye_configs)
             self._set_sub_step(op, f"Waste bore collecting {total_vol:.2f} µL")
-            _settled_pump_move(self.controller, cfg.waste_bore, -total_vol,
+            self._pump_move(cfg.waste_bore, -total_vol,
                                          rate_uL_s=1.0)
         else:
             # Aspirate with each dye bore
             for dye in cfg.dye_configs:
                 self._set_sub_step(op, f"Aspirating {dye.dye_name}")
-                _settled_pump_move(self.controller, dye.bore, -dye.volume_uL,
+                self._pump_move(dye.bore, -dye.volume_uL,
                                              rate_uL_s=1.0)
                 self._check_abort()
 
@@ -1824,7 +2258,7 @@ class PickPlaceExecutor:
             self._safe_move_to_well(cfg.waste_well)
             self._check_abort()
             for dye in cfg.dye_configs:
-                _settled_pump_move(self.controller, dye.bore, dye.volume_uL,
+                self._pump_move(dye.bore, dye.volume_uL,
                                              rate_uL_s=2.0)
 
         # Buffer
@@ -1841,7 +2275,8 @@ class PickPlaceExecutor:
 
     # ── Movement helpers (Safe Z protocol) ───────────────────────
 
-    def _safe_move_to(self, target: PickPlaceTarget, target_z_mm: float | None = None):
+    def _safe_move_to(self, target: PickPlaceTarget, target_z_mm: float | None = None,
+                      bore_index: int = 0):
         """Move to a target with appropriate Z protocol.
 
         INTER-WELL: full safe Z protocol (raise → wait → XY → wait → lower)
@@ -1853,6 +2288,11 @@ class PickPlaceExecutor:
         move — an empty well name (arbitrary clicked points, e.g. the spheroid
         live picker) always uses the full safe-Z travel, since we can't assume
         two un-named points are close enough for a 1 mm retract.
+
+        v7.9 ``bore_index``: which bore of a multi-bore assembly to place ON the
+        target. Defaults to 0 (the calibrated ``needle_origin_um`` datum), which
+        makes this byte-identical to the pre-v7.9 behaviour for every single-bore
+        needle and every existing caller.
         """
         # SAFETY: a cross-position XY move must be preceded by a CONFIRMED Z
         # retract. If the ZP board has dropped off USB (the documented
@@ -1871,12 +2311,17 @@ class PickPlaceExecutor:
                 "the Z/pump board and restart the operation.")
 
         z = self.operating_z_mm if target_z_mm is None else target_z_mm
+        # v7.9: place the REQUESTED BORE on the target, not the datum bore. Both
+        # helpers are no-ops at bore_index 0 / an unmeasured assembly, so every
+        # pre-v7.9 call site behaves exactly as before.
+        x_um, y_um = self._bore_target_xy_um(target, bore_index)
+        z = self._bore_z_mm(z, bore_index)
         same_well = bool(target.well_name) and target.well_name == self._current_well
         if not same_well:
             # Inter-well: full safe Z
-            self.controller.safe_travel_to(
-                target_x_um=target.x_um,
-                target_y_um=target.y_um,
+            self._safe_travel(
+                target_x_um=x_um,
+                target_y_um=y_um,
                 safe_z_mm=self.safe_z_mm,
                 target_z_mm=z,
                 z_timeout_s=self.z_timeout_s,
@@ -1884,11 +2329,12 @@ class PickPlaceExecutor:
             )
         else:
             # Intra-well: small retract
-            self._intra_well_move(target.x_um, target.y_um, target_z_mm=z)
+            self._intra_well_move(x_um, y_um, target_z_mm=z)
 
         self._current_well = target.well_name
 
-    def _safe_move_to_well(self, well_name: str, target_z_mm: float | None = None):
+    def _safe_move_to_well(self, well_name: str, target_z_mm: float | None = None,
+                           bore_index: int = 0):
         """Move to a well center with full safe Z protocol.
 
         Well position must be resolved from well_positions dict. ``target_z_mm``
@@ -1906,7 +2352,7 @@ class PickPlaceExecutor:
             x_um=pos[0], y_um=pos[1],
             well_name=well_name,
         )
-        self._safe_move_to(target, target_z_mm=target_z_mm)
+        self._safe_move_to(target, target_z_mm=target_z_mm, bore_index=bore_index)
         return True
 
     def _intra_well_move(self, target_x_um: float, target_y_um: float,
@@ -1915,27 +2361,159 @@ class PickPlaceExecutor:
 
         Still follows the wait-for-Z-before-XY rule. ``target_z_mm`` (zero-ref
         mm) is the height to lower back to; None falls back to operating_z_mm.
+
+        ⚠ v7.9 POLARITY FIX — this used to drive the needle INTO THE GLASS.
+        The lift was ``move_z_relative(-intra_well_retract_mm)``, a **raw**
+        Marlin delta (see StageController.move_z_relative), while "up" in the
+        HEIGHT frame is ``z_up_sign × raw`` — and BOTH shipped device profiles
+        (ME3B V1, ME3B V3) record ``z_up_sign = +1.0``. So a negative raw delta
+        LOWERED the tip by ``intra_well_retract_mm`` (1 mm by default) starting
+        from a height only ~0.1 mm off the plate bottom.
+
+        It stayed dormant because the only caller reaches this branch when
+        ``target.well_name`` is non-empty AND equals the previous move's well,
+        and live-picker targets carry ``well_name=""``. v7.9's per-bore targets
+        inside ONE well are exactly the case that activates it, so it is fixed
+        rather than worked around. Pattern copied from :meth:`_do_wash`.
         """
         z = self.operating_z_mm if target_z_mm is None else target_z_mm
-        # 1. Retract Z by intra_well_retract_mm
-        self.controller.move_z_relative(-self.intra_well_retract_mm)
-        retracted_z = z - self.intra_well_retract_mm
-        self.controller.wait_for_z_arrival(retracted_z,
-                                           timeout_s=self.z_timeout_s)
+        ctrl = self.controller
+        amp = max(0.0, float(self.intra_well_retract_mm))
+
+        # 1. Retract Z — in the HEIGHT frame, so it can only ever move AWAY from
+        #    the plate. A zero amplitude degrades to "no lift", never a descent.
+        if amp > 0:
+            if hasattr(ctrl, "move_z_user_relative"):
+                ctrl.move_z_user_relative(+amp)
+            else:
+                ctrl.move_z_relative(self._z_up_sign() * amp)
+            # Zero-ref height after a HEIGHT-frame lift of +amp.
+            ctrl.wait_for_z_arrival(z + self._z_up_sign() * amp,
+                                    timeout_s=self.z_timeout_s)
 
         # 2. Move XY
         # v7.5.x bugfix: target_{x,y}_um are ABSOLUTE stage µm (same frame the
         # inter-well safe_travel_to uses). move_xy_absolute(from_zero_ref=True)
         # would treat them as mm (×1000 + zero) → gross mis-placement; use the
         # µm entry point.
-        self.controller.move_xy_absolute_um(target_x_um, target_y_um)
-        self.controller.wait_for_xy_arrival(
+        ctrl.move_xy_absolute_um(target_x_um, target_y_um)
+        ctrl.wait_for_xy_arrival(
             target_x_um / 1000.0, target_y_um / 1000.0,
             timeout_s=self.xy_timeout_s)
 
-        # 3. Lower Z back
-        self.controller.move_z_relative(self.intra_well_retract_mm)
-        self.controller.wait_for_z_arrival(z, timeout_s=self.z_timeout_s)
+        # 3. Lower Z back — ABSOLUTE, so the tip returns to exactly the working
+        #    height even if the lift was soft-limit clamped (a symmetric relative
+        #    descend would let the tip walk toward the plate over repeated moves,
+        #    the same failure _do_wash already guards against).
+        if amp > 0:
+            if hasattr(ctrl, "move_z_absolute"):
+                ctrl.move_z_absolute(z, from_zero_ref=True)
+            elif hasattr(ctrl, "move_z_user_relative"):
+                ctrl.move_z_user_relative(-amp)
+            else:
+                ctrl.move_z_relative(-self._z_up_sign() * amp)
+            ctrl.wait_for_z_arrival(z, timeout_s=self.z_timeout_s)
+
+    # ── Per-bore geometry (v7.9) ─────────────────────────────────
+
+    def _needle(self):
+        """The configured needle assembly, or None."""
+        return (getattr(self.hw_config, "needle", None)
+                if self.hw_config is not None else None)
+
+    def _bore_offset_um(self, bore_index: int) -> tuple[float, float]:
+        """Lateral offset (µm) of one bore from bore 0, the calibrated datum.
+
+        Returns (0, 0) for a single-bore needle, for an unmeasured bore, and for
+        any stub that cannot say — so the offset-aware motion below is a no-op on
+        every pre-v7.9 setup and can be applied unconditionally.
+        """
+        needle = self._needle()
+        if needle is None or not bore_index:
+            return (0.0, 0.0)
+        return needle_bore_offset_um(needle, bore_index)
+
+    def _bore_target_xy_um(self, target: PickPlaceTarget,
+                           bore_index: int) -> tuple[float, float]:
+        """Stage XY that puts BORE ``bore_index`` on ``target``.
+
+        ``stage_xy = target_xy - bore_offset`` — the sign convention fixed in
+        ``NeedleBore``'s docstring and pinned by a round-trip test. Bore 0 is the
+        ``needle_origin_um`` datum, so its offset is (0, 0) and this reduces to
+        the target itself.
+
+        ⚠ A mis-signed offset here is a *right-distance-wrong-way* error: the
+        needle lands the correct distance away on the WRONG side of the cell,
+        which looks like a calibration problem rather than a sign bug. That is
+        the same failure class as the plate-orientation bugs in CLAUDE.md.
+        """
+        ox, oy = self._bore_offset_um(bore_index)
+        return (float(target.x_um) - ox, float(target.y_um) - oy)
+
+    def _bore_z_mm(self, base_z_mm: float | None,
+                   bore_index: int) -> float | None:
+        """Zero-ref Z that puts BORE ``bore_index``'s tip at the working height.
+
+        A bore whose ``z_offset_mm`` is positive reaches LOWER than the datum
+        bore, so the stage must sit that much HIGHER in the height frame for its
+        tip to end up at the requested clearance — otherwise a longer bore is
+        driven into the glass. Converted through ``z_up_sign`` so it is correct
+        on both Z polarities.
+
+        Measured spacing on this rig is coplanar within ~50 µm (decision D7),
+        which is HALF the default 0.10 mm working clearance — small, but not
+        negligible, which is why it is applied rather than assumed away.
+        """
+        if base_z_mm is None or not bore_index:
+            return base_z_mm
+        dz = needle_bore_z_offset_mm(self._needle(), bore_index)
+        if not dz:
+            return base_z_mm
+        return float(base_z_mm) + self._z_up_sign() * float(dz)
+
+    def _shift_to_bore(self, op: PickPlaceOperation,
+                       target: PickPlaceTarget,
+                       from_bore: int, to_bore: int,
+                       target_z_mm: float | None) -> bool:
+        """Shift XY so a DIFFERENT bore of the assembly sits on the same target.
+
+        This is the move between the trypsin push and the aspirate (decision
+        D5). The displacement is the inter-bore spacing — ~100-500 µm measured —
+        so it stays inside the well and uses the small intra-well retract rather
+        than a full safe-Z round trip, which would be both slow and more
+        disturbing to the drop just deposited.
+
+        Returns False (having moved nothing) when the two bores share a position,
+        which is the single-bore case and every unmeasured assembly.
+        """
+        src = self._bore_offset_um(from_bore)
+        dst = self._bore_offset_um(to_bore)
+        if abs(src[0] - dst[0]) < 1e-6 and abs(src[1] - dst[1]) < 1e-6:
+            return False
+        x_um, y_um = self._bore_target_xy_um(target, to_bore)
+        z = self._bore_z_mm(target_z_mm, to_bore)
+        self._set_sub_step(
+            op, f"Shifting {abs(dst[0] - src[0]):.0f}×{abs(dst[1] - src[1]):.0f} µm "
+                f"to put bore {to_bore + 1} on the target")
+        self._intra_well_move(x_um, y_um, target_z_mm=z)
+        return True
+
+    def _z_up_sign(self) -> float:
+        """``+1``/``-1`` — which way a RAW Marlin Z delta moves the needle UP.
+
+        Reads the live controller so the per-machine profile drives it, and
+        defaults to ``+1`` (what BOTH shipped profiles record, and what a
+        ``__new__``-partial test controller reports) when it cannot say.
+        """
+        get_sign = getattr(self.controller, "z_up_sign", None)
+        if callable(get_sign):
+            try:
+                sign = float(get_sign())
+                if sign:
+                    return 1.0 if sign > 0 else -1.0
+            except (TypeError, ValueError):
+                pass
+        return 1.0
 
     # ── Well position resolution ─────────────────────────────────
 
@@ -1998,6 +2576,29 @@ class PickPlaceExecutor:
         """Raise AbortException if abort was requested."""
         if self._abort_flag.is_set():
             raise AbortException("Aborted")
+
+    def _pump_move(self, pump, volume_uL, rate_uL_s=None, *,
+                   compensate=False):
+        """v7.6: every executor pump actuation goes through here so this
+        operation's ``_abort_flag`` reaches the blocking drain/settle waits.
+
+        Before this, an Abort pressed during a long reagent aspirate had to wait
+        out the whole move (the M400 drain caps at 180 s per sub-move) because
+        ``_abort_flag`` was only polled at ``_check_abort()`` points BETWEEN
+        steps. Same signature as the module-level ``_settled_pump_move``.
+        """
+        return _settled_pump_move(self.controller, pump, volume_uL, rate_uL_s,
+                                  compensate=compensate,
+                                  abort_event=self._abort_flag)
+
+    def _safe_travel(self, **kw):
+        """v7.6: abort-aware ``safe_travel_to`` (degrades on fakes/older
+        controllers that lack the kwarg)."""
+        try:
+            return self.controller.safe_travel_to(
+                abort_event=self._abort_flag, **kw)
+        except TypeError:
+            return self.controller.safe_travel_to(**kw)
 
     def _uL_s_to_mm_min(self, speed_uL_s: float, bore: str) -> float:
         """Convert µL/s pump speed to mm/min feedrate.

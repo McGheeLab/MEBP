@@ -1,0 +1,21 @@
+{
+  "id": "mcherry-single-positive",
+  "name": "mCherry single-positive",
+  "color": "#f38ba8",
+  "notes": "Bright in mCherry only -- the mirror of the FITC single-positive example.",
+  "signature_rule": {
+    "combinator": "all",
+    "clauses": [
+      {
+        "imaging_channel": "mCherry",
+        "state": "positive"
+      },
+      {
+        "imaging_channel": "FITC",
+        "state": "negative"
+      }
+    ]
+  },
+  "builtin": true,
+  "_note": "EXAMPLE. The signature rule is AUTHORED metadata only -- nothing evaluates it against an image yet (v7.9 decision D3)."
+}

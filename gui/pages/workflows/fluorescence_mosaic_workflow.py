@@ -27,12 +27,12 @@ import logging
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QRectF, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPixmap, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QFrame, QSizePolicy, QSplitter, QMessageBox, QColorDialog,
-    QSpinBox, QDoubleSpinBox, QGraphicsView, QGraphicsScene,
+    QSpinBox, QDoubleSpinBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
     QGraphicsItemGroup, QGraphicsEllipseItem, QGraphicsRectItem,
 )
 
@@ -61,20 +61,25 @@ class _SingleWellMosaicWorker(QThread):
     Signals (queued → GUI-thread slots):
         progress(done, total)
         tile(composite_bgr_copy, extent_tuple)
-        finished_ok(composite, extent, scale, frames)
+        finished_ok(composite, extent, scale, frames, shift_um)
         failed(message)
+
+    ``shift_um`` (v7.8) is the global registration shift the builder baked into
+    ``extent``; the caller MUST persist it, because px → stage-µm
+    back-projection needs ``extent[:2] − shift`` and the shift is otherwise
+    unrecoverable from the saved mosaic.
     """
 
     progress = Signal(int, int)
     tile = Signal(object, object)
-    finished_ok = Signal(object, object, float, int)
+    finished_ok = Signal(object, object, float, int, object)
     failed = Signal(str)
 
     _MAX_CONSEC_NONE = 8
 
     def __init__(self, controller, cam, builder, positions, safe_z,
                  fresh_frames=3, fresh_timeout_s=2.5, settle_ms=300,
-                 frame_orient="none", parent=None):
+                 registration_method="fourier_mellin", parent=None):
         super().__init__(parent)
         self._controller = controller
         self._cam = cam
@@ -84,26 +89,27 @@ class _SingleWellMosaicWorker(QThread):
         self._fresh_frames = int(fresh_frames)
         self._fresh_timeout_s = float(fresh_timeout_s)
         self._settle_ms = max(0, int(settle_ms))
-        self._frame_orient = str(frame_orient or "none")
+        self._registration_method = str(registration_method or "fourier_mellin")
         self._stop = False
 
     def stop(self):
         self._stop = True
 
-    def _orient_frame(self, frame):
-        if frame is None or self._frame_orient == "none":
-            return frame
+    # v7.5.x: the per-tile ``_orient_frame`` (the retired coarse
+    # ``mosaic_scan.frame_orient`` none/rot180/fliph/flipv transform) is GONE.
+    # Frames now reach the builder RAW and the builder applies the MEASURED
+    # camera->stage orientation in ``_orient_tile`` — the same single orientation
+    # the full-plate scan, the live view and the click mapping use. Applying the
+    # coarse string here was why this mosaic came out rotated but un-flipped
+    # while the plate mosaic got both.
+
+    def _read_global_shift(self) -> tuple:
+        """The builder's global registration shift, ``(0, 0)`` when unavailable."""
+        sh = getattr(self._builder, "_global_shift_um", None)
         try:
-            import cv2
-            if self._frame_orient == "rot180":
-                return cv2.rotate(frame, cv2.ROTATE_180)
-            if self._frame_orient == "fliph":
-                return cv2.flip(frame, 1)
-            if self._frame_orient == "flipv":
-                return cv2.flip(frame, 0)
-        except Exception:
-            pass
-        return frame
+            return (float(sh[0]), float(sh[1]))
+        except (TypeError, ValueError, IndexError):
+            return (0.0, 0.0)
 
     def _grab_post_move_frame(self):
         cam = self._cam
@@ -172,7 +178,6 @@ class _SingleWellMosaicWorker(QThread):
                     sy = xy[1] if xy and xy[1] is not None else ty
                 except Exception:
                     sx, sy = tx, ty
-                frame = self._orient_frame(frame)
                 self._builder.add_raster_frame(frame, sx, sy, index=idx)
                 self._builder.stitch_incremental()
                 comp = self._builder.composite
@@ -183,6 +188,18 @@ class _SingleWellMosaicWorker(QThread):
 
             if self._stop:
                 return
+            # v7.5.x: run the SAME two-step alignment the full-plate scan runs.
+            # optimize_registration (pairwise Fourier-Mellin + weighted global
+            # least-squares) was never called here, so this mosaic was stitched by
+            # a strictly weaker algorithm than the plate scan — another way the
+            # "same" mosaic came out different. It needs the retained
+            # canvas-resolution tiles, which build_mosaic_builder now requests.
+            try:
+                if getattr(self._builder, "has_reorient_tiles", lambda: False)():
+                    self._builder.optimize_registration(
+                        method=self._registration_method)
+            except Exception as e:
+                logger.debug(f"Fluor mosaic optimize_registration skipped: {e}")
             try:
                 self._builder.finalize_global_shift()
             except Exception as e:
@@ -191,9 +208,14 @@ class _SingleWellMosaicWorker(QThread):
             extent = self._builder.canvas_extent_um
             scale = float(getattr(self._builder, "_mosaic_scale", 0.0) or 0.0)
             frames = self._builder.frame_count
+            # canvas_extent_um ADDS the global shift while the tile pixels stay
+            # in the raw stage frame, so the shift must travel with the extent
+            # or px → stage-µm back-projection is wrong by up to 20% of a FOV.
+            # Read it defensively, exactly as calibration._ploc_mosaic_world_shift does.
+            shift = self._read_global_shift()
             self.finished_ok.emit(
                 composite.copy() if composite is not None else None,
-                extent, scale, frames)
+                extent, scale, frames, shift)
         except Exception as e:
             logger.exception("Fluor mosaic worker crashed")
             self.failed.emit(str(e))
@@ -227,7 +249,22 @@ class _ZoomImageView(QGraphicsView):
     Drag pans (ScrollHandDrag); the wheel zooms about the cursor. The first
     image (and any explicit :meth:`reset_fit`) fits to the view; later live
     updates preserve the operator's current zoom/pan.
+
+    v7.8: opt-in :meth:`set_interactive_items` frees the left button for scene
+    items (moving a detected-spheroid circle, grabbing its radius handle) and
+    moves panning to the middle button — the ``_MappingView`` arrangement from
+    ``mosaic_well_mapping_dialog``. Default OFF, so the Fluorescence Mosaic
+    page's own behaviour is unchanged.
+
+    Scene coordinates are mosaic pixels 1:1 (the pixmap is added at the origin
+    and the scene rect is its bounding rect), which is what lets a host apply
+    ``SpheroidDetector.back_project_px`` to a scene point directly.
     """
+
+    # Left-click in interactive mode, in SCENE (= mosaic pixel) coords.
+    scene_clicked = Signal(QPointF)
+    scene_dragged = Signal(QPointF)
+    scene_released = Signal(QPointF)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -236,6 +273,9 @@ class _ZoomImageView(QGraphicsView):
         self._item = None
         self._grid_group = None
         self._fitted = False
+        self._interactive_items = False
+        self._panning = False
+        self._pan_origin = None
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
@@ -244,6 +284,31 @@ class _ZoomImageView(QGraphicsView):
             | QPainter.RenderHint.SmoothPixmapTransform)
         self.setBackgroundBrush(QColor(COLORS["base"]))
         self.setMinimumSize(s(220), s(180))
+
+    # ── interactive-items mode (v7.8) ─────────────────────────────
+
+    def set_interactive_items(self, enabled: bool) -> None:
+        """Free the left button for scene items; pan with the middle button."""
+        enabled = bool(enabled)
+        if enabled == self._interactive_items:
+            return
+        self._interactive_items = enabled
+        self.setDragMode(QGraphicsView.NoDrag if enabled
+                         else QGraphicsView.ScrollHandDrag)
+
+    def interactive_items(self) -> bool:
+        return self._interactive_items
+
+    def scene_obj(self) -> QGraphicsScene:
+        """The scene, so a host can add/remove its own overlay items."""
+        return self._scene
+
+    def image_size(self) -> tuple[int, int]:
+        """``(w, h)`` of the displayed mosaic pixmap, or ``(0, 0)``."""
+        if self._item is None:
+            return (0, 0)
+        r = self._item.boundingRect()
+        return (int(r.width()), int(r.height()))
 
     def reset_fit(self):
         self._fitted = False
@@ -347,6 +412,61 @@ class _ZoomImageView(QGraphicsView):
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         self.scale(factor, factor)
 
+    # ── mouse (interactive-items mode only) ───────────────────────
+
+    def mousePressEvent(self, event):
+        if not self._interactive_items:
+            super().mousePressEvent(event)
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_origin = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Let the base class start a drag when the press landed on a movable
+            # item; otherwise report the click in scene coords. The host decides
+            # what an empty-space click means (add a spheroid, place a rim point).
+            it = self.itemAt(event.position().toPoint())
+            if it is not None and bool(
+                    it.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable):
+                super().mousePressEvent(event)
+                return
+            self.scene_clicked.emit(
+                self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._interactive_items and self._panning and self._pan_origin is not None:
+            pos = event.position().toPoint()
+            delta = pos - self._pan_origin
+            self._pan_origin = pos
+            hbar, vbar = self.horizontalScrollBar(), self.verticalScrollBar()
+            hbar.setValue(hbar.value() - delta.x())
+            vbar.setValue(vbar.value() - delta.y())
+            event.accept()
+            return
+        if self._interactive_items:
+            self.scene_dragged.emit(
+                self.mapToScene(event.position().toPoint()))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (self._interactive_items
+                and event.button() == Qt.MouseButton.MiddleButton):
+            self._panning = False
+            self._pan_origin = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        if self._interactive_items:
+            self.scene_released.emit(
+                self.mapToScene(event.position().toPoint()))
+        super().mouseReleaseEvent(event)
+
 
 def _contrast_fg(color: QColor) -> str:
     """Black or white text for legibility on ``color``."""
@@ -355,13 +475,27 @@ def _contrast_fg(color: QColor) -> str:
 
 
 class FluorescenceMosaicWorkflowPage(QWidget):
-    """High-resolution multi-channel fluorescence mosaic of a single well."""
+    """High-resolution multi-channel fluorescence mosaic of a single well.
+
+    v7.8: also embeddable. ``embedded=True`` drops the "← Back to Workflows"
+    header row so a host page (the Spheroid Pick & Place survey tab) can mount a
+    real INSTANCE of this page rather than reimplementing the scan — the same
+    "re-home, don't rewrite" pattern ``FullPrintWorkflowPage`` uses for
+    ``PrintingModePage``. There is therefore exactly one single-well mosaic scan
+    implementation and it cannot diverge between the two surfaces.
+    """
 
     back_requested = Signal()
+    # Emitted (with the well name) whenever a mosaic for the selected well
+    # becomes available — after a channel scan completes AND when a saved one is
+    # loaded on a well change — so an embedding host can re-arm detection on
+    # both paths.
+    mosaic_ready = Signal(str)
 
     def __init__(self, controller, settings, camera_manager=None,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *, embedded: bool = False):
         super().__init__(parent)
+        self._embedded = bool(embedded)
         self._controller = controller
         self._settings = settings
         self._camera_manager = camera_manager
@@ -404,7 +538,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(s(12), s(10), s(12), s(12))
         outer.setSpacing(s(10))
-        outer.addLayout(self._build_header())
+        if not self._embedded:
+            outer.addLayout(self._build_header())
         # Top row: objective · filter-cube pills · selected well
         outer.addWidget(self._build_top_row())
 
@@ -428,6 +563,7 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                 camera_manager=camera_manager,
                 cam_idx=self._resolve_microscope_cam_idx(),
                 show_crosshair=True,
+                auto_orient=True,   # v7.5.x: matches the mosaic's orientation
                 label="Microscope feed — starts on this page",
             )
             cam_card = Card("Live view", flush=True)
@@ -515,6 +651,14 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._well_label.setStyleSheet(
             f"color: {COLORS['text']}; font-size: {sf(13)}pt; font-weight: 600;")
         row.addWidget(self._well_label)
+        if self._embedded:
+            # The header (which normally carries ⚙ Settings) is suppressed when
+            # embedded, so the scan knobs would otherwise be unreachable.
+            scan_settings_btn = QPushButton("⚙ Scan settings")
+            scan_settings_btn.setCursor(Qt.PointingHandCursor)
+            scan_settings_btn.clicked.connect(self._open_settings)
+            row.addSpacing(s(10))
+            row.addWidget(scan_settings_btn)
         return frame
 
     def _on_pill_toggled(self, channel: str):
@@ -1118,6 +1262,131 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._refresh_preview()
         self._refresh_grid_preview()
         self._update_button_state()
+        self._notify_mosaic_ready()
+
+    def _notify_mosaic_ready(self) -> None:
+        """Tell an embedding host that this well's mosaic state changed.
+
+        Fired on both paths a mosaic can appear — a completed channel scan and a
+        well change that loads a saved one — so a host never has to guess which
+        one happened. Emits with the well name, or "" when the well has none.
+        """
+        well = self._scan_well or ""
+        try:
+            plate_key = self._plate_key()
+            has = bool(plate_key and well
+                       and fms.get_store().has(plate_key, well))
+        except Exception:
+            has = False
+        self.mosaic_ready.emit(well if has else "")
+
+    # ── Embedding host API (v7.8) ─────────────────────────────────
+    # Read-only accessors so a host can drive detection without reaching into
+    # this page's privates. Nothing here commands motion.
+
+    def mosaic_view(self):
+        """The zoomable mosaic view, for overlaying host-owned scene items."""
+        return self._mosaic_view
+
+    def current_well(self) -> str | None:
+        return self._scan_well
+
+    def plate_key(self) -> str | None:
+        return self._plate_key()
+
+    def selected_channels(self) -> list[str]:
+        return self._selected_channels()
+
+    def stored_channels(self) -> list[str]:
+        """Channels with a saved mosaic for the selected well."""
+        plate_key = self._plate_key()
+        if not plate_key or not self._scan_well:
+            return []
+        try:
+            return fms.get_store().list_channels(plate_key, self._scan_well)
+        except Exception:
+            return []
+
+    def is_scanning(self) -> bool:
+        """True while a channel raster is driving the stage.
+
+        A host MUST consult this before any manual travel: the worker holds the
+        serial channel and toggles the non-refcounted position-poller suspend.
+        """
+        w = self._worker
+        return w is not None and w.isRunning()
+
+    def well_geometry(self):
+        """``(center_um, radius_um)`` of the selected well, or ``(None, None)``.
+
+        Absolute stage µm, straight from the calibrated/geometric well map —
+        used to mask detections outside the well.
+        """
+        well = self._scan_well
+        if not well:
+            return (None, None)
+        center = self._well_center_um(well)
+        diam_mm = self._well_diameter_mm(well)
+        if center is None or diam_mm <= 0:
+            return (center, None)
+        return (center, (diam_mm / 2.0) * 1000.0)
+
+    def mosaic_context(self, channel: str | None = None) -> dict | None:
+        """Everything needed to detect on this well and back-project the result.
+
+        Returns None when the well has no stored mosaic. ``channel=None`` picks
+        the first stored channel. ``image`` is that ONE channel's raw composite,
+        deliberately not the blended overlay: the blend goes through grayscale
+        and a saturating add, which clips overlapping channels and pushes a
+        saturated blob's edge outward — i.e. it over-reads a diameter.
+
+        ``scale`` is cross-checked against the image width so a channel whose
+        stored ``mosaic_scale`` disagrees with its own pixels is reported rather
+        than silently mis-projected.
+        """
+        plate_key = self._plate_key()
+        well = self._scan_well
+        if not plate_key or not well:
+            return None
+        store = fms.get_store()
+        chans = store.list_channels(plate_key, well)
+        if not chans:
+            return None
+        ch = str(channel) if channel and str(channel) in chans else chans[0]
+        image = store.load_channel_image(plate_key, well, ch)
+        extent = store.get_extent_um(plate_key, well, ch)
+        if image is None or extent is None:
+            return None
+        stored_scale = store.get_mosaic_scale(plate_key, well, ch)
+        span_x = float(extent[2]) - float(extent[0])
+        derived_scale = (image.shape[1] / span_x) if span_x > 0 else 0.0
+        scale_warning = ""
+        scale = stored_scale or derived_scale
+        if stored_scale and derived_scale > 0:
+            rel = abs(stored_scale - derived_scale) / derived_scale
+            if rel > 0.01:
+                scale_warning = (
+                    f"stored mosaic scale {stored_scale:.5f} px/µm disagrees "
+                    f"with the image's own {derived_scale:.5f} px/µm "
+                    f"({rel * 100:.1f}%) — re-scan this well")
+        center_um, radius_um = self.well_geometry()
+        return {
+            "plate_key": plate_key,
+            "well": well,
+            "channel": ch,
+            "channels": list(chans),
+            "image": image,
+            "extent_um": tuple(float(v) for v in extent),
+            "mosaic_scale": float(scale or 0.0),
+            "derived_scale": float(derived_scale),
+            "scale_warning": scale_warning,
+            "shift_um": store.get_shift_um(plate_key, well, ch),
+            "has_shift": store.has_shift(plate_key, well, ch),
+            "um_per_px": store.get_um_per_px(plate_key, well, ch) or 0.0,
+            "objective": store.get_objective(plate_key, well),
+            "well_center_um": center_um,
+            "well_radius_um": radius_um,
+        }
 
     # ── Live camera ───────────────────────────────────────────────
 
@@ -1182,6 +1451,31 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             pass
         return 0.0
 
+    # ── Unified mosaic calibration ────────────────────────────────
+
+    def _mosaic_calibration(self, live_resolution):
+        """The ONE resolved mosaic calibration for this page's camera/objective.
+
+        v7.5.x: identical resolution to the full-plate and rosette scans (see
+        ``SupportClasses/MosaicCalibration``), so all three mosaics are oriented
+        and scaled the same way by construction. Returns None if unavailable.
+        """
+        try:
+            from SupportClasses.MosaicCalibration import resolve
+        except ImportError:
+            return None
+        cam_idx = self._resolve_microscope_cam_idx()
+        try:
+            return resolve(
+                camera_manager=self._camera_manager, cam_idx=cam_idx,
+                camera_name=self._camera_key(),
+                objective=self._current_objective_name(),
+                live_resolution=live_resolution,
+                scan_settings=self._scan_settings())
+        except Exception as exc:
+            logger.debug("fluorescence mosaic calibration resolve failed: %s", exc)
+            return None
+
     # ── Raster plan (shared by the grid preview AND the actual scan) ──
 
     def _compute_raster_plan(self, well) -> dict | None:
@@ -1214,38 +1508,20 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             fw, fh = self._scan_frame_size
         if fw <= 0 or fh <= 0:
             return None
-        # Effective µm/px. UNLIKE the fixed-objective full-plate mosaic, this
-        # workflow is OBJECTIVE-SELECTABLE (2x / 4x / 10x), so the per-objective
-        # sources are AUTHORITATIVE and size the tiles — they must NOT be
-        # overridden by the shared full-plate ``fov_um`` (calibrated for ONE
-        # objective; it would size 4x/10x tiles as if they were 2x → big gaps).
-        # Precedence, all per camera+objective except the shared fallbacks:
-        #   1. learned FOV/spacing from a mosaic calibration (this workflow's
-        #      "Calibrate…" or Plate Location's), rescaled to the live width,
-        #   2. the objective-store µm/px (also rescaled),
-        #   3. the shared ``fov_um`` override (fallback), then
-        #   4. the live camera µm/px.
-        # (The ``spacing_um`` setting below still forces the grid step directly,
-        # objective-independently, when needed.)
-        scan = self._scan_settings()
-        eff = self._learned_um_per_px(fw) or 0.0
-        if eff <= 0:
-            eff = self._objective_um_per_px(fw) or 0.0
-        if eff <= 0:
-            fov_um = float(scan.get("fov_um", 0) or 0)
-            if fov_um > 0 and fw > 0:
-                eff = fov_um / float(fw)
-            else:
-                try:
-                    eff = float(self._camera_manager.effective_um_per_px(cam_idx, fw)
-                                or self._camera_manager.get_um_per_px(cam_idx) or 0.0)
-                except Exception:
-                    eff = float(self._camera_manager.get_um_per_px(cam_idx) or 0.0)
-        if eff <= 0:
+        # v7.5.x: ONE resolver for every mosaic (see SupportClasses/
+        # MosaicCalibration). This page is OBJECTIVE-SELECTABLE (2x/4x/10x), which
+        # the resolver handles by keying µm/px on (camera, objective) — so the
+        # right scale is used per objective without this page carrying its own
+        # precedence. It previously had a DIFFERENT precedence from the full-plate
+        # scan (and honoured the retired coarse ``frame_orient`` instead of the
+        # measured orientation), which is why the same camera produced
+        # differently-oriented, differently-scaled fluorescence and plate mosaics.
+        cal = self._mosaic_calibration((fw, fh))
+        if cal is None or cal.um_per_px <= 0:
             return None
-        overlap_frac = float(scan.get("overlap_pct", 25)) / 100.0
-        spacing_um = float(scan.get("spacing_um", 0) or 0)
-        step = spacing_um if spacing_um > 0 else None
+        eff = cal.um_per_px
+        overlap_frac = cal.overlap_frac
+        step = None
         margin = float(self._well_margin.value())
         r_um = (diam_mm / 2.0) * 1000.0 * margin
         cx, cy = center
@@ -1253,13 +1529,11 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         if bounds is None:
             return None
         try:
-            from SupportClasses.MosaicBuilder import MosaicBuilder
+            from SupportClasses.MosaicCalibration import build_mosaic_builder
         except ImportError:
             return None
         target_px = int(self._target_px.value())
-        tmpl = MosaicBuilder(
-            frame_size_px=(fw, fh), micron_per_pixel=eff,
-            overlap=overlap_frac, target_mosaic_px=target_px, register=True)
+        tmpl = build_mosaic_builder(cal, target_mosaic_px=target_px)
         grid = tmpl.generate_raster_positions(
             bounds, overlap=overlap_frac, step_x_um=step, step_y_um=step)
         env = self._envelope()
@@ -1460,30 +1734,43 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._status.setText("Camera unavailable.")
             return
         fw, fh = self._scan_frame_size
-        # Stitch-critical params inherited from the shared full-plate mosaic
-        # settings (frame_orient / overlap / registration / camera timing), so
-        # the single-well scan stitches with the exact same pattern as the
-        # full-plate scan. Only the resolution is fluorescence-local.
-        scan = self._scan_settings()
-        overlap_frac = float(scan.get("overlap_pct", 25)) / 100.0
-        spacing_um = float(scan.get("spacing_um", 0) or 0)
-        step = spacing_um if spacing_um > 0 else None
-        target_px = int(self._target_px.value())
-        settle_ms = int(scan.get("settle_ms", 300))
-        fresh_frames = int(scan.get("fresh_frames", 3))
-        fresh_timeout_s = float(scan.get("fresh_timeout_s", 2.5))
-        frame_orient = str(scan.get("frame_orient", "none"))
-        register = bool(scan.get("register", True))
-        max_shift_um = float(scan.get("max_shift_um", 0) or 0)
-        try:
-            from SupportClasses.MosaicBuilder import MosaicBuilder
-        except ImportError:
-            self._status.setText("MosaicBuilder unavailable.")
+        # v7.5.x: EVERY stitch-critical parameter now comes from the ONE shared
+        # resolver, so this single-well scan is identical to the full-plate and
+        # rosette scans by construction.
+        #
+        # This is the fix for "rosette, full plate overview and fluorescence
+        # should all have the exact same behaviour". Before, this path applied the
+        # RETIRED coarse ``mosaic_scan.frame_orient`` string (a none/rot180/
+        # fliph/flipv per-tile transform) instead of the measured camera->stage
+        # orientation — so on a camera stored as rotation 180 + flip_y it rotated
+        # but LOST THE FLIP, while the plate scan applied both. It also used its
+        # own target_px and never ran optimize_registration.
+        cal = self._mosaic_calibration((fw, fh))
+        if cal is None:
+            self._status.setText("Mosaic calibration unavailable.")
             return
-        builder = MosaicBuilder(
-            frame_size_px=(fw, fh), micron_per_pixel=self._scan_um_per_px,
-            overlap=overlap_frac, target_mosaic_px=target_px,
-            register=register, max_shift_um=max_shift_um)
+        try:
+            from SupportClasses.MosaicCalibration import (
+                build_mosaic_builder, refuse_reason)
+        except ImportError:
+            self._status.setText("MosaicCalibration unavailable.")
+            return
+        why = refuse_reason(cal)
+        if why:
+            self._status.setText(why)
+            logger.warning(f"Fluorescence mosaic refused: {why}")
+            return
+        overlap_frac = cal.overlap_frac
+        step = None
+        target_px = int(self._target_px.value())
+        settle_ms = cal.settle_ms
+        fresh_frames = cal.fresh_frames
+        fresh_timeout_s = cal.fresh_timeout_s
+        # retain_frames=False: a long scan otherwise accumulates ~2 MB/tile of
+        # dead image data (this path used to keep them all).
+        builder = build_mosaic_builder(
+            cal, target_mosaic_px=target_px, retain_for_reorient=True,
+            retain_frames=False)
         # CRITICAL: allocate the composite canvas on the SAME builder the worker
         # uses. generate_raster_positions() is the only thing that calls
         # _init_composite(); in _on_start the grid was generated on a THROWAWAY
@@ -1506,12 +1793,12 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._worker = _SingleWellMosaicWorker(
             self._controller, cam, builder, self._scan_positions, safe_z,
             fresh_frames=fresh_frames, fresh_timeout_s=fresh_timeout_s,
-            settle_ms=settle_ms, frame_orient=frame_orient)
+            settle_ms=settle_ms, registration_method=cal.reg_method)
         self._worker.progress.connect(self._on_channel_progress)
         self._worker.tile.connect(self._on_channel_tile)
         self._worker.finished_ok.connect(
-            lambda comp, ext, scale, frames, ch=channel:
-            self._on_channel_finished(ch, comp, ext, scale, frames))
+            lambda comp, ext, scale, frames, shift, ch=channel:
+            self._on_channel_finished(ch, comp, ext, scale, frames, shift))
         self._worker.failed.connect(self._on_channel_failed)
         self._worker.start()
         self._update_button_state()
@@ -1527,7 +1814,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         if composite is not None:
             self._set_preview_image(composite)
 
-    def _on_channel_finished(self, channel, composite, extent, scale, frames):
+    def _on_channel_finished(self, channel, composite, extent, scale, frames,
+                             shift_um=(0.0, 0.0)):
         self._worker = None
         if composite is not None and extent is not None:
             plate_key = self._plate_key() or "plate"
@@ -1538,12 +1826,13 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                     color_rgb=(color.red(), color.green(), color.blue()),
                     objective=self._scan_objective,
                     um_per_px=self._scan_um_per_px, mosaic_scale=scale,
-                    frames=frames)
+                    frames=frames, shift_um=shift_um)
             except Exception as exc:
                 logger.warning("Fluor mosaic save failed: %s", exc)
         self._capture_index += 1
         self._refresh_channel_status()
         self._refresh_preview()
+        self._notify_mosaic_ready()
         self._prompt_next_channel()
 
     def _on_channel_failed(self, msg: str):

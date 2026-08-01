@@ -407,29 +407,60 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
         self.assertGreater(pg._navigator._raster_cols, 1)
         self.assertGreater(pg._navigator._raster_rows, 1)
 
-    def test_inherits_shared_mosaic_frame_orient(self):
-        """The single-well scan must follow the EXACT same pattern as the
-        full-plate mosaic: it reads frame_orient / overlap / fov_um from the
-        shared ``mosaic_scan`` settings section (not its own defaults). This is
-        the misalignment fix — ME3B V1's camera is mounted rot180."""
+    def test_applies_measured_orientation_not_legacy_frame_orient(self):
+        """v7.5.x REGRESSION: the fluorescence scan must orient its tiles with the
+        MEASURED camera→stage orientation, exactly like the full-plate scan.
+
+        It used to apply the retired coarse ``mosaic_scan.frame_orient`` string
+        (none/rot180/fliph/flipv) instead. On this machine's camera — stored as
+        ``rotation_deg 180 + flip_y`` — that rotated the tiles but LOST THE FLIP,
+        while the plate scan applied both: the same camera produced two
+        differently-oriented mosaics. A stale ``frame_orient`` must now have no
+        effect whatsoever.
+        """
+        from SupportClasses.MosaicCalibration import build_mosaic_builder
+
         class _Settings:
             def get_section(self, name):
+                # A stale rot180 + a 5 % overlap, as found on the real machine.
                 if name == "mosaic_scan":
-                    return {"frame_orient": "rot180", "overlap_pct": 5,
-                            "fov_um": 2822}
+                    return {"frame_orient": "rot180", "overlap_pct": 5}
                 return None
 
-        pg = self._page(eff=0.385)
-        pg._settings = _Settings()
-        scan = pg._scan_settings()
-        self.assertEqual(scan["frame_orient"], "rot180")
-        self.assertEqual(scan["overlap_pct"], 5)
-        self.assertEqual(scan["fov_um"], 2822)
+        class _CalStore:
+            def get_calibration(self, ident):
+                return {"um_per_px": 3.227061, "rotation_deg": 180.0,
+                        "flip_y": True}
+            def get_um_per_px_resolution(self, ident):
+                return (1024, 1024)
+            def get_mosaic_output_rotation(self, ident):
+                return 0.0
 
-    def test_fov_override_is_fallback_when_no_objective_cal(self):
-        """When the selected objective has NO stored calibration, the shared
-        ``fov_um`` override sizes the tiles (a graceful fallback). Here the page
-        has no matching objective calibration, so fov_um wins."""
+        import SupportClasses.CameraCalibrationStore as ccs
+        orig = ccs.get_store
+        ccs.get_store = lambda *a, **k: _CalStore()
+        try:
+            pg = self._page(eff=0.385)
+            pg._settings = _Settings()
+            pg._camera_manager.camera_identity = lambda i: ("id_scope", "Scope")
+            cal = pg._mosaic_calibration((1024, 1024))
+            self.assertIsNotNone(cal)
+            # BOTH the rotation and the flip, from the measured calibration.
+            self.assertAlmostEqual(cal.rotation_deg, 180.0)
+            self.assertTrue(cal.flip_y)
+            # And they reach the builder that actually places the tiles.
+            b = build_mosaic_builder(cal)
+            self.assertAlmostEqual(b._frame_rotation_deg, 180.0)
+            self.assertTrue(b._frame_flip_y)
+        finally:
+            ccs.get_store = orig
+
+    def test_fov_um_override_no_longer_shadows_the_calibration(self):
+        """v7.5.x: the ``fov_um`` override is GONE from the µm/px precedence.
+
+        It was a top-precedence spin buried in an Advanced submenu that beat
+        every measured value, forever. The measured calibration must win.
+        """
         class _Settings:
             def get_section(self, name):
                 return {"fov_um": 916.0} if name == "mosaic_scan" else None
@@ -438,9 +469,9 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
         pg._settings = _Settings()
         plan = pg._compute_raster_plan("A1")
         self.assertIsNotNone(plan)
-        # fov_um=916 over a 916 px frame → eff = 1.0 µm/px → FOV = 916 µm.
-        self.assertAlmostEqual(plan["eff_um_per_px"], 1.0, places=3)
-        self.assertAlmostEqual(plan["fov_um"][0], 916.0, places=1)
+        # The calibrated 0.385 µm/px is used; fov_um=916 (which would have forced
+        # 1.0 µm/px over the 916 px frame) is ignored.
+        self.assertAlmostEqual(plan["eff_um_per_px"], 0.385, places=3)
 
     def test_objective_um_per_px_overrides_shared_fov(self):
         """REGRESSION: the fluorescence workflow is objective-SELECTABLE, so the
@@ -487,10 +518,17 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
         finally:
             oc.get_store = orig
 
-    def test_learned_calibration_overrides_objective_and_rescales(self):
-        """A mosaic FOV/spacing calibration (learned, per camera+objective) wins
-        over the objective µm/px AND is resolution-safe: a value measured at
-        916 px rescales for a wider live frame."""
+    def test_learned_value_no_longer_shadows_objective_calibration(self):
+        """v7.5.x REGRESSION: the learned "Store FOV/spacing" value must NOT beat
+        the measured objective calibration.
+
+        That shadowing is precisely why the operator could calibrate the camera
+        and see the mosaic keep using an older scale ("I literally just
+        calibrated it"): a learned value written by an earlier mosaic-alignment
+        session sat ABOVE the objective store in the precedence. The measured
+        calibration now wins; ``MosaicAlignmentStore`` keeps only its
+        ``shift_um``, which is a genuinely different quantity.
+        """
         import SupportClasses.ObjectiveCalibration as oc
         import SupportClasses.MosaicAlignmentStore as mas
 
@@ -498,7 +536,7 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
             def get_calibration(self, cam, obj):
                 return {"measured_um_per_px": 1.54, "resolution": [916, 686]}
 
-        class _AlignStore:      # learned spacing correction @ 916 px
+        class _AlignStore:      # stale learned spacing correction @ 916 px
             def get_um_per_px(self, key):
                 return 1.20
             def get_resolution(self, key):
@@ -515,14 +553,9 @@ class TestRasterPlanAndGridPreview(unittest.TestCase):
                     current_objective_name = "4x"
                     camera_spec = type("S", (), {"name": "BUC3D"})()
             pg._hw_config = _Cfg()
-            # Live frame is 916 px (the fake cam) → learned used directly, and it
-            # beats the objective's 1.54.
-            self.assertAlmostEqual(pg._learned_um_per_px(916), 1.20, places=3)
             plan = pg._compute_raster_plan("A1")
-            self.assertAlmostEqual(plan["eff_um_per_px"], 1.20, places=3)
-            # At a wider live frame the learned value rescales (µm/px ∝ 1/width).
-            self.assertAlmostEqual(
-                pg._learned_um_per_px(1832), 1.20 * 916 / 1832, places=4)
+            # The MEASURED objective value, not the learned 1.20.
+            self.assertAlmostEqual(plan["eff_um_per_px"], 1.54, places=3)
         finally:
             oc.get_store, mas.get_store = o_orig, a_orig
 
@@ -681,14 +714,19 @@ class TestWorkerProducesComposite(unittest.TestCase):
             fresh_frames=1, fresh_timeout_s=0.5, settle_ms=0)
         got = {}
 
-        def on_done(comp, ext, scale, frames):
+        def on_done(comp, ext, scale, frames, shift):
             got["comp"] = comp
             got["ext"] = ext
+            got["shift"] = shift
 
         worker.finished_ok.connect(on_done)
         worker.run()   # synchronous (same thread) — direct-connected slot fires
         self.assertIsNotNone(got.get("comp"))
         self.assertIsNotNone(got.get("ext"))
+        # v7.8: the registration shift travels with the extent so the caller can
+        # persist it — px → stage-µm needs extent[:2] − shift.
+        self.assertIsNotNone(got.get("shift"))
+        self.assertEqual(len(got["shift"]), 2)
 
 
 @unittest.skipUnless(_QT, "PySide6 not available")
