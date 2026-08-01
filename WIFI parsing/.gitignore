@@ -1,0 +1,14 @@
+# LabLink runtime data — never commit these.
+# The server's default --root is lablink_data beside the script, so without
+# this a test run would try to commit every transferred file.
+lablink_data/
+*.part
+.partial/
+
+# Local configuration holds this rig's server address and shared token.
+sync.json
+sync_state.json
+token.txt
+
+__pycache__/
+*.pyc
