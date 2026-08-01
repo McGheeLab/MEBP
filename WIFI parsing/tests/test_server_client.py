@@ -248,6 +248,7 @@ class TestTruncatedTransfers(ServerCase):
         listener.listen(8)
         port = listener.getsockname()[1]
         stop = th.Event()
+        threads: list = []
 
         def pump(src, dst, limit):
             sent = 0
@@ -263,9 +264,16 @@ class TestTruncatedTransfers(ServerCase):
             except OSError:
                 pass
             finally:
+                # Both pumps share the pair, so the second pass here finds
+                # them already shut — harmless, but leaving them open emits
+                # ResourceWarnings that drown the real test output.
                 for s in (src, dst):
                     try:
                         s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        s.close()
                     except OSError:
                         pass
 
@@ -283,12 +291,22 @@ class TestTruncatedTransfers(ServerCase):
                 except OSError:
                     client.close()
                     continue
-                th.Thread(target=pump, args=(client, upstream, 0), daemon=True).start()
-                th.Thread(target=pump, args=(upstream, client, cut_after),
-                          daemon=True).start()
+                t_up = th.Thread(target=pump, args=(client, upstream, 0), daemon=True)
+                t_down = th.Thread(target=pump, args=(upstream, client, cut_after),
+                                   daemon=True)
+                t_up.start()
+                t_down.start()
+                threads.extend((t_up, t_down))
 
         th.Thread(target=serve, daemon=True).start()
-        self.addCleanup(lambda: (stop.set(), listener.close()))
+
+        def shutdown():
+            stop.set()
+            listener.close()
+            for t in threads:
+                t.join(timeout=2)
+
+        self.addCleanup(shutdown)
         return f"http://127.0.0.1:{port}"
 
     def test_resumes_through_repeated_cuts(self):
@@ -333,6 +351,10 @@ class TestTruncatedTransfers(ServerCase):
                     conn, _ = listener.accept()
                 except OSError:
                     return
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 conn.close()          # no response at all
 
         th.Thread(target=accept_and_hang_up, daemon=True).start()
