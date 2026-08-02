@@ -31,17 +31,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lablink.client import LabLinkClient, LabLinkError  # noqa: E402
-from lablink.fsutil import read_json  # noqa: E402
+from lablink.fsutil import human_size, read_json  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 2
-
-
-def human_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} GB"
 
 
 def human_time(epoch: float) -> str:

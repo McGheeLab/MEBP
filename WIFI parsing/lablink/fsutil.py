@@ -64,6 +64,21 @@ def sha256_file(path: Path) -> str:
         return digest.hexdigest()
 
 
+def human_size(n: float) -> str:
+    """Format a byte count for display.
+
+    Lives here so every tool agrees: the CLI and the connect script used to
+    disagree about MB (1024- vs 1000-based) and reported the same file as
+    8.7 MB and 9.2 MB, which reads like a failed transfer.
+    """
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
 def validate_name(name: str) -> str:
     """Validate a channel or file name; returns it unchanged or raises ValueError.
 

@@ -40,6 +40,15 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "lablink_config.json"
 INBOX = HERE / "inbox"
 
+# Import the sibling lablink package regardless of the working directory.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+try:
+    from lablink.fsutil import human_size
+except ImportError:                     # load_lablink() reports this properly
+    def human_size(n):
+        return f"{n} B"
+
 MIN_PYTHON = (3, 8)
 BAR = "=" * 68
 
@@ -90,8 +99,6 @@ def check_python():
 
 def load_lablink():
     """Import the lablink package that lives beside this script."""
-    if str(HERE) not in sys.path:
-        sys.path.insert(0, str(HERE))
     try:
         from lablink.client import LabLinkClient, LabLinkError  # noqa: E402
         return LabLinkClient, LabLinkError
@@ -344,7 +351,7 @@ def run_send(cfg, client, LabLinkError, files, channel):
             rec = client.upload(channel, p)
             secs = max(time.time() - t0, 1e-6)
             ok(f"{rec['status']:<9} {rec['name']}  "
-               f"({rec['size']/1e6:.1f} MB, {rec['size']/secs/1e6:.1f} MB/s)")
+               f"({human_size(rec['size'])}, {rec['size']/secs/1e6:.1f} MB/s)")
         except (LabLinkError, ValueError) as exc:
             bad(f"{p.name}: {exc}")
             failed += 1
@@ -368,7 +375,7 @@ def run_get(cfg, client, LabLinkError, channel):
         try:
             client.download(channel, rec["name"], INBOX,
                             expected_sha=rec["sha256"])
-            ok(f"got {rec['name']} ({rec['size']/1e6:.1f} MB)")
+            ok(f"got {rec['name']} ({human_size(rec['size'])})")
             new += 1
         except (LabLinkError, ValueError) as exc:
             bad(f"{rec['name']}: {exc}")
@@ -389,7 +396,7 @@ def run_list(cfg, client, LabLinkError, channel):
     for rec in files:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S",
                               time.localtime(rec.get("uploaded", 0)))
-        print(f"{rec['size']/1e6:>7.1f} MB  {stamp:19}  {rec['name']}")
+        print(f"{human_size(rec['size']):>10}  {stamp:19}  {rec['name']}")
     return 0
 
 
