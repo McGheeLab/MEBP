@@ -9,6 +9,10 @@ lablink_data/
 sync.json
 sync_state.json
 token.txt
+lablink_config.json
+
+# Default download folder for lablink_connect.py
+inbox/
 
 __pycache__/
 *.pyc
