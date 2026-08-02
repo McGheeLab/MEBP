@@ -370,6 +370,8 @@ files it cannot name and logs why once.
 | A file never arrives | Check the sending agent's log for `CONFLICT` or `skipping`. The inbox reconcile pass also recovers anything missed within a few minutes. |
 | Sync agent won't start | `outbox and inbox must use DIFFERENT channels` — see §7 rule 1. |
 | Want a clean slate | Stop the agent, delete its `state_file`, restart. Safe: nothing is re-sent or re-downloaded. |
+| `--meta is not valid JSON` in PowerShell | PowerShell strips the inner quotes before Python sees them. Escape them: `--meta '{\"plate\":\"nest-24\"}'`. In bash/zsh the plain form `'{"plate":"nest-24"}'` is correct. |
+| `not a file` when sending | The file name is taken relative to your current folder. Use a full path, or `cd` to where the file is first. |
 
 ---
 
