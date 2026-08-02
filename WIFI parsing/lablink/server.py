@@ -463,9 +463,14 @@ def main(argv=None) -> int:
     if not args.token:
         ap.error("a token is required: pass --token or set LABLINK_TOKEN")
 
+    # stdout, not the default stderr: the usual way to run this is
+    #   Start-Process ... -RedirectStandardOutput server.log
+    # and sending the request log to stderr would silently drop exactly the
+    # lines you want when diagnosing a client that cannot connect.
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
     )
 
     root = Path(args.root) if args.root else Path(__file__).resolve().parent.parent / "lablink_data"

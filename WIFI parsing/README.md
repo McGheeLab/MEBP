@@ -110,6 +110,14 @@ the fastest option. Two notes:
 
 ### Option C — Tailscale (different rooms, more than two machines, or A and B failed)
 
+> **This is what this lab ended up using.** Measured 2026-08-01, Windows
+> server + MacBook client, both on UAWiFi: options A and B both failed (see
+> the verified results at the end of this section), and Tailscale worked
+> first try at **117 ms RTT, 1.5 MB/s up and 1.9 MB/s down** — a relayed
+> connection, not direct, because the access point blocks the peer traffic
+> Tailscale needs to punch through. That is fast enough for this workload:
+> a 12 MB mosaic moves in about 8 seconds, a 40 MB one in under half a minute.
+
 Install [Tailscale](https://tailscale.com/download) on both machines and sign
 in with the same account (the free tier is sufficient). Each machine gets a
 permanent `100.x.y.z` address that survives IP changes and works across
@@ -130,6 +138,20 @@ still functional, but much slower (a 40 MB mosaic may take a minute).
 Record the server URL. Nothing in the code depends on which option you picked —
 the address is just a configuration string, so you can change your mind later
 without touching anything else.
+
+### Verified results on this lab's hardware (2026-08-01)
+
+Windows server (`McGheeLab-CellC`, Intel AX211) and a MacBook Pro client,
+both associated to UAWiFi:
+
+| Option | Result |
+|---|---|
+| **A. Plain UAWiFi** | **Failed — timed out.** The server was confirmed listening on `0.0.0.0:8765`, answering on its own LAN IP, with an all-profiles firewall rule allowing the port. The client still got no reply at all. A *timeout* rather than *refused* is the tell: the packets never arrive, so the access point is dropping device-to-device traffic. |
+| **B. Windows Mobile Hotspot** | **Not possible on this hardware.** `netsh wlan show drivers` reports `Hosted network supported: No`, there are no Wi-Fi Direct adapters, and UAWiFi is WPA2-Enterprise, which commonly blocks connection sharing. |
+| **C. Tailscale** | **Worked.** 117 ms RTT, 1.5 MB/s up, 1.9 MB/s down, checksum verified. Relayed rather than direct — expected, since the isolation that broke option A also prevents the direct hole-punch. |
+
+If your access point behaves differently, options A and B are still worth the
+five minutes: they are several times faster when they work.
 
 ---
 
