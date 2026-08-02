@@ -38,16 +38,25 @@ It is **not**:
 
 ## 2. Prerequisites
 
-On **both** machines:
+Python 3.8 or newer on every machine. Nothing else — no `pip install`.
 
 ```powershell
-python --version      # must be 3.11 or newer
+python --version       # Windows
+```
+```bash
+python3 --version      # macOS / Linux — note the "3"
 ```
 
-Copy this whole `WIFI parsing` folder to each machine (or just the four files
-you need: `lablink/`, `lablink_server.py`, `lablink_cli.py`, `lablink_sync.py`).
-`tools_link_check.py` is deliberately standalone — a single file you can copy
-by USB stick to test the network before anything else is set up.
+**The command differs by platform.** On Windows it is `python`; on macOS and
+Linux it is `python3` (a bare `python` usually does not exist and gives
+`command not found`). Every example below shows the Windows form — substitute
+`python3` on a Mac. Paths differ too: Windows `WIFI parsing\lablink_cli.py`,
+macOS/Linux `"WIFI parsing/lablink_cli.py"` (the quotes matter, the folder
+name has a space).
+
+Copy this whole `WIFI parsing` folder to each machine, or pull the repo on
+both. `tools_link_check.py` is deliberately standalone — a single file you can
+copy by USB stick to test the network before anything else is set up.
 
 ---
 

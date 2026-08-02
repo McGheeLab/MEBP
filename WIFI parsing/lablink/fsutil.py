@@ -49,9 +49,19 @@ def read_json(path: Path, default=None):
 
 
 def sha256_file(path: Path) -> str:
-    """Hex sha256 of a file's contents (streaming, constant memory)."""
+    """Hex sha256 of a file's contents (streaming, constant memory).
+
+    hashlib.file_digest arrived in Python 3.11; the manual loop keeps this
+    working on the 3.8-3.10 interpreters that ship with older macOS and Linux
+    installs, so a lab machine does not need a Python upgrade to join.
+    """
     with open(path, "rb") as fh:
-        return hashlib.file_digest(fh, "sha256").hexdigest()
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(fh, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+        return digest.hexdigest()
 
 
 def validate_name(name: str) -> str:
