@@ -135,6 +135,93 @@ class TestCollisionPolicy(StoreCase):
         self.assertGreater(rec2["seq"], rec1["seq"])
 
 
+class TestCaseInsensitiveNames(StoreCase):
+    """Two names differing only in case must never coexist in one channel.
+
+    Windows and macOS treat them as the same file, so a client fetching the
+    channel into a single folder would silently overwrite one with the other.
+    Refusing at upload keeps a channel safe to download on any platform.
+    """
+
+    def test_case_variant_with_different_content_is_refused(self):
+        put(self.fs, "ch", "Scan.png", b"AAA")
+        with self.assertRaises(Conflict) as ctx:
+            put(self.fs, "ch", "scan.png", b"BBB")
+        self.assertIn("capitalisation", str(ctx.exception))
+        self.assertIn("Scan.png", str(ctx.exception))
+        _, files = self.fs.list_files("ch")
+        self.assertEqual([f["name"] for f in files], ["Scan.png"])
+
+    def test_case_variant_with_identical_content_stays_idempotent(self):
+        """Identical bytes must be a no-op even under a different case.
+
+        Only one file exists either way, so the channel is still safe to fetch
+        on any filesystem — and refusing would break the retry-after-crash
+        guarantee, which for the sync agent meant a permanent, unrecoverable
+        conflict for a file it had already delivered.
+        """
+        _, first = put(self.fs, "ch", "Scan.png", b"AAA")
+        status, rec = put(self.fs, "ch", "scan.png", b"AAA")
+        self.assertEqual(status, "duplicate")
+        self.assertEqual(rec["seq"], first["seq"])
+        _, files = self.fs.list_files("ch")
+        self.assertEqual([f["name"] for f in files], ["Scan.png"])
+
+    def test_case_conflict_detected_on_a_case_sensitive_store(self):
+        # Simulate a Linux server: the exact-name lookup misses, so the
+        # explicit scan is what has to catch it.
+        ch = self.fs.open_channel("ch")
+        put(self.fs, "ch", "Data.csv", b"one")
+        self.assertEqual(self.fs._case_conflict(ch, "data.csv"), "Data.csv")
+        self.assertEqual(self.fs._case_conflict(ch, "DATA.CSV"), "Data.csv")
+        self.assertIsNone(self.fs._case_conflict(ch, "Data.csv"))   # itself
+        self.assertIsNone(self.fs._case_conflict(ch, "other.csv"))
+
+    def test_exact_same_name_still_deduplicates(self):
+        put(self.fs, "ch", "same.bin", b"x")
+        status, _ = put(self.fs, "ch", "same.bin", b"x")
+        self.assertEqual(status, "duplicate")
+
+
+class TestDeleteWhileOpen(StoreCase):
+    """Deleting a file a download still holds open must not raise.
+
+    Windows refuses to unlink an open file. Removing the sidecar first makes
+    the file invisible immediately (the invariant needs both halves), so the
+    delete always takes effect and the bytes are reclaimed later.
+    """
+
+    def test_delete_succeeds_while_file_is_open(self):
+        put(self.fs, "ch", "held.bin", b"y" * 500)
+        fh, _ = self.fs.open_read("ch", "held.bin")
+        try:
+            self.assertTrue(self.fs.delete("ch", "held.bin"))
+            _, files = self.fs.list_files("ch")
+            self.assertEqual(files, [])                  # invisible at once
+        finally:
+            fh.close()
+
+    def test_orphaned_data_is_reclaimed_on_restart(self):
+        put(self.fs, "ch", "held.bin", b"z" * 500)
+        ch = self.fs.open_channel("ch")
+        fh, _ = self.fs.open_read("ch", "held.bin")
+        try:
+            self.fs.delete("ch", "held.bin")
+        finally:
+            fh.close()
+        # On Windows the data file survived the delete; a fresh store sweeps it.
+        FileStore(self.root).open_channel("ch")
+        self.assertFalse((ch.data / "held.bin").exists())
+
+    def test_sweep_keeps_files_that_have_a_sidecar(self):
+        put(self.fs, "ch", "keep.bin", b"keep")
+        ch = self.fs.open_channel("ch")
+        FileStore(self.root).open_channel("ch")
+        self.assertTrue((ch.data / "keep.bin").exists())
+        _, files = FileStore(self.root).list_files("ch")
+        self.assertEqual([f["name"] for f in files], ["keep.bin"])
+
+
 class TestSeq(StoreCase):
     def test_monotonic_across_restart(self):
         for i in range(3):

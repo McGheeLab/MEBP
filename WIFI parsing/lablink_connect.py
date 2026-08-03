@@ -324,7 +324,7 @@ def run_check(cfg, LabLinkClient, LabLinkError, megabytes):
     print(BAR)
     print(" CONNECTION CHECK: PASS")
     print(BAR)
-    print(" Settings saved — from now on you can just run:")
+    print(" Settings saved -- from now on you can just run:")
     print(f"   python3 {Path(__file__).name} send <file>     send to the lab")
     print(f"   python3 {Path(__file__).name} get             fetch new files")
     print(f"   python3 {Path(__file__).name} list            see what is there")

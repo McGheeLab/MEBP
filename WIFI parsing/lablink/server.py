@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -56,6 +57,25 @@ log = logging.getLogger("lablink.server")
 # finish writing and then read our error response. See _reject_with_body.
 DRAIN_LIMIT = 8 * 1024 * 1024
 
+# Much smaller allowance before a token has been presented: enough that a
+# mistyped token still yields a readable 401, too small to be an amplifier.
+UNAUTH_DRAIN_LIMIT = 64 * 1024
+
+# Absolute ceiling on one connection's lifetime. Handler.timeout is per-read
+# and resets on every byte, so without this a peer dribbling one byte a minute
+# pins a thread indefinitely.
+MAX_CONNECTION_SECONDS = 3600.0
+
+# Cap on simultaneous connections. Each one costs an OS thread, and accept
+# happens before any authentication, so an unauthenticated peer could otherwise
+# spawn threads until the process dies.
+MAX_CONNECTIONS = 64
+
+
+def _reject_json_constant(token: str):
+    """Refuse NaN / Infinity / -Infinity, which are not valid JSON."""
+    raise ValueError(f"{token} is not valid JSON")
+
 
 class Handler(BaseHTTPRequestHandler):
     """One request. Every response carries an exact Content-Length (HTTP/1.1)."""
@@ -66,6 +86,19 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     # ------------------------------------------------------------------ helpers
+    def setup(self):
+        super().setup()
+        self._deadline = time.monotonic() + MAX_CONNECTION_SECONDS
+
+    def _past_deadline(self) -> bool:
+        """True once this connection has outlived MAX_CONNECTION_SECONDS.
+
+        Checked inside every byte-consuming loop, because the socket timeout is
+        per-operation and resets on each successful read: a peer sending one
+        byte per 29 s would otherwise hold a thread for as long as it liked.
+        """
+        return time.monotonic() > getattr(self, "_deadline", float("inf"))
+
     @property
     def store(self) -> FileStore:
         return self.server.store           # type: ignore[attr-defined]
@@ -86,11 +119,22 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json(status, {"error": message})
 
+    def _token_ok(self) -> bool:
+        """Constant-time token comparison.
+
+        Compares BYTES: headers are decoded as latin-1, so any byte 0x80-0xFF
+        in the token header yields a non-ASCII str, and hmac.compare_digest
+        raises TypeError on those — an unauthenticated caller could crash the
+        handler and dump a traceback with one malformed header.
+        """
+        expected = str(self.server.token)          # type: ignore[attr-defined]
+        got = self.headers.get(H_TOKEN, "") or ""
+        return hmac.compare_digest(got.encode("utf-8", "surrogateescape"),
+                                   expected.encode("utf-8", "surrogateescape"))
+
     def _check_token(self) -> bool:
-        """Constant-time token comparison; sends 401 and returns False on failure."""
-        expected = self.server.token       # type: ignore[attr-defined]
-        got = self.headers.get(H_TOKEN, "")
-        if hmac.compare_digest(str(got), str(expected)):
+        """As _token_ok, but sends 401 and returns False on failure."""
+        if self._token_ok():
             return True
         self._error(401, "bad or missing token")
         return False
@@ -108,7 +152,8 @@ class Handler(BaseHTTPRequestHandler):
             return "file", parts[1], parts[2], query
         return "none", None, None, query
 
-    def _reject_with_body(self, status: int, message: str) -> None:
+    def _reject_with_body(self, status: int, message: str,
+                          max_drain: int = DRAIN_LIMIT) -> None:
         """Reject a request that has an unsent/unread body.
 
         The client is still writing when we decide to refuse, so replying
@@ -123,10 +168,13 @@ class Handler(BaseHTTPRequestHandler):
             remaining = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             remaining = 0
-        if remaining > DRAIN_LIMIT:
+        if remaining > max_drain:
             self.close_connection = True
         else:
             while remaining > 0:
+                if self._past_deadline():
+                    self.close_connection = True
+                    break
                 chunk = self.rfile.read(min(CHUNK, remaining))
                 if not chunk:
                     break
@@ -162,9 +210,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         kind, channel, name, _ = self._route()
-        expected = self.server.token       # type: ignore[attr-defined]
-        if not hmac.compare_digest(str(self.headers.get(H_TOKEN, "")), str(expected)):
-            self._reject_with_body(401, "bad or missing token")
+        if not self._token_ok():
+            # Drain only a SMALL body for an unauthenticated caller, so a
+            # legitimate client with a mistyped token still reads a clean 401
+            # instead of a connection reset — while a large body cannot be used
+            # to make us do megabytes of read syscalls for free.
+            self._reject_with_body(401, "bad or missing token",
+                                   max_drain=UNAUTH_DRAIN_LIMIT)
+            return
+        if self.headers.get("Transfer-Encoding"):
+            # Not supported, and silently mis-framing it is how request
+            # smuggling starts if anyone ever puts a proxy in front.
+            self.close_connection = True
+            self._error(400, "Transfer-Encoding is not supported; "
+                             "send the body with an explicit Content-Length")
             return
         if kind != "file":
             self._reject_with_body(404, "PUT requires /c/{channel}/{name}")
@@ -182,6 +241,10 @@ class Handler(BaseHTTPRequestHandler):
             removed = self.store.delete(channel, name)
         except ValueError as exc:
             self._error(400, str(exc))
+            return
+        except OSError as exc:
+            log.exception("deleting %s/%s failed", channel, name)
+            self._error(500, f"could not delete {name}: {exc}")
             return
         if removed:
             self._send_json(200, {"deleted": name})
@@ -211,8 +274,24 @@ class Handler(BaseHTTPRequestHandler):
         except NotFound:
             self._error(404, f"{channel}/{name} not found")
             return
+        except OSError as exc:
+            log.exception("opening %s/%s failed", channel, name)
+            self._error(500, f"could not read {name}: {exc}")
+            return
 
-        size = rec["size"]
+        # Validate the record BEFORE anything that could raise, because the file
+        # handle is not yet owned by a `with` block — a KeyError here would leak
+        # it, and on Windows a leaked read handle makes the file undeletable for
+        # the life of the process.
+        try:
+            size = int(rec["size"])
+            sha = str(rec["sha256"])
+        except (KeyError, TypeError, ValueError):
+            fh.close()
+            log.error("corrupt sidecar for %s/%s: %r", channel, name, rec)
+            self._error(500, f"metadata for {name} is corrupt")
+            return
+
         start = self._parse_range(size)
         if start == "unsatisfiable":
             fh.close()
@@ -235,13 +314,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header(H_SHA, rec["sha256"])
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(H_SHA, sha)
             self.end_headers()
             try:
                 remaining = length
                 while remaining > 0:
                     chunk = fh.read(min(CHUNK, remaining))
                     if not chunk:
+                        # Fewer bytes on disk than advertised: we have already
+                        # committed to a Content-Length, so the only honest way
+                        # out is to close and let the client retry.
+                        log.error("%s/%s is shorter than its record claims",
+                                  channel, name)
+                        self.close_connection = True
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
@@ -279,15 +365,17 @@ class Handler(BaseHTTPRequestHandler):
         # --- header validation, before touching the body -----------------
         raw_len = self.headers.get("Content-Length")
         if raw_len is None:
+            self.close_connection = True
             self._error(400, "Content-Length is required")
             return
-        try:
-            declared = int(raw_len)
-            if declared < 0:
-                raise ValueError
-        except ValueError:
-            self._error(400, "Content-Length must be a non-negative integer")
+        # Strict: int() would accept "1_0" (=10), " 5 ", "+7" and non-Latin
+        # digits like "٥" (=5). A proxy in front of us would read those
+        # differently, which is the seed of a request-smuggling desync.
+        if not re.fullmatch(r"[0-9]+", raw_len.strip()):
+            self.close_connection = True
+            self._error(400, "Content-Length must be a plain non-negative integer")
             return
+        declared = int(raw_len.strip())
 
         claimed_sha = (self.headers.get(H_SHA) or "").strip().lower()
         if not claimed_sha:
@@ -301,9 +389,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._reject_with_body(400, f"{H_META} exceeds {MAX_META_BYTES} bytes")
                 return
             try:
-                meta = json.loads(raw_meta)
-            except ValueError:
-                self._reject_with_body(400, f"{H_META} is not valid JSON")
+                # parse_constant rejects NaN/Infinity/-Infinity. Python accepts
+                # them and re-emits them verbatim, but they are NOT legal JSON:
+                # one such value would be stored in the sidecar and then appear
+                # in EVERY listing of that channel, permanently breaking MATLAB
+                # jsondecode, JavaScript JSON.parse, Go, jq and every other
+                # strict parser — while Python clients noticed nothing.
+                meta = json.loads(raw_meta, parse_constant=_reject_json_constant)
+            except ValueError as exc:
+                self._reject_with_body(400, f"{H_META} is not valid JSON: {exc}")
                 return
             if not isinstance(meta, dict):
                 self._reject_with_body(400, f"{H_META} must be a JSON object")
@@ -327,6 +421,11 @@ class Handler(BaseHTTPRequestHandler):
             with session:
                 remaining = declared
                 while remaining > 0:
+                    if self._past_deadline():
+                        raise StoreError(
+                            f"upload exceeded the {MAX_CONNECTION_SECONDS:.0f}s "
+                            f"connection limit with {remaining} bytes outstanding"
+                        )
                     chunk = self.rfile.read(min(CHUNK, remaining))
                     if not chunk:
                         raise StoreError(
@@ -345,6 +444,16 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._error(400, str(exc))
             return
+        except (OSError, KeyError) as exc:
+            # A filesystem failure (path too long, disk error, a file held open
+            # by a concurrent reader) or a corrupt sidecar. Without this the
+            # exception escapes the handler, the socket closes with NO response
+            # at all, and the client misreports it as "server unreachable" and
+            # retries four times.
+            log.exception("storing %s/%s failed", channel, name)
+            self.close_connection = True
+            self._error(500, f"could not store {name}: {exc}")
+            return
 
         self._send_json(201 if status == "created" else 200, record)
 
@@ -356,10 +465,51 @@ class Handler(BaseHTTPRequestHandler):
         log.warning("%s %s", self.address_string(), fmt % args)
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on simultaneous connections.
+
+    Plain ThreadingHTTPServer spawns a thread per connection with no limit, and
+    it does so BEFORE any token is checked — so an unauthenticated peer on the
+    same network could open sockets until the process ran out of memory. Over
+    the cap we close immediately rather than queueing, because a lab tool
+    failing fast and visibly beats one that degrades mysteriously.
+    """
+
+    max_connections = MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        self._conn_lock = threading.Lock()
+        self._conn_count = 0
+        self.rejected_connections = 0
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        with self._conn_lock:
+            if self._conn_count >= self.max_connections:
+                self.rejected_connections += 1
+                log.warning("refusing connection from %s: %d already open "
+                            "(cap %d)", client_address[0], self._conn_count,
+                            self.max_connections)
+                try:
+                    request.close()
+                except OSError:
+                    pass
+                return
+            self._conn_count += 1
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            with self._conn_lock:
+                self._conn_count = max(0, self._conn_count - 1)
+
+
 def make_server(store: FileStore, host: str, port: int, token: str,
                 label: str = "") -> ThreadingHTTPServer:
-    """Build a ThreadingHTTPServer with the store and token attached."""
-    srv = ThreadingHTTPServer((host, port), Handler)
+    """Build the HTTP server with the store and token attached."""
+    srv = BoundedThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     srv.store = store                                    # type: ignore[attr-defined]
     srv.token = token                                    # type: ignore[attr-defined]
@@ -410,20 +560,32 @@ def print_banner(host: str, port: int, token: str, root: Path,
           (f", TTL {ttl_hours} h" if ttl_hours else ", no TTL (files kept forever)"))
     print(f" listening  : {host}:{port}")
     print(line)
-    print(" Clients connect with:")
+    # The token is NOT printed: this output is normally redirected to a log
+    # file with default ACLs, which would hand the shared secret to every local
+    # account and to log collection.
+    masked = f"{token[:3]}…{token[-2:]}" if len(token) > 6 else "…"
+    print(f" Clients connect with  --url <address below>  --token {masked}")
+    print(" (token shown masked; use the value you configured)")
     for ip in local_ipv4_addresses():
-        print(f"   --url http://{ip}:{port} --token {token}{_describe_address(ip)}")
-    print(f"   --url http://127.0.0.1:{port} --token {token}  (this machine only)")
+        print(f"   http://{ip}:{port}{_describe_address(ip)}")
+    print(f"   http://127.0.0.1:{port}  (this machine only)")
     print(line)
     print(" If clients cannot connect, allow the port through the firewall")
-    print(" (run once, in an ADMIN PowerShell, on THIS machine):")
+    print(" (run once, in an ADMIN PowerShell, on THIS machine).")
+    print(" Over Tailscale, scope the rule to the tailnet so the port is NOT")
+    print(" exposed to the local Wi-Fi:")
     print(f'   netsh advfirewall firewall add rule name="LabLink {port}" '
+          f"dir=in action=allow protocol=TCP localport={port} "
+          f"remoteip=100.64.0.0/10")
+    print(" Only if you need plain-LAN access (opens the port to the whole")
+    print(" network segment):")
+    print(f'   netsh advfirewall firewall add rule name="LabLink {port} LAN" '
           f"dir=in action=allow protocol=TCP localport={port}")
-    print(" To remove it later:")
+    print(" To remove:")
     print(f'   netsh advfirewall firewall delete rule name="LabLink {port}"')
     print(line)
     print(" The token is an anti-misdirection guard, NOT security.")
-    print(" Traffic is plain HTTP — do not send sensitive data.")
+    print(" Traffic is plain HTTP -- do not send sensitive data.")
     print(line, flush=True)
 
 
@@ -451,8 +613,10 @@ def main(argv=None) -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--bind", default="0.0.0.0",
                     help="bind address (default: all interfaces)")
-    ap.add_argument("--token", default=os.environ.get("LABLINK_TOKEN"),
-                    help="shared token (or set LABLINK_TOKEN)")
+    ap.add_argument("--token", default=None,
+                    help="shared token. PREFER the LABLINK_TOKEN environment "
+                         "variable: a command line is visible to every local "
+                         "user via the process table")
     ap.add_argument("--max-file-mb", type=int, default=DEFAULT_MAX_FILE_MB)
     ap.add_argument("--ttl-hours", type=float, default=0,
                     help="delete files older than this (0 = keep forever)")
@@ -460,8 +624,13 @@ def main(argv=None) -> int:
     ap.add_argument("--quiet", action="store_true", help="only log warnings")
     args = ap.parse_args(argv)
 
-    if not args.token:
-        ap.error("a token is required: pass --token or set LABLINK_TOKEN")
+    token = args.token or os.environ.get("LABLINK_TOKEN")
+    if not token:
+        ap.error("a token is required: set LABLINK_TOKEN (preferred) or pass --token")
+    if args.token:
+        print("note: --token is visible in the process table to other local "
+              "users; prefer the LABLINK_TOKEN environment variable.",
+              file=sys.stderr)
 
     # stdout, not the default stderr: the usual way to run this is
     #   Start-Process ... -RedirectStandardOutput server.log
@@ -483,12 +652,12 @@ def main(argv=None) -> int:
         store.cleanup_expired()
         _ttl_thread(store)
 
-    srv = make_server(store, args.bind, args.port, args.token, args.label)
-    print_banner(args.bind, args.port, args.token, root, args.max_file_mb, args.ttl_hours)
+    srv = make_server(store, args.bind, args.port, token, args.label)
+    print_banner(args.bind, args.port, token, root, args.max_file_mb, args.ttl_hours)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down…", flush=True)
+        print("\nshutting down...", flush=True)
     finally:
         srv.shutdown()
         srv.server_close()

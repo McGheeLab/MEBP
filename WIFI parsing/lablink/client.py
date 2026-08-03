@@ -221,8 +221,30 @@ class LabLinkClient:
                 time.sleep(2 ** (stalled - 1))
                 continue
 
-            sha = server_sha or expected_sha
-            if sha and sha256_file(part) != sha:
+            # The CALLER's hash wins. The server's own header only proves the
+            # response is self-consistent, so trusting it in preference would
+            # let a hostile or spoofed server substitute any content and hash
+            # it to match — the listing's sha256 that the caller pinned would
+            # never actually be enforced.
+            if expected_sha and server_sha and server_sha != expected_sha:
+                part.unlink(missing_ok=True)
+                raise LabLinkError(
+                    0,
+                    f"{name}: the server offered sha256 {server_sha[:12]} but "
+                    f"{expected_sha[:12]} was expected — refusing (content was "
+                    f"substituted, or the file changed mid-transfer)",
+                )
+            sha = expected_sha or server_sha
+            if sha is None:
+                # Nothing to verify against. Accept only if the length was
+                # known and matched; never promote a wholly unchecked file.
+                if total is None:
+                    part.unlink(missing_ok=True)
+                    raise LabLinkError(
+                        0, f"{name}: server supplied neither {H_SHA} nor a "
+                           f"length, so the download cannot be verified")
+                log.warning("%s: no checksum available; verified by length only", name)
+            elif sha256_file(part) != sha:
                 log.warning("checksum mismatch for %s; refetching from zero", name)
                 part.unlink(missing_ok=True)
                 stalled += 1
@@ -248,9 +270,16 @@ class LabLinkClient:
             resp = self._open("GET", url, headers=headers)
         except LabLinkError as exc:
             if exc.status == 416 and have:
-                # The part is at or past the full length: complete, or corrupt
-                # and overlong. Let the caller's checksum decide.
-                return None, None
+                # Our partial is at or past the server's length, so it cannot
+                # be a prefix of the current file — the file was replaced, or
+                # two downloads shared one destination. Discard and restart:
+                # keeping it risked promoting a stale, unverifiable file to the
+                # final name whenever the caller passed no expected_sha.
+                log.info("%s: partial is longer than the server's copy; restarting",
+                         part.name)
+                part.unlink(missing_ok=True)
+                raise LabLinkError(
+                    0, f"{part.name}: stale partial discarded, retrying") from None
             raise
 
         with resp:

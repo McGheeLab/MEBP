@@ -162,6 +162,94 @@ class TestOutbox(SyncCase):
         self.assertIn("clash.bin", agent._state["failed"])
 
 
+class TestHostileServer(SyncCase):
+    """A listing arrives over the network; the agent must not trust its names.
+
+    Security regression: `dest / name` accepted absolute paths, traversals and
+    UNC shares, and `_have_locally` stat()ed them BEFORE any validation. A
+    spoofed listing (no token needed — there is no TLS) could make Windows
+    offer NTLM credentials to an attacker's SMB share, and turn the
+    download/no-download decision into a filesystem existence-and-size oracle.
+    """
+
+    HOSTILE_NAMES = [
+        "../../../Windows/win.ini",
+        "..\\..\\evil.txt",
+        "C:/Windows/win.ini",
+        "//attacker-host/share/f",
+        "\\\\attacker-host\\share\\f",
+        "/etc/passwd",
+        "CON",
+        ".ssh",
+        "",
+        None,
+        5,
+    ]
+
+    def test_hostile_names_are_refused_before_any_filesystem_access(self):
+        inbox = self.work / "in"
+        agent = self.agent(inbox_dir=inbox)
+
+        touched, downloaded = [], []
+        agent._have_locally = lambda local, rec, verify_sha: touched.append(local)
+        agent.client.download = lambda *a, **k: downloaded.append(a)
+        agent.client.list_files = lambda ch, since_seq=None: {
+            "channel": ch, "seq": 1,
+            "files": [{"name": n, "size": 1, "sha256": "0" * 64, "seq": 1}
+                      for n in self.HOSTILE_NAMES],
+        }
+
+        agent._poll_inbox()
+        self.assertEqual(touched, [], "a rejected name must never be stat()ed")
+        self.assertEqual(downloaded, [])
+        self.assertEqual(agent._state["since_seq"], 0)
+
+    def test_malformed_listing_entries_do_not_crash_the_cycle(self):
+        agent = self.agent(inbox_dir=self.work / "in")
+        agent.client.list_files = lambda ch, since_seq=None: {
+            "channel": ch, "seq": 3,
+            "files": [
+                "not-a-dict",
+                {"name": "ok.bin"},                            # missing fields
+                {"name": "ok.bin", "size": "big", "sha256": "x", "seq": 1},
+                {"size": 1, "sha256": "0" * 64, "seq": 2},     # no name
+            ],
+        }
+        agent.run_once()          # must not raise
+        self.assertEqual(agent._state["since_seq"], 0)
+
+
+class TestConflictRecovery(SyncCase):
+    def test_reconcile_retries_a_previously_conflicting_file(self):
+        """A 409 must not be permanent.
+
+        Regression: `failed` was persisted and never re-probed, so the advice in
+        the error message — delete the server copy and it will send — did
+        nothing, and the file was never delivered.
+        """
+        out = self.work / "out"
+        out.mkdir()
+        agent = self.agent(outbox_dir=out)
+
+        other = self.work / "other"
+        other.mkdir()
+        (other / "clash.bin").write_bytes(b"server-version")
+        self.client.upload(self.chan_out, other / "clash.bin")
+
+        (out / "clash.bin").write_bytes(b"local-version")
+        agent._cycle = 1                          # not a reconcile cycle
+        self.settle(agent)
+        self.assertIn("clash.bin", agent._state["failed"])
+
+        # Operator follows the advice in the error message.
+        self.client.delete(self.chan_out, "clash.bin")
+
+        agent._cycle = 0                          # reconcile clears the blacklist
+        self.settle(agent)
+        got = self.client.download(self.chan_out, "clash.bin", self.work / "check")
+        self.assertEqual(got.read_bytes(), b"local-version")
+
+
 class TestInbox(SyncCase):
     def test_downloads_new_files_atomically(self):
         inbox = self.work / "in"

@@ -160,7 +160,7 @@ def check_hello(url: str, timeout: float):
             with _request("GET", f"{url}/hello", timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
-            say(FAIL, f"GET /hello returned HTTP {exc.code} — is this a LabLink server?")
+            say(FAIL, f"GET /hello returned HTTP {exc.code} -- is this a LabLink server?")
             return None, None
         except (urllib.error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
@@ -177,7 +177,7 @@ def check_hello(url: str, timeout: float):
 def check_clock(info: dict) -> bool:
     skew = info.get("time", 0) - time.time()
     if abs(skew) > 2:
-        say(WARN, f"clocks differ by {abs(skew):.1f} s — file timestamps across "
+        say(WARN, f"clocks differ by {abs(skew):.1f} s -- file timestamps across "
                   f"machines will look wrong (transfers still work: LabLink "
                   f"orders files by seq, not by clock)")
         return False
@@ -207,7 +207,7 @@ def check_transfer(url: str, token: str, megabytes: int, is_probe: bool,
             resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            say(FAIL, "upload rejected: HTTP 401 — the token does not match the server's")
+            say(FAIL, "upload rejected: HTTP 401 -- the token does not match the server's")
         else:
             body = exc.read()[:200].decode("utf-8", "replace")
             say(FAIL, f"upload failed: HTTP {exc.code} {body}")
@@ -244,7 +244,7 @@ def check_transfer(url: str, token: str, megabytes: int, is_probe: bool,
             resp.read()
         say(PASS, "test file deleted from the server")
     except Exception:
-        say(WARN, f"could not delete the test file {name} — remove it manually")
+        say(WARN, f"could not delete the test file {name} -- remove it manually")
     return True
 
 

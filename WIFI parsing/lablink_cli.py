@@ -141,12 +141,17 @@ def cmd_get(client: LabLinkClient, args) -> int:
             raise SystemExit("give a file name, or --all")
         names = [args.name]
 
+    # Pin each file's hash from the listing so downloads are verified against
+    # what the listing promised, not merely against the server's own header.
+    shas = {r["name"]: r.get("sha256")
+            for r in client.list_files(args.channel).get("files", [])}
     failures = 0
     for name in names:
         t0 = time.time()
         try:
-            out = client.download(args.channel, name, dest)
-        except (LabLinkError, ValueError) as exc:
+            out = client.download(args.channel, name, dest,
+                                  expected_sha=shas.get(name))
+        except (LabLinkError, ValueError, OSError) as exc:
             print(f"ERROR  {name}: {exc}", file=sys.stderr)
             failures += 1
             continue
@@ -183,21 +188,28 @@ def cmd_watch(client: LabLinkClient, args) -> int:
             try:
                 listing = client.list_files(args.channel, since_seq=since)
             except LabLinkError as exc:
-                print(f"  (server unreachable: {exc.message}) retrying…", file=sys.stderr)
+                print(f"  (server unreachable: {exc.message}) retrying...", file=sys.stderr)
                 time.sleep(args.interval)
                 continue
+            # Advance only over an unbroken run of successes: bumping the cursor
+            # after a later file succeeded would skip the failed one forever.
+            may_advance = True
             for rec in listing["files"]:
                 stamp = human_time(rec.get("uploaded", 0))
                 print(f"[{stamp}] seq {rec['seq']:<5} {rec['name']} "
                       f"({human_size(rec['size'])})")
                 if args.dest:
                     try:
-                        out = client.download(args.channel, rec["name"], Path(args.dest))
+                        out = client.download(args.channel, rec["name"],
+                                              Path(args.dest),
+                                              expected_sha=rec.get("sha256"))
                         print(f"           -> {out}")
-                    except (LabLinkError, ValueError) as exc:
+                    except (LabLinkError, ValueError, OSError) as exc:
                         print(f"           ERROR downloading: {exc}", file=sys.stderr)
+                        may_advance = False
                         continue
-                since = rec["seq"]
+                if may_advance:
+                    since = rec["seq"]
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped")

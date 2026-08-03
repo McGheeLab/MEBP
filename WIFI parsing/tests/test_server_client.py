@@ -368,6 +368,53 @@ class TestTruncatedTransfers(ServerCase):
         self.assertLess(time.monotonic() - started, 30, "should fail fast, not spin")
 
 
+class TestVerificationCannotBeBypassed(ServerCase):
+    """The caller's pinned hash must win over the server's own header.
+
+    Security regression: `sha = server_sha or expected_sha` meant the header
+    took precedence, so a hostile or spoofed server could serve any bytes and
+    hash them to match. The listing's sha256 — the one value a caller may have
+    obtained out of band — was never actually enforced.
+    """
+
+    def test_caller_hash_is_enforced_over_the_servers_header(self):
+        data = b"genuine content"
+        self.client.upload("verify", self.make_file("v.bin", data))
+        with self.assertRaises(LabLinkError) as ctx:
+            self.client.download("verify", "v.bin", self.work / "d",
+                                 expected_sha="a" * 64, retries=1)
+        msg = str(ctx.exception)
+        self.assertIn("expected", msg)
+        self.assertFalse((self.work / "d" / "v.bin").exists())
+
+    def test_matching_hashes_still_succeed(self):
+        data = b"genuine content"
+        rec = self.client.upload("verify", self.make_file("ok.bin", data))
+        out = self.client.download("verify", "ok.bin", self.work / "d2",
+                                   expected_sha=rec["sha256"])
+        self.assertEqual(out.read_bytes(), data)
+
+    def test_stale_overlong_part_is_never_promoted_unverified(self):
+        """A 416 must not hand back a leftover partial as if it were the file.
+
+        Regression: with no expected_sha, the 416 path returned (None, None),
+        which skipped both the length check and the hash check, and
+        os.replace()d a stale partial into the final name — reporting success
+        for content from a different, deleted file.
+        """
+        data = os.urandom(4000)
+        self.client.upload("verify", self.make_file("small.bin", data))
+
+        dest = self.work / "d3"
+        (dest / PARTIAL_DIR).mkdir(parents=True)
+        stale = dest / PARTIAL_DIR / "small.bin.part"
+        stale.write_bytes(os.urandom(9999))       # longer than the real file
+
+        # No expected_sha — exactly how lablink_cli's `get` used to call it.
+        out = self.client.download("verify", "small.bin", dest)
+        self.assertEqual(out.read_bytes(), data, "must refetch, not promote")
+
+
 class TestCollisions(ServerCase):
     def test_identical_reupload_is_duplicate(self):
         src = self.make_file("same.bin", b"identical")
@@ -436,6 +483,65 @@ class TestValidationAndLimits(ServerCase):
         huge = '{"k":"' + "x" * (MAX_META_BYTES + 100) + '"}'
         status, _, _ = self._put("meta3.bin", b"x", meta=huge)
         self.assertEqual(status, 400)
+
+    def test_non_ascii_token_does_not_crash_the_handler(self):
+        """Latin-1 header decoding + hmac.compare_digest on str raises TypeError.
+
+        Security regression: one malformed header from an unauthenticated caller
+        killed the handler and dumped a traceback instead of answering 401.
+        """
+        from lablink.protocol import H_TOKEN
+
+        status, _, _ = self.raw_request(
+            "GET", "/c/val", headers={H_TOKEN: "\xff\xfe-not-ascii"})
+        self.assertEqual(status, 401)
+
+    def test_nan_in_metadata_is_refused(self):
+        """NaN/Infinity are not valid JSON and would poison every listing.
+
+        Python emits them back verbatim, so one such value in a sidecar breaks
+        MATLAB jsondecode, JavaScript JSON.parse, Go and jq for that whole
+        channel — while Python clients notice nothing.
+        """
+        for bad in ('{"x": NaN}', '{"x": Infinity}', '{"x": -Infinity}'):
+            with self.subTest(meta=bad):
+                status, _, _ = self._put("nan.bin", b"x", meta=bad)
+                self.assertEqual(status, 400)
+        names = [f["name"] for f in self.client.list_files("val")["files"]]
+        self.assertNotIn("nan.bin", names)
+
+    def test_transfer_encoding_is_rejected(self):
+        from lablink.protocol import H_SHA, H_TOKEN
+
+        body = b"x"
+        status, _, _ = self.raw_request(
+            "PUT", "/c/val/te.bin", body,
+            {H_TOKEN: TOKEN, H_SHA: hashlib.sha256(body).hexdigest(),
+             "Transfer-Encoding": "chunked"})
+        self.assertEqual(status, 400)
+
+    def test_lax_content_length_forms_are_rejected(self):
+        """Reject forms a proxy in front of us would read differently.
+
+        int() accepts Python-specific spellings: "1_0" is 10 and "+7" is 7.
+        Surrounding whitespace is NOT in this list — HTTP defines optional
+        whitespace around a field value and the stdlib strips it, so " 5 "
+        legitimately means 5.
+        """
+        from lablink.protocol import H_SHA, H_TOKEN
+
+        for bad_len in ("1_0", "+7", "0x5", "5.0"):
+            with self.subTest(content_length=bad_len):
+                status, _, _ = self.raw_request(
+                    "PUT", "/c/lax/cl.bin", b"xxxxx",
+                    {H_TOKEN: TOKEN, "Content-Length": bad_len,
+                     H_SHA: hashlib.sha256(b"xxxxx").hexdigest()})
+                self.assertIn(status, (400, 0))
+        self.assertEqual(self.client.list_files("lax")["files"], [])
+
+    def test_listing_an_unused_channel_does_not_create_it(self):
+        self.client.list_files("never-created-channel")
+        self.assertFalse((self.root / "never-created-channel").exists())
 
     def test_bad_since_seq_rejected(self):
         from lablink.protocol import H_TOKEN

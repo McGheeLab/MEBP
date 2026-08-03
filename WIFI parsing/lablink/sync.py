@@ -169,7 +169,18 @@ class SyncAgent:
                 else:
                     log.warning("upload %s failed: %s", name, exc)
                 continue
+            except OSError as exc:
+                # upload() re-stats, re-hashes and re-opens the file, so a file
+                # removed between our scan and this call raises here. Skipping
+                # one file is right; letting it escape would abandon every
+                # remaining file in the outbox for this cycle.
+                log.warning("upload %s skipped: %s", name, exc)
+                continue
 
+            # Record the digest the SERVER confirmed, not the one we hashed
+            # earlier: if the file changed in between, storing our stale digest
+            # would make the next cycle re-upload and hit a permanent 409.
+            digest = rec.get("sha256", digest)
             self._state["uploaded"][name] = digest
             self._state["failed"].pop(name, None)
             self._conflict_logged.pop(name, None)
@@ -244,8 +255,32 @@ class SyncAgent:
         # never blocked by one bad file); they are simply skipped cheaply next
         # cycle by the "already have it" check below.
         may_advance = True
-        for rec in listing["files"]:
-            name = rec["name"]
+        for rec in listing.get("files") or []:
+            # VALIDATE BEFORE TOUCHING THE FILESYSTEM. The name arrives over
+            # the network, and `dest / name` would accept an absolute path
+            # ("C:/Windows/x"), a traversal ("../../x") or a UNC share
+            # ("//attacker/share/f") — the last of which makes Windows hand
+            # NTLM credentials to whoever answers. Even the exists()/stat()
+            # inside _have_locally is an information leak, so nothing may run
+            # before this check.
+            if not isinstance(rec, dict):
+                log.warning("ignoring malformed listing entry: %r", rec)
+                may_advance = False
+                continue
+            name = rec.get("name")
+            try:
+                validate_name(name)
+            except (ValueError, TypeError) as exc:
+                log.warning("refusing server-supplied name %r: %s", name, exc)
+                may_advance = False
+                continue
+            if not (isinstance(rec.get("size"), int)
+                    and isinstance(rec.get("sha256"), str)
+                    and isinstance(rec.get("seq"), int)):
+                log.warning("ignoring %s: listing entry has malformed fields", name)
+                may_advance = False
+                continue
+
             if self._have_locally(dest / name, rec, verify_sha=not full):
                 if may_advance:
                     self._advance_seq(rec["seq"])
@@ -254,7 +289,11 @@ class SyncAgent:
                 self.client.download(box["channel"], name, dest,
                                      expected_sha=rec["sha256"],
                                      retries=self.retries)
-            except (LabLinkError, ValueError) as exc:
+            except (LabLinkError, ValueError, OSError) as exc:
+                # OSError matters as much as the rest: os.replace into the inbox
+                # raises PermissionError on Windows while the consumer app holds
+                # the file open, which is the documented workflow. Letting it
+                # escape would abandon the whole batch, not just this file.
                 log.warning("download %s failed (will retry): %s", name, exc)
                 may_advance = False
                 continue
@@ -285,6 +324,16 @@ class SyncAgent:
         """
         full = (self._cycle % self.reconcile_cycles) == 0
         self._cycle += 1
+        if full and self._state["failed"]:
+            # Give conflicts another chance on every reconcile. Otherwise a 409
+            # was permanent: the error message tells the operator to delete the
+            # server copy, but nothing ever re-probed the server, so following
+            # that advice changed nothing and the file was never sent.
+            log.info("retrying %d previously conflicting file(s)",
+                     len(self._state["failed"]))
+            self._state["failed"].clear()
+            self._conflict_logged.clear()
+            self._save_state()
         try:
             self._scan_outbox()
         except Exception:
