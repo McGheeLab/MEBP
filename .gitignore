@@ -74,9 +74,18 @@ logs/prints/*.jsonl
 # Testing
 .pytest_cache/
 
+# Walkthrough recordings (REC button): one full-window PNG per click,
+# so a single take is tens of MB of binaries.
+logs/sessions/
+
 # HyperFrames tutorial videos — commit the composition + generated CSS,
 # ignore the toolchain, rendered MP4s and review snapshots.
 docs/videos/*/node_modules/
 docs/videos/*/out/
 docs/videos/*/snapshots/
 docs/videos/*/.hyperframes/
+
+# Tucsen TUCam SDK per-camera parameter files. The SDK writes one XML per
+# physical unit (named with its serial) into the config path we hand it; that is
+# machine-local state for one specific camera, not something another rig wants.
+config/hardware/tucsen/

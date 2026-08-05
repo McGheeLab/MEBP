@@ -136,6 +136,8 @@ def identity_for_source(
         return (f"toupcam:{value}", "ToupCam")
     if kind == "andor":
         return (f"andor:{value}", "Andor Zyla")
+    if kind == "tucam":
+        return (f"tucam:{value}", "Tucsen Camera")
     if kind == "simulated":
         return (f"simulated:{value}", "Simulated Camera")
     return None
@@ -165,6 +167,8 @@ def source_for_identity(identity: str, ds_cameras: list[dict]):
         return ("toupcam", identity[len("toupcam:"):])
     if identity.startswith("andor:"):
         return ("andor", identity[len("andor:"):])
+    if identity.startswith("tucam:"):
+        return ("tucam", identity[len("tucam:"):])
     if identity.startswith("simulated:"):
         return ("simulated", identity[len("simulated:"):])
     return None

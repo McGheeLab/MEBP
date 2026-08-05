@@ -71,6 +71,15 @@ except ImportError:
     AndorBackend = None
     logger.info("Andor backend not available")
 
+# v7.9.x: Try to import the Tucsen TUCam backend (Libra / Dhyana / Aries / FL).
+# Guarded/lazy exactly like ToupCam and Andor — importing never loads TUCam.dll.
+try:
+    from gui.widgets.tucam_backend import TUCamBackend, TUCAM_AVAILABLE
+except ImportError:
+    TUCAM_AVAILABLE = False
+    TUCamBackend = None
+    logger.info("TUCam backend not available")
+
 # v7.3.0: Try to import SimulatedCamera backend
 try:
     from SupportClasses.SimulatedCamera import SimulatedCamera
@@ -81,7 +90,8 @@ except ImportError:
 
 # v7.3-camera: Unified availability flag
 CAMERA_AVAILABLE = (CV2_AVAILABLE or bool(TOUPCAM_AVAILABLE)
-                    or bool(ANDOR_AVAILABLE) or SIM_AVAILABLE)
+                    or bool(ANDOR_AVAILABLE) or bool(TUCAM_AVAILABLE)
+                    or SIM_AVAILABLE)
 
 
 
@@ -162,6 +172,20 @@ def detect_andor_cameras() -> list[dict]:
         return AndorBackend.enumerate()
     except Exception as e:
         logger.warning(f"Andor detection error: {e}")
+        return []
+
+
+def detect_tucam_cameras() -> list[dict]:
+    """v7.9.x: Detect Tucsen TUCam cameras (Libra / Dhyana / Aries / FL).
+
+    Returns list of dicts with 'id' (device index) and 'displayname' keys.
+    """
+    if not TUCAM_AVAILABLE or TUCamBackend is None:
+        return []
+    try:
+        return TUCamBackend.enumerate()
+    except Exception as e:
+        logger.warning(f"TUCam detection error: {e}")
         return []
 
 
@@ -252,7 +276,10 @@ class CameraWidget(QWidget):
         self._toupcam = None
         # v7.5.x: Andor SDK3 backend state (ANDOR Zyla sCMOS)
         self._andor = None
-        self._backend_type = "opencv"  # "opencv" | "toupcam" | "andor" | "simulated"
+        # v7.9.x: Tucsen TUCam backend state (Libra / Dhyana / Aries / FL)
+        self._tucam = None
+        # "opencv" | "toupcam" | "andor" | "tucam" | "simulated"
+        self._backend_type = "opencv"
 
         # v7.5.x: async-open state (see start_async). ``_open_token`` supersedes
         # an in-flight open when stop()/another start happens; ``_opening`` marks
@@ -482,7 +509,8 @@ class CameraWidget(QWidget):
                 opencv_indices = detect_cameras()
             probe = {"opencv": opencv_indices, "dshow": ds_cams,
                      "toupcam": detect_toupcam_cameras(),
-                     "andor": detect_andor_cameras()}
+                     "andor": detect_andor_cameras(),
+                     "tucam": detect_tucam_cameras()}
 
         # OpenCV cameras — v7.5.x: label with the DirectShow friendly name
         # + USB port tag (e.g. "Teslong Camera (port 6&29d1719c&2)") so two
@@ -514,6 +542,13 @@ class CameraWidget(QWidget):
             name = an_dev.get('displayname', 'Andor Zyla')
             dev_id = an_dev.get('id', '')
             self.camera_combo.addItem(f"Andor: {name}", ("andor", dev_id))
+
+        # Tucsen TUCam cameras (v7.9.x — Libra / Dhyana / Aries / FL). The
+        # displayname is the model the SDK itself reports (e.g. "Libra 25").
+        for tu_dev in (probe.get("tucam") or []):
+            name = tu_dev.get('displayname', 'Tucsen')
+            dev_id = tu_dev.get('id', '')
+            self.camera_combo.addItem(f"Tucsen: {name}", ("tucam", dev_id))
 
         # v7.3.0: Simulated camera
         if SIM_AVAILABLE:
@@ -550,6 +585,9 @@ class CameraWidget(QWidget):
                 return
             elif backend_type == "andor":
                 self._start_andor(identifier)
+                return
+            elif backend_type == "tucam":
+                self._start_tucam(identifier)
                 return
             elif backend_type == "simulated":
                 self._start_simulated(identifier)
@@ -643,6 +681,12 @@ class CameraWidget(QWidget):
                     if an.open(identifier):
                         payload["handle"] = an
                         payload["meta"] = an.get_resolution()
+                elif (backend_type == "tucam" and TUCAM_AVAILABLE
+                      and TUCamBackend is not None):
+                    tu = TUCamBackend()
+                    if tu.open(identifier):
+                        payload["handle"] = tu
+                        payload["meta"] = tu.get_resolution()
             except Exception as exc:
                 logger.warning(
                     f"{self._camera_label}: async camera open failed: {exc}")
@@ -685,6 +729,8 @@ class CameraWidget(QWidget):
             self._toupcam = handle
         elif backend == "andor":
             self._andor = handle
+        elif backend == "tucam":
+            self._tucam = handle
         self._backend_type = backend
         self._running = True
         self._timer.start(int(1000 / self._fps))
@@ -705,7 +751,8 @@ class CameraWidget(QWidget):
         if handle is None:
             return
         try:
-            handle.release()  # cv2.VideoCapture / ToupCam / Andor all expose it
+            # cv2.VideoCapture / ToupCam / Andor / TUCam all expose release().
+            handle.release()
         except Exception:
             pass
 
@@ -765,6 +812,16 @@ class CameraWidget(QWidget):
             except Exception:
                 pass
             self._andor = None
+        # v7.9.x: release the Tucsen stream (stops acquisition, joins the reader
+        # thread, frees the SDK buffer and drops the API refcount) — same
+        # rationale as the ToupCam/Andor releases above.
+        tu = getattr(self, '_tucam', None)
+        if tu is not None:
+            try:
+                tu.release()
+            except Exception:
+                pass
+            self._tucam = None
         self._backend_type = "opencv"
         # v7.3.0: Clear simulated camera reference
         if hasattr(self, '_simulated_camera'):
@@ -814,6 +871,26 @@ class CameraWidget(QWidget):
         if hasattr(self, 'btn_start'):
             self.btn_start.setText("\u23f9")
         logger.info(f"{self._camera_label}: Andor started ({w}x{h}) at {self._fps} FPS")
+
+    def _start_tucam(self, device_id: str):
+        """v7.9.x: Start a Tucsen (TUCam SDK) camera feed."""
+        if not TUCAM_AVAILABLE or TUCamBackend is None or self._running:
+            return
+
+        self._tucam = TUCamBackend()
+        if not self._tucam.open(device_id):
+            self.video_label.setText("Failed to open Tucsen camera")
+            self._tucam = None
+            return
+
+        w, h = self._tucam.get_resolution()
+        self._running = True
+        self._backend_type = "tucam"
+        self._timer.start(int(1000 / self._fps))
+        if hasattr(self, 'btn_start'):
+            self.btn_start.setText("⏹")
+        logger.info(f"{self._camera_label}: Tucsen started ({w}x{h}) "
+                    f"at {self._fps} FPS")
 
     def _start_simulated(self, mode: str = "microscope"):
         """v7.3.0: Start the simulated microscope camera."""
@@ -976,6 +1053,35 @@ class CameraWidget(QWidget):
                 "andor_scale_lo": {"range": an.get_display_level_range()},
                 "andor_scale_hi": {"range": an.get_display_level_range()},
             }
+        elif backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            tu = self._tucam
+            caps.update(source="tucam", controllable=True, resolution=True,
+                        device_name=getattr(tu, "_model", "Tucsen") or "Tucsen")
+            # Only advertise what THIS camera actually implements: each range
+            # comes from the SDK's own TUCAM_Prop_GetAttr, and a property the
+            # model lacks returns None → the control is omitted → the settings
+            # dialog auto-hides it. That is what keeps the unverified property-ID
+            # table from presenting a control that does nothing.
+            ctrls: dict = {}
+            for key, rng in (
+                ("exposure_us", tu.get_exposure_time_range()),
+                ("exposure_gain_pct", tu.get_exposure_gain_range()),
+                ("gamma", tu.get_gamma_range()),
+                ("brightness", tu.get_brightness_range()),
+                ("contrast", tu.get_contrast_range()),
+            ):
+                if rng is not None:
+                    ctrls[key] = {"range": rng}
+            if tu.get_auto_exposure() is not None:
+                ctrls["auto_exposure"] = {"range": None}
+            # Mono→8-bit display scaling: the same controls (and the same
+            # historical `andor_*` keys) the Zyla uses, so both mono cameras are
+            # adjusted identically during the A/B evaluation.
+            lvl = tu.get_display_level_range()
+            ctrls["andor_auto_scale"] = {"range": None}
+            ctrls["andor_scale_lo"] = {"range": lvl}
+            ctrls["andor_scale_hi"] = {"range": lvl}
+            caps["controls"] = ctrls
         elif backend == "opencv" and self._capture is not None:
             caps.update(source="opencv", controllable=True, resolution=True,
                         device_name=f"OpenCV #{self._camera_index}")
@@ -1010,6 +1116,10 @@ class CameraWidget(QWidget):
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             d = self._andor.get_settings()
             d["source"] = "andor"
+            return d
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            d = self._tucam.get_settings()
+            d["source"] = "tucam"
             return d
         if backend == "opencv" and self._capture is not None:
             cap = self._capture
@@ -1051,6 +1161,8 @@ class CameraWidget(QWidget):
             return self._toupcam.set_auto_exposure(bool(enabled))
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.set_auto_exposure(bool(enabled))
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.set_auto_exposure(bool(enabled))
         if backend == "opencv" and self._capture is not None:
             # DirectShow: 0.75 = auto, 0.25 = manual.
             return bool(self._capture.set(
@@ -1063,6 +1175,8 @@ class CameraWidget(QWidget):
             return self._toupcam.put_exposure_time(microseconds)
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.put_exposure_time(microseconds)
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.put_exposure_time(microseconds)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_EXPOSURE, microseconds))
         return False
@@ -1073,6 +1187,8 @@ class CameraWidget(QWidget):
             return self._toupcam.put_exposure_gain(percent)
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.put_exposure_gain(percent)
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.put_exposure_gain(percent)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_GAIN, percent))
         return False
@@ -1083,6 +1199,8 @@ class CameraWidget(QWidget):
             return self._toupcam.put_gamma(value)
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.put_gamma(value)
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.put_gamma(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_GAMMA, value))
         return False
@@ -1093,6 +1211,8 @@ class CameraWidget(QWidget):
             return self._toupcam.put_brightness(value)
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.put_brightness(value)
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.put_brightness(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_BRIGHTNESS, value))
         return False
@@ -1103,65 +1223,74 @@ class CameraWidget(QWidget):
             return self._toupcam.put_contrast(value)
         if backend == "andor" and getattr(self, "_andor", None) is not None:
             return self._andor.put_contrast(value)
+        if backend == "tucam" and getattr(self, "_tucam", None) is not None:
+            return self._tucam.put_contrast(value)
         if backend == "opencv" and self._capture is not None:
             return bool(self._capture.set(cv2.CAP_PROP_CONTRAST, value))
         return False
 
+    def _mono_display_backend(self):
+        """The live backend that owns mono→8-bit DISPLAY scaling, or None.
+
+        v7.9.x: both scientific cameras convert a mono sensor to 8-bit BGR for
+        display through the same shared math (gui/widgets/mono_display.py), so
+        both expose the same scaling API. Resolving the backend here keeps the
+        three delegates below from duplicating the branch per camera type.
+
+        The ``andor_*`` method/key names are HISTORICAL — this control shipped
+        first on the Zyla — and are kept because they are the names the settings
+        dialog gates on and ``hw_controls`` persists.
+        """
+        backend = getattr(self, "_backend_type", "")
+        if backend == "andor":
+            return getattr(self, "_andor", None)
+        if backend == "tucam":
+            return getattr(self, "_tucam", None)
+        return None
+
     def set_hw_andor_auto_scale(self, enabled: bool) -> bool:
-        """Andor only: toggle the mono16→8-bit per-frame display auto-scale."""
-        if (getattr(self, "_backend_type", "") == "andor"
-                and getattr(self, "_andor", None) is not None):
-            return self._andor.set_display_auto_scale(bool(enabled))
-        return False
+        """Mono cameras: toggle the mono→8-bit per-frame display auto-scale."""
+        be = self._mono_display_backend()
+        return be.set_display_auto_scale(bool(enabled)) if be is not None else False
 
     def set_hw_andor_scale_lo(self, counts) -> bool:
-        """Andor only: manual display black level (raw sensor counts)."""
-        if (getattr(self, "_backend_type", "") == "andor"
-                and getattr(self, "_andor", None) is not None):
-            return self._andor.put_display_black(counts)
-        return False
+        """Mono cameras: manual display black level (raw sensor counts)."""
+        be = self._mono_display_backend()
+        return be.put_display_black(counts) if be is not None else False
 
     def set_hw_andor_scale_hi(self, counts) -> bool:
-        """Andor only: manual display white level (raw sensor counts)."""
-        if (getattr(self, "_backend_type", "") == "andor"
-                and getattr(self, "_andor", None) is not None):
-            return self._andor.put_display_white(counts)
-        return False
+        """Mono cameras: manual display white level (raw sensor counts)."""
+        be = self._mono_display_backend()
+        return be.put_display_white(counts) if be is not None else False
 
     def set_capture_resolution(self, width: int, height: int):
         """Reconfigure the *device* capture resolution. Returns actual (w,h).
 
-        ToupCam: maps (w,h) to the nearest supported eSize and restarts the
-        pull-mode stream. OpenCV: sets CAP_PROP_FRAME_WIDTH/HEIGHT. Returns the
-        resolution actually adopted (read back from the device), or None.
+        SDK backends (ToupCam / Andor / TUCam): maps (w,h) to the nearest
+        supported resolution index and restarts the stream. OpenCV: sets
+        CAP_PROP_FRAME_WIDTH/HEIGHT. Returns the resolution actually adopted
+        (read back from the device), or None.
 
         NOTE: changing capture resolution changes the effective µm/px, so any
         existing pixel-scale calibration for this camera must be redone.
         """
         backend = getattr(self, "_backend_type", "opencv")
-        if backend == "toupcam" and getattr(self, "_toupcam", None) is not None:
-            res = self._toupcam.get_resolution_list()
+        # v7.9.x: the three SDK backends expose the identical
+        # get_resolution_list / set_resolution_index / get_resolution contract,
+        # so one branch serves all of them (the ToupCam and Andor branches were
+        # byte-identical copies; adding a third would have been triplication).
+        sdk_attr = {"toupcam": "_toupcam", "andor": "_andor",
+                    "tucam": "_tucam"}.get(backend)
+        sdk = getattr(self, sdk_attr, None) if sdk_attr else None
+        if sdk is not None:
+            res = sdk.get_resolution_list()
             if not res:
                 return None
             target_area = int(width) * int(height)
             idx = min(range(len(res)),
                       key=lambda i: abs(res[i][0] * res[i][1] - target_area))
-            ok = self._toupcam.set_resolution_index(idx)
-            actual = self._toupcam.get_resolution()
-            logger.info(
-                f"{self._camera_label}: capture resolution -> {actual} "
-                f"(eSize {idx}){'' if ok else ' [FAILED]'} — µm/px calibration "
-                f"may need redoing")
-            return actual if ok else None
-        if backend == "andor" and getattr(self, "_andor", None) is not None:
-            res = self._andor.get_resolution_list()
-            if not res:
-                return None
-            target_area = int(width) * int(height)
-            idx = min(range(len(res)),
-                      key=lambda i: abs(res[i][0] * res[i][1] - target_area))
-            ok = self._andor.set_resolution_index(idx)
-            actual = self._andor.get_resolution()
+            ok = sdk.set_resolution_index(idx)
+            actual = sdk.get_resolution()
             logger.info(
                 f"{self._camera_label}: capture resolution -> {actual} "
                 f"(eSize {idx}){'' if ok else ' [FAILED]'} — µm/px calibration "
@@ -1190,7 +1319,7 @@ class CameraWidget(QWidget):
         src = st.get("source", "none")
         head = f"{prefix}{self._camera_label}: hardware settings — source = {src}"
         lines = [head]
-        if src in ("toupcam", "opencv", "andor"):
+        if src in ("toupcam", "opencv", "andor", "tucam"):
             lines.append(f"  device       : {st.get('device_id', '?')}")
             lines.append(f"  resolution   : {st.get('resolution')}"
                          + (f"  (eSize {st.get('eSize')})"
@@ -1203,7 +1332,7 @@ class CameraWidget(QWidget):
             lines.append(f"  gamma        : {st.get('gamma')}")
             lines.append(f"  brightness   : {st.get('brightness')}")
             lines.append(f"  contrast     : {st.get('contrast')}")
-            if src == "andor":
+            if src in ("andor", "tucam"):
                 lines.append(
                     f"  display scale: "
                     f"{'auto (per-frame)' if st.get('andor_auto_scale') else 'manual'}"
@@ -1219,22 +1348,19 @@ class CameraWidget(QWidget):
     def _grab_frame(self):
         """Capture, adjust, and display one frame.
 
-        v7.3-camera: Reads from OpenCV or ToupCam backend.
+        v7.3-camera: Reads from OpenCV or an SDK backend.
+        v7.9.x: SDK backends (ToupCam / Andor / TUCam) share one read path —
+        each exposes the same isOpened()/read() contract and returns BGR8.
         """
-        # v7.3-camera: Dual backend read
         backend = getattr(self, '_backend_type', 'opencv')
-        if backend == 'toupcam':
-            tc = getattr(self, '_toupcam', None)
-            if tc is None or not tc.isOpened():
+        sdk_attr = {'toupcam': '_toupcam', 'andor': '_andor',
+                    'tucam': '_tucam'}.get(backend)
+        if sdk_attr:
+            sdk = getattr(self, sdk_attr, None)
+            if sdk is None or not sdk.isOpened():
                 self.stop()
                 return
-            ret, frame = tc.read()
-        elif backend == 'andor':
-            an = getattr(self, '_andor', None)
-            if an is None or not an.isOpened():
-                self.stop()
-                return
-            ret, frame = an.read()
+            ret, frame = sdk.read()
         else:
             if not self._capture or not self._capture.isOpened():
                 self.stop()

@@ -191,6 +191,11 @@ class CameraManager(QObject):
         except ImportError:
             def detect_andor_cameras():
                 return []
+        try:
+            from gui.widgets.camera_widget import detect_tucam_cameras
+        except ImportError:
+            def detect_tucam_cameras():
+                return []
         # DirectShow identity map (Windows; [] elsewhere) — also the labels.
         try:
             from gui.widgets.camera_identity import enumerate_directshow_cameras
@@ -210,8 +215,13 @@ class CameraManager(QObject):
         except Exception as exc:
             logger.debug(f"Andor enumeration skipped: {exc}")
             andor = []
+        try:
+            tucam = detect_tucam_cameras()
+        except Exception as exc:
+            logger.debug(f"TUCam enumeration skipped: {exc}")
+            tucam = []
         probe = {"opencv": opencv_indices, "dshow": ds_cams,
-                 "toupcam": toupcam, "andor": andor}
+                 "toupcam": toupcam, "andor": andor, "tucam": tucam}
 
         # Use the first camera widget's refresh to populate from the inventory
         first = self._cameras[0]

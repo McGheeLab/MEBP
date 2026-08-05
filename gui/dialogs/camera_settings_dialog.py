@@ -472,7 +472,7 @@ class CameraSettingsDialog(QDialog):
         lines = [f"source = {src}"]
         if name:
             lines.append(f"device = {name}")
-        if src in ("toupcam", "opencv", "andor"):
+        if src in ("toupcam", "opencv", "andor", "tucam"):
             lines.append(f"resolution    = {st.get('resolution')}"
                          + (f"  (eSize {st.get('eSize')})"
                             if st.get("eSize") is not None else ""))
@@ -481,12 +481,20 @@ class CameraSettingsDialog(QDialog):
                          + (f"   range {st.get('exposure_range_us')}"
                             if st.get("exposure_range_us") else ""))
             lines.append(f"gain          = {st.get('exposure_gain_pct')} %")
-            if src == "andor":
+            # Mono→8-bit display scaling: reported for every mono scientific
+            # camera (Zyla, Tucsen) since both render through the same shared
+            # conversion and the operator compares them directly.
+            if src in ("andor", "tucam"):
                 mode = ("auto (per-frame)" if st.get("andor_auto_scale")
                         else "manual")
                 lines.append(f"display scale = {mode}   levels "
                              f"{st.get('andor_scale_lo')}.."
                              f"{st.get('andor_scale_hi')}")
+            if src == "tucam":
+                if st.get("temperature_c") is not None:
+                    lines.append(f"sensor temp   = {st.get('temperature_c')} C")
+                lines.append(f"frame format  = {st.get('channels')} ch, "
+                             f"{st.get('elem_bytes')} byte/px")
             lines.append(f"gamma         = {st.get('gamma')}")
             lines.append(f"brightness    = {st.get('brightness')}")
             lines.append(f"contrast      = {st.get('contrast')}")
