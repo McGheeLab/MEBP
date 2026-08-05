@@ -5,6 +5,8 @@ tutorial project.
 
 Usage:  python tools_build_tour_from_tape.py <tape.jsonl> [-o docs/videos/<name>]
         python tools_build_tour_from_tape.py <tape.jsonl> --all-steps
+        (refuses to overwrite an existing STORYBOARD.md/NARRATION.md — the
+         director's edits — unless --force)
 
 Emits, into the output directory:
 
@@ -33,12 +35,17 @@ sys.path.insert(0, HERE)
 
 
 def _load(tape_path):
-    from gui.action_recorder import read_tape
+    # GUI-free tape parser — this tool must run without PySide6 installed.
+    from SupportClasses.WalkthroughTape import read_tape
     return read_tape(tape_path)
 
 
-def _has_letters(text):
-    return any(c.isalpha() and ord(c) < 128 for c in (text or ""))
+def _is_readable(text):
+    """A label worth showing: contains an ASCII letter OR digit. Digits count
+    because '10' / '96' / '1' are legitimate control labels (magnification,
+    well count, channel); a pure-emoji icon label does not."""
+    return any((c.isalpha() or c.isdigit()) and ord(c) < 128
+               for c in (text or ""))
 
 
 def _display(step):
@@ -49,9 +56,37 @@ def _display(step):
     reads as nothing, so fall through to its objectName — which is how the
     code names it, and what the director will recognise."""
     label = step.get("label") or ""
-    if _has_letters(label):
+    if _is_readable(label):
         return label
     return step.get("object_name") or label or step.get("widget") or "?"
+
+
+# When the recorded rect is unusable (missing, or a container-sized ancestor),
+# the spotlight is synthesized as a small box centred on the actual click.
+_FALLBACK_SPOT_W_PCT = 8.0
+_FALLBACK_SPOT_H_PCT = 10.0
+
+
+def _spot_rect(step):
+    """Choose the spotlight rect for a beat.
+
+    Returns (rect, source) where source ∈ {"widget", "click", "none"}.
+    A half-window rect (rect_oversized — the operator clicked a canvas whose
+    only named ancestor is its Card) makes a useless spotlight, so fall back
+    to a small box around click_pct — the true point of interest."""
+    rect = step.get("rect_pct")
+    if rect and not step.get("rect_oversized"):
+        return rect, "widget"
+    click = step.get("click_pct")
+    if click:
+        w, h = _FALLBACK_SPOT_W_PCT, _FALLBACK_SPOT_H_PCT
+        left = min(100.0 - w, max(0.0, click["x"] - w / 2.0))
+        top = min(100.0 - h, max(0.0, click["y"] - h / 2.0))
+        return ({"left": round(left, 3), "top": round(top, 3),
+                 "width": w, "height": h}, "click")
+    if rect:
+        return rect, "widget"          # oversized but no click point — best we have
+    return None, "none"
 
 
 def _slug(step):
@@ -77,6 +112,8 @@ def main(argv=None):
                     help="output project dir (default: docs/videos/<session>)")
     ap.add_argument("--all-steps", action="store_true",
                     help="keep every click, not just F9-marked beats")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing STORYBOARD.md / NARRATION.md")
     args = ap.parse_args(argv)
 
     tape_path = os.path.abspath(args.tape)
@@ -102,6 +139,18 @@ def main(argv=None):
 
     out = os.path.abspath(args.out or os.path.join(
         HERE, "docs", "videos", session_name))
+
+    # A filled-in NARRATION.md is the director's work — never clobber it
+    # silently (re-running with --all-steps after 40 minutes of writing
+    # narration must not destroy that writing).
+    existing = [name for name in ("STORYBOARD.md", "NARRATION.md")
+                if os.path.exists(os.path.join(out, name))]
+    if existing and not args.force:
+        raise SystemExit(
+            "refusing to overwrite %s in %s — these may hold the director's "
+            "edits. Re-run with --force to overwrite, or use -o for a fresh "
+            "directory." % (" + ".join(existing), out))
+
     screens_dir = os.path.join(out, "screens")
     os.makedirs(screens_dir, exist_ok=True)
 
@@ -114,16 +163,22 @@ def main(argv=None):
             shutil.copy2(src, os.path.join(screens_dir, dest_name))
         else:
             dest_name = ""
+        spot, spot_source = _spot_rect(step)
         spotlights.append({
             "beat": n,
             "screen": dest_name,
-            "rect_pct": step.get("rect_pct"),
+            "spot": spot,                       # what the composition should use
+            "spot_source": spot_source,         # "widget" | "click" | "none"
+            "rect_pct": step.get("rect_pct"),   # raw, for reference
+            "click_pct": step.get("click_pct"),
+            "window_kind": step.get("window_kind", "main"),
             "target": _display(step),
             "widget": step.get("widget", ""),
             "where": _where(step),
             "t": step.get("t"),
         })
-        rows.append((n, _where(step), _display(step), dest_name))
+        rows.append((n, _where(step), _display(step), dest_name,
+                     spot_source, step.get("window_kind", "main")))
 
     with io.open(os.path.join(out, "spotlights.json"), "w",
                  encoding="utf-8") as fh:
@@ -132,11 +187,18 @@ def main(argv=None):
                    "beats": spotlights}, fh, indent=2)
 
     # ── STORYBOARD.md — review gate 1 ───────────────────────────
+    kept_note = ""
+    if args.all_steps:
+        kept_note = " (`--all-steps`: every click kept)"
+    elif not marked:
+        kept_note = (" (**no F9 marks found — every click was kept**; prune "
+                     "this table, or re-record and press F9 after the steps "
+                     "that matter)")
     sb = [
         "# Storyboard — %s" % session_name,
         "",
-        "Recorded %s · %d step(s) captured, %d kept as beats."
-        % (header.get("created", "?"), len(steps), len(beats)),
+        "Recorded %s · %d step(s) captured, %d kept as beats.%s"
+        % (header.get("created", "?"), len(steps), len(beats), kept_note),
         "",
         "> **This is review gate 1.** Change it here — reordering a row costs",
         "> seconds; changing your mind after the render costs an hour.",
@@ -145,19 +207,25 @@ def main(argv=None):
         "",
         "**This video teaches _[who]_ that _[one sentence]_.**  ← fill this in",
         "",
-        "| # | Where | What you clicked | Beat says… | Screen |",
-        "|---|-------|------------------|-----------|--------|",
+        "| # | Where | What you clicked | Beat says… | Screen | Spotlight |",
+        "|---|-------|------------------|-----------|--------|-----------|",
     ]
-    for n, where, target, shot in rows:
-        sb.append("| %d | %s | %s | _(to write)_ | `%s` |"
-                  % (n, where, target, shot or "—"))
+    for n, where, target, shot, spot_source, window_kind in rows:
+        spot_desc = {"widget": "on the control",
+                     "click": "at the click point",
+                     "none": "⚠ none"}[spot_source]
+        if window_kind != "main":
+            spot_desc += " · in a %s" % window_kind
+        sb.append("| %d | %s | %s | _(to write)_ | `%s` | %s |"
+                  % (n, where, target, shot or "—", spot_desc))
     sb += [
         "",
         "## Notes",
         "",
         "- Spotlight geometry is taken from the widget you actually clicked",
         "  (`spotlights.json`), so highlights land on the real control rather",
-        "  than being eyeballed against a screenshot.",
+        "  than being eyeballed against a screenshot. Clicks on large canvases",
+        "  fall back to a small box at the exact click point.",
         "- Every factual claim added to a beat gets traced to a source line",
         "  before the composition is built.",
         "",
@@ -177,7 +245,7 @@ def main(argv=None):
         "result looks like, what you would warn a new operator about here.",
         "",
     ]
-    for n, where, target, _shot in rows:
+    for n, where, target, _shot, _spot, _wk in rows:
         nar += ["## %d · %s — %s" % (n, where, target), "", "", ""]
     with io.open(os.path.join(out, "NARRATION.md"), "w",
                  encoding="utf-8") as fh:

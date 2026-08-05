@@ -12,18 +12,28 @@
       any UI change and the video updates with it.
 
       Every claim on screen is checked against live code, NOT README.md
-      (whose Usage section still documents the retired 7-page nav):
+      (whose Usage section still documents the retired 7-page nav).
 
-        sidebar pages + order ...... gui/app.py:1974
-        page gating ................ gui/app.py:1878   (HW Setup AND Settings
-                                     stay enabled; only pages 2–5 lock)
-        HW Setup sub-pages ......... gui/pages/hardware_setup.py:1857-1873
-        Device jog bypasses limits . gui/pages/hardware/stage_panel.py:1021
-        Microscope Go rotates ...... microscope_setup_panel.py:589-595
-        calibration tabs + why ..... gui/pages/calibration.py:10994-11028
-        jog cockpit layout ......... gui/pages/jog_control.py:1-32
-        Print Builder sub-pages .... gui/pages/print_builder.py:184-188
-        workflow tiles + enabled ... gui/pages/workflows/workflow_picker.py:40-120
+      Anchored by SYMBOL first, line second — line numbers drift, and a stale
+      number sends the next reviewer to unrelated code (they already had,
+      by 17 lines, before this pass):
+
+        sidebar pages + order ...... `titles = [...]` in _navigate_to,
+                                     gui/app.py ~1991
+        page gating ................ `_update_page_gating`, gui/app.py ~1895
+                                     (HW Setup AND Settings stay enabled;
+                                     only pages 2–5 lock)
+        HW Setup sub-pages ......... `add_sub_page` calls,
+                                     gui/pages/hardware_setup.py 1857-1873
+        Device jog bypasses limits . `_on_jog_array_z`,
+                                     gui/pages/hardware/stage_panel.py ~1021
+        Xbox row has no Simulate ... gui/pages/hardware/stage_panel.py ~1122
+        calibration tabs + why ..... `_workflow_tabs.addTab` + comments,
+                                     gui/pages/calibration.py 10994-11028
+        jog cockpit layout ......... module docstring,
+                                     gui/pages/jog_control.py 1-32
+        Print Builder sub-pages .... gui/pages/print_builder.py 184-188
+        workflow tiles + enabled ... gui/pages/workflows/workflow_picker.py 40-120
 
       Palette: styles/mocha.css is GENERATED from gui/styles.py by
       tools_export_theme_tokens.py. Do not hand-edit it.
@@ -101,11 +111,15 @@
 
         <!-- step 2 — connect the hardware -->
         <div class="spot s2-spot2" style="left:4.0%; top:9.2%; width:21.8%; height:17.6%"></div>
+        <!-- NOT "every row has Connect and Simulate": the Xbox row spans the
+             Simulate column (stage_panel.py ~1122, "Xbox has no simulator"),
+             and that is visible in the very screenshot under this spotlight. -->
         <div class="callout-card s2-call2" style="left:29%; top:11%">
           <div class="step-num">2</div>
-          Start here: <span class="k">Connect Hardware</span>. Each row has
-          <strong>Connect</strong> for the real device and
-          <strong>Simulate</strong> to work without it.
+          Start here: <span class="k">Connect Hardware</span>.
+          <strong>Connect</strong> talks to the real device;
+          <strong>Simulate</strong> stands in for it so you can work with no
+          hardware attached — every row but Xbox offers both.
         </div>
 
         <!-- step 3 — the safety exception -->
@@ -131,11 +145,14 @@
 
         <!-- step 1 — the tab order is load-bearing -->
         <div class="spot s3-spot1" style="left:27.0%; top:9.6%; width:37.4%; height:3.4%"></div>
+        <!-- Deliberately NOT "work these left to right": that would imply
+             Pump Compliance is step 2 and that Custom is a step. The real,
+             sourced facts are the two dependencies. -->
         <div class="callout-card s3-call1" style="left:27.0%; top:15%; max-width:900px">
           <div class="step-num">1</div>
-          Work these left to right — the order is load-bearing.
+          The tab order encodes real dependencies.
           <span class="k">Plate Location</span> retracts to the Safe Z between
-          wells, so Safe Z must already exist: that is why the reference Z
+          wells, so Safe Z must already exist — that is why the reference Z
           heights live on <span class="k">Needle Location</span>, before it.
         </div>
 
@@ -170,11 +187,16 @@
 
         <!-- step 1 — click the workspace to travel -->
         <div class="spot s4-spot1" style="left:27.0%; top:4.6%; width:37.8%; height:66.6%"></div>
+        <!-- NOT "no controls": the spotlit region contains the Free/Snap
+             toggle, zoom, pan and the plate-view row. jog_control.py's own
+             docstring is the careful version — click-to-travel is the only
+             control in the main area; the canvas has a Free/Snap toggle bar. -->
         <div class="callout-card s4-call1" style="left:66%; top:16%; max-width:600px">
           <div class="step-num">1</div>
-          The main area holds <span class="k">no controls</span> — only live
-          state. Click anywhere on the plate to travel there. It
-          <strong>snaps to wells</strong> unless you switch to Free.
+          This is live state, not a control panel — the one thing you
+          <em>do</em> here is <span class="k">click the plate to travel</span>
+          there. It <strong>snaps to wells</strong> unless you switch the
+          toggle to Free.
         </div>
 
         <!-- step 2 — the Z side view -->
@@ -264,9 +286,11 @@
         </div>
 
         <div class="spot s7-spot2" style="left:3.3%; top:4.1%; width:6.5%; height:2.9%"></div>
+        <!-- The first pill is page-dependent ("Jog" here, "Controls" on
+             Hardware Setup), so name the pattern, not the exact label. -->
         <div class="callout-card s7-call2" style="left:30%; top:55%; max-width:700px">
           <div class="step-num">★</div>
-          Two views, one panel: <span class="k">Jog</span> is the built-in set,
+          Two views, one panel: the first pill is the page's built-in set, and
           <span class="k">Custom</span> is the one you compose yourself.
         </div>
       </div>

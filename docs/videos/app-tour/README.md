@@ -1,6 +1,6 @@
 # MEBP — "Where Everything Lives" (app tour)
 
-A ~94-second orientation video for new operators: what the six sidebar pages
+A ~95-second orientation video for new operators: what the six sidebar pages
 are for, and what order to learn them in. Built with
 [HyperFrames](https://github.com/heygen-com/hyperframes), which renders an HTML
 composition to a deterministic MP4.
@@ -24,7 +24,7 @@ Render explicitly:
 
 ```bash
 npx hyperframes render --quality high --output out/mebp-app-tour.mp4
-npx hyperframes snapshot --at 10,23,36,53,63,75,85,91   # eyeball frames
+npx hyperframes snapshot --at 16.5,31,37,47,62,70,82   # eyeball frames
 ```
 
 ## Files
@@ -85,8 +85,10 @@ first-pass spotlight framed empty canvas.
 
 `styles/mocha.css` is produced from the app's own theme by
 [`tools_export_theme_tokens.py`](../../../tools_export_theme_tokens.py), whose
-single source of truth is `COLORS` in `gui/styles.py`. No hex value is
-hand-written anywhere in this project. After a theme change:
+single source of truth is `COLORS` in `gui/styles.py`. The one literal left is
+the spotlight scrim's `rgba(17,17,27,.82)` — `box-shadow` needs an alpha
+channel — and it carries a `= --mocha-crust at 82%` comment. After a theme
+change:
 
 ```bash
 python tools_export_theme_tokens.py     # from the repo root
@@ -104,8 +106,8 @@ Two claims were corrected during the build after checking the source, and are
 worth not regressing:
 
 - Page gating leaves **Hardware Setup *and* Settings** always enabled
-  (`gui/app.py:1878`); only pages 2–5 lock. An earlier cut said "the rest stay
-  closed".
+  (`_update_page_gating`, `gui/app.py`); only pages 2–5 lock. An earlier cut
+  said "the rest stay closed".
 - Hardware Setup is **not** inert. `stage_panel._on_jog_array_z` jogs Z with
   `bypass_safety=True`, and `microscope_setup_panel._go_filter` /
   `_go_objective` rotate the turrets. An earlier cut said "nothing on this page

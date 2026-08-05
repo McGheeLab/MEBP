@@ -8,7 +8,7 @@ html, body {
   width: 1920px;
   height: 1080px;
   overflow: hidden;
-  background: #000;
+  background: var(--mocha-crust);
 }
 
 /* Roboto is the renderer's bundled font. Naming a system font here (e.g.
@@ -28,8 +28,10 @@ body {
 
 .scene { inset: 0; }
 
-/* Real app capture. The grabs are 2880x1620 — exactly 16:9 — so they fill
-   the frame with no crop. Produced by tools_capture_app_screens.py. */
+/* Real app capture from tools_capture_app_screens.py. The grab is a 1920x1080
+   CLIENT window times the display's devicePixelRatio (2880x1620 at 150%,
+   1920x1080 at 100%) — always 16:9, so it fills the frame with no crop at
+   either density. Never assume the pixel dimensions. */
 .shot {
   position: absolute;
   inset: 0;
@@ -47,6 +49,8 @@ body {
   position: absolute;
   border: 3px solid var(--mocha-mauve);
   border-radius: 12px;
+  /* = --mocha-crust at 82%. Kept as rgba because box-shadow needs an
+     alpha channel; if the theme's crust changes, change this too. */
   box-shadow: 0 0 0 9999px rgba(17, 17, 27, 0.82);
   opacity: 0;
   z-index: 2;

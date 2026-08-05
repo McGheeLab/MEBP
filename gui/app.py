@@ -2294,24 +2294,39 @@ class MainWindow(QMainWindow):
             if self._action_recorder is None:
                 from gui.action_recorder import ActionRecorder
                 self._action_recorder = ActionRecorder(self)
+                # Never record the stop-click on the REC button itself — the
+                # press arrives while still armed (stop fires on release), so
+                # without this every tape ends with a junk final step.
+                self._action_recorder.ignore_widget(self._rec_btn)
                 self._action_recorder.step_recorded.connect(
                     self._on_recorder_step)
+                self._action_recorder.step_marked.connect(
+                    self._on_recorder_mark)
 
             rec = self._action_recorder
             if rec.armed:
                 path = rec.stop()
                 self._rec_btn.setChecked(False)
                 self._rec_btn.setText("● REC")
+                # Release the fixed width reserved while armed.
+                self._rec_btn.setMinimumWidth(0)
+                self._rec_btn.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
                 self._rec_btn.setStyleSheet(self._rec_button_qss(False))
                 self.console.log(
-                    f"Recording stopped — {rec.step_count} step(s) → {path}",
-                    "success")
+                    f"Recording stopped — {rec.step_count} step(s), "
+                    f"{rec.mark_count} marked → {path}", "success")
                 self.console.log(
                     "Build a tutorial from it:  python "
                     "tools_build_tour_from_tape.py \"%s\"" % path, "info")
             else:
                 session = rec.start()
                 self._rec_btn.setChecked(True)
+                # Fix the width for the whole take: the counter must never
+                # relayout the top bar mid-recording (geometry shifts would
+                # land in the captured frames and desync top-bar rects).
+                fm = self._rec_btn.fontMetrics()
+                self._rec_btn.setFixedWidth(
+                    fm.horizontalAdvance("● REC 999 ★99") + s(28))
                 self._rec_btn.setText("● REC 0")
                 self._rec_btn.setStyleSheet(self._rec_button_qss(True))
                 self.console.log(
@@ -2320,10 +2335,30 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error("recorder toggle failed: %s", e, exc_info=True)
             self._rec_btn.setChecked(False)
+            self._rec_btn.setMinimumWidth(0)
+            self._rec_btn.setMaximumWidth(16777215)
             self._rec_btn.setStyleSheet(self._rec_button_qss(False))
+            # Silent-grey-button failure is how an operator loses a 10-minute
+            # take believing it was recorded — say it where they look.
+            try:
+                self.console.log(f"⚠ Recorder failed: {e}", "error")
+            except Exception:
+                pass
 
-    def _on_recorder_step(self, count: int):
-        self._rec_btn.setText(f"● REC {count}")
+    def _on_recorder_step(self, steps: int, marks: int):
+        self._rec_btn.setText(
+            f"● REC {steps} ★{marks}" if marks else f"● REC {steps}")
+
+    def _on_recorder_mark(self, step_index: int):
+        """F9 feedback — the button already re-renders via _on_recorder_step's
+        next tick; this makes the mark itself visible immediately."""
+        rec = self._action_recorder
+        if rec is not None:
+            self._rec_btn.setText(f"● REC {rec.step_count} ★{rec.mark_count}")
+        try:
+            self.console.log(f"★ marked step {step_index}", "success")
+        except Exception:
+            pass
 
     def register_form_row(self, row):
         """Register a FormRow so the top-bar Help toggle controls it.

@@ -70,12 +70,13 @@ Four things, one message:
 
 ## After the first approved video
 
-I freeze it as a HyperFrames **recipe**, so the next one of the same kind
-starts from the proven structure instead of a blank page:
+Ask me to **freeze it as a HyperFrames recipe** — the next one of the same kind
+then starts from the proven structure instead of a blank page.
 
-```bash
-node .agents/skills/media-use/scripts/recipe.mjs freeze --name mebp-walkthrough
-```
+> The freeze script ships with the HyperFrames agent skills, which are **not
+> installed in this repo** (they were installed into a scratchpad during the
+> build). Install them first if you want to run it yourself:
+> `npx skills add heygen-com/hyperframes --full-depth`
 
 ---
 
@@ -83,10 +84,13 @@ node .agents/skills/media-use/scripts/recipe.mjs freeze --name mebp-walkthrough
 
 **● REC** in the top bar, next to Help.
 
-1. Click **● REC**. It turns red and counts steps.
-2. Do the task, at normal pace. Every click is captured with a screenshot.
+1. Click **● REC**. It turns red and shows `● REC <steps> ★<marks>`.
+2. Do the task, at normal pace. Each click is captured with a screenshot —
+   including clicks inside dialogs, ⚙ settings popouts and dropdown menus.
 3. Press **F9** right after any step that matters — that is you saying
-   *"this one is a teaching beat."* Everything else is kept as context.
+   *"this one is a teaching beat."* The ★ count ticks up and the console logs
+   `★ marked step N`, so you can see it landed. Everything else is kept as
+   context.
 4. Click **● REC** again. The console prints the tape path.
 
 Then:
@@ -113,7 +117,24 @@ files and hand them back.
   the recorder must never be the reason the app misbehaves.
 - **Recording costs a window grab per click**, so expect a slight hitch on each
   one. Do not leave it armed during a real print.
-- **Closing the app mid-recording still writes the tape.**
+- **A crash does not lose the take.** Each event is flushed to `tape.jsonl` as
+  it happens, so whatever you had done up to the crash is still readable.
+
+### What it does *not* capture
+
+Worth knowing before you plan a walkthrough around it:
+
+- **Typed values.** Only clicks are recorded. "Set feed rate to 12 mm/s" shows
+  up as a click on the spin box with no value — say the number in
+  `NARRATION.md`. Typed text is also deliberately excluded from the tape for
+  privacy (sample IDs, file paths), so labels never echo what you entered.
+- **Scrolling, dragging, hover.** A drag records only where it started.
+- **The REC chip is in every frame** of the recorded screenshots. Those shots
+  are for planning; the final video is re-captured clean with
+  `tools_capture_app_screens.py`.
+
+Right-clicks *are* distinguished from left-clicks, so a context-menu step will
+not be taught as an ordinary click.
 
 ### If you are not recording
 
