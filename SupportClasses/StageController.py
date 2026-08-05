@@ -5929,6 +5929,7 @@ class StageController:
     def move_pumps_uL(
         self, volumes_uL: dict[str, float], rate_uL_s: float | None = None,
         *, settle: bool = False, abort_event=None,
+        delivered: dict | None = None,
     ) -> bool:
         """Move SEVERAL pumps **simultaneously** in one coordinated Marlin move.
 
@@ -5988,6 +5989,14 @@ class StageController:
                 has physically drained, then dwell ``pump_settle_time_s``.
             abort_event: Optional ``threading.Event``; forwarded to the drain
                 wait so an abort unwinds promptly.
+            delivered: Optional dict, **populated in place** with
+                ``{pump_id: µL actually commanded}`` after soft-limit shortening
+                and the sub-Marlin-step drop. Exists because the bool return
+                cannot express "True, but nothing was delivered" — a caller that
+                must know a prep volume really moved (an unconditioned bore
+                doses AIR) passes a dict and compares. Kept as an out-param
+                rather than a richer return so the documented ``bool`` contract
+                and its tests are untouched.
 
         Returns:
             True when the coordinated move was commanded — or when there was
@@ -6042,7 +6051,12 @@ class StageController:
         deltas: dict[str, float] = {}        # physical letter → raw mm
         per_axis_feed: dict[str, float] = {} # physical letter → own max mm/min
         by_letter: dict[str, str] = {}       # physical letter → pump id
-        delivered: dict[str, float] = {}     # pump id → µL actually commanded
+        # pump id → µL actually commanded. When the caller supplied a dict we
+        # populate THAT one in place, so it sees the same accounting the log does.
+        if delivered is None:
+            delivered = {}
+        else:
+            delivered.clear()
         for pump, volume_uL in requested.items():
             pump_cfg = self._hardware_config.pumps.get(pump)
             if not pump_cfg or not pump_cfg.is_configured:

@@ -1003,6 +1003,18 @@ class LiveTargetPicker(QWidget):
         return self.set_target_position(target_id, x_um, y_um,
                                         provenance=PROV_CONFIRMED)
 
+    @property
+    def cam_idx(self) -> int:
+        """The microscope camera slot this picker maps clicks through.
+
+        Exposed so a HOST page can own the camera's start/stop without keeping
+        its own copy of the ``camera_for_role(MICROSCOPE)`` resolution — two
+        copies drift, and a host that started slot 0 while the picker mapped
+        clicks through slot 2 would silently project them through the wrong
+        µm/px.
+        """
+        return int(self._cam_idx)
+
     def set_hardware_config(self, hw_config):
         """Re-resolve microscope camera + active objective from hw_config."""
         self._hw_config = hw_config

@@ -265,6 +265,8 @@ class _ZoomImageView(QGraphicsView):
     scene_clicked = Signal(QPointF)
     scene_dragged = Signal(QPointF)
     scene_released = Signal(QPointF)
+    #: The operator panned while following, so the view stopped following.
+    follow_broken = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -276,6 +278,11 @@ class _ZoomImageView(QGraphicsView):
         self._interactive_items = False
         self._panning = False
         self._pan_origin = None
+        # v7.9: opt-in follow mode (default OFF, so every existing consumer is
+        # unchanged). While following, the host keeps calling `follow_point` and
+        # the view holds that scene point at its centre — the map-app model.
+        self._following = False
+        self._follow_point: QPointF | None = None
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
@@ -298,6 +305,47 @@ class _ZoomImageView(QGraphicsView):
 
     def interactive_items(self) -> bool:
         return self._interactive_items
+
+    # ── follow mode (v7.9) ────────────────────────────────────────
+
+    def set_follow(self, enabled: bool) -> None:
+        """Hold ``follow_point`` at the view centre until the operator pans.
+
+        ⚠ While following, zoom anchors on the VIEW CENTRE rather than the
+        cursor. Cursor-anchored zoom is the normal behaviour, but it would drag
+        the followed point off-centre — the opposite of "zoom out and still see
+        the edges around where I am".
+        """
+        enabled = bool(enabled)
+        if enabled == self._following:
+            return
+        self._following = enabled
+        self.setTransformationAnchor(
+            QGraphicsView.AnchorViewCenter if enabled
+            else QGraphicsView.AnchorUnderMouse)
+        if enabled and self._follow_point is not None:
+            self.centerOn(self._follow_point)
+
+    def is_following(self) -> bool:
+        return self._following
+
+    def follow_point(self, point: QPointF | None) -> None:
+        """Where the followed thing is now, in scene (mosaic pixel) coords."""
+        self._follow_point = point
+        if self._following and point is not None:
+            self.centerOn(point)
+
+    def _break_follow(self) -> None:
+        """A user pan stops the follow. Detected from the DRAG, deliberately.
+
+        Not from ``scrollContentsBy``/scrollbar changes: ``centerOn`` fires those
+        too, so the view would be fighting its own follow updates.
+        """
+        if not self._following:
+            return
+        self._following = False
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.follow_broken.emit()
 
     def scene_obj(self) -> QGraphicsScene:
         """The scene, so a host can add/remove its own overlay items."""
@@ -411,6 +459,10 @@ class _ZoomImageView(QGraphicsView):
             return
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         self.scale(factor, factor)
+        # Zooming must NOT break the follow — zooming out to see the mosaic
+        # around the current position is the whole point of following.
+        if self._following and self._follow_point is not None:
+            self.centerOn(self._follow_point)
 
     # ── mouse (interactive-items mode only) ───────────────────────
 
@@ -422,6 +474,7 @@ class _ZoomImageView(QGraphicsView):
             self._panning = True
             self._pan_origin = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._break_follow()
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -440,6 +493,11 @@ class _ZoomImageView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # A hand-drag (ScrollHandDrag, left button) is handled by the base class,
+        # so this is the only place to notice it. Dragging IS the unlock gesture.
+        if (self._following and not self._interactive_items
+                and event.buttons() != Qt.MouseButton.NoButton):
+            self._break_follow()
         if self._interactive_items and self._panning and self._pan_origin is not None:
             pos = event.position().toPoint()
             delta = pos - self._pan_origin
@@ -493,9 +551,21 @@ class FluorescenceMosaicWorkflowPage(QWidget):
     mosaic_ready = Signal(str)
 
     def __init__(self, controller, settings, camera_manager=None,
-                 parent: QWidget | None = None, *, embedded: bool = False):
+                 parent: QWidget | None = None, *, embedded: bool = False,
+                 owns_camera: bool = True):
+        """``owns_camera=False``: a HOST page manages the microscope camera.
+
+        Ownership has to be DECLARED, not inferred from who reached the camera
+        first. Qt delivers ``showEvent`` to a **child before its parent**
+        (verified), so an embedded instance sitting on the host's visible tab
+        always won the race — claimed the camera, and then stopped it from its
+        own ``hideEvent`` even though the host was still using it. A host that
+        wants to keep the feed alive across its own tabs, or across a scan,
+        passes False and this page stops touching start/stop entirely.
+        """
         super().__init__(parent)
         self._embedded = bool(embedded)
+        self._owns_camera = bool(owns_camera)
         self._controller = controller
         self._settings = settings
         self._camera_manager = camera_manager
@@ -1073,7 +1143,10 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         try:
             if not self._camera_manager.is_running(cam_idx):
                 self._camera_manager.start(cam_idx)
-                self._camera_started_by_us = True
+                # Only claim it if this page is the owner — otherwise the host's
+                # camera would be stopped from this page's hideEvent.
+                if self._owns_camera:
+                    self._camera_started_by_us = True
         except Exception:
             pass
         if not self._camera_manager.is_um_per_px_calibrated(cam_idx):
@@ -1397,6 +1470,10 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         try:
             if self._camera_view.cam_idx != cam_idx:
                 self._camera_view.set_camera(cam_idx)
+            # The view still binds to the right slot when a host owns the camera
+            # — it just does not start or stop it.
+            if not self._owns_camera:
+                return
             if not self._camera_manager.is_running(cam_idx):
                 self._camera_manager.start(cam_idx)
                 self._camera_started_by_us = True
@@ -1404,6 +1481,8 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             logger.debug("Fluor mosaic camera start failed: %s", e)
 
     def _stop_camera(self):
+        if not self._owns_camera:
+            return
         if (self._camera_manager is None or self._camera_view is None
                 or not self._camera_started_by_us):
             return

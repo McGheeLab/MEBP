@@ -43,16 +43,17 @@ emits :attr:`programs_changed`; it commands no motion and writes no store.
 from __future__ import annotations
 
 import logging
+import math
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
-    QDoubleSpinBox, QPushButton, QScrollArea,
+    QAbstractSpinBox, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QComboBox, QDoubleSpinBox, QMessageBox, QPushButton, QScrollArea,
 )
 
 from gui.scaling import s, sf
 from gui.styles import COLORS
-from gui.widgets.components import Card, FormRow
+from gui.widgets.components import Card, FormRow, ReadinessList
 
 from SupportClasses.PhysicalModels import (
     needle_bore_at, needle_bore_count, needle_bore_offset_um,
@@ -69,7 +70,7 @@ logger = logging.getLogger(__name__)
 #: the combo reads in the sequence the roles actually act in.
 ROLE_LABELS: dict[BoreRole, str] = {
     BoreRole.IDLE: "Idle (unused this run)",
-    BoreRole.PUSH_REAGENT: "Push reagent onto the target",
+    BoreRole.PUSH_REAGENT: "Dose the target with reagent",
     BoreRole.ASPIRATE_TARGET: "Aspirate the target",
     BoreRole.DISPENSE_PLACE: "Dispense at the placement",
 }
@@ -82,6 +83,20 @@ NO_TARGET_TYPE = "(any / untyped)"
 
 #: Sentinel for a bore whose pump the operator has not named.
 NO_PUMP = "(unassigned)"
+
+#: "No declaration has ever been seen for this bore" — distinct from a bore that
+#: declares None, which is a legitimate value. See `_apply_remembered`.
+_UNKNOWN = object()
+
+#: Smallest dose the operator can enter, in nL. Below a picolitre nothing on this
+#: class of hardware moves, and the field's own minimum is a better guard than a
+#: magic zero: the old field accepted 0 to mean "derive from the depth instead",
+#: which is exactly the ambiguity volume-primary entry removes.
+_MIN_DOSE_NL = 0.001
+
+#: nL per µL. The model layer is µL everywhere; this factor appears at the two
+#: boundaries where the operator's number crosses into it, and nowhere else.
+NL_PER_UL = 1000.0
 
 
 def _small(text: str = "", color_key: str = "subtext0") -> QLabel:
@@ -115,8 +130,14 @@ class SetupGroup:
     promoting one is a one-line change and cannot silently drop its label.
     """
 
-    def __init__(self, card: Card):
+    def __init__(self, card: Card, help_rows: list | None = None):
         self._card = card
+        # The FormRows this group builds, so the panel can register them with the
+        # MainWindow's Help toggle. Without that registration every `help_text`
+        # here is DEAD WEIGHT: FormRow hides its help label at construction and
+        # only `MainWindow.register_form_row` ever reveals it, so turning the
+        # top-bar Help toggle on changed nothing at all on this tab.
+        self._help_rows = help_rows if help_rows is not None else []
 
     def add(self, label: str, widget: QWidget,
             help_text: str | None = None) -> QWidget:
@@ -126,7 +147,9 @@ class SetupGroup:
                 text = widget.toolTip() or None
             except Exception:
                 text = None
-        self._card.add_widget(FormRow(label, widget, help_text=text))
+        row = FormRow(label, widget, help_text=text)
+        self._card.add_widget(row)
+        self._help_rows.append(row)
         return widget
 
     def add_widget(self, widget: QWidget) -> QWidget:
@@ -174,30 +197,55 @@ class _BoreRow:
         self.role.setMinimumWidth(s(150))
 
         self.target_type = QComboBox()
-        self.target_type.setToolTip(
+        self._type_tip = (
             "The user-defined class of object this bore services (Target types "
             "below). Recorded intent — the fluorescent-signature rules are not "
             "evaluated against an image yet.")
+        self.target_type.setToolTip(self._type_tip)
         self.target_type.setMinimumWidth(s(130))
 
+        # ⚠ VOLUME-PRIMARY, in nL. A dose is what the operator is choosing; the
+        # column depth is an implementation detail of how it gets metered, and
+        # "0.100 mm through this bore" is not a quantity anyone can reason about.
+        # µL was also the wrong unit: a real dose through a 200 µm bore is
+        # ~0.003 µL, so a 4-decimal µL field printed "0.0031" and a 30 µm bore
+        # printed "0.0001" — indistinguishable from zero.
         self.volume = _dspin(
-            0.0, 1000.0, 0.0, " µL", 4, 0.01,
-            "Reagent volume pushed onto the target. 0 = derive it from this "
-            "bore's own orifice area × the push depth.")
+            _MIN_DOSE_NL, 2_000_000.0, 3.142, " nL", 3, 0.5,
+            "Reagent volume this bore doses onto the target. Capped at what the "
+            "bore itself holds; the column depth beside it is derived from this "
+            "bore's own orifice area.")
+        # Derived, read-only: the number the executor meters with, shown so the
+        # geometry stays visible, but not a second place to type the same dose.
         self.depth = _dspin(
-            0.001, 5.0, 0.10, " mm", 3, 0.05,
-            "Push depth — the reagent column is this bore's orifice area × this "
-            "depth. Ignored when an explicit volume is given.")
+            0.0, 500.0, 0.10, " mm", 4, 0.0,
+            "Column depth this dose corresponds to through this bore's orifice "
+            "— derived from the volume, not typed.")
+        self.depth.setReadOnly(True)
+        self.depth.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.rate = _dspin(
             0.01, 50.0, 0.5, " µL/s", 2, 0.1,
-            "Flow used for this bore's push (⇒ push duration = volume / rate).")
+            "Flow used for this bore's dose (⇒ dose duration = volume / rate). "
+            "Clamped to this bore's own Hagen-Poiseuille ceiling; the readout "
+            "shows the rate that will actually run.")
         self.lead = _dspin(
             0.0, 3600.0, 0.0, " s", 1, 0.5,
-            "Lead time: how long the reagent acts after the push finishes and "
-            "the tool has shifted, before the aspirate starts.")
+            "EXTRA time after the shift, ADDED to the incubation below — the "
+            "full dose→aspirate interval is lead + incubation.")
 
         self.offset = _small()
         self.offset.setMinimumWidth(s(140))
+
+        #: This bore's orifice area (mm²), pushed in by ``_refresh_row_labels``.
+        #: 0 = unknown, in which case the derived depth is simply not shown —
+        #: never guessed, because a guessed area is a wrong metered volume.
+        self._area_mm2: float = 0.0
+
+        #: A legacy profile's ``depth_mm``, held until the bore geometry arrives.
+        #: The migration CANNOT complete at load time: the profile is restored
+        #: before ``set_hardware_config``, so there is no orifice area yet to turn
+        #: a depth into a volume. None = nothing pending.
+        self._legacy_depth_mm: float | None = None
 
         #: The push cells' own tooltips, so re-gating can put them back instead
         #: of leaving the "not used by this role" note on a row that IS pushing.
@@ -210,8 +258,75 @@ class _BoreRow:
         self.role.currentIndexChanged.connect(self._on_role_changed)
         for w in (self.pump, self.target_type):
             w.currentIndexChanged.connect(lambda *_: self._on_change())
-        for w in (self.volume, self.depth, self.rate, self.lead):
+        self.volume.valueChanged.connect(self._on_volume_changed)
+        for w in (self.rate, self.lead):
             w.valueChanged.connect(lambda *_: self._on_change())
+        # `depth` is derived and read-only, so it has no change handler: it is
+        # written by `_sync_depth` and read back by `_collect_programs`.
+
+    # ── volume ⇄ derived depth ────────────────────────────────────
+
+    def _on_volume_changed(self, *_):
+        self._sync_depth()
+        self._on_change()
+
+    def set_orifice_area_mm2(self, area) -> None:
+        """Tell the row this bore's orifice area, then re-derive the depth."""
+        try:
+            self._area_mm2 = max(0.0, float(area or 0.0))
+        except (TypeError, ValueError):
+            self._area_mm2 = 0.0
+        self._sync_depth()
+
+    def _sync_depth(self) -> None:
+        """depth = volume / orifice area, in the executor's own units."""
+        if self._area_mm2 <= 0:
+            self.depth.setSpecialValueText("— (bore Ø unknown)")
+            self.depth.blockSignals(True)
+            self.depth.setValue(0.0)
+            self.depth.blockSignals(False)
+            return
+        self.depth.setSpecialValueText("")
+        mm = (self.volume.value() / NL_PER_UL) / self._area_mm2
+        self.depth.blockSignals(True)
+        self.depth.setValue(min(mm, self.depth.maximum()))
+        self.depth.blockSignals(False)
+
+    def resolve_legacy_depth(self) -> bool:
+        """Turn a pending legacy ``depth_mm`` into a dose, once, when it can be.
+
+        Returns True if a migration actually happened. Called from
+        ``_refresh_row_labels``, i.e. the first moment the bore's orifice area is
+        known. Deliberately one-shot: after this the VOLUME is authoritative, so
+        changing bores holds the dose and re-derives the depth — the whole point
+        of entering a volume.
+        """
+        if self._legacy_depth_mm is None or self._area_mm2 <= 0:
+            return False
+        mm, self._legacy_depth_mm = self._legacy_depth_mm, None
+        if mm <= 0:
+            return False
+        self.set_volume_uL(self._area_mm2 * mm)
+        logger.info("Bore %d: migrated a saved dose depth of %.4f mm to %.3f nL "
+                    "through its own orifice.", self.bore_index + 1, mm,
+                    self.volume.value())
+        return True
+
+    def volume_uL(self) -> float:
+        """The dose in the model's own unit."""
+        return float(self.volume.value()) / NL_PER_UL
+
+    def set_volume_uL(self, uL) -> None:
+        """Write a µL dose into the nL field without re-entering the host."""
+        try:
+            nL = float(uL) * NL_PER_UL
+        except (TypeError, ValueError):
+            return
+        self.volume.blockSignals(True)
+        self.volume.setValue(max(self.volume.minimum(),
+                                 min(nL, self.volume.maximum())))
+        self.volume.blockSignals(False)
+        self._sync_depth()
 
     # ── read ──────────────────────────────────────────────────────
 
@@ -244,12 +359,48 @@ class _BoreRow:
         pushing = self.role_value() is BoreRole.PUSH_REAGENT
         active = self.role_value().is_active
         self.target_type.setEnabled(active)
+        # A disabled control with no explanation reads as broken. The four dose
+        # cells already swapped in a reason; the target-type combo did not.
+        self.target_type.setToolTip(
+            self._type_tip if active else
+            "Only a bore with a role services a class of object — set this "
+            "bore's role first.")
         idle_tip = (
-            "Only a “Push reagent” bore uses these — the aspirate and dispense "
-            "flows are set once for the whole assembly under Reagent push / pull.")
+            "Only a “Dose the target” bore uses these — the aspirate and "
+            "dispense flows are set once for the whole assembly under the "
+            "aspirating bore's column group.")
         for w in (self.volume, self.depth, self.rate, self.lead):
             w.setEnabled(pushing)
             w.setToolTip(self._push_tips[w] if pushing else idle_tip)
+
+    def set_holdup_uL(self, holdup_uL) -> None:
+        """Cap the dose at what this bore physically holds. Takes µL, caps in nL.
+
+        A field whose ceiling is orders of magnitude above the bore's holdup makes
+        a decimal-place slip ask for far more than the bore can contain. The
+        plunger then soft-clamps, which silently SHORTENS the move and breaks the
+        load/dose/pull/dispense volume balance with no report. Skipped when the
+        holdup is unknown — a missing getter must never forbid work.
+        """
+        try:
+            cap_uL = float(holdup_uL)
+        except (TypeError, ValueError):
+            return
+        if cap_uL <= 0:
+            return
+        # ⚠ FLOOR to the field's own precision. `setMaximum` on a 3-decimal spin
+        # box rounds, and a cap that rounds UP is not a cap — it would admit a
+        # dose fractionally larger than the bore holds, which is the very thing
+        # this guards against.
+        q = 10.0 ** self.volume.decimals()
+        cap_nL = math.floor(cap_uL * NL_PER_UL * q) / q
+        current = self.volume.value()
+        self.volume.setMaximum(max(cap_nL, _MIN_DOSE_NL))
+        if current > cap_nL:
+            logger.info(
+                "Bore %d's dose %.3f nL exceeds what the bore holds "
+                "(%.3f nL) — capped.", self.bore_index + 1, current, cap_nL)
+            self._sync_depth()
 
 
 class CellTargetingSetupPanel(QWidget):
@@ -260,6 +411,8 @@ class CellTargetingSetupPanel(QWidget):
     """
 
     programs_changed = Signal()
+    #: The operator asked to go pick targets on the other tab.
+    goto_targets_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -276,6 +429,13 @@ class CellTargetingSetupPanel(QWidget):
         #: from "the assembly was re-wired / a different needle was mounted"
         #: (hardware truth wins) — see :meth:`_apply_remembered`.
         self._declared_pumps: dict[int, str] = {}
+        #: The target type selected in the library list ("" = none).
+        self._selected_tt_id: str = ""
+        #: Every FormRow this panel builds, for the Help toggle.
+        self._help_rows: list = []
+        #: pump id → its own flow ceiling (µL/s), pushed in by the host.
+        #: The panel never reaches for the controller itself.
+        self._flow_ceilings: dict[str, float] = {}
         self._target_types: list = []
         self._rebuilding = False
 
@@ -298,6 +458,10 @@ class CellTargetingSetupPanel(QWidget):
         cols.addLayout(self._left, stretch=3)
         cols.addLayout(self._right, stretch=2)
 
+        # FIRST, because on a half-configured machine it is the only thing that
+        # matters: what to do next, in one place, instead of a disabled button
+        # with no tooltip and a status line that says "Idle."
+        self._left.addWidget(self._build_readiness_card())
         self._left.addWidget(self._build_bore_table_card())
         self._left.addWidget(self._build_target_types_card())
         self._left.addWidget(self._build_trypsin_card())
@@ -305,9 +469,8 @@ class CellTargetingSetupPanel(QWidget):
         # The host's promoted groups land in the right column, under this
         # heading, so the "what/how much/how fast" establishment reads as one
         # block beside the per-bore assignment.
-        self._right.addWidget(_small(
-            "Assembly-wide run parameters. Everything here is saved with the "
-            "workflow profile (⚙ Settings → Save)."))
+        # (No heading paragraph: the groups below are self-titled and "saved
+        # with the profile" is what ⚙ Settings in the header already says.)
         self._right_stretch_added = False
 
         scroll.setWidget(body)
@@ -318,15 +481,24 @@ class CellTargetingSetupPanel(QWidget):
 
     # ── host-filled groups ────────────────────────────────────────
 
-    def add_group(self, title: str) -> SetupGroup:
-        """A card in the right-hand column for the host's promoted fields."""
-        card = Card(title)
+    def add_group(self, title: str, *, collapsible: bool = False,
+                  collapsed: bool = False) -> SetupGroup:
+        """A card in the right-hand column for the host's promoted fields.
+
+        ``collapsible``/``collapsed``: for the settings an operator configures
+        once and then stops reading. Note the widgets inside a collapsed card are
+        STILL PARENTED and still read by ``_current_config`` — collapsing changes
+        what claims vertical space, never what governs a run.
+        """
+        card = Card(title, collapsible=collapsible)
+        if collapsed:
+            card.set_collapsed(True)
         if self._right_stretch_added:
             # Keep the trailing stretch last no matter when a group is added.
             self._right.insertWidget(self._right.count() - 1, card)
         else:
             self._right.addWidget(card)
-        return SetupGroup(card)
+        return SetupGroup(card, self._help_rows)
 
     def finalize(self) -> None:
         """Call once the host has added every group (adds the trailing stretch)."""
@@ -336,27 +508,66 @@ class CellTargetingSetupPanel(QWidget):
 
     # ── per-bore program table ────────────────────────────────────
 
+    # ── readiness ─────────────────────────────────────────────────
+
+    def _build_readiness_card(self) -> Card:
+        """"What to do next" — the checklist plus the jump to the other tab.
+
+        The single most-missing element in this feature was any statement that the
+        workflow's entire input (which cells to remove) lives on a DIFFERENT tab.
+        A first-time operator could complete this whole page and find Start
+        greyed out with no tooltip and no explanation anywhere.
+        """
+        card = Card("Readiness — what to do next")
+        self.readiness_list = ReadinessList()
+        card.add_widget(self.readiness_list)
+
+        self.goto_targets_btn = QPushButton("Pick the cells  →")
+        # The 42-word ordering essay that used to sit under this button is now
+        # its tooltip: the operator asks for it by hovering the thing they are
+        # about to press, instead of reading it every visit forever. The
+        # readiness checklist above already names the NEXT missing step, which is
+        # the part that actually changes.
+        self.goto_targets_btn.setToolTip(
+            "Bring the well into view and click each cell to remove, then a "
+            "placement for each one.\n\n"
+            "Order: needle form + bore geometry (Hardware Setup → Needle) → "
+            "bore offsets (Calibration → Needle Location) → a role per bore "
+            "below → pick the cells.")
+        self.goto_targets_btn.clicked.connect(
+            lambda: self.goto_targets_requested.emit())
+        card.add_widget(self.goto_targets_btn)
+        return card
+
     def _build_bore_table_card(self) -> Card:
         card = Card("Needle assembly — one program per bore")
-        card.add_widget(_small(
+        card.setToolTip(
             "One row per bore of the configured assembly (Hardware Setup → "
             "Needle). Give each bore a role; the run order is derived "
-            "(push → aspirate → dispense)."))
+            "(push → aspirate → dispense), so there is nothing to misorder.")
 
         holder = QWidget()
         self._grid = QGridLayout(holder)
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setHorizontalSpacing(s(8))
         self._grid.setVerticalSpacing(s(6))
+        # ⚠ "Dose", not "Push". The right-hand column has its OWN "Push depth"
+        # (the ASPIRATING bore's reagent column), and two live controls with the
+        # same label, the same units and different meanings, 15 cm apart, is not a
+        # naming nit — it is a wrong-number-entered-in-the-wrong-field waiting to
+        # happen. "Dose" = what the dosing bore ejects onto the cell;
+        # "push/pull" = the aspirating bore's column and extraction.
         headers = ("Bore", "Pump", "Role", "Target type",
-                   "Push volume", "Push depth", "Push flow", "Lead time",
+                   "Dose", "≙ depth", "Dose flow", "Lead time",
                    "Mount offset")
+        self._headers: list[QLabel] = []
         for col, text in enumerate(headers):
             head = QLabel(text)
             head.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
                 f"font-weight: 600;")
             self._grid.addWidget(head, 0, col)
+            self._headers.append(head)
         self._header_row_count = 1
         card.add_widget(holder)
 
@@ -365,9 +576,74 @@ class CellTargetingSetupPanel(QWidget):
             "Hardware Setup → Needle.", "peach")
         card.add_widget(self._bore_empty)
 
+        # Arming a dosing bore is now deliberate (see `_default_role`), so make
+        # the intended workflow ONE click rather than zero — otherwise "safe by
+        # default" just becomes "hard to use".
+        self._arm_dose_row = QWidget()
+        arm = QHBoxLayout(self._arm_dose_row)
+        arm.setContentsMargins(0, 0, 0, 0)
+        arm.setSpacing(s(8))
+        self._arm_dose_btn = QPushButton("")
+        self._arm_dose_btn.setToolTip(
+            "Give this bore the dosing role: it loads reagent from its own well, "
+            "doses the cell, then the tool shifts so the aspirating bore is over "
+            "the same cell. The aspirating bore then loads nothing.")
+        self._arm_dose_btn.clicked.connect(self._arm_dosing_bore)
+        arm.addWidget(self._arm_dose_btn)
+        arm.addStretch(1)
+        self._arm_dose_row.setVisible(False)
+        card.add_widget(self._arm_dose_row)
+
         self._bore_notes = _small("")
         card.add_widget(self._bore_notes)
+
+        # Help-mode substitute for per-cell FormRows (see set_help_mode).
+        self._help_legend = _small(
+            "Bore — one lumen of the assembly, with its measured geometry. "
+            "Pump — the syringe that feeds it. "
+            "Role — what it does this run; the order is derived "
+            "(dose → aspirate → dispense), so there is nothing to misorder. "
+            "Target type — the class of object it services (recorded intent; "
+            "nothing detects it yet). "
+            "Dose, ≙ depth, Dose flow and Lead time — used only by a DOSING "
+            "bore. Type the dose as a volume in nL; the depth beside it is the "
+            "column that corresponds to through this bore's own orifice, and is "
+            "derived rather than typed. The lead time is ADDED to the "
+            "incubation. Mount offset — this bore's measured lateral offset from "
+            "bore 1, without which it is driven to bore 1's position.")
+        self._help_legend.setVisible(False)
+        card.add_widget(self._help_legend)
         return card
+
+    def _arm_dosing_bore(self) -> None:
+        """Give the first idle non-datum bore the dosing role."""
+        for row in self._rows:
+            if row.bore_index == 0:
+                continue
+            if row.role.currentData() == BoreRole.IDLE.value:
+                idx = row.role.findData(BoreRole.PUSH_REAGENT.value)
+                if idx >= 0:
+                    row.role.setCurrentIndex(idx)   # fires _on_row_changed
+                return
+
+    def _refresh_arm_dose_row(self) -> None:
+        """Offer the one-click arm only when it is actually available."""
+        if not hasattr(self, "_arm_dose_row"):
+            return
+        candidate = None
+        has_doser = False
+        for row in self._rows:
+            data = row.role.currentData()
+            if data == BoreRole.PUSH_REAGENT.value:
+                has_doser = True
+            elif (row.bore_index != 0 and data == BoreRole.IDLE.value
+                  and candidate is None):
+                candidate = row.bore_index
+        show = (len(self._rows) >= 2) and not has_doser and candidate is not None
+        self._arm_dose_row.setVisible(show)
+        if show:
+            self._arm_dose_btn.setText(
+                f"Use bore {candidate + 1} to dose the reagent")
 
     def set_pump_ids(self, pump_ids) -> None:
         """The enabled+configured pump ids, for every row's Pump combo."""
@@ -378,6 +654,44 @@ class CellTargetingSetupPanel(QWidget):
         """Point the table at a needle assembly (None clears it)."""
         self._needle = needle
         self._rebuild_rows()
+
+    def set_flow_ceilings(self, ceilings) -> None:
+        """Per-pump flow ceilings (µL/s) so a clamped dose flow can be SHOWN.
+
+        ``SafetyLimits.clamp_flow_rate`` hard-clamps to each bore's own
+        Hagen-Poiseuille ceiling and emits only a ``logger.warning``. On a pulled
+        30 µm tip a typed 5 µL/s therefore runs ~100× slower while the readout
+        still says 5.00 — and the operator's lead-time arithmetic is wrong by two
+        orders of magnitude with no sign of it. Quick Print already surfaces this;
+        this panel did not.
+        """
+        clean = {}
+        for pid, v in (ceilings or {}).items():
+            # Strict: a bare MagicMock's __float__ is 1.0 and would fabricate a
+            # 1 µL/s limit for every pump.
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if float(v) > 0:
+                clean[str(pid).strip().upper()] = float(v)
+        self._flow_ceilings = clean
+        self._refresh_notes()
+
+    def flow_ceiling_for(self, pump_id):
+        """This pump's ceiling, or None when unknown."""
+        if not pump_id:
+            return None
+        return self._flow_ceilings.get(str(pump_id).strip().upper())
+
+    def effective_dose_rate(self, pump_id, requested):
+        """The rate that will ACTUALLY run, after the per-bore clamp."""
+        ceiling = self.flow_ceiling_for(pump_id)
+        try:
+            req = float(requested)
+        except (TypeError, ValueError):
+            return None
+        if ceiling is None:
+            return req
+        return min(req, ceiling)
 
     def bore_count(self) -> int:
         return len(self._rows)
@@ -397,16 +711,25 @@ class CellTargetingSetupPanel(QWidget):
         self._refresh_notes()
 
     def _default_role(self, bore_index: int, n_bores: int) -> BoreRole:
-        """Bore 0 aspirates; a second bore doses. Everything else idles.
+        """Bore 0 aspirates. **Everything else idles.**
 
         Bore 0 is the ``needle_origin_um`` datum, so making it the aspirating
         bore means a single-bore assembly (and every pre-v7.9 needle) reproduces
         the legacy sequence with no offsets applied at all.
+
+        ⚠ A second bore used to default to PUSH_REAGENT, which silently ARMED a
+        two-bore dosing sequence — a lateral shift of 100-500 µm performed with
+        the needle ~0.1 mm above the glass, plus a reagent dose onto live cells —
+        the instant the operator switched the needle form, possibly for an
+        unrelated reason, with default numbers they had never seen. Nothing asked
+        them to confirm it.
+
+        Arming it is now one explicit click ("Use bore N to dose the reagent"),
+        which is the same trade the trypsin card already argues for elsewhere:
+        make the safe thing the default and the consequential thing deliberate.
         """
         if bore_index == 0:
             return BoreRole.ASPIRATE_TARGET
-        if bore_index == 1 and n_bores >= 2:
-            return BoreRole.PUSH_REAGENT
         return BoreRole.IDLE
 
     def _rebuild_rows(self, *, remember_first: bool = True) -> None:
@@ -450,8 +773,47 @@ class CellTargetingSetupPanel(QWidget):
                 self._rows.append(row)
         finally:
             self._rebuilding = False
+        self._refresh_column_visibility()
         self._refresh_notes()
         self.programs_changed.emit()
+
+    #: Grid column indices, so "hide the dose columns" is not four magic numbers.
+    _COL_TARGET_TYPE = 3
+    _COL_DOSE = (4, 5, 6, 7)          # dose · ≙ depth · dose flow · lead time
+    _COL_OFFSET = 8
+
+    def _refresh_column_visibility(self) -> None:
+        """Show only the columns that can apply to this configuration.
+
+        ⚠ HIDDEN ≠ UNREAD. ``_collect_programs`` still reads every cell, so each
+        hidden column is justified by the value being unreachable downstream:
+
+        * **Dose columns** — consumed by ``_current_config`` only from the row
+          with the dosing role. With no such row ``trypsin_enabled`` stays False
+          and they never reach the config at all.
+        * **Target type** — an id that is not in the (empty) library resolves to
+          "" exactly as an unset one does.
+        * **Mount offset** — a read-only label on a single-bore assembly, where
+          bore 1 IS the datum and its offset is zero by definition.
+        """
+        header_visible = bool(self._rows)
+        has_types = bool(getattr(self, "_target_types", None))
+        has_dosing = any(r.role_value() is BoreRole.PUSH_REAGENT
+                         for r in self._rows)
+        multi_bore = len(self._rows) > 1
+
+        def show(col: int, visible: bool, widgets) -> None:
+            if col < len(self._headers):
+                self._headers[col].setVisible(visible and header_visible)
+            for w in widgets:
+                w.setVisible(visible)
+
+        show(self._COL_TARGET_TYPE, has_types,
+             [r.target_type for r in self._rows])
+        for col, attr in zip(self._COL_DOSE,
+                             ("volume", "depth", "rate", "lead")):
+            show(col, has_dosing, [getattr(r, attr) for r in self._rows])
+        show(self._COL_OFFSET, multi_bore, [r.offset for r in self._rows])
 
     def _populate_pump_combo(self, row: _BoreRow) -> str:
         """Fill one row's Pump combo; returns the pump the ASSEMBLY declares."""
@@ -466,7 +828,11 @@ class CellTargetingSetupPanel(QWidget):
             # Needle is where a bore's pump is declared.
             if declared:
                 if row.pump.findData(declared) < 0:
-                    row.pump.addItem(declared, declared)
+                    # The assembly names a pump that is not enabled/configured.
+                    # Say so, exactly as Hardware Setup's own bore-pump combo
+                    # does — an unlabelled entry looks like a working choice, and
+                    # driving it fails at prep time with the needle in a well.
+                    row.pump.addItem(f"{declared} (not enabled)", declared)
                 row.pump.setCurrentIndex(row.pump.findData(declared))
         finally:
             row.pump.blockSignals(False)
@@ -512,8 +878,21 @@ class CellTargetingSetupPanel(QWidget):
         # ``_aspirate_pump_id()`` and ``trypsin_bore`` are read straight off this
         # table. Measured before the fix: swapping a P1/P2 backpack for a P2/P3
         # one left the table (and the executed config) on P1/P2.
-        rewired = bool(declared) and declared != self._declared_pumps.get(
-            row.bore_index, declared)
+        #
+        # ⚠ THE SENTINEL IS LOAD-BEARING. `.get(k, declared)` defaulted the
+        # "previously declared" value to the CURRENT one, so "I have never seen a
+        # declaration for this bore" was indistinguishable from "it has not
+        # changed" — and that is exactly the state at STARTUP: the panel is built
+        # with needle=None, `load_last()` restores the saved profile while there
+        # are still zero rows, and the first REAL build therefore finds
+        # `_declared_pumps` empty. Result: across a restart the saved profile's
+        # pump beat the mounted assembly's declaration, so a P2/P3 backpack ran on
+        # P1 — a syringe not plumbed to this needle at all. The in-session swap was
+        # tested; the restart was not. Now an unknown history means HARDWARE WINS,
+        # which is the fail-safe direction. (`_UNKNOWN` rather than None because
+        # None is a legitimate "this bore declares no pump".)
+        known = self._declared_pumps.get(row.bore_index, _UNKNOWN)
+        rewired = bool(declared) and known != declared
         if prog.pump_id and not rewired:
             idx = row.pump.findData(prog.pump_id)
             if idx >= 0:
@@ -528,13 +907,25 @@ class CellTargetingSetupPanel(QWidget):
                 self._declared_pumps.get(row.bore_index), prog.pump_id)
         if prog.target_type_id:
             idx = row.target_type.findData(prog.target_type_id)
+            if idx < 0:
+                # ⚠ PERMANENT-LOSS FIX. An unresolvable id used to be silently
+                # dropped, the row fell back to "(any / untyped)", and the very
+                # next row edit called `_remember_current()` → the profile was
+                # rewritten with `target_type_id: ""`. Renaming one JSON file
+                # therefore ERASED every assignment, with no message. Re-add it as
+                # a placeholder — exactly what `_populate_pump_combo` and the
+                # trypsin reagent already do — so it round-trips instead.
+                label = prog.target_type_name or prog.target_type_id
+                row.target_type.blockSignals(True)
+                row.target_type.addItem(f"{label} (missing)",
+                                        prog.target_type_id)
+                row.target_type.blockSignals(False)
+                idx = row.target_type.findData(prog.target_type_id)
             if idx >= 0:
                 row.target_type.blockSignals(True)
                 row.target_type.setCurrentIndex(idx)
                 row.target_type.blockSignals(False)
-        for widget, value in ((row.volume, prog.volume_uL),
-                              (row.depth, prog.depth_mm),
-                              (row.rate, prog.rate_uL_s),
+        for widget, value in ((row.rate, prog.rate_uL_s),
                               (row.lead, prog.lead_time_s)):
             widget.blockSignals(True)
             try:
@@ -543,6 +934,19 @@ class CellTargetingSetupPanel(QWidget):
                 pass
             finally:
                 widget.blockSignals(False)
+        # ⚠ The dose is stored in µL and entered in nL, and a LEGACY profile may
+        # carry the retired magic zero ("derive it from the depth instead").
+        # Resolve that here, once, rather than leaving a 0 that the volume field's
+        # own minimum would silently promote to 0.001 nL.
+        try:
+            vol_uL = float(prog.volume_uL or 0.0)
+        except (TypeError, ValueError):
+            vol_uL = 0.0
+        if vol_uL <= 0:
+            row._legacy_depth_mm = float(prog.depth_mm or 0.0)
+        else:
+            row._legacy_depth_mm = None
+            row.set_volume_uL(vol_uL)
 
     def _refresh_row_labels(self, row: _BoreRow) -> None:
         """Bore identity + its geometry, and the measured mount offset."""
@@ -552,6 +956,23 @@ class CellTargetingSetupPanel(QWidget):
             summary = bore.summary_line()
         except Exception:
             summary = ""
+        # This bore's own orifice area drives the derived column depth, and its
+        # holdup caps the dose (see set_holdup_uL). Area FIRST, so the cap's
+        # re-derive uses the right geometry.
+        try:
+            from SupportClasses.PhysicalModels import needle_orifice_area_mm2
+            row.set_orifice_area_mm2(needle_orifice_area_mm2(bore))
+        except Exception:
+            logger.debug("could not resolve bore %d's orifice area",
+                         row.bore_index + 1, exc_info=True)
+        try:
+            row.set_holdup_uL(getattr(bore, "internal_volume_uL", None))
+        except Exception:
+            logger.debug("could not cap bore %d's dose volume",
+                         row.bore_index + 1, exc_info=True)
+        # A legacy profile's magic-zero volume becomes a real dose only once the
+        # bore geometry is known — which is HERE, not at load time.
+        row.resolve_legacy_depth()
         row.bore_label.setText(
             f"<b>Bore {row.bore_index + 1}</b>"
             f"<br><span style=\"color:{COLORS['subtext0']};"
@@ -572,15 +993,19 @@ class CellTargetingSetupPanel(QWidget):
             # An unmeasured offset does not fail loudly at run time — the bore
             # simply lands on bore 0's position, i.e. 100-500 µm off the cell.
             # That is larger than the cell, so it has to be visible here.
-            row.offset.setText("⚠ offset not measured")
+            row.offset.setText("⚠ not measured — Calibration → Needle Location")
             row.offset.setStyleSheet(
                 f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+            # NAME THE PAGE. Every other pointer on this panel sends the operator
+            # to Hardware Setup, so "measure the bore offsets" without a
+            # destination sent them hunting in the wrong place.
             row.offset.setToolTip(
                 "This bore has no measured lateral offset from bore 1, so it "
                 "would be driven to bore 1's position — typically 100-500 µm "
-                "off the target. Measure the bore offsets after every needle "
-                "change or re-seat (the assembly's rotation in the holder is "
-                "arbitrary).")
+                "off the target.\n\n"
+                "Measure them on Calibration → Needle Location. They must be "
+                "re-measured after every needle change or re-seat, because a "
+                "fused assembly's rotation in the holder is arbitrary.")
             return
         text = f"Δ {ox:+.0f}, {oy:+.0f} µm"
         if dz:
@@ -596,6 +1021,9 @@ class CellTargetingSetupPanel(QWidget):
         if self._rebuilding:
             return
         self._remember_current()
+        # Arming or disarming a dosing bore is what makes the four dose columns
+        # apply or not, so the table has to re-narrow on a role change.
+        self._refresh_column_visibility()
         self._refresh_notes()
         self.programs_changed.emit()
 
@@ -623,7 +1051,12 @@ class CellTargetingSetupPanel(QWidget):
                 # later rename / delete cannot relabel a recorded run.
                 target_type_name=(tt.label if tt is not None else ""),
                 target_type_color=(tt.color if tt is not None else ""),
-                volume_uL=float(row.volume.value()),
+                # THE ONE nL→µL boundary. Every model field downstream is µL.
+                volume_uL=row.volume_uL(),
+                # Derived from that same volume, so the two can never disagree
+                # about the dose — which is what mattered, since the executor
+                # prefers `trypsin_volume_uL` while `release_depth_mm` wins on
+                # the aspirating side.
                 depth_mm=float(row.depth.value()),
                 rate_uL_s=float(row.rate.value()),
                 lead_time_s=float(row.lead.value()),
@@ -657,6 +1090,37 @@ class CellTargetingSetupPanel(QWidget):
         row.addWidget(_small(
             "A target type is a user-defined class of object plus its "
             "fluorescent-signature rule."), stretch=1)
+        # v7.9 (post-audit): target types were authorable ONLY by hand-editing
+        # JSON. `save_user`/`delete_user` existed and were called from nowhere in
+        # the GUI. Same button set and the same built-in protections as the
+        # well-type / needle-type preset editors.
+        self._tt_new_btn = QPushButton("＋ New…")
+        self._tt_new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tt_new_btn.setToolTip("Author a new target type.")
+        self._tt_new_btn.clicked.connect(self._new_target_type)
+        row.addWidget(self._tt_new_btn)
+
+        self._tt_edit_btn = QPushButton("✎ Edit…")
+        self._tt_edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tt_edit_btn.setToolTip(
+            "Edit the selected type. Editing a built-in saves your version as an "
+            "override — the built-in itself stays intact.")
+        self._tt_edit_btn.clicked.connect(self._edit_selected_target_type)
+        row.addWidget(self._tt_edit_btn)
+
+        self._tt_dup_btn = QPushButton("⧉ Duplicate…")
+        self._tt_dup_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tt_dup_btn.setToolTip("Start a new type from the selected one.")
+        self._tt_dup_btn.clicked.connect(self._duplicate_selected_target_type)
+        row.addWidget(self._tt_dup_btn)
+
+        self._tt_del_btn = QPushButton("🗑 Delete")
+        self._tt_del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tt_del_btn.setToolTip(
+            "Delete one of YOUR types. Built-ins cannot be deleted.")
+        self._tt_del_btn.clicked.connect(self._delete_selected_target_type)
+        row.addWidget(self._tt_del_btn)
+
         reload_btn = QPushButton("⟳ Reload")
         reload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         reload_btn.setToolTip(
@@ -678,31 +1142,57 @@ class CellTargetingSetupPanel(QWidget):
         # not just in a docstring, because a type picker that looks like a
         # detector would be trusted as one.
         note = _small(
-            "⚠ Recorded intent only: these rules are saved and shown, but "
-            "nothing selects objects from a fluorescence image from them yet. "
-            "Choose the removal targets by clicking them.", "peach")
+            "⚠ Recorded intent only — nothing detects these yet. Pick the "
+            "cells by clicking them.", "peach")
+        note.setToolTip(
+            "The signature rules are saved and shown, but nothing selects "
+            "objects from a fluorescence image using them. Choose the removal "
+            "targets by clicking each cell.")
         card.add_widget(note)
         return card
 
     def reload_target_types(self) -> None:
-        """Re-read the store and refresh the list + every row's combo."""
+        """Re-read the store and refresh the list + every row's combo.
+
+        ⚠ A transient failure must NOT empty the list. It used to set
+        ``self._target_types = []`` on any exception, so one unreadable config dir
+        made the card read "No target types defined yet" with three built-ins
+        sitting on disk — an actively false statement, whose real reason went to a
+        debug log the operator will never see.
+        """
+        self._load_errors = []
         try:
             from SupportClasses.TargetTypeStore import get_store
             store = get_store()
             store.reload()
             self._target_types = list(store.all())
+            self._load_errors = list(getattr(store, "load_errors", []) or [])
         except Exception as exc:
-            logger.debug("target type store unavailable: %s", exc)
-            self._target_types = []
+            logger.warning("target type store unavailable: %s", exc, exc_info=True)
+            # KEEP whatever we had. Report the failure instead of pretending the
+            # library is empty.
+            self._load_errors = [("(target-type library)", str(exc))]
         self._refresh_types_list()
         for row in self._rows:
             keep = row.target_type_id()
+            keep_label = row.target_type.currentText()
             self._populate_type_combo(row)
             idx = row.target_type.findData(keep)
+            if idx < 0 and keep:
+                # Same reasoning as `_apply_remembered`: keep the assignment
+                # visible as "(missing)" rather than silently discarding it.
+                label = keep_label.replace(" (missing)", "")
+                row.target_type.blockSignals(True)
+                row.target_type.addItem(f"{label} (missing)", keep)
+                row.target_type.blockSignals(False)
+                idx = row.target_type.findData(keep)
             if idx >= 0:
                 row.target_type.blockSignals(True)
                 row.target_type.setCurrentIndex(idx)
                 row.target_type.blockSignals(False)
+        # The first authored type makes the column apply; deleting the last one
+        # makes it stop applying.
+        self._refresh_column_visibility()
 
     def _target_type_by_id(self, type_id: str):
         if not type_id:
@@ -719,11 +1209,21 @@ class CellTargetingSetupPanel(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        if not self._target_types:
+        for name, reason in (getattr(self, "_load_errors", None) or []):
             self._types_body.addWidget(_small(
-                "No target types defined yet — add JSON files under "
-                "config/hardware/target_types/user/."))
+                f"⚠ {name} could not be read: {reason}", "peach"))
+        if not self._target_types:
+            if getattr(self, "_load_errors", None):
+                self._types_body.addWidget(_small(
+                    "No target types loaded — fix the file(s) above, then Reload.",
+                    "peach"))
+            else:
+                self._types_body.addWidget(_small(
+                    "No target types defined yet — use ＋ New… to create one."))
             return
+        if getattr(self, "_load_errors", None):
+            self._types_body.addWidget(_small(
+                f"Showing the {len(self._target_types)} type(s) that did load."))
         try:
             from SupportClasses.FluorescenceMosaicStore import CHANNELS
         except Exception:
@@ -749,16 +1249,132 @@ class CellTargetingSetupPanel(QWidget):
                 # on this rig today, and the authored rule stays intact.
                 text += f"  ⚠ unknown imaging channel(s): {', '.join(unknown)}"
             h.addWidget(_small(text, "peach" if unknown else "text"), stretch=1)
+            if tt.builtin:
+                h.addWidget(_small("built-in", "overlay0"))
+            # Click to select, double-click to edit — the same affordance the
+            # other preset libraries in this app use.
+            row.setCursor(Qt.CursorShape.PointingHandCursor)
+            row.mousePressEvent = (
+                lambda _e, tid=tt.id: self._select_target_type(tid))
+            row.mouseDoubleClickEvent = (
+                lambda _e, tid=tt.id: (self._select_target_type(tid),
+                                       self._edit_selected_target_type()))
+            if tt.id == getattr(self, "_selected_tt_id", ""):
+                row.setStyleSheet(
+                    f"background: {COLORS['surface1']}; border-radius: {s(3)}px;")
             self._types_body.addWidget(row)
+        self._refresh_tt_buttons()
+
+    def _select_target_type(self, type_id: str) -> None:
+        self._selected_tt_id = str(type_id or "")
+        self._refresh_types_list()
+
+    def _selected_target_type(self):
+        return self._target_type_by_id(getattr(self, "_selected_tt_id", ""))
+
+    def _refresh_tt_buttons(self) -> None:
+        tt = self._selected_target_type()
+        for btn in (getattr(self, "_tt_edit_btn", None),
+                    getattr(self, "_tt_dup_btn", None)):
+            if btn is not None:
+                btn.setEnabled(tt is not None)
+        if getattr(self, "_tt_del_btn", None) is not None:
+            # A built-in is never deletable — your version SHADOWS it instead.
+            deletable = tt is not None and not tt.builtin
+            self._tt_del_btn.setEnabled(deletable)
+            self._tt_del_btn.setToolTip(
+                "Built-ins cannot be deleted — edit one to save your own "
+                "override instead." if (tt is not None and tt.builtin)
+                else "Delete the selected target type.")
+
+    def _tt_store(self):
+        try:
+            from SupportClasses.TargetTypeStore import get_store
+            return get_store()
+        except Exception:
+            logger.warning("target type store unavailable", exc_info=True)
+            return None
+
+    def _open_target_type_dialog(self, tt=None, prefill=None) -> None:
+        store = self._tt_store()
+        if store is None:
+            return
+        try:
+            from gui.dialogs.target_type_dialog import TargetTypeDialog
+        except Exception:
+            logger.exception("could not open the target type editor")
+            return
+        dlg = TargetTypeDialog(
+            self, target_type=tt, store=store, prefill=prefill,
+            existing_ids=[t.id for t in self._target_types])
+        if dlg.exec() and dlg.result_type is not None:
+            self._selected_tt_id = dlg.result_type.id
+            self.reload_target_types()
+            self.programs_changed.emit()
+
+    def _new_target_type(self) -> None:
+        self._open_target_type_dialog(None)
+
+    def _edit_selected_target_type(self) -> None:
+        tt = self._selected_target_type()
+        if tt is not None:
+            self._open_target_type_dialog(tt)
+
+    def _duplicate_selected_target_type(self) -> None:
+        tt = self._selected_target_type()
+        if tt is None:
+            return
+        # Opened as NEW with the source's rule pre-filled, so it derives a FRESH
+        # id from the new name. Reusing the original's id would silently overwrite
+        # the type every already-assigned bore points at.
+        self._open_target_type_dialog(None, prefill=tt)
+
+    def _delete_selected_target_type(self) -> None:
+        tt = self._selected_target_type()
+        if tt is None or tt.builtin:
+            return
+        store = self._tt_store()
+        if store is None:
+            return
+        # Name the consequence for bores already using it. This is only TRUE
+        # because a missing id is now kept as "(missing)" rather than erased.
+        users = [f"Bore {p.bore_index + 1}" for p in self._collect_programs()
+                 if p.target_type_id == tt.id]
+        extra = ""
+        if users:
+            who = ", ".join(users)
+            verb = "uses" if len(users) == 1 else "use"
+            extra = ("\n\n"
+                     f"{who} currently {verb} it. Deleting it leaves that "
+                     f"assignment recorded as “(missing)” rather than "
+                     f"clearing it.")
+        btn = QMessageBox.question(
+            self, "Delete target type",
+            f"Delete “{tt.label}”?{extra}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if btn != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            store.delete_user(tt.id)
+        except Exception as exc:
+            logger.exception("delete_user failed")
+            QMessageBox.critical(
+                self, "Could not delete",
+                f"Deleting “{tt.label}” failed:\n{exc}")
+            return
+        self._selected_tt_id = ""
+        self.reload_target_types()
+        self.programs_changed.emit()
 
     # ── trypsin bore ──────────────────────────────────────────────
 
     def _build_trypsin_card(self) -> Card:
-        card = Card("Trypsin bore — reagent well")
-        card.add_widget(_small(
-            "Give a bore the “Push reagent onto the target” role above; its push "
-            "volume, flow and lead time are that row's own cells. This card only "
-            "says WHERE that bore refills."))
+        card = Card("Dosing bore — where it refills")
+        card.setToolTip(
+            "Give a bore the “Dose the target with reagent” role in the table "
+            "above; its dose, flow and lead time are that row's own cells. This "
+            "card only says WHERE that bore refills.")
         self.trypsin_reagent = QComboBox()
         self.trypsin_reagent.setMinimumWidth(s(180))
         self.trypsin_reagent.setToolTip(
@@ -772,13 +1388,15 @@ class CellTargetingSetupPanel(QWidget):
         self.trypsin_status = _small("")
         card.add_widget(self.trypsin_status)
 
-        # Not a disabled control: an "overlap" checkbox greyed out would read as
-        # "coming soon". The geometry forbids it outright.
-        card.add_widget(_small(
+        # Still NOT a disabled control — a greyed "overlap" checkbox would read
+        # as "coming soon" when the geometry forbids it outright. But the
+        # explanation is a tooltip now rather than a permanent paragraph: it
+        # answers a question nobody asks until they go looking for the control.
+        self.trypsin_status.setToolTip(
             "There is no “start aspirating before the push ends” option: the "
-            "pushing bore and the aspirating bore are laterally offset, so the "
+            "dosing bore and the aspirating bore are laterally offset, so the "
             "tool has to travel between the push and the pull. They are never "
-            "over the target at the same time."))
+            "over the target at the same time.")
         return card
 
     def set_reagent_choices(self, names, *, preferred: str | None = None) -> None:
@@ -800,6 +1418,46 @@ class CellTargetingSetupPanel(QWidget):
     def trypsin_reagent_name(self) -> str:
         return self.trypsin_reagent.currentData() or ""
 
+    def register_help_rows(self) -> None:
+        """Register this panel's FormRows with the MainWindow's Help toggle.
+
+        Copied from ``WorkflowSettingsDialog._note_help_row``: walk up the parent
+        chain for a callable ``register_form_row``, best-effort.
+
+        ⚠ MUST be called from the host's ``showEvent``, not from ``__init__``: the
+        panel is parented to the page before the page is in the window, so a
+        construction-time walk finds nothing. ``register_form_row`` de-duplicates,
+        so repeat calls are free.
+        """
+        w = self.parent()
+        seen = 0
+        while w is not None and seen < 12:
+            reg = getattr(w, "register_form_row", None)
+            if callable(reg):
+                for row in self._help_rows:
+                    try:
+                        reg(row)
+                    except Exception as exc:
+                        logger.debug("register_form_row failed: %s", exc)
+                return
+            w = w.parent()
+            seen += 1
+
+    def set_help_mode(self, visible: bool) -> None:
+        """Reveal/hide the bore-table column legend.
+
+        The table's cells CANNOT be FormRows — they share one QGridLayout so the
+        columns line up across bores, and per-row FormRows give a ragged table —
+        so help mode gets an honest substitute: one paragraph explaining the nine
+        columns.
+        """
+        if hasattr(self, "_help_legend"):
+            self._help_legend.setVisible(bool(visible))
+
+    def target_types(self) -> list:
+        """The target types currently loaded (a copy — callers must not mutate)."""
+        return list(self._target_types)
+
     def set_trypsin_status(self, text: str, color_key: str = "subtext0") -> None:
         self.trypsin_status.setText(text)
         self.trypsin_status.setStyleSheet(
@@ -813,7 +1471,15 @@ class CellTargetingSetupPanel(QWidget):
         Following the house convention: advise, and hard-block only the
         physically impossible. Each note names the bore in the 1-based form the
         table and the turret both use.
+
+        Returns ``[]`` when there is no assembly at all: with no needle there is
+        nothing to validate, the empty-state label already says what to do, and
+        printing "⚠ No bore is set to aspirate — bore 1 will be used" beside "No
+        needle configured yet" is nonsense — the kind that makes an operator stop
+        trusting the warnings that matter.
         """
+        if self._needle is None or not self._rows:
+            return []
         progs = self._collect_programs()
         notes: list[str] = []
 
@@ -875,9 +1541,44 @@ class CellTargetingSetupPanel(QWidget):
                     f"Bore {p.bore_index + 1} has no measured offset from bore "
                     "1, so it will be driven to bore 1's position (typically "
                     "100-500 µm off the target).")
+        # The dose flow is silently clamped to each bore's own Hagen-Poiseuille
+        # ceiling. Naming the LEAD-TIME consequence is the point: the clamp alone
+        # is not the harm, the operator's timing arithmetic being wrong by two
+        # orders of magnitude is.
+        for p in push:
+            ceiling = self.flow_ceiling_for(p.pump_id)
+            requested = float(p.rate_uL_s or 0.0)
+            if ceiling and requested > ceiling:
+                notes.append(
+                    f"Bore {p.bore_index + 1}'s dose flow {requested:.2f} µL/s "
+                    f"exceeds this bore's flow ceiling ({ceiling:.3f} µL/s) — it "
+                    f"will be auto-limited to {ceiling:.3f} µL/s, so the dose "
+                    f"takes {requested / ceiling:.0f}× longer than the lead time "
+                    f"assumes.")
+        # A dose bigger than the bore holds cannot be delivered: the plunger
+        # clamps, which silently breaks the volume balance.
+        for p in push:
+            bore = needle_bore_at(self._needle, p.bore_index)
+            holdup = getattr(bore, "internal_volume_uL", None)
+            vol = float(p.volume_uL or 0.0)
+            if isinstance(holdup, (int, float)) and holdup > 0 and vol > holdup:
+                notes.append(
+                    f"Bore {p.bore_index + 1}'s dose volume {vol:.4f} µL exceeds "
+                    f"what the bore holds ({float(holdup):.4f} µL) — the plunger "
+                    f"will clamp and the volume balance will break.")
         return notes
 
     def _refresh_notes(self) -> None:
+        self._refresh_arm_dose_row()
+        # With no needle there is nothing to validate, and the empty-state label
+        # already says what to do. Printing "⚠ No bore is set to aspirate — bore 1
+        # will be used" beside "No needle configured yet" is nonsense, and the kind
+        # of thing that makes an operator stop trusting the warnings that matter.
+        if self._needle is None or not self._rows:
+            self._bore_notes.setText("")
+            self._bore_notes.setVisible(False)
+            return
+        self._bore_notes.setVisible(True)
         notes = self.validation_notes()
         if not notes:
             active = self.active_bore_indices()
@@ -909,11 +1610,33 @@ class CellTargetingSetupPanel(QWidget):
             "bore_programs": [self._remembered[k]
                               for k in sorted(self._remembered)],
             "trypsin_reagent": self.trypsin_reagent_name(),
+            # WHICH assembly those programs were authored against. Without this,
+            # a restart cannot tell a re-wired assembly from an unchanged one and
+            # the saved pumps win — see `_apply_remembered`'s sentinel note.
+            "assembly_fingerprint": {
+                "bore_count": len(self._rows),
+                "declared_pumps": {str(k): v
+                                   for k, v in self._declared_pumps.items()},
+            },
         }
 
     def apply_state(self, state) -> None:
         if not isinstance(state, dict):
             return
+        # Restore the fingerprint FIRST: `_rebuild_rows` below consults
+        # `_declared_pumps` to decide whether the assembly was re-wired, so it has
+        # to know what the profile was authored against before it runs.
+        fp = state.get("assembly_fingerprint")
+        if isinstance(fp, dict):
+            declared = fp.get("declared_pumps")
+            if isinstance(declared, dict):
+                restored = {}
+                for k, v in declared.items():
+                    try:
+                        restored[int(k)] = (str(v).strip().upper() if v else None)
+                    except (TypeError, ValueError):
+                        continue
+                self._declared_pumps = restored
         progs = state.get("bore_programs")
         if isinstance(progs, list):
             self._remembered = {}

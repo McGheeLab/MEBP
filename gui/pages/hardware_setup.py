@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
 from pathlib import Path
 from functools import partial
 
@@ -66,8 +67,9 @@ from SupportClasses.PhysicalModels import (
     WELL_TYPES, INK_SUBTYPES, is_service_reagent,
     NEEDLE_TYPE_HYPODERMIC, NEEDLE_TYPE_CAPILLARY,
     TIP_PROFILE_CYLINDER, TIP_PROFILE_CONE,
-    NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK, NEEDLE_FORM_TRIPLE,
-    NEEDLE_FORM_BORE_COUNT,
+    NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK, NEEDLE_FORM_SEPTUM,
+    NEEDLE_FORM_TRIPLE,
+    NEEDLE_FORM_BORE_COUNT, needle_form_bores_are_uniform,
 )
 from SupportClasses.NeedleTypeStore import (
     NeedleType, get_store as get_needle_type_store, safe_id as safe_needle_type_id,
@@ -1086,17 +1088,24 @@ class HardwareSetupPage(ModePage):
         # assembly would vanish with no error).
         needle_lay.addWidget(QLabel("Assembly form:"), 0, 0)
         self._needle_form_combo = QComboBox()
-        self._needle_form_combo.addItem("Single needle (1 bore)", NEEDLE_FORM_SINGLE)
-        self._needle_form_combo.addItem("Backpack (2 bores)", NEEDLE_FORM_BACKPACK)
-        self._needle_form_combo.addItem("Triple (3 bores)", NEEDLE_FORM_TRIPLE)
+        self._needle_form_combo.addItem("Single needle — 1 bore",
+                                        NEEDLE_FORM_SINGLE)
+        self._needle_form_combo.addItem(
+            "Backpack — 2 bores, different sizes", NEEDLE_FORM_BACKPACK)
+        self._needle_form_combo.addItem("Septum — 2 identical bores",
+                                        NEEDLE_FORM_SEPTUM)
+        self._needle_form_combo.addItem("Triple — 3 identical bores",
+                                        NEEDLE_FORM_TRIPLE)
         self._needle_form_combo.setToolTip(
-            "How many needles are bound together in the mounted assembly.\n"
+            "How the mounted assembly is built. This ONE choice decides how much "
+            "geometry you enter:\n"
             "Single: one bore — identical to every pre-v7.9 setup.\n"
-            "Backpack: two needles of DIFFERENT sizes bound together.\n"
-            "Triple: three needles fused together.\n"
-            "Each bore gets its own geometry, its own pump and its own flow "
-            "ceiling below. The form is independent of the needle TYPE (taper) — "
-            "a backpack of two pulled capillaries is a legitimate build.")
+            "Backpack: two needles of DIFFERENT sizes bound together — enter the "
+            "second needle's diameters below; the two share a length.\n"
+            "Septum: two identical bores split by a septum — bore 2 copies bore 1.\n"
+            "Triple: three of the same needle fused — bores 2 and 3 copy bore 1.\n"
+            "Every bore still gets its own pump, its own label and its own "
+            "measured mount offset.")
         self._needle_form_combo.currentIndexChanged.connect(self._on_needle_form_changed)
         needle_lay.addWidget(self._needle_form_combo, 0, 1, 1, 3)
 
@@ -1116,10 +1125,11 @@ class HardwareSetupPage(ModePage):
         # v7.9: on a multi-bore assembly this block edits BORE 1 — the datum bore
         # whose geometry every legacy reader of `needle.id_um` /
         # `cross_section_area_mm2` sees (NeedleSpec mirrors bores[0] onto its flat
-        # fields). Bores 2..N are edited in the per-bore group below, so there is
-        # exactly ONE editor per bore and nothing to keep in sync.
-        self._needle_datum_note = QLabel(
-            "This block configures <b>Bore 1</b> (the calibrated datum bore).")
+        # fields). What the OTHER bores are is decided by the form, right here:
+        # a septum/triple copies this bore, and a backpack takes its second set of
+        # diameters from the row below. Nothing about a bore's geometry is entered
+        # anywhere else on the page, so there is exactly one editor per value.
+        self._needle_datum_note = QLabel("")
         self._needle_datum_note.setWordWrap(True)
         self._needle_datum_note.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
@@ -1153,6 +1163,15 @@ class HardwareSetupPage(ModePage):
         self._cap_row = self._build_capillary_card()
         needle_lay.addWidget(self._cap_row, 4, 0, 1, 4)
 
+        # ── Backpack second needle (v7.9.x) ──
+        # The ONE form whose bores differ, and they differ in DIAMETER only —
+        # two needles bound side by side share a length. So this row asks for
+        # exactly the two numbers that can differ and derives the rest from
+        # bore 1: no second length to contradict the first, and no way to save a
+        # backpack whose bores disagree about how far the tips reach.
+        self._bp_row = self._build_backpack_card()
+        needle_lay.addWidget(self._bp_row, 5, 0, 1, 4)
+
         # v7.9: the bore COUNT is derived from the assembly form — one number,
         # one control. `channels_spin` is kept alive (hidden) as a mirror because
         # `_rebuild_config`, `_rebuild_channel_map_rows` and
@@ -1167,13 +1186,13 @@ class HardwareSetupPage(ModePage):
             "Bores in the assembly — derived from the assembly form above.")
         self.channels_spin.valueChanged.connect(self._on_channels_changed)
         self.channels_spin.setVisible(False)
-        needle_lay.addWidget(self.channels_spin, 5, 0)
+        needle_lay.addWidget(self.channels_spin, 6, 0)
 
         self.needle_info_label = QLabel("Select a needle gauge above")
         self.needle_info_label.setWordWrap(True)
         self.needle_info_label.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
-        needle_lay.addWidget(self.needle_info_label, 6, 0, 1, 4)
+        needle_lay.addWidget(self.needle_info_label, 7, 0, 1, 4)
 
         self._sub_layouts["needle"].addWidget(needle_group)
 
@@ -1193,7 +1212,8 @@ class HardwareSetupPage(ModePage):
 
         # Info label
         self.channel_map_info = QLabel(
-            "Each needle bore must be assigned to a unique enabled pump.")
+            "Each needle bore must be assigned to its own pump. Picking one here "
+            "enables it on the Pump tab — nothing needs setting up there first.")
         self.channel_map_info.setStyleSheet(
             f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         self.channel_map_info.setWordWrap(True)
@@ -1318,7 +1338,8 @@ class HardwareSetupPage(ModePage):
         detect_row.setSpacing(s(10))
         self._btn_detect_live_cams = icon_button(
             "Detect Cameras", "search", object_name="accentBtn",
-            tooltip="Scan for available cameras (OpenCV, ToupCam, Andor, Simulated)")
+            tooltip="Scan for available cameras "
+                    "(OpenCV, ToupCam, Andor, Tucsen, Simulated)")
         self._btn_detect_live_cams.setMinimumWidth(s(170))
         self._btn_detect_live_cams.clicked.connect(self._on_detect_live_cameras)
         detect_row.addWidget(self._btn_detect_live_cams)
@@ -2014,6 +2035,14 @@ class HardwareSetupPage(ModePage):
                     f"Wall: {spec.wall_um} µm")
             else:
                 self.needle_info_label.setText("Select a needle gauge above")
+        # v7.9.x: every bore's geometry is DERIVED from this block (a copy, or
+        # bore 1's length with the second needle's diameters), so a geometry edit
+        # changes what the per-bore rows resolve to — including each bore's own
+        # flow ceiling. Refreshing here is what keeps the echo from claiming a
+        # needle that is no longer configured; the readouts never rebuild the
+        # config, so there is no loop. Guarded, so this is a no-op while the page
+        # is still being built.
+        self._refresh_bore_readouts()
         self._on_config_changed()
 
     def _on_channels_changed(self, value: int):
@@ -2129,6 +2158,72 @@ class HardwareSetupPage(ModePage):
         self._needle_type_preset_combo.currentIndexChanged.connect(
             self._on_needle_type_preset_selected)
         return card
+
+    def _build_backpack_card(self) -> QWidget:
+        """The backpack's SECOND needle — its diameters, and nothing else.
+
+        A backpack is "two needles of different sizes bound together": bound side
+        by side, so they are the same length and only the diameters differ. Asking
+        for a second length would offer the operator a way to describe an assembly
+        that cannot exist, and the descend is planned against the LONGEST bore —
+        so a stray second length is a real Z error, not a cosmetic one.
+        """
+        card = QGroupBox("Backpack — second needle")
+        card.setStyleSheet(self._group_style())
+        lay = QGridLayout(card)
+        lay.setHorizontalSpacing(s(10))
+        lay.setVerticalSpacing(s(6))
+
+        note = QLabel(
+            "Only the <b>diameters</b> differ. Bore 2 is bound alongside bore 1, "
+            "so it takes bore 1's length (and, for a capillary, its barrel).")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
+        lay.addWidget(note, 0, 0, 1, 6)
+
+        # ── hypodermic: one gauge picks both diameters ──
+        self._bp_hypo_row = QWidget()
+        bp_hypo = QHBoxLayout(self._bp_hypo_row)
+        bp_hypo.setContentsMargins(0, 0, 0, 0)
+        bp_hypo.setSpacing(s(10))
+        bp_hypo.addWidget(QLabel("Bore 2 gauge:"))
+        self._bp_gauge_combo = QComboBox()
+        self._bp_gauge_combo.addItem("— same as Bore 1 —", None)
+        for gauge in sorted(self._needle_catalog.keys()):
+            self._bp_gauge_combo.addItem(f"{gauge}G", gauge)
+        self._bp_gauge_combo.setToolTip(
+            "The second needle's gauge — one number, because a gauge fixes both "
+            "the inner and the outer Ø from the ASTM catalog.\n"
+            "Left at 'same as Bore 1' the backpack is two identical needles, "
+            "which is legitimate (and is what a septum is).")
+        self._bp_gauge_combo.currentIndexChanged.connect(self._on_needle_changed)
+        bp_hypo.addWidget(self._bp_gauge_combo)
+        bp_hypo.addStretch(1)
+        lay.addWidget(self._bp_hypo_row, 1, 0, 1, 6)
+
+        # ── capillary: the pulled tip's two diameters ──
+        self._bp_cap_row = QWidget()
+        bp_cap = QGridLayout(self._bp_cap_row)
+        bp_cap.setContentsMargins(0, 0, 0, 0)
+        bp_cap.setHorizontalSpacing(s(10))
+        bp_cap.setVerticalSpacing(s(6))
+        bp_cap.addWidget(QLabel("Bore 2 tip inner Ø:"), 0, 0)
+        self._bp_tip_id_spin = _make_cap_spin("tip_id", self._on_needle_changed)
+        bp_cap.addWidget(self._bp_tip_id_spin, 0, 1)
+        bp_cap.addWidget(QLabel("Tip outer Ø:"), 0, 2)
+        self._bp_tip_od_spin = _make_cap_spin("tip_od", self._on_needle_changed)
+        bp_cap.addWidget(self._bp_tip_od_spin, 0, 3)
+        bp_cap.setColumnStretch(4, 1)
+        lay.addWidget(self._bp_cap_row, 2, 0, 1, 6)
+
+        lay.setColumnStretch(5, 1)
+        card.setVisible(False)
+        return card
+
+    def _backpack_bore2_gauge(self) -> int | None:
+        """Bore 2's gauge, or None for "same as bore 1"."""
+        combo = getattr(self, "_bp_gauge_combo", None)
+        return combo.currentData() if combo is not None else None
 
     def _capillary_geometry(self) -> dict:
         """The six live capillary values, as NeedleType/NeedleSpec kwargs."""
@@ -2257,6 +2352,13 @@ class HardwareSetupPage(ModePage):
         cap = self._needle_type_combo.currentData() == NEEDLE_TYPE_CAPILLARY
         self._hypo_row.setVisible(not cap)
         self._cap_row.setVisible(cap)
+        # v7.9.x: the second needle's diameters follow the SAME taper — the two
+        # halves of one bound assembly, not two independently-shaped needles.
+        if hasattr(self, "_bp_row"):
+            self._bp_row.setVisible(
+                self._current_needle_form() == NEEDLE_FORM_BACKPACK)
+            self._bp_hypo_row.setVisible(not cap)
+            self._bp_cap_row.setVisible(cap)
         # v7.9: a pulled capillary is NO LONGER clamped to one bore — the
         # assembly FORM (how many needles are bound together) is orthogonal to
         # one bore's taper, so a backpack of two pulled capillaries is a
@@ -2289,6 +2391,56 @@ class HardwareSetupPage(ModePage):
         combo = getattr(self, "_needle_form_combo", None)
         return (combo.currentData() if combo is not None else None) or NEEDLE_FORM_SINGLE
 
+    def _uniform_bores(self) -> bool:
+        """True when the selected form's bores all copy the datum bore."""
+        return needle_form_bores_are_uniform(self._current_needle_form())
+
+    @staticmethod
+    def _form_for_bore_count(n_bores: int, needle=None) -> str:
+        """The form to show for a needle whose stored form contradicts its bores.
+
+        Reads the answer off the BORES rather than guessing from the count, which
+        matters at 2: a septum's bores are identical and a backpack's are not, so
+        a legacy ``num_channels: 2`` needle (whose two bores are synthesized
+        identical from the flat fields) restores as a SEPTUM and needs no second
+        geometry — where calling it a backpack would demand a second diameter the
+        file never had.
+        """
+        if n_bores >= 3:
+            return NEEDLE_FORM_TRIPLE
+        if n_bores == 2:
+            try:
+                b0, b1 = list(needle.bores_resolved())[:2]
+                same = (abs(float(b0.orifice_id_um or 0.0)
+                            - float(b1.orifice_id_um or 0.0)) < 1e-6
+                        and abs(float(b0.od_um or 0.0)
+                                - float(b1.od_um or 0.0)) < 1e-6)
+            except Exception:
+                same = False
+            return NEEDLE_FORM_SEPTUM if same else NEEDLE_FORM_BACKPACK
+        return NEEDLE_FORM_SINGLE
+
+    def _needle_form_rule_text(self) -> str:
+        """What the selected form means, in the operator's terms.
+
+        The form is the page's one structural choice, so it has to say what it
+        committed the operator to — otherwise "3 bores" and "one geometry block"
+        look like a missing editor rather than a deliberate copy.
+        """
+        form = self._current_needle_form()
+        if form == NEEDLE_FORM_BACKPACK:
+            return ("<b>Backpack</b> — 2 bores. Bore 1 is configured above; "
+                    "bore 2 takes its <b>diameters</b> from the second-needle "
+                    "row and bore 1's length. Each bore gets its own pump below.")
+        if form == NEEDLE_FORM_SEPTUM:
+            return ("<b>Septum</b> — 2 bores, <b>both identical to bore 1</b>. "
+                    "Only the pump (and the measured mount offset) differs per "
+                    "bore.")
+        if form == NEEDLE_FORM_TRIPLE:
+            return ("<b>Triple</b> — 3 bores, <b>each a copy of bore 1</b>. Only "
+                    "the pump (and the measured mount offset) differs per bore.")
+        return ""
+
     def _on_needle_form_changed(self):
         """Assembly-form combo changed — resize the bore rows, then rebuild.
 
@@ -2299,23 +2451,31 @@ class HardwareSetupPage(ModePage):
         self.channels_spin.blockSignals(True)
         self.channels_spin.setValue(n)
         self.channels_spin.blockSignals(False)
-        self._rebuild_bore_rows()
-        self._rebuild_channel_map_rows()
+        # Visibility first: the backpack row is part of the geometry the rows
+        # below echo, so it has to be right before the readouts are derived.
+        # It rebuilds the bore→pump rows AND the per-bore rows for the new count.
+        self._apply_needle_type_visibility()
         self._on_needle_changed()
 
     def _build_bore_group(self) -> QWidget:
-        """The per-bore geometry group — hidden entirely for a single needle."""
-        self._bore_group = QGroupBox("Bore Geometry (assembly)")
+        """The bore→pump table — hidden entirely for a single needle.
+
+        v7.9.x: geometry is NOT entered here. The assembly form above decides each
+        bore's geometry (a copy of bore 1, or bore 1's length with the second
+        needle's diameters), so this table is one decision per bore: which pump
+        pushes it. Each row echoes the resolved geometry read-only so the operator
+        can see what they wired a pump to.
+        """
+        self._bore_group = QGroupBox("Bore → Pump Assignment")
         self._bore_group.setStyleSheet(self._group_style())
         lay = QVBoxLayout(self._bore_group)
         lay.setSpacing(s(8))
 
         info = QLabel(
-            "One row per bore of the assembly. Bore 1 is the datum bore and is "
-            "configured in <b>Needle Configuration</b> above; bores 2–3 are "
-            "entered here — a backpack fuses needles of <i>different</i> sizes, "
-            "so each bore carries its own geometry, its own pump and its own "
-            "flow ceiling.")
+            "One row per bore: give it a pump. Geometry comes from the assembly "
+            "form above and is shown read-only — a bore cannot be sized twice. "
+            "Two bores may not share a pump: one pump pushes one volume, so the "
+            "second bore would be driven blind.")
         info.setWordWrap(True)
         info.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
         lay.addWidget(info)
@@ -2353,8 +2513,12 @@ class HardwareSetupPage(ModePage):
         return self._bore_group
 
     def _build_bore_row(self, bore_index: int) -> dict:
-        """Widgets for one bore's row. ``bore_index`` is 0-based; the operator
-        sees "Bore N+1" — the numbering ``validate()`` already uses."""
+        """Widgets for one bore's row: a label, a pump, and a read-only echo.
+
+        ``bore_index`` is 0-based; the operator sees "Bore N+1" — the numbering
+        ``validate()`` already uses. There are deliberately NO geometry editors
+        here: the assembly form owns geometry (see :meth:`_build_bore_group`).
+        """
         row = QGroupBox(f"Bore {bore_index + 1}"
                         + (" · datum" if bore_index == 0 else ""))
         row.setStyleSheet(self._group_style())
@@ -2364,7 +2528,7 @@ class HardwareSetupPage(ModePage):
 
         on_change = partial(self._on_bore_row_changed, bore_index)
 
-        # ── line 0: label · pump · needle type ──
+        # ── line 0: label · pump ──
         grid.addWidget(QLabel("Label:"), 0, 0)
         label_edit = QLineEdit()
         label_edit.setPlaceholderText("optional, e.g. trypsin")
@@ -2377,76 +2541,20 @@ class HardwareSetupPage(ModePage):
         grid.addWidget(QLabel("Pump:"), 0, 2)
         pump_combo = QComboBox()
         pump_combo.setToolTip(
-            "The syringe pump that feeds this bore. Two bores cannot share a "
-            "pump — one pump can only push one volume, so the second bore would "
-            "be driven blind.")
+            "The syringe pump that feeds this bore. Every pump is offered here — "
+            "picking one enables it on the Pump tab, so the wiring is a single "
+            "decision made in one place.\n"
+            "Two bores cannot share a pump: one pump can only push one volume, "
+            "so the second bore would be driven blind.")
         # Populated by `_refresh_bore_pump_options`; signal wired after, so the
         # populate can't re-enter the config rebuild.
         grid.addWidget(pump_combo, 0, 3)
 
-        type_combo = QComboBox()
-        type_combo.addItem("Hypodermic (gauge)", NEEDLE_TYPE_HYPODERMIC)
-        type_combo.addItem("Pulled glass capillary", NEEDLE_TYPE_CAPILLARY)
-        type_combo.setToolTip(
-            "This BORE's taper — independent of every other bore's, and "
-            "independent of the assembly form.")
-        if bore_index == 0:
-            # Bore 1's taper is the top block's `_needle_type_combo`; showing a
-            # second control for it would be a divergence waiting to happen.
-            type_combo.setVisible(False)
-        else:
-            grid.addWidget(QLabel("Type:"), 0, 4)
-            grid.addWidget(type_combo, 0, 5)
-
-        # ── line 1: hypodermic geometry ──
-        hypo = QWidget()
-        hypo_lay = QHBoxLayout(hypo)
-        hypo_lay.setContentsMargins(0, 0, 0, 0)
-        hypo_lay.setSpacing(s(10))
-        hypo_lay.addWidget(QLabel("Gauge:"))
-        gauge_combo = QComboBox()
-        gauge_combo.addItem("— Select —", None)
-        for gauge in sorted(self._needle_catalog.keys()):
-            gauge_combo.addItem(f"{gauge}G", gauge)
-        hypo_lay.addWidget(gauge_combo)
-        hypo_lay.addSpacing(s(8))
-        hypo_lay.addWidget(QLabel("Length:"))
-        length_combo = QComboBox()
-        for inches in (1.0, 1.5, 2.0):
-            length_combo.addItem(f'{inches:g}"', inches)
-        hypo_lay.addWidget(length_combo)
-        hypo_lay.addStretch(1)
-        grid.addWidget(hypo, 1, 0, 1, 6)
-
-        # ── line 2: capillary geometry (same table as the single-needle card) ──
-        cap = QWidget()
-        cap_lay = QGridLayout(cap)
-        cap_lay.setContentsMargins(0, 0, 0, 0)
-        cap_lay.setHorizontalSpacing(s(10))
-        cap_lay.setVerticalSpacing(s(6))
-        cap_spins = {}
-        for col, (key, text) in enumerate((
-                ("barrel_id", "Barrel ID:"), ("barrel_od", "Barrel OD:"),
-                ("barrel_len", "Barrel L:"))):
-            cap_lay.addWidget(QLabel(text), 0, col * 2)
-            cap_spins[key] = _make_cap_spin(key, on_change)
-            cap_lay.addWidget(cap_spins[key], 0, col * 2 + 1)
-        for col, (key, text) in enumerate((
-                ("tip_id", "Tip ID:"), ("tip_od", "Tip OD:"),
-                ("tip_len", "Tip L:"))):
-            cap_lay.addWidget(QLabel(text), 1, col * 2)
-            cap_spins[key] = _make_cap_spin(key, on_change)
-            cap_lay.addWidget(cap_spins[key], 1, col * 2 + 1)
-        cap_lay.addWidget(QLabel("Tip profile:"), 2, 0)
-        profile_combo = _make_tip_profile_combo(on_change)
-        cap_lay.addWidget(profile_combo, 2, 1, 1, 3)
-        grid.addWidget(cap, 2, 0, 1, 6)
-
-        # ── line 3: read-only geometry echo (bore 1 only) + physics readout ──
+        # ── line 1: read-only geometry echo ──
         geom_lbl = QLabel("")
         geom_lbl.setWordWrap(True)
         geom_lbl.setStyleSheet(f"color: {COLORS.get('subtext0', '#a6adc8')}; ")
-        grid.addWidget(geom_lbl, 3, 0, 1, 6)
+        grid.addWidget(geom_lbl, 1, 0, 1, 4)
 
         flow_lbl = QLabel("")
         flow_lbl.setWordWrap(True)
@@ -2457,35 +2565,33 @@ class HardwareSetupPage(ModePage):
             "pump over-pressures it and shatters a pulled glass tip.")
         flow_lbl.setStyleSheet(
             f"color: {COLORS.get('green', '#a6e3a1')}; font-weight: 600;")
-        grid.addWidget(flow_lbl, 4, 0, 1, 6)
+        grid.addWidget(flow_lbl, 2, 0, 1, 4)
 
-        grid.setColumnStretch(5, 1)
+        grid.setColumnStretch(3, 1)
 
-        # Signals wired LAST: `_rebuild_bore_rows` seeds these combos right after
+        # Signal wired LAST: `_rebuild_bore_rows` seeds this combo right after
         # building the row, and a seed that re-entered `_on_config_changed` would
         # persist a half-built assembly.
         pump_combo.currentIndexChanged.connect(on_change)
-        type_combo.currentIndexChanged.connect(
-            partial(self._on_bore_type_changed, bore_index))
-        gauge_combo.currentIndexChanged.connect(on_change)
-        length_combo.currentIndexChanged.connect(on_change)
 
         return {
             "widget": row, "label": label_edit, "pump": pump_combo,
-            "type": type_combo, "hypo": hypo, "gauge": gauge_combo,
-            "length": length_combo, "cap": cap, "cap_spins": cap_spins,
-            "profile": profile_combo, "geom": geom_lbl, "flow": flow_lbl,
+            "geom": geom_lbl, "flow": flow_lbl,
         }
 
     def _rebuild_bore_rows(self):
-        """Rebuild the per-bore rows for the selected form.
+        """Rebuild the bore→pump rows for the selected form.
 
-        Existing geometry is PRESERVED across the rebuild, and geometry belonging
-        to bores the new form drops is parked in ``_bore_cache`` so
+        Each row's label + pump are PRESERVED across the rebuild, and those
+        belonging to bores the new form drops are parked in ``_bore_cache`` so
         Triple → Single → Triple is non-destructive. Without that, the
         ``_on_needle_form_changed`` → ``_rebuild_config`` that follows would
         persist whatever the freshly-defaulted widgets happen to say — the same
         silent-destruction shape the bore-count spin used to have.
+
+        v7.9.x: there is no per-row geometry to preserve any more (the form owns
+        it), so what is at stake here is the WIRING — and losing a bore→pump
+        binding is what leaves a fine bore's pump on a coarse bore's flow ceiling.
         """
         if not hasattr(self, "_bore_rows_layout"):
             return
@@ -2522,15 +2628,10 @@ class HardwareSetupPage(ModePage):
             cached = self._bore_cache.pop(k, None)
             if cached:
                 self._set_bore_row_geometry(k, cached)
-            self._apply_bore_row_visibility(k)
-
-        # Bore 1's editors live in the top block; only its label + pump are here.
-        if self._bore_rows:
-            self._bore_rows[0]["hypo"].setVisible(False)
-            self._bore_rows[0]["cap"].setVisible(False)
 
         multi = n > 1
         self._bore_group.setVisible(multi)
+        self._needle_datum_note.setText(self._needle_form_rule_text())
         self._needle_datum_note.setVisible(multi)
         # The per-bore rows are a strict superset of the bore→pump rows, and on a
         # multi-bore assembly `NeedleBore.pump_id` is the authority, so showing
@@ -2540,23 +2641,15 @@ class HardwareSetupPage(ModePage):
             self.channel_map_group.setVisible(not multi)
         self._refresh_bore_readouts()
 
-    def _apply_bore_row_visibility(self, bore_index: int):
-        """Show the geometry block matching this bore's own needle type."""
-        if bore_index >= len(self._bore_rows) or bore_index == 0:
-            return
-        row = self._bore_rows[bore_index]
-        cap = row["type"].currentData() == NEEDLE_TYPE_CAPILLARY
-        row["hypo"].setVisible(not cap)
-        row["cap"].setVisible(cap)
-
-    def _on_bore_type_changed(self, bore_index: int, _idx: int = None):
-        self._apply_bore_row_visibility(bore_index)
-        self._on_bore_row_changed(bore_index)
-
     def _on_bore_row_changed(self, bore_index: int, *_args):
         """A per-bore widget changed."""
         if getattr(self, "_restoring", False):
             return
+        # Claiming a pump here enables it. The operator's decision is "this bore
+        # is fed by P2"; making them repeat it as a checkbox on another tab is how
+        # a bore ends up bound to a pump that never runs — and the binding is what
+        # the per-pump flow ceiling resolves through.
+        self._ensure_claimed_pumps_enabled()
         # The per-bore pump combo is the authority on a multi-bore assembly, so
         # push it into the (now redundant) bore→pump rows before the rebuild
         # reads them. One-directional, single point — no sync loop.
@@ -2564,13 +2657,44 @@ class HardwareSetupPage(ModePage):
         self._refresh_bore_readouts()
         self._on_config_changed()
 
+    def _ensure_claimed_pumps_enabled(self):
+        """Enable every pump a bore claims — never disable one.
+
+        Enable-only on purpose: a bore that loses its pump (or a form that shrinks)
+        must not silently switch off a pump the operator configured for something
+        else.
+        A pump enabled without a syringe is reported by ``validate()`` as
+        "enabled but no syringe", which names the one remaining action instead of
+        hiding the wiring.
+        """
+        want = {str(row["pump"].currentData()).strip().upper()
+                for row in self._bore_rows if row["pump"].currentData()}
+        for pid, pw in self._pump_widgets.items():
+            if pid.strip().upper() in want and not pw.enable_check.isChecked():
+                pw.enable_check.blockSignals(True)
+                pw.enable_check.setChecked(True)
+                pw.enable_check.blockSignals(False)
+                # `toggled` was blocked so this cannot re-enter the config rebuild
+                # already in flight (the widget's `changed` signal lands there);
+                # apply the enable's own side-effects — which sub-controls are
+                # editable — explicitly instead.
+                pw._update_controls()
+                logger.debug("Pump %s enabled: claimed by a needle bore", pid)
+
     def _refresh_bore_pump_options(self):
-        """Re-populate every per-bore pump combo from the ENABLED pumps.
+        """Re-populate every per-bore pump combo with EVERY pump.
+
+        Not just the enabled ones (which is what the legacy bore→pump map offers):
+        the bore→pump wiring is a property of how the needle is plumbed, and the
+        operator should not have to go and enable a pump on another tab before
+        they are allowed to say which bore it feeds. Picking one enables it (see
+        :meth:`_ensure_claimed_pumps_enabled`); until then the row is annotated so
+        the pending action is visible rather than implied.
 
         Seeded from the bore→pump map rows so an assembly that was mapped before
         the per-bore editor existed keeps its assignments.
         """
-        enabled = self._get_enabled_pump_ids()
+        enabled = set(self._get_enabled_pump_ids())
         for k, row in enumerate(self._bore_rows):
             combo = row["pump"]
             current = combo.currentData()
@@ -2579,29 +2703,29 @@ class HardwareSetupPage(ModePage):
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("— Unassigned —", None)
-            for pid in enabled:
-                combo.addItem(pid, pid)
+            for pid in self._pump_widgets:
+                combo.addItem(
+                    pid if pid in enabled else f"{pid} (will be enabled)", pid)
             combo.blockSignals(False)
             if current:
                 self._select_bore_pump(combo, current)
 
     @staticmethod
     def _select_bore_pump(combo: QComboBox, pump_id: str) -> None:
-        """Select ``pump_id`` in a per-bore pump combo, keeping it even when that
-        pump is not currently enabled.
+        """Select ``pump_id`` in a per-bore pump combo, adding it if unknown.
 
-        A bore may legitimately claim a pump the Pump sub-page has not enabled yet
-        (a setup being filled in, or loaded pump-section-last). Dropping the
-        selection there would silently forget which bore that pump feeds — and
-        ``NeedleBore.pump_id`` is the AUTHORITY the per-pump flow ceiling resolves
-        through. Keeping it flagged instead makes ``validate()`` say
-        "Bore N → P3 but P3 is not enabled", which names the operator's next
+        The combo offers every pump this machine has, so the add-it branch is for a
+        pump id the page does not know at all — a hand-edited or newer setup file.
+        Dropping the selection there would silently forget which bore that pump
+        feeds, and ``NeedleBore.pump_id`` is the AUTHORITY the per-pump flow ceiling
+        resolves through, so it is kept and flagged instead: ``validate()`` then
+        says "Bore N → P4 but P4 is not enabled", which names the operator's next
         action rather than losing their wiring.
         """
         idx = combo.findData(pump_id)
         if idx < 0:
             combo.blockSignals(True)
-            combo.addItem(f"{pump_id} (not enabled)", pump_id)
+            combo.addItem(f"{pump_id} (unknown pump)", pump_id)
             idx = combo.count() - 1
             combo.blockSignals(False)
         if combo.currentIndex() != idx:
@@ -2668,80 +2792,75 @@ class HardwareSetupPage(ModePage):
                 continue
             self._select_bore_pump(self._bore_rows[k]["pump"], want)
 
-    # ── per-bore geometry ↔ widgets ───────────────────────────────────
+    # ── per-bore row data ↔ widgets ───────────────────────────────────
+    #
+    # A row carries the two things that are genuinely per-bore and cannot be
+    # derived: the operator's label and the pump. Geometry is NOT here — see
+    # `_build_bore_group` — so there is exactly one editor for every value.
 
     @staticmethod
     def _bore_geometry_is_pristine(g: dict) -> bool:
-        """True when a row holds nothing the operator entered.
-
-        Only the fields that CARRY meaning count: the capillary spins always read
-        back their defaults, so comparing them would mark every untouched
-        hypodermic row as "configured" and turn the shrink warning into noise.
-        """
+        """True when a row holds nothing the operator entered."""
         if not g:
             return True
-        if g.get("label"):
-            return False
-        if g.get("pump_id"):
-            return False
-        if g.get("needle_type") == NEEDLE_TYPE_CAPILLARY:
-            return False
-        return g.get("gauge") is None
+        return not g.get("label") and not g.get("pump_id")
 
     def _bore_row_geometry(self, bore_index: int) -> dict:
         """The live values of one row, as plain data (cacheable / comparable)."""
         if bore_index >= len(self._bore_rows):
             return {}
         row = self._bore_rows[bore_index]
-        g = {
+        return {
             "label": row["label"].text().strip(),
             "pump_id": row["pump"].currentData(),
-            "needle_type": row["type"].currentData() or NEEDLE_TYPE_HYPODERMIC,
-            "gauge": row["gauge"].currentData(),
-            "length_inches": row["length"].currentData() or 1.0,
-            "tip_profile": row["profile"].currentData() or TIP_PROFILE_CYLINDER,
         }
-        for key, spin in row["cap_spins"].items():
-            g[key] = float(spin.value())
-        return g
 
     def _set_bore_row_geometry(self, bore_index: int, g: dict):
         """Push cached/loaded values back into a row without firing handlers."""
         if bore_index >= len(self._bore_rows) or not g:
             return
         row = self._bore_rows[bore_index]
+        row["label"].blockSignals(True)
+        try:
+            row["label"].setText(g.get("label", "") or "")
+        finally:
+            row["label"].blockSignals(False)
+        pump_id = g.get("pump_id")
+        if pump_id:
+            # Keeps a pump the enabled list has not caught up with — dropping the
+            # selection there is how a saved bore→pump binding used to vanish.
+            self._select_bore_pump(row["pump"], pump_id)
 
-        def _blocked(widget, fn):
-            widget.blockSignals(True)
+    def _restore_backpack_bore2(self, saved_bores: list) -> None:
+        """Put a saved backpack's second-needle diameters back in their row.
+
+        Silent on any other form: a septum/triple derives bore 2 from bore 1, so
+        writing a stale gauge into this row would resurface the moment the operator
+        switched to backpack — as a size they never typed.
+        """
+        if self._current_needle_form() != NEEDLE_FORM_BACKPACK:
+            return
+        if len(saved_bores) < 2:
+            return
+        b1 = saved_bores[1]
+
+        combo = self._bp_gauge_combo
+        combo.blockSignals(True)
+        try:
+            idx = combo.findData(getattr(b1, "gauge", None))
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+
+        for spin, value in ((self._bp_tip_id_spin,
+                             getattr(b1, "tip_id_um", None)),
+                            (self._bp_tip_od_spin,
+                             getattr(b1, "tip_od_um", None))):
+            spin.blockSignals(True)
             try:
-                fn()
+                spin.setValue(float(value or 0.0))
             finally:
-                widget.blockSignals(False)
-
-        _blocked(row["label"], lambda: row["label"].setText(g.get("label", "") or ""))
-        for combo_key, data in (("pump", g.get("pump_id")),
-                                ("type", g.get("needle_type")),
-                                ("gauge", g.get("gauge")),
-                                ("profile", g.get("tip_profile"))):
-            combo = row[combo_key]
-            idx = combo.findData(data)
-            if idx >= 0:
-                _blocked(combo, partial(combo.setCurrentIndex, idx))
-        length = g.get("length_inches")
-        if length is not None:
-            combo = row["length"]
-            idx = combo.findData(float(length))
-            if idx < 0:
-                # Same lesson as the single-needle card: a length outside the
-                # presets used to findData(-1) and be silently rewritten.
-                combo.blockSignals(True)
-                combo.addItem(f'{float(length):g}"', float(length))
-                idx = combo.count() - 1
-                combo.blockSignals(False)
-            _blocked(combo, partial(combo.setCurrentIndex, idx))
-        for key, spin in row["cap_spins"].items():
-            if key in g and g[key] is not None:
-                _blocked(spin, partial(spin.setValue, float(g[key])))
+                spin.blockSignals(False)
 
     def _bore_zero_from_ui(self) -> NeedleBore:
         """Bore 1 — geometry from the top block, label + pump from its own row.
@@ -2776,31 +2895,47 @@ class HardwareSetupPage(ModePage):
             gauge=gauge, pump_id=pump, label=label,
         )
 
-    def _bore_from_row(self, bore_index: int) -> NeedleBore:
-        """Bore ``bore_index`` (≥ 1) from its editable row."""
+    def _bore_from_row(self, bore_index: int, datum: NeedleBore | None = None
+                       ) -> NeedleBore:
+        """Bore ``bore_index`` (≥ 1) — DERIVED from the datum bore + the form.
+
+        The form decides how much of the datum carries over:
+
+        * **septum / triple** — everything. Bores 2..N are the same needle.
+        * **backpack** — everything except the DIAMETERS of bore 2, which come
+          from the second-needle row. The length carries over because the two
+          needles are bound side by side, and the descend is planned against the
+          longest bore — so a second, independently-typed length is a Z error
+          waiting to be typed, not a capability.
+
+        Only the label and the pump come from the row itself.
+        """
         g = self._bore_row_geometry(bore_index)
-        if g.get("needle_type") == NEEDLE_TYPE_CAPILLARY:
-            b_id, b_od = g["barrel_id"], g["barrel_od"]
-            tip_od = g.get("tip_od") or 0.0
-            return NeedleBore(
-                id_um=b_id, od_um=b_od,
-                wall_um=max(0.0, (b_od - b_id) / 2.0),
-                length_mm=g["barrel_len"], gauge=None,
-                needle_type=NEEDLE_TYPE_CAPILLARY,
-                tip_id_um=g["tip_id"], tip_length_mm=g["tip_len"],
-                tip_od_um=tip_od if tip_od > 0 else None,
-                tip_profile=g["tip_profile"],
-                pump_id=g["pump_id"], label=g["label"],
-            )
-        gauge = g.get("gauge")
-        spec = self._needle_catalog.get(gauge) if gauge else None
-        return NeedleBore(
-            id_um=spec.id_um if spec else 0.0,
-            od_um=spec.od_um if spec else 0.0,
-            wall_um=spec.wall_um if spec else 0.0,
-            length_mm=float(g.get("length_inches") or 1.0) * 25.4,
-            gauge=gauge, pump_id=g["pump_id"], label=g["label"],
-        )
+        base = datum if datum is not None else self._bore_zero_from_ui()
+        # A copy, so a later mutation of one bore can never reach the datum.
+        bore = replace(base, pump_id=g.get("pump_id"), label=g.get("label", ""),
+                       offset_um=(0.0, 0.0), z_offset_mm=0.0)
+
+        if bore_index == 1 and self._current_needle_form() == NEEDLE_FORM_BACKPACK:
+            if base.needle_type == NEEDLE_TYPE_CAPILLARY:
+                tip_id = float(self._bp_tip_id_spin.value())
+                tip_od = float(self._bp_tip_od_spin.value())
+                # A 0 reads "not entered" → keep the datum's value rather than
+                # fabricating a 0 µm orifice, which validate() would report as an
+                # error the operator never caused.
+                if tip_id > 0:
+                    bore.tip_id_um = tip_id
+                if tip_od > 0:
+                    bore.tip_od_um = tip_od
+            else:
+                gauge = self._backpack_bore2_gauge()
+                spec = self._needle_catalog.get(gauge) if gauge else None
+                if spec is not None:
+                    bore.gauge = spec.gauge
+                    bore.id_um = spec.id_um
+                    bore.od_um = spec.od_um
+                    bore.wall_um = spec.wall_um
+        return bore
 
     def _bores_from_ui(self) -> list[NeedleBore] | None:
         """The assembly's bores, or None for a single needle.
@@ -2812,8 +2947,9 @@ class HardwareSetupPage(ModePage):
         n = self._form_bore_count()
         if n <= 1 or len(self._bore_rows) < n:
             return None
-        bores = [self._bore_zero_from_ui()]
-        bores.extend(self._bore_from_row(k) for k in range(1, n))
+        datum = self._bore_zero_from_ui()
+        bores = [datum]
+        bores.extend(self._bore_from_row(k, datum) for k in range(1, n))
         # Carry the MEASURED mount offsets through the rebuild — losing them on a
         # geometry edit (or a form round-trip) would silently un-calibrate the
         # assembly, and the error is a right-distance-wrong-place miss of
@@ -2880,11 +3016,15 @@ class HardwareSetupPage(ModePage):
         if not self._bore_rows or not hasattr(self, "_bore_status"):
             return
         n = len(self._bore_rows)
+        datum = None
         bores = []
         for k in range(n):
             try:
-                bores.append(self._bore_zero_from_ui() if k == 0
-                             else self._bore_from_row(k))
+                if k == 0:
+                    datum = self._bore_zero_from_ui()
+                    bores.append(datum)
+                else:
+                    bores.append(self._bore_from_row(k, datum))
             except Exception as e:      # never break a config rebuild
                 logger.debug("bore %d readout build failed: %s", k, e)
                 bores.append(None)
@@ -2892,6 +3032,7 @@ class HardwareSetupPage(ModePage):
         # Measured mount offsets are owned by the calibration, not this page.
         self._absorb_live_bore_offsets()
 
+        uniform = self._uniform_bores()
         claimed: dict[str, list[int]] = {}
         for k, bore in enumerate(bores):
             row = self._bore_rows[k]
@@ -2899,14 +3040,18 @@ class HardwareSetupPage(ModePage):
                 row["geom"].setText("—")
                 row["flow"].setText("")
                 continue
+            # Every row echoes the geometry it RESOLVED to. None of it is typed
+            # here, so showing it is the only way the operator can confirm which
+            # needle they just wired a pump to.
+            summary = bore.summary_line() or "—"
             if k == 0:
-                row["geom"].setText(
-                    f"Geometry: configured above — {bore.summary_line() or '—'}")
+                row["geom"].setText(f"Geometry (from above): {summary}")
+            elif uniform:
+                row["geom"].setText(f"Geometry: copy of Bore 1 — {summary}")
             else:
-                row["geom"].setText("")
-            # An empty QLabel still occupies a line, which puts a dead band in
-            # every editable row.
-            row["geom"].setVisible(bool(row["geom"].text()))
+                row["geom"].setText(
+                    f"Geometry: second needle, Bore 1's length — {summary}")
+            row["geom"].setVisible(True)
 
             flow = self._bore_flow_ceiling_uL_s(bore)
             bits = []
@@ -2959,10 +3104,10 @@ class HardwareSetupPage(ModePage):
         parked = sorted(k + 1 for k in self._bore_cache)
         if parked:
             text += ("\n⚠ Bore(s) " + ", ".join(str(i) for i in parked)
-                     + " are hidden by the current form. Their geometry is "
-                       "remembered while this page stays open and returns if you "
-                       "pick the larger form again — but it is NOT saved with the "
-                       "setup.")
+                     + " are hidden by the current form. Their label and pump are "
+                       "remembered while this page stays open and return if you "
+                       "pick the larger form again — but they are NOT saved with "
+                       "the setup.")
             colour = COLORS.get("yellow", "#f9e2af")
 
         self._bore_status.setText(text)
@@ -4469,7 +4614,8 @@ class HardwareSetupPage(ModePage):
             if running:                            # hw controls only read live
                 try:
                     st = mgr.get_hw_settings(i)
-                    if st.get("source") in ("toupcam", "opencv", "andor"):
+                    if st.get("source") in ("toupcam", "opencv", "andor",
+                                            "tucam"):
                         store.set_hw_controls(key, {
                             "auto_exposure": st.get("auto_exposure"),
                             "exposure_us": st.get("exposure_us"),
@@ -4693,7 +4839,11 @@ class HardwareSetupPage(ModePage):
                 item.widget().deleteLater()
 
         num_channels = self.channels_spin.value()
-        enabled_pumps = self._get_enabled_pump_ids()
+        # v7.9.x: every pump, not just the enabled ones — same reasoning as
+        # `_refresh_bore_pump_options`. This card is the pump surface for a SINGLE
+        # bore, so an operator who has not been to the Pump tab yet must still be
+        # able to say which pump feeds their needle; claiming one enables it.
+        enabled_pumps = set(self._get_enabled_pump_ids())
 
         for ch_idx in range(num_channels):
             row_widget = QWidget()
@@ -4712,8 +4862,10 @@ class HardwareSetupPage(ModePage):
 
             combo = QComboBox()
             combo.addItem("— Unassigned —", None)
-            for pid in enabled_pumps:
-                combo.addItem(pid, pid)
+            for pid in self._pump_widgets:
+                combo.addItem(
+                    pid if pid in enabled_pumps else f"{pid} (will be enabled)",
+                    pid)
             # Restore this bore's previous pump before wiring the signal, so the
             # restore itself can't re-enter `_on_config_changed`.
             prev = previous.get(ch_idx)
@@ -4736,15 +4888,17 @@ class HardwareSetupPage(ModePage):
         v7.2.4 S3.10: Refresh the pump combos in channel mapping
         when pumps are enabled/disabled.
         """
-        enabled_pumps = self._get_enabled_pump_ids()
+        enabled_pumps = set(self._get_enabled_pump_ids())
 
         for ch_idx, (label, combo) in enumerate(self._channel_map_widgets):
             current = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("— Unassigned —", None)
-            for pid in enabled_pumps:
-                combo.addItem(pid, pid)
+            for pid in self._pump_widgets:
+                combo.addItem(
+                    pid if pid in enabled_pumps else f"{pid} (will be enabled)",
+                    pid)
             # Restore selection if still valid
             if current:
                 idx = combo.findData(current)
@@ -4763,8 +4917,10 @@ class HardwareSetupPage(ModePage):
         self._update_channel_map_status()
         # v7.9: a map row is still the pump editor for a SINGLE bore, so mirror
         # it back into the per-bore row's combo (which is what the NeedleBore
-        # takes its pump_id from).
+        # takes its pump_id from) — and do it BEFORE enabling, since that reads
+        # the bore rows.
         self._sync_bores_from_channel_map()
+        self._ensure_claimed_pumps_enabled()
         self._on_config_changed()
 
     def _sync_bores_from_channel_map(self):
@@ -5843,8 +5999,7 @@ class HardwareSetupPage(ModePage):
                 n_bores = max(1, int(getattr(n, "num_channels", 1) or 1))
         form = getattr(n, "needle_form", NEEDLE_FORM_SINGLE) if n else NEEDLE_FORM_SINGLE
         if NEEDLE_FORM_BORE_COUNT.get(form) != n_bores:
-            form = {1: NEEDLE_FORM_SINGLE, 2: NEEDLE_FORM_BACKPACK,
-                    3: NEEDLE_FORM_TRIPLE}.get(n_bores, NEEDLE_FORM_SINGLE)
+            form = self._form_for_bore_count(n_bores, n)
         self._needle_form_combo.blockSignals(True)
         fidx = self._needle_form_combo.findData(form)
         self._needle_form_combo.setCurrentIndex(fidx if fidx >= 0 else 0)
@@ -5902,33 +6057,41 @@ class HardwareSetupPage(ModePage):
         # restore — `_restoring` short-circuits `_on_config_changed`.
         self._on_needle_type_changed()
 
-        # v7.9: per-bore geometry, now that the rows exist. Bore 1's geometry came
-        # from the flat fields above (it mirrors `bores[0]`), so only its label +
-        # pump are pushed here; bores 2..N get everything.
+        # v7.9: the per-bore rows, now that they exist. Bore 1's geometry came from
+        # the flat fields above (it mirrors `bores[0]`); v7.9.x: every OTHER bore's
+        # geometry is derived from the form, so all a row needs is its label + pump.
+        # A backpack's one non-derivable value — bore 2's diameters — is restored
+        # into the second-needle row below.
         # The incoming setup's mount offsets are authoritative INCLUDING their
         # absence — carrying the outgoing machine's over would place bores using
         # another rig's calibration.
         self._bore_offsets.clear()
-        saved_bores = list(getattr(n, "bores", None) or []) if n else []
+        # ⚠ RESOLVED, not raw. The row COUNT above reads `n.bore_count` (resolved),
+        # so reading the raw `bores` field here disagreed with it for a legacy
+        # `num_channels: 2` needle — which has a bore count of 2 and NO bores list.
+        # Two rows were built, row 2 was never filled, the form combo was set to
+        # "backpack", and saving then persisted a FABRICATED 0 µm bore — which
+        # `HardwareConfig.validate()` reports as a blocking "Bore 2: No needle
+        # gauge selected" the operator never caused, and which SafetyLimits and the
+        # prep planner would then resolve as a real bore. `bores_resolved()` exists
+        # for exactly this case: it synthesizes N identical bores from the flat
+        # fields, which IS the documented meaning of the legacy bore count.
+        saved_bores = []
+        if n is not None:
+            try:
+                saved_bores = list(n.bores_resolved())
+            except Exception:
+                logger.debug("bores_resolved() failed; falling back to the raw "
+                             "bore list", exc_info=True)
+                saved_bores = list(getattr(n, "bores", None) or [])
         for k, b in enumerate(saved_bores):
             if k >= len(self._bore_rows):
                 break
-            g = {
+            self._set_bore_row_geometry(k, {
                 "label": getattr(b, "label", "") or "",
                 "pump_id": getattr(b, "pump_id", None),
-                "needle_type": getattr(b, "needle_type", NEEDLE_TYPE_HYPODERMIC),
-                "gauge": getattr(b, "gauge", None),
-                "length_inches": (float(b.length_mm) / 25.4) if b.length_mm else 1.0,
-                "tip_profile": getattr(b, "tip_profile", TIP_PROFILE_CYLINDER),
-                "barrel_id": b.id_um,
-                "barrel_od": b.od_um,
-                "barrel_len": b.length_mm,
-                "tip_id": getattr(b, "tip_id_um", None),
-                "tip_od": getattr(b, "tip_od_um", None) or 0.0,
-                "tip_len": getattr(b, "tip_length_mm", None),
-            }
-            self._set_bore_row_geometry(k, g)
-            self._apply_bore_row_visibility(k)
+            })
+        self._restore_backpack_bore2(saved_bores)
         self._refresh_bore_readouts()
 
         # ── 6. Pump Channels (ink combos now populated) ──────────

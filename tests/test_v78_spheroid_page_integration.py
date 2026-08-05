@@ -477,10 +477,6 @@ class TestForwarding(_PageCase):
                          "the next visit")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSettingsRoundTrip(_PageCase):
     """Detection parameters live on the survey panel and the picker, so they
     round-trip through the dialog's extra-state hook rather than being
@@ -616,3 +612,7 @@ class TestStartInterlock(_PageCase):
         page._z_references["plate_bottom_z"] = None
         page._on_start()
         self.assertIn("Plate bottom Z", page._status.text())
+
+
+if __name__ == "__main__":
+    unittest.main()

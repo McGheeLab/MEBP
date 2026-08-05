@@ -63,16 +63,76 @@ TIP_PROFILES = (TIP_PROFILE_CYLINDER, TIP_PROFILE_CONE)
 # needle_type to "hypodermic", so the whole assembly would vanish with no error.
 NEEDLE_FORM_SINGLE = "single"        # one bore — every needle before v7.9
 NEEDLE_FORM_BACKPACK = "backpack"    # two needles of DIFFERENT sizes bound together
-NEEDLE_FORM_TRIPLE = "triple"        # three needles fused together
-NEEDLE_FORMS = (NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK, NEEDLE_FORM_TRIPLE)
+NEEDLE_FORM_SEPTUM = "septum"        # two IDENTICAL bores split by a septum
+NEEDLE_FORM_TRIPLE = "triple"        # three IDENTICAL needles fused together
+NEEDLE_FORMS = (NEEDLE_FORM_SINGLE, NEEDLE_FORM_BACKPACK,
+                NEEDLE_FORM_SEPTUM, NEEDLE_FORM_TRIPLE)
 
 # Nominal bore count per form. The authority is always ``len(bores_resolved())``;
 # this only seeds the GUI and validates what the operator selected.
 NEEDLE_FORM_BORE_COUNT = {
     NEEDLE_FORM_SINGLE: 1,
     NEEDLE_FORM_BACKPACK: 2,
+    NEEDLE_FORM_SEPTUM: 2,
     NEEDLE_FORM_TRIPLE: 3,
 }
+
+# Whether every bore of the assembly is GEOMETRICALLY IDENTICAL to the datum
+# bore. This is a property of how the assembly is MADE, and it is what decides
+# how much the operator has to type:
+#
+#   * triple  — three of the same needle fused, so bores 2 and 3 are copies of
+#               bore 1. Asking for their geometry three times invites a typo
+#               that reads as a real (wrong) 100× flow-ceiling difference.
+#   * septum  — two identical bores split by a septum: bore 2 is a copy too.
+#   * backpack— two needles of DIFFERENT sizes bound together. This is the ONE
+#               form with per-bore geometry, and only the DIAMETERS differ: the
+#               needles are bound side by side, so they share a length.
+#
+# The bores still differ in the things that are not geometry — each has its own
+# pump, its own label and its own MEASURED mount offset.
+NEEDLE_FORM_UNIFORM_BORES = {
+    NEEDLE_FORM_SINGLE: True,
+    NEEDLE_FORM_BACKPACK: False,
+    NEEDLE_FORM_SEPTUM: True,
+    NEEDLE_FORM_TRIPLE: True,
+}
+
+
+def needle_form_bores_are_uniform(form: str | None) -> bool:
+    """True when every bore of ``form`` copies the datum bore's geometry.
+
+    Unknown forms answer **True** — the fail-safe direction, because a copy of a
+    real, operator-entered bore is always a valid needle, whereas inventing
+    independent geometry for a form we do not recognise would fabricate a bore
+    (a 0 µm one, which ``validate()`` then reports as an error the operator never
+    caused — the exact failure the legacy ``num_channels`` path shipped).
+    """
+    f = (form or "").strip().lower() or NEEDLE_FORM_SINGLE
+    return bool(NEEDLE_FORM_UNIFORM_BORES.get(f, True))
+
+
+# ── Physical plausibility bounds on the per-MOUNT bore calibration ──────────
+#
+# These exist because a mount offset is MEASURED, and a mis-measured or
+# hand-edited one drives real motion: the lateral offset becomes an XY move made
+# with the needle ~0.1 mm above the glass INSIDE a well, and the axial offset
+# shifts a descend. Neither is clamped anywhere downstream in a way that helps —
+# a clamped offset is a wrong move that looks right — so the motion path
+# REFUSES beyond these, naming the bore and the value.
+#
+# MAX_BORE_OFFSET_UM: measured spacing on this rig is 100-500 µm (decision D7).
+# Two fused 18G needles sit ~1.3 mm apart and a triple spans ~2.6 mm end to end,
+# but the shift must also stay inside the well — a 384-well well is only 3.3 mm
+# across — so 2 mm is generous for any real fused assembly while still refusing
+# a units error (mm typed into a µm field) or a centring done on the wrong
+# feature.
+MAX_BORE_OFFSET_UM = 2000.0
+
+# MAX_BORE_Z_OFFSET_MM: bores are coplanar within ~50 µm (decision D7); this is
+# 20× that and 10× the default 0.10 mm working clearance, so it cannot fire on a
+# real measurement but does catch a decimal-point slip.
+MAX_BORE_Z_OFFSET_MM = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -448,15 +508,28 @@ class NeedleBore:
             except (TypeError, ValueError):
                 v = None
             setattr(self, name, v if (v is not None and v > 0.0) else None)
-        # Normalize the offset to a 2-tuple of floats so consumers can unpack it
-        # unconditionally (it round-trips through JSON as a list).
+        # Normalize the offset to a 2-tuple of finite floats so consumers can
+        # unpack it unconditionally (it round-trips through JSON as a list).
+        #
+        # ⚠ NON-FINITE MUST COLLAPSE TO ZERO, NOT PASS THROUGH. A NaN offset is
+        # not merely useless, it is DANGEROUS: `SafetyLimits.clamp_xy` computes
+        # `max(lo, min(hi, v))`, and every NaN comparison is False, so `min`
+        # returns `hi` — a NaN offset is silently clamped to the FAR CORNER of
+        # the travel envelope and the stage is commanded there, potentially with
+        # the needle down inside a well. Collapsing to the (0, 0) datum instead
+        # degrades to "this bore is unmeasured", which the motion path already
+        # refuses to run a multi-bore sequence on.
         try:
             ox, oy = self.offset_um
-            self.offset_um = (float(ox), float(oy))
+            ox, oy = float(ox), float(oy)
+            if not (math.isfinite(ox) and math.isfinite(oy)):
+                raise ValueError("non-finite bore offset")
+            self.offset_um = (ox, oy)
         except (TypeError, ValueError):
             self.offset_um = (0.0, 0.0)
         try:
-            self.z_offset_mm = float(self.z_offset_mm)
+            z = float(self.z_offset_mm)
+            self.z_offset_mm = z if math.isfinite(z) else 0.0
         except (TypeError, ValueError):
             self.z_offset_mm = 0.0
 
@@ -1373,6 +1446,21 @@ def needle_bore_for_pump(needle, pump_id: str):
     return None
 
 
+def _strict_finite(v, default: float = 0.0) -> float:
+    """``float(v)`` only for a REAL, finite number — else ``default``.
+
+    Shared by every duck-typed geometry reader that feeds the motion path. The
+    strictness is the point: ``MagicMock`` implements ``__float__`` and returns
+    **1.0**, so a plain ``float(v)`` makes every stub claim a 1 mm/1 µm offset,
+    and non-finite values are worse than useless (see ``NeedleBore``'s
+    ``__post_init__`` on how a NaN reaches the far corner of the envelope).
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return default
+    v = float(v)
+    return v if math.isfinite(v) else default
+
+
 def needle_bore_offset_um(needle, bore_index: int = 0) -> tuple[float, float]:
     """Lateral offset (µm) of a bore from bore 0.
 
@@ -1380,20 +1468,33 @@ def needle_bore_offset_um(needle, bore_index: int = 0) -> tuple[float, float]:
     (0, 0) for anything that cannot say, which is exactly the single-bore
     behaviour — so the offset-aware motion path is a no-op on every existing
     needle and can be enabled unconditionally.
+
+    ⚠ Requires REAL, FINITE numbers, exactly like its sibling
+    ``needle_bore_z_offset_mm`` — this function used to coerce with a bare
+    ``float()``, an unexplained asymmetry between two functions that feed the
+    same motion path. Both a mock's 1.0 and a NaN are refused here; a NaN in
+    particular survives ``SafetyLimits.clamp_xy`` as the envelope maximum.
     """
     fn = getattr(needle, "bore_offset_um", None)
     if callable(fn):
         try:
             ox, oy = fn(bore_index)
-            return (float(ox), float(oy))
+            if (isinstance(ox, (int, float)) and isinstance(oy, (int, float))
+                    and not isinstance(ox, bool) and not isinstance(oy, bool)
+                    and math.isfinite(float(ox)) and math.isfinite(float(oy))):
+                return (float(ox), float(oy))
+            logger.debug(
+                "needle_bore_offset_um: bore %r reported an unusable offset "
+                "%r — treating it as the (0, 0) datum.", bore_index, (ox, oy))
+            return (0.0, 0.0)
         except Exception:
             logger.debug("needle_bore_offset_um: failed for %r", bore_index, exc_info=True)
     bore = needle_bore_at(needle, bore_index)
     try:
         ox, oy = getattr(bore, "offset_um", (0.0, 0.0))
-        return (float(ox), float(oy))
     except (TypeError, ValueError):
         return (0.0, 0.0)
+    return (_strict_finite(ox), _strict_finite(oy))
 
 
 def needle_bore_z_offset_mm(needle, bore_index: int = 0) -> float:
@@ -1408,21 +1509,25 @@ def needle_bore_z_offset_mm(needle, bore_index: int = 0) -> float:
     correctly degrades to "no offset".
     """
     bore = needle_bore_at(needle, bore_index)
-    v = getattr(bore, "z_offset_mm", 0.0)
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return 0.0
-    v = float(v)
-    return v if math.isfinite(v) else 0.0
+    return _strict_finite(getattr(bore, "z_offset_mm", 0.0))
 
 
 def needle_max_bore_z_offset_mm(needle) -> float:
     """Largest z_offset across the assembly — what a DESCEND must be planned
-    against so a longer bore is not driven into the glass."""
+    against so a longer bore is not driven into the glass.
+
+    Never negative: bore 0 is pinned to ``z_offset_mm = 0.0`` by
+    ``NeedleSpec.__post_init__``, so the max is ``>= 0`` for any real assembly
+    and the clearance guarantee built on this is **raise-only**. The ``max(0.0,
+    ...)`` makes that hold even for a hand-built stub with no bore 0.
+    """
     v = getattr(needle, "max_bore_z_offset_mm", None)
-    if isinstance(v, (int, float)):
-        return float(v)
-    return max((needle_bore_z_offset_mm(needle, k)
-                for k in range(needle_bore_count(needle))), default=0.0)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        v = float(v)
+        if math.isfinite(v):
+            return max(0.0, v)
+    return max([0.0] + [needle_bore_z_offset_mm(needle, k)
+                        for k in range(needle_bore_count(needle))])
 
 
 def needle_bore_internal_volume_uL(needle, bore_index: int = 0) -> float:

@@ -96,6 +96,29 @@ def _backpack():
     )
 
 
+def _triple():
+    """Three bores, ALL THREE at distinct positions — bore 0 is the datum.
+
+    Needed because a two-bore fixture with the aspirate on bore 0 cannot expose
+    a shift bug: bore 0's offset is (0, 0) by definition, so "target - offset"
+    is just the target. Every bore here carries a different offset AND a
+    different Z offset so direction, magnitude and polarity are all observable.
+    """
+    return NeedleSpec(
+        needle_form=NEEDLE_FORM_TRIPLE,
+        bores=[
+            NeedleBore(gauge=22, od_um=718, id_um=413, wall_um=152,
+                       length_mm=50.8, pump_id="P1", label="datum"),
+            NeedleBore(gauge=30, od_um=311, id_um=159, wall_um=76,
+                       length_mm=50.8, pump_id="P2", label="trypsin",
+                       offset_um=(320.0, -140.0), z_offset_mm=0.040),
+            NeedleBore(gauge=27, od_um=413, id_um=210, wall_um=102,
+                       length_mm=50.8, pump_id="P3", label="aspirate",
+                       offset_um=(-180.0, 260.0), z_offset_mm=-0.015),
+        ],
+    )
+
+
 def _hw(needle):
     hw = MagicMock()
     hw.needle = needle
@@ -369,12 +392,49 @@ class TestTrypsinBore(unittest.TestCase):
                                         "target before pulling the cell")
 
     def test_the_shift_moves_by_the_inter_bore_spacing(self):
-        ctrl, n, cfg = self._run()
-        # The shift is an intra-well XY move to (target - offset(bore 0)).
+        """The shift must displace the stage by exactly the inter-bore spacing.
+
+        ⚠ This test used to run with ``aspirate_bore_index=0``, whose offset is
+        the (0, 0) datum by definition — so the shift destination WAS the target
+        and the assertion could not detect a sign error, a scale error, or the
+        spacing being ignored altogether, despite its name. It now uses a THIRD
+        bore so both the from- and to- offsets are non-zero and different.
+        """
+        ctrl = _FakeCtrl()
+        n = _triple()
+        cfg = _cfg(trypsin_enabled=True, trypsin_bore="P2",
+                   trypsin_bore_index=1, trypsin_depth_mm=0.10,
+                   trypsin_push_rate_uL_s=0.25, trypsin_lead_time_s=0.0,
+                   reagent_bore="P3", aspirate_bore_index=2)
+        ex = _exec(ctrl, n, _well_positions={"__trypsin__": (500.0, 600.0)})
+        ex._execute_cell_removal(_op(cfg))
+
+        ax, ay = n.bore_offset_um(1)          # trypsin bore (dosing)
+        bx, by = n.bore_offset_um(2)          # aspirating bore
+        self.assertNotEqual((ax, ay), (0.0, 0.0), "fixture must offset bore 2")
+        self.assertNotEqual((bx, by), (ax, ay), "the two bores must differ")
+
+        travels = [c for c in ctrl.calls if c[0] == "safe_travel_to"]
         shifts = [c for c in ctrl.calls if c[0] == "move_xy_absolute_um"]
-        self.assertTrue(shifts)
-        self.assertAlmostEqual(shifts[0][1], 50000.0, places=6)
-        self.assertAlmostEqual(shifts[0][2], 60000.0, places=6)
+        self.assertTrue(travels and shifts)
+        park = next(t for t in travels
+                    if abs(t[1] - (50000.0 - ax)) < 1e-6)
+
+        # (a) the dosing bore is parked at target - its own offset
+        self.assertAlmostEqual(park[1], 50000.0 - ax, places=6)
+        self.assertAlmostEqual(park[2], 60000.0 - ay, places=6)
+        # (b) the shift puts the ASPIRATING bore on the same target
+        self.assertAlmostEqual(shifts[0][1], 50000.0 - bx, places=6)
+        self.assertAlmostEqual(shifts[0][2], 60000.0 - by, places=6)
+        # (c) the displacement IS the inter-bore spacing, sign included
+        self.assertAlmostEqual(shifts[0][1] - park[1], ax - bx, places=6)
+        self.assertAlmostEqual(shifts[0][2] - park[2], ay - by, places=6)
+        # (d) and it is a real, non-zero move of the expected magnitude
+        import math
+        self.assertAlmostEqual(
+            math.dist((park[1], park[2]), (shifts[0][1], shifts[0][2])),
+            math.dist((ax, ay), (bx, by)), places=6)
+        self.assertGreater(math.dist((ax, ay), (bx, by)), 1.0)
 
     def test_trypsin_bore_is_parked_on_the_target_for_the_push(self):
         ctrl, n, cfg = self._run()
@@ -404,12 +464,75 @@ class TestTrypsinBore(unittest.TestCase):
         for (_p, _v, rate) in p2:
             self.assertEqual(rate, 0.25)
 
+    def _run_recording_dwells(self, **over):
+        """Run one op with ``_dwell`` stubbed out, recording (label, seconds).
+
+        The stub means no real sleeping, so a NON-zero lead time is testable —
+        which is the whole point: the previous version of this test only ever
+        ran with 0.0 and asserted wall-clock, so it stayed green whether the
+        dwell fired, fired with the wrong duration, or was deleted outright.
+        """
+        ctrl = _FakeCtrl()
+        n = _backpack()
+        kw = dict(trypsin_enabled=True, trypsin_bore="P2",
+                  trypsin_bore_index=1, trypsin_depth_mm=0.10,
+                  trypsin_push_rate_uL_s=0.25, trypsin_lead_time_s=0.0,
+                  aspirate_bore_index=0)
+        kw.update(over)
+        cfg = _cfg(**kw)
+        ex = _exec(ctrl, n, _well_positions={"__trypsin__": (500.0, 600.0)})
+        dwells: list[tuple[str, float]] = []
+        ex._dwell = lambda op, secs, label: dwells.append((label, float(secs)))
+        ex._execute_cell_removal(_op(cfg))
+        return ctrl, dwells
+
+    def test_lead_time_dwell_fires_with_the_configured_duration(self):
+        _ctrl, dwells = self._run_recording_dwells(trypsin_lead_time_s=30.0)
+        leads = [d for d in dwells if "lead" in d[0].lower()]
+        self.assertEqual(len(leads), 1, f"expected ONE lead dwell, got {dwells}")
+        self.assertAlmostEqual(leads[0][1], 30.0, places=9)
+
     def test_lead_time_is_a_true_no_op_at_zero(self):
-        """Every executor suite sets dwells to 0 to avoid real sleeps."""
-        import time
-        t0 = time.monotonic()
-        self._run(trypsin_lead_time_s=0.0)
-        self.assertLess(time.monotonic() - t0, 1.0)
+        """0.0 must reach _dwell as 0.0 (which is a genuine no-op), not vanish."""
+        _ctrl, dwells = self._run_recording_dwells(trypsin_lead_time_s=0.0)
+        leads = [d for d in dwells if "lead" in d[0].lower()]
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0][1], 0.0)
+
+    def test_the_lead_dwell_falls_between_the_shift_and_the_pull(self):
+        """Ordering is the property that matters: the reagent must already be
+        on the cell and the aspirating bore already over it while we wait."""
+        ctrl = _FakeCtrl()
+        n = _backpack()
+        cfg = _cfg(trypsin_enabled=True, trypsin_bore="P2",
+                   trypsin_bore_index=1, trypsin_depth_mm=0.10,
+                   trypsin_lead_time_s=30.0, aspirate_bore_index=0)
+        ex = _exec(ctrl, n, _well_positions={"__trypsin__": (500.0, 600.0)})
+        seq: list[str] = []
+        real_pump = ctrl.move_pump_uL
+
+        def spy_pump(pump, volume_uL, rate_uL_s=None, **k):
+            seq.append(f"pump {pump} {'+' if volume_uL > 0 else '-'}")
+            real_pump(pump, volume_uL, rate_uL_s=rate_uL_s, **k)
+        ctrl.move_pump_uL = spy_pump
+        real_xy = ctrl.move_xy_absolute_um
+
+        def spy_xy(x, y):
+            seq.append("shift")
+            real_xy(x, y)
+        ctrl.move_xy_absolute_um = spy_xy
+        ex._dwell = lambda op, secs, label: seq.append(
+            f"dwell {label} {float(secs):g}")
+        ex._execute_cell_removal(_op(cfg))
+
+        dose = seq.index("pump P2 +")
+        shift = seq.index("shift")
+        lead = next(i for i, s in enumerate(seq) if s.startswith("dwell Trypsin lead"))
+        pull = next(i for i, s in enumerate(seq)
+                    if s == "pump P1 -" and i > dose)
+        self.assertLess(dose, shift, "dose before the shift")
+        self.assertLess(shift, lead, "shift before the lead time starts")
+        self.assertLess(lead, pull, "lead time before the aspirate")
 
     def test_unsized_trypsin_push_is_skipped_not_silently_zero(self):
         ctrl = _FakeCtrl()
@@ -488,10 +611,6 @@ class TestSingleBoreUnchanged(unittest.TestCase):
         t = PickPlaceTarget(target_id="T", x_um=1.0, y_um=2.0, well_name="A1")
         self.assertFalse(ex._shift_to_bore(_op(_cfg()), t, 0, 1, 10.0))
         self.assertEqual(ctrl.calls, [])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ── Simultaneous multi-bore prep (operator decision D8) ──────────────
@@ -592,10 +711,44 @@ class TestSimultaneousPrep(unittest.TestCase):
             self.assertEqual(set(v), {"P2"})
 
     def test_duplicate_pump_is_collapsed(self):
-        """One pump cannot be driven twice in a single coordinated move."""
-        ex = self._ex(_FakeCtrl(), [{"pump_id": "P1", "bore_index": 0},
-                                    {"pump_id": "p1", "bore_index": 0}])
-        self.assertEqual(len(ex._prep_bore_plan()), 1)
+        """One pump cannot be driven twice in a single coordinated move.
+
+        Case-insensitively: "p1" and "P1" are the same motor, and naming it twice
+        in one G0 would collide and silently drop a bore.
+        """
+        ex = self._ex(_FakeCtrl(), [{"pump_id": "P2", "bore_index": 1},
+                                    {"pump_id": "p2", "bore_index": 1}])
+        plan = ex._prep_bore_plan()
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0][0], "P2")
+
+    def test_a_lone_legacy_bore_collapses_to_the_legacy_path(self):
+        """BYTE-IDENTITY GUARANTEE for every single-bore setup.
+
+        A plan of exactly one bore that is already `prep_bore` describes the
+        legacy prep, so `_prep_bore_plan` returns [] and the caller takes the
+        legacy branch verbatim. Without this, a single-bore run would be silently
+        re-routed through the COORDINATED path, which cannot carry
+        `compensate=None` — so the oil and buffer aspirates would lose their
+        backlash take-up on every existing machine, for no benefit.
+        """
+        ex = self._ex(_FakeCtrl(), [{"pump_id": "P1", "bore_index": 0}])
+        self.assertEqual(ex._prep_bore_plan(), [],
+                         "a lone prep_bore must collapse to the legacy path")
+
+    def test_the_collapse_produces_an_IDENTICAL_call_sequence(self):
+        """Prove the collapse, not just its return value."""
+        a, b = _FakeCtrl(), _FakeCtrl()
+        self._ex(a, [{"pump_id": "P1", "bore_index": 0}]).run_prep()
+        self._ex(b, []).run_prep()
+        self.assertEqual(a.calls, b.calls)
+
+    def test_a_lone_NON_legacy_bore_still_takes_the_coordinated_path(self):
+        """The collapse is narrow: it must not swallow a genuine re-route."""
+        ex = self._ex(_FakeCtrl(), [{"pump_id": "P2", "bore_index": 1}])
+        plan = ex._prep_bore_plan()
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0][0], "P2")
 
     def test_falls_back_to_sequential_on_an_older_controller(self):
         """Degrade to correct-but-not-simultaneous, never to failing."""
@@ -644,3 +797,7 @@ class TestSimultaneousPostClean(unittest.TestCase):
             self.assertEqual(set(v), {"P1", "P2"})
         self.assertTrue(all(v > 0 for v in calls[0].values()))
         self.assertTrue(all(v < 0 for v in calls[1].values()))
+
+
+if __name__ == "__main__":
+    unittest.main()

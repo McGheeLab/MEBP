@@ -139,6 +139,10 @@ class Card(QFrame):
     def body_layout(self) -> QVBoxLayout:
         return self._body_layout
 
+    def title(self) -> str:
+        """The card's heading, or "" when it was built without one."""
+        return self._title_label.text() if self._title_label is not None else ""
+
     def set_collapsed(self, collapsed: bool):
         if not self._collapsible:
             return
@@ -434,3 +438,97 @@ class LoadingBanner(QFrame):
     def _tick(self):
         self._frame_idx = (self._frame_idx + 1) % len(self._SPIN_FRAMES)
         self._spin_label.setText(self._SPIN_FRAMES[self._frame_idx])
+
+
+class ReadinessList(QWidget):
+    """Renders a ``PrintReadiness.Readiness`` as a grouped, badged checklist.
+
+    v7.9: extracted verbatim from ``QuickPrintWorkflowPage._render_readiness`` so
+    the Cell Targeting Setup tab and its pre-run confirmation dialog render the
+    SAME visual language rather than inventing a third one. Quick Print's own
+    renderer is a candidate to fold in here later; nothing about this widget is
+    print-specific.
+
+    Groups where nothing needs attention collapse to a single line, so a fully
+    configured machine shows a short panel and a half-configured one shows
+    exactly what is wrong.
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(s(4))
+        self._empty = QLabel("—")
+        self._empty.setStyleSheet(
+            f"color: {COLORS['overlay0']}; font-size: {sf(9)}pt;")
+        self._lay.addWidget(self._empty)
+
+    def clear(self) -> None:
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None and w is not self._empty:
+                w.setParent(None)
+                w.deleteLater()
+
+    def set_readiness(self, readiness, *, states=None) -> None:
+        """Paint ``readiness``. ``states`` optionally filters which to show."""
+        from SupportClasses.PrintReadiness import BLOCK, WARN, OK, INFO
+        self.clear()
+        if readiness is None:
+            self._lay.addWidget(self._empty)
+            self._empty.setVisible(True)
+            return
+        self._empty.setVisible(False)
+        variant = {BLOCK: "err", WARN: "warn", OK: "ok", INFO: "info"}
+        badge = {BLOCK: "blocked", WARN: "check", OK: "ok", INFO: "fyi"}
+        any_row = False
+        for group, checks in readiness.by_group():
+            if states is not None:
+                checks = [c for c in checks if c.state in states]
+                if not checks:
+                    continue
+            attention = [c for c in checks if c.state in (BLOCK, WARN)]
+            hdr = QLabel(group)
+            hdr.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(8)}pt; "
+                f"font-weight: 600; letter-spacing: 1px;")
+            self._lay.addWidget(hdr)
+            any_row = True
+            if not attention:
+                # Collapse an all-clear group to one line.
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(s(6))
+                rl.addWidget(StatusBadge("ok", variant="ok"))
+                lbl = QLabel(", ".join(c.label for c in checks))
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet(
+                    f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
+                rl.addWidget(lbl, stretch=1)
+                self._lay.addWidget(row)
+                continue
+            for c in checks:
+                row = QWidget()
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(0, 0, 0, 0)
+                rl.setSpacing(s(6))
+                rl.addWidget(StatusBadge(badge.get(c.state, "fyi"),
+                                         variant=variant.get(c.state, "info")))
+                text = f"<b>{c.label}</b> — {c.detail}" if c.detail \
+                    else f"<b>{c.label}</b>"
+                if c.fix:
+                    text += (f" <span style='color:{COLORS['overlay0']}'>"
+                             f"({c.fix})</span>")
+                lbl = QLabel(text)
+                lbl.setWordWrap(True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setStyleSheet(
+                    f"color: {COLORS['text']}; font-size: {sf(9)}pt;")
+                rl.addWidget(lbl, stretch=1)
+                self._lay.addWidget(row)
+        if not any_row:
+            self._lay.addWidget(self._empty)
+            self._empty.setVisible(True)

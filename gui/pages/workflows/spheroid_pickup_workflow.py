@@ -50,6 +50,7 @@ from gui.dialogs.workflow_settings_dialog import (
 from gui.pages.workflows._fluorescence_overlay import (
     load_plate_fluor_overlay, plate_key_of,
 )
+from gui.pages.workflows import _reagent_prep
 from gui.pages.workflows._reagent_prep import resolve_pickup_well
 
 from SupportClasses.PickAndPlaceManager import (
@@ -574,6 +575,13 @@ class SpheroidPickupWorkflowPage(QWidget):
                 "diameter used for every pick when per-spheroid sizing is off.")
         sec.add("bore", "Pump / bore", self._bore, "P1",
                 "Which pump drives the aspirate + dispense.")
+        # v7.9: states the bore-1-only restriction where the choice is made.
+        self._multi_bore_note = QLabel("")
+        self._multi_bore_note.setWordWrap(True)
+        self._multi_bore_note.setStyleSheet(
+            f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+        self._multi_bore_note.setVisible(False)
+        sec.add_widget(self._multi_bore_note)
         sec.add("safety_factor", "Safety factor (×)", self._safety, 1.5,
                 "Volume multiplier on the computed spheroid volume. Applied to "
                 "the per-spheroid volume too.")
@@ -1278,20 +1286,30 @@ class SpheroidPickupWorkflowPage(QWidget):
         self._bore.blockSignals(True)
         previous = self._bore.currentText()
         self._bore.clear()
+        # v7.9: on a multi-bore assembly, offer ONLY the pump feeding bore 1.
+        # This workflow positions bore 1 and resolves its pickup volume, bore
+        # area AND sink-timing bore profile from bore 1, so another pump would
+        # mis-size every aspirate by the bore-area ratio and land 100-500 µm off
+        # the spheroid. None ⇒ single bore or unknown ⇒ no restriction.
+        datum = _reagent_prep.datum_bore_pump(hw_config)
         if hw_config is not None and hasattr(hw_config, "pumps"):
             for pid, pcfg in hw_config.pumps.items():
                 # Only show enabled + configured pumps when those flags exist
                 enabled = getattr(pcfg, "enabled", True)
                 configured = getattr(pcfg, "is_configured", True)
-                if enabled and configured:
+                if enabled and configured and (datum is None or pid == datum):
                     self._bore.addItem(pid)
         if self._bore.count() == 0:
-            self._bore.addItem("P1")
+            self._bore.addItem(datum or "P1")
         # Restore previous selection if still present
         idx = self._bore.findText(previous)
         if idx >= 0:
             self._bore.setCurrentIndex(idx)
         self._bore.blockSignals(False)
+        note = _reagent_prep.multi_bore_restriction_note(hw_config)
+        if hasattr(self, "_multi_bore_note"):
+            self._multi_bore_note.setText(note)
+            self._multi_bore_note.setVisible(bool(note))
 
         # Push to the shared live picker + workspace/XZ needle size
         self._picker.set_hardware_config(hw_config)
@@ -1979,6 +1997,19 @@ class SpheroidPickupWorkflowPage(QWidget):
                 "ZP (Z + pump) board not connected — pick & place needs it to "
                 "retract the needle and run the pumps. Reconnect it first.")
             return
+
+        # v7.9 backstop: the combo is already restricted, but a settings profile
+        # saved before the assembly changed can still carry another bore's pump.
+        datum = _reagent_prep.datum_bore_pump(self._hw_config)
+        if datum and str(cfg.pickup_bore).strip().upper() != datum:
+            self._status.setText(
+                f"This workflow drives bore 1 ({datum}) on a multi-bore "
+                f"assembly, but the saved pump is {cfg.pickup_bore}. The pickup "
+                f"volume, bore area and sink timing are all resolved from bore 1, "
+                f"so another bore would mis-size every aspirate. Select {datum} "
+                f"in Settings.")
+            return
+
         pick_z = self._plate_offset_to_zref(cfg.pick_z_offset_mm)
         place_z = self._plate_offset_to_zref(cfg.place_z_offset_mm)
         if pick_z is None or place_z is None:

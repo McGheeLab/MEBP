@@ -498,12 +498,20 @@ class TargetTypeStore:
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception as exc:  # pragma: no cover - corrupt file
+            except Exception as exc:
+                # RECORDED, not just logged. A hand-authored file with a trailing
+                # comma used to vanish from the UI with no message, no filename
+                # and no hint that a file had been rejected at all — the operator
+                # simply could not see their own type. `load_errors` lets the GUI
+                # say which file and why.
                 logger.warning(f"TargetTypeStore: failed to load {path}: {exc}")
+                self.load_errors.append((path.name, str(exc)))
                 continue
             tt = TargetType.from_dict(data, builtin=builtin)
             if not tt.id:
                 logger.warning(f"TargetTypeStore: {path} has no id — skipped")
+                self.load_errors.append(
+                    (path.name, "no \"id\" field — every target type needs one"))
                 continue
             # User entries (loaded second) shadow built-ins of the same id.
             self._types[tt.id] = tt
@@ -511,6 +519,9 @@ class TargetTypeStore:
     def reload(self) -> None:
         """Re-scan both directories (built-ins first, then user overrides)."""
         self._types = {}
+        #: ``[(filename, reason)]`` for files rejected by THIS load. Cleared here
+        #: so it always describes the current state of the directories.
+        self.load_errors: list[tuple[str, str]] = []
         self._load_dir(self._builtin_dir, builtin=True)
         self._load_dir(self._user_dir, builtin=False)
 

@@ -250,8 +250,12 @@ class HardwareSummaryWidget(QWidget):
         # Needle
         if config.needle:
             n = config.needle
-            ch_str = (f" | {n.num_channels} channel(s)"
-                      if hasattr(n, 'num_channels') and n.num_channels > 1 else "")
+            # v7.9 vocabulary: a lumen is a BORE. "Channel" now means an imaging
+            # channel (a fluorescence filter cube) and must not be reused here.
+            _nb = getattr(n, "bore_count", None)
+            if not isinstance(_nb, int):
+                _nb = getattr(n, "num_channels", 1) or 1
+            ch_str = f" | {_nb} bores" if _nb > 1 else ""
             if getattr(n, "has_tip", False):
                 # v7.6: a pulled capillary is two stages; show both.
                 self._needle_label.setText(

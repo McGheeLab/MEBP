@@ -56,6 +56,7 @@ from gui.dialogs.workflow_settings_dialog import (
 from gui.pages.workflows._fluorescence_overlay import (
     load_plate_fluor_overlay, plate_key_of,
 )
+from gui.pages.workflows import _reagent_prep
 from gui.pages.workflows._reagent_prep import (
     SERVICE_ROLES, service_well_names, resolve_service_positions,
     needle_volume_uL, resolve_pickup_well,
@@ -364,6 +365,14 @@ class CellLabelingWorkflowPage(QWidget):
             "Needle dip height above the plate bottom when aspirating the stain.")
         sec = dlg.add_section("Pump & stain reagent")
         sec.add("bore", "Pump / bore", self._bore, "P1")
+        # v7.9: states the bore-1-only restriction where the choice is made,
+        # rather than letting a silent 6.75× dose error look like a preference.
+        self._multi_bore_note = QLabel("")
+        self._multi_bore_note.setWordWrap(True)
+        self._multi_bore_note.setStyleSheet(
+            f"color: {COLORS['peach']}; font-size: {sf(9)}pt;")
+        self._multi_bore_note.setVisible(False)
+        sec.add_widget(self._multi_bore_note)
         sec.add("reagent", "Stain reagent", self._reagent_combo, "")
         sec.add("reagent_z", "Stain dip Z (↑ bottom)", self._reagent_z, 0.50)
         self._reagent_status = QLabel("")
@@ -776,18 +785,28 @@ class CellLabelingWorkflowPage(QWidget):
         self._bore.blockSignals(True)
         previous = self._bore.currentText()
         self._bore.clear()
+        # v7.9: on a multi-bore assembly, offer ONLY the pump feeding bore 1.
+        # This workflow positions bore 1 and sizes its stain column from bore 1's
+        # orifice area, so any other pump would over/under-dose by the bore-area
+        # ratio (6.75× on the reference backpack) and deposit 100-500 µm off the
+        # region. None ⇒ single bore or unknown ⇒ no restriction.
+        datum = _reagent_prep.datum_bore_pump(hw_config)
         if hw_config is not None and hasattr(hw_config, "pumps"):
             for pid, pcfg in hw_config.pumps.items():
                 enabled = getattr(pcfg, "enabled", True)
                 configured = getattr(pcfg, "is_configured", True)
-                if enabled and configured:
+                if enabled and configured and (datum is None or pid == datum):
                     self._bore.addItem(pid)
         if self._bore.count() == 0:
-            self._bore.addItem("P1")
+            self._bore.addItem(datum or "P1")
         idx = self._bore.findText(previous)
         if idx >= 0:
             self._bore.setCurrentIndex(idx)
         self._bore.blockSignals(False)
+        note = _reagent_prep.multi_bore_restriction_note(hw_config)
+        if hasattr(self, "_multi_bore_note"):
+            self._multi_bore_note.setText(note)
+            self._multi_bore_note.setVisible(bool(note))
 
         # Push to the shared live picker + workspace/XZ needle size
         self._picker.set_hardware_config(hw_config)
@@ -1131,6 +1150,19 @@ class CellLabelingWorkflowPage(QWidget):
             self._status.setText(
                 "ZP (Z + pump) board not connected — staining needs it to "
                 "retract the needle and run the pumps. Reconnect it first.")
+            return
+
+        # v7.9 backstop: the combo is already restricted, but a settings profile
+        # saved before the assembly changed can still carry another bore's pump.
+        # Driving it would deposit the wrong volume in the wrong place.
+        datum = _reagent_prep.datum_bore_pump(self._hw_config)
+        if datum and str(cfg.stain_bore).strip().upper() != datum:
+            self._status.setText(
+                f"This workflow drives bore 1 ({datum}) on a multi-bore "
+                f"assembly, but the saved pump is {cfg.stain_bore}. Its stain "
+                f"volume and position are both resolved from bore 1, so another "
+                f"bore would dose the wrong amount in the wrong place. Select "
+                f"{datum}, or use Cell Targeting & Removal for a per-bore program.")
             return
 
         label_z = self._plate_offset_to_zref(cfg.label_z_offset_mm)

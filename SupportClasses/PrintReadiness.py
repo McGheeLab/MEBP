@@ -39,8 +39,15 @@ WARN = "warn"
 BLOCK = "block"
 
 #: Groups, in display order.
-GROUPS = ("Hardware", "Selection", "Calibration", "Machine", "Print",
-          "Fluidics", "Ink & needle", "Routine")
+#
+#: v7.9 appends "Needle assembly", "Targets" and "Reagents" for
+#: :mod:`SupportClasses.CellRemovalReadiness`, which reuses this module's
+#: ``Check``/``Readiness`` rather than defining a parallel pair. This tuple only
+#: controls DISPLAY ORDER and grouping in ``Readiness.by_group()``; Quick Print
+#: emits no checks in the new groups, so its rendering is unchanged.
+GROUPS = ("Hardware", "Selection", "Needle assembly", "Targets", "Reagents",
+          "Calibration", "Machine", "Print", "Fluidics", "Ink & needle",
+          "Routine")
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,15 @@ class Readiness:
     def can_print(self) -> bool:
         """True when nothing is explicitly blocking. Warnings do not block."""
         return not self.blocking()
+
+    def can_start(self) -> bool:
+        """Alias for :meth:`can_print`, for non-printing consumers.
+
+        v7.9: ``CellRemovalReadiness`` reuses this class, and "can_print" reads
+        wrong when the operation is aspirating cells. Same semantics — one
+        implementation, so the two pages cannot disagree about what blocks.
+        """
+        return self.can_print()
 
     def by_group(self) -> list[tuple[str, list[Check]]]:
         out = []

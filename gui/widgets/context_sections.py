@@ -504,8 +504,10 @@ class HardwareInfoSection(QWidget):
 # ── Illumination LED (drop-in module) ──────────────────────────────
 
 class IlluminationSection(QWidget):
-    """Standalone illumination-LED module (on/off toggle + brightness slider),
-    reusing the same widget embedded in the jog panel."""
+    """Standalone illumination-LED module (on/off toggle + brightness slider).
+
+    Reuses the same widget embedded in the jog panel, and the same shared
+    illumination state, so both surfaces show one consistent LED setting."""
 
     def __init__(self, ctx: SectionContext, options: dict):
         super().__init__()
@@ -514,10 +516,14 @@ class IlluminationSection(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         # Lazy import to avoid pulling the widget in when this section is unused.
-        from gui.widgets.illumination_control import IlluminationControl
+        from gui.widgets.illumination_control import (
+            IlluminationControl, illumination_state)
         self._ctrl = IlluminationControl(ctx.controller)
-        # Restore persisted UI state (does not command hardware).
-        if isinstance(options, dict):
+        # Restore persisted UI state (does not command hardware) — but only
+        # while the shared state is untouched. The custom panel rebuilds its
+        # sections on every layout change, and re-seeding then would reset the
+        # LED (and every other view of it) to whatever was last saved.
+        if isinstance(options, dict) and illumination_state().is_pristine():
             if "level" in options:
                 try:
                     self._ctrl.set_value(int(options["level"]))

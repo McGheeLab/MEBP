@@ -446,8 +446,11 @@ class StandardJogContextPanel(QWidget):
                     parts.append(f"ID {n.id_um:.0f} µm")
                 if getattr(n, "length_mm", None):
                     parts.append(f"L {n.length_mm:.1f} mm")
-                if getattr(n, "num_channels", 1) > 1:
-                    parts.append(f"{n.num_channels}-channel")
+                _nb = getattr(n, "bore_count", None)
+                if not isinstance(_nb, int):
+                    _nb = getattr(n, "num_channels", 1) or 1
+                if _nb > 1:
+                    parts.append(f"{_nb} bores")
                 needle_text = " · ".join(parts) if parts else "Configured"
         self._lbl_info_needle.setText(needle_text)
 

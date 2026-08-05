@@ -69,6 +69,54 @@ def needle_volume_uL(hw_config) -> float:
         return 0.0
 
 
+def datum_bore_pump(hw_config):
+    """The pump feeding BORE 1 (the datum), or None when it cannot be resolved.
+
+    v7.9 (post-audit): Spheroid Pick & Place and Cell Labeling let the operator
+    choose a PUMP but always position **bore 1** and always size their volumes
+    from **bore 1's** orifice area — they were never taught about bores. On a
+    backpack whose two bores differ 6.75× in area (the test suite's own fixture),
+    choosing the second bore's pump therefore over-doses by that ratio AND lands
+    100-500 µm off the region, with nothing to say so. This is the same defect
+    Cell Targeting already fixed, where the measured disagreement was 4.00×.
+
+    Until those workflows resolve a bore properly, they restrict the choice to
+    this pump. Returns None when there is no needle, only one bore, or the datum
+    bore names no pump — in every one of those cases the caller must NOT
+    restrict, because unknown data must never forbid work.
+    """
+    needle = getattr(hw_config, "needle", None) if hw_config else None
+    if needle is None:
+        return None
+    try:
+        from SupportClasses.PhysicalModels import needle_bore_count
+        if int(needle_bore_count(needle)) <= 1:
+            return None                      # single bore — nothing to restrict
+        bores = list(needle.bores_resolved())
+    except Exception:
+        return None
+    if not bores:
+        return None
+    pid = getattr(bores[0], "pump_id", None)
+    pid = str(pid).strip().upper() if pid else ""
+    return pid or None
+
+
+def multi_bore_restriction_note(hw_config) -> str:
+    """Operator-facing note for the restriction, or "" when none applies."""
+    pid = datum_bore_pump(hw_config)
+    if not pid:
+        return ""
+    try:
+        from SupportClasses.PhysicalModels import needle_bore_count
+        n = int(needle_bore_count(getattr(hw_config, "needle", None)))
+    except Exception:
+        n = 2
+    return (f"⚠ Multi-bore assembly ({n} bores): this workflow drives bore 1 "
+            f"({pid}) only — its volumes and positions are all resolved from "
+            f"bore 1. Use Cell Targeting & Removal for a per-bore program.")
+
+
 def service_well_names(hw_config, plate=None) -> dict[str, str]:
     """role → well name, read from Hardware Setup reagent locations.
 
