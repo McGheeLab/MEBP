@@ -11,10 +11,20 @@ Single source of truth used in two places:
   - wrapped by ``IlluminationSection`` in ``gui/widgets/context_sections.py``
     so users can drop a standalone LED module into any custom panel.
 
-Every hardware write is guarded on ``controller.is_zp_connected`` and coalesced
-through a short debounce timer so dragging the slider can't flood the shared,
-``ok``-blocking ZP serial channel. The widget is a command output, not a live
-sensor — it needs the ~status tick only to grey out when the board drops.
+**One LED, one state.** Every page that hosts a jog context builds its OWN
+``StandardJogContextPanel``, so there are many of these widgets alive at once —
+and the LED has no readback (Marlin ``M106`` is write-only), so nothing would
+ever reconcile them. The toggle + brightness therefore live in the process-wide
+:class:`_IlluminationState` (``illumination_state()``) and each widget is only a
+VIEW of it: user edits go to the state, the state re-renders every view. Without
+this, each page showed its own stale copy of the light's setting, and mirrors the
+shared-``MicroscopeController`` arrangement of the card directly below it.
+
+The state also owns the single debounce timer and the hardware write, so N
+mounted views produce ONE ``M106`` per change rather than N — dragging a slider
+must not flood the shared, ``ok``-blocking ZP serial channel. Every write is
+guarded on ``controller.is_zp_connected``. The widget is a command output, not a
+live sensor — it needs the ~status tick only to grey out when the board drops.
 """
 
 from __future__ import annotations
@@ -22,7 +32,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
 )
@@ -48,6 +58,123 @@ def _pct_from_level(level: int) -> int:
     return max(0, min(100, round(level / _MAX_LEVEL * 100.0)))
 
 
+class _IlluminationState(QObject):
+    """Process-wide illumination-LED state shared by every view.
+
+    Holds the on/off flag, the brightness percentage, the remembered brightness
+    used when toggling back on from a dark slider, the stage controller used to
+    reach the board, and the ONE debounce timer that coalesces changes into a
+    single ``M106``. Views connect to :attr:`changed` and re-render; they never
+    hold state of their own.
+    """
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._on = False
+        self._pct = _pct_from_level(_DEFAULT_ON_LEVEL)
+        # Remembered brightness (0-255) restored when toggled back on from 0.
+        self._last_level = _DEFAULT_ON_LEVEL
+        self._controller = None
+        # True until anything (a user edit or a silent restore) touches the
+        # state — lets a persisted custom-panel layout seed the LED at startup
+        # without clobbering a setting the operator has already made.
+        self._pristine = True
+
+        # Debounce: restarted on each change, fires one command after the pause.
+        self._send_timer = QTimer(self)
+        self._send_timer.setSingleShot(True)
+        self._send_timer.setInterval(_SEND_DEBOUNCE_MS)
+        self._send_timer.timeout.connect(self.send_now)
+
+    # ── Read ───────────────────────────────────────────────────────
+
+    def is_on(self) -> bool:
+        return self._on
+
+    def pct(self) -> int:
+        return self._pct
+
+    def is_pristine(self) -> bool:
+        return self._pristine
+
+    def connected(self) -> bool:
+        return bool(self._controller
+                    and getattr(self._controller, "is_zp_connected", False))
+
+    def level(self) -> int:
+        """Brightness actually commanded (0 while the LED is off)."""
+        return _level_from_pct(self._pct) if self._on else 0
+
+    # ── Write ──────────────────────────────────────────────────────
+
+    def set_controller(self, controller) -> None:
+        if controller is None or controller is self._controller:
+            return
+        self._controller = controller
+        self.changed.emit()  # views re-evaluate their enabled state
+
+    def apply(self, *, on: bool | None = None, pct: int | None = None,
+              send: bool) -> None:
+        """Update the shared state, re-render every view, optionally command.
+
+        ``send=False`` is a silent restore (state + UI only, no hardware).
+        """
+        dirty = False
+        if pct is not None:
+            pct = max(0, min(100, int(pct)))
+            if pct > 0:
+                self._last_level = _level_from_pct(pct)
+            if pct != self._pct:
+                self._pct = pct
+                dirty = True
+        if on is not None:
+            on = bool(on)
+            # Toggling on from a dark slider gives a sensible default so the LED
+            # actually illuminates rather than turning "on at 0 %".
+            if on and self._pct == 0:
+                self._pct = _pct_from_level(self._last_level or _DEFAULT_ON_LEVEL)
+                dirty = True
+            if on != self._on:
+                self._on = on
+                dirty = True
+        self._pristine = False
+        if dirty:
+            self.changed.emit()
+        if send:
+            self._send_timer.start()
+
+    def send_now(self) -> None:
+        if not self.connected():
+            return
+        try:
+            self._controller.set_led_brightness(self.level())
+        except Exception as exc:  # never let a serial hiccup break the UI
+            logger.warning("LED brightness set failed: %s", exc)
+
+    def reset(self) -> None:
+        """Back to a fresh process state (tests; never used by the app)."""
+        self._send_timer.stop()
+        self._on = False
+        self._pct = _pct_from_level(_DEFAULT_ON_LEVEL)
+        self._last_level = _DEFAULT_ON_LEVEL
+        self._controller = None
+        self._pristine = True
+        self.changed.emit()
+
+
+_STATE: "_IlluminationState | None" = None
+
+
+def illumination_state() -> _IlluminationState:
+    """The one shared LED state (lazily created; needs a QApplication)."""
+    global _STATE
+    if _STATE is None:
+        _STATE = _IlluminationState()
+    return _STATE
+
+
 class IlluminationControl(QWidget):
     """On/off toggle + 0-100 % brightness slider for the illumination LED."""
 
@@ -57,9 +184,9 @@ class IlluminationControl(QWidget):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
-        self._controller = controller
-        # Remembered brightness (0-255) restored when toggled back on from 0.
-        self._last_level = _DEFAULT_ON_LEVEL
+        self._state = illumination_state()
+        if controller is not None:
+            self._state.set_controller(controller)
         self._suppress = False  # block feedback during programmatic widget sets
 
         root = QVBoxLayout(self)
@@ -84,24 +211,21 @@ class IlluminationControl(QWidget):
         # Row 2: brightness slider (percentage).
         self._slider = QSlider(Qt.Horizontal)
         self._slider.setRange(0, 100)
-        self._slider.setValue(_pct_from_level(self._last_level))
         self._slider.setToolTip("LED brightness.")
         self._slider.valueChanged.connect(self._on_slider)
         root.addWidget(self._slider)
 
-        # Debounce: restarted on each change, fires one command after the pause.
-        self._send_timer = QTimer(self)
-        self._send_timer.setSingleShot(True)
-        self._send_timer.setInterval(_SEND_DEBOUNCE_MS)
-        self._send_timer.timeout.connect(self._send_now)
-
-        self._update_label()
-        self._apply_connection_state()
+        # Every view re-renders whenever the shared state changes, so the LED
+        # reads the same on the Jog page, the Calibration page, each workflow
+        # page and a Custom panel. Qt drops this connection when the widget is
+        # destroyed, so a closed page can't be rendered into.
+        self._state.changed.connect(self._render)
+        self._render()
 
     # ── Public API ─────────────────────────────────────────────────
 
     def set_controller(self, controller) -> None:
-        self._controller = controller
+        self._state.set_controller(controller)
         self._apply_connection_state()
 
     def on_status_update(self) -> None:
@@ -109,33 +233,29 @@ class IlluminationControl(QWidget):
         self._apply_connection_state()
 
     def is_on(self) -> bool:
-        return self._chk_on.isChecked()
+        return self._state.is_on()
 
     def value(self) -> int:
         """Current brightness as a percentage (0-100)."""
-        return int(self._slider.value())
+        return self._state.pct()
 
     def set_on(self, on: bool) -> None:
         """Set the toggle without commanding hardware (for state restore)."""
-        self._suppress = True
-        self._chk_on.setChecked(bool(on))
-        self._suppress = False
-        self._update_label()
+        self._state.apply(on=on, send=False)
 
     def set_value(self, pct: int) -> None:
         """Set the slider without commanding hardware (for state restore)."""
-        self._suppress = True
-        self._slider.setValue(max(0, min(100, int(pct))))
-        self._suppress = False
-        if self._slider.value() > 0:
-            self._last_level = _level_from_pct(self._slider.value())
-        self._update_label()
+        self._state.apply(pct=pct, send=False)
 
     # ── Internals ──────────────────────────────────────────────────
 
+    @property
+    def _send_timer(self) -> QTimer:
+        """The shared debounce timer (one pending write for all views)."""
+        return self._state._send_timer
+
     def _connected(self) -> bool:
-        return bool(self._controller
-                    and getattr(self._controller, "is_zp_connected", False))
+        return self._state.connected()
 
     def _apply_connection_state(self) -> None:
         conn = self._connected()
@@ -143,44 +263,36 @@ class IlluminationControl(QWidget):
         self._slider.setEnabled(conn)
 
     def _desired_level(self) -> int:
-        if not self._chk_on.isChecked():
-            return 0
-        return _level_from_pct(self._slider.value())
+        return self._state.level()
+
+    def _render(self) -> None:
+        """Paint this view from the shared state (no hardware, no feedback)."""
+        self._suppress = True
+        try:
+            self._chk_on.setChecked(self._state.is_on())
+            self._slider.setValue(self._state.pct())
+        finally:
+            self._suppress = False
+        self._update_label()
+        self._apply_connection_state()
 
     def _on_toggle(self, checked: bool) -> None:
         if self._suppress:
             return
-        # Toggling on from a dark slider gives a sensible default so the LED
-        # actually illuminates rather than turning "on at 0 %".
-        if checked and self._slider.value() == 0:
-            self.set_value(_pct_from_level(self._last_level or _DEFAULT_ON_LEVEL))
-        self._update_label()
-        self._queue_send()
+        self._state.apply(on=checked, send=True)
 
     def _on_slider(self, pct: int) -> None:
-        if pct > 0:
-            self._last_level = _level_from_pct(pct)
-        self._update_label()
         if self._suppress:
             return
         # Only touch the bus when the LED is on; when off the slider just
         # pre-sets a value for the next toggle-on.
-        if self._chk_on.isChecked():
-            self._queue_send()
+        self._state.apply(pct=pct, send=self._state.is_on())
 
     def _update_label(self) -> None:
-        if self._chk_on.isChecked():
-            self._value_lbl.setText(f"{self._slider.value()}%")
+        if self._state.is_on():
+            self._value_lbl.setText(f"{self._state.pct()}%")
         else:
             self._value_lbl.setText("off")
 
-    def _queue_send(self) -> None:
-        self._send_timer.start()
-
     def _send_now(self) -> None:
-        if not self._connected():
-            return
-        try:
-            self._controller.set_led_brightness(self._desired_level())
-        except Exception as exc:  # never let a serial hiccup break the UI
-            logger.warning("LED brightness set failed: %s", exc)
+        self._state.send_now()

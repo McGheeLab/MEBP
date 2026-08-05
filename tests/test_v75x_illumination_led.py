@@ -11,6 +11,8 @@ via Marlin ``M106`` (no custom firmware needed). Covered here:
      the right level, gate on connection, and expose silent state restore.
   4. The ``illumination`` section is registered in the custom-panel catalog and
      builds headless (with optional persisted state).
+  5. Every view reads ONE shared state, so the LED reads the same on every page
+     that hosts a jog context — and N mounted views still emit ONE ``M106``.
 """
 
 import os
@@ -141,6 +143,12 @@ class TestControllerPassthrough(unittest.TestCase):
 # ── 3. IlluminationControl widget ─────────────────────────────────────────────
 
 class TestIlluminationControl(unittest.TestCase):
+    def setUp(self):
+        # The LED state is process-wide by design (one light, many views), so
+        # each test starts from a fresh one.
+        from gui.widgets.illumination_control import illumination_state
+        illumination_state().reset()
+
     def _make(self, connected=True):
         from gui.widgets.illumination_control import IlluminationControl
         ctrl = _FakeController(connected=connected)
@@ -208,6 +216,10 @@ class TestIlluminationControl(unittest.TestCase):
 # ── 4. Custom-panel registration ──────────────────────────────────────────────
 
 class TestSectionRegistration(unittest.TestCase):
+    def setUp(self):
+        from gui.widgets.illumination_control import illumination_state
+        illumination_state().reset()
+
     def test_registered_in_catalog(self):
         from gui.widgets.context_sections import catalog, known_types
         self.assertIn("illumination", known_types())
@@ -230,6 +242,94 @@ class TestSectionRegistration(unittest.TestCase):
         w = build_section("illumination", ctx, {"level": 40, "on": True})
         self.assertTrue(w._ctrl.is_on())
         self.assertEqual(w._ctrl.value(), 40)
+
+    def test_persisted_options_do_not_clobber_a_live_setting(self):
+        """The custom panel rebuilds its sections on every layout change; a
+        re-seed then would reset the LED the operator just set."""
+        from gui.widgets.context_sections import build_section, SectionContext
+        from gui.widgets.illumination_control import IlluminationControl
+        ctrl = _FakeController()
+        live = IlluminationControl(ctrl)
+        live.set_value(70)
+        live.set_on(True)                 # operator's current setting
+
+        ctx = SectionContext(controller=ctrl)
+        rebuilt = build_section("illumination", ctx, {"level": 10, "on": False})
+        self.assertTrue(rebuilt._ctrl.is_on())
+        self.assertEqual(rebuilt._ctrl.value(), 70)
+
+
+# ── 5. One shared state across every page ────────────────────────────────────
+
+class TestSharedAcrossPanels(unittest.TestCase):
+    """Each page builds its own StandardJogContextPanel, hence its own
+    IlluminationControl. All of them must show the one light's real setting."""
+
+    def setUp(self):
+        from gui.widgets.illumination_control import illumination_state
+        illumination_state().reset()
+
+    def _two_views(self, connected=True):
+        from gui.widgets.illumination_control import IlluminationControl
+        ctrl = _FakeController(connected=connected)
+        return IlluminationControl(ctrl), IlluminationControl(ctrl), ctrl
+
+    def test_toggle_on_one_view_shows_on_the_other(self):
+        a, b, _ctrl = self._two_views()
+        a.set_value(60)
+        a._chk_on.setChecked(True)
+        self.assertTrue(b.is_on())
+        self.assertTrue(b._chk_on.isChecked())
+        self.assertEqual(b.value(), 60)
+        self.assertEqual(b._slider.value(), 60)
+        self.assertEqual(b._value_lbl.text(), "60%")
+
+    def test_brightness_drag_on_one_view_shows_on_the_other(self):
+        a, b, _ctrl = self._two_views()
+        a._chk_on.setChecked(True)
+        a._slider.setValue(25)
+        self.assertEqual(b._slider.value(), 25)
+        self.assertEqual(b._value_lbl.text(), "25%")
+
+    def test_a_view_built_later_opens_on_the_current_state(self):
+        """Navigating to a page for the first time mid-session must not show a
+        stale default — this is the reported bug."""
+        from gui.widgets.illumination_control import IlluminationControl
+        a, _b, ctrl = self._two_views()
+        a.set_value(35)
+        a._chk_on.setChecked(True)
+        late = IlluminationControl(ctrl)          # e.g. a workflow page opened now
+        self.assertTrue(late.is_on())
+        self.assertEqual(late._slider.value(), 35)
+
+    def test_many_views_emit_one_command(self):
+        """N mounted views must not each write to the ok-blocking ZP channel."""
+        from gui.widgets.illumination_control import IlluminationControl
+        ctrl = _FakeController()
+        views = [IlluminationControl(ctrl) for _ in range(4)]
+        views[0].set_value(50)
+        views[0]._chk_on.setChecked(True)
+        views[0]._send_now()
+        self.assertEqual(ctrl.led_calls, [_level_from_pct_expected(50)])
+
+    def test_views_share_one_debounce_timer(self):
+        a, b, _ctrl = self._two_views()
+        a._chk_on.setChecked(True)
+        self.assertTrue(b._send_timer.isActive())
+        self.assertIs(a._send_timer, b._send_timer)
+
+    def test_off_on_one_view_greys_out_all(self):
+        a, b, ctrl = self._two_views(connected=True)
+        ctrl.is_zp_connected = False
+        b.on_status_update()                 # only ONE view gets the tick…
+        self.assertFalse(b._slider.isEnabled())
+        a.on_status_update()                 # …the other reflects it on its own tick
+        self.assertFalse(a._slider.isEnabled())
+
+
+def _level_from_pct_expected(pct: int) -> int:
+    from gui.widgets.illumination_control import _level_from_pct
+    return _level_from_pct(pct)
 
 
 if __name__ == "__main__":
