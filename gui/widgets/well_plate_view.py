@@ -358,11 +358,9 @@ class WellPlateView(QGraphicsView):
 
         # v7.4.8: custom plates have per-well diameters (well_diameter is
         # 0.0). Use a representative radius for the border/header layout and
-        # render each well at its own size below.
-        if self._plate.well_diameter > 0:
-            radius_mm = self._plate.well_diameter / 2.0
-        else:
-            radius_mm = max((w.diameter for w in wells), default=6.0) / 2.0
+        # render each well at its own size below. v7.12: that resolution now
+        # lives on WellPlate rather than being spelled out per widget.
+        radius_mm = (self._plate.representative_well_diameter / 2.0) or 3.0
         radius_scene = radius_mm * SCALE_FACTOR
 
         # Standard grids draw A/B/C + 1/2/3 headers; custom plates (no
@@ -446,8 +444,8 @@ class WellPlateView(QGraphicsView):
         # Draw wells — each at its own diameter (v7.4.8: custom plates /
         # flattened rosette sub-wells have mixed sizes).
         for well in wells:
-            well_r = ((well.diameter / 2.0) * SCALE_FACTOR
-                      if well.diameter > 0 else radius_scene)
+            well_r = (self._plate.well_diameter_of(well.name)
+                      / 2.0) * SCALE_FACTOR or radius_scene
             item = WellGraphicsItem(well, well_r)
             item.setZValue(1)
             self._scene.addItem(item)

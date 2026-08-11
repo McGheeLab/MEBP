@@ -64,6 +64,60 @@ def _default_path() -> Path:
     return Path("config/hardware") / _DEFAULT_FILENAME
 
 
+#: Plausibility band for a filter wavelength (nm). Deliberately generous —
+#: it exists to catch a unit slip (µm typed as 0.519, or an Ångström value),
+#: not to police exotic optics.
+_MIN_WAVELENGTH_NM = 200.0
+_MAX_WAVELENGTH_NM = 1600.0
+
+#: Public so the Microscope setup UI can bound its spin boxes to exactly what
+#: the store will accept. There is ONE owner of this rule and it is here —
+#: a second copy in the UI is the "two homes for one fact" trap, and the
+#: symptom would be a value the operator can type but not save.
+WAVELENGTH_BAND_NM = (_MIN_WAVELENGTH_NM, _MAX_WAVELENGTH_NM)
+
+
+def clean_wavelength(value):
+    """A plausible wavelength in nm, or None. Never raises.
+
+    Public for the same reason as :data:`WAVELENGTH_BAND_NM`.
+    """
+    try:
+        nm = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (_MIN_WAVELENGTH_NM <= nm <= _MAX_WAVELENGTH_NM):
+        return None
+    return nm
+
+
+#: Retained name for this module's own callers.
+_clean_wavelength = clean_wavelength
+
+
+def _clean_optics(raw) -> dict:
+    """``{cube name: {emission_nm, excitation_nm}}``, dropping anything unusable.
+
+    Entries with neither wavelength are removed entirely, so "present but
+    empty" can never be mistaken for "measured".
+    """
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        key = str(name).strip()
+        if not key or not isinstance(entry, dict):
+            continue
+        clean = {}
+        for field in ("emission_nm", "excitation_nm"):
+            nm = _clean_wavelength(entry.get(field))
+            if nm is not None:
+                clean[field] = nm
+        if clean:
+            out[key] = clean
+    return out
+
+
 def _clean_slots(value, default: int) -> int:
     try:
         n = int(value)
@@ -105,11 +159,39 @@ class MicroscopeConfigStore:
             "objective_slots": _DEFAULT_OBJECTIVE_SLOTS,
             "filter_cubes": {},         # {"1": "DAPI", ...} — 1-based string keys
             "objectives": {},           # {"1": "4x Plan Fluor", ...}
+            # v7.17 — per-cube emission/excitation, for the LabLink image-job
+            # sidecar. Keyed by the cube's NAME, not its turret position: the
+            # wavelengths are a property of the cube and travel with it if it
+            # is moved to another slot, and a fluorescence scan labels its
+            # channels by name, which is the join a sidecar needs.
+            #   {"FITC": {"emission_nm": 519.0, "excitation_nm": 495.0}}
+            # ⚠ Absent means UNKNOWN and is left absent all the way to the
+            # wire. LabLink answers `missing_metadata` naming the fields,
+            # which is recoverable; a fabricated nominal value is not — it
+            # silently changes the answer (measured on real data: supplying
+            # NA + emission moved a segmented object count 2855 -> 2660 with
+            # no warning from any layer).
+            "filter_optics": {},
             # Focus preferences.
             "focus_step_um": _DEFAULT_FOCUS_STEP_UM,
             "focus_up_is_positive": True,
             "focus_min_um": None,       # optional operator soft limits
             "focus_max_um": None,
+            # Per-objective focus offsets measured by the plate-leveling survey.
+            # Parfocality is a property of the objectives AS MOUNTED IN THIS
+            # NOSEPIECE and of the tube/camera path — not of the plate — so it
+            # belongs to the body, is measured once, and must be readable by any
+            # surface that switches objectives without importing the wizard.
+            #   {camera_identity: {"reference": "4x",
+            #                      "offsets_um": {...},
+            #                      "centration_um": {name: [dx, dy]},
+            #                      "product_codes": {name: "MRH20040"},
+            #                      "measured_at": iso}}
+            "parfocal_offsets_um": {},
+            # Apply the parfocal shift automatically when the objective changes.
+            # Off by default: silently moving focus on a turret change is a
+            # surprise until the operator has seen the measurement.
+            "parfocal_auto_apply": False,
         }
 
     def _load(self) -> None:
@@ -141,6 +223,11 @@ class MicroscopeConfigStore:
             raw = data.get(key)
             data[key] = ({str(k): str(v) for k, v in raw.items()}
                          if isinstance(raw, dict) else {})
+        # v7.17 — nested {name: {emission_nm, excitation_nm}}, so it cannot go
+        # through the {str: str} coercion above. A malformed entry is DROPPED
+        # rather than coerced: a wavelength that is not a positive number is
+        # not recoverable into one, and absent is the honest answer.
+        data["filter_optics"] = _clean_optics(data.get("filter_optics"))
         self._data = data
 
     def _write(self) -> None:
@@ -282,6 +369,72 @@ class MicroscopeConfigStore:
             if save:
                 self._write()
 
+    # ── Filter-cube optics (v7.17, for the LabLink image-job sidecar) ──
+
+    def filter_optics(self) -> dict:
+        """``{cube name: {"emission_nm": .., "excitation_nm": ..}}``.
+
+        Only cubes the operator has actually filled in appear. A cube with no
+        entry is UNKNOWN, and stays unknown all the way to the sidecar.
+        """
+        with self._lock:
+            return json.loads(json.dumps(self._data.get("filter_optics") or {}))
+
+    def filter_optics_for(self, cube_name: str) -> dict:
+        """One cube's optics, or ``{}`` if never recorded.
+
+        Matched case-insensitively, because a scan's channel name comes from
+        `FluorescenceMosaicStore.CHANNELS` while the cube name is typed by
+        hand on the Microscope tab, and "FITC" vs "FITC " vs "fitc" should not
+        silently cost a deconvolution its emission wavelength.
+        """
+        want = str(cube_name or "").strip().lower()
+        if not want:
+            return {}
+        for name, entry in self.filter_optics().items():
+            if name.strip().lower() == want:
+                return dict(entry)
+        return {}
+
+    def set_filter_optics(self, cube_name: str, *,
+                          emission_nm=None, excitation_nm=None,
+                          save: bool = True) -> None:
+        """Record one cube's wavelengths. Passing None for both clears it.
+
+        Values outside a plausible band are REFUSED rather than clamped: a
+        clamped wavelength is a fabricated number that looks measured, and
+        this value silently changes an analysis result.
+        """
+        key = str(cube_name or "").strip()
+        if not key:
+            raise ValueError("a filter cube name is required")
+        entry = {}
+        for field, value in (("emission_nm", emission_nm),
+                             ("excitation_nm", excitation_nm)):
+            if value in (None, ""):
+                continue
+            nm = _clean_wavelength(value)
+            if nm is None:
+                raise ValueError(
+                    f"{field}={value!r} is not a wavelength in nm "
+                    f"(expected {_MIN_WAVELENGTH_NM:.0f}-{_MAX_WAVELENGTH_NM:.0f}). "
+                    f"A green emission is about 519, not 0.519.")
+            entry[field] = nm
+        with self._lock:
+            table = self._data.setdefault("filter_optics", {})
+            if entry:
+                table[key] = entry
+            else:
+                table.pop(key, None)
+            if save:
+                self._write()
+
+    def set_all_filter_optics(self, optics: dict) -> None:
+        """Replace the whole table in one write (unusable entries dropped)."""
+        with self._lock:
+            self._data["filter_optics"] = _clean_optics(optics)
+            self._write()
+
     def set_filter_labels(self, labels: dict) -> None:
         """Replace every filter-cube assignment in one write."""
         self._set_labels("filter_cubes", labels)
@@ -346,6 +499,71 @@ class MicroscopeConfigStore:
             self._data["focus_min_um"] = None if lo is None else float(lo)
             self._data["focus_max_um"] = None if hi is None else float(hi)
             self._write()
+
+    # ── Parfocality (per camera identity) ───────────────────────────
+
+    def parfocal_block(self, camera_identity: str) -> dict:
+        with self._lock:
+            blk = self._data.get("parfocal_offsets_um") or {}
+            return dict(blk.get(str(camera_identity)) or {})
+
+    def set_parfocal(self, camera_identity: str, *, reference: str,
+                     offsets_um: dict, centration_um: Optional[dict] = None,
+                     product_codes: Optional[dict] = None) -> None:
+        from datetime import datetime
+        rec = {
+            "reference": str(reference),
+            "offsets_um": {str(k): float(v) for k, v in (offsets_um or {}).items()},
+            "measured_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if centration_um:
+            rec["centration_um"] = {
+                str(k): [float(v[0]), float(v[1])]
+                for k, v in centration_um.items() if v is not None}
+        if product_codes:
+            rec["product_codes"] = {str(k): str(v)
+                                    for k, v in product_codes.items()}
+        with self._lock:
+            blk = self._data.setdefault("parfocal_offsets_um", {})
+            if not isinstance(blk, dict):
+                blk = self._data["parfocal_offsets_um"] = {}
+            blk[str(camera_identity)] = rec
+            self._write()
+
+    def parfocal_offset_um(self, camera_identity: str, objective_name: str,
+                           product_code: Optional[str] = None
+                           ) -> tuple[Optional[float], str]:
+        """Stored focus offset for one objective. ``(offset_um, why_not)``.
+
+        Returns ``(None, why)`` when the objective at that name has been
+        physically SWAPPED since the measurement — detected from the body's own
+        product code, which is the strongest invalidation signal available: the
+        hardware tells us, so no operator discipline is required.
+        """
+        blk = self.parfocal_block(camera_identity)
+        offsets = blk.get("offsets_um") or {}
+        if str(objective_name) not in offsets:
+            return (None, f"no parfocal offset measured for "
+                          f"'{objective_name}' on this camera")
+        if product_code:
+            known = (blk.get("product_codes") or {}).get(str(objective_name))
+            if known and str(known) != str(product_code):
+                return (None,
+                        f"the objective at '{objective_name}' is now "
+                        f"{product_code} but the parfocal offset was measured "
+                        f"with {known} — it was physically swapped, so the "
+                        f"offset no longer applies. Re-measure it.")
+        try:
+            return (float(offsets[str(objective_name)]), "")
+        except (TypeError, ValueError):
+            return (None, "stored parfocal offset is malformed")
+
+    def parfocal_auto_apply(self) -> bool:
+        with self._lock:
+            return bool(self._data.get("parfocal_auto_apply", False))
+
+    def set_parfocal_auto_apply(self, value: bool) -> None:
+        self.set("parfocal_auto_apply", bool(value))
 
 
 # ── Module-level singleton ──────────────────────────────────────────

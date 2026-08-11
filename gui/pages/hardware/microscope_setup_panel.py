@@ -54,8 +54,13 @@ class _SlotTable(QWidget):
         super().__init__(parent)
         self._kind = kind                 # "filter" | "objective"
         self._on_go = on_go
+        #: v7.17 — filter cubes carry emission/excitation wavelengths for the
+        #: LabLink image-job sidecar. Objectives do not (their NA comes from the
+        #: body, which reports it).
+        self._optics = (kind == "filter")
         self._rows: dict[int, dict] = {}
         self._cache: dict[int, str] = {}  # typed names surviving a rebuild
+        self._optics_cache: dict[int, tuple] = {}   # (em, ex) across a rebuild
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setHorizontalSpacing(s(10))
@@ -64,21 +69,36 @@ class _SlotTable(QWidget):
         self._grid.setColumnStretch(2, 4)   # name
         self._build_header()
 
+    #: Columns after the name column. Kept as a constant because
+    #: ``set_slot_count`` tears rows down by count and must keep the header.
+    _HEADER = ("#", "Fitted (read from microscope)", "Name shown in the app")
+    _OPTICS_HEADER = ("Em (nm)", "Ex (nm)")
+
     def _build_header(self) -> None:
-        for col, text in enumerate(
-                ("#", "Fitted (read from microscope)", "Name shown in the app",
-                 "")):
+        cols = list(self._HEADER)
+        if self._optics:
+            cols += list(self._OPTICS_HEADER)
+        cols.append("")
+        self._n_cols = len(cols)
+        for col, text in enumerate(cols):
             lbl = QLabel(text)
             lbl.setStyleSheet(
                 f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt; "
                 f"font-weight: 600;")
+            if text in self._OPTICS_HEADER:
+                lbl.setToolTip(
+                    "Emission / excitation wavelength of this cube, in "
+                    "nanometres. Sent to LabLink so a deconvolution recipe can "
+                    "compute the right PSF. Leave blank if you do not know it — "
+                    "LabLink names a missing field, and a plausible guess would "
+                    "silently change the result.")
             self._grid.addWidget(lbl, 0, col)
 
     # ── Build / read ──────────────────────────────────────────────
 
     def set_slot_count(self, count: int) -> None:
         self._absorb_typed()
-        while self._grid.count() > 4:              # keep the header row
+        while self._grid.count() > self._n_cols:    # keep the header row
             item = self._grid.takeAt(self._grid.count() - 1)
             w = item.widget()
             if w is not None:
@@ -109,8 +129,36 @@ class _SlotTable(QWidget):
             self._grid.addWidget(num, row, 0)
             self._grid.addWidget(fitted, row, 1)
             self._grid.addWidget(edit, row, 2)
-            self._grid.addWidget(go, row, 3)
-            self._rows[pos] = {"fitted": fitted, "edit": edit, "go": go}
+            col = 3
+            entry = {"fitted": fitted, "edit": edit, "go": go}
+            if self._optics:
+                em_v, ex_v = self._optics_cache.get(pos, (0, 0))
+                for key, value in (("em", em_v), ("ex", ex_v)):
+                    spin = self._wavelength_spin(value)
+                    self._grid.addWidget(spin, row, col)
+                    entry[key] = spin
+                    col += 1
+            self._grid.addWidget(go, row, col)
+            self._rows[pos] = entry
+
+    @staticmethod
+    def _wavelength_spin(value) -> QSpinBox:
+        """A nanometre spin whose 0 means "not known".
+
+        The range comes from the store, the one owner of the plausible band —
+        a second copy here would let an operator type a value they cannot save.
+        Values below the band are still reachable by typing, so ``commit()``
+        refuses them rather than quietly rounding one into range: a fabricated
+        wavelength looks measured and changes a deconvolution's output.
+        """
+        from SupportClasses.MicroscopeConfigStore import WAVELENGTH_BAND_NM
+        spin = QSpinBox()
+        spin.setRange(0, int(WAVELENGTH_BAND_NM[1]))
+        spin.setSpecialValueText("—")         # 0 renders as "unknown"
+        spin.setSingleStep(5)
+        spin.setFixedWidth(s(72))
+        spin.setValue(int(value or 0))
+        return spin
 
     def _absorb_typed(self) -> None:
         for pos, row in self._rows.items():
@@ -119,6 +167,13 @@ class _SlotTable(QWidget):
                 self._cache[pos] = text
             else:
                 self._cache.pop(pos, None)
+            if self._optics and "em" in row:
+                em = int(row["em"].value())
+                ex = int(row["ex"].value())
+                if em or ex:
+                    self._optics_cache[pos] = (em, ex)
+                else:
+                    self._optics_cache.pop(pos, None)
 
     def labels(self) -> dict:
         return {pos: row["edit"].text() for pos, row in self._rows.items()}
@@ -127,6 +182,55 @@ class _SlotTable(QWidget):
         self._cache.update({int(k): str(v) for k, v in (labels or {}).items()})
         for pos, row in self._rows.items():
             row["edit"].setText(str((labels or {}).get(pos, "")))
+
+    # ── Filter-cube optics (v7.17) ────────────────────────────────
+
+    def optics(self) -> dict:
+        """``{cube name: {"emission_nm": .., "excitation_nm": ..}}``.
+
+        Keyed by NAME because the store is: a wavelength is a property of the
+        cube, not of the slot it happens to sit in, so moving a cube between
+        slots must not lose it. Two slots sharing a name therefore share one
+        entry — the last row wins, which is right for two cubes of one type.
+        A slot with no name contributes nothing (there is no key to file it
+        under), and a row left at "—" is reported ABSENT, not zero.
+        """
+        out: dict = {}
+        if not self._optics:
+            return out
+        for _pos, row in self._rows.items():
+            name = row["edit"].text().strip()
+            if not name or "em" not in row:
+                continue
+            entry = {}
+            if int(row["em"].value()):
+                entry["emission_nm"] = float(row["em"].value())
+            if int(row["ex"].value()):
+                entry["excitation_nm"] = float(row["ex"].value())
+            if entry:
+                out[name] = entry
+        return out
+
+    def set_optics(self, table: dict) -> None:
+        """Fill the wavelength spins from a name-keyed store table.
+
+        ⚠ Call AFTER :meth:`set_labels` — the rows are matched by the name they
+        are currently showing.
+        """
+        if not self._optics:
+            return
+        lookup = {str(k).strip().lower(): (v or {})
+                  for k, v in (table or {}).items()}
+        for pos, row in self._rows.items():
+            if "em" not in row:
+                continue
+            entry = lookup.get(row["edit"].text().strip().lower(), {})
+            em = int(float(entry.get("emission_nm") or 0))
+            ex = int(float(entry.get("excitation_nm") or 0))
+            row["em"].setValue(em)
+            row["ex"].setValue(ex)
+            if em or ex:
+                self._optics_cache[pos] = (em, ex)
 
     def set_mounted(self, optics) -> None:
         """Show what the body reports, and mark the current slot."""
@@ -344,7 +448,10 @@ class MicroscopeSetupPanel(QWidget):
         lay.addWidget(self._hint(
             "Name what is loaded in each cassette slot — these names are what "
             "the jog panel and workflows show. The turret only reports a slot "
-            "NUMBER, so this mapping is the part only you know."))
+            "NUMBER, so this mapping is the part only you know.\n"
+            "Em / Ex are this cube's emission and excitation wavelengths in nm. "
+            "They are recorded nowhere else on the microscope, and a "
+            "deconvolution recipe needs them; leave blank if unknown."))
         lay.addLayout(self._slot_header(
             "Slots", "_filter_slots_spin", self._on_filter_slots,
             self._read_filters))
@@ -492,6 +599,9 @@ class MicroscopeSetupPanel(QWidget):
         self._objective_table.set_slot_count(st.objective_slots())
         self._filter_table.set_labels(st.filter_labels())
         self._objective_table.set_labels(st.objective_labels())
+        # AFTER set_labels: the optics table is name-keyed, so the rows have to
+        # be showing their names before they can be matched.
+        self._filter_table.set_optics(st.filter_optics())
 
         self._focus_step_spin.setValue(st.focus_step_um())
         self._focus_dir_chk.setChecked(st.focus_up_is_positive())
@@ -543,8 +653,32 @@ class MicroscopeSetupPanel(QWidget):
             st.set("focus_min_um", None, save=False)
             st.set("focus_max_um", None, save=False)
 
+        # v7.17 filter-cube wavelengths. REFUSED, not rounded, when out of the
+        # store's band: a wavelength nudged into range still looks measured, and
+        # it silently changes what a deconvolution returns.
+        from SupportClasses.MicroscopeConfigStore import (
+            WAVELENGTH_BAND_NM, clean_wavelength,
+        )
+        optics = self._filter_table.optics()
+        for name, entry in optics.items():
+            for field, value in entry.items():
+                if clean_wavelength(value) is None:
+                    QMessageBox.warning(
+                        self, "Microscope setup",
+                        f"{name}: {value:.0f} nm is not a plausible "
+                        f"{'emission' if field.startswith('em') else 'excitation'} "
+                        f"wavelength (expected "
+                        f"{WAVELENGTH_BAND_NM[0]:.0f}–{WAVELENGTH_BAND_NM[1]:.0f} nm).\n\n"
+                        "Leave the field blank if you do not know it — LabLink "
+                        "reports a missing wavelength by name, which is "
+                        "recoverable; a wrong one is not.")
+                    return False
+
         st.set_filter_labels(self._filter_table.labels())
         st.set_objective_labels(self._objective_table.labels())
+        # Whole-table replace, so clearing a row's wavelengths actually clears
+        # it rather than leaving a stale entry behind.
+        st.set_all_filter_optics(optics)
         st.save()
         return True
 

@@ -398,6 +398,10 @@ class ToupCamBackend:
         self._frame: np.ndarray | None = None
         self._lock = threading.Lock()
         self._frame_ready = threading.Event()
+        # v7.14: monotonic count of GENUINELY-NEW frames (see
+        # SupportClasses/CaptureTiming.py). read() serves the cached frame on
+        # demand, so read() calls do not measure sensor frames.
+        self._frames_acquired = 0
         self._w = 0
         self._h = 0
         self._running = False
@@ -520,6 +524,7 @@ class ToupCamBackend:
                     )
                     if hr >= 0:
                         self._frame = self._buf.copy()
+                        self._frames_acquired += 1
                         self._frame_ready.set()
             except Exception as e:
                 logger.debug(f"ToupCam pull error: {e}")
@@ -536,6 +541,15 @@ class ToupCamBackend:
         handle_ok = self._handle is not None and bool(self._handle)
         return handle_ok and self._running
     
+    def frames_acquired(self) -> int:
+        """v7.14: monotonic count of distinct frames the sensor has delivered.
+
+        Advances only in the image callback, so waiting on it is the only way
+        to know a frame is post-move rather than a repeat of the cached one.
+        """
+        with self._lock:
+            return self._frames_acquired
+
     def read(self) -> tuple[bool, np.ndarray | None]:
         """Read the latest frame (BGR numpy array).
         

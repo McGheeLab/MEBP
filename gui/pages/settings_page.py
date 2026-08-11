@@ -330,8 +330,41 @@ class SettingsPage(QWidget):
         # route through move_z_user_relative so it follows the taught z_up_sign.
         self.controller.move_z_user_relative(dz)
 
-    def _ctx_jog_pump(self, pump: str, dist: float):
-        self.controller.move_pump_relative(pump, dist)
+    def _ctx_jog_pump(self, pump: str, volume_uL: float):
+        # v7.9.x: this array is built with pump_action_labels=True, so the
+        # emitted distance is a SIGNED µL VOLUME (− aspirate / + dispense) —
+        # route it through the µL entry point. It previously went to
+        # move_pump_relative, which expects PLUNGER MM, so a "1 %" step
+        # commanded a 1 mm plunger move; the units never matched.
+        #
+        # v7.9.1: ...and it still passed NO rate, so every pump on this panel
+        # ran at move_pump_uL's internal default while the same pump on every
+        # other jog tile ran at its own configured flow. This panel carries no
+        # speed widget of its own, so it reads the per-pump % the CONTROLLER
+        # holds — the same cross-page state HardwareControlPanel writes — and
+        # anchors it to THIS pump's own safe ceiling. Same resolution as
+        # `HardwareControlPanel._on_jog_pump`, so a pump jogs identically
+        # wherever it is jogged from.
+        self.controller.move_pump_uL(
+            pump, volume_uL, rate_uL_s=self._ctx_pump_rate_uL_s(pump))
+
+    def _ctx_pump_rate_uL_s(self, pump: str):
+        """This pump's own jog flow (µL/s), or None to keep the legacy default.
+
+        None on anything unexpected: a wrong rate is worse than the previous
+        behaviour, and the controller's own clamp is the backstop either way.
+        """
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return None
+        try:
+            pct = float(dict(ctrl.get_pump_jog_pcts() or {}).get(pump, 0.0))
+            ceiling = float(ctrl.get_max_pump_feedrate_for(pump))
+        except Exception:
+            return None
+        if pct <= 0.0 or ceiling <= 0.0:
+            return None
+        return pct / 100.0 * ceiling
 
     def _ctx_jog_home(self):
         self.controller.move_to_zero()

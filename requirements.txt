@@ -32,5 +32,11 @@ llvmlite>=0.43; sys_platform == "win32"
 # Micro-Manager's adapter wraps rather than replaces (see micro-manager.org/NikonTI).
 pymmcore==12.5.0.75.0
 
+# .nd3 container format (SupportClasses/ND3.py) — HDF5-based image container
+# shared with Blender / LabLink readers. Wheels only, no compiler needed; does
+# NOT move the numpy pin (h5py needs numpy>=1.21.2). PyInstaller detects h5py
+# automatically via its bundled hook.
+h5py>=3.12
+
 # Packaging (build_exe.py)
 pyinstaller==6.21.0

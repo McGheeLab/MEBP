@@ -14,8 +14,9 @@ Then, once the check passes:
     python3 lablink_connect.py list                see what is on the server
 
 Settings are remembered in lablink_config.json beside this file, so you only
-ever type the server address and token once (and the defaults below are
-already filled in for this lab).
+ever type the server address and token once:
+
+    python lablink_connect.py --url http://100.x.y.z:8765 --token YOUR-TOKEN
 
 Deliberately forgiving: it can be run from any folder, works on Python 3.8+,
 never needs arguments, and turns every failure into a sentence telling you
@@ -30,9 +31,17 @@ import sys
 import time
 from pathlib import Path
 
-# --- defaults for this lab; override in lablink_config.json or on the CLI ----
-DEFAULT_URL = "http://10.134.186.83:8765"
-DEFAULT_TOKEN = "k7ouj2tny6d0br3l5xsp"
+# --- site defaults -----------------------------------------------------------
+# Left empty on purpose. A shared secret committed to a repository is a secret
+# no longer, and a URL baked in here would point every copy of this script at
+# one particular machine. Supply them once and they are remembered in
+# lablink_config.json beside this script (which .gitignore excludes):
+#
+#   python lablink_connect.py --url http://100.x.y.z:8765 --token YOUR-TOKEN
+#
+# or set LABLINK_URL and LABLINK_TOKEN in the environment.
+DEFAULT_URL = ""
+DEFAULT_TOKEN = ""
 DEFAULT_SEND_CHANNEL = "results"     # this machine -> lab
 DEFAULT_GET_CHANNEL = "mebp-out"     # lab -> this machine
 

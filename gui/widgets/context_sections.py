@@ -30,7 +30,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QGridLayout, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from gui.scaling import s, sf
@@ -38,7 +38,7 @@ from gui.styles import COLORS
 from gui.widgets.components import Card
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.pump_rack import PumpRack
-from gui.pages.hardware.control_panel import PositionBar
+from gui.pages.hardware.control_panel import PositionBar, PositionValueLabel
 
 try:  # module-level height helper fallback for Z display
     from SupportClasses.StageController import z_raw_to_display
@@ -250,13 +250,16 @@ class PositionReadoutCard(QWidget):
             ax_lbl.setMinimumWidth(s(22))
             grid.addWidget(ax_lbl, r, 0)
             bar = PositionBar()
+            # v7.9.x: match the control-panel copy — the bar yields, the value
+            # text keeps priority (PositionValueLabel tracks its text width),
+            # so a long position can never be clipped into the unit label and
+            # the card can still shrink to a narrow pane.
+            bar.setMinimumWidth(s(10))
+            bar.setSizePolicy(QSizePolicy.Ignored,
+                              bar.sizePolicy().verticalPolicy())
             grid.addWidget(bar, r, 1)
             self._bar[axis] = bar
-            val = QLabel("—")
-            val.setStyleSheet(
-                f"color: {COLORS['text']}; font-family: monospace;")
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val.setMinimumWidth(s(70))
+            val = PositionValueLabel()
             grid.addWidget(val, r, 2)
             unit_lbl = QLabel(unit)
             unit_lbl.setStyleSheet(f"color: {COLORS['subtext0']};")

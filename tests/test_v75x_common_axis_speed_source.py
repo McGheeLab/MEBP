@@ -300,21 +300,24 @@ class TestControlPanelModes(unittest.TestCase):
 
     def test_hardware_setup_pump_jog_is_mm(self):
         p, c = self._panel(pump_action_labels=False)
-        self.assertFalse(p._jog_array.pump_step_is_percent)
+        self.assertFalse(p._jog_array.pump_step_is_uL)
         p._on_jog_pump("P1", 0.1)
         self.assertTrue(_wait_for(lambda: c.move_pump_relative.called))
         self.assertFalse(c.move_pump_uL.called)
 
-    def test_other_pages_pump_jog_is_percent_uL(self):
+    def test_other_pages_pump_jog_is_uL(self):
+        # v7.9.x: the emitted distance is a SIGNED µL VOLUME (was a % of the
+        # syringe volume, which cannot express a 0.001 µL step).
         p, c = self._panel(pump_action_labels=True)
-        self.assertTrue(p._jog_array.pump_step_is_percent)
-        p._on_jog_pump("P1", -10.0)            # signed % (aspirate)
+        self.assertTrue(p._jog_array.pump_step_is_uL)
+        p._on_jog_pump("P1", -0.005)           # signed µL (aspirate)
         self.assertTrue(_wait_for(lambda: c.move_pump_uL.called))
         self.assertFalse(c.move_pump_relative.called)
         pump, vol = c.move_pump_uL.call_args[0][0], c.move_pump_uL.call_args[0][1]
         self.assertEqual(pump, "P1")
         self.assertLess(vol, 0.0)              # aspirate = negative µL
-        self.assertAlmostEqual(vol, -25.0)     # -10% of 250 µL
+        self.assertAlmostEqual(vol, -0.005)    # passed through, not scaled
+        self.assertFalse(c.pump_pct_to_uL.called)
 
     def test_percent_change_pushes_shared_jog_pct(self):
         p, c = self._panel(pump_action_labels=True)

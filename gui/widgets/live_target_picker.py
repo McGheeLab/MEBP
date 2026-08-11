@@ -86,9 +86,10 @@ class _PickerCameraView(TargetOverlayCameraView):
     adds a target — which is what protects the legacy workflow and the
     ``pick_only`` consumers (Cell Labeling).
 
-    Coordinates: ``_widget_to_image`` gives RAW frame pixels (this branch of the
-    hierarchy bypasses ``_orient_qimage``, so there is no view transform to
-    invert), the model is in µm, and hit-testing is in WIDGET pixels. The
+    Coordinates: ``_widget_to_image`` gives RAW frame pixels (the base class
+    inverts the view transform for us), the model is in µm, and hit-testing is
+    in WIDGET pixels. ``_image_to_widget`` re-applies that transform, so the two
+    stay exact inverses on a rotated/mirrored camera as well as an aligned one. The
     µm↔px projection is FROZEN for the duration of a drag: the host polls the
     stage at 5 Hz and calls ``set_stage_position``, so a drag spanning a stage
     settle would otherwise silently resize the circle.
@@ -198,31 +199,17 @@ class _PickerCameraView(TargetOverlayCameraView):
             return QPointF(img_w / 2.0, img_h / 2.0)
         return QPointF(dx_um / eff + img_w / 2.0, dy_um / eff + img_h / 2.0)
 
-    def _image_to_widget(self, ix: float, iy: float):
-        """Raw frame pixel → widget pixel — exact inverse of `_widget_to_image`."""
-        pm = self._last_pixmap
-        if pm is None or pm.isNull():
-            return None
-        img_w, img_h = (self._displayed_image_size
-                        if self._displayed_image_size[0]
-                        else self._last_image_size)
-        if not img_w or not img_h:
-            return None
-        scale = pm.width() / float(img_w)
-        ox = (self._display.width() - pm.width()) / 2.0
-        oy = (self._display.height() - pm.height()) / 2.0
-        return (ix * scale + ox, iy * scale + oy)
+    # v7.15 — the three hand-rolled letterbox mappings that used to live here
+    # (_image_to_widget, _widget_scale, _clamped_image_point) now delegate to
+    # the base class's single ViewGeometry. They were independent copies of
+    # the same arithmetic, so adding zoom to one and not the others would have
+    # drifted the target rings away from the clicks that placed them — the
+    # v7.8 identity-inverse defect at a different layer.
 
     def _widget_scale(self) -> float:
         """Widget px per raw frame px (for converting a grab tolerance)."""
-        pm = self._last_pixmap
-        if pm is None or pm.isNull():
-            return 1.0
-        img_w = (self._displayed_image_size[0]
-                 if self._displayed_image_size[0] else self._last_image_size[0])
-        if not img_w:
-            return 1.0
-        return pm.width() / float(img_w)
+        geo = self.geometry_map()
+        return geo.widget_scale() if geo.valid else 1.0
 
     def _radius_image_px(self, t: PickPlaceTarget) -> float:
         _sx, _sy, eff = self._projection()
@@ -334,20 +321,11 @@ class _PickerCameraView(TargetOverlayCameraView):
         Clamping (rather than bailing) means the circle keeps following the
         cursor when it strays off the pixmap instead of lurching back — the same
         behaviour MeasurementCameraView's endpoint drag has.
+
+        v7.15: one call, into the shared geometry. This used to re-derive the
+        letterbox offset and scale for itself.
         """
-        img = self._widget_to_image(wx, wy)
-        if img is not None:
-            return img
-        pm = self._last_pixmap
-        img_w, img_h = self._last_image_size
-        if pm is None or not img_w or not img_h:
-            return None
-        scale = self._widget_scale() or 1.0
-        ox = (self._display.width() - pm.width()) / 2.0
-        oy = (self._display.height() - pm.height()) / 2.0
-        ix = min(max(0.0, (wx - ox) / scale), float(img_w))
-        iy = min(max(0.0, (wy - oy) / scale), float(img_h))
-        return (ix, iy)
+        return self._widget_to_image(wx, wy, clamp=True)
 
     def _apply_drag(self, wx: float, wy: float, *, commit: bool):
         target = self._target_by_id(self._drag_id)
@@ -446,8 +424,20 @@ class _PickerCameraView(TargetOverlayCameraView):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
+        # v7.15: the pixmap is the SCALED one, so project stage µm → RAW frame
+        # px (the frame the calibration describes) and then map RAW → pixmap
+        # through the shared geometry. Passing the scaled size into
+        # stage_offset_to_pixel would ALSO change the µm/px it resolves —
+        # effective_um_per_px is a function of the frame width.
+        geo = self.geometry_map()
+        raw_w, raw_h = (geo.raw_size if geo.raw_size[0]
+                        else self._last_image_size)
+        self._draw_scale = geo.widget_scale() if geo.valid else 1.0
+
         def to_px(t: PickPlaceTarget) -> QPointF:
-            return self._um_to_image_px(t.x_um, t.y_um, img_w, img_h)
+            p = self._um_to_image_px(t.x_um, t.y_um, raw_w, raw_h)
+            m = geo.to_pixmap(p.x(), p.y()) if geo.valid else (p.x(), p.y())
+            return QPointF(m[0], m[1]) if m else QPointF(-1e6, -1e6)
 
         # Connector lines for paired entries.
         painter.setPen(QPen(QColor(COLORS["overlay0"]), 1, Qt.DashLine))
@@ -458,7 +448,7 @@ class _PickerCameraView(TargetOverlayCameraView):
                               QColor(COLORS["green"]), img_w, img_h, to_px)
         self._draw_marker_set(painter, self._place_targets,
                               QColor(COLORS["mauve"]), img_w, img_h, to_px)
-        self._draw_rim(painter)
+        self._draw_rim(painter, geo, raw_w, raw_h)
         painter.end()
 
     def _draw_marker_set(self, painter, targets, color, img_w, img_h, to_px):
@@ -468,7 +458,7 @@ class _PickerCameraView(TargetOverlayCameraView):
             if (pos.x() < -50 or pos.y() < -50
                     or pos.x() > img_w + 50 or pos.y() > img_h + 50):
                 continue
-            r_px = self._radius_image_px(t)
+            r_px = self._radius_image_px(t) * getattr(self, "_draw_scale", 1.0)
             # A mosaic-derived position is a hint until a live click confirms it
             # — dashed says "not yet verified against this frame".
             unconfirmed = (self._provenance.get(t.target_id) == PROV_MOSAIC)
@@ -493,22 +483,44 @@ class _PickerCameraView(TargetOverlayCameraView):
             painter.drawText(
                 int(pos.x() + r_px + 3), int(pos.y() - 2), label)
 
-    def _draw_rim(self, painter):
+    def _draw_rim(self, painter, geo=None, raw_w=0, raw_h=0):
+        """Rim picks and the fitted circle, in PIXMAP coords (v7.15).
+
+        The stored rim points are RAW frame pixels (that is what
+        ``_widget_to_image`` yields), so they go through the geometry like
+        everything else — they used to be painted straight onto the pixmap,
+        which only coincided with the truth on an unrotated, unzoomed camera.
+        """
         if not self._rim_points:
             return
+        if geo is None:
+            geo = self.geometry_map()
+        if not raw_w or not raw_h:
+            raw_w, raw_h = (geo.raw_size if geo.raw_size[0]
+                            else self._last_image_size)
+        scale = geo.widget_scale() if geo.valid else 1.0
+
+        def px(x, y):
+            m = geo.to_pixmap(x, y) if geo.valid else (x, y)
+            return QPointF(m[0], m[1]) if m else None
+
         peach = QColor(COLORS["peach"])
         painter.setPen(QPen(peach, 1))
         painter.setBrush(QBrush(peach))
-        for (px, py) in self._rim_points:
-            painter.drawEllipse(QPointF(px, py), 2.5, 2.5)
+        for (rx, ry) in self._rim_points:
+            p = px(rx, ry)
+            if p is not None:
+                painter.drawEllipse(p, 2.5, 2.5)
         painter.setBrush(Qt.NoBrush)
         if self._rim_fit is None:
             return
-        img_w, img_h = self._last_image_size
         x_um, y_um, d_um = self._rim_fit
-        pos = self._um_to_image_px(x_um, y_um, img_w, img_h)
+        raw = self._um_to_image_px(x_um, y_um, raw_w, raw_h)
+        pos = px(raw.x(), raw.y())
+        if pos is None:
+            return
         _sx, _sy, eff = self._projection()
-        r_px = (d_um / 2.0) / (eff or 1.0)
+        r_px = (d_um / 2.0) / (eff or 1.0) * scale
         pen = QPen(QColor(COLORS["yellow"]), 2, Qt.DashLine)
         painter.setPen(pen)
         painter.drawEllipse(pos, r_px, r_px)
@@ -1038,7 +1050,20 @@ class LiveTargetPicker(QWidget):
         if cam_cfg is not None:
             self._objective_name = getattr(cam_cfg, "current_objective_name", None)
             spec = getattr(cam_cfg, "camera_spec", None)
-            self._camera_model = getattr(spec, "model", None) if spec else None
+            # v7.16: the SHARED objectives.json key (device identity), like
+            # every other reader. This used to be ``spec.model`` — a name
+            # ``CameraSpec`` does not even define, so the lookup below silently
+            # found nothing and the picker fell back to the manager's µm/px for
+            # every camera.
+            try:
+                from SupportClasses.MosaicCalibration import (
+                    objective_camera_key)
+                self._camera_model = objective_camera_key(
+                    self._camera_manager, cam_idx,
+                    getattr(spec, "name", None) if spec else None)
+            except Exception:              # pragma: no cover - import guard
+                self._camera_model = (
+                    getattr(spec, "name", None) if spec else None)
         else:
             self._objective_name = None
             self._camera_model = None

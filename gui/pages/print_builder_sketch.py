@@ -2122,23 +2122,12 @@ class SketchPage(QWidget):
         uniform diameter, then the largest well on custom/varied plates."""
         if self._plate is None:
             return 0.0
+        # v7.12: one implementation of the per-well → plate-level → largest
+        # chain, on WellPlate.
         try:
-            if self._selected_well:
-                d = float(self._plate.get_well_info(self._selected_well).diameter or 0.0)
-                if d > 0:
-                    return d
-        except Exception:
-            pass
-        d = float(getattr(self._plate, "well_diameter", 0.0) or 0.0)
-        if d > 0:
-            return d
-        try:
-            wells = self._plate.get_all_wells()
-            if wells:
-                return float(max(w.diameter for w in wells))
-        except Exception:
-            pass
-        return 0.0
+            return float(self._plate.well_diameter_of(self._selected_well))
+        except Exception:                                  # pragma: no cover
+            return float(getattr(self._plate, "well_diameter", 0.0) or 0.0)
 
     def _apply_well_boundary(self) -> None:
         """Push the well-wall + needle-safe boundary circles to the canvas and

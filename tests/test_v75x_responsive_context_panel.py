@@ -58,9 +58,12 @@ class TestJogButtonArrayResponsive(unittest.TestCase):
     def test_structure_registered_for_scaling(self):
         arr = JogButtonArray(compact=True, show_pumps=True,
                              pump_action_labels=True)
-        # 3 step rows (XY/Z/P) × 5 presets = 15; 3 custom edits.
-        self.assertEqual(len(arr._scale_presets), 15)
+        # v7.9.x: the five preset buttons per row became ONE step slider.
+        # 3 step rows (XY/Z/P) → 3 sliders + 3 value boxes; the settings
+        # section adds a min/max edit per axis (6).
+        self.assertEqual(len(arr._scale_sliders), 3)
         self.assertEqual(len(arr._scale_customs), 3)
+        self.assertEqual(len(arr._scale_setting_edits), 6)
         # 5 XY/Z pad + home + 2 Z = 7 direction buttons.
         self.assertEqual(len(arr._scale_dir), 7)
         # 3 pumps × (aspirate + dispense) = 6 word buttons; no arrows.
@@ -78,16 +81,16 @@ class TestJogButtonArrayResponsive(unittest.TestCase):
                              pump_action_labels=True)
         arr._apply_scale(DEFAULT_MIN_SCALE)
         narrow_dir = arr._scale_dir[0].width()
-        narrow_preset = arr._scale_presets[0].minimumWidth()
+        narrow_slider = arr._scale_sliders[0].minimumWidth()
         narrow_pt = arr._scale_dir[0].font().pointSizeF()
 
         arr._apply_scale(DEFAULT_MAX_SCALE)
         wide_dir = arr._scale_dir[0].width()
-        wide_preset = arr._scale_presets[0].minimumWidth()
+        wide_slider = arr._scale_sliders[0].minimumWidth()
         wide_pt = arr._scale_dir[0].font().pointSizeF()
 
         self.assertLess(narrow_dir, wide_dir)
-        self.assertLess(narrow_preset, wide_preset)
+        self.assertLess(narrow_slider, wide_slider)
         self.assertLess(narrow_pt, wide_pt)
 
     def test_resize_event_drives_scale(self):

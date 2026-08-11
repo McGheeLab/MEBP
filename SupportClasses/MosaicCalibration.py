@@ -79,6 +79,7 @@ at paint time; the builder never sees it.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -102,10 +103,16 @@ SCAN_DEFAULTS: dict = {
     "settle_ms": 300,
     "fresh_frames": 3,
     "fresh_timeout_s": 2.5,
+    "avg_frames": 1,
     "target_px": 3000,
     "register": True,
     "max_shift_um": 0,
     "reg_method": "fourier_mellin",
+    # v7.14 — capture each tile at the camera's FULL sensor resolution,
+    # restoring the preview resolution when the scan ends. Binning does not
+    # change the field of view, so this visits the SAME tiles; it costs
+    # per-tile transfer time, not coverage.
+    "full_res_scan": False,
 }
 
 # Overlap is clamped to this band. The floor is not cosmetic: raster spacing is
@@ -131,6 +138,16 @@ class MosaicCalibration:
     base_um_per_px: float = 0.0
     calib_resolution: Optional[tuple[int, int]] = None
     live_resolution: Optional[tuple[int, int]] = None
+    # v7.16: the PRE-crop frame size. ``live_resolution`` is what the camera
+    # DELIVERS (and so what the FOV is computed from — a crop really does
+    # shrink the field); this is the sensor mode the µm/px rescale is keyed on.
+    # None => no crop, i.e. identical to ``live_resolution``.
+    capture_resolution: Optional[tuple[int, int]] = None
+    # v7.16: raw-pixel displacement of the delivered frame's centre from the
+    # sensor's centre, non-zero only for an OFF-CENTRE crop. See
+    # ``crop_offset_um`` — the tile placement has to carry it or the mosaic and
+    # the click path disagree about where the stage was pointing.
+    crop_offset_px: tuple[float, float] = (0.0, 0.0)
 
     # (1)(2)(3) orientation — the camera→stage 2×2, canonically decomposed
     rotation_deg: float = 0.0
@@ -148,6 +165,13 @@ class MosaicCalibration:
     settle_ms: int = 300
     fresh_frames: int = 3
     fresh_timeout_s: float = 2.5
+    # v7.13 — raw frames averaged per tile (SNR ×√N); 1 = single frame.
+    avg_frames: int = 1
+    # v7.14 — scan at the camera's full sensor resolution (a SCAN parameter:
+    # the switch happens before the calibration is resolved, so by the time
+    # this object exists ``live_resolution`` already reflects it; the flag is
+    # carried only so the worker and the log can say what was asked for).
+    full_res_scan: bool = False
 
     # display-only whole-mosaic rotation (never baked into the composite)
     output_rotation_deg: float = 0.0
@@ -182,10 +206,52 @@ class MosaicCalibration:
         return self.um_per_px > 0 and self.calib_resolution is not None
 
     @property
-    def was_rescaled(self) -> bool:
-        if not (self.calib_resolution and self.live_resolution):
+    def crop_offset_um(self) -> tuple[float, float]:
+        """``crop_offset_px`` mapped into the STAGE frame.
+
+        v7.16. An off-centre crop means the delivered frame's middle shows a
+        point that is NOT where the stage is pointing. The displacement is a
+        raw-pixel vector, so it goes through the SAME camera→stage chain a click
+        does — ``µm/px · R(θ) · diag(mx, my)`` — which is what keeps the mosaic's
+        tile placement and ``CameraManager.pixel_to_stage_offset`` in agreement.
+        Two conventions consistently applied would each be fine; one of each is
+        the bug.
+
+        ``(0, 0)`` for a centred or absent crop.
+        """
+        dx_px, dy_px = self.crop_offset_px
+        if (abs(dx_px) < 1e-9 and abs(dy_px) < 1e-9) or self.um_per_px <= 0:
+            return (0.0, 0.0)
+        if self.flip_x:
+            dx_px = -dx_px
+        if self.flip_y:
+            dy_px = -dy_px
+        dx = dx_px * self.um_per_px
+        dy = dy_px * self.um_per_px
+        theta = float(self.rotation_deg or 0.0)
+        if not theta:
+            return (dx, dy)
+        t = math.radians(theta)
+        c, s = math.cos(t), math.sin(t)
+        return (dx * c - dy * s, dx * s + dy * c)
+
+    @property
+    def is_cropped(self) -> bool:
+        """True when the delivered frame is a crop of the captured one."""
+        if not (self.capture_resolution and self.live_resolution):
             return False
-        return abs(self.calib_resolution[0] - self.live_resolution[0]) > 1
+        return (abs(self.capture_resolution[0] - self.live_resolution[0]) > 1
+                or abs(self.capture_resolution[1] - self.live_resolution[1]) > 1)
+
+    @property
+    def was_rescaled(self) -> bool:
+        # v7.16: compared against the CAPTURE width — a crop changes the
+        # delivered width without any rescale having happened, and reporting
+        # that as "rescaled" would point the operator at the wrong thing.
+        ref = self.capture_resolution or self.live_resolution
+        if not (self.calib_resolution and ref):
+            return False
+        return abs(self.calib_resolution[0] - ref[0]) > 1
 
     def describe(self) -> str:
         """One-line human summary — used in logs and in the calibration UI."""
@@ -197,10 +263,14 @@ class MosaicCalibration:
             [n for n, on in (("flip X", self.flip_x), ("flip Y", self.flip_y))
              if on]) or "none"
         fw, fh = self.fov_um
+        crop = ""
+        if self.is_cropped and self.capture_resolution:
+            crop = (f" | cropped from "
+                    f"{self.capture_resolution[0]}x{self.capture_resolution[1]}")
         return (f"{self.um_per_px:.4f} um/px at {lr} "
                 f"(measured {self.base_um_per_px:.4f} @ {cr}) | "
                 f"FOV {fw:.0f}x{fh:.0f} um | rotation {self.rotation_deg:.1f} deg "
-                f"| flips {flips} | overlap {self.overlap_frac * 100:.0f}%")
+                f"| flips {flips} | overlap {self.overlap_frac * 100:.0f}%{crop}")
 
 
 # ── Resolution ───────────────────────────────────────────────────────────────
@@ -229,32 +299,113 @@ def _scan_params(scan_settings: Optional[Mapping]) -> dict:
     return out
 
 
+def objective_camera_key(camera_manager=None, cam_idx=None,
+                         camera_spec_name=None,
+                         identity=None) -> Optional[str]:
+    """THE key ``ObjectiveCalibrationStore`` is addressed by, for every caller.
+
+    v7.16 — this used to be ``camera_config.camera_spec.name`` at each call
+    site: a CONFIGURED catalogue label, not a property of the camera that is
+    actually plugged in. Two physical cameras sharing one spec name therefore
+    shared one per-objective calibration block, and the damage ran both ways:
+
+    * calibrating a newly fitted camera **overwrote** the previous camera's
+      values for that objective, and
+    * the mosaic then **read them back** and resolution-rescaled them, which is
+      only ever valid WITHIN one sensor — across two cameras it produces a
+      physically meaningless µm/px.
+
+    Measured on this rig: a Tucsen was calibrated while the spec still read
+    ``"Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)"``, so the ToupTek's 4x
+    calibration was destroyed, and a mosaic resolved
+    ``1.2710 um/px at 2600×2048 (measured 3.2271 @ 1024×1024)`` — the *Andor's*
+    number stretched onto the Tucsen's sensor.
+
+    The device identity is used whenever one can be read. There is deliberately
+    **no fallback to the spec name once an identity exists**: falling back is
+    precisely how one camera reads another's calibration, and an absent
+    calibration is recoverable (re-run a 30-second measurement) where a wrong
+    one is not. The spec name is used only when there is no identity at all
+    (simulated cameras, tests, no manager), which preserves legacy behaviour
+    exactly for those.
+    """
+    if identity is None and camera_manager is not None and cam_idx is not None:
+        try:
+            got = camera_manager.camera_identity(cam_idx)
+            if got:
+                identity = got[0] if isinstance(got, (tuple, list)) else got
+        except Exception:
+            identity = None
+    if identity:
+        return str(identity)
+    name = str(camera_spec_name or "").strip()
+    return name or None
+
+
+def capture_width_px(camera_manager=None, cam_idx=None,
+                     fallback: float = 0.0) -> float:
+    """Frame width in CAPTURE pixels, falling back to a delivered width.
+
+    v7.16 — THE one place the crop is divided out of a µm/px rescale.
+
+    ``µm/px ∝ 1/width`` describes the sensor being sampled differently (binning,
+    a resolution switch): the same optical field over more pixels. A centred
+    CROP changes the pixel count without changing what a pixel spans, so a
+    cropped width in that ratio rescales µm/px by the crop fraction — 27 % on
+    this rig's Tucsen at a square crop, and in the direction that makes a mosaic
+    believe its field is wider than it is and step past its own edges.
+
+    Every rescale site resolves its denominator through here rather than reading
+    ``frame.shape``, so there is one answer to "how wide is this sensor mode"
+    instead of one per call site. With no crop configured, the capture width IS
+    the delivered width and every caller is unchanged.
+    """
+    if camera_manager is not None and cam_idx is not None:
+        try:
+            getter = getattr(camera_manager, "capture_width", None)
+            if callable(getter):
+                got = float(getter(cam_idx, fallback) or 0.0)
+                if got > 0:
+                    return got
+        except Exception as exc:
+            logger.debug(f"capture_width_px: manager lookup failed: {exc}")
+    try:
+        return float(fallback or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _resolve_scale(camera_manager, cam_idx, camera_name, objective,
-                   live_res, obj_store, prov) -> tuple[float, float,
-                                                       Optional[tuple[int, int]]]:
+                   live_res, obj_store, prov, identity=None
+                   ) -> tuple[float, float, Optional[tuple[int, int]]]:
     """``(effective, base, calib_resolution)`` µm/px. See ``resolve``.
 
     Precedence — measurement first, and NOTHING may shadow it:
-      1. ``ObjectiveCalibration`` for (camera_name, objective). This is the one
+      1. ``ObjectiveCalibration`` for (camera key, objective). This is the one
          source that has always recorded the resolution it was measured at.
       2. The live ``CameraManager`` value (with its resolution, when it has one).
       3. Nothing — 0.0, which ``refuse_reason`` turns into a refusal.
+
+    v7.16: the camera key is :func:`objective_camera_key` — the DEVICE
+    IDENTITY, not the configured spec name. See that function for why.
     """
     base = 0.0
     cal_res = None
 
-    if camera_name and objective:
+    cam_key = objective_camera_key(
+        camera_manager, cam_idx, camera_name, identity)
+    if cam_key and objective:
         try:
             if obj_store is None:
                 from SupportClasses.ObjectiveCalibration import get_store
                 obj_store = get_store()
-            cal = obj_store.get_calibration(str(camera_name), str(objective))
+            cal = obj_store.get_calibration(str(cam_key), str(objective))
             if cal:
                 base = float(cal.get("measured_um_per_px") or 0.0)
                 cal_res = _as_res(cal.get("resolution"))
                 if base > 0:
                     prov["um_per_px"] = (
-                        f"objective calibration ({camera_name} / {objective})")
+                        f"objective calibration ({cam_key} / {objective})")
         except Exception as exc:
             logger.debug(f"MosaicCalibration: objective lookup failed: {exc}")
 
@@ -291,28 +442,52 @@ def _resolve_scale(camera_manager, cam_idx, camera_name, objective,
 
     prov["um_per_px_resolution"] = f"{cal_res[0]}×{cal_res[1]}"
     eff = base
-    if live_res and live_res[0] > 0:
+    # v7.16: rescale against the CAPTURE width, not the delivered one. A centred
+    # crop removes pixels without changing what a pixel spans, so dividing by a
+    # cropped width would rescale µm/px by the crop fraction — in the direction
+    # that makes the mosaic believe its field is wider than it is, which opens
+    # seams. With no crop configured this IS the live width.
+    denom = capture_width_px(camera_manager, cam_idx,
+                             live_res[0] if live_res else 0.0)
+    if denom > 0:
         # µm/px ∝ 1/frame_width: the same optical FOV over more pixels means
         # each pixel spans fewer µm.
-        eff = base * float(cal_res[0]) / float(live_res[0])
-        if abs(cal_res[0] - live_res[0]) > 1:
+        eff = base * float(cal_res[0]) / denom
+        if abs(cal_res[0] - denom) > 1:
             logger.info(
                 f"MosaicCalibration: um/px rescaled {base:.4f}@{cal_res[0]}px "
-                f"-> {eff:.4f}@{live_res[0]}px")
+                f"-> {eff:.4f}@{denom:.0f}px")
     return eff, base, cal_res
 
 
-def _resolve_orientation(camera_manager, cam_idx, identity, cal_store,
-                         prov) -> tuple[float, bool, bool, float]:
-    """``(rotation_deg, flip_x, flip_y, output_rotation_deg)``.
+def resolve_camera_orientation(camera_manager=None, cam_idx=None,
+                               identity: Optional[str] = None,
+                               cal_store=None,
+                               provenance: Optional[dict] = None
+                               ) -> tuple[float, bool, bool]:
+    """THE single answer to "how is this camera oriented vs the stage?".
+
+    Returns the canonical ``(rotation_deg, flip_x, flip_y)`` that
+    ``MosaicBuilder._orient_tile``, ``CameraFeedView.set_view_orientation`` and
+    ``CameraManager.pixel_to_stage_offset`` all consume as ``R(θ)·diag(mx, my)``.
 
     Precedence per field: the persisted ``CameraCalibrationStore`` entry (ground
     truth — it survives navigation and restarts) then the live
     ``CameraManager``, then neutral. Per-field rather than all-or-nothing so a
     camera with a stored rotation but a live-only flip still gets both.
+
+    v7.10: this used to exist THREE times — here, hand-rolled again in
+    ``CalibrationPage._ploc_microscope_frame_orientation``, and implicitly a
+    third time in ``CameraFeedView`` (manager-only, no store). Three copies of a
+    precedence rule is three chances for the mosaic, the plate-location feed and
+    the live view to disagree about the same camera, which is exactly what the
+    operator saw. There is now one implementation and the callers delegate; a
+    test pins that they are the same function object.
+
+    ``provenance`` (optional dict) is filled in with per-field sources.
     """
+    prov = provenance if provenance is not None else {}
     rot = flip_x = flip_y = None
-    out_rot = 0.0
 
     if identity:
         try:
@@ -330,9 +505,6 @@ def _resolve_orientation(camera_manager, cam_idx, identity, cal_store,
                 if "flip_y" in entry:
                     flip_y = bool(entry["flip_y"])
                     prov["flip_y"] = "camera store"
-            getter = getattr(cal_store, "get_mosaic_output_rotation", None)
-            if callable(getter):
-                out_rot = float(getter(identity) or 0.0)
         except Exception as exc:
             logger.debug(f"MosaicCalibration: camera store read failed: {exc}")
 
@@ -357,7 +529,34 @@ def _resolve_orientation(camera_manager, cam_idx, identity, cal_store,
     prov.setdefault("rotation_deg", "unmeasured (0°)")
     prov.setdefault("flip_x", "unmeasured (no flip)")
     prov.setdefault("flip_y", "unmeasured (no flip)")
-    return (float(rot or 0.0), bool(flip_x), bool(flip_y), out_rot)
+    return (float(rot or 0.0), bool(flip_x), bool(flip_y))
+
+
+def _resolve_orientation(camera_manager, cam_idx, identity, cal_store,
+                         prov) -> tuple[float, bool, bool, float]:
+    """``(rotation_deg, flip_x, flip_y, output_rotation_deg)``.
+
+    Thin wrapper over :func:`resolve_camera_orientation` that additionally
+    reads the display-only whole-mosaic output rotation (which is a mosaic
+    concern, not a camera-orientation one, so it does not belong in the
+    shared resolver).
+    """
+    rot, flip_x, flip_y = resolve_camera_orientation(
+        camera_manager, cam_idx, identity, cal_store, prov)
+
+    out_rot = 0.0
+    if identity:
+        try:
+            if cal_store is None:
+                from SupportClasses.CameraCalibrationStore import get_store
+                cal_store = get_store()
+            getter = getattr(cal_store, "get_mosaic_output_rotation", None)
+            if callable(getter):
+                out_rot = float(getter(identity) or 0.0)
+        except Exception as exc:
+            logger.debug(f"MosaicCalibration: output rotation read: {exc}")
+
+    return (rot, flip_x, flip_y, out_rot)
 
 
 def resolve(*, camera_manager=None, cam_idx: Optional[int] = None,
@@ -391,9 +590,32 @@ def resolve(*, camera_manager=None, cam_idx: Optional[int] = None,
     if live_res is None:
         prov["live_resolution"] = "unknown"
 
+    # v7.16: the PRE-crop sensor mode. Kept beside the delivered size because
+    # they answer different questions — the FOV comes from what is delivered,
+    # the µm/px rescale from what was captured.
+    cap_res = None
+    crop_off = (0.0, 0.0)
+    if camera_manager is not None and cam_idx is not None:
+        try:
+            getter = getattr(camera_manager, "capture_resolution", None)
+            cap_res = _as_res(getter(cam_idx)) if callable(getter) else None
+        except Exception:
+            cap_res = None
+        try:
+            coff = getattr(camera_manager, "crop_center_offset_px", None)
+            if callable(coff):
+                got = coff(cam_idx)
+                crop_off = (float(got[0]), float(got[1]))
+        except Exception:
+            crop_off = (0.0, 0.0)
+    if cap_res and live_res and (abs(cap_res[0] - live_res[0]) > 1
+                                 or abs(cap_res[1] - live_res[1]) > 1):
+        prov["crop"] = (f"cropped to {live_res[0]}×{live_res[1]} of "
+                        f"{cap_res[0]}×{cap_res[1]}")
+
     eff, base, cal_res = _resolve_scale(
         camera_manager, cam_idx, camera_name, objective, live_res, obj_store,
-        prov)
+        prov, identity)
     rot, flip_x, flip_y, out_rot = _resolve_orientation(
         camera_manager, cam_idx, identity, cal_store, prov)
 
@@ -408,6 +630,8 @@ def resolve(*, camera_manager=None, cam_idx: Optional[int] = None,
         base_um_per_px=base,
         calib_resolution=cal_res,
         live_resolution=live_res,
+        capture_resolution=cap_res,
+        crop_offset_px=crop_off,
         rotation_deg=rot,
         flip_x=flip_x,
         flip_y=flip_y,
@@ -419,6 +643,8 @@ def resolve(*, camera_manager=None, cam_idx: Optional[int] = None,
         settle_ms=max(0, int(p["settle_ms"])),
         fresh_frames=max(1, int(p["fresh_frames"])),
         fresh_timeout_s=float(p["fresh_timeout_s"]),
+        avg_frames=max(1, int(p.get("avg_frames", 1))),
+        full_res_scan=bool(p.get("full_res_scan", False)),
         output_rotation_deg=out_rot,
         provenance=prov,
     )
@@ -523,6 +749,7 @@ def build_mosaic_builder(cal: MosaicCalibration, *, retain_frames: bool = False,
         frame_flip_y=bool(cal.flip_y),
         retain_for_reorient=bool(retain_for_reorient),
         registration_method=str(cal.reg_method),
+        tile_center_offset_um=cal.crop_offset_um,
     )
     kwargs.update(overrides)
     return MosaicBuilder(**kwargs)

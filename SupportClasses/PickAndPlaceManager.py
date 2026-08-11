@@ -98,9 +98,14 @@ class PickPlaceTarget:
     size_um: float = 0.0              # Estimated target diameter in µm
     label: str = ""                   # User label
     selected: bool = True             # Whether included in operations
+    # v7.13 — per-target pick/removal Z override (zero-ref mm), resolved by
+    # the GUI from the measured SAMPLE SURFACE through the verified
+    # focus↔needle datum. None = use the run-level pick_z_mm. The plate-bottom
+    # floor armed for the queue remains the hard backstop underneath it.
+    pick_z_zref_mm: Optional[float] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "target_id": self.target_id,
             "x_um": self.x_um,
             "y_um": self.y_um,
@@ -111,6 +116,11 @@ class PickPlaceTarget:
             "label": self.label,
             "selected": self.selected,
         }
+        # Conditional-emit: a target without an override serializes exactly
+        # as before (byte-identity for existing stored targets).
+        if self.pick_z_zref_mm is not None:
+            d["pick_z_zref_mm"] = float(self.pick_z_zref_mm)
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> PickPlaceTarget:
@@ -1561,6 +1571,21 @@ class PickPlaceExecutor:
         # Pick / place use independent operating heights when supplied.
         removal_z = self.pick_z_mm if self.pick_z_mm is not None else self.operating_z_mm
         place_z = self.place_z_mm if self.place_z_mm is not None else self.operating_z_mm
+
+        # v7.13 — per-target sample-surface removal Z. Resolved by the GUI at
+        # queue build (measured surface + verified focus↔needle datum + the
+        # operator's offset), already gated page-side: low-confidence targets
+        # arrive with None and use the run-level height. The plate-bottom
+        # floor armed for this queue stays the hard backstop.
+        target_removal_z = getattr(source, "pick_z_zref_mm", None)
+        if target_removal_z is not None:
+            try:
+                removal_z = float(target_removal_z)
+                logger.info(
+                    "Cell removal: %s uses sample-surface removal Z "
+                    "%.3f mm (zref)", source.target_id, removal_z)
+            except (TypeError, ValueError):
+                pass
 
         logger.info(
             "Cell removal: %s → %s, push=%.5f µL (slow %.2f µL/s), pull=%.5f µL "

@@ -101,14 +101,56 @@ def plus_column_direction_deg(commanded_deg: float, measured_dx_px: float,
     return ((angle + 180.0) % 360.0) - 180.0  # normalize to [−180, 180)
 
 
-def fold_parallel_deg(angle_deg: float) -> float:
-    """Fold an angle to (−90, 90] — its deviation from PARALLEL.
+def column_direction_to_camera_rotation_deg(commanded_deg: float,
+                                            raw_deg: float,
+                                            mirrored: bool = False,
+                                            flip_y: bool = False) -> float:
+    """Convert ``plus_column_direction_deg``'s output into the camera rotation
+    ``θ`` that belongs beside the ALREADY-STORED ``mirrored`` / ``flip_y``.
 
-    A displacement vector and its negation lie on the same line, so both
-    fold to the same roll (e.g. 179° → −1°, −135° → 45°).
+    That helper models the stage→image map as ``scale·R(α)`` and its docstring
+    says so — but the repo's convention (``CameraManager.pixel_to_stage_offset``,
+    ``camera_feed_view.view_transform_coeffs``, ``MosaicBuilder._orient_tile``)
+    is ``s = R(θ)·F·u·p`` with ``F = diag(mx, my)``, ``mx = −1`` iff mirrored,
+    ``my = −1`` iff flip_y. A commanded move ``m`` at stage angle ``c`` shifts
+    image content by ``d = −(1/u)·F⁻¹·R(−θ)·m`` (from ``pto``'s own contract:
+    a plate feature's stage LABEL ``xy + pto(P)`` is invariant under stage
+    motion).
+
+    Two separate things then go wrong, and BOTH must be undone:
+
+    1. ``diag(−1,−1) == R(180)``, so ``R(θ)·F`` always reduces to
+       ``R(θ_eff)·diag(1, my_eff)`` with ``θ_eff = θ + 180`` and
+       ``my_eff = −my`` whenever ``mx = −1``. The helper can only ever report
+       ``θ_eff``, i.e. it is **180° out for any mirrored camera**.
+    2. Conjugating a rotation by a reflection reverses it, so for
+       ``det F = −1`` the helper returns ``2c − θ_eff`` — a reflection *about
+       the commanded angle*, not a plain sign flip. It therefore changes with
+       whichever direction preset the operator happened to click, which is why
+       a single reading cannot look wrong.
+
+    Inverting both, in order::
+
+        θ_eff = (2c − raw) if det F == −1 else raw
+        θ     = θ_eff − 180 if mirrored else θ_eff
+
+    Exactly a no-op for an unmirrored, unflipped camera. Verified numerically
+    against a forward simulation of ``pixel_to_stage_offset`` for all four flip
+    combinations.
     """
-    r = float(angle_deg) % 180.0  # Python % is non-negative for float rhs>0
-    return r - 180.0 if r > 90.0 else r
+    theta = float(raw_deg)
+    if bool(mirrored) != bool(flip_y):          # det F == -1
+        theta = 2.0 * float(commanded_deg) - theta
+    if bool(mirrored):                          # diag(-1, .) carries an R(180)
+        theta -= 180.0
+    return ((theta + 180.0) % 360.0) - 180.0    # normalize to [-180, 180)
+
+
+# v7.10: fold_parallel_deg moved to the Qt-free SupportClasses module so the
+# live rotation tracker and this dialog cannot drift apart on a sign-carrying
+# helper. Re-exported here, unchanged, for every existing importer.
+from SupportClasses.CameraRotationTracker import (  # noqa: E402
+    fold_parallel_deg, wrap_deg)  # noqa: F401
 
 
 def view_roll_from_displacement(dx_px: float, dy_px: float,
@@ -148,12 +190,27 @@ class PixelCalibrationDialog(QDialog):
     """Modal dialog for empirical camera µm/px calibration via stage movement."""
 
     def __init__(self, camera_manager, controller, cam_idx: int = 0,
-                 parent=None):
+                 parent=None, needle_mode: bool = False,
+                 cam_key: str | None = None, objective: str | None = None):
         super().__init__(parent)
         self._camera_manager = camera_manager
         self._controller = controller
         self._cam_idx = cam_idx
+        # v7.16: which camera + which objective this calibration is FOR.
+        # Needed to size the in-frame move bound: the bound depends on µm/px,
+        # but the move happens BEFORE the measurement exists, so the estimate
+        # has to come from the camera's native scale (a sensor property,
+        # derivable from ANY calibrated objective) divided by THIS objective's
+        # magnification. See ``_expected_um_per_px``.
+        self._cam_key = cam_key
+        self._objective = objective
         self._state = _CalState.READY
+        # v7.10: a needle SIDE camera gets a second measurement leg — a Z move,
+        # which moves the needle and nothing else. See the module docstring of
+        # SupportClasses/NeedleCameraCalibration for why one leg is not enough.
+        self._needle_mode = bool(needle_mode)
+        self.result_needle_axes = None      # NeedleCameraAxes | None
+        self._lateral_px = None             # (dx, dy) of the accepted XY leg
 
         self._frame_before = None
         self._frame_after = None
@@ -327,6 +384,55 @@ class PixelCalibrationDialog(QDialog):
         self._result_group.setVisible(False)
         side.addWidget(self._result_group)
 
+        # ── v7.10: Z leg (needle side cameras only) ───────────────
+        self._z_group = QGroupBox("Step 2 — Z leg (needle motion)")
+        self._z_group.setStyleSheet(self._group_style())
+        z_form = QFormLayout(self._z_group)
+
+        z_note = QLabel(
+            "An XY move slides the whole scene (the cameras ride the stage). "
+            "A Z move moves the NEEDLE and nothing else, which is what makes "
+            "the sensor roll, the Z direction and the true µm/px measurable "
+            "instead of assumed.\n\n"
+            "This leg stands alone — run it on its own for a rotation/scale "
+            "correction. The XY leg is only needed for the needle aligner's "
+            "±45° mount direction.\n\nThe needle retracts UP and returns.")
+        z_note.setWordWrap(True)
+        z_note.setMaximumWidth(s(340))
+        z_note.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {scaled_font_size(9)}pt;")
+        z_form.addRow(z_note)
+
+        self._spin_z = QDoubleSpinBox()
+        self._spin_z.setRange(20.0, 2000.0)
+        self._spin_z.setValue(200.0)
+        self._spin_z.setSuffix(" µm")
+        self._spin_z.setDecimals(0)
+        self._spin_z.setToolTip(
+            "How far to retract the needle (up — away from the plate) for the "
+            "Z leg. Kept small enough that the needle stays in frame.")
+        z_form.addRow("Z move (up):", self._spin_z)
+
+        self._btn_z = QPushButton("Measure Z leg")
+        self._btn_z.clicked.connect(self._start_z_leg)
+        # v7.10: NOT gated on the XY leg. The Z leg is the independent, more
+        # trustworthy measurement; requiring the lateral one first would make a
+        # rotation correction depend on the very measurement it supersedes.
+        self._btn_z.setEnabled(self._needle_mode)
+        z_form.addRow(self._btn_z)
+
+        self._lbl_z_result = QLabel(
+            "Run this on its own for rotation + µm/px, or after the XY leg to "
+            "also get the aligner's mount direction.")
+        self._lbl_z_result.setWordWrap(True)
+        self._lbl_z_result.setMaximumWidth(s(340))
+        self._lbl_z_result.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {scaled_font_size(9)}pt;")
+        z_form.addRow(self._lbl_z_result)
+
+        self._z_group.setVisible(self._needle_mode)
+        side.addWidget(self._z_group)
+
         side.addStretch()
 
         # Buttons
@@ -420,6 +526,33 @@ class PixelCalibrationDialog(QDialog):
             QMessageBox.warning(self, "Stage Required",
                                 "Stage controller is not connected.")
             return
+
+        # v7.10: refuse a move that would carry the tracked content off the
+        # sensor. A too-large move and a move along the optical axis both come
+        # back as "almost no displacement", so bounding it up front is what
+        # makes the failure message trustworthy. Silent when µm/px is unknown —
+        # the first calibration has to be allowed to run.
+        try:
+            from SupportClasses.NeedleCameraCalibration import in_frame_refusal
+            fw, fh = self._frame_wh()
+            # v7.16: size the bound from THIS camera + THIS objective, not from
+            # whatever µm/px happens to be sitting in the manager. See
+            # _expected_um_per_px — the old path produced a bogus 199 µm limit
+            # from another camera's unstamped value.
+            if self.result_um_per_px:
+                u_known, src = float(self.result_um_per_px), "this measurement"
+            else:
+                u_known, src = self._expected_um_per_px(fw)
+            why = in_frame_refusal(
+                self._spin_distance.value(), u_known, fw, fh, what="XY move")
+            if why:
+                # Always say WHERE the limit came from: a bound the operator
+                # can see is wrong is one they can act on, and this exact
+                # number ("199 µm") was wrong and unexplained.
+                self._set_status(f"{why} (scale from {src}.)", "red")
+                return
+        except Exception as exc:
+            logger.debug(f"XY leg in-frame check skipped: {exc}")
 
         self._state = _CalState.CAPTURING_BEFORE
         self._btn_start.setEnabled(False)
@@ -537,10 +670,6 @@ class PixelCalibrationDialog(QDialog):
         # (the "+column" direction), NOT just the commanded move angle whose sign
         # is arbitrary for a ~45°-mounted camera — that was the wrong-direction
         # auto-center bug. Resolve the sign from the measured displacement.
-        self.result_rotation_deg = plus_column_direction_deg(
-            self._spin_direction.value(), dx, dy)
-        # v7.5.x (rotated rig): the sensor roll = deviation of the measured
-        # vector from parallel, for the needle cameras' display orientation.
         # Parity flips must match the display chain (flips first, then R(θ)).
         flip_y = False
         try:
@@ -549,12 +678,40 @@ class PixelCalibrationDialog(QDialog):
                 flip_y = bool(gfy(self._cam_idx))
         except Exception:
             flip_y = False
+        commanded = float(self._spin_direction.value())
+        # v7.10: plus_column_direction_deg's model assumes a NON-mirrored image
+        # (its own docstring says so), so its output must be converted into the
+        # θ that belongs beside the already-stored flips. Exactly a no-op for an
+        # unmirrored, unflipped camera; on this rig's microscope (Andor,
+        # mirrored, θ=180°) the raw value at the default 45° preset is 90°, and
+        # committing that would rotate click→stage, every mosaic tile and every
+        # per-objective entry by 90°.
+        self.result_rotation_deg = column_direction_to_camera_rotation_deg(
+            commanded, plus_column_direction_deg(commanded, dx, dy),
+            mirrored=bool(self._view_mir), flip_y=flip_y)
+        # v7.5.x (rotated rig): the sensor roll = deviation of the measured
+        # vector from parallel, for the needle cameras' display orientation.
         self.result_view_roll_deg = view_roll_from_displacement(
             dx, dy, mirrored=bool(self._view_mir), flip_y=flip_y)
 
-        self._set_status(
-            "Good lateral motion — Accept to use this µm/px and direction, "
-            "or try other directions to compare.", "green")
+        # v7.10: keep the accepted XY leg so the Z leg can solve both together.
+        # Re-measuring the XY leg invalidates any previous solve — the pair must
+        # come from the same framing.
+        self._lateral_px = (dx, dy)
+        if self._needle_mode:
+            self.result_needle_axes = None
+            self._btn_z.setEnabled(True)
+            self._set_z_note(
+                "XY leg captured. Now measure the Z leg — it is what gives the "
+                "true µm/px, the sensor roll and the Z direction.", "yellow")
+            self._set_status(
+                "XY leg good. Measure the Z leg before accepting: on its own "
+                "this µm/px is over-estimated by however far the move was off "
+                "this camera's lateral direction.", "yellow")
+        else:
+            self._set_status(
+                "Good lateral motion — Accept to use this µm/px and direction, "
+                "or try other directions to compare.", "green")
         self._btn_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
         self._btn_start.setEnabled(True)
         self._btn_start.setText("Re-measure")
@@ -566,6 +723,264 @@ class PixelCalibrationDialog(QDialog):
             self._controller.move_xy_relative_um(-dx, -dy)
         except Exception as e:
             logger.warning(f"Failed to move stage back: {e}")
+
+    # ── v7.10: Z leg — the needle as the reference object ─────────
+
+    def _expected_um_per_px(self, frame_w: int) -> tuple:
+        """``(um_per_px, source)`` expected for this camera + objective, or
+        ``(0.0, "")`` when genuinely unknown.
+
+        v7.16 — operator: *"when calibrating the rotation of the microscope
+        camera, it says that it needs to move less than 199 microns. this is
+        fully not true. for it to know how far it can move it needs to know the
+        objective its on and the measured magnification of the objective."*
+
+        They are right, and the 199 µm was measurable proof: the bound had been
+        sized from ``CameraManager.effective_um_per_px``, which held **another
+        camera's** 0.389135 µm/px (unstamped, so it passed straight through
+        un-rescaled). 0.25 x 2048 px x 0.389135 = **199.2 µm** exactly. At this
+        camera's real scale the same bound is ~651 µm.
+
+        Precedence, measurement-first and never a bare passthrough:
+
+        1. this objective's own stored calibration, rescaled to the live width;
+        2. **predicted from the camera's other objectives** — µm/px x
+           magnification x width is a sensor property, so the camera's native
+           1x scale divides by THIS objective's magnification. This is the leg
+           the operator described, and it is the only one available for an
+           objective that has never been calibrated;
+        3. the live manager, but ONLY when it is both calibrated AND carries
+           the resolution it was measured at. An unstamped value cannot be
+           rescaled, and treating it as valid at whatever width happens to be
+           running is what produced the 199.
+        """
+        try:
+            from SupportClasses.ObjectiveCalibration import get_store
+            store = get_store()
+        except Exception:
+            store = None
+
+        # v7.16: both store legs rescale by width, so they need the CAPTURE
+        # width — a centred crop shrinks the delivered frame without changing
+        # what a pixel spans. The bound itself is still measured against the
+        # DELIVERED frame (below), which is what has to stay in view.
+        from SupportClasses.MosaicCalibration import capture_width_px
+        cap_w = capture_width_px(self._camera_manager, self._cam_idx, frame_w)
+
+        if store is not None and self._cam_key and self._objective:
+            try:
+                cal = store.get_calibration(
+                    str(self._cam_key), str(self._objective))
+                if cal:
+                    base = float(cal.get("measured_um_per_px") or 0.0)
+                    res = cal.get("resolution") or ()
+                    cw = float(res[0]) if res else 0.0
+                    if base > 0 and cw > 0 and cap_w > 0:
+                        return (base * cw / float(cap_w),
+                                f"stored {self._objective} calibration")
+            except Exception:
+                pass
+
+        if store is not None and self._cam_key and self._objective:
+            try:
+                pred = store.predicted_um_per_px(
+                    str(self._cam_key), str(self._objective), float(cap_w))
+                if pred and pred > 0:
+                    return (pred,
+                            f"this camera's other objectives / "
+                            f"{self._objective} magnification")
+            except Exception:
+                pass
+
+        mgr = self._camera_manager
+        try:
+            stamped = None
+            getter = getattr(mgr, "get_um_per_px_resolution", None)
+            if callable(getter):
+                stamped = getter(self._cam_idx)
+            checker = getattr(mgr, "is_um_per_px_calibrated", None)
+            ok = bool(checker(self._cam_idx)) if callable(checker) else False
+            if ok and stamped:
+                v = float(mgr.effective_um_per_px(self._cam_idx, frame_w) or 0)
+                if v > 0:
+                    return (v, "the camera's stored µm/px")
+        except Exception:
+            pass
+        return (0.0, "")
+
+    def _frame_wh(self) -> tuple:
+        """(w, h) of the live frame, or (0, 0)."""
+        try:
+            frame = self._camera_manager.cameras[self._cam_idx].get_current_frame()
+            if frame is not None and getattr(frame, "shape", None):
+                return (int(frame.shape[1]), int(frame.shape[0]))
+        except Exception:
+            pass
+        return (0, 0)
+
+    def _set_z_note(self, text: str, color: str = "subtext0") -> None:
+        self._lbl_z_result.setText(text)
+        self._lbl_z_result.setStyleSheet(
+            f"color: {COLORS.get(color, COLORS['subtext0'])}; "
+            f"font-size: {scaled_font_size(9)}pt;")
+
+    def _start_z_leg(self):
+        """Retract the needle a known distance, track IT, and solve both legs.
+
+        Safety: the move is in the HEIGHT frame via ``move_z_user_relative``, so
+        it is polarity-safe on either ``z_up_sign``, and it goes **UP first** —
+        away from the plate — then returns. A calibration that descended a blind
+        200 µm could put a needle through glass.
+
+        Tracking is template-based, NOT the whole-frame phase correlation the XY
+        leg uses. On a Z move only the needle moves; the background is
+        stationary, so phase correlation would faithfully report the
+        background's zero displacement. A near-zero reading is therefore
+        surfaced as "the tracker locked onto the background", which is a thing
+        the operator can actually fix.
+        """
+        mgr = self._camera_manager
+        if mgr is None or not mgr.is_running(self._cam_idx):
+            self._set_z_note("Start the camera first.", "red")
+            return
+        mover = getattr(self._controller, "move_z_user_relative", None)
+        if not callable(mover):
+            self._set_z_note(
+                "This controller cannot jog Z in the height frame, so the Z leg "
+                "cannot run safely here.", "red")
+            return
+
+        dz = float(self._spin_z.value())
+        # In-frame pre-check. Without it, "the move was along the optical axis"
+        # and "the feature left the sensor" arrive as the SAME symptom — a tiny,
+        # low-confidence displacement — and the operator cannot tell which they
+        # are looking at.
+        fw, fh = self._frame_wh()
+        try:
+            from SupportClasses.NeedleCameraCalibration import in_frame_refusal
+            # v7.16: same resolution order as the XY leg — never a bare
+            # passthrough from the manager (see _expected_um_per_px).
+            if self.result_um_per_px:
+                u_guess, src = float(self.result_um_per_px), "this measurement"
+            else:
+                u_guess, src = self._expected_um_per_px(fw)
+            why = in_frame_refusal(dz, u_guess, fw, fh, what="Z move")
+            if why:
+                self._set_z_note(f"{why} (scale from {src}.)", "red")
+                return
+        except Exception as exc:
+            logger.debug(f"Z leg in-frame check skipped: {exc}")
+
+        try:
+            from SupportClasses.VisionDetector import (
+                select_trackable_patch, find_template)
+        except ImportError:
+            self._set_z_note("Vision module unavailable.", "red")
+            return
+
+        self._btn_z.setEnabled(False)
+        self._set_z_note(f"Retracting the needle {dz:.0f} µm…", "yellow")
+        self._lbl_z_result.repaint()
+
+        cam = mgr.cameras[self._cam_idx]
+        before = cam.capture_fresh_frame()
+        if before is None:
+            self._set_z_note("Could not capture the reference frame.", "red")
+            self._btn_z.setEnabled(True)
+            return
+        picked = select_trackable_patch(before)
+        if picked is None:
+            self._set_z_note(
+                "No trackable feature — the view is too flat. Focus on the "
+                "needle so its edge gives the tracker something to hold.", "red")
+            self._btn_z.setEnabled(True)
+            return
+        cx0, cy0, patch = picked
+
+        moved = False
+        try:
+            mover(dz / 1000.0)          # height frame, mm, + = up = safe
+            moved = True
+            QTimer.singleShot(int(self._spin_settle.value()),
+                              lambda: self._finish_z_leg(
+                                  dz, cx0, cy0, patch, find_template))
+        except Exception as exc:
+            if moved:
+                self._return_z(dz, mover)
+            self._set_z_note(f"Z move failed: {exc}", "red")
+            self._btn_z.setEnabled(True)
+
+    def _return_z(self, dz: float, mover) -> None:
+        try:
+            mover(-dz / 1000.0)
+        except Exception as exc:
+            logger.warning(f"Failed to return Z after the calibration leg: {exc}")
+
+    def _finish_z_leg(self, dz, cx0, cy0, patch, find_template):
+        """Capture after the Z move, solve, and ALWAYS put Z back."""
+        mover = getattr(self._controller, "move_z_user_relative", None)
+        try:
+            cam = self._camera_manager.cameras[self._cam_idx]
+            after = cam.capture_fresh_frame()
+            if after is None:
+                self._set_z_note("Could not capture the moved frame.", "red")
+                return
+            found = find_template(after, patch)
+            if found is None:
+                self._set_z_note(
+                    "Lost the tracked feature after the Z move. Try a smaller "
+                    "Z step.", "red")
+                return
+            cx1, cy1, conf = found
+            if conf < 0.35:
+                self._set_z_note(
+                    f"Low match confidence ({conf:.2f}) after the Z move — the "
+                    f"feature may have left the frame or defocused. Try a "
+                    f"smaller Z step.", "red")
+                return
+            self._solve_needle_axes(dz, cx1 - cx0, cy1 - cy0, conf)
+        finally:
+            if callable(mover):
+                self._return_z(dz, mover)
+            self._btn_z.setEnabled(True)
+
+    def _solve_needle_axes(self, dz, zdx, zdy, conf):
+        from SupportClasses.NeedleCameraCalibration import (
+            solve_needle_camera_axes)
+        kw = {}
+        if self._lateral_px is not None:
+            kw = dict(lateral_um=float(self._spin_distance.value()),
+                      lateral_dx_px=self._lateral_px[0],
+                      lateral_dy_px=self._lateral_px[1])
+        axes = solve_needle_camera_axes(z_um=dz, z_dx_px=zdx, z_dy_px=zdy, **kw)
+        why = axes.refusal()
+        if why:
+            self.result_needle_axes = None
+            self._set_z_note(why, "red")
+            return
+        self.result_needle_axes = axes
+        # The Z leg's µm/px is the one that cannot be foreshortened, so it
+        # supersedes the XY leg's value — and the roll it measured supersedes
+        # the one inferred from the lateral vector.
+        self.result_um_per_px = axes.um_per_px
+        self.result_view_roll_deg = -axes.roll_deg
+        self._lbl_umpx.setText(f"{axes.um_per_px:.4f} µm/px")
+        lines = [f"Z leg: {axes.z_travel_px:.0f} px (match {conf:.2f})"]
+        if axes.has_lateral:
+            lines.append(
+                f"µm/px {axes.um_per_px:.4f} (XY leg alone said "
+                f"{axes.um_per_px_lateral:.4f})")
+            lines.append(
+                f"roll {axes.roll_deg:+.2f}°, axes "
+                f"{90 + axes.orthogonality_err_deg:.1f}° apart")
+        else:
+            lines.append(f"µm/px {axes.um_per_px:.4f}")
+            lines.append(f"roll {axes.roll_deg:+.2f}°")
+        lines += axes.advisories()
+        self._set_z_note("\n".join(lines), "green")
+        # A Z-only run is a complete, committable result.
+        self._btn_box.button(
+            QDialogButtonBox.StandardButton.Ok).setEnabled(True)
 
     def _accept_result(self):
         """Accept the calibration result and close."""

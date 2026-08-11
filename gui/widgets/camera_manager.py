@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -123,6 +123,24 @@ class CameraManager(QObject):
         # orientation as R(θ)·diag(sx, sy). Applied to the live display, the
         # mosaic tiles, and the click→stage mapping — ONE unified system.
         self._flip_y: list[bool] = [False] * max_cameras
+        # v7.16: per-slot LIVE-VIEW orientation — ``(flip_x, flip_y, rot)`` or
+        # None. Deliberately NOT the same numbers as the three above, which are
+        # the MEASURED camera→stage matrix that orients mosaic tiles and maps
+        # every click. This one is only ever read by the live feeds, so the
+        # operator can set up the view they want to look at without moving any
+        # geometry — and, crucially, without a later measurement resetting it.
+        # None = no preference ⇒ fall back to the measured orientation.
+        self._view_orient: list[Optional[tuple[bool, bool, float]]] = (
+            [None] * max_cameras)
+        # v7.16: per-slot centred crop. Unlike the flips above (declarations
+        # each consumer applies), this one really removes pixels, at the frame
+        # source, so every surface inherits it. The widget owns it once running;
+        # this list is the cache for slots with no widget yet.
+        self._crop: list[Any] = [None] * max_cameras
+        # v7.16: last completed Tucsen enumeration. The probe is bounded (see
+        # _probe_tucam_bounded) and a late answer lands here rather than being
+        # discarded, so a slow SDK costs one detection round, not the camera.
+        self._tucam_cache: Optional[list] = None
 
         # Create camera widgets (headless — no built-in controls)
         if CAMERA_AVAILABLE and CameraWidget is not None:
@@ -215,11 +233,7 @@ class CameraManager(QObject):
         except Exception as exc:
             logger.debug(f"Andor enumeration skipped: {exc}")
             andor = []
-        try:
-            tucam = detect_tucam_cameras()
-        except Exception as exc:
-            logger.debug(f"TUCam enumeration skipped: {exc}")
-            tucam = []
+        tucam = self._probe_tucam_bounded(detect_tucam_cameras)
         probe = {"opencv": opencv_indices, "dshow": ds_cams,
                  "toupcam": toupcam, "andor": andor, "tucam": tucam}
 
@@ -248,6 +262,64 @@ class CameraManager(QObject):
         n = len(self._available_sources)
         logger.info(f"CameraManager detected {n} sources")
         self.cameras_detected.emit(n)
+
+    #: How long camera detection may wait for the Tucsen SDK before giving up
+    #: on it for this round.
+    #:
+    #: Chosen from measurement, not taste. Seven ``TUCAM_Api_Init`` calls in
+    #: ME3B V1's own log, timed from the "library loaded" line beside them:
+    #:
+    #:   healthy   2.07 / 2.11 / 2.07 s  → "1 camera(s)"
+    #:   wedged   29.13 / 29.13 s        → "0 camera(s)"
+    #:
+    #: So a healthy probe finishes in ~2 s and a wedged one takes ~29 s with the
+    #: GUI thread inside it. 4 s sits between the two with ~2x headroom over
+    #: healthy, and the cache below means overshooting it costs one detection
+    #: round rather than the camera.
+    TUCAM_PROBE_TIMEOUT_S = 4.0
+
+    def _probe_tucam_bounded(self, probe) -> list:
+        """Enumerate Tucsen cameras without letting a wedged one freeze the UI.
+
+        ``TUCAM_Api_Init`` is a blocking C call with no cancellation: when the
+        device is present but cannot be claimed it scans for ~30 seconds before
+        answering "0 cameras". Detection runs on the GUI thread (DirectShow/COM
+        wants the main thread, and the rest of the enumeration is fast), so that
+        is a 30-second freeze of the whole application — on startup AND on every
+        press of Detect. It is also the freeze an operator sees as "python
+        freezes", because nothing in the UI says a camera probe is in progress.
+
+        So the call is made on a daemon thread and waited on for a bounded time.
+        A late answer is NOT thrown away — it lands in the cache and the next
+        detection uses it — so a merely slow SDK costs one round, not the
+        camera. A wedged one costs 4 seconds instead of 30.
+        """
+        result: dict = {}
+
+        def _worker():
+            try:
+                result["cams"] = probe()
+            except Exception as exc:
+                logger.debug(f"TUCam enumeration failed: {exc}")
+                result["cams"] = []
+            # Cache whenever it finishes, however late — the next detection is
+            # then instant and correct.
+            self._tucam_cache = result.get("cams") or []
+
+        t = threading.Thread(target=_worker, name="TucamProbe", daemon=True)
+        t.start()
+        t.join(self.TUCAM_PROBE_TIMEOUT_S)
+        if t.is_alive():
+            cached = getattr(self, "_tucam_cache", None)
+            logger.warning(
+                f"Tucsen enumeration did not answer in "
+                f"{self.TUCAM_PROBE_TIMEOUT_S:.0f}s — the camera is present to "
+                f"Windows but the SDK cannot claim it (TUCAM_Api_Init blocks "
+                f"~30s in that state). Continuing without it; unplug and "
+                f"replug the camera to re-enumerate it."
+                + ("" if cached is None else " Using the previous result."))
+            return list(cached or [])
+        return list(result.get("cams") or [])
 
     def detect_cameras_async(self, on_complete):
         """Probe OpenCV camera indices (the slow device opens) on a BACKGROUND
@@ -454,13 +526,21 @@ class CameraManager(QObject):
         live_width`` when the calibration resolution is known, else the stored
         value unchanged. This keeps the pixel→stage transform correct even
         when the live feed runs at a different resolution than the calibration.
+
+        v7.16: the denominator is the CAPTURE width, not the delivered one. A
+        centred crop shrinks the frame without changing what a pixel spans, so
+        dividing by a cropped width would rescale µm/px by the crop fraction.
+        With no crop the two are identical and this is byte-identical to before
+        — see :meth:`capture_width`.
         """
         base = self.get_um_per_px(cam_idx)
         cal_res = None
         if 0 <= cam_idx < self._max_cameras:
             cal_res = self._um_per_px_res[cam_idx]
         if cal_res and cal_res[0] and live_width and live_width > 0:
-            return base * float(cal_res[0]) / float(live_width)
+            denom = self.capture_width(cam_idx, live_width)
+            if denom > 0:
+                return base * float(cal_res[0]) / denom
         return base
 
     def get_um_per_px_resolution(self, cam_idx: int) -> Optional[tuple[int, int]]:
@@ -557,6 +637,99 @@ class CameraManager(QObject):
         if fy is not None and 0 <= cam_idx < len(fy):
             fy[cam_idx] = bool(value)
 
+    # ── v7.16: centred crop ───────────────────────────────────────
+
+    def get_crop(self, cam_idx: int):
+        """The slot's centred crop (``CameraCrop``); a neutral one by default.
+
+        Delegates to the owning ``CameraWidget`` — which actually applies it to
+        the frames — falling back to the local cache for slots without a widget
+        and for lightweight ``__new__`` test doubles."""
+        from SupportClasses.CameraCrop import CameraCrop
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "crop"):
+            try:
+                return cam.crop()
+            except Exception:
+                pass
+        cache = getattr(self, "_crop", None)
+        if cache is not None and 0 <= cam_idx < len(cache):
+            return cache[cam_idx] or CameraCrop()
+        return CameraCrop()
+
+    def set_crop(self, cam_idx: int, crop) -> None:
+        """Set the slot's centred crop. Applied at the frame source, so it
+        reaches the live view, the mosaic, captures and recordings alike."""
+        from SupportClasses.CameraCrop import CameraCrop
+        crop = crop if isinstance(crop, CameraCrop) else CameraCrop.from_dict(crop)
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "set_crop"):
+            try:
+                cam.set_crop(crop)
+            except Exception as exc:
+                logger.debug(f"set_crop slot {cam_idx}: {exc}")
+        cache = getattr(self, "_crop", None)
+        if cache is not None and 0 <= cam_idx < len(cache):
+            cache[cam_idx] = crop
+
+    def capture_resolution(self, cam_idx: int):
+        """The slot's PRE-crop frame size ``(w, h)``, or None if unknown.
+
+        The delivered frame may be a crop of this. µm/px calibrations are
+        stamped with, and rescaled against, the CAPTURE size — see
+        :meth:`capture_width`.
+        """
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "capture_size"):
+            try:
+                got = cam.capture_size()
+                if got and got[0] and got[1]:
+                    return (int(got[0]), int(got[1]))
+            except Exception:
+                pass
+        return None
+
+    def crop_center_offset_px(self, cam_idx: int) -> tuple[float, float]:
+        """Raw-pixel displacement of the delivered frame's centre from the
+        sensor's centre — ``(0, 0)`` unless the crop has been moved off-centre.
+
+        The pixel↔stage conversions add this back, so an offset crop maps to
+        exactly the same stage coordinates a full frame would. Without it,
+        moving the crop would move the pixel that means "the stage is here" and
+        drag every click, overlay and mosaic tile with it — up to ~1 mm at a
+        small crop on this rig, i.e. a silently relocated plate calibration.
+        """
+        try:
+            crop = self.get_crop(cam_idx)
+            if crop is None or not crop.enabled:
+                return (0.0, 0.0)
+            cap = self.capture_resolution(cam_idx)
+            if not cap or not cap[0] or not cap[1]:
+                return (0.0, 0.0)
+            return crop.center_offset_px(cap[0], cap[1])
+        except Exception as exc:
+            logger.debug(f"crop_center_offset_px slot {cam_idx}: {exc}")
+            return (0.0, 0.0)
+
+    def capture_width(self, cam_idx: int, fallback: float = 0.0) -> float:
+        """Width in CAPTURE pixels, falling back to a delivered width.
+
+        THE reason this exists: ``µm/px ∝ 1/width`` holds when the pixel count
+        changes because the sensor is sampled differently (binning, a
+        resolution switch) — the same optical field over more pixels. A CROP
+        changes the pixel count WITHOUT changing what a pixel spans, so feeding
+        a cropped width into that ratio rescales µm/px by the crop fraction:
+        27 % on this rig's Tucsen at a square crop, in the direction that makes
+        the mosaic think its field is wider than it is and leave gaps.
+
+        Every rescale site therefore resolves its denominator through here, and
+        with no crop configured this returns ``fallback`` unchanged.
+        """
+        got = self.capture_resolution(cam_idx)
+        if got and got[0] > 0:
+            return float(got[0])
+        return float(fallback or 0.0)
+
     def view_orientation(self, cam_idx: int) -> tuple[bool, float]:
         """v7.5.x: ``(mirrored, rotation_deg)`` for a slot — the camera's
         calibrated orientation, for correcting the DISPLAY (CameraFeedView) and
@@ -570,13 +743,61 @@ class CameraManager(QObject):
                 float(rot) if rot is not None else 0.0)
 
     def full_orientation(self, cam_idx: int) -> tuple[bool, bool, float]:
-        """v7.5.x: ``(flip_x, flip_y, rotation_deg)`` — the camera's full
-        calibrated orientation (flip_x == mirrored). ONE unified system applied
-        to the live display, the mosaic, and the click→stage mapping."""
+        """v7.5.x: ``(flip_x, flip_y, rotation_deg)`` — the camera's MEASURED
+        orientation vs the stage (flip_x == mirrored).
+
+        This is GEOMETRY. ``MosaicBuilder._orient_tile`` orients every tile by
+        it and ``pixel_to_stage_offset`` maps every click through it, so it must
+        only ever come from a measurement.
+
+        ⚠ v7.16: this is no longer what the live view shows — use
+        :meth:`display_orientation` for that. They were one value until the
+        objective calibration was found resetting the operator's view each time
+        it ran.
+        """
         rot = self.get_rotation_deg(cam_idx)
         return (bool(self.get_mirrored(cam_idx)),
                 bool(self.get_flip_y(cam_idx)),
                 float(rot) if rot is not None else 0.0)
+
+    # ── v7.16: live-view orientation (display only) ────────────────
+
+    def display_orientation(self, cam_idx: int) -> tuple[bool, bool, float]:
+        """``(flip_x, flip_y, rotation_deg)`` to apply to the LIVE VIEW.
+
+        Same field order as :meth:`full_orientation` on purpose — flips first —
+        so a caller that swaps between them cannot silently trade a mirror for
+        an angle.
+
+        Falls back to the measured orientation when the operator has expressed
+        no view preference, which is byte-identical to the pre-v7.16 behaviour.
+        """
+        vo = getattr(self, "_view_orient", None)
+        if vo is not None and 0 <= cam_idx < len(vo) and vo[cam_idx] is not None:
+            flip_x, flip_y, rot = vo[cam_idx]
+            return (bool(flip_x), bool(flip_y), float(rot))
+        return self.full_orientation(cam_idx)
+
+    def has_display_orientation(self, cam_idx: int) -> bool:
+        """True when this slot has an explicit live-view preference (so the
+        measured orientation is NOT what the feed is showing)."""
+        vo = getattr(self, "_view_orient", None)
+        return bool(vo is not None and 0 <= cam_idx < len(vo)
+                    and vo[cam_idx] is not None)
+
+    def set_display_orientation(self, cam_idx: int, flip_x: bool, flip_y: bool,
+                                rotation_deg: float) -> None:
+        """Set the slot's live-view orientation. Touches NO geometry — the
+        mosaic and the click→stage mapping are unaffected."""
+        vo = getattr(self, "_view_orient", None)
+        if vo is not None and 0 <= cam_idx < len(vo):
+            vo[cam_idx] = (bool(flip_x), bool(flip_y), float(rotation_deg or 0.0))
+
+    def clear_display_orientation(self, cam_idx: int) -> None:
+        """Drop the slot's view preference so the feed follows the measurement."""
+        vo = getattr(self, "_view_orient", None)
+        if vo is not None and 0 <= cam_idx < len(vo):
+            vo[cam_idx] = None
 
     def restore_calibration_from_store(self, cam_idx: int) -> bool:
         """Push the persisted per-identity calibration into this slot.
@@ -626,6 +847,25 @@ class CameraManager(QObject):
                 self.set_mirrored(cam_idx, bool(entry["mirrored"]))
             if "flip_y" in entry:
                 self.set_flip_y(cam_idx, bool(entry["flip_y"]))
+            # v7.16: the live-view preference, restored ALONGSIDE (never
+            # instead of) the measured orientation.
+            #
+            # ⚠ This CLEARS as well as sets. A slot's CameraWidget outlives the
+            # source assigned to it, so reassigning a slot from a camera with a
+            # view preference to one without must hand the view back to the
+            # measurement — otherwise the new camera inherits the old one's
+            # rotation. (Same hazard as the v7.16 crop restore.)
+            try:
+                vo = store.get_view_orientation(identity[0])
+            except Exception:
+                vo = None
+            if vo is None:
+                self.clear_display_orientation(cam_idx)
+            else:
+                self.set_display_orientation(
+                    cam_idx, bool(vo.get("flip_x", False)),
+                    bool(vo.get("flip_y", False)),
+                    float(vo.get("rotation_deg", 0.0) or 0.0))
         except Exception as exc:
             logger.debug(f"restore_calibration_from_store({cam_idx}): {exc}")
             return False
@@ -769,6 +1009,33 @@ class CameraManager(QObject):
         return bool(cam and hasattr(cam, "set_hw_andor_scale_hi")
                     and cam.set_hw_andor_scale_hi(counts))
 
+    # v7.13 — Andor sensor-quality features + raw-frame statistics + averaged
+    # capture. All hasattr-guarded no-ops on other backends.
+    def set_hw_andor_feature(self, cam_idx: int, key: str, value) -> bool:
+        cam = self._widget(cam_idx)
+        return bool(cam and hasattr(cam, "set_hw_andor_feature")
+                    and cam.set_hw_andor_feature(key, value))
+
+    def reset_andor_sensor_defaults(self, cam_idx: int) -> bool:
+        cam = self._widget(cam_idx)
+        return bool(cam and hasattr(cam, "reset_andor_sensor_defaults")
+                    and cam.reset_andor_sensor_defaults())
+
+    def get_raw_frame_stats(self, cam_idx: int):
+        """Latest raw 16-bit frame stats (lock snapshot, GUI-timer-safe)."""
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "get_raw_frame_stats"):
+            return cam.get_raw_frame_stats()
+        return None
+
+    def capture_raw_average(self, cam_idx: int, n: int,
+                            timeout_s: float = 10.0):
+        """Blocking averaged raw capture — call from worker threads ONLY."""
+        cam = self._widget(cam_idx)
+        if cam is not None and hasattr(cam, "capture_raw_average"):
+            return cam.capture_raw_average(n, timeout_s=timeout_s)
+        return None
+
     def set_capture_resolution(self, cam_idx: int, width: int, height: int):
         cam = self._widget(cam_idx)
         if cam is not None and hasattr(cam, "set_capture_resolution"):
@@ -822,6 +1089,15 @@ class CameraManager(QObject):
         cy = image_h / 2.0
         dx_px = px_x - cx
         dy_px = px_y - cy
+        # v7.16: an OFF-CENTRE crop moves the pixel that means "the stage is
+        # here", so add the crop's displacement back in the RAW frame (before
+        # the flips and rotation, which is the frame it is measured in). A
+        # centred or absent crop contributes (0, 0) — byte-identical.
+        get_coff = getattr(self, "crop_center_offset_px", None)
+        if callable(get_coff):
+            off_x, off_y = get_coff(cam_idx)
+            dx_px += off_x
+            dy_px += off_y
         # Mirrored view → horizontal parity flip BEFORE scaling/rotation
         # (getattr-guarded for test doubles; None/False → no-op).
         get_mir = getattr(self, "get_mirrored", None)
@@ -885,11 +1161,27 @@ class CameraManager(QObject):
         get_fy = getattr(self, "get_flip_y", None)
         if callable(get_fy) and get_fy(cam_idx):
             dy_px = -dy_px
+        # v7.16: undo the crop displacement the forward map added, in the same
+        # raw frame and at the mirroring point in the chain.
+        get_coff = getattr(self, "crop_center_offset_px", None)
+        if callable(get_coff):
+            off_x, off_y = get_coff(cam_idx)
+            dx_px -= off_x
+            dy_px -= off_y
         return (dx_px + image_w / 2.0, dy_px + image_h / 2.0)
 
     # ── Cleanup ───────────────────────────────────────────────────
 
     def shutdown(self):
         """Stop all cameras and clean up resources."""
+        # v7.14 — finalize any live recording BEFORE the cameras close: a
+        # recorder whose camera vanishes mid-write leaves a truncated file.
+        try:
+            from SupportClasses.CaptureContext import finalize_all_recordings
+            n = finalize_all_recordings()
+            if n:
+                logger.info(f"Finalized {n} recording(s) on shutdown")
+        except Exception as exc:
+            logger.warning(f"could not finalize recordings on shutdown: {exc}")
         self.stop_all()
         logger.info("CameraManager shutdown complete")

@@ -95,9 +95,14 @@ class MeasurementCameraView(CameraFeedView):
     # ── Rendering ─────────────────────────────────────────────────
 
     def _render_frame(self, q_img: QImage):
-        """Render the frame, then overlay measurement endpoints + line."""
-        # Build the scaled pixmap exactly like the base class does.
-        pixmap = QPixmap.fromImage(q_img)
+        """Render the frame, then overlay measurement endpoints + line.
+
+        v7.15: composes through the base class and takes its scale/offset from
+        the shared :class:`ViewGeometry`. This was the FOURTH hand-rolled copy
+        of the letterbox arithmetic; keeping it would have left the endpoints
+        drifting from the cursor the moment the view zoomed.
+        """
+        pixmap, _true_xf = self._compose_pixmap(q_img)
         display_size = self._display.size()
         if display_size.width() < 1 or display_size.height() < 1:
             return
@@ -106,24 +111,17 @@ class MeasurementCameraView(CameraFeedView):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        # Compute frame→widget transform; cached so eventFilter can
-        # hit-test endpoints without recomputing.
-        img_w, img_h = self._last_image_size
-        if img_w > 0 and img_h > 0:
-            self._last_widget_scale = scaled.width() / img_w
-        else:
-            self._last_widget_scale = 1.0
-        # Pixmap is centered inside the QLabel (KeepAspectRatio + AlignCenter).
-        lbl_w, lbl_h = self._display.width(), self._display.height()
-        ox = (lbl_w - scaled.width()) / 2.0
-        oy = (lbl_h - scaled.height()) / 2.0
-        self._last_widget_offset = (ox, oy)
+        self._last_pixmap = scaled
+        self._publish_geometry(scaled)
+        geo = self.geometry_map()
+        # Cached so eventFilter can hit-test endpoints without recomputing —
+        # but derived from the one geometry, not re-derived here.
+        self._last_widget_scale = geo.widget_scale() if geo.valid else 1.0
+        self._last_widget_offset = geo.offset if geo.valid else (0.0, 0.0)
 
         # Draw endpoints + line directly onto the scaled pixmap so the
         # marker sizes are widget-pixels (crisp regardless of resolution).
         self._draw_measurement(scaled)
-
-        self._last_pixmap = scaled
         self._display.setPixmap(scaled)
 
     def _draw_measurement(self, pixmap: QPixmap) -> None:
@@ -238,19 +236,13 @@ class MeasurementCameraView(CameraFeedView):
 
     def _handle_drag(self, event) -> None:
         wx, wy = event.position().x(), event.position().y()
-        frame_xy = self._widget_to_image(wx, wy)
+        # Clamp rather than bail: the endpoint must keep following the cursor
+        # when it crosses a letterbox edge instead of lurching back to the
+        # press location. v7.15 — one call into the shared geometry; this used
+        # to re-derive the offset and scale for itself.
+        frame_xy = self._widget_to_image(wx, wy, clamp=True)
         if frame_xy is None:
-            # Allow drag outside the pixmap area — clamp to nearest valid
-            # frame coord so the endpoint doesn't lurch back to the press
-            # location when the cursor crosses a letterbox edge.
-            img_w, img_h = self._last_image_size
-            if img_w == 0 or img_h == 0:
-                return
-            ox, oy = self._last_widget_offset
-            scale = self._last_widget_scale or 1.0
-            ix = max(0.0, min(img_w, (wx - ox) / scale))
-            iy = max(0.0, min(img_h, (wy - oy) / scale))
-            frame_xy = (ix, iy)
+            return
 
         if self._dragging == 0:
             self._p1 = frame_xy

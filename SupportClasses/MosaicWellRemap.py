@@ -49,6 +49,35 @@ def _plate_tolerance_um(plate) -> float:
     return max(well_d_um * 0.6, pitch_um * 0.4)
 
 
+def orient_lattice_index(row, col, rows, cols, plate_axis_sign=(1.0, 1.0)):
+    """Detector pixel-lattice (row, col) → PLATE (row, col).
+
+    v7.9.1. ``PlateWellDetector.fit_lattice`` canonicalises its solution to the
+    near-0° branch, so its **col increases with +pixel-x and row with +pixel-y**
+    — and a mosaic canvas is built with pixel (0,0) at MIN stage X / MIN stage Y
+    (``MosaicBuilder`` applies no Y inversion). Its own comment is explicit that
+    *which corner is really A1 stays the caller's decision, made from the
+    plate-orientation convention, not from pixels*: a 180°-rotated lattice fits
+    the image exactly as well, and nothing in the picture can break the tie.
+
+    That decision is this rule, and it is the same one
+    :func:`label_positions` makes — A1 sits at the MAX coordinate of any axis
+    whose ``plate_axis_sign`` is negative, because a plate mounted 180° to the
+    stage has ``+col → −stage X`` and ``+row → −stage Y``. The mapping dialog's
+    auto-detect used the raw detector indices instead, so on this rig
+    (``plate_flip_180=True`` ⇒ sign ``(-1,-1)``) every name landed on the
+    diagonally opposite well and A1 appeared bottom-right.
+
+    Per-axis, not a single 180° rotation: each axis flips independently on its
+    own sign, and only both-negative reduces to a rotation.
+    """
+    sx = -1.0 if float(plate_axis_sign[0]) < 0 else 1.0
+    sy = -1.0 if float(plate_axis_sign[1]) < 0 else 1.0
+    out_col = (int(cols) - 1 - int(col)) if sx < 0 else int(col)
+    out_row = (int(rows) - 1 - int(row)) if sy < 0 else int(row)
+    return out_row, out_col
+
+
 def label_positions(positions, plate, plate_axis_sign=(1.0, 1.0)) -> dict:
     """Assign well names to ground-truth absolute-µm detected centres.
 

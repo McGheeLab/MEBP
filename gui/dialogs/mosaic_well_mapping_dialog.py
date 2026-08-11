@@ -1083,9 +1083,17 @@ class MosaicWellMappingDialog(QDialog):
                 grid_names[(w.row, w.col)] = w.name
         except Exception:
             pass
+        # v7.9.1: the detector's (row, col) are PIXEL-lattice indices anchored at
+        # the min-pixel corner; which corner is A1 is the plate-orientation
+        # convention's call, not the picture's. Route them through the one rule
+        # that already exists for this (MosaicWellRemap), or on a 180°-mounted
+        # plate every name lands on the diagonally opposite well.
+        from SupportClasses.MosaicWellRemap import orient_lattice_index
+        sign = (-1.0, -1.0) if self._flip_180 else (1.0, 1.0)
         for w in res.wells:
-            name = (grid_names.get((w.row, w.col))
-                    or f"{chr(ord('A') + w.row)}{w.col + 1}")
+            prow, pcol = orient_lattice_index(w.row, w.col, rows, cols, sign)
+            name = (grid_names.get((prow, pcol))
+                    or f"{chr(ord('A') + prow)}{pcol + 1}")
             # Draw each well at its MEASURED size, so the operator can see
             # what was measured rather than a nominal ring drawn over it.
             self._place_marker(name, w.center_px[0], w.center_px[1],

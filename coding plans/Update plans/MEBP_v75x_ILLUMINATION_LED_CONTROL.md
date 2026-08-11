@@ -41,7 +41,7 @@ appears.
 | File | Rationale |
 |------|-----------|
 | `SupportClasses/ZPStage.py` | New `ZPStageManager.set_led_brightness(level)` — clamps 0-255, sends `M106 P{_LED_FAN_INDEX} S<v>` via the existing `send_data()` (`ok`-handshaked, lock-safe). Placed next to `save_settings`/`emergency_stop`. Module constant `_LED_FAN_INDEX = 0` (FAN0) is the one place the header is named. |
-| `SupportClasses/StageController.py` | New `set_led_brightness(level)` passthrough — guarded on `is_zp_connected`; no-op returning False when the ZP board is not connected. |
+| `SupportClasses/StageController.py` | New `set_led_brightness(level)` passthrough — guarded on `is_zp_connected`; no-op returning False when the ZP board is not connected. **2026-08-05:** new best-effort `led_off()` + a call in `shutdown()`, placed after `_pos_poller.stop()` and before `disconnect_stages()`. |
 | `gui/widgets/illumination_control.py` | **New.** Reusable `IlluminationControl(QWidget)`: on/off `QCheckBox` + 0-100 % `QSlider` + live label. Debounced (~100 ms `QTimer`) so slider drags don't flood the shared serial bus; every write guarded on `is_zp_connected`; `on_status_update()` greys the card when disconnected; silent `set_on`/`set_value`/`is_on`/`value` for state restore. **2026-08-04:** the on/off + brightness state moved OUT of the widget into a process-wide `_IlluminationState` (`illumination_state()`), which also owns the single debounce timer, the controller reference and the hardware write; the widget is now only a VIEW (`_render()` on `state.changed`). |
 | `gui/widgets/standard_jog_context.py` | Adds a `Card("Illumination")` (new `_build_illumination_card`) between "Absolute Go To" and "Hardware Info"; forwards the tick in `on_status_update` and the controller in `set_controller`. Because `JogControlPage.get_context_widget()` returns this panel, the card rides the left-box **"Jog" pill** on every jog-aware page automatically. |
 | `gui/widgets/context_sections.py` | New `IlluminationSection` wrapper (reuses `IlluminationControl`, restores persisted `options` `{level, on}`) + `register_section("illumination", SectionSpec("Illumination LED", "💡", …))`. No changes needed to the panel/host/store. |
@@ -63,6 +63,8 @@ those profiles model only motion; there is no pin/output map.
 - [x] **2026-08-04 — one shared LED state across every page** (operator: *"if i go
       to different pages, the LED section on the jog pannel is each different we
       need them to read from the same source and be alligned with each other."*)
+- [x] **2026-08-05 — the LED is turned off on shutdown** (operator: *"when i shut
+      down the software make sure it turns the led off"*)
 - [ ] **Real-HW verification on ME3B V1** (see Testing Notes)
 
 ## Testing Notes
@@ -82,12 +84,28 @@ section options don't clobber a live setting. **Mutation-verified:** reverting
 `illumination_state()` to return a fresh state per view (i.e. the old per-widget
 behaviour) fails 4 of the 6 sync tests.
 
+**Shutdown (2026-08-05, `TestShutdownTurnsLedOff` — 6 new, suite now 31):**
+`shutdown()` sends level 0; ordered **before** `disconnect_stages()` and **after**
+`poller.stop()`; a board that raises mid-shutdown still reaches
+`disconnect_stages`/`processor.stop`; no-ZP and disconnected cases are clean
+no-ops; and end-to-end through the real `ZPStageManager`, `M106 P0 S0` lands on
+the wire. **Mutation-verified — all three properties bite:** removing the call
+fails 3 tests, moving it after the disconnect fails the ordering test, and
+dropping the `try/except` fails the dying-board test.
+
 Regression (all green): `test_v75x_context_panel`, `test_v75x_responsive_context_panel`, `test_v75x_nikon_ti_microscope` (137), `test_v731_jog_navigation`, `test_v75x_zp_serial_flow_control`, `test_v75x_workflow_settings_popout` (78), `test_v75x_zp_position_override`, `test_v75x_jog_pump_fill_readout` (66), plus a `gui.app` import smoke. Offscreen smoke: `StandardJogContextPanel` builds with the LED card, ticks, and commands the controller — and three panels built as three pages all read `on / 45 % / "45%"` after one edit on one of them, with a single `M106 S115` on the wire.
 
 **Real hardware (ME3B V1) — pending:**
 1. Bench, no flash: send `M106 P0 S255 / S64 / M107` from a terminal (38400 baud); confirm the LED lights/dims/off and — at real camera exposures — **no banding** and smooth low end. If banding → flash `FAST_PWM_FAN`, re-test. (Marlin acks an unassigned fan index with `ok` and does nothing, so if the LED is ever silent, confirm the header on a terminal before suspecting the app.)
 2. App: left context box → **Jog pill** shows the Illumination card; slider/toggle drive the LED live; card greys out when the ZP board is disconnected. Confirm the ZP `ok` handshake stays healthy (no `M400`/serial timeouts from slider spam — debounce should prevent it).
 3. Custom pill → **＋ Add section → 💡 Illumination LED**: drops in and works standalone.
+4. **Shared state (2026-08-04):** set the LED to ~50 % on the Jog page, then visit
+   Calibration / a workflow page → the card reads the same 50 % everywhere, and
+   the light does not change as you navigate.
+5. **Shutdown (2026-08-05):** leave the LED lit, close the app → **the LED goes
+   dark as the app exits** (and `logs/zp_serial.log` shows a final
+   `M106 P0 S0` acked *before* the port closes). Confirm the close is not visibly
+   delayed; worst case is the one-command `ok` wait.
 
 ## Issues & Decisions
 
@@ -122,6 +140,32 @@ Regression (all green): `test_v75x_context_panel`, `test_v75x_responsive_context
   exists to prevent. The timer and the send therefore live on the state, not the
   widget (`_send_timer` / `_send_now` remain on the widget as thin delegates).
   Pinned by `test_many_views_emit_one_command` + `test_views_share_one_debounce_timer`.
+- **2026-08-05 — the LED is turned off on shutdown, at ONE chokepoint.** Operator:
+  *"when i shut down the software make sure it turns the led off."* Nothing did:
+  the LED is a write-only output, so a lit LED simply stayed lit after exit with
+  no software left to control it. `StageController.shutdown()` is the single
+  chokepoint — every exit path reaches it (`MainWindow.closeEvent` plus all three
+  `main.py` headless paths) — so `led_off()` goes there and nowhere else.
+  **Placement is the substance of the change:** *after* `_pos_poller.stop()` so
+  the write doesn't contend for the ZP serial lock on the way out, and *before*
+  `disconnect_stages()` because once the port is closed there is no way left to
+  reach the board. Synchronous on the shutdown thread, never a worker — a write
+  racing `serial.close()` is a hard Windows crash (`MEBP_v75x_ZP_CLOSE_DURING_READ_CRASH.md`).
+  Wrapped so a board dying mid-exit can't derail the rest of the teardown.
+  All three properties are mutation-verified (each fails a distinct test when
+  reverted).
+- **Do NOT rely on the close-time DTR/RTS de-assert to darken the LED.** That
+  pulse (`MEBP_v75x_ZP_DTR_NO_RESET.md`) resets the board on some
+  board/driver-polarity combinations, which *would* drop the fan output — which
+  is exactly why this looked like it might already work. It is not dependable,
+  and on this rig the LED stays lit, so the explicit `M106 P0 S0` is the fix.
+- **Deliberately NOT extended to `disconnect_zp()`.** It is tempting to darken
+  the LED wherever the ZP link goes away, but that method is also called from the
+  board-drop handler and around the auto-reconnect cycle — where the LED is
+  already dark because the board is gone, and where a self-healing reconnect
+  would come back with the operator's light silently killed. Shutdown is the one
+  place the intent is unambiguous. A manual "Disconnect ZP" from the UI therefore
+  still leaves the LED as-is; flag it if that should change.
 - **Custom-panel restore is now seed-once.** `IlluminationSection` applies its
   persisted `{level, on}` options only while `illumination_state().is_pristine()`.
   The custom panel rebuilds its sections on every layout change, and re-seeding

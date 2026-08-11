@@ -332,6 +332,13 @@ class WellPlate:
         if name.startswith("custom:"):
             name = name[7:]
 
+        # v7.12: a parametric PlateDocument, resolved by stable id. Probed
+        # BEFORE the v1 path so the two schemes coexist during the transition —
+        # rolling back is deleting this block.
+        plate = cls._load_plate_document(name)
+        if plate is not None:
+            return plate
+
         path = USER_PLATES_DIR / f"{name}.json"
         if not path.exists():
             raise FileNotFoundError(
@@ -343,6 +350,34 @@ class WellPlate:
             data = json.load(f)
         design = PlateDesign.from_dict(data)
         return design.compile()
+
+    @classmethod
+    def _load_plate_document(cls, key: str) -> "WellPlate | None":
+        """Resolve *key* as a v7.12 ``PlateDocument``, or None.
+
+        Tries the stable id first, then falls back to a display-name lookup.
+        The fallback matters: without it, a saved ``HardwareConfig`` still
+        naming a plate the old way would silently fall through to the 96-well
+        default instead of loading the operator's plate.
+
+        Every failure degrades to None so the v1 path still gets its turn, and
+        the import is local because PlateDocument imports this module.
+        """
+        try:
+            from SupportClasses.PlateDocumentStore import (
+                get_plate_store, get_rosette_store,
+            )
+            store = get_plate_store()
+            doc = store.get(key)
+            if doc is None:
+                summary = store.find_by_name(key)
+                doc = store.get(summary.id) if summary else None
+            if doc is None:
+                return None
+            return doc.compile(loader=get_rosette_store().get)
+        except Exception as exc:   # pragma: no cover - defensive
+            logger.debug("Not a v7.12 plate document (%s): %s", key, exc)
+            return None
 
     # ── Lookups ───────────────────────────────────────────────────
 
@@ -463,6 +498,39 @@ class WellPlate:
         return [w.name for w in self.get_all_wells()]
 
     @property
+    def footprint_mm(self) -> tuple[float, float]:
+        """This plate's physical outline ``(width, height)`` in mm.
+
+        v7.12: resolved from the authoring ``PlateDocument``'s boundary, which
+        is where the footprint is actually declared — ``WellPlate`` itself is a
+        compiled well list and deliberately does not carry a second copy.
+        Falls back to the ANSI/SLAS footprint when the plate cannot be resolved
+        (an unsaved plate, a synthetic test plate), which is the value this used
+        to hardcode, so a plate that IS standard is unaffected.
+
+        Cached: it is read on every default-position seed, and the resolution
+        walks the plate stores.
+        """
+        cached = getattr(self, "_footprint_cache", None)
+        if cached is not None:
+            return cached
+        footprint = (PLATE_FOOTPRINT_X_MM, PLATE_FOOTPRINT_Y_MM)
+        try:
+            # Local import: PlateDocumentStore -> PlateDocument -> WellPlate.
+            from SupportClasses.PlateDocumentStore import (
+                plate_footprint_extent_mm,
+            )
+            extent = plate_footprint_extent_mm(self.format)
+            if extent is not None:
+                w, h = extent[2] - extent[0], extent[3] - extent[1]
+                if w > 0 and h > 0:
+                    footprint = (float(w), float(h))
+        except Exception as exc:                           # pragma: no cover
+            logger.debug("Footprint lookup failed for %s: %s", self.format, exc)
+        object.__setattr__(self, "_footprint_cache", footprint)
+        return footprint
+
+    @property
     def is_custom(self) -> bool:
         """v7.4.5: True iff this plate was built from a custom design."""
         return isinstance(self.format, str) and self.format.startswith("custom:")
@@ -500,12 +568,125 @@ class WellPlate:
 
     def _max_well_radius_mm(self) -> float:
         """v7.4.5: largest well radius on the plate (for custom plates)."""
+        return self.representative_well_diameter / 2.0
+
+    @property
+    def representative_well_diameter(self) -> float:
+        """v7.12: ONE well diameter (mm) to size things that aren't per-well.
+
+        A parametric plate has no single diameter — ``from_wells`` stores 0.0
+        on purpose ("varies — see WellInfo per well") — so every caller that
+        reaches for the plate-level ``well_diameter`` gets 0.0 and silently
+        sizes a circle, a search radius or a detection window to nothing.
+
+        Prefer :meth:`well_diameter_of` whenever a well NAME is in hand; this
+        is the fallback for the genuinely plate-wide cases (a snap radius, a
+        default FOV). Returns the largest well so a radius derived from it
+        still *reaches* every well; returns 0.0 only for an empty plate.
+        """
         if self.well_diameter > 0:
-            return self.well_diameter / 2.0
+            return float(self.well_diameter)
         wells = list(self._wells.values())
         if not wells:
             return 0.0
-        return max(w.diameter for w in wells) / 2.0
+        return float(max(w.diameter for w in wells))
+
+    def well_diameter_of(self, well_name: str | None) -> float:
+        """v7.12: diameter (mm) of *well_name*, or a representative one.
+
+        The resolution chain — per-well → plate-level → largest well — used to
+        be written out separately in four places (the jog workspace view, the
+        mosaic mapping dialog, the sketch page and the plate view). Three
+        copies agreeing the day they are written says nothing about the next
+        edit, so it lives here once.
+
+        Never raises: an unknown/None name falls through to
+        :attr:`representative_well_diameter`.
+        """
+        if well_name:
+            well = self._wells.get(str(well_name).upper())
+            if well is not None and well.diameter > 0:
+                return float(well.diameter)
+        return self.representative_well_diameter
+
+    def nearest_neighbour_pitch_mm(self) -> float:
+        """v7.12: typical centre-to-centre spacing (mm) between wells.
+
+        ``well_spacing_x``/``_y`` are 0.0 on a parametric plate, which turns
+        every "is the needle within ~one well pitch" gate into "within 0" —
+        i.e. never. This measures the pitch from the wells themselves as the
+        MEDIAN nearest-neighbour distance, so a plate mixing a 40 mm grid with
+        an 8 mm ring reports a sane middle value instead of being dominated by
+        either extreme. Falls back to the declared spacing on a regular plate
+        (byte-identical there) and to 0.0 for a plate with fewer than 2 wells.
+        """
+        if self.well_spacing_x > 0 and self.well_spacing_y > 0:
+            return float(min(self.well_spacing_x, self.well_spacing_y))
+        wells = list(self._wells.values())
+        if len(wells) < 2:
+            return 0.0
+        nearest: list[float] = []
+        for i, a in enumerate(wells):
+            best = float("inf")
+            for j, b in enumerate(wells):
+                if i == j:
+                    continue
+                d = math.hypot(a.x - b.x, a.y - b.y)
+                if d < best:
+                    best = d
+            if math.isfinite(best):
+                nearest.append(best)
+        if not nearest:
+            return 0.0
+        nearest.sort()
+        return float(nearest[len(nearest) // 2])
+
+    def extreme_well(self, dx: float, dy: float) -> str | None:
+        """v7.12: name of the well farthest along direction *(dx, dy)*.
+
+        A support function over the real well centres, so it works on any
+        layout. On a regular plate ``(-1,-1)`` is A1, ``(+1,-1)`` the
+        top-right, ``(+1,+1)`` the bottom-right and ``(-1,+1)`` the
+        bottom-left — the same wells the old ``f"A{cols}"`` name arithmetic
+        produced, but derived from wells that actually exist. Returns None for
+        an empty plate.
+        """
+        wells = list(self._wells.values())
+        if not wells:
+            return None
+        # Tie-break on (row, col) so the choice is deterministic when several
+        # wells sit on the same extreme (e.g. a single-row plate).
+        best = max(wells, key=lambda w: (dx * w.x + dy * w.y, -w.row, -w.col))
+        return best.name
+
+    def calibration_triangle(self) -> list[str]:
+        """v7.12: three wells spanning the plate, for 3-point teaching.
+
+        Replaces the ``["A1", f"A{cols}", f"{ROW_LABELS[rows-1]}{cols}"]`` name
+        arithmetic, which asks for wells that do not exist on a parametric
+        plate (``rows``/``cols`` there are a pseudo-grid where a whole ring of
+        wells shares one cell) and raises ``KeyError`` from
+        :meth:`get_well_position`.
+
+        Returns the three corner wells of the layout's bounding box — on a
+        standard plate exactly ``A1``, the top-right and the bottom-right, i.e.
+        the same right triangle as before. Falls back to the fourth corner, and
+        then to any remaining wells, if corners coincide on a degenerate
+        layout; may return fewer than 3 names on a plate with fewer wells.
+        """
+        picks: list[str] = []
+        for dx, dy in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)):
+            name = self.extreme_well(dx, dy)
+            if name is not None and name not in picks:
+                picks.append(name)
+            if len(picks) == 3:
+                return picks
+        for well in self.get_all_wells():
+            if well.name not in picks:
+                picks.append(well.name)
+            if len(picks) == 3:
+                break
+        return picks
 
     def get_bounding_box(self) -> tuple[float, float, float, float]:
         """Plate bounding box relative to A1: (min_x, min_y, max_x, max_y)."""
@@ -574,8 +755,14 @@ class WellPlate:
         sx, sy = plate_axis_sign
         # A1 is offset from the plate's top-left corner by (a1_offset_x, a1_offset_y).
         # Plate center is at (footprint/2) from that corner.
-        a1_x_um = center_x_um + sx * (self.a1_offset_x - PLATE_FOOTPRINT_X_MM / 2.0) * 1000.0
-        a1_y_um = center_y_um + sy * (self.a1_offset_y - PLATE_FOOTPRINT_Y_MM / 2.0) * 1000.0
+        #
+        # v7.12: use THIS plate's authored footprint, not the ANSI constants.
+        # A parametric carrier need not be 127.76 x 85.48, and centring it by
+        # the standard footprint puts it off by half the difference — visible
+        # as "the default plate sits off-centre in the travel envelope".
+        fw, fh = self.footprint_mm
+        a1_x_um = center_x_um + sx * (self.a1_offset_x - fw / 2.0) * 1000.0
+        a1_y_um = center_y_um + sy * (self.a1_offset_y - fh / 2.0) * 1000.0
         return (a1_x_um, a1_y_um)
 
     def get_all_positions_from_plate_center(

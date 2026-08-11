@@ -34,13 +34,22 @@ class TargetOverlayCameraView(CameraFeedView):
 
     def __init__(self, camera_manager=None, cam_idx: int = 0,
                  show_crosshair: bool = True, label: str = "",
-                 parent=None):
+                 auto_orient: bool = True, parent=None):
         # Forward by KEYWORD: the base signature now has `enable_settings`
         # before `parent`, so positional forwarding would bind `parent` to
         # `enable_settings`. Pick/place overlays don't want the HW-settings gear.
+        #
+        # v7.10: ``auto_orient`` defaults ON and is now FORWARDED. It previously
+        # could not be set at all, so every pick/place live view (spheroid, cell
+        # targeting, cell labeling) rendered RAW while the microscope feed on
+        # the neighbouring page rendered corrected — the same camera, two
+        # orientations. The base class inverts clicks back to raw frame pixels
+        # (``_widget_to_image``), so ``pixel_to_stage_offset`` and every target
+        # coordinate are unaffected; only what the operator sees changes.
         super().__init__(camera_manager=camera_manager, cam_idx=cam_idx,
                          show_crosshair=show_crosshair, label=label,
-                         enable_settings=False, parent=parent)
+                         enable_settings=False, auto_orient=auto_orient,
+                         parent=parent)
         self._targets: list[PickPlaceTarget] = []
         self._stage_x_um: float = 0.0
         self._stage_y_um: float = 0.0
@@ -70,15 +79,21 @@ class TargetOverlayCameraView(CameraFeedView):
     # ── Rendering override ───────────────────────────────────────
 
     def _render_frame(self, q_img: QImage):
-        """Override: draw crosshair + target overlays, then scale and display."""
-        pixmap = QPixmap.fromImage(q_img)
+        """Override: draw crosshair + target overlays, then scale and display.
+
+        v7.15: goes through the base class's ``_compose_pixmap`` instead of
+        building the pixmap itself. It previously skipped ``_orient_qimage``
+        entirely, which left ``_view_true_xform`` unset and
+        ``_displayed_image_size`` at (0, 0) — the clicks only stayed correct
+        because ``_widget_to_image`` had fallbacks for exactly that. Zoom
+        would not have applied here at all, and this is the click-to-select
+        surface (spheroid pickup, cell targeting, cell labeling).
+        """
+        pixmap, _true_xf = self._compose_pixmap(q_img)
 
         # Draw crosshair on full-res pixmap
         if self._show_crosshair:
             self._draw_crosshair(pixmap)
-
-        # Draw target overlays on full-res pixmap
-        self._draw_targets(pixmap)
 
         # Scale to fit display label
         display_size = self._display.size()
@@ -90,10 +105,21 @@ class TargetOverlayCameraView(CameraFeedView):
             Qt.TransformationMode.SmoothTransformation,
         )
         self._last_pixmap = scaled
+        # Publish BEFORE drawing targets: _draw_targets projects through the
+        # geometry, so it must describe the pixmap it is about to paint on.
+        self._publish_geometry(scaled)
+        self._draw_targets(scaled)
         self._display.setPixmap(scaled)
 
     def _draw_targets(self, pixmap: QPixmap):
-        """Draw target markers at their stage positions on the pixmap."""
+        """Draw target markers at their stage positions on the pixmap.
+
+        v7.15: the pixmap handed in is the SCALED one, and the projection runs
+        stage µm → RAW frame px → pixmap px through the shared
+        :class:`ViewGeometry`. Previously it went straight to full-resolution
+        image pixels with the frame centre assumed at ``w/2`` and no view
+        transform at all — correct only on an unrotated, unzoomed camera.
+        """
         if not self._targets:
             return
 
@@ -101,24 +127,32 @@ class TargetOverlayCameraView(CameraFeedView):
         img_h = pixmap.height()
         if img_w == 0 or img_h == 0:
             return
+        geo = self.geometry_map()
+        raw_w, raw_h = (geo.raw_size if geo.raw_size[0]
+                        else self._last_image_size)
+        if not raw_w or not raw_h:
+            return
+        scale = geo.widget_scale() if geo.valid else 1.0
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
         for target in self._targets:
-            # Convert stage coords → image pixel coords
-            # Camera center = stage position = image center
-            ix = (target.x_um - self._stage_x_um) / self._um_per_px + img_w / 2
-            iy = (target.y_um - self._stage_y_um) / self._um_per_px + img_h / 2
+            # stage µm → RAW frame px (camera centre = stage position)
+            rx = (target.x_um - self._stage_x_um) / self._um_per_px + raw_w / 2
+            ry = (target.y_um - self._stage_y_um) / self._um_per_px + raw_h / 2
+            pt = geo.to_pixmap(rx, ry) if geo.valid else (rx, ry)
+            if pt is None:
+                continue
+            ix, iy = pt
 
             # Skip targets outside the frame
             if ix < -50 or iy < -50 or ix > img_w + 50 or iy > img_h + 50:
                 continue
 
-            # Radius in image pixels
+            # Radius in PIXMAP pixels — scales with the zoom, as the picture does
             if target.size_um > 0:
-                r_px = (target.size_um / 2) / self._um_per_px
-                r_px = max(6, r_px)
+                r_px = max(6, (target.size_um / 2) / self._um_per_px * scale)
             else:
                 r_px = 8
 

@@ -511,6 +511,7 @@ class MosaicBuilder:
         frame_flip_y: bool = False,
         retain_for_reorient: bool = False,
         registration_method: str = "fourier_mellin",
+        tile_center_offset_um: tuple[float, float] = (0.0, 0.0),
     ):
         # v7.5.x: ``frame_rotation_deg`` / ``frame_mirrored`` — the camera's
         # calibrated orientation vs the stage axes. Each tile is oriented
@@ -532,6 +533,23 @@ class MosaicBuilder:
         self._retain_for_reorient = bool(retain_for_reorient)
         # Each: (resized_raw_bgr, px, py, tile_w, tile_h) at canvas resolution.
         self._reorient_tiles: list = []
+        # v7.16: STAGE-frame displacement of a tile's centre from the stage
+        # position it was captured at. Non-zero only when the camera's crop has
+        # been moved off-centre (see CameraCrop.center_offset_px): the delivered
+        # frame's middle then shows a point that is NOT where the stage is
+        # pointing, so every tile must be placed there instead. Added at the two
+        # points a stage position enters the builder, which is what lets every
+        # caller stay unchanged. (0, 0) → byte-identical placement.
+        try:
+            self._tile_center_offset_um = (
+                float(tile_center_offset_um[0]),
+                float(tile_center_offset_um[1]))
+        except (TypeError, ValueError, IndexError):
+            self._tile_center_offset_um = (0.0, 0.0)
+        # v7.16: intensity regularization state. None = no correction, and the
+        # blend is then byte-identical to before regularize_intensity() ran.
+        self._flat_field = None
+        self._tile_gains = None
         # v7.5.x: ``retain_frames`` — when False, each tile's raw frame is freed
         # immediately after it is blended into the incremental composite
         # (``stitch_incremental``). A long full-plate scan (hundreds of tiles ×
@@ -632,8 +650,7 @@ class MosaicBuilder:
         scale = getattr(self, "_mosaic_scale", None)
         if origin is None or not scale:
             return []
-        fov_w_um = self._frame_size_px[0] * self._um_per_px
-        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        fov_w_um, fov_h_um = self._oriented_fov_um()
         ox, oy = origin
         w = fov_w_um * scale
         h = fov_h_um * scale
@@ -655,8 +672,7 @@ class MosaicBuilder:
         scale = getattr(self, "_mosaic_scale", None)
         if origin is None or not scale:
             return []
-        fov_w_um = self._frame_size_px[0] * self._um_per_px
-        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        fov_w_um, fov_h_um = self._oriented_fov_um()
         ox, oy = origin
         w = max(1, int(fov_w_um * scale))
         h = max(1, int(fov_h_um * scale))
@@ -722,9 +738,12 @@ class MosaicBuilder:
         self._overlap = overlap
         min_x, min_y, max_x, max_y = bounds_um
 
-        # FOV in µm
-        fov_w = self._frame_size_px[0] * self._um_per_px
-        fov_h = self._frame_size_px[1] * self._um_per_px
+        # FOV in µm, along the STAGE axes (v7.16). A camera mounted at ±90°
+        # covers the sensor's HEIGHT in stage-X and its WIDTH in stage-Y; using
+        # the raw camera-axis FOV stepped too far on one axis (near-zero real
+        # overlap) and too little on the other, and only min(w,h) of each frame
+        # survived — the sensor behaved as a square.
+        fov_w, fov_h = self._oriented_fov_um()
 
         # Step size with overlap — or the explicit override when provided.
         step_x = (float(step_x_um) if step_x_um and step_x_um > 0
@@ -799,8 +818,7 @@ class MosaicBuilder:
         cx, cy = center_um
         min_x, min_y, max_x, max_y = bounds_um
 
-        fov_w = self._frame_size_px[0] * self._um_per_px
-        fov_h = self._frame_size_px[1] * self._um_per_px
+        fov_w, fov_h = self._oriented_fov_um()
 
         # Radial pitch: distance between rings (use smaller FOV dim for overlap)
         pitch = min(fov_w, fov_h) * (1.0 - overlap)
@@ -859,12 +877,18 @@ class MosaicBuilder:
             return
 
         min_x, min_y, max_x, max_y = bounds_um
-        fov_w = self._frame_size_px[0] * self._um_per_px
-        fov_h = self._frame_size_px[1] * self._um_per_px
+        fov_w, fov_h = self._oriented_fov_um()
+        # v7.16: an off-centre crop places every tile displaced from the position
+        # it was commanded to, so the padding has to cover that too. At a small
+        # crop the displacement can EXCEED half a FOV, and the tile would then be
+        # clipped at the canvas edge — the bounds are the operator's scan region,
+        # not the tiles' true footprint. Only the canvas grows; the origin is
+        # unchanged, so extent→stage back-projection is untouched.
+        toff_x, toff_y = getattr(self, "_tile_center_offset_um", (0.0, 0.0))
 
         # Canvas covers scan bounds + half-FOV padding on each side
-        canvas_w_um = (max_x - min_x) + fov_w
-        canvas_h_um = (max_y - min_y) + fov_h
+        canvas_w_um = (max_x - min_x) + fov_w + 2.0 * abs(toff_x)
+        canvas_h_um = (max_y - min_y) + fov_h + 2.0 * abs(toff_y)
 
         # Scale factor: µm → mosaic pixels
         self._mosaic_scale = self._target_mosaic_px / max(canvas_w_um, canvas_h_um, 1.0)
@@ -872,8 +896,10 @@ class MosaicBuilder:
         canvas_w = max(1, int(canvas_w_um * self._mosaic_scale))
         canvas_h = max(1, int(canvas_h_um * self._mosaic_scale))
 
-        # Origin: top-left of canvas in µm (min position minus half-FOV)
-        self._canvas_origin_um = (min_x - fov_w / 2.0, min_y - fov_h / 2.0)
+        # Origin: top-left of canvas in µm (min position minus half-FOV, minus
+        # any crop displacement so a negative offset also stays on the canvas).
+        self._canvas_origin_um = (min_x - fov_w / 2.0 - abs(toff_x),
+                                  min_y - fov_h / 2.0 - abs(toff_y))
         # Store the full canvas world extent for display coordinate mapping
         self._canvas_extent_um = (
             self._canvas_origin_um[0],
@@ -923,20 +949,26 @@ class MosaicBuilder:
         """
         offset_um = None
         confidence = 0.0
+        # v7.16: an off-centre crop displaces the tile's content from the stage
+        # position it was captured at — see ``_tile_center_offset_um``.
+        toff_x, toff_y = getattr(self, "_tile_center_offset_um", (0.0, 0.0))
 
         if detection is not None:
             cx_px, cy_px = detection.center_px
             fw, fh = self._frame_size_px
             dx_px = cx_px - fw / 2.0
             dy_px = cy_px - fh / 2.0
-            offset_um = (dx_px * self._um_per_px, dy_px * self._um_per_px)
+            # The detection's offset is measured from the frame centre too, so
+            # it carries the same displacement.
+            offset_um = (dx_px * self._um_per_px + toff_x,
+                         dy_px * self._um_per_px + toff_y)
             confidence = detection.confidence
 
         record = FrameRecord(
             well_name=well_name,
             frame=frame,
-            stage_x_um=stage_x_um,
-            stage_y_um=stage_y_um,
+            stage_x_um=stage_x_um + toff_x,
+            stage_y_um=stage_y_um + toff_y,
             detected_offset_um=offset_um,
             confidence=confidence,
         )
@@ -961,11 +993,12 @@ class MosaicBuilder:
         Returns:
             The created FrameRecord.
         """
+        toff_x, toff_y = getattr(self, "_tile_center_offset_um", (0.0, 0.0))
         record = FrameRecord(
             well_name=f"R{index}",
             frame=frame,
-            stage_x_um=stage_x_um,
-            stage_y_um=stage_y_um,
+            stage_x_um=stage_x_um + toff_x,
+            stage_y_um=stage_y_um + toff_y,
         )
         self._records.append(record)
         return record
@@ -1024,7 +1057,7 @@ class MosaicBuilder:
         """Per-tile registration bound in mosaic px (0 µm → 20% of the FOV)."""
         if self._max_shift_um and self._max_shift_um > 0:
             return float(self._max_shift_um) * self._mosaic_scale
-        fov_w_px = self._frame_size_px[0] * self._um_per_px * self._mosaic_scale
+        fov_w_px = self._oriented_fov_um()[0] * self._mosaic_scale
         return 0.2 * fov_w_px
 
     def _measure_tile_shift(self, resized, px, py, tw, th):
@@ -1101,6 +1134,52 @@ class MosaicBuilder:
             f"µm (median of {len(self._measured_shifts)} overlaps)")
         return self._global_shift_um
 
+    def _fov_um(self) -> tuple[float, float]:
+        """One frame's extent in µm along the CAMERA's own pixel axes."""
+        return (self._frame_size_px[0] * self._um_per_px,
+                self._frame_size_px[1] * self._um_per_px)
+
+    def _oriented_fov_um(self) -> tuple[float, float]:
+        """One frame's extent in µm along the STAGE axes, after orientation.
+
+        v7.16. The camera can be mounted rotated; ``_orient_tile`` turns each
+        tile into stage axes, so the stage-frame footprint of a tile is the
+        rotated rectangle's bounding box — NOT the raw (w, h).
+
+        For a rectangular sensor at ±90° the two differ by the aspect ratio,
+        and using the raw values (as every caller used to) is what made the
+        mosaic behave as if the sensor were **square**:
+
+        * ``_orient_tile`` rendered the rotated content back into a w×h canvas,
+          so on a 2600×2048 frame at −90° the 2600-px axis was clipped to 2048
+          — **21 % of every frame discarded** — and black bars were blended in
+          on the other axis;
+        * the raster stepped by the *unrotated* FOV, so the real coverage per
+          tile collapsed to min(w,h)² — a square — leaving ~0 % overlap on one
+          axis while over-scanning the other.
+
+        Exact at 0°/±90°/180°; for a non-axis angle this is the bounding box, so
+        the corners are empty — that is the pre-existing, documented trade (the
+        scan overlap covers it), unchanged here.
+        """
+        fw, fh = self._fov_um()
+        theta = float(getattr(self, "_frame_rotation_deg", 0.0) or 0.0)
+        if abs(theta) < 0.05:
+            return (fw, fh)
+        t = math.radians(theta)
+        c, s = abs(math.cos(t)), abs(math.sin(t))
+        return (fw * c + fh * s, fw * s + fh * c)
+
+    def _oriented_size_px(self, w: int, h: int) -> tuple[int, int]:
+        """Canvas size a ``w×h`` tile occupies once oriented into stage axes."""
+        theta = float(getattr(self, "_frame_rotation_deg", 0.0) or 0.0)
+        if abs(theta) < 0.05:
+            return (int(w), int(h))
+        t = math.radians(theta)
+        c, s = abs(math.cos(t)), abs(math.sin(t))
+        return (max(1, int(round(w * c + h * s))),
+                max(1, int(round(w * s + h * c))))
+
     def _orient_tile(self, tile: np.ndarray) -> np.ndarray:
         """v7.5.x: orient a tile from CAMERA-pixel axes into STAGE axes.
 
@@ -1112,12 +1191,18 @@ class MosaicBuilder:
         with the stage axes — making the composite a stage-aligned orthophoto.
 
         No-op fast path when unmirrored and |θ| < 0.05° (byte-identical to the
-        legacy raw placement). Rotation keeps the same tile W×H (content rotates
-        about the centre; for a large non-axis angle the corners clip — the
-        mapping stays geometrically correct, only peripheral coverage is lost,
-        which the scan overlap covers). NOTE: the rotation SIGN / mirror axis
-        match ``pixel_to_stage_offset`` by construction; verify on real hardware
-        (a mis-signed θ would orient the mosaic the wrong way).
+        legacy raw placement).
+
+        v7.16: the output is the ROTATED BOUNDING BOX (``_oriented_size_px``),
+        not the input W×H. Rendering back into W×H clipped a rectangular sensor
+        to its short axis at ±90° — 21 % of a 2600×2048 frame — and padded the
+        other axis with black, which is the "the mosaic treats the view as a
+        square" the operator reported. The tile CENTRE is still invariant, so
+        callers place it centred on the same stage point.
+
+        NOTE: the rotation SIGN / mirror axis match ``pixel_to_stage_offset`` by
+        construction; verify on real hardware (a mis-signed θ would orient the
+        mosaic the wrong way).
         """
         theta = self._frame_rotation_deg
         mir = self._frame_mirrored                 # flip X (horizontal)
@@ -1125,8 +1210,11 @@ class MosaicBuilder:
         if (not mir and not fy and abs(theta) < 0.05) or cv2 is None:
             return tile
         h, w = tile.shape[:2]
+        ow, oh = self._oriented_size_px(w, h)
         cx = (w - 1) / 2.0
         cy = (h - 1) / 2.0
+        dcx = (ow - 1) / 2.0
+        dcy = (oh - 1) / 2.0
         t = math.radians(theta)
         c, s = math.cos(t), math.sin(t)
         mx = -1.0 if mir else 1.0
@@ -1138,12 +1226,12 @@ class MosaicBuilder:
         a00, a01 = c * mx, -s * my
         a10, a11 = s * mx, c * my
         M = np.array([
-            [a00, a01, cx - (a00 * cx + a01 * cy)],
-            [a10, a11, cy - (a10 * cx + a11 * cy)],
+            [a00, a01, dcx - (a00 * cx + a01 * cy)],
+            [a10, a11, dcy - (a10 * cx + a11 * cy)],
         ], dtype=np.float64)
         try:
             return cv2.warpAffine(
-                tile, M, (w, h), flags=cv2.INTER_LINEAR,
+                tile, M, (ow, oh), flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         except Exception:
             return tile
@@ -1153,18 +1241,17 @@ class MosaicBuilder:
         if self._composite is None or self._weight_sum is None:
             return
 
-        fov_w_um = self._frame_size_px[0] * self._um_per_px
-        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        fov_w_um, fov_h_um = self._fov_um()
+        # v7.16: the stage-frame footprint AFTER orientation. Identical to the
+        # camera-axis FOV at 0°; transposed at ±90°. Placing an oriented tile in
+        # the unrotated box is what squashed a rectangular sensor into a square.
+        ofov_w_um, ofov_h_um = self._oriented_fov_um()
         scale = self._mosaic_scale
         ox, oy = self._canvas_origin_um
 
-        # Top-left corner of this tile on the canvas (in µm, then pixels)
-        tile_left_um = rec.stage_x_um - fov_w_um / 2.0
-        tile_top_um = rec.stage_y_um - fov_h_um / 2.0
-        px = int((tile_left_um - ox) * scale)
-        py = int((tile_top_um - oy) * scale)
-
-        # Target tile size on canvas
+        # Camera-axis tile box. The resize preserves the frame's aspect, which
+        # is what keeps px→µm ISOTROPIC — and that isotropy is precisely what
+        # makes rotating inside this box geometrically correct.
         tile_w = max(1, int(fov_w_um * scale))
         tile_h = max(1, int(fov_h_um * scale))
 
@@ -1175,21 +1262,30 @@ class MosaicBuilder:
         except Exception:
             return
 
+        # Top-left of the ORIENTED footprint on the canvas (µm → px). The tile
+        # centre is orientation-invariant, so this stays pinned to the stage
+        # position the frame was captured at.
+        px = int((rec.stage_x_um - ofov_w_um / 2.0 - ox) * scale)
+        py = int((rec.stage_y_um - ofov_h_um / 2.0 - oy) * scale)
+        out_w, out_h = self._oriented_size_px(tile_w, tile_h)
+
         # v7.5.x: retain the small PRE-orient canvas-res tile so the interactive
         # fix-orientation tool (set_frame_orientation + reblend_reoriented) can
         # re-render the whole mosaic with a NEW orientation without re-scanning.
+        # The box recorded alongside it is the ORIENTED one, so its centre is
+        # what a later re-blend re-centres on when the orientation changes.
         if self._retain_for_reorient:
             try:
                 self._reorient_tiles.append(
                     (resized.copy(), int(px), int(py),
-                     int(tile_w), int(tile_h)))
+                     int(out_w), int(out_h)))
             except Exception:
                 pass
 
         # v7.5.x: orient the tile from camera-pixel axes into stage axes
         # (calibrated mirror + rotation) so the composite is stage-aligned and
         # mosaic clicks back-project to the correct XY. No-op at (0°, unmirrored).
-        resized = self._orient_tile(resized)
+        oriented = self._orient_tile(resized)
 
         # v7.5.x: registration. Measure this tile's overlap misalignment, then
         # either (global, default) record it for ONE uniform shift finalized
@@ -1198,31 +1294,207 @@ class MosaicBuilder:
         # bounded shift now.
         if self._register:
             try:
-                shift = self._measure_tile_shift(resized, px, py,
-                                                 tile_w, tile_h)
+                shift = self._measure_tile_shift(oriented, px, py,
+                                                 out_w, out_h)
                 if shift is not None:
                     if self._register_mode == "per_tile":
                         m = self._max_shift_px()
                         px += int(round(max(-m, min(m, shift[0]))))
                         py += int(round(max(-m, min(m, shift[1]))))
-                        rec.refined_x_px = float(px + tile_w / 2.0)
-                        rec.refined_y_px = float(py + tile_h / 2.0)
+                        rec.refined_x_px = float(px + out_w / 2.0)
+                        rec.refined_y_px = float(py + out_h / 2.0)
                     else:
                         self._measured_shifts.append(shift)
             except Exception as e:
                 logger.debug(f"Overlap registration skipped: {e}")
 
-        self._accumulate_oriented_tile(resized, px, py, tile_w, tile_h)
+        self._accumulate_oriented_tile(oriented, px, py, out_w, out_h)
 
         # Store refined position on canvas
-        rec.refined_x_px = float(px + tile_w / 2.0)
-        rec.refined_y_px = float(py + tile_h / 2.0)
+        rec.refined_x_px = float(px + out_w / 2.0)
+        rec.refined_y_px = float(py + out_h / 2.0)
+
+    # ── v7.16: intensity regularization (flat field + per-tile gain) ──
+
+    def _intensity_correct(self, tile, gain=None):
+        """Apply the estimated flat field + per-tile gain to a PRE-orient tile.
+
+        No-op (and byte-identical) until ``regularize_intensity`` has run.
+        Applied BEFORE orientation because both corrections live in CAMERA
+        pixel coordinates — vignetting is a property of the optical path and
+        the sensor, so it is fixed in the frame, not on the plate.
+        """
+        ff = getattr(self, "_flat_field", None)
+        if ff is None and (gain is None or abs(gain - 1.0) < 1e-9):
+            return tile
+        try:
+            out = tile.astype(np.float32)
+            if ff is not None and ff.shape[:2] == out.shape[:2]:
+                out = out / ff[:, :, None]
+            if gain is not None:
+                out = out * float(gain)
+            return np.clip(out, 0.0, 255.0).astype(tile.dtype)
+        except Exception as exc:
+            logger.debug(f"intensity correction skipped: {exc}")
+            return tile
+
+    def _tile_luma(self, tile):
+        """Robust per-tile brightness (median over a subsample)."""
+        try:
+            g = tile[::4, ::4]
+            g = g.mean(axis=2) if g.ndim == 3 else g
+            return float(np.median(g))
+        except Exception:
+            return 0.0
+
+    def estimate_flat_field(self, *, blur_frac: float = 0.25,
+                            min_tiles: int = 6):
+        """Estimate the illumination/vignetting profile FROM THE TILES.
+
+        Returns a float32 (h, w) gain field normalised to a mean of 1.0, or
+        None when there is not enough data.
+
+        Each retained tile is divided by its own median, so specimen content —
+        which moves from tile to tile — averages out under a per-pixel MEDIAN
+        while the illumination pattern, which is fixed in the frame, survives.
+        The median (not the mean) is what makes this robust to the minority of
+        tiles containing a big bright or dark object.
+
+        The result is heavily blurred: real vignetting is a smooth, low-order
+        function of position, so anything sharp in the estimate is residual
+        specimen structure — and dividing by that would BURN a ghost of one
+        tile's content into every tile. ``min_tiles`` exists for the same
+        reason; with only a handful of frames the median cannot separate the
+        two and the honest answer is "don't correct".
+        """
+        tiles = [t[0] for t in getattr(self, "_reorient_tiles", []) or []]
+        if cv2 is None or len(tiles) < int(min_tiles):
+            return None
+        try:
+            h, w = tiles[0].shape[:2]
+            stack = []
+            for t in tiles:
+                if t.shape[:2] != (h, w):
+                    continue
+                g = t.mean(axis=2).astype(np.float32) if t.ndim == 3 else \
+                    t.astype(np.float32)
+                m = float(np.median(g))
+                if m <= 1e-3:
+                    continue
+                stack.append(g / m)
+            if len(stack) < int(min_tiles):
+                return None
+            ff = np.median(np.stack(stack, axis=0), axis=0).astype(np.float32)
+            k = max(3, int(min(h, w) * float(blur_frac)) | 1)
+            ff = cv2.GaussianBlur(ff, (k, k), 0, borderType=cv2.BORDER_REPLICATE)
+            mean = float(ff.mean())
+            if mean <= 1e-6:
+                return None
+            ff /= mean
+            # A degenerate field (near-flat or wildly out of range) means the
+            # estimate failed; correcting by it would only add noise.
+            np.clip(ff, 0.2, 5.0, out=ff)
+            return ff
+        except Exception as exc:
+            logger.debug(f"flat-field estimate failed: {exc}")
+            return None
+
+    def regularize_intensity(self, *, flat_field: bool = True,
+                             match_gain: bool = True,
+                             positions=None):
+        """Even out illumination across the mosaic, then re-blend.
+
+        Two independent effects, both visible as a tile grid in a large mosaic:
+
+        * **vignetting** — each frame is darker at its edges, so every tile
+          boundary shows as a soft dark seam. Corrected by dividing each tile
+          by :meth:`estimate_flat_field`.
+        * **tile-to-tile level** — lamp drift, auto-exposure, or simply a
+          brighter region of the specimen leave neighbouring tiles at
+          different levels. Corrected by scaling each tile's median to the
+          median of all tiles.
+
+        Requires ``retain_for_reorient=True`` (the canvas-res tiles are the
+        input). Returns ``(composite, applied_flat_field, n_gain_corrected)``;
+        ``composite`` is unchanged when there was nothing to do, so a caller
+        can always call this unconditionally.
+        """
+        tiles = getattr(self, "_reorient_tiles", None)
+        if not tiles or self._composite is None or self._weight_sum is None:
+            return self.composite, False, 0
+
+        ff = self.estimate_flat_field() if flat_field else None
+        self._flat_field = ff
+
+        gains = None
+        if match_gain:
+            lumas = [self._tile_luma(t[0]) for t in tiles]
+            valid = [x for x in lumas if x > 1e-3]
+            if len(valid) >= 2:
+                target = float(np.median(valid))
+                # Bounded: a tile legitimately dominated by a bright object
+                # must not be dragged to the plate average, which would erase
+                # the very signal the scan is for.
+                gains = [
+                    (min(2.0, max(0.5, target / x)) if x > 1e-3 else 1.0)
+                    for x in lumas]
+        self._tile_gains = gains
+
+        if ff is None and gains is None:
+            return self.composite, False, 0
+
+        if positions is None:
+            positions = getattr(self, "_optimized_positions", None)
+        self._composite[...] = 0.0
+        self._weight_sum[...] = 0.0
+        if self._display_cache is not None:
+            self._display_cache[...] = 0
+        for i, (resized, px, py, tw, th) in enumerate(tiles):
+            try:
+                if positions is not None and i < len(positions):
+                    px = int(round(float(positions[i][0])))
+                    py = int(round(float(positions[i][1])))
+                self._place_from_box(resized, px, py, tw, th,
+                                     gain=(gains[i] if gains else None))
+            except Exception as e:
+                logger.debug(f"regularize tile skipped: {e}")
+        n_gain = len(gains) if gains else 0
+        logger.info(
+            "Mosaic intensity regularized: flat-field=%s, gain-matched %d tiles",
+            "yes" if ff is not None else "no", n_gain)
+        return self.composite, ff is not None, n_gain
+
+    def _place_from_box(self, resized, px, py, tw, th, gain=None):
+        """Orient a retained PRE-orient tile and blend it centred on the box.
+
+        v7.16. The three re-blend paths used to pass the STORED box size
+        straight to ``_accumulate_oriented_tile``. That was fine while
+        ``_orient_tile`` returned the input size, but it now returns the rotated
+        bounding box — and ``reblend_reoriented`` exists precisely to re-render
+        at a DIFFERENT orientation, where the stored box no longer describes the
+        result. Re-centring on the stored box's centre keeps every tile pinned
+        to the same stage point across an orientation change.
+        """
+        oriented = self._orient_tile(self._intensity_correct(resized, gain))
+        oh, ow = oriented.shape[:2]
+        cx = float(px) + float(tw) / 2.0
+        cy = float(py) + float(th) / 2.0
+        self._accumulate_oriented_tile(
+            oriented, int(round(cx - ow / 2.0)), int(round(cy - oh / 2.0)),
+            ow, oh)
 
     def _accumulate_oriented_tile(self, oriented, px, py, tile_w, tile_h):
         """Feather-blend an already-oriented, canvas-res tile into the composite
         at (px, py). Shared by ``_blend_tile_to_composite`` and
         ``reblend_reoriented``."""
         if self._composite is None or self._weight_sum is None:
+            return
+        # v7.16: trust the ARRAY, not the caller's idea of its size — the
+        # oriented size is derived from the rotation and a stale (tile_w,
+        # tile_h) would silently crop or over-read the blend region.
+        try:
+            tile_h, tile_w = oriented.shape[:2]
+        except Exception:
             return
         # Get feather weights (resize if dimensions don't match)
         if (self._feather_weights is not None
@@ -1290,8 +1562,7 @@ class MosaicBuilder:
             self._display_cache[...] = 0
         for (resized, px, py, tw, th) in self._reorient_tiles:
             try:
-                self._accumulate_oriented_tile(
-                    self._orient_tile(resized), px, py, tw, th)
+                self._place_from_box(resized, px, py, tw, th)
             except Exception as e:
                 logger.debug(f"reblend tile skipped: {e}")
         return self.composite
@@ -1434,10 +1705,10 @@ class MosaicBuilder:
         for (resized, _px, _py, tw, th), pos in zip(
                 self._reorient_tiles, positions):
             try:
-                self._accumulate_oriented_tile(
-                    self._orient_tile(resized),
-                    int(round(float(pos[0]))), int(round(float(pos[1]))),
-                    int(tw), int(th))
+                # ``pos`` is the solver's top-left for the SAME (tw, th) box.
+                self._place_from_box(
+                    resized, int(round(float(pos[0]))),
+                    int(round(float(pos[1]))), int(tw), int(th))
             except Exception as e:
                 logger.debug(f"reblend-at tile skipped: {e}")
         return self.composite
@@ -1459,8 +1730,7 @@ class MosaicBuilder:
         # Derive bounds from stage positions
         xs = [r.stage_x_um for r in self._records]
         ys = [r.stage_y_um for r in self._records]
-        fov_w = self._frame_size_px[0] * self._um_per_px
-        fov_h = self._frame_size_px[1] * self._um_per_px
+        fov_w, fov_h = self._oriented_fov_um()
         bounds = (
             min(xs) - fov_w / 2.0,
             min(ys) - fov_h / 2.0,
@@ -1509,8 +1779,7 @@ class MosaicBuilder:
             )
             return self.composite
 
-        fov_w_um = self._frame_size_px[0] * self._um_per_px
-        fov_h_um = self._frame_size_px[1] * self._um_per_px
+        fov_w_um, fov_h_um = self._oriented_fov_um()
 
         # Compute stage bounds for canvas
         xs = [r.stage_x_um for r in self._records]

@@ -70,9 +70,95 @@ RESOLUTION_PRESETS = [
 # unusable value. A middling exposure so the operator sees *something*.
 _DEFAULT_EXPOSURE_S = 0.03
 
+# Longest exposure the UI advertises (the Zyla's spec'd maximum is 30 s). The
+# setter always clamps against the SDK's own live range, so an optimistic
+# ceiling here is safe — an artificially tiny one was the v7.13 bench bug.
+_MAX_EXPOSURE_S = 30.0
+
+# Fraction of the USB link's MaxInterfaceTransferRate the frame rate is capped
+# to. Running AT the link ceiling overflows the camera's internal buffer under
+# any jitter (dropped frames / stalled acquisition at full resolution).
+_LINK_RATE_MARGIN = 0.97
+
+# Headroom multiplier when lowering the frame period to fit a requested
+# exposure (rolling-shutter readout overhead).
+_EXPOSURE_PERIOD_HEADROOM = 1.02
+
 # Display-level range for the mono-16 sensor (black/white points used when the
 # per-frame auto-scale is turned OFF).
 _LEVEL_MAX = 65535
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Sensor feature table (v7.13)
+# ════════════════════════════════════════════════════════════════════
+# The Zyla's biggest signal-to-noise levers are plain SDK3 features that were
+# never wired: sensor cooling (dark current), pixel readout rate (slow readout
+# = lower read noise), the pre-amp gain mode (16-bit low-noise), and the
+# on-camera spurious-noise / static-blemish filters. One table drives the
+# probe, the open-time defaults, the capability advertisement, the settings
+# dialog and persistence, so a feature can never be half-wired.
+#
+# Rows: (settings_key, sdk_feature_name, kind, default)
+#   kind "bool" — default is the bool to apply.
+#   kind "enum" — default is a tuple of MATCH TOKENS, not a literal SDK
+#     string: the applied value is whichever runtime-enumerated allowed value
+#     contains all tokens (case-insensitive). Hardcoding an SDK enum string a
+#     different camera/SDK build might spell differently is exactly the class
+#     of semantic mismatch the Tucsen bring-up documented — never do it.
+ANDOR_SENSOR_FEATURES = (
+    ("andor_sensor_cooling",     "SensorCooling",           "bool", True),
+    ("andor_readout_rate",       "PixelReadoutRate",        "enum", ("216",)),
+    ("andor_gain_mode",          "SimplePreAmpGainControl", "enum", ("16-bit", "low noise")),
+    ("andor_noise_filter",       "SpuriousNoiseFilter",     "bool", True),
+    ("andor_blemish_correction", "StaticBlemishCorrection", "bool", True),
+)
+
+# Keys (in table order) — convenience for capability/persistence consumers.
+ANDOR_SENSOR_FEATURE_KEYS = tuple(row[0] for row in ANDOR_SENSOR_FEATURES)
+
+
+def _match_enum_value(values, tokens) -> "str | None":
+    """First allowed enum value containing ALL tokens (case-insensitive).
+
+    ``values`` is the runtime-enumerated list from the SDK; ``tokens`` the
+    match-token tuple from ANDOR_SENSOR_FEATURES. Returns None when nothing
+    matches — the caller must then SKIP the default rather than guess.
+    """
+    if not values:
+        return None
+    toks = [str(t).lower() for t in (tokens or ())]
+    if not toks:
+        return None
+    for v in values:
+        s = str(v).lower()
+        if all(t in s for t in toks):
+            return str(v)
+    return None
+
+
+def _parse_bit_depth(text) -> "int | None":
+    """Full-scale count from a bit-depth-ish string ("12 Bit", "16-bit (...)").
+
+    Returns 2**n − 1 for the first plausible integer (8..32) found, else None.
+    """
+    if text is None:
+        return None
+    digits = ""
+    for ch in str(text):
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    if not digits:
+        return None
+    try:
+        n = int(digits)
+    except ValueError:
+        return None
+    if 8 <= n <= 32:
+        return (1 << n) - 1
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -226,6 +312,11 @@ class _LazyAvailable:
 ANDOR_AVAILABLE = _LazyAvailable()
 
 
+# v7.13: the raw averaged-capture request lives in gui/widgets/mono_display.py
+# (RawAverageRequest) so the Tucsen backend services the IDENTICAL contract —
+# re-exported below as _RawAverageRequest for existing references.
+
+
 # ════════════════════════════════════════════════════════════════════
 #  AndorBackend — OpenCV/ToupCam-like Camera Interface
 # ════════════════════════════════════════════════════════════════════
@@ -294,6 +385,13 @@ class AndorBackend:
         self._frame: "np.ndarray | None" = None       # latest BGR8
         self._lock = threading.Lock()
         self._frame_ready = threading.Event()
+        # v7.14: monotonic count of GENUINELY-NEW frames delivered by the
+        # reader thread. read() is non-blocking and hands back the same cached
+        # frame as often as it is asked, so a caller polling read() cannot tell
+        # a new frame from a repeat — which is how a mosaic tile ended up
+        # stitching the frame exposed DURING the stage move. See
+        # SupportClasses/CaptureTiming.py.
+        self._frames_acquired = 0
         self._reader: "threading.Thread | None" = None
         self._running = False
         self._w = 0
@@ -308,6 +406,16 @@ class AndorBackend:
         self._scale_lo = 0
         self._scale_hi = _LEVEL_MAX
         self._last_auto_levels: "tuple[float, float] | None" = None
+        # v7.13 — sensor features probed at open (key -> spec dict); the true
+        # full-scale clip level for the CURRENT gain mode (12-bit modes clip at
+        # ~4095, far below the uint16 container); latest raw-frame statistics;
+        # the pending averaged-capture request serviced by the reader thread.
+        self._features: dict = {}
+        self._clip_level = _LEVEL_MAX
+        self._raw_stats: "dict | None" = None
+        self._avg_request: "_RawAverageRequest | None" = None
+        self._temp_read_ts = 0.0
+        self._temp_cache: tuple = (None, None)
 
     # ── Lifecycle ─────────────────────────────────────────────────
     def open(self, device_id: str, resolution_index: int | None = None) -> bool:
@@ -341,6 +449,15 @@ class AndorBackend:
         except Exception:
             pass
 
+        # v7.13 — probe the sensor-quality features and apply the low-noise
+        # defaults BEFORE acquisition starts (readout rate / gain mode may be
+        # NOTWRITABLE mid-acquisition). Persisted per-identity hw_controls are
+        # restored AFTER start via the camera_started signal and simply
+        # overwrite these — persisted wins, absent key = default stands.
+        self._probe_sensor_features()
+        self._apply_sensor_defaults()
+        self._clip_level = self._read_clip_level()
+
         # Resolution / binning
         if resolution_index is None:
             resolution_index = self._auto_pick_resolution_index()
@@ -353,6 +470,12 @@ class AndorBackend:
                 cam.set_exposure(_DEFAULT_EXPOSURE_S)
         except Exception:
             pass
+
+        # v7.13.x — cap FrameRate to the USB link's sustainable rate BEFORE
+        # acquisition starts. At full 2048x2048 Mono16 the sensor-max frame
+        # rate exceeds MaxInterfaceTransferRate, overflowing the camera's
+        # internal buffer (dropped frames, stalled acquisition).
+        self._sync_frame_rate()
 
         if not self._start_stream():
             self.release()
@@ -406,6 +529,25 @@ class AndorBackend:
         except Exception as exc:
             logger.debug(f"Andor re-arm failed: {exc}")
 
+    def _stall_threshold_fails(self) -> int:
+        """Consecutive wait_for_frame failures before a FORCED re-arm.
+
+        Exposure-aware: at 0.5 s per wait timeout a long exposure produces
+        several timeouts between perfectly healthy frames, so the stall window
+        is max(10 s, 4x the current exposure). A wedged camera whose exposure
+        can't even be read falls back to the 10 s floor — the case that most
+        needs the forced re-arm.
+        """
+        exp_s = 0.0
+        try:
+            e = self.get_exposure_time()
+            if e:
+                exp_s = float(e) / 1e6
+        except Exception:
+            pass
+        stall_s = max(10.0, 4.0 * exp_s)
+        return max(20, int(stall_s / 0.5) + 1)
+
     def _reader_loop(self):
         """Pull the newest frame from pylablib into the BGR8 buffer.
 
@@ -414,6 +556,7 @@ class AndorBackend:
         transient stall self-heals rather than freezing the feed forever."""
         cam = self._cam
         fails = 0
+        backoff = 1
         while self._running and cam is not None:
             try:
                 cam.wait_for_frame(timeout=0.5)
@@ -425,13 +568,30 @@ class AndorBackend:
                 # If acquisition died (e.g. buffer overflow), re-arm it rather
                 # than spin silently. Check occasionally to avoid hammering.
                 if fails % 10 == 0:
+                    rearmed = False
                     try:
                         if not cam.acquisition_in_progress():
                             logger.info("Andor reader: acquisition stopped — re-arming")
                             self._rearm_acquisition()
-                            fails = 0
+                            rearmed = True
                     except Exception:
                         pass
+                    # v7.13.x — a wedged USB stream can keep CLAIMING the
+                    # acquisition is in progress while no frame ever arrives
+                    # (bench: full-res feed "goes dead"). Force a re-arm after
+                    # a stall window sized to the exposure (a 5 s exposure
+                    # legitimately yields many wait timeouts per frame), with
+                    # exponential backoff so a truly dead camera doesn't
+                    # re-arm-spin.
+                    if not rearmed and fails >= self._stall_threshold_fails() * backoff:
+                        logger.info(
+                            f"Andor reader: no frame for ~{fails * 0.5:.0f}s while "
+                            "acquisition claims to be in progress — forcing a re-arm")
+                        self._rearm_acquisition()
+                        rearmed = True
+                        backoff = min(backoff * 2, 16)
+                    if rearmed:
+                        fails = 0
                 continue
             try:
                 raw = cam.read_newest_image()
@@ -440,6 +600,55 @@ class AndorBackend:
                 continue
             if raw is None:
                 continue
+
+            # Reduce to ONE 2-D plane — raw statistics, the averaged-capture
+            # accumulator, the auto-levels and the display conversion must all
+            # consult the same pixels.
+            plane = None
+            if _NP_AVAILABLE:
+                try:
+                    arr = np.asarray(raw)
+                    if arr.ndim == 3:
+                        arr = arr[..., 0]
+                    if arr.ndim == 2:
+                        plane = arr
+                except Exception:
+                    plane = None
+
+            # v7.13 — raw 16-bit statistics (saturation/histogram). Guarded so
+            # statistics can never take the feed down.
+            if plane is not None and plane.dtype != np.uint8:
+                try:
+                    stats = compute_raw_frame_stats(plane, self._clip_level)
+                except Exception:
+                    stats = None
+                if stats is not None:
+                    now = time.monotonic()
+                    if now - self._temp_read_ts > 2.0:
+                        # The reader thread owns the camera, so the periodic
+                        # temperature read happens here — never on a GUI timer.
+                        self._temp_read_ts = now
+                        self._temp_cache = (self.get_sensor_temperature(),
+                                            self.get_temperature_status())
+                    stats["temperature_c"] = self._temp_cache[0]
+                    stats["temperature_status"] = self._temp_cache[1]
+                    with self._lock:
+                        self._raw_stats = stats
+
+            # v7.13 — service a pending averaged-capture request.
+            if plane is not None:
+                with self._lock:
+                    req = self._avg_request
+                if req is not None:
+                    try:
+                        req.add(plane)
+                    except Exception as exc:
+                        req.fail(f"accumulate error: {exc}")
+                    if req.done.is_set():
+                        with self._lock:
+                            if self._avg_request is req:
+                                self._avg_request = None
+
             with self._lock:
                 auto = self._auto_scale
                 manual_levels = (self._scale_lo, self._scale_hi)
@@ -447,9 +656,7 @@ class AndorBackend:
             if auto:
                 # Per-frame percentile auto-scale; remember the levels so a
                 # switch to manual freezes the CURRENT look instead of jumping.
-                arr = np.asarray(raw) if _NP_AVAILABLE else None
-                if arr is not None and arr.ndim >= 2 and arr.dtype != np.uint8:
-                    plane = arr if arr.ndim == 2 else arr[..., 0]
+                if plane is not None and plane.dtype != np.uint8:
                     levels = _auto_levels(plane)
                     with self._lock:
                         self._last_auto_levels = levels
@@ -460,11 +667,23 @@ class AndorBackend:
                 continue
             with self._lock:
                 self._frame = bgr
+                self._frames_acquired += 1
             self._frame_ready.set()
             fails = 0
+            backoff = 1
 
     def isOpened(self) -> bool:
         return self._cam is not None and self._running
+
+    def frames_acquired(self) -> int:
+        """v7.14: monotonic count of distinct frames the sensor has delivered.
+
+        Advances ONLY when the reader thread receives a new frame — unlike
+        ``read()``, which returns the cached frame on demand. A caller that
+        needs a post-move frame must wait on THIS, not on read() call count.
+        """
+        with self._lock:
+            return self._frames_acquired
 
     def read(self) -> tuple[bool, "np.ndarray | None"]:
         """Return (ok, latest BGR8 frame). Non-blocking after the first frame."""
@@ -479,6 +698,7 @@ class AndorBackend:
 
     def release(self):
         """Stop acquisition + close the camera, serialized against the reader."""
+        self._fail_pending_average("camera released")
         self._running = False
         reader = self._reader
         self._reader = None
@@ -491,6 +711,7 @@ class AndorBackend:
         with self._lock:
             self._cam = None
             self._frame = None
+            self._raw_stats = None
         if cam is not None:
             try:
                 cam.stop_acquisition()
@@ -574,6 +795,7 @@ class AndorBackend:
         cam = self._cam
         if cam is None:
             return False
+        self._fail_pending_average("resolution changed")
         self._running = False
         reader = self._reader
         self._reader = None
@@ -589,6 +811,10 @@ class AndorBackend:
         with self._lock:
             self._frame = None
         ok = self._apply_resolution_index(index)
+        # The ROI change moves the sensor-max frame rate; re-cap it to the USB
+        # link's sustainable rate (acquisition is stopped here — always
+        # writable). Full resolution is exactly where the overflow bites.
+        self._sync_frame_rate()
         started = self._start_stream()
         logger.info(f"Andor resolution -> {self._w}x{self._h} (eSize {self._eSize})"
                     f"{'' if (ok and started) else ' [partial]'}")
@@ -606,33 +832,487 @@ class AndorBackend:
         except Exception:
             return None
 
-    def put_exposure_time(self, microseconds) -> bool:
-        cam = self._cam
-        if cam is None:
-            return False
-        try:
-            cam.set_exposure(max(0.0, float(microseconds) / 1e6))
-            return True
-        except Exception as exc:
-            logger.debug(f"Andor set_exposure failed: {exc}")
-            return False
-
-    def get_exposure_time_range(self):
-        """(min_us, max_us, default_us) or None."""
+    def _sdk_attr(self, name: str):
+        """SDK attribute object with LIVE min/max when the pylablib build
+        supports ``update_properties`` (without it the limits are the values
+        cached at construction — stale relative to any binning / gain-mode /
+        frame-rate change made since). None when absent."""
         cam = self._cam
         if cam is None:
             return None
         try:
-            attr = cam.get_attribute("ExposureTime")
-            lo = getattr(attr, "min", None)
-            hi = getattr(attr, "max", None)
-            if lo is None or hi is None:
-                return None
-            cur = cam.get_exposure() or lo
-            return (int(round(lo * 1e6)), int(round(hi * 1e6)),
-                    int(round(cur * 1e6)))
+            return cam.get_attribute(name, update_properties=True)
+        except TypeError:
+            pass
         except Exception:
             return None
+        try:
+            return cam.get_attribute(name)
+        except Exception:
+            return None
+
+    def get_frame_rate(self) -> "float | None":
+        cam = self._cam
+        if cam is None:
+            return None
+        try:
+            return float(cam.get_attribute_value("FrameRate"))
+        except Exception:
+            return None
+
+    def get_max_interface_transfer_rate(self) -> "float | None":
+        """The USB link's sustainable frame rate (fps), or None if the SDK
+        doesn't expose it on this model."""
+        cam = self._cam
+        if cam is None:
+            return None
+        try:
+            v = float(cam.get_attribute_value("MaxInterfaceTransferRate"))
+            return v if v > 0 else None
+        except Exception:
+            return None
+
+    def _sync_frame_rate(self):
+        """Cap FrameRate to min(FrameRate.max, link rate x margin).
+
+        FrameRate.max is dynamic — the SDK already folds the current exposure,
+        ROI and readout rate into it — so raising FrameRate to (at most) that
+        max can never clamp the exposure back down. Capping below the link's
+        MaxInterfaceTransferRate is Andor's own guidance for USB Zylas: run
+        faster and the camera's INTERNAL buffer overflows (dropped frames,
+        stalled acquisition — the full-resolution "feed goes dead" bench bug).
+        Missing attributes → silent no-op."""
+        cam = self._cam
+        if cam is None:
+            return
+        attr = self._sdk_attr("FrameRate")
+        if attr is None:
+            return
+        hi = getattr(attr, "max", None)
+        if not hi or float(hi) <= 0:
+            return
+        target = float(hi)
+        mitr = self.get_max_interface_transfer_rate()
+        if mitr:
+            target = min(target, mitr * _LINK_RATE_MARGIN)
+        lo = getattr(attr, "min", None)
+        if lo:
+            target = max(target, float(lo))
+        try:
+            cam.set_attribute_value("FrameRate", target)
+            logger.debug(f"Andor: FrameRate -> {target:.3f} fps"
+                         + (f" (link max {mitr:.3f})" if mitr else ""))
+        except Exception as exc:
+            logger.debug(f"Andor: FrameRate -> {target:.3f} fps refused: {exc}")
+
+    def _apply_exposure_s(self, req_s: float) -> bool:
+        """FrameRate-aware exposure write (see put_exposure_time)."""
+        cam = self._cam
+        if cam is None:
+            return False
+        # 1) Lower the frame rate first when the requested exposure does not
+        #    fit the current frame period — the OPPOSITE of pylablib's
+        #    set_exposure(), which pins FrameRate at max and truncates the
+        #    exposure to ~one maximum-rate frame.
+        try:
+            fr = float(cam.get_attribute_value("FrameRate"))
+            period = 1.0 / fr if fr > 0 else None
+        except Exception:
+            period = None
+        if period is not None and req_s > period * 0.98:
+            try:
+                cam.set_frame_period(req_s * _EXPOSURE_PERIOD_HEADROOM)
+            except Exception as exc:
+                logger.debug(f"Andor: frame-period lowering failed: {exc}")
+        # 2) Clamp into the LIVE ExposureTime range (limits reflect the frame
+        #    rate we just set) and write the attribute directly — never
+        #    through pylablib's set_exposure.
+        t = req_s
+        attr = self._sdk_attr("ExposureTime")
+        if attr is not None:
+            lo = getattr(attr, "min", None)
+            hi = getattr(attr, "max", None)
+            if lo is not None:
+                t = max(t, float(lo))
+            if hi is not None:
+                t = min(t, float(hi))
+        if abs(t - req_s) > max(1e-6, 0.02 * req_s):
+            logger.info(f"Andor: exposure clamped {req_s * 1e3:.3f} -> "
+                        f"{t * 1e3:.3f} ms by the SDK's own range")
+        try:
+            cam.set_attribute_value("ExposureTime", t)
+        except Exception as exc:
+            logger.debug(f"Andor set ExposureTime failed: {exc}")
+            return False
+        # 3) Re-raise FrameRate to min(its new max, link rate) so short
+        #    exposures keep a live-feeling feed. Its max now accounts for the
+        #    exposure just set, so this cannot clamp the exposure back down.
+        self._sync_frame_rate()
+        return True
+
+    def put_exposure_time(self, microseconds) -> bool:
+        """Set exposure, managing FrameRate so long exposures actually stick.
+
+        pylablib's own ``set_exposure()`` first pins FrameRate at its MAXIMUM
+        (``set_frame_period(0)``) and then truncates the request against
+        ``ExposureTime.max ~= 1/FrameRate`` — so any exposure longer than one
+        maximum-rate frame silently collapsed to tens of milliseconds (the
+        "exposure resets to a small number" bench bug). This bypasses it:
+        lower FrameRate to fit the exposure, write ExposureTime directly, then
+        raise FrameRate back to min(max, link rate).
+
+        Returns True only when the achieved exposure is within ~2 % of the
+        request; the achieved value is always what get_exposure_time reads.
+        """
+        cam = self._cam
+        if cam is None:
+            return False
+        req_s = max(0.0, float(microseconds) / 1e6)
+        applied = self._apply_exposure_s(req_s)
+        if not applied and self._running:
+            # Live write refused — pause acquisition, apply, restart (the
+            # proven set_sensor_feature recovery shape; the stream is ALWAYS
+            # restarted so a refused setting never costs the feed).
+            self._running = False
+            reader = self._reader
+            self._reader = None
+            if reader is not None and reader.is_alive() \
+                    and reader is not threading.current_thread():
+                try:
+                    reader.join(timeout=1.5)
+                except Exception:
+                    pass
+            try:
+                cam.stop_acquisition()
+            except Exception:
+                pass
+            with self._lock:
+                self._frame = None
+            applied = self._apply_exposure_s(req_s)
+            self._start_stream()
+        if not applied:
+            return False
+        got = self.get_exposure_time()
+        if got is not None:
+            got_s = float(got) / 1e6
+            if abs(got_s - req_s) > max(2e-4, 0.02 * req_s):
+                logger.info(f"Andor: exposure requested {req_s * 1e3:.3f} ms, "
+                            f"achieved {got_s * 1e3:.3f} ms")
+                return False
+        return True
+
+    def get_exposure_time_range(self):
+        """(min_us, max_us, default_us) or None.
+
+        The hi bound is the exposure ACHIEVABLE — put_exposure_time lowers the
+        frame rate to fit — not ExposureTime.max at the CURRENT frame rate,
+        which is ~one frame period and was the tiny ceiling the dialog spin
+        clamped every keystroke against. Capped at the Zyla's spec'd 30 s.
+        """
+        cam = self._cam
+        if cam is None:
+            return None
+        attr = self._sdk_attr("ExposureTime")
+        if attr is None:
+            return None
+        lo = getattr(attr, "min", None)
+        hi = getattr(attr, "max", None)
+        if lo is None or hi is None:
+            return None
+        lo, hi = float(lo), float(hi)
+        fr = self._sdk_attr("FrameRate")
+        fr_min = getattr(fr, "min", None) if fr is not None else None
+        if fr_min and float(fr_min) > 0:
+            hi = max(hi, min(_MAX_EXPOSURE_S, 1.0 / float(fr_min)))
+        try:
+            cur = cam.get_exposure() or lo
+        except Exception:
+            cur = lo
+        return (int(round(lo * 1e6)), int(round(hi * 1e6)),
+                int(round(float(cur) * 1e6)))
+
+    # ── Sensor-quality features (v7.13) ───────────────────────────
+    # Cooling / readout rate / gain mode / noise + blemish filters. All access
+    # is defensive: a feature that fails to probe is simply absent (its dialog
+    # control auto-hides), and enum values are always the SDK's own
+    # runtime-enumerated strings — never hardcoded literals.
+
+    def _probe_sensor_features(self):
+        """Discover which ANDOR_SENSOR_FEATURES this camera implements."""
+        cam = self._cam
+        feats: dict = {}
+        if cam is None:
+            self._features = feats
+            return
+        for key, sdk_name, kind, default in ANDOR_SENSOR_FEATURES:
+            try:
+                attr = cam.get_attribute(sdk_name)
+            except Exception:
+                continue
+            if attr is None:
+                continue
+            values = None
+            if kind == "enum":
+                try:
+                    vals = getattr(attr, "values", None)
+                    if vals:
+                        values = [str(v) for v in vals]
+                except Exception:
+                    values = None
+                if not values:
+                    # An enum whose allowed values can't be enumerated can't be
+                    # offered safely — skip it entirely.
+                    logger.info(f"Andor: {sdk_name} present but its values "
+                                "could not be enumerated — feature hidden")
+                    continue
+            feats[key] = {"sdk_name": sdk_name, "kind": kind,
+                          "values": values, "default": default}
+        self._features = feats
+        if feats:
+            logger.info(f"Andor sensor features available: {sorted(feats)}")
+
+    def _resolved_default(self, spec):
+        """The concrete value a spec's default resolves to, or None to skip."""
+        if spec["kind"] == "enum":
+            return _match_enum_value(spec.get("values") or [], spec.get("default"))
+        return bool(spec.get("default"))
+
+    def _apply_sensor_defaults(self):
+        """Apply the low-noise defaults at open (pre-acquisition, direct sets)."""
+        cam = self._cam
+        if cam is None:
+            return
+        for key, spec in self._features.items():
+            value = self._resolved_default(spec)
+            if value is None:
+                logger.info(
+                    f"Andor sensor default SKIPPED: {spec['sdk_name']} has no "
+                    f"value matching {spec.get('default')} in {spec.get('values')}")
+                continue
+            try:
+                cam.set_attribute_value(spec["sdk_name"], value)
+                logger.info(f"Andor sensor default applied: "
+                            f"{spec['sdk_name']} = {value!r}")
+            except Exception as exc:
+                logger.info(f"Andor sensor default FAILED: "
+                            f"{spec['sdk_name']} = {value!r}: {exc}")
+
+    def apply_sensor_defaults(self) -> bool:
+        """Re-apply the table defaults on a LIVE camera (dialog Defaults button)."""
+        ok = True
+        for key, spec in self._features.items():
+            value = self._resolved_default(spec)
+            if value is None:
+                continue
+            ok = self.set_sensor_feature(key, value) and ok
+        return ok
+
+    def sensor_feature_specs(self) -> dict:
+        """{key: {"kind", "values"}} for the AVAILABLE features (capabilities)."""
+        return {k: {"kind": v["kind"],
+                    "values": (list(v["values"]) if v.get("values") else None)}
+                for k, v in self._features.items()}
+
+    def sensor_feature_values(self, key: str) -> "list[str] | None":
+        spec = self._features.get(key)
+        if not spec or not spec.get("values"):
+            return None
+        return list(spec["values"])
+
+    def get_sensor_feature(self, key: str):
+        """Current value of a probed feature (bool or SDK enum string), or None."""
+        spec = self._features.get(key)
+        cam = self._cam
+        if spec is None or cam is None:
+            return None
+        try:
+            v = cam.get_attribute_value(spec["sdk_name"])
+        except Exception:
+            return None
+        if spec["kind"] == "bool":
+            return bool(v)
+        return str(v)
+
+    def set_sensor_feature(self, key: str, value) -> bool:
+        """Set a probed feature; falls back to stop→apply→restart when the SDK
+        refuses a live write (readout rate / gain mode are typically
+        NOTWRITABLE mid-acquisition — same recovery as a resolution switch).
+
+        Enum values are validated against the probed allowed list: a stale
+        persisted string from a different camera/SDK build is REFUSED with a
+        log line, never guessed at.
+        """
+        spec = self._features.get(key)
+        cam = self._cam
+        if spec is None or cam is None:
+            return False
+        if spec["kind"] == "enum":
+            sval = str(value)
+            values = spec.get("values") or []
+            if sval not in values:
+                logger.info(f"Andor: refusing {key} = {value!r} — not one of "
+                            f"the camera's allowed values {values}")
+                return False
+            value = sval
+        else:
+            value = bool(value)
+
+        applied = False
+        try:
+            cam.set_attribute_value(spec["sdk_name"], value)
+            applied = True
+        except Exception:
+            applied = False
+
+        if not applied and self._running:
+            # Live write refused — pause acquisition, apply, restart (the
+            # proven set_resolution_index recovery shape).
+            self._running = False
+            reader = self._reader
+            self._reader = None
+            if reader is not None and reader.is_alive() \
+                    and reader is not threading.current_thread():
+                try:
+                    reader.join(timeout=1.5)
+                except Exception:
+                    pass
+            try:
+                cam.stop_acquisition()
+            except Exception:
+                pass
+            with self._lock:
+                self._frame = None
+            try:
+                cam.set_attribute_value(spec["sdk_name"], value)
+                applied = True
+            except Exception as exc:
+                logger.warning(f"Andor: {spec['sdk_name']} = {value!r} failed "
+                               f"even with acquisition stopped: {exc}")
+            # ALWAYS restart the stream, even when the set failed — a dead
+            # feed must never be the price of a refused setting.
+            self._start_stream()
+
+        if applied:
+            logger.info(f"Andor sensor feature: {spec['sdk_name']} = {value!r}")
+            if key in ("andor_gain_mode", "andor_readout_rate"):
+                # BitDepth follows the gain mode; the clip level must track it.
+                self._clip_level = self._read_clip_level()
+                # The readout/gain change moves the sensor-max frame rate —
+                # re-cap to the USB link's sustainable rate (v7.13.x).
+                self._sync_frame_rate()
+        return applied
+
+    def get_sensor_temperature(self) -> "float | None":
+        cam = self._cam
+        if cam is None:
+            return None
+        try:
+            return float(cam.get_attribute_value("SensorTemperature"))
+        except Exception:
+            return None
+
+    def get_temperature_status(self) -> "str | None":
+        cam = self._cam
+        if cam is None:
+            return None
+        try:
+            v = cam.get_attribute_value("TemperatureStatus")
+            return str(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _read_bit_depth(self) -> "str | None":
+        cam = self._cam
+        if cam is None:
+            return None
+        try:
+            v = cam.get_attribute_value("BitDepth")
+            return str(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _read_clip_level(self) -> int:
+        """True full-scale for the CURRENT gain mode.
+
+        A Zyla in a 12-bit gain mode clips at ~4095, far below the uint16
+        container's 65535 — judging saturation against 65535 there would never
+        fire. Preference: the SDK's own BitDepth → the gain-mode string →
+        full 16-bit. The observed frame max is carried in the stats dict, so a
+        wrong clip level is diagnosable on the bench.
+        """
+        lvl = _parse_bit_depth(self._read_bit_depth())
+        if lvl:
+            return int(lvl)
+        lvl = _parse_bit_depth(self.get_sensor_feature("andor_gain_mode"))
+        if lvl:
+            return int(lvl)
+        return _LEVEL_MAX
+
+    def get_raw_clip_level(self) -> int:
+        return int(self._clip_level)
+
+    # ── Raw frame statistics + averaged capture (v7.13) ───────────
+
+    def get_raw_frame_stats(self) -> "dict | None":
+        """Latest raw-frame statistics snapshot (see compute_raw_frame_stats).
+
+        Lock-guarded copy; the histogram array is copied so callers can hold
+        it across reader updates. Returns None before the first mono frame.
+        """
+        with self._lock:
+            st = self._raw_stats
+        if st is None:
+            return None
+        out = dict(st)
+        hist = out.get("hist")
+        if hist is not None:
+            try:
+                out["hist"] = hist.copy()
+            except Exception:
+                out["hist"] = list(hist)
+        return out
+
+    def capture_raw_average(self, n: int, timeout_s: float = 10.0) -> "np.ndarray | None":
+        """Per-pixel mean of ``n`` consecutive NEW raw frames, as uint16.
+
+        BLOCKING — must be called off the GUI thread (mosaic workers already
+        sample frames from their own thread; same rule). Serviced by the
+        reader thread so there is never a second ``wait_for_frame`` waiter.
+        Returns None on: closed camera, n < 1, timeout, a concurrent request,
+        a resolution change or release mid-capture.
+        """
+        if not _NP_AVAILABLE:
+            return None
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return None
+        if n < 1 or not self.isOpened():
+            return None
+        req = _RawAverageRequest(n)
+        with self._lock:
+            if self._avg_request is not None:
+                return None
+            self._avg_request = req
+        try:
+            if not req.done.wait(timeout=max(0.1, float(timeout_s))):
+                req.fail("timeout")
+                logger.info(f"Andor capture_raw_average({n}) timed out")
+                return None
+            if req.error:
+                logger.info(f"Andor capture_raw_average({n}): {req.error}")
+            return req.result()
+        finally:
+            with self._lock:
+                if self._avg_request is req:
+                    self._avg_request = None
+
+    def _fail_pending_average(self, reason: str):
+        with self._lock:
+            req = self._avg_request
+            self._avg_request = None
+        if req is not None:
+            req.fail(reason)
 
     # ── Display scaling (mono-16 → 8-bit display conversion) ──────
     # The Zyla has NO ISP auto-gain; what LOOKS like the camera auto-adjusting
@@ -740,7 +1420,7 @@ class AndorBackend:
         None so the dialog hides them.
         """
         lo, hi = self.get_display_levels()
-        return {
+        d = {
             "brightness": None,
             "contrast": None,
             "gamma": None,
@@ -757,6 +1437,21 @@ class AndorBackend:
             "resolutions": self.get_resolution_list(),
             "device_id": self._device_id,
         }
+        # v7.13 — sensor-quality features (None when the camera lacks one) and
+        # read-only sensor info for the readout pane.
+        for key in ANDOR_SENSOR_FEATURE_KEYS:
+            d[key] = self.get_sensor_feature(key)
+        d["andor_readout_rate_values"] = self.sensor_feature_values("andor_readout_rate")
+        d["andor_gain_mode_values"] = self.sensor_feature_values("andor_gain_mode")
+        d["temperature_c"] = self.get_sensor_temperature()
+        d["temperature_status"] = self.get_temperature_status()
+        d["bit_depth"] = self._read_bit_depth()
+        d["raw_clip_level"] = self.get_raw_clip_level()
+        # v7.13.x — make the frame-rate constraint visible at the bench (the
+        # [camera start] readback + dialog readout).
+        d["frame_rate"] = self.get_frame_rate()
+        d["max_interface_transfer_rate"] = self.get_max_interface_transfer_rate()
+        return d
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -770,7 +1465,11 @@ class AndorBackend:
 # sensors). Re-exported under the original names: behaviour is unchanged and
 # existing `andor_backend._mono_to_bgr8` / `._auto_levels` references still
 # resolve here.
-from gui.widgets.mono_display import _auto_levels, _mono_to_bgr8  # noqa: E402,F401
+from gui.widgets.mono_display import (  # noqa: E402,F401
+    _auto_levels, _mono_to_bgr8, compute_raw_frame_stats, RawAverageRequest)
+
+# Historical private name (v7.13 shipped it here first).
+_RawAverageRequest = RawAverageRequest
 
 
 def _andor_cameras_number(Andor) -> int:

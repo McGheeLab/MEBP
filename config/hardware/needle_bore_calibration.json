@@ -1,0 +1,30 @@
+{
+  "version": "1.0",
+  "measured_at": "2026-08-10T15:51:55",
+  "fingerprint": {
+    "needle_form": "single",
+    "bore_count": 1,
+    "bores": [
+      {
+        "pump_id": null,
+        "orifice_id_um": 686.0,
+        "total_length_mm": 50.8
+      }
+    ]
+  },
+  "bores": [
+    {
+      "bore_index": 0,
+      "offset_um": [
+        0.0,
+        0.0
+      ],
+      "z_offset_mm": 0.0,
+      "stage_um": [
+        -34.097,
+        -0.934
+      ],
+      "measured_at": "2026-08-10T15:51:55"
+    }
+  ]
+}

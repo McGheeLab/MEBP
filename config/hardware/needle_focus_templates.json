@@ -1,0 +1,44 @@
+{
+  "version": "1.0",
+  "templates": {
+    "tucam:0|4x|hypodermic:686": {
+      "captures": [
+        {
+          "n": 0,
+          "image": "needle_focus_templates/tucam_0_4x_hypodermic_686_0.png",
+          "patch_wh": [
+            650,
+            650
+          ],
+          "center_offset_px": [
+            -87.62254901960796,
+            -2.400735294117567
+          ],
+          "center_offset_um": [
+            -34.09700061274514,
+            -0.9342101286764394
+          ],
+          "um_per_px": 0.5483810153846154,
+          "frame_wh": [
+            2600,
+            2048
+          ],
+          "focus_score": 3432.4912821261787,
+          "z_zref_mm": -25.730000000000004,
+          "stage_um": [
+            95360.0,
+            57399.0
+          ],
+          "well": "",
+          "microscope_focus_um": 4834.175072034821,
+          "needle_z_user_mm": 25.730000000000004,
+          "date": "2026-08-10T16:08:41"
+        }
+      ],
+      "needle_type": "hypodermic",
+      "needle_bore_um": 686.0,
+      "needle_tip_length_mm": null,
+      "camobj": ""
+    }
+  }
+}

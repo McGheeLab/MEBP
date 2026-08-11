@@ -62,8 +62,13 @@ def _axis_phrase(rotation_deg: float, flip_x: bool, flip_y: bool) -> str:
         y_dir = {"down": "up", "up": "down"}.get(y_dir, y_dir)
     off = min(abs(rot - nearest), 360 - abs(rot - nearest))
     extra = f" (measured {rot}°, {off}° off square)" if off > 2 else ""
+    # v7.10: point at the tool that removes that tilt physically. Squaring the
+    # mount turns the software correction into a lossless quarter-turn instead
+    # of a resample of every frame and every mosaic tile.
+    tip = ("  To remove that tilt physically, use Square up mount… on the "
+           "camera's slot card." if off > 2 else "")
     return (f"Moving the stage +X moves the image {x_dir}; "
-            f"+Y moves it {y_dir}{extra}.")
+            f"+Y moves it {y_dir}{extra}.{tip}")
 
 
 class MosaicCalibrationConfirmDialog(QDialog):

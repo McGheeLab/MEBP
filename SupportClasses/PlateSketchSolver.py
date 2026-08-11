@@ -68,35 +68,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════
 # Solve report
 # ═══════════════════════════════════════════════════════════════════
-
-class DOFStatus(str, Enum):
-    WELL_DETERMINED = "well_determined"
-    UNDER_DETERMINED = "under_determined"
-    INCONSISTENT = "inconsistent"
-    EMPTY = "empty"   # No free variables → trivially solved
-
-
-@dataclass
-class SolveReport:
-    status: DOFStatus = DOFStatus.WELL_DETERMINED
-    residual_norm: float = 0.0
-    n_free_vars: int = 0
-    n_constraint_eqs: int = 0
-    rank: int = 0
-    dof: int = 0                # n_free_vars - rank
-    conflicts: list[int] = field(default_factory=list)   # constraint ids
-    iterations: int = 0
-    converged: bool = True
-    message: str = ""
-
-    def __str__(self) -> str:
-        return (
-            f"SolveReport(status={self.status.value}, "
-            f"res={self.residual_norm:.4g}, "
-            f"vars={self.n_free_vars}, eqs={self.n_constraint_eqs}, "
-            f"rank={self.rank}, dof={self.dof}, "
-            f"conflicts={self.conflicts})"
-        )
+#
+# v7.12: moved to SupportClasses.SolveTypes so PlateSolver and
+# SketchConstraintSolver can share them. Re-exported here verbatim — several
+# modules import these names from this one.
+from SupportClasses.SolveTypes import DOFStatus, SolveReport  # noqa: F401,E402
 
 
 # Convergence thresholds.

@@ -86,6 +86,15 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         enabled=True,
     ),
     WorkflowTile(
+        workflow_id="lablink",
+        icon="🔗",
+        title="LabLink Processing",
+        description="Send scans, mosaics, images and video to a LabLink hub for "
+                    "an ND2Studios recipe — deconvolution, segmentation — and "
+                    "collect the results.",
+        enabled=True,
+    ),
+    WorkflowTile(
         workflow_id="immuno",
         icon="🧪",
         title="Immuno",

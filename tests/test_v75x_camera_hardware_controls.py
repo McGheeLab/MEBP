@@ -268,13 +268,22 @@ class TestSettingsDialog(unittest.TestCase):
 @unittest.skipUnless(CAMERA_AVAILABLE, "camera backend unavailable")
 class TestFeedViewGear(unittest.TestCase):
     def test_gear_visible_when_controllable(self):
+        """v7.15: the toolbar is hover-revealed, so 'available' and 'on
+        screen' are now two things. A controllable camera makes the gear
+        available; the pointer being over the feed puts it up."""
         from gui.widgets.camera_feed_view import CameraFeedView
         mgr, _ = _toupcam_widget()
         fv = CameraFeedView(camera_manager=mgr, cam_idx=0)
         fv.show()
         fv._update_settings_visibility()
         self.assertIsNotNone(fv._settings_btn)
-        self.assertTrue(fv._settings_btn.isVisible())
+        self.assertTrue(fv._settings_available,
+                        "a controllable camera did not enable the gear")
+        fv._hovering = True
+        fv._position_settings_btn()
+        # isHidden(), not isVisible(): the latter is False while any ancestor
+        # is unshown, which would make this pass regardless.
+        self.assertFalse(fv._settings_btn.isHidden())
 
     def test_gear_hidden_when_not_controllable(self):
         from gui.widgets.camera_feed_view import CameraFeedView

@@ -24,19 +24,46 @@ from __future__ import annotations
 
 import logging
 import math
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QSizePolicy, QPushButton,
 )
-from PySide6.QtCore import Qt, Signal, QEvent, QPointF
+from PySide6.QtCore import Qt, Signal, QEvent, QPointF, QTimer
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QColor, QBrush, QFont, QMouseEvent,
 )
 
 from gui.styles import COLORS
+from gui.widgets.view_geometry import (
+    NULL_GEOMETRY, ZOOM_MAX, ZOOM_MIN, ViewGeometry, clamp_zoom, visible_rect)
 
 logger = logging.getLogger(__name__)
+
+# v7.13 — fraction of (sampled) raw pixels at/above the sensor clip level that
+# lights the red SATURATED badge on the live feed. 0.5% is deliberate: single
+# hot pixels shouldn't nag, genuine highlight clipping should. Bench-tunable.
+SATURATION_WARN_FRAC = 0.005
+
+# v7.14 — shared styling for every overlay button (gear / capture / record) so
+# a new one cannot look like a different app.
+_OVERLAY_BTN_QSS = (
+    "QPushButton {"
+    "  background: rgba(30,30,46,170); color: #cdd6f4;"
+    "  border: 1px solid rgba(180,190,254,120);"
+    "  border-radius: 13px; font-size: 14px; padding: 0px; }"
+    "QPushButton:hover { background: rgba(49,50,68,210); }"
+    "QPushButton:disabled { color: #6c7086; }")
+
+# Recording: red pill with the elapsed time, so it can never be mistaken for
+# the idle state at a glance.
+_RECORD_ACTIVE_QSS = (
+    "QPushButton {"
+    "  background: rgba(243,139,168,225); color: #11111b;"
+    "  border: 1px solid rgba(243,139,168,255);"
+    "  border-radius: 13px; font-size: 12px; font-weight: bold;"
+    "  padding: 0px 6px; }")
 
 
 def view_transform_coeffs(mirrored: bool, flip_y: bool, rot_deg: float
@@ -82,7 +109,9 @@ class CameraFeedView(QWidget):
     def __init__(self, camera_manager=None, cam_idx: int = 0,
                  show_crosshair: bool = True, label: str = "",
                  enable_settings: bool = True,
+                 enable_capture: bool = True,
                  auto_orient: bool = False,
+                 snap_rotation_to_cardinal: bool = False,
                  parent=None):
         super().__init__(parent)
         self._manager = camera_manager
@@ -96,14 +125,38 @@ class CameraFeedView(QWidget):
         # as the orientation is changed. Display-only + click-inverting (see
         # set_view_orientation); suppressed in edge-pick mode.
         self._auto_orient = bool(auto_orient)
+        # v7.10: display the nearest 0/90/180/270 instead of the exact measured
+        # angle, leaving the RESIDUAL visible.
+        #
+        # This is the correct policy for a camera whose mount the operator
+        # squares up by hand — the needle side cams. Silently un-rotating the
+        # residual is self-defeating: the tilt they are trying to remove
+        # disappears from the view, and as they turn the camera the correction
+        # tracks them, so the picture never appears to change. It also resamples
+        # every frame for a few degrees of correction, where a cardinal turn is
+        # a lossless fast path.
+        #
+        # The FULL measured angle still drives the geometry — clicks
+        # (``pixel_to_stage_offset``) and mosaic tiles (``_orient_tile``) — which
+        # must be right to a fraction of a degree. Only what is DISPLAYED snaps.
+        self._snap_rotation = bool(snap_rotation_to_cardinal)
         # v7.5.x: when True, a gear button appears top-right whenever the
         # backing camera reports controllable hardware (e.g. the ToupCam
         # microscope), opening a pop-out hardware-settings dialog. Disabled
         # for the small preview the dialog itself hosts (avoids recursion).
         self._enable_settings = bool(enable_settings)
+        # v7.14 — 📷 capture + ⏺ record overlay buttons. On by default so the
+        # operator gets them on EVERY live feed (their explicit ask); turned
+        # off only for previews inside dialogs that are already about capture.
+        self._enable_capture = bool(enable_capture)
         self._settings_btn = None
         self._settings_dialog = None
         self._frame_count = 0  # throttle for gear-visibility SDK polling
+        # v7.13 — raw-count saturation flag (mono scientific cameras only).
+        # The display auto-scale HIDES clipping, so the badge is driven by the
+        # backend's raw 16-bit statistics, polled as a lock snapshot (no SDK
+        # traffic) every few frames.
+        self._saturated = False
         self._connected_cam = None  # CameraWidget we're subscribed to
         self._last_pixmap: Optional[QPixmap] = None
         self._last_qimage: Optional[QImage] = None  # full-res for re-render on show
@@ -117,6 +170,11 @@ class CameraFeedView(QWidget):
         self._ref_markers: list[tuple[str, float, float]] = []
         self._ref_stage_um: tuple[float, float] = (0.0, 0.0)
         self._ref_um_per_px: float = 0.0
+        # v7.13: needle-bore dots — (label, dx_um, dy_um, color_hex) where
+        # (dx, dy) is the bore's offset from the CAMERA CENTRE in stage-frame
+        # µm (pixel_to_stage_offset label space). Fixed in the frame, so no
+        # stage tracking is needed; projected via the calibrated inverse map.
+        self._bore_markers: list[tuple[str, float, float, str]] = []
         # v7.5.x: display-only view orientation (correct a mirrored/rotated
         # camera so the operator sees an upright, un-mirrored feed). The RAW
         # frame is untouched; clicks are inverted back to raw pixel coords so
@@ -126,7 +184,36 @@ class CameraFeedView(QWidget):
         self._view_rot_deg = 0.0
         self._view_true_xform = None          # QTransform raw→displayed, or None
         self._displayed_image_size = (0, 0)   # (w, h) after the view transform
+        # v7.15 — zoom/pan. The geometry object is rebuilt on every render and
+        # is the SINGLE source for both painting and hit-testing.
+        self._zoom = 1.0
+        self._view_center = None              # displayed-image coords, or None
+        self._crop_origin = (0.0, 0.0)        # top-left of the zoom crop
+        self._cropped_size = (0, 0)           # size after that crop
+        self._geometry = NULL_GEOMETRY
+        self._zoom_enabled = True
+        self._panning = False
+        self._pan_anchor = None               # (widget px, view centre) at grab
+        # v7.15 — hover-revealed toolbar. "Available" is what the camera
+        # state allows; "visible" additionally needs the pointer over the feed
+        # and room in the row (see _position_settings_btn).
+        self._hovering = False
+        self._settings_available = False
+        self._capture_available = False
+        self._overflow_actions = []
+        self._overflow_btn = None
+        self._popout_btn = None
+        self._zoom_in_btn = self._zoom_out_btn = self._zoom_fit_btn = None
+        self._popout_window = None
         self._edge_pick_mode = False          # feeds skip the transform when set
+        # v7.10: alignment ghost — a translucent reference image composited over
+        # the live feed so the operator can turn a camera in its mount until the
+        # two coincide. None = no ghost (every other feed in the app).
+        self._ghost_img: Optional[QImage] = None
+        self._ghost_opacity = 0.45
+        self._ghost_offset = (0.0, 0.0)       # display px
+        self._ghost_cache: Optional[QPixmap] = None
+        self._ghost_cache_key = None
 
         # v7.5.x: aspect the widget last laid itself out for, so updateGeometry()
         # only fires when the camera's shape actually changes (not every frame).
@@ -173,24 +260,63 @@ class CameraFeedView(QWidget):
             self.updateGeometry()
 
     def _sync_auto_orientation(self) -> None:
-        """When ``auto_orient`` is on, mirror the camera's saved orientation onto
-        this view so it stays consistent with the calibration/live/mosaic views
-        (they all derive from the same ``view_orientation``)."""
+        """When ``auto_orient`` is on, apply the camera's saved LIVE-VIEW
+        orientation to this view.
+
+        v7.16: this reads ``display_orientation``, not ``full_orientation``. The
+        latter is the measured camera→stage matrix, which the objective/mosaic
+        calibration rewrites every time it runs — so while the view was driven
+        from it, setting the live view up and then calibrating flipped the view
+        back. ``display_orientation`` falls back to the measured value when the
+        operator has expressed no preference, so an untouched camera behaves
+        exactly as before.
+
+        Clicks are unaffected either way: the click handler reports RAW frame
+        coordinates (it inverts this view's transform via ``ViewGeometry``) and
+        ``pixel_to_stage_offset`` then applies the MEASURED orientation. That is
+        what makes the display safe to change independently.
+        """
         if (not self._auto_orient or self._manager is None
                 or self._edge_pick_mode):
             return
         try:
+            do = getattr(self._manager, "display_orientation", None)
+            if callable(do):
+                mir, fy, rot = do(self._cam_idx)
+                self.set_view_orientation(
+                    bool(mir), self._display_rotation(rot), bool(fy))
+                return
             fo = getattr(self._manager, "full_orientation", None)
             if callable(fo):
                 mir, fy, rot = fo(self._cam_idx)
-                self.set_view_orientation(bool(mir), float(rot), bool(fy))
+                self.set_view_orientation(
+                    bool(mir), self._display_rotation(rot), bool(fy))
                 return
             vo = getattr(self._manager, "view_orientation", None)
             if callable(vo):
                 mir, rot = vo(self._cam_idx)
-                self.set_view_orientation(bool(mir), float(rot))  # no-op if same
+                # no-op if unchanged
+                self.set_view_orientation(bool(mir),
+                                          self._display_rotation(rot))
         except Exception:
             pass
+
+    def _display_rotation(self, rot) -> float:
+        """The rotation to APPLY to the view for a measured ``rot``.
+
+        Identity unless this view snaps to cardinals, in which case the nearest
+        quarter-turn is used and the residual is left on screen for the operator
+        to square out physically.
+        """
+        rot = float(rot or 0.0)
+        if not getattr(self, "_snap_rotation", False):
+            return rot
+        try:
+            from SupportClasses.CameraRotationTracker import (
+                nearest_square_rotation)
+            return float(nearest_square_rotation(rot)[0])
+        except Exception:
+            return rot
 
     def set_throttled(self, on: bool) -> None:
         """v7.6: forward a display-rate throttle to the underlying camera
@@ -231,6 +357,7 @@ class CameraFeedView(QWidget):
         self._view_mirror = mirrored
         self._view_flip_y = fy
         self._view_rot_deg = rot
+        self._invalidate_ghost_cache()
         self._maybe_update_geometry()   # a ~90° rotation swaps the displayed W/H
         self._rerender_last()
 
@@ -238,6 +365,9 @@ class CameraFeedView(QWidget):
         """v7.5.x: needle edge-pick relies on raw row=Z geometry — suppress the
         view transform while it is active."""
         self._edge_pick_mode = bool(enabled)
+        # This also changes _orient_qimage's output, so the ghost cache (keyed
+        # on the resolved transform) must go with it.
+        self._invalidate_ghost_cache()
         self._maybe_update_geometry()
         self._rerender_last()
 
@@ -290,6 +420,130 @@ class CameraFeedView(QWidget):
             self._ref_stage_um = new
             if self._ref_markers:
                 self._rerender_last()
+
+    def set_bore_markers(self, markers) -> None:
+        """v7.13: overlay colored needle-bore dots on the feed.
+
+        ``markers``: iterable of ``(label, dx_um, dy_um, color_hex)`` where
+        ``(dx, dy)`` is the bore's offset from the CAMERA CENTRE in stage-frame
+        µm — the ``pixel_to_stage_offset`` label space. The dot is FIXED in the
+        frame (a bore rides the same body the camera does), so no stage
+        position is needed and the markers never lag a move.
+
+        ``None``/empty clears. Change-gated: callers push from 3–7 Hz refresh
+        ticks, so an identical push must not cost a re-render.
+        """
+        norm: list[tuple[str, float, float, str]] = []
+        for m in (markers or ()):
+            try:
+                norm.append((str(m[0]), float(m[1]), float(m[2]), str(m[3])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if norm == self._bore_markers:
+            return
+        self._bore_markers = norm
+        self._rerender_last()
+
+    def _bore_marker_raw_px(self, dx_um: float, dy_um: float,
+                            raw_w: int, raw_h: int) -> tuple[float, float]:
+        """Camera-centre FOV offset (µm) → RAW frame px.
+
+        Routes through ``CameraManager.stage_offset_to_pixel`` — the exact
+        inverse of the click path — NEVER the naive identity divide: on a
+        camera with a calibrated rotation/mirror the identity map draws the dot
+        away from the bore (the v7.8 ``to_px`` lesson, and the known flaw in
+        ``_draw_reference_markers``). Identity fallback only when no manager is
+        attached (test doubles / headless builds).
+        """
+        mgr = self._manager
+        fn = getattr(mgr, "stage_offset_to_pixel", None) if mgr else None
+        if callable(fn):
+            try:
+                px, py = fn(self._cam_idx, float(dx_um), float(dy_um),
+                            int(raw_w), int(raw_h))
+                return float(px), float(py)
+            except Exception:
+                pass
+        upp = 0.0
+        eff = getattr(mgr, "effective_um_per_px", None) if mgr else None
+        if callable(eff):
+            try:
+                upp = float(eff(self._cam_idx, raw_w))
+            except Exception:
+                upp = 0.0
+        if upp <= 0.0:
+            upp = 1.0
+        return raw_w / 2.0 + float(dx_um) / upp, raw_h / 2.0 + float(dy_um) / upp
+
+    def set_alignment_ghost(self, image: Optional[QImage],
+                            opacity: float = 0.45,
+                            offset_px: tuple = (0.0, 0.0)) -> None:
+        """v7.10: composite a translucent reference image over the live feed.
+
+        Used by the *Square up mount* tool: the ghost is the frozen reference
+        frame pre-rotated to the target, so the operator turns the camera until
+        live and ghost coincide. ``None`` clears it, which is the state every
+        other feed in the app stays in.
+
+        ``image`` must have the SAME aspect as the raw frame — it is stretched
+        onto the displayed pixmap. ``offset_px`` is in DISPLAYED pixels and
+        keeps the ghost overlaid when the mount axis is not the optical axis,
+        so the operator judges angle rather than chasing a slide.
+
+        ⚠ Only meaningful on a view whose ``rotation_deg`` is 0 (or a multiple
+        of 90). ``QImage.transformed`` grows the bounding box for an arbitrary
+        angle, and the ghost and the frame — different source sizes — would
+        then grow differently and stop registering.
+        """
+        self._ghost_img = image
+        self._ghost_opacity = max(0.0, min(1.0, float(opacity)))
+        try:
+            self._ghost_offset = (float(offset_px[0]), float(offset_px[1]))
+        except Exception:
+            self._ghost_offset = (0.0, 0.0)
+        self._invalidate_ghost_cache()
+        self._rerender_last()
+
+    def _invalidate_ghost_cache(self) -> None:
+        self._ghost_cache = None
+        self._ghost_cache_key = None
+
+    def _ghost_for(self, size) -> Optional[QPixmap]:
+        """The ghost, oriented + scaled to ``size``, cached.
+
+        Load-bearing, not an optimisation: re-running ``_orient_qimage`` on the
+        ghost every frame costs ~33 ms at 3664x2748 (measured), which would
+        halve the GUI thread's frame budget on the microscope camera.
+        """
+        if self._ghost_img is None or size.width() < 1 or size.height() < 1:
+            return None
+        key = (id(self._ghost_img), self._ghost_img.cacheKey(),
+               self._view_mirror, getattr(self, "_view_flip_y", False),
+               round(self._view_rot_deg, 4), self._edge_pick_mode,
+               size.width(), size.height())
+        if self._ghost_cache is not None and self._ghost_cache_key == key:
+            return self._ghost_cache
+        try:
+            oriented, _ = self._orient_qimage(self._ghost_img)
+            scaled = QPixmap.fromImage(oriented).scaled(
+                size, Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        except Exception:
+            return None
+        self._ghost_cache = scaled
+        self._ghost_cache_key = key
+        return scaled
+
+    def _draw_alignment_ghost(self, pixmap: QPixmap) -> None:
+        ghost = self._ghost_for(pixmap.size())
+        if ghost is None:
+            return
+        painter = QPainter(pixmap)
+        painter.setOpacity(self._ghost_opacity)
+        painter.drawPixmap(int(round(self._ghost_offset[0])),
+                           int(round(self._ghost_offset[1])), ghost)
+        painter.setOpacity(1.0)
+        painter.end()
 
     def _rerender_last(self) -> None:
         if self._last_qimage is not None and self.isVisible():
@@ -352,28 +606,380 @@ class CameraFeedView(QWidget):
             self._settings_btn.setToolTip("Camera settings (exposure, gamma, …)")
             self._settings_btn.setCursor(Qt.PointingHandCursor)
             self._settings_btn.setFixedSize(26, 26)
-            self._settings_btn.setStyleSheet(
-                "QPushButton {"
-                "  background: rgba(30,30,46,170); color: #cdd6f4;"
-                "  border: 1px solid rgba(180,190,254,120);"
-                "  border-radius: 13px; font-size: 14px; padding: 0px; }"
-                "QPushButton:hover { background: rgba(49,50,68,210); }")
+            self._settings_btn.setStyleSheet(_OVERLAY_BTN_QSS)
             self._settings_btn.clicked.connect(self._open_settings_dialog)
             self._settings_btn.hide()
-            self._position_settings_btn()
 
-    # ── Settings gear (v7.5.x) ────────────────────────────────────
+        # v7.14 — capture + record overlay buttons. Same styling as the gear,
+        # laid out to its left. Shown once the camera delivers a frame (a
+        # capture only means anything on a live feed), NOT gated on the SDK
+        # capability poll — that is a round-trip and would delay them a second.
+        self._capture_btn = self._record_btn = None
+        self._capture_ctrl = None
+        if self._enable_capture:
+            self._capture_btn = self._make_overlay_button(
+                "📷", "Capture an image from this camera")
+            self._capture_btn.clicked.connect(self._on_capture_clicked)
+            self._capture_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._capture_btn.customContextMenuRequested.connect(
+                lambda _p: self.open_capture_settings("still"))
+            self._record_btn = self._make_overlay_button(
+                "⏺", "Record video from this camera")
+            self._record_btn.clicked.connect(self._on_record_clicked)
+            self._record_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._record_btn.customContextMenuRequested.connect(
+                lambda _p: self.open_capture_settings("video"))
+            for b, tip, what in ((self._capture_btn, "Capture an image",
+                                  "image capture"),
+                                 (self._record_btn, "Record video",
+                                  "video recording")):
+                b.setToolTip(f"{tip} from this camera\n"
+                             f"(right-click for {what} settings)")
+
+        # v7.15 — view controls. Lower priority than the capture actions, so
+        # these are the ones that fall into the ⋯ menu on a small feed.
+        self._zoom_in_btn = self._make_overlay_button(
+            "＋", "Zoom in (mouse wheel up)")
+        self._zoom_in_btn.clicked.connect(self.zoom_in)
+        self._zoom_out_btn = self._make_overlay_button(
+            "－", "Zoom out (mouse wheel down)")
+        self._zoom_out_btn.clicked.connect(self.zoom_out)
+        self._zoom_fit_btn = self._make_overlay_button(
+            "⛶", "Fit the whole frame\n(middle-drag pans while zoomed)")
+        self._zoom_fit_btn.clicked.connect(self.zoom_fit)
+        self._popout_btn = self._make_overlay_button(
+            "⇱", "Open this view in its own window")
+        self._popout_btn.clicked.connect(self.pop_out)
+        self._overflow_btn = self._make_overlay_button(
+            "⋯", "More view controls")
+        self._overflow_btn.clicked.connect(self._show_overflow_menu)
+        self._position_settings_btn()
+
+    def _make_overlay_button(self, glyph: str, tip: str):
+        btn = QPushButton(glyph, self._display)
+        btn.setToolTip(tip)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedSize(26, 26)
+        btn.setStyleSheet(_OVERLAY_BTN_QSS)
+        btn.hide()
+        return btn
+
+    # ── Overlay buttons (gear v7.5.x · capture + record v7.14) ────
 
     def _position_settings_btn(self):
-        if self._settings_btn is None:
+        """Lay the visible overlay buttons out from the right edge.
+
+        Kept under its historical name because several call sites and the
+        existing tests use it. The gear is FIRST in the right-to-left order,
+        so a feed with no capture buttons puts it in exactly the position it
+        has always had — pinned by a test.
+
+        v7.15: seven buttons at 26 px do not fit a 200 px feed, so anything
+        that would not fit moves into a ``⋯`` overflow menu. Sizing decides
+        it, not per-call-site configuration, which is what makes the same code
+        work in the 4-up camera grid and the height-capped settings preview.
+        """
+        margin, gap = 6, 4
+        avail = max(0, self._display.width() - 2 * margin)
+        buttons = [b for b in self._overlay_buttons()
+                   if b is not None and self._wants_visible(b)]
+        overflow = self._overflow_btn
+
+        # How many fit, in priority order, leaving room for ⋯ if needed?
+        def _fits(items, with_more):
+            need = sum(b.width() for b in items) + gap * max(0, len(items) - 1)
+            if with_more and overflow is not None:
+                need += overflow.width() + gap
+            return need <= avail
+
+        shown = list(buttons)
+        hidden = []
+        while shown and not _fits(shown, bool(hidden)):
+            hidden.insert(0, shown.pop())          # drop the lowest priority
+        self._overflow_actions = hidden
+
+        if overflow is not None:
+            overflow.setVisible(bool(hidden) and self._hover_active())
+        for b in buttons:
+            b.setVisible(b in shown and self._button_shown(b))
+
+        x = max(margin, self._display.width() - margin)
+        row = ([overflow] if (hidden and overflow is not None) else []) + shown
+        for btn in row:
+            # ⚠ isHidden(), NOT isVisible(). isVisible() is False while ANY
+            # ancestor is unshown, so a page that has not been displayed yet
+            # would lay none of these out and they would all pile up at (0,0)
+            # the first time it appeared. CLAUDE.md records this exact trap.
+            if btn is None or btn.isHidden():
+                continue
+            x -= btn.width()
+            btn.move(max(margin, x), margin)
+            btn.raise_()
+            x -= gap
+
+    def _overlay_buttons(self):
+        """Right-to-left order = priority. Gear first (its position is pinned
+        by tests), then the two capture actions, then the view controls —
+        which are the ones that fall into the overflow menu on a small feed.
+        """
+        rec = getattr(self, "_record_btn", None)
+        order = [self._settings_btn, rec,
+                 getattr(self, "_capture_btn", None),
+                 getattr(self, "_popout_btn", None),
+                 getattr(self, "_zoom_in_btn", None),
+                 getattr(self, "_zoom_out_btn", None),
+                 getattr(self, "_zoom_fit_btn", None)]
+        if getattr(self, "_recording", False) and rec is not None:
+            # While recording the stop pill outranks everything: it must never
+            # be the button that gets pushed into the overflow menu.
+            order.remove(rec)
+            order.insert(0, rec)
+        return order
+
+    # ── Hover reveal (v7.15) ──────────────────────────────────────
+
+    def _hover_active(self) -> bool:
+        """Buttons are shown only under the pointer — except while recording.
+
+        The operator asked for the controls to stop crowding the picture. A
+        recording is the one thing that must stay visible and stoppable
+        without hunting for it, so the pill is exempt (see _wants_visible).
+        """
+        return bool(self._hovering)
+
+    def _button_shown(self, btn) -> bool:
+        """Hover gate, with the recording pill exempt."""
+        if (getattr(self, "_recording", False)
+                and btn is getattr(self, "_record_btn", None)):
+            return True
+        return self._hover_active()
+
+    def _wants_visible(self, btn) -> bool:
+        """Whether this button would be shown if there were room."""
+        if btn is self._settings_btn:
+            return bool(self._settings_available)
+        if btn in (getattr(self, "_capture_btn", None),
+                   getattr(self, "_record_btn", None)):
+            return bool(self._capture_available)
+        if btn in (getattr(self, "_zoom_in_btn", None),
+                   getattr(self, "_zoom_out_btn", None),
+                   getattr(self, "_zoom_fit_btn", None)):
+            return bool(self._zoom_enabled and self._capture_available)
+        if btn is getattr(self, "_popout_btn", None):
+            return bool(self._capture_available)
+        return True
+
+    def enterEvent(self, event):
+        self._hovering = True
+        self._position_settings_btn()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        self._position_settings_btn()
+        super().leaveEvent(event)
+
+    # ── Pop out (v7.15) ───────────────────────────────────────────
+
+    def pop_out(self):
+        """Move this view into its own resizable window.
+
+        Returns the dialog, or None if the view could not be detached (it is
+        not in a layout, or one is already open).
+        """
+        if self._popout_window is not None:
+            self._popout_window.raise_()
+            self._popout_window.activateWindow()
+            return self._popout_window
+        try:
+            from gui.dialogs.camera_popout_dialog import CameraPopoutDialog
+        except Exception as exc:
+            logger.warning(f"pop-out unavailable: {exc}")
+            return None
+        parent = self.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if layout is None or layout.indexOf(self) < 0:
+            logger.info("this view is not in a layout — cannot pop it out")
+            return None
+
+        # The cached settings dialog is parented to the OLD window; drop it so
+        # it cannot outlive the window it belongs to.
+        self._settings_dialog = None
+        title = (self._label_text or f"Camera {self._cam_idx + 1}").split("—")[0]
+        dlg = CameraPopoutDialog(title=title.strip() or "Camera",
+                                 parent=self.window())
+        if not dlg.take(self):
+            dlg.deleteLater()
+            return None
+        self._popout_window = dlg
+        dlg.finished.connect(lambda _r: self._on_popout_closed())
+        dlg.show()
+        self._rerender()          # the new window has a different size
+        return dlg
+
+    def _on_popout_closed(self):
+        self._popout_window = None
+
+    def on_returned_from_popout(self):
+        """Called by the dialog once the view is back in its slot.
+
+        ``eventFilter`` refuses to emit ``clicked`` while ``_last_pixmap`` is
+        None, and ``_on_frame`` skips rendering while hidden — so a view that
+        merely waited for the next frame would be click-dead in between, which
+        on a long exposure is seconds.
+        """
+        self._popout_window = None
+        if self._connected_cam is None and self._manager is not None:
+            self._connect_camera()
+        self._rerender()
+        self._position_settings_btn()
+
+    def _show_overflow_menu(self):
+        """The buttons that did not fit, as a menu."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        for btn in self._overflow_actions:
+            act = menu.addAction(f"{btn.text()}  {btn.toolTip().splitlines()[0]}")
+            act.triggered.connect(btn.click)
+        if self._overflow_btn is not None:
+            menu.exec(self._overflow_btn.mapToGlobal(
+                self._overflow_btn.rect().bottomLeft()))
+
+    # ── Capture + record (v7.14) ──────────────────────────────────
+
+    def capture_controller(self):
+        """The lazily-built :class:`CaptureController` for this slot."""
+        ctrl = getattr(self, "_capture_ctrl", None)
+        if ctrl is None and self._manager is not None:
+            try:
+                from gui.widgets.capture_controller import CaptureController
+                ctrl = CaptureController(self._manager, self._cam_idx, self)
+                ctrl.captured.connect(self._on_capture_done)
+                ctrl.failed.connect(self._on_capture_failed)
+                ctrl.record_state.connect(self._on_record_state)
+                from SupportClasses.CaptureContext import register_recorder
+                register_recorder(ctrl)
+                self._capture_ctrl = ctrl
+            except Exception as exc:
+                logger.warning(f"capture unavailable on this feed: {exc}")
+        return ctrl
+
+    def open_capture_settings(self, kind: str = "still"):
+        """Open the settings for ONE kind of capture.
+
+        v7.15: two dialogs, reached by right-clicking the button they belong
+        to — the operator reported the combined one confusing. ``kind`` is
+        "still" (📷) or "video" (⏺).
+        """
+        try:
+            from gui.dialogs.capture_settings_dialog import (
+                ImageCaptureSettingsDialog, VideoRecordingSettingsDialog)
+            from SupportClasses.CaptureContext import get_settings
+            cls = (VideoRecordingSettingsDialog if kind == "video"
+                   else ImageCaptureSettingsDialog)
+            dlg = cls(get_settings(), self._manager, self._cam_idx, parent=self)
+            dlg.exec()
+        except Exception as exc:
+            logger.warning(f"capture settings unavailable: {exc}")
+
+    def set_capture_context_provider(self, fn):
+        """Let the host page name what is being imaged (channel/well/plate).
+
+        Those land in the filename template AND the embedded metadata.
+        """
+        ctrl = self.capture_controller()
+        if ctrl is not None:
+            ctrl.set_context_provider(fn)
+
+    def _on_capture_clicked(self):
+        ctrl = self.capture_controller()
+        if ctrl is None:
             return
-        margin = 6
-        x = max(margin, self._display.width() - self._settings_btn.width() - margin)
-        self._settings_btn.move(x, margin)
-        self._settings_btn.raise_()
+        ctrl.set_orientation_provider(
+            lambda: (self._view_rot_deg, self._view_mirror,
+                     getattr(self, "_view_flip_y", False)))
+        if ctrl.capture_still():
+            self._capture_btn.setEnabled(False)
+
+    def _on_record_clicked(self):
+        ctrl = self.capture_controller()
+        if ctrl is None:
+            return
+        if ctrl.is_recording:
+            ctrl.stop_recording()
+            return
+        ctrl.set_orientation_provider(
+            lambda: (self._view_rot_deg, self._view_mirror,
+                     getattr(self, "_view_flip_y", False)))
+        ctrl.start_recording()
+
+    def _on_capture_done(self, path, note):
+        if self._capture_btn is not None:
+            self._capture_btn.setEnabled(True)
+        name = Path(path).name if path else ""
+        self._flash_status(f"Saved {name}")
+        logger.info(f"Capture saved: {path} ({note})")
+
+    def _on_capture_failed(self, reason):
+        if self._capture_btn is not None:
+            self._capture_btn.setEnabled(True)
+        self._flash_status(f"Capture failed: {reason}", ms=6000)
+        logger.warning(f"Capture failed: {reason}")
+
+    def _on_record_state(self, active, elapsed_s, frames):
+        self._recording = bool(active)
+        btn = getattr(self, "_record_btn", None)
+        if btn is None:
+            return
+        if active:
+            mins, secs = divmod(int(elapsed_s), 60)
+            btn.setText(f"⏹ {mins}:{secs:02d}")
+            btn.setStyleSheet(_RECORD_ACTIVE_QSS)
+            btn.setFixedSize(max(56, btn.fontMetrics().horizontalAdvance(
+                btn.text()) + 18), 26)
+            btn.setToolTip("Stop recording")
+        else:
+            btn.setText("⏺")
+            btn.setStyleSheet(_OVERLAY_BTN_QSS)
+            btn.setFixedSize(26, 26)
+            btn.setToolTip("Record video from this camera")
+        self._position_settings_btn()      # the pill's width changed
+
+    def _flash_status(self, text: str, ms: int = 3500):
+        """Transient caption over the feed confirming what was written."""
+        lbl = getattr(self, "_capture_toast", None)
+        if lbl is None:
+            from PySide6.QtWidgets import QLabel
+            lbl = QLabel("", self._display)
+            lbl.setStyleSheet(
+                "QLabel { background: rgba(30,30,46,205); color: #a6e3a1;"
+                "  border-radius: 4px; padding: 3px 8px; font-size: 11px; }")
+            self._capture_toast = lbl
+        lbl.setText(text)
+        lbl.adjustSize()
+        lbl.move(6, max(6, self._display.height() - lbl.height() - 6))
+        lbl.show()
+        lbl.raise_()
+        QTimer.singleShot(int(ms), lbl.hide)
+
+    def _update_capture_visibility(self):
+        """Capture/record become AVAILABLE once the camera is delivering.
+
+        Deliberately NOT on the gear's 30-frame capability poll: that is an
+        SDK round-trip, and a capture button that takes a second to appear
+        reads as broken.
+
+        v7.15: sets availability; whether a button is actually on screen is
+        decided by the hover state and the space available (see
+        ``_position_settings_btn``).
+        """
+        live = self._frame_count > 0 and self._manager is not None
+        if live != self._capture_available:
+            self._capture_available = live
+            self._position_settings_btn()
 
     def _update_settings_visibility(self):
-        """Show the gear only when the backing camera has controllable HW."""
+        """The gear is available only when the camera has controllable HW."""
         btn = self._settings_btn
         if btn is None:
             return
@@ -384,9 +990,9 @@ class CameraFeedView(QWidget):
                 controllable = bool(caps.get("controllable"))
             except Exception:
                 controllable = False
-        btn.setVisible(controllable)
-        if controllable:
-            self._position_settings_btn()
+        if controllable != self._settings_available:
+            self._settings_available = controllable
+        self._position_settings_btn()
 
     def _open_settings_dialog(self):
         if self._manager is None:
@@ -489,18 +1095,97 @@ class CameraFeedView(QWidget):
         self._frame_count += 1
         if self._settings_btn is not None and (self._frame_count % 30 == 1):
             self._update_settings_visibility()
+        # v7.14 — capture/record: cheap local check (no SDK), so they appear on
+        # the FIRST frame rather than up to a second later.
+        if self._frame_count == 1 and getattr(self, "_capture_btn", None):
+            self._update_capture_visibility()
+
+        # v7.13 — raw-count saturation badge (every 10th frame; the stats read
+        # is a lock snapshot, not an SDK round-trip).
+        if self._frame_count % 10 == 1:
+            self._update_saturation_flag()
 
         self._render_frame(q_img)
+
+    def _update_saturation_flag(self):
+        """Poll the backend's raw-frame stats for clipping (guarded no-op on
+        cameras without raw retention)."""
+        sat = False
+        try:
+            getter = getattr(self._manager, "get_raw_frame_stats", None)
+            stats = getter(self._cam_idx) if callable(getter) else None
+            if stats is not None:
+                sat = float(stats.get("clipped_frac", 0.0)) >= SATURATION_WARN_FRAC
+        except Exception:
+            sat = False
+        self._saturated = sat
+
+    def _compose_pixmap(self, q_img: QImage):
+        """Orientation + zoom crop, as ``(pixmap, displayed_image, true_xf)``.
+
+        v7.15: extracted so the subclasses that override ``_render_frame``
+        (TargetOverlayCameraView, MeasurementCameraView, _PickerCameraView)
+        share this geometry instead of each re-implementing the pipeline.
+        They previously skipped ``_orient_qimage`` entirely, which left
+        ``_view_true_xform`` unset — so zoom added only to the base class
+        would silently not apply to the picker, the primary click-to-select
+        surface.
+
+        The zoom is a CROP of the oriented image rather than a scale-up of the
+        whole thing: only the visible region is resampled, so the cost does
+        not grow with the zoom factor on a 2048² frame.
+        """
+        disp_img, true_xf = self._orient_qimage(q_img)
+        self._view_true_xform = true_xf
+        self._displayed_image_size = (disp_img.width(), disp_img.height())
+        self._crop_origin = (0.0, 0.0)
+        self._cropped_size = (disp_img.width(), disp_img.height())
+        if self._zoom > 1.0:
+            rect = visible_rect(disp_img.width(), disp_img.height(),
+                                self._zoom, self._view_center)
+            ir = rect.toRect()
+            disp_img = disp_img.copy(ir)
+            self._crop_origin = (float(ir.x()), float(ir.y()))
+            self._cropped_size = (disp_img.width(), disp_img.height())
+        return QPixmap.fromImage(disp_img), true_xf
+
+    def _map_to_pixmap(self, true_xf, x: float, y: float) -> tuple:
+        """RAW frame px → coords on the pixmap currently being painted.
+
+        v7.15: the pixmap is a CROP of the oriented image when zoomed, so the
+        crop origin has to come off after the orientation transform. Every
+        overlay goes through here; a site that mapped with ``true_xf`` alone
+        would drift the moment the operator zoomed.
+        """
+        if true_xf is not None:
+            pt = true_xf.map(QPointF(float(x), float(y)))
+            x, y = pt.x(), pt.y()
+        ox, oy = self._crop_origin
+        return (x - ox, y - oy)
+
+    def _publish_geometry(self, scaled):
+        """Record how the pixmap now on screen maps to the raw frame.
+
+        The src_rect comes from the crop that was ACTUALLY applied, not from
+        recomputing it — see ViewGeometry.build.
+        """
+        from PySide6.QtCore import QRectF
+        cw, ch = self._cropped_size
+        self._geometry = ViewGeometry.build(
+            raw_size=self._last_image_size,
+            disp_size=self._displayed_image_size,
+            pixmap_size=(scaled.width(), scaled.height()),
+            label_size=(self._display.width(), self._display.height()),
+            true_xform=self._view_true_xform,
+            src_rect=QRectF(self._crop_origin[0], self._crop_origin[1],
+                            float(cw), float(ch)))
 
     def _render_frame(self, q_img: QImage):
         """Scale and display a QImage on the label."""
         # v7.5.x: apply the display-only view orientation first, then draw
         # overlays in the DISPLAYED frame (markers/vector mapped through the
         # same transform so they stay registered).
-        disp_img, true_xf = self._orient_qimage(q_img)
-        self._view_true_xform = true_xf
-        self._displayed_image_size = (disp_img.width(), disp_img.height())
-        pixmap = QPixmap.fromImage(disp_img)
+        pixmap, true_xf = self._compose_pixmap(q_img)
 
         # Draw crosshair (display centre, axis-aligned)
         if self._show_crosshair:
@@ -514,6 +1199,10 @@ class CameraFeedView(QWidget):
         if self._ref_markers and self._ref_um_per_px > 0:
             self._draw_reference_markers(pixmap, true_xf)
 
+        # v7.13: needle-bore dots (camera-centre-relative, fixed in frame)
+        if self._bore_markers:
+            self._draw_bore_markers(pixmap, true_xf)
+
         # Scale to fit display label
         display_size = self._display.size()
         if display_size.width() < 1 or display_size.height() < 1:
@@ -523,11 +1212,47 @@ class CameraFeedView(QWidget):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        # v7.10: the alignment ghost is composited HERE, after the downscale —
+        # blending a ~600x450 pixmap is sub-millisecond, whereas orienting a
+        # full-res ghost per frame costs ~33 ms on a 10 Mpx camera.
+        if self._ghost_img is not None:
+            self._draw_alignment_ghost(scaled)
+        # v7.13 — saturation badge, drawn post-downscale (sub-millisecond) in
+        # the top-LEFT corner (the gear owns the top-right).
+        if self._saturated:
+            self._draw_saturation_badge(scaled)
         self._last_pixmap = scaled
+        self._publish_geometry(scaled)
         self._display.setPixmap(scaled)
         # Keep the gear pinned to the top-right above the pixmap.
         if self._settings_btn is not None and self._settings_btn.isVisible():
             self._position_settings_btn()
+
+    def _draw_saturation_badge(self, pixmap: QPixmap):
+        """Small red 'SATURATED' pill, top-left of the displayed frame.
+
+        Signals raw-count clipping the auto-scaled display can't show —
+        reduce exposure (or raise the white level) when this is lit.
+        """
+        painter = QPainter(pixmap)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            font = QFont()
+            font.setPointSizeF(max(7.0, pixmap.height() / 28.0))
+            font.setBold(True)
+            painter.setFont(font)
+            text = "SATURATED"
+            metrics = painter.fontMetrics()
+            pad = max(3, metrics.height() // 3)
+            w = metrics.horizontalAdvance(text) + 2 * pad
+            h = metrics.height() + pad
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(243, 139, 168, 200)))  # red, ~80%
+            painter.drawRoundedRect(6, 6, w, h, 4, 4)
+            painter.setPen(QPen(QColor("#11111b")))
+            painter.drawText(6 + pad, 6 + pad // 2 + metrics.ascent(), text)
+        finally:
+            painter.end()
 
     def _draw_crosshair(self, pixmap: QPixmap):
         """Draw crosshair overlay on the pixmap."""
@@ -548,9 +1273,9 @@ class CameraFeedView(QWidget):
             # Map the RAW centre + endpoint through the view transform so the
             # arrow rotates/flips with the displayed frame.
             rw, rh = self._last_image_size
-            cp = true_xf.map(QPointF(rw / 2.0, rh / 2.0))
-            ep = true_xf.map(QPointF(rw / 2.0 + dx, rh / 2.0 + dy))
-            cx, cy, ex, ey = cp.x(), cp.y(), ep.x(), ep.y()
+            cx, cy = self._map_to_pixmap(true_xf, rw / 2.0, rh / 2.0)
+            ex, ey = self._map_to_pixmap(true_xf, rw / 2.0 + dx,
+                                         rh / 2.0 + dy)
         else:
             cx = pixmap.width() / 2.0
             cy = pixmap.height() / 2.0
@@ -598,9 +1323,7 @@ class CameraFeedView(QWidget):
         for name, mx, my in self._ref_markers:
             ix = (mx - sx) / upp + raw_w / 2.0
             iy = (my - sy) / upp + raw_h / 2.0
-            if true_xf is not None:
-                pt = true_xf.map(QPointF(ix, iy))
-                ix, iy = pt.x(), pt.y()
+            ix, iy = self._map_to_pixmap(true_xf, ix, iy)
             if ix < -40 or iy < -40 or ix > disp_w + 40 or iy > disp_h + 40:
                 continue
             painter.setPen(QPen(color, pen_w))
@@ -610,6 +1333,44 @@ class CameraFeedView(QWidget):
             painter.drawLine(QPointF(ix, iy - r - 3), QPointF(ix, iy + r + 3))
             if name:
                 painter.drawText(int(ix + r + 5), int(iy - 4), name)
+        painter.end()
+
+    def _draw_bore_markers(self, pixmap: QPixmap, true_xf=None):
+        """v7.13: filled colored dot + label per bore.
+
+        Each marker's (dx, dy) is camera-centre-relative stage µm, projected to
+        RAW frame px through the calibrated inverse map
+        (:meth:`_bore_marker_raw_px`), then through the view transform — so the
+        dots stay registered on a flipped/rotated display exactly like clicks.
+        """
+        disp_w, disp_h = pixmap.width(), pixmap.height()
+        if not disp_w or not disp_h:
+            return
+        raw_w, raw_h = self._last_image_size
+        if not raw_w or not raw_h:
+            raw_w, raw_h = disp_w, disp_h
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = max(5.0, pixmap.width() / 150.0)
+        font = QFont("Consolas", max(8, pixmap.width() // 110))
+        font.setBold(True)
+        painter.setFont(font)
+        for label, dx_um, dy_um, color_hex in self._bore_markers:
+            ix, iy = self._bore_marker_raw_px(dx_um, dy_um, raw_w, raw_h)
+            ix, iy = self._map_to_pixmap(true_xf, ix, iy)
+            if ix < -40 or iy < -40 or ix > disp_w + 40 or iy > disp_h + 40:
+                continue
+            color = QColor(color_hex)
+            if not color.isValid():
+                color = QColor(COLORS.get("green", "#a6e3a1"))
+            fill = QColor(color)
+            fill.setAlpha(170)
+            painter.setPen(QPen(color, max(2, pixmap.width() // 400)))
+            painter.setBrush(QBrush(fill))
+            painter.drawEllipse(QPointF(ix, iy), r, r)
+            if label:
+                painter.setPen(QPen(color))
+                painter.drawText(int(ix + r + 4), int(iy - 4), label)
         painter.end()
 
     # ── Properties ────────────────────────────────────────────────
@@ -640,6 +1401,8 @@ class CameraFeedView(QWidget):
         and waiting for event propagation from the child QLabel, which can
         fail in PySide6 when the QLabel has a pixmap set.
         """
+        if obj is self._display and self._pan_event(event):
+            return True
         if (obj is self._display
                 and event.type() == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.LeftButton
@@ -652,41 +1415,179 @@ class CameraFeedView(QWidget):
                 return True  # consumed
         return super().eventFilter(obj, event)
 
-    def _widget_to_image(self, wx: float, wy: float
-                         ) -> Optional[tuple[float, float]]:
-        """Convert widget pixel coords to original image pixel coords."""
+    def _pan_event(self, event) -> bool:
+        """Middle-button drag pans while zoomed in. True if consumed.
+
+        ⚠ MIDDLE, not left. Left-click on these views SELECTS — a well rim, a
+        target, a needle edge — so a left-drag pan (Qt's ScrollHandDrag, or a
+        RubberBandDrag) would claim the button the whole feature exists for.
+        The same split the repo already uses in _ZoomImageView.
+        """
+        et = event.type()
+        if et == QEvent.Type.MouseButtonPress:
+            if (event.button() == Qt.MiddleButton and self._zoom > 1.0
+                    and self._last_pixmap):
+                self._panning = True
+                self._pan_anchor = ((event.position().x(),
+                                     event.position().y()),
+                                    self._current_center())
+                self.setCursor(Qt.ClosedHandCursor)
+                return True
+            return False
+        if et == QEvent.Type.MouseMove and self._panning:
+            geo = self.geometry_map()
+            (ax, ay), c0 = self._pan_anchor
+            if c0 is None or not geo.valid:
+                return True
+            sc = geo.scale or 1.0
+            # Drag the picture WITH the cursor: the view centre moves opposite.
+            self._view_center = (c0[0] - (event.position().x() - ax) / sc,
+                                 c0[1] - (event.position().y() - ay) / sc)
+            self._rerender()
+            return True
+        if et == QEvent.Type.MouseButtonRelease and self._panning:
+            self._panning = False
+            self._pan_anchor = None
+            self.unsetCursor()
+            return True
+        return False
+
+    # ── Zoom / pan (v7.15) ────────────────────────────────────────
+
+    def set_zoom_enabled(self, enabled: bool) -> None:
+        """Opt out for a view where magnifying makes no sense."""
+        self._zoom_enabled = bool(enabled)
+        if not self._zoom_enabled:
+            self.zoom_fit()
+
+    @property
+    def zoom(self) -> float:
+        return self._zoom
+
+    def zoom_fit(self) -> None:
+        """Back to the whole frame, centred."""
+        self._zoom = 1.0
+        self._view_center = None
+        self._rerender()
+
+    def set_zoom(self, z: float, *, about=None) -> None:
+        """Set the zoom, optionally holding a WIDGET point still.
+
+        Holding the point under the cursor is what makes wheel-zoom feel
+        right; the buttons pass ``about=None`` and zoom about the centre.
+        """
+        if not self._zoom_enabled:
+            return
+        new = clamp_zoom(z)
+        if abs(new - self._zoom) < 1e-9:
+            return
+        anchor = None
+        if about is not None:
+            geo = self.geometry_map()
+            if geo.valid:
+                pt = geo.to_image(about[0], about[1], clamp=True)
+                if pt is not None and geo.true_xform is not None:
+                    p = geo.true_xform.map(QPointF(pt[0], pt[1]))
+                    anchor = (p.x(), p.y())
+                elif pt is not None:
+                    anchor = pt
+        old_center = self._current_center()
+        self._zoom = new
+        if anchor is not None and new > 1.0:
+            # Keep the anchor at the same fraction across the view.
+            dw, dh = self._displayed_image_size
+            frac_x = ((about[0] - self.geometry_map().offset[0])
+                      / max(1.0, self.geometry_map().pixmap_size[0]))
+            frac_y = ((about[1] - self.geometry_map().offset[1])
+                      / max(1.0, self.geometry_map().pixmap_size[1]))
+            vw, vh = dw / new, dh / new
+            self._view_center = (anchor[0] - (frac_x - 0.5) * vw,
+                                 anchor[1] - (frac_y - 0.5) * vh)
+        elif new <= 1.0:
+            self._view_center = None
+        else:
+            self._view_center = old_center
+        self._rerender()
+
+    def zoom_in(self):
+        self.set_zoom(self._zoom * 1.6)
+
+    def zoom_out(self):
+        self.set_zoom(self._zoom / 1.6)
+
+    def _current_center(self):
+        dw, dh = self._displayed_image_size
+        if self._view_center is not None:
+            return self._view_center
+        return (dw / 2.0, dh / 2.0) if dw and dh else None
+
+    def _rerender(self):
+        """Redraw the last frame with the current zoom, without waiting for
+        the next one — a zoom must feel immediate even at 4 fps."""
+        if self._last_qimage is not None:
+            self._render_frame(self._last_qimage)
+
+    def wheelEvent(self, event):
+        if not self._zoom_enabled or self._last_pixmap is None:
+            super().wheelEvent(event)
+            return
+        step = 1.25 if event.angleDelta().y() > 0 else 0.8
+        pos = event.position()
+        # The wheel arrives on the view; the geometry is in LABEL coords.
+        p = self._display.mapFrom(self, pos.toPoint())
+        self.set_zoom(self._zoom * step, about=(p.x(), p.y()))
+        event.accept()
+
+    def geometry_map(self):
+        """How the pixmap on screen maps to the raw frame (v7.15).
+
+        The ONE transform. Overlay painters and hit-testing both take it from
+        here, so they cannot disagree — which is what adding zoom would
+        otherwise have caused.
+
+        Falls back to deriving the mapping from the current pixmap when none
+        has been published. That keeps a caller that sets ``_last_pixmap``
+        directly working (several tests drive the view without rendering a
+        frame), and means a subclass that overrides ``_render_frame`` without
+        publishing still gets correct clicks rather than silently dead ones.
+        """
+        geo = getattr(self, "_geometry", None)
+        if geo is not None and geo.valid:
+            return geo
         pm = self._last_pixmap
         if pm is None or pm.isNull():
+            return NULL_GEOMETRY
+        disp = self._displayed_image_size
+        if not disp[0] or not disp[1]:
+            disp = self._last_image_size
+        if not disp[0] or not disp[1]:
+            return NULL_GEOMETRY
+        return ViewGeometry.build(
+            raw_size=self._last_image_size, disp_size=disp,
+            pixmap_size=(pm.width(), pm.height()),
+            label_size=(self._display.width(), self._display.height()),
+            true_xform=self._view_true_xform)
+
+    def _widget_to_image(self, wx: float, wy: float, *, clamp: bool = False
+                         ) -> Optional[tuple[float, float]]:
+        """Widget pixel coords → RAW frame pixel coords.
+
+        v7.15: delegates to :class:`ViewGeometry`. This used to hand-roll the
+        letterbox + scale + orientation-inverse chain, and three other places
+        hand-rolled it again; none knew about zoom.
+        """
+        geo = self.geometry_map()
+        if not geo.valid:
             return None
-        lbl = self._display
-        # The pixmap is centered in the label (KeepAspectRatio + AlignCenter)
-        lbl_w, lbl_h = lbl.width(), lbl.height()
-        pm_w, pm_h = pm.width(), pm.height()
-        # Offset of pixmap within label
-        ox = (lbl_w - pm_w) / 2
-        oy = (lbl_h - pm_h) / 2
-        # Position within the scaled pixmap
-        px = wx - ox
-        py = wy - oy
-        if px < 0 or py < 0 or px > pm_w or py > pm_h:
+        return geo.to_image(wx, wy, clamp=clamp)
+
+    def _image_to_widget(self, ix: float, iy: float
+                         ) -> Optional[tuple[float, float]]:
+        """RAW frame px → widget px. Exact inverse of :meth:`_widget_to_image`."""
+        geo = self.geometry_map()
+        if not geo.valid:
             return None
-        # Scale back to the DISPLAYED image coords (the pixmap is the oriented
-        # frame). Falls back to the raw size when no view transform is active.
-        disp_w, disp_h = self._displayed_image_size
-        if not disp_w or not disp_h:
-            disp_w, disp_h = self._last_image_size
-        if not disp_w or not disp_h:
-            return None
-        ix = px / pm_w * disp_w
-        iy = py / pm_h * disp_h
-        # v7.5.x: invert the view transform so we always emit RAW frame pixel
-        # coords (pixel_to_stage_offset works on the raw frame).
-        if self._view_true_xform is not None:
-            inv, ok = self._view_true_xform.inverted()
-            if ok:
-                pt = inv.map(QPointF(ix, iy))
-                return (pt.x(), pt.y())
-        return (ix, iy)
+        return geo.to_widget(ix, iy)
 
     # ── Lifecycle ─────────────────────────────────────────────────
 

@@ -183,6 +183,8 @@ class FluorescenceMosaicStore:
         frames: int = 0,
         exposure_us: float = 0.0,
         shift_um: tuple[float, float] = (0.0, 0.0),
+        display_levels: tuple[float, float] | None = None,
+        avg_frames: int = 1,
     ) -> bool:
         """Persist one channel's stitched single-well mosaic.
 
@@ -234,7 +236,7 @@ class FluorescenceMosaicStore:
         if objective:
             entry["objective"] = str(objective)
         entry["date"] = date.today().isoformat()
-        entry.setdefault("channels", {})[str(channel)] = {
+        ch_entry = {
             "image": f"fluor_mosaics/{fname}",
             "color": [int(c) for c in color_rgb],
             "extent_um": ex,
@@ -245,6 +247,22 @@ class FluorescenceMosaicStore:
             "exposure_us": float(exposure_us),
             "date": date.today().isoformat(),
         }
+        # v7.13 — quantitative-capture metadata. display_lo/hi are the FROZEN
+        # per-channel mono16→8-bit levels every averaged tile was converted
+        # with (absent for legacy / single autoscaled captures — absent means
+        # UNKNOWN, never assumed); avg_frames is the per-tile raw average
+        # count. A fresh save also drops any stale processed sibling — the
+        # raw stitch just changed, so a previous run's *_proc.png must not
+        # keep shadowing it (attach_processed() re-adds it afterwards).
+        if display_levels is not None:
+            try:
+                ch_entry["display_lo"] = float(display_levels[0])
+                ch_entry["display_hi"] = float(display_levels[1])
+            except (TypeError, ValueError, IndexError):
+                pass
+        if int(avg_frames) > 1:
+            ch_entry["avg_frames"] = int(avg_frames)
+        entry.setdefault("channels", {})[str(channel)] = ch_entry
         self._save_meta()
         logger.info(
             f"FluorescenceMosaicStore: saved {plate_key}/{well_name}/{channel} "
@@ -258,6 +276,134 @@ class FluorescenceMosaicStore:
         if ch is None:
             return False
         ch["color"] = [int(c) for c in color_rgb]
+        self._save_meta()
+        return True
+
+    def attach_processed(self, plate_key, well_name, channel: str,
+                         image_bgr, processing: dict) -> bool:
+        """v7.13 — store a POST-PROCESSED copy beside the raw channel stitch.
+
+        Non-destructive by design: the raw PNG stays the canonical ``image``
+        entry (detection and re-processing always have the untouched stitch);
+        the processed copy is written as ``*_proc.png`` and preferred by the
+        display overlays. ``processing`` records exactly what was applied
+        (see FluorescencePostProcess.process) so the image can say what was
+        done to it.
+        """
+        if not _CV2 or image_bgr is None:
+            return False
+        ch = self._channel_meta(plate_key, well_name, channel)
+        if ch is None:
+            return False
+        fname = (f"{_safe_token(plate_key)}_{_safe_token(well_name)}_"
+                 f"{_safe_token(channel)}_proc.png")
+        try:
+            self._img_dir.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(self._img_dir / fname), image_bgr):
+                return False
+        except Exception as exc:
+            logger.error(f"FluorescenceMosaicStore.attach_processed: {exc}")
+            return False
+        ch["processed_image"] = f"fluor_mosaics/{fname}"
+        ch["processing"] = dict(processing or {})
+        self._save_meta()
+        return True
+
+    # ── v7.13 quantitative-capture metadata getters ───────────────
+
+    def get_display_levels(self, plate_key, well_name, channel=None):
+        """Frozen (lo, hi) display levels a channel was converted with, or
+        None for legacy / autoscaled captures (absent = unknown)."""
+        for ch in self._channels_for(plate_key, well_name, channel):
+            lo, hi = ch.get("display_lo"), ch.get("display_hi")
+            if lo is not None and hi is not None:
+                try:
+                    return (float(lo), float(hi))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def get_avg_frames(self, plate_key, well_name, channel=None) -> int:
+        for ch in self._channels_for(plate_key, well_name, channel):
+            try:
+                return max(1, int(ch.get("avg_frames", 1)))
+            except (TypeError, ValueError):
+                return 1
+        return 1
+
+    def get_exposure_us(self, plate_key, well_name, channel=None) -> float:
+        for ch in self._channels_for(plate_key, well_name, channel):
+            try:
+                return float(ch.get("exposure_us", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def get_processing(self, plate_key, well_name, channel=None):
+        """The applied post-processing record for a channel, or None."""
+        for ch in self._channels_for(plate_key, well_name, channel):
+            p = ch.get("processing")
+            if isinstance(p, dict):
+                return dict(p)
+        return None
+
+    # ── v7.13 per-well focus survey (the CRITICAL SAMPLE SURFACE) ─
+
+    def set_focus_survey(self, plate_key, well_name, samples,
+                         summary: dict | None = None,
+                         model: str = "plane") -> bool:
+        """Persist a mosaic focus survey for one well.
+
+        ``samples`` are the accepted (x_um, y_um, focus_um[, …]) dicts from
+        the scan's MosaicFocusTracker. This is the operator's CRITICAL SAMPLE
+        SURFACE — where the cells are, commonly ABOVE the well bottom (e.g.
+        on hydrogel) — and is deliberately a separate artifact from the
+        plate-bottom Z plane (v7.11 wizard). The raw samples are kept so any
+        surface model can be re-fit later; ``model`` records the operator's
+        chosen evaluation model (plane / linear / spline).
+        """
+        wkey = well_key(plate_key, well_name)
+        wells = self._data.setdefault("wells", {})
+        entry = wells.setdefault(wkey, {
+            "plate_key": str(plate_key),
+            "well_name": str(well_name),
+            "channels": {},
+        })
+        try:
+            clean = []
+            for s_ in (samples or ()):
+                d = dict(s_) if isinstance(s_, dict) else dict(
+                    getattr(s_, "to_dict", lambda: {})())
+                if not d:
+                    continue
+                clean.append({k: (float(v) if isinstance(v, (int, float))
+                                  else v) for k, v in d.items()})
+        except Exception:
+            return False
+        entry["focus_survey"] = {
+            "samples": clean,
+            "summary": dict(summary or {}),
+            "model": str(model or "plane"),
+            "date": date.today().isoformat(),
+        }
+        self._save_meta()
+        logger.info(
+            f"FluorescenceMosaicStore: focus survey saved for "
+            f"{plate_key}/{well_name} ({len(clean)} samples, model={model})")
+        return True
+
+    def get_focus_survey(self, plate_key, well_name) -> Optional[dict]:
+        well = self.get_well(plate_key, well_name)
+        if not well:
+            return None
+        fs = well.get("focus_survey")
+        return dict(fs) if isinstance(fs, dict) else None
+
+    def set_surface_model(self, plate_key, well_name, model: str) -> bool:
+        well = self.get_well(plate_key, well_name)
+        if not well or not isinstance(well.get("focus_survey"), dict):
+            return False
+        well["focus_survey"]["model"] = str(model or "plane")
         self._save_meta()
         return True
 
@@ -400,21 +546,38 @@ class FluorescenceMosaicStore:
         p = self._path.parent / rel.replace("fluor_mosaics/", "fluor_mosaics" + os.sep)
         return str(p) if p.exists() else None
 
-    def load_channel_image(self, plate_key, well_name, channel):
-        """Return one channel's stored composite as a numpy BGR array (or None)."""
+    def load_channel_image(self, plate_key, well_name, channel,
+                           prefer_processed: bool = False):
+        """Return one channel's stored composite as a numpy BGR array (or None).
+
+        ``prefer_processed`` (v7.13): load the post-processed sibling when one
+        exists, falling back to the raw stitch when its file is missing. The
+        default stays False DELIBERATELY — detection code reads raw channels
+        and must never have its input silently swapped for a denoised /
+        background-subtracted copy; only the display overlays opt in.
+        """
         if not _CV2:
             return None
         ch = self._channel_meta(plate_key, well_name, channel)
         if not ch:
             return None
-        path = self._abs_image_path(ch.get("image", ""))
-        if path is None:
-            return None
-        try:
-            return cv2.imread(path)
-        except Exception as exc:
-            logger.warning(f"FluorescenceMosaicStore.load_channel_image failed: {exc}")
-            return None
+        paths = []
+        if prefer_processed and ch.get("processed_image"):
+            paths.append(ch.get("processed_image"))
+        paths.append(ch.get("image", ""))
+        for rel in paths:
+            path = self._abs_image_path(rel)
+            if path is None:
+                continue
+            try:
+                img = cv2.imread(path)
+            except Exception as exc:
+                logger.warning(
+                    f"FluorescenceMosaicStore.load_channel_image failed: {exc}")
+                img = None
+            if img is not None:
+                return img
+        return None
 
     # ── Blending ──────────────────────────────────────────────────
 
@@ -437,7 +600,11 @@ class FluorescenceMosaicStore:
         extent = None
         shape = None
         for name in names:
-            img = self.load_channel_image(plate_key, well_name, name)
+            # v7.13: overlays prefer the post-processed copy when one exists
+            # (denoise / background subtraction); detection paths keep loading
+            # the raw stitch via load_channel_image's default.
+            img = self.load_channel_image(plate_key, well_name, name,
+                                          prefer_processed=True)
             if img is None:
                 continue
             color = self.channel_color(plate_key, well_name, name) or default_color(name)

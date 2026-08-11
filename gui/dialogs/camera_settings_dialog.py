@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
     QCheckBox, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from gui.styles import COLORS
 from gui.scaling import s, scaled_font_size
+from gui.widgets.hw_controls_snapshot import hw_controls_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,33 @@ except Exception:  # pragma: no cover
     CameraFeedView = None
     _FEED_AVAILABLE = False
 
+try:
+    from gui.widgets.raw_histogram_widget import RawHistogramWidget
+    _HIST_AVAILABLE = True
+except Exception:  # pragma: no cover
+    RawHistogramWidget = None
+    _HIST_AVAILABLE = False
+
+# v7.13 — Andor sensor-quality features surfaced in this dialog. Keys match
+# ANDOR_SENSOR_FEATURES in gui/widgets/andor_backend.py (and hw_controls).
+_SENSOR_BOOL_ROWS = (
+    ("andor_sensor_cooling", "Sensor cooling",
+     "Cool the sCMOS sensor (lower dark current). Leave on for fluorescence."),
+    ("andor_noise_filter", "Spurious noise filter",
+     "On-camera single-pixel noise filter. CAUTION: can also suppress real "
+     "sub-resolution signal (fluorescent puncta) — verify on your sample."),
+    ("andor_blemish_correction", "Blemish correction",
+     "On-camera static hot/dark pixel correction."),
+)
+_SENSOR_ENUM_ROWS = (
+    ("andor_readout_rate", "Readout rate",
+     "Pixel readout rate. The slower rate reads with less noise — prefer it "
+     "for dim fluorescence."),
+    ("andor_gain_mode", "Gain mode",
+     "Pre-amp gain mode. The 16-bit low-noise / high-well-capacity mode is "
+     "the best default for quantitative fluorescence."),
+)
+
 
 class CameraSettingsDialog(QDialog):
     """Modeless hardware-settings panel for one camera slot."""
@@ -47,6 +75,10 @@ class CameraSettingsDialog(QDialog):
     # resolution actually changes, so the "Microscope Camera Setup" block can
     # update its `active_resolution` (the block was pulling a stale resolution).
     resolution_applied = Signal(int, int, int)
+
+    # v7.13.x — signal-optimizer worker → GUI thread (achieved exposure_us or
+    # None, human-readable note).
+    _optimize_done = Signal(object, str)
 
     def __init__(self, manager, cam_idx: int, identity_getter=None,
                  parent=None):
@@ -57,6 +89,9 @@ class CameraSettingsDialog(QDialog):
         self._identity_getter = identity_getter
         self._loading = False           # guard: suppress live-apply while loading
         self._rows: dict = {}           # control name -> widget(s)
+        self._has_raw_stats = False     # v7.13: backend retains raw stats?
+        self._optimizing = False        # v7.13.x: signal optimizer running?
+        self._optimize_done.connect(self._on_optimize_done)
 
         self.setWindowTitle(f"Camera Controls — Cam {cam_idx + 1}")
         self.setModal(False)
@@ -124,6 +159,28 @@ class CameraSettingsDialog(QDialog):
         self._gain_label, self._gain_sld, self._gain_val = self._make_slider(
             "Gain (%)", 0, 1000, 100, self._on_gain_changed)
 
+        # v7.13 — Andor sensor-quality features (shown only when the live
+        # camera probed them; enum combos are populated from the camera's own
+        # runtime-enumerated values in reload()).
+        self._sensor_checks: dict = {}
+        for key, label, tip in _SENSOR_BOOL_ROWS:
+            chk = QCheckBox(label)
+            chk.setToolTip(tip)
+            chk.toggled.connect(
+                lambda checked, k=key: self._on_sensor_bool(k, checked))
+            self._add_grid_row(QLabel(""), chk)
+            self._sensor_checks[key] = chk
+        self._sensor_combos: dict = {}
+        for key, label, tip in _SENSOR_ENUM_ROWS:
+            lbl = QLabel(label)
+            lbl.setToolTip(tip)
+            combo = QComboBox()
+            combo.setToolTip(tip)
+            combo.currentIndexChanged.connect(
+                lambda _i, k=key: self._on_sensor_enum(k))
+            self._add_grid_row(lbl, combo)
+            self._sensor_combos[key] = (lbl, combo)
+
         # Andor (Zyla) display scaling — the mono-16 sensor is normalized to
         # 8-bit for display; auto = per-frame percentile scaling (the image
         # "auto-adjusts" to the scene), manual = fixed black/white levels.
@@ -151,6 +208,49 @@ class CameraSettingsDialog(QDialog):
             "Brightness", -64, 64, 0, self._on_brightness_changed)
         self._con_label, self._con_sld, self._con_val = self._make_slider(
             "Contrast", -100, 100, 0, self._on_contrast_changed)
+
+        # v7.13 — Signal (raw sensor) group: live histogram + clipping readout
+        # computed from RAW counts (the display auto-scale hides clipping, so
+        # this — not the image — is the exposure instrument). Shown only when
+        # the backend retains raw statistics; refreshed on a timer while the
+        # dialog is visible.
+        self._signal_group = QGroupBox("Signal (raw sensor)")
+        sig_lay = QVBoxLayout(self._signal_group)
+        sig_lay.setSpacing(s(6))
+        if _HIST_AVAILABLE:
+            self._hist_widget = RawHistogramWidget(self._signal_group)
+            sig_lay.addWidget(self._hist_widget)
+        else:  # pragma: no cover
+            self._hist_widget = None
+        self._signal_label = QLabel("—")
+        self._signal_label.setStyleSheet(
+            "font-family: Consolas, monospace; "
+            f"font-size: {scaled_font_size(8)}pt;")
+        sig_lay.addWidget(self._signal_label)
+        # v7.13.x — one-shot signal optimizer: auto-expose to the target
+        # histogram, then freeze the display levels (nothing per-frame after).
+        opt_row = QHBoxLayout()
+        self._opt_btn = QPushButton("⚡ Optimize signal")
+        self._opt_btn.setToolTip(
+            "One-shot: adjust the exposure until the raw histogram's P99.9 "
+            "sits at ~70% of full scale with no clipping, then FREEZE the "
+            "display black/white levels — nothing changes per frame "
+            "afterwards.")
+        self._opt_btn.clicked.connect(self._on_optimize_clicked)
+        opt_row.addWidget(self._opt_btn)
+        opt_row.addStretch()
+        sig_lay.addLayout(opt_row)
+        self._opt_note = QLabel("")
+        self._opt_note.setWordWrap(True)
+        self._opt_note.setStyleSheet(
+            f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+            f"font-size: {scaled_font_size(8)}pt;")
+        sig_lay.addWidget(self._opt_note)
+        self._signal_group.setVisible(False)
+        root.addWidget(self._signal_group)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(500)
+        self._stats_timer.timeout.connect(self._refresh_raw_stats)
 
         # Action row
         actions = QHBoxLayout()
@@ -264,6 +364,22 @@ class CameraSettingsDialog(QDialog):
             self._setup_slider("andor_scale_hi", ctrls, st.get("andor_scale_hi"),
                                self._wht_label, self._wht_sld, self._wht_val,
                                enabled=not ascale_on)
+            # v7.13 — Andor sensor-quality features.
+            for key, chk in self._sensor_checks.items():
+                self._setup_checkbox(key, ctrls, st.get(key), chk)
+            for key, (lbl, combo) in self._sensor_combos.items():
+                self._setup_combo(key, ctrls, st.get(key), lbl, combo)
+            # Signal (raw sensor) section — offered when the backend retains
+            # raw statistics; the timer only runs while the dialog is shown.
+            self._has_raw_stats = "andor_raw_stats" in ctrls
+            self._signal_group.setVisible(self._has_raw_stats)
+            if self._has_raw_stats:
+                self._refresh_raw_stats()
+                # The optimizer drives exposure — needs both raw stats and an
+                # exposure control (all mono scientific backends have both).
+                self._opt_btn.setEnabled(
+                    not self._optimizing
+                    and ctrls.get("exposure_us") is not None)
             # Gamma / brightness / contrast
             self._setup_slider("gamma", ctrls, st.get("gamma"),
                                self._gamma_label, self._gamma_sld, self._gamma_val)
@@ -322,6 +438,41 @@ class CameraSettingsDialog(QDialog):
         sld.blockSignals(False)
         sld.setEnabled(enabled)
 
+    def _setup_checkbox(self, key, ctrls, value, chk):
+        """Visible iff the key is advertised; disabled on a None readback so a
+        widget default can never be mistaken for a device value."""
+        supported = key in ctrls
+        chk.setVisible(supported)
+        if not supported:
+            return
+        chk.blockSignals(True)
+        chk.setChecked(value is True)
+        chk.blockSignals(False)
+        chk.setEnabled(value is not None)
+
+    def _setup_combo(self, key, ctrls, value, label, combo):
+        """Enum combo populated from the camera's OWN runtime values."""
+        spec = ctrls.get(key)
+        supported = spec is not None
+        label.setVisible(supported)
+        combo.setVisible(supported)
+        if not supported:
+            return
+        values = spec.get("values") or []
+        combo.blockSignals(True)
+        combo.clear()
+        for v in values:
+            combo.addItem(str(v))
+        if value is not None and str(value) in values:
+            combo.setCurrentIndex(values.index(str(value)))
+            combo.setEnabled(True)
+        else:
+            # Supported but no authoritative reading — placeholder + disabled.
+            combo.insertItem(0, "—")
+            combo.setCurrentIndex(0)
+            combo.setEnabled(False)
+        combo.blockSignals(False)
+
     # ── Live-apply handlers (each persists) ───────────────────────
 
     def _on_resolution_changed(self):
@@ -359,6 +510,20 @@ class CameraSettingsDialog(QDialog):
         if self._loading or self._mgr is None:
             return
         self._mgr.set_hw_exposure_us(self._cam_idx, int(round(ms * 1000.0)))
+        # v7.13.x — re-sync the spin to the ACHIEVED exposure. The SDK may
+        # clamp the request (frame-rate / readout constraints); the spin must
+        # never display a value the camera isn't actually running — and the
+        # persist below must record the truth, not the wish (the old path
+        # silently wrote the clamped value to disk while SHOWING the request).
+        try:
+            got = (self._mgr.get_hw_settings(self._cam_idx) or {}).get(
+                "exposure_us")
+        except Exception:
+            got = None
+        if got is not None:
+            self._exp_spin.blockSignals(True)
+            self._exp_spin.setValue(float(got) / 1000.0)
+            self._exp_spin.blockSignals(False)
         self._persist()
 
     def _on_gain_changed(self, v):
@@ -387,6 +552,87 @@ class CameraSettingsDialog(QDialog):
             return
         self._mgr.set_hw_andor_scale_hi(self._cam_idx, int(v))
         self._persist()
+
+    def _on_sensor_bool(self, key, checked):
+        if self._loading or self._mgr is None:
+            return
+        self._mgr.set_hw_andor_feature(self._cam_idx, key, bool(checked))
+        self._persist()
+
+    def _on_sensor_enum(self, key):
+        if self._loading or self._mgr is None:
+            return
+        _lbl, combo = self._sensor_combos[key]
+        value = combo.currentText()
+        if not value or value == "—":
+            return
+        self._mgr.set_hw_andor_feature(self._cam_idx, key, value)
+        self._persist()
+        # Gain mode changes BitDepth (histogram clip level, exposure range);
+        # readout rate can shift the exposure range — re-read either way.
+        self.reload()
+
+    def _refresh_raw_stats(self):
+        """Timer tick: pull the latest raw-frame stats (lock snapshot, no SDK
+        traffic on the GUI thread) into the histogram + readout line."""
+        if self._mgr is None or not getattr(self, "_has_raw_stats", False):
+            return
+        try:
+            stats = self._mgr.get_raw_frame_stats(self._cam_idx)
+        except Exception:
+            stats = None
+        if self._hist_widget is not None:
+            self._hist_widget.set_stats(stats)
+        if stats is None:
+            self._signal_label.setText("no raw data yet")
+            return
+        try:
+            clipped = 100.0 * float(stats.get("clipped_frac", 0.0))
+            text = (f"clipped {clipped:.2f}%   "
+                    f"max {float(stats.get('max', 0)):.0f}"
+                    f" / clip {stats.get('clip_level')}   "
+                    f"mean {float(stats.get('mean', 0)):.0f}")
+            t = stats.get("temperature_c")
+            if t is not None:
+                status = stats.get("temperature_status") or ""
+                text += (f"   temp {float(t):.1f} °C"
+                         + (f" ({status})" if status else ""))
+        except (TypeError, ValueError):
+            text = "raw stats unreadable"
+        self._signal_label.setText(text)
+
+    # ── One-shot signal optimizer (v7.13.x) ───────────────────────
+
+    def _on_optimize_clicked(self):
+        if self._mgr is None or self._optimizing:
+            return
+        self._optimizing = True
+        self._opt_btn.setEnabled(False)
+        self._opt_note.setText("optimizing signal…")
+        import threading
+        threading.Thread(target=self._optimize_worker, daemon=True,
+                         name="SignalOptimize").start()
+
+    def _optimize_worker(self):
+        """Daemon worker — run_signal_optimize BLOCKS on fresh raw captures
+        (worker-thread-only contract, like capture_raw_average)."""
+        try:
+            from gui.widgets.mono_display import run_signal_optimize
+            exp_us, note = run_signal_optimize(self._mgr, self._cam_idx)
+        except Exception as exc:
+            exp_us, note = None, f"optimize failed: {exc}"
+        self._optimize_done.emit(exp_us, note)
+
+    def _on_optimize_done(self, exp_us, note):
+        self._optimizing = False
+        self._opt_btn.setEnabled(True)
+        self._opt_note.setText(str(note))
+        logger.info(f"Cam {self._cam_idx + 1}: signal optimize -> {note}")
+        if exp_us is not None:
+            # Exposure + frozen display levels changed on the device —
+            # persist the achieved state and re-read every control.
+            self._persist()
+        self.reload()
 
     def _on_gamma_changed(self, v):
         if self._loading or self._mgr is None:
@@ -418,6 +664,12 @@ class CameraSettingsDialog(QDialog):
         # Andor: per-frame display auto-scale is the historical default.
         if "andor_auto_scale" in ctrls:
             self._mgr.set_hw_andor_auto_scale(self._cam_idx, True)
+        # v7.13 — Andor sensor features: re-apply the backend's low-noise
+        # defaults (cooling on, slow readout, 16-bit low-noise gain, filters).
+        if any(k in ctrls for k in self._sensor_checks) or \
+                any(k in ctrls for k in self._sensor_combos):
+            if hasattr(self._mgr, "reset_andor_sensor_defaults"):
+                self._mgr.reset_andor_sensor_defaults(self._cam_idx)
         for key, setter in (
             ("gamma", self._mgr.set_hw_gamma),
             ("brightness", self._mgr.set_hw_brightness),
@@ -448,18 +700,10 @@ class CameraSettingsDialog(QDialog):
         if not identity:
             return
         st = self._mgr.get_hw_settings(self._cam_idx)
-        controls = {
-            "auto_exposure": st.get("auto_exposure"),
-            "exposure_us": st.get("exposure_us"),
-            "exposure_gain_pct": st.get("exposure_gain_pct"),
-            "gamma": st.get("gamma"),
-            "brightness": st.get("brightness"),
-            "contrast": st.get("contrast"),
-            "andor_auto_scale": st.get("andor_auto_scale"),
-            "andor_scale_lo": st.get("andor_scale_lo"),
-            "andor_scale_hi": st.get("andor_scale_hi"),
-            "resolution": list(st["resolution"]) if st.get("resolution") else None,
-        }
+        # v7.13 — ONE shared key list for both persistence sites (this dialog
+        # and Hardware Setup's bulk save), so a key can no longer be persisted
+        # by one and silently dropped by the other.
+        controls = hw_controls_snapshot(st)
         try:
             from SupportClasses.CameraCalibrationStore import get_store
             get_store().set_hw_controls(identity[0], controls, name=identity[1])
@@ -490,14 +734,81 @@ class CameraSettingsDialog(QDialog):
                 lines.append(f"display scale = {mode}   levels "
                              f"{st.get('andor_scale_lo')}.."
                              f"{st.get('andor_scale_hi')}")
+            # Sensor temperature: reported for both mono scientific cameras
+            # (v7.13 widened from tucam-only once the Zyla gained the read).
+            if src in ("andor", "tucam") and st.get("temperature_c") is not None:
+                temp_line = f"sensor temp   = {st.get('temperature_c')} C"
+                if st.get("temperature_status"):
+                    temp_line += f" ({st.get('temperature_status')})"
+                lines.append(temp_line)
+            if src == "andor":
+                for key, lbl in (("andor_sensor_cooling", "cooling"),
+                                 ("andor_readout_rate", "readout rate"),
+                                 ("andor_gain_mode", "gain mode"),
+                                 ("andor_noise_filter", "noise filter"),
+                                 ("andor_blemish_correction", "blemish corr")):
+                    if st.get(key) is not None:
+                        lines.append(f"{lbl:<13} = {st.get(key)}")
+                if st.get("bit_depth") is not None:
+                    lines.append(f"bit depth     = {st.get('bit_depth')}"
+                                 f"   clip {st.get('raw_clip_level')}")
+                # v7.13.x — the frame-rate constraint made visible: exposure
+                # max ≈ 1/frame rate, and running above the link max is what
+                # dropped frames at full resolution.
+                if st.get("frame_rate") is not None:
+                    try:
+                        fr_line = (f"frame rate    = "
+                                   f"{float(st.get('frame_rate')):.2f} fps")
+                        mitr = st.get("max_interface_transfer_rate")
+                        if mitr:
+                            fr_line += f" (link max {float(mitr):.2f})"
+                        lines.append(fr_line)
+                    except (TypeError, ValueError):
+                        pass
             if src == "tucam":
-                if st.get("temperature_c") is not None:
-                    lines.append(f"sensor temp   = {st.get('temperature_c')} C")
                 lines.append(f"frame format  = {st.get('channels')} ch, "
                              f"{st.get('elem_bytes')} byte/px")
             lines.append(f"gamma         = {st.get('gamma')}")
             lines.append(f"brightness    = {st.get('brightness')}")
             lines.append(f"contrast      = {st.get('contrast')}")
+            # v7.13 — the SOFTWARE (display-only) correction always exists and
+            # is always readable, even on cameras with no ISP (the Zyla's
+            # gamma/brightness/contrast above are None BY DESIGN — its knobs
+            # live here and in the per-slot Image Correction strip).
+            try:
+                corr = (self._mgr.image_correction(self._cam_idx)
+                        if hasattr(self._mgr, "image_correction") else None)
+            except Exception:
+                corr = None
+            if corr:
+                lines.append(
+                    f"software corr = brightness {corr.get('brightness', 0):+}"
+                    f"   contrast {float(corr.get('contrast', 1.0)):.2f}"
+                    f"   gamma {float(corr.get('gamma', 1.0)):.2f}"
+                    f"   (display-only)")
         else:
             lines.append("(no controllable camera — start the camera first)")
         self._readout.setPlainText("\n".join(str(x) for x in lines))
+
+    # ── Visibility-scoped stats timer (v7.13) ─────────────────────
+
+    def showEvent(self, event):  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        try:
+            self._stats_timer.start()
+        except Exception:
+            pass
+
+    def hideEvent(self, event):  # noqa: N802 (Qt override)
+        try:
+            self._stats_timer.stop()
+        except Exception:
+            pass
+        super().hideEvent(event)
+
+    def closeEvent(self, event):  # noqa: N802 (Qt override)
+        try:
+            self._stats_timer.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)

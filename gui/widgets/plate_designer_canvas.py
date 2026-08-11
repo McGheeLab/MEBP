@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem,
     QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem,
     QGraphicsItemGroup, QGraphicsItem, QSizePolicy, QWidget,
+    QApplication, QLineEdit, QAbstractSpinBox, QComboBox, QTextEdit,
+    QPlainTextEdit,
 )
 
 from gui.scaling import s, scaled_font_size
@@ -49,6 +51,25 @@ from SupportClasses.PlateSketchSolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_key_allowed() -> bool:
+    """False when a text-entry widget holds focus.
+
+    The third leg of the v7.12 shortcut-theft fix. Even with tool letters moved
+    onto the canvas and the remaining shortcuts scoped to the widget, a shortcut
+    parented to a container can still outrank an editor nested inside it, so
+    both key paths consult this before acting.
+    """
+    focus = QApplication.focusWidget()
+    if focus is None:
+        return True
+    if isinstance(focus, (QLineEdit, QAbstractSpinBox, QTextEdit,
+                          QPlainTextEdit)):
+        return False
+    if isinstance(focus, QComboBox) and focus.isEditable():
+        return False
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -87,7 +108,11 @@ class Tool(Enum):
     DRAW_LINE = auto()
     DRAW_CONSTRUCTION_LINE = auto()
     DIMENSION = auto()          # v7.4.7 — edge-distance dimensions
-    ADD_CONSTRAINT = auto()
+    # NOTE: there is no ADD_CONSTRAINT tool. It existed until v7.12 but was
+    # unreachable — no toolbar button created it, and its gate
+    # (_enough_picks_for_kind) returned False on every branch, so the commit
+    # could never fire. Constraints are created from the properties panel via
+    # add_constraint_now() / add_constraint_explicit().
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -264,6 +289,16 @@ class PlateDesignerCanvas(QGraphicsView):
     GRID_MAJOR_MM = 10.0
     GRID_MINOR_MM = 1.0
 
+    # Below this on-screen spacing the 1 mm grid stops being drawn — it reads
+    # as a grey wash and costs ~215 drawLine() calls per paint (see
+    # drawBackground).
+    _GRID_MIN_DEVICE_PX = 4.0
+    # Absolute zoom bounds, in scene-units-per-device-pixel. Without these,
+    # repeated wheel steps compound 1.15x without limit and reach a degenerate
+    # transform the view cannot recover from.
+    _ZOOM_MIN = 0.05
+    _ZOOM_MAX = 40.0
+
     # Default placement params for new wells.
     DEFAULT_WELL_DIAMETER_MM = 6.0
     DEFAULT_GRID_ROWS = 8
@@ -292,9 +327,6 @@ class PlateDesignerCanvas(QGraphicsView):
         # Selection state — entity ids (Wells primarily).
         self._selected_ids: list[EntityId] = []
 
-        # Constraint-add pick state (used by ADD_CONSTRAINT tool).
-        self._constraint_picks: list[EntityId] = []
-        self._pending_constraint_kind: str = ""
 
         # Drag state.
         self._dragging_id: Optional[EntityId] = None
@@ -363,12 +395,21 @@ class PlateDesignerCanvas(QGraphicsView):
                            QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"border: 1px solid {COLOR_PLATE_BORDER};")
 
-        # Keyboard shortcuts.
-        QShortcut(QKeySequence("Esc"), self, activated=self._cancel_tool)
-        QShortcut(QKeySequence("F"), self, activated=self.fit_view)
-        QShortcut(QKeySequence("Delete"), self, activated=self.delete_selection)
-        QShortcut(QKeySequence("Backspace"), self,
-                  activated=self.delete_selection)
+        # The canvas must be able to hold focus for its own key bindings
+        # (see keyPressEvent) and to receive click-to-focus.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # Keyboard shortcuts. Scoped to this widget and its children — the
+        # default Qt.WindowShortcut context made every one of these fire from
+        # anywhere on the Hardware Setup window, including inside text fields.
+        for seq, slot in (
+            ("Esc", self._cancel_tool),
+            ("F", self.fit_view),
+            ("Delete", self.delete_selection),
+            ("Backspace", self.delete_selection),
+        ):
+            sc = QShortcut(QKeySequence(seq), self, activated=slot)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
 
     # ── Background grid (drawn via drawBackground) ────────────────
 
@@ -381,19 +422,25 @@ class PlateDesignerCanvas(QGraphicsView):
         # transform / parent offset), so its `rect()` IS the scene rect.
         plate_rect = self._outline_item.rect()
 
-        # Minor grid (1 mm).
+        # Minor grid (1 mm) — skipped once it would render denser than
+        # _GRID_MIN_DEVICE_PX on screen. A 128x86 mm plate is ~215 minor lines
+        # drawn one drawLine() at a time on EVERY paint, including every frame
+        # of a drag, and below a few pixels apart they are a grey wash rather
+        # than a readable grid. The major grid always draws.
+        zoom = self.transform().m11()
         minor_spacing = self.GRID_MINOR_MM * SCALE_FACTOR
-        painter.setPen(QPen(QColor(COLOR_GRID_MINOR), 0))
-        x = plate_rect.left()
-        while x <= plate_rect.right():
-            painter.drawLine(QPointF(x, plate_rect.top()),
-                             QPointF(x, plate_rect.bottom()))
-            x += minor_spacing
-        y = plate_rect.top()
-        while y <= plate_rect.bottom():
-            painter.drawLine(QPointF(plate_rect.left(), y),
-                             QPointF(plate_rect.right(), y))
-            y += minor_spacing
+        if minor_spacing * zoom >= self._GRID_MIN_DEVICE_PX:
+            painter.setPen(QPen(QColor(COLOR_GRID_MINOR), 0))
+            x = plate_rect.left()
+            while x <= plate_rect.right():
+                painter.drawLine(QPointF(x, plate_rect.top()),
+                                 QPointF(x, plate_rect.bottom()))
+                x += minor_spacing
+            y = plate_rect.top()
+            while y <= plate_rect.bottom():
+                painter.drawLine(QPointF(plate_rect.left(), y),
+                                 QPointF(plate_rect.right(), y))
+                y += minor_spacing
 
         # Major grid (10 mm).
         major_spacing = self.GRID_MAJOR_MM * SCALE_FACTOR
@@ -416,7 +463,6 @@ class PlateDesignerCanvas(QGraphicsView):
         self._design = design
         self._solver = PlateSketchSolver(design)
         self._selected_ids.clear()
-        self._constraint_picks.clear()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._rebuild_scene()
@@ -503,10 +549,21 @@ class PlateDesignerCanvas(QGraphicsView):
     def solver(self) -> Optional[PlateSketchSolver]:
         return self._solver
 
+    def _end_active_drag(self) -> None:
+        """Finish any in-flight solver drag. Safe to call when none is active.
+
+        Without this, switching tools or pressing Esc mid-drag left the solver
+        holding a live drag ghost with no widget still driving it — an orphaned
+        weight-1000 pin on the design.
+        """
+        if self._dragging_id is not None and self._solver is not None:
+            self._solver.end_drag()
+        self._dragging_id = None
+        self._drag_pending_target = None
+
     def set_tool(self, tool: Tool) -> None:
+        self._end_active_drag()
         self._tool = tool
-        self._constraint_picks.clear()
-        self._pending_constraint_kind = ""
         # Reset any in-progress circle-pattern definition.
         self._circle_defining = False
         self._circle_center = None
@@ -517,7 +574,7 @@ class PlateDesignerCanvas(QGraphicsView):
         elif tool in (Tool.DRAW_SINGLE_WELL, Tool.DRAW_GRID,
                       Tool.DRAW_CIRCLE_PATTERN):
             self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
-        elif tool in (Tool.ADD_CONSTRAINT, Tool.DIMENSION):
+        elif tool == Tool.DIMENSION:
             self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.tool_changed.emit(tool)
 
@@ -557,12 +614,6 @@ class PlateDesignerCanvas(QGraphicsView):
 
     def selected_ids(self) -> list[EntityId]:
         return list(self._selected_ids)
-
-    def begin_add_constraint(self, kind: str) -> None:
-        """Switch to ADD_CONSTRAINT tool with the requested kind."""
-        self._pending_constraint_kind = kind
-        self.set_tool(Tool.ADD_CONSTRAINT)
-        self._constraint_picks = []
 
     def lock_selection(self) -> None:
         """Toggle the `fix` constraint on currently-selected wells.
@@ -1097,8 +1148,6 @@ class PlateDesignerCanvas(QGraphicsView):
                                            Tool.DRAW_CONSTRUCTION_LINE))
             elif self._tool == Tool.DIMENSION:
                 self._handle_dimension(scene_pt)
-            elif self._tool == Tool.ADD_CONSTRAINT:
-                self._handle_add_constraint_pick(scene_pt)
             event.accept()
             return
 
@@ -1220,15 +1269,57 @@ class PlateDesignerCanvas(QGraphicsView):
             event.ignore()
             return
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self.scale(factor, factor)
+        # Clamp, or repeated steps compound without bound into a transform the
+        # view cannot be zoomed back out of.
+        current = self.transform().m11()
+        target = max(self._ZOOM_MIN, min(self._ZOOM_MAX, current * factor))
+        if abs(target - current) < 1e-9:
+            return
+        self.scale(target / current, target / current)
 
     def set_wheel_zoom_enabled(self, enabled: bool) -> None:
         """Enable/disable scroll-wheel zoom (Fit + buttons still work)."""
         self._wheel_zoom_enabled = bool(enabled)
 
+    # Single-letter tool bindings. These live on the CANVAS rather than on
+    # window-scoped QShortcuts: a QShortcut with the default Qt.WindowShortcut
+    # context fires for the whole window, so typing "s" or "g" into the plate
+    # name — or any other field on Hardware Setup — silently switched tools and
+    # ate the keystroke. A widget's own key handler cannot reach a sibling
+    # QLineEdit, which is what makes this the actual fix rather than a mitigation.
+    _TOOL_KEYS = {
+        (Qt.Key.Key_S, False): Tool.SELECT,
+        (Qt.Key.Key_W, False): Tool.DRAW_SINGLE_WELL,
+        (Qt.Key.Key_G, False): Tool.DRAW_GRID,
+        (Qt.Key.Key_C, False): Tool.DRAW_CIRCLE_PATTERN,
+        (Qt.Key.Key_L, False): Tool.DRAW_LINE,
+        (Qt.Key.Key_L, True): Tool.DRAW_CONSTRUCTION_LINE,
+        (Qt.Key.Key_D, False): Tool.DIMENSION,
+    }
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        # Tool shortcuts handled by parent's shortcuts; canvas-local
-        # only handles modifiers that affect drag-in-progress.
+        mods = event.modifiers()
+        # Never steal a letter from a text field, even if one somehow holds
+        # focus while the canvas receives the event.
+        if (mods & (Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier)):
+            super().keyPressEvent(event)
+            return
+        if not _tool_key_allowed():
+            super().keyPressEvent(event)
+            return
+
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        tool = self._TOOL_KEYS.get((event.key(), shift))
+        if tool is not None:
+            self.set_tool(tool)
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_K and not shift:
+            self.lock_selection()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     # ── Tool handlers ─────────────────────────────────────────────
@@ -1544,54 +1635,6 @@ class PlateDesignerCanvas(QGraphicsView):
         self.set_tool(Tool.SELECT)
         self.selection_changed.emit([])
 
-    def _handle_add_constraint_pick(self, scene_pt: QPointF) -> None:
-        if self._design is None:
-            return
-        eid = self._well_id_at(scene_pt)
-        if eid is None:
-            return
-        self._constraint_picks.append(eid)
-        self.set_selection(list(self._constraint_picks))
-        # Apply once enough picks have been collected for this kind.
-        if self._enough_picks_for_kind(self._pending_constraint_kind):
-            self._commit_pending_constraint()
-
-    @staticmethod
-    def _enough_picks_for_kind(kind: str) -> bool:
-        if kind == "fix":
-            return False  # single-shot; UI applies via Lock action
-        if kind in ("coincident_pp", "concentric", "distance_pp",
-                    "horizontal", "vertical", "equal_radius"):
-            return False  # finalized via _commit_pending_constraint with =2
-        return False
-
-    def _commit_pending_constraint(self) -> None:
-        if (self._design is None
-                or not self._pending_constraint_kind
-                or len(self._constraint_picks) < 2):
-            return
-        kind = self._pending_constraint_kind
-        if kind in ("coincident_pp", "horizontal", "vertical",
-                    "concentric", "equal_radius"):
-            self._add_simple_constraint(kind, self._constraint_picks[:2])
-        elif kind == "distance_pp":
-            # Default to current distance, user edits in properties panel.
-            w1 = self._design.entities.get(self._constraint_picks[0])
-            w2 = self._design.entities.get(self._constraint_picks[1])
-            d = 0.0
-            if isinstance(w1, Well) and isinstance(w2, Well):
-                c1 = self._design.entities[w1.center]
-                c2 = self._design.entities[w2.center]
-                if isinstance(c1, Point) and isinstance(c2, Point):
-                    d = math.hypot(c1.x - c2.x, c1.y - c2.y)
-            self._add_simple_constraint(
-                kind, self._constraint_picks[:2], value=d)
-        # Reset.
-        self._constraint_picks = []
-        self._pending_constraint_kind = ""
-        self.set_tool(Tool.SELECT)
-        self._resolve_and_repaint()
-
     def _add_simple_constraint(
         self, kind: str, well_ids: list[EntityId],
         value: Optional[float] = None,
@@ -1719,8 +1762,7 @@ class PlateDesignerCanvas(QGraphicsView):
         return f"ring-{i}"
 
     def _cancel_tool(self) -> None:
-        self._constraint_picks = []
-        self._pending_constraint_kind = ""
+        # set_tool() ends any in-flight solver drag.
         self.set_tool(Tool.SELECT)
         self.clear_selection()
 

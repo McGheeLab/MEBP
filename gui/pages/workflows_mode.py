@@ -41,6 +41,7 @@ from gui.pages.workflows.timing_calibration_workflow import (
 from gui.pages.workflows.common_print_settings_workflow import (
     CommonPrintSettingsWorkflowPage,
 )
+from gui.pages.workflows.lablink_workflow import LabLinkWorkflowPage
 
 if TYPE_CHECKING:
     from SupportClasses.StageController import StageController
@@ -140,6 +141,12 @@ class WorkflowsModePage(QWidget):
                 )
             elif tile.workflow_id == "common_print_settings":
                 page = CommonPrintSettingsWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
+            elif tile.workflow_id == "lablink":
+                page = LabLinkWorkflowPage(
                     controller=controller,
                     settings=settings,
                     camera_manager=camera_manager,
@@ -305,6 +312,17 @@ class WorkflowsModePage(QWidget):
                     page.set_z_references(refs)
                 except Exception as e:
                     logger.debug("set_z_references fanout failed: %s", e)
+
+    def set_visible_z_references(self, keys):
+        """v7.9.1: fan out the quick-move badge selection (see the Jog page)."""
+        for i in range(1, self._stack.count()):
+            page = self._stack.widget(i)
+            if hasattr(page, "set_visible_z_references"):
+                try:
+                    page.set_visible_z_references(keys)
+                except Exception as e:
+                    logger.debug(
+                        "set_visible_z_references fanout failed: %s", e)
 
     def set_settings(self, settings):
         for i in range(1, self._stack.count()):

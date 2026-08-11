@@ -247,6 +247,33 @@ class PlateTypeStore:
             f"(z_offsets={plate_type.z_offsets})")
         return True
 
+    def delete_user(self, plate_type_id) -> bool:
+        """Delete a USER plate-type override (built-ins cannot be deleted).
+
+        Removes ``user/<id>.json`` if present, then reloads so a shadowed
+        built-in re-surfaces with its bundled Z offsets. Returns True if a user
+        file was removed.
+
+        v7.12: this is the counterpart to :meth:`save_user`, which the Z-offset
+        learn loop calls. Without it a learned override was permanent — there
+        was no way back to the bundled defaults short of deleting the file by
+        hand. Mirrors ``WellTypeStore.delete_user``.
+        """
+        if not plate_type_id:
+            return False
+        path = self._user_dir / f"{safe_id(plate_type_id)}.json"
+        if not path.exists():
+            return False
+        try:
+            os.remove(path)
+        except Exception as exc:
+            logger.error(f"PlateTypeStore.delete_user: remove failed: {exc}")
+            return False
+        self.reload()
+        logger.info(
+            f"PlateTypeStore: deleted user plate type '{plate_type_id}'")
+        return True
+
 
 _store_singleton: Optional[PlateTypeStore] = None
 

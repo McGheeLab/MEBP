@@ -379,33 +379,25 @@ class PlateDesignerWidget(QWidget):
 
         self._refresh_picker()
 
-        # Keyboard shortcuts (designer-scoped — fire whenever the designer
-        # has focus, not just the canvas).
-        QShortcut(QKeySequence("S"), self,
-                  activated=lambda: self._activate_tool(Tool.SELECT))
-        QShortcut(QKeySequence("W"), self,
-                  activated=lambda: self._activate_tool(Tool.DRAW_SINGLE_WELL))
-        QShortcut(QKeySequence("G"), self,
-                  activated=lambda: self._activate_tool(Tool.DRAW_GRID))
-        QShortcut(QKeySequence("C"), self,
-                  activated=lambda: self._activate_tool(
-                      Tool.DRAW_CIRCLE_PATTERN))
-        QShortcut(QKeySequence("L"), self,
-                  activated=lambda: self._activate_tool(Tool.DRAW_LINE))
-        QShortcut(QKeySequence("Shift+L"), self,
-                  activated=lambda: self._activate_tool(
-                      Tool.DRAW_CONSTRUCTION_LINE))
-        QShortcut(QKeySequence("D"), self,
-                  activated=lambda: self._activate_tool(Tool.DIMENSION))
-        QShortcut(QKeySequence("K"), self,
-                  activated=self._on_lock_clicked)
-        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._on_undo)
-        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self._on_redo)
-        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self._on_redo)
-
-    def _activate_tool(self, tool: Tool) -> None:
-        """Activate a tool both via canvas state and toolbar check."""
-        self._canvas.set_tool(tool)
+        # Keyboard shortcuts.
+        #
+        # The single-letter tool bindings (S/W/G/C/L/Shift+L/D/K) deliberately
+        # do NOT live here any more. As window-scoped QShortcuts they fired for
+        # the entire Hardware Setup window, so typing "s" or "g" into the plate
+        # name — or any other text field on the page — switched tools and ate
+        # the keystroke. They are now handled by PlateDesignerCanvas.keyPressEvent,
+        # which cannot reach a sibling editor. The canvas syncs the toolbar back
+        # through its tool_changed signal, so the buttons still track the keys.
+        #
+        # What remains is chorded and unambiguous, but still scoped to this
+        # widget subtree rather than the window.
+        for seq, slot in (
+            ("Ctrl+Z", self._on_undo),
+            ("Ctrl+Shift+Z", self._on_redo),
+            ("Ctrl+Y", self._on_redo),
+        ):
+            sc = QShortcut(QKeySequence(seq), self, activated=slot)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
 
     # Toolbar button geometry — all buttons share the same shape so the
     # column reads as a coherent palette.
@@ -794,6 +786,14 @@ class PlateDesignerWidget(QWidget):
     # Save / Save As / Delete
     # ─────────────────────────────────────────────────────────────
 
+    def _name_rejection(self, name: str) -> str:
+        """Why *name* cannot be used as a plate name, or "" if it is fine."""
+        if not name:
+            return "Name cannot be empty."
+        if name in (str(f) for f in _BUNDLED_FORMATS) or name.isdigit():
+            return f"'{name}' clashes with a standard format. Pick another name."
+        return ""
+
     def _on_save(self) -> None:
         if self._design is None:
             return
@@ -801,11 +801,82 @@ class PlateDesignerWidget(QWidget):
         if isinstance(self._current_key, int):
             self._on_save_as()
             return
+
+        # The Plate card's Name field is a RENAME request, not decoration.
+        # Until v7.12 this line read `self._design.name = self._current_key`,
+        # which silently threw the typed name away on every Save.
+        typed = (self._design.name or "").strip()
+        if typed and typed != self._current_key:
+            if not self._rename_current(typed):
+                # Refused or cancelled — keep the file's name so the card and
+                # the document agree again rather than showing a phantom edit.
+                self._design.name = self._current_key
+                self._rebuild_properties_panel()
+                return
+            return
+
         self._design.name = self._current_key
         path = self._design.save()
         self._dirty = False
         self._update_dirty_label()
         logger.info(f"Saved plate to {path}")
+
+    def _rename_current(self, new_name: str) -> bool:
+        """Save the current design under *new_name* and retire the old file.
+
+        Returns True when the rename committed.
+
+        The plate name is also the per-plate store key (mosaics, plate templates,
+        well training, and the taught calibration archive), and none of those
+        follow a rename, so this asks first and says what is at stake.
+        """
+        why = self._name_rejection(new_name)
+        if why:
+            QMessageBox.warning(self, "Rename Plate", why)
+            return False
+
+        old_key = self._current_key
+        new_path = USER_PLATES_DIR / f"{new_name}.json"
+        if new_path.exists():
+            answer = QMessageBox.question(
+                self, "Rename Plate",
+                f"'{new_name}' already exists. Overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return False
+
+        answer = QMessageBox.question(
+            self, "Rename Plate",
+            f"Rename '{old_key}' to '{new_name}'?\n\n"
+            f"Taught calibration, mosaics and well training are stored under the "
+            f"plate name. '{new_name}' starts a fresh set — the data taught for "
+            f"'{old_key}' stays with that name.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return False
+
+        self._design.name = new_name
+        self._design.save()
+        old_path = USER_PLATES_DIR / f"{old_key}.json"
+        if old_path.exists() and old_path != new_path:
+            try:
+                old_path.unlink()
+            except OSError as exc:
+                # The new file is already written, so the rename stands; the
+                # stale copy just lingers in the picker. Say so rather than
+                # failing a save the operator can see succeeded.
+                logger.warning("Could not remove old plate file %s: %s",
+                               old_path, exc)
+
+        self._current_key = new_name
+        self._dirty = False
+        self._refresh_picker()
+        self._refresh_picker_selection()
+        self._set_buttons_for_current_kind()
+        self._update_dirty_label()
+        self.plate_changed.emit(self._current_key)
+        logger.info("Renamed plate '%s' → '%s'", old_key, new_name)
+        return True
 
     def _on_save_as(self) -> None:
         if self._design is None:
@@ -818,13 +889,9 @@ class PlateDesignerWidget(QWidget):
         if not ok:
             return
         name = name.strip()
-        if not name:
-            QMessageBox.warning(self, "Save As", "Name cannot be empty.")
-            return
-        if name in (str(f) for f in _BUNDLED_FORMATS) or name.isdigit():
-            QMessageBox.warning(
-                self, "Save As",
-                f"'{name}' clashes with a standard format. Pick another name.")
+        why = self._name_rejection(name)
+        if why:
+            QMessageBox.warning(self, "Save As", why)
             return
         # Overwrite confirmation if file exists.
         path = USER_PLATES_DIR / f"{name}.json"

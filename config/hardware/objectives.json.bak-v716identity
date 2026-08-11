@@ -1,0 +1,101 @@
+{
+  "version": "1.0",
+  "objectives": [
+    {
+      "name": "2x",
+      "nominal_magnification": 2.0
+    },
+    {
+      "name": "4x",
+      "nominal_magnification": 4.0
+    },
+    {
+      "name": "10x",
+      "nominal_magnification": 10.0
+    },
+    {
+      "name": "20x",
+      "nominal_magnification": 20.0
+    }
+  ],
+  "camera_objective_calibrations": {
+    "BUC3D-1000C": {
+      "2x": {
+        "measured_um_per_px": 3.11919,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      },
+      "4x": {
+        "measured_um_per_px": 1.547113,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      },
+      "10x": {
+        "measured_um_per_px": 0.624919,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-03-13"
+      }
+    },
+    "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)": {
+      "4x": {
+        "measured_um_per_px": 0.389135,
+        "resolution": [
+          2600,
+          2048
+        ],
+        "date": "2026-08-10",
+        "rotation_deg": -89.97
+      },
+      "2x": {
+        "measured_um_per_px": 0.778843,
+        "resolution": [
+          3664,
+          2748
+        ],
+        "date": "2026-08-10",
+        "rotation_deg": -89.97
+      },
+      "10x": {
+        "measured_um_per_px": 0.314136,
+        "resolution": [
+          916,
+          686
+        ],
+        "date": "2026-08-10",
+        "rotation_deg": -89.97
+      }
+    },
+    "Andor Zyla 4.2P (USB3)": {
+      "4x": {
+        "measured_um_per_px": 3.227061,
+        "resolution": [
+          1024,
+          1024
+        ],
+        "date": "2026-08-06",
+        "rotation_deg": 0.1
+      },
+      "10x": {
+        "measured_um_per_px": 1.320118,
+        "resolution": [
+          2048,
+          2048
+        ],
+        "date": "2026-08-06",
+        "rotation_deg": 0.1
+      }
+    },
+    "TestCamProp": {}
+  },
+  "description": "Standard microscope objectives and per-camera empirical \u00b5m/px calibrations.",
+  "notes": "Calibrations are keyed by camera model name then objective name. measured_um_per_px is the empirically measured scale via stage-motion phase correlation. resolution records the active frame size at calibration time."
+}

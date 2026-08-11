@@ -1,0 +1,176 @@
+{
+  "schema": "mebp.plate-document",
+  "schema_version": 2,
+  "meta": {
+    "id": "plt_7863c425dc27",
+    "name": "Custom 6 insert with rosette",
+    "kind": "plate",
+    "rev": 7,
+    "description": "24-well plate",
+    "created": "2026-08-06T22:56:43+00:00",
+    "modified": "2026-08-07T01:23:18+00:00",
+    "z_offsets": {
+      "bottom": 12.43,
+      "max": -7.0,
+      "safe": -4.0,
+      "top": 2.8
+    }
+  },
+  "units": "mm",
+  "boundary": {
+    "kind": "rect",
+    "width_mm": 127.76,
+    "height_mm": 85.48,
+    "a1_x_mm": 17.05,
+    "a1_y_mm": 13.67,
+    "origin_ref": "bottom_left"
+  },
+  "defaults": {
+    "diameter_mm": 15.6,
+    "well_depth_mm": 17.4
+  },
+  "entities": [
+    {
+      "type": "Point",
+      "id": 3,
+      "x": 7.388,
+      "y": 9.894
+    },
+    {
+      "type": "GridPattern",
+      "id": 4,
+      "name": "G1",
+      "anchor": 3,
+      "style": {
+        "diameter_mm": 28.0,
+        "well_depth_mm": 9.5
+      },
+      "rows": 2,
+      "cols": 3,
+      "pitch_x_mm": 40.0,
+      "pitch_y_mm": 40.0
+    },
+    {
+      "type": "Point",
+      "id": 9,
+      "x": 26.35,
+      "y": 29.07
+    },
+    {
+      "type": "RingPattern",
+      "id": 10,
+      "name": "R1",
+      "anchor": 9,
+      "style": {
+        "diameter_mm": 5.5,
+        "well_depth_mm": 17.4,
+        "rim_height_mm": 11.82
+      },
+      "naming": {
+        "scheme": "numbers",
+        "prefix": "C"
+      },
+      "count": 3,
+      "ring_diameter_mm": 8.0
+    },
+    {
+      "type": "Point",
+      "id": 11,
+      "x": 67.38,
+      "y": 29.07
+    },
+    {
+      "type": "RingPattern",
+      "id": 12,
+      "name": "R2",
+      "anchor": 11,
+      "style": {
+        "diameter_mm": 5.5,
+        "well_depth_mm": 17.4,
+        "rim_height_mm": 11.6
+      },
+      "naming": {
+        "scheme": "numbers",
+        "prefix": "D"
+      },
+      "count": 3,
+      "ring_diameter_mm": 8.0
+    }
+  ],
+  "constraints": [
+    {
+      "id": 1,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          4,
+          ""
+        ]
+      ],
+      "value": 24.438,
+      "datum": "edge_left"
+    },
+    {
+      "id": 2,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          4,
+          ""
+        ]
+      ],
+      "value": 23.564,
+      "datum": "edge_top"
+    },
+    {
+      "id": 7,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          12,
+          ""
+        ]
+      ],
+      "value": 43.33,
+      "datum": "edge_right"
+    },
+    {
+      "id": 8,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          12,
+          ""
+        ]
+      ],
+      "value": 0.0,
+      "datum": "axis_h"
+    },
+    {
+      "id": 9,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          10,
+          ""
+        ]
+      ],
+      "value": 0.0,
+      "datum": "axis_h"
+    },
+    {
+      "id": 10,
+      "kind": "distance_to_datum",
+      "refs": [
+        [
+          10,
+          ""
+        ]
+      ],
+      "value": 43.4,
+      "datum": "edge_left"
+    }
+  ],
+  "next_entity_id": 13,
+  "next_constraint_id": 11
+}

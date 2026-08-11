@@ -111,11 +111,15 @@ class TestAxisMaxSpeedInputs(unittest.TestCase):
         return p, c
 
     # 1 — sub-1% pump jog on the %/µL jog pages
+    # v7.9.x: the single P spin became one flow spin PER PUMP; the sub-1%
+    # floor applies to each of them.
     def test_pump_percent_spin_allows_below_one_percent(self):
         p, _ = self._panel(speed_as_max=False)
-        self.assertLess(p.spin_p_pct.minimum(), 1.0)
-        p.spin_p_pct.setValue(0.05)
-        self.assertAlmostEqual(p.spin_p_pct.value(), 0.05, places=3)
+        for pid in ("P1", "P2", "P3"):
+            self.assertLess(p.spin_p_pct_pumps[pid].minimum(), 1.0)
+        p.spin_p_pct_pumps["P1"].setValue(0.05)
+        self.assertAlmostEqual(p.spin_p_pct_pumps["P1"].value(), 0.05,
+                               places=3)
         # XY/Z keep the 1% floor (scoped to the pump per the request).
         self.assertGreaterEqual(p.spin_xy_pct.minimum(), 1.0)
 

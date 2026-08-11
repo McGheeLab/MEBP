@@ -138,6 +138,110 @@ def z_offset_from_centred_heights(datum_z_user_mm: float,
     return float(bore_z_user_mm) - float(datum_z_user_mm)
 
 
+# ── v7.10: the MICROSCOPE measurement ───────────────────────────────────────
+#
+# The side-camera method above jogs each bore onto a crosshair and subtracts the
+# two stage positions. The microscope method instead parks ONCE and clicks every
+# bore's tip in a single frame: faster, needs no needle-cam calibration, and —
+# because the stage never moves between clicks — the unknown microscope-to-
+# needle registration cancels out exactly.
+#
+# ⚠⚠ THE ARGUMENT ORDER IS THE OPPOSITE OF `offset_from_centred_positions`, AND
+# THAT IS CORRECT. This is the single most dangerous line in the file, so the
+# derivation is written out rather than asserted.
+#
+# The ONE fact both this and the pick workflow rest on is the code-verified
+# contract of `CameraManager.pixel_to_stage_offset` (call it `pto`), used
+# identically at every live-view click site in the app:
+#
+#     a PLATE feature seen at pixel P has stage-coordinate label
+#         c(P) = current_xy + pto(P)
+#
+# Bore k's tip appears at pixel P_k. Whatever plate point lies directly under
+# that tip is the plate feature at P_k, so at stage S bore k is over the plate
+# point labelled  S + pto(P_k).
+#
+# To put bore k on a target whose label is T:   S + pto(P_k) = T
+#                                          ⟹   S = T − pto(P_k)
+# and the store's convention is                S = T − offset_um(k)
+#                                          ⟹   offset_um(k) = pto(P_k)
+#
+# Bore 0 is the datum and its offset is defined to be zero, so the recorded,
+# datum-relative value is
+#
+#     offset_um(k) = pto(P_k) − pto(P_0)          ← bore MINUS datum
+#
+# whereas the side-camera form is `datum − bore`. The asymmetry is real: one
+# subtracts stage positions the stage was DRIVEN to, the other subtracts
+# pixel-derived labels of where the bores ALREADY are. Do not "tidy" them into
+# the same order.
+#
+# WHY THIS IS FRAME-INDEPENDENT — and why an earlier attempt to settle it by
+# measurement was abandoned. Whether the XY stage carries the plate or carries
+# the needle+microscope head changes where things sit in the LAB frame, but both
+# the measurement above and the target the pick workflow builds
+# (`T = current_xy + pto(click)`) go through the same `pto` label space, so the
+# lab frame never appears and cannot flip the answer. Reasoning via "the bore
+# protrudes +320 µm in world +X" — as this module's own worked example does —
+# introduces exactly that unobservable intermediate and is where the confusion
+# comes from; the arithmetic contract (`offset = S_0 − S_k` composed with
+# `stage = T − offset`) is what actually runs and is self-consistent either way.
+# A probe move cannot settle it either: the needle and the microscope are on the
+# same body in every configuration, so the tip never moves in that view.
+#
+# A mis-signed offset is a RIGHT-DISTANCE-WRONG-WAY error — the bore lands the
+# correct distance from the cell, on the wrong side, missing by TWICE the
+# spacing — and it reads as a calibration problem rather than a bug. So: one
+# function, pinned by a composed end-to-end test against
+# `PickAndPlaceManager._bore_target_xy_um`, plus an in-app cross-check against
+# the side-camera method (the two must agree, sign included) and a bench check
+# that drives every bore to one target and confirms DIRECTION, not just distance.
+
+
+def offset_from_frame_clicks(datum_pto_um: Sequence[float],
+                             bore_pto_um: Sequence[float],
+                             ) -> tuple[float, float]:
+    """``offset_um = bore_pto − datum_pto`` — see the block comment above.
+
+    Both arguments are ``CameraManager.pixel_to_stage_offset(...)`` for the pixel
+    at which that bore's tip appears, in ONE frame with the stage stationary.
+
+    Feeds the same store field and obeys the same consumption convention as
+    :func:`offset_from_centred_positions` (``stage = target − offset``), so a
+    bore measured by both methods must give the same answer — that is the
+    cross-check the wizard offers. The argument order differs from that function
+    ON PURPOSE; the block comment derives why.
+
+    The datum's own position cancels, so the datum bore need not be centred in
+    the frame — only visible.
+    """
+    return (_finite(bore_pto_um[0]) - _finite(datum_pto_um[0]),
+            _finite(bore_pto_um[1]) - _finite(datum_pto_um[1]))
+
+
+def needle_camera_offset_from_click(datum_pto_um: Sequence[float],
+                                    ) -> tuple[float, float]:
+    """The datum bore's offset from the microscope camera centre (stage µm).
+
+    Same click as the bore-0 measurement, answering a different question, so it
+    is worth its own name. By the derivation above, at stage S the datum bore is
+    over the plate point labelled ``S + pto(P_0)``; to put it on a feature
+    labelled ``f`` the stage must go to ``f − pto(P_0)``. That matches
+    ``StageController.needle_target_xy_for_feature_um``'s contract
+    (``target = feature − offset``) with
+
+        offset = pto(P_0)
+
+    i.e. the raw click, with NO negation — unlike the bore offsets, which are a
+    difference. This is the value that makes every live-view click-to-PICK land
+    on the needle rather than under the crosshair, and it is why a SINGLE-bore
+    needle also has something to measure here.
+
+    Invariant worth testing: ``offset_um(k) == centre_offset(k) − centre_offset(0)``.
+    """
+    return (_finite(datum_pto_um[0]), _finite(datum_pto_um[1]))
+
+
 def _finite(value, default: float = 0.0) -> float:
     try:
         v = float(value)

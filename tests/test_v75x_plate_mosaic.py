@@ -745,12 +745,26 @@ class TestMosaicSettings(_CalBase):
         # v7.5.x: frame_orient / fov_um / spacing_um are RETIRED (orientation and
         # scale are measured in one place — see MOSAIC_SCAN_DEFAULTS' note), so
         # they are no longer part of the round-trip.
-        custom = {"overlap_pct": 40, "settle_ms": 500, "fresh_frames": 6,
-                  "fresh_timeout_s": 4.0, "target_px": 4000,
-                  "detect_param2": 25, "detect_tol_pct": 50,
-                  "register": False, "max_shift_um": 120,
-                  "reg_method": "phase",
-                  "cal_cols": 5, "cal_rows": 5}
+        # Built FROM the defaults with every value overridden to something
+        # different, rather than hand-listed: a hand-written dict silently
+        # breaks the moment a setting is added (v7.13's avg_frames and v7.14's
+        # full_res_scan both did exactly that), and the round-trip is what
+        # this test is actually about.
+        custom = dict(MOSAIC_SCAN_DEFAULTS)
+        custom.update({"overlap_pct": 40, "settle_ms": 500, "fresh_frames": 6,
+                       "fresh_timeout_s": 4.0, "target_px": 4000,
+                       "detect_param2": 25, "detect_tol_pct": 50,
+                       "register": False, "max_shift_um": 120,
+                       "reg_method": "phase", "avg_frames": 8,
+                       "full_res_scan": True,
+                       "regularize_intensity": False,
+                       "cal_cols": 5, "cal_rows": 5})
+        # Every key must genuinely differ from its default, or a control that
+        # silently ignores its input would still round-trip.
+        differing = [k for k in custom if custom[k] != MOSAIC_SCAN_DEFAULTS[k]]
+        self.assertEqual(len(differing), len(MOSAIC_SCAN_DEFAULTS) - 2,
+                         "every setting except cal_cols/cal_rows should be "
+                         "exercised with a non-default value")
         dlg = MosaicScanSettingsDialog(custom)
         self.assertEqual(dlg.values(), custom)
         dlg.set_values(MOSAIC_SCAN_DEFAULTS)

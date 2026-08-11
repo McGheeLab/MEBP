@@ -75,6 +75,19 @@ class MountedOptic:
     #: Longer one-line description for a setup table.
     detail: str = ""
 
+    # ── numerics, kept as NUMBERS ────────────────────────────────────
+    # These used to be read from the SDK, formatted into ``detail`` and then
+    # thrown away. Anything that has to SIZE something from the optics — the
+    # depth of field that sets a focus step, the working distance that bounds
+    # how far a focus sweep may travel before the front lens reaches the plate —
+    # needs them as floats. Re-parsing them back out of ``detail`` would fail
+    # silently into a wrong step size or a wrong collision bound, so the numbers
+    # are carried directly. ``None`` means "the body did not report it", which
+    # callers must treat as unknown rather than substituting a default.
+    magnification: float | None = None
+    numerical_aperture: float | None = None
+    working_distance_mm: float | None = None
+
 
 @dataclass(frozen=True)
 class MicroscopeState:
@@ -297,14 +310,26 @@ class SimulatedMicroscopeBackend(MicroscopeBackend):
             for p in range(1, self._filter_slots + 1))
 
     def mounted_objectives(self) -> tuple:
-        mags = ("4", "10", "20")
-        return tuple(
-            MountedOptic(position=p, present=p <= len(mags),
-                         label=f"{mags[p - 1]}x" if p <= len(mags) else "",
-                         code=f"SIMOBJ{p}" if p <= len(mags) else "",
-                         detail=("simulated objective"
-                                 if p <= len(mags) else "empty"))
-            for p in range(1, self._objective_slots + 1))
+        # (magnification, NA, working distance mm) for plausible Nikon dry
+        # objectives. The NA and WD are what size a focus step and bound a
+        # sweep, so the simulator must report them or the whole planning layer
+        # is untestable without a body. The 20x's ~1 mm WD is deliberate: it is
+        # the case that makes a naive ±1 mm sweep a collision.
+        specs = (("4", 0.13, 16.4), ("10", 0.30, 16.0), ("20", 0.45, 1.0))
+        out = []
+        for p in range(1, self._objective_slots + 1):
+            if p > len(specs):
+                out.append(MountedOptic(position=p, present=False,
+                                        detail="empty"))
+                continue
+            mag, na, wd = specs[p - 1]
+            out.append(MountedOptic(
+                position=p, present=True, label=f"{mag}x",
+                code=f"SIMOBJ{p}",
+                detail=f"simulated objective · NA {na:g} · WD {wd:g} mm",
+                magnification=float(mag),
+                numerical_aperture=na, working_distance_mm=wd))
+        return tuple(out)
 
     def filter_names(self) -> tuple:
         return tuple(o.label for o in self.mounted_filters())
@@ -926,9 +951,19 @@ class NikonTiSdkBackend(MicroscopeBackend):
                 bits.append(f"NA {na:g}")
             if wd:
                 bits.append(f"WD {wd:g} mm")
+            # `mag` is the SDK's magnification TABLE entry (a string like "20"),
+            # because item.Magnification is an INDEX into that table, not a
+            # magnification. Carry the numeric form alongside the label.
+            try:
+                mag_num = float(mag) if mag else None
+            except (TypeError, ValueError):
+                mag_num = None
             out.append(MountedOptic(
                 position=pos, present=True, label=label, code=product,
-                detail=" · ".join(bits)))
+                detail=" · ".join(bits),
+                magnification=mag_num,
+                numerical_aperture=(float(na) if na else None),
+                working_distance_mm=(float(wd) if wd else None)))
         return tuple(out)
 
     def filter_names(self) -> tuple:
@@ -1252,6 +1287,71 @@ class MicroscopeController:
         self._pending = 0
         self._shutdown = False
         self._thread: Optional[threading.Thread] = None
+        # Exclusivity lease — see try_acquire().
+        self._lease_owner: Optional[str] = None
+        self._lease_thread: Optional[int] = None
+        self._lease_lock = threading.RLock()
+
+    # ── Exclusivity lease ─────────────────────────────────────────
+    #
+    # This controller is a process-wide singleton shared by the jog panel's
+    # Microscope card (which polls ~1 Hz), the Hardware Setup microscope page
+    # and any long-running calibration. That sharing is not benign: STALE_OP_S
+    # drops any op that has waited in the queue longer than 20 s, SILENTLY, with
+    # error='dropped (stale)'. A dropped set_objective during a focus survey
+    # means every subsequent sample is taken through the WRONG objective — and
+    # the resulting measurement looks perfectly well-formed.
+    #
+    # The lease is bound to the acquiring THREAD, not just to a name, because
+    # that is what the hazard actually looks like: one worker thread owns the
+    # body while every competing surface lives on the GUI thread. Ops submitted
+    # from any other thread while a lease is held fail fast with an explanatory
+    # error instead of queueing up behind the survey.
+
+    #: Ops that must work even while another owner holds the lease — a wedged
+    #: calibration must never be able to prevent releasing the hardware.
+    _LEASE_EXEMPT_OPS = frozenset({"disconnect"})
+
+    def try_acquire(self, owner: str, timeout: float = 0.0) -> bool:
+        """Take exclusive ownership of the body. Re-entrant for the same thread.
+
+        Returns False if someone else holds it. ALWAYS pair with release() in a
+        finally — a leaked lease locks every other microscope surface out.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        me = threading.get_ident()
+        while True:
+            with self._lease_lock:
+                if self._lease_owner is None:
+                    self._lease_owner = str(owner)
+                    self._lease_thread = me
+                    return True
+                if self._lease_owner == str(owner) and self._lease_thread == me:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def release(self, owner: str) -> None:
+        """Release a lease taken by ``owner``. Safe to call when not held."""
+        with self._lease_lock:
+            if self._lease_owner == str(owner):
+                self._lease_owner = None
+                self._lease_thread = None
+
+    def lease_owner(self) -> Optional[str]:
+        with self._lease_lock:
+            return self._lease_owner
+
+    def _lease_blocks(self, name: str) -> Optional[str]:
+        """The refusal text if this caller may not submit ``name``, else None."""
+        if name in self._LEASE_EXEMPT_OPS:
+            return None
+        with self._lease_lock:
+            owner, thr = self._lease_owner, self._lease_thread
+        if owner is None or thr == threading.get_ident():
+            return None
+        return f"microscope is reserved by {owner}"
 
     # ── State / listeners ─────────────────────────────────────────
 
@@ -1332,6 +1432,14 @@ class MicroscopeController:
 
     def _submit(self, name: str, fn: Callable[[], None]) -> _Op:
         op = _Op(name=name, fn=fn)
+        blocked = self._lease_blocks(name)
+        if blocked is not None:
+            # Fail fast rather than queue. Queueing here is what produces the
+            # silent 'dropped (stale)' 20 s later, by which point the caller has
+            # long since assumed the move happened.
+            op.error = blocked
+            op.done.set()
+            return op
         if not self._threaded:
             self._emit(busy=True)
             self._run_op(op)

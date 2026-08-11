@@ -95,7 +95,13 @@ class _CalStore:
 
 
 # The real machine's microscope: Andor Zyla, 4x @ 1024x1024, mounted 180 + flipY.
-_ANDOR_OBJ = {("Andor Zyla 4.2P (USB3)", "4x"): {
+#
+# v7.16: the objective store is keyed by the camera's DEVICE IDENTITY (what
+# ``_Mgr.camera_identity`` reports), not the configured spec name. See
+# ``MosaicCalibration.objective_camera_key`` — keying by name let two physical
+# cameras share one calibration block. ``camera_name=`` is still passed by
+# every caller and is still the key when there is no identity at all.
+_ANDOR_OBJ = {("id_scope", "4x"): {
     "measured_um_per_px": 3.227061, "resolution": [1024, 1024]}}
 _ANDOR_CAM = {"um_per_px": 3.227061, "rotation_deg": 180.0, "flip_y": True}
 

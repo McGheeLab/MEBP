@@ -925,6 +925,11 @@ class CellTargetingWorkflowPage(QWidget):
         ):
             card.add_widget(FormRow(label, widget,
                                     help_text=widget.toolTip() or None))
+        # v7.13 — sample-surface removal Z (per-target, from the fluorescence
+        # scan's autofocus survey).
+        card.add_widget(self._surface_z_chk)
+        card.add_widget(FormRow("↑ above surface", self._surface_offset,
+                                help_text=self._surface_offset.toolTip()))
         self._tuning_derived = QLabel("")
         self._tuning_derived.setWordWrap(True)
         self._tuning_derived.setStyleSheet(
@@ -1071,6 +1076,27 @@ class CellTargetingWorkflowPage(QWidget):
         self._place_z = self._dspin(
             0.0, 20.0, 0.50, " mm", 2, 0.05,
             "Needle height above the plate bottom when dispensing extracted cells.")
+        # v7.13 — removal Z from the MEASURED sample surface (the fluorescence
+        # mosaic's per-tile autofocus survey). Cells often sit ABOVE the well
+        # bottom (e.g. on hydrogel); a plate-bottom offset then aims below
+        # them. Gated at Start on the survey + the verified focus↔needle
+        # datum; low-confidence targets fall back to the plate-bottom offset.
+        self._surface_z_chk = QCheckBox(
+            "Removal Z from measured sample surface")
+        self._surface_z_chk.setChecked(False)
+        self._surface_z_chk.setToolTip(
+            "Per-target removal height evaluated on the sample surface "
+            "measured by the fluorescence scan's autofocus (Survey tab), "
+            "converted through the verified focus↔needle datum. Targets "
+            "outside the surveyed region fall back to the plate-bottom "
+            "offset above. Needs: a focus survey for the scanned well + the "
+            "focus↔needle datum.")
+        self._surface_z_chk.toggled.connect(
+            lambda *_: self._update_settings_summary())
+        self._surface_offset = self._dspin(
+            0.0, 500.0, 10.0, " µm", 0, 5.0,
+            "Extra clearance ABOVE the measured sample surface for the "
+            "aspirating bore.")
 
         # ── Pump & reagent ──
         self._bore = QComboBox()
@@ -1237,6 +1263,10 @@ class CellTargetingWorkflowPage(QWidget):
         ("prep", "_prep_check", True),
         ("clean", "_clean_check", True),
         ("wash_after_pickup", "_wash_after_pickup_check", True),
+        # v7.13 — sample-surface removal Z (old profiles lack the keys →
+        # defaults, mode off).
+        ("surface_z", "_surface_z_chk", False),
+        ("surface_offset_um", "_surface_offset", 10.0),
     )
 
     def _register_promoted_fields(self, dlg: WorkflowSettingsDialog) -> None:
@@ -2028,6 +2058,17 @@ class CellTargetingWorkflowPage(QWidget):
         self._refresh_reagent_status()
         self._refresh_prep_status()
         self._forward_to_scan_page("set_z_references", self._z_references)
+
+
+    def set_visible_z_references(self, keys) -> None:
+        """v7.9.1: which Z references get a quick-move badge (see the Jog page).
+
+        Presentation only — the reference VALUES are untouched.
+        """
+        try:
+            self._xz_view.set_visible_z_references(keys)
+        except Exception:
+            pass
 
     def _wells_in_zero_ref(self) -> dict[str, tuple[float, float]]:
         if not self._well_positions:
@@ -2984,6 +3025,105 @@ class CellTargetingWorkflowPage(QWidget):
         self._trial_status.setStyleSheet(
             f"color: {COLORS[color_key]}; font-size: {sf(9)}pt;")
 
+    def _surface_z_resolver(self):
+        """v7.13 — build a per-target removal-Z evaluator from the measured
+        sample surface, or refuse with an operator-actionable reason.
+
+        Returns ``(resolve, "")`` where ``resolve(x_um, y_um) -> zref_mm |
+        None`` (None = low-confidence at that point → caller falls back per
+        target), or ``(None, why)`` when the mode cannot run at all. The
+        conversion chain is: surface focus-µm → needle zref through the
+        VERIFIED focus↔needle datum → height above the taught plate bottom
+        (polarity-safe) → + the operator's clearance. A surface converting to
+        BELOW the plate bottom means the datum or the taught bottom is wrong
+        — the whole mode refuses rather than aim a needle there.
+        """
+        page = getattr(self, "_scan_page", None)
+        well = getattr(page, "_scan_well", None) if page is not None else None
+        plate_key = None
+        try:
+            plate_key = page._plate_key() if page is not None else None
+        except Exception:
+            plate_key = None
+        if not well or not plate_key:
+            return None, "no scanned well selected on the Survey tab"
+        try:
+            from SupportClasses import FluorescenceMosaicStore as fms
+            survey = fms.get_store().get_focus_survey(plate_key, well)
+        except Exception:
+            survey = None
+        if not survey or not survey.get("samples"):
+            return None, (f"no focus survey stored for {well} — run a "
+                          f"fluorescence scan with autofocus enabled")
+        summary = survey.get("summary") or {}
+        center = summary.get("well_center_um")
+        radius = summary.get("well_radius_um")
+        if not center or not radius:
+            try:
+                center = page._well_center_um(well)
+                radius = page._well_diameter_mm(well) / 2.0 * 1000.0
+            except Exception:
+                center = radius = None
+        if not center or not radius:
+            return None, "well geometry unknown"
+        try:
+            from SupportClasses.SampleSurface import SampleSurfaceModel, CONF_HIGH
+            model = SampleSurfaceModel(
+                survey["samples"], well_center_um=center,
+                well_radius_um=float(radius),
+                model=str(survey.get("model") or "plane"))
+        except Exception as exc:
+            return None, f"surface model unusable ({exc})"
+        try:
+            from SupportClasses.PlateFocusDatumStore import (
+                get_store as datum_store)
+            ds = datum_store()
+        except Exception:
+            return None, "focus↔needle datum store unavailable"
+        cam = ""
+        try:
+            cam = page._camera_key() or ""
+        except Exception:
+            cam = ""
+        ctrl = self._controller
+        if ds.needle_z_zref_mm(cam, "", plate_key, 0.0) is None:
+            return None, ("no verified focus↔needle datum for this camera / "
+                          "plate — capture it via the plate touch-off with "
+                          "the focus confirmation")
+        if not hasattr(ctrl, "zref_to_print_height") \
+                or not hasattr(ctrl, "print_height_to_zref"):
+            return None, "controller lacks the plate-bottom height frame"
+        # Whole-mode sanity: the surface at the well centre must sit at or
+        # above the plate bottom.
+        f_c, _conf = model.evaluate(float(center[0]), float(center[1]))
+        z_c = ds.needle_z_zref_mm(cam, "", plate_key, float(f_c))
+        h_c = ctrl.zref_to_print_height(float(z_c)) if z_c is not None else None
+        if h_c is None:
+            return None, "plate bottom Z is not calibrated"
+        if h_c < -1e-6:
+            return None, ("the measured surface converts to BELOW the plate "
+                          "bottom — the focus↔needle datum or the taught "
+                          "plate bottom is wrong; re-teach before using the "
+                          "surface for needle heights")
+        offset_mm = float(self._surface_offset.value()) / 1000.0
+
+        def resolve(x_um: float, y_um: float):
+            try:
+                f_um, conf = model.evaluate(float(x_um), float(y_um))
+                if conf != CONF_HIGH:
+                    return None
+                z_zref = ds.needle_z_zref_mm(cam, "", plate_key, float(f_um))
+                if z_zref is None:
+                    return None
+                h = ctrl.zref_to_print_height(float(z_zref))
+                if h is None or h < 0:
+                    return None
+                return ctrl.print_height_to_zref(h + offset_mm)
+            except Exception:
+                return None
+
+        return resolve, ""
+
     def _plate_offset_to_zref(self, offset_mm: float) -> float | None:
         """Height above the calibrated plate bottom (mm) → zero-ref Z (mm),
         polarity-correct. Returns None if the plate bottom isn't calibrated."""
@@ -3343,6 +3483,21 @@ class CellTargetingWorkflowPage(QWidget):
                 "Calibration page so the removal/place heights can be resolved.")
             return
 
+        # v7.13 — sample-surface removal Z: resolve the surface evaluator up
+        # front so a missing prerequisite REFUSES before anything moves
+        # (a silent fallback for the whole run would look like the feature
+        # working while every removal ran at the plate-bottom offset).
+        surface_resolver = None
+        if getattr(self, "_surface_z_chk", None) is not None \
+                and self._surface_z_chk.isChecked():
+            surface_resolver, why = self._surface_z_resolver()
+            if surface_resolver is None:
+                self._status.setText(
+                    f"Sample-surface removal Z unavailable: {why} — untick "
+                    f"'Removal Z from measured sample surface' or fix the "
+                    f"prerequisite.")
+                return
+
         # v7.9 (post-audit): a DOSING bore REPLACES the aspirating bore's push, so
         # the aspirate-side reagent is only required when there is no dosing bore.
         # Demanding it unconditionally is exactly what forced the operator into the
@@ -3453,6 +3608,25 @@ class CellTargetingWorkflowPage(QWidget):
                                  prep_enabled, clean_enabled):
             self._status.setText("Cancelled — nothing has moved.")
             return
+
+        # v7.13 — stamp per-target sample-surface removal heights. A target
+        # whose surface evaluation is low-confidence (outside the surveyed
+        # region) keeps the run-level plate-bottom offset, per target, logged.
+        n_surface = n_fallback = 0
+        if surface_resolver is not None:
+            stamped = []
+            for pick, place in pairs:
+                z_over = surface_resolver(float(pick.x_um), float(pick.y_um))
+                if z_over is not None:
+                    pick = replace(pick, pick_z_zref_mm=float(z_over))
+                    n_surface += 1
+                else:
+                    n_fallback += 1
+                stamped.append((pick, place))
+            pairs = stamped
+            logger.info(
+                "Cell removal: sample-surface Z on %d target(s), plate-bottom "
+                "fallback on %d", n_surface, n_fallback)
 
         queue = OperationQueue()
         for pick, place in pairs:

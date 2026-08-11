@@ -2,24 +2,35 @@
 
 A desktop application for controlling laboratory-scale bioprinting hardware. MEBP orchestrates Prior ProScan XY stages, Marlin-based Z-axis and syringe pump controllers, and Hamilton syringe systems to precisely deposit biological materials into standard well plates.
 
-**Version 7.5.0** | Python 3.10+ | PySide6 (Qt 6)
+**Version 7.17.0** | Python 3.10+ | PySide6 (Qt 6)
 
-> **v7.5.0** introduces the **Print Builder** mode page — a dedicated home for
-> *authoring* print trajectories, inserted in the sidebar before *Printing*.
-> Its flagship **Sketch** tool lets you draw a print directly from vector
-> primitives (line / rect / circle / ellipse / polygon) with paint-bucket fill
-> of enclosed regions, multi-layer Z-stacks, object/border snapping, and a
-> per-shape printed bead width — all driven by the active needle's diameter.
-> The compiled toolpath renders as the **main view** (colored by pump,
-> dashed-grey travel); your shapes are a slim editable overlay on top. A
-> dashed **standard well** outline is drawn at the origin for scale. Output
-> bakes through the existing `csv_import` contract so it shows up in Print
-> Setup's custom-prints area alongside the legacy image-stack importer
-> (relocated as the *Image Import* sub-page). Bundles the staged v7.4.3–v7.4.8
-> increments — see
-> [`coding plans/Update plans/MEBP_v75x_PRINT_BUILDER.md`](coding%20plans/Update%20plans/MEBP_v75x_PRINT_BUILDER.md)
-> and
-> [`coding plans/Architectures/ARCHITECTURE_V750.md`](coding%20plans/Architectures/ARCHITECTURE_V750.md).
+> **v7.17.0** lands the accumulated **v7.10 → v7.17** work in one release. The
+> largest threads:
+>
+> * **Cameras & optics** — a full camera-orientation audit (one measured
+>   camera→stage matrix behind the live view, the mosaic and click→stage
+>   mapping), a mount square-up aid, a Tucsen Libra 25 backend, a per-camera
+>   square sensor crop, and mosaic intensity regularization. **The live-view
+>   orientation is now separate from the measured one**, so calibrating no
+>   longer resets how the feed looks.
+> * **Calibration & safety** — optical plate-bed leveling (the microscope
+>   measures plate tilt with the needle retracted), a needle-bore wizard that
+>   measures per-bore XY/Z offsets in the microscope frame, and a fix for a
+>   real crash-down where a stale Z reference turned a retract into a plunge.
+> * **Plates** — a parametric plate/rosette builder with a constraint solver,
+>   custom plates rendering correctly everywhere, plate types with per-type Z
+>   offsets, and mosaics referenced to the plate frame as well as the stage.
+> * **Data** — the **`.nd3`** container format (an ND2-like HDF5 multidimensional
+>   image container with dual-frame georeferencing) plus a LabLink imaging
+>   bridge.
+> * **Hardware** — Nikon Ti Eclipse body control (filter cubes, focus,
+>   objectives) and multi-bore needle assemblies with per-bore cell targeting.
+>
+> Every thread has a plan document in
+> [`coding plans/Update plans/`](coding%20plans/Update%20plans/); the
+> architecture reference is still
+> [`coding plans/Architectures/ARCHITECTURE_V750.md`](coding%20plans/Architectures/ARCHITECTURE_V750.md)
+> — an `ARCHITECTURE_V717.md` consolidating these deltas is outstanding.
 
 ---
 

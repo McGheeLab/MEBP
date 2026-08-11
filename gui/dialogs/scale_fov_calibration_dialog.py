@@ -572,7 +572,21 @@ class ScaleFovCalibrationDialog(QDialog):
         self.result_rotation_deg = rot
         self.result_flip_x = bool(flip_x)
         self.result_flip_y = bool(flip_y)
-        self.result_resolution = (int(fw), int(fh))
+        # v7.16: stamp the CAPTURE resolution, not the delivered one. µm/px is
+        # unchanged by a centred crop, so the stamp has to name the sensor mode
+        # the measurement belongs to — otherwise turning the crop on or off
+        # later would rescale a perfectly good calibration by the crop fraction.
+        # (fw, fh) remains what the FOV is computed from, since that IS what the
+        # camera delivers.
+        cap = None
+        try:
+            getter = getattr(self._mgr, "capture_resolution", None)
+            cap = getter(self._cam_idx) if callable(getter) else None
+        except Exception:
+            cap = None
+        self.result_resolution = (
+            (int(cap[0]), int(cap[1])) if cap and cap[0] and cap[1]
+            else (int(fw), int(fh)))
         self.result_fov_um = (fov_w, fov_h)
 
         flips = []
@@ -668,6 +682,17 @@ class ScaleFovCalibrationDialog(QDialog):
         verify_settings = dict(self._scan_settings or {})
         verify_settings.pop("fov_um", None)
         verify_settings.pop("spacing_um", None)
+        # v7.16: snapshot the manager BEFORE the verify dialog, so afterwards we
+        # can tell an actual correction from "nothing happened". See below.
+        def _mgr_eff():
+            try:
+                v = float(self._mgr.effective_um_per_px(self._cam_idx, fw))
+                return v if v > 0 else None
+            except Exception:
+                return None
+
+        before = _mgr_eff()
+
         dlg = MosaicCalibrationDialog(
             self._controller, self._mgr, self._cam_idx,
             safe_z=safe_z, align_key=self._align_key, store=store,
@@ -676,16 +701,48 @@ class ScaleFovCalibrationDialog(QDialog):
             cam_key=self._cam_key, objective=self._objective, parent=self)
         dlg.exec()
 
-        # Re-sync the (possibly corrected) µm/px + orientation so the dialog's
-        # Accept reflects the correction and doesn't clobber it.
+        # Re-sync the µm/px ONLY when the verify step actually CORRECTED it.
+        #
+        # ⚠ This used to adopt the manager's value unconditionally, which
+        # destroyed the measurement this dialog exists to make. The manager
+        # holds whatever was last pushed into the slot — including another
+        # camera's stored calibration — so simply opening Verify and changing
+        # nothing replaced a fresh reading with a stale one, silently, with the
+        # label still saying "measured".
+        #
+        # That is the whole 400-minute mosaic on this rig: the microscope slot
+        # had been seeded with the ToupTek's 0.3891 µm/px (the objective store
+        # was keyed by camera *model name*, so the Tucsen read the ToupTek's
+        # block), the operator measured the Tucsen, opened Verify, and Accept
+        # then saved 0.3891 stamped at the Tucsen's 2600x2048 — a FOV of
+        # 1012 um instead of ~3305, i.e. 18,972 tiles instead of ~1,800.
+        #
+        # Comparing against the pre-dialog snapshot is what distinguishes the
+        # two cases without needing the verify dialog to report back.
         try:
-            eff = float(self._mgr.effective_um_per_px(self._cam_idx, fw))
-            if eff and eff > 0:
-                self.result_um_per_px = eff
-                self._lbl_umpx.setText(f"{eff:.4f} µm/px")
+            after = _mgr_eff()
+            corrected = (
+                after is not None and before is not None
+                and abs(after - before) > 1e-9)
+            if after is not None and before is None:
+                # No comparable "before" (an unstamped slot cannot be rescaled
+                # to this width) — the measurement stands. Adopting here is how
+                # an unrescalable value reaches Accept wearing a fresh stamp.
+                corrected = False
+            if corrected:
+                self.result_um_per_px = after
+                self._lbl_umpx.setText(f"{after:.4f} µm/px")
                 if fw > 0 and fh > 0:
-                    self.result_fov_um = (fw * eff, fh * eff)
-                    self._lbl_fov.setText(f"{fw * eff:.0f} × {fh * eff:.0f} µm")
+                    self.result_fov_um = (fw * after, fh * after)
+                    self._lbl_fov.setText(
+                        f"{fw * after:.0f} × {fh * after:.0f} µm")
+                logger.info(
+                    "ScaleFov: verify corrected um/px %.4f -> %.4f",
+                    before, after)
+            else:
+                logger.info(
+                    "ScaleFov: verify made no um/px correction — keeping the "
+                    "measured %.4f um/px", float(self.result_um_per_px or 0.0))
         except Exception:
             pass
         try:
@@ -719,8 +776,11 @@ class ScaleFovCalibrationDialog(QDialog):
         ``target_z_mm=None`` so the needle never descends.
         """
         self.result_um_per_px = float(cal.um_per_px)
-        if cal.live_resolution:
-            self.result_resolution = tuple(cal.live_resolution)
+        # v7.16: the CAPTURE resolution (falling back to the delivered one when
+        # there is no crop) — the stamp names a sensor mode, not a frame size.
+        stamp = getattr(cal, "capture_resolution", None) or cal.live_resolution
+        if stamp:
+            self.result_resolution = tuple(stamp)
         self.result_rotation_deg = float(cal.rotation_deg)
         self.result_flip_x = bool(cal.flip_x)
         self.result_flip_y = bool(cal.flip_y)

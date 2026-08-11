@@ -13,9 +13,13 @@ via Marlin ``M106`` (no custom firmware needed). Covered here:
      builds headless (with optional persisted state).
   5. Every view reads ONE shared state, so the LED reads the same on every page
      that hosts a jog context — and N mounted views still emit ONE ``M106``.
+  6. Shutting the software down turns the LED off, ordered before the link is
+     closed, and a dying board can't derail the rest of the exit path.
 """
 
 import os
+import shutil
+import tempfile
 import threading
 import unittest
 
@@ -330,6 +334,112 @@ class TestSharedAcrossPanels(unittest.TestCase):
 def _level_from_pct_expected(pct: int) -> int:
     from gui.widgets.illumination_control import _level_from_pct
     return _level_from_pct(pct)
+
+
+# ── 6. Shutdown turns the LED off ────────────────────────────────────────────
+
+class _Recorder:
+    """Stands in for the shutdown collaborators, logging call ORDER."""
+
+    def __init__(self, log, name):
+        self._log, self._name = log, name
+
+    def stop(self):
+        self._log.append(f"{self._name}.stop")
+
+
+class _ShutdownZP:
+    def __init__(self, log, raises=False):
+        self.simulate = True          # → StageController.is_zp_connected True
+        self.serial = object()
+        self._log = log
+        self._raises = raises
+        self.levels: list[int] = []
+
+    def set_led_brightness(self, level):
+        if self._raises:
+            raise OSError("board went away mid-shutdown")
+        self.levels.append(level)
+        self._log.append(f"led:{level}")
+        return True
+
+
+class TestShutdownTurnsLedOff(unittest.TestCase):
+    """The LED has no readback and nothing turns it off on its own, so an app
+    that exits with it lit leaves it lit with nothing left to control it."""
+
+    def _ctrl(self, log, *, zp=True, raises=False):
+        ctrl = StageController.__new__(StageController)
+        ctrl.zp_stage = _ShutdownZP(log, raises=raises) if zp else None
+        ctrl._watchdog = _Recorder(log, "watchdog")
+        ctrl._pos_poller = _Recorder(log, "poller")
+        ctrl.processor = _Recorder(log, "processor")
+        ctrl.disconnect_xbox = lambda: log.append("disconnect_xbox")
+        ctrl.disconnect_stages = lambda: log.append("disconnect_stages")
+        return ctrl
+
+    def setUp(self):
+        # shutdown() flushes the calibration-status store; keep it off the real
+        # config dir.
+        self._tmp = tempfile.mkdtemp()
+        self._prev = os.environ.get("MEBP_CALIBRATION_STATUS_DIR")
+        os.environ["MEBP_CALIBRATION_STATUS_DIR"] = self._tmp
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("MEBP_CALIBRATION_STATUS_DIR", None)
+        else:
+            os.environ["MEBP_CALIBRATION_STATUS_DIR"] = self._prev
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_shutdown_sends_led_off(self):
+        log = []
+        ctrl = self._ctrl(log)
+        ctrl.shutdown()
+        self.assertEqual(ctrl.zp_stage.levels, [0])
+
+    def test_led_off_precedes_the_disconnect(self):
+        """After disconnect_stages() closes the port there is no way left to
+        reach the board — the order is the fix, not an incidental detail."""
+        log = []
+        self._ctrl(log).shutdown()
+        self.assertLess(log.index("led:0"), log.index("disconnect_stages"))
+
+    def test_led_off_follows_the_poller_stop(self):
+        """Written with the poller stopped so it doesn't contend for the ZP
+        serial lock on the way out."""
+        log = []
+        self._ctrl(log).shutdown()
+        self.assertLess(log.index("poller.stop"), log.index("led:0"))
+
+    def test_a_dying_board_does_not_derail_shutdown(self):
+        log = []
+        self._ctrl(log, raises=True).shutdown()   # must not raise
+        self.assertIn("disconnect_stages", log)
+        self.assertIn("processor.stop", log)
+
+    def test_shutdown_without_a_zp_board_is_clean(self):
+        log = []
+        self._ctrl(log, zp=False).shutdown()      # must not raise
+        self.assertIn("processor.stop", log)
+        self.assertNotIn("led:0", log)
+
+    def test_shutdown_puts_m106_s0_on_the_wire(self):
+        """End-to-end through the real ZPStageManager: the G-code the board
+        actually receives at exit."""
+        log = []
+        ser = _ScriptedSerial()
+        zp = _bare_zp(ser)
+        zp.simulate = False
+        ctrl = self._ctrl(log)
+        ctrl.zp_stage = zp
+        ctrl.shutdown()
+        self.assertIn("M106 P0 S0", ser.writes)
+
+    def test_led_off_helper_is_a_guarded_noop_when_disconnected(self):
+        ctrl = StageController.__new__(StageController)
+        ctrl.zp_stage = None
+        self.assertFalse(ctrl.led_off())
 
 
 if __name__ == "__main__":

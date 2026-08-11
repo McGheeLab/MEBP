@@ -60,6 +60,36 @@ class FakeAndorCam:
         self.released = False
         self._frame = frame if frame is not None else np.full(
             (1024, 1024, 3), 40, dtype=np.uint8)
+        # v7.13 — sensor-quality features (mirrors ANDOR_SENSOR_FEATURES; the
+        # values lists imitate realistic SDK spellings, deliberately NOT the
+        # match tokens verbatim).
+        self._sensor = {
+            "andor_sensor_cooling": True,
+            "andor_readout_rate": "216 MHz - lowest noise",
+            "andor_gain_mode": "16-bit (low noise & high well capacity)",
+            "andor_noise_filter": True,
+            "andor_blemish_correction": True,
+        }
+        self._sensor_values = {
+            "andor_readout_rate": ["100 MHz", "216 MHz - lowest noise",
+                                   "280 MHz", "540 MHz - fastest readout"],
+            "andor_gain_mode": ["11-bit (high well capacity)",
+                                "11-bit (low noise)",
+                                "12-bit (low noise)",
+                                "16-bit (low noise & high well capacity)"],
+        }
+        self._clip_level = 65535
+        # Raw-frame stats / averaged-capture stand-ins for integration tests.
+        self.raw_stats: "dict | None" = {
+            "min": 100.0, "max": 60000.0, "mean": 8000.0,
+            "clipped_frac": 0.0, "clip_level": 65535,
+            "hist": np.zeros(256, dtype=np.int64),
+            "hist_range": (0, 65536), "sample_count": 65536,
+            "temperature_c": 0.0, "temperature_status": "Stabilised",
+        }
+        self.raw_average_frame: "np.ndarray | None" = np.full(
+            (64, 64), 1234, dtype=np.uint16)
+        self.raw_average_calls: list = []
 
     # lifecycle
     def isOpened(self):
@@ -133,8 +163,58 @@ class FakeAndorCam:
     def get_gamma(self): return None
     def put_gamma(self, v): return False
 
+    # v7.13 — sensor-quality features + raw stats + averaged capture
+    def sensor_feature_specs(self):
+        return {k: {"kind": ("enum" if k in self._sensor_values else "bool"),
+                    "values": self._sensor_values.get(k)}
+                for k in self._sensor}
+
+    def sensor_feature_values(self, key):
+        vals = self._sensor_values.get(key)
+        return list(vals) if vals else None
+
+    def get_sensor_feature(self, key):
+        return self._sensor.get(key)
+
+    def set_sensor_feature(self, key, value):
+        if key not in self._sensor:
+            return False
+        if key in self._sensor_values and str(value) not in self._sensor_values[key]:
+            return False
+        self._sensor[key] = (str(value) if key in self._sensor_values
+                             else bool(value))
+        return True
+
+    def apply_sensor_defaults(self):
+        self._sensor.update({
+            "andor_sensor_cooling": True,
+            "andor_readout_rate": "216 MHz - lowest noise",
+            "andor_gain_mode": "16-bit (low noise & high well capacity)",
+            "andor_noise_filter": True,
+            "andor_blemish_correction": True,
+        })
+        return True
+
+    def get_sensor_temperature(self):
+        return 0.0
+
+    def get_temperature_status(self):
+        return "Stabilised"
+
+    def get_raw_clip_level(self):
+        return self._clip_level
+
+    def get_raw_frame_stats(self):
+        return dict(self.raw_stats) if self.raw_stats is not None else None
+
+    def capture_raw_average(self, n, timeout_s=10.0):
+        self.raw_average_calls.append((int(n), float(timeout_s)))
+        if self.raw_average_frame is None:
+            return None
+        return self.raw_average_frame.copy()
+
     def get_settings(self):
-        return {
+        d = {
             "brightness": None, "contrast": None, "gamma": None,
             "exposure_us": self._exposure_us,
             "exposure_gain_pct": None, "auto_exposure": None,
@@ -148,6 +228,15 @@ class FakeAndorCam:
             "resolutions": list(self._res),
             "device_id": self._device_id,
         }
+        # v7.13 additions (mirrors AndorBackend.get_settings()).
+        d.update(self._sensor)
+        d["andor_readout_rate_values"] = self.sensor_feature_values("andor_readout_rate")
+        d["andor_gain_mode_values"] = self.sensor_feature_values("andor_gain_mode")
+        d["temperature_c"] = self.get_sensor_temperature()
+        d["temperature_status"] = self.get_temperature_status()
+        d["bit_depth"] = "16 Bit"
+        d["raw_clip_level"] = self._clip_level
+        return d
 
 
 def _andor_widget(frame=None):

@@ -182,6 +182,9 @@ class CameraConfig:
         if self.camera_spec is None:
             return None
         effective = self.camera_spec.effective_pixel_size_um(self.active_resolution)
+        # v7.16: an unknown sensor pitch yields an unknown scale, not a guess.
+        if effective is None or not self.objective_magnification:
+            return None
         return effective / self.objective_magnification
 
     @property
@@ -458,6 +461,15 @@ class HardwareConfig:
     # both `plate_name` and `plate_format`.
     plate_type_id: str = ""
 
+    # ── v7.12: Parametric plate DOCUMENT (stable id) ──────────────
+    # The id of a `PlateDocument` in `PlateDocumentStore`. Unlike `plate_name`
+    # — which was the raw Save-As string, the filename AND the key of eight
+    # per-plate stores at once — this id is generated once at creation and
+    # never re-derived, so renaming a plate cannot orphan its taught
+    # calibration, mosaics or well training. `plate_name` is retained as a
+    # display cache and as the fallback for configs written before v7.12.
+    plate_doc_id: str = ""
+
     # ── Ink library (persisted across sessions) ───────────────────
     ink_library: dict[str, InkSpec] = field(default_factory=dict)
 
@@ -684,10 +696,59 @@ class HardwareConfig:
         into the individual fields. A plate-type id resolves to its base
         format geometry inside `WellPlate.load`, so the returned key may be a
         string even though the plate is geometrically a standard format.
+
+        v7.12 inserts `plate_doc_id` between the type and the legacy name.
         """
         if self.plate_type_id:
             return self.plate_type_id
+        if self.plate_doc_id:
+            return self.plate_doc_id
         return self.plate_name if self.plate_name else self.plate_format
+
+    def plate_z_offsets(self) -> dict:
+        """Learned needle-Z references for the active plate, mm below the
+        needle-camera fiducial, keyed ``top``/``bottom``/``safe``/``max``.
+
+        THE one resolver. Three sites used to reach for ``plate_type_id``
+        independently — the learn loop's writer, ``StageController``'s adopter
+        and the calibration page's auto-fill — so a plate identity that was not
+        a product had nowhere to store offsets and no way to read them back.
+
+        Merged **per key**, product first then design, so a design that has
+        learned only its plate bottom keeps inheriting its product's guesses
+        for top / safe / max. A measured value always wins over an inherited
+        one, and these are only ever the STARTING GUESS — a taught reference
+        is never overwritten by them (see
+        ``CalibrationPage._apply_plate_type_z_estimates``).
+        """
+        out: dict = {}
+        if self.plate_type_id:
+            try:
+                from SupportClasses.PlateTypeStore import get_store
+                pt = get_store().get(self.plate_type_id)
+                if pt is not None:
+                    out.update(pt.z_offsets or {})
+            except Exception as exc:                   # pragma: no cover
+                logger.debug(f"plate type Z offsets unavailable: {exc}")
+        if self.plate_doc_id:
+            try:
+                from SupportClasses.PlateDocumentStore import get_plate_store
+                doc = get_plate_store().get(self.plate_doc_id)
+                if doc is not None:
+                    out.update(doc.meta.z_offsets or {})
+            except Exception as exc:                   # pragma: no cover
+                logger.debug(f"plate document Z offsets unavailable: {exc}")
+        return out
+
+    def plate_z_offset_home(self) -> tuple[str, str]:
+        """``(kind, id)`` naming where a learned offset would be SAVED —
+        ``("document", <id>)``, ``("type", <id>)``, or ``("", "")`` when the
+        active plate is a bare standard format, which has nowhere to put it."""
+        if self.plate_doc_id:
+            return ("document", self.plate_doc_id)
+        if self.plate_type_id:
+            return ("type", self.plate_type_id)
+        return ("", "")
 
     @property
     def geometry_plate_key(self) -> int | str:
@@ -706,6 +767,14 @@ class HardwareConfig:
         file must exist; otherwise fall back to `active_plate_key` so a stale
         `plate_name` can't break the load.
         """
+        if self.plate_type_id and self.plate_doc_id:
+            # v7.12: a parametric document layered under a product.
+            try:
+                from SupportClasses.PlateDocumentStore import get_plate_store
+                if get_plate_store().get(self.plate_doc_id) is not None:
+                    return self.plate_doc_id
+            except Exception:   # pragma: no cover - defensive
+                pass
         if self.plate_type_id and self.plate_name:
             try:
                 from SupportClasses.WellPlate import USER_PLATES_DIR
@@ -837,7 +906,16 @@ class HardwareConfig:
             if pcfg.enabled and pcfg.syringe and not pcfg.has_ink:
                 issues.append(f"{pid} is enabled but has no ink assigned")
 
-        # Plate type / custom plate name / format (v7.5.x precedence)
+        # Plate identity. This MUST walk the same precedence as
+        # `active_plate_key` — `plate_type_id → plate_doc_id → plate_name →
+        # plate_format` — because it is checking that the key that property
+        # returns actually resolves. v7.12 inserted `plate_doc_id` into the
+        # property and not into here, so a v2 design fell through to the
+        # legacy `plate_name` branch and was looked up as a v1 file named
+        # after its DISPLAY NAME. That file will never exist: the whole point
+        # of the v7.12 identity change is that the filename is the stable id
+        # and the name is only a label. Every operator using a custom plate
+        # was blocked out of Calibration by a plate that was perfectly valid.
         if self.plate_type_id:
             # Selectable plate product — must resolve to a known base format.
             from SupportClasses.PlateTypeStore import get_store as _pt_store
@@ -850,8 +928,24 @@ class HardwareConfig:
                 issues.append(
                     f"Plate type '{self.plate_type_id}' has an invalid base "
                     f"format: {pt.base_format}")
+        elif self.plate_doc_id:
+            # v7.12 parametric design — must resolve in the document store,
+            # BY ID. A missing document is a real problem (the plate was
+            # deleted out from under the setup), so it is still reported.
+            from SupportClasses.PlateDocumentStore import (
+                get_plate_store as _doc_store)
+            try:
+                doc = _doc_store().get(self.plate_doc_id)
+            except Exception as exc:                   # pragma: no cover
+                doc, exc_note = None, exc
+                logger.debug(f"plate document lookup failed: {exc_note}")
+            if doc is None:
+                issues.append(
+                    f"Plate '{self.plate_name or self.plate_doc_id}' is no "
+                    f"longer in the plate library — pick one on Hardware "
+                    f"Setup → Plate")
         elif self.plate_name:
-            # Custom plate — file must exist under user plates dir.
+            # Legacy v1 custom plate — file must exist under user plates dir.
             from SupportClasses.WellPlate import USER_PLATES_DIR
             if not (USER_PLATES_DIR / f"{self.plate_name}.json").exists():
                 issues.append(
@@ -1202,6 +1296,7 @@ class HardwareConfig:
             "plate_format": self.plate_format,
             "plate_name": self.plate_name,  # v7.4.5
             "plate_type_id": self.plate_type_id,  # v7.5.x
+            "plate_doc_id": self.plate_doc_id,    # v7.12
             "ink_library": {name: ink.to_dict() for name, ink in self.ink_library.items()},
             # v7.5.x: reagent locations (ink name → wells); skip empty lists
             "ink_locations": {
@@ -1279,6 +1374,7 @@ class HardwareConfig:
         config.plate_name = data.get("plate_name", "") or ""
         # v7.5.x: selectable plate type/product id (takes precedence over both)
         config.plate_type_id = data.get("plate_type_id", "") or ""
+        config.plate_doc_id = data.get("plate_doc_id", "") or ""
 
         # Ink library
         for name, ink_data in data.get("ink_library", {}).items():

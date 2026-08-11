@@ -75,6 +75,19 @@ hiddenimports = [
     'serial',
     'serial.tools',
     'serial.tools.list_ports',
+    # .nd3 container (HDF5). h5py's own PyInstaller hook pulls its extension
+    # modules; these two are ours and are reached through lazy imports.
+    'h5py',
+    'SupportClasses.ND3',
+    'SupportClasses.ND3Export',
+    # LabLink client — vendored stdlib-only subpackage (v7.17). Imported
+    # lazily by LabLinkService so the app starts without it; PyInstaller's
+    # static analysis therefore does not see it.
+    'SupportClasses.lablink',
+    'SupportClasses.lablink.protocol',
+    'SupportClasses.lablink.fsutil',
+    'SupportClasses.lablink.client',
+    'SupportClasses.lablink.session_client',
     # Xbox controller
     'pygame',
     # App modules that may be imported dynamically

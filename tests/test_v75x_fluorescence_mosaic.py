@@ -714,10 +714,11 @@ class TestWorkerProducesComposite(unittest.TestCase):
             fresh_frames=1, fresh_timeout_s=0.5, settle_ms=0)
         got = {}
 
-        def on_done(comp, ext, scale, frames, shift):
+        def on_done(comp, ext, scale, frames, shift, meta=None):
             got["comp"] = comp
             got["ext"] = ext
             got["shift"] = shift
+            got["meta"] = meta
 
         worker.finished_ok.connect(on_done)
         worker.run()   # synchronous (same thread) — direct-connected slot fires
@@ -727,6 +728,11 @@ class TestWorkerProducesComposite(unittest.TestCase):
         # persist it — px → stage-µm needs extent[:2] − shift.
         self.assertIsNotNone(got.get("shift"))
         self.assertEqual(len(got["shift"]), 2)
+        # v7.13: the 6th arg is the capture meta; defaults for a legacy run
+        # (no averaging / no AF) are a plain single-frame record.
+        self.assertIsInstance(got.get("meta"), dict)
+        self.assertEqual(got["meta"].get("avg_frames"), 1)
+        self.assertIsNone(got["meta"].get("display_levels"))
 
 
 @unittest.skipUnless(_QT, "PySide6 not available")
@@ -738,16 +744,30 @@ class TestNavigatorRasterGrid(unittest.TestCase):
         from gui.widgets.jog_well_plate import WellPlateNavigator
         from PySide6.QtGui import QPixmap
 
+        # v7.12: the navigator lays wells out from their real x/y/diameter
+        # rather than from row/col grid cells, so a plate stub has to carry
+        # geometry — a stub with only row/col can no longer describe a plate
+        # this widget is able to draw.
         class _W:
             def __init__(self, name, row, col):
                 self.name = name; self.row = row; self.col = col
+                self.x = col * 9.0; self.y = row * 9.0
+                self.diameter = 6.35
 
         class _Plate:
             rows = 2; cols = 3
             well_spacing_x = 9.0
+            well_spacing_y = 9.0
+            well_diameter = 6.35
 
             def get_all_wells(self):
                 return [_W("A1", 0, 0), _W("A2", 0, 1), _W("B1", 1, 0)]
+
+            def well_diameter_of(self, name=None):
+                return self.well_diameter
+
+            def nearest_neighbour_pitch_mm(self):
+                return self.well_spacing_x
 
         nav = WellPlateNavigator()
         nav.set_plate(_Plate())

@@ -139,11 +139,43 @@ class NeedleFocusTemplateStore:
                     needle_type: str | None = None,
                     needle_bore_um: float | None = None,
                     needle_tip_length_mm: float | None = None,
-                    camobj: str = "") -> bool:
+                    camobj: str = "",
+                    microscope_focus_um: float | None = None,
+                    needle_z_user_mm: float | None = None,
+                    ground_truth: bool = False,
+                    adopted_by: str | None = None,
+                    auto_focus_um: float | None = None,
+                    margin_um: float | None = None) -> bool:
         """Append one in-focus needle capture. Returns False if nothing stored.
 
         ``center_offset_um`` is the NEEDLE's position minus the CAMERA CENTRE's
         position, in stage µm — see :meth:`needle_center_offset_um`.
+
+        v7.10 — ``microscope_focus_um`` / ``needle_z_user_mm`` record the OPTICAL
+        datum: the motorised microscope's focus-axis reading and the needle's own
+        height, both sampled at the instant the tip is confirmed sitting on the
+        plate bottom. Their difference ties the scope's focus axis to the needle
+        Z axis (see :meth:`focus_to_needle_z_mm`), which is what lets a refocus
+        predict a needle height instead of the operator re-touching off.
+
+        Both are optional and default to ``None``: a rig with no motorised focus
+        still gets a fully useful capture (the template patch and the needle↔
+        camera offset), and every capture written before v7.10 simply lacks the
+        keys — the readers skip those rather than inventing a value.
+
+        v7.11 — the training fields. ``ground_truth`` is set ONLY by an explicit
+        operator confirmation, and only such captures feed :meth:`focus_bias_um`
+        and the template bank; an unconfirmed capture is still stored, so a run
+        is never lost, but it does not teach anything. ``adopted_by`` is
+        ``"auto"`` or ``"operator"`` and ``auto_focus_um`` is what the estimator
+        proposed — recorded even when the operator overrode it, because the
+        DIFFERENCE is the entire training signal. A systematic difference means
+        the gradient metric peaks off the true tip focus for this needle type,
+        which is one measurable, correctable number; without storing both there
+        is nothing to measure it from.
+
+        All four are conditional-emit, so a capture that supplies none of them
+        round-trips byte-identically to a pre-v7.11 entry.
         """
         if not _CV2 or patch_bgr is None or getattr(patch_bgr, "size", 0) == 0:
             return False
@@ -183,8 +215,33 @@ class NeedleFocusTemplateStore:
             "stage_um": ([float(stage_um[0]), float(stage_um[1])]
                          if _is_xy(stage_um) else None),
             "well": str(well or ""),
+            # v7.10 optical datum. Stored as two RAW numbers rather than their
+            # difference on purpose: if the focus axis turns out to be inverted
+            # or differently scaled on some scope, a stored difference would be
+            # unrecoverable whereas these can be re-derived by hand.
+            "microscope_focus_um": (None if microscope_focus_um is None
+                                    else float(microscope_focus_um)),
+            "needle_z_user_mm": (None if needle_z_user_mm is None
+                                 else float(needle_z_user_mm)),
             "date": datetime.now().isoformat(timespec="seconds"),
         })
+        # v7.11 training fields — conditional-emit so a capture that supplies
+        # none of them is byte-identical to a pre-v7.11 entry.
+        cap = caps[-1]
+        if ground_truth:
+            cap["ground_truth"] = True
+        if adopted_by:
+            cap["adopted_by"] = str(adopted_by)
+        if auto_focus_um is not None:
+            try:
+                cap["auto_focus_um"] = float(auto_focus_um)
+            except (TypeError, ValueError):
+                pass
+        if margin_um is not None:
+            try:
+                cap["margin_um"] = float(margin_um)
+            except (TypeError, ValueError):
+                pass
         # Trim oldest first, and drop their images so the directory cannot grow
         # without bound across repeated recalibrations.
         while len(caps) > MAX_CAPTURES_PER_KEY:
@@ -302,6 +359,46 @@ class NeedleFocusTemplateStore:
                 worst = max(worst, math.dist((o[0], o[1]), mean))
         return worst
 
+    def _focus_datum_pairs(self, key) -> list:
+        """``[(microscope_focus_um, needle_z_user_mm), ...]`` for captures that
+        carry both. Pre-v7.10 captures lack the keys and are skipped."""
+        out = []
+        for c in self.captures(key):
+            f, z = c.get("microscope_focus_um"), c.get("needle_z_user_mm")
+            if isinstance(f, (int, float)) and isinstance(z, (int, float)):
+                if math.isfinite(float(f)) and math.isfinite(float(z)):
+                    out.append((float(f), float(z)))
+        return out
+
+    def focus_to_needle_z_mm(self, key) -> Optional[float]:
+        """Mean ``K = needle_z_user_mm − microscope_focus_um/1000`` (mm), or None.
+
+        The invariant that turns the microscope's focus axis into a Z metrology
+        tool: with the scope focused on any plane, the needle height that reaches
+        that plane is ``needle_z_user ≈ K + focus_um/1000``.
+
+        Returns None when no capture carries the datum — which is the case for
+        every pre-v7.10 file and for any rig without a motorised focus axis, so
+        callers must treat None as "not measured", never as zero.
+        """
+        pairs = self._focus_datum_pairs(key)
+        if not pairs:
+            return None
+        return sum(z - f / 1000.0 for f, z in pairs) / len(pairs)
+
+    def focus_to_needle_z_spread_mm(self, key) -> Optional[float]:
+        """Max |K_i − mean K| across captures (mm), or None with < 2 samples.
+
+        A large spread means the focus axis disagrees with the needle Z axis in
+        scale or sign — the failure this datum could otherwise hide. Surface it;
+        do not average it away.
+        """
+        pairs = self._focus_datum_pairs(key)
+        mean = self.focus_to_needle_z_mm(key)
+        if mean is None or len(pairs) < 2:
+            return None
+        return max(abs((z - f / 1000.0) - mean) for f, z in pairs)
+
     def reference_focus_score(self, key) -> Optional[float]:
         """Median in-focus score across captures, or None.
 
@@ -314,6 +411,42 @@ class NeedleFocusTemplateStore:
             return None
         m = len(vals) // 2
         return vals[m] if len(vals) % 2 else (vals[m - 1] + vals[m]) / 2.0
+
+    def ground_truth_captures(self, key) -> list:
+        """Only the captures an operator explicitly confirmed.
+
+        The bank is worth exactly what its labels are worth. A capture the
+        operator never confirmed may be centred on a reflection, a neighbouring
+        bore or the well wall, and averaging those into the reference is how a
+        "trained" model gets quietly worse than no model.
+        """
+        return [c for c in self.captures(key) if c.get("ground_truth") is True]
+
+    def focus_bias_um(self, key) -> Optional[float]:
+        """Median ``operator_focus − auto_focus`` (µm) over confirmed captures.
+
+        The one learnable parameter here. ``compute_focus_score`` is a gradient
+        metric on a 3-D specular tip: it can peak reproducibly a few µm off the
+        plane the operator judges to be the true tip focus, and if it does so
+        CONSISTENTLY for a needle type that is a correctable bias, not noise.
+
+        Median over ground truth only, and ``None`` below two samples — one
+        disagreement is an anecdote. None means "not measured": callers must not
+        read it as zero, since a zero bias is itself a claim.
+        """
+        deltas = []
+        for c in self.ground_truth_captures(key):
+            auto = c.get("auto_focus_um")
+            got = c.get("microscope_focus_um")
+            if (isinstance(auto, (int, float)) and isinstance(got, (int, float))
+                    and math.isfinite(float(auto)) and math.isfinite(float(got))):
+                deltas.append(float(got) - float(auto))
+        if len(deltas) < 2:
+            return None
+        deltas.sort()
+        m = len(deltas) // 2
+        return (deltas[m] if len(deltas) % 2
+                else 0.5 * (deltas[m - 1] + deltas[m]))
 
     def summary(self, key) -> str:
         """One-line operator-facing description of what is stored."""

@@ -32,6 +32,7 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QLinearGradient
 
 from gui.styles import COLORS
 from gui.scaling import s as _sc, scaled_font_size
+from gui.widgets.plate_layout import fit_wells
 
 try:
     from SupportClasses.PrintManager import PrintState
@@ -74,6 +75,9 @@ class PlateOverviewWidget(QWidget):
         self._needle_y: float | None = None
         self._margin = 28
         self._active_well = ""
+        # v7.12: plate outline in the A1-relative mm frame, when resolvable.
+        self._footprint: tuple[float, float, float, float] | None = None
+        self._grid_headers = True
         # v7.5.x: per-machine plate orientation. Wells are drawn PLATE-LOCAL
         # (A1 top-left, +col right / +row down), but the live needle is fed in
         # the zero-ref STAGE frame. On a 180°-mounted stage (ME3B V1) the two
@@ -82,9 +86,24 @@ class PlateOverviewWidget(QWidget):
         self._flip_180 = False
 
     def set_plate(self, plate):
+        # v7.12: resolve each diameter through the plate so a parametric plate
+        # (per-well diameters, plate-level 0.0) sizes every well correctly.
         self._wells = [{"name": w.name, "x": w.x, "y": w.y,
-                        "diameter": w.diameter, "row": w.row, "col": w.col}
+                        "diameter": plate.well_diameter_of(w.name),
+                        "row": w.row, "col": w.col}
                        for w in plate.get_all_wells()]
+        self._grid_headers = bool(getattr(plate, "well_spacing_x", 0) > 0
+                                  and getattr(plate, "well_spacing_y", 0) > 0)
+        self._footprint = None
+        try:
+            from SupportClasses.PlateDocumentStore import (
+                plate_footprint_extent_mm,
+            )
+            self._footprint = plate_footprint_extent_mm(
+                getattr(plate, "format", None))
+        except Exception:                                  # pragma: no cover
+            logger.debug("No plate footprint for monitor overview",
+                         exc_info=True)
         self._well_states.clear()
         self._well_roles.clear()
         self.update()
@@ -133,15 +152,23 @@ class PlateOverviewWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QColor(COLORS.get("mantle", "#181825")))
 
-        max_x = max((w["x"] for w in self._wells), default=1) or 1
-        max_y = max((w["y"] for w in self._wells), default=1) or 1
-        aw = self.width() - 2 * self._margin
-        ah = self.height() - 2 * self._margin
-        scale = min(aw / max(max_x, 0.1), ah / max(max_y, 0.1))
-        wr = max(self._wells[0]["diameter"] * scale / 2, 4) * 0.75
+        # v7.12: fit from the full extent — including every well's own radius
+        # and the minimum corner, not just max_x/max_y — so wells are not
+        # clipped at the edges; and size each well by its OWN diameter instead
+        # of reusing the first well's, which drew a plate's 5.5 mm rosette
+        # bores as 28 mm blobs overlapping their neighbours.
+        transform = fit_wells(
+            [(w["name"], w["x"], w["y"], w["diameter"]) for w in self._wells],
+            self.width(), self.height(),
+            (self._margin, self._margin, self._margin, self._margin),
+            footprint=self._footprint, min_radius_px=3.0)
+        if transform is None:
+            return
+        scale = transform.scale
 
         for w in self._wells:
-            cx, cy = self._margin + w["x"] * scale, self._margin + w["y"] * scale
+            cx, cy = transform.to_px(w["x"], w["y"])
+            wr = transform.radius_px(w["diameter"]) * 0.75
             name = w["name"]
             state = self._well_states.get(name)
             if state and state in self.STATE_COLORS:
@@ -163,8 +190,8 @@ class PlateOverviewWidget(QWidget):
             # Map the zero-ref needle into the plate-local well frame: on a
             # 180°-mounted stage the plate axes are negated relative to stage.
             nsign = -1.0 if self._flip_180 else 1.0
-            nx = self._margin + (self._needle_x * nsign) * scale
-            ny = self._margin + (self._needle_y * nsign) * scale
+            nx, ny = transform.to_px(self._needle_x * nsign,
+                                     self._needle_y * nsign)
             pen = QPen(self.NEEDLE_COLOR, 2)
             p.setPen(pen)
             p.drawLine(QPointF(nx - 8, ny), QPointF(nx + 8, ny))
@@ -172,15 +199,22 @@ class PlateOverviewWidget(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QPointF(nx, ny), 4, 4)
 
-        # Headers
-        p.setPen(QColor("#6c7086")); p.setFont(QFont("Arial", scaled_font_size(7)))
-        rows_done, cols_done = set(), set()
-        for w in self._wells:
-            cx, cy = self._margin + w["x"] * scale, self._margin + w["y"] * scale
-            if w["col"] == 0 and w["row"] not in rows_done:
-                rows_done.add(w["row"]); p.drawText(QPointF(3, cy + 3), w["name"][0])
-            if w["row"] == 0 and w["col"] not in cols_done:
-                cols_done.add(w["col"]); p.drawText(QPointF(cx - 3, self._margin - 5), str(w["col"] + 1))
+        # Headers — only on a real grid. v7.12: `row`/`col` are a pseudo-grid on
+        # a parametric plate (a whole ring shares one cell), so the letters
+        # would label wells that are not in that row.
+        if self._grid_headers:
+            p.setPen(QColor("#6c7086"))
+            p.setFont(QFont("Arial", scaled_font_size(7)))
+            rows_done, cols_done = set(), set()
+            for w in self._wells:
+                cx, cy = transform.to_px(w["x"], w["y"])
+                if w["col"] == 0 and w["row"] not in rows_done:
+                    rows_done.add(w["row"])
+                    p.drawText(QPointF(3, cy + 3), w["name"][0])
+                if w["row"] == 0 and w["col"] not in cols_done:
+                    cols_done.add(w["col"])
+                    p.drawText(QPointF(cx - 3, self._margin - 5),
+                               str(w["col"] + 1))
         p.end()
 
 

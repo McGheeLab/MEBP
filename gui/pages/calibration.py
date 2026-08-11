@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QDoubleSpinBox,
     QFrame, QSizePolicy, QMessageBox, QCheckBox, QSlider,
     QScrollArea, QTabWidget, QSplitter, QListWidget, QListWidgetItem,
+    QStackedWidget, QToolButton,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject
 from PySide6.QtGui import QFont
@@ -33,6 +34,8 @@ from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPixmap
 
 from SupportClasses.StageController import StageController, plate_relative_to_zref
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
+from SupportClasses.CaptureTiming import resolve_grab_timing
+from SupportClasses.FrameAveraging import average_if_agreeing
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
 from gui.scaling import s, sf, sp, scaled_font_size
@@ -624,8 +627,15 @@ class _MosaicScanWorker(QThread):
                  expected_d_px, min_dist_px, fresh_frames=3,
                  fresh_timeout_s=2.5, settle_ms=0,
                  detect_param2=30.0, detect_tolerance=0.35,
-                 frame_orient="none", parent=None):
+                 frame_orient="none", avg_frames=1,
+                 regularize_intensity=True, parent=None):
         super().__init__(parent)
+        # v7.16: even out vignetting + tile-to-tile level after the scan.
+        # Default on; a scan too small for a reliable estimate self-disables.
+        self._regularize_intensity = bool(regularize_intensity)
+        # v7.14: frames averaged per tile (SNR x sqrt(N)). 1 = off, and off is
+        # byte-identical to the pre-v7.14 single-frame path.
+        self._avg_frames = max(1, int(avg_frames or 1))
         self._controller = controller
         self._cam = cam
         self._builder = builder
@@ -678,31 +688,122 @@ class _MosaicScanWorker(QThread):
         return frame
 
     def _grab_post_move_frame(self):
-        """Give the camera time to settle, then wait for the GUI grab timer to
-        deliver N fresh frames (draining any buffered backlog so the frame is
-        post-move) and return the latest."""
+        """Settle, then wait for N genuinely-new camera frames and return the
+        latest — or None if they never arrived.
+
+        v7.14, two changes that matter at full resolution:
+
+        * The timeout is sized from the camera's OWN frame period. A flat 2.5 s
+          is ample at preview rates and too short at 2048x2048 with a long
+          exposure, where three frames can take several seconds.
+        * A timeout now returns **None** instead of whatever happened to be in
+          the buffer. The old code fell through to ``get_current_frame()``
+          unconditionally, so a camera that had not delivered a post-move frame
+          contributed a STALE tile — stitched at the new canvas position, which
+          is the same "duplicate image at the wrong spot" corruption the
+          arrival check exists to prevent, except silent. The caller already
+          treats None correctly (warns, counts, aborts on a sustained run).
+        """
         cam = self._cam
-        # Settle first: lets the exposure window / callback advance past the
-        # move so the frames we then count are genuinely post-move + sharp.
+        # Settle first: mechanical, and it lets an in-flight exposure that
+        # straddles the move complete before we start counting.
         if self._settle_ms > 0 and not self._stop:
             time.sleep(self._settle_ms / 1000.0)
         try:
             c0 = cam.frame_count_value()
         except Exception:
             c0 = None
-        if c0 is not None:
-            t_end = time.time() + self._fresh_timeout_s
+        if c0 is None:
+            # Camera cannot report frame arrivals — fall back to the settle
+            # alone, as before, rather than refusing to scan at all.
+            try:
+                return cam.get_current_frame()
+            except Exception:
+                return None
+
+        n_frames, timeout_s, _period = resolve_grab_timing(
+            cam, self._fresh_frames, self._fresh_timeout_s)
+        fresh = False
+        t_end = time.time() + timeout_s
+        while time.time() < t_end and not self._stop:
+            try:
+                if cam.frame_count_value() - c0 >= n_frames:
+                    fresh = True
+                    break
+            except Exception:
+                # Reporting broke mid-wait: accept the frame rather than lose
+                # the tile, matching the no-counter path above.
+                fresh = True
+                break
+            time.sleep(0.02)
+        if self._stop:
+            return None
+        if not fresh:
+            logger.warning(
+                "Mosaic worker: no new camera frame within %.1f s after the "
+                "move (needed %d) — dropping this tile rather than stitching "
+                "a frame exposed before/during the move", timeout_s, n_frames)
+            return None
+        try:
+            first = cam.get_current_frame()
+        except Exception:
+            return None
+        if first is None or self._avg_frames <= 1:
+            return first
+        return self._average_more(cam, first, timeout_s)
+
+    def _average_more(self, cam, first, timeout_s):
+        """Collect further post-move frames and average them (SNR x sqrt(N)).
+
+        The gate above already discarded the frame that may have straddled the
+        move, so ``first`` is clean and counts as one of the N — only N-1 more
+        are waited for.
+
+        Averaging is REFUSED when the frames do not show the same thing (stage
+        still settling, drift, lamp flicker, an auto-exposure step): the mean
+        would then be blurred, which is worse than one sharp frame and looks
+        plausible enough that nothing downstream would notice. See
+        SupportClasses/FrameAveraging.py for the statistic and its measured
+        separation from shot noise.
+        """
+        frames = [first]
+        for _ in range(self._avg_frames - 1):
+            if self._stop:
+                break
+            try:
+                base = cam.frame_count_value()
+            except Exception:
+                break
+            got = False
+            t_end = time.time() + timeout_s
             while time.time() < t_end and not self._stop:
                 try:
-                    if cam.frame_count_value() - c0 >= self._fresh_frames:
+                    if cam.frame_count_value() > base:
+                        got = True
                         break
                 except Exception:
                     break
                 time.sleep(0.02)
-        try:
-            return cam.get_current_frame()
-        except Exception:
-            return None
+            if not got:
+                break
+            try:
+                f = cam.get_current_frame()
+            except Exception:
+                break
+            if f is None:
+                break
+            frames.append(f)
+        if len(frames) < 2:
+            return first
+        frame, n_used, note = average_if_agreeing(frames)
+        if note:
+            # Not an error — one sharp frame is exactly the pre-v7.14 result.
+            logger.info("Mosaic worker: averaging skipped for this tile — %s",
+                        note)
+        elif n_used < self._avg_frames:
+            logger.debug("Mosaic worker: averaged %d of %d requested frames",
+                         n_used, self._avg_frames)
+        return frame
 
     # Abort the scan if this many consecutive tiles yield no fresh frame
     # (camera stopped / crashed) rather than silently building a partial mosaic.
@@ -958,6 +1059,26 @@ class _MosaicScanWorker(QThread):
             except Exception as e:
                 logger.debug(f"Mosaic global optimize skipped: {e}")
 
+            # v7.16: even out illumination across the finished mosaic — the
+            # vignetting that makes every tile boundary a soft dark seam, and
+            # the tile-to-tile level drift. Runs AFTER the global optimize so it
+            # re-blends at the final positions (it is handed them explicitly;
+            # otherwise a re-blend here would undo the registration).
+            # Best-effort and self-disabling: too few tiles, or a degenerate
+            # estimate, leaves the composite exactly as it was.
+            try:
+                if (self._regularize_intensity
+                        and hasattr(self._builder, "regularize_intensity")
+                        and self._builder.has_reorient_tiles()):
+                    _c, _ff, _ng = self._builder.regularize_intensity()
+                    if _ff or _ng:
+                        logger.info(
+                            f"Mosaic intensity regularized "
+                            f"(flat-field={'yes' if _ff else 'no'}, "
+                            f"{_ng} tiles level-matched)")
+            except Exception as e:
+                logger.debug(f"Mosaic intensity regularize skipped: {e}")
+
             # Aggregate the per-overlap measurements into ONE global alignment
             # shift (median, bounded) applied uniformly via canvas_extent_um —
             # featureless tiles contributed nothing and are unaffected.
@@ -1018,6 +1139,47 @@ class _MosaicScanWorker(QThread):
             self.failed.emit(str(e))
         finally:
             self._resume_poller()
+
+
+
+# ── v7.12: plate geometry helpers (module level, not methods) ─────
+#
+# Free functions rather than CalibrationPage methods on purpose: this page is
+# routinely exercised through `CalibrationPage.__new__` / SimpleNamespace stubs
+# that carry only the attributes a handler touches, and a new bound helper
+# would break every one of those call sites. They take the plate explicitly,
+# which the stubs already supply.
+
+def _well_diameter_mm(plate, well_name: str | None = None) -> float:
+    """Well diameter (mm) for sizing detection / search radii.
+
+    Every radius on this page used to come from ``plate.well_diameter``, which
+    is 0.0 on a parametric plate ("varies — see WellInfo per well") — so the
+    expected-circle radius, the rim-fit tolerance and the mosaic metrics all
+    collapsed to zero and detection could not succeed. Pass a well name
+    whenever one is in scope so a 5.5 mm rosette bore is not searched for at a
+    28 mm insert's radius.
+    """
+    if plate is None:
+        return 0.0
+    try:
+        return float(plate.well_diameter_of(well_name))
+    except Exception:                                      # pragma: no cover
+        return float(getattr(plate, "well_diameter", 0.0) or 0.0)
+
+
+def _well_pitch_mm(plate) -> float:
+    """Typical well-to-well spacing (mm); 0.0 if unknown.
+
+    ``well_spacing_x``/``_y`` are 0.0 on a parametric plate, which turned every
+    "within one well pitch" gate into "within nothing".
+    """
+    if plate is None:
+        return 0.0
+    try:
+        return float(plate.nearest_neighbour_pitch_mm())
+    except Exception:                                      # pragma: no cover
+        return float(getattr(plate, "well_spacing_x", 0.0) or 0.0)
 
 
 class _SubPlate:
@@ -1370,7 +1532,10 @@ class CalibrationPage(QWidget):
 
                   # v7.4.4: new Z reference heights for the Needle
                   # Offset Calibration tab.
-                  '_replace_z','_max_z','_plate_bottom_z']:
+                  '_replace_z','_max_z','_plate_bottom_z',
+
+                  # v7.9.1: the plate-bottom anchor (bed-level plane origin).
+                  '_plate_bottom_anchor_xy_um','_plate_bottom_z_source']:
 
             if not hasattr(self, _a): setattr(self, _a, None)
 
@@ -1517,6 +1682,10 @@ class CalibrationPage(QWidget):
         self._replace_z = None
         self._max_z = None
         self._plate_bottom_z = None
+        # v7.9.1: WHERE the plate bottom was taught (absolute stage µm) and by
+        # which method. The bed-level survey anchors its plane on this point.
+        self._plate_bottom_anchor_xy_um = None
+        self._plate_bottom_z_source = None
         self._three_well_calibration = None
         self._plate_warp = None
         self._calibrated_positions = None
@@ -1654,6 +1823,66 @@ class CalibrationPage(QWidget):
             "plate_top_z":    getattr(self, "_top_z", None),
             "plate_bottom_z": getattr(self, "_plate_bottom_z", None),
         }
+
+    #: Default: every reference gets a quick-move badge (the pre-v7.9.1 look).
+    _ALL_Z_REF_KEYS = ("replace_z", "max_z", "fast_move_z",
+                       "plate_top_z", "plate_bottom_z")
+
+    def get_z_reference_visibility(self) -> dict:
+        """v7.9.1: which Z references get a badge on the quick-move strip.
+
+        ``{key: bool}`` over the same five keys as :meth:`get_z_references`.
+        Deliberately a SEPARATE dict rather than ``None``-ing a hidden entry in
+        that one: the reference dict feeds the controller's print-floor datum
+        and the Hardware Info card, so hiding a badge by blanking the value
+        would disarm a safety clamp to tidy a strip.
+        """
+        checks = getattr(self, "_zoff_qm_checks", None) or {}
+        return {k: bool(checks[k].isChecked()) if k in checks else True
+                for k in self._ALL_Z_REF_KEYS}
+
+    def visible_z_reference_keys(self) -> list:
+        """The ticked keys, in the canonical order."""
+        vis = self.get_z_reference_visibility()
+        return [k for k in self._ALL_Z_REF_KEYS if vis.get(k, True)]
+
+    def _zoff_on_quick_move_toggled(self, _checked: bool = False) -> None:
+        """A "Quick move" tick changed — persist and fan out."""
+        self._zoff_apply_quick_move_visibility()
+        try:
+            if self.settings is not None:
+                self.settings.set("calibration.z_ref_visible",
+                                  self.get_z_reference_visibility())
+                self.settings.save()
+        except Exception as exc:                       # noqa: BLE001
+            logger.debug("Could not persist z_ref_visible: %s", exc)
+        self._emit_calibration_data_changed()
+
+    def _zoff_apply_quick_move_visibility(self) -> None:
+        """Push the ticked subset onto this page's own XZ views."""
+        keys = self.visible_z_reference_keys()
+        for attr in ("_zoff_xz_view", "_ploc_xz_view"):
+            view = getattr(self, attr, None)
+            if view is not None and hasattr(view, "set_visible_z_references"):
+                view.set_visible_z_references(keys)
+
+    def _zoff_restore_quick_move_visibility(self) -> None:
+        """Restore the ticks from settings (all on when unset)."""
+        checks = getattr(self, "_zoff_qm_checks", None)
+        if not checks:
+            return
+        stored = None
+        try:
+            if self.settings is not None:
+                stored = self.settings.get("calibration.z_ref_visible")
+        except Exception:
+            stored = None
+        if isinstance(stored, dict):
+            for key, chk in checks.items():
+                chk.blockSignals(True)
+                chk.setChecked(bool(stored.get(key, True)))
+                chk.blockSignals(False)
+        self._zoff_apply_quick_move_visibility()
 
     def _reference_in_zero_ref(self) -> dict:
         """Taught reference markers (absolute stage µm) → zero-ref µm for the
@@ -1872,8 +2101,13 @@ class CalibrationPage(QWidget):
                     f"Failed to load plate '{geom_key}': {e}; "
                     f"falling back to 24-well")
                 self._plate = WellPlate.from_format(24)
-            rows, cols = self._plate.rows, self._plate.cols
-            self._corner_well = f"{chr(ord('A') + rows - 1)}{cols}"
+            # v7.12: the far corner is the well farthest from A1 in the real
+            # layout, not `f"{ROW_LABELS[rows-1]}{cols}"` — on a parametric
+            # plate that names a well that does not exist ("C5" on the
+            # operator's 12-well plate), and every Go-To-Corner and
+            # predicted-position call on it raised KeyError.
+            corner = self._plate.extreme_well(1.0, 1.0)
+            self._corner_well = corner or "A1"
             if hasattr(self, 'val_well_combo'):
                 wells = self._plate.well_names
                 self.val_well_combo.clear()
@@ -2001,6 +2235,14 @@ class CalibrationPage(QWidget):
                 self._bore_cal_refresh()
             except Exception as e:
                 logger.debug(f"bore-offset refresh skipped: {e}")
+        # v7.10: a new config can mean a different assembly, which invalidates
+        # any half-finished measurement in the wizard.
+        wiz = getattr(self, "_needle_bore_wizard", None)
+        if wiz is not None:
+            try:
+                wiz.set_hardware_config(config)
+            except Exception as e:
+                logger.debug(f"bore wizard config push skipped: {e}")
 
         # v7.4.4: keep the shared XY workspace view in sync with the
         # latest plate / needle / safety envelope.
@@ -2222,12 +2464,13 @@ class CalibrationPage(QWidget):
             f"border: 1px solid {COLORS['surface1']}; border-radius: 4px;")
         outer.addWidget(self._needle_loc_banner)
 
-        # ── Splitter: cameras (top) / wizard steps (bottom) ──────
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(s(4))
-
-        # Camera tiles row (a horizontal splitter inside the vertical one).
+        # ── v7.13: one BIG camera pane (left) + a compact wizard column
+        # (right). The pane is a QStackedWidget the wizard drives through its
+        # step_changed signal — the needle side cams during steps 1-2, the
+        # wizard's own microscope pane during steps 3-4 — so the step's
+        # relevant video is always the biggest thing on screen. The old layout
+        # buried the wizard (and its microscope feed) at the bottom of a
+        # scrolled 2/5-width column.
         cam_row_wrap = QWidget()
         cam_row = QHBoxLayout(cam_row_wrap)
         cam_row.setContentsMargins(0, 0, 0, 0)
@@ -2261,18 +2504,30 @@ class CalibrationPage(QWidget):
             slot.setProperty("_feed_view", None)
             cam_splitter.addWidget(slot)
         cam_row.addWidget(cam_splitter, stretch=1)
-        splitter.addWidget(cam_row_wrap)
+        cam_row_wrap.setMinimumHeight(s(240))
 
-        # Wizard panel.
-        wiz_panel = QWidget()
-        wiz_lay = QVBoxLayout(wiz_panel)
+        self._needle_loc_camera_stack = QStackedWidget()
+        self._needle_loc_camera_stack.addWidget(cam_row_wrap)     # page 0
+
+        # ── The wizard column (right) ────────────────────────────
+        wiz_col = QWidget()
+        wiz_lay = QVBoxLayout(wiz_col)
         wiz_lay.setContentsMargins(s(4), s(4), s(4), s(4))
         wiz_lay.setSpacing(s(6))
+
+        # Step-1 (needle-centring) controls — built as a PANEL that mounts
+        # INSIDE the wizard's step-1 page (set_step_panel), so the working
+        # controls are on the step that describes them instead of 2000 lines
+        # up a scrolled column. Every attribute name is unchanged.
+        s1_panel = QWidget()
+        s1_lay = QVBoxLayout(s1_panel)
+        s1_lay.setContentsMargins(0, 0, 0, 0)
+        s1_lay.setSpacing(s(6))
 
         self._needle_loc_step_label = QLabel()
         self._needle_loc_step_label.setStyleSheet(
             f"font-weight: 600; color: {COLORS['text']};")
-        wiz_lay.addWidget(self._needle_loc_step_label)
+        s1_lay.addWidget(self._needle_loc_step_label)
 
         # ── v7.5.x: Quick-move to the saved approximate needle location ──
         # The side cameras are bolted to the frame, so the centered needle
@@ -2311,13 +2566,13 @@ class CalibrationPage(QWidget):
             self._needle_loc_use_last_known)
         goto_row.addWidget(self._needle_loc_btn_last_known)
         goto_row.addStretch()
-        wiz_lay.addLayout(goto_row)
+        s1_lay.addLayout(goto_row)
 
         self._needle_loc_goto_label = QLabel()
         self._needle_loc_goto_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-size: 9pt;")
         self._needle_loc_goto_label.setWordWrap(True)
-        wiz_lay.addWidget(self._needle_loc_goto_label)
+        s1_lay.addWidget(self._needle_loc_goto_label)
 
         # Pick status table — four rows.
         self._needle_loc_pick_labels: dict[str, QLabel] = {}
@@ -2335,13 +2590,13 @@ class CalibrationPage(QWidget):
             v.setStyleSheet(f"color: {COLORS['subtext0']};")
             self._needle_loc_pick_labels[key] = v
             pick_grid.addWidget(v, row, 1)
-        wiz_lay.addLayout(pick_grid)
+        s1_lay.addLayout(pick_grid)
 
         # Computed offset preview.
         self._needle_loc_offset_label = QLabel("Offset preview: —")
         self._needle_loc_offset_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; font-style: italic;")
-        wiz_lay.addWidget(self._needle_loc_offset_label)
+        s1_lay.addWidget(self._needle_loc_offset_label)
 
         # v7.5.x: Z centering — drive Z so the tip's center-bottom lands on the
         # crosshair (rows of each side camera map to stage Z). Opt-in; the
@@ -2357,7 +2612,7 @@ class CalibrationPage(QWidget):
             "Z soft-limit. Click the tip's bottom-left / bottom-right corners.")
         self._needle_loc_z_center_chk.toggled.connect(
             lambda _=False: self._needle_loc_update_ui())
-        wiz_lay.addWidget(self._needle_loc_z_center_chk)
+        s1_lay.addWidget(self._needle_loc_z_center_chk)
 
         self._needle_loc_z_invert_chk = QCheckBox(
             "Invert Z direction (flipped camera mount)")
@@ -2366,7 +2621,7 @@ class CalibrationPage(QWidget):
             "instead of toward it.")
         self._needle_loc_z_invert_chk.toggled.connect(
             lambda _=False: self._needle_loc_update_ui())
-        wiz_lay.addWidget(self._needle_loc_z_invert_chk)
+        s1_lay.addWidget(self._needle_loc_z_invert_chk)
 
         # Action buttons.
         action_row = QHBoxLayout()
@@ -2380,33 +2635,86 @@ class CalibrationPage(QWidget):
         self._needle_loc_btn_center.clicked.connect(
             self._needle_loc_center_and_save)
         action_row.addWidget(self._needle_loc_btn_center)
-        wiz_lay.addLayout(action_row)
+        s1_lay.addLayout(action_row)
 
         # Last saved origin.
         self._needle_loc_origin_label = QLabel("needle_origin_um: not set")
         self._needle_loc_origin_label.setStyleSheet(
             f"color: {COLORS['subtext0']}; padding-top: {sp(6)};")
-        wiz_lay.addWidget(self._needle_loc_origin_label)
+        s1_lay.addWidget(self._needle_loc_origin_label)
 
-        # v7.9: per-bore mount offsets (hidden entirely for a single-bore needle,
-        # so every existing setup sees exactly the tab it saw before).
-        wiz_lay.addWidget(self._build_bore_offset_group())
+        # v7.10/v7.13: the microscope wizard — now THE bore-offset method (the
+        # offsets are camera-frame click differences), and the column's main
+        # occupant. Shown for EVERY needle: a single-bore assembly still needs
+        # its offset from the microscope camera centre, which is what makes a
+        # live-view click-to-pick land on the needle instead of the crosshair.
+        wiz = self._build_needle_bore_wizard()
+        if hasattr(wiz, "set_step_panel"):
+            try:
+                from gui.widgets.needle_bore_wizard import STEP_NEEDLE_ZERO
+                wiz.set_step_panel(STEP_NEEDLE_ZERO, s1_panel)
+            except Exception:
+                wiz_lay.addWidget(s1_panel)
+        else:
+            # Import-poor build: the wizard is a bare placeholder, so the
+            # centring controls mount directly on the column.
+            wiz_lay.addWidget(s1_panel)
+        wiz_lay.addWidget(wiz, stretch=1)
 
-        splitter.addWidget(wiz_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # The wizard's microscope pane is page 1 of the big camera stack.
+        pane = (wiz.microscope_pane()
+                if hasattr(wiz, "microscope_pane") else None)
+        self._needle_loc_camera_stack.addWidget(
+            pane if pane is not None else QWidget())              # page 1
+        if hasattr(wiz, "step_changed"):
+            wiz.step_changed.connect(self._needle_loc_show_camera_pane)
+            self._needle_loc_show_camera_pane(
+                getattr(wiz, "current_step", ""))
 
-        # ── v7.5.x: merge the former "Needle Offset Calibration" tab in as the
-        # right pane. Center the needle in the side cameras (left) while setting
-        # its reference-Z heights on the XZ elevation view (right) — one tab,
-        # since the operator treats them as the same needle-reference cal.
+        # ── Advanced Z references — the full reference-heights panel
+        # (Replace/Max Z, the XZ side view, needle-cam estimates, the learn
+        # loop), collapsed by default. Step 2 carries the primary flow now;
+        # this is the escape hatch. Its content keeps its own scroll area.
+        self._needle_loc_adv_btn = QToolButton()
+        self._needle_loc_adv_btn.setText("Advanced Z references…")
+        self._needle_loc_adv_btn.setCheckable(True)
+        self._needle_loc_adv_btn.setChecked(False)
+        self._needle_loc_adv_btn.setArrowType(Qt.RightArrow)
+        self._needle_loc_adv_btn.setToolButtonStyle(
+            Qt.ToolButtonTextBesideIcon)
+        adv_content = self._build_z_offset_content()
+        adv_content.setVisible(False)
+
+        def _adv_toggled(on: bool) -> None:
+            adv_content.setVisible(bool(on))
+            self._needle_loc_adv_btn.setArrowType(
+                Qt.DownArrow if on else Qt.RightArrow)
+        self._needle_loc_adv_btn.toggled.connect(_adv_toggled)
+        wiz_lay.addWidget(self._needle_loc_adv_btn)
+        wiz_lay.addWidget(adv_content, stretch=1)
+
+        # v7.9 side-camera bore group: built but NOT shown (v7.13 — the
+        # camera-click wizard is the method; this stays alive as the
+        # cross-validator and because its gates/tests pin it). It must keep a
+        # hidden PARENT: _bore_cal_refresh calls setVisible(True) on it for a
+        # multi-bore needle, and an unparented widget would float as a
+        # top-level window.
+        legacy_host = QWidget()
+        legacy_lay = QVBoxLayout(legacy_host)
+        legacy_lay.setContentsMargins(0, 0, 0, 0)
+        legacy_lay.addWidget(self._build_bore_offset_group())
+        legacy_host.hide()
+        wiz_lay.addWidget(legacy_host)
+
+        # ── One horizontal splitter: big video left, wizard column right.
         main_split = QSplitter(Qt.Horizontal)
         main_split.setChildrenCollapsible(False)
         main_split.setHandleWidth(s(4))
-        main_split.addWidget(splitter)
-        main_split.addWidget(self._build_z_offset_content())
+        main_split.addWidget(self._needle_loc_camera_stack)
+        main_split.addWidget(wiz_col)
         main_split.setStretchFactor(0, 3)
-        main_split.setStretchFactor(1, 2)
+        main_split.setStretchFactor(1, 1)
+        wiz_col.setMinimumWidth(s(360))
         outer.addWidget(main_split, stretch=1)
 
         # Initial UI state.
@@ -2415,6 +2723,19 @@ class CalibrationPage(QWidget):
         self._needle_loc_update_goto_ui()
         self._bore_cal_refresh()
         return page
+
+    def _needle_loc_show_camera_pane(self, step_key: str) -> None:
+        """Switch the big camera pane to match the wizard's step.
+
+        Steps 1-2 look at the needle side cameras; steps 3-4 look at the
+        microscope. String keys rather than imported constants so an
+        import-poor build degrades to page 0.
+        """
+        stack = getattr(self, "_needle_loc_camera_stack", None)
+        if stack is None or stack.count() < 2:
+            return
+        stack.setCurrentIndex(
+            1 if step_key in ("bores", "touchoff") else 0)
 
     # ════════════════════════════════════════════════════════════════
     #  v7.5.x: Pump compliance / pressure-relief calibration
@@ -2667,6 +2988,11 @@ class CalibrationPage(QWidget):
                     cam_idx=cam_idx,
                     show_crosshair=True,
                     label=f"Camera {cam_idx + 1}",
+                    # v7.10: un-mirrored, but held at a fixed quarter-turn — a
+                    # needle feed must never rotate by the residual (see the
+                    # Needle Location feed for the reasoning).
+                    auto_orient=True,
+                    snap_rotation_to_cardinal=True,
                     parent=slot,
                 )
                 slot.layout().addWidget(fv, stretch=1)
@@ -2989,11 +3315,33 @@ class CalibrationPage(QWidget):
                     cam_idx=cam_idx,
                     show_crosshair=True,
                     label=f"Camera {cam_idx + 1}",
+                    # v7.10: un-mirror the view, but hold it at a FIXED
+                    # quarter-turn — never at the measured angle.
+                    #
+                    # The residual roll is precisely what the operator squares
+                    # out by turning the camera in its mount. Correcting it in
+                    # software destroys their only feedback: the tilt vanishes,
+                    # and as they turn the camera the correction follows them, so
+                    # the picture never appears to move. Snapping to
+                    # 0/90/180/270 keeps the view stable and leaves the residual
+                    # on screen where it can be driven to zero by hand. (It also
+                    # keeps a camera still carrying the pre-v7.5.x conflated
+                    # ±45° from tilting.)
+                    #
+                    # The FULL angle still drives the geometry, and clicks are
+                    # reported in RAW frame pixels either way, so
+                    # TwoCameraNeedleAligner's arithmetic is untouched.
+                    auto_orient=True,
+                    snap_rotation_to_cardinal=True,
                     parent=slot,
                 )
                 fv.clicked.connect(
                     lambda px, py, role_=role: self._needle_loc_on_click(role_, px, py)
                 )
+                # Edges are picked by clicking on this image, so it has to stay
+                # big enough to aim at. Matches the placeholder's own min-height
+                # so the pane does not resize when a camera is assigned.
+                fv.setMinimumHeight(s(180))
                 slot.layout().addWidget(fv, stretch=1)
                 slot.setProperty("_feed_view", fv)
                 if placeholder is not None:
@@ -3212,6 +3560,12 @@ class CalibrationPage(QWidget):
             return None
         invert = (hasattr(self, "_needle_loc_z_invert_chk")
                   and self._needle_loc_z_invert_chk.isChecked())
+        # v7.10: prefer the MEASURED Z→row sign per camera. The two-leg needle
+        # calibration moves the needle a known distance UP and watches which way
+        # it goes in each view, so this stops being a checkbox the operator has
+        # to get right — a wrong guess drove the needle the wrong way in Z.
+        # Absent (never measured) keeps the checkbox in charge, so a camera
+        # calibrated the old way behaves exactly as before.
         estimates: list[float] = []
         for role, left_key, right_key in (
             (CameraRole.NEEDLE_X, "x_left", "x_right"),
@@ -3239,11 +3593,32 @@ class CalibrationPage(QWidget):
             tip_row = (self._needle_loc_rows[left_key]
                        + self._needle_loc_rows[right_key]) / 2.0
             row_offset_px = tip_row - (frame_h / 2.0)  # + = below center
-            estimates.append(row_offset_px * um_per_px)
+            estimates.append(
+                row_offset_px * um_per_px
+                * self._needle_loc_z_sign(cam_idx, invert))
         if not estimates:
             return None
-        height_um = sum(estimates) / len(estimates)
-        return -height_um if invert else height_um
+        return sum(estimates) / len(estimates)
+
+    def _needle_loc_z_sign(self, cam_idx, invert: bool) -> float:
+        """+1 / −1 for a needle camera's Z→image-row direction.
+
+        The measured value (two-leg calibration, stored per device identity)
+        wins; the manual *Invert Z* checkbox is the fallback for a camera that
+        has never had its Z leg measured.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is not None:
+            try:
+                ident = mgr.camera_identity(cam_idx)
+                if ident and ident[0]:
+                    from SupportClasses.CameraCalibrationStore import get_store
+                    measured = get_store().get_z_row_sign(ident[0])
+                    if measured is not None:
+                        return float(measured)
+            except Exception:
+                pass
+        return -1.0 if invert else 1.0
 
     def _needle_loc_offset_breakdown(self) -> str:
         """Compact per-camera column-offset string for the preview label.
@@ -3600,6 +3975,116 @@ class CalibrationPage(QWidget):
 
     # ── refresh ──────────────────────────────────────────────────
 
+    # ── v7.10: the microscope bore wizard ────────────────────────
+
+    def _build_needle_bore_wizard(self) -> QWidget:
+        """Mount :class:`NeedleBoreWizard`, or a quiet placeholder if absent.
+
+        The wizard owns presentation and the click arithmetic only; every datum
+        write (``needle_origin_um``, the reference Z heights, the plate-bottom
+        Z) still goes through this page's existing single writers, which the
+        wizard reaches through ``host``. Two writers for one datum is how a
+        second source of truth is born.
+        """
+        try:
+            from gui.widgets.needle_bore_wizard import NeedleBoreWizard
+        except ImportError as e:                     # pragma: no cover
+            logger.debug(f"needle bore wizard unavailable: {e}")
+            self._needle_bore_wizard = None
+            return QWidget()
+        try:
+            wiz = NeedleBoreWizard(host=self, parent=self)
+        except Exception as e:                       # pragma: no cover
+            logger.warning(f"needle bore wizard failed to build: {e}")
+            self._needle_bore_wizard = None
+            return QWidget()
+        wiz.calibration_changed.connect(self._emit_calibration_data_changed)
+        wiz.bore_offsets_changed.connect(self._bore_cal_apply_stored)
+        wiz.bore_offsets_changed.connect(self._bore_cal_refresh)
+        self._needle_bore_wizard = wiz
+        return wiz
+
+    def _needle_bore_wizard_click(self, px: float, py: float) -> None:
+        """Route a microscope-feed click to the wizard when it wants one.
+
+        The Plate Z Auto-Cal live view is shared, so this is a no-op unless the
+        wizard is actually on its bore-clicking step — a stray click elsewhere
+        must never record a bore.
+        """
+        wiz = getattr(self, "_needle_bore_wizard", None)
+        if wiz is None:
+            return
+        try:
+            wiz.on_view_clicked(px, py)
+        except Exception as e:                       # pragma: no cover
+            logger.debug(f"bore wizard click skipped: {e}")
+
+    def _bore_cal_gate_key(self):
+        """A cheap, hashable snapshot of every input :meth:`_bore_cal_gate` reads.
+
+        v7.10 — BUG FIX. ``_bore_cal_refresh`` used to run only at page build, on
+        a hardware-config push, and after a capture/clear. The page is built at
+        startup BEFORE the XY stage connects, so the gate froze at "Connect the
+        XY stage", every row button stayed disabled, and nothing re-evaluated it
+        for the rest of the session — the operator saw a stale refusal with the
+        stage plainly connected. The only accidental cure was re-saving a
+        hardware config.
+
+        The fix is to re-check on the ~300 ms page tick, but a full rebuild at
+        3 Hz would churn widgets (which this app watches for as a leak
+        signature). So the tick compares THIS key and rebuilds only on a real
+        transition. Everything here is an attribute read or a small tuple; the
+        frame WIDTH is sampled rather than the frame, so a camera coming up is
+        detected without copying a pixel.
+        """
+        ctrl = getattr(self, "controller", None)
+
+        def cam(role):
+            try:
+                info = self._needle_loc_camera_info(role)
+            except Exception:
+                return None
+            if info is None:
+                return None
+            # (um_per_px, frame_w, column_dir_deg) — rounded so float jitter
+            # can't manufacture a change every tick.
+            return (round(float(info[0]), 4), int(info[1]),
+                    None if info[2] is None else round(float(info[2]), 2))
+
+        store = self._bore_cal_store()
+        return (
+            BORE_CAL_AVAILABLE,
+            self._bore_cal_bore_count(),
+            ctrl is not None and bool(ctrl.is_xy_connected),
+            ctrl is not None and bool(ctrl.is_zp_connected),
+            cam(CameraRole.NEEDLE_X) if CameraRole is not None else None,
+            cam(CameraRole.NEEDLE_Y) if CameraRole is not None else None,
+            None if store is None else store.measured_at(),
+            None if store is None else tuple(store.measured_bore_indices()),
+        )
+
+    def _bore_cal_tick(self) -> None:
+        """Re-evaluate the bore gate from the periodic page tick.
+
+        Called from :meth:`on_status_update`, which the main window runs only
+        for the ACTIVE page — so this costs one key build per 300 ms while the
+        calibration page is open, and nothing at all otherwise.
+        """
+        if not hasattr(self, "_bore_cal_group"):
+            return
+        try:
+            key = self._bore_cal_gate_key()
+        except Exception as e:      # pragma: no cover — defensive
+            logger.debug(f"bore-cal gate key skipped: {e}")
+            return
+        if key == getattr(self, "_bore_cal_last_key", None):
+            return
+        self._bore_cal_last_key = key
+        try:
+            self._bore_cal_refresh()
+        except Exception as e:      # pragma: no cover — defensive
+            logger.debug(f"bore-cal tick refresh skipped: {e}")
+
     def _bore_cal_refresh(self) -> None:
         """Rebuild the per-bore rows + status from the live needle and the store.
 
@@ -3608,6 +4093,13 @@ class CalibrationPage(QWidget):
         """
         if not hasattr(self, "_bore_cal_group"):
             return
+        # Keep the tick's change key in step with what is now on screen, so an
+        # explicit refresh (capture / clear / config push) doesn't leave the key
+        # stale and cause one redundant rebuild on the next tick.
+        try:
+            self._bore_cal_last_key = self._bore_cal_gate_key()
+        except Exception:
+            pass
         n_bores = self._bore_cal_bore_count()
         self._bore_cal_group.setVisible(n_bores > 1)
         if n_bores <= 1:
@@ -4211,31 +4703,49 @@ class CalibrationPage(QWidget):
         z_grid.setVerticalSpacing(s(6))
 
         z_rows = [
-            # (button_label, tooltip, handler, label_attr, label_prefix)
+            # (button_label, tooltip, handler, label_attr, label_prefix,
+            #  z-reference key — the same keys XZSideView._Z_REF_META uses)
             ("Set Replace Z",
              "Needle-swap clearance — highest safe Z when changing "
              "the needle. Set with stage at the position you use "
              "for replacing the needle.",
-             self._zoff_set_replace_z, "_zoff_lbl_replace_z", "Replace Z"),
+             self._zoff_set_replace_z, "_zoff_lbl_replace_z", "Replace Z",
+             "replace_z"),
             ("Set Max Z",
              "Soft-limit ceiling — the highest Z the stage may "
              "travel to during normal motion.",
-             self._zoff_set_max_z, "_zoff_lbl_max_z", "Max Z"),
+             self._zoff_set_max_z, "_zoff_lbl_max_z", "Max Z", "max_z"),
             ("Set Fast Move Z",
              "Travel height for fast XY moves between wells "
              "(retract before XY, return below afterward).",
-             self._zoff_set_safe_z, "_zoff_lbl_safe_z", "Fast Move Z"),
+             self._zoff_set_safe_z, "_zoff_lbl_safe_z", "Fast Move Z",
+             "fast_move_z"),
             ("Set Plate Top Z",
              "Plate's top surface — first contact with the plate "
              "from above.",
-             self._zoff_set_top_z, "_zoff_lbl_top_z", "Plate Top Z"),
+             self._zoff_set_top_z, "_zoff_lbl_top_z", "Plate Top Z",
+             "plate_top_z"),
             ("Set Plate Bottom Z",
              "Well floor — needle just touching the bottom of a "
              "calibrated well.",
              self._zoff_set_plate_bottom_z, "_zoff_lbl_plate_bottom_z",
-             "Plate Bottom Z"),
+             "Plate Bottom Z", "plate_bottom_z"),
         ]
-        for row, (btn_label, tooltip, handler, lbl_attr, prefix) in enumerate(z_rows):
+        # v7.9.1: a "Quick move" column — tick which references get a clickable
+        # badge on the XZ quick-move strip. Five badges on a short panel crowd
+        # each other into the collision-nudge, and most rigs only ever drive to
+        # two of them. Presentation only: an unticked reference keeps its value
+        # and every consumer of it (print floor, Hardware Info) is unaffected.
+        _qm_hdr = QLabel("Quick move")
+        _qm_hdr.setToolTip(
+            "Show this height as a clickable badge on the XZ quick-move strip "
+            "(here, on the Jog page, and on the workflow side views).")
+        _qm_hdr.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        z_grid.addWidget(_qm_hdr, 0, 2)
+        self._zoff_qm_checks: dict[str, QCheckBox] = {}
+        for row, (btn_label, tooltip, handler, lbl_attr, prefix,
+                  ref_key) in enumerate(z_rows, start=1):
             btn = QPushButton(btn_label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
@@ -4244,7 +4754,13 @@ class CalibrationPage(QWidget):
             lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
             z_grid.addWidget(lbl, row, 1)
             setattr(self, lbl_attr, lbl)
-        z_grid.setRowStretch(len(z_rows), 1)
+            chk = QCheckBox()
+            chk.setChecked(True)
+            chk.setToolTip(f"Show “{prefix}” on the quick-move strip.")
+            chk.toggled.connect(self._zoff_on_quick_move_toggled)
+            z_grid.addWidget(chk, row, 2)
+            self._zoff_qm_checks[ref_key] = chk
+        z_grid.setRowStretch(len(z_rows) + 1, 1)
         z_split.addWidget(z_grid_widget)
 
         # v7.5.x: live XZ side view beside the capture grid. Reuses the same
@@ -4882,13 +5398,72 @@ class CalibrationPage(QWidget):
                 f"feed.")
         self._rosette_refresh_wells()
 
-    def _build_plate_z_autocal_tab(self) -> QWidget:
-        """Workflow tab (after Plate Location): focus-based per-well Z-bottom
-        auto-cal. The operator teaches the first well's bottom by hand while
-        watching the live microscope feed, then the auto-cal walks Z to each
-        remaining well's bottom by maximizing focus, seeded from that taught Z.
-        Requires the finished Plate Location XY map + Fast Move Z. Wires the
-        existing v7.4.2 Z handlers so the math is unchanged."""
+    def _build_plate_bed_level_tab(self) -> QWidget:
+        """v7.11: the tab is now about the PLATE BED, in two sub-tabs.
+
+        "Bed level (optical)" is the primary flow: the microscope measures the
+        plate's tilt by focusing on a trained feature at several sites, fits a
+        plane and installs it — with the needle retracted throughout. The plate
+        bottom is flat but TILTED (0.0199 mm/mm here, ~1.15 mm across a 24-well
+        plate), and before this that tilt was measured and then discarded.
+
+        "Needle Z auto-cal" is the legacy per-well needle-descent flow, kept
+        reachable because the Custom tab's button still opens it and because it
+        owns the microscope feed the descent watches. Relocating it into the
+        needle-centring wizard is tracked as follow-up work — that move has to
+        take its live view with it.
+        """
+        host = QTabWidget()
+        host.setObjectName("plateBedLevelTabs")
+        host.addTab(self._build_bed_level_wizard(), "Bed level (optical)")
+        host.addTab(self._build_needle_z_autocal_page(), "Needle Z auto-cal")
+        self._bed_level_tabs = host
+        return host
+
+    def _build_bed_level_wizard(self) -> QWidget:
+        """Mount :class:`PlateLevelWizard`, or a quiet placeholder if absent."""
+        try:
+            from gui.widgets.plate_level_wizard import PlateLevelWizard
+        except ImportError as e:                      # pragma: no cover
+            logger.warning(f"plate level wizard unavailable: {e}")
+            self._plate_level_wizard = None
+            lbl = QLabel("The plate-leveling wizard is unavailable.")
+            lbl.setWordWrap(True)
+            return lbl
+        try:
+            wiz = PlateLevelWizard(self)
+        except Exception as e:                        # pragma: no cover
+            logger.warning(f"plate level wizard failed to build: {e}")
+            self._plate_level_wizard = None
+            lbl = QLabel("The plate-leveling wizard failed to build.")
+            lbl.setWordWrap(True)
+            return lbl
+        self._plate_level_wizard = wiz
+        # The wizard owns no datum: it reads the taught plate bottom and calls
+        # the controller to install the plane, then tells the page to persist and
+        # re-broadcast, exactly as the bore wizard does.
+        wiz.calibration_changed.connect(self._on_bed_level_changed)
+        return wiz
+
+    def _on_bed_level_changed(self) -> None:
+        """The wizard installed a plane — persist and re-broadcast."""
+        try:
+            self._save_calibration()
+        except Exception as e:                        # pragma: no cover
+            logger.debug(f"bed level save failed: {e}")
+        try:
+            self._emit_calibration_data_changed()
+        except Exception as e:                        # pragma: no cover
+            logger.debug(f"bed level broadcast failed: {e}")
+
+    def _build_needle_z_autocal_page(self) -> QWidget:
+        """Legacy focus-based per-well Z-bottom auto-cal (needle descent).
+
+        The operator teaches the first well's bottom by hand while watching the
+        live microscope feed, then the auto-cal walks Z to each remaining well's
+        bottom by maximizing focus, seeded from that taught Z. Requires the
+        finished Plate Location XY map + Fast Move Z. Wires the existing v7.4.2
+        Z handlers so the math is unchanged."""
         page = QWidget()
         # Controls on top (scrollable), live microscope feed below, split
         # vertically so the operator can watch the needle approach focus while
@@ -5061,6 +5636,65 @@ class CalibrationPage(QWidget):
             return ctrl.zref_to_user_z(zref_mm)
         return zref_mm
 
+    #: Every Z reference: attribute, the labels that show it, display name.
+    _Z_REFERENCE_FIELDS = [
+        ("_safe_z", ("lbl_safe_z", "_zoff_lbl_safe_z"), "Fast Move Z"),
+        ("_top_z", ("lbl_top_z", "_zoff_lbl_top_z"), "Plate Top Z"),
+        ("_replace_z", ("_zoff_lbl_replace_z",), "Replace Z"),
+        ("_max_z", ("_zoff_lbl_max_z",), "Max Z"),
+        ("_plate_bottom_z", ("_zoff_lbl_plate_bottom_z",), "Plate Bottom Z"),
+    ]
+
+    def _zoff_drop_unreachable_z_references(self) -> list[str]:
+        """Clear any restored Z reference this machine cannot physically reach.
+
+        A Z reference is stored as ``raw − zero_position["Z"]``, so it only
+        means anything against the datum live when it was captured. Running Set
+        Bottom / Set Top rewrites that datum, the up-sign and the envelope —
+        and nothing invalidated the references captured against the old one, so
+        a stale value survived as an ordinary-looking number that the travel
+        primitives would then act on.
+
+        That is not hypothetical: this rig carried Fast Move Z = +24.79 mm
+        zero-ref = 24.79 mm BELOW the mechanical hard bottom, and the bore
+        wizard's "go to needle at survey height" turned it into a plunge that
+        only the print floor arrested, at the plate bottom.
+
+        Dropped, never clamped, and never repaired by guesswork: absent forces
+        a re-teach, which is recoverable; a silently corrected travel height is
+        a wrong move that looks right. Returns the display names cleared.
+        """
+        ctrl = getattr(self, "controller", None)
+        check = getattr(ctrl, "z_reference_reachable", None)
+        if not callable(check):
+            return []
+        dropped: list[str] = []
+        for attr, lbl_attrs, name in self._Z_REFERENCE_FIELDS:
+            val = getattr(self, attr, None)
+            if val is None:
+                continue
+            try:
+                if check(val):
+                    continue
+            except Exception:
+                continue
+            setattr(self, attr, None)
+            dropped.append(name)
+            for lbl_attr in lbl_attrs:
+                lbl = getattr(self, lbl_attr, None)
+                if lbl is not None:
+                    lbl.setText(f"{name}: ⚠ stale — re-teach")
+                    lbl.setStyleSheet(f"color: {COLORS['red']};")
+        if dropped:
+            logger.warning(
+                "Dropped Z reference(s) outside this machine's travel "
+                "envelope: %s. They were captured against a previous Z datum "
+                "(the Set Bottom / Set Top setup has been re-run since) and "
+                "acting on one would drive the needle the wrong way. Re-teach "
+                "them on Calibration → Needle Location → Advanced Z references.",
+                ", ".join(dropped))
+        return dropped
+
     def _zoff_estimate_from_needle_cam(self) -> None:
         """v7.5.x: pre-fill Plate Top / Plate Bottom / Fast-Move Z with guesses
         derived from the needle-cam Z fiducial + the standard offsets. Editable
@@ -5094,11 +5728,29 @@ class CalibrationPage(QWidget):
                 lbl.setText(f"{prefix}: {self._zoff_user_z(val):.2f} mm (guess)")
                 lbl.setStyleSheet(f"color: {COLORS['yellow']};")
         # Keep the controller's plate datum in sync for printing.
+        # source="estimated" is not decoration: this is the ONLY path that
+        # produces an estimate, and pushing it untagged made a guess
+        # indistinguishable from a taught value downstream — so the plate-level
+        # wizard's "the plate bottom is only estimated" warning, which reads
+        # get_plate_bottom_z_source(), could never fire from the one place that
+        # would have made it fire.
         try:
             ctrl.set_plate_top_z(self._top_z)
-            ctrl.set_plate_bottom_z(self._plate_bottom_z)
         except Exception:
             pass
+        # v7.9.1: an estimate is measured NOWHERE on the plate, so it has no
+        # anchor — and leaving a previous touch-off's XY in place would pair
+        # that position with this different Z, anchoring the bed-level plane at
+        # the right place and the wrong height. Absent is honest; the wizard
+        # already refuses (and separately warns "only estimated") on that basis.
+        self._plate_bottom_anchor_xy_um = None
+        self._plate_bottom_z_source = "estimated"
+        try:
+            ctrl.clear_plate_bottom_anchor()
+        except Exception:
+            pass
+        self._zoff_push_plate_bottom_to_controller(
+            self._plate_bottom_z, "estimated")
         self._zoff_lbl_needle_cam.setText(
             f"Pre-filled guesses from needle-cam Z "
             f"{ctrl.get_needle_cam_z_user():.2f} mm. Refine below, then save.")
@@ -5167,12 +5819,19 @@ class CalibrationPage(QWidget):
                 "teach the plate heights and try again.")
             return
         hw = getattr(self, "_hardware_config", None)
-        type_id = getattr(hw, "plate_type_id", "") if hw is not None else ""
-        if not type_id:
+        # v7.12: a parametric DESIGN owns its offsets too. This used to demand
+        # a `PlateType`, so an operator on their own custom plate was told to
+        # "select a specific plate TYPE" for a plate that already was one.
+        home = getattr(hw, "plate_z_offset_home", None)
+        kind, target_id = home() if callable(home) else ("", "")
+        if not kind:
             QMessageBox.information(
                 self, "Save Z offsets",
-                "Select a specific plate TYPE on Hardware Setup → Plate first "
-                "(the generic format has nowhere to store offsets).")
+                "The active plate is a bundled standard format, which has "
+                "nowhere to store learned offsets.\n\nOn Hardware Setup → "
+                "Plate, either pick a product (Corning / NEST) or Duplicate "
+                "the standard into your own plate, then activate it and try "
+                "again.")
             return
         # offset = fiducial − user_z(reference)  (mm BELOW the fiducial)
         ref_map = (
@@ -5190,23 +5849,42 @@ class CalibrationPage(QWidget):
                 "Fast-Move / Max above first.")
             return
         try:
-            from SupportClasses.PlateTypeStore import get_store, PlateType
-            store = get_store()
-            pt = store.get(type_id)
-            if pt is None:
-                self._zoff_lbl_save_to_type.setText(
-                    f"Plate type '{type_id}' not found in the library.")
-                self._zoff_lbl_save_to_type.setStyleSheet(
-                    f"color: {COLORS['red']};")
-                return
-            merged = dict(pt.z_offsets)
-            merged.update(new_off)
-            updated = PlateType(
-                id=pt.id, base_format=pt.base_format,
-                display_name=pt.display_name, manufacturer=pt.manufacturer,
-                model=pt.model, bottom_material=pt.bottom_material,
-                well_depth_mm=pt.well_depth_mm, z_offsets=merged, builtin=False)
-            store.save_user(updated)
+            if kind == "document":
+                from SupportClasses.PlateDocumentStore import get_plate_store
+                store = get_plate_store()
+                doc = store.get(target_id)
+                if doc is None:
+                    self._zoff_lbl_save_to_type.setText(
+                        f"Plate '{target_id}' not found in the library.")
+                    self._zoff_lbl_save_to_type.setStyleSheet(
+                        f"color: {COLORS['red']};")
+                    return
+                merged = dict(doc.meta.z_offsets)
+                merged.update(new_off)
+                doc.meta.z_offsets = merged
+                store.save(doc)
+                label = doc.meta.name
+            else:
+                from SupportClasses.PlateTypeStore import get_store, PlateType
+                store = get_store()
+                pt = store.get(target_id)
+                if pt is None:
+                    self._zoff_lbl_save_to_type.setText(
+                        f"Plate type '{target_id}' not found in the library.")
+                    self._zoff_lbl_save_to_type.setStyleSheet(
+                        f"color: {COLORS['red']};")
+                    return
+                merged = dict(pt.z_offsets)
+                merged.update(new_off)
+                updated = PlateType(
+                    id=pt.id, base_format=pt.base_format,
+                    display_name=pt.display_name,
+                    manufacturer=pt.manufacturer, model=pt.model,
+                    bottom_material=pt.bottom_material,
+                    well_depth_mm=pt.well_depth_mm, z_offsets=merged,
+                    builtin=False)
+                store.save_user(updated)
+                label = pt.display_name or pt.id
             # Refresh the live guess source so the next estimate matches.
             ctrl.set_plate_z_offsets(
                 top=merged.get("top"), bottom=merged.get("bottom"),
@@ -5219,11 +5897,11 @@ class CalibrationPage(QWidget):
             return
         saved_keys = ", ".join(sorted(new_off))
         self._zoff_lbl_save_to_type.setText(
-            f"Saved offsets ({saved_keys}) to plate type '{type_id}'. Future "
+            f"Saved offsets ({saved_keys}) to {kind} '{label}'. Future "
             f"selections of this plate will auto-fill these guesses.")
         self._zoff_lbl_save_to_type.setStyleSheet(f"color: {COLORS['green']};")
         logger.info(
-            f"Learn loop: saved Z offsets {new_off} to plate type '{type_id}'")
+            f"Learn loop: saved Z offsets {new_off} to {kind} '{target_id}'")
 
     def _zoff_set_safe_z(self) -> None:
         """Fast Move Z setter — delegates to the legacy ``_set_safe_z``
@@ -5290,11 +5968,97 @@ class CalibrationPage(QWidget):
         if z is None:
             return
         self._plate_bottom_z = z
+        # v7.9.1: record WHERE this height was measured. The plate-bed-level
+        # survey measures TILT only — this scalar is its single absolute point,
+        # so its XY is load-bearing arithmetic in PlateLeveling.solve (a plane
+        # anchored at an unknown position is not a plane) and the wizard's
+        # preflight refuses without it. Only the OPTICAL writer passed
+        # `at_xy_um=`, so the CONTACT touch-off — the documented fallback, and
+        # the one this operator used because the optical path did not work —
+        # could never satisfy that gate. Pushed here rather than relying on
+        # app.py's untagged re-push, which passes at_xy_um=None (a no-op, not a
+        # clear) and so can never establish the anchor.
+        self._plate_bottom_anchor_xy_um = self._zoff_read_stage_xy_um()
+        self._plate_bottom_z_source = "taught"
+        self._zoff_push_plate_bottom_to_controller(z, "taught")
         self._zoff_lbl_plate_bottom_z.setText(
             f"Plate Bottom Z: {self._zoff_user_z(z):.2f} mm")
         self._zoff_lbl_plate_bottom_z.setStyleSheet(
             f"color: {COLORS['green']};")
         logger.info(f"Plate Bottom Z set: {z:.2f} mm")
+        self._emit_calibration_data_changed()
+
+    def _zoff_read_stage_xy_um(self):
+        """Fresh absolute stage XY (µm) for a Z-reference anchor, or None.
+
+        None on any failure — a garbled Prior read returns ``(None, None, …)``,
+        and recording a fabricated position for a measured height is exactly
+        what the bed-level preflight exists to prevent. (Not to be confused with
+        ``_MosaicScanWorker._read_xy_um``, which is the scan worker's own.)
+        """
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return None
+        try:
+            xy = ctrl.get_xy_position(cached=False)
+        except Exception:
+            return None
+        if not xy or xy[0] is None or xy[1] is None:
+            return None
+        try:
+            return float(xy[0]), float(xy[1])
+        except (TypeError, ValueError):
+            return None
+
+    def _zoff_push_plate_bottom_to_controller(self, z_zref_mm: float,
+                                              source: str) -> None:
+        """Push the plate-bottom datum WITH its anchor XY and provenance.
+
+        One writer for every plate-bottom push that originates on this page, so
+        a new capture path cannot forget the anchor again. Degrades through the
+        older controller signatures rather than failing the capture.
+        """
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None:
+            return
+        xy = getattr(self, "_plate_bottom_anchor_xy_um", None)
+        for kwargs in ({"at_xy_um": xy, "source": source},
+                       {"source": source}, {}):
+            try:
+                ctrl.set_plate_bottom_z(float(z_zref_mm), **kwargs)
+                return
+            except TypeError:
+                continue        # older controller without these kwargs
+            except Exception:
+                return
+
+    def _zoff_apply_plate_bottom_z(self, zref_mm: float,
+                                   source: str = "estimated") -> None:
+        """v7.13: single writer for a COMPUTED plate-bottom Z (zero-ref mm).
+
+        Unlike :meth:`_zoff_set_plate_bottom_z` (which captures the CURRENT
+        stage Z), this applies a value derived elsewhere — the bore wizard's
+        step-2 "plate top + typed offset" derivation. The controller push
+        carries its provenance so downstream "the plate bottom is only
+        estimated" warnings can fire; ``set_plate_bottom_z`` only overwrites
+        ``source`` when non-None, so app.py's untagged re-push on
+        ``calibration_data_changed`` cannot clobber the tag afterwards.
+        """
+        z = float(zref_mm)
+        self._plate_bottom_z = z
+        lbl = getattr(self, "_zoff_lbl_plate_bottom_z", None)
+        if lbl is not None:
+            lbl.setText(
+                f"Plate Bottom Z: {self._zoff_user_z(z):.2f} mm ({source})")
+            lbl.setStyleSheet(
+                f"color: {COLORS['yellow' if source == 'estimated' else 'green']};")
+        # v7.9.1: this height is derived at the CURRENT XY (the bore wizard's
+        # step-2 derivation runs with the stage parked over the survey spot), so
+        # the anchor is the live position — same rule as the touch-off.
+        self._plate_bottom_anchor_xy_um = self._zoff_read_stage_xy_um()
+        self._plate_bottom_z_source = source
+        self._zoff_push_plate_bottom_to_controller(z, source)
+        logger.info(f"Plate Bottom Z applied: {z:.3f} mm (source={source})")
         self._emit_calibration_data_changed()
 
     def _zoff_goto_replace_z(self) -> None:
@@ -5452,6 +6216,11 @@ class CalibrationPage(QWidget):
             camera_manager=self._camera_manager,
             cam_idx=0,
             show_crosshair=True,
+            # v7.10: self-syncing, so the feed cannot go stale between the
+            # explicit ``_ploc_apply_feed_orientation`` pushes (which fire only
+            # on camera bind / tab entry — an orientation changed on the Cameras
+            # page while this tab stayed open used to leave the feed behind).
+            auto_orient=True,
             label="Microscope feed — starts on Run/Mosaic scan (or start it "
                   "on the Cameras tab)",
         )
@@ -6322,7 +7091,7 @@ class CalibrationPage(QWidget):
                 return
             self._ploc_plate_cam = plate_cam
             self._ploc_um_per_px = um_per_px
-            well_radius_um = (self._plate.well_diameter * 1000.0) / 2.0
+            well_radius_um = _well_diameter_mm(self._plate) * 1000.0 / 2.0
             self._ploc_expected_radius_px = well_radius_um / um_per_px
             self._ploc_locator = EdgeFitWellLocator()
             # v7.5.x: the live view shows this microscope slot; require the
@@ -6421,7 +7190,11 @@ class CalibrationPage(QWidget):
             return None
         um = self._ploc_um_per_px
         fh, fw = frame.shape[0], frame.shape[1]
-        d_um = float(self._plate.well_diameter) * 1000.0
+        d_um = _well_diameter_mm(self._plate, well_name) * 1000.0
+        # v7.12: size the expected circle for THIS well — a mixed-diameter
+        # plate must not hunt for a 5.5 mm bore at a 28 mm insert's radius.
+        if um > 0:
+            self._ploc_expected_radius_px = (d_um / 2.0) / um
         strategy = select_well_fit_strategy(d_um, fw * um, fh * um)
         logger.info(
             f"PlateLocation: {well_name} strategy={strategy} "
@@ -6546,13 +7319,33 @@ class CalibrationPage(QWidget):
     def _ploc_apply_feed_orientation(self) -> None:
         """v7.5.x: correct the live microscope feed for the camera's calibrated
         mirror + rotation so the operator sees an upright, un-mirrored view
-        (clicks are inverted back to raw coords, so mapping is unaffected)."""
+        (clicks are inverted back to raw coords, so mapping is unaffected).
+
+        v7.16: prefers the camera's LIVE-VIEW orientation — the one the operator
+        set on Hardware Setup → Cameras — over the measured camera→stage matrix,
+        so this feed shows the same thing every other live view does. Falls back
+        to the measured orientation when no preference is recorded. The click
+        mapping is untouched either way: ``pixel_to_stage_offset`` applies the
+        MEASURED orientation to raw-frame coordinates.
+        """
         lv = getattr(self, "_ploc_live_view", None)
         if lv is None or not hasattr(lv, "set_view_orientation"):
             return
-        rot, mir, fy = self._ploc_microscope_frame_orientation()
+        mir = fy = False
+        rot = 0.0
+        mgr = getattr(self, "_camera_manager", None)
+        do = getattr(mgr, "display_orientation", None) if mgr else None
+        resolved = False
+        if callable(do):
+            try:
+                mir, fy, rot = do(self._ploc_live_cam_idx)
+                resolved = True
+            except Exception as e:
+                logger.debug(f"PlateLocation: display orientation read: {e}")
+        if not resolved:
+            rot, mir, fy = self._ploc_microscope_frame_orientation()
         try:
-            lv.set_view_orientation(mir, rot, fy)
+            lv.set_view_orientation(bool(mir), float(rot), bool(fy))
         except Exception as e:
             logger.debug(f"PlateLocation: feed orientation failed: {e}")
 
@@ -6580,11 +7373,15 @@ class CalibrationPage(QWidget):
         try:
             from SupportClasses.ObjectiveCalibration import get_store
             # Use the SAME key the objective card WRITES and the mosaic FOV READS
-            # (camera_spec.name), NOT the extracted model token — else a freshly
-            # stored calibration is missed and this warns falsely (operator: "I
-            # literally just calibrated it with the same camera and objective").
+            # — else a freshly stored calibration is missed and this warns
+            # falsely (operator: "I literally just calibrated it with the same
+            # camera and objective"). v7.16: that key is the DEVICE IDENTITY,
+            # not camera_spec.name, which two cameras could share.
+            from SupportClasses.MosaicCalibration import objective_camera_key
             spec2 = getattr(cam_cfg, "camera_spec", None) if cam_cfg else None
-            model = str(getattr(spec2, "name", "") or "")
+            model = objective_camera_key(
+                self._camera_manager, cam_idx,
+                getattr(spec2, "name", None)) or ""
             cal = get_store().get_calibration(model, obj_name) if model else None
             if cal:
                 cal_note = (
@@ -6711,7 +7508,7 @@ class CalibrationPage(QWidget):
         fit = (fit_circle_to_points(pts)
                if (len(pts) >= 3 and fit_circle_to_points is not None)
                else None)
-        r_exp = float(self._plate.well_diameter) * 1000.0 / 2.0
+        r_exp = _well_diameter_mm(self._plate, well) * 1000.0 / 2.0
         if fit is not None and r_exp > 0:
             if abs(fit[2] - r_exp) / r_exp > self._PLOC_RADIUS_TOL:
                 logger.warning(
@@ -6815,7 +7612,7 @@ class CalibrationPage(QWidget):
         self._ploc_manual_points = []
         try:
             cx, cy = self._predict_well_xy(well_name)
-            r_um = float(self._plate.well_diameter) * 1000.0 / 2.0
+            r_um = _well_diameter_mm(self._plate, well_name) * 1000.0 / 2.0
             self._ploc_safe_goto(cx + r_um, cy)  # retract Z first (inter-well)
         except Exception as e:
             logger.warning(f"PlateLocation: manual-start move failed: {e}")
@@ -6880,7 +7677,7 @@ class CalibrationPage(QWidget):
                 return
             well = self._ploc_manual_well
             fit = fit_circle_to_points(self._ploc_manual_points)
-            r_exp = float(self._plate.well_diameter) * 1000.0 / 2.0
+            r_exp = _well_diameter_mm(self._plate, well) * 1000.0 / 2.0
             ok = fit is not None
             if ok and r_exp > 0:
                 ok = abs(fit[2] - r_exp) / r_exp <= self._PLOC_RADIUS_TOL
@@ -7139,56 +7936,34 @@ class CalibrationPage(QWidget):
 
         Returns ``(0.0, False, False)`` when unknown so the mosaic build is a
         no-op (byte-identical legacy placement).
+
+        v7.10: delegates to ``MosaicCalibration.resolve_camera_orientation``.
+        This method used to re-implement that precedence by hand, which meant
+        the plate mosaic and the shared resolver could drift apart on any change
+        to either. One implementation now; a test pins that this calls it.
         """
         mgr = getattr(self, "_camera_manager", None)
         cam_idx = self._ploc_microscope_cam_idx()
         if mgr is None or cam_idx is None:
             return 0.0, False, False
-        # Per-field precedence: the PERSISTED per-identity CameraCalibrationStore
-        # value (what the operator set on the camera slot / correction) is GROUND
-        # TRUTH — it survives navigating away from the Hardware Setup page, unlike
-        # the live manager which can come up UN-SYNCED. The live manager fills any
-        # field the store lacks.
-        rot_store = mir_store = fy_store = None
+        try:
+            from SupportClasses.MosaicCalibration import (
+                resolve_camera_orientation)
+        except ImportError:
+            return 0.0, False, False
+        identity = None
         try:
             ident = mgr.camera_identity(cam_idx)
-            if ident and ident[0]:
-                from SupportClasses.CameraCalibrationStore import get_store
-                entry = get_store().get_calibration(ident[0])
-                if entry:
-                    if entry.get("rotation_deg") is not None:
-                        rot_store = float(entry["rotation_deg"])
-                    if "mirrored" in entry:
-                        mir_store = bool(entry["mirrored"])
-                    if "flip_y" in entry:
-                        fy_store = bool(entry["flip_y"])
+            identity = ident[0] if ident else None
         except Exception:
-            pass
-        rot_mgr = mir_mgr = fy_mgr = None
-        try:
-            r = mgr.get_rotation_deg(cam_idx)
-            rot_mgr = float(r) if r is not None else None
-        except Exception:
-            rot_mgr = None
-        try:
-            mir_mgr = bool(mgr.get_mirrored(cam_idx))
-        except Exception:
-            mir_mgr = None
-        try:
-            gfy = getattr(mgr, "get_flip_y", None)
-            fy_mgr = bool(gfy(cam_idx)) if callable(gfy) else None
-        except Exception:
-            fy_mgr = None
-        rot = (rot_store if rot_store is not None
-               else (rot_mgr if rot_mgr is not None else 0.0))
-        mir = (mir_store if mir_store is not None
-               else (mir_mgr if mir_mgr is not None else False))
-        fy = (fy_store if fy_store is not None
-              else (fy_mgr if fy_mgr is not None else False))
+            identity = None
+        prov: dict = {}
+        rot, mir, fy = resolve_camera_orientation(
+            camera_manager=mgr, cam_idx=cam_idx, identity=identity,
+            provenance=prov)
         logger.info(
             f"Mosaic orientation: rotation {rot:.1f}°, flip_x {mir}, "
-            f"flip_y {fy} (rotation from "
-            f"{'store' if rot_store is not None else 'manager'})")
+            f"flip_y {fy} (rotation from {prov.get('rotation_deg', '?')})")
         return float(rot), bool(mir), bool(fy)
 
     def _ploc_mosaic_calibration(self, live_resolution):
@@ -7232,28 +8007,42 @@ class CalibrationPage(QWidget):
         raster needs huge overlap just to keep tiles touching. Falls back to the
         live CameraManager value (which is NOT resolution-scaled) when no
         objective calibration with a recorded resolution is available.
+
+        v7.16: the rescale divides by the CAPTURE width, not ``frame_w``. A
+        centred crop shrinks the delivered frame without changing what a pixel
+        spans, so using the delivered width here would inflate µm/px by the crop
+        fraction — the exact direction that makes the raster step past its own
+        tiles and leave seams. With no crop the two widths are the same.
         """
         try:
             from SupportClasses.ObjectiveCalibration import get_store as _objs
+            from SupportClasses.MosaicCalibration import (
+                objective_camera_key, capture_width_px)
             hw = getattr(self, "_hardware_config", None)
             cam_cfg = getattr(hw, "camera_config", None) if hw else None
             obj = (getattr(cam_cfg, "current_objective_name", None)
                    if cam_cfg else None)
             spec = getattr(cam_cfg, "camera_spec", None) if cam_cfg else None
-            cam_name = getattr(spec, "name", None) if spec else None
+            # v7.16: DEVICE IDENTITY, matching what the card writes.
+            cam_name = objective_camera_key(
+                self._camera_manager, self._ploc_microscope_cam_idx(),
+                getattr(spec, "name", None) if spec else None)
             if cam_name and obj:
                 cal = _objs().get_calibration(str(cam_name), str(obj))
                 if cal:
                     meas = float(cal.get("measured_um_per_px") or 0.0)
                     res = cal.get("resolution")
                     cal_w = float(res[0]) if (res and len(res) >= 1) else 0.0
-                    if meas > 0 and cal_w > 0 and frame_w > 0:
-                        eff = meas * (cal_w / float(frame_w))
-                        if abs(cal_w - frame_w) > 1:
+                    cap_w = capture_width_px(
+                        self._camera_manager,
+                        self._ploc_microscope_cam_idx(), frame_w)
+                    if meas > 0 and cal_w > 0 and cap_w > 0:
+                        eff = meas * (cal_w / float(cap_w))
+                        if abs(cal_w - cap_w) > 1:
                             logger.info(
                                 f"Mosaic µm/px rescaled for resolution: "
                                 f"{meas:.4f}@{cal_w:.0f}px → {eff:.4f}@"
-                                f"{frame_w:.0f}px")
+                                f"{cap_w:.0f}px")
                         return eff
         except Exception as e:
             logger.debug(f"microscope µm/px scale skipped: {e}")
@@ -7288,6 +8077,26 @@ class CalibrationPage(QWidget):
         except Exception as e:
             logger.debug(f"MosaicAlignmentStore unavailable: {e}")
             return None
+
+    def _ploc_plate_anchor(self):
+        """v7.13: ``(anchor_um, axis_sign)`` tying a mosaic to the PLATE.
+
+        The anchor is the taught A1 in absolute stage µm — the same value every
+        geometric prediction is anchored on — so a mosaic saved with it records
+        where the image sits on the plate, not merely where the stage was. With
+        nothing taught yet there is no plate frame to reference, and
+        ``(None, (1, 1))`` makes the scan store stage-frame-only rather than
+        inventing an anchor: a wrong plate frame is worse than none, because it
+        would silently re-place the mosaic on the next re-teach.
+        """
+        anchor = getattr(self, "_taught_a1", None)
+        if anchor is None:
+            return (None, (1.0, 1.0))
+        try:
+            return ((float(anchor[0]), float(anchor[1])),
+                    self._plate_axis_sign())
+        except (TypeError, ValueError, IndexError):        # pragma: no cover
+            return (None, (1.0, 1.0))
 
     def _ploc_mosaic_store(self):
         try:
@@ -7383,6 +8192,12 @@ class CalibrationPage(QWidget):
                 self._camera_manager.start(cam_idx)
             except Exception:
                 pass
+        # v7.14 — optional full-sensor-resolution scan. This MUST happen before
+        # the frame grab below: that frame's width/height size the µm/px
+        # rescale, the FOV, the raster and the canvas, so switching after it
+        # would build the whole scan against the preview resolution. Restored
+        # in _ploc_mosaic_cleanup_ui (every exit) + _shutdown_mosaic_worker.
+        self._ploc_apply_full_res(cam_idx)
         frame = None
         try:
             frame = cam.get_current_frame()
@@ -7516,8 +8331,16 @@ class CalibrationPage(QWidget):
         reg_method = cal.reg_method
         frame_rot, frame_mir, frame_fy = (
             cal.rotation_deg, cal.flip_x, cal.flip_y)
+        # v7.14 — when the scan switched to full sensor resolution, raise the
+        # stitch canvas with it: MosaicBuilder resizes every tile into the
+        # canvas, so at the preview canvas the extra pixels are discarded and
+        # the switch buys nothing.
+        canvas_override = {}
+        full_canvas = getattr(self, "_ploc_full_res_canvas", None)
+        if full_canvas and int(full_canvas) > int(cal.target_px):
+            canvas_override["target_mosaic_px"] = int(full_canvas)
         builder = build_mosaic_builder(
-            cal, initial_shift_um=init_shift,
+            cal, initial_shift_um=init_shift, **canvas_override,
             # v7.5.x: full-plate scan can be hundreds of tiles — free each raw
             # frame after it's blended so RAM stays bounded (this path consumes
             # only the live ``.composite`` display cache, never re-blends).
@@ -7628,6 +8451,10 @@ class CalibrationPage(QWidget):
         fresh_timeout_s = float(cfg.get("fresh_timeout_s", 2.5))
         detect_param2 = float(cfg.get("detect_param2", 30))
         detect_tol = float(cfg.get("detect_tol_pct", 35)) / 100.0
+        # v7.14: frames averaged per tile (SNR x sqrt(N)); 1 = off. The
+        # fluorescence page already honoured this setting; the plate / rosette /
+        # single-well scans ignored it and always took one frame.
+        avg_frames = max(1, int(cfg.get("avg_frames", 1)))
         # v7.5.x: the coarse per-tile "frame_orient" (rot180/flip) is RETIRED —
         # the builder already orients each tile with the calibrated rotation +
         # flip X + flip Y (frame_rot/frame_mir/frame_fy above). Reading it here
@@ -7649,7 +8476,8 @@ class CalibrationPage(QWidget):
             expected_d_px, min_dist_px,
             fresh_frames=fresh_frames, fresh_timeout_s=fresh_timeout_s,
             settle_ms=settle_ms, detect_param2=detect_param2,
-            detect_tolerance=detect_tol)
+            detect_tolerance=detect_tol, avg_frames=avg_frames,
+            regularize_intensity=bool(cfg.get("regularize_intensity", True)))
         self._ploc_mosaic_worker.progress.connect(
             self._ploc_on_mosaic_progress)
         self._ploc_mosaic_worker.tile.connect(self._ploc_on_mosaic_tile)
@@ -7781,6 +8609,12 @@ class CalibrationPage(QWidget):
         except Exception as e:
             logger.debug(f"Mosaic alignment store (shift) skipped: {e}")
         self._ploc_apply_mosaic(composite, extent, scale, frames)
+        # v7.17: offer the completed PLATE mosaic to LabLink — after
+        # _ploc_apply_mosaic's synchronous store.save, so the export reads the
+        # persisted scan. The single-well branch returned above and is
+        # deliberately not published (it is a well mapping aid, not the plate).
+        from SupportClasses.LabLinkPublish import publish_plate_mosaic
+        publish_plate_mosaic(self._ploc_plate_key())
         n_fit = self._ploc_fit_from_mosaic_detections(
             detections, extent, scale)
         dropped = max(0, getattr(self, "_ploc_mosaic_total", frames) - frames)
@@ -7827,7 +8661,59 @@ class CalibrationPage(QWidget):
         self._ploc_confirm_label.setText(f"Mosaic scan failed: {msg}")
         logger.warning(f"PlateLocation mosaic scan failed: {msg}")
 
+    # ── Full-resolution scan capture (v7.14) ──────────────────────
+
+    def _ploc_apply_full_res(self, cam_idx) -> None:
+        """Switch the microscope camera to full sensor resolution for a scan.
+
+        Records the previous resolution on the page so EVERY scan exit can
+        restore it. A camera that cannot switch simply scans as before.
+        """
+        # Clear BOTH up front: a stale canvas left over from a previous
+        # full-res run must not silently raise the memory of a normal scan.
+        self._ploc_full_res_prev = None
+        self._ploc_full_res_canvas = None
+        cfg = getattr(self, "_mosaic_settings", None) or {}
+        if not cfg.get("full_res_scan"):
+            return
+        try:
+            from SupportClasses.CaptureResolution import (
+                canvas_px_for_full_res, current_resolution, describe_switch,
+                switch_to_max)
+            prev = switch_to_max(self._camera_manager, cam_idx)
+            if prev is None:
+                return
+            self._ploc_full_res_prev = prev
+            new = current_resolution(self._camera_manager, cam_idx)
+            # Raise the stitch canvas with the capture, or the extra sensor
+            # pixels are thrown away when each tile is resized into it.
+            canvas = canvas_px_for_full_res(
+                int(cfg.get("target_px", 3000)), prev, new)
+            self._ploc_full_res_canvas = canvas
+            logger.info("Mosaic scan: " + describe_switch(prev, new, canvas))
+        except Exception as exc:
+            logger.warning(f"Mosaic scan: full-resolution switch failed: {exc}")
+            self._ploc_full_res_prev = None
+
+    def _ploc_restore_full_res(self) -> None:
+        """Restore the preview resolution. Idempotent; never raises."""
+        prev = getattr(self, "_ploc_full_res_prev", None)
+        if prev is None:
+            return
+        self._ploc_full_res_prev = None
+        self._ploc_full_res_canvas = None
+        try:
+            from SupportClasses.CaptureResolution import restore
+            restore(self._camera_manager,
+                    getattr(self, "_ploc_live_cam_idx", None), prev)
+        except Exception as exc:
+            logger.warning(f"Mosaic scan: resolution restore failed: {exc}")
+
     def _ploc_mosaic_cleanup_ui(self) -> None:
+        # v7.14 — the ONE chokepoint every scan exit already funnels through
+        # (objective declined / tile count declined / finished / failed /
+        # cancelled), so the capture resolution is restored on all of them.
+        self._ploc_restore_full_res()
         self._ploc_btn_run.setEnabled(True)
         self._ploc_btn_clear.setEnabled(True)
         if getattr(self, "_ploc_btn_mosaic", None) is not None:
@@ -7874,14 +8760,13 @@ class CalibrationPage(QWidget):
     def _ploc_mosaic_metrics(self) -> tuple[float, float]:
         """(well_diameter_µm, well_pitch_µm) for the active plate (fallbacks)."""
         try:
-            well_d_um = float(self._plate.well_diameter) * 1000.0
+            well_d_um = _well_diameter_mm(self._plate) * 1000.0
         except Exception:
             well_d_um = 0.0
         if well_d_um <= 0:
             well_d_um = 6000.0
         try:
-            pitch_um = min(float(self._plate.well_spacing_x),
-                           float(self._plate.well_spacing_y)) * 1000.0
+            pitch_um = _well_pitch_mm(self._plate) * 1000.0
         except Exception:
             pitch_um = well_d_um
         if pitch_um <= 0:
@@ -8528,11 +9413,14 @@ class CalibrationPage(QWidget):
         store = self._ploc_mosaic_store()
         if store is None or composite is None or extent is None:
             return
+        _anchor, _axis = self._ploc_plate_anchor()
         try:
             store.save(
                 f"{self._ploc_plate_key()}#{well}", composite, extent,
                 um_per_px=getattr(self, "_ploc_mosaic_um_per_px", 0.0),
-                mosaic_scale=scale, frames=frames, shift_um=shift_um)
+                mosaic_scale=scale, frames=frames, shift_um=shift_um,
+                # v7.13: tie the scan to the PLATE as well as the stage.
+                anchor_um=_anchor, axis_sign=_axis)
         except Exception as e:
             logger.warning(f"Single-well mosaic persist failed: {e}")
 
@@ -9609,6 +10497,7 @@ class CalibrationPage(QWidget):
         """Persist the mosaic + show it as the plate-view overlay."""
         store = self._ploc_mosaic_store()
         if store is not None and mosaic is not None and extent is not None:
+            _anchor, _axis = self._ploc_plate_anchor()
             try:
                 store.save(
                     self._ploc_plate_key(), mosaic, extent,
@@ -9616,7 +10505,10 @@ class CalibrationPage(QWidget):
                     mosaic_scale=scale, frames=frames,
                     # Record the registration shift baked into the extent so
                     # store-loaded mapping recovers the trusted frame.
-                    shift_um=self._ploc_mosaic_world_shift())
+                    shift_um=self._ploc_mosaic_world_shift(),
+                    # v7.13: and where the mosaic sits on the PLATE, so a
+                    # re-teach carries it instead of needing a manual drag.
+                    anchor_um=_anchor, axis_sign=_axis)
             except Exception as e:
                 logger.warning(f"Mosaic persist failed: {e}")
         # Default to showing the freshly captured mosaic.
@@ -9705,42 +10597,14 @@ class CalibrationPage(QWidget):
 
     @staticmethod
     def _ploc_copy_mosaic_key(store, src: str, dst: str) -> int:
-        """Copy the plate mosaic stored under key ``src`` to key ``dst``
-        (image + extent + scale + shift + its single-well scans; the source
-        entries are untouched). Returns the number of entries copied
-        (plate + wells), or −1 when the plate copy failed."""
-        def _copy_one(a, b) -> bool:
-            img = store.load_image(a)
-            ext = store.get_extent_um(a)
-            meta = store.get_meta(a) or {}
-            if img is None or ext is None:
-                return False
-            ok = bool(store.save(
-                b, img, ext,
-                um_per_px=float(meta.get("um_per_px", 0.0) or 0.0),
-                mosaic_scale=float(meta.get("mosaic_scale", 0.0) or 0.0),
-                frames=int(meta.get("frames", 0) or 0),
-                shift_um=store.get_shift_um(a)))
-            # The last good well mapping travels with the mosaic (save()
-            # rebuilds the meta, so carry it across explicitly).
-            if ok and hasattr(store, "get_wells"):
-                try:
-                    wells = store.get_wells(a)
-                    if wells:
-                        store.set_wells(b, wells)
-                except Exception as exc:
-                    logger.debug(f"Load mosaic: wells copy skipped: {exc}")
-            return ok
-        if not _copy_one(src, dst):
-            return -1
-        n = 1
-        for well in store.list_well_keys(src):
-            try:
-                if _copy_one(f"{src}#{well}", f"{dst}#{well}"):
-                    n += 1
-            except Exception as exc:
-                logger.debug(f"Load mosaic: well '{well}' copy skipped: {exc}")
-        return n
+        """Copy the plate mosaic stored under ``src`` to ``dst``.
+
+        v7.12: delegates to ``MosaicStore.copy_plate`` — the plate library's
+        per-card mosaic picker needs the same operation, and two copies of a
+        multi-step copy (image + extent + scale + shift + well mapping + every
+        single-well scan) would drift the first time either gained a field.
+        """
+        return store.copy_plate(src, dst)
 
     def _ploc_apply_stored_mosaic_wells(self, store, key) -> int:
         """Apply the well mapping stored WITH a mosaic (written on every
@@ -10036,13 +10900,20 @@ class CalibrationPage(QWidget):
                     wells_snap = mstore.get_wells(pkey)
             except Exception:
                 wells_snap = {}
+            # v7.13: re-derive the PLATE frame from the new extent. Nudging
+            # the mosaic is the operator saying "the image sits HERE relative
+            # to the plate", so the plate-frame reference has to be rewritten —
+            # leaving the old one would make the next re-teach undo the nudge.
+            _anchor, _axis = self._ploc_plate_anchor()
             try:
                 mstore.save(
                     pkey, img, new_ext,
                     um_per_px=float(meta.get("um_per_px", 0.0)),
                     mosaic_scale=float(meta.get("mosaic_scale", 0.0)),
                     frames=int(meta.get("frames", 0)),
-                    shift_um=(float(sh[0]), float(sh[1])))
+                    shift_um=(float(sh[0]), float(sh[1])),
+                    anchor_um=_anchor, axis_sign=_axis,
+                    name=str(meta.get("name", "") or ""))
             except Exception as e:
                 logger.warning(f"Mosaic shift persist failed: {e}")
             if wells_snap and hasattr(mstore, "set_wells"):
@@ -10679,24 +11550,30 @@ class CalibrationPage(QWidget):
         return getattr(cam_cfg, 'camera_spec', None)
 
     def _get_camera_model_for_idx(self, idx: int) -> str:
-        """Return a camera model name string suitable as an objectives.json key.
+        """Return the objectives.json key for camera slot ``idx``.
 
-        Tries to extract the model ID from the camera spec name
-        (e.g. "Bestscope BUC3D-1000C (ToupTek...)" → "BUC3D-1000C").
-        Falls back to "unknown" when no spec is available.
+        v7.16: the DEVICE IDENTITY, via the shared
+        ``MosaicCalibration.objective_camera_key`` — the same key the objective
+        card writes and every mosaic resolves with.
+
+        This used to extract a MODEL TOKEN from the spec name (e.g. "Bestscope
+        BUC3D-1000C (ToupTek…)" → "BUC3D-1000C"), which made it a THIRD key
+        convention in this file alongside the card's ``camera_spec.name`` — so
+        this readout and the card disagreed about whether a calibration
+        existed, and a write here landed somewhere nothing read. Worse, both
+        old forms are shared by every unit of the same model, so two cameras
+        overwrote each other. Falls back to the spec name only when no identity
+        can be read (simulated cameras / tests), preserving legacy behaviour
+        there.
         """
         spec = self._get_camera_spec_for_idx(idx)
-        if spec is None:
-            return "unknown"
-        # Prefer the first parenthetical token or the first word-run with digits
-        name: str = spec.name
-        # e.g. "Bestscope BUC3D-1000C (ToupTek C3CMOS10000KPA)"
-        # Extract the second word if the first looks like a brand
-        parts = name.split()
-        for part in parts:
-            if any(ch.isdigit() for ch in part):
-                return part.rstrip("()")
-        return parts[0] if parts else "unknown"
+        spec_name = getattr(spec, "name", None) if spec is not None else None
+        try:
+            from SupportClasses.MosaicCalibration import objective_camera_key
+            key = objective_camera_key(self._camera_manager, idx, spec_name)
+        except Exception:                      # pragma: no cover - import guard
+            key = str(spec_name) if spec_name else None
+        return key or "unknown"
 
     def _ctx_on_objective_changed(self, idx: int) -> None:
         """Called when the objective combo selection changes."""
@@ -10740,7 +11617,10 @@ class CalibrationPage(QWidget):
                     cam_cfg.active_resolution if cam_cfg else (916, 686)
                 )
                 effective_px = spec.effective_pixel_size_um(active_res)
-                theoretical_um_per_px = effective_px / nom_mag
+                # v7.16: None = this model's sensor pitch is not known; leave
+                # the theoretical value absent rather than invent one.
+                if effective_px is not None:
+                    theoretical_um_per_px = effective_px / nom_mag
         elif spec is not None:
             # Fallback: try to get magnification from hardware config
             nom_mag = (
@@ -10751,7 +11631,10 @@ class CalibrationPage(QWidget):
                     cam_cfg.active_resolution if cam_cfg else (916, 686)
                 )
                 effective_px = spec.effective_pixel_size_um(active_res)
-                theoretical_um_per_px = effective_px / nom_mag
+                # v7.16: None = this model's sensor pitch is not known; leave
+                # the theoretical value absent rather than invent one.
+                if effective_px is not None:
+                    theoretical_um_per_px = effective_px / nom_mag
 
         if idx < len(theo_labels):
             if theoretical_um_per_px is not None:
@@ -10853,8 +11736,16 @@ class CalibrationPage(QWidget):
                                 "Stage controller must be connected for calibration.")
             return
 
+        obj_combos = getattr(self, '_ctx_cam_obj_combos', [])
+        _obj = (obj_combos[idx].currentText()
+                if idx < len(obj_combos) and obj_combos[idx].count() else None)
         dlg = PixelCalibrationDialog(mgr, self.controller, cam_idx=idx,
-                                     parent=self)
+                                     parent=self,
+                                     # v7.16: size the in-frame move bound from
+                                     # this objective + the camera's native
+                                     # scale, not a stale manager value.
+                                     cam_key=self._get_camera_model_for_idx(idx),
+                                     objective=_obj)
         if not dlg.exec():
             return
 
@@ -10872,9 +11763,21 @@ class CalibrationPage(QWidget):
             camera_model = self._get_camera_model_for_idx(idx)
             hw = getattr(self, '_hardware_config', None)
             cam_cfg = getattr(hw, 'camera_config', None) if hw else None
-            active_res = (
-                cam_cfg.active_resolution if cam_cfg else (916, 686)
-            )
+            # v7.16: stamp the resolution the frame was ACTUALLY captured at.
+            # ``active_resolution`` is a CONFIGURED value that belongs to the
+            # spec, and when the fitted camera is not the configured one it is
+            # simply another camera's number — stamping it makes the value
+            # unrescalable-but-plausible, the worst kind of wrong.
+            active_res = None
+            try:
+                frame = self._camera_manager.cameras[idx].get_current_frame()
+                if frame is not None and getattr(frame, "shape", None):
+                    active_res = (int(frame.shape[1]), int(frame.shape[0]))
+            except Exception:
+                active_res = None
+            if active_res is None:
+                active_res = (
+                    tuple(cam_cfg.active_resolution) if cam_cfg else (916, 686))
             if store is not None:
                 store.set_calibration(camera_model, obj_name,
                                       measured, active_res)
@@ -10956,6 +11859,11 @@ class CalibrationPage(QWidget):
                     cam_idx=i,
                     show_crosshair=True,
                     label=f"Camera {i + 1}",
+                    # v7.10: calibrated orientation, like every other feed.
+                    # Clicks here drive click-to-move, and CameraFeedView
+                    # inverts them back to raw frame pixels, so the mapping is
+                    # unchanged — only what the operator sees is corrected.
+                    auto_orient=True,
                     parent=self,
                 )
                 fv.clicked.connect(
@@ -11014,21 +11922,30 @@ class CalibrationPage(QWidget):
         # v7.5.x: the focus-based per-well Z-bottom auto-cal runs AFTER Plate
         # Location (it drives to each calibration well, so it needs the
         # finished XY map). Its live microscope feed lives on this tab.
-        self._workflow_tabs.addTab(
-            self._build_plate_z_autocal_tab(), "Plate Z Auto-Cal")
+        # Index taken from addTab rather than written as a literal: it is read
+        # back to decide which tab starts the microscope feed, and a literal
+        # silently points at the wrong tab the moment one is inserted above.
+        self._zauto_tab_index = self._workflow_tabs.addTab(
+            self._build_plate_bed_level_tab(), "Plate Bed Level")
         self._workflow_tabs.addTab(
             self._build_custom_tab(), "Custom")
+        # Index of the Needle Location tab — re-check the bore-offset gate on
+        # arrival (v7.10; it previously had no tab-change branch at all).
+        self._needle_loc_tab_index = 0
         # Index of the Pump Compliance tab — start the live needle side-camera
         # feeds when it's shown so the operator can watch the droplet.
         self._compcal_tab_index = 1
         # Index of the Rosettes tab — start the microscope feed when shown.
         self._rosette_tab_index = 3
-        # Index of the Plate Z Auto-Cal tab — start the microscope feed when
-        # it's shown so the operator can teach the first spot by eye.
-        self._zauto_tab_index = 4
         self._workflow_tabs.currentChanged.connect(
             self._on_workflow_tab_changed)
         outer.addWidget(self._workflow_tabs, stretch=1)
+
+        # v7.9.1: restore the operator's quick-move badge selection. Done here,
+        # after EVERY tab is built, so both XZ views exist to receive it — the
+        # Advanced-Z-refs view is created several tabs before the Plate Location
+        # one.
+        self._zoff_restore_quick_move_visibility()
 
         # The right-context entry point still exists on this class
         # for back-compat with app.py's hasattr check, but it now
@@ -11730,6 +12647,18 @@ class CalibrationPage(QWidget):
         else:
             self.lbl_z.setText("—")
 
+        # v7.10: re-evaluate the bore-offset gate. Cheap (a tuple compare);
+        # rebuilds the rows only when the gate result actually changes. Without
+        # this the "Connect the XY stage" refusal, decided at page-build time
+        # before the stage was up, never cleared for the whole session.
+        self._bore_cal_tick()
+        wiz = getattr(self, "_needle_bore_wizard", None)
+        if wiz is not None:
+            try:
+                wiz.on_status_update()
+            except Exception as e:      # pragma: no cover — defensive
+                logger.debug(f"bore wizard tick skipped: {e}")
+
     # ════════════════════════════════════════════════════════════════
     #  CALIBRATION STEPS
     # ════════════════════════════════════════════════════════════════
@@ -11748,8 +12677,40 @@ class CalibrationPage(QWidget):
             target_y_um: Absolute Y in µm (raw stage coords).
             target_z_mm: Optional Z to lower to (mm, zero-ref). Ignored if lower_z=False.
             lower_z: If False, stay at safe Z after XY move (used during plate calibration).
+
+        Returns:
+            True when the travel completed (or there was nothing to do); False
+            when it was refused or a move could not be confirmed. Callers used
+            to ignore this — and this method logged "Safe navigate to …"
+            unconditionally, so an aborted travel still read as success.
         """
-        safe_z = getattr(self, '_safe_z', None) or 0.0
+        # v7.9.1: NEVER fall back to a raw literal. `or 0.0` is not a neutral
+        # default — zero-ref 0 IS the bottom datum, so on a ZDIR=-1 machine the
+        # old fallback asked for a full-depth descent as its "safe" height.
+        # Derive a real retract instead, from whatever reference we do have.
+        safe_z = getattr(self, '_safe_z', None)
+        if safe_z is None:
+            ctrl = self.controller
+            ref = None
+            for attr in ('_top_z', '_plate_bottom_z'):
+                if getattr(self, attr, None) is not None:
+                    ref = getattr(self, attr)
+                    break
+            default_travel = getattr(ctrl, 'default_travel_z', None)
+            if ref is not None and callable(default_travel):
+                safe_z = default_travel(ref, 10.0)
+                logger.warning(
+                    "No Fast Move / Safe Z is taught — travelling at a derived "
+                    "height %.2f mm (zero-ref), 10 mm above the nearest taught "
+                    "plate reference. Teach Fast Move Z on Calibration → "
+                    "Needle Location → Advanced Z references.", safe_z)
+            else:
+                logger.error(
+                    "Safe navigate REFUSED: no Fast Move / Safe Z is taught and "
+                    "no plate reference exists to derive one from. Travelling "
+                    "would mean guessing a retract height. Teach Fast Move Z on "
+                    "Calibration → Needle Location → Advanced Z references.")
+                return False
 
         # Compute final Z target
         final_z = None
@@ -11759,12 +12720,19 @@ class CalibrationPage(QWidget):
             elif getattr(self, '_top_z', None) is not None:
                 final_z = self._top_z + getattr(self, '_z_buffer_mm', 0.5)
 
-        self.controller.safe_travel_to(
+        ok = self.controller.safe_travel_to(
             target_x_um, target_y_um,
             safe_z_mm=safe_z,
             target_z_mm=final_z,
         )
+        if ok is False:
+            logger.error(
+                "Safe navigate to (%.0f, %.0f) µm did NOT complete — the "
+                "travel was refused or a move could not be confirmed.",
+                target_x_um, target_y_um)
+            return False
         logger.info(f"Safe navigate to ({target_x_um:.0f}, {target_y_um:.0f}) µm")
+        return True
 
 
     def _estimate_well_position_um(self, well_name):
@@ -11834,20 +12802,20 @@ class CalibrationPage(QWidget):
     # ── v7.3.1: 3-Well Auto-Calibration ────────────────────────────
 
     def _get_calibration_wells(self) -> list[str]:
-        """Return 3 well names forming a right triangle for plate calibration.
+        """Return 3 well names spanning the plate, for 3-point teaching.
 
-        Uses A1, A(last_col), (last_row)(last_col) — e.g. for 96-well: A1, A12, H12.
+        v7.12: was ``["A1", f"A{cols}", f"{ROW_LABELS[rows-1]}{cols}"]``. On a
+        parametric plate ``rows``/``cols`` are a PSEUDO-grid (a whole ring of
+        wells shares one cell), so this asked for wells like "A5" / "C5" that
+        do not exist and ``get_well_position`` raised ``KeyError`` — 3-well
+        auto-calibration could not run at all. ``calibration_triangle`` picks
+        the corner wells of the real layout, which is the same right triangle
+        (A1 / A6 / D6 on a 24-well, A1 / A12 / H12 on a 96-well) on every
+        standard plate.
         """
-        from SupportClasses.WellPlate import ROW_LABELS
         if self._plate is None:
             return []
-        rows = self._plate.rows
-        cols = self._plate.cols
-        return [
-            "A1",
-            f"A{cols}",
-            f"{ROW_LABELS[rows - 1]}{cols}",
-        ]
+        return self._plate.calibration_triangle()
 
     def _compute_approach_position(self, well_x_um: float, well_y_um: float,
                                    well_index: int) -> tuple[float, float]:
@@ -11868,7 +12836,7 @@ class CalibrationPage(QWidget):
         if self._plate is None:
             return (well_x_um, well_y_um)
 
-        well_diam_um = self._plate.well_diameter * 1000.0
+        well_diam_um = _well_diameter_mm(self._plate) * 1000.0
 
         # Determine FOV size
         cam = self._get_primary_camera()
@@ -11943,7 +12911,7 @@ class CalibrationPage(QWidget):
         if cam_cfg and cam_cfg.micron_per_pixel:
             um_per_px = cam_cfg.micron_per_pixel
 
-        diameter_um = self._plate.well_diameter * 1000.0
+        diameter_um = _well_diameter_mm(self._plate) * 1000.0
         fov_min = min(fw, fh) * um_per_px
 
         # ── Small well: circle detection ──
@@ -12191,7 +13159,7 @@ class CalibrationPage(QWidget):
         # Compute expected diameter in pixels, capped to 80% of smaller frame dim
         if self._plate is None:
             return None, None
-        diameter_um = self._plate.well_diameter * 1000.0
+        diameter_um = _well_diameter_mm(self._plate, nearest_well) * 1000.0
         expected_diam_px = diameter_um / um_per_px
         max_diam_px = min(fw, fh) * 0.8
         expected_diam_px = min(expected_diam_px, max_diam_px)
@@ -12249,7 +13217,7 @@ class CalibrationPage(QWidget):
                 best_dist = d
                 best_name = name
         # Only match if within half the well spacing
-        if self._plate and best_dist < self._plate.well_spacing_x * 1000.0 * 0.5:
+        if self._plate and best_dist < _well_pitch_mm(self._plate) * 1000.0 * 0.5:
             return best_name
         return None
 
@@ -12516,7 +13484,7 @@ class CalibrationPage(QWidget):
             # Display on plate view
             if hasattr(self, '_cal_plate_view') and self._plate is not None:
                 self._cal_plate_view.set_well_composite(
-                    well_name, composite, self._plate.well_diameter)
+                    well_name, composite, _well_diameter_mm(self._plate, well_name))
 
         self._well_scan_builder = None
 
@@ -12603,6 +13571,12 @@ class CalibrationPage(QWidget):
         if index == getattr(self, "_rosette_tab_index", -1):
             self._rosette_ensure_live_camera()
             self._rosette_refresh_wells()
+        # v7.10: the Needle Location tab (index 0) had no branch at all. Force a
+        # bore-gate re-evaluation on arrival so the operator never lands on a
+        # refusal decided before the hardware came up — the tick would catch it
+        # ~300 ms later anyway, but arriving to a stale warning reads as a bug.
+        if index == getattr(self, "_needle_loc_tab_index", 0):
+            self._bore_cal_tick()
 
     def _zoff_ensure_live_camera(self) -> None:
         """Point the Plate Z Auto-Cal live view at the microscope slot and
@@ -12677,6 +13651,13 @@ class CalibrationPage(QWidget):
         idx = getattr(self, "_zauto_tab_index", None)
         if tabs is not None and idx is not None:
             tabs.setCurrentIndex(idx)
+        # v7.11: that tab now hosts two sub-tabs and opens on the optical bed
+        # leveller, so select the needle-descent one too — otherwise this button
+        # starts a flow whose Confirm / Record / Accept controls are on a page
+        # the operator cannot see.
+        sub = getattr(self, "_bed_level_tabs", None)
+        if sub is not None:
+            sub.setCurrentIndex(1)
         self._start_auto_z_cal()
 
     def _start_auto_z_cal(self):
@@ -13586,18 +14567,28 @@ class CalibrationPage(QWidget):
 
         Given A1 and the diagonal corner, pick a well on the other diagonal.
         For 96-well H12 corner: third = A12 or H1.
+
+        v7.12: derived from the real layout rather than ``f"A{cols}"`` name
+        arithmetic, which named wells that do not exist on a parametric plate.
+        The corner wells of the bounding box give the same answer (A12 for a
+        96-well) while remaining wells that can actually be driven to.
         """
         if not self._plate:
             return None
-        rows = self._plate.rows
-        cols = self._plate.cols
-        corner_letter = chr(ord('A') + rows - 1)
-        # If corner is bottom-right (e.g., H12), pick top-right (A12)
-        third = f"A{cols}"
-        # If that's A1, pick bottom-left instead
-        if third == "A1":
-            third = f"{corner_letter}1"
-        return third
+        picks = self._plate.calibration_triangle()
+        corner = getattr(self, '_corner_well', None)
+        for name in picks:
+            if name not in ("A1", corner):
+                return name
+        # Degenerate layout (fewer than 3 distinct corners) — fall back to the
+        # far corner on the other diagonal, then to anything that isn't A1.
+        third = self._plate.extreme_well(-1.0, 1.0)
+        if third and third not in ("A1", corner):
+            return third
+        for name in self._plate.well_names:
+            if name not in ("A1", corner):
+                return name
+        return None
 
     # v7.3.2: Step 1 "Zero Needle" removed — use jog page Set Zero instead.
 
@@ -13989,6 +14980,23 @@ class CalibrationPage(QWidget):
                 self._taught_corner[0], self._taught_corner[1], lower_z=False)
 
 
+    def _well_position_mm(self, well_name: str):
+        """Plate-local (x, y) mm for *well_name*, or None if the plate has no such well.
+
+        ``WellPlate.get_well_position`` RAISES ``KeyError`` for an unknown well — it
+        never returns None, which is why the ``is None`` guards at the call sites were
+        dead code. A plate whose A1 carries a rosette has no ``"A1"`` well at all:
+        ``PlateDesign.compile()`` drops the parent and emits ``A1.a``, ``A1.b`` …
+        instead. So every hardcoded ``"A1"`` lookup here was a live crash on an
+        entirely ordinary plate. Returning None makes those guards mean something.
+        """
+        if self._plate is None:
+            return None
+        try:
+            return self._plate.get_well_position(well_name)
+        except KeyError:
+            return None
+
     def _calculate_alignment(self):
         """v7.2.7: alignment with µm — compute scale + rotation from taught points.
 
@@ -14000,8 +15008,8 @@ class CalibrationPage(QWidget):
                 "\u26a0 Record A1 and corner first, and select plate format.")
             return
 
-        a1_expected = self._plate.get_well_position("A1")
-        corner_expected = self._plate.get_well_position(self._corner_well)
+        a1_expected = self._well_position_mm("A1")
+        corner_expected = self._well_position_mm(self._corner_well)
 
         if a1_expected is None or corner_expected is None:
             self.lbl_alignment.setText(
@@ -14063,13 +15071,10 @@ class CalibrationPage(QWidget):
         elif self._predicted_positions and well in self._predicted_positions:
             target_x_um, target_y_um = self._predicted_positions[well]
         elif self._taught_a1 is not None:
-            try:
-                pos = self._plate.get_well_position(well)
-            except KeyError:
-                return
+            pos = self._well_position_mm(well)
             if pos is None:
                 return
-            a1_expected = self._plate.get_well_position("A1")
+            a1_expected = self._well_position_mm("A1")
             if a1_expected is None:
                 return
             # Map the plate-local offset onto stage axes (per-machine sign).
@@ -14148,6 +15153,18 @@ class CalibrationPage(QWidget):
             "replace_z": getattr(self, '_replace_z', None),
             "max_z": getattr(self, '_max_z', None),
             "plate_bottom_z": getattr(self, '_plate_bottom_z', None),
+            # v7.9.1: WHERE the plate bottom was taught, and by which method.
+            # The bed-level survey measures tilt only, so this scalar is its one
+            # absolute point and the plane's intercept is pinned by this XY —
+            # without it PlateLeveling.solve has nothing to anchor and the
+            # wizard's preflight refuses. Persisted because the anchor used to
+            # live only in memory on the controller, so even an operator who did
+            # record one lost it at the next restart.
+            "plate_bottom_anchor_xy_um": (
+                list(self._plate_bottom_anchor_xy_um)
+                if getattr(self, '_plate_bottom_anchor_xy_um', None) else None),
+            "plate_bottom_z_source": getattr(
+                self, '_plate_bottom_z_source', None),
             # v7.5.x: stamp the plate orientation the taught/warped positions
             # were captured under. A saved warp's predicted-leg uses the
             # geometric sign; if the machine orientation later changes, applying
@@ -14246,6 +15263,27 @@ class CalibrationPage(QWidget):
                     _get_cal_status_store().mark_calibrated("xy")
         except Exception as e:
             logger.debug(f"XY calibration timestamp skipped: {e}")
+        # v7.13: carry the plate's mosaics with a re-teach. Every scan stores
+        # WHERE IT SITS ON THE PLATE as well as on the stage, so once the
+        # taught A1 moves the stage extents can be re-derived — the mosaic
+        # follows the plate instead of needing "Re-anchor mosaic" by hand.
+        # Done at this one commit funnel, which every XY teach path reaches, so
+        # the eight reader sites keep calling the store unchanged. Scans taken
+        # before v7.13 carry no plate frame and are deliberately left alone.
+        try:
+            _anchor, _axis = self._ploc_plate_anchor()
+            if _anchor is not None and _anchor != getattr(
+                    self, "_mosaic_anchor_applied", None):
+                _mstore = self._ploc_mosaic_store()
+                if _mstore is not None and hasattr(_mstore, "reanchor"):
+                    _pkey = self._ploc_plate_key()
+                    if _mstore.reanchor(_pkey, _anchor, _axis):
+                        self._ploc_load_persisted_mosaic()
+                    for _w in _mstore.list_well_keys(_pkey):
+                        _mstore.reanchor(f"{_pkey}#{_w}", _anchor, _axis)
+                self._mosaic_anchor_applied = _anchor
+        except Exception as e:
+            logger.debug(f"Mosaic re-anchor skipped: {e}")
         # v7.5.x: refresh the durable last-known-good snapshot (needle zero +
         # plate + Z + hardware fingerprint) so a future restart can offer to
         # restore the whole calibration as a unit. Gated on a real plate
@@ -14413,6 +15451,26 @@ class CalibrationPage(QWidget):
             if val is not None and lbl is not None:
                 lbl.setText(f"{prefix}: {self._zoff_user_z(val):.2f} mm")
                 lbl.setStyleSheet(f"color: {COLORS['green']};")
+
+        # v7.9.1: drop any Z reference that this machine cannot reach. See
+        # _zoff_drop_unreachable_z_references — a reference captured against a
+        # previous Z datum survives a re-datum as a plausible-looking number,
+        # and the travel primitives will act on it.
+        self._zoff_drop_unreachable_z_references()
+
+        # v7.9.1: restore the plate-bottom anchor XY + provenance and re-push
+        # them, so the bed-level preflight survives a restart. app.py's
+        # `_update_print_floor_datum` re-pushes the Z untagged, and
+        # `at_xy_um=None` is a no-op there rather than a clear, so nothing else
+        # can re-establish the anchor.
+        anchor = cal.get("plate_bottom_anchor_xy_um")
+        self._plate_bottom_anchor_xy_um = (
+            (float(anchor[0]), float(anchor[1]))
+            if anchor and len(anchor) >= 2 else None)
+        self._plate_bottom_z_source = cal.get("plate_bottom_z_source")
+        if self._plate_bottom_z is not None:
+            self._zoff_push_plate_bottom_to_controller(
+                self._plate_bottom_z, self._plate_bottom_z_source or "taught")
 
         # v7.5.x: the Z soft-limit envelope is owned by Hardware Setup →
         # Device (settings ``safety_limits.z_min/z_max``, loaded onto the
@@ -14627,7 +15685,7 @@ class CalibrationPage(QWidget):
         if cam_cfg is None or cam_cfg.micron_per_pixel is None:
             return None
         # well_diameter is in mm → convert to µm → convert to pixels
-        diameter_um = self._plate.well_diameter * 1000.0
+        diameter_um = _well_diameter_mm(self._plate) * 1000.0
         return cam_cfg.um_to_pixel(diameter_um)
 
     def _get_primary_camera(self):
@@ -14761,6 +15819,10 @@ class CalibrationPage(QWidget):
             except Exception:
                 pass
             self._ploc_mosaic_worker = None
+        # v7.14 — the one scan exit that does NOT pass through
+        # _ploc_mosaic_cleanup_ui: closing the app mid-scan must still leave
+        # the camera at the preview resolution it was found at.
+        self._ploc_restore_full_res()
 
     def closeEvent(self, event):
         """Ensure background threads are stopped before destruction."""

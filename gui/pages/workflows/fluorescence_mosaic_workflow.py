@@ -27,13 +27,14 @@ import logging
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QPointF, QRectF, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QPointF, QRectF, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QFrame, QSizePolicy, QSplitter, QMessageBox, QColorDialog,
     QSpinBox, QDoubleSpinBox, QGraphicsView, QGraphicsScene, QGraphicsItem,
     QGraphicsItemGroup, QGraphicsEllipseItem, QGraphicsRectItem,
+    QCheckBox, QDialog, QDialogButtonBox, QPlainTextEdit,
 )
 
 from gui.styles import COLORS
@@ -45,13 +46,33 @@ from gui.widgets.jog_workspace_view import pixmap_from_bgr
 from gui.dialogs.workflow_settings_dialog import WorkflowSettingsDialog
 
 from SupportClasses import FluorescenceMosaicStore as fms
+from SupportClasses.CaptureTiming import resolve_grab_timing
 
 try:
     from SupportClasses.HardwareConfig import CameraRole
 except Exception:   # pragma: no cover
     CameraRole = None
 
+try:
+    from SupportClasses.TileAutofocus import AfAbort, AfCancelled
+except Exception:   # pragma: no cover
+    class AfAbort(RuntimeError):
+        ...
+
+    class AfCancelled(RuntimeError):
+        ...
+
+try:
+    from SupportClasses.MosaicFocusTracker import FocusSampleXY
+except Exception:   # pragma: no cover
+    FocusSampleXY = None
+
 logger = logging.getLogger(__name__)
+
+# v7.13 — coarse-AF search half-range at the probe position when no previous
+# survey narrows it. The operator has just focused at the channel prompt, so
+# this only needs to absorb ordinary hand mis-focus. Bench-tunable.
+PROBE_HALF_RANGE_UM = 150.0
 
 
 class _SingleWellMosaicWorker(QThread):
@@ -72,14 +93,22 @@ class _SingleWellMosaicWorker(QThread):
 
     progress = Signal(int, int)
     tile = Signal(object, object)
-    finished_ok = Signal(object, object, float, int, object)
+    # v7.13: 6th arg = meta dict {display_levels, avg_frames, exposure_us,
+    # levels_degenerate, af_note, af?, focus_map?}.
+    finished_ok = Signal(object, object, float, int, object, object)
     failed = Signal(str)
 
     _MAX_CONSEC_NONE = 8
+    _LEASE = "fluor_mosaic_af"
 
     def __init__(self, controller, cam, builder, positions, safe_z,
                  fresh_frames=3, fresh_timeout_s=2.5, settle_ms=300,
-                 registration_method="fourier_mellin", parent=None):
+                 registration_method="fourier_mellin",
+                 avg_frames=1, probe_xy=None, exposure_us=0.0,
+                 scope=None, autofocus=None, tracker=None,
+                 focus_predictor=None, optics=None,
+                 probe_half_range_um=PROBE_HALF_RANGE_UM,
+                 probe_sigma_um=None, parent=None):
         super().__init__(parent)
         self._controller = controller
         self._cam = cam
@@ -91,6 +120,27 @@ class _SingleWellMosaicWorker(QThread):
         self._settle_ms = max(0, int(settle_ms))
         self._registration_method = str(registration_method or "fourier_mellin")
         self._stop = False
+        # v7.13 — averaged raw capture with per-channel FROZEN display levels.
+        self._avg_frames = max(1, int(avg_frames))
+        self._probe_xy = probe_xy
+        self._exposure_us = float(exposure_us or 0.0)
+        self._levels: "tuple[float, float] | None" = None
+        self._levels_degenerate = False
+        self._avg_used = 1
+        self._avg_warned = False
+        self._probed = False
+        # v7.13 — per-tile autofocus. ``tracker`` (first channel: checkerboard
+        # sweeps + running fit) or ``focus_predictor`` (later channels: replay
+        # of the measured map). The worker owns the microscope LEASE for the
+        # scan and restores the entry focus in ``finally``.
+        self._scope = scope
+        self._af = autofocus
+        self._tracker = tracker
+        self._predictor = focus_predictor
+        self._optics = optics
+        self._probe_half = float(probe_half_range_um or PROBE_HALF_RANGE_UM)
+        self._probe_sigma = probe_sigma_um
+        self._af_note = ""
 
     def stop(self):
         self._stop = True
@@ -111,7 +161,19 @@ class _SingleWellMosaicWorker(QThread):
         except (TypeError, ValueError, IndexError):
             return (0.0, 0.0)
 
-    def _grab_post_move_frame(self):
+    def _wait_settled(self) -> bool:
+        """Settle + wait for genuinely-new frames after a move (the
+        motion-settle guarantee every capture path shares).
+
+        Returns True when a post-move frame is known to have arrived. False
+        means the camera did not deliver one in time, so anything read now was
+        exposed before or during the move.
+
+        v7.14: the timeout is sized from the camera's own frame period.
+        Fluorescence runs the longest exposures in the app, and at full
+        resolution three frames can take longer than the flat configured
+        timeout — which used to be abandoned silently.
+        """
         cam = self._cam
         if self._settle_ms > 0 and not self._stop:
             time.sleep(self._settle_ms / 1000.0)
@@ -119,50 +181,311 @@ class _SingleWellMosaicWorker(QThread):
             c0 = cam.frame_count_value()
         except Exception:
             c0 = None
-        if c0 is not None:
-            t_end = time.time() + self._fresh_timeout_s
-            while time.time() < t_end and not self._stop:
-                try:
-                    if cam.frame_count_value() - c0 >= self._fresh_frames:
-                        break
-                except Exception:
-                    break
-                time.sleep(0.02)
+        if c0 is None:
+            # Cannot report frame arrivals — the settle is all we have.
+            return True
+        n_frames, timeout_s, _period = resolve_grab_timing(
+            cam, self._fresh_frames, self._fresh_timeout_s)
+        t_end = time.time() + timeout_s
+        while time.time() < t_end and not self._stop:
+            try:
+                if cam.frame_count_value() - c0 >= n_frames:
+                    return True
+            except Exception:
+                return True
+            time.sleep(0.02)
+        if self._stop:
+            return False
+        logger.warning(
+            "Fluor mosaic: no new camera frame within %.1f s after the move "
+            "(needed %d) — dropping this tile rather than stitching a frame "
+            "exposed before/during the move", timeout_s, n_frames)
+        return False
+
+    def _grab_post_move_frame(self):
+        if not self._wait_settled():
+            return None
         try:
-            return cam.get_current_frame()
+            return self._cam.get_current_frame()
         except Exception:
             return None
+
+    # ── v7.13: averaged raw capture with frozen per-channel levels ──
+
+    def _avg_timeout_s(self) -> float:
+        # Generous: long fluorescence exposures deliver frames slowly.
+        return self._fresh_timeout_s + 0.5 * self._avg_frames
+
+    def _freeze_levels(self, raw) -> "tuple[float, float] | None":
+        """Choose the channel's fixed display mapping from a probe frame.
+
+        P0.5 → black; P99.9 stretched by 20% headroom → white, so tiles
+        BRIGHTER than the probe frame don't clip. A degenerate spread (empty
+        well / lamp off) falls back to a narrow fixed window and is flagged
+        in the meta rather than silently autoscaling noise to full range.
+        """
+        try:
+            import numpy as np
+            step = max(1, int(max(raw.shape) // 512))
+            sample = raw[::step, ::step]
+            lo = float(np.percentile(sample, 0.5))
+            hi_raw = float(np.percentile(sample, 99.9))
+            hi = min(65535.0, lo + max(0.0, hi_raw - lo) * 1.2)
+            if hi - lo < 16.0:
+                self._levels_degenerate = True
+                hi = lo + 256.0
+            return (lo, hi)
+        except Exception:
+            return None
+
+    def _capture_tile(self):
+        """One tile image: averaged raw (fixed levels) when available, else
+        the legacy single display frame — byte-identical fallback."""
+        if not self._wait_settled():
+            # No confirmed post-move frame: skip the tile. Stitching one
+            # exposed during the move places a smeared image at this canvas
+            # spot and feeds the overlap registration a bogus measurement.
+            return None
+        if self._stop:
+            return None
+        if self._avg_frames > 1 and hasattr(self._cam, "capture_raw_average"):
+            raw = None
+            try:
+                raw = self._cam.capture_raw_average(
+                    self._avg_frames, timeout_s=self._avg_timeout_s())
+            except Exception:
+                raw = None
+            if raw is not None:
+                if self._levels is None:
+                    self._levels = self._freeze_levels(raw)
+                try:
+                    from gui.widgets.mono_display import mono_to_bgr8
+                    frame8 = mono_to_bgr8(raw, levels=self._levels)
+                except Exception:
+                    frame8 = None
+                if frame8 is not None:
+                    self._avg_used = self._avg_frames
+                    return frame8
+            if not self._avg_warned:
+                # Do NOT fake-average display frames: each is independently
+                # autoscaled, so their mean is not quantitative. Single-frame
+                # fallback is honest and preserves today's behaviour exactly.
+                logger.info(
+                    "Fluor mosaic: raw frame averaging unavailable on this "
+                    "camera — falling back to single display frames")
+                self._avg_warned = True
+        try:
+            return self._cam.get_current_frame()
+        except Exception:
+            return None
+
+    # ── v7.13: probe visit (frozen levels + coarse autofocus) ─────
+
+    def _move_to(self, tx, ty, first: bool):
+        """One raster move; ``first`` gets the retract-gated safe travel."""
+        if first:
+            self._controller.safe_travel_to(
+                tx, ty, safe_z_mm=self._safe_z, target_z_mm=None)
+        else:
+            self._controller.move_xy_absolute_um(tx, ty)
+            try:
+                zero = self._controller.zero_position
+                self._controller.wait_for_xy_arrival(
+                    (tx - float(zero.get("x", 0.0))) / 1000.0,
+                    (ty - float(zero.get("y", 0.0))) / 1000.0)
+            except Exception:
+                pass
+
+    def _do_probe(self):
+        """Visit the well centre ONCE before the raster: run the coarse AF
+        solve and freeze the channel's display levels there.
+
+        The raster's first tile is a corner of the well's bounding square —
+        guaranteed EMPTY GLASS on a circular well — so freezing levels (or
+        seeding focus) from tile 1 would calibrate on background and clip
+        every real structure. The well centre is where the sample is.
+        """
+        wants_levels = (self._avg_frames > 1
+                        and hasattr(self._cam, "capture_raw_average"))
+        wants_af = self._af is not None and self._tracker is not None
+        if self._probe_xy is None or not (wants_levels or wants_af):
+            return
+        px, py = self._probe_xy
+        try:
+            self._move_to(px, py, first=True)
+        except Exception as e:
+            logger.warning(f"Fluor mosaic: probe move failed: {e}")
+            return
+        self._probed = True
+        if self._stop:
+            return
+        self._wait_settled()
+
+        # Coarse AF FIRST — the levels probe should be taken in focus.
+        if wants_af:
+            center = self._af.focus_now_um()
+            if center is None or self._optics is None:
+                self._af_note = ("autofocus off: focus position or objective "
+                                 "optics unavailable")
+                self._tracker = None
+            else:
+                peak, why = self._af.coarse_solve(
+                    self._optics, float(center), self._probe_half,
+                    prior_sigma_um=self._probe_sigma,
+                    should_stop=lambda: self._stop)
+                if peak is not None:
+                    self._af.goto_focus(peak.z_um)
+                    if FocusSampleXY is not None:
+                        self._tracker.add(FocusSampleXY(
+                            x_um=float(px), y_um=float(py),
+                            focus_um=float(peak.z_um),
+                            prominence=float(peak.prominence),
+                            sigma_um=float(peak.sigma_z_um), tile_index=-1))
+                else:
+                    # Degrade to a normal no-AF scan and SAY so — never limp
+                    # on with a fit seeded by a refused curve.
+                    self._af_note = f"autofocus off for this scan: {why}"
+                    self._tracker = None
+
+        if wants_levels and not self._stop:
+            raw = None
+            try:
+                raw = self._cam.capture_raw_average(
+                    self._avg_frames, timeout_s=self._avg_timeout_s())
+            except Exception:
+                raw = None
+            if raw is not None:
+                self._levels = self._freeze_levels(raw)
+
+    # ── v7.13: per-tile focus (sweep on the lattice, predict elsewhere) ──
+
+    def _set_tile_focus(self, idx: int, tx: float, ty: float):
+        af = self._af
+        if af is None:
+            return
+        if self._tracker is not None:
+            pred = self._tracker.predict(tx, ty)
+            if self._tracker.should_af(idx, tx, ty):
+                center = pred if pred is not None else af.focus_now_um()
+                if center is None:
+                    return
+                peak, why = self._af.micro_sweep(
+                    float(center), should_stop=lambda: self._stop)
+                if peak is not None:
+                    accepted = self._tracker.add(FocusSampleXY(
+                        x_um=float(tx), y_um=float(ty),
+                        focus_um=float(peak.z_um),
+                        prominence=float(peak.prominence),
+                        sigma_um=float(peak.sigma_z_um), tile_index=int(idx)))
+                    target = (peak.z_um if accepted
+                              else (self._tracker.predict(tx, ty) or peak.z_um))
+                    af.goto_focus(float(target))
+                else:
+                    # Refused (empty glass, low prominence, …): the tile still
+                    # gets the predicted focus; it never drags the fit.
+                    self._tracker.note_refused()
+                    if pred is not None:
+                        af.goto_focus(float(pred))
+            elif pred is not None:
+                af.goto_focus(float(pred))
+        elif self._predictor is not None:
+            z = self._predictor.predict(tx, ty)
+            if z is not None:
+                af.goto_focus(float(z))
+
+    def _restore_focus(self, entry_focus):
+        if entry_focus is None or self._af is None:
+            return
+        try:
+            back = self._af.goto_focus(float(entry_focus), lead_in=False)
+            if abs(back - float(entry_focus)) > 5.0:
+                logger.warning(
+                    f"Fluor mosaic: focus restored to {back:.0f} µm, not the "
+                    f"entry {float(entry_focus):.0f} µm — check the body")
+        except Exception:
+            logger.warning("Fluor mosaic: focus did not restore to its entry "
+                           "value — check the body")
+
+    def _build_meta(self) -> dict:
+        meta = {
+            "display_levels": self._levels,
+            "avg_frames": self._avg_used,
+            "exposure_us": self._exposure_us,
+            "levels_degenerate": self._levels_degenerate,
+            "af_note": self._af_note,
+        }
+        if self._tracker is not None:
+            meta["af"] = self._tracker.summary()
+            meta["focus_map"] = self._tracker.sample_dicts()
+        return meta
 
     def run(self):
         try:
             self._controller.suspend_position_poller()
         except Exception:
             pass
+        lease_held = False
+        entry_focus = None
         try:
+            # v7.13 — the microscope lease, acquired ON THIS WORKER THREAD
+            # (the controller's lease is thread-affine; acquiring it on the
+            # GUI thread and releasing here would leak it — the B4 lesson).
+            if self._af is not None:
+                scope = self._scope
+                acquired = False
+                if scope is not None:
+                    try:
+                        acquired = scope.try_acquire(self._LEASE, timeout=2.0)
+                    except Exception:
+                        acquired = False
+                if not acquired:
+                    who = ""
+                    try:
+                        who = scope.lease_owner() if scope is not None else ""
+                    except Exception:
+                        who = ""
+                    self.failed.emit(
+                        "another part of the app is driving the microscope"
+                        + (f" ({who})" if who else "")
+                        + " — close it and re-run, or disable autofocus")
+                    return
+                lease_held = True
+                entry_focus = self._af.focus_now_um()
+
+            try:
+                self._do_probe()
+            except AfCancelled:
+                return
+            except AfAbort as e:
+                self.failed.emit(str(e))
+                return
+            if self._stop:
+                return
+
             total = len(self._positions)
             consecutive_none = 0
             for idx, (tx, ty) in enumerate(self._positions):
                 if self._stop:
                     return
                 try:
-                    if idx == 0:
-                        self._controller.safe_travel_to(
-                            tx, ty, safe_z_mm=self._safe_z, target_z_mm=None)
-                    else:
-                        self._controller.move_xy_absolute_um(tx, ty)
-                        try:
-                            zero = self._controller.zero_position
-                            self._controller.wait_for_xy_arrival(
-                                (tx - float(zero.get("x", 0.0))) / 1000.0,
-                                (ty - float(zero.get("y", 0.0))) / 1000.0)
-                        except Exception:
-                            pass
+                    # The probe visit already did the retract-gated first
+                    # travel; without a probe, tile 0 keeps it.
+                    self._move_to(tx, ty, first=(idx == 0 and not self._probed))
                 except Exception as e:
                     logger.warning(
                         f"Fluor mosaic: move to ({tx:.0f},{ty:.0f}) failed: {e}")
                 if self._stop:
                     return
-                frame = self._grab_post_move_frame()
+                try:
+                    self._set_tile_focus(idx, tx, ty)
+                except AfCancelled:
+                    return
+                except AfAbort as e:
+                    # A wedged / claimed body mid-scan: stop loudly rather
+                    # than limp on capturing out-of-focus tiles.
+                    self.failed.emit(str(e))
+                    return
+                frame = self._capture_tile()
                 if frame is None:
                     consecutive_none += 1
                     if consecutive_none >= self._MAX_CONSEC_NONE:
@@ -215,11 +538,20 @@ class _SingleWellMosaicWorker(QThread):
             shift = self._read_global_shift()
             self.finished_ok.emit(
                 composite.copy() if composite is not None else None,
-                extent, scale, frames, shift)
+                extent, scale, frames, shift, self._build_meta())
         except Exception as e:
             logger.exception("Fluor mosaic worker crashed")
             self.failed.emit(str(e))
         finally:
+            # Restore the entry focus + release the lease on EVERY exit —
+            # success, failure, abort. A leaked lease locks every microscope
+            # surface in the app until restart.
+            self._restore_focus(entry_focus)
+            if lease_held and self._scope is not None:
+                try:
+                    self._scope.release(self._LEASE)
+                except Exception:
+                    pass
             try:
                 self._controller.resume_position_poller()
             except Exception:
@@ -526,6 +858,333 @@ class _ZoomImageView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
 
+class _ChannelPromptDialog(QDialog):
+    """v7.13 — the per-channel 'set the filter' prompt, now with exposure.
+
+    Replaces the plain QMessageBox so each channel can carry its own exposure:
+    the spinbox pre-fills from the remembered per-channel value and applies
+    LIVE (debounced ~300 ms) while the dialog is open, so the operator sees
+    the running feed respond while choosing. 0 displays as "camera default"
+    and means "don't touch the camera".
+
+    v7.13.x — an "Auto" button runs the one-shot signal optimizer (raw-stats
+    backends only): it iterates the exposure until the raw histogram's P99.9
+    sits at ~70 % of full scale and writes the result into the spin. Exposure
+    only — the mosaic scan freezes its own capture levels from the probe, so
+    the live display scaling is deliberately left alone here.
+    """
+
+    # Optimizer worker → GUI thread (exposure_us | None, note).
+    _auto_done = Signal(object, str)
+
+    def __init__(self, channel: str, label_text: str, exposure_ms: float = 0.0,
+                 on_apply_exposure=None, camera_manager=None, cam_idx=None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set filter")
+        self.setModal(True)
+        self._on_apply = on_apply_exposure
+        self._mgr = camera_manager
+        self._cam_idx = cam_idx
+        self._optimizing = False
+        self._auto_done.connect(self._on_auto_done)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(s(10))
+        text = QLabel(label_text)
+        text.setWordWrap(True)
+        lay.addWidget(text)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"{channel} exposure:"))
+        self._spin = QDoubleSpinBox()
+        self._spin.setDecimals(2)
+        self._spin.setRange(0.0, 10000.0)
+        self._spin.setSuffix(" ms")
+        self._spin.setSpecialValueText("camera default")
+        self._spin.setKeyboardTracking(False)
+        self._spin.setValue(max(0.0, float(exposure_ms or 0.0)))
+        self._spin.setToolTip(
+            "Exposure applied for THIS channel's scan (remembered per "
+            "channel). Applies live while this dialog is open so the feed "
+            "shows the result. 0 = leave the camera as it is.")
+        row.addWidget(self._spin)
+        self._auto_btn = QPushButton("Auto")
+        self._auto_btn.setToolTip(
+            "One-shot: find the exposure that puts the raw histogram's P99.9 "
+            "at ~70% of full scale with no clipping, for THIS channel's "
+            "filter/illumination as currently set.")
+        self._auto_btn.clicked.connect(self._on_auto_clicked)
+        self._auto_btn.setVisible(self._supports_auto())
+        row.addWidget(self._auto_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._auto_note = QLabel("")
+        self._auto_note.setWordWrap(True)
+        lay.addWidget(self._auto_note)
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self._apply_now)
+        self._spin.valueChanged.connect(
+            lambda _v: self._debounce.start())
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
+        buttons.button(QDialogButtonBox.Ok).setText("Start scan")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _apply_now(self):
+        ms = self.exposure_ms()
+        if self._on_apply is not None and ms > 0:
+            try:
+                self._on_apply(ms)
+            except Exception:
+                logger.debug("channel prompt: live exposure apply failed")
+
+    def exposure_ms(self) -> float:
+        return float(self._spin.value())
+
+    # ── Auto (one-shot signal optimizer, v7.13.x) ─────────────────
+
+    def _supports_auto(self) -> bool:
+        """Only offered when the camera retains raw statistics (the same
+        capability gate as the settings dialog's Signal section)."""
+        if self._mgr is None or self._cam_idx is None:
+            return False
+        try:
+            caps = self._mgr.hardware_capabilities(self._cam_idx)
+            return "andor_raw_stats" in (caps.get("controls") or {})
+        except Exception:
+            return False
+
+    def _on_auto_clicked(self):
+        if self._optimizing or self._mgr is None:
+            return
+        self._optimizing = True
+        self._auto_btn.setEnabled(False)
+        self._auto_note.setText("optimizing exposure…")
+        import threading
+        threading.Thread(target=self._auto_worker, daemon=True,
+                         name="ChannelAutoExpose").start()
+
+    def _auto_worker(self):
+        """Daemon worker — run_signal_optimize blocks on fresh raw frames."""
+        try:
+            from gui.widgets.mono_display import run_signal_optimize
+            exp_us, note = run_signal_optimize(
+                self._mgr, int(self._cam_idx), freeze_display=False)
+        except Exception as exc:
+            exp_us, note = None, f"auto-expose failed: {exc}"
+        self._auto_done.emit(exp_us, note)
+
+    def _on_auto_done(self, exp_us, note):
+        self._optimizing = False
+        self._auto_btn.setEnabled(True)
+        self._auto_note.setText(str(note))
+        if exp_us is not None and float(exp_us) > 0:
+            # Writing the spin fires the debounce → _apply_now, which is
+            # idempotent (the optimizer already left the camera there).
+            self._spin.setValue(float(exp_us) / 1000.0)
+
+
+class _FocusSurveyDialog(QDialog):
+    """v7.13 — inspect a well's mosaic focus survey: the CRITICAL SAMPLE
+    SURFACE (where the cells are), NOT the plate bottom.
+
+    Reports the within-well tilt, the flatness residual (a domed hydrogel
+    shows as residual — never silently flattened), the surface's height above
+    the taught plate bottom (convertible only through the verified
+    focus↔needle datum), and a diagnostic-only comparison against the v7.11
+    plate plane. The operator picks the evaluation model (plane / linear /
+    spline); the choice persists with the survey. There are deliberately NO
+    plate-bottom or plate-plane install actions here — the plate datum is
+    owned by the v7.11 leveling wizard.
+    """
+
+    def __init__(self, page, plate_key: str, well: str, parent=None):
+        super().__init__(parent)
+        self._page = page
+        self._plate_key = plate_key
+        self._well = well
+        self.setWindowTitle(f"Sample surface — {well}")
+        self.setModal(True)
+        self.setMinimumSize(s(520), s(420))
+        lay = QVBoxLayout(self)
+        lay.setSpacing(s(8))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Surface model:"))
+        self._model_combo = QComboBox()
+        try:
+            from SupportClasses.SampleSurface import SURFACE_MODELS
+            for m in SURFACE_MODELS:
+                self._model_combo.addItem(m)
+        except Exception:
+            self._model_combo.addItem("plane")
+        row.addWidget(self._model_combo)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setStyleSheet("font-family: Consolas, monospace;")
+        lay.addWidget(self._text, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, parent=self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        buttons.clicked.connect(lambda _b: self.accept())
+        lay.addWidget(buttons)
+
+        survey = None
+        try:
+            survey = fms.get_store().get_focus_survey(plate_key, well)
+        except Exception:
+            survey = None
+        self._survey = survey
+        if survey:
+            model = str(survey.get("model") or "plane")
+            i = self._model_combo.findText(model)
+            if i >= 0:
+                self._model_combo.setCurrentIndex(i)
+        self._model_combo.currentTextChanged.connect(self._on_model_changed)
+        self._render()
+
+    def _on_model_changed(self, model: str):
+        try:
+            fms.get_store().set_surface_model(self._plate_key, self._well,
+                                              model)
+        except Exception:
+            pass
+        self._render()
+
+    # ── geometry helpers ──────────────────────────────────────────
+
+    def _well_geometry(self):
+        summary = (self._survey or {}).get("summary") or {}
+        c = summary.get("well_center_um")
+        r = summary.get("well_radius_um")
+        if not c or not r:
+            try:
+                c = self._page._well_center_um(self._well)
+                r = self._page._well_diameter_mm(self._well) / 2.0 * 1000.0
+            except Exception:
+                return None, None
+        return (float(c[0]), float(c[1])), float(r)
+
+    def _build_model(self):
+        from SupportClasses.SampleSurface import SampleSurfaceModel
+        center, radius = self._well_geometry()
+        if center is None:
+            return None
+        return SampleSurfaceModel(
+            (self._survey or {}).get("samples") or (),
+            well_center_um=center, well_radius_um=radius,
+            model=self._model_combo.currentText())
+
+    def _render(self):
+        L: list[str] = []
+        survey = self._survey
+        if not survey or not survey.get("samples"):
+            self._text.setPlainText(
+                "No focus survey stored for this well — run a scan with "
+                "autofocus enabled first.")
+            return
+        summary = survey.get("summary") or {}
+        L.append(f"Focus survey for {self._well}  ({survey.get('date', '')})")
+        L.append(f"  samples accepted {summary.get('n_accepted', '?')}"
+                 f" · sweeps refused {summary.get('n_refused', 0)}"
+                 f" (empty tiles) · outliers {summary.get('n_outlier', 0)}")
+        L.append("")
+        try:
+            model = self._build_model()
+        except Exception as exc:
+            self._text.setPlainText("\n".join(L) + f"\nSurface unusable: {exc}")
+            return
+        if model is None:
+            self._text.setPlainText("\n".join(L) + "\nWell geometry unknown.")
+            return
+        sx, sy = model.tilt_mm_per_mm()
+        L.append(f"Model: {model.model()}   (choice persists with the survey)")
+        L.append(f"  Within-well tilt: {sx * 1000:+.1f} / {sy * 1000:+.1f} "
+                 f"µm per mm → {model.span_across_well_um():.0f} µm across "
+                 f"the well")
+        L.append(f"  Flatness (plane residual RMS): "
+                 f"{model.rms_plane_residual_um():.1f} µm — a domed hydrogel "
+                 f"surface shows up HERE, it is not flattened away")
+        L.append("")
+
+        # Height above the taught plate bottom — only through the verified
+        # focus↔needle datum. A surface below the plate bottom is a bad datum.
+        center, _r = self._well_geometry()
+        f_center, conf = model.evaluate(center[0], center[1])
+        L.append(f"Surface focus at the well centre: {f_center:.1f} µm "
+                 f"({conf} confidence)")
+        L.extend(self._height_above_bottom_lines(f_center))
+        L.append("")
+        L.extend(self._plate_tilt_diagnostic_lines(sx, sy))
+        L.append("")
+        L.append("⚠ This survey spans ONE well. Its tilt extrapolated across "
+                 "the plate amplifies any slope error ~8× — which is why "
+                 "nothing here installs a plate-wide datum. The plate bottom "
+                 "and plate tilt stay owned by the Plate Bed Level wizard.")
+        L.append("This surface is available to Cell Targeting as the removal-"
+                 "Z reference (Setup → 'Removal Z from measured sample "
+                 "surface').")
+        self._text.setPlainText("\n".join(L))
+
+    def _height_above_bottom_lines(self, f_center_um: float) -> list:
+        ctrl = getattr(self._page, "_controller", None)
+        try:
+            from SupportClasses.PlateFocusDatumStore import get_store as datum_store
+            cam = self._page._camera_key() or ""
+            z_zref = datum_store().needle_z_zref_mm(
+                cam, "", self._plate_key, float(f_center_um))
+            bottom = ctrl.get_plate_bottom_z() if ctrl is not None else None
+            if z_zref is None or bottom is None:
+                raise ValueError("no datum or plate bottom")
+            height_mm = None
+            if hasattr(ctrl, "zref_to_print_height"):
+                height_mm = ctrl.zref_to_print_height(float(bottom),
+                                                      float(z_zref))
+            if height_mm is None:
+                raise ValueError("height not convertible")
+            lines = [f"  → needle frame: {z_zref:.3f} mm zref = "
+                     f"{height_mm * 1000:.0f} µm ABOVE the taught plate bottom"]
+            if height_mm < 0:
+                lines.append(
+                    "  ⚠ the surface converts to BELOW the plate bottom — "
+                    "the focus↔needle datum or the taught bottom is wrong; "
+                    "do not use this surface for needle Z until re-taught.")
+            return lines
+        except Exception:
+            return ["  (not convertible to needle Z — no verified "
+                    "focus↔needle datum for this camera/plate; run the plate "
+                    "touch-off with the focus confirmation, or the optical "
+                    "plate-bottom calibration)"]
+
+    def _plate_tilt_diagnostic_lines(self, sx: float, sy: float) -> list:
+        ctrl = getattr(self._page, "_controller", None)
+        try:
+            plane = ctrl.get_plate_z_plane() if ctrl is not None else None
+            if plane is None:
+                raise ValueError("no plate plane")
+            px = float(getattr(plane, "sx_mm_per_mm", 0.0))
+            py = float(getattr(plane, "sy_mm_per_mm", 0.0))
+            return [
+                "Diagnostic — whole-plate tilt comparison (report only):",
+                f"  this well's surface tilt {sx * 1000:+.1f}/"
+                f"{sy * 1000:+.1f} µm/mm vs installed plate plane "
+                f"{px * 1000:+.1f}/{py * 1000:+.1f} µm/mm",
+            ]
+        except Exception:
+            return ["Diagnostic: no installed plate Z plane to compare "
+                    "against (Plate Bed Level wizard)."]
+
+
 def _contrast_fg(color: QColor) -> str:
     """Black or white text for legibility on ``color``."""
     lum = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
@@ -747,6 +1406,14 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._abort_btn.setEnabled(False)
         self._abort_btn.clicked.connect(self._on_abort)
         row.addWidget(self._abort_btn)
+        # v7.13 — inspect the per-well sample surface measured by autofocus.
+        self._survey_btn = QPushButton("Focus survey…")
+        self._survey_btn.setEnabled(False)
+        self._survey_btn.setToolTip(
+            "Inspect the sample surface (tilt, flatness, height above the "
+            "plate bottom) measured by per-tile autofocus for this well.")
+        self._survey_btn.clicked.connect(self._open_focus_survey)
+        row.addWidget(self._survey_btn)
         row.addStretch(1)
         self._status = QLabel("Idle.")
         self._status.setStyleSheet(
@@ -786,12 +1453,91 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         # full-plate mosaic. (Tune them on Calibration → Plate Location →
         # Mosaic scan → Settings.)
         note = QLabel(
-            "Camera orientation, FOV, overlap and settle timing are inherited "
-            "from the full-plate Mosaic scan settings (Calibration → Plate "
-            "Location → Mosaic scan → Settings).")
+            "Camera orientation, FOV, overlap, settle timing and per-tile "
+            "frame averaging are inherited from the full-plate Mosaic scan "
+            "settings (Calibration → Plate Location → Mosaic scan → Settings).")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;")
         sec.add_widget(note)
+
+        # ── v7.13: per-channel exposure ───────────────────────────
+        chan = dlg.add_section("Channels")
+        chan.add_note(
+            "Exposure applied when each channel's scan starts (also editable "
+            "in the per-channel filter prompt, where it applies live). "
+            "0 = leave the camera as it is. Recorded with each saved channel.")
+        self._channel_exposure: dict[str, QDoubleSpinBox] = {}
+        for ch in fms.CHANNELS:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(2)
+            spin.setRange(0.0, 10000.0)
+            spin.setSuffix(" ms")
+            spin.setSpecialValueText("camera default")
+            spin.setValue(0.0)
+            key = f"exposure_ms_{fms._safe_token(ch).lower()}"
+            chan.add(key, f"{ch} exposure", spin, 0.0)
+            self._channel_exposure[ch] = spin
+
+        # ── v7.13: per-tile autofocus (the sample's critical surface) ──
+        af = dlg.add_section("Autofocus (per tile)")
+        af.add_note(
+            "With the microscope connected, the FIRST scanned channel "
+            "micro-sweeps the focus drive on a checkerboard of in-well tiles "
+            "and every tile is captured at the running surface fit — the "
+            "needle never moves. Later channels replay the measured map. The "
+            "result is the per-well SAMPLE surface (where the cells are), "
+            "inspectable via 'Focus survey…' after the scan.")
+        self._af_enabled = QCheckBox("Autofocus during the scan")
+        self._af_enabled.setChecked(True)
+        af.add_check("af_enabled", self._af_enabled, True)
+        self._af_lattice = QSpinBox()
+        self._af_lattice.setRange(1, 10)
+        self._af_lattice.setValue(2)
+        self._af_lattice.setToolTip(
+            "Checkerboard lattice spacing: sweep every Nth tile in BOTH grid "
+            "axes (staggered). 2 ≈ a quarter of in-well tiles; 1 = literal "
+            "per-tile sweeps (slowest, most photobleaching).")
+        af.add("af_lattice", "Sweep every Nth tile", self._af_lattice, 2)
+        self._af_step = self._dspin(0.0, 200.0, 0.0, " µm", 1, 0.5)
+        self._af_step.setSpecialValueText("auto (1× DOF)")
+        af.add("af_step_um", "Sweep Z step", self._af_step, 0.0)
+        self._af_range = self._dspin(0.0, 2000.0, 0.0, " µm", 1, 5.0)
+        self._af_range.setSpecialValueText("auto (±2× DOF)")
+        af.add("af_range_um", "Sweep Z range (±)", self._af_range, 0.0)
+
+        # ── v7.13: post-processing (non-destructive) ──────────────
+        post = dlg.add_section("Post-processing")
+        post.add_note(
+            "Optional per-channel processing applied AT SAVE to a copy — the "
+            "raw stitch is kept on disk and detection always reads it; only "
+            "the display overlays prefer the processed version.")
+        self._post_denoise = QComboBox()
+        for m in ("off", "median", "gaussian"):
+            self._post_denoise.addItem(m, m)
+        post.add("post_denoise", "Denoise", self._post_denoise,
+                 {"text": "off", "data": "off"})
+        self._post_strength = QSpinBox()
+        self._post_strength.setRange(1, 3)
+        self._post_strength.setValue(1)
+        post.add("post_denoise_strength", "Denoise strength",
+                 self._post_strength, 1)
+        self._post_bg = QCheckBox("Subtract background (rolling-ball)")
+        self._post_bg.setChecked(False)
+        post.add_check("post_bg_subtract", self._post_bg, False)
+        self._post_bg_radius = self._dspin(20.0, 1000.0, 100.0, " µm", 0, 10.0)
+        post.add("post_bg_radius_um", "Background radius",
+                 self._post_bg_radius, 100.0)
+        # v7.13 — retroactive apply: process mosaics that were ALREADY
+        # captured (the automatic path runs at save time; this covers data
+        # collected before the toggles were enabled, or after changing them).
+        self._post_apply_btn = QPushButton("Apply to captured channels now")
+        self._post_apply_btn.setCursor(Qt.PointingHandCursor)
+        self._post_apply_btn.setToolTip(
+            "Re-run the post-processing above over every stored channel of "
+            "the selected well, from the RAW stitches (non-destructive: the "
+            "raw PNGs are kept; overlays prefer the processed copies).")
+        self._post_apply_btn.clicked.connect(self._apply_post_to_captured)
+        post.add_widget(self._post_apply_btn)
 
         # ── Mosaic FOV calibration (mirrors the full-plate scan's Calibrate…) ──
         cal = dlg.add_section("Mosaic FOV calibration")
@@ -1000,12 +1746,22 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         return 0
 
     def _camera_key(self) -> str | None:
+        """The shared objectives.json key — v7.16: the DEVICE IDENTITY.
+
+        Was ``camera_spec.name``, which two physical cameras can share; see
+        ``MosaicCalibration.objective_camera_key``.
+        """
         cam_idx = self._resolve_microscope_cam_idx()
         cfg = self._hw_config
         spec = getattr(getattr(cfg, "camera_config", None), "camera_spec", None)
-        if spec is not None and getattr(spec, "name", None):
-            return str(spec.name)
-        return f"camera_{cam_idx}"
+        spec_name = getattr(spec, "name", None) if spec is not None else None
+        try:
+            from SupportClasses.MosaicCalibration import objective_camera_key
+            key = objective_camera_key(
+                getattr(self, "_camera_manager", None), cam_idx, spec_name)
+        except Exception:                      # pragma: no cover - import guard
+            key = str(spec_name) if spec_name else None
+        return key or f"camera_{cam_idx}"
 
     def _current_objective_name(self) -> str:
         cfg = self._hw_config
@@ -1305,9 +2061,11 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._camera_manager.set_um_per_px(
                 cam_idx, float(cal["measured_um_per_px"]),
                 resolution=cal.get("resolution"))
-            if cal.get("rotation_deg") is not None:
-                self._camera_manager.set_rotation_deg(
-                    cam_idx, float(cal["rotation_deg"]))
+            # v7.10: the per-objective ``rotation_deg`` is NOT pushed. Only
+            # µm/px is per-objective; rotation belongs to the mount and lives in
+            # CameraCalibrationStore. Pushing it here let switching objectives on
+            # THIS page silently re-orient every live view and the click→stage
+            # map, while the mosaic (which reads the store) disagreed.
         except Exception as exc:
             logger.debug("Fluor mosaic objective apply failed: %s", exc)
         # The FOV (and thus the grid) depends on the objective scale; the learned
@@ -1679,6 +2437,28 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         ready = bool(self._scan_well) and bool(self._selected_channels())
         self._start_btn.setEnabled(ready and not running)
         self._abort_btn.setEnabled(running)
+        self._update_survey_button()
+
+    def _update_survey_button(self):
+        btn = getattr(self, "_survey_btn", None)
+        if btn is None:
+            return
+        has = False
+        try:
+            plate_key = self._plate_key()
+            if plate_key and self._scan_well:
+                has = bool(fms.get_store().get_focus_survey(
+                    plate_key, self._scan_well))
+        except Exception:
+            has = False
+        btn.setEnabled(has)
+
+    def _open_focus_survey(self):
+        plate_key = self._plate_key()
+        if not plate_key or not self._scan_well:
+            return
+        dlg = _FocusSurveyDialog(self, plate_key, self._scan_well, parent=self)
+        dlg.exec()
 
     def _on_start(self):
         if self._worker is not None and self._worker.isRunning():
@@ -1763,6 +2543,25 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         if proceed != QMessageBox.StandardButton.Yes:
             return
 
+        # v7.14 — optional full-sensor-resolution capture. Deliberately AFTER
+        # the confirm: binning does not change the field of view, so the tile
+        # count the operator just approved is identical at either resolution,
+        # and a declined dialog never leaves the camera switched. The plan is
+        # then re-derived because the frame size and µm/px both change (their
+        # product, the FOV, does not).
+        if self._apply_full_res():
+            re_plan = self._compute_raster_plan(well)
+            if re_plan is not None:
+                plan = re_plan
+                grid = plan["grid"]
+                bounds = plan["bounds"]
+                eff_um_per_px = plan["eff_um_per_px"]
+                fw, fh = plan["frame_size"]
+            else:
+                logger.warning("Fluor mosaic: could not re-plan at full "
+                               "resolution — restoring the preview resolution")
+                self._restore_full_res()
+
         # Stash run params and start the per-channel sequence.
         self._scan_positions = grid
         self._scan_bounds = bounds
@@ -1772,38 +2571,169 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         self._capture_queue = channels
         self._capture_index = 0
         self._aborting = False
+        # v7.13 — snapshot the entry exposure (restored when the run ends,
+        # aborts or fails) and reset the per-run focus map (measured by the
+        # first channel, replayed by the rest).
+        self._entry_exposure_us = None
+        try:
+            st = self._camera_manager.get_hw_settings(cam_idx)
+            v = st.get("exposure_us")
+            self._entry_exposure_us = float(v) if v else None
+        except Exception:
+            self._entry_exposure_us = None
+        self._run_focus_map = None
+        self._run_af_summary = None
+        self._scan_exposure_us = 0.0
         self._start_camera()
         self._prompt_next_channel()
 
     def _prompt_next_channel(self):
         if self._aborting:
+            self._restore_entry_exposure()
             self._status.setText("Aborted.")
             self._update_button_state()
             return
         if self._capture_index >= len(self._capture_queue):
-            self._status.setText(
-                f"Done — captured {len(self._capture_queue)} channel(s) for "
-                f"{self._scan_well}.")
-            self._refresh_channel_status()
-            self._refresh_preview()
-            self._update_button_state()
+            self._finish_run()
             return
         channel = self._capture_queue[self._capture_index]
         num = fms.channel_number(channel)
         ch_label = (f"{channel} channel ({num})" if num is not None
                     else f"{channel} channel")
-        resp = QMessageBox.information(
-            self, "Set filter",
-            f"Set the microscope filter / illumination for the "
-            f"{ch_label}, focus if needed, then click OK to scan.\n\n"
+        # v7.13 — the prompt carries the channel's remembered exposure and
+        # applies it LIVE while open, so the operator focuses/checks at the
+        # exposure the scan will actually use.
+        spin = getattr(self, "_channel_exposure", {}).get(channel)
+        dlg = _ChannelPromptDialog(
+            channel,
+            f"Set the microscope filter / illumination for the {ch_label}, "
+            f"focus if needed, then click Start scan.\n\n"
             f"(Cancel stops the capture.)",
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Ok)
-        if resp != QMessageBox.StandardButton.Ok:
+            exposure_ms=(float(spin.value()) if spin is not None else 0.0),
+            on_apply_exposure=self._apply_channel_exposure,
+            camera_manager=self._camera_manager,
+            cam_idx=self._resolve_microscope_cam_idx(),
+            parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            self._restore_entry_exposure()
             self._status.setText("Capture stopped by operator.")
             self._update_button_state()
             return
+        ms = dlg.exposure_ms()
+        if spin is not None:
+            spin.setValue(ms)      # write-back → popout persistence
+        self._apply_channel_exposure(ms)
         self._start_channel_scan(channel)
+
+    def _apply_channel_exposure(self, ms: float):
+        """Apply a per-channel exposure to the microscope camera (0 = skip)."""
+        if not ms or ms <= 0 or self._camera_manager is None:
+            return
+        try:
+            self._camera_manager.set_hw_exposure_us(
+                self._resolve_microscope_cam_idx(), int(round(ms * 1000.0)))
+        except Exception:
+            logger.debug("fluor mosaic: per-channel exposure apply failed")
+
+    # ── Full-resolution capture (v7.14) ───────────────────────────
+
+    def _apply_full_res(self) -> bool:
+        """Switch to full sensor resolution for the run. True if switched.
+
+        The previous resolution is remembered on the page and restored by
+        :meth:`_restore_full_res`, which rides the same four exit paths as the
+        entry-exposure restore (finish / abort / operator cancel / failure).
+        """
+        self._full_res_prev = None
+        self._full_res_canvas = None
+        cfg = self._scan_settings() or {}
+        if not cfg.get("full_res_scan"):
+            return False
+        try:
+            from SupportClasses.CaptureResolution import (
+                canvas_px_for_full_res, current_resolution, describe_switch,
+                switch_to_max)
+            cam_idx = self._resolve_microscope_cam_idx()
+            prev = switch_to_max(self._camera_manager, cam_idx)
+            if prev is None:
+                return False
+            self._full_res_prev = prev
+            new = current_resolution(self._camera_manager, cam_idx)
+            canvas = canvas_px_for_full_res(
+                int(self._target_px.value()), prev, new)
+            self._full_res_canvas = canvas
+            logger.info("Fluor mosaic: " + describe_switch(prev, new, canvas))
+            return True
+        except Exception as exc:
+            logger.warning(f"Fluor mosaic: full-resolution switch failed: {exc}")
+            self._full_res_prev = None
+            return False
+
+    def _restore_full_res(self):
+        """Restore the preview resolution. Idempotent; never raises."""
+        prev = getattr(self, "_full_res_prev", None)
+        if prev is None:
+            return
+        self._full_res_prev = None
+        self._full_res_canvas = None
+        try:
+            from SupportClasses.CaptureResolution import restore
+            restore(self._camera_manager,
+                    self._resolve_microscope_cam_idx(), prev)
+        except Exception as exc:
+            logger.warning(f"Fluor mosaic: resolution restore failed: {exc}")
+
+    def _restore_entry_exposure(self):
+        """Best-effort restore of the exposure in force before the run.
+
+        v7.14 — also restores the capture resolution: both are run-scoped
+        camera state snapshotted at start, and pairing them here means every
+        exit path that already restores one restores the other.
+        """
+        self._restore_full_res()
+        entry = getattr(self, "_entry_exposure_us", None)
+        if entry is None or self._camera_manager is None:
+            return
+        try:
+            self._camera_manager.set_hw_exposure_us(
+                self._resolve_microscope_cam_idx(), int(round(float(entry))))
+            logger.info(f"Fluor mosaic: entry exposure restored ({entry} µs)")
+        except Exception:
+            logger.debug("fluor mosaic: entry exposure restore failed")
+        self._entry_exposure_us = None
+
+    def _finish_run(self):
+        """Queue complete: restore exposure, persist the focus survey, report."""
+        self._restore_entry_exposure()
+        # v7.13 — persist the measured sample surface (raw samples + summary)
+        # so the Focus survey dialog and Cell Targeting can use it. This is
+        # DATA persistence only — nothing is installed into any datum.
+        try:
+            fmap = getattr(self, "_run_focus_map", None)
+            plate_key = self._plate_key()
+            if fmap and plate_key and self._scan_well:
+                existing = fms.get_store().get_focus_survey(
+                    plate_key, self._scan_well) or {}
+                fms.get_store().set_focus_survey(
+                    plate_key, self._scan_well, fmap,
+                    summary=getattr(self, "_run_af_summary", None),
+                    model=str(existing.get("model") or "plane"))
+        except Exception:
+            logger.exception("fluor mosaic: focus survey persist failed")
+        # v7.17: offer the completed well to LabLink — once per RUN, after the
+        # store (channels + focus survey) is fully written, so the .nd3 export
+        # reads a finished record. Never per channel (that would send N
+        # partial files); never raises; a no-op unless the feature is enabled.
+        from SupportClasses.LabLinkPublish import publish_fluorescence_well
+        publish_fluorescence_well(self._plate_key() or "", self._scan_well or "")
+        n_af = len(getattr(self, "_run_focus_map", None) or ())
+        af_txt = f" · focus survey: {n_af} samples" if n_af else ""
+        self._status.setText(
+            f"Done — captured {len(self._capture_queue)} channel(s) for "
+            f"{self._scan_well}.{af_txt}")
+        self._refresh_channel_status()
+        self._refresh_preview()
+        self._update_button_state()
 
     def _start_channel_scan(self, channel: str):
         cam_idx = self._resolve_microscope_cam_idx()
@@ -1847,6 +2777,12 @@ class FluorescenceMosaicWorkflowPage(QWidget):
         fresh_timeout_s = cal.fresh_timeout_s
         # retain_frames=False: a long scan otherwise accumulates ~2 MB/tile of
         # dead image data (this path used to keep them all).
+        # v7.14 — when the run switched to full sensor resolution, raise the
+        # stitch canvas with it, or the extra pixels are discarded when each
+        # tile is resized into the canvas.
+        full_canvas = getattr(self, "_full_res_canvas", None)
+        if full_canvas and int(full_canvas) > target_px:
+            target_px = int(full_canvas)
         builder = build_mosaic_builder(
             cal, target_mosaic_px=target_px, retain_for_reorient=True,
             retain_frames=False)
@@ -1866,21 +2802,165 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             except Exception as e:
                 logger.warning("Fluor mosaic: builder canvas init failed: %s", e)
         safe_z = self._safe_z if self._safe_z is not None else 0.0
+
+        # v7.13 — record the exposure ACTUALLY in force (readback, not the
+        # spinbox) so the store metadata says what the camera did.
+        self._scan_exposure_us = 0.0
+        try:
+            st = self._camera_manager.get_hw_settings(cam_idx)
+            v = st.get("exposure_us")
+            self._scan_exposure_us = float(v) if v else 0.0
+        except Exception:
+            self._scan_exposure_us = 0.0
+
+        # v7.13 — autofocus wiring: tracker on the first channel of the run,
+        # replay predictor on later channels. Any refusal degrades to a
+        # normal no-AF scan with the reason in the status line.
+        scope = af = tracker = predictor = optics = None
+        probe_sigma = None
+        af_note = ""
+        avg_frames = int(getattr(cal, "avg_frames", 1) or 1)
+        probe_xy = self._well_center_um(self._scan_well)
+        if self._af_wanted():
+            (scope, af, tracker, predictor, optics,
+             probe_sigma, af_note) = self._build_autofocus(cal, cam)
+            if af_note:
+                logger.info(f"Fluor mosaic AF: {af_note}")
+
+        status_af = f"  ({af_note})" if af_note else ""
         self._status.setText(
             f"[{self._capture_index + 1}/{len(self._capture_queue)}] "
-            f"Scanning {channel}: 0/{len(self._scan_positions)}…")
+            f"Scanning {channel}: 0/{len(self._scan_positions)}…{status_af}")
         self._worker = _SingleWellMosaicWorker(
             self._controller, cam, builder, self._scan_positions, safe_z,
             fresh_frames=fresh_frames, fresh_timeout_s=fresh_timeout_s,
-            settle_ms=settle_ms, registration_method=cal.reg_method)
+            settle_ms=settle_ms, registration_method=cal.reg_method,
+            avg_frames=avg_frames, probe_xy=probe_xy,
+            exposure_us=self._scan_exposure_us,
+            scope=scope, autofocus=af, tracker=tracker,
+            focus_predictor=predictor, optics=optics,
+            probe_sigma_um=probe_sigma)
         self._worker.progress.connect(self._on_channel_progress)
         self._worker.tile.connect(self._on_channel_tile)
         self._worker.finished_ok.connect(
-            lambda comp, ext, scale, frames, shift, ch=channel:
-            self._on_channel_finished(ch, comp, ext, scale, frames, shift))
+            lambda comp, ext, scale, frames, shift, meta, ch=channel:
+            self._on_channel_finished(ch, comp, ext, scale, frames, shift,
+                                      meta))
         self._worker.failed.connect(self._on_channel_failed)
         self._worker.start()
         self._update_button_state()
+
+    # ── v7.13: autofocus construction (GUI thread; lease taken by worker) ──
+
+    def _af_wanted(self) -> bool:
+        chk = getattr(self, "_af_enabled", None)
+        return bool(chk is not None and chk.isChecked())
+
+    def _build_autofocus(self, cal, cam):
+        """Resolve (scope, TileAutofocus, tracker|None, predictor|None,
+        optics, probe_sigma, note). Every refusal returns Nones + a note —
+        the scan must always be able to run without AF."""
+        none = (None, None, None, None, None, None)
+        try:
+            from SupportClasses.MicroscopeControl import get_microscope
+        except Exception:
+            return (*none, "microscope control unavailable")
+        try:
+            scope = get_microscope()
+            st = scope.state()
+        except Exception:
+            return (*none, "microscope not reachable")
+        if not getattr(st, "connected", False) or not getattr(st, "has_focus",
+                                                              False):
+            return (*none, "autofocus off: microscope focus not connected")
+        try:
+            from SupportClasses.ObjectiveOptics import (
+                ObjectiveOptics, depth_of_field_um, refuse_if_incomplete)
+            from SupportClasses.TileAutofocus import TileAutofocus
+            from SupportClasses.MosaicFocusTracker import (
+                MosaicFocusTracker, PlanePredictor)
+        except Exception:
+            return (*none, "autofocus modules unavailable")
+
+        # The body's own optics for the CURRENT turret position (read-only —
+        # this never writes current_objective_name).
+        pos = getattr(st, "objective_position", None)
+        optic = None
+        for o in (getattr(st, "mounted_objectives", ()) or ()):
+            if int(getattr(o, "position", 0) or 0) == int(pos or 0):
+                optic = o
+                break
+        optics = ObjectiveOptics(
+            label=str(getattr(optic, "name", "") or self._scan_objective),
+            position=int(pos or 0),
+            magnification=getattr(optic, "magnification", None),
+            numerical_aperture=getattr(optic, "numerical_aperture", None),
+            working_distance_mm=getattr(optic, "working_distance_mm", None),
+            um_per_px_sample=float(cal.um_per_px),
+            frame_wh=self._scan_frame_size)
+        why = refuse_if_incomplete(optics)
+        if why:
+            return (*none, f"autofocus off: {why}")
+        dof = depth_of_field_um(optics)
+        if not dof or dof <= 0:
+            return (*none, "autofocus off: depth of field unknown")
+
+        fingerprint = ""
+        try:
+            hw = self._camera_manager.get_hw_settings(
+                self._resolve_microscope_cam_idx()) or {}
+            fingerprint = "|".join(
+                f"{k}={hw.get(k)}" for k in sorted(hw)
+                if "expo" in k.lower() or "gain" in k.lower())
+        except Exception:
+            fingerprint = ""
+
+        af = TileAutofocus(
+            scope=scope, cam=cam, dof_um=float(dof),
+            step_um=float(self._af_step.value()),
+            half_range_um=float(self._af_range.value()),
+            fingerprint=fingerprint)
+
+        tracker = predictor = None
+        probe_sigma = None
+        fmap = getattr(self, "_run_focus_map", None)
+        if fmap:
+            predictor = PlanePredictor(fmap)
+            note = "autofocus: replaying the first channel's focus map"
+        else:
+            center = self._well_center_um(self._scan_well)
+            r_um = self._well_diameter_mm(self._scan_well) / 2.0 * 1000.0
+            if center is None or r_um <= 0:
+                return (*none, "autofocus off: well geometry unknown")
+            tracker = MosaicFocusTracker(
+                well_center_um=center, well_radius_um=r_um,
+                lattice_spacing=int(self._af_lattice.value()),
+                dof_um=float(dof), positions=self._scan_positions)
+            note = ""
+            # A previous survey of this well narrows the probe search window
+            # (narrow-only: it never contributes to the new fit).
+            try:
+                prev = fms.get_store().get_focus_survey(
+                    self._plate_key(), self._scan_well)
+                rms = ((prev or {}).get("summary") or {}).get(
+                    "rms_residual_um")
+                if prev and rms is not None:
+                    probe_sigma = max(25.0, float(rms))
+            except Exception:
+                probe_sigma = None
+        return (scope, af, tracker, predictor, optics, probe_sigma, note)
+
+    def _post_settings(self) -> dict:
+        return {
+            "denoise": str(getattr(self, "_post_denoise", None)
+                           and self._post_denoise.currentText() or "off"),
+            "denoise_strength": int(getattr(self, "_post_strength", None)
+                                    and self._post_strength.value() or 1),
+            "bg_subtract": bool(getattr(self, "_post_bg", None)
+                                and self._post_bg.isChecked()),
+            "bg_radius_um": float(getattr(self, "_post_bg_radius", None)
+                                  and self._post_bg_radius.value() or 100.0),
+        }
 
     def _on_channel_progress(self, done: int, total: int):
         ch = (self._capture_queue[self._capture_index]
@@ -1894,8 +2974,16 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             self._set_preview_image(composite)
 
     def _on_channel_finished(self, channel, composite, extent, scale, frames,
-                             shift_um=(0.0, 0.0)):
+                             shift_um=(0.0, 0.0), meta=None):
         self._worker = None
+        meta = meta if isinstance(meta, dict) else {}
+        # The first channel's measured focus map is replayed by the rest of
+        # the queue and persisted at run end.
+        if meta.get("focus_map"):
+            self._run_focus_map = meta["focus_map"]
+            self._run_af_summary = meta.get("af")
+        if meta.get("af_note"):
+            logger.info(f"Fluor mosaic AF: {meta['af_note']}")
         if composite is not None and extent is not None:
             plate_key = self._plate_key() or "plate"
             color = self._channel_colors[channel]
@@ -1905,17 +2993,95 @@ class FluorescenceMosaicWorkflowPage(QWidget):
                     color_rgb=(color.red(), color.green(), color.blue()),
                     objective=self._scan_objective,
                     um_per_px=self._scan_um_per_px, mosaic_scale=scale,
-                    frames=frames, shift_um=shift_um)
+                    frames=frames, shift_um=shift_um,
+                    exposure_us=float(meta.get("exposure_us")
+                                      or self._scan_exposure_us or 0.0),
+                    display_levels=meta.get("display_levels"),
+                    avg_frames=int(meta.get("avg_frames", 1) or 1))
             except Exception as exc:
                 logger.warning("Fluor mosaic save failed: %s", exc)
+            self._maybe_attach_processed(plate_key, channel, composite, scale)
         self._capture_index += 1
         self._refresh_channel_status()
         self._refresh_preview()
         self._notify_mosaic_ready()
         self._prompt_next_channel()
 
+    def _maybe_attach_processed(self, plate_key, channel, composite, scale):
+        """v7.13 — bake the optional denoise / background subtraction into a
+        SIBLING copy (the raw stitch stays canonical; overlays prefer the
+        processed one; detection keeps reading the raw)."""
+        try:
+            from SupportClasses import FluorescencePostProcess as fpp
+            settings = self._post_settings()
+            if not fpp.is_active(settings):
+                return
+            import cv2
+            gray = cv2.cvtColor(composite, cv2.COLOR_BGR2GRAY)
+            # The composite's own µm/px = 1 / mosaic_scale (scale is px/µm).
+            upp = (1.0 / float(scale)) if scale and float(scale) > 0 else 0.0
+            out, applied = fpp.process(gray, settings, um_per_px=upp)
+            if not applied:
+                return
+            fms.get_store().attach_processed(
+                plate_key, self._scan_well, channel,
+                cv2.cvtColor(out, cv2.COLOR_GRAY2BGR), applied)
+        except Exception:
+            logger.exception("fluor mosaic: post-processing failed")
+
+    def _apply_post_to_captured(self):
+        """v7.13 — retroactively post-process every stored channel of the
+        selected well from its RAW stitch (the automatic path only runs at
+        save time; this covers mosaics captured before the toggles were on,
+        or after the settings changed). Non-destructive, same as the save
+        path: raw PNGs stay canonical, overlays prefer the processed copies."""
+        plate_key = self._plate_key()
+        well = self._scan_well
+        if not plate_key or not well:
+            self._status.setText("Select a scanned well first.")
+            return
+        try:
+            from SupportClasses import FluorescencePostProcess as fpp
+        except Exception:
+            self._status.setText("Post-processing module unavailable.")
+            return
+        settings = self._post_settings()
+        if not fpp.is_active(settings):
+            self._status.setText(
+                "Enable a post-processing option (denoise / background "
+                "subtraction) first — nothing to apply.")
+            return
+        st = fms.get_store()
+        channels = st.list_channels(plate_key, well)
+        if not channels:
+            self._status.setText(f"No captured channels for {well} yet.")
+            return
+        import cv2
+        n_done = 0
+        for ch in channels:
+            try:
+                img = st.load_channel_image(plate_key, well, ch)   # RAW
+                if img is None:
+                    continue
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                scale = st.get_mosaic_scale(plate_key, well, ch)
+                upp = (1.0 / float(scale)) if scale else 0.0
+                out, applied = fpp.process(gray, settings, um_per_px=upp)
+                if applied and st.attach_processed(
+                        plate_key, well, ch,
+                        cv2.cvtColor(out, cv2.COLOR_GRAY2BGR), applied):
+                    n_done += 1
+            except Exception:
+                logger.exception(
+                    f"retroactive post-processing failed for {ch}")
+        self._refresh_preview()
+        self._status.setText(
+            f"Post-processing applied to {n_done}/{len(channels)} captured "
+            f"channel(s) of {well}.")
+
     def _on_channel_failed(self, msg: str):
         self._worker = None
+        self._restore_entry_exposure()
         self._status.setText(f"Channel scan failed: {msg}")
         self._update_button_state()
 

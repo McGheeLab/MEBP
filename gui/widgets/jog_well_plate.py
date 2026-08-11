@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 )
 
 from gui.scaling import s, scaled_font_size
+from gui.widgets.plate_layout import fit_wells, wells_from_plate
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +62,17 @@ class WellPlateNavigator(QWidget):
     _CLR_TEXT = QColor("#cdd6f4")
     _CLR_LABEL = QColor("#6c7086")
 
+    # v7.12: floor so a small well on a mixed-diameter plate (a 5.5 mm rosette
+    # bore beside a 28 mm insert) stays visible and clickable in this widget,
+    # which is often only ~200 px wide.
+    _MIN_WELL_RADIUS_PX = 4.0
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._plate = None
+        # v7.12: the plate's real outline in the A1-relative mm frame, when it
+        # can be resolved (see set_plate). None → frame the wells instead.
+        self._footprint: tuple[float, float, float, float] | None = None
         self._calibrated_wells: set[str] = set()
         self._approximate_wells: set[str] = set()  # v7.3.2: geometry-predicted positions
         self._current_well: str | None = None
@@ -81,12 +90,39 @@ class WellPlateNavigator(QWidget):
 
     # ── Public API ─────────────────────────────────────────────
 
-    def set_plate(self, plate):
-        """Set the well plate model. Triggers repaint."""
+    def set_plate(self, plate, footprint=None):
+        """Set the well plate model. Triggers repaint.
+
+        v7.12: *footprint* is the plate outline ``(x0, y0, x1, y1)`` in
+        A1-relative mm. Callers rarely need to pass it — it is resolved from
+        the plate's own identity via
+        ``PlateDocumentStore.plate_footprint_extent_mm`` — but an explicit
+        value wins, which is what lets tests pin the framing.
+        """
         self._plate = plate
+        self._footprint = footprint if footprint is not None \
+            else self._resolve_footprint(plate)
         self._hover_well = None
         self._current_well = None
         self.update()
+
+    @staticmethod
+    def _resolve_footprint(plate):
+        """Plate outline in A1-relative mm, or None.
+
+        Never raises: a plate we cannot identify simply frames its wells, which
+        is what this widget did for its whole life before v7.12.
+        """
+        if plate is None:
+            return None
+        try:
+            from SupportClasses.PlateDocumentStore import (
+                plate_footprint_extent_mm,
+            )
+            return plate_footprint_extent_mm(getattr(plate, "format", None))
+        except Exception:                                  # pragma: no cover
+            logger.debug("No plate footprint for navigator", exc_info=True)
+            return None
 
     def set_calibrated_wells(self, names: set[str]):
         """Mark wells that have calibrated positions."""
@@ -142,71 +178,94 @@ class WellPlateNavigator(QWidget):
             if d < best_dist:
                 best_dist = d
                 best_name = name
-        # Only highlight if within ~1 well spacing
-        if self._plate and best_dist < self._plate.well_spacing_x * 1000.0 * 0.6:
+        # Only highlight if within ~1 well spacing. v7.12: `well_spacing_x` is
+        # 0.0 on a parametric plate, so this gate used to be "within 0 µm" —
+        # the current well could never light up. Measure the pitch from the
+        # wells themselves (identical to the declared spacing on a regular
+        # plate), and fall back to the well radius on a one-well plate.
+        if self._plate is None:
+            self.set_current_well(None)
+            return
+        pitch_mm = self._plate.nearest_neighbour_pitch_mm()
+        if pitch_mm <= 0:
+            pitch_mm = self._plate.representative_well_diameter
+        if pitch_mm > 0 and best_dist < pitch_mm * 1000.0 * 0.6:
             self.set_current_well(best_name)
         else:
             self.set_current_well(None)
 
     # ── Geometry helpers ───────────────────────────────────────
 
+    def _draw_headers(self) -> bool:
+        """True when row/column headers describe this plate.
+
+        Headers spell a regular grid ("row B, column 4"), which a parametric
+        plate does not have: ``rows``/``cols`` there are a pseudo-grid where a
+        whole ring of wells shares one cell, so the letters would label wells
+        that are not in that row at all. Same gate ``WellPlateView`` uses.
+        """
+        plate = self._plate
+        return bool(plate is not None
+                    and getattr(plate, "well_spacing_x", 0) > 0
+                    and getattr(plate, "well_spacing_y", 0) > 0)
+
     def _well_layout(self):
-        """Compute layout metrics for rendering."""
+        """Compute the mm → px transform for rendering.
+
+        v7.12: was a ``rows`` × ``cols`` cell grid indexed by ``well.row`` /
+        ``well.col``. On a parametric plate several wells share a cell (an
+        entire 3-well ring lands on one), so they were drawn stacked — a ring
+        rendered as a single circle — and every well got the same radius. Now
+        every well is placed at its real ``x``/``y`` and sized by its own
+        diameter, which is also what makes the standard grid come out right:
+        a regular plate's real geometry *is* a regular grid.
+        """
         if self._plate is None:
             return None
-        rows = self._plate.rows
-        cols = self._plate.cols
-        w = self.width()
-        h = self.height()
+        wells = wells_from_plate(self._plate)
+        if not wells:
+            return None
 
-        # Reserve margin for row/col labels
-        margin_left = 18
-        margin_top = 14
-        margin_right = 4
-        margin_bottom = 4
+        headers = self._draw_headers()
+        margins = (18.0, 14.0, 4.0, 4.0) if headers else (4.0, 4.0, 4.0, 4.0)
+        transform = fit_wells(
+            wells, self.width(), self.height(), margins,
+            footprint=self._footprint,
+            min_radius_px=self._MIN_WELL_RADIUS_PX,
+        )
+        if transform is None:
+            return None
+        return {"transform": transform, "wells": wells, "headers": headers}
 
-        avail_w = w - margin_left - margin_right
-        avail_h = h - margin_top - margin_bottom
+    def _well_center(self, layout, well_name: str):
+        """Pixel centre of *well_name*, or None if it is not on the plate."""
+        for name, x, y, _d in layout["wells"]:
+            if name == well_name:
+                return layout["transform"].to_px(x, y)
+        return None
 
-        cell_w = avail_w / max(cols, 1)
-        cell_h = avail_h / max(rows, 1)
-        cell = min(cell_w, cell_h)
-        radius = cell * 0.38
-
-        # Center the grid
-        grid_w = cols * cell
-        grid_h = rows * cell
-        ox = margin_left + (avail_w - grid_w) / 2
-        oy = margin_top + (avail_h - grid_h) / 2
-
-        return {
-            "rows": rows, "cols": cols,
-            "cell": cell, "radius": radius,
-            "ox": ox, "oy": oy,
-        }
-
-    def _well_center(self, layout, row, col):
-        """Get pixel center of a well given layout metrics."""
-        x = layout["ox"] + (col + 0.5) * layout["cell"]
-        y = layout["oy"] + (row + 0.5) * layout["cell"]
-        return x, y
+    def _well_radius(self, layout, diameter_mm: float) -> float:
+        return layout["transform"].radius_px(diameter_mm)
 
     def _hit_test(self, pos) -> str | None:
-        """Find well under mouse position."""
-        if self._plate is None:
-            return None
+        """Find the well under the mouse.
+
+        Picks the NEAREST centre rather than the first well whose circle
+        contains the point: on a plate with mixed diameters a small well can
+        sit inside a large neighbour's circle, and row-major "first match"
+        would make it unclickable.
+        """
         layout = self._well_layout()
         if layout is None:
             return None
 
-        from SupportClasses.WellPlate import ROW_LABELS
-        for well in self._plate.get_all_wells():
-            cx, cy = self._well_center(layout, well.row, well.col)
-            dx = pos.x() - cx
-            dy = pos.y() - cy
-            if math.sqrt(dx * dx + dy * dy) <= layout["radius"] + 2:
-                return well.name
-        return None
+        best_name, best_dist = None, float("inf")
+        for name, x, y, diameter in layout["wells"]:
+            cx, cy = layout["transform"].to_px(x, y)
+            dist = math.hypot(pos.x() - cx, pos.y() - cy)
+            if dist <= self._well_radius(layout, diameter) + 2 and dist < best_dist:
+                best_dist, best_name = dist, name
+        return best_name
 
     # ── Painting ───────────────────────────────────────────────
 
@@ -223,30 +282,16 @@ class WellPlateNavigator(QWidget):
         # Background
         p.fillRect(self.rect(), self._CLR_BG)
 
-        from SupportClasses.WellPlate import ROW_LABELS
-        r = layout["radius"]
+        transform = layout["transform"]
 
-        # Row labels
-        label_font = QFont("Consolas", scaled_font_size(max(7, int(layout["cell"] * 0.35))))
-        p.setFont(label_font)
-        p.setPen(self._CLR_LABEL)
-        for row in range(layout["rows"]):
-            _, cy = self._well_center(layout, row, 0)
-            p.drawText(QRectF(0, cy - 8, layout["ox"] - 2, 16),
-                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                       ROW_LABELS[row])
+        # Row / column labels — only where they mean something (a real grid).
+        if layout["headers"]:
+            self._paint_headers(p, layout)
 
-        # Column labels
-        for col in range(layout["cols"]):
-            cx, _ = self._well_center(layout, 0, col)
-            p.drawText(QRectF(cx - 12, 0, 24, layout["oy"] - 1),
-                       Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignBottom,
-                       str(col + 1))
-
-        # Wells
-        for well in self._plate.get_all_wells():
-            cx, cy = self._well_center(layout, well.row, well.col)
-            name = well.name
+        # Wells — each at its own centre and its own size.
+        for name, wx, wy, diameter in layout["wells"]:
+            cx, cy = transform.to_px(wx, wy)
+            r = self._well_radius(layout, diameter)
 
             # Determine colour
             if name == self._hover_well:
@@ -274,11 +319,15 @@ class WellPlateNavigator(QWidget):
         # well circle so it reads as "the tile grid that will cover this well".
         if (self._raster_cols > 0 and self._raster_rows > 0
                 and self._current_well):
-            well_obj = next(
-                (w for w in self._plate.get_all_wells()
-                 if w.name == self._current_well), None)
-            if well_obj is not None:
-                cx, cy = self._well_center(layout, well_obj.row, well_obj.col)
+            # v7.12: resolve THIS well's own centre and radius. The old code
+            # indexed the pseudo-grid by row/col and reused `r` left over from
+            # the well loop, so on a mixed-diameter plate the preview grid was
+            # drawn at the last-painted well's size.
+            hit = next((w for w in layout["wells"]
+                        if w[0] == self._current_well), None)
+            if hit is not None:
+                cx, cy = transform.to_px(hit[1], hit[2])
+                r = self._well_radius(layout, hit[3])
                 p.save()
                 clip = QPainterPath()
                 clip.addEllipse(QPointF(cx, cy), r, r)
@@ -302,6 +351,42 @@ class WellPlateNavigator(QWidget):
                 p.restore()
 
         p.end()
+
+    def _paint_headers(self, p: QPainter, layout) -> None:
+        """Row letters and column numbers for a regular grid.
+
+        Positions come from the real well centres of column 0 / row 0, not
+        from cell arithmetic, so the labels stay glued to the wells they name
+        under the geometric layout.
+        """
+        from SupportClasses.WellPlate import ROW_LABELS
+
+        transform = layout["transform"]
+        pitch_px = max(8.0, self._plate.nearest_neighbour_pitch_mm()
+                       * transform.scale)
+        p.setFont(QFont("Consolas",
+                        scaled_font_size(max(7, int(pitch_px * 0.35)))))
+        p.setPen(self._CLR_LABEL)
+
+        seen_rows: set[int] = set()
+        seen_cols: set[int] = set()
+        for well in self._plate.get_all_wells():
+            cx, cy = transform.to_px(well.x, well.y)
+            if well.col == 0 and well.row not in seen_rows:
+                seen_rows.add(well.row)
+                if 0 <= well.row < len(ROW_LABELS):
+                    p.drawText(
+                        QRectF(0, cy - 8, 16, 16),
+                        Qt.AlignmentFlag.AlignRight
+                        | Qt.AlignmentFlag.AlignVCenter,
+                        ROW_LABELS[well.row])
+            if well.row == 0 and well.col not in seen_cols:
+                seen_cols.add(well.col)
+                p.drawText(
+                    QRectF(cx - 12, 0, 24, 13),
+                    Qt.AlignmentFlag.AlignCenter
+                    | Qt.AlignmentFlag.AlignBottom,
+                    str(well.col + 1))
 
     # ── Mouse events ───────────────────────────────────────────
 

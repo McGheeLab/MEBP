@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import replace
 from pathlib import Path
 from functools import partial
@@ -50,7 +51,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QScrollArea, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QFormLayout, QDialogButtonBox,
     QCheckBox, QAbstractItemView, QListWidget, QListWidgetItem,
-    QSlider, QInputDialog,
+    QSlider, QInputDialog, QApplication,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QColor, QStandardItem
@@ -75,6 +76,8 @@ from SupportClasses.NeedleTypeStore import (
     NeedleType, get_store as get_needle_type_store, safe_id as safe_needle_type_id,
 )
 from SupportClasses.WellPlate import PLATE_DEFINITIONS, WellPlate
+from SupportClasses.CameraRotationTracker import (  # v7.10
+    nearest_nominal, nearest_square_rotation, wrap_deg)
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
@@ -113,21 +116,14 @@ def role_nominal_rotations(role) -> tuple[float, ...]:
     return _AXIS_ALIGNED_NOMINALS
 
 
-def _wrap_deg(angle: float) -> float:
-    """Wrap an angle to (-180, 180]."""
-    a = (float(angle) + 180.0) % 360.0 - 180.0
-    return 180.0 if a == -180.0 else a
-
-
 def nominal_rotation_delta(theta_deg: float, role) -> tuple[float, float]:
     """(nearest_nominal, signed_delta) of a measured rotation vs the
-    role's nominal mount set. ``theta = nominal + delta`` (mod 360)."""
-    best_nom, best_delta = 0.0, _wrap_deg(theta_deg)
-    for nom in role_nominal_rotations(role):
-        d = _wrap_deg(theta_deg - nom)
-        if abs(d) < abs(best_delta):
-            best_nom, best_delta = nom, d
-    return best_nom, best_delta
+    role's nominal mount set. ``theta = nominal + delta`` (mod 360).
+
+    Delegates to the Qt-free ``CameraRotationTracker.nearest_nominal`` so the
+    slot-card readout and the live square-up tool share ONE implementation.
+    """
+    return nearest_nominal(theta_deg, role_nominal_rotations(role))
 
 
 def role_rotation_hint(role) -> str:
@@ -277,83 +273,6 @@ class InkEditorDialog(QDialog):
 # Rosette Editor Dialog
 # ═══════════════════════════════════════════════════════════════════
 
-class RosetteEditorDialog(QDialog):
-    """Dialog for adding/editing a rosette insert."""
-
-    def __init__(self, rosette: RosetteInsert | None = None, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Edit Rosette" if rosette else "Add Rosette")
-        self.setMinimumWidth(s(400))
-        self._build_ui(rosette)
-
-    def _build_ui(self, rosette: RosetteInsert | None):
-        layout = QFormLayout(self)
-
-        self.name_edit = QLineEdit(rosette.name if rosette else "")
-        self.name_edit.setPlaceholderText("e.g. 4-subwell ring")
-        layout.addRow("Name:", self.name_edit)
-
-        self.format_combo = QComboBox()
-        for fmt in sorted(PLATE_DEFINITIONS.keys()):
-            self.format_combo.addItem(f"{fmt}-well", fmt)
-        if rosette:
-            idx = self.format_combo.findData(rosette.well_format)
-            if idx >= 0:
-                self.format_combo.setCurrentIndex(idx)
-        layout.addRow("Well format:", self.format_combo)
-
-        self.ring_spin = QSpinBox()
-        self.ring_spin.setRange(1, 12)
-        self.ring_spin.setValue(rosette.num_subwells - (1 if rosette and rosette.has_center_well else 0) if rosette else 4)
-        layout.addRow("Ring sub-wells:", self.ring_spin)
-
-        self.center_check = QComboBox()
-        self.center_check.addItems(["Yes", "No"])
-        if rosette and not rosette.has_center_well:
-            self.center_check.setCurrentIndex(1)
-        layout.addRow("Center well:", self.center_check)
-
-        self.diameter_spin = QDoubleSpinBox()
-        self.diameter_spin.setRange(0.1, 10.0)
-        self.diameter_spin.setDecimals(2)
-        self.diameter_spin.setSuffix(" mm")
-        self.diameter_spin.setValue(rosette.subwell_diameter_mm if rosette else 2.0)
-        layout.addRow("Sub-well Ø:", self.diameter_spin)
-
-        self.depth_spin = QDoubleSpinBox()
-        self.depth_spin.setRange(0.1, 20.0)
-        self.depth_spin.setDecimals(1)
-        self.depth_spin.setSuffix(" mm")
-        self.depth_spin.setValue(rosette.subwell_depth_mm if rosette else 3.0)
-        layout.addRow("Sub-well depth:", self.depth_spin)
-
-        self.z_offset_spin = QDoubleSpinBox()
-        self.z_offset_spin.setRange(-10.0, 10.0)
-        self.z_offset_spin.setDecimals(1)
-        self.z_offset_spin.setSuffix(" mm")
-        self.z_offset_spin.setValue(rosette.insert_z_offset_mm if rosette else 0.0)
-        layout.addRow("Insert Z offset:", self.z_offset_spin)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def get_rosette(self) -> RosetteInsert:
-        return RosetteInsert.create_standard(
-            name=self.name_edit.text().strip() or "Unnamed",
-            well_format=self.format_combo.currentData(),
-            num_ring=self.ring_spin.value(),
-            has_center=self.center_check.currentIndex() == 0,
-            subwell_diameter_mm=self.diameter_spin.value(),
-            subwell_depth_mm=self.depth_spin.value(),
-            insert_z_offset_mm=self.z_offset_spin.value(),
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Pump Channel Widget (v7.2.4: exclusive ink assignment)
-# ═══════════════════════════════════════════════════════════════════
 
 class PumpChannelWidget(QGroupBox):
     """
@@ -895,28 +814,41 @@ class HardwareSetupPage(ModePage):
         # Backward-compat shim: a hidden QComboBox mirrors the picker so
         # external code that still calls self.plate_combo.currentData()
         # or .findData() keeps working until the migration finishes.
-        from gui.pages.hardware.plate_designer import PlateDesignerWidget
-        self._plate_designer = PlateDesignerWidget(self, mode="plate")
-        self._plate_designer.plate_changed.connect(self._on_designer_plate_changed)
-        # v7.5.x: two-step plate-TYPE selector (Format → product) ABOVE the
-        # designer. The card is the primary plate selector — a product (Corning
-        # glass-bottom, NEST plastic, …) supplies the per-plate Z offsets and
-        # auto-loads its own mosaic. The designer below remains for custom
-        # geometry editing.
-        self._selected_plate_type_id = ""
-        self._plate_type_syncing = False
-        self._sub_layouts["plate"].addWidget(self._build_plate_type_card())
-        self._sub_layouts["plate"].addWidget(self._plate_designer)
+        # v7.12: the Plate sub-page opens as a LIBRARY of plate documents and
+        # drills into a parametric builder. Plates and rosettes are the same
+        # kind of document behind a mode pill, so one builder serves both —
+        # the rosette case differs only in that its boundary is a bore.
+        #
+        # This replaces the v7.4.x pair of PlateDesignerWidget instances that
+        # shared one design object across two sub-pages, and the Format→Type
+        # card that sat above them. Splitting plate identity across a card and
+        # a picker gave `plate_format` / `plate_name` / `plate_type_id` two
+        # owners, and each silently cleared the other's choice; the active
+        # design is now the single owner.
+        from gui.pages.hardware.plate_workspace import PlateWorkspacePage
+        from gui.pages.hardware.rosette_placement import RosettePlacementPage
 
-        # v7.4.8: the Rosette sub-page hosts a rosette-mode designer that
-        # mirrors the plate layout; double-clicking a well drills into its
-        # rosette. It shares the plate design object with the Plate page
-        # (synced on sub-page switch — see _on_hw_sub_page_changed).
-        self._rosette_designer = PlateDesignerWidget(self, mode="rosette")
-        self._rosette_designer.save_requested.connect(
-            self._on_rosette_save_requested)
-        self._rosette_designer.design_edited.connect(
-            self._on_rosette_design_edited)
+        # v7.9.1: the unsaved stand-in document for a BUNDLED plate selection,
+        # as ``((format, plate_type_id), PlateDocument)``. Written on disk only
+        # once a rosette is actually placed (see _on_placements_changed).
+        self._pending_plate_fork = None
+
+        self._plate_workspace = PlateWorkspacePage()
+        self._plate_workspace.active_plate_changed.connect(
+            self._on_active_plate_changed)
+        self._plate_workspace.library_changed.connect(self._on_library_changed)
+        self._sub_layouts["plate"].addWidget(self._plate_workspace, 1)
+
+        # The old Rosette sub-page hosted a second designer reached by
+        # double-clicking a well. Rosettes are library documents now, so this
+        # slot becomes PLACEMENT: design once, seat many.
+        self._rosette_placement = RosettePlacementPage(
+            plate_store=self._plate_workspace.plate_store(),
+            rosette_store=self._plate_workspace.rosette_store())
+        self._rosette_placement.placements_changed.connect(
+            self._on_placements_changed)
+        self._rosette_placement.edit_rosette_requested.connect(
+            self._on_edit_rosette_requested)
 
         self.plate_combo = QComboBox()
         self.plate_combo.hide()
@@ -1243,46 +1175,17 @@ class HardwareSetupPage(ModePage):
         # handler rebuilds the config, which needs widgets built later.
         self._apply_needle_type_visibility()
 
-        # ── Section 7a: Rosette Designer (v7.4.8) ─────────────────
-        # Primary content of the Rosette sub-page: the plate layout with
-        # double-click-to-drill-into-a-well rosette design.
-        self._sub_layouts["rosette"].addWidget(self._rosette_designer, 1)
-
-        # ── Section 7b: Rosette Library (legacy RosetteInsert presets) ─
-        ros_group = QGroupBox("Rosette Library")
-        ros_group.setStyleSheet(self._group_style())
-        ros_lay = QVBoxLayout(ros_group)
-
-        self.rosette_table = QTableWidget(0, 5)
-        self.rosette_table.setHorizontalHeaderLabels(
-            ["Name", "Sub-wells", "Fits", "Depth", "Z-offset"])
-        self.rosette_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch)
-        self.rosette_table.setSelectionBehavior(
-            QAbstractItemView.SelectRows)
-        self.rosette_table.setSelectionMode(
-            QAbstractItemView.SingleSelection)
-        self.rosette_table.setEditTriggers(
-            QAbstractItemView.NoEditTriggers)
-        self.rosette_table.setMaximumHeight(s(140))
-        ros_lay.addWidget(self.rosette_table)
-
-        # v7.4.2 polish: action row — primary add, secondary edit, danger remove.
-        ros_btns = QHBoxLayout()
-        ros_btns.setSpacing(s(8))
-        btn_add_ros = icon_button("Add Rosette", "plus", object_name="accentBtn")
-        btn_add_ros.clicked.connect(self._add_rosette)
-        ros_btns.addWidget(btn_add_ros)
-        btn_edit_ros = icon_button("Edit", "pencil")
-        btn_edit_ros.clicked.connect(self._edit_rosette)
-        ros_btns.addWidget(btn_edit_ros)
-        btn_del_ros = icon_button("Remove", "trash", object_name="dangerBtn")
-        btn_del_ros.clicked.connect(self._remove_rosette)
-        ros_btns.addWidget(btn_del_ros)
-        ros_btns.addStretch()
-        ros_lay.addLayout(ros_btns)
-
-        self._sub_layouts["rosette"].addWidget(ros_group)
+        # ── Section 7: Rosette placement (v7.12) ──────────────────
+        # The "Layout" sub-page. The v7.4.8 rosette DESIGNER moved into the
+        # Plate tab's Rosettes mode; this slot is now where designed rosettes
+        # are seated into wells.
+        #
+        # The legacy "Rosette Library" table and its RosetteEditorDialog were
+        # removed here: they edited `HardwareConfig.rosette_library`, whose only
+        # consumer (`WellSetup.attach_rosette`) has no callers repo-wide, so the
+        # table was write-only and unrelated to the designer beside it. The
+        # config FIELD is retained so older setup JSON still round-trips.
+        self._sub_layouts["rosette"].addWidget(self._rosette_placement, 1)
 
         # ── Section 0: Camera Detection & Assignment (v7.4.x rev3) ──
         # Top-of-page block. Detect row stays single-line; per-slot
@@ -1370,12 +1273,43 @@ class HardwareSetupPage(ModePage):
         # v7.5.x: per-slot rotation-vs-stage readout + calibrate button.
         self._live_cam_rot_labels: list[QLabel] = []
         self._live_cam_rot_btns: list[QPushButton] = []
+        # v7.10: per-slot "square up the mount" button (live rotation aid).
+        self._live_cam_square_btns: list[QPushButton] = []
         # v7.5.x: per-slot orientation controls (ONE unified system applied to
         # the live view + mosaic + click-mapping): flip X (mirror), flip Y, and
         # a custom rotation spin.
         self._live_cam_mirror_checks: list[QCheckBox] = []
         self._live_cam_flip_y_checks: list[QCheckBox] = []
         self._live_cam_rot_spins: list = []
+        # v7.16: per-slot centred crop — a sensor wider than the illuminated
+        # field images the dark tube wall at the edges. Applied at the frame
+        # SOURCE, so it reaches the live view, the mosaic, captures and
+        # recordings alike.
+        self._live_cam_crop_checks: list[QCheckBox] = []
+        self._live_cam_crop_spins: list = []
+        self._live_cam_crop_labels: list[QLabel] = []
+        # WHERE the crop sits — the lit circle is centred on the optical axis,
+        # which need not be the middle of the sensor.
+        self._live_cam_crop_off_x_spins: list = []
+        self._live_cam_crop_off_y_spins: list = []
+        self._live_cam_crop_centre_btns: list[QPushButton] = []
+        # Debounced persistence. The offset spins auto-repeat, so a held arrow
+        # would otherwise write the calibration file on every step — file I/O
+        # on the GUI thread, at a rate set by Qt's key-repeat. See
+        # _apply_slot_crop.
+        self._pending_crop_writes: dict[int, object] = {}
+        self._crop_persist_timer = QTimer(self)
+        self._crop_persist_timer.setSingleShot(True)
+        self._crop_persist_timer.setInterval(400)
+        self._crop_persist_timer.timeout.connect(self._flush_crop_persist)
+        # hideEvent covers navigating away; this covers closing the app while
+        # still ON this page, which no page-level event reliably reports.
+        try:
+            _qapp = QApplication.instance()
+            if _qapp is not None:
+                _qapp.aboutToQuit.connect(self._flush_crop_persist)
+        except Exception:
+            pass
         self._cam_preview_signals_wired = False
 
         from gui.styles import build_glass_panel_style
@@ -1525,15 +1459,38 @@ class HardwareSetupPage(ModePage):
             self._live_cam_rot_btns.append(rot_btn)
             cl.addWidget(rot_btn)
 
-            # Flip X / Flip Y — a mirror reverses image handedness (which a
-            # rotation alone cannot express), so each is a separate declaration
-            # applied to the live view, the mosaic, and the click→stage mapping.
+            # v7.10: physically square the mount, with live optical feedback.
+            square_btn = QPushButton("⊾ Square up mount…")
+            square_btn.setEnabled(False)
+            square_btn.setToolTip(
+                "Turn this camera in its mount until its measured rotation "
+                "lands on 0/90/180/270°, watching a live degrees-to-go "
+                "readout and a translucent ghost of the target. Moves "
+                "nothing — the measurement is purely optical. Requires the "
+                "camera running and a rotation already calibrated."
+            )
+            square_btn.clicked.connect(
+                lambda _checked=False, cam_i=i:
+                self._on_square_up_mount(cam_i)
+            )
+            self._live_cam_square_btns.append(square_btn)
+            cl.addWidget(square_btn)
+
+            # v7.16: Flip X / Flip Y / Rotation set the LIVE VIEW only — how the
+            # operator wants the feed to look. They used to write the measured
+            # camera→stage orientation, which the objective/mosaic calibration
+            # then overwrote, so setting the view up and calibrating flipped it
+            # back. The measured orientation now has its own controls (⟳
+            # Rotation…, ⊾ Square up mount…, the objective calibration) and is
+            # reported in the readout above.
             mirror_cb = QCheckBox("⇄ Flip X axis")
             mirror_cb.setEnabled(False)
             mirror_cb.setToolTip(
-                "Flip this camera horizontally (mirror the X axis). Applied to "
-                "the live view, the mosaic, and the click→stage mapping (one "
-                "unified orientation)."
+                "Flip the LIVE VIEW horizontally (mirror the X axis).\n\n"
+                "Display only — this does not change how mosaic tiles are "
+                "placed or where a click drives the stage. Those follow the "
+                "measured camera-vs-stage orientation shown above, and a "
+                "calibration will no longer reset this view setting."
             )
             mirror_cb.toggled.connect(
                 lambda checked, cam_i=i: self._on_toggle_mirror(cam_i, checked)
@@ -1543,8 +1500,9 @@ class HardwareSetupPage(ModePage):
             flip_y_cb = QCheckBox("⇅ Flip Y axis")
             flip_y_cb.setEnabled(False)
             flip_y_cb.setToolTip(
-                "Flip this camera vertically (mirror the Y axis). Applied to the "
-                "live view, the mosaic, and the click→stage mapping."
+                "Flip the LIVE VIEW vertically (mirror the Y axis).\n\n"
+                "Display only — the mosaic and the click→stage mapping are "
+                "unaffected (they use the measured orientation above)."
             )
             flip_y_cb.toggled.connect(
                 lambda checked, cam_i=i: self._on_toggle_flip_y(cam_i, checked)
@@ -1564,10 +1522,11 @@ class HardwareSetupPage(ModePage):
             rot_spin.setDecimals(1)
             rot_spin.setEnabled(False)
             rot_spin.setToolTip(
-                "Custom DISPLAY rotation applied to the live view, the mosaic, "
-                "and the click→stage mapping. For the needle side cams this is "
-                "the small sensor roll — their ±45° mount direction is a "
-                "separate, measured value that never tilts the view.")
+                "Rotate the LIVE VIEW by this angle.\n\n"
+                "Display only — it does not change the measured camera-vs-stage "
+                "rotation above, so mosaic tiles and click→stage mapping are "
+                "unaffected and a calibration will not reset it. Typically 0/90/"
+                "180/270 to get the plate the way up you want to see it.")
             rot_spin.valueChanged.connect(
                 lambda v, cam_i=i: self._on_slot_rotation_spin(cam_i, v))
             self._live_cam_rot_spins.append(rot_spin)
@@ -1576,6 +1535,105 @@ class HardwareSetupPage(ModePage):
             rot_spin_row.addWidget(QLabel("Rotation °:"))
             rot_spin_row.addWidget(rot_spin, 1)
             cl.addLayout(rot_spin_row)
+
+            # v7.16: square crop. A microscope's illuminated field is a circle;
+            # a sensor wider than it images the dark tube wall at the left and
+            # right edges. Those pixels carry no specimen, they drag the
+            # mosaic's flat-field estimate toward black, and the raster still
+            # steps by their width. Unlike the flips above this really removes
+            # pixels — at the frame source, so every surface agrees.
+            crop_cb = QCheckBox("⬛ Square crop")
+            crop_cb.setEnabled(False)
+            crop_cb.setToolTip(
+                "Crop every frame from this camera to a centred square, so the "
+                "dark edges outside the illuminated field are discarded.\n\n"
+                "Applied at the frame source: the live view, mosaic tiles, "
+                "still captures, video recordings and detection all see the "
+                "cropped frame. The centre is preserved exactly, so click-to-"
+                "stage stays correct, and µm/px is unaffected (cropping removes "
+                "pixels; it does not change what a pixel spans).")
+            crop_cb.toggled.connect(
+                lambda checked, cam_i=i: self._on_toggle_crop(cam_i, checked))
+            self._live_cam_crop_checks.append(crop_cb)
+
+            crop_spin = QDoubleSpinBox()
+            crop_spin.setRange(10.0, 100.0)
+            crop_spin.setSingleStep(5.0)
+            crop_spin.setDecimals(0)
+            crop_spin.setValue(100.0)
+            crop_spin.setSuffix(" %")
+            crop_spin.setEnabled(False)
+            crop_spin.setToolTip(
+                "Size of the square as a percentage of the sensor's SHORT "
+                "side. 100 % is the largest square that fits; lower it when "
+                "the illuminated circle is smaller than the short side and the "
+                "corners are still dark.\n\n"
+                "A percentage rather than pixels, so the cropped region stays "
+                "the same physical part of the field if the capture resolution "
+                "changes (e.g. switching 2x2 binning off).")
+            crop_spin.valueChanged.connect(
+                lambda v, cam_i=i: self._on_crop_scale_spin(cam_i, v))
+            self._live_cam_crop_spins.append(crop_spin)
+
+            crop_row = QHBoxLayout()
+            crop_row.setSpacing(s(6))
+            crop_row.addWidget(crop_cb)
+            crop_row.addWidget(crop_spin, 1)
+            cl.addLayout(crop_row)
+
+            # WHERE the square sits. The illuminated circle is centred on the
+            # optical axis, which need not pass through the middle of the
+            # sensor — so a centred square can still clip one side. The
+            # displacement is compensated in the pixel↔stage conversions, so
+            # re-aiming the crop does NOT move taught coordinates.
+            off_x_spin = QDoubleSpinBox()
+            off_y_spin = QDoubleSpinBox()
+            for sp_, ax in ((off_x_spin, "X"), (off_y_spin, "Y")):
+                sp_.setRange(-50.0, 50.0)
+                sp_.setSingleStep(1.0)
+                sp_.setDecimals(1)
+                sp_.setValue(0.0)
+                sp_.setSuffix(" %")
+                sp_.setEnabled(False)
+                sp_.setToolTip(
+                    f"Move the crop along {ax}, as a percentage of the frame. "
+                    f"0 % is centred.\n\n"
+                    f"Use this when the lit circle is not centred on the sensor "
+                    f"and a centred square still clips one edge. The offset is "
+                    f"cancelled out of the click-to-stage map and the mosaic "
+                    f"tile placement, so re-aiming it does NOT shift a taught "
+                    f"plate calibration. It is clamped to keep the crop inside "
+                    f"the frame.")
+            off_x_spin.valueChanged.connect(
+                lambda v, cam_i=i: self._on_crop_offset_spin(cam_i))
+            off_y_spin.valueChanged.connect(
+                lambda v, cam_i=i: self._on_crop_offset_spin(cam_i))
+            self._live_cam_crop_off_x_spins.append(off_x_spin)
+            self._live_cam_crop_off_y_spins.append(off_y_spin)
+
+            centre_btn = QPushButton("⌖")
+            centre_btn.setEnabled(False)
+            centre_btn.setFixedWidth(s(28))
+            centre_btn.setToolTip("Re-centre the crop (offset back to 0 %).")
+            centre_btn.clicked.connect(
+                lambda _checked=False, cam_i=i: self._on_crop_recentre(cam_i))
+            self._live_cam_crop_centre_btns.append(centre_btn)
+
+            off_row = QHBoxLayout()
+            off_row.setSpacing(s(4))
+            off_row.addWidget(QLabel("Offset:"))
+            off_row.addWidget(off_x_spin, 1)
+            off_row.addWidget(off_y_spin, 1)
+            off_row.addWidget(centre_btn)
+            cl.addLayout(off_row)
+
+            crop_lbl = QLabel("Crop: off (full sensor)")
+            crop_lbl.setWordWrap(True)
+            crop_lbl.setStyleSheet(
+                f"color: {COLORS.get('subtext0', '#a6adc8')}; "
+                f"font-size: {scaled_font_size(9)}pt;")
+            self._live_cam_crop_labels.append(crop_lbl)
+            cl.addWidget(crop_lbl)
 
             # Holder for the image-correction strip (mounted lazily once the
             # CameraManager arrives, so the feed can be previewed first).
@@ -1849,11 +1907,20 @@ class HardwareSetupPage(ModePage):
         actions_lay.setSpacing(s(8))
 
         btn_save = icon_button(
-            "Save Config", "save", object_name="accentBtn",
-            tooltip="Save the current hardware configuration to disk.")
+            "Save Setup", "save", object_name="accentBtn",
+            tooltip="Save this setup into the Saved setups folder "
+                    "(config/hardware) under the Name above, so it appears "
+                    "in the Saved setups list.")
         btn_save.clicked.connect(self._save_config)
         actions_lay.addStretch()
         actions_lay.addWidget(btn_save)
+
+        btn_save_as = icon_button(
+            "Save As…", "save",
+            tooltip="Save a copy to any folder. A setup saved outside "
+                    "config/hardware will NOT appear in the Saved setups list.")
+        btn_save_as.clicked.connect(self._save_config_as)
+        actions_lay.addWidget(btn_save_as)
 
         btn_load = icon_button(
             "Load Config", "folder-open",
@@ -1865,8 +1932,9 @@ class HardwareSetupPage(ModePage):
 
         # ── Finalize sub-pages (v7.4.0-b) ─────────────────────────
         # Add stretch to each sub-page layout so groups stack at the top.
-        for key in ("identity", "plate", "pumps_inks", "inks", "needle",
-                    "rosette", "cameras"):
+        # v7.12: "plate" and "rosette" host full-height workspaces now, so a
+        # trailing stretch would squash them to nothing.
+        for key in ("identity", "pumps_inks", "inks", "needle", "cameras"):
             self._sub_layouts[key].addStretch()
 
         # Register sub-pages with ModePage in user-facing order.
@@ -1884,8 +1952,11 @@ class HardwareSetupPage(ModePage):
         # v7.5.x: order the dependent setups left-to-right so each
         # section's options build on the ones to its left:
         # Rosette → Ink → Needle → Pump.
+        # v7.12: the rosette DESIGNER lives on the Plate tab now; this slot is
+        # rosette PLACEMENT, so it is named for what it does.
         self._rosette_sub_index = len(self._sub_pages)
-        self.add_sub_page("flower",    "Rosette",         self._sub_scrolls["rosette"])
+        self._layout_sub_index = self._rosette_sub_index
+        self.add_sub_page("flower",    "Layout",          self._sub_scrolls["rosette"])
         self.add_sub_page("flask",     "Ink",             self._sub_scrolls["inks"])
         self.add_sub_page("needle",    "Needle",          self._sub_scrolls["needle"])
         self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
@@ -1914,43 +1985,203 @@ class HardwareSetupPage(ModePage):
         scroll.setWidget(content)
         return scroll, layout
 
-    # ── v7.4.8: Plate ↔ Rosette designer sync ────────────────────
+    # ── v7.12: Plate workspace ↔ Layout placement ────────────────
 
     def _on_hw_sub_page_changed(self, index: int) -> None:
-        """Keep the rosette designer mirroring the plate layout.
+        """Point the Layout tab at the active plate when it is shown.
 
-        On showing the Rosette sub-page, adopt the Plate page's current
-        design (shared object) so the rosette designer starts from the
-        same plate. On returning to the Plate sub-page, re-render so any
-        rosettes added on the Rosette page show their badges.
+        Also guards unsaved builder work: leaving the Plate tab mid-edit used
+        to discard geometry with no prompt.
         """
-        if not hasattr(self, "_rosette_designer"):
+        if not hasattr(self, "_plate_workspace"):
             return
         if index == getattr(self, "_rosette_sub_index", -1):
-            self._rosette_designer.adopt_design(
-                self._plate_designer.current_design(),
-                key=self._plate_designer.current_plate_key())
+            self._plate_workspace.maybe_discard()
+            self._rosette_placement.set_plate(
+                self._active_plate_document(materialize=True))
         elif index == getattr(self, "_plate_sub_index", -1):
-            self._plate_designer.refresh()
+            self._plate_workspace.refresh()
 
-    def _on_rosette_design_edited(self) -> None:
-        """A rosette edit mutates the shared plate design → mark dirty so
-        the user knows to save (Save works on either sub-page)."""
-        self._plate_designer._dirty = True
-        self._plate_designer._update_dirty_label()
+    def _active_plate_document(self, materialize: bool = False):
+        """The `PlateDocument` the hardware config points at, or None.
+
+        v7.9.1 ``materialize``: a BUNDLED plate (a bare standard format, or a
+        `PlateType` product) has no document on disk — `_on_active_plate_changed`
+        clears `plate_doc_id` for exactly that reason — so the Layout tab showed
+        "No plate selected" for every plate the library ships, which is every
+        plate in a fresh install and every saved hardware config in this repo.
+        The operator's report ("I can't add a rosette because the plate I have
+        selected doesn't load") is that state.
+
+        With ``materialize=True`` one is stood up on demand, the same way the
+        builder already does when you open a bundled card: standards auto-fork
+        on first edit. The fork is held unsaved until a rosette is actually
+        placed — `_on_placements_changed` is what writes it and re-points the
+        config. Cached so re-entering the tab, or a config refresh, cannot swap
+        the document out from under in-progress placements.
+
+        ⚠ It defaults to **False**, and `_rebuild_config` must keep it that way:
+        that method copies `doc.meta.name` into `plate_name`, which sits in
+        `active_plate_key`'s precedence chain. Materialising there would rekey
+        every per-plate store (mosaic, taught calibration, well training) to
+        "Copy of 24-well" for a plate the operator never forked.
+        """
+        doc_id = getattr(self._config, "plate_doc_id", "") if self._config \
+            else ""
+        if doc_id:
+            self._pending_plate_fork = None
+            try:
+                return self._plate_workspace.plate_store().get(doc_id)
+            except Exception:                          # pragma: no cover
+                return None
+        if self._config is None or not materialize:
+            return None
+        return self._bundled_plate_fork()
+
+    def _bundled_plate_fork(self):
+        """An unsaved PlateDocument standing in for the selected bundled plate.
+
+        Keyed by (format, product id) so the cache is dropped the moment the
+        operator picks a different plate — otherwise placements stamped onto one
+        standard would reappear on the next.
+        """
+        from gui.pages.hardware.plate_library import product_id, standard_id
+        fmt = getattr(self._config, "plate_format", 0) or 0
+        type_id = getattr(self._config, "plate_type_id", "") or ""
+        if fmt not in PLATE_DEFINITIONS:
+            return None
+        key = (fmt, type_id)
+        cached = getattr(self, "_pending_plate_fork", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        label = type_id or f"{fmt}-well"
+        try:
+            from SupportClasses.PlateDocument import PlateDocument
+            doc = PlateDocument.from_standard_format(
+                fmt, name=f"Copy of {label}")
+        except Exception as exc:                       # pragma: no cover
+            logger.warning("Could not materialise bundled plate %s: %s",
+                           label, exc)
+            return None
+        if type_id:
+            # Keep the product identity on the fork so its Z offsets and its
+            # per-plate stores still resolve (same rule as the builder's fork).
+            doc.meta.plate_type_id = type_id
+        self._pending_plate_fork = (key, doc)
+        logger.info(
+            "Layout tab: '%s' is a bundled plate with no document — editing it "
+            "will save a new plate '%s'. (library card %s)",
+            label, doc.meta.name,
+            product_id(type_id) if type_id else standard_id(fmt))
+        return doc
+
+    def _on_active_plate_changed(self, doc_id: str) -> None:
+        """★ on a library card → this plate becomes the setup's plate.
+
+        Two shapes, because ``active_plate_key`` resolves
+        ``plate_type_id → plate_doc_id → plate_format``:
+
+        * a **saved design** is carried by ``plate_doc_id``;
+        * a **bundled standard** has no document, so it is carried by
+          ``plate_format`` with ``plate_doc_id`` cleared.
+
+        The combo is synced in the standard case because ``_rebuild_config``
+        falls back to it whenever ``plate_doc_id`` is empty — leaving it stale
+        would quietly revert the choice on the very next rebuild.
+        """
+        from gui.pages.hardware.plate_library import (
+            base_format_of, is_bundled, is_product, product_type_id)
+        if self._config is None:
+            return
+        if is_bundled(doc_id):
+            self._config.plate_doc_id = ""
+            self._config.plate_name = ""
+            # A product keeps its type id — that is what carries its Z offsets
+            # and gives it a mosaic separate from the bare format's.
+            self._config.plate_type_id = (product_type_id(doc_id)
+                                          if is_product(doc_id) else "")
+            fmt = base_format_of(doc_id)
+            if fmt in PLATE_DEFINITIONS:
+                self._config.plate_format = fmt
+            idx = self.plate_combo.findData(self._config.plate_format)
+            if idx >= 0:
+                self.plate_combo.blockSignals(True)
+                self.plate_combo.setCurrentIndex(idx)
+                self.plate_combo.blockSignals(False)
+        else:
+            self._config.plate_doc_id = doc_id or ""
+            doc = self._plate_workspace.plate_store().get(doc_id)
+            if doc is not None:
+                # A display cache only — `plate_doc_id` is the key.
+                self._config.plate_name = doc.meta.name
+                self._config.plate_type_id = doc.meta.plate_type_id or ""
+        if hasattr(self, "_rosette_placement"):
+            self._rosette_placement.set_plate(
+                self._active_plate_document(materialize=True))
         self._on_config_changed()
 
-    def _on_rosette_save_requested(self) -> None:
-        """Rosette page 'Save plate' → save the shared plate via the Plate
-        page (forks standards to a custom name), then clear the rosette
-        page's unsaved flag + re-sync its key."""
-        self._plate_designer._on_save()
-        # Mirror the (possibly new) key + cleared dirty state onto the
-        # rosette designer so its header stops showing "unsaved".
-        self._rosette_designer._current_key = (
-            self._plate_designer.current_plate_key())
-        self._rosette_designer._dirty = False
-        self._rosette_designer._update_dirty_label()
+    def _active_library_id(self) -> str:
+        """What the library should draw the ★ on, for the current config."""
+        from gui.pages.hardware.plate_library import product_id, standard_id
+        if self._config is None:
+            return ""
+        # Mirrors `active_plate_key`'s precedence, so the ★ always lands on
+        # the card whose key the per-plate stores are actually using.
+        doc_id = getattr(self._config, "plate_doc_id", "") or ""
+        type_id = getattr(self._config, "plate_type_id", "") or ""
+        if type_id and not doc_id:
+            return product_id(type_id)
+        if doc_id:
+            return doc_id
+        fmt = getattr(self._config, "plate_format", 0) or 0
+        return standard_id(fmt) if fmt in PLATE_DEFINITIONS else ""
+
+    def _on_library_changed(self) -> None:
+        """A plate was created, renamed, duplicated or deleted."""
+        if hasattr(self, "_rosette_placement"):
+            self._rosette_placement.refresh()
+        self._on_config_changed()
+
+    def _on_placements_changed(self) -> None:
+        """A rosette was seated or removed — persist and tell the app.
+
+        v7.9.1: this is the "first edit" that turns a bundled plate into a real
+        one. Saving the fork mints its id, so the config must be re-pointed at
+        it here — otherwise the placements land in a document nothing refers to
+        and the tab reverts to a blank fork on the next visit.
+        """
+        doc = self._rosette_placement._doc
+        if doc is None:
+            self._on_config_changed()
+            return
+        was_fork = (self._config is not None
+                    and not getattr(self._config, "plate_doc_id", ""))
+        try:
+            self._plate_workspace.plate_store().save(doc)
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("Could not save placements: %s", exc)
+            self._on_config_changed()
+            return
+        if was_fork:
+            self._config.plate_doc_id = doc.meta.id
+            self._config.plate_name = doc.meta.name
+            self._pending_plate_fork = None
+            logger.info(
+                "Placed a rosette on a bundled plate — forked it to '%s' (%s) "
+                "and pointed the hardware config at it.",
+                doc.meta.name, doc.meta.id)
+            try:
+                self._plate_workspace.refresh()
+            except Exception:                          # pragma: no cover
+                pass
+        self._on_config_changed()
+
+    def _on_edit_rosette_requested(self, rosette_id: str) -> None:
+        """Layout → 'edit this rosette' opens its DESIGN on the Plate tab."""
+        idx = getattr(self, "_plate_sub_index", -1)
+        if idx >= 0:
+            self.switch_to(idx)
+        self._plate_workspace.open_rosette(rosette_id)
 
     # ════════════════════════════════════════════════════════════════
     #  SHARED STYLES
@@ -1991,17 +2222,17 @@ class HardwareSetupPage(ModePage):
     # ════════════════════════════════════════════════════════════════
 
     def get_sub_page_title(self) -> str:
-        """Override ModePage to return descriptive sub-page name.
+        """Override ModePage to return the descriptive sub-page name.
 
-        v7.4.1: Device sub-page first (initial setup), then experiment
-        sub-pages.
+        v7.12: derived from the titles recorded at registration rather than a
+        hand-maintained parallel list. The old list had drifted badly — nine
+        labels for ten tabs, in the wrong order from index 3 on (it claimed
+        Pump/Needle/Ink/Rosette where the tabs are Rosette/Ink/Needle/Pump) and
+        with Microscope missing entirely — so most tabs reported the wrong name
+        and the last one reported "Hardware Setup".
         """
-        labels = ["Hardware: Device", "Hardware: Identity", "Hardware: Plate",
-                  "Hardware: Pump", "Hardware: Needle", "Hardware: Ink",
-                  "Hardware: Rosette", "Hardware: Cameras",
-                  "Hardware: Xbox Controller"]
-        idx = self.get_active_index()
-        return labels[idx] if 0 <= idx < len(labels) else "Hardware Setup"
+        title = self.sub_page_title()
+        return f"Hardware: {title}" if title else "Hardware Setup"
 
     # ════════════════════════════════════════════════════════════════
     #  NEEDLE CHANGE HANDLER
@@ -3336,11 +3567,164 @@ class HardwareSetupPage(ModePage):
         # calibration may have carried a fresh rotation — resync the strips.
         self._refresh_slot_rotation_displays()
 
+    def square_up_refusal(self, cam_idx: int, running: bool) -> str:
+        """Why the square-up tool cannot run on this slot, or '' if it can.
+
+        Pure enough to test directly. Three refusals, each for a real hazard:
+
+        * no running camera — the tool is entirely optical;
+        * no measured rotation — there is nothing to aim at, and
+          ``nearest_square_rotation(None)`` would throw;
+        * a needle-role slot with no ``column_dir_deg``. That combination is
+          the pre-v7.5.x conflated state, where ``rotation_deg`` still holds
+          the ±45° MOUNT rather than the sensor roll. Reading it as a roll
+          would command a 45° physical turn, which rolls the camera out of
+          level and scales its column µm/px by cos 45° — the needle aligner
+          would then drive to the wrong XY. Three such entries still sit in
+          this machine's store (the v1.0→1.1 migration only converts
+          identities that were assigned at the time).
+        """
+        if not running:
+            return "Start the camera first — this tool watches the live feed."
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return "Camera manager not available."
+        try:
+            theta = mgr.get_rotation_deg(cam_idx)
+        except Exception:
+            theta = None
+        if theta is None:
+            return ("Calibrate this camera's rotation first (⟳ Rotation…) — "
+                    "there is no measured angle to square up against.")
+        role = (self._config.camera_roles[cam_idx]
+                if cam_idx < len(self._config.camera_roles)
+                else CameraRole.UNASSIGNED)
+        if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
+            col = None
+            try:
+                gcd = getattr(mgr, "get_column_dir_deg", None)
+                col = gcd(cam_idx) if callable(gcd) else None
+            except Exception:
+                col = None
+            if col is None:
+                return ("Run ⟳ Rotation… on this needle camera first, so the "
+                        "±45° mount direction and the sensor roll are stored "
+                        "separately. Until then its rotation may still be the "
+                        "legacy mount value, and squaring that up would roll "
+                        "the camera out of level.")
+        return ""
+
+    def _refresh_square_up_gate(self, cam_idx: int, running: bool) -> None:
+        btns = getattr(self, "_live_cam_square_btns", [])
+        if cam_idx >= len(btns):
+            return
+        why = self.square_up_refusal(cam_idx, running)
+        btns[cam_idx].setEnabled(not why)
+        btns[cam_idx].setToolTip(why or (
+            "Turn this camera in its mount until its measured rotation lands "
+            "on 0/90/180/270°, with a live degrees-to-go readout and a "
+            "translucent ghost of the target. Moves nothing."))
+
+    def _on_square_up_mount(self, cam_idx: int):
+        """v7.10: open the live mount-alignment tool for one slot."""
+        from PySide6.QtWidgets import QMessageBox
+        mgr = getattr(self, "_camera_manager", None)
+        running = bool(mgr is not None and mgr.is_running(cam_idx))
+        why = self.square_up_refusal(cam_idx, running)
+        if why:
+            QMessageBox.information(self, "Square up mount", why)
+            return
+        try:
+            from gui.dialogs.camera_rotation_align_dialog import (
+                CameraRotationAlignDialog, suggest_reverification)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Square up mount",
+                f"The alignment tool is unavailable: {e}")
+            return
+        role = (self._config.camera_roles[cam_idx]
+                if cam_idx < len(self._config.camera_roles)
+                else CameraRole.UNASSIGNED)
+        before = None
+        try:
+            before = mgr.get_rotation_deg(cam_idx)
+        except Exception:
+            pass
+        # The dialog puts a SECOND live view on this camera. On a 10 Mpx sensor
+        # each view spends ~33 ms per frame in QImage.transformed, so leaving
+        # the card's preview at full rate would stack them and stall the GUI.
+        self._set_slot_preview_throttled(cam_idx, True)
+        try:
+            dlg = CameraRotationAlignDialog(
+                mgr, cam_idx, role=role,
+                remeasure=lambda: bool(
+                    self._on_calibrate_slot_rotation(cam_idx)),
+                parent=self)
+            dlg.exec()
+        finally:
+            self._set_slot_preview_throttled(cam_idx, False)
+        self._refresh_slot_rotation_displays()
+        after = None
+        try:
+            after = mgr.get_rotation_deg(cam_idx)
+        except Exception:
+            pass
+        if before is not None and after is not None and abs(
+                wrap_deg(float(after) - float(before))) > 0.01:
+            nom, delta = nearest_square_rotation(float(after))
+            QMessageBox.information(
+                self, "Square up mount",
+                f"Cam {cam_idx + 1} rotation vs stage is now "
+                f"{float(after):+.2f}° — {abs(delta):.2f}° from {nom:g}°.\n\n"
+                + suggest_reverification(role))
+
+    def _set_slot_preview_throttled(self, cam_idx: int, on: bool) -> None:
+        views = getattr(self, "_live_cam_previews", None) or []
+        if cam_idx < len(views) and views[cam_idx] is not None:
+            fn = getattr(views[cam_idx], "set_throttled", None)
+            if callable(fn):
+                try:
+                    fn(bool(on))
+                except Exception:
+                    pass
+
+    def _slot_view_orientation_note(self, cam_idx: int) -> str:
+        """A short clause describing this slot's LIVE-VIEW orientation.
+
+        v7.16: the readout's headline figures (rotation vs stage, mirrored) are
+        the MEASURED geometry the mosaic uses. The live view is now independent,
+        so it gets its own words — otherwise an operator reading "Rotation vs
+        stage: 180°" would reasonably conclude the feed is rotated 180°, which is
+        exactly the ambiguity this split introduces.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return ""
+        try:
+            has = getattr(mgr, "has_display_orientation", None)
+            if not callable(has) or not has(cam_idx):
+                return ""          # following the measurement — nothing to add
+            fx, fy, rot = self._slot_view_orientation_now(cam_idx)
+        except Exception:
+            return ""
+        parts = []
+        if fx:
+            parts.append("flip X")
+        if fy:
+            parts.append("flip Y")
+        if abs(float(rot or 0.0)) > 0.05:
+            parts.append(f"{float(rot):+.1f}°")
+        return f"  · live view: {', '.join(parts) if parts else 'as captured'}"
+
     def _refresh_slot_rotation_displays(self):
         """v7.5.x: sync each slot's 'Rotation vs stage' readout with the live
         CameraManager rotation and the slot's role (which sets the
-        nominal-mount hint + the Δ-from-nominal sanity figure), plus the
-        mirrored-view checkbox state."""
+        nominal-mount hint + the Δ-from-nominal sanity figure).
+
+        v7.16: also syncs the Flip X / Flip Y / Rotation controls, which now
+        describe the LIVE VIEW (display only) rather than the measured
+        orientation reported in the readout itself.
+        """
         mgr = getattr(self, "_camera_manager", None)
         for i, lbl in enumerate(getattr(self, "_live_cam_rot_labels", [])):
             role = (
@@ -3366,7 +3750,13 @@ class HardwareSetupPage(ModePage):
                     mirrored = bool(mgr.get_mirrored(i))
                 except Exception:
                     mirrored = False
-            mir_txt = "  · mirrored view" if mirrored else ""
+            mir_txt = "  · mirrored" if mirrored else ""
+            # v7.16: the live view is a SEPARATE, display-only orientation, so
+            # say what it is doing rather than let the operator assume it
+            # matches the measurement (they routinely differ by 180° on a rig
+            # with plate_flip_180). Named here so every branch below can append
+            # it and the two can never be confused for one number.
+            mir_txt += self._slot_view_orientation_note(i)
             is_needle = role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y)
             if is_needle and (column_dir is not None or theta is not None):
                 # v7.5.x (rotated rig): a needle cam carries TWO angles — the
@@ -3403,30 +3793,46 @@ class HardwareSetupPage(ModePage):
                     f"color: {COLORS['green']}; "
                     f"font-size: {scaled_font_size(9)}pt;"
                 )
-            # Sync the mirror checkbox without re-triggering its handler.
-            if i < len(getattr(self, "_live_cam_mirror_checks", [])):
-                cb = self._live_cam_mirror_checks[i]
-                if cb.isChecked() != mirrored:
-                    cb.blockSignals(True)
-                    cb.setChecked(mirrored)
-                    cb.blockSignals(False)
-            # Sync the flip-Y checkbox + custom-rotation spin from the manager.
-            flip_y = False
+            # v7.10: θ and column_dir are gate inputs for the square-up tool,
+            # so re-evaluate it wherever they are re-read.
+            try:
+                self._refresh_square_up_gate(
+                    i, bool(mgr is not None and mgr.is_running(i)))
+            except Exception:
+                pass
+            # v7.16: the three controls below describe the LIVE VIEW, not the
+            # measured orientation the readout above reports, so they sync from
+            # display_orientation. While they synced from the measured values,
+            # running the objective calibration visibly reset them.
+            view_fx, view_fy, view_rot = False, False, 0.0
             if mgr is not None:
                 try:
-                    gfy = getattr(mgr, "get_flip_y", None)
-                    flip_y = bool(gfy(i)) if callable(gfy) else False
+                    do = getattr(mgr, "display_orientation", None)
+                    if callable(do):
+                        view_fx, view_fy, view_rot = do(i)
+                    else:
+                        view_fx = bool(mgr.get_mirrored(i))
+                        gfy = getattr(mgr, "get_flip_y", None)
+                        view_fy = bool(gfy(i)) if callable(gfy) else False
+                        view_rot = float(theta) if theta is not None else 0.0
                 except Exception:
-                    flip_y = False
+                    view_fx, view_fy, view_rot = False, False, 0.0
+            # Sync the Flip X checkbox without re-triggering its handler.
+            if i < len(getattr(self, "_live_cam_mirror_checks", [])):
+                cb = self._live_cam_mirror_checks[i]
+                if cb.isChecked() != bool(view_fx):
+                    cb.blockSignals(True)
+                    cb.setChecked(bool(view_fx))
+                    cb.blockSignals(False)
             if i < len(getattr(self, "_live_cam_flip_y_checks", [])):
                 fcb = self._live_cam_flip_y_checks[i]
-                if fcb.isChecked() != flip_y:
+                if fcb.isChecked() != bool(view_fy):
                     fcb.blockSignals(True)
-                    fcb.setChecked(flip_y)
+                    fcb.setChecked(bool(view_fy))
                     fcb.blockSignals(False)
             if i < len(getattr(self, "_live_cam_rot_spins", [])):
                 sp = self._live_cam_rot_spins[i]
-                cur = float(theta) if theta is not None else 0.0
+                cur = float(view_rot or 0.0)
                 if abs(sp.value() - cur) > 1e-6:
                     sp.blockSignals(True)
                     sp.setValue(cur)
@@ -3479,6 +3885,19 @@ class HardwareSetupPage(ModePage):
         """
         super().showEvent(event)
         self._maybe_auto_detect_cameras()
+
+    def hideEvent(self, event):
+        """v7.16: a debounced crop write must not outlive the page.
+
+        Navigating away is the ordinary way this page stops being visible, and
+        a crop that was applied but never reached disk would come back wrong on
+        the next launch — the failure mode this store exists to prevent.
+        """
+        try:
+            self._flush_crop_persist()
+        except Exception:
+            pass
+        super().hideEvent(event)
 
     def _maybe_auto_detect_cameras(self):
         """Run camera detection once if a camera setup was remembered.
@@ -3539,6 +3958,14 @@ class HardwareSetupPage(ModePage):
                     cam_idx=i,
                     show_crosshair=True,
                     label=f"Cam {i + 1} — live",
+                    # v7.10: show the CORRECTED (un-mirrored, upright) view.
+                    # This is the surface where the operator sets the mirror /
+                    # flip-Y / rotation for this slot, and it was the ONE feed
+                    # still showing raw pixels — so ticking "Mirrored view"
+                    # changed the mosaic and every other page's feed while the
+                    # preview six inches away did not move. auto_orient re-reads
+                    # the manager each frame, so a flip is visible immediately.
+                    auto_orient=True,
                     parent=holder,
                 )
                 holder.layout().addWidget(fv, stretch=1)
@@ -3819,6 +4246,11 @@ class HardwareSetupPage(ModePage):
             # the click handler with a clear message.
             if i < len(getattr(self, "_live_cam_rot_btns", [])):
                 self._live_cam_rot_btns[i].setEnabled(running)
+            # v7.10: the square-up tool needs a live feed AND an existing
+            # rotation to aim at. Refreshed from the SAME places as rot_btn —
+            # a gate evaluated once at page build and never re-run is exactly
+            # the v7.10 bore-calibration bug.
+            self._refresh_square_up_gate(i, running)
             # v7.5.x: the flip flags + custom rotation are declarations (no live
             # feed needed) — enabled once the slot has a source to persist to.
             if i < len(getattr(self, "_live_cam_mirror_checks", [])):
@@ -3827,9 +4259,15 @@ class HardwareSetupPage(ModePage):
                 self._live_cam_flip_y_checks[i].setEnabled(has_source)
             if i < len(getattr(self, "_live_cam_rot_spins", [])):
                 self._live_cam_rot_spins[i].setEnabled(has_source)
+            # v7.16: crop is likewise a declaration — the size spin follows the
+            # checkbox so a disabled crop cannot be silently "sized".
+            if i < len(getattr(self, "_live_cam_crop_checks", [])):
+                self._live_cam_crop_checks[i].setEnabled(has_source)
+            self._sync_crop_spin_enabled(i)
         # Rotation values + mirror flag restore on source assignment — keep the
         # readouts/checkboxes in sync with the manager on the same triggers.
         self._refresh_slot_rotation_displays()
+        self._refresh_slot_crop_displays()
 
     def set_controller(self, controller):
         """v7.3.3: Receive StageController for pixel calibration.
@@ -3947,6 +4385,43 @@ class HardwareSetupPage(ModePage):
         except Exception as exc:
             logger.debug(f"camera calibration store read failed: {exc}")
             entry = None
+        # v7.16: the crop is restored BEFORE the no-entry early-return, and is
+        # pushed even when there is no entry at all. The CameraWidget for a slot
+        # persists across source changes, so a camera with no stored crop must
+        # actively CLEAR whatever the previously-assigned camera left behind —
+        # otherwise reassigning a slot silently crops a camera that should see
+        # its full sensor.
+        try:
+            from SupportClasses.CameraCrop import CameraCrop
+            scr = getattr(mgr, "set_crop", None)
+            if callable(scr):
+                scr(cam_idx, CameraCrop.from_dict((entry or {}).get("crop")))
+                self._sync_crop_controls(cam_idx)
+        except Exception as exc:
+            logger.debug(f"restore crop slot {cam_idx}: {exc}")
+        # v7.16: the LIVE-VIEW orientation is restored on the SAME terms as the
+        # crop — before the no-entry early-return, and pushed even with nothing
+        # stored. A slot's CameraWidget outlives the source assigned to it, so a
+        # camera with no view preference must actively hand the view back to the
+        # measurement; otherwise reassigning a slot leaves the new camera showing
+        # the previous one's rotation.
+        try:
+            vo = None
+            if entry:
+                from SupportClasses.CameraCalibrationStore import get_store as _gs
+                vo = _gs().get_view_orientation(identity[0])
+            if vo is None:
+                cdo = getattr(mgr, "clear_display_orientation", None)
+                if callable(cdo):
+                    cdo(cam_idx)
+            else:
+                sdo = getattr(mgr, "set_display_orientation", None)
+                if callable(sdo):
+                    sdo(cam_idx, bool(vo.get("flip_x", False)),
+                        bool(vo.get("flip_y", False)),
+                        float(vo.get("rotation_deg", 0.0) or 0.0))
+        except Exception as exc:
+            logger.debug(f"restore view orientation slot {cam_idx}: {exc}")
         if not entry:
             return False
         # v7.5.x: restore the display correction (independent of µm/px).
@@ -4112,6 +4587,26 @@ class HardwareSetupPage(ModePage):
                     mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
                 except Exception as exc:
                     logger.debug(f"restore resolution failed: {exc}")
+        # v7.13 — Andor sensor-quality features, BEFORE the exposure restore
+        # (v7.13.x: the achievable exposure range depends on the readout rate
+        # and gain mode, so the saved exposure must be applied against the
+        # constraint set it was saved UNDER, not the open-time defaults) and
+        # BEFORE the display-scaling block (the manual black/white levels are
+        # raw counts whose meaning depends on the bit depth the gain mode
+        # selects, so the stored levels must be the LAST thing applied).
+        # Within this block: gain mode first (it constrains bit depth and the
+        # legal readout rates), then readout rate, then the booleans.
+        if hasattr(mgr, "set_hw_andor_feature"):
+            if isinstance(hw.get("andor_gain_mode"), str):
+                mgr.set_hw_andor_feature(cam_idx, "andor_gain_mode",
+                                         hw["andor_gain_mode"])
+            if isinstance(hw.get("andor_readout_rate"), str):
+                mgr.set_hw_andor_feature(cam_idx, "andor_readout_rate",
+                                         hw["andor_readout_rate"])
+            for key in ("andor_sensor_cooling", "andor_noise_filter",
+                        "andor_blemish_correction"):
+                if isinstance(hw.get(key), bool):
+                    mgr.set_hw_andor_feature(cam_idx, key, hw[key])
         # Restore manual exposure/gain UNLESS auto-exposure is explicitly on.
         # (When auto is unknown/None — e.g. an OpenCV cam — we still restore the
         # saved exposure so "reload exactly" holds; there's no auto state to
@@ -4156,6 +4651,11 @@ class HardwareSetupPage(ModePage):
         only) and only the sensor roll (deviation from parallel) becomes
         the display ``rotation_deg`` — storing the ±45° mount as the
         display rotation was what tilted the live view.
+
+        v7.10: returns True only when a rotation was actually COMMITTED. The
+        square-up tool re-uses this as its confirmation step and must not
+        report success when the operator cancelled or the measurement was
+        refused — this handler returns early on five separate paths.
         """
         from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
         from PySide6.QtWidgets import QDialog, QMessageBox
@@ -4165,7 +4665,7 @@ class HardwareSetupPage(ModePage):
         if mgr is None:
             QMessageBox.warning(
                 self, "Calibrate rotation", "Camera manager not available.")
-            return
+            return False
         if ctrl is None or not getattr(ctrl, "xy_stage", None):
             QMessageBox.warning(
                 self, "Calibrate rotation",
@@ -4173,32 +4673,62 @@ class HardwareSetupPage(ModePage):
                 "the stage to measure the camera's orientation. Connect "
                 "hardware first.",
             )
-            return
+            return False
         if not mgr.is_running(cam_idx):
             QMessageBox.warning(
                 self, "Calibrate rotation",
                 f"Start Cam {cam_idx + 1} before calibrating so the dialog "
                 "can watch the live feed.",
             )
-            return
+            return False
 
-        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self)
+        role = (
+            self._config.camera_roles[cam_idx]
+            if cam_idx < len(self._config.camera_roles)
+            else CameraRole.UNASSIGNED
+        )
+        is_needle = role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y)
+        # v7.10: the role decides whether the Z leg is offered, so it has to be
+        # resolved BEFORE the dialog is built rather than after it returns.
+        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self,
+                                     needle_mode=is_needle)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+            return False
         rotation_deg = dlg.result_rotation_deg
+        axes_only = getattr(dlg, "result_needle_axes", None)
+        if rotation_deg is None and is_needle and axes_only is not None:
+            # v7.10: a Z-ONLY run. It fully determines the roll, the scale and
+            # the Z direction; only the aligner's mount direction needs an XY
+            # move, so any previously measured one is left untouched rather
+            # than the whole result being thrown away.
+            self._apply_slot_rotation(cam_idx, -float(axes_only.roll_deg))
+            self._apply_slot_z_row_sign(cam_idx, axes_only.z_row_sign)
+            if dlg.result_um_per_px:
+                self.set_calibrated_um_per_px(
+                    cam_idx, float(dlg.result_um_per_px),
+                    resolution=self._live_capture_resolution(cam_idx))
+            QMessageBox.information(
+                self, "Calibrate rotation",
+                f"Cam {cam_idx + 1} measured from the Z leg alone:\n\n"
+                f"• sensor roll {-float(axes_only.roll_deg):+.2f}°\n"
+                f"• µm/px {float(axes_only.um_per_px):.4f}\n"
+                f"• moving the needle up "
+                f"{'decreases' if axes_only.z_row_sign > 0 else 'increases'} "
+                f"the image row\n\n"
+                "The live view stays at a fixed quarter-turn, so the roll above "
+                "is the residual still to be taken out by turning the camera in "
+                "its mount. The column→stage mount direction was NOT changed — "
+                "that needs an XY leg.",
+            )
+            return True
         if rotation_deg is None:
             QMessageBox.information(
                 self, "Calibrate rotation",
                 "No rotation was measured (move too small / low confidence). "
                 "Try a larger stage move along a clear feature.",
             )
-            return
-        role = (
-            self._config.camera_roles[cam_idx]
-            if cam_idx < len(self._config.camera_roles)
-            else CameraRole.UNASSIGNED
-        )
-        if role in (CameraRole.NEEDLE_X, CameraRole.NEEDLE_Y):
+            return False
+        if is_needle:
             # v7.5.x (rotated rig): for a needle side cam the measured stage
             # direction is the ±45° MOUNT direction — aligner-only. Only the
             # sensor roll (deviation of the measured vector from parallel)
@@ -4207,7 +4737,24 @@ class HardwareSetupPage(ModePage):
             self._apply_slot_rotation(
                 cam_idx, float(roll) if roll is not None else 0.0)
             self._apply_slot_column_dir(cam_idx, float(rotation_deg))
+            axes = getattr(dlg, "result_needle_axes", None)
+            self._apply_slot_z_row_sign(
+                cam_idx, getattr(axes, "z_row_sign", None))
             nom, delta = nominal_rotation_delta(float(rotation_deg), role)
+            extra = ""
+            if axes is None:
+                extra = ("\n\n⚠ The Z leg was not measured, so the roll above "
+                         "is inferred from the XY move rather than from a known "
+                         "vertical, and the Z direction still comes from the "
+                         "Invert Z checkbox.")
+            else:
+                extra = (f"\n\nZ leg: µm/px {axes.um_per_px:.4f} "
+                         f"(the XY move alone read "
+                         f"{axes.um_per_px_lateral:.4f}), axes "
+                         f"{90 + axes.orthogonality_err_deg:.1f}° apart, "
+                         f"moving the needle up "
+                         f"{'decreases' if axes.z_row_sign > 0 else 'increases'}"
+                         f" the image row.")
             QMessageBox.information(
                 self, "Calibrate rotation",
                 f"Cam {cam_idx + 1} mount direction: "
@@ -4216,9 +4763,9 @@ class HardwareSetupPage(ModePage):
                 f"view roll {0.0 if roll is None else float(roll):+.1f}°.\n\n"
                 f"This camera {role_rotation_hint(role)}. The mount direction "
                 "drives the needle-centering math; only the roll tilts the "
-                "displayed view.",
+                "displayed view." + extra,
             )
-            return
+            return True
         self._apply_slot_rotation(cam_idx, float(rotation_deg))
         nom, delta = nominal_rotation_delta(float(rotation_deg), role)
         QMessageBox.information(
@@ -4227,6 +4774,7 @@ class HardwareSetupPage(ModePage):
             f"(Δ {delta:+.1f}° from the nominal {nom:g}° mount).\n\n"
             f"This camera {role_rotation_hint(role)}.",
         )
+        return True
 
     def _apply_slot_rotation(self, cam_idx: int, rotation_deg: float):
         """v7.5.x: commit a measured camera→stage rotation for a slot.
@@ -4275,6 +4823,48 @@ class HardwareSetupPage(ModePage):
             f"{float(rotation_deg):.2f}° "
             f"(identity={identity[0] if identity else '?'})"
         )
+
+    def _live_capture_resolution(self, cam_idx: int):
+        """The slot's ACTUAL captured (w, h), or None.
+
+        µm/px must be stamped with the resolution it was measured at or it
+        cannot be rescaled when the camera later runs at a different one.
+        Reads the live frame (authoritative) rather than a configured value.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        try:
+            frame = mgr.cameras[cam_idx].get_current_frame()
+            if frame is not None and getattr(frame, "shape", None):
+                return (int(frame.shape[1]), int(frame.shape[0]))
+        except Exception:
+            pass
+        return None
+
+    def _apply_slot_z_row_sign(self, cam_idx: int, z_row_sign) -> None:
+        """v7.10: persist a MEASURED needle-camera Z→image-row sign.
+
+        ``None`` (no Z leg measured) leaves any stored value untouched, so a
+        camera calibrated the old way keeps behaving exactly as before and the
+        manual *Invert Z* checkbox still governs it.
+        """
+        if z_row_sign is None:
+            return
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is None:
+            return
+        try:
+            identity = mgr.camera_identity(cam_idx)
+        except Exception:
+            identity = None
+        if not identity or not identity[0]:
+            return
+        try:
+            from SupportClasses.CameraCalibrationStore import get_store
+            get_store().set_z_row_sign(
+                identity[0], float(z_row_sign),
+                name=(identity[1] if len(identity) > 1 else ""))
+        except Exception as exc:
+            logger.warning(f"slot Z-row sign: store write failed — {exc}")
 
     def _apply_slot_column_dir(self, cam_idx: int, column_dir_deg: float):
         """v7.5.x (rotated rig): commit a needle camera's measured column→stage
@@ -4332,13 +4922,21 @@ class HardwareSetupPage(ModePage):
         mir, fy, rot = False, False, 0.0
         if mgr is not None:
             try:
-                fo = getattr(mgr, "full_orientation", None)
-                if callable(fo):
-                    mir, fy, rot = fo(cam_idx)
+                # v7.16: the LIVE-VIEW orientation, not the measured one — this
+                # preview is the surface the Flip/Rotation controls below it
+                # edit, so it must show what they set and must NOT be rewritten
+                # by the objective calibration.
+                do = getattr(mgr, "display_orientation", None)
+                if callable(do):
+                    mir, fy, rot = do(cam_idx)
                 else:
-                    vo = getattr(mgr, "view_orientation", None)
-                    if callable(vo):
-                        mir, rot = vo(cam_idx)
+                    fo = getattr(mgr, "full_orientation", None)
+                    if callable(fo):
+                        mir, fy, rot = fo(cam_idx)
+                    else:
+                        vo = getattr(mgr, "view_orientation", None)
+                        if callable(vo):
+                            mir, rot = vo(cam_idx)
             except Exception:
                 mir, fy, rot = False, False, 0.0
         try:
@@ -4347,25 +4945,63 @@ class HardwareSetupPage(ModePage):
             logger.debug(f"slot preview orientation ({cam_idx}): {exc}")
 
     def _on_toggle_mirror(self, cam_idx: int, checked: bool):
-        """v7.5.x: user toggled the slot's 'Mirrored view' checkbox."""
+        """v7.5.x: user toggled the slot's 'Flip X axis' checkbox."""
         self._apply_slot_mirror(cam_idx, bool(checked))
 
-    def _apply_slot_mirror(self, cam_idx: int, mirrored: bool):
-        """v7.5.x: commit a slot's mirrored-view flag.
+    def _slot_view_orientation_now(self, cam_idx: int
+                                   ) -> tuple[bool, bool, float]:
+        """This slot's current LIVE-VIEW orientation ``(flip_x, flip_y, rot)``.
 
-        Pushes it live (``CameraManager.set_mirrored`` — the click→stage
-        mapping flips horizontally immediately) and persists it per device
-        identity (``CameraCalibrationStore.set_mirrored``, preserving any
-        µm/px / rotation / image-correction siblings). Independent of the
-        rotation calibration: a mirror is a handedness flip, not a rotation.
+        Read from the manager (which falls back to the measured orientation when
+        the operator has set no preference) rather than from the widgets, so a
+        partial commit starts from what the feed is actually showing.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is not None:
+            try:
+                do = getattr(mgr, "display_orientation", None)
+                if callable(do):
+                    fx, fy, rot = do(cam_idx)
+                    return (bool(fx), bool(fy), float(rot or 0.0))
+            except Exception as exc:
+                logger.debug(f"slot view orientation read ({cam_idx}): {exc}")
+        return (False, False, 0.0)
+
+    def _commit_slot_view_orientation(
+            self, cam_idx: int, *, flip_x: Optional[bool] = None,
+            flip_y: Optional[bool] = None, rot: Optional[float] = None) -> None:
+        """THE one place this slot's LIVE-VIEW orientation is committed.
+
+        v7.16. These three controls used to write the MEASURED camera→stage
+        orientation (``set_mirrored`` / ``set_flip_y`` / ``set_rotation``) — the
+        very numbers ``MosaicBuilder._orient_tile`` and ``pixel_to_stage_offset``
+        consume. That gave ONE quantity TWO writers: the operator here, and
+        ``derive_camera_stage_orientation`` inside the objective/mosaic
+        calibration. The measurement won, so the reported workflow — set the live
+        view up, then calibrate — always ended with the view flipped back.
+
+        They are now separate. This writes **display only**: nothing here changes
+        where a click lands or how a mosaic tile is placed. The measured
+        orientation keeps its own controls (⟳ Rotation…, ⊾ Square up mount…, the
+        objective calibration) and its own readout above.
+
+        Persisted as one triple because it is one decision — "this is how I want
+        the feed to look" — and a half-applied view is worse than either half;
+        unspecified fields keep their current value.
         """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is None:
             return
+        cur_fx, cur_fy, cur_rot = self._slot_view_orientation_now(cam_idx)
+        fx = cur_fx if flip_x is None else bool(flip_x)
+        fy = cur_fy if flip_y is None else bool(flip_y)
+        rr = cur_rot if rot is None else float(rot)
         try:
-            mgr.set_mirrored(cam_idx, bool(mirrored))
+            sdo = getattr(mgr, "set_display_orientation", None)
+            if callable(sdo):
+                sdo(cam_idx, fx, fy, rr)
         except Exception as exc:
-            logger.debug(f"slot mirror: push to manager — {exc}")
+            logger.debug(f"slot view orientation: push to manager — {exc}")
         identity = None
         try:
             identity = mgr.camera_identity(cam_idx)
@@ -4374,82 +5010,293 @@ class HardwareSetupPage(ModePage):
         if identity is not None and identity[0]:
             try:
                 from SupportClasses.CameraCalibrationStore import get_store
-                get_store().set_mirrored(
-                    identity[0], bool(mirrored),
+                get_store().set_view_orientation(
+                    identity[0], rr, fx, fy,
                     name=(identity[1] if len(identity) > 1 else ""))
             except Exception as exc:
-                logger.warning(f"slot mirror: store write failed — {exc}")
-        # Refresh the readout + checkbox AND mirror the live preview so the
-        # operator sees the un-mirrored view immediately (via the shared
+                logger.warning(
+                    f"slot view orientation: store write failed — {exc}")
+        # Refresh the readout + controls AND re-orient the live preview so the
+        # operator sees the change immediately (via the shared
         # _refresh_slot_rotation_displays → _push_slot_view_orientation).
         self._refresh_slot_rotation_displays()
         logger.info(
-            f"Camera {cam_idx + 1} mirrored-view set to {bool(mirrored)} "
-            f"(identity={identity[0] if identity else '?'})"
-        )
+            f"Camera {cam_idx + 1} live-view orientation set to "
+            f"flip_x={fx} flip_y={fy} rot={rr:.1f}° (display only; "
+            f"identity={identity[0] if identity else '?'})")
+
+    def _apply_slot_mirror(self, cam_idx: int, mirrored: bool):
+        """v7.5.x: commit a slot's horizontal-flip (Flip X) LIVE-VIEW flag.
+
+        v7.16: display only — see :meth:`_commit_slot_view_orientation`. This
+        used to write the measured ``mirrored`` (mosaic + click mapping), which
+        the objective calibration then overwrote.
+        """
+        self._commit_slot_view_orientation(cam_idx, flip_x=bool(mirrored))
 
     def _on_toggle_flip_y(self, cam_idx: int, checked: bool):
         """v7.5.x: user toggled the slot's 'Flip Y axis' checkbox."""
         self._apply_slot_flip_y(cam_idx, bool(checked))
 
     def _apply_slot_flip_y(self, cam_idx: int, flip_y: bool):
-        """v7.5.x: commit a slot's vertical-flip (flip Y) flag — pushes it live
-        (mosaic + click mapping + display) and persists per identity. Sibling of
-        the mirror (flip X)."""
+        """v7.5.x: commit a slot's vertical-flip (Flip Y) LIVE-VIEW flag.
+        v7.16: display only (sibling of Flip X)."""
+        self._commit_slot_view_orientation(cam_idx, flip_y=bool(flip_y))
+
+    # ── v7.16: per-slot square crop ───────────────────────────────
+
+    def _slot_crop_from_ui(self, cam_idx: int):
+        """Build a ``CameraCrop`` from this slot's checkbox + size spin."""
+        from SupportClasses.CameraCrop import CameraCrop, MODE_NONE, MODE_SQUARE
+        on = False
+        pct = 100.0
+        off_x = off_y = 0.0
+        checks = getattr(self, "_live_cam_crop_checks", [])
+        spins = getattr(self, "_live_cam_crop_spins", [])
+        xs = getattr(self, "_live_cam_crop_off_x_spins", [])
+        ys = getattr(self, "_live_cam_crop_off_y_spins", [])
+        if cam_idx < len(checks):
+            on = bool(checks[cam_idx].isChecked())
+        if cam_idx < len(spins):
+            pct = float(spins[cam_idx].value())
+        if cam_idx < len(xs):
+            off_x = float(xs[cam_idx].value()) / 100.0
+        if cam_idx < len(ys):
+            off_y = float(ys[cam_idx].value()) / 100.0
+        return CameraCrop(mode=(MODE_SQUARE if on else MODE_NONE),
+                          scale=pct / 100.0,
+                          offset_x=off_x, offset_y=off_y)
+
+    def _on_toggle_crop(self, cam_idx: int, checked: bool):
+        """v7.16: user toggled the slot's 'Square crop' checkbox.
+
+        Persisted immediately — a checkbox is one discrete decision, so there is
+        nothing to coalesce, and turning the crop OFF is the action an operator
+        takes when something looks wrong. That must reach disk even if the app
+        is closed (or dies) a moment later.
+        """
+        self._sync_crop_spin_enabled(cam_idx)
+        self._apply_slot_crop(cam_idx, self._slot_crop_from_ui(cam_idx),
+                              persist_now=True)
+
+    def _on_crop_scale_spin(self, cam_idx: int, value: float):
+        """v7.16: user changed the slot's crop size (% of the short side).
+
+        Only commits while the crop is ON — otherwise dialling the size of a
+        disabled crop would write a store entry (and log a change) for
+        something the operator has not switched on.
+        """
+        checks = getattr(self, "_live_cam_crop_checks", [])
+        if cam_idx < len(checks) and not checks[cam_idx].isChecked():
+            self._refresh_slot_crop_displays()
+            return
+        self._apply_slot_crop(cam_idx, self._slot_crop_from_ui(cam_idx))
+
+    def _on_crop_offset_spin(self, cam_idx: int):
+        """v7.16: user moved the crop. Committed only while the crop is ON, for
+        the same reason as the size spin — nudging a disabled crop must not
+        write a store entry for something not switched on."""
+        checks = getattr(self, "_live_cam_crop_checks", [])
+        if cam_idx < len(checks) and not checks[cam_idx].isChecked():
+            self._refresh_slot_crop_displays()
+            return
+        self._apply_slot_crop(cam_idx, self._slot_crop_from_ui(cam_idx))
+
+    def _on_crop_recentre(self, cam_idx: int):
+        """v7.16: put the crop back in the middle of the sensor."""
+        for lst in ("_live_cam_crop_off_x_spins", "_live_cam_crop_off_y_spins"):
+            spins = getattr(self, lst, [])
+            if cam_idx < len(spins):
+                sp = spins[cam_idx]
+                sp.blockSignals(True)
+                sp.setValue(0.0)
+                sp.blockSignals(False)
+        self._apply_slot_crop(cam_idx, self._slot_crop_from_ui(cam_idx),
+                              persist_now=True)
+
+    def _apply_slot_crop(self, cam_idx: int, crop, *, persist_now: bool = False):
+        """Commit a slot's crop: push it live, and persist per device identity.
+
+        Pushing live reaches EVERY surface at once, because the crop is applied
+        where frames enter the application (``CameraWidget._apply_crop``) rather
+        than by each consumer.
+
+        The live push is immediate — the operator is aiming the crop by eye, so
+        the preview has to follow the spin box. The STORE WRITE is debounced,
+        because the offset spins auto-repeat: holding one arrow walked the crop
+        1 %→23 % in seven seconds and wrote the calibration file forty times.
+        The store is small and fast here, but a disk write per auto-repeat step
+        is exactly the shape the image-correction sliders already avoid (they
+        persist on ``sliderReleased``), and it puts file I/O — which is NOT
+        bounded by anything we control, e.g. an on-access virus scanner — in
+        the middle of a drag on the GUI thread.
+
+        ``persist_now`` skips the debounce for a discrete decision (the
+        checkbox, the ⌖ button) where there is no repeat to coalesce.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        if mgr is not None:
+            try:
+                setter = getattr(mgr, "set_crop", None)
+                if callable(setter):
+                    setter(cam_idx, crop)
+            except Exception as exc:
+                logger.debug(f"slot crop: push to manager — {exc}")
+        self._refresh_slot_crop_displays()
+        # The Microscope Camera Setup FOV line quotes the DELIVERED field, so it
+        # has to follow a crop change on the microscope slot.
+        try:
+            self._update_camera_info_labels()
+        except Exception:
+            pass
+        logger.debug(f"Camera {cam_idx + 1} crop → {crop.describe()}")
+        self._pending_crop_writes[cam_idx] = crop
+        if persist_now:
+            self._flush_crop_persist()
+        else:
+            self._crop_persist_timer.start()
+
+    def _flush_crop_persist(self):
+        """Write every pending crop to the per-identity store.
+
+        Deliberately keyed by SLOT: coalescing repeats of one slot is the point,
+        and a pending write must never be dropped — a crop that survives the
+        session but not a restart is worse than one that was never applied.
+        """
+        try:
+            self._crop_persist_timer.stop()
+        except Exception:
+            pass
+        pending = getattr(self, "_pending_crop_writes", None)
+        if not pending:
+            return
+        mgr = getattr(self, "_camera_manager", None)
+        for cam_idx, crop in list(pending.items()):
+            identity = None
+            if mgr is not None:
+                try:
+                    identity = mgr.camera_identity(cam_idx)
+                except Exception:
+                    identity = None
+            if identity is None or not identity[0]:
+                continue
+            try:
+                from SupportClasses.CameraCalibrationStore import get_store
+                get_store().set_crop(
+                    identity[0], crop.to_dict() if crop.enabled else None,
+                    name=(identity[1] if len(identity) > 1 else ""))
+                logger.info(
+                    f"Camera {cam_idx + 1} crop set to {crop.describe()} "
+                    f"(identity={identity[0]})")
+            except Exception as exc:
+                logger.warning(f"slot crop: store write failed — {exc}")
+        pending.clear()
+
+    def _sync_crop_controls(self, cam_idx: int):
+        """Point this slot's checkbox + size spin at the LIVE crop.
+
+        Signals are blocked while setting: these widgets' handlers WRITE to the
+        store, so echoing a restored value back through them would re-persist
+        (and re-log) a change the operator never made.
+        """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is None:
             return
         try:
-            sfy = getattr(mgr, "set_flip_y", None)
-            if callable(sfy):
-                sfy(cam_idx, bool(flip_y))
-        except Exception as exc:
-            logger.debug(f"slot flip_y: push to manager — {exc}")
-        identity = None
-        try:
-            identity = mgr.camera_identity(cam_idx)
+            getter = getattr(mgr, "get_crop", None)
+            crop = getter(cam_idx) if callable(getter) else None
         except Exception:
-            identity = None
-        if identity is not None and identity[0]:
-            try:
-                from SupportClasses.CameraCalibrationStore import get_store
-                get_store().set_flip_y(
-                    identity[0], bool(flip_y),
-                    name=(identity[1] if len(identity) > 1 else ""))
-            except Exception as exc:
-                logger.warning(f"slot flip_y: store write failed — {exc}")
-        self._refresh_slot_rotation_displays()
-        logger.info(f"Camera {cam_idx + 1} flip-Y set to {bool(flip_y)}")
+            crop = None
+        if crop is None:
+            return
+        checks = getattr(self, "_live_cam_crop_checks", [])
+        spins = getattr(self, "_live_cam_crop_spins", [])
+        if cam_idx < len(checks):
+            cb = checks[cam_idx]
+            cb.blockSignals(True)
+            cb.setChecked(bool(crop.enabled))
+            cb.blockSignals(False)
+        if cam_idx < len(spins):
+            sp = spins[cam_idx]
+            sp.blockSignals(True)
+            sp.setValue(float(crop.scale) * 100.0)
+            sp.blockSignals(False)
+        for name, val in (("_live_cam_crop_off_x_spins", crop.offset_x),
+                          ("_live_cam_crop_off_y_spins", crop.offset_y)):
+            spl = getattr(self, name, [])
+            if cam_idx < len(spl):
+                sp = spl[cam_idx]
+                sp.blockSignals(True)
+                sp.setValue(float(val) * 100.0)
+                sp.blockSignals(False)
+        self._sync_crop_spin_enabled(cam_idx)
+        self._refresh_slot_crop_displays()
+
+    def _sync_crop_spin_enabled(self, cam_idx: int):
+        """The size and offset controls are live only when the crop itself is —
+        one rule, so a disabled crop can never be given a size or a position."""
+        checks = getattr(self, "_live_cam_crop_checks", [])
+        if cam_idx >= len(checks):
+            return
+        cb = checks[cam_idx]
+        live = cb.isEnabled() and cb.isChecked()
+        for name in ("_live_cam_crop_spins", "_live_cam_crop_off_x_spins",
+                     "_live_cam_crop_off_y_spins",
+                     "_live_cam_crop_centre_btns"):
+            widgets = getattr(self, name, [])
+            if cam_idx < len(widgets):
+                widgets[cam_idx].setEnabled(live)
+
+    def _refresh_slot_crop_displays(self):
+        """Re-render every slot's crop readout from the LIVE camera.
+
+        Reads the pre-crop size off the manager rather than trusting the spin
+        boxes, so the line states the delivered frame the operator will actually
+        get — including "waiting for a frame" before one has arrived.
+        """
+        mgr = getattr(self, "_camera_manager", None)
+        labels = getattr(self, "_live_cam_crop_labels", [])
+        for i, lbl in enumerate(labels):
+            crop = self._slot_crop_from_ui(i)
+            cap = None
+            if mgr is not None:
+                try:
+                    getter = getattr(mgr, "capture_resolution", None)
+                    cap = getter(i) if callable(getter) else None
+                except Exception:
+                    cap = None
+            if not crop.enabled:
+                lbl.setText("Crop: off (full sensor)")
+            elif cap and cap[0] and cap[1]:
+                x0, y0, cw, ch = crop.rect_for(cap[0], cap[1])
+                dx, dy = crop.center_offset_px(cap[0], cap[1])
+                # Report the ACHIEVED displacement, not the requested one — the
+                # rect is clamped to the frame, so at the edge the two differ
+                # and the compensated value is the one that matters.
+                moved = ""
+                if abs(dx) > 0.5 or abs(dy) > 0.5:
+                    moved = f", offset {dx:+.0f}, {dy:+.0f} px"
+                lbl.setText(f"Crop: {cw} × {ch} px at ({x0}, {y0}) "
+                            f"of {int(cap[0])} × {int(cap[1])}{moved}")
+            else:
+                lbl.setText(f"Crop: square {crop.scale * 100:.0f}% "
+                            f"— start the camera to see the size")
 
     def _on_slot_rotation_spin(self, cam_idx: int, value: float):
         """v7.5.x: user typed a custom rotation on the slot's Rotation spin."""
         self._apply_slot_rotation_value(cam_idx, float(value))
 
     def _apply_slot_rotation_value(self, cam_idx: int, rot: float):
-        """v7.5.x: commit a slot's custom rotation (deg) — pushes live (mosaic +
-        click mapping + display) and persists per identity."""
-        mgr = getattr(self, "_camera_manager", None)
-        if mgr is None:
-            return
-        try:
-            mgr.set_rotation_deg(cam_idx, float(rot))
-        except Exception as exc:
-            logger.debug(f"slot rotation: push to manager — {exc}")
-        identity = None
-        try:
-            identity = mgr.camera_identity(cam_idx)
-        except Exception:
-            identity = None
-        if identity is not None and identity[0]:
-            try:
-                from SupportClasses.CameraCalibrationStore import get_store
-                get_store().set_rotation(
-                    identity[0], float(rot),
-                    name=(identity[1] if len(identity) > 1 else ""))
-            except Exception as exc:
-                logger.warning(f"slot rotation: store write failed — {exc}")
-        self._refresh_slot_rotation_displays()
-        logger.info(f"Camera {cam_idx + 1} rotation set to {float(rot):.1f}°")
+        """v7.5.x: commit a slot's custom LIVE-VIEW rotation (deg).
+
+        v7.16: display only. This spin used to write ``rotation_deg`` — the
+        MEASURED camera→stage angle that orients every mosaic tile and rotates
+        every click — so a hand-typed viewing angle silently moved the geometry,
+        and the next objective calibration silently moved it back. The measured
+        angle is now only ever written by a measurement (⟳ Rotation…, ⊾ Square up
+        mount…, the objective calibration) and is reported in the readout above.
+        """
+        self._commit_slot_view_orientation(cam_idx, rot=float(rot))
 
     def _on_calibrate_needle(self, role: CameraRole):
         """Launch the stage-motion µm/px calibration for a needle camera.
@@ -4494,7 +5341,11 @@ class HardwareSetupPage(ModePage):
             )
             return
 
-        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self)
+        # v7.10: needle_mode offers the Z leg — a move that displaces the NEEDLE
+        # and nothing else, which is the only way to measure this camera's roll,
+        # its Z direction and a µm/px free of lateral foreshortening.
+        dlg = PixelCalibrationDialog(mgr, ctrl, cam_idx=cam_idx, parent=self,
+                                     needle_mode=True)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             result = dlg.result_um_per_px
             if result is not None:
@@ -4504,14 +5355,33 @@ class HardwareSetupPage(ModePage):
                 # (deviation of the measured vector from parallel) becomes the
                 # display orientation (rotation_deg). Storing the mount angle
                 # as rotation was what tilted the live view ~45°.
+                #
+                # v7.10: stamp the resolution the value was measured at. It was
+                # being dropped, so `effective_um_per_px` had nothing to rescale
+                # from and the needle aligner silently used a value that was
+                # only right at one capture resolution.
                 self.set_calibrated_um_per_px(
                     cam_idx, result,
                     rotation_deg=dlg.result_view_roll_deg,
-                    column_dir_deg=dlg.result_rotation_deg)
+                    column_dir_deg=dlg.result_rotation_deg,
+                    resolution=self._live_capture_resolution(cam_idx))
+                self._apply_slot_z_row_sign(
+                    cam_idx, getattr(
+                        getattr(dlg, "result_needle_axes", None),
+                        "z_row_sign", None))
+                axes = getattr(dlg, "result_needle_axes", None)
+                detail = ""
+                if axes is not None:
+                    detail = (f" (Z leg: roll {axes.roll_deg:+.2f}°, "
+                              f"z_row_sign {axes.z_row_sign:+.0f}")
+                    # um_per_px_lateral is None on a Z-only run.
+                    detail += (
+                        f", XY-alone would have said "
+                        f"{axes.um_per_px_lateral:.4f})" if axes.has_lateral
+                        else ", Z-only)")
                 logger.info(
                     f"Needle calibration applied: Cam {cam_idx + 1} "
-                    f"({role.value}) = {result:.4f} µm/px"
-                )
+                    f"({role.value}) = {result:.4f} µm/px" + detail)
 
     def _on_detect_live_cameras(self, opencv_indices=None):
         """Detect live cameras via CameraManager and populate source combos.
@@ -4616,16 +5486,15 @@ class HardwareSetupPage(ModePage):
                     st = mgr.get_hw_settings(i)
                     if st.get("source") in ("toupcam", "opencv", "andor",
                                             "tucam"):
-                        store.set_hw_controls(key, {
-                            "auto_exposure": st.get("auto_exposure"),
-                            "exposure_us": st.get("exposure_us"),
-                            "exposure_gain_pct": st.get("exposure_gain_pct"),
-                            "gamma": st.get("gamma"),
-                            "brightness": st.get("brightness"),
-                            "contrast": st.get("contrast"),
-                            "resolution": (list(st["resolution"])
-                                           if st.get("resolution") else None),
-                        }, name=name)
+                        # v7.13 — ONE shared key list with the settings
+                        # dialog's _persist(). This bulk save used to
+                        # hand-list keys and silently dropped the andor_*
+                        # ones (documented gap since v7.9) — the shared
+                        # snapshot makes that drift structurally impossible.
+                        from gui.widgets.hw_controls_snapshot import (
+                            hw_controls_snapshot)
+                        store.set_hw_controls(
+                            key, hw_controls_snapshot(st), name=name)
                 except Exception as exc:
                     logger.debug(f"save hw controls slot {i}: {exc}")
             store.set_autostart(key, running)
@@ -4780,11 +5649,20 @@ class HardwareSetupPage(ModePage):
 
         if spec is not None:
             effective = spec.effective_pixel_size_um(active_res)
-            computed = effective / mag
-            self.cam_scale_label.setText(
-                f"{computed:.2f} µm/px  (sensor: {spec.sensor_pixel_size_um} µm, "
-                f"bin: {spec.max_resolution[0] // max(active_res[0], 1)}×, "
-                f"mag: {mag}×)")
+            # v7.16: an unknown sensor pitch must READ as unknown. Showing a
+            # made-up "theoretical µm/px" is worse than showing none — it is
+            # the seed a first calibration is sanity-checked against.
+            computed = (effective / mag) if (effective and mag) else None
+            if computed is None:
+                self.cam_scale_label.setText(
+                    "µm/px unknown for this model — run Mosaic && Camera "
+                    "Calibration to measure it")
+            else:
+                self.cam_scale_label.setText(
+                    f"{computed:.2f} µm/px  (sensor: "
+                    f"{spec.sensor_pixel_size_um} µm, "
+                    f"bin: {spec.max_resolution[0] // max(active_res[0], 1)}×, "
+                    f"mag: {mag}×)")
 
             # Determine active scale
             if self.cam_override_check.isChecked():
@@ -4792,11 +5670,33 @@ class HardwareSetupPage(ModePage):
             else:
                 scale = computed
 
-            fov_w = active_res[0] * scale
-            fov_h = active_res[1] * scale
-            self.cam_fov_label.setText(
-                f"{fov_w:.0f} × {fov_h:.0f} µm  "
-                f"({fov_w / 1000:.2f} × {fov_h / 1000:.2f} mm)")
+            if scale:
+                # v7.16: report the DELIVERED field. µm/px is unchanged by a
+                # crop, but the field is not — and this label is what the
+                # operator reads to judge how many tiles a plate will take, so
+                # quoting the full sensor while the app delivers a square would
+                # under-state the tile count by the crop fraction.
+                fov_res = active_res
+                crop_note = ""
+                try:
+                    mic_idx = self._config.camera_for_role(CameraRole.MICROSCOPE)
+                    mgr = getattr(self, "_camera_manager", None)
+                    getter = getattr(mgr, "get_crop", None) if mgr else None
+                    crop = (getter(mic_idx)
+                            if callable(getter) and mic_idx is not None else None)
+                    if crop is not None and crop.is_active_for(*active_res):
+                        fov_res = crop.size_for(*active_res)
+                        crop_note = (f"  — cropped to {fov_res[0]}×{fov_res[1]} "
+                                     f"of {active_res[0]}×{active_res[1]} px")
+                except Exception:
+                    pass
+                fov_w = fov_res[0] * scale
+                fov_h = fov_res[1] * scale
+                self.cam_fov_label.setText(
+                    f"{fov_w:.0f} × {fov_h:.0f} µm  "
+                    f"({fov_w / 1000:.2f} × {fov_h / 1000:.2f} mm){crop_note}")
+            else:
+                self.cam_fov_label.setText("— (measure µm/px first)")
         else:
             self.cam_scale_label.setText("—")
             self.cam_fov_label.setText("—")
@@ -5087,179 +5987,6 @@ class HardwareSetupPage(ModePage):
             except Exception:
                 pass
 
-    # ── v7.5.x: Plate TYPE (product) selection ────────────────────────
-
-    def _build_plate_type_card(self):
-        """Two-step plate-type selector: a Format combo narrows a Plate-type
-        combo of products for that format (+ a Generic entry). Selecting a
-        product sets ``plate_type_id`` (its own Z offsets + mosaic); Generic
-        falls back to the bare format."""
-        group = QGroupBox("Plate Type")
-        group.setStyleSheet(self._group_style())
-        lay = QVBoxLayout(group)
-        lay.setSpacing(s(6))
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Format:"))
-        self._plate_type_format_combo = QComboBox()
-        for fmt in sorted(PLATE_DEFINITIONS.keys()):
-            pdef = PLATE_DEFINITIONS[fmt]
-            self._plate_type_format_combo.addItem(
-                f"{fmt}-well ({pdef.get('rows','?')}×{pdef.get('cols','?')})", fmt)
-        self._plate_type_format_combo.currentIndexChanged.connect(
-            self._on_plate_type_format_changed)
-        row.addWidget(self._plate_type_format_combo, 1)
-        row.addSpacing(s(8))
-        row.addWidget(QLabel("Plate type:"))
-        self._plate_type_combo = QComboBox()
-        self._plate_type_combo.setMinimumWidth(s(220))
-        self._plate_type_combo.currentIndexChanged.connect(
-            self._on_plate_type_changed)
-        row.addWidget(self._plate_type_combo, 2)
-        lay.addLayout(row)
-
-        self._plate_type_readout = QLabel("")
-        self._plate_type_readout.setWordWrap(True)
-        self._plate_type_readout.setStyleSheet(f"color: {COLORS['subtext0']};")
-        lay.addWidget(self._plate_type_readout)
-
-        # Initial population (default format 24 / Generic) — block signals so
-        # construction doesn't fire a config change.
-        self._plate_type_syncing = True
-        try:
-            idx = self._plate_type_format_combo.findData(24)
-            if idx >= 0:
-                self._plate_type_format_combo.setCurrentIndex(idx)
-            self._refresh_plate_type_combo(select_id="")
-        finally:
-            self._plate_type_syncing = False
-        self._sync_plate_type_readout()
-        return group
-
-    def _refresh_plate_type_combo(self, select_id: str = "") -> None:
-        """Rebuild the Plate-type combo for the currently-selected format:
-        a Generic entry (empty id) + every product of that base format."""
-        tcombo = getattr(self, "_plate_type_combo", None)
-        fcombo = getattr(self, "_plate_type_format_combo", None)
-        if tcombo is None or fcombo is None:
-            return
-        fmt = fcombo.currentData() or 24
-        was = tcombo.blockSignals(True)
-        tcombo.clear()
-        tcombo.addItem(f"Generic {fmt}-well", "")
-        try:
-            from SupportClasses.PlateTypeStore import get_store as _pt_store
-            for pt in _pt_store().list_for_format(fmt):
-                tcombo.addItem(pt.label, pt.id)
-        except Exception as e:
-            logger.debug(f"plate-type combo populate failed: {e}")
-        sidx = tcombo.findData(select_id or "")
-        tcombo.setCurrentIndex(sidx if sidx >= 0 else 0)
-        tcombo.blockSignals(was)
-
-    def _sync_plate_type_readout(self) -> None:
-        lbl = getattr(self, "_plate_type_readout", None)
-        if lbl is None:
-            return
-        pt_id = getattr(self, "_selected_plate_type_id", "")
-        if not pt_id:
-            lbl.setText(
-                "Generic plate — Z offsets come from the global Device "
-                "defaults. Pick a product for per-plate Z guesses and its own "
-                "auto-loading mosaic.")
-            lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
-            return
-        try:
-            from SupportClasses.PlateTypeStore import get_store as _pt_store
-            pt = _pt_store().get(pt_id)
-        except Exception:
-            pt = None
-        if pt is None:
-            lbl.setText(f"Plate type '{pt_id}' not found in the library.")
-            lbl.setStyleSheet(f"color: {COLORS['red']};")
-            return
-        off = pt.z_offsets or {}
-        mat = pt.bottom_material or "—"
-        lbl.setText(
-            f"{pt.label}  ·  bottom: {mat}  ·  Z offsets below fiducial (mm): "
-            f"top {off.get('top', 0):.1f} / bottom {off.get('bottom', 0):.1f} / "
-            f"safe {off.get('safe', 0):.1f} / max {off.get('max', 0):.1f}. "
-            f"Calibration inherits these; its own mosaic auto-loads.")
-        lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
-
-    def _on_plate_type_format_changed(self) -> None:
-        if getattr(self, "_plate_type_syncing", False):
-            return
-        fmt = self._plate_type_format_combo.currentData() or 24
-        # New base format → reset to Generic and load that geometry into the
-        # designer (no product selected yet for the new format).
-        self._selected_plate_type_id = ""
-        self._refresh_plate_type_combo(select_id="")
-        if hasattr(self, "_plate_designer"):
-            self._plate_type_syncing = True
-            try:
-                self._plate_designer.load_plate(fmt)
-            finally:
-                self._plate_type_syncing = False
-        self._sync_plate_type_readout()
-        self._on_config_changed()
-
-    def _on_plate_type_changed(self) -> None:
-        if getattr(self, "_plate_type_syncing", False):
-            return
-        # Geometry is identical across types of one format (the designer
-        # already shows the base format); only identity + Z offsets change.
-        self._selected_plate_type_id = self._plate_type_combo.currentData() or ""
-        self._sync_plate_type_readout()
-        self._on_config_changed()
-
-    def _on_designer_plate_changed(self, key) -> None:
-        """The designer's OWN picker changed (standard or custom geometry) —
-        that is never a product, so clear the plate-type selection and sync
-        the Plate Type card's format combo (best-effort)."""
-        if getattr(self, "_plate_type_syncing", False):
-            return   # programmatic load driven by the card — ignore
-        self._selected_plate_type_id = ""
-        fcombo = getattr(self, "_plate_type_format_combo", None)
-        if fcombo is not None:
-            self._plate_type_syncing = True
-            try:
-                if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
-                    fidx = fcombo.findData(int(key))
-                    if fidx >= 0:
-                        fcombo.setCurrentIndex(fidx)
-                self._refresh_plate_type_combo(select_id="")
-            finally:
-                self._plate_type_syncing = False
-        self._sync_plate_type_readout()
-        self._on_config_changed()
-
-    def _sync_plate_type_card_from_config(self) -> None:
-        """Mirror the active plate type/format from the loaded config onto the
-        Plate Type card (called from set_hardware_config; signals blocked)."""
-        fcombo = getattr(self, "_plate_type_format_combo", None)
-        if fcombo is None:
-            return
-        pt_id = getattr(self, "_selected_plate_type_id", "")
-        fmt = self._config.plate_format
-        if pt_id:
-            try:
-                from SupportClasses.PlateTypeStore import get_store as _pt_store
-                pt = _pt_store().get(pt_id)
-                if pt is not None:
-                    fmt = pt.base_format
-            except Exception:
-                pass
-        self._plate_type_syncing = True
-        try:
-            fidx = fcombo.findData(fmt)
-            if fidx >= 0:
-                fcombo.setCurrentIndex(fidx)
-            self._refresh_plate_type_combo(select_id=pt_id)
-        finally:
-            self._plate_type_syncing = False
-        self._sync_plate_type_readout()
-
     def _rebuild_config(self):
         """Rebuild HardwareConfig from all widget states."""
         # Name & notes — name_edit is a plain QLineEdit (v7.4.2 rev2).
@@ -5272,20 +5999,25 @@ class HardwareSetupPage(ModePage):
         # designer on its base-format geometry, so current_plate_format() is
         # the base int and current_plate_name() is "" — active_plate_key then
         # resolves to plate_type_id.
-        if hasattr(self, "_plate_designer"):
-            self._config.plate_format = (
-                self._plate_designer.current_plate_format())
-            self._config.plate_name = (
-                self._plate_designer.current_plate_name())
-            self._config.plate_type_id = (
-                getattr(self, "_selected_plate_type_id", "") or "")
+        # v7.12: the ACTIVE DESIGN is the single owner of plate identity —
+        # `plate_doc_id` is set by the library's ★ (see
+        # `_on_active_plate_changed`) and is not rebuilt from widgets here.
+        # Splitting ownership between a Format→Type card and a designer picker
+        # is what made each silently clear the other.
+        doc = self._active_plate_document()
+        if doc is not None:
+            self._config.plate_name = doc.meta.name
+            self._config.plate_type_id = doc.meta.plate_type_id or ""
+            wells = len(doc.evaluate())
+            if wells in PLATE_DEFINITIONS:
+                self._config.plate_format = wells
             # Keep the shim combo in sync for legacy readers.
             idx = self.plate_combo.findData(self._config.plate_format)
             if idx >= 0:
                 self.plate_combo.blockSignals(True)
                 self.plate_combo.setCurrentIndex(idx)
                 self.plate_combo.blockSignals(False)
-        else:
+        elif not getattr(self._config, "plate_doc_id", ""):
             self._config.plate_format = self.plate_combo.currentData() or 24
 
         # Needle (v7.6: hypodermic gauge OR pulled glass capillary;
@@ -5787,91 +6519,102 @@ class HardwareSetupPage(ModePage):
         self._on_config_changed()
 
     # ════════════════════════════════════════════════════════════════
-    #  ROSETTE LIBRARY CRUD
-    # ════════════════════════════════════════════════════════════════
-
-    def _add_rosette(self):
-        dlg = RosetteEditorDialog(parent=self)
-        if dlg.exec() == QDialog.Accepted:
-            ros = dlg.get_rosette()
-            self._config.rosette_library[ros.name] = ros
-            self._refresh_rosette_table()
-            self._on_config_changed()
-
-    def _edit_rosette(self):
-        row = self.rosette_table.currentRow()
-        if row < 0:
-            return
-        name = self.rosette_table.item(row, 0).text()
-        ros = self._config.rosette_library.get(name)
-        if not ros:
-            return
-        dlg = RosetteEditorDialog(rosette=ros, parent=self)
-        if dlg.exec() == QDialog.Accepted:
-            new_ros = dlg.get_rosette()
-            if new_ros.name != name:
-                self._config.rosette_library.pop(name, None)
-            self._config.rosette_library[new_ros.name] = new_ros
-            self._refresh_rosette_table()
-            self._on_config_changed()
-
-    def _remove_rosette(self):
-        row = self.rosette_table.currentRow()
-        if row < 0:
-            return
-        name = self.rosette_table.item(row, 0).text()
-        self._config.rosette_library.pop(name, None)
-        self._refresh_rosette_table()
-        self._on_config_changed()
-
-    def _refresh_rosette_table(self):
-        """Rebuild the rosette table from config."""
-        self.rosette_table.setRowCount(0)
-        for name, ros in self._config.rosette_library.items():
-            row = self.rosette_table.rowCount()
-            self.rosette_table.insertRow(row)
-            center_str = "+center" if ros.has_center_well else ""
-            ring_n = ros.num_subwells - (1 if ros.has_center_well else 0)
-            self.rosette_table.setItem(row, 0, QTableWidgetItem(ros.name))
-            self.rosette_table.setItem(row, 1, QTableWidgetItem(
-                f"{ring_n}{center_str}"))
-            self.rosette_table.setItem(row, 2, QTableWidgetItem(
-                f"{ros.well_format}w"))
-            self.rosette_table.setItem(row, 3, QTableWidgetItem(
-                f"{ros.subwell_depth_mm:.1f} mm"))
-            self.rosette_table.setItem(row, 4, QTableWidgetItem(
-                f"{ros.insert_z_offset_mm:.1f} mm"))
-
-    # ════════════════════════════════════════════════════════════════
     #  SAVE / LOAD
     # ════════════════════════════════════════════════════════════════
 
+    def _setup_dir(self) -> str:
+        """The folder saved setups are READ from — and so saved to.
+
+        v7.16: both dialogs used to default to the process CWD (Save passed a
+        bare filename, Load passed ""), while the file browser and the Setup
+        Name combo only ever scan ``config/hardware``. So a saved setup landed
+        somewhere the page could not see it and did not appear in the list —
+        which is also how loose setup .json files ended up in the repo root.
+        """
+        try:
+            CONFIG_HARDWARE_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return str(CONFIG_HARDWARE_DIR)
+
+    def _setup_path_for_name(self, name: str) -> Path:
+        """``<setups folder>/<name>.json`` — where Save puts a setup.
+
+        The Saved-setups list scans exactly one folder, so a setup saved
+        anywhere else is invisible to the page that is supposed to load it.
+        Passing that folder as a file-dialog *default* was not enough: the
+        Windows native dialog re-opens wherever it was last used, so Save
+        kept landing in the process CWD (which is how loose setup .json
+        files ended up in the repo root). The destination is therefore
+        derived, not chosen.
+        """
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (name or "").strip())
+        stem = stem.rstrip(". ") or "Untitled Setup"
+        return Path(self._setup_dir()) / f"{stem}.json"
+
+    def _write_config_to(self, path: Path | str) -> bool:
+        """Write the current config to ``path`` and refresh both browsers."""
+        try:
+            self._config.save(str(path))
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+            return False
+        QMessageBox.information(
+            self, "Saved", f"Configuration saved to:\n{path}")
+        # v7.2.4: Refresh the config file browser
+        self._scan_config_directory()
+        # v7.4.2: Refresh the Setup Name list so the new file appears as a
+        # pickable option immediately.
+        self._refresh_setup_name_combo()
+        return True
+
     def _save_config(self):
-        """Save the current config to a JSON file."""
+        """Save the current config into the saved-setups folder.
+
+        Deliberately no folder chooser: the file must land where the
+        Saved-setups list reads from, and the name comes from the Name
+        field. Use *Save As…* to put a copy somewhere else.
+        """
+        self._rebuild_config()
+        if not (self._config.config_name or "").strip():
+            QMessageBox.warning(
+                self, "Name this setup",
+                "Enter a Name for this setup before saving — the name "
+                "becomes the filename and the entry in the Saved setups "
+                "list.")
+            if hasattr(self, "name_edit"):
+                self.name_edit.setFocus()
+            return
+        path = self._setup_path_for_name(self._config.config_name)
+        if path.exists():
+            if QMessageBox.question(
+                self, "Overwrite setup?",
+                f"“{path.name}” already exists in:\n{path.parent}\n\n"
+                "Overwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+        self._write_config_to(path)
+
+    def _save_config_as(self):
+        """Save a copy anywhere (escape hatch for the derived path above).
+
+        Defaults to the setups folder; a file saved elsewhere will NOT
+        appear in the Saved setups list.
+        """
         self._rebuild_config()
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Hardware Setup",
-            f"{self._config.config_name}.json",
+            self, "Save Hardware Setup As",
+            str(self._setup_path_for_name(self._config.config_name)),
             "Hardware Setup (*.json)",
         )
         if path:
-            try:
-                self._config.save(path)
-                QMessageBox.information(
-                    self, "Saved", f"Configuration saved to:\n{path}")
-                # v7.2.4: Refresh the config file browser
-                self._scan_config_directory()
-                # v7.4.2: Refresh the Setup Name combo so the new file
-                # appears as a pickable option immediately.
-                self._refresh_setup_name_combo()
-            except Exception as e:
-                QMessageBox.critical(
-                    self, "Error", f"Failed to save:\n{e}")
+            self._write_config_to(path)
 
     def _load_config(self):
         """Load a config from a JSON file."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Hardware Setup", "",
+            self, "Load Hardware Setup", self._setup_dir(),
             "Hardware Setup (*.json)",
         )
         if path:
@@ -5920,41 +6663,22 @@ class HardwareSetupPage(ModePage):
         self.notes_edit.blockSignals(False)
         logger.debug(f"  Name: {self._config.config_name}")
 
-        # ── 2. Plate Type / Format / Custom Plate (v7.5.x) ───────
-        # active_plate_key precedence: plate_type_id → plate_name → format.
-        # A plate TYPE id is NOT a designer document — load its BASE format
-        # geometry into the designer and reflect the product on the card.
-        # v7.5.x: but when a custom design (rosette) is ALSO layered under the
-        # type, load THAT into the designer (geometry_plate_key) so the user
-        # sees/edits their rosette instead of the plain base format — and can't
-        # accidentally re-save the base format over it.
+        # ── 2. Active plate (v7.12) ──────────────────────────────
+        # The library's ★ is the plate selector; restoring the config just
+        # points the library and the Layout tab at the saved document.
         active_key = self._config.active_plate_key
-        self._selected_plate_type_id = self._config.plate_type_id or ""
-        designer_key = getattr(self._config, "geometry_plate_key", None) \
-            or active_key
-        if self._selected_plate_type_id and designer_key == active_key:
-            # Plate type selected with NO layered custom design → base format.
-            try:
-                from SupportClasses.PlateTypeStore import get_store as _pt_store
-                pt = _pt_store().get(self._selected_plate_type_id)
-                if pt is not None:
-                    designer_key = pt.base_format
-            except Exception as e:
-                logger.debug(f"plate-type resolve failed: {e}")
-        if hasattr(self, "_plate_designer"):
-            self._plate_type_syncing = True
-            try:
-                self._plate_designer.load_plate(designer_key)
-            finally:
-                self._plate_type_syncing = False
-        self._sync_plate_type_card_from_config()
+        if hasattr(self, "_plate_workspace"):
+            self._plate_workspace.set_active_plate_id(self._active_library_id())
+            self._plate_workspace.refresh()
+        if hasattr(self, "_rosette_placement"):
+            self._rosette_placement.set_plate(
+                self._active_plate_document(materialize=True))
         self.plate_combo.blockSignals(True)
         pidx = self.plate_combo.findData(self._config.plate_format)
         if pidx >= 0:
             self.plate_combo.setCurrentIndex(pidx)
         self.plate_combo.blockSignals(False)
-        logger.debug(
-            f"  Plate: {active_key} (type={self._selected_plate_type_id or '-'})")
+        logger.debug(f"  Plate: {active_key}")
 
         # ── 3. Ink Library (MUST come before pumps) ──────────────
         self._refresh_ink_table()
@@ -5964,10 +6688,10 @@ class HardwareSetupPage(ModePage):
         ink_names = self._pump_ink_names()
         logger.debug(f"  Ink library: {len(ink_names)} printable inks — pump combos refreshed")
 
-        # ── 4. Rosette Library ───────────────────────────────────
-        self._refresh_rosette_table()
-        logger.debug(
-            f"  Rosette library: {len(self._config.rosette_library)} rosettes")
+        # ── 4. Rosettes ──────────────────────────────────────────
+        # v7.12: rosettes are library documents placed from the Layout tab.
+        # `config.rosette_library` is a retired field, kept only so older
+        # setup JSON still round-trips.
 
         # v7.5.x: reagent locations (force a plate reload — the active plate
         # key may have changed with the loaded config; _on_config_changed is

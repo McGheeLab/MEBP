@@ -1176,7 +1176,16 @@ class TestBoreGroupOnTheRealPage(unittest.TestCase):
         page._hardware_config = SimpleNamespace(needle=_backpack())
         self._with_cameras(page)
         page._bore_cal_refresh()
-        self.assertTrue(page._bore_cal_group.isVisibleTo(page))
+        # v7.13 — the side-camera group is RETIRED from the visible tab (the
+        # microscope wizard's camera-click method is THE bore-offset method);
+        # the group stays alive as the cross-validator inside a hidden parent,
+        # so its own visible flag flips while isVisibleTo(page) stays False.
+        # The hidden parent matters: without one, setVisible(True) would float
+        # the group as a top-level window.
+        self.assertTrue(page._bore_cal_group.isVisibleTo(
+            page._bore_cal_group.parentWidget()))
+        self.assertFalse(page._bore_cal_group.isVisibleTo(page))
+        self.assertFalse(page._bore_cal_group.isWindow())
         self.assertEqual(len(page._bore_cal_row_widgets), 2)
         # Nothing measured yet → point at the datum, since bore 2's offset is
         # meaningless until bore 1 has been recorded.

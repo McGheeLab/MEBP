@@ -12,13 +12,17 @@ A ``WellType`` carries only DESIGN-TIME geometry:
   * ``diameter_mm``   — the opening / top diameter (single-diameter approximation; the
     tapered bottom Ø is a later follow-up).
   * ``well_depth_mm`` — cavity depth (informational).
-  * ``rim_height_mm`` — how far the vessel TOP sits ABOVE the plate surface. This is the
-    safety-critical value: it maps straight onto ``PlateDesign.Well.rim_height_mm``,
-    which flows through ``WellPlate.max_rim_height_mm`` →
-    ``app.py::_update_insert_clearance`` → ``StageController.set_min_travel_z`` and
-    floors every ``safe_travel_to`` retract so the needle clears the tallest tube
-    before travelling over / into it. This module does NOT touch that clearance math;
-    it only makes ``rim_height_mm`` (and the sibling geometry) easy to set from a preset.
+  * ``rim_height_mm`` — how far the vessel TOP sits ABOVE the plate surface. It maps
+    onto ``PlateDesign.Well.rim_height_mm`` and is carried through ``compile()`` onto
+    ``WellInfo.rim_height_mm`` and aggregated by ``WellPlate.max_rim_height_mm``.
+
+    ⚠ It is NOT wired to travel-Z clearance today, despite what this docstring used
+    to claim. ``app.py::_update_insert_clearance`` unconditionally calls
+    ``StageController.set_min_travel_z(None)`` (2026-07-27 operator decision — Fast
+    Move Z is authoritative), so ``max_rim_height_mm`` currently has **zero**
+    production consumers and nothing floors ``safe_travel_to`` from this value.
+    Re-arming it is a one-line change in ``_update_insert_clearance``; until then,
+    do not rely on a rim height to keep the needle clear of a tall insert.
   * ``ink_z_mm``      — optional prescribed dispense Z (rel. plate top); ``None`` = the
     well uses the global print Z.
   * ``volume_uL``     — optional, purely informational (e.g. 100 µL for a 0.1 mL tube).

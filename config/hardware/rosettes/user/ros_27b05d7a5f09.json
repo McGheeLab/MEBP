@@ -1,0 +1,50 @@
+{
+  "schema": "mebp.plate-document",
+  "schema_version": 2,
+  "meta": {
+    "id": "ros_27b05d7a5f09",
+    "name": "3 channel",
+    "kind": "rosette",
+    "rev": 3,
+    "created": "2026-08-10T23:10:05+00:00",
+    "modified": "2026-08-10T23:13:14+00:00"
+  },
+  "units": "mm",
+  "boundary": {
+    "kind": "circle",
+    "radius_mm": 7.7,
+    "origin_ref": "center"
+  },
+  "defaults": {
+    "diameter_mm": 3.12,
+    "well_depth_mm": 10.0
+  },
+  "entities": [
+    {
+      "type": "Point",
+      "id": 3,
+      "x": -0.031116,
+      "y": 0.0
+    },
+    {
+      "type": "RingPattern",
+      "id": 4,
+      "name": "ring-1",
+      "anchor": 3,
+      "style": {
+        "diameter_mm": 5.5,
+        "well_depth_mm": 21.0,
+        "rim_height_mm": 3.5
+      },
+      "naming": {
+        "scheme": "numbers",
+        "prefix": "Ro"
+      },
+      "count": 3,
+      "ring_diameter_mm": 8.0
+    }
+  ],
+  "constraints": [],
+  "next_entity_id": 5,
+  "next_constraint_id": 1
+}

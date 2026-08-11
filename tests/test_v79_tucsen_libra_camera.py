@@ -899,6 +899,63 @@ class TestHardwareConfirmedMapping(_TUCamFixture):
         be = self._open(lib)
         self.assertAlmostEqual(be.get_temperature(), -12.5)
 
+    def test_the_refusal_is_logged_once_not_per_read(self):
+        """🐞 The verdict is a fixed property of the model, so repeating it says
+        nothing new.
+
+        Measured on a real session before the fix: this one line was **7821 of
+        44220 log lines — 17.7%** of everything the app recorded, at roughly one
+        per frame, burying every other message.
+        """
+        lib = self._install(props={
+            tb.TUIDP_TEMPERATURE: [500.0, 1000.0, 500.0, 1.0, 0.375],
+        })
+        be = self._open(lib)
+        # open() may already have read it once, so start from a known state
+        # rather than depending on whether it did.
+        be._temp_refused = False
+        with self.assertLogs(tb.logger, level="DEBUG") as caught:
+            for _ in range(20):
+                self.assertIsNone(be.get_temperature())
+            tb.logger.debug("sentinel")   # assertLogs needs >=1 record
+        said = [r for r in caught.output if "temperature" in r]
+        self.assertEqual(len(said), 1,
+                         f"expected one notice for 20 reads, got {len(said)}")
+
+    def test_coming_back_into_range_is_reported_again(self):
+        """Log transitions, not states — including the recovery."""
+        lib = self._install(props={
+            tb.TUIDP_TEMPERATURE: [-50.0, 50.0, 0.0, 0.1, 900.0],
+        })
+        be = self._open(lib)
+        self.assertIsNone(be.get_temperature())      # out of range: refused
+        self.assertTrue(be._temp_refused)
+        lib.props[tb.TUIDP_TEMPERATURE][4] = -12.5   # now plausible
+        self.assertAlmostEqual(be.get_temperature(), -12.5)
+        self.assertFalse(be._temp_refused)
+
+    def test_an_unknown_temperature_is_still_cached_for_the_throttle(self):
+        """🐞 ROOT CAUSE of the log firehose.
+
+        `None` is a legitimate answer ("this model reports nothing usable"), so
+        an `is None` cache-miss test could not tell it from "not read yet" — the
+        2 s throttle never engaged and the SDK was re-read on every frame. The
+        same absent-vs-zero conflation, one layer down.
+        """
+        lib = self._install(props={
+            tb.TUIDP_TEMPERATURE: [500.0, 1000.0, 500.0, 1.0, 0.375],
+        })
+        be = self._open(lib)
+        plane = np.zeros((4, 4), dtype=np.uint16)
+        reads = []
+        real = be.get_temperature
+        be.get_temperature = lambda: (reads.append(1), real())[1]
+        for _ in range(15):
+            be._service_raw_plane(plane, 16)
+        self.assertEqual(len(reads), 1,
+                         f"15 frames should hit the SDK once, hit it {len(reads)}")
+        self.assertIsNone(be.get_raw_frame_stats().get("temperature_c"))
+
     def test_redundant_capability_write_is_not_sent(self):
         """🐞 On a real Libra 25, writing auto_exposure=0 while it was ALREADY 0
         reset the exposure to the 6.3 us sensor minimum — a black preview.

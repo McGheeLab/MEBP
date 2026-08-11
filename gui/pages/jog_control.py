@@ -479,14 +479,21 @@ class JogControlPage(QWidget):
                 or zx_um is None):
             self._xz_view.set_well_under_needle(None, None)
             return
-        well_r_um = (self._plate.well_diameter / 2.0) * 1000.0
+        # v7.12: resolve the diameter PER WELL. The plate-level `well_diameter`
+        # is 0.0 on a parametric plate, which made `well_r_um` zero — so the
+        # `abs(...) <= 0` test never matched and the XZ side view never showed
+        # a well under the needle at all.
         zero = self.controller.zero_position
-        for _, (wx_stage, wy_stage) in self._well_positions.items():
+        for name, (wx_stage, wy_stage) in self._well_positions.items():
+            diameter = self._plate.well_diameter_of(name)
+            well_r_um = (diameter / 2.0) * 1000.0
+            if well_r_um <= 0:
+                continue
             wx_zr = wx_stage - zero["x"]
             wy_zr = wy_stage - zero["y"]
             if abs(wx_zr - zx_um) <= well_r_um and abs(wy_zr - zy_um) <= well_r_um:
                 self._xz_view.set_well_under_needle(
-                    self._plate.well_diameter, self._plate.well_depth_mm)
+                    diameter, self._plate.well_depth_mm)
                 return
         self._xz_view.set_well_under_needle(None, None)
 
@@ -618,6 +625,19 @@ class JogControlPage(QWidget):
         if self._context_widget is not None:
             try:
                 self._context_widget.set_z_references(self._z_references)
+            except Exception:
+                pass
+
+    def set_visible_z_references(self, keys) -> None:
+        """v7.9.1: which Z references get a quick-move badge on the side view.
+
+        Chosen on Calibration → Needle Location → Advanced Z references. Values
+        are untouched — the Hardware Info card still lists every reference; only
+        the clickable badge strip is filtered.
+        """
+        if self._xz_view is not None:
+            try:
+                self._xz_view.set_visible_z_references(keys)
             except Exception:
                 pass
 

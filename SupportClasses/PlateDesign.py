@@ -236,8 +236,26 @@ CONSTRAINT_KINDS: tuple[str, ...] = (
     "symmetric_pp",    # v7.4.6 — two points symmetric about a line
     "dist_left_edge",  # v7.4.7 — well distance from plate left edge
     "dist_top_edge",   # v7.4.7 — well distance from plate top edge
-    "drag_ghost",      # transient, solver-internal
+    "drag_ghost",      # transient, solver-internal — NEVER persisted (see below)
 )
+
+# Kinds that may reach disk. `drag_ghost` is the solver's transient drag pin
+# (weight 1000, id -1) and is deliberately excluded.
+#
+# v7.12: this filter exists because the exclusion was previously only a comment.
+# `PlateSketchSolver.begin_drag` appends the ghost into `design.constraints`, and
+# any save or undo-snapshot taken between begin_drag and end_drag serialized it.
+# Reloading then restored it as an INVISIBLE weight-1000 pin that silently fought
+# every later edit and solve. Seven of them had already reached disk across three
+# shipped plate files. Filtered on BOTH write and read, so a hand-edited or
+# already-contaminated file cannot reintroduce one either.
+PERSISTABLE_CONSTRAINT_KINDS: frozenset[str] = frozenset(
+    k for k in CONSTRAINT_KINDS if k != "drag_ghost")
+
+
+def _is_persistable(c: "Constraint") -> bool:
+    """True when *c* belongs on disk. Transients carry id <= 0."""
+    return c.id > 0 and c.kind in PERSISTABLE_CONSTRAINT_KINDS
 
 
 @dataclass
@@ -858,7 +876,9 @@ class PlateDesign:
                 str(eid): _entity_to_dict(e)
                 for eid, e in self.entities.items()
             },
-            "constraints": [c.to_dict() for c in self.constraints],
+            "constraints": [
+                c.to_dict() for c in self.constraints if _is_persistable(c)
+            ],
             "a1_offset_x": self.a1_offset_x,
             "a1_offset_y": self.a1_offset_y,
             "well_depth_default_mm": self.well_depth_default_mm,
@@ -884,7 +904,15 @@ class PlateDesign:
             design.entities[ent.id] = ent
 
         for cdata in data.get("constraints", []):
-            design.constraints.append(Constraint.from_dict(cdata))
+            con = Constraint.from_dict(cdata)
+            if not _is_persistable(con):
+                # An already-contaminated file, or a hand edit. Dropping on read
+                # is what heals the seven ghosts that reached disk before v7.12.
+                logger.warning(
+                    "Dropping non-persistable constraint on load: "
+                    "kind=%s id=%s weight=%s", con.kind, con.id, con.weight)
+                continue
+            design.constraints.append(con)
 
         # Restore id counters; fall back to max(id) + 1.
         max_eid = max(design.entities.keys(), default=0)

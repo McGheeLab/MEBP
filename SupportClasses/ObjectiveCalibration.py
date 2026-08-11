@@ -223,6 +223,192 @@ class ObjectiveCalibrationStore:
             f"= {measured_um_per_px:.4f} µm/px @ {resolution}"
         )
 
+    # ── Plausibility ───────────────────────────────────────────────
+
+    @staticmethod
+    def _implied_pixel_um(um_per_px: float, magnification: float,
+                          calib_w: float) -> Optional[float]:
+        """Effective sensor pixel pitch implied by a calibration, at 1x width.
+
+        ``um_per_px`` is specimen µm per image pixel, so ``× magnification``
+        gives the µm of SENSOR each pixel spans. Multiplying by the capture
+        width normalises across binning/ROI modes, giving a quantity that is a
+        property of the camera alone — the same for every objective.
+        """
+        try:
+            if um_per_px <= 0 or magnification <= 0 or calib_w <= 0:
+                return None
+            return float(um_per_px) * float(magnification) * float(calib_w)
+        except (TypeError, ValueError):
+            return None
+
+    def sensor_width_um(self, camera_name: str,
+                        tol_frac: float = 0.25) -> Optional[float]:
+        """The camera's imaged sensor WIDTH in µm, measured from its objectives.
+
+        v7.16. ``µm/px × magnification × capture_width`` is the width of sensor
+        the image spans — a property of the camera alone, identical for every
+        objective. Measured on this rig's ToupTek it is 5707 / 5669 / 5724 for
+        2x / 4x / 10x (1.0 % spread), and on the Andor 13218 against a datasheet
+        13312 (6.5 µm × 2048), so it is real and it is accurate.
+
+        Returns None when nothing on this camera is calibrated, **and also when
+        the calibrated objectives disagree by more than ``tol_frac``**. That
+        refusal is the point: with two entries a plain median just picks one, so
+        a single bad stamp would silently become the camera's "native" scale and
+        every derived bound would inherit it. This machine has exactly that case
+        — the Andor's 10x is stamped 2048 but was measured at 1024, giving
+        13218 vs 27036 — and an unusable answer must read as unusable.
+        """
+        vals: list[float] = []
+        for obj, cal in (self.all_calibrations_for_camera(camera_name)
+                         or {}).items():
+            if not isinstance(cal, dict):
+                continue
+            mag = self.nominal_magnification(obj)
+            res = cal.get("resolution") or ()
+            try:
+                w = float(res[0]) if res else 0.0
+            except (TypeError, ValueError, IndexError):
+                w = 0.0
+            v = self._implied_pixel_um(
+                float(cal.get("measured_um_per_px") or 0.0),
+                float(mag or 0.0), w)
+            if v is not None:
+                vals.append(v)
+        if not vals:
+            return None
+        vals.sort()
+        if vals[0] <= 0 or (vals[-1] / vals[0]) > (1.0 + float(tol_frac)):
+            logger.warning(
+                "Camera %r: its objectives disagree on sensor width (%s um) — "
+                "at least one calibration's resolution stamp or measurement is "
+                "wrong, so the camera's native um/px cannot be derived. "
+                "Re-measure the odd one out.",
+                camera_name, ", ".join(f"{v:.0f}" for v in vals))
+            return None
+        n = len(vals)
+        if n % 2:
+            return vals[n // 2]
+        return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+    def native_um_per_px(self, camera_name: str,
+                         frame_width: float) -> Optional[float]:
+        """µm/px this camera would have at **1x magnification**, at
+        ``frame_width`` pixels — i.e. the operator's "native µm/px for the
+        camera at a 1x frame". None when the camera has no calibration."""
+        width_um = self.sensor_width_um(camera_name)
+        try:
+            fw = float(frame_width)
+        except (TypeError, ValueError):
+            return None
+        if width_um is None or fw <= 0:
+            return None
+        return width_um / fw
+
+    def predicted_um_per_px(self, camera_name: str, objective_name: str,
+                            frame_width: float) -> Optional[float]:
+        """µm/px this objective SHOULD have on this camera, at ``frame_width``.
+
+        v7.16, and the operator's own reasoning: *"for it to know how far it can
+        move it needs to know the objective its on and the measured
+        magnification of the objective — only this way can we get the native
+        microns per pixel for the camera at a 1x frame."*
+
+        Lets a NEVER-CALIBRATED objective still get a correct scale estimate
+        from its siblings, which is what any bound on the calibration move
+        itself has to be sized from — the move happens BEFORE the measurement
+        exists, so it cannot use it.
+        """
+        native = self.native_um_per_px(camera_name, frame_width)
+        mag = self.nominal_magnification(objective_name)
+        if native is None or not mag or mag <= 0:
+            return None
+        return native / float(mag)
+
+    def implausible_reason(self, camera_name: str, objective_name: str,
+                           um_per_px: float, resolution,
+                           tol_frac: float = 0.25) -> Optional[str]:
+        """Why a fresh µm/px looks wrong for this camera — or None.
+
+        v7.16. A stage-motion measurement can silently return a number for the
+        WRONG camera or the wrong scale (a stale value echoed back, a feature
+        that left the frame, an objective that is not the one on the turret).
+        Nothing downstream can tell: a mosaic simply scans at that scale, and
+        the only symptom is a tile count that is wrong by the square of the
+        error — an 8-hour scan instead of 45 minutes.
+
+        The check needs no camera spec and no datasheet. For ONE camera,
+        ``µm/px × magnification × capture_width`` is a property of the sensor,
+        so it must agree across every objective. Measured on this rig's
+        ToupTek: 2x → 0.778843×2×3664 = 5707, 4x → 0.389135×4×3664 = 5703 —
+        0.07 % apart.
+
+        Compares against the camera's OTHER calibrated objectives only, so it
+        cannot be fooled by another camera's numbers. Returns None when there
+        is nothing to compare against — an unverifiable value is reported as
+        unverified by the caller, never as passed.
+        """
+        mag = self.nominal_magnification(objective_name)
+        try:
+            calib_w = float(resolution[0]) if resolution else 0.0
+        except (TypeError, ValueError, IndexError):
+            calib_w = 0.0
+        mine = self._implied_pixel_um(float(um_per_px or 0.0),
+                                      float(mag or 0.0), calib_w)
+        if mine is None:
+            return None
+
+        others: list[tuple[str, float]] = []
+        for obj, cal in (self.all_calibrations_for_camera(camera_name)
+                         or {}).items():
+            if obj == objective_name or not isinstance(cal, dict):
+                continue
+            m2 = self.nominal_magnification(obj)
+            res2 = cal.get("resolution") or ()
+            try:
+                w2 = float(res2[0]) if res2 else 0.0
+            except (TypeError, ValueError, IndexError):
+                w2 = 0.0
+            v = self._implied_pixel_um(
+                float(cal.get("measured_um_per_px") or 0.0),
+                float(m2 or 0.0), w2)
+            if v is not None:
+                others.append((obj, v))
+        if not others:
+            return None
+
+        ref = sorted(v for _o, v in others)[len(others) // 2]     # median
+        if ref <= 0:
+            return None
+        ratio = mine / ref
+        if (1.0 - float(tol_frac)) <= ratio <= (1.0 + float(tol_frac)):
+            return None
+        names = ", ".join(o for o, _v in others)
+        if ratio < 1.0:
+            # µm/px too SMALL ⇒ the FOV is under-estimated ⇒ the raster steps
+            # too finely. Tile count grows with the square of the error.
+            consequence = (
+                f"This reads {1.0 / ratio:.2f}x too SMALL, which under-states "
+                f"the field of view — a mosaic would scan about "
+                f"{1.0 / (ratio * ratio):.0f}x more tiles than it needs.")
+        else:
+            # µm/px too LARGE ⇒ FOV over-estimated ⇒ the raster steps too far.
+            # Fewer tiles, but they no longer overlap: the mosaic has holes.
+            consequence = (
+                f"This reads {ratio:.2f}x too LARGE, which over-states the "
+                f"field of view — a mosaic would step further than each frame "
+                f"actually covers and leave GAPS between tiles.")
+        return (
+            f"This measurement implies a sensor {ratio:.2f}x the size that "
+            f"{objective_name!r} should have on this camera, judged against "
+            f"its other calibrated objectives ({names}).\n\n"
+            f"For one camera, µm/px × magnification must be the same for every "
+            f"objective — so either this reading is wrong (the tracked feature "
+            f"left the frame, or a stale value was picked up), or the "
+            f"objective actually on the scope is not {objective_name!r}.\n\n"
+            + consequence)
+
     def clear_calibration(self, camera_name: str,
                           objective_name: str) -> None:
         """Remove a stored calibration entry."""

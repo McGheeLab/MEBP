@@ -422,13 +422,63 @@ class TestSlotMirrorUI(_PageHarness):
         self.assertEqual(len(self.pg._live_cam_mirror_checks), 4)
 
     def test_apply_mirror_pushes_live_and_persists(self):
+        """v7.16: these controls set the LIVE VIEW, not the measured geometry.
+
+        They used to write ``mirrored`` — the value the mosaic orients tiles by
+        and every click is mapped through — which gave that one number two
+        writers (here and the objective calibration's stage-motion measurement).
+        The measurement won, so setting the view up and then calibrating flipped
+        the view back. That is the defect this asserts is gone.
+        """
         store = self.CCS.get_store()
         store.set_calibration("dshow:PATH_A", 5.54, name="Teslong")
         self.pg._apply_slot_mirror(0, True)
-        self.assertTrue(self.mgr.get_mirrored(0))
+        self.assertTrue(self.mgr.display_orientation(0)[0])   # live view flipped
+        self.assertFalse(self.mgr.get_mirrored(0))            # geometry untouched
         entry = store.get_calibration("dshow:PATH_A")
-        self.assertTrue(entry["mirrored"])
-        self.assertAlmostEqual(entry["um_per_px"], 5.54)  # µm/px untouched
+        self.assertTrue(entry["view_orientation"]["flip_x"])
+        self.assertNotIn("mirrored", entry)                   # not the measured one
+        self.assertAlmostEqual(entry["um_per_px"], 5.54)      # µm/px untouched
+
+    def test_a_measurement_does_not_move_the_live_view(self):
+        """THE reported bug, end to end: set the view up, then calibrate.
+
+        Drives the real store + manager through the page's own commit path, then
+        applies a measurement the way ``objective_calibration_card`` does.
+        """
+        store = self.CCS.get_store()
+        store.set_calibration("dshow:PATH_A", 5.54, name="Teslong")
+        # 1) operator dials in the live view they want
+        self.pg._apply_slot_mirror(0, True)
+        self.pg._apply_slot_rotation_value(0, 180.0)
+        before = self.mgr.display_orientation(0)
+        self.assertEqual(before, (True, False, 180.0))
+        # 2) the objective/mosaic calibration measures camera→stage and commits
+        self.mgr.set_rotation_deg(0, -90.0)
+        self.mgr.set_mirrored(0, False)
+        self.mgr.set_flip_y(0, True)
+        store.set_rotation("dshow:PATH_A", -90.0)
+        store.set_mirrored("dshow:PATH_A", False)
+        store.set_flip_y("dshow:PATH_A", True)
+        # 3) the live view must not have moved…
+        self.assertEqual(self.mgr.display_orientation(0), before)
+        self.assertEqual(
+            store.get_view_orientation("dshow:PATH_A"),
+            {"rotation_deg": 180.0, "flip_x": True, "flip_y": False})
+        # …while the mosaic/click geometry took the measurement.
+        self.assertEqual(self.mgr.full_orientation(0), (False, True, -90.0))
+
+    def test_the_split_is_what_makes_this_pass(self):
+        """Guard the guard: with no view preference the feed still follows the
+        measurement, so the tests above cannot be passing merely because the
+        display ignores orientation altogether."""
+        self.mgr.clear_display_orientation(0)
+        self.mgr.set_rotation_deg(0, -90.0)
+        self.mgr.set_mirrored(0, True)
+        self.assertFalse(self.mgr.has_display_orientation(0))
+        self.assertEqual(self.mgr.display_orientation(0),
+                         self.mgr.full_orientation(0))
+        self.assertEqual(self.mgr.display_orientation(0), (True, False, -90.0))
 
     def test_mirror_flips_the_live_preview(self):
         """Regression: toggling the mirror checkbox must mirror the slot's live
@@ -447,15 +497,29 @@ class TestSlotMirrorUI(_PageHarness):
         self.pg._apply_slot_mirror(0, False)
         self.assertEqual(calls[-1][0], False)    # un-mirror pushed too
 
-    def test_readout_shows_mirrored(self):
+    def test_readout_names_the_live_view_separately(self):
+        """v7.16: the readout reports the MEASURED orientation, so it must say
+        so when the live view differs — otherwise "Rotation vs stage: 180°" reads
+        as a claim about the feed, which is exactly the ambiguity the split
+        introduces."""
         self.pg._config.set_camera_role(0, CameraRole.NEEDLE_X)
         self.pg._apply_slot_mirror(0, True)
-        self.assertIn("mirrored", self.pg._live_cam_rot_labels[0].text())
-        # Checkbox state tracks the manager.
+        txt = self.pg._live_cam_rot_labels[0].text()
+        self.assertIn("live view", txt)
+        self.assertIn("flip X", txt)
+        # Checkbox state tracks the live-view orientation.
         self.assertTrue(self.pg._live_cam_mirror_checks[0].isChecked())
         self.pg._apply_slot_mirror(0, False)
-        self.assertNotIn("mirrored", self.pg._live_cam_rot_labels[0].text())
+        self.assertNotIn("flip X", self.pg._live_cam_rot_labels[0].text())
         self.assertFalse(self.pg._live_cam_mirror_checks[0].isChecked())
+
+    def test_readout_still_reports_a_measured_mirror(self):
+        """The measured mirror keeps its own word in the readout — it is what the
+        mosaic uses, so it must stay visible independently of the view."""
+        self.pg._config.set_camera_role(0, CameraRole.NEEDLE_X)
+        self.mgr.set_mirrored(0, True)          # a MEASURED mirror
+        self.pg._refresh_slot_rotation_displays()
+        self.assertIn("mirrored", self.pg._live_cam_rot_labels[0].text())
 
     def test_flip_y_and_rotation_controls_exist(self):
         self.assertEqual(len(self.pg._live_cam_flip_y_checks), 4)
@@ -465,26 +529,41 @@ class TestSlotMirrorUI(_PageHarness):
         store = self.CCS.get_store()
         store.set_calibration("dshow:PATH_A", 5.54, name="Teslong")
         self.pg._apply_slot_flip_y(0, True)
-        self.assertTrue(self.mgr.get_flip_y(0))
+        self.assertTrue(self.mgr.display_orientation(0)[1])   # live view
+        self.assertFalse(self.mgr.get_flip_y(0))              # geometry untouched
         entry = store.get_calibration("dshow:PATH_A")
-        self.assertTrue(entry["flip_y"])
-        self.assertAlmostEqual(entry["um_per_px"], 5.54)   # µm/px untouched
+        self.assertTrue(entry["view_orientation"]["flip_y"])
+        self.assertNotIn("flip_y", entry)
+        self.assertAlmostEqual(entry["um_per_px"], 5.54)      # µm/px untouched
 
     def test_apply_rotation_value_pushes_live_and_persists(self):
         store = self.CCS.get_store()
         store.set_calibration("dshow:PATH_A", 5.54, name="Teslong")
         self.pg._apply_slot_rotation_value(0, 42.0)
-        self.assertAlmostEqual(self.mgr.get_rotation_deg(0), 42.0)
+        self.assertAlmostEqual(self.mgr.display_orientation(0)[2], 42.0)
         entry = store.get_calibration("dshow:PATH_A")
-        self.assertAlmostEqual(entry["rotation_deg"], 42.0)
+        self.assertAlmostEqual(entry["view_orientation"]["rotation_deg"], 42.0)
+        # The MEASURED rotation is untouched — a hand-typed viewing angle must
+        # not move the angle the mosaic orients tiles by.
+        self.assertIsNone(entry.get("rotation_deg"))
+        self.assertIsNone(self.mgr.get_rotation_deg(0))
+
+    def test_one_control_does_not_clear_the_others(self):
+        """The view is stored as one triple, so a partial commit must preserve
+        the fields it does not name."""
+        self.pg._apply_slot_mirror(0, True)
+        self.pg._apply_slot_rotation_value(0, 90.0)
+        self.pg._apply_slot_flip_y(0, True)
+        self.assertEqual(self.mgr.display_orientation(0), (True, True, 90.0))
 
     def test_flip_y_persists_per_identity(self):
         self.pg._apply_slot_flip_y(1, True)
         ident = self.mgr.camera_identity(1)
         self.assertTrue(ident and ident[0])
-        self.assertTrue(self.CCS.get_store().get_flip_y(ident[0]))
+        vo = self.CCS.get_store().get_view_orientation(ident[0])
+        self.assertTrue(vo and vo["flip_y"])
 
-    def test_mirror_restores_on_slot_assignment(self):
+    def test_view_orientation_restores_on_slot_assignment(self):
         self.pg._apply_slot_mirror(1, True)
         self.CCS._store = self.CCS.CameraCalibrationStore(self.tmp)
         from gui.widgets.camera_manager import CameraManager
@@ -497,9 +576,35 @@ class TestSlotMirrorUI(_PageHarness):
         combo.addItem("cam1", ("opencv", 1))
         combo.setCurrentIndex(combo.count() - 1)
         combo.blockSignals(False)
-        self.assertFalse(mgr2.get_mirrored(1))
+        self.assertFalse(mgr2.has_display_orientation(1))
         self.pg._restore_calibration_for_slot(1)
-        self.assertTrue(mgr2.get_mirrored(1))
+        self.assertTrue(mgr2.has_display_orientation(1))
+        self.assertTrue(mgr2.display_orientation(1)[0])
+
+    def test_restore_clears_a_stale_view_when_the_new_camera_has_none(self):
+        """⚠ A slot's CameraWidget outlives the source assigned to it, so
+        reassigning from a camera WITH a view preference to one WITHOUT must hand
+        the view back to the measurement — otherwise the new camera silently
+        inherits the old one's rotation. (Same hazard as the v7.16 crop restore.)
+        """
+        # _restore_calibration_for_slot only acts on a slot with an assigned
+        # source, so assign one first (as the sibling test does).
+        self.mgr.get_source = lambda i: ("opencv", i)
+        combo = self.pg._live_cam_source_combos[1]
+        combo.blockSignals(True)
+        combo.addItem("cam1", ("opencv", 1))
+        combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+        ident = self.mgr.camera_identity(1)
+        self.assertTrue(ident and ident[0])
+        # The newly-assigned camera has a calibration but NO view preference,
+        # while the slot still carries the previous camera's view.
+        self.CCS.get_store().set_calibration(ident[0], 4.0, name="Other")
+        self.CCS.get_store().clear_view_orientation(ident[0])
+        self.mgr.set_display_orientation(1, True, True, 180.0)
+        self.assertTrue(self.mgr.has_display_orientation(1))
+        self.pg._restore_calibration_for_slot(1)
+        self.assertFalse(self.mgr.has_display_orientation(1))
 
 
 if __name__ == "__main__":

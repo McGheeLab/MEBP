@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "cell_targeting",
   "name": "__last__",
-  "saved": "2026-08-01T12:10:45",
+  "saved": "2026-08-11T10:53:43",
   "values": {
     "service_z": 0.5,
     "service_z__ovr": false,
@@ -37,7 +37,8 @@
       "data": null
     },
     "reagent_z": 0.5,
-    "push_depth": 0.1,
+    "push_volume_nL": 3.142,
+    "push_depth": 0.400052,
     "pull_mult": 2.0,
     "dwell": 60.0,
     "push_speed": 0.5,
@@ -45,9 +46,61 @@
     "prep": true,
     "clean": true,
     "wash_after_pickup": true,
+    "surface_z": false,
+    "surface_offset_um": 10.0,
     "__extra__": {
-      "bore_programs": [],
-      "trypsin_reagent": ""
+      "bore_programs": [
+        {
+          "bore_index": 0,
+          "pump_id": "P1",
+          "role": "aspirate_target",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        },
+        {
+          "bore_index": 1,
+          "pump_id": "P2",
+          "role": "idle",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        },
+        {
+          "bore_index": 2,
+          "pump_id": "P3",
+          "role": "idle",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        }
+      ],
+      "trypsin_reagent": "",
+      "assembly_fingerprint": {
+        "bore_count": 0,
+        "declared_pumps": {
+          "0": "P1",
+          "1": "P2",
+          "2": "P3"
+        }
+      },
+      "fluor_overlay": false,
+      "active_tab": 0
     }
   }
 }

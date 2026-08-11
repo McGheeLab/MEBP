@@ -239,6 +239,18 @@ def run_gui(controller: StageController, settings: Settings):
     # still overrides per-widget wherever it sets an explicit background.
     _apply_dark_palette(app)
 
+    # v7.16: arm the GUI-thread stall watchdog. faulthandler (above) catches a
+    # hard crash but is blind to a HANG — the process is alive, the event loop
+    # simply stops turning — which is what gets reported as "python freezes"
+    # and which leaves no trail whatsoever. This dumps every thread's stack to
+    # logs/freeze.log when the event loop stalls, so a freeze that only happens
+    # on the rig still produces the frame it is stuck in.
+    try:
+        from SupportClasses.GuiWatchdog import start_watchdog
+        start_watchdog()
+    except Exception as exc:                          # never block startup
+        logging.getLogger(__name__).debug(f"GUI watchdog unavailable: {exc}")
+
     from SupportClasses.PrintRecorder import PrintRecorder
     recorder = PrintRecorder()
 

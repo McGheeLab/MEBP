@@ -132,6 +132,9 @@ class XZSideView(QWidget):
         }
         # Hit rects for the badges (populated in paint).
         self._z_ref_hit_rects: dict[str, tuple[QRectF, float]] = {}
+        # v7.9.1: which references the quick-move strip shows. None = all
+        # (default, unchanged). See set_visible_z_references.
+        self._z_ref_visible: set[str] | None = None
 
         # ── v7.5.x: custom Z locations (opt-in; Jog page) ──────────
         # Values are raw zero-ref mm — the same frame as _z_refs and
@@ -262,6 +265,31 @@ class XZSideView(QWidget):
         elif "fast_move_z" in refs and refs["fast_move_z"] is None:
             self._safe_z_mm = None
         self.update()
+
+    def set_visible_z_references(self, keys) -> None:
+        """Choose WHICH Z-reference badges the quick-move strip shows.
+
+        v7.9.1. ``keys`` is an iterable of the keys in :attr:`_Z_REF_META`, or
+        ``None`` to show every reference that has a value (the previous, and
+        still default, behaviour). Unknown keys are ignored.
+
+        This is presentation only: the hidden reference keeps its value and
+        every consumer that reads it — the print floor, the Hardware Info card,
+        `get_z_references` — is untouched. Hiding by writing ``None`` into the
+        reference dict instead would have disarmed the print-floor clamp.
+        """
+        if keys is None:
+            self._z_ref_visible = None
+        else:
+            known = {k for k, _, _ in self._Z_REF_META}
+            self._z_ref_visible = {str(k) for k in keys} & known
+        self.update()
+
+    def visible_z_references(self) -> set:
+        """The currently shown reference keys (all of them when unfiltered)."""
+        if self._z_ref_visible is None:
+            return {k for k, _, _ in self._Z_REF_META}
+        return set(self._z_ref_visible)
 
     def set_position(self, x_um: float | None, z_mm: float | None) -> None:
         self._x_um = float(x_um) if x_um is not None else None
@@ -591,6 +619,9 @@ class XZSideView(QWidget):
         for key, label, color_key in self._Z_REF_META:
             value = self._z_refs.get(key)
             if value is None:
+                continue
+            # v7.9.1: operator-chosen subset (None = show all).
+            if self._z_ref_visible is not None and key not in self._z_ref_visible:
                 continue
             # v7.5.x: draw in the display frame; the hit rect below keeps the
             # raw zero-ref `value` so the go-to emit stays in the move frame.

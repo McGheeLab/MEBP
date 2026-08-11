@@ -232,6 +232,72 @@ class TestDerivedValues(_StoreCase):
                       self.store.summary("other-key"))
 
 
+class TestTrainingFields(_StoreCase):
+    """v7.11 — the labelled-capture fields that make the bank trainable.
+
+    Before this, the only writer passed neither ``needle_type`` nor
+    ``focus_score``, so ``reference_focus_score`` returned None for every
+    capture on disk and the needle type survived only inside the key string.
+    """
+
+    def test_a_capture_without_them_is_byte_identical_to_a_pre_v711_entry(self):
+        self._add()
+        cap = self.store.captures(KEY)[0]
+        for k in ("ground_truth", "adopted_by", "auto_focus_um", "margin_um"):
+            self.assertNotIn(k, cap)
+
+    def test_they_round_trip_through_disk(self):
+        self._add(ground_truth=True, adopted_by="operator",
+                  auto_focus_um=2200.0, margin_um=1000.0,
+                  microscope_focus_um=2192.0)
+        again = NeedleFocusTemplateStore(
+            self.root / "needle_focus_templates.json")
+        cap = again.captures(KEY)[0]
+        self.assertTrue(cap["ground_truth"])
+        self.assertEqual(cap["adopted_by"], "operator")
+        self.assertEqual(cap["auto_focus_um"], 2200.0)
+        self.assertEqual(cap["margin_um"], 1000.0)
+
+    def test_ground_truth_captures_are_the_confirmed_ones_only(self):
+        self._add(ground_truth=True, microscope_focus_um=2192.0,
+                  auto_focus_um=2200.0)
+        self._add(microscope_focus_um=2100.0, auto_focus_um=2000.0)
+        self.assertEqual(len(self.store.captures(KEY)), 2)
+        self.assertEqual(len(self.store.ground_truth_captures(KEY)), 1)
+
+    def test_the_bias_is_the_median_over_confirmed_captures(self):
+        for got, auto in ((2192.0, 2200.0), (2191.0, 2200.0),
+                          (2189.0, 2200.0)):
+            self._add(ground_truth=True, microscope_focus_um=got,
+                      auto_focus_um=auto)
+        self.assertAlmostEqual(self.store.focus_bias_um(KEY), -9.0, places=6)
+
+    def test_unconfirmed_captures_do_not_teach(self):
+        """An unconfirmed capture may be centred on a reflection or the well
+        wall; averaging those in is how a trained model gets worse."""
+        self._add(ground_truth=True, microscope_focus_um=2192.0,
+                  auto_focus_um=2200.0)
+        self._add(ground_truth=True, microscope_focus_um=2191.0,
+                  auto_focus_um=2200.0)
+        self._add(microscope_focus_um=1000.0, auto_focus_um=2200.0)
+        self.assertAlmostEqual(self.store.focus_bias_um(KEY), -8.5, places=6)
+
+    def test_one_sample_is_an_anecdote_not_a_bias(self):
+        self._add(ground_truth=True, microscope_focus_um=2192.0,
+                  auto_focus_um=2200.0)
+        self.assertIsNone(self.store.focus_bias_um(KEY))
+
+    def test_no_data_reports_unmeasured_rather_than_zero(self):
+        """A zero bias is itself a claim."""
+        self._add()
+        self.assertIsNone(self.store.focus_bias_um(KEY))
+
+    def test_the_reference_score_works_once_focus_score_is_written(self):
+        for sc in (1700.0, 1800.0, 1900.0):
+            self._add(focus_score=sc)
+        self.assertAlmostEqual(self.store.reference_focus_score(KEY), 1800.0)
+
+
 class TestKeyScheme(unittest.TestCase):
     def test_key_includes_camera_objective_and_needle(self):
         """camobj already carries "<camera>|<objective>"; the needle is appended."""

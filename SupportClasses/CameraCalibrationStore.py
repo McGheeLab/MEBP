@@ -67,7 +67,7 @@ _DEFAULT_PATH = Path("config/hardware/camera_calibrations.json")
 
 # Current on-disk schema version. A FRESH store is born here; only files that
 # load with an older version run the migration chain in ``_migrate``.
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
 
 # Relative tolerance for matching a stored µm/px against an objective
 # calibration's ``measured_um_per_px`` during the v1.2 backfill. Both are
@@ -128,9 +128,60 @@ class CameraCalibrationStore:
             self._migrate_11_to_12()
             ver = "1.2"
             dirty = True
+        if ver == "1.2":
+            self._migrate_12_to_13()
+            ver = "1.3"
+            dirty = True
         if dirty or self._data.get("version") != SCHEMA_VERSION:
             self._data["version"] = SCHEMA_VERSION
             self.save()
+
+    def _migrate_12_to_13(self) -> None:
+        """v7.16: split the LIVE-VIEW orientation off the MEASURED one.
+
+        Before this, one ``(rotation_deg, mirrored, flip_y)`` triple served
+        three consumers at once — the live display, ``MosaicBuilder._orient_tile``
+        and ``CameraManager.pixel_to_stage_offset`` — and had two writers: the
+        operator's per-slot Flip X / Flip Y / Rotation controls (a *viewing*
+        preference) and ``derive_camera_stage_orientation`` (the *measured*
+        camera→stage matrix). The measurement therefore overwrote the operator's
+        view: set the live view up, run the objective/mosaic calibration, and the
+        view flipped back. That is the reported defect.
+
+        They are genuinely different quantities. The measured triple makes the
+        display STAGE-ALIGNED (image +X → stage +X); on a rig with
+        ``plate_flip_180`` the plate then reads 180° from the A1-top-left
+        convention every other plate view uses, so the orientation the operator
+        wants to look at is legitimately not the one the mosaic needs.
+
+        This migration seeds ``view_orientation`` from the existing geometry so
+        **every camera looks exactly as it did before the upgrade**; from here on
+        the two evolve independently. A camera whose geometry is fully neutral
+        gets nothing written (absent ⇒ falls back to geometry, which is neutral
+        too), so those entries stay byte-identical.
+        """
+        seeded = 0
+        for identity, entry in (self._data.get("cameras") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if isinstance(entry.get("view_orientation"), dict):
+                continue                      # already split — never re-seed
+            rot = entry.get("rotation_deg")
+            flip_x = bool(entry.get("mirrored", False))
+            flip_y = bool(entry.get("flip_y", False))
+            if rot in (None, 0, 0.0) and not flip_x and not flip_y:
+                continue                      # neutral ⇒ nothing to preserve
+            entry["view_orientation"] = {
+                "rotation_deg": float(rot or 0.0),
+                "flip_x": flip_x,
+                "flip_y": flip_y,
+            }
+            seeded += 1
+        if seeded:
+            logger.info(
+                f"CameraCalibrationStore: seeded live-view orientation for "
+                f"{seeded} camera(s) from the measured orientation (v1.3) — "
+                f"the view is unchanged; the two are now independent.")
 
     def _migrate_11_to_12(self) -> None:
         """v1.1 → v1.2: backfill ``um_per_px_resolution``.
@@ -477,6 +528,52 @@ class CameraCalibrationStore:
             f"= {column_dir_deg if column_dir_deg is None else round(column_dir_deg, 2)}"
             f"° vs stage +X [{identity[:48]}…]")
 
+    def get_z_row_sign(self, identity: str) -> Optional[float]:
+        """MEASURED image-row response to needle Z, or None if never measured.
+
+        v7.10. ``+1`` = moving the needle UP decreases the image row (an upright
+        side camera); ``-1`` = the view is vertically inverted.
+
+        ``TwoCameraNeedleAligner`` and the needle Z-centring both assume image
+        rows map to stage Z, and until now the SIGN of that mapping was a manual
+        *Invert Z* checkbox — a guess the operator had to get right, with a
+        wrong answer driving the needle the wrong way vertically. The two-leg
+        needle-camera calibration measures it (see
+        ``SupportClasses/NeedleCameraCalibration``); absent means "never
+        measured", so the checkbox still governs and nothing changes for a
+        camera that has not been re-calibrated.
+        """
+        if not identity:
+            return None
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            v = entry.get("z_row_sign")
+            return None if v is None else (1.0 if float(v) >= 0 else -1.0)
+        except (TypeError, ValueError):
+            return None
+
+    def set_z_row_sign(self, identity: str, z_row_sign: Optional[float],
+                       name: str = "") -> None:
+        """Store/replace ONLY the measured Z→row sign. ``None`` clears it."""
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        if z_row_sign is None:
+            entry.pop("z_row_sign", None)
+        else:
+            entry["z_row_sign"] = 1.0 if float(z_row_sign) >= 0 else -1.0
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera Z-row sign saved: {entry.get('name', '?')} = "
+            f"{entry.get('z_row_sign', 'cleared')} [{identity[:48]}…]")
+
     def get_mirrored(self, identity: str) -> bool:
         """Whether the camera's view is mirrored (horizontal flip), or False.
 
@@ -546,6 +643,153 @@ class CameraCalibrationStore:
         logger.info(
             f"Camera flip-Y saved: {entry.get('name', '?')} "
             f"flip_y={bool(flip_y)} [{identity[:48]}…]")
+
+    # ── Live-view (display-only) orientation (v7.16) ──────────────
+    # DELIBERATELY SEPARATE from ``rotation_deg`` / ``mirrored`` / ``flip_y``
+    # above, which are the MEASURED camera→stage matrix. Those three are
+    # geometry: the mosaic orients every tile by them and every click→stage
+    # conversion goes through them, so they must only ever be written by a
+    # measurement. The triple below is what the operator wants to SEE, and is
+    # read by nothing but the live feeds. Keeping one set of numbers for both
+    # jobs is what let the objective calibration reset the operator's view.
+
+    def get_view_orientation(self, identity: str) -> Optional[dict]:
+        """The camera's LIVE-VIEW orientation, or ``None`` when never set.
+
+        ``{"rotation_deg": float, "flip_x": bool, "flip_y": bool}``.
+
+        ``None`` means "no view preference recorded" and callers must fall back
+        to the measured orientation — which is exactly the pre-v1.3 behaviour,
+        so an untouched camera is unaffected.
+        """
+        if not identity:
+            return None
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return None
+        vo = entry.get("view_orientation")
+        if not isinstance(vo, dict):
+            return None
+        try:
+            return {
+                "rotation_deg": float(vo.get("rotation_deg", 0.0) or 0.0),
+                "flip_x": bool(vo.get("flip_x", False)),
+                "flip_y": bool(vo.get("flip_y", False)),
+            }
+        except (TypeError, ValueError):
+            # Malformed ⇒ report ABSENT, not neutral: falling back to the
+            # measured orientation is the recoverable answer, whereas silently
+            # forcing "no flips" would show a mirrored feed as if it were fine.
+            logger.warning(
+                f"CameraCalibrationStore: malformed view_orientation for "
+                f"[{identity[:48]}…] — falling back to the measured one.")
+            return None
+
+    def set_view_orientation(self, identity: str, rotation_deg: float,
+                             flip_x: bool, flip_y: bool,
+                             name: str = "") -> None:
+        """Store/replace ONLY the camera's live-view orientation.
+
+        Preserves every sibling (µm/px, the measured orientation, crop,
+        image_correction, hw_controls). Written as a whole triple rather than
+        three keys because it is one decision — "this is how I want the feed to
+        look" — and a half-applied view is worse than either.
+
+        A fully-neutral view is stored EXPLICITLY (it does not pop the key): the
+        operator having deliberately chosen "no flips, no rotation" must survive
+        a later measurement, and popping it would let the measured orientation
+        take the view back over.
+        """
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        entry["view_orientation"] = {
+            "rotation_deg": float(rotation_deg or 0.0),
+            "flip_x": bool(flip_x),
+            "flip_y": bool(flip_y),
+        }
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera live-view orientation saved: {entry.get('name', '?')} "
+            f"rot={float(rotation_deg or 0.0):.1f}° flip_x={bool(flip_x)} "
+            f"flip_y={bool(flip_y)} [{identity[:48]}…] "
+            f"(display only — the mosaic is unaffected)")
+
+    def clear_view_orientation(self, identity: str) -> None:
+        """Forget the live-view preference so the feed follows the MEASURED
+        orientation again (the pre-v1.3 behaviour)."""
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        if "view_orientation" not in entry:
+            return
+        entry.pop("view_orientation", None)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera live-view orientation cleared: {entry.get('name', '?')} "
+            f"[{identity[:48]}…] — the feed now follows the measured "
+            f"orientation.")
+
+    # ── Per-camera centred crop (v7.16) ───────────────────────────
+    # The crop is a property of the physical camera + optics on this machine —
+    # a sensor wider than the illuminated field images the dark tube wall — so
+    # it belongs here beside µm/px and the flips rather than in the swappable
+    # hardware setup, and it follows the camera across slot reassignment.
+
+    def get_crop(self, identity: str) -> Optional[dict]:
+        """The camera's stored crop as ``{mode, scale}``, or None if unset."""
+        if not identity:
+            return None
+        entry = self._data.get("cameras", {}).get(identity)
+        if not isinstance(entry, dict):
+            return None
+        crop = entry.get("crop")
+        return dict(crop) if isinstance(crop, dict) else None
+
+    def set_crop(self, identity: str, crop: Optional[dict],
+                 name: str = "") -> None:
+        """Store/replace ONLY a camera's crop — µm/px, rotation, flips and
+        image-correction siblings are preserved.
+
+        A disabled (or None) crop POPS the key, so a camera that has never been
+        cropped keeps a byte-identical entry and nothing has to be migrated.
+        """
+        if not identity:
+            return
+        cams = self._data.setdefault("cameras", {})
+        entry = dict(cams.get(identity, {}))
+        mode = str((crop or {}).get("mode", "none") or "none").lower()
+        if crop and mode != "none":
+            stored = {"mode": mode,
+                      "scale": round(float(crop.get("scale", 1.0)), 4)}
+            # Placement, kept only when non-zero so a centred crop's entry is
+            # exactly what pre-offset builds wrote (nothing to migrate).
+            for k in ("offset_x", "offset_y"):
+                try:
+                    v = float(crop.get(k, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if abs(v) > 1e-9:
+                    stored[k] = round(v, 5)
+            entry["crop"] = stored
+        else:
+            entry.pop("crop", None)
+        if name:
+            entry["name"] = str(name)
+        entry["date"] = str(date.today())
+        cams[identity] = entry
+        self.save()
+        logger.info(
+            f"Camera crop saved: {entry.get('name', '?')} "
+            f"crop={entry.get('crop', 'off')} [{identity[:48]}…]")
 
     def clear_calibration(self, identity: str) -> None:
         try:

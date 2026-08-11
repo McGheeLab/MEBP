@@ -68,6 +68,14 @@ class _TempStoreMixin:
     def _install_temp_store(self, builtin_types=(), user_types=()):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
+        # v7.12: also redirect the plate DOCUMENT store. A test that builds a
+        # real HardwareSetupPage and creates a plate through it otherwise
+        # writes into the operator's live library — nine junk plates
+        # accumulated there before this was added, and showed up as cards on
+        # their Plate tab.
+        self._plate_env = {k: os.environ.get(k)
+                           for k in ("MEBP_PLATES_DIR", "MEBP_ROSETTES_DIR")}
+        os.environ["MEBP_PLATES_DIR"] = str(root / "plate_docs")
         self._builtin_dir = root / "builtin"
         self._user_dir = root / "user"
         for t in builtin_types:
@@ -80,6 +88,11 @@ class _TempStoreMixin:
         return store
 
     def _restore_store(self):
+        for k, v in getattr(self, "_plate_env", {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         PTS._store_singleton = getattr(self, "_prev_singleton", None)
         if hasattr(self, "_tmp"):
             self._tmp.cleanup()
@@ -573,50 +586,62 @@ class TestHardwareSetupCard(unittest.TestCase, _TempStoreMixin):
     def tearDown(self):
         self._restore_store()
 
-    def test_card_builds_and_filters_by_format(self):
-        from gui.pages.hardware_setup import HardwareSetupPage
-        page = HardwareSetupPage()
-        self.assertTrue(hasattr(page, "_plate_type_format_combo"))
-        self.assertTrue(hasattr(page, "_plate_type_combo"))
-        # default format 24 → Generic + 2 products
-        ids = [page._plate_type_combo.itemData(i)
-               for i in range(page._plate_type_combo.count())]
-        self.assertEqual(ids, ["", "corning-24", "nest-24"])
+    # v7.12: the two-step Format→Type card is retired. It gave plate identity
+    # two owners (a card and a designer picker), and each silently cleared the
+    # other's choice. The active DESIGN is the single owner now: the plate
+    # library's ★ sets `plate_doc_id`, and the product comes from the document.
+    #
+    # The CONTRACT those tests protected — selecting a plate resolves
+    # `active_plate_key`, and `set_hardware_config` round-trips it — is
+    # re-pinned below against the new surface.
 
-    def test_selecting_type_sets_plate_type_id(self):
+    def test_plate_tab_hosts_the_library_workspace(self):
         from gui.pages.hardware_setup import HardwareSetupPage
         page = HardwareSetupPage()
-        ci = page._plate_type_combo.findData("corning-24")
-        page._plate_type_combo.setCurrentIndex(ci)
-        self.assertEqual(page._selected_plate_type_id, "corning-24")
-        self.assertEqual(page._config.plate_type_id, "corning-24")
-        self.assertEqual(page._config.active_plate_key, "corning-24")
+        self.assertTrue(hasattr(page, "_plate_workspace"))
+        self.assertTrue(hasattr(page, "_rosette_placement"))
+        # The retired card is really gone.
+        self.assertFalse(hasattr(page, "_plate_type_combo"))
+        self.assertFalse(hasattr(page, "_plate_designer"))
 
-    def test_format_change_resets_to_generic_and_refilters(self):
+    def test_activating_a_plate_sets_the_document_id(self):
         from gui.pages.hardware_setup import HardwareSetupPage
         page = HardwareSetupPage()
-        # select a 24 product, then switch format to 96
-        page._plate_type_combo.setCurrentIndex(
-            page._plate_type_combo.findData("nest-24"))
-        page._plate_type_format_combo.setCurrentIndex(
-            page._plate_type_format_combo.findData(96))
-        self.assertEqual(page._selected_plate_type_id, "")       # reset
-        ids = [page._plate_type_combo.itemData(i)
-               for i in range(page._plate_type_combo.count())]
-        self.assertEqual(ids, ["", "corning-96"])
-        self.assertEqual(page._config.plate_type_id, "")
-        self.assertEqual(page._config.active_plate_key, 96)
+        store = page._plate_workspace.plate_store()
+        doc = store.create("Bench plate", template=24)
+        doc.meta.plate_type_id = "corning-24"
+        store.save(doc)
 
-    def test_set_hardware_config_syncs_card(self):
+        page._on_active_plate_changed(doc.meta.id)
+
+        self.assertEqual(doc.meta.id, page._config.plate_doc_id)
+        self.assertEqual("Bench plate", page._config.plate_name)
+        self.assertEqual("corning-24", page._config.plate_type_id)
+        # A product still wins the identity key, exactly as before.
+        self.assertEqual("corning-24", page._config.active_plate_key)
+
+    def test_a_plate_with_no_product_keys_on_its_document_id(self):
         from gui.pages.hardware_setup import HardwareSetupPage
         page = HardwareSetupPage()
+        store = page._plate_workspace.plate_store()
+        doc = store.create("Plain plate", template=24)
+        page._on_active_plate_changed(doc.meta.id)
+        self.assertEqual(doc.meta.id, page._config.active_plate_key)
+
+    def test_set_hardware_config_points_the_library_at_the_saved_plate(self):
+        from gui.pages.hardware_setup import HardwareSetupPage
+        page = HardwareSetupPage()
+        store = page._plate_workspace.plate_store()
+        doc = store.create("Restored plate", template=24)
+
         cfg = HardwareConfig()
         cfg.plate_format = 24
-        cfg.plate_type_id = "corning-24"
+        cfg.plate_doc_id = doc.meta.id
         page.set_hardware_config(cfg)
-        self.assertEqual(page._selected_plate_type_id, "corning-24")
-        self.assertEqual(page._plate_type_combo.currentData(), "corning-24")
-        self.assertEqual(page._plate_type_format_combo.currentData(), 24)
+
+        self.assertEqual(doc.meta.id,
+                         page._plate_workspace.library("plate").active_id())
+        self.assertIsNotNone(page._active_plate_document())
 
 
 # ── Per-plate-key calibration archive ──────────────────────────────

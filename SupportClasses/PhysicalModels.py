@@ -1678,19 +1678,31 @@ class CameraSpec:
     resolution (binning/downscaling from max resolution).
     """
     name: str                                       # e.g. "BUC3D-1000C"
-    sensor_pixel_size_um: float                     # Physical pixel pitch on sensor (µm)
+    # Physical pixel pitch on the sensor (µm). v7.16: OPTIONAL — ``None`` means
+    # the pitch is not known for this model, and every consumer reports that
+    # rather than showing a fabricated "theoretical µm/px". A wrong pitch looks
+    # entirely plausible and silently seeds the wrong scale, which is the exact
+    # class of failure the mosaic work has been chasing; the real µm/px comes
+    # from the stage-motion calibration either way.
+    sensor_pixel_size_um: Optional[float] = None
     max_resolution: tuple[int, int] = (3664, 2748)  # (width, height) at full res
     preview_resolutions: list[tuple[int, int]] = field(default_factory=list)
     interface: str = "USB 3.0"
     notes: str = ""
 
-    def effective_pixel_size_um(self, active_resolution: tuple[int, int]) -> float:
+    def effective_pixel_size_um(
+            self, active_resolution: tuple[int, int]) -> Optional[float]:
         """
         Compute effective pixel size at a given active resolution.
 
         When the camera is binning or downscaling from max resolution,
         each output pixel covers more physical area.
+
+        Returns ``None`` when the sensor pitch is unknown — callers must show
+        "unknown", never guess.
         """
+        if self.sensor_pixel_size_um is None:
+            return None
         if active_resolution[0] <= 0:
             return self.sensor_pixel_size_um
         bin_factor = self.max_resolution[0] / active_resolution[0]
@@ -1710,7 +1722,9 @@ class CameraSpec:
     def from_dict(cls, data: dict) -> CameraSpec:
         return cls(
             name=data["name"],
-            sensor_pixel_size_um=data["sensor_pixel_size_um"],
+            sensor_pixel_size_um=(
+                None if data.get("sensor_pixel_size_um") is None
+                else float(data["sensor_pixel_size_um"])),
             max_resolution=tuple(data.get("max_resolution", [3664, 2748])),
             preview_resolutions=[
                 tuple(r) for r in data.get("preview_resolutions", [])

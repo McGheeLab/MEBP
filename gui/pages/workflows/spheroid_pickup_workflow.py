@@ -1404,6 +1404,17 @@ class SpheroidPickupWorkflowPage(QWidget):
                 pass
         self._forward_to_scan_page("set_z_references", self._z_references)
 
+
+    def set_visible_z_references(self, keys) -> None:
+        """v7.9.1: which Z references get a quick-move badge (see the Jog page).
+
+        Presentation only — the reference VALUES are untouched.
+        """
+        try:
+            self._xz_view.set_visible_z_references(keys)
+        except Exception:
+            pass
+
     def _wells_in_zero_ref(self) -> dict[str, tuple[float, float]]:
         if not self._well_positions:
             return {}

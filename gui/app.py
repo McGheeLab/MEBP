@@ -188,7 +188,51 @@ class MainWindow(QMainWindow):
         # after the window is shown so it appears on top).
         QTimer.singleShot(0, self._maybe_show_onboarding)
 
+        # v7.17: construct the LabLink upload service iff the operator turned
+        # it on — publish_* calls are no-ops while peek_service() is None, so
+        # this single call is what arms them for the whole session.
+        self._init_lablink()
+
         logger.info("MainWindow initialized (v7.4.2)")
+
+    def _init_lablink(self) -> None:
+        """Minimal v7.17 wiring: start the upload service when configured.
+
+        No UI page yet — the service's own per-source config gating
+        (`LabLinkConfigStore.source_enabled`) decides what actually uploads,
+        and everything here degrades to a silent no-op: feature off, config
+        unreadable, vendored client absent. Deliberately after the pages are
+        built so `_lablink_busy` can see the print manager."""
+        try:
+            from SupportClasses import LabLinkConfigStore
+            cfg = LabLinkConfigStore.get_store()
+            if not (cfg.enabled() and cfg.is_configured()):
+                return
+            from SupportClasses.LabLinkService import get_service
+            get_service(busy_check=self._lablink_busy).start()
+            logger.info("LabLink: upload service started")
+        except Exception:
+            logger.exception("LabLink: service startup failed (feature off)")
+
+    def _lablink_busy(self) -> bool:
+        """True while a print runs — uploads are held back, not dropped.
+
+        Hashing hundreds of MB and writing a socket alongside a print can
+        starve the serial reader enough to trip a disconnect watchdog (the
+        failure class three update plans document), so the LabLink worker
+        polls this before each job. PAUSED counts as busy: the machine is still
+        mid-print and must not be disturbed. Called from the LabLink worker
+        thread — reads only, defensively."""
+        try:
+            page = getattr(self, "_full_print_page", None)
+            pm = getattr(getattr(page, "setup_page", None),
+                         "print_manager", None)
+            if pm is None:
+                return False
+            from SupportClasses.PrintManager import PrintState
+            return pm.state in (PrintState.RUNNING, PrintState.PAUSED)
+        except Exception:
+            return False                # never let the probe wedge an upload
 
     # ════════════════════════════════════════════════════════════════
     #  v7.4.0-c: ONBOARDING WIZARD TRIGGER
@@ -225,11 +269,15 @@ class MainWindow(QMainWindow):
             target = getattr(self.sender(), 'get_deep_link_target', lambda: None)()
             if target is not None:
                 self._navigate_to(target)
-                # v7.5.x: Pumps & Inks split into separate Pump/Needle/Ink tabs.
-                #   0=Device 1=Identity 2=Plate 3=Pump 4=Needle 5=Ink ...
-                # Land on Pump (3), the first of the material-config tabs.
-                if hasattr(hw_page, 'switch_to'):
-                    hw_page.switch_to(3)
+                # Land on the Pump tab, the first of the material-config tabs.
+                # v7.12: resolved BY NAME. The hardcoded index 3 here was stale —
+                # it dated from before the Rosette/Ink tabs were inserted, so
+                # onboarding actually dropped the operator on Rosette while the
+                # comment claimed Pump.
+                if hasattr(hw_page, 'sub_page_index'):
+                    idx = hw_page.sub_page_index("Pump")
+                    if idx >= 0:
+                        hw_page.switch_to(idx)
             logger.info("Onboarding config applied")
         except Exception as e:
             logger.error(f"Failed to apply onboarding config: {e}")
@@ -751,6 +799,18 @@ class MainWindow(QMainWindow):
         # Monitor overview camera) via CameraManager's default.
         self._camera_manager = CameraManager()
 
+        # v7.14 — the capture buttons live on ~18 live-feed widgets that are
+        # constructed with only (camera_manager, cam_idx). Registering the
+        # settings + stage controller here lets a capture stamp its stage
+        # position and read its destination without threading both through
+        # every one of those constructors.
+        try:
+            from SupportClasses.CaptureContext import register as _cap_register
+            _cap_register(settings=self.settings, controller=self.controller,
+                          camera_manager=self._camera_manager)
+        except Exception as exc:
+            logger.debug(f"capture context not registered: {exc}")
+
         # v7.3.3: Mode pages wrap sub-pages internally
         self._print_builder = PrintBuilderPage(self.controller, self.settings)  # v7.5.x
         self._workflows_mode = WorkflowsModePage(
@@ -945,6 +1005,22 @@ class MainWindow(QMainWindow):
                     jog_page.set_z_references(cal_page.get_z_references())
                 except Exception as e:
                     logger.debug(f"set_z_references on jog page failed: {e}")
+            # v7.9.1: and WHICH of them get a quick-move badge. Pushed as its
+            # own call rather than folded into the reference dict — that dict
+            # also feeds the print-floor datum, so a hidden badge must not read
+            # as a missing height.
+            _vis = None
+            if hasattr(cal_page, 'visible_z_reference_keys'):
+                try:
+                    _vis = cal_page.visible_z_reference_keys()
+                except Exception as e:
+                    logger.debug(f"visible_z_reference_keys failed: {e}")
+            if _vis is not None and hasattr(jog_page,
+                                            'set_visible_z_references'):
+                try:
+                    jog_page.set_visible_z_references(_vis)
+                except Exception as e:
+                    logger.debug(f"set_visible_z_references on jog failed: {e}")
             # v7.4.x: also push to the Workflows mode (active workflow
             # pages need the same plate / safe_z / Z-references so their
             # embedded XY workspace + XZ side view + StandardJogContextPanel
@@ -957,6 +1033,9 @@ class MainWindow(QMainWindow):
                     if (hasattr(wf, "set_z_references")
                             and hasattr(cal_page, "get_z_references")):
                         wf.set_z_references(cal_page.get_z_references())
+                    if _vis is not None and hasattr(
+                            wf, "set_visible_z_references"):
+                        wf.set_visible_z_references(_vis)
                     if hasattr(wf, "set_settings"):
                         wf.set_settings(self.settings)
                 except Exception as e:
@@ -1233,7 +1312,13 @@ class MainWindow(QMainWindow):
                             print_wells.append(name)
 
             if plate is not None and hasattr(monitor_page, 'setup_plate'):
-                well_diam = getattr(plate, 'well_diameter', 0.0)
+                # v7.12: `well_diameter` is 0.0 on a parametric plate ("varies
+                # — see WellInfo per well"), and setup_plate skips the XY-detail
+                # and YZ well geometry entirely when it gets 0.
+                well_diam = getattr(plate, 'representative_well_diameter',
+                                    None)
+                if well_diam is None:
+                    well_diam = getattr(plate, 'well_diameter', 0.0)
                 monitor_page.setup_plate(
                     plate=plate,
                     well_roles=well_roles if well_roles else None,
@@ -1790,6 +1875,21 @@ class MainWindow(QMainWindow):
         if prev is None or getattr(prev, 'plate_format', None) != \
                 getattr(current, 'plate_format', None):
             changed["plate_format"] = getattr(current, 'plate_format', None)
+        # v7.12: the plate IDENTITY matters as much as the well count. Switching
+        # between two custom plates, or between two products of the same base
+        # format, leaves `plate_format` untouched — so before this, changing
+        # plate never invalidated anything. Every per-plate store (mosaics,
+        # templates, well training, taught calibration) is keyed off exactly
+        # these two fields.
+        # v7.12: `plate_doc_id` joins these. It is what every per-plate store
+        # keys on for a parametric design, and two plates may legitimately
+        # share a display name — so watching `plate_name` alone would let a
+        # switch between them go unnoticed and leave the calibration page on
+        # the previous plate's taught wells.
+        for attr in ("plate_name", "plate_type_id", "plate_doc_id"):
+            if prev is None or getattr(prev, attr, None) != \
+                    getattr(current, attr, None):
+                changed[attr] = getattr(current, attr, None)
         if prev is None or getattr(prev, 'pumps', None) != \
                 getattr(current, 'pumps', None):
             changed["pumps"] = True
@@ -1808,6 +1908,9 @@ class MainWindow(QMainWindow):
         parts = []
         if "plate_format" in changed:
             parts.append("plate format")
+        if ("plate_name" in changed or "plate_type_id" in changed
+                or "plate_doc_id" in changed):
+            parts.append("plate")
         if "pumps" in changed:
             parts.append("pumps")
         if parts:
@@ -3058,6 +3161,22 @@ class MainWindow(QMainWindow):
             shutdown_microscope()
         except Exception as e:
             logger.debug(f"microscope shutdown failed: {e}")
+
+        # v7.17: stop the LabLink upload worker and STATE what was not sent —
+        # the operator chose in-session-only retry, which is honest only if
+        # the loss is named at the moment it happens. WorkflowsModePage has no
+        # shutdown fan-out, so the service is stopped here directly.
+        try:
+            from SupportClasses.LabLinkService import peek_service
+            _svc = peek_service()
+            if _svc is not None:
+                _report = _svc.stop(timeout=2.0)
+                if _report.get("unsent"):
+                    logger.warning(
+                        "LabLink: %d queued upload(s) were dropped by this "
+                        "close and will not be retried", _report["unsent"])
+        except Exception as e:
+            logger.debug(f"LabLink shutdown failed: {e}")
 
         self.controller.shutdown()
         event.accept()

@@ -732,6 +732,34 @@ class ZPJogHandler:
         except Exception:
             return self._flip_sign(logical)
 
+    def _xbox_pump_ceiling_uL_s(self, pump_id: str) -> float:
+        """This pump's OWN 100 %-flow ceiling (µL/s), or 0 when unknown.
+
+        v7.9.1. Read straight from ``SafetyLimits.get_max_flow_rate`` — the same
+        source ``StageController.get_max_pump_feedrate_for`` uses — so the Xbox
+        and the on-screen tiles resolve a pump's rate from one authority
+        instead of two. 0 means "no answer", and the caller falls back to the
+        legacy shared scalars rather than guessing.
+        """
+        sl = self.safety_limits
+        if sl is None or not hasattr(sl, "get_max_flow_rate"):
+            return 0.0
+        try:
+            r = float(sl.get_max_flow_rate(pump_id))
+        except Exception:
+            return 0.0
+        return r if r > 0 else 0.0
+
+    def _xbox_pump_pct(self, pump_id: str) -> float:
+        """The % of that ceiling a full stick deflection commands.
+
+        Deliberately the SHARED 'p' ladder value: the Xbox has one physical
+        speed control for the pump group, so per-pump percentages would leave
+        its buttons meaningless. Independence comes from the per-pump ceiling.
+        """
+        pct = float(getattr(self, "p_speed_pct", 0.0) or 0.0)
+        return pct if pct > 0 else 100.0
+
     def _pump_vel_mm_s(self, raw: float, pump_id: str) -> float:
         """Convert raw Xbox axis to pump velocity in mm/s.
 
@@ -743,13 +771,26 @@ class ZPJogHandler:
         if hw:
             pump_cfg = hw.pumps.get(pump_id)
             if pump_cfg and pump_cfg.is_configured:
-                target_uL_s = raw * self.p_speed  # µL/s
+                # v7.9.1: resolve the µL/s from THIS pump's own ceiling rather
+                # than the one shared `p_speed_max`. Those ceilings differ by
+                # orders of magnitude between bores (v7.9 measured ~2000×
+                # between a 22G and a 30 µm pulled tip), so a single anchor
+                # meant a stick deflection drove a fine bore at a coarse bore's
+                # rate. The Xbox's %-ladder stays SHARED — it is one physical
+                # control for the whole "p" group, and splitting it would leave
+                # its buttons with no defined meaning — but the rate that %
+                # resolves to is now per-pump.
+                pct = self._xbox_pump_pct(pump_id)
+                anchor_uL_s = self._xbox_pump_ceiling_uL_s(pump_id)
+                target_uL_s = raw * (pct / 100.0 * anchor_uL_s
+                                     if anchor_uL_s > 0 else self.p_speed)
                 vel_mm_s = pump_cfg.uL_to_mm(abs(target_uL_s))
-                # v7.5.x: cap at this pump's own 100%-flow ceiling (mm/s) so a
-                # full deflection can't exceed the anchored max; the per-pump
-                # safe rate is still enforced by _clamp_pump_flow downstream.
+                # Cap at this pump's own 100%-flow ceiling (mm/s) so a full
+                # deflection can't exceed the anchored max; the per-pump safe
+                # rate is still enforced by _clamp_pump_flow downstream.
                 try:
-                    cap_mm_s = pump_cfg.uL_to_mm(self.p_speed_max)
+                    cap_mm_s = pump_cfg.uL_to_mm(
+                        anchor_uL_s if anchor_uL_s > 0 else self.p_speed_max)
                 except Exception:
                     cap_mm_s = self.max_speed
                 vel_mm_s = min(vel_mm_s, cap_mm_s)
@@ -1458,6 +1499,15 @@ class StageController:
         # the controller re-applies it whenever the jog handlers are recreated
         # (see set_jog_speed_pct / _apply_jog_speed_pct / refresh_jog_speed_limits).
         self._jog_speed_pct: dict[str, float] = {}
+        # v7.9.x: PER-PUMP jog flow % (the jog tiles' P1/P2/P3 flow spinboxes).
+        # Owned here — not on the panels — so every jog tile reads the same
+        # value (nine pages each build their own StandardJogContextPanel; the
+        # illumination-LED lesson is that per-panel state silently diverges).
+        # Keyed "P1"/"P2"/"P3"; absent = fall back to the shared 'p' group %.
+        self._pump_jog_pct: dict[str, float] = {}
+        # v7.9.x: jog step-slider configuration (snap + per-axis range/value),
+        # shared across every jog tile for the same reason as _pump_jog_pct.
+        self._jog_step_settings: dict = {}
         # v7.4.2 hotfix: last-known-good ZP serial port. Tried first on
         # connect_stages() so we skip the rediscovery scan. Set by
         # the caller from settings (zp_stage.last_port) and re-saved
@@ -1630,7 +1680,14 @@ class StageController:
         # (see `print_z_dir`), so print offsets are polarity-correct without a
         # hard-coded ZDIR. None until the plate top is taught in calibration.
         self._plate_top_z_zref: float | None = None
-        self._print_floor_active: bool = False
+        # v7.10: REFCOUNT, not a bool. There are now several independent
+        # arm/disarm sites (PrintManager, SimplePrintManager, PickAndPlaceManager
+        # and the needle-calibration wizard's touch-off), and with a plain bool a
+        # nested arm/disarm disarms EARLY — the caller still running believes it
+        # is protected while the floor is off, which is worse than never arming.
+        # Same non-refcounted-global hazard as `PositionPoller._suspended`.
+        # The external API (`set_print_floor_active(bool)`) is unchanged.
+        self._print_floor_depth: int = 0
         # v7.5.x: per-machine user-facing Z up-direction (+1 or -1). The
         # canonical user frame is  user_Z = z_up_sign · (raw − zero["Z"]),
         # with the datum (zero["Z"]) at the needle-all-the-way-DOWN raw
@@ -2538,6 +2595,15 @@ class StageController:
         would propagate its error across the whole plate, so it is recorded and
         surfaced rather than silently trusted. Both are optional and omitting
         them leaves behaviour identical to before.
+
+        v7.9.1 — ``at_xy_um=None`` is deliberately a NO-OP, not a clear, because
+        ``app.py``'s ``_update_print_floor_datum`` re-pushes the scalar untagged
+        on every ``calibration_data_changed`` and must not wipe the anchor. A
+        writer that genuinely has no anchor (the needle-cam *estimate*, which is
+        measured nowhere on the plate) must therefore call
+        :meth:`clear_plate_bottom_anchor` — otherwise a previous touch-off's XY
+        would stay paired with the new, different Z, anchoring the bed-level
+        plane at the right place and the wrong height.
         """
         self._plate_bottom_z_zref = (None if z_zero_ref_mm is None
                                      else float(z_zero_ref_mm))
@@ -2549,6 +2615,17 @@ class StageController:
                 self._plate_bottom_anchor_xy_um = None
         if source is not None:
             self._plate_bottom_z_source = str(source)
+        # Stamp the needle-zero epoch this scalar was measured against. A Set Z
+        # Zero re-anchors the zero-ref frame, which makes every previously taught
+        # Z number mean something different. set_plate_z_plane already refuses a
+        # plane whose epoch has moved — loudly — but the SCALAR had no epoch at
+        # all, so the same event left it stale SILENTLY. The scalar is the more
+        # dangerous of the two: it is what every non-tilt-aware consumer reads.
+        try:
+            self._plate_bottom_zero_z_mm = float(
+                (getattr(self, "zero_position", None) or {}).get("Z", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            self._plate_bottom_zero_z_mm = None
         if self._plate_bottom_z_zref is not None:
             logger.info(f"StageController: plate-bottom Z datum = "
                         f"{self._plate_bottom_z_zref:.3f} mm (zero-ref)")
@@ -2570,9 +2647,46 @@ class StageController:
         """Where the plate-bottom scalar was measured (absolute stage µm)."""
         return getattr(self, "_plate_bottom_anchor_xy_um", None)
 
+    def clear_plate_bottom_anchor(self) -> None:
+        """Forget where the plate bottom was measured.
+
+        v7.9.1. Needed because ``set_plate_bottom_z(at_xy_um=None)`` preserves
+        the anchor by design (app.py re-pushes the scalar untagged and must not
+        wipe it). A writer that replaces the scalar with a value measured
+        NOWHERE on the plate — the needle-cam estimate — must call this, or a
+        previous touch-off's XY stays paired with the new, different Z and the
+        bed-level plane is anchored at the right place and the wrong height.
+        """
+        self._plate_bottom_anchor_xy_um = None
+
     def get_plate_bottom_z_source(self) -> str | None:
         """Provenance of the plate-bottom scalar: taught / estimated / restored."""
         return getattr(self, "_plate_bottom_z_source", None)
+
+    def plate_bottom_zero_z_mm(self) -> float | None:
+        """The needle-zero epoch the plate-bottom scalar was taught against.
+
+        None means it was recorded before this was tracked (or never taught) —
+        which callers must treat as "unknown", not as "unchanged".
+        """
+        return getattr(self, "_plate_bottom_zero_z_mm", None)
+
+    def plate_bottom_z_is_stale(self, tol_mm: float = 0.01) -> bool:
+        """True when Set Z Zero has run since the plate bottom was taught.
+
+        Every Z taught in the old frame is offset by the change, so anchoring a
+        tilt plane to the scalar — or descending against it — would be wrong by
+        exactly that amount.
+        """
+        epoch = self.plate_bottom_zero_z_mm()
+        if epoch is None or self._plate_bottom_z_zref is None:
+            return False
+        try:
+            now = float((getattr(self, "zero_position", None)
+                         or {}).get("Z", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return abs(now - epoch) > float(tol_mm)
 
     # ── v7.5.x: plate-bottom Z PLANE (tilt) ────────────────────────────
     #
@@ -2616,6 +2730,32 @@ class StageController:
     def set_plate_tilt_enabled(self, enabled: bool) -> None:
         """Operator switch for using the tilt plane in print-Z resolution."""
         self._plate_tilt_enabled = bool(enabled)
+
+    def would_accept_plate_z_plane(self, plane) -> tuple[bool, str]:
+        """Would :meth:`set_plate_z_plane` accept this plane? ``(ok, reason)``.
+
+        Read-only — installs nothing, mutates nothing. It exists so a calibration
+        UI can show the operator the *actual* verdict before asking them to
+        accept, rather than re-implementing the rules in the dialog (where they
+        would drift) or installing-then-restoring (where a crash between the two
+        leaves the machine holding a plane nobody approved).
+
+        One validator, two entry points: this and :meth:`set_plate_z_plane` share
+        ``_validate_plate_z_plane``, so a Verify screen and the print path can
+        never disagree about whether a plane is trustworthy.
+        """
+        from SupportClasses.PlateZPlane import (
+            PLANE_FRAME, PlateZPlane as _PZP, DEFAULT_RESIDUAL_TOL_MM,
+            tilt_is_plausible,
+        )
+        if plane is None:
+            return (False, "no plane")
+        if isinstance(plane, dict):
+            plane = _PZP.from_dict(plane)
+            if plane is None:
+                return (False, "plane payload is not in the stage frame")
+        return self._validate_plate_z_plane(
+            plane, PLANE_FRAME, DEFAULT_RESIDUAL_TOL_MM, tilt_is_plausible)
 
     def set_plate_z_plane(self, plane) -> tuple[bool, str]:
         """Install a measured plate-bottom tilt plane. ``(accepted, reason)``.
@@ -2925,8 +3065,42 @@ class StageController:
                                 fallback=self.z_up_sign())
 
     def set_print_floor_active(self, active: bool) -> None:
-        """Arm/disarm the plate-bottom floor (armed only during printing)."""
-        self._print_floor_active = bool(active)
+        """Arm/disarm the plate-bottom floor.
+
+        REFCOUNTED. Several independent subsystems arm this — the print
+        executors, pick & place, and the needle-calibration touch-off — and they
+        can overlap. With a plain flag the first disarm would drop the floor
+        while another caller is still descending, i.e. *false* protection, which
+        is worse than no protection because the caller believes it is guarded.
+
+        So each ``True`` increments and each ``False`` decrements; the floor is
+        active while the count is positive. The signature is deliberately
+        unchanged, so every existing caller keeps working — as long as its
+        arm/disarm are balanced, which they are (all three wrap the disarm in a
+        ``finally``).
+
+        The count is clamped at zero: an unbalanced extra disarm cannot drive it
+        negative and thereby make a later arm a no-op.
+        """
+        if active:
+            self._print_floor_depth = getattr(self, "_print_floor_depth", 0) + 1
+        else:
+            self._print_floor_depth = max(
+                0, getattr(self, "_print_floor_depth", 0) - 1)
+
+    @property
+    def _print_floor_active(self) -> bool:
+        """True while at least one caller has the plate-bottom floor armed.
+
+        Kept as a property under the original name so existing readers (and
+        tests that assert on it) are unaffected by the move to a refcount.
+        """
+        return getattr(self, "_print_floor_depth", 0) > 0
+
+    @_print_floor_active.setter
+    def _print_floor_active(self, value) -> None:
+        """Direct assignment forces the count, for tests and hard resets."""
+        self._print_floor_depth = 1 if value else 0
 
     def print_height_to_zref(self, height_above_bottom_mm: float,
                              x_zref_mm: float | None = None,
@@ -3478,6 +3652,53 @@ class StageController:
         needle-derived flow ceiling (µL/s in µL mode) or the legacy mm/s
         fallback. Delegates to :meth:`_pump_jog_max_native`."""
         return self._pump_jog_max_native()
+
+    def get_max_pump_feedrate_for(self, pump: str) -> float:
+        """ONE pump's own jog 100% anchor — its needle/syringe-derived safe
+        flow ceiling (µL/s in µL mode), so the jog tiles can offer a per-pump
+        flow rate. The shared :meth:`get_max_pump_feedrate` anchors to the
+        FASTEST configured pump, which over-states a slower pump's ceiling by
+        the ratio of their bores. Legacy/no-config → the shared anchor so
+        per-pump surfaces degrade to the shared behaviour."""
+        hw = self._hardware_config
+        sl = self.safety_limits
+        if hw is not None and getattr(hw, "configured_pump_ids", None):
+            if sl is not None and pump in (hw.configured_pump_ids or []):
+                try:
+                    r = float(sl.get_max_flow_rate(pump))
+                except Exception:
+                    r = 0.0
+                if r > 0:
+                    return r
+            return 10.0  # µL/s default when no flow limit is computed yet
+        return self._pump_jog_max_native()
+
+    def set_pump_jog_pct(self, pump: str, pct: float) -> None:
+        """Store ONE pump's jog-flow % (the jog tiles' per-pump spinboxes).
+        Held on the controller — the shared state every jog panel re-reads on
+        show — so the tiles can't diverge from each other. Distinct from the
+        shared 'p' group % (:meth:`set_jog_speed_pct`), which stays the Xbox
+        pump-jog ladder value."""
+        try:
+            self._pump_jog_pct[str(pump)] = float(pct)
+        except (TypeError, ValueError):
+            return
+
+    def get_pump_jog_pcts(self) -> dict[str, float]:
+        """The stored per-pump jog-flow percentages ({} when none set yet)."""
+        return dict(self._pump_jog_pct)
+
+    def set_jog_step_settings(self, cfg: dict) -> None:
+        """Store the jog step-slider configuration (snap / per-axis range +
+        step value). Held here — like the per-pump jog % — because nine pages
+        each build their own jog panel and per-panel state silently
+        diverges; every panel re-reads this on show."""
+        if isinstance(cfg, dict):
+            self._jog_step_settings = dict(cfg)
+
+    def get_jog_step_settings(self) -> dict:
+        """The stored jog step-slider configuration ({} when none set)."""
+        return dict(getattr(self, "_jog_step_settings", {}) or {})
 
     # ── v7.5.x: per-pump max plunger feedrate (mm/min) + µL/s readout ──
 
@@ -4084,6 +4305,19 @@ class StageController:
             return self.zp_stage.set_led_brightness(level)
         return False
 
+    def led_off(self) -> bool:
+        """Best-effort: turn the illumination LED off. Never raises.
+
+        Used on shutdown (see :meth:`shutdown`). The LED is a command output
+        with no readback, so nothing turns it off on its own — if the app exits
+        with it lit, it STAYS lit with nothing left to control it.
+        """
+        try:
+            return self.set_led_brightness(0)
+        except Exception as exc:  # a dying board must not break the exit path
+            logger.debug("LED off failed: %s", exc)
+            return False
+
     @property
     def simulate_xy(self) -> bool:
         """v7.4.2: True iff the currently-connected XY stage is a simulator.
@@ -4507,10 +4741,31 @@ class StageController:
 
 
 
+    def effective_z_target_zref(self, z_zero_ref_mm: float) -> float:
+        """Where a ``move_z_absolute(z, from_zero_ref=True)`` would ACTUALLY land.
+
+        Applies the same two clamps the move applies — the absolute-raw soft
+        limit and the print floor — and converts back to zero-ref mm. Pure: it
+        commands no motion.
+
+        This exists because those clamps silently MUTATE the destination. Before
+        v7.9.1 the retract helper commanded ``z`` and then waited for ``z``, so
+        any clamped move was structurally unconfirmable: the machine went one
+        place and the wait polled for another until it timed out (16.5 s of
+        unsupervised motion on the operator's bore-survey park). Callers now
+        predict the landing point, refuse it if it is the wrong way, and confirm
+        against what was really commanded.
+        """
+        raw = float(z_zero_ref_mm) + self.zero_position.get("Z", 0)
+        if self.safety_limits.enabled:
+            raw = self.safety_limits.clamp_z(raw)
+        raw = self._apply_print_floor_raw(raw)
+        return raw - self.zero_position.get("Z", 0)
+
     def move_z_absolute(
         self, z_value: float, from_zero_ref: bool = True, fast: bool = False,
         feedrate_mm_min: float | None = None,
-    ) -> None:
+    ) -> float | None:
         """Move Z needle to absolute position.
 
         Args:
@@ -4518,9 +4773,17 @@ class StageController:
             from_zero_ref: If True, add zero reference offset.
             fast: If True, use maximum feedrate.
             feedrate_mm_min: Optional per-move feedrate (mm/min).
+
+        Returns:
+            The EFFECTIVE destination actually commanded, in the caller's own
+            frame (zero-ref when ``from_zero_ref``, else raw) — i.e. after the
+            soft-limit and print-floor clamps. ``None`` when there is no ZP
+            stage. Returning this (it used to return ``None`` unconditionally,
+            so no existing caller is affected) is what lets a retract confirm
+            against the position the machine was really sent.
         """
         if not self.zp_stage:
-            return
+            return None
         position = z_value
         if from_zero_ref:
             position += self.zero_position["Z"]
@@ -4650,6 +4913,40 @@ class StageController:
         Z. Identical to :meth:`zref_to_user_z` (the user frame *is* this height).
         """
         return self.z_up_sign() * float(raw_zref_mm)
+
+    def z_reference_reachable(self, z_zero_ref_mm) -> bool:
+        """Is a stored Z reference (zero-ref mm) inside this machine's travel?
+
+        A Z reference is captured as ``raw − zero_position["Z"]``, so it is only
+        meaningful against the datum that was live when it was captured. Running
+        the Set Bottom / Set Top setup (:meth:`apply_z_setup`) rewrites that
+        datum, the up-sign AND the envelope — and nothing used to invalidate the
+        references captured against the old one. The operator's rig carried a
+        Fast-Move Z of +24.79 mm zero-ref, i.e. 24.79 mm BELOW the mechanical
+        hard bottom: a "retract" to it was a full-depth plunge.
+
+        Unreachable is provable, not a guess: the value maps to a raw position
+        the soft-limit envelope itself rejects. Treat such a reference as absent
+        (re-teach it) rather than clamping it into range — a clamped travel
+        height is a wrong move that looks right.
+
+        Returns True when there is nothing to check against (limits disabled or
+        no envelope), so a machine without a configured envelope is unaffected.
+        """
+        if z_zero_ref_mm is None:
+            return False
+        limits = getattr(self, "safety_limits", None)
+        if limits is None or not getattr(limits, "enabled", False):
+            return True
+        try:
+            raw = float(z_zero_ref_mm) + self.zero_position.get("Z", 0)
+            lo, hi = float(limits.z_min), float(limits.z_max)
+        except Exception:
+            return True
+        if not (hi > lo):        # unset / degenerate envelope — nothing to say
+            return True
+        tol = 1e-6
+        return (lo - tol) <= raw <= (hi + tol)
 
     def default_travel_z(self, reference_z_zero_ref_mm: float,
                          margin_mm: float = 10.0) -> float:
@@ -4844,7 +5141,66 @@ class StageController:
 
         ``cur_zref_mm`` is the current needle Z in zero-ref mm (the caller has
         usually already read it). Returns True iff Z confirms at the target.
+
+        v7.9.1 — THIS HELPER IS RAISE-ONLY, and it is the guard of record.
+        Both callers are retracts, and CLAUDE.md's safety rule is absolute: a
+        retract for travel must never lower the needle; a misconfigured
+        travel-Z must degrade to a no-op, not a crash-down. It used to command
+        the target unconditionally, so ``safe_travel_to`` — which, unlike
+        ``ensure_retracted_to``, had no at-or-above pre-check — executed a
+        DESCENT whenever the configured safe Z sat below the needle. On the
+        operator's rig a stale ``safe_z`` (height −24.79 mm, i.e. below the
+        mechanical bottom) turned the bore-survey park's "retract" into a plunge
+        that only the print floor stopped, at the plate bottom.
+
+        Note the at-or-above early-return is the WHOLE raise-only guard: if the
+        needle is already high enough we do not move, and if it is not, the move
+        is by construction a lift. There is deliberately no separate "refuse a
+        descent" branch — every descent case is already an at-or-above case, so
+        such a branch would only fire on ordinary travel that starts above the
+        safe height, and would refuse it.
+
+        Both guards below matter:
+          1. Predict the EFFECTIVE landing point (the soft-limit and print-floor
+             clamps silently mutate the destination) and both compare and
+             confirm against that, not against the requested value. Confirming
+             against the request is what made a clamped retract structurally
+             unconfirmable.
+          2. At-or-above ⇒ no motion.
         """
+        # Read the current height if the caller did not — guard 2 needs it, and
+        # without it a too-low target is executed as a descent (the crash).
+        if cur_zref_mm is None:
+            try:
+                _zp = self.get_zp_position(cached=False)
+                _cur = self.zp_logical_value(_zp, "Z")
+                if _cur is not None:
+                    cur_zref_mm = _cur - self.zero_position.get("Z", 0)
+            except Exception:
+                cur_zref_mm = None
+
+        # Where the move would REALLY land once the clamps have had their say.
+        try:
+            eff_zref = self.effective_z_target_zref(float(target_zref_mm))
+        except Exception:
+            eff_zref = float(target_zref_mm)
+
+        if cur_zref_mm is not None and self.needle_at_or_above(
+                float(cur_zref_mm), eff_zref, tol_mm=float(tol_mm)):
+            # Already retracted far enough — no motion. A misconfigured
+            # (too-low) travel Z degrades to a no-op here, never a descent.
+            return True
+
+        if abs(eff_zref - float(target_zref_mm)) > 1e-6:
+            logger.warning(
+                "Z retract target %.2f mm clamped to %.2f mm (zero-ref) — "
+                "confirming against the clamped value. A large clamp usually "
+                "means the Fast-Move / Safe Z reference is stale (captured "
+                "against a previous Z datum); re-teach it on Calibration → "
+                "Needle Location → Advanced Z references.",
+                float(target_zref_mm), eff_zref)
+        target_zref_mm = eff_zref
+
         slow_dist = max(0.0, float(getattr(self, "_retract_slow_dist_mm", 0.0) or 0.0))
         if slow_dist > 0.0 and cur_zref_mm is not None:
             cur_h = self.z_height_of(float(cur_zref_mm))
@@ -5187,6 +5543,15 @@ class StageController:
                             _cur_zref3 = _cur3 - self.zero_position.get("Z", 0)
                     except Exception:
                         _cur_zref3 = None
+                # v7.9.1: confirm against where the descent will REALLY land.
+                # The soft-limit and print-floor clamps mutate the destination
+                # silently, so waiting on the requested value made any clamped
+                # descent structurally unconfirmable (see
+                # effective_z_target_zref).
+                try:
+                    target_z_mm = self.effective_z_target_zref(float(target_z_mm))
+                except Exception:
+                    pass
                 self._descend_z_moves_only(_cur_zref3, float(target_z_mm),
                                            self._zp_insert_feedrate)
 
@@ -5617,6 +5982,17 @@ class StageController:
             get_store().flush()
         except Exception:
             pass
+        # v7.5.x: turn the illumination LED off before the link goes away.
+        # ORDERING IS THE WHOLE POINT: after the poller is stopped (so the write
+        # doesn't contend for the ZP serial lock) but BEFORE disconnect_stages()
+        # closes the port — afterwards there is no way left to reach the board.
+        # Done synchronously on this thread, never on a worker: a write racing
+        # serial.close() is a hard crash on Windows (see
+        # MEBP_v75x_ZP_CLOSE_DURING_READ_CRASH.md). Do NOT rely on the
+        # close-time DTR/RTS de-assert to do this — whether that pulses the
+        # board's RESET (which would drop the fan output) is board- and
+        # driver-polarity dependent, and on this rig the LED stays lit.
+        self.led_off()
         self.disconnect_xbox()
         self.disconnect_stages()
         self.processor.stop()
@@ -5685,27 +6061,31 @@ class StageController:
         self._apply_active_plate_type_offsets(config)
 
     def _apply_active_plate_type_offsets(self, config) -> None:
-        """Push the active plate type's ``z_offsets`` into ``_plate_z_offsets``.
+        """Push the active plate's learned ``z_offsets`` into
+        ``_plate_z_offsets``.
 
-        No-op (keeps the device-profile / generic offsets) when no specific
-        plate type is selected. Guarded + lazy-imported so a missing/corrupt
-        plate-type library never breaks a hardware-config update.
+        v7.12: resolves through ``HardwareConfig.plate_z_offsets()`` — a
+        parametric DESIGN can own these too, not just a `PlateType` product.
+        This used to read ``plate_type_id`` directly, so a custom plate's
+        taught offsets could be neither saved nor adopted.
+
+        No-op (keeps the device-profile / generic offsets) when the active
+        plate has none. Guarded so a missing/corrupt library never breaks a
+        hardware-config update.
         """
         try:
-            type_id = getattr(config, "plate_type_id", "") if config else ""
-            if not type_id:
+            if config is None:
                 return
-            from SupportClasses.PlateTypeStore import get_store as _pt_store
-            pt = _pt_store().get(type_id)
-            if pt is None:
+            getter = getattr(config, "plate_z_offsets", None)
+            off = getter() if callable(getter) else {}
+            if not off:
                 return
-            off = pt.z_offsets or {}
             self.set_plate_z_offsets(
                 top=off.get("top"), bottom=off.get("bottom"),
                 safe=off.get("safe"), max=off.get("max"))
             logger.info(
-                f"StageController: adopted plate-type '{type_id}' Z offsets "
-                f"{self._plate_z_offsets}")
+                f"StageController: adopted plate Z offsets for "
+                f"'{config.active_plate_key}' {self._plate_z_offsets}")
         except Exception as exc:   # pragma: no cover - defensive
             logger.debug(f"_apply_active_plate_type_offsets failed: {exc}")
 

@@ -119,6 +119,12 @@ class ZPlanePoint:
     focus_axis_um_at_record: float | None = None
     needle_conf: float | None = None
     focus_score: float | None = None
+    # 1-sigma uncertainty of the interpolated best-focus Z, in mm. Floored at
+    # DOF/10 by the estimator because no amount of sub-step interpolation beats
+    # the optics. Compare it against holdout_error_mm: a hold-out many times the
+    # per-point sigma means the plate is not planar and the FIT, not the FOCUS,
+    # is the problem.
+    focus_sigma_um: float | None = None
     recorded_at: str = ""
 
     def to_dict(self) -> dict:
@@ -139,7 +145,8 @@ class ZPlanePoint:
                      ("focal_mm", self.focal_mm),
                      ("focus_axis_um_at_record", self.focus_axis_um_at_record),
                      ("needle_conf", self.needle_conf),
-                     ("focus_score", self.focus_score)):
+                     ("focus_score", self.focus_score),
+                     ("focus_sigma_um", self.focus_sigma_um)):
             if v is not None:
                 d[k] = v
         return d
@@ -164,6 +171,7 @@ class ZPlanePoint:
             focus_axis_um_at_record=_opt_float(d.get("focus_axis_um_at_record")),
             needle_conf=_opt_float(d.get("needle_conf")),
             focus_score=_opt_float(d.get("focus_score")),
+            focus_sigma_um=_opt_float(d.get("focus_sigma_um")),
             recorded_at=str(d.get("recorded_at", "")),
         )
 
@@ -670,6 +678,54 @@ def holdout_error_mm(points: Sequence[ZPlanePoint],
     return worst
 
 
+def holdout_focal_error_mm(points: Sequence[ZPlanePoint],
+                           focal_sign: int = 1,
+                           ref_index: int = 0) -> float | None:
+    """Leave-one-out prediction error (mm) for a FOCAL-readout survey.
+
+    ``holdout_error_mm`` above cannot serve this mode: it filters on
+    ``p.z_zref_mm is not None`` and a focal reading never has one — its Z lives
+    in ``focal_mm``. The consequence was that ``from_focal_readings`` passed
+    ``holdout=None``, ``_validate_plate_z_plane`` skipped its hold-out branch
+    entirely (`if hold is not None`), and **the acceptance gate this module's
+    own docstring calls "the acceptance gate, not R²" was not enforced on the
+    one mode that measures the plate optically.** A four-site survey with one
+    bad site validated.
+
+    The error is reported in mm of the FOCAL axis. That is directly comparable
+    to a zref-mm tolerance because the two axes are related by a scale of
+    exactly ±1.000 (both measure the same physical displacement of the same
+    rigid object) — which is why the focus↔needle calibration *gates* on
+    ``|scale| ∈ [0.98, 1.02]`` and then applies exactly ±1 rather than applying
+    a fitted number.
+
+    Needs ≥ 4 focal points: dropping one must still leave two independent
+    directions away from the gradient reference.
+    """
+    usable = [p for p in points if p.focal_mm is not None]
+    if len(usable) < 4 or not (0 <= ref_index < len(usable)):
+        return None
+    sign = 1 if int(focal_sign or 1) >= 0 else -1
+    ref = usable[ref_index]
+    ref_z = sign * float(ref.focal_mm)
+    worst = 0.0
+    for i, held in enumerate(usable):
+        if i == ref_index:
+            continue                      # the reference is exact by definition
+        rest = [(p.x_stage_um, p.y_stage_um, sign * float(p.focal_mm))
+                for j, p in enumerate(usable)
+                if j != i and j != ref_index]
+        fit = fit_gradient_through_anchor(
+            (ref.x_stage_um, ref.y_stage_um), ref_z, rest)
+        if fit is None or fit.degenerate:
+            return None
+        pred = (ref_z
+                + fit.sx_mm_per_mm * (held.x_stage_um - ref.x_stage_um) / 1000.0
+                + fit.sy_mm_per_mm * (held.y_stage_um - ref.y_stage_um) / 1000.0)
+        worst = max(worst, abs(pred - sign * float(held.focal_mm)))
+    return worst
+
+
 def _resolve_anchor_index(points: Sequence[ZPlanePoint],
                           anchor_label: str | None) -> int:
     if anchor_label:
@@ -750,10 +806,20 @@ def from_focal_readings(*, points: Sequence[ZPlanePoint],
     if anchor is None or anchor.z_zref_mm is None:
         return (None, "no needle-touch anchor — the focal plane has no datum")
 
+    # The ANCHOR is folded into this check, not just the focal readings. The
+    # anchor supplies the datum, so if the needle touched the well glass bottom
+    # while the scope focused on the coverslip's OUTER face, the whole plane is
+    # offset by the substrate thickness (~170 µm on a #1.5 coverslip, 3.4× the
+    # residual tolerance) — a systematic common to every site and therefore
+    # invisible to every numeric gate downstream. Only this comparison and the
+    # focus-curve SHAPE can catch it.
     surfaces = {p.surface for p in usable}
+    if anchor is not None:
+        surfaces.add(anchor.surface)
     if len(surfaces) > 1:
         return (None,
-                "focal readings mix surfaces (" + ", ".join(sorted(surfaces))
+                "the focal readings and the needle anchor mix surfaces ("
+                + ", ".join(sorted(surfaces))
                 + ") — they would measure different planes")
 
     area = triangle_max_area_mm2([(p.x_stage_um, p.y_stage_um) for p in usable])
@@ -784,7 +850,8 @@ def from_focal_readings(*, points: Sequence[ZPlanePoint],
 
     plane = _build(anchor=anchor, fit=fit,
                    points=list(usable) + [anchor], mode="focal_readout",
-                   provenance=provenance, holdout=None)
+                   provenance=provenance,
+                   holdout=holdout_focal_error_mm(usable, sign))
     return (replace(plane, focal_sign=sign), "")
 
 

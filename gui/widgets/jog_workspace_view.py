@@ -652,18 +652,13 @@ class JogWorkspaceView(QWidget):
         representative radius (uniform diameter, or the max for customs)."""
         if self._plate is None:
             return 0.0
-        if name is not None:
-            try:
-                d = self._plate.get_well_info(name).diameter
-                if d > 0:
-                    return d * 1000.0 / 2.0
-            except Exception:
-                pass
-        d = float(getattr(self._plate, "well_diameter", 0.0) or 0.0)
-        if d <= 0:
-            # Custom plate (no uniform diameter) — use the largest well.
-            d = self._plate._max_well_radius_mm() * 2.0
-        return d * 1000.0 / 2.0
+        # v7.12: the per-well → plate-level → largest-well chain lives on
+        # WellPlate. It used to be written out here and in three other places.
+        try:
+            return float(self._plate.well_diameter_of(name)) * 1000.0 / 2.0
+        except Exception:                                  # pragma: no cover
+            d = float(getattr(self._plate, "well_diameter", 0.0) or 0.0)
+            return d * 1000.0 / 2.0
 
     def _all_wells(self) -> dict[str, tuple[float, float]]:
         merged = dict(self._wells_approx)

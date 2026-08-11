@@ -429,15 +429,23 @@ class ObjectiveCalibrationCard(QGroupBox):
         if not cal:
             return
         um_per_px = float(cal["measured_um_per_px"])
-        rotation_deg = cal.get("rotation_deg")
         cal_resolution = cal.get("resolution")
         if self._camera_manager is not None:
             try:
                 self._camera_manager.set_um_per_px(
                     cam_idx, um_per_px, resolution=cal_resolution)
-                if rotation_deg is not None:
-                    self._camera_manager.set_rotation_deg(
-                        cam_idx, float(rotation_deg))
+                # v7.10: deliberately does NOT push the per-objective
+                # ``rotation_deg``. Rotation is a property of how the camera is
+                # MOUNTED, not of which objective is fitted — the objective
+                # store keeps a copy only for backwards compatibility, and
+                # MosaicCalibration explicitly refuses to read it.
+                #
+                # Pushing it here made an objective switch overwrite the live
+                # CameraManager with a stale copy while the CameraCalibrationStore
+                # (ground truth) stayed correct. The mosaic reads the store and
+                # stayed right; the live view and ``pixel_to_stage_offset`` read
+                # the manager and went wrong — the same camera, two orientations,
+                # with nothing on screen to say which was in force.
             except Exception as exc:
                 logger.debug(f"ObjectiveCalibrationCard: set_um_per_px — {exc}")
         self.um_per_px_committed.emit(cam_idx, um_per_px)
@@ -639,6 +647,9 @@ class ObjectiveCalibrationCard(QGroupBox):
 
         dlg = PixelCalibrationDialog(
             self._camera_manager, controller, cam_idx=cam_idx, parent=self,
+            # v7.16: lets the dialog size its in-frame move bound from THIS
+            # objective's magnification and the camera's native scale.
+            cam_key=cam_key, objective=objective,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -661,17 +672,47 @@ class ObjectiveCalibrationCard(QGroupBox):
             try:
                 self._camera_manager.set_um_per_px(
                     cam_idx, um_per_px, resolution=resolution)
-                if rotation_deg is not None:
-                    self._camera_manager.set_rotation_deg(cam_idx, rotation_deg)
             except Exception as exc:
                 logger.debug(f"ObjectiveCalibrationCard: push to manager — {exc}")
+        # v7.10: the rotation this dialog also measured goes through the SAME
+        # commit path as every other rotation, so it reaches the per-identity
+        # mount store. It previously reached only the live manager and the
+        # per-objective copy, so the mosaic kept the old angle and a restart
+        # threw the measurement away.
+        if rotation_deg is not None:
+            self.commit_camera_rotation(cam_idx, float(rotation_deg))
 
+        self._persist_um_per_px_stamp(cam_idx, um_per_px, resolution)
         if self._current_objective_name() == objective:
             self.um_per_px_committed.emit(cam_idx, um_per_px)
         self._refresh_table()
         self._refresh_objective_note()
         self._refresh_orientation_readout()
         self.calibration_changed.emit()
+
+    def _persist_um_per_px_stamp(self, cam_idx: int, um_per_px: float,
+                                 resolution) -> None:
+        """Write µm/px + its measurement resolution to the identity store.
+
+        v7.16. See the note in ``_on_autocal_scale_fov_clicked``: the
+        ``um_per_px_committed`` signal carries only ``(cam_idx, value)``, so the
+        resolution stamp never reached the store and every camera start warned
+        "µm/px restored WITHOUT a measurement resolution".
+        """
+        try:
+            from SupportClasses.CameraCalibrationStore import (
+                get_store as _cam_store)
+            cid = getattr(self._camera_manager, "camera_identity", None)
+            ident = cid(cam_idx) if callable(cid) else None
+            if not (ident and ident[0]):
+                return
+            res_wh = tuple(resolution) if resolution and resolution[0] else None
+            _cam_store().set_calibration(
+                ident[0], float(um_per_px),
+                name=(ident[1] if len(ident) > 1 else ""),
+                um_per_px_resolution=res_wh)
+        except Exception as exc:
+            logger.debug(f"um/px stamp persist — {exc}")
 
     def _true_capture_resolution(self, cam_idx: int) -> tuple:
         """The camera's ACTUAL captured (w, h) — the real pixels off the sensor.
@@ -680,8 +721,23 @@ class ObjectiveCalibrationCard(QGroupBox):
         the mosaic can rescale to whatever the live feed runs at. Reading the
         LIVE frame shape (authoritative) instead of ``config.active_resolution``
         (which can be stale/assumed) is the fix for the FOV that "assumes a
-        camera resolution". Falls back to the HW settings, then the config."""
+        camera resolution". Falls back to the HW settings, then the config.
+
+        v7.16: with a centred crop configured, the delivered frame is SMALLER
+        than the capture, so the frame shape is no longer the capture size — ask
+        the manager for the pre-crop size first. Stamping a cropped width here
+        would (a) rescale µm/px by the crop fraction whenever the crop changed
+        and (b) break ``ObjectiveCalibration.sensor_width_um``, whose whole
+        premise is that ``µm/px × magnification × width`` is one fixed sensor
+        property shared by every objective on the camera."""
         mgr = self._camera_manager
+        try:
+            getter = getattr(mgr, "capture_resolution", None)
+            got = getter(cam_idx) if callable(getter) else None
+            if got and got[0] and got[1]:
+                return (int(got[0]), int(got[1]))
+        except Exception:
+            pass
         try:
             frame = mgr.cameras[cam_idx].get_current_frame()
             if frame is not None and getattr(frame, "shape", None):
@@ -881,6 +937,30 @@ class ObjectiveCalibrationCard(QGroupBox):
         # reviews it, sets the tile overlap and the whole-mosaic output rotation,
         # builds a test mosaic through the shared build path, and only then is
         # anything written. Cancel leaves the previous calibration byte-identical.
+        # v7.16: sanity-check the measurement against this camera's OTHER
+        # objectives before anything is written. µm/px × magnification is a
+        # property of the sensor, so it must agree across objectives; a value
+        # that fails this scans a mosaic at the wrong scale, and the only
+        # symptom is a tile count wrong by the square of the error. Advisory,
+        # not a block — the operator may genuinely have swapped the objective.
+        try:
+            why = self._store.implausible_reason(
+                cam_key, objective, float(um_per_px),
+                dlg.result_resolution or self._true_capture_resolution(cam_idx))
+        except Exception as exc:
+            logger.debug(f"plausibility check skipped: {exc}")
+            why = None
+        if why:
+            logger.warning(f"Objective calibration looks implausible: {why}")
+            keep = QMessageBox.question(
+                self, "Check this measurement",
+                f"{why}\n\nSave it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if keep != QMessageBox.StandardButton.Yes:
+                logger.info("Implausible calibration discarded by operator.")
+                return
+
         confirmed = self._confirm_calibration(cam_idx, dlg)
         if confirmed is None:
             logger.info("Mosaic & camera calibration cancelled — nothing saved.")
@@ -929,6 +1009,24 @@ class ObjectiveCalibrationCard(QGroupBox):
             if ident and ident[0]:
                 st = _cam_store()
                 nm = ident[1] if len(ident) > 1 else ""
+                # v7.16: persist µm/px WITH the resolution it was measured at.
+                # The identity store was previously written by
+                # ``HardwareSetupPage.set_calibrated_um_per_px`` via the
+                # ``um_per_px_committed`` signal, which carries only
+                # ``(cam_idx, value)`` — so the stamp was always dropped and
+                # every camera start logged "µm/px restored WITHOUT a
+                # measurement resolution". Unstamped means
+                # ``effective_um_per_px`` degrades to a passthrough, which is
+                # what let a value measured on one camera be reused verbatim on
+                # another at a different sensor width.
+                try:
+                    res_wh = (tuple(resolution)
+                              if resolution and resolution[0] else None)
+                    st.set_calibration(
+                        ident[0], float(um_per_px), name=nm,
+                        um_per_px_resolution=res_wh)
+                except Exception as exc:
+                    logger.debug(f"autocal: um/px stamp persist — {exc}")
                 if rotation_deg is not None:
                     st.set_rotation(ident[0], float(rotation_deg), name=nm)
                 if flip_x is not None:
@@ -988,6 +1086,9 @@ class ObjectiveCalibrationCard(QGroupBox):
 
         dlg = PixelCalibrationDialog(
             self._camera_manager, controller, cam_idx=cam_idx, parent=self,
+            cam_key=self._camera_key(),
+            objective=(self._selected_objective_name()
+                       or self._current_objective_name()),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1000,13 +1101,40 @@ class ObjectiveCalibrationCard(QGroupBox):
             )
             return
 
-        # Push live so the click→stage mapping is corrected immediately.
-        try:
-            self._camera_manager.set_rotation_deg(cam_idx, float(rotation_deg))
-        except Exception as exc:
-            logger.debug(f"orientation: push to manager — {exc}")
-        # Persist per camera IDENTITY (independent of µm/px; restored on slot
-        # assignment via hardware_setup._restore_calibration_for_slot).
+        self.commit_camera_rotation(cam_idx, float(rotation_deg))
+        self.calibration_changed.emit()
+        QMessageBox.information(
+            self, "Calibrate orientation",
+            f"Camera rotation vs stage measured: {rotation_deg:.1f}°.\n\n"
+            "Live-view clicks (re-anchor, well fits) now map in the corrected "
+            "direction. A previously scanned mosaic is unaffected — the rotation "
+            "only changes the click→stage mapping, not the stored image.",
+        )
+
+    def commit_camera_rotation(self, cam_idx: int, rotation_deg: float) -> None:
+        """THE one place a measured camera rotation is committed from this card.
+
+        v7.10. Writes all three homes in one go so they cannot drift:
+
+        1. the live ``CameraManager`` (every ``auto_orient`` feed and
+           ``pixel_to_stage_offset`` read it),
+        2. ``CameraCalibrationStore`` per device identity — the persisted ground
+           truth every mosaic resolves against and the only copy that survives a
+           restart,
+        3. the per-objective mirror, via :meth:`adopt_camera_rotation`.
+
+        Before this existed, the per-objective µm/px calibration
+        (``_on_calibrate_clicked``) pushed a freshly measured rotation to (1)
+        and (3) but **not (2)**. The live view was therefore right, the mosaic
+        (store-first) kept the old angle, and a restart silently reverted the
+        measurement — a rotation that appeared to take and then vanished.
+        """
+        if self._camera_manager is not None:
+            try:
+                self._camera_manager.set_rotation_deg(
+                    cam_idx, float(rotation_deg))
+            except Exception as exc:
+                logger.debug(f"orientation: push to manager — {exc}")
         try:
             from SupportClasses.CameraCalibrationStore import (
                 get_store as _cam_store)
@@ -1020,18 +1148,7 @@ class ObjectiveCalibrationCard(QGroupBox):
                     name=(ident[1] if len(ident) > 1 else ""))
         except Exception as exc:
             logger.debug(f"orientation: persist per identity — {exc}")
-        # Sync the fresh rotation into every per-objective calibration and
-        # refresh the readout (shared with the Hardware Setup per-slot
-        # rotation calibration — see adopt_camera_rotation).
         self.adopt_camera_rotation(float(rotation_deg))
-        self.calibration_changed.emit()
-        QMessageBox.information(
-            self, "Calibrate orientation",
-            f"Camera rotation vs stage measured: {rotation_deg:.1f}°.\n\n"
-            "Live-view clicks (re-anchor, well fits) now map in the corrected "
-            "direction. A previously scanned mosaic is unaffected — the rotation "
-            "only changes the click→stage mapping, not the stored image.",
-        )
 
     def adopt_camera_rotation(self, rotation_deg: float) -> None:
         """v7.5.x: adopt a freshly-measured camera→stage rotation.
@@ -1040,10 +1157,15 @@ class ObjectiveCalibrationCard(QGroupBox):
         per-slot rotation calibration on the Camera Detection & Assignment
         card when the calibrated slot holds the MICROSCOPE role. The mount
         rotation is a property of the CAMERA, not the objective — sync it
-        into EVERY objective that has a µm/px calibration for this camera,
-        so a later objective swap (_push_stored_um_per_px_to_manager pushes
-        the per-objective rotation) can't push a STALE rotation back over
-        this fresh measurement. Then refresh the readout.
+        into EVERY objective that has a µm/px calibration for this camera.
+
+        v7.10: this used to be load-bearing — an objective swap pushed the
+        per-objective ``rotation_deg`` into the live manager, so keeping the
+        copies identical was the only thing stopping a stale one winning. That
+        push is gone (rotation now has exactly one live source), so this is
+        now defence in depth: it keeps the per-objective copies consistent for
+        an older build reading the same files, and stops the readout in the
+        objective table contradicting the mount. Then refresh the readout.
         """
         try:
             cam_key = self._camera_key()
@@ -1110,15 +1232,57 @@ class ObjectiveCalibrationCard(QGroupBox):
         return config.camera_for_role(CameraRole.MICROSCOPE)
 
     def _camera_key(self) -> Optional[str]:
-        """Stable key used by `ObjectiveCalibrationStore` for this slot."""
+        """Stable key used by `ObjectiveCalibrationStore` for this slot.
+
+        v7.16: the DEVICE IDENTITY, via the shared
+        :func:`MosaicCalibration.objective_camera_key` — the same function the
+        mosaic resolves with, so a value written here is found there. It used
+        to be ``camera_spec.name``, which let two physical cameras share one
+        calibration block; see that function for the measured damage.
+        """
         cam_idx = self._microscope_idx()
         if cam_idx is None:
             return None
         config = self._config_getter()
         spec = getattr(config.camera_config, "camera_spec", None) if config else None
-        if spec is not None and getattr(spec, "name", None):
-            return str(spec.name)
-        return f"camera_{cam_idx}"
+        spec_name = getattr(spec, "name", None) if spec is not None else None
+        try:
+            from SupportClasses.MosaicCalibration import objective_camera_key
+            key = objective_camera_key(
+                self._camera_manager, cam_idx, spec_name)
+        except Exception:                      # pragma: no cover - import guard
+            key = str(spec_name) if spec_name else None
+        return key or f"camera_{cam_idx}"
+
+    def _legacy_camera_key(self) -> Optional[str]:
+        """The pre-v7.16 key (the configured spec name), for adoption only.
+
+        Never used for a WRITE and never used as a read fallback — that is what
+        cross-assigned two cameras' calibrations. It exists so the card can
+        OFFER to adopt an older block, as a deliberate operator action.
+        """
+        config = self._config_getter()
+        spec = getattr(config.camera_config, "camera_spec", None) if config else None
+        name = getattr(spec, "name", None) if spec is not None else None
+        return str(name) if name else None
+
+    def adoptable_legacy_calibrations(self) -> dict:
+        """Legacy name-keyed calibrations that this camera has none of.
+
+        Returned as ``{objective: cal}``. Empty when the identity key already
+        has entries for everything, when there is no legacy block, or when the
+        legacy key IS the identity key (no identity available).
+        """
+        legacy = self._legacy_camera_key()
+        key = self._camera_key()
+        if not legacy or not key or legacy == key:
+            return {}
+        try:
+            old = self._store.all_calibrations_for_camera(legacy) or {}
+            new = self._store.all_calibrations_for_camera(key) or {}
+        except Exception:
+            return {}
+        return {obj: cal for obj, cal in old.items() if obj not in new}
 
     def _selected_objective_name(self) -> str:
         row = self._table.currentRow()

@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
@@ -110,6 +110,52 @@ class PositionBar(QWidget):
             p.setPen(QPen(QColor(COLORS.get("red", "#f38ba8")), 1.5))
             p.drawEllipse(QRectF(x - dot_r / 2 - 1, (h - dot_r) / 2 - 1,
                                   dot_r + 2, dot_r + 2))
+
+
+class PositionValueLabel(QLabel):
+    """v7.9.x: numeric position readout whose minimum width TRACKS its text.
+
+    Each Live-Position row is ``axis | PositionBar (stretch) | value | unit``.
+    The value label used to sit behind a tiny fixed floor (s(20)) with an
+    Ignored size policy so the row could scrunch — but the bar owns the row's
+    only stretch column, so at normal widths the bar absorbed everything and
+    the number was clipped to its low-order digits, visually running into the
+    unit label. Priority is now inverted: this label claims exactly the width
+    its CURRENT text needs (recomputed on every setText and on font changes,
+    so the responsive font scaler keeps it honest at narrow widths) and the
+    BAR is the element that yields. The width is capped so a pathological
+    string can't blow up the layout.
+
+    ⚠ v7.9.1 — the horizontal policy must NOT be ``Ignored``. It was, and it
+    fought the tracking minimum width: ``Ignored`` tells the layout to size the
+    COLUMN without regard to this widget, while ``setMinimumWidth`` forces the
+    WIDGET to stay that wide. The grid handed column 2 about 5 px and the label
+    then drew itself ~100 px wide straight over the unit label — measured at
+    every panel width, which is the operator's "the position is overtop of the
+    units". ``Preferred`` makes the layout actually reserve the width, and the
+    BAR (``Ignored``, 10 px minimum) stays the element that yields, so a narrow
+    panel still scrunches without clipping the number."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__("—", parent)
+        self.setStyleSheet(
+            f"color: {COLORS['text']}; font-family: monospace;")
+        self.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._sync_min_width()
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt override)
+        super().setText(text)
+        self._sync_min_width()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().changeEvent(event)
+        if event.type() == QEvent.FontChange:
+            self._sync_min_width()
+
+    def _sync_min_width(self) -> None:
+        w = self.fontMetrics().horizontalAdvance(self.text()) + s(4)
+        self.setMinimumWidth(max(s(20), min(w, s(160))))
 
 
 class HardwareControlPanel(QWidget):
@@ -534,6 +580,8 @@ class HardwareControlPanel(QWidget):
         self._jog_array.jog_z_requested.connect(self._on_jog_z)
         self._jog_array.jog_pump_requested.connect(self._on_jog_pump)
         self._jog_array.home_requested.connect(self._force_refresh_positions)
+        self._jog_array.step_settings_changed.connect(
+            self._persist_step_settings)
         lay.addWidget(self._jog_array)
 
         # v7.4.2: per-axis jog speeds. Values flow through the
@@ -599,21 +647,36 @@ class HardwareControlPanel(QWidget):
             "Z", self.spin_z_pct, self.lbl_z_resolved,
             tooltip="Z jog speed as a % of the max Z feedrate."))
 
-        # v7.5.x: the pump jog % can go below 1 % (down to 0.01 %) for fine
-        # plunger jogs — the operator asked for sub-1 % pump rates.
-        self.spin_p_pct = self._pct_spin(min_pct=0.01, decimals=2, step=0.1)
-        self.lbl_p_resolved = self._resolved_label()
-        outer.addLayout(self._labeled_pct(
-            "P", self.spin_p_pct, self.lbl_p_resolved,
-            tooltip="Pump jog speed as a % of the max pump flow / feedrate "
-                    "(can go below 1 %)."))
+        # v7.9.x: PER-PUMP jog flow rows (the operator asked for each pump to
+        # get its own flow rate on every jog tile, not just Hardware Setup).
+        # One row per pump: a % spin (can go below 1 % for fine plunger jogs)
+        # anchored to THIS pump's own safe flow ceiling, + a resolved µL/s
+        # readout. Unconfigured pumps are hidden in _resolve_speeds.
+        from PySide6.QtWidgets import QWidget as _QWidget
+        self.spin_p_pct_pumps: dict[str, "QDoubleSpinBox"] = {}
+        self.lbl_p_resolved_pumps: dict[str, QLabel] = {}
+        self.row_p_pct_pumps: dict[str, QWidget] = {}
+        for pid in ("P1", "P2", "P3"):
+            spin = self._pct_spin(min_pct=0.01, decimals=2, step=0.1)
+            lbl = self._resolved_label()
+            row_lay = self._labeled_pct(
+                pid, spin, lbl,
+                tooltip=(f"{pid} jog flow as a % of {pid}'s own safe flow "
+                         f"ceiling (needle/syringe-derived; can go below "
+                         f"1 %). The resolved rate is shown beside it."))
+            row_w = _QWidget()
+            row_w.setLayout(row_lay)
+            outer.addWidget(row_w)
+            self.spin_p_pct_pumps[pid] = spin
+            self.lbl_p_resolved_pumps[pid] = lbl
+            self.row_p_pct_pumps[pid] = row_w
+            spin.valueChanged.connect(
+                lambda _v=None, p=pid: self._on_pump_pct_changed(p))
 
         self.spin_xy_pct.valueChanged.connect(
             lambda: self._on_speed_pct_changed("xy"))
         self.spin_z_pct.valueChanged.connect(
             lambda: self._on_speed_pct_changed("z"))
-        self.spin_p_pct.valueChanged.connect(
-            lambda: self._on_speed_pct_changed("p"))
         return wrap
 
     def _pct_spin(self, *, min_pct: float = 1.0, decimals: int = 0,
@@ -770,6 +833,44 @@ class HardwareControlPanel(QWidget):
                 mpf = 200.0
         return float(mpf or 200.0), "mm/min"
 
+    def _pump_speed_anchor_for(self, pump: str) -> tuple[float, str]:
+        """ONE pump's own jog 100% anchor + unit, by mode.
+
+        %/µL pages → THIS pump's needle/syringe-derived flow ceiling (µL/s)
+        via the controller's per-pump resolver. Hardware Setup (mm jog) →
+        this pump's max plunger feedrate (per-pump override aware, mm/min).
+        Falls back to the shared :meth:`_pump_speed_anchor` when the
+        controller lacks the per-pump resolvers (older stub / test double)."""
+        ctrl = self._controller
+        if self._pump_action_labels:
+            if ctrl is not None and hasattr(ctrl, "get_max_pump_feedrate_for"):
+                try:
+                    m = float(ctrl.get_max_pump_feedrate_for(pump))
+                    if m > 0:
+                        return m, "µL/s"
+                except Exception:
+                    pass
+            return self._pump_speed_anchor()
+        if ctrl is not None and hasattr(ctrl, "get_pump_max_feedrate_mm_min"):
+            try:
+                m = float(ctrl.get_pump_max_feedrate_mm_min(pump))
+                if m > 0:
+                    return m, "mm/min"
+            except Exception:
+                pass
+        return self._pump_speed_anchor()
+
+    def _pump_jog_pct_value(self, pump: str) -> float:
+        """The jog-flow % chosen for ``pump`` (its per-pump spin; 50% default
+        when the row doesn't exist, e.g. a partially built test panel)."""
+        spin = getattr(self, "spin_p_pct_pumps", {}).get(pump)
+        if spin is None:
+            return 50.0
+        try:
+            return float(spin.value())
+        except (TypeError, ValueError):
+            return 50.0
+
     def _max_xy_speed_um_s(self) -> float:
         ctrl = self._controller
         if ctrl is not None and hasattr(ctrl, "get_max_xy_speed_um_s"):
@@ -820,24 +921,36 @@ class HardwareControlPanel(QWidget):
             return
         xy_max = self._max_xy_speed_um_s()
         z_max = self._max_z_feedrate_mm_min()
-        p_max, p_unit = self._pump_speed_anchor()
         xy = self.spin_xy_pct.value() / 100.0 * xy_max
         z = self.spin_z_pct.value() / 100.0 * z_max
-        p = self.spin_p_pct.value() / 100.0 * p_max
         self.lbl_xy_resolved.setText(f"= {xy:,.0f} µm/s")
         self.lbl_z_resolved.setText(f"= {z:,.0f} mm/min")
-        if p_unit == "µL/s":
-            self.lbl_p_resolved.setText(
-                f"= {p:.2f} µL/s" if p_max > 0 else "= — µL/s")
-        else:
-            self.lbl_p_resolved.setText(f"= {p:,.0f} mm/min")
+        # v7.9.x: per-pump rows — each resolved against its OWN pump's anchor;
+        # pumps that aren't configured are hidden (mirrors the Hardware Setup
+        # per-pump max rows).
+        configured = set(self._configured_pump_ids())
+        for pid, spin in getattr(self, "spin_p_pct_pumps", {}).items():
+            row = self.row_p_pct_pumps.get(pid)
+            show = pid in configured
+            if row is not None:
+                row.setVisible(show)
+            if not show:
+                continue
+            lbl = self.lbl_p_resolved_pumps.get(pid)
+            if lbl is None:
+                continue
+            p_max, p_unit = self._pump_speed_anchor_for(pid)
+            p = spin.value() / 100.0 * p_max
+            if p_unit == "µL/s":
+                lbl.setText(f"= {p:.2f} µL/s" if p_max > 0 else "= — µL/s")
+            else:
+                lbl.setText(f"= {p:,.0f} mm/min")
 
     def _on_speed_pct_changed(self, group: str) -> None:
         """A percent spinbox changed: persist the shared % on the controller,
         refresh the resolved labels, and (for XY) push the velocity now."""
         spin = {"xy": getattr(self, "spin_xy_pct", None),
-                "z": getattr(self, "spin_z_pct", None),
-                "p": getattr(self, "spin_p_pct", None)}.get(group)
+                "z": getattr(self, "spin_z_pct", None)}.get(group)
         if spin is None:
             return
         self._speed_user_edited[group] = True
@@ -856,6 +969,31 @@ class HardwareControlPanel(QWidget):
         if group == "xy":
             self._apply_xy_speed(spin.value() / 100.0 * self._max_xy_speed_um_s())
 
+    def _on_pump_pct_changed(self, pump: str) -> None:
+        """A per-pump jog-flow % spin changed: store it on the controller (the
+        shared state every jog tile re-reads on show, so the nine panels can't
+        diverge), persist it, and refresh the resolved rate."""
+        spin = getattr(self, "spin_p_pct_pumps", {}).get(pump)
+        if spin is None:
+            return
+        self._speed_user_edited["p"] = True
+        val = float(spin.value())
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_pump_jog_pct"):
+            try:
+                ctrl.set_pump_jog_pct(pump, val)
+            except Exception as e:
+                logger.debug(f"set_pump_jog_pct({pump}) failed: {e}")
+        if self._settings is not None:
+            try:
+                stored = dict(self._settings.get("jog.pump_jog_pct") or {})
+                stored[pump] = val
+                self._settings.set("jog.pump_jog_pct", stored)
+                self._settings.save()
+            except Exception:
+                pass
+        self._resolve_speeds()
+
     def _seed_jog_pct_from_controller(self) -> None:
         """Adopt the shared jog-% the controller holds (so this panel agrees
         with the Xbox page and any other surface). Falls back to the spinbox
@@ -870,8 +1008,7 @@ class HardwareControlPanel(QWidget):
             except Exception:
                 state = {}
         for group, spin in (("xy", self.spin_xy_pct),
-                            ("z", self.spin_z_pct),
-                            ("p", self.spin_p_pct)):
+                            ("z", self.spin_z_pct)):
             st = state.get(group)
             if st and st.get("pct") is not None:
                 spin.blockSignals(True)
@@ -880,6 +1017,115 @@ class HardwareControlPanel(QWidget):
                 except (TypeError, ValueError):
                     pass
                 spin.blockSignals(False)
+        self._seed_pump_jog_pcts(state)
+
+    # ── v7.9.x: jog step-slider settings, shared across every jog tile ──
+
+    def _persist_step_settings(self) -> None:
+        """A step slider's config changed: store it on the controller (shared
+        by every jog panel) and persist it (survives a restart)."""
+        arr = getattr(self, "_jog_array", None)
+        if arr is None:
+            return
+        try:
+            cfg = arr.step_settings()
+        except Exception as e:
+            logger.debug(f"step_settings read failed: {e}")
+            return
+        ctrl = self._controller
+        if ctrl is not None and hasattr(ctrl, "set_jog_step_settings"):
+            try:
+                ctrl.set_jog_step_settings(cfg)
+            except Exception as e:
+                logger.debug(f"set_jog_step_settings failed: {e}")
+        if self._settings is not None:
+            try:
+                self._settings.set("jog.step_settings", cfg)
+                self._settings.save()
+            except Exception:
+                pass
+
+    def _seed_step_settings(self) -> None:
+        """Seed the jog array's step sliders. Precedence mirrors the per-pump
+        jog %: the controller's store (freshest — another panel may have
+        edited it this session) → the persisted settings (restart; pushed
+        back onto the controller so later panels agree without re-reading
+        settings) → the array's built-in defaults."""
+        arr = getattr(self, "_jog_array", None)
+        if arr is None:
+            return
+        ctrl = self._controller
+        cfg = {}
+        if ctrl is not None and hasattr(ctrl, "get_jog_step_settings"):
+            try:
+                cfg = ctrl.get_jog_step_settings() or {}
+            except Exception:
+                cfg = {}
+        if not cfg and self._settings is not None:
+            try:
+                cfg = self._settings.get("jog.step_settings") or {}
+            except Exception:
+                cfg = {}
+            if cfg and ctrl is not None and hasattr(
+                    ctrl, "set_jog_step_settings"):
+                try:
+                    ctrl.set_jog_step_settings(cfg)
+                except Exception:
+                    pass
+        if cfg:
+            try:
+                arr.apply_step_settings(cfg)
+            except Exception as e:
+                logger.debug(f"apply_step_settings failed: {e}")
+
+    def _seed_pump_jog_pcts(self, state: dict | None = None) -> None:
+        """Seed each per-pump jog-flow % spin. Precedence: the controller's
+        per-pump store (freshest — another panel may have edited it this
+        session) → the persisted ``jog.pump_jog_pct`` settings (restart; the
+        value is pushed back onto the controller so every other panel agrees
+        without re-reading settings) → the shared 'p' group % (pre-per-pump
+        installs) → leave the spinbox default."""
+        pumps = getattr(self, "spin_p_pct_pumps", None)
+        if not pumps:
+            return
+        ctrl = self._controller
+        stored_ctrl: dict = {}
+        if ctrl is not None and hasattr(ctrl, "get_pump_jog_pcts"):
+            try:
+                stored_ctrl = dict(ctrl.get_pump_jog_pcts() or {})
+            except Exception:
+                stored_ctrl = {}
+        stored_settings: dict = {}
+        if self._settings is not None:
+            try:
+                stored_settings = dict(
+                    self._settings.get("jog.pump_jog_pct") or {})
+            except Exception:
+                stored_settings = {}
+        shared = None
+        if state is not None:
+            st = state.get("p") or {}
+            shared = st.get("pct")
+        for pid, spin in pumps.items():
+            val = stored_ctrl.get(pid)
+            if val is None:
+                val = stored_settings.get(pid)
+                if (val is not None and ctrl is not None
+                        and hasattr(ctrl, "set_pump_jog_pct")):
+                    try:
+                        ctrl.set_pump_jog_pct(pid, float(val))
+                    except Exception:
+                        pass
+            if val is None:
+                val = shared
+            if val is None:
+                continue
+            spin.blockSignals(True)
+            try:
+                spin.setValue(float(val))
+            except (TypeError, ValueError):
+                pass
+            spin.blockSignals(False)
 
     def _seed_axis_max_from_controller(self) -> None:
         """Max mode: seed the absolute-max spinboxes from the single common
@@ -1080,6 +1326,10 @@ class HardwareControlPanel(QWidget):
         """v7.5.x: external hook — re-read the single common per-axis max and
         the shared jog-%. Call after any page changes a max (the GUI fans this
         out via ``HardwareSetupPage.safety_limits_changed``) or on show."""
+        # v7.9.x: the step-slider config is shared by every jog tile, so it is
+        # re-read on the same hooks as the speeds (set_controller /
+        # set_settings / showEvent) in BOTH modes.
+        self._seed_step_settings()
         if getattr(self, "_speed_as_max", False):
             self._seed_axis_max_from_controller()
             return
@@ -1127,19 +1377,16 @@ class HardwareControlPanel(QWidget):
             ax_lbl.setMinimumWidth(s(14))
             grid.addWidget(ax_lbl, r, 0)
             bar = PositionBar()
-            # Let the bar shrink freely so the row fits a narrow panel.
+            # Let the bar shrink freely so the row fits a narrow panel — the
+            # bar is the element that yields; the value text keeps priority.
             bar.setMinimumWidth(s(10))
             bar.setSizePolicy(QSizePolicy.Ignored, bar.sizePolicy().verticalPolicy())
             grid.addWidget(bar, r, 1)
             self.bar_pos[axis] = bar
-            val = QLabel("—")
-            val.setStyleSheet(
-                f"color: {COLORS['text']}; font-family: monospace;")
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            # v7.5.x: tiny min + Ignored policy so the numeric readout scrunches
-            # (right-aligned, shows the low-order digits) on a narrow panel.
-            val.setMinimumWidth(s(20))
-            val.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            # v7.9.x: the numeric readout's min width tracks its text (see
+            # PositionValueLabel) so the stretch-driven bar can never squeeze
+            # the number into clipping over the unit label.
+            val = PositionValueLabel()
             grid.addWidget(val, r, 2)
             unit_lbl = QLabel(unit)
             unit_lbl.setStyleSheet(f"color: {COLORS['subtext0']};")
@@ -1574,24 +1821,35 @@ class HardwareControlPanel(QWidget):
             logger.debug(f"pump jog already in flight — ignoring {pump} "
                          f"{distance:g}")
             return
-        # v7.5.x: %/µL pages drive the plunger by a % of the syringe volume;
-        # Hardware Setup (raw arrows) keeps the mm path for plunger calibration.
+        # v7.5.x: %/µL pages drive the plunger volumetrically; Hardware Setup
+        # (raw arrows) keeps the mm path for plunger calibration.
         if self._pump_action_labels:
-            # ``distance`` here is a SIGNED % of the syringe volume
-            # (− = aspirate, + = dispense — matches move_pump_uL's convention).
-            volume_uL = None
-            if hasattr(ctrl, "pump_pct_to_uL"):
-                try:
-                    volume_uL = ctrl.pump_pct_to_uL(pump, distance)
-                except Exception:
-                    volume_uL = None
+            # v7.9.x: ``distance`` is a SIGNED µL VOLUME straight from the
+            # step slider (− = aspirate, + = dispense — matches move_pump_uL).
+            # It used to be a % of the syringe volume, which could not express
+            # the sub-µL steps the operator asked for (0.001 µL is 0.0004 % of
+            # a 250 µL syringe). A legacy array still emitting % is converted
+            # so an un-upgraded embedder can't silently dose 100× wrong.
+            volume_uL = distance
+            arr = getattr(self, "_jog_array", None)
+            if arr is not None and not getattr(arr, "pump_step_is_uL", True):
+                volume_uL = None
             if volume_uL is None:
-                self.lbl_status.setText(
-                    f"{pump}: calibrate the plunger or assign a syringe to jog "
-                    f"in % of volume.")
-                return
-            p_max, _ = self._pump_speed_anchor()      # µL/s ceiling
-            rate = self.spin_p_pct.value() / 100.0 * p_max if p_max > 0 else None
+                if hasattr(ctrl, "pump_pct_to_uL"):
+                    try:
+                        volume_uL = ctrl.pump_pct_to_uL(pump, distance)
+                    except Exception:
+                        volume_uL = None
+                if volume_uL is None:
+                    self.lbl_status.setText(
+                        f"{pump}: calibrate the plunger or assign a syringe "
+                        f"to jog this pump.")
+                    return
+            # v7.9.x: THIS pump's own spin % × its own flow ceiling — each
+            # pump gets its own jog flow rate on the tiles.
+            p_max, _ = self._pump_speed_anchor_for(pump)   # µL/s ceiling
+            rate = self._pump_jog_pct_value(pump) / 100.0 * p_max \
+                if p_max > 0 else None
             # v7.5.x: backlash compensation — when enabled (pump jog toggle), the
             # click is bracketed with a flex take-up + unload so it leaves the
             # tip pressure-neutral. A single click is one discrete start→stop, so
@@ -1616,14 +1874,16 @@ class HardwareControlPanel(QWidget):
         else:
             # Hardware Setup mm jog — speed = the raw-plunger feedrate.
             # Max mode: the PER-PUMP mm/min spin holds the absolute ceiling for
-            # this pump directly; percent mode (legacy / tests): % of anchor.
-            feed, _ = self._pump_speed_anchor()           # mm/min
+            # this pump directly; percent mode (legacy / tests): % of THIS
+            # pump's own mm/min anchor.
             if getattr(self, "_speed_as_max", False):
+                feed, _ = self._pump_speed_anchor()       # mm/min
                 spin = getattr(self, "spin_p_max_pumps", {}).get(pump)
                 feed = max(1.0, float(spin.value())) if spin is not None \
                     else max(1.0, feed)
             else:
-                feed = self.spin_p_pct.value() / 100.0 * feed
+                feed, _ = self._pump_speed_anchor_for(pump)   # mm/min
+                feed = self._pump_jog_pct_value(pump) / 100.0 * feed
             bypass = self._bypass_safety
 
             def _move():

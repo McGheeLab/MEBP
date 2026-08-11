@@ -96,7 +96,9 @@ except ImportError:
 
 # Shared with the Andor backend so both mono scientific cameras render through
 # IDENTICAL display math (see gui/widgets/mono_display.py for why that matters).
-from gui.widgets.mono_display import LEVEL_MAX, _mono_to_bgr8, _auto_levels
+from gui.widgets.mono_display import (
+    LEVEL_MAX, _mono_to_bgr8, _auto_levels, compute_raw_frame_stats,
+    RawAverageRequest)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -558,6 +560,10 @@ class TUCamBackend:
         self._reader: threading.Thread | None = None
         self._lock = threading.RLock()
         self._frame_ready = threading.Event()
+        # v7.14: monotonic count of GENUINELY-NEW frames (see
+        # SupportClasses/CaptureTiming.py). read() serves the cached frame on
+        # demand, so read() calls do not measure sensor frames.
+        self._frames_acquired = 0
         self._frame = None
         # Resolution capability, discovered on open.
         self._res_capa_id: int | None = None
@@ -570,6 +576,18 @@ class TUCamBackend:
         self._last_auto_levels: tuple[float, float] | None = None
         self._last_channels = 0
         self._last_elem_bytes = 0
+        # v7.13 — raw 16-bit statistics + averaged capture, the SAME treatment
+        # the Zyla got (histogram / saturation badge / √N tile averaging). The
+        # clip level comes from each frame's OWN declared bit depth (ucDepth),
+        # so a 12-bit readout judges saturation at 4095, not 65535.
+        self._raw_stats: "dict | None" = None
+        self._avg_request: "RawAverageRequest | None" = None
+        self._clip_level = LEVEL_MAX
+        self._temp_read_ts = 0.0
+        self._temp_cache = None
+        #: True once this camera's temperature property has been judged
+        #: unusable, so the reason is stated once rather than per read.
+        self._temp_refused = False
 
     # ── Open / close ──────────────────────────────────────────────
     def open(self, device_id: str, resolution_index: int | None = None) -> bool:
@@ -690,6 +708,10 @@ class TUCamBackend:
         BEFORE Cap_Stop / Buf_Release — releasing the buffer under a live reader
         would hand the SDK a freed pointer.
         """
+        # v7.13: a pending averaged-capture must fail (never hang its caller)
+        # whenever the stream stops — release AND resolution changes both
+        # route through here.
+        self._fail_pending_average("stream stopped")
         lib, handle = self._lib, self._handle
         self._running = False
         if lib is not None and handle is not None and self._capturing:
@@ -728,6 +750,7 @@ class TUCamBackend:
             self._handle = None
             self._frame = None
             self._frame_desc = None
+            self._raw_stats = None
         if handle is not None and self._lib is not None:
             try:
                 self._lib.TUCAM_Dev_Close(handle)
@@ -779,6 +802,7 @@ class TUCamBackend:
                 continue
             with self._lock:
                 self._frame = bgr
+                self._frames_acquired += 1
             self._frame_ready.set()
 
     def _decode_frame(self, frame: TUCAM_FRAME):
@@ -837,6 +861,11 @@ class TUCamBackend:
             return None
 
         if channels == 1:
+            # v7.13 — raw statistics + averaged-capture servicing on the raw
+            # plane, BEFORE the display conversion destroys it (the same
+            # treatment as the Andor reader loop).
+            if arr.ndim == 2 and arr.dtype != np.uint8:
+                self._service_raw_plane(arr, int(frame.ucDepth or 16))
             # Mono sensor → shared mono→BGR8 display conversion. Record the
             # auto levels so switching auto OFF freezes the current look
             # (the Andor backend's behaviour, kept identical here).
@@ -864,6 +893,15 @@ class TUCamBackend:
 
     def isOpened(self) -> bool:
         return self._handle is not None and bool(self._handle) and self._running
+
+    def frames_acquired(self) -> int:
+        """v7.14: monotonic count of distinct frames the sensor has delivered.
+
+        Advances only in the reader thread, so waiting on it is the only way
+        to know a frame is post-move rather than a repeat of the cached one.
+        """
+        with self._lock:
+            return self._frames_acquired
 
     def read(self) -> "tuple[bool, np.ndarray | None]":
         """Return ``(ok, latest BGR8 frame)``. Non-blocking after first frame."""
@@ -1185,10 +1223,22 @@ class TUCamBackend:
             return None
         if attr.dbValMax > attr.dbValMin and not (
                 attr.dbValMin <= val <= attr.dbValMax):
-            logger.debug(
-                "TUCam: temperature %.3f outside declared %.3f..%.3f -> "
-                "reporting unknown", val, attr.dbValMin, attr.dbValMax)
+            # Log the TRANSITION, not the state. The declared range is a fixed
+            # property of the model, so on a camera like the Libra 25 this
+            # verdict never changes — repeating it once per read says nothing
+            # new and buries every other line in the log.
+            if not self._temp_refused:
+                self._temp_refused = True
+                logger.debug(
+                    "TUCam: temperature %.3f is outside the range the SDK "
+                    "itself declares (%.3f..%.3f), so it is not a temperature "
+                    "in degrees -> reporting unknown for this camera. Logged "
+                    "once.", val, attr.dbValMin, attr.dbValMax)
             return None
+        if self._temp_refused:
+            self._temp_refused = False
+            logger.debug("TUCam: temperature is now inside its declared range "
+                         "(%.3f) -> reporting it again", val)
         return val
 
     def prop_range(self, prop_id: int):
@@ -1216,6 +1266,108 @@ class TUCamBackend:
 
     def set_auto_exposure(self, enabled: bool) -> bool:
         return self._capa_set(TUIDC_ATEXPOSURE, 1 if enabled else 0)
+
+    # ── Raw statistics + averaged capture (v7.13, shared contract) ──
+    def _service_raw_plane(self, plane, depth: int):
+        """Per-frame raw-plane servicing, on the reader thread: statistics
+        (histogram / clipped fraction against the frame's OWN bit depth) and
+        the pending averaged-capture request. Guarded — can never take the
+        feed down."""
+        clip = ((1 << int(depth)) - 1) if 8 <= int(depth) <= 32 else LEVEL_MAX
+        self._clip_level = clip
+        try:
+            stats = compute_raw_frame_stats(plane, clip)
+        except Exception:
+            stats = None
+        if stats is not None:
+            now = time.monotonic()
+            # ⚠ Gate on the CLOCK only. `None` is a legitimate answer here
+            # ("this model reports nothing usable"), so an `is None` cache-miss
+            # test made "unknown" indistinguishable from "not read yet" and the
+            # throttle never engaged: on the Libra 25, whose temperature
+            # property is permanently unusable, this re-read the SDK on EVERY
+            # frame and its refusal notice was 17.7% of a whole session's log.
+            if self._temp_read_ts == 0.0 or now - self._temp_read_ts > 2.0:
+                # The reader thread owns the handle — never on a GUI timer.
+                self._temp_read_ts = now
+                try:
+                    self._temp_cache = self.get_temperature()
+                except Exception:
+                    self._temp_cache = None
+            stats["temperature_c"] = self._temp_cache
+            stats["temperature_status"] = None
+            with self._lock:
+                self._raw_stats = stats
+        with self._lock:
+            req = self._avg_request
+        if req is not None:
+            try:
+                req.add(plane)
+            except Exception as exc:
+                req.fail(f"accumulate error: {exc}")
+            if req.done.is_set():
+                with self._lock:
+                    if self._avg_request is req:
+                        self._avg_request = None
+
+    def get_raw_clip_level(self) -> int:
+        return int(self._clip_level)
+
+    def get_raw_frame_stats(self) -> "dict | None":
+        """Latest raw-frame statistics snapshot (lock copy), or None."""
+        with self._lock:
+            st = self._raw_stats
+        if st is None:
+            return None
+        out = dict(st)
+        hist = out.get("hist")
+        if hist is not None:
+            try:
+                out["hist"] = hist.copy()
+            except Exception:
+                out["hist"] = list(hist)
+        return out
+
+    def capture_raw_average(self, n: int, timeout_s: float = 10.0):
+        """Per-pixel uint16 mean of ``n`` consecutive NEW raw frames.
+
+        BLOCKING — worker threads only. Same contract as
+        AndorBackend.capture_raw_average (one shared RawAverageRequest
+        implementation); returns None on closed camera / timeout / a
+        concurrent request / a stream stop mid-capture.
+        """
+        if not _NP_AVAILABLE:
+            return None
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return None
+        if n < 1 or not self.isOpened():
+            return None
+        req = RawAverageRequest(n)
+        with self._lock:
+            if self._avg_request is not None:
+                return None
+            self._avg_request = req
+        try:
+            if not req.done.wait(timeout=max(0.1, float(timeout_s))):
+                req.fail("timeout")
+                logger.info("TUCam capture_raw_average(%d) timed out", n)
+                return None
+            if req.error:
+                logger.info("TUCam capture_raw_average(%d): %s", n, req.error)
+            return req.result()
+        finally:
+            with self._lock:
+                if self._avg_request is req:
+                    self._avg_request = None
+
+    def _fail_pending_average(self, reason: str):
+        with self._lock:
+            req = self._avg_request
+            self._avg_request = None
+        if req is not None:
+            req.fail(reason)
 
     # ── mono16 → 8-bit display scaling (shared with the Andor path) ──
     def get_display_auto_scale(self) -> bool:
@@ -1306,6 +1458,9 @@ class TUCamBackend:
             "andor_auto_scale": self.get_display_auto_scale(),
             "andor_scale_lo": lo,
             "andor_scale_hi": hi,
+            # v7.13 — true full-scale for the current readout depth (from the
+            # frame's own ucDepth), for the raw histogram / saturation badge.
+            "raw_clip_level": self.get_raw_clip_level(),
         }
 
     # ── Diagnostics ───────────────────────────────────────────────

@@ -43,6 +43,13 @@ config/hardware/camera_calibrations.json
 config/hardware/fluorescence_mosaics.json
 config/hardware/last_calibration.json
 config/hardware/microscope.json
+# LabLink node config — per-machine AND it holds a bearer site token. The
+# older vendored lablink_connect.py shipped a live token to GitHub because
+# this line was not written at the same time as the code that needed it.
+config/hardware/lablink.json
+config/hardware/lablink_results.json
+config/hardware/lablink_results/
+config/hardware/lablink_outbox/
 config/hardware/mosaic_alignment.json
 config/hardware/objectives.json
 config/hardware/plate_mosaics.json
@@ -89,3 +96,17 @@ docs/videos/*/.hyperframes/
 # physical unit (named with its serial) into the config path we hand it; that is
 # machine-local state for one specific camera, not something another rig wants.
 config/hardware/tucsen/
+
+# v7.14 operator captures (📷 / ⏺ buttons on every live feed): full-resolution
+# 16-bit TIFFs and video are large experiment data, not source. This is only
+# the DEFAULT destination — the capture settings dialog can point anywhere.
+captures/
+
+# v7.16 .nd3 exports written by the end-to-end checks in logs/nd3/. The rest of
+# logs/ is covered by `logs/*.log` above, which does not match these — a 16 MB
+# HDF5 container of one plate's imagery is experiment output, not source.
+logs/nd3/
+
+# Scratch directory a test run moved stray plate documents into. Debris, not a
+# fixture: the plate-document tests build what they need in a tmpdir.
+.trash-testdebris/

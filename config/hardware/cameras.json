@@ -14,6 +14,25 @@
       "interface": "USB 3.0",
       "notes": "10MP CMOS, 1/2.3 inch sensor, VID_0547 PID_1377"
     },
+    "TUCSEN-LIBRA-25": {
+      "name": "Tucsen Libra 25 (TUCam)",
+      "sensor_pixel_size_um": null,
+      "max_resolution": [5200, 4096],
+      "preview_resolutions": [
+        [2600, 2048],
+        [5200, 4096]
+      ],
+      "interface": "USB 3.0",
+      "notes": "Hardware-verified on this rig: USB\\VID_5453&PID_E437, driver TUUSB3, mono 16-bit. Capability 0 RESOLUTION = [0 = 5200x4096 'Resolution', 1 = 2600x2048 'Sensitive']; 'Sensitive' is 2x2 binning, so it does NOT change the field of view. 2600x2048 is listed FIRST because that is what the preview auto-selects. sensor_pixel_size_um is null ON PURPOSE: the pitch is not published in anything verifiable here, and a guessed value would show as a plausible 'theoretical um/px' that a real calibration is then judged against. Measure it with Mosaic & Camera Calibration; see gui/widgets/tucam_backend.py."
+    },
+    "TUCSEN-GENERIC": {
+      "name": "Tucsen (TUCam, other model)",
+      "sensor_pixel_size_um": null,
+      "max_resolution": [4096, 3000],
+      "preview_resolutions": [],
+      "interface": "USB 3.0",
+      "notes": "Fallback entry for any other Tucsen body on the TUCam SDK (Dhyana / Aries / FL). Resolutions are read from the camera at start, so leaving preview_resolutions empty is correct — the device reports its own. Pitch unknown; measure um/px."
+    },
     "ZYLA-4.2P": {
       "name": "Andor Zyla 4.2P (USB3)",
       "sensor_pixel_size_um": 6.5,

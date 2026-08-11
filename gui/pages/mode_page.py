@@ -74,6 +74,7 @@ class ModePage(QWidget):
         super().__init__(parent)
 
         self._sub_pages: list[QWidget] = []
+        self._sub_titles: list[str] = []
         self._sub_buttons: list[QToolButton] = []
         self._active_index: int = 0
         self._context_widgets: list[QWidget | None] = []
@@ -196,6 +197,10 @@ class ModePage(QWidget):
         """
         index = len(self._sub_pages)
         self._sub_pages.append(widget)
+        # Keep the label alongside the page so subclasses can name the active
+        # sub-page without maintaining a parallel list that silently drifts out
+        # of order every time a tab is inserted (see sub_page_title()).
+        self._sub_titles.append(title)
         self._sub_stack.addWidget(widget)
 
         ctx = None
@@ -248,6 +253,29 @@ class ModePage(QWidget):
             if hasattr(self, "_embedded_ctx_stack"):
                 self._embedded_ctx_stack.setCurrentIndex(0)
                 self._refresh_embedded_ctx_visibility()
+
+    def sub_page_title(self, index: int | None = None) -> str:
+        """Label of sub-page *index* (default: the active one), or "".
+
+        Reads the title recorded by :meth:`add_sub_page`, so it can never
+        disagree with the tab the user is actually looking at.
+        """
+        if index is None:
+            index = self.get_active_index()
+        if 0 <= index < len(self._sub_titles):
+            return self._sub_titles[index]
+        return ""
+
+    def sub_page_index(self, title: str) -> int:
+        """Index of the sub-page labelled *title*, or -1.
+
+        Prefer this to a hardcoded index when deep-linking: tab order changes,
+        and a stale integer silently lands the operator on the wrong page.
+        """
+        try:
+            return self._sub_titles.index(title)
+        except ValueError:
+            return -1
 
     def _refresh_sub_nav_visibility(self) -> None:
         """Show the sub-nav column iff the active sub-page contributed

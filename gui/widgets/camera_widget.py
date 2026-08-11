@@ -42,6 +42,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QObject
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 
 from gui.scaling import s, scaled_font_size
+from SupportClasses.CameraCrop import CameraCrop
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +298,15 @@ class CameraWidget(QWidget):
         # is NOT mirrored, and downstream code needs no further mirror handling.
         self._mirrored = False
 
+        # v7.16: centred crop, applied at the frame SOURCE (all three egress
+        # points below) so every surface — live view, mosaic, still capture,
+        # video recording, detection — sees the same pixels. Default: no crop.
+        self._crop = CameraCrop()
+        # Last PRE-crop frame size (w, h), or None until a frame arrives. This
+        # is the CAPTURE size: µm/px rescaling is only valid between capture
+        # resolutions, so it must never be read off a cropped frame.
+        self._capture_size: tuple[int, int] | None = None
+
         # v7.3.0: Thread-safe frame buffer for detection workers
         self._current_frame = None        # Latest BGR numpy array (or None)
         self._frame_lock = threading.Lock()
@@ -306,6 +316,11 @@ class CameraWidget(QWidget):
         # backlog so the captured frame is post-move — without touching the
         # camera backend itself (which only the grab timer reads).
         self._frame_seq = 0
+        # v7.14: the backend's own acquisition count as of the last grab, so
+        # _grab_frame can tell a NEW sensor frame from a repeat of the cached
+        # one. None on backends that cannot report it (OpenCV / simulated,
+        # where every read() is genuinely new anyway).
+        self._frame_src_seq = None
 
         # v7.4.4: Edge-pick mode (Needle Location workflow)
         self._edge_pick_mode = False
@@ -982,6 +997,44 @@ class CameraWidget(QWidget):
     def mirrored(self) -> bool:
         return bool(getattr(self, "_mirrored", False))
 
+    # ── v7.16: centred crop (applied at the frame source) ─────────
+
+    def set_crop(self, crop) -> None:
+        """Set the centred crop applied to EVERY frame this widget delivers.
+
+        Unlike ``set_mirrored`` (a flag consumers apply themselves), this one
+        really does change the pixels — at the source, so the live view, the
+        mosaic tiles, still captures, video recording, detection and the
+        click→stage map all see one consistent frame size. See
+        :mod:`SupportClasses.CameraCrop` for why it belongs here.
+        """
+        self._crop = CameraCrop.from_dict(crop) if not isinstance(
+            crop, CameraCrop) else crop
+
+    def crop(self) -> CameraCrop:
+        return getattr(self, "_crop", None) or CameraCrop()
+
+    def capture_size(self) -> "tuple[int, int] | None":
+        """Last PRE-crop frame size ``(w, h)``, or None if none seen yet.
+
+        This is what a µm/px calibration must be stamped with and rescaled
+        against: cropping removes pixels without changing what a pixel spans,
+        so comparing DELIVERED widths across a crop change would rescale µm/px
+        by the crop fraction — a wrong scale that looks entirely plausible.
+        """
+        return getattr(self, "_capture_size", None)
+
+    def _apply_crop(self, frame):
+        """Crop one frame and record its pre-crop size. The single place the
+        crop is applied, shared by all three frame egress points."""
+        if frame is None:
+            return None
+        shape = getattr(frame, "shape", None)
+        if shape and len(shape) >= 2:
+            self._capture_size = (int(shape[1]), int(shape[0]))
+        crop = getattr(self, "_crop", None)
+        return crop.apply(frame) if crop is not None else frame
+
     def image_correction(self) -> dict:
         """Snapshot of the current correction as a plain dict (for persistence)."""
         return {
@@ -1053,6 +1106,20 @@ class CameraWidget(QWidget):
                 "andor_scale_lo": {"range": an.get_display_level_range()},
                 "andor_scale_hi": {"range": an.get_display_level_range()},
             }
+            # v7.13 — sensor-quality features (cooling / readout rate / gain
+            # mode / noise + blemish filters). Only features the OPEN camera
+            # actually probed appear, so the dialog auto-hides the rest; enum
+            # combos are populated from the camera's own runtime values.
+            try:
+                for key, spec in an.sensor_feature_specs().items():
+                    caps["controls"][key] = {"range": None,
+                                             "kind": spec.get("kind"),
+                                             "values": spec.get("values")}
+            except Exception:
+                pass
+            # Raw 16-bit frame statistics (histogram / saturation) available?
+            if hasattr(an, "get_raw_frame_stats"):
+                caps["controls"]["andor_raw_stats"] = {"range": None}
         elif backend == "tucam" and getattr(self, "_tucam", None) is not None:
             tu = self._tucam
             caps.update(source="tucam", controllable=True, resolution=True,
@@ -1081,6 +1148,11 @@ class CameraWidget(QWidget):
             ctrls["andor_auto_scale"] = {"range": None}
             ctrls["andor_scale_lo"] = {"range": lvl}
             ctrls["andor_scale_hi"] = {"range": lvl}
+            # v7.13 — raw 16-bit statistics (histogram / saturation): the
+            # Tucsen gets the same treatment as the Zyla; the key gates the
+            # dialog's Signal section and the live-feed SATURATED badge.
+            if hasattr(tu, "get_raw_frame_stats"):
+                ctrls["andor_raw_stats"] = {"range": None}
             caps["controls"] = ctrls
         elif backend == "opencv" and self._capture is not None:
             caps.update(source="opencv", controllable=True, resolution=True,
@@ -1263,6 +1335,61 @@ class CameraWidget(QWidget):
         be = self._mono_display_backend()
         return be.put_display_white(counts) if be is not None else False
 
+    def set_hw_andor_feature(self, key: str, value) -> bool:
+        """v7.13 — set a probed Andor sensor-quality feature by settings key.
+
+        Andor-only today (the sensor feature table lives on that backend);
+        the seam mirrors _mono_display_backend so a future Tucsen adoption
+        widens one resolver, not five call sites.
+        """
+        backend = getattr(self, "_backend_type", "")
+        be = getattr(self, "_andor", None) if backend == "andor" else None
+        if be is None or not hasattr(be, "set_sensor_feature"):
+            return False
+        return bool(be.set_sensor_feature(key, value))
+
+    def reset_andor_sensor_defaults(self) -> bool:
+        """v7.13 — re-apply the backend's low-noise sensor defaults (live)."""
+        backend = getattr(self, "_backend_type", "")
+        be = getattr(self, "_andor", None) if backend == "andor" else None
+        if be is None or not hasattr(be, "apply_sensor_defaults"):
+            return False
+        return bool(be.apply_sensor_defaults())
+
+    def get_raw_frame_stats(self):
+        """v7.13 — latest raw 16-bit frame statistics from a mono backend.
+
+        Lock-snapshot read (no SDK call) — safe from GUI timers. None for
+        backends without raw retention (OpenCV / simulated / stopped).
+        """
+        be = self._mono_display_backend()
+        if be is None or not hasattr(be, "get_raw_frame_stats"):
+            return None
+        try:
+            return be.get_raw_frame_stats()
+        except Exception:
+            return None
+
+    def capture_raw_average(self, n: int, timeout_s: float = 10.0):
+        """v7.13 — blocking averaged raw capture (worker threads ONLY).
+
+        Returns a uint16 2-D mean of n consecutive new frames, or None when
+        the backend can't do it (see AndorBackend.capture_raw_average).
+
+        v7.16: cropped like every other frame this widget delivers. This is the
+        THIRD egress point — it reads the raw sensor buffer straight from the
+        backend — and leaving it out would make a raw still the one image in
+        the app that still showed the vignetted edges.
+        """
+        be = self._mono_display_backend()
+        if be is None or not hasattr(be, "capture_raw_average"):
+            return None
+        try:
+            return self._apply_crop(be.capture_raw_average(n, timeout_s=timeout_s))
+        except Exception as exc:
+            logger.debug(f"{self._camera_label}: capture_raw_average failed: {exc}")
+            return None
+
     def set_capture_resolution(self, width: int, height: int):
         """Reconfigure the *device* capture resolution. Returns actual (w,h).
 
@@ -1355,20 +1482,58 @@ class CameraWidget(QWidget):
         backend = getattr(self, '_backend_type', 'opencv')
         sdk_attr = {'toupcam': '_toupcam', 'andor': '_andor',
                     'tucam': '_tucam'}.get(backend)
-        if sdk_attr:
-            sdk = getattr(self, sdk_attr, None)
-            if sdk is None or not sdk.isOpened():
-                self.stop()
-                return
-            ret, frame = sdk.read()
-        else:
-            if not self._capture or not self._capture.isOpened():
-                self.stop()
-                return
-            ret, frame = self._capture.read()
+        try:
+            if sdk_attr:
+                sdk = getattr(self, sdk_attr, None)
+                if sdk is None or not sdk.isOpened():
+                    self.stop()
+                    return
+                ret, frame = sdk.read()
+                # v7.14: ask the backend how many DISTINCT frames the sensor
+                # has delivered, so _frame_seq below can tell a new frame from
+                # a repeat of the cached one. None => backend cannot report.
+                try:
+                    getter = getattr(sdk, "frames_acquired", None)
+                    src_seq = int(getter()) if callable(getter) else None
+                except Exception:
+                    src_seq = None
+            else:
+                if not self._capture or not self._capture.isOpened():
+                    self.stop()
+                    return
+                ret, frame = self._capture.read()
+                # OpenCV / SimulatedCamera: read() advances the driver FIFO or
+                # generates on demand, so every successful read IS a new frame
+                # and no separate accounting is needed.
+                src_seq = None
+        except Exception as exc:
+            # A camera can open successfully and still be unable to deliver a
+            # frame — an idle OBS Virtual Camera, or any device unplugged
+            # mid-stream. OpenCV then raises out of this slot on EVERY timer
+            # tick: the console fills with identical tracebacks, the feed never
+            # recovers, and the wasted work is continuous (observed at ~7
+            # minutes of CPU in one session). isOpened() does not catch it,
+            # because the capture still reports itself open.
+            #
+            # Stop this feed instead. One clear line, and the label reads
+            # "stopped" so the operator can see which camera died rather than
+            # hunting a scrolling traceback.
+            logger.error("%s: frame read failed (%s backend) — stopping this "
+                         "feed: %s", self._camera_label, backend, exc)
+            self.stop()
+            self.video_label.setText(
+                f"{self._camera_label} — read failed, feed stopped")
+            return
 
         if not ret or frame is None:
             return
+
+        # v7.16: crop FIRST — before the raw cache and before the display
+        # conversion — so the cached frame (detection / mosaic / calibration),
+        # the emitted QImage (live view / video recording) and the on-screen
+        # pixmap are all the same pixels. Cropping later, per consumer, is how
+        # four surfaces end up disagreeing about how big a frame is.
+        frame = self._apply_crop(frame)
 
         # Import numpy/cv2 for processing
         try:
@@ -1381,9 +1546,31 @@ class CameraWidget(QWidget):
         # Frames are kept RAW — orientation (mirror + rotation) is applied per
         # consumer (display / click-mapping / mosaic), so the mosaic can re-blend
         # against a changing orientation. See set_mirrored.
+        # v7.14: advance _frame_seq ONLY when the sensor actually delivered a
+        # new frame.
+        #
+        # This timer runs at a fixed 15 fps regardless of how fast the camera
+        # is, and the SDK backends' read() is non-blocking — it returns the
+        # SAME cached frame as often as it is asked. So the old unconditional
+        # increment counted timer ticks, not frames. While the camera outran
+        # the timer that was harmless; at 2048x2048 with a 200 ms exposure the
+        # Zyla delivers ~5 fps, so a mosaic worker waiting for "3 fresh frames"
+        # was satisfied in ~3 ticks (200 ms) having seen ZERO new frames — and
+        # stitched the frame exposed DURING the stage move. That is the
+        # full-resolution blur.
+        #
+        # The gate lives HERE, not in frame_count_value(), so the counter and
+        # _current_frame stay paired: reading the backend's counter directly
+        # would let it advance while this timer is stopped (a hidden page),
+        # and a worker would then be told "new frame" while _current_frame
+        # still held the old one.
         with self._frame_lock:
+            advanced = (src_seq is None or self._frame_src_seq is None
+                        or src_seq != self._frame_src_seq)
+            self._frame_src_seq = src_seq
             self._current_frame = frame.copy()
-            self._frame_seq += 1
+            if advanced:
+                self._frame_seq += 1
 
         # Convert BGR -> RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1423,13 +1610,30 @@ class CameraWidget(QWidget):
 
 
     def _draw_crosshair(self, pixmap: QPixmap):
-        """Draw a crosshair overlay on the pixmap."""
+        """Draw a crosshair overlay on the pixmap.
+
+        v7.16: the crosshair marks where the STAGE is pointing, which is the
+        middle of the frame only while the crop is centred. Once the crop is
+        moved off-centre that point shifts, and a crosshair left at the
+        geometric middle would aim the operator at somewhere the stage is not.
+        """
         painter = QPainter(pixmap)
         pen = QPen(QColor("#f38ba8"), 1, Qt.PenStyle.DashLine)
         painter.setPen(pen)
 
         cx = pixmap.width() // 2
         cy = pixmap.height() // 2
+        crop = getattr(self, "_crop", None)
+        cap = getattr(self, "_capture_size", None)
+        if crop is not None and crop.enabled and cap:
+            try:
+                rx, ry = crop.reference_pixel(cap[0], cap[1])
+                cw, ch = crop.size_for(cap[0], cap[1])
+                if cw > 0 and ch > 0:
+                    cx = int(round(rx * pixmap.width() / cw))
+                    cy = int(round(ry * pixmap.height() / ch))
+            except Exception:
+                pass
 
         # Horizontal line
         painter.drawLine(0, cy, pixmap.width(), cy)
@@ -1506,15 +1710,38 @@ class CameraWidget(QWidget):
             return None
 
     def frame_count_value(self) -> int:
-        """v7.5.x: monotonic count of frames grabbed by the display timer.
+        """Monotonic count of DISTINCT camera frames in the display buffer.
 
         Thread-safe. A worker thread can sample this before/after a stage move
-        and wait for it to advance by N to guarantee N fresh frames have been
-        grabbed (draining any buffered backlog) before reading
-        ``get_current_frame()``.
+        and wait for it to advance by N to guarantee N genuinely-new frames
+        have arrived before reading ``get_current_frame()``.
+
+        v7.14: this now counts SENSOR frames, not display-timer ticks. It
+        previously incremented on every tick, so on a camera slower than the
+        15 fps timer (full resolution, or any long exposure) it advanced
+        without a single new frame having been delivered — see ``_grab_frame``.
         """
         with self._frame_lock:
             return self._frame_seq
+
+    def frames_acquired(self) -> "int | None":
+        """The BACKEND's own acquisition count, or None if it cannot report.
+
+        Diagnostic. Prefer ``frame_count_value()`` for post-move waits: this
+        one advances even while the display timer is stopped, so it is not
+        paired with what ``get_current_frame()`` would return.
+        """
+        backend = getattr(self, '_backend_type', 'opencv')
+        sdk_attr = {'toupcam': '_toupcam', 'andor': '_andor',
+                    'tucam': '_tucam'}.get(backend)
+        if not sdk_attr:
+            return None
+        try:
+            sdk = getattr(self, sdk_attr, None)
+            getter = getattr(sdk, "frames_acquired", None)
+            return int(getter()) if callable(getter) else None
+        except Exception:
+            return None
 
     def capture_fresh_frame(self, discard_n_frames: int = 0,
                             settle_ms: int = 0):
@@ -1556,6 +1783,16 @@ class CameraWidget(QWidget):
                 if an is None or not an.isOpened():
                     return None
                 ret, frame = an.read()
+            elif backend == 'tucam':
+                # v7.14 — the Tucsen branch was MISSING: this fell through to
+                # ``self._capture``, which is None on a tucam slot, so
+                # capture_fresh_frame returned None on the Libra and every
+                # caller (mosaic tiles, calibration grabs, the capture button)
+                # silently got nothing.
+                tu = getattr(self, '_tucam', None)
+                if tu is None or not tu.isOpened():
+                    return None
+                ret, frame = tu.read()
             else:
                 if not self._capture or not self._capture.isOpened():
                     return None
@@ -1576,10 +1813,13 @@ class CameraWidget(QWidget):
             if backend in ('toupcam', 'andor'):
                 time.sleep(0.02)
 
+        # v7.16: this path reads the backend DIRECTLY, bypassing _grab_frame, so
+        # it must crop for itself — otherwise a mosaic tile (which comes through
+        # here) would be full-frame while the live view beside it is cropped.
         final = _read_once()
         if final is not None:
-            return final.copy()
-        return last.copy() if last is not None else None
+            return self._apply_crop(final).copy()
+        return self._apply_crop(last).copy() if last is not None else None
 
     # ── Snapshot ──────────────────────────────────────────────────
 

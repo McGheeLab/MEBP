@@ -243,5 +243,47 @@ class TestSanityOfTheHygieneCheckItself(unittest.TestCase):
                       [p.name for p in files])
 
 
+class TestPlateStoreIsolation(unittest.TestCase):
+    """A test that builds a real page must not write to the live library.
+
+    ``HardwareSetupPage`` constructs its own ``PlateDocumentStore`` from
+    ``MEBP_PLATES_DIR``, so a test that creates a plate *through the page*
+    lands it in ``config/hardware/plates/v2`` — the operator's own library.
+    Nine junk plates ("Wired plate", "Bench plate", "Restored plate"…)
+    accumulated there and showed up as cards on their Plate tab before this
+    guard existed. Injecting a store into the page is not enough; the env var
+    is what the page reads.
+    """
+
+    #: Files that build the page but genuinely never create a document.
+    _EXEMPT: set[str] = set()
+
+    def test_pages_that_create_plates_redirect_the_store(self):
+        offenders = []
+        for path in _test_files():
+            if path.name in self._EXEMPT:
+                continue
+            src = path.read_text(encoding="utf-8", errors="replace")
+            if "HardwareSetupPage(" not in src:
+                continue
+            creates = (".create(" in src or ".duplicate(" in src)
+            if creates and "MEBP_PLATES_DIR" not in src:
+                offenders.append(path.name)
+        self.assertEqual(
+            [], offenders,
+            "these build a HardwareSetupPage and create plates without "
+            "setting MEBP_PLATES_DIR, so they write into the operator's "
+            "real plate library")
+
+    def test_the_check_can_actually_fail(self):
+        """A guard that cannot fire is not a guard."""
+        bad = ("from gui.pages.hardware_setup import HardwareSetupPage\n"
+               "page = HardwareSetupPage()\n"
+               "page._plate_workspace.plate_store().create('X')\n")
+        self.assertIn("HardwareSetupPage(", bad)
+        self.assertIn(".create(", bad)
+        self.assertNotIn("MEBP_PLATES_DIR", bad)
+
+
 if __name__ == "__main__":
     unittest.main()

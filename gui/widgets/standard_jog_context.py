@@ -496,11 +496,20 @@ class StandardJogContextPanel(QWidget):
         plate_text = "—"
         if self._plate is not None:
             try:
-                wells = self._plate.rows * self._plate.cols
+                # v7.12: count the wells that exist rather than multiplying
+                # rows × cols — on a parametric plate those are a pseudo-grid
+                # (this 12-well plate reported "15-well · 0.00 mm Ø"). Mixed
+                # diameters print as a range, matching print_workspace.
+                all_wells = self._plate.get_all_wells()
+                diameters = [self._plate.well_diameter_of(w.name)
+                             for w in all_wells]
+                lo, hi = min(diameters), max(diameters)
+                dia = (f"{lo:.2f}" if abs(hi - lo) < 1e-6
+                       else f"{lo:.2f}–{hi:.2f}")
                 plate_text = (
-                    f"{wells}-well · {self._plate.well_diameter:.2f} mm Ø · "
+                    f"{len(all_wells)}-well · {dia} mm Ø · "
                     f"depth {self._plate.well_depth_mm:.1f} mm")
-            except AttributeError:
+            except (AttributeError, ValueError):
                 plate_text = "Configured"
         self._lbl_info_plate.setText(plate_text)
 
