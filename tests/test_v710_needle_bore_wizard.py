@@ -311,24 +311,150 @@ class TestGates(_Base):
         self.assertFalse(ok)
         self.assertIn("µm/px", why)
 
-    def test_missing_plate_bottom_is_refused(self):
-        w = self._wizard(plate_bottom=None)
-        ok, why = w.gate(STEP_BORES)
-        self.assertFalse(ok)
-        self.assertIn("Plate Bottom Z", why)
-
-    def test_missing_safe_z_is_refused(self):
-        w = self._wizard(safe_z=None)
-        ok, why = w.gate(STEP_BORES)
-        self.assertFalse(ok)
-        self.assertIn("Safe", why)
-
     def test_a_SINGLE_bore_needle_is_NOT_refused(self):
         """The v7.9 group hid itself for a single bore. The wizard must not:
         that needle still needs its offset from the microscope centre."""
         w = self._wizard(needle=_single())
         ok, why = w.gate(STEP_BORES)
         self.assertTrue(ok, why)
+
+
+class TestMeasuringNeedsNoMotionPrerequisites(_Base):
+    """The bore offsets are differences between clicks in ONE camera frame, so
+    the measurement gate must ask ONLY for what turns a click into a distance.
+
+    The reference heights and the saved needle location exist for the optional
+    park *travel*; requiring them to MEASURE made an un-taught height block a
+    procedure that never moves the stage.
+    """
+
+    def test_missing_plate_bottom_does_not_block_measuring(self):
+        w = self._wizard(plate_bottom=None)
+        ok, why = w.gate(STEP_BORES)
+        self.assertTrue(ok, why)
+
+    def test_missing_safe_z_does_not_block_measuring(self):
+        w = self._wizard(safe_z=None)
+        ok, why = w.gate(STEP_BORES)
+        self.assertTrue(ok, why)
+
+    def test_no_saved_needle_location_does_not_block_measuring(self):
+        w = self._wizard()
+        w._host._needle_loc_xy_um = None
+        ok, why = w.gate(STEP_BORES)
+        self.assertTrue(ok, why)
+
+    def test_a_session_starts_and_clicks_land_with_no_reference_heights(self):
+        """End to end: the whole point of the change. No plate bottom, no safe
+        Z, no saved needle location — the offsets still measure, with no motion."""
+        w = self._wizard(plate_bottom=None, safe_z=None)
+        w._host._needle_loc_xy_um = None
+        w.go_to_step(STEP_BORES)
+        w._mic_feed = _View()
+        w._on_start_session()
+        self.assertIsNotNone(w._meas, "the session must arm")
+        w.on_view_clicked(960, 540)
+        w.on_view_clicked(960 + 640, 540)
+        self.assertAlmostEqual(w._meas.offset_for(1)[0], 320.0, places=6)
+        self.assertEqual(self.nav, [], "measuring commands no travel")
+        self.assertEqual(self.ctrl.z_moves, [], "measuring commands no Z move")
+
+    def test_the_still_needed_prerequisites_are_kept(self):
+        """Relaxing the gate must not drop what a click genuinely needs."""
+        for kwargs, expect in (({"mic_idx": None}, "Microscope role"),
+                               ({"mgr": _Mgr(calibrated=False)}, "µm/px"),
+                               ({"ctrl": _Ctrl(xy=False)}, "XY stage")):
+            with self.subTest(**kwargs):
+                ok, why = self._wizard(**kwargs).gate(STEP_BORES)
+                self.assertFalse(ok)
+                self.assertIn(expect, why)
+
+    def test_touchoff_still_requires_both_reference_heights(self):
+        """Step 4 really does descend toward the glass — it keeps them."""
+        ok, why = self._wizard(plate_bottom=None).gate(STEP_TOUCHOFF)
+        self.assertFalse(ok)
+        self.assertIn("Plate Bottom Z", why)
+        ok, why = self._wizard(safe_z=None).gate(STEP_TOUCHOFF)
+        self.assertFalse(ok)
+        self.assertIn("Safe", why)
+
+
+class TestParkGate(_Base):
+    """The park is the one stage-moving action in step 3, so it keeps every
+    prerequisite the measurement shed — on its own gate."""
+
+    def test_ready_rig_may_park(self):
+        ok, why = self._wizard().park_gate()
+        self.assertTrue(ok, why)
+
+    def test_park_needs_the_plate_bottom(self):
+        ok, why = self._wizard(plate_bottom=None).park_gate()
+        self.assertFalse(ok)
+        self.assertIn("Plate Bottom Z", why)
+
+    def test_park_needs_the_safe_z(self):
+        ok, why = self._wizard(safe_z=None).park_gate()
+        self.assertFalse(ok)
+        self.assertIn("Safe", why)
+
+    def test_park_needs_a_destination(self):
+        w = self._wizard()
+        w._host._needle_loc_xy_um = None
+        ok, why = w.park_gate()
+        self.assertFalse(ok)
+        self.assertIn("needle location", why)
+
+    def test_every_park_refusal_names_the_no_motion_alternative(self):
+        """A blocked park must not read as 'step 3 is blocked'."""
+        for kwargs in ({"plate_bottom": None}, {"safe_z": None}):
+            with self.subTest(**kwargs):
+                ok, why = self._wizard(**kwargs).park_gate()
+                self.assertFalse(ok)
+                self.assertIn("Start measuring here", why)
+
+    def test_the_park_itself_refuses_without_a_safe_z(self):
+        """⚠ The park must be wired to park_gate, not the relaxed measurement
+        gate. Asserting on park_gate() alone would not catch _on_park calling
+        gate(): with no safe Z, _survey_target_zref still returns a number and
+        the destination still exists, so the travel would proceed with nothing
+        to retract to."""
+        w = self._wizard(safe_z=None)
+        w.go_to_step(STEP_BORES)
+        w._on_park()
+        self.assertEqual(self.nav, [], "no travel may be commanded")
+        self.assertIsNone(w._meas, "and no session may be armed")
+        self.assertIn("Safe", w._refusal_text or "")
+
+    def test_the_park_itself_refuses_without_a_destination(self):
+        w = self._wizard()
+        w._host._needle_loc_xy_um = None
+        w.go_to_step(STEP_BORES)
+        w._on_park()
+        self.assertEqual(self.nav, [])
+        self.assertIn("needle location", w._refusal_text or "")
+
+    def test_a_blocked_park_leaves_start_measuring_enabled(self):
+        """The button states are the operator-visible half of the split."""
+        w = self._wizard(plate_bottom=None, safe_z=None)
+        w.go_to_step(STEP_BORES)
+        self.assertFalse(w._s3_park_btn.isEnabled())
+        self.assertTrue(w._s3_start_btn.isEnabled())
+        self.assertIn("Plate Bottom Z", w._s3_park_btn.toolTip())
+
+    def test_a_blocked_measurement_disables_both(self):
+        w = self._wizard(mic_idx=None)
+        w.go_to_step(STEP_BORES)
+        self.assertFalse(w._s3_start_btn.isEnabled())
+        self.assertFalse(w._s3_park_btn.isEnabled())
+
+    def test_an_inactive_plate_floor_is_disclosed(self):
+        """Recording focus Z means jogging down by hand, and the clamp is a
+        no-op with no datum — say so instead of implying protection."""
+        w = self._wizard(plate_bottom=None)
+        w.go_to_step(STEP_BORES)
+        self.assertIn("clamp is inactive", w._status.text().replace("  ", " "))
+        self.assertEqual(self._wizard()._floor_advisory(), "",
+                         "silent once the datum exists")
 
 
 # ── safety ──────────────────────────────────────────────────────────
@@ -498,7 +624,10 @@ class TestClicking(_Base):
         self.assertAlmostEqual(w._meas.pto[0][0], 320.0, places=6)
 
     def test_start_measuring_is_refused_when_gated(self):
-        w = self._wizard(plate_bottom=None)
+        """Gated on what a CLICK needs (a µm/px-calibrated microscope), not on
+        the park's reference heights — see
+        TestMeasuringNeedsNoMotionPrerequisites."""
+        w = self._wizard(mgr=_Mgr(calibrated=False))
         w._on_start_session()
         self.assertIsNone(w._meas)
         self.assertTrue(w._refusal_text)

@@ -22,9 +22,18 @@ plate-bottom Z all keep their existing single writers on ``CalibrationPage``;
 this widget calls them through an injected host. Duplicating a datum writer is
 how two sources of truth are born.
 
-It also commands **no XY at all** after the initial park, and no Z except
-through the host's own bounded helpers — see ``_park`` and the safety notes on
-each step below.
+It also commands **no XY at all** except in the one optional park (step 3's
+"Go to needle at survey height"), and no Z except through the host's own bounded
+helpers — see ``_on_park`` and the safety notes on each step below.
+
+⚠ THE BORE OFFSETS ARE A ZERO-MOTION MEASUREMENT. They are differences between
+clicks in ONE camera frame, so the stage position cancels exactly and *where*
+the needle sits is irrelevant — only that it does not move between clicks (the
+drift guard). The park is therefore convenience, never calibration: put the
+needle wherever the bores are visible, by any means, and press "Start measuring
+here". Its gate (:meth:`park_gate`) is deliberately separate from the
+measurement's (:meth:`gate`) so an un-taught reference height cannot block a
+procedure that never moves the stage.
 
 Layout (v7.13): the wizard renders as a compact CONTROL COLUMN — step strip,
 Back/Next, one instruction line, one status line, stacked step pages. The
@@ -884,11 +893,27 @@ class NeedleBoreWizard(QWidget):
 
         # The offsets are relative to the CAMERA field of view: with the stage
         # still, each bore's click IS its position in the frame, and the
-        # differences are the offsets — no stage move is part of the
-        # measurement. Getting into position is convenience, not calibration:
-        # the park button drives there, or the operator jogs by hand.
+        # differences are the offsets — NO stage move is part of the
+        # measurement. So 'Start measuring here' is the primary action: put the
+        # needle wherever the bores are visible, by any means (hand jog, Xbox,
+        # a previous operation), and click them. The park below is pure
+        # convenience for a rig whose needle location is already taught.
+        start_row = QHBoxLayout()
+        self._s3_start_btn = QPushButton("Start measuring here")
+        self._s3_start_btn.setObjectName("successBtn")
+        self._s3_start_btn.setToolTip(
+            "Begin a measurement session at the CURRENT stage position — no "
+            "stage motion is commanded. Put the needle wherever you like; all "
+            "that matters is that every bore is visible in one frame and the "
+            "stage does not move until the offsets are saved.")
+        self._s3_start_btn.clicked.connect(self._on_start_session)
+        start_row.addWidget(self._s3_start_btn)
+        start_row.addStretch()
+        lay.addLayout(start_row)
+
         park = QHBoxLayout()
-        park.addWidget(QLabel("Survey height:"))
+        park.addWidget(QLabel("Optional park —"))
+        park.addWidget(QLabel("survey height:"))
         self._s3_clearance = QDoubleSpinBox()
         self._s3_clearance.setRange(MIN_SURVEY_CLEARANCE_MM, 10.0)
         self._s3_clearance.setSingleStep(0.05)
@@ -896,26 +921,19 @@ class NeedleBoreWizard(QWidget):
         self._s3_clearance.setSuffix(" mm")
         self._s3_clearance.setValue(DEFAULT_SURVEY_CLEARANCE_MM)
         self._s3_clearance.setToolTip(
-            "Height above the plate bottom for the park. The bores are "
-            "measured here, not at the glass: only DIFFERENCES matter, and "
+            "Height above the plate bottom for the optional park. The bores "
+            "are measured here, not at the glass: only DIFFERENCES matter, and "
             "the longest bore reaches lower by exactly the amount being "
             "measured, which is unknown until afterwards.")
         park.addWidget(self._s3_clearance)
         self._s3_park_btn = QPushButton("Go to needle at survey height")
         self._s3_park_btn.setToolTip(
-            "Safe-travel to the saved needle location at the survey height "
-            "(retract → XY → lower) and start a measurement session. Or jog "
-            "there yourself and press 'Start measuring'.")
+            "Convenience only: safe-travel to the SAVED needle location at the "
+            "survey height (retract → XY → lower), then start a session. This "
+            "is the one part of step 3 that moves the stage — you never have to "
+            "use it.")
         self._s3_park_btn.clicked.connect(self._on_park)
         park.addWidget(self._s3_park_btn)
-        self._s3_start_btn = QPushButton("Start measuring")
-        self._s3_start_btn.setToolTip(
-            "Begin a measurement session at the CURRENT stage position — for "
-            "when you have jogged the bores into the microscope view "
-            "yourself. All bores must be visible in one frame, and the stage "
-            "must not move until the offsets are saved.")
-        self._s3_start_btn.clicked.connect(self._on_start_session)
-        park.addWidget(self._s3_start_btn)
         park.addStretch()
         lay.addLayout(park)
 
@@ -1282,7 +1300,18 @@ class NeedleBoreWizard(QWidget):
     # ── gates ────────────────────────────────────────────────────
 
     def gate(self, step: str) -> tuple:
-        """``(ok, why_not)`` for the step's stage-moving action."""
+        """``(ok, why_not)`` for the step's own action.
+
+        ⚠ For step 3 this is the gate on a MEASUREMENT, which commands no
+        motion at all — so it asks only for what turns a click into a distance:
+        a µm/px-calibrated microscope, a configured needle, and a readable stage
+        position (the drift guard). It deliberately does NOT require the plate
+        bottom or the safe Z. Those are needed only by the optional park
+        *travel*, and are gated separately by :meth:`park_gate`; requiring them
+        here made an un-taught reference height block a procedure that never
+        moves the stage, forcing the operator through step 2 to click two dots
+        in one camera frame.
+        """
         ctrl = self._ctrl()
         if step == STEP_NEEDLE_ZERO:
             if ctrl is None or not ctrl.is_xy_connected:
@@ -1294,8 +1323,8 @@ class NeedleBoreWizard(QWidget):
             if not BORE_STORE_AVAILABLE:
                 return False, "The bore-offset calibration store is unavailable."
             if ctrl is None or not ctrl.is_xy_connected:
-                return False, ("Connect the XY stage — the park and the offsets "
-                               "are read from the stage position.")
+                return False, ("Connect the XY stage — the offsets are "
+                               "referenced to the stage position.")
             if self._needle() is None:
                 return False, ("No needle is configured. Set it on Hardware "
                                "Setup → Needle first.")
@@ -1308,12 +1337,45 @@ class NeedleBoreWizard(QWidget):
                 return False, ("The microscope camera is not µm/px-calibrated — "
                                "run 'Calibrate µm/px' for it. Without a scale a "
                                "click cannot become a distance.")
+        if step == STEP_TOUCHOFF:
+            # Step 4 genuinely descends toward the glass, so it keeps both
+            # reference heights as hard requirements.
             if getattr(self._host, "_plate_bottom_z", None) is None:
-                return False, ("Teach the Plate Bottom Z on step 2 — the park "
-                               "height is measured from it.")
+                return False, ("Teach the Plate Bottom Z on step 2 — the "
+                               "approach height is measured from it.")
             if getattr(self._host, "_safe_z", None) is None:
                 return False, ("Set the Fast Move (Safe) Z on step 2 — travel "
                                "retracts to it first.")
+        return True, ""
+
+    def park_gate(self) -> tuple:
+        """``(ok, why_not)`` for step 3's OPTIONAL park travel.
+
+        Separate from :meth:`gate` because this one moves the stage: it needs a
+        destination (the saved needle location), a height measured from the
+        plate bottom, and a safe Z to retract to first. A failure here disables
+        the park button and nothing else — the click session stays available,
+        because measuring bore offsets never required any of this.
+        """
+        ok, why = self.gate(STEP_BORES)
+        if not ok:
+            return False, why
+        if getattr(self._host, "_plate_bottom_z", None) is None:
+            return False, ("Teach the Plate Bottom Z on step 2 — the park "
+                           "height is measured from it. (Not needed to measure: "
+                           "jog the bores into view and press "
+                           "'Start measuring here'.)")
+        if getattr(self._host, "_safe_z", None) is None:
+            return False, ("Set the Fast Move (Safe) Z on step 2 — the park "
+                           "retracts to it first. (Not needed to measure: jog "
+                           "the bores into view and press 'Start measuring here'.)")
+        if not getattr(self._host, "_needle_loc_xy_um", None):
+            return False, ("No saved needle location — complete step 1, or use "
+                           "'Set current as needle center', so the park knows "
+                           "where to go. (Not needed to measure: jog the bores "
+                           "into view and press 'Start measuring here'.)")
+        if not callable(getattr(self._host, "_safe_navigate_to", None)):
+            return False, "This build cannot travel safely."
         return True, ""
 
     def step_state(self, step: str) -> str:
@@ -1695,7 +1757,13 @@ class NeedleBoreWizard(QWidget):
         return float(bottom) + sign * clearance
 
     def _on_park(self) -> None:
-        ok, why = self.gate(STEP_BORES)
+        """OPTIONAL convenience: drive to the saved needle location.
+
+        Gated by :meth:`park_gate`, not :meth:`gate` — this is the only part of
+        step 3 that moves the stage, so it is the only part that needs a
+        destination and the reference heights.
+        """
+        ok, why = self.park_gate()
         if not ok:
             self._refuse(why)
             return
@@ -1704,16 +1772,7 @@ class NeedleBoreWizard(QWidget):
             self._refuse("The plate bottom Z is not taught — step 2.")
             return
         xy = getattr(self._host, "_needle_loc_xy_um", None)
-        if not xy:
-            self._refuse(
-                "No saved needle location — complete step 1, or use 'Set "
-                "current as needle center', so the park knows where to go. "
-                "(Or jog the bores into view and press 'Start measuring'.)")
-            return
         nav = getattr(self._host, "_safe_navigate_to", None)
-        if not callable(nav):
-            self._refuse("This build cannot travel safely.")
-            return
         # safe_travel_to: retract → wait → XY → wait → lower. Never a bare
         # move_z followed by a move_xy; that is the dragged-needle failure.
         self._s3_park_btn.setEnabled(False)
@@ -1745,7 +1804,7 @@ class NeedleBoreWizard(QWidget):
         irrelevant — what matters is that it does not move between clicks. The
         session records the reference XY here; the drift readout and the click
         gate are both measured against it. Reached from the park (after
-        arriving) or directly ('Start measuring') when the operator jogged the
+        arriving) or directly ('Start measuring here') when the operator jogged the
         bores into view themselves.
         """
         ok, why = self.gate(STEP_BORES)
@@ -1804,7 +1863,7 @@ class NeedleBoreWizard(QWidget):
                 f"Click ignored — the stage has moved {drift:.0f} µm since "
                 f"the session started. The offsets are differences taken in "
                 f"ONE frame, so every click must be at the same stage "
-                f"position. Press 'Start measuring' to re-anchor and re-click "
+                f"position. Press 'Start measuring here' to re-anchor and re-click "
                 f"every bore.")
             self._update_drift_label()
             return
@@ -2877,6 +2936,7 @@ class NeedleBoreWizard(QWidget):
         self._btn_next.setEnabled(i < len(STEP_ORDER) - 1)
         self._render_step1()
         self._render_step2()
+        self._render_step3_buttons()
         self._render_bore_rows()
         self._update_drift_label()
         self._push_bore_markers()
@@ -2891,9 +2951,9 @@ class NeedleBoreWizard(QWidget):
             return ("Jog the tip to the plate TOP and capture it — the plate "
                     "bottom is derived from the typed offset below it.")
         if step == STEP_BORES:
-            return ("Bring every bore into the microscope view, start a "
-                    "session, then click each bore's tip — the offsets are "
-                    "measured in the camera frame.")
+            return ("Put the needle anywhere every bore is visible in the "
+                    "microscope, press 'Start measuring here', then click each "
+                    "bore's tip — no stage motion is needed.")
         if step == STEP_TOUCHOFF:
             return ("Find the needle tip by focus — this measures the plate "
                     "bottom and the focal-plane ↔ needle-tip offset.")
@@ -2903,11 +2963,12 @@ class NeedleBoreWizard(QWidget):
         if step == STEP_BORES:
             n = self._bore_count()
             if self._meas is None:
-                return ("Park (or jog) the bores into view, then press "
-                        "'Start measuring'. "
+                return ("Jog the bores into the microscope view — anywhere is "
+                        "fine — then press 'Start measuring here'. "
                         + ("This needle has one bore, so only the "
                            "needle↔camera offset is measured." if n <= 1 else
-                           f"{n} bores to measure."))
+                           f"{n} bores to measure.")
+                        + self._floor_advisory())
             miss_c = self._meas.missing_clicks()
             miss_z = self._meas.missing_z()
             if miss_c:
@@ -2915,12 +2976,54 @@ class NeedleBoreWizard(QWidget):
                         + ", ".join(str(k + 1) for k in miss_c) + ".")
             if miss_z:
                 return ("Jog Z and record the focus peak for bore "
-                        + ", ".join(str(k + 1) for k in miss_z) + ".")
+                        + ", ".join(str(k + 1) for k in miss_z) + "."
+                        + self._floor_advisory())
             return "All bores measured — save the offsets."
         if step == STEP_TOUCHOFF:
             return ("Focus the microscope on the plate bottom, bring the tip to "
                     "that plane, then confirm.")
         return ""
+
+    def _floor_advisory(self) -> str:
+        """Advisory (never a refusal) when the plate-bottom clamp has no datum.
+
+        Step 3 is now reachable without a taught plate bottom, which is correct —
+        clicking two dots in one frame does not need one. But recording each
+        bore's focus Z means jogging the needle DOWN by hand, and
+        ``_arm_floor(True)`` is a no-op without the datum
+        (``StageController._apply_print_floor_raw`` returns early on
+        ``_plate_bottom_z_zref is None``), so the clamp the operator may assume
+        is protecting them is not armed. Say so rather than either blocking the
+        measurement or staying silent about an inactive guard.
+        """
+        if getattr(self._host, "_plate_bottom_z", None) is not None:
+            return ""
+        return (" ⚠ Plate Bottom Z is not taught, so the plate-bottom clamp is "
+                "inactive — jog Z by hand with care, or teach it on step 2.")
+
+    def _render_step3_buttons(self) -> None:
+        """Enable/disable step 3's two buttons with the first reason as tooltip.
+
+        The two gates are independent on purpose: an un-taught reference height
+        disables only the PARK, while 'Start measuring here' stays live because
+        measuring commands no motion. Disabling-with-a-reason follows
+        ``_commit_blockers`` — the operator never has to click to find out.
+        """
+        start = getattr(self, "_s3_start_btn", None)
+        park = getattr(self, "_s3_park_btn", None)
+        if start is None or park is None:
+            return
+        ok, why = self.gate(STEP_BORES)
+        start.setEnabled(ok)
+        start.setToolTip(why if not ok else (
+            "Begin a measurement session at the CURRENT stage position — no "
+            "stage motion is commanded. Every bore must be visible in one "
+            "frame, and the stage must not move until the offsets are saved."))
+        pok, pwhy = self.park_gate()
+        park.setEnabled(pok)
+        park.setToolTip(pwhy if not pok else (
+            "Convenience only: safe-travel to the saved needle location at the "
+            "survey height, then start a session."))
 
     def _update_drift_label(self) -> None:
         """Live stage-drift readout for step 3 — cached position, so the ~3 Hz
@@ -2929,7 +3032,7 @@ class NeedleBoreWizard(QWidget):
         if lbl is None:
             return
         if self._meas is None or self._park_xy is None:
-            lbl.setText("No measurement session — press 'Start measuring' "
+            lbl.setText("No measurement session — press 'Start measuring here' "
                         "once the bores are in view.")
             lbl.setStyleSheet(f"color: {COLORS['subtext0']}; font-size: 9pt;")
             return
@@ -2948,7 +3051,7 @@ class NeedleBoreWizard(QWidget):
         elif drift > MAX_STAGE_DRIFT_UM:
             lbl.setText(
                 f"Stage drift: {drift:.1f} µm — clicks paused (limit "
-                f"{MAX_STAGE_DRIFT_UM:.0f} µm). Press 'Start measuring' to "
+                f"{MAX_STAGE_DRIFT_UM:.0f} µm). Press 'Start measuring here' to "
                 f"re-anchor and re-click every bore.")
             lbl.setStyleSheet(f"color: {COLORS['red']}; font-size: 9pt;")
         else:

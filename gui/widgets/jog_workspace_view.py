@@ -34,7 +34,7 @@ import math
 from collections import deque
 from typing import Literal
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, QSizeF, Qt, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QImage, QMouseEvent, QPainter, QPen, QPixmap,
     QTransform,
@@ -855,30 +855,58 @@ class JogWorkspaceView(QWidget):
         rect = QRectF(tl, br).normalized()
         if rect.width() < 1 or rect.height() < 1:
             return
-        # v7.5.x: scale (+180° rotate) ONCE into a cache, keyed by on-screen size
+        # v7.5.x: scale (+180° rotate) ONCE into a cache, keyed by the cache size
         # + flip + source identity. The manual-align nudge only moves rect's
         # top-left (size is shift-invariant), so panning/needle motion reuse the
-        # cache; only zoom / a new mosaic / flip change rebuild it. paintEvent
-        # then blits the pre-rendered pixmap with no per-frame scale/transform.
+        # cache; only zoom / a new mosaic / flip change rebuild it — and past the
+        # source-resolution cap below, not even zoom does, so paintEvent then
+        # blits the pre-rendered pixmap with at most a cheap clipped magnify.
         tw = max(1, int(round(rect.width())))
         th = max(1, int(round(rect.height())))
         out_rot = self.mosaic_output_rotation()
-        key = (tw, th, bool(self._flip_180), out_rot, id(self._mosaic_pixmap))
+        # Compose the plate-frame 180° display flip with the operator's
+        # whole-mosaic output rotation. Both are DISPLAY-ONLY: the stored
+        # composite and its extent are untouched, so the back-projection
+        # every consumer uses to derive well centres for MOTION is unaffected.
+        total = ((180 if self._flip_180 else 0) + int(out_rot)) % 360
+        # On-screen box the (possibly quarter-turned) image occupies: a 90/270
+        # turn transposes it, 0/180 leave it as-is. Same rule as drawing the
+        # transformed pixmap at rect.topLeft() at its own size, which is what
+        # this used to do — so the destination geometry is unchanged.
+        dest_w, dest_h = (th, tw) if total % 180 else (tw, th)
+        # ⚠ NEVER scale the cache beyond the source's OWN resolution. `rect` is
+        # the mosaic's on-screen size, so it grows with the zoom and the old
+        # unbounded scaled(tw, th) asked for a pixmap whose AREA grows as zoom²:
+        # on a full-plate mosaic at _ZOOM_MAX that is 59943x40299 = 9.7 GB, which
+        # SEGFAULTS the process (reproduced; .transformed() below would double
+        # it). Capping costs nothing — upscaling a 3000 px source to 60000 px
+        # invents no detail; the painter magnifies the capped cache into the SAME
+        # destination rect under the SmoothPixmapTransform hint paintEvent
+        # already sets, so the picture is unchanged while peak memory stays
+        # O(source) instead of O(zoom²). Below the cap (every zoom that worked
+        # before) the cache is scaled exactly as it was and drawn 1:1.
+        cw = max(1, min(tw, self._mosaic_pixmap.width()))
+        ch = max(1, min(th, self._mosaic_pixmap.height()))
+        key = (cw, ch, bool(self._flip_180), out_rot, id(self._mosaic_pixmap))
         if key != self._mosaic_cache_key or self._mosaic_scaled_cache is None:
+            # Drop the previous cache FIRST: at high zoom the old and new
+            # pixmaps are the two largest allocations in the process, and
+            # holding both doubles the peak for no reason.
+            self._mosaic_scaled_cache = None
+            self._mosaic_cache_key = None
             scaled = self._mosaic_pixmap.scaled(
-                tw, th, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            # Compose the plate-frame 180° display flip with the operator's
-            # whole-mosaic output rotation. Both are DISPLAY-ONLY: the stored
-            # composite and its extent are untouched, so the back-projection
-            # every consumer uses to derive well centres for MOTION is unaffected.
-            total = (180 if self._flip_180 else 0) + int(out_rot)
-            if total % 360:
-                scaled = scaled.transformed(QTransform().rotate(total % 360))
+                cw, ch, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            if total:
+                scaled = scaled.transformed(QTransform().rotate(total))
             self._mosaic_scaled_cache = scaled
             self._mosaic_cache_key = key
         p.save()
         p.setOpacity(self._mosaic_opacity)
-        p.drawPixmap(rect.topLeft(), self._mosaic_scaled_cache)
+        p.drawPixmap(
+            QRectF(rect.topLeft(), QSizeF(float(dest_w), float(dest_h))),
+            self._mosaic_scaled_cache,
+            QRectF(self._mosaic_scaled_cache.rect()),
+        )
         p.restore()
 
     def _paint_fluor_overlay(self, p: QPainter) -> None:
