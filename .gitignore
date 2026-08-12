@@ -26,6 +26,10 @@ xy_debug_*.csv
 # Print execution logs (keep the schema README, ignore the runs)
 logs/prints/*.jsonl
 
+# Incubator bring-up tool: local machine state + run logs
+tools/incubator/_data/
+logs/incubator/*.jsonl
+
 # IDE
 .vscode/
 .idea/

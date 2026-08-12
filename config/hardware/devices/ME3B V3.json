@@ -47,15 +47,15 @@
   },
   "steps_per_mm": {
     "Z": -5255.0,
-    "P1": 10120.0,
-    "P2": 10240.0,
+    "P1": 5125.0,
+    "P2": 5124.0,
     "P3": 5069
   },
   "per_axis_max_feedrate": {
     "Z": 500.0,
-    "P1": 200.0,
-    "P2": 200.0,
-    "P3": 200
+    "P1": 100.0,
+    "P2": 100.0,
+    "P3": 100.0
   },
   "per_axis_max_accel": {
     "Z": 1000.0,
@@ -68,15 +68,15 @@
   "xy_jerk": null,
   "z_up_sign": 1.0,
   "plate_flip_180": null,
-  "needle_cam_z": 18.46,
+  "needle_cam_z": 22.42,
   "plate_z_offsets": {
     "top": -8.16,
     "bottom": 11.65,
     "safe": -10.0
   },
   "needle_loc_xy_um": [
-    59307.0,
-    54276.0
+    57686.0,
+    53876.0
   ],
   "pump_setup": {
     "P2": {

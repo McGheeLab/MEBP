@@ -73,6 +73,9 @@
         ]
       },
       "autostart": true
+    },
+    "simulated:microscope": {
+      "autostart": true
     }
   },
   "assignments": {
