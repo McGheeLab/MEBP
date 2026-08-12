@@ -2126,6 +2126,19 @@ class StageHardwarePanel(QWidget):
         self.btn_check_alignment.clicked.connect(self._check_marlin_alignment)
         save_row.addWidget(self.btn_check_alignment)
 
+        self.btn_load_from_hardware = icon_button(
+            "Load values from hardware", "arrow-down",
+            tooltip=(
+                "Query Marlin (M503) and ADOPT its reported steps/mm, "
+                "max feedrate, and max acceleration into software — the "
+                "reverse of Save Calibration. Use this when the board "
+                "already has the correct values (e.g. just tuned in "
+                "firmware) and software should follow hardware instead "
+                "of overwriting it."))
+        self.btn_load_from_hardware.clicked.connect(
+            self._load_calibration_from_hardware)
+        save_row.addWidget(self.btn_load_from_hardware)
+
         btn_save_cal = icon_button(
             "Save Calibration", "save", object_name="accentBtn",
             tooltip=("Re-send steps_per_mm (M92), per-axis max acceleration "
@@ -3447,6 +3460,108 @@ class StageHardwarePanel(QWidget):
                 self.lbl_alignment_status.setText("✓ Marlin matches software.")
                 self.lbl_alignment_status.setStyleSheet(
                     f"color: {COLORS['green']}; ")
+
+    def _load_calibration_from_hardware(self) -> None:
+        """Query Marlin (M503) and ADOPT its reported steps_per_mm,
+        per-axis max feedrate, and per-axis max acceleration into
+        software — the mirror of :meth:`_apply_steps_cal` (which pushes
+        software → hardware via M92/M203/M201).
+
+        Use this when the board already carries the correct calibration
+        (freshly tuned in firmware, or re-flashed with known-good values)
+        and the software side has drifted and should follow the board
+        instead of overwriting it.
+
+        No G-code is re-sent — the values already live on the board;
+        this only updates ``StageController``/settings.json/the active
+        profile and the on-screen grids.
+        """
+        if self._settings is None:
+            return
+        if (self._controller is None or self._controller.zp_stage is None
+                or self._controller.simulate_zp):
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "Connect ZP (real hardware) to load values from hardware.")
+            return
+        zp = self._controller.zp_stage
+        try:
+            reported = zp.query_settings()
+        except Exception as e:
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(f"M503 query failed: {e}")
+            return
+
+        hw_steps = reported.get("steps_per_mm") or {}
+        hw_feed = reported.get("max_feedrate") or {}
+        hw_accel = reported.get("max_accel") or {}
+        if not (hw_steps or hw_feed or hw_accel):
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "M503 returned nothing usable — check the serial "
+                    "connection and try again.")
+            return
+
+        axis_map = zp.axis_map
+        new_steps = dict(zp.steps_per_mm)
+        new_feed = dict(
+            self._settings.get("device_profile.per_axis_max_feedrate") or {})
+        new_accel = dict(
+            self._settings.get("device_profile.per_axis_max_accel") or {})
+        loaded: list[str] = []
+        for logical, physical in axis_map.items():
+            if physical in hw_steps:
+                new_steps[logical] = hw_steps[physical]
+                loaded.append(f"{logical} steps/mm")
+            if physical in hw_feed:
+                new_feed[logical] = hw_feed[physical]
+                loaded.append(f"{logical} feedrate")
+            if physical in hw_accel:
+                new_accel[logical] = hw_accel[physical]
+                loaded.append(f"{logical} accel")
+
+        if not loaded:
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "M503 didn't report any axis matching this device's "
+                    "axis mapping — nothing to load.")
+            return
+
+        # Adopt locally only (persist=False) — these values already live
+        # on the board, so there is nothing to re-send it.
+        zp.set_steps_per_mm(new_steps, persist=False)
+        zp.set_per_axis_max_feedrate(new_feed, persist=False)
+        zp.set_axis_accelerations(new_accel, persist=False)
+
+        self._settings.set("device_profile.steps_per_mm", new_steps)
+        self._settings.set("device_profile.per_axis_max_feedrate", new_feed)
+        self._settings.set("device_profile.per_axis_max_accel", new_accel)
+        self._settings.save()
+        # v7.4.2: also persist to the active profile JSON so the change
+        # survives a profile switch round-trip.
+        self._persist_active_profile()
+
+        # Reflect the loaded acceleration values in the visible spinboxes.
+        if hasattr(self, 'spin_axis_accel'):
+            for ax, sp_w in self.spin_axis_accel.items():
+                if ax in new_accel:
+                    sp_w.blockSignals(True)
+                    sp_w.setValue(float(new_accel[ax]))
+                    sp_w.blockSignals(False)
+
+        self._refresh_steps_grid()
+        self._refresh_max_feedrate_grid()
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
+
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                "Loaded from hardware: steps_per_mm, per_axis_max_feedrate, "
+                "and per_axis_max_accel adopted from Marlin's M503 report "
+                "(nothing re-sent to the board).")
+        logger.info(f"ZP calibration loaded from hardware (M503): {loaded}")
 
     def _apply_safety_and_zero(self) -> None:
         """Save safety_limits + zero positions: settings + controller.
