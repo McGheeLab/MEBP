@@ -43,6 +43,7 @@ from gui.widgets.components import Card
 from gui.widgets.camera_feed_view import CameraFeedView
 from gui.widgets.jog_well_plate import WellPlateNavigator
 from gui.widgets.jog_workspace_view import pixmap_from_bgr
+from gui.worker_retirement import retire_worker
 from gui.dialogs.workflow_settings_dialog import WorkflowSettingsDialog
 
 from SupportClasses import FluorescenceMosaicStore as fms
@@ -2975,6 +2976,14 @@ class FluorescenceMosaicWorkflowPage(QWidget):
 
     def _on_channel_finished(self, channel, composite, extent, scale, frames,
                              shift_um=(0.0, 0.0), meta=None):
+        # ⚠ finished_ok is emitted from INSIDE the worker's run(), which then
+        # goes on to restore the microscope focus, release the scope lease and
+        # resume the poller in its finally block. The worker has no Qt parent,
+        # so this attribute is the ONLY strong reference: clearing it here used
+        # to hand a still-running QThread to the garbage collector and abort the
+        # process (0xC0000409, no traceback) right after a scan completed
+        # successfully. See gui/worker_retirement.py.
+        retire_worker(self._worker)
         self._worker = None
         meta = meta if isinstance(meta, dict) else {}
         # The first channel's measured focus map is replayed by the rest of
@@ -3080,6 +3089,9 @@ class FluorescenceMosaicWorkflowPage(QWidget):
             f"channel(s) of {well}.")
 
     def _on_channel_failed(self, msg: str):
+        # Same hazard as _on_channel_finished: failed is emitted from run() too,
+        # and the finally block still has the focus restore + lease release to do.
+        retire_worker(self._worker)
         self._worker = None
         self._restore_entry_exposure()
         self._status.setText(f"Channel scan failed: {msg}")
