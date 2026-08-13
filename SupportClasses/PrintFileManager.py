@@ -306,6 +306,20 @@ def write_migration_backup(path: Path, original_data: dict) -> Path | None:
 # Filename Sanitizer
 # ═══════════════════════════════════════════════════════════════════
 
+def _stat_key(path: Path) -> tuple | None:
+    """Identity of a file's CONTENT for cache validation: (mtime_ns, size).
+
+    Returns None when the file cannot be stat'd (missing/unreadable), which
+    callers must treat as "do not cache" rather than as a key — otherwise a
+    deleted file and a present one would share a key.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def _sanitize_filename(name: str) -> str:
     """
     Convert a display name to a safe filename (no extension).
@@ -345,6 +359,14 @@ class PrintFileManager:
         self.current: PrintFileData | None = None
         self.current_path: Path | None = None
         self._last_save_time: float = 0.0
+        # v7.17.1 — load cache: name -> (path, stat_key, validated+migrated raw).
+        # ``load`` resolves a name by globbing prints_dir and JSON-parsing EVERY
+        # file to match on metadata.name, so one call is O(number of prints) in
+        # file opens. The Quick Print readiness / planned-path refreshes call it
+        # per tick; a single observed session did 302 loads over 39 prints —
+        # roughly 12,000 file opens on the GUI thread. Keyed on the resolved
+        # file's (mtime_ns, size) so an edit on disk invalidates itself.
+        self._load_cache: dict[str, tuple[Path, tuple, dict]] = {}
 
     # ── List ──────────────────────────────────────────────────────
 
@@ -436,6 +458,21 @@ class PrintFileManager:
 
         Searches for a matching .json file, validates and migrates schema.
         """
+        # Fast path: the same name resolved to a file that has not changed on
+        # disk since we last parsed it. Costs one stat() instead of globbing and
+        # JSON-parsing the whole prints directory. A fresh PrintFileData is
+        # still constructed from a deep copy on every call, so callers keep
+        # their own mutable object exactly as before.
+        cached = self._load_cache.get(name)
+        if cached is not None:
+            cached_path, cached_key, cached_raw = cached
+            if _stat_key(cached_path) == cached_key:
+                self.current = PrintFileData.from_dict(copy.deepcopy(cached_raw))
+                self.current_path = cached_path
+                logger.debug(f"Loaded (cached): {name} from {cached_path}")
+                return self.current
+            self._load_cache.pop(name, None)
+
         # Find file by name
         target_path = None
         for fp in self.prints_dir.glob("*.json"):
@@ -485,6 +522,15 @@ class PrintFileManager:
                 # roll back if anything regenerated unexpectedly.
                 if pre_migration_snapshot is not None:
                     write_migration_backup(target_path, pre_migration_snapshot)
+
+            # Cache the validated + migrated raw dict (what from_dict consumes),
+            # so a repeat load skips the scan, the parse, validation AND
+            # migration. Stat AFTER reading, so a file rewritten mid-read is
+            # keyed to content we did not parse and re-reads next time.
+            key = _stat_key(target_path)
+            if key is not None:
+                self._load_cache[name] = (
+                    target_path, key, copy.deepcopy(raw))
 
             self.current = PrintFileData.from_dict(raw)
             self.current_path = target_path

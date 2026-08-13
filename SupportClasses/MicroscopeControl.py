@@ -123,6 +123,40 @@ class MicroscopeState:
     #: Result of the last probe_optic_write_support() call — see there for the
     #: shape. {} until probed, or when the driver has no notion of this.
     optic_write_support: dict = field(default_factory=dict)
+
+    # ── Illumination accessories (v7.17) ──────────────────────────────
+    # EpiShutter / DiaLamp / LightPathDrive are ACCESSORIES: a body may not
+    # have them fitted at all, and on this rig's Ti-E the epi shutter is not
+    # (IsMounted=0), while the dia lamp and light path are.
+    #
+    # ⚠ ABSENT, UNKNOWN and KNOWN are three different readings and the GUI
+    # renders them differently. ``*_present`` False means the body told us
+    # there is no such device; a ``None`` value means it IS fitted and did not
+    # answer. That is why the value fields default to None and not to False —
+    # "closed"/"off" is a state we would be inventing, and for a shutter that
+    # is the difference between "the sample is protected" and "we do not know".
+    #
+    # ⚠ NOTHING POPULATES THESE YET. They exist so the panel can honestly
+    # report "not fitted"; the backend that reads the devices is not present on
+    # any branch (see the v7.17.1 update plan). Wiring a driver must set these
+    # from real reads — never default them to a comfortable value.
+    epi_shutter_present: bool = False
+    epi_shutter_open: Optional[bool] = None
+    dia_lamp_present: bool = False
+    dia_lamp_on: Optional[bool] = None
+    dia_lamp_intensity: Optional[float] = None
+    #: The SDK's OWN declared range — never rescaled to a percentage. The unit
+    #: may be volts or an arbitrary index, and a percentage of an unknown
+    #: quantity is a fabricated number that reads as measured.
+    dia_lamp_min: Optional[float] = None
+    dia_lamp_max: Optional[float] = None
+    #: False = the body's front-panel knob owns the lamp (Ti "MainMode") and
+    #: the SDK refuses every write. None = not known.
+    dia_lamp_remote: Optional[bool] = None
+    light_path_position: Optional[int] = None
+    light_path_count: int = 0
+    native_light_path_names: tuple = ()
+
     #: Last error text, cleared by the next successful operation.
     error: Optional[str] = None
     last_op: Optional[str] = None

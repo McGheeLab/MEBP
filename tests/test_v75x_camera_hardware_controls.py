@@ -243,9 +243,22 @@ class TestSettingsDialog(unittest.TestCase):
         self.assertEqual(dlg._res_combo.count(), 3)
 
     def test_live_apply_and_persist(self):
+        """v7.17.1: the two halves now have different timing, deliberately.
+
+        The live push to the camera stays IMMEDIATE — aiming a control is a
+        visual task, so the preview must follow the slider. The store WRITE is
+        debounced, because this slider is wired on ``valueChanged`` and one
+        drag used to serialise + atomically replace the calibration file on
+        every mouse tick (~50 writes in 9 s, on the GUI thread).
+        """
         dlg, mgr, cam = self._dialog()
         dlg._gamma_sld.setValue(150)
+        # Immediate: the camera has it already.
         self.assertEqual(cam.get_hw_settings()["gamma"], 150)
+        # Deferred: not yet on disk, but pending.
+        self.assertTrue(dlg._persist_pending)
+        # Flush the way hide/close/quit do — the value must not be lost.
+        dlg._flush_persist()
         stored = self.CCS.get_store().get_hw_controls("dshow:BUC3D")
         self.assertEqual(stored["gamma"], 150)
 

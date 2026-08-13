@@ -1513,6 +1513,9 @@ class StageController:
         # the caller from settings (zp_stage.last_port) and re-saved
         # whenever the ZP stage reports its connected_port.
         self._preferred_zp_port: str | None = None
+        # v7.18.1: last-known-good XY detection hint
+        # ({protocol, port, baud}) — the XY twin of _preferred_zp_port.
+        self._preferred_xy_hint: dict | None = None
 
         # v7.5.x: True once a REAL ZP board has connected this session. Sticky
         # (never reset on disconnect) so safe_travel_to can tell a dropped board
@@ -1785,6 +1788,10 @@ class StageController:
                     simulate=sim_xy,
                     controller_json=self.controller_json,
                     exclude_ports=xy_exclude,
+                    # v7.18.1: last-known-good (protocol, port, baud) so a
+                    # reconnect is ONE probe instead of re-walking every
+                    # protocol × baud that was ruled out last time.
+                    preferred=self._preferred_xy_hint,
                 )
             except (ConnectionError, ImportError, OSError) as e:
                 logger.error(f"XY stage connection failed: {e}")
@@ -1826,6 +1833,12 @@ class StageController:
                         self.xy_stage.set_max_speed_um_s(_ms)
                 except Exception as e:
                     logger.debug("apply stored XY max speed failed: %s", e)
+                # v7.18.1: adopt what actually answered, so an in-session
+                # reconnect (a USB drop, a Connect re-click) is already fast
+                # without waiting for the GUI to persist the hint.
+                hint = self.xy_connection_hint
+                if hint:
+                    self._preferred_xy_hint = hint
             logger.info(f"XY stage connected ({'SIM' if sim_xy else 'REAL'})")
 
         if zp and self.zp_stage is None:
@@ -1971,6 +1984,26 @@ class StageController:
         the next connect_stages() can try it first instead of
         scanning every tty."""
         self._preferred_zp_port = port
+
+    def set_preferred_xy_hint(self, hint: dict | None) -> None:
+        """v7.18.1: cache the last-known-good XY (protocol, port, baud) so the
+        next connect_stages() probes it directly instead of re-walking every
+        protocol JSON × baud × port.
+
+        A stale hint is harmless — the probe misses and the full scan runs.
+        """
+        self._preferred_xy_hint = dict(hint) if isinstance(hint, dict) else None
+
+    @property
+    def xy_connection_hint(self) -> dict | None:
+        """v7.18.1: {protocol, port, baud} the live XY stage actually opened.
+
+        None when simulating or not connected — never persist a hint that
+        would point the next launch at something that never answered.
+        """
+        if self.xy_stage and not self.simulate_xy:
+            return getattr(self.xy_stage, "detection_hint", None)
+        return None
 
     @property
     def zp_connected_port(self) -> str | None:
@@ -2602,6 +2635,52 @@ class StageController:
             "plate_bottom_z": self.user_z_to_zref(bottom_user),
             "safe_z": self.user_z_to_zref(safe_user),
             "plate_max_z": self.user_z_to_zref(max_user),
+        }
+
+    def plate_z_refs_from_top(self, top_zref: float) -> dict | None:
+        """Derive the other plate Z references from a TAUGHT Plate Top Z.
+
+        v7.17.1. ``estimate_plate_z_refs`` anchors every guess on the
+        needle-cam fiducial, which is a property of the MACHINE. Once the
+        operator has actually touched off the plate's top surface, the taught
+        top is a far better anchor for this particular plate and seating: it
+        absorbs plate-to-plate thickness variation and any drift in the
+        fiducial, while the plate type still supplies the one thing it really
+        knows — the SPACING between its own features.
+
+        The stored offsets are mm BELOW the fiducial, so the fiducial cancels:
+
+            user_z(k) = user_z(top) − (offset[k] − offset["top"])
+
+        Returns ``{"plate_bottom_z", "safe_z", "plate_max_z"}`` in zero-ref mm
+        — deliberately NOT ``plate_top_z``, which is the input. ``None`` when
+        the active plate has no stored offsets, because every delta would then
+        be zero and the caller would be told the well floor is exactly at the
+        plate's top surface: a confident, wrong, and dangerous answer.
+
+        NOTE — the bore wizard's step 2 uses the SAME identity for one pair
+        (``NeedleBoreWizard._plate_top_bottom_distance`` = ``bottom − top``,
+        with the same "the fiducial cancels" reasoning). That one yields a
+        scalar spacing to seed a typed spin box; this one maps every stored
+        reference into the zero-ref frame. Kept separate deliberately: folding
+        the hardware-verified v7.13 path into this would change a tested
+        descent-planning input for no functional gain.
+        """
+        off = self._plate_z_offsets or {}
+        if not any(k in off for k in ("top", "bottom", "safe", "max")):
+            return None
+        top_off = float(off.get("top", 0.0))
+        top_user = self.zref_to_user_z(float(top_zref))
+
+        def _from(key: str) -> float:
+            # + is DOWN here: a feature further below the fiducial than the
+            # top is that much below the taught top.
+            return top_user - (float(off.get(key, top_off)) - top_off)
+
+        return {
+            "plate_bottom_z": self.user_z_to_zref(_from("bottom")),
+            "safe_z": self.user_z_to_zref(_from("safe")),
+            "plate_max_z": self.user_z_to_zref(_from("max")),
         }
 
     def apply_z_convention(self, z_up_sign: float | None = None,

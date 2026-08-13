@@ -25,9 +25,9 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QDoubleSpinBox,
     QFrame, QSizePolicy, QMessageBox, QCheckBox, QSlider,
     QScrollArea, QTabWidget, QSplitter, QListWidget, QListWidgetItem,
-    QStackedWidget, QToolButton,
+    QStackedWidget, QToolButton, QProgressDialog,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, QThread, QObject, QEventLoop
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPixmap
@@ -1540,6 +1540,123 @@ class _CompCalBridge(QObject):
     done = Signal(bool, str)
 
 
+def run_safe_travel_responsive(page, target_x_um, target_y_um, *,
+                               safe_z_mm, target_z_mm):
+    """``safe_travel_to`` off the GUI thread, keeping this call synchronous.
+
+    v7.17.1. The travel itself is unchanged — same call, same arguments,
+    same retract-before-XY ordering and the same abort-if-unconfirmed
+    semantics. What changes is only WHERE it runs and what Qt does while it
+    runs.
+
+    Previously this ran on the GUI thread, so the whole application stopped
+    for the duration: on ME3B V1 a real retract is 11-14 s, and a measured
+    session logged a 10.0 s stall here (GuiWatchdog, 2026-08-13 14:26:24 —
+    29 such stalls across three days). Every camera feed is a QTimer, so
+    they all froze with it.
+
+    All twelve callers depend on the ``bool`` return to decide whether it is
+    safe to proceed (``_on_park`` arms a measurement session on it), so this
+    keeps the synchronous contract instead of restructuring them into
+    callbacks: the move runs on ``SafeTravelWorker``'s daemon thread while a
+    nested ``QEventLoop`` keeps this thread's event queue turning.
+
+    ⚠ THE MODAL WAIT DIALOG IS LOAD-BEARING, NOT COSMETIC. A frozen GUI
+    accidentally provided a safety property: the operator physically could
+    not issue a second motion command mid-travel. Spinning the event loop
+    gives that ability back, and a Z jog issued while the stage is
+    travelling XY is exactly the crash this page's safe-travel rules exist
+    to prevent. Application-modal input blocking restores that property
+    while still letting QTimer-driven repaints through.
+
+    It appears only after a delay, because a travel that starts already
+    retracted is a sub-second no-op and must not flash a dialog.
+
+    There is deliberately NO Cancel button: ``safe_travel_to`` has no
+    mid-flight abort, so a Cancel that left the stage moving would be a lie
+    about the machine's state.
+    A module-level FREE FUNCTION, not a method, deliberately: the
+    calibration suites drive these handlers through lightweight
+    ``SimpleNamespace`` pages carrying only the attributes a handler touches,
+    and a new bound helper breaks every such call site. This repo has already
+    paid for that lesson once (v7.12, four click-rim tests).
+    """
+    ctrl = getattr(page, "controller", None)
+    if ctrl is None:
+        return False
+
+    # Second line of defence behind the modal block — a nested event loop
+    # can be re-entered by a path that does not go through the blocked UI
+    # (a queued timer callback), and two concurrent travels would fight
+    # over the stage.
+    if getattr(page, "_nav_travel_in_flight", False):
+        logger.error(
+            "Safe navigate REFUSED: a stage travel is already in flight.")
+        return False
+
+    from gui.widgets.safe_travel_worker import SafeTravelWorker
+
+    # Qt parentage is lifetime hygiene only. A stub page is not a QWidget,
+    # so parent to it only when it really is one — never let ownership
+    # bookkeeping decide whether the travel can run.
+    parent = page if isinstance(page, QWidget) else None
+
+    worker = SafeTravelWorker(parent)
+    loop = QEventLoop(parent)
+    outcome = {"ok": False}
+
+    def _on_finished(ok: bool) -> None:
+        outcome["ok"] = bool(ok)
+        loop.quit()
+
+    # `finished` is emitted from the worker thread and delivered as a QUEUED
+    # call, so the event sits in this thread's queue until loop.exec()
+    # processes it — a travel that finishes before exec() starts cannot
+    # deadlock the loop.
+    worker.finished.connect(_on_finished)
+
+    page._nav_travel_in_flight = True
+    dlg = None
+    show_timer = None
+    try:
+        if not worker.start(ctrl, target_x_um, target_y_um,
+                            safe_z_mm=safe_z_mm, target_z_mm=target_z_mm):
+            return False
+
+        dlg = QProgressDialog(
+            "Travelling to position…\n"
+            "The needle retracts to safe Z before any XY move.",
+            None, 0, 0, parent)
+        dlg.setWindowTitle("Stage travel")
+        dlg.setCancelButton(None)
+        dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.reset()  # keep it hidden until the delay elapses
+
+        show_timer = QTimer(parent)
+        show_timer.setSingleShot(True)
+        show_timer.setInterval(400)
+        show_timer.timeout.connect(dlg.show)
+        show_timer.start()
+
+        loop.exec()
+    finally:
+        if show_timer is not None:
+            show_timer.stop()
+        if dlg is not None:
+            dlg.close()
+            dlg.deleteLater()
+        try:
+            worker.finished.disconnect(_on_finished)
+        except (RuntimeError, TypeError):
+            pass
+        worker.deleteLater()
+        page._nav_travel_in_flight = False
+
+    return outcome["ok"]
+
+
 class CalibrationPage(QWidget):
     """Multi-camera calibration page with steps in the context panel."""
 
@@ -2803,7 +2920,9 @@ class CalibrationPage(QWidget):
             # Import-poor build: the wizard is a bare placeholder, so the
             # centring controls mount directly on the column.
             wiz_lay.addWidget(s1_panel)
-        wiz_lay.addWidget(wiz, stretch=1)
+        # v7.17.1 — `wiz` no longer goes straight into the column; it becomes
+        # the top half of a vertical splitter whose bottom half is the Advanced
+        # Z references panel (built below). See there for why.
 
         # The wizard's microscope pane is page 1 of the big camera stack.
         pane = (wiz.microscope_pane()
@@ -2816,26 +2935,72 @@ class CalibrationPage(QWidget):
                 getattr(wiz, "current_step", ""))
 
         # ── Advanced Z references — the full reference-heights panel
-        # (Replace Z, the XZ side view, needle-cam estimates, the learn
-        # loop), collapsed by default. Step 2 carries the primary flow now;
-        # this is the escape hatch. Its content keeps its own scroll area.
+        # (Replace Z, the XZ side view, needle-cam estimates, the learn loop).
+        #
+        # v7.17.1 — OPEN BY DEFAULT and freely resizable. It used to start
+        # collapsed and, when opened, shared the column 50/50 with the wizard
+        # (both were added at stretch=1), so the panel it revealed was too
+        # short to work in: the Reference-Z grid, the live XZ side view, the
+        # needle-cam estimate group and the learn loop all had to fit in half a
+        # column, leaving the XZ view — the thing you actually drive Z with —
+        # a few dozen pixels tall.
+        #
+        # Now the wizard and this panel are the two halves of a VERTICAL
+        # SPLITTER, so the operator sets the division by dragging rather than
+        # living with a hardcoded ratio, and it can be taken nearly full
+        # height. The toggle is kept (it is still useful to reclaim the space
+        # for the wizard), it simply no longer starts closed.
         self._needle_loc_adv_btn = QToolButton()
         self._needle_loc_adv_btn.setText("Advanced Z references…")
         self._needle_loc_adv_btn.setCheckable(True)
-        self._needle_loc_adv_btn.setChecked(False)
-        self._needle_loc_adv_btn.setArrowType(Qt.RightArrow)
+        self._needle_loc_adv_btn.setChecked(True)
+        self._needle_loc_adv_btn.setArrowType(Qt.DownArrow)
         self._needle_loc_adv_btn.setToolButtonStyle(
             Qt.ToolButtonTextBesideIcon)
         adv_content = self._build_z_offset_content()
-        adv_content.setVisible(False)
+        # Tall enough that the XZ side view inside is usable rather than a
+        # sliver; the splitter can still be dragged well past this.
+        adv_content.setMinimumHeight(s(340))
+        adv_content.setVisible(True)
+
+        # The button rides WITH the content in the splitter pane so it stays
+        # directly above what it toggles.
+        adv_host = QWidget()
+        adv_host_lay = QVBoxLayout(adv_host)
+        adv_host_lay.setContentsMargins(0, 0, 0, 0)
+        adv_host_lay.setSpacing(s(4))
+        adv_host_lay.addWidget(self._needle_loc_adv_btn)
+        adv_host_lay.addWidget(adv_content, stretch=1)
+
+        self._needle_loc_adv_split = QSplitter(Qt.Vertical)
+        self._needle_loc_adv_split.setChildrenCollapsible(False)
+        self._needle_loc_adv_split.setHandleWidth(s(4))
+        self._needle_loc_adv_split.addWidget(wiz)
+        self._needle_loc_adv_split.addWidget(adv_host)
+        # Favour the advanced panel — it is the taller of the two by content,
+        # and the wizard's own step panels are compact.
+        self._needle_loc_adv_split.setStretchFactor(0, 1)
+        self._needle_loc_adv_split.setStretchFactor(1, 2)
 
         def _adv_toggled(on: bool) -> None:
-            adv_content.setVisible(bool(on))
+            on = bool(on)
+            adv_content.setVisible(on)
             self._needle_loc_adv_btn.setArrowType(
                 Qt.DownArrow if on else Qt.RightArrow)
+            if not on:
+                return
+            # Re-opening must hand back real estate. Without this the pane
+            # keeps whatever (possibly collapsed-to-the-button) size the last
+            # toggle left it with, so the panel would reappear as a sliver.
+            split = self._needle_loc_adv_split
+            total = split.height()
+            if total <= 0:                      # not laid out yet
+                return
+            adv = max(int(total * 0.6), min(s(340), total))
+            split.setSizes([max(total - adv, 0), adv])
+
         self._needle_loc_adv_btn.toggled.connect(_adv_toggled)
-        wiz_lay.addWidget(self._needle_loc_adv_btn)
-        wiz_lay.addWidget(adv_content, stretch=1)
+        wiz_lay.addWidget(self._needle_loc_adv_split, stretch=1)
 
         # v7.9 side-camera bore group: built but NOT shown (v7.13 — the
         # camera-click wizard is the method; this stays alive as the
@@ -4900,7 +5065,43 @@ class CalibrationPage(QWidget):
             chk.toggled.connect(self._zoff_on_quick_move_toggled)
             z_grid.addWidget(chk, row, 2)
             self._zoff_qm_checks[ref_key] = chk
-        z_grid.setRowStretch(len(z_rows) + 1, 1)
+
+        # ── v7.17.1: plate-type learn/apply, right where the heights are set.
+        # These existed only as a separate group further down the panel (and
+        # that panel used to be collapsed by default), so the round trip was
+        # effectively undiscoverable from the picker itself.
+        pt_row = len(z_rows) + 1
+        self._zoff_btn_assign_to_type = QPushButton(
+            "Assign these to the plate type")
+        self._zoff_btn_assign_to_type.setToolTip(
+            "Save the heights above onto the ACTIVE plate as offsets, so "
+            "picking this plate next time fills them in automatically.\n"
+            "Writes a user override — bundled products stay pristine.")
+        self._zoff_btn_assign_to_type.clicked.connect(
+            self._zoff_save_offsets_to_plate_type)
+        z_grid.addWidget(self._zoff_btn_assign_to_type, pt_row, 0, 1, 2)
+
+        self._zoff_btn_apply_from_top = QPushButton(
+            "Apply plate offsets from Plate Top Z")
+        self._zoff_btn_apply_from_top.setToolTip(
+            "Re-derive Plate Bottom and Fast Move Z from the plate type's "
+            "saved offsets, anchored on the Plate Top Z taught above.\n"
+            "Use after touching off a new plate of a known type: the taught "
+            "top absorbs this plate's thickness and seating, while the plate "
+            "type supplies the spacing between its features.\n"
+            "The derived bottom is a GUESS and does NOT arm the print-floor "
+            "clamp — touch it off to make it a measurement.")
+        self._zoff_btn_apply_from_top.clicked.connect(
+            self._zoff_apply_offsets_from_top)
+        z_grid.addWidget(self._zoff_btn_apply_from_top, pt_row + 1, 0, 1, 2)
+
+        self._zoff_lbl_apply_from_top = QLabel("")
+        self._zoff_lbl_apply_from_top.setWordWrap(True)
+        self._zoff_lbl_apply_from_top.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: 9pt;")
+        z_grid.addWidget(self._zoff_lbl_apply_from_top, pt_row + 2, 0, 1, 3)
+
+        z_grid.setRowStretch(pt_row + 3, 1)
         z_split.addWidget(z_grid_widget)
 
         # v7.5.x: live XZ side view beside the capture grid. Reuses the same
@@ -5892,6 +6093,82 @@ class CalibrationPage(QWidget):
             f"{ctrl.get_needle_cam_z_user():.2f} mm. Refine below, then save.")
         self._zoff_lbl_needle_cam.setStyleSheet(
             f"color: {COLORS['green']}; font-size: 9pt;")
+        self._emit_calibration_data_changed()
+
+    def _zoff_apply_offsets_from_top(self) -> None:
+        """v7.17.1: re-derive the lower Z references from the TAUGHT Plate Top Z.
+
+        The companion to "Assign these to the plate type". Once a plate type
+        carries offsets, touching off only the top of a fresh plate of that
+        type is enough to place the rest: the taught top absorbs this plate's
+        thickness and seating while the type supplies the spacing.
+
+        ⚠ Everything written here is a GUESS. The plate bottom is pushed with
+        ``source="estimated"``, so ``print_floor_datum_zref()`` withholds it
+        from the print-floor clamp — an estimated floor is unsafe in BOTH
+        directions (too high and it blocks the very touch-off that would
+        measure it; too low and it passes a Z that punches through the glass
+        while the caller believes it is guarded). Plate Top itself is never
+        overwritten: it is the input.
+        """
+        lbl = getattr(self, "_zoff_lbl_apply_from_top", None)
+
+        def _say(text: str, colour: str) -> None:
+            if lbl is not None:
+                lbl.setText(text)
+                lbl.setStyleSheet(f"color: {COLORS[colour]}; font-size: 9pt;")
+
+        ctrl = getattr(self, "controller", None)
+        if ctrl is None or not hasattr(ctrl, "plate_z_refs_from_top"):
+            _say("Not available on this controller.", "red")
+            return
+        top = getattr(self, "_top_z", None)
+        if top is None:
+            _say("Teach Plate Top Z first — it is the anchor everything else "
+                 "is measured from.", "yellow")
+            return
+        try:
+            refs = ctrl.plate_z_refs_from_top(float(top))
+        except Exception as exc:
+            logger.exception("apply offsets from top failed")
+            _say(f"Could not derive the offsets: {exc}", "red")
+            return
+        if not refs:
+            _say("This plate has no saved Z offsets yet. Teach the heights "
+                 "and press “Assign these to the plate type” first.", "yellow")
+            return
+
+        applied = []
+        for attr, ref_key, lbl_attr, prefix in (
+                ("_plate_bottom_z", "plate_bottom_z",
+                 "_zoff_lbl_plate_bottom_z", "Plate Bottom Z"),
+                ("_safe_z", "safe_z", "_zoff_lbl_safe_z", "Fast Move Z")):
+            val = refs.get(ref_key)
+            if val is None:
+                continue
+            setattr(self, attr, val)
+            applied.append(prefix)
+            row_lbl = getattr(self, lbl_attr, None)
+            if row_lbl is not None:
+                row_lbl.setText(
+                    f"{prefix}: {self._zoff_user_z(val):.2f} mm (guess)")
+                row_lbl.setStyleSheet(f"color: {COLORS['yellow']};")
+
+        if not applied:
+            _say("Nothing to apply — the saved offsets cover none of the "
+                 "lower references.", "yellow")
+            return
+
+        # Route the bottom through the single page-level writer so the
+        # controller datum, the anchor XY and the provenance all stay in step.
+        if "Plate Bottom Z" in applied:
+            self._zoff_push_plate_bottom_to_controller(
+                self._plate_bottom_z, "estimated")
+        _say(f"Derived {', '.join(applied)} from the taught Plate Top Z. "
+             "These are estimates — touch off the plate bottom to arm the "
+             "print-floor clamp.", "green")
+        logger.info("Applied plate-type Z offsets anchored on Plate Top Z: %s",
+                    ", ".join(applied))
         self._emit_calibration_data_changed()
 
     def _apply_plate_type_z_estimates(self, force: bool = False) -> None:
@@ -12860,8 +13137,8 @@ class CalibrationPage(QWidget):
             elif getattr(self, '_top_z', None) is not None:
                 final_z = self._top_z + getattr(self, '_z_buffer_mm', 0.5)
 
-        ok = self.controller.safe_travel_to(
-            target_x_um, target_y_um,
+        ok = run_safe_travel_responsive(
+            self, target_x_um, target_y_um,
             safe_z_mm=safe_z,
             target_z_mm=final_z,
         )
@@ -12873,7 +13150,6 @@ class CalibrationPage(QWidget):
             return False
         logger.info(f"Safe navigate to ({target_x_um:.0f}, {target_y_um:.0f}) µm")
         return True
-
 
     def _estimate_well_position_um(self, well_name):
         """v7.2.7-scalefix: estimate well position — ignore scale/rotation until calibrated.

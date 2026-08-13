@@ -1490,6 +1490,15 @@ class HardwareControlPanel(QWidget):
                     "ok", "Simulated" if simulate else "Connected")
             else:
                 self.badge_xy.set_status("err", "Failed")
+            # v7.18.1: cache what actually answered (protocol + port + baud)
+            # so the next connect is one probe, not a full protocol × baud
+            # sweep. Real HW only — a simulator hint would be meaningless.
+            if ok and not simulate and self._settings is not None:
+                hint = self._controller.xy_connection_hint
+                if hint:
+                    self._settings.set("xy_stage.last_good", hint)
+                    self._settings.save()
+                    logger.info("XY last_good cached: %s", hint)
         except Exception as e:
             self.badge_xy.set_status("err", f"Error: {e}")
 

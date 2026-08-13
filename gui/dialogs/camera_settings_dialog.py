@@ -22,8 +22,8 @@ import logging
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
-    QCheckBox, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox,
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QSlider, QCheckBox, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox,
     QPlainTextEdit, QWidget, QSizePolicy,
 )
 
@@ -92,6 +92,28 @@ class CameraSettingsDialog(QDialog):
         self._has_raw_stats = False     # v7.13: backend retains raw stats?
         self._optimizing = False        # v7.13.x: signal optimizer running?
         self._optimize_done.connect(self._on_optimize_done)
+        # v7.17.1 — Debounced persistence. Every slider here is wired on
+        # ``valueChanged`` (see _make_slider), so a single drag used to write
+        # the whole calibration store once per tick: a JSON serialise + atomic
+        # file replace on the GUI thread, at the rate the mouse moves. A gamma
+        # drag from 84 to 128 was measured writing the file ~50 times in 9
+        # seconds. Same failure shape as the v7.16 crop-offset spins, and the
+        # same remedy: the LIVE PUSH to the camera stays immediate (aiming a
+        # control is a visual task, the preview must follow the slider) while
+        # only the WRITE waits for the drag to settle.
+        self._persist_pending = False
+        self._persist_timer = QTimer(self)
+        self._persist_timer.setSingleShot(True)
+        self._persist_timer.setInterval(400)
+        self._persist_timer.timeout.connect(self._flush_persist)
+        # hide/close cover the ordinary ways this dialog goes away; aboutToQuit
+        # covers quitting the app with it still open, which neither reports.
+        try:
+            _qapp = QApplication.instance()
+            if _qapp is not None:
+                _qapp.aboutToQuit.connect(self._flush_persist)
+        except Exception:
+            pass
 
         self.setWindowTitle(f"Camera Controls — Cam {cam_idx + 1}")
         self.setModal(False)
@@ -328,7 +350,9 @@ class CameraSettingsDialog(QDialog):
                 self._res_combo.setCurrentIndex(
                     [tuple(r) for r in resolutions].index(tuple(cur_res)))
             self._res_combo.blockSignals(False)
-            res_ok = caps.get("resolution") and bool(resolutions)
+            # bool(): setVisible rejects None, and a caps dict that simply
+            # omits "resolution" would otherwise raise inside reload().
+            res_ok = bool(caps.get("resolution")) and bool(resolutions)
             self._res_label.setVisible(res_ok)
             self._res_combo.setVisible(res_ok)
 
@@ -494,7 +518,7 @@ class CameraSettingsDialog(QDialog):
                     int(self._cam_idx), int(data[0]), int(data[1]))
         except Exception:
             pass
-        self._persist()
+        self._persist(now=True)
         # Re-read (eSize / exposure ranges can shift with resolution).
         self.reload()
 
@@ -504,7 +528,7 @@ class CameraSettingsDialog(QDialog):
         self._mgr.set_hw_auto_exposure(self._cam_idx, checked)
         self._exp_spin.setEnabled(not checked)
         self._gain_sld.setEnabled(not checked)
-        self._persist()
+        self._persist(now=True)
 
     def _on_exposure_changed(self, ms):
         if self._loading or self._mgr is None:
@@ -536,7 +560,7 @@ class CameraSettingsDialog(QDialog):
         if self._loading or self._mgr is None:
             return
         self._mgr.set_hw_andor_auto_scale(self._cam_idx, checked)
-        self._persist()
+        self._persist(now=True)
         # Turning auto OFF freezes the current auto levels into the manual
         # black/white — re-read so the sliders show (and enable at) them.
         self.reload()
@@ -557,7 +581,7 @@ class CameraSettingsDialog(QDialog):
         if self._loading or self._mgr is None:
             return
         self._mgr.set_hw_andor_feature(self._cam_idx, key, bool(checked))
-        self._persist()
+        self._persist(now=True)
 
     def _on_sensor_enum(self, key):
         if self._loading or self._mgr is None:
@@ -567,7 +591,7 @@ class CameraSettingsDialog(QDialog):
         if not value or value == "—":
             return
         self._mgr.set_hw_andor_feature(self._cam_idx, key, value)
-        self._persist()
+        self._persist(now=True)
         # Gain mode changes BitDepth (histogram clip level, exposure range);
         # readout rate can shift the exposure range — re-read either way.
         self.reload()
@@ -631,7 +655,7 @@ class CameraSettingsDialog(QDialog):
         if exp_us is not None:
             # Exposure + frozen display levels changed on the device —
             # persist the achieved state and re-read every control.
-            self._persist()
+            self._persist(now=True)
         self.reload()
 
     def _on_gamma_changed(self, v):
@@ -678,7 +702,7 @@ class CameraSettingsDialog(QDialog):
             rng = (ctrls.get(key) or {}).get("range")
             if rng and len(rng) >= 3:
                 setter(self._cam_idx, rng[2])
-        self._persist()
+        self._persist(now=True)
         self.reload()
 
     def _on_read_clicked(self):
@@ -690,7 +714,40 @@ class CameraSettingsDialog(QDialog):
 
     # ── Persistence ───────────────────────────────────────────────
 
-    def _persist(self):
+    def _persist(self, *, now: bool = False):
+        """Schedule a write of the current hardware controls.
+
+        Debounced by DEFAULT: a continuous control (slider / spin) fires this
+        on every tick of a drag, and coalescing them is the whole point. Pass
+        ``now=True`` from a discrete decision — a checkbox, a resolution
+        change, Defaults — where there is exactly one event and the operator
+        expects it committed.
+
+        Defaulting to debounced is deliberate: a call site that forgets to ask
+        for an immediate write merely lands 400 ms later (and is still flushed
+        on hide / close / quit), whereas defaulting to immediate would let a
+        future slider silently reintroduce the write storm.
+        """
+        self._persist_pending = True
+        if now:
+            self._flush_persist()
+        else:
+            self._persist_timer.start()
+
+    def _flush_persist(self):
+        """Write the pending hardware controls to the per-identity store.
+
+        Reads the live state at FLUSH time rather than snapshotting it at
+        schedule time, so the value written is the one the camera actually
+        ended the drag on.
+        """
+        try:
+            self._persist_timer.stop()
+        except Exception:
+            pass
+        if not self._persist_pending:
+            return
+        self._persist_pending = False
         if self._identity_getter is None or self._mgr is None:
             return
         try:
@@ -804,6 +861,8 @@ class CameraSettingsDialog(QDialog):
             self._stats_timer.stop()
         except Exception:
             pass
+        # A debounced write must never be lost to closing the dialog mid-drag.
+        self._flush_persist()
         super().hideEvent(event)
 
     def closeEvent(self, event):  # noqa: N802 (Qt override)
@@ -811,4 +870,5 @@ class CameraSettingsDialog(QDialog):
             self._stats_timer.stop()
         except Exception:
             pass
+        self._flush_persist()
         super().closeEvent(event)

@@ -108,6 +108,13 @@ def array_to_waypoints(arr: np.ndarray, **kwargs) -> list[Waypoint]:
 
 REQUIRED_COLUMNS = ["x", "y", "z", "p1", "p2", "p3", "t"]
 
+# v7.17.1 — parsed-CSV cache: resolved path -> ((mtime_ns, size), array).
+# Print previews re-import the same CSV on every refresh tick (a single
+# observed session re-parsed one 37-waypoint file 302 times). Keyed on the
+# file's own (mtime, size) so an edit on disk invalidates itself; callers
+# always receive a COPY, so nothing downstream can mutate the cached array.
+_CSV_CACHE: dict[Path, tuple[tuple, np.ndarray]] = {}
+
 
 def import_csv_trajectory(filepath: str | Path) -> np.ndarray:
     """
@@ -130,6 +137,16 @@ def import_csv_trajectory(filepath: str | Path) -> np.ndarray:
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"CSV file not found: {filepath}")
+
+    try:
+        _st = filepath.stat()
+        _key = (_st.st_mtime_ns, _st.st_size)
+    except OSError:
+        _key = None
+    if _key is not None:
+        _hit = _CSV_CACHE.get(filepath)
+        if _hit is not None and _hit[0] == _key:
+            return _hit[1].copy()
 
     rows = []
     with open(filepath, 'r', newline='') as f:
@@ -164,6 +181,10 @@ def import_csv_trajectory(filepath: str | Path) -> np.ndarray:
 
     logger.info(f"Imported CSV: {len(data)} waypoints, "
                 f"t=[{times[0]:.3f}, {times[-1]:.3f}]s")
+    # Cache only a fully validated array — a file that failed monotonicity
+    # raised above and must be re-checked (and re-reported) next time.
+    if _key is not None:
+        _CSV_CACHE[filepath] = (_key, data.copy())
     return data
 
 

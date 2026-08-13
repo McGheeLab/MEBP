@@ -1167,6 +1167,14 @@ class StageHardwarePanel(QWidget):
                     "ok", "Simulated" if simulate else "Connected")
             else:
                 self.badge_xy.set_status("err", "Failed")
+            # v7.18.1: cache the winning protocol + port + baud so the next
+            # connect skips the full sweep. Real HW only.
+            if ok and not simulate and self._settings is not None:
+                hint = self._controller.xy_connection_hint
+                if hint:
+                    self._settings.set("xy_stage.last_good", hint)
+                    self._settings.save()
+                    logger.info("XY last_good cached: %s", hint)
         except Exception as e:
             self.badge_xy.set_status("err", f"Error: {e}")
 
