@@ -41,6 +41,7 @@ from SupportClasses.FrameAveraging import average_if_agreeing
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
 from gui.scaling import s, sf, sp, scaled_font_size
+from gui.worker_retirement import retire_worker
 
 try:
     from SupportClasses.HardwareConfig import HardwareConfig, CameraConfig, CameraRole
@@ -8672,6 +8673,12 @@ class CalibrationPage(QWidget):
         _worker = self._ploc_mosaic_worker
         _skipped = int(getattr(_worker, "unreachable_skipped", 0) or 0)
         _reach_note = str(getattr(_worker, "reach_note", "") or "")
+        # ⚠ finished_ok is emitted from INSIDE run(), and the worker has no Qt
+        # parent, so this attribute is its only strong reference. Dropping it
+        # here can destroy a still-running QThread → hard process abort with no
+        # traceback. The local `_worker` above only defers that to the end of
+        # this method. See gui/worker_retirement.py.
+        retire_worker(self._ploc_mosaic_worker)
         self._ploc_mosaic_worker = None
         if _skipped:
             QMessageBox.warning(
@@ -8804,6 +8811,8 @@ class CalibrationPage(QWidget):
         self._ploc_scan_well_is_rosette = False
         self._ploc_mosaic_cleanup_ui()
         self._ploc_mosaic_builder = None
+        # failed is emitted from run() as well — same hazard as the finished path.
+        retire_worker(self._ploc_mosaic_worker)
         self._ploc_mosaic_worker = None
         self._ploc_confirm_label.setText(f"Mosaic scan failed: {msg}")
         logger.warning(f"PlateLocation mosaic scan failed: {msg}")
@@ -10095,6 +10104,9 @@ class CalibrationPage(QWidget):
     def _ploc_on_auto_reanchor_done(self, ax: float, ay: float,
                                     conf: float) -> None:
         """Worker found the feature → apply E = actual − stored (GUI thread)."""
+        # finished_ok is emitted from inside run(); this attribute is the only
+        # strong reference (no Qt parent). See gui/worker_retirement.py.
+        retire_worker(self._ploc_auto_reanchor_worker)
         self._ploc_auto_reanchor_worker = None
         store = self._ploc_feature_store()
         rec = store.get(self._ploc_plate_key()) if store is not None else None
@@ -10126,6 +10138,7 @@ class CalibrationPage(QWidget):
             f"confidence {conf:.2f}")
 
     def _ploc_on_auto_reanchor_failed(self, msg: str) -> None:
+        retire_worker(self._ploc_auto_reanchor_worker)
         self._ploc_auto_reanchor_worker = None
         self._ploc_refresh_auto_reanchor_button()
         self._ploc_confirm_label.setVisible(True)

@@ -1,0 +1,254 @@
+{
+  "schema_version": "7.5.0",
+  "metadata": {
+    "name": "1Circle_1",
+    "description": "1Circle_1: 6 shape(s), 1 layer(s), 23.2 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-08-12T21:46:12.710796+00:00",
+    "modified": "2026-08-12T21:46:12.710796+00:00",
+    "author": "Print Builder"
+  },
+  "objects": {
+    "1Circle_1": {
+      "object_type": "csv_import",
+      "params": {
+        "source_file": "config\\prints\\1Circle_1.csv",
+        "csv_path": "config\\prints\\1Circle_1.csv",
+        "source": "SketchTrajectory",
+        "num_waypoints": 68,
+        "z_above_plate_bottom_mm": 0.2,
+        "z_datum": "plate_bottom",
+        "layer_height_mm": 0.2,
+        "num_layers": 1,
+        "extrusion_multiplier": 1.0,
+        "sketch": {
+          "shapes": [
+            {
+              "kind": "circle",
+              "cx": 1.1652661064425753,
+              "cy": -3.074570368688016,
+              "radius": 0.8830874639123223,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "id": 2
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  2.865924748277688,
+                  1.3975319857672763
+                ],
+                [
+                  2.29,
+                  -1.1377091377091382
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.29,
+                -1.1377091377091382
+              ],
+              "id": 6
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  0.11022787493375372,
+                  2.9564690741161295
+                ],
+                [
+                  2.865924748277688,
+                  1.3975319857672763
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                2.865924748277688,
+                1.3975319857672763
+              ],
+              "id": 5
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -2.755696873343934,
+                  3.6020894844424256
+                ],
+                [
+                  -0.3464304640775247,
+                  3.161177984707392
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -0.3464304640775247,
+                3.161177984707392
+              ],
+              "id": 4
+            },
+            {
+              "kind": "line",
+              "cx": 0.0,
+              "cy": 0.0,
+              "radius": 5.0,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [
+                [
+                  -4.67681126504656,
+                  1.6967219320160452
+                ],
+                [
+                  -2.755696873343934,
+                  3.6020894844424256
+                ]
+              ],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -2.755696873343934,
+                3.6020894844424256
+              ],
+              "id": 3
+            },
+            {
+              "kind": "circle",
+              "cx": -3.6375198728139906,
+              "cy": -2.2714815655992133,
+              "radius": 0.9965398153131115,
+              "rx": 5.0,
+              "ry": 3.0,
+              "width": 10.0,
+              "height": 10.0,
+              "points": [],
+              "filled": false,
+              "line_width_mm": 1.067,
+              "ink_id": 1,
+              "color": "#89b4fa",
+              "z_offset_mm": 0.0,
+              "no_print": false,
+              "start_point": [
+                -4.018879149826485,
+                -1.3507988268988518
+              ],
+              "id": 1
+            }
+          ],
+          "inks": [
+            {
+              "id": 1,
+              "name": "Ink 1",
+              "color": "#89b4fa"
+            }
+          ],
+          "_next_ink_id": 2,
+          "z_start_mm": 0.2,
+          "layer_height_mm": 0.2,
+          "num_layers": 1,
+          "print_speed_mm_s": 5.0,
+          "travel_speed_mm_s": 20.0,
+          "travel_clearance_mm": 2.0,
+          "lift_slow_dist_mm": 1.0,
+          "lift_slow_speed_mm_s": 1.0,
+          "line_spacing_mm": 1.067,
+          "outline_points_per_mm": 2.0,
+          "flow_factor": 1.0,
+          "extrusion_multiplier": 1.0,
+          "constraints": [
+            {
+              "id": 1,
+              "kind": "coincident",
+              "refs": [
+                [
+                  4,
+                  "p0"
+                ],
+                [
+                  3,
+                  "p1"
+                ]
+              ]
+            },
+            {
+              "id": 2,
+              "kind": "coincident",
+              "refs": [
+                [
+                  6,
+                  "p0"
+                ],
+                [
+                  5,
+                  "p1"
+                ]
+              ]
+            }
+          ]
+        }
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "color": "#cba6f7",
+      "ink": "",
+      "in_well": true
+    }
+  },
+  "collections": {},
+  "layout_presets": {}
+}

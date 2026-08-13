@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 
 from gui.styles import COLORS
 from gui.scaling import s, sf
+from gui.worker_retirement import retire_worker
 
 from SupportClasses import SpheroidDetector as sd
 
@@ -418,6 +419,12 @@ class SpheroidSurveyPanel(QWidget):
         self._context_provider = fn
 
     def _on_detect_done(self, report):
+        # `done` is emitted from inside run() and the worker has no Qt parent,
+        # so clearing this attribute is what frees it — see
+        # gui/worker_retirement.py. The window is narrower here than in the
+        # mosaic workers (the emit is run()'s last statement) but the failure
+        # mode is the same hard abort.
+        retire_worker(self._worker)
         self._worker = None
         self._detect_btn.setEnabled(True)
         manual = [d for d in self._dets if d.source == "user"]
@@ -428,6 +435,7 @@ class SpheroidSurveyPanel(QWidget):
         self.detections_changed.emit()
 
     def _on_detect_failed(self, msg: str):
+        retire_worker(self._worker)
         self._worker = None
         self._detect_btn.setEnabled(True)
         self._status.setText(f"Detection failed: {msg}")

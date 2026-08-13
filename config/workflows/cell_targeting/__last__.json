@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "cell_targeting",
   "name": "__last__",
-  "saved": "2026-08-13T13:57:04",
+  "saved": "2026-08-12T13:19:28",
   "values": {
     "service_z": 0.5,
     "service_z__ovr": false,
@@ -10,8 +10,8 @@
     "prep_rate__ovr": false,
     "oil_needles": 1.0,
     "oil_needles__ovr": false,
-    "buffer_needles": 1.0,
-    "buffer_needles__ovr": false,
+    "buffer_needles": 4.0,
+    "buffer_needles__ovr": true,
     "wash_cycles": 3,
     "wash_cycles__ovr": false,
     "wash_z_amp": 0.5,
@@ -38,7 +38,7 @@
     },
     "reagent_z": 0.5,
     "push_volume_nL": 3.142,
-    "push_depth": 0.1,
+    "push_depth": 0.400052,
     "pull_mult": 2.0,
     "dwell": 60.0,
     "push_speed": 0.5,
@@ -49,11 +49,55 @@
     "surface_z": false,
     "surface_offset_um": 10.0,
     "__extra__": {
-      "bore_programs": [],
+      "bore_programs": [
+        {
+          "bore_index": 0,
+          "pump_id": "P1",
+          "role": "aspirate_target",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        },
+        {
+          "bore_index": 1,
+          "pump_id": "P2",
+          "role": "idle",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        },
+        {
+          "bore_index": 2,
+          "pump_id": "P3",
+          "role": "idle",
+          "target_type_id": "",
+          "target_type_name": "",
+          "target_type_color": "",
+          "volume_uL": 0.000785,
+          "depth_mm": 0.0999,
+          "rate_uL_s": 0.5,
+          "lead_time_s": 0.0,
+          "z_offset_mm": 0.1
+        }
+      ],
       "trypsin_reagent": "",
       "assembly_fingerprint": {
         "bore_count": 0,
-        "declared_pumps": {}
+        "declared_pumps": {
+          "0": "P1",
+          "1": "P2",
+          "2": "P3"
+        }
       },
       "fluor_overlay": false,
       "active_tab": 0

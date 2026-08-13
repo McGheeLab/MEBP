@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "Alexs new",
-  "saved": "2026-08-13T13:52:15",
+  "saved": "2026-08-12T14:22:35",
   "values": {
     "pump": {
       "text": "P1",
@@ -17,11 +17,11 @@
       "data": "velocity"
     },
     "ink": {
-      "text": "RhoB_LLS",
-      "data": "RhoB_LLS"
+      "text": "LLS rhodamine",
+      "data": "LLS rhodamine"
     },
-    "ink_z": 5.0,
-    "ink_padding": 0.5,
+    "ink_z": 5.5,
+    "ink_padding": 1.0,
     "ink_prime": true,
     "ink_prime_uL": 2.0,
     "orbit_granular": true,
@@ -41,8 +41,8 @@
     "postclean": true,
     "postclean_margin": 0.5,
     "travel_speed": 6.0,
-    "preflow": 5.0,
-    "g_settle": 1.0,
+    "preflow": 1.0,
+    "g_settle": 10.0,
     "__extra__": {
       "ink_map_last": {}
     }
