@@ -1,0 +1,1650 @@
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:21:23 — idle 5.1s
+======================================================================
+Current thread 0x000020e0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000005a0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005064 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006f8c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005fc8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\PrintFileManager.py", line 971 in read_print_objects
+  File "c:\dev\MEBP\gui\pages\print_library.py", line 505 in refresh
+  File "c:\dev\MEBP\gui\pages\print_library.py", line 466 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\mode_page.py", line 404 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:21:31 — idle 5.9s
+======================================================================
+Current thread 0x000020e0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000005a0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005064 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006f8c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005fc8 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 433 in _api_init
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 531 in enumerate
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 187 in detect_tucam_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 224 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5308 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5439 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:22:17 — idle 5.5s
+======================================================================
+Current thread 0x000020e0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000005a0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005064 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006f8c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005fc8 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 433 in _api_init
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 531 in enumerate
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 187 in detect_tucam_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 224 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5308 in _on_detect_live_cameras
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:34:16 — idle 5.1s
+======================================================================
+Current thread 0x00006aa0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006e48 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005bf8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007b34 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004ba4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\PrintFileManager.py", line 360 in list_files
+  File "c:\dev\MEBP\gui\pages\print_library.py", line 491 in refresh
+  File "c:\dev\MEBP\gui\pages\print_library.py", line 466 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\mode_page.py", line 404 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:34:24 — idle 6.0s
+======================================================================
+Thread 0x00005550 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 433 in _api_init
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 531 in enumerate
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 187 in detect_tucam_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 283 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00006aa0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006e48 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005bf8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007b34 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004ba4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1092 in join
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 293 in _probe_tucam_bounded
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 227 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5308 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5439 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 10:53:47 — idle 5.1s
+======================================================================
+Current thread 0x00005780 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006428 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005c9c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003dd4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005dd0 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\components.py", line 518 in set_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 2744 in _refresh_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 462 in _on_programs_changed
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_setup_panel.py", line 778 in _rebuild_rows
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_setup_panel.py", line 651 in set_pump_ids
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 1973 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\workflows_mode.py", line 271 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 13:50:08 — idle 5.5s
+======================================================================
+Current thread 0x00002fb0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000a9c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005378 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005200 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004164 (most recent call first):
+  File "c:\dev\MEBP\gui\app.py", line 685 in _build_ui
+  File "c:\dev\MEBP\gui\app.py", line 158 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 13:50:32 — idle 5.5s
+======================================================================
+Current thread 0x00002fb0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000a9c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005378 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005200 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004164 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\tokenize.py", line 455 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\linecache.py", line 171 in updatecache
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\linecache.py", line 42 in getlines
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1074 in findsource
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1240 in getsourcelines
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1258 in getsource
+  File "shibokensupport/feature.py", line 158 in _mod_uses_pyside
+  File "shibokensupport/feature.py", line 147 in feature_imported
+  File "shibokensupport/signature/loader.py", line 71 in feature_imported
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\cpu.py", line 7 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\compiler.py", line 6 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\dispatcher.py", line 14 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\registry.py", line 6 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\stencils\stencil.py", line 11 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\decorators.py", line 13 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\__init__.py", line 92 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\iir_transform.py", line 12 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\filters.py", line 9 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\__export__.py", line 9 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\__init__.py", line 8 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 275 in _load_andor
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 292 in _check_available
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 305 in __bool__
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 170 in detect_andor_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 232 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5404 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5535 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 15:51:49 — idle 5.1s
+======================================================================
+Thread 0x000083dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 1398 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000038e4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006e0c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004db4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numpy\_core\_methods.py", line 45 in _amin
+  File "c:\dev\MEBP\gui\widgets\mono_display.py", line 132 in compute_raw_frame_stats
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 1279 in _service_raw_plane
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 868 in _decode_frame
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 800 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00002fb0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000a9c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1379 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005378 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005200 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004164 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 3951 in wait_for_xy_arrival
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 5518 in safe_travel_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 12723 in _safe_navigate_to
+  File "c:\dev\MEBP\gui\widgets\needle_bore_wizard.py", line 1721 in _on_park
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 16:21:05 — idle 6.0s
+======================================================================
+Thread 0x000083dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 1398 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000038e4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006e0c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004db4 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 782 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00002fb0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000a9c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1379 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005378 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005200 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004164 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\serial\serialwin32.py", line 288 in read
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 1203 in flush_moves
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 5573 in safe_travel_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 12723 in _safe_navigate_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 4638 in _needle_loc_goto
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-11 16:57:52 — idle 5.2s
+======================================================================
+Current thread 0x00004194 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007c98 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000074ec (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000075b8 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006ed8 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\components.py", line 530 in set_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 2744 in _refresh_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 462 in _on_programs_changed
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_setup_panel.py", line 778 in _rebuild_rows
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_setup_panel.py", line 656 in set_needle
+  File "c:\dev\MEBP\gui\pages\workflows\cell_targeting_workflow.py", line 1974 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\workflows_mode.py", line 271 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 09:20:12 — idle 6.7s
+======================================================================
+Current thread 0x00007178 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003f18 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004324 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003cf4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003294 (most recent call first):
+  File "c:\dev\MEBP\gui\app.py", line 685 in _build_ui
+  File "c:\dev\MEBP\gui\app.py", line 158 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 09:20:34 — idle 5.5s
+======================================================================
+Current thread 0x00007178 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003f18 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004324 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003cf4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003294 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\tokenize.py", line 455 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\linecache.py", line 171 in updatecache
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\linecache.py", line 42 in getlines
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1074 in findsource
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1240 in getsourcelines
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\inspect.py", line 1258 in getsource
+  File "shibokensupport/feature.py", line 158 in _mod_uses_pyside
+  File "shibokensupport/feature.py", line 147 in feature_imported
+  File "shibokensupport/signature/loader.py", line 71 in feature_imported
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\utils.py", line 7 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\types\__init__.py", line 4 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\__init__.py", line 74 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\iir_transform.py", line 12 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\filters.py", line 9 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\dataproc\__export__.py", line 9 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\__init__.py", line 8 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 275 in _load_andor
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 292 in _check_available
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 305 in __bool__
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 170 in detect_andor_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 232 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5404 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5535 in _finish_auto_load
+  File "c:\dev\MEBP\gui\dialogs\calibration_status_dialog.py", line 134 in show_calibration_status
+  File "c:\dev\MEBP\gui\app.py", line 2648 in _maybe_show_calibration_status
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 10:11:13 — idle 5.4s
+======================================================================
+Thread 0x00007954 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 1398 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002ed8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000079a8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000709c (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 782 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00007178 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003f18 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1379 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004324 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003cf4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003294 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\serial\serialwin32.py", line 288 in read
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 1203 in flush_moves
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 5573 in safe_travel_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 12723 in _safe_navigate_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 4638 in _needle_loc_goto
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 11:51:51 — idle 5.4s
+======================================================================
+Current thread 0x00002bd0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000dfc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000012ac (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002064 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006f48 (most recent call first):
+  File "c:\dev\MEBP\gui\app.py", line 685 in _build_ui
+  File "c:\dev\MEBP\gui\app.py", line 158 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 11:52:10 — idle 5.7s
+======================================================================
+Current thread 0x00002bd0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000dfc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000012ac (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002064 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006f48 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\pathlib\_local.py", line 537 in open
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\pathlib\_abc.py", line 632 in read_text
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\pathlib\_local.py", line 546 in read_text
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\metadata\__init__.py", line 915 in read_text
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\metadata\__init__.py", line 496 in entry_points
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\metadata\__init__.py", line 1009 in <genexpr>
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\metadata\__init__.py", line 1011 in entry_points
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\entrypoints.py", line 36 in init_all
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\cpu.py", line 138 in load_additional_registries
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\base.py", line 267 in refresh
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\compiler.py", line 396 in __init__
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\compiler.py", line 737 in compile_extra
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\dispatcher.py", line 107 in _compile_core
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\dispatcher.py", line 94 in _compile_cached
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\dispatcher.py", line 80 in compile
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\dispatcher.py", line 906 in compile
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\numba\core\decorators.py", line 234 in wrapper
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\atcore_lib.py", line 195 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\AndorSDK3.py", line 2 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\devices\Andor\__init__.py", line 3 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 277 in _load_andor
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 292 in _check_available
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 305 in __bool__
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 170 in detect_andor_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 232 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5404 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5535 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 13:19:31 — idle 5.3s
+======================================================================
+Current thread 0x000056a8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e44 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002328 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e94 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e30 (most recent call first):
+  File "c:\dev\MEBP\gui\app.py", line 918 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 13:42:24 — idle 6.0s
+======================================================================
+Thread 0x00006efc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000056b8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004900 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 480 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003124 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 782 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000021f0 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 1398 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000056a8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e44 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1379 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002328 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e94 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e30 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 3951 in wait_for_xy_arrival
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 5518 in safe_travel_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 12736 in _safe_navigate_to
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 4639 in _needle_loc_goto
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 13:58:39 — idle 5.5s
+======================================================================
+Thread 0x0000611c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\serial\serialwin32.py", line 288 in read
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 1203 in flush_moves
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 5573 in safe_travel_to
+  File "c:\dev\MEBP\SupportClasses\PickAndPlaceManager.py", line 3249 in _safe_travel
+  File "c:\dev\MEBP\SupportClasses\PickAndPlaceManager.py", line 2794 in _safe_move_to
+  File "c:\dev\MEBP\SupportClasses\PickAndPlaceManager.py", line 2827 in _safe_move_to_well
+  File "c:\dev\MEBP\SupportClasses\PickAndPlaceManager.py", line 2040 in goto
+  File "c:\dev\MEBP\SupportClasses\PickAndPlaceManager.py", line 2075 in run_prep
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 3928 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00006efc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000056b8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004900 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 480 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003124 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 782 in _reader_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000021f0 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 1398 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x000056a8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e44 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1379 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002328 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e94 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00001e30 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 887 in _txn
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 842 in send_data
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 1391 in set_led_brightness
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 4305 in set_led_brightness
+  File "c:\dev\MEBP\gui\widgets\illumination_control.py", line 152 in send_now
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 17:33:35 — idle 5.2s
+======================================================================
+Current thread 0x000066c8 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007ba4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005364 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000611c (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007bdc (most recent call first):
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 17:56:25 — idle 5.5s
+======================================================================
+Current thread 0x00006950 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002ce0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005a14 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007038 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000053b4 (most recent call first):
+  File "<frozen importlib._bootstrap_external>", line 1217 in get_data
+  File "<frozen importlib._bootstrap_external>", line 1118 in get_code
+  File "<frozen importlib._bootstrap_external>", line 1022 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap>", line 1415 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\scipy\ndimage\__init__.py", line 166 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1387 in _gcd_import
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\__init__.py", line 88 in import_module
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\scipy\__init__.py", line 149 in __getattr__
+  File "<frozen importlib._bootstrap>", line 1412 in _handle_fromlist
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\skimage\registration\_phase_cross_correlation.py", line 11 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1387 in _gcd_import
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\importlib\__init__.py", line 88 in import_module
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\lazy_loader\__init__.py", line 78 in __getattr__
+  File "<frozen importlib._bootstrap>", line 1412 in _handle_fromlist
+  File "c:\dev\MEBP\SupportClasses\MosaicBuilder.py", line 49 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 15570 in _load_calibration
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 1737 in _activate_calibration_for_key
+  File "c:\dev\MEBP\gui\pages\calibration.py", line 2177 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 17:57:05 — idle 5.5s
+======================================================================
+Thread 0x000012a4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "c:\dev\MEBP\SupportClasses\MicroscopeControl.py", line 2336 in _worker_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000301c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000264c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00006950 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00002ce0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005a14 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00007038 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000053b4 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 433 in _api_init
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 531 in enumerate
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 187 in detect_tucam_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 528 in refresh_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 588 in start
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 410 in start
+  File "c:\dev\MEBP\gui\pages\jog_control.py", line 379 in _start_camera
+  File "c:\dev\MEBP\gui\pages\jog_control.py", line 396 in showEvent
+  File "c:\dev\MEBP\gui\widgets\page_transition.py", line 49 in fade_swap
+  File "c:\dev\MEBP\gui\app.py", line 2084 in _navigate_to
+  File "c:\dev\MEBP\gui\app.py", line 2062 in _on_menu_click
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 19:04:34 — idle 5.3s
+======================================================================
+Current thread 0x0000704c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005db0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000034cc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000035a4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005af4 (most recent call first):
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2538 in _render_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2874 in _refresh_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2865 in _refresh_setup_status
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 1276 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\workflows_mode.py", line 284 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 19:04:46 — idle 5.4s
+======================================================================
+Current thread 0x0000704c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005db0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000034cc (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000035a4 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00005af4 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\tucam_backend.py", line 620 in open
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 896 in _start_tucam
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 605 in start
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 410 in start
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 4161 in _on_live_cam_source_changed
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 1405 in <lambda>
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 4213 in _auto_assign_sources_from_store
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5457 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5557 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-12 19:38:24 — idle 5.1s
+======================================================================
+Thread 0x00003d54 (most recent call first):
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 126 in detect_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 339 in _worker
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00004494 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000055f0 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004290 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003854 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000040c0 (most recent call first):
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-13 11:51:20 — idle 6.3s
+======================================================================
+Current thread 0x00002f2c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000c30 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000042f4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000040ec (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000047f8 (most recent call first):
+  File "c:\dev\MEBP\gui\app.py", line 685 in _build_ui
+  File "c:\dev\MEBP\gui\app.py", line 158 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-13 11:51:40 — idle 5.9s
+======================================================================
+Current thread 0x00002f2c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000c30 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000042f4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000040ec (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000047f8 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\ctypes\__init__.py", line 390 in __init__
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\ctypes\__init__.py", line 461 in __getattr__
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\ft232\d2xx.py", line 29 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\ft232\__init__.py", line 19 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\comm_backend.py", line 761 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\core\devio\__export__.py", line 3 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\pylablib\__init__.py", line 9 in <module>
+  File "<frozen importlib._bootstrap>", line 488 in _call_with_frames_removed
+  File "<frozen importlib._bootstrap_external>", line 1026 in exec_module
+  File "<frozen importlib._bootstrap>", line 935 in _load_unlocked
+  File "<frozen importlib._bootstrap>", line 1331 in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 1360 in _find_and_load
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 275 in _load_andor
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 292 in _check_available
+  File "c:\dev\MEBP\gui\widgets\andor_backend.py", line 305 in __bool__
+  File "c:\dev\MEBP\gui\widgets\camera_widget.py", line 170 in detect_andor_cameras
+  File "c:\dev\MEBP\gui\widgets\camera_manager.py", line 232 in detect_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5426 in _on_detect_live_cameras
+  File "c:\dev\MEBP\gui\pages\hardware_setup.py", line 5557 in _finish_auto_load
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-13 11:55:31 — idle 5.1s
+======================================================================
+Current thread 0x00003a8c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004480 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1434 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x0000189c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\SerialUtils.py", line 361 in _check_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000b10 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000007dc (most recent call first):
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2538 in _render_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2874 in _refresh_readiness
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 2865 in _refresh_setup_status
+  File "c:\dev\MEBP\gui\pages\workflows\quick_print_workflow.py", line 1276 in set_hardware_config
+  File "c:\dev\MEBP\gui\pages\workflows_mode.py", line 284 in set_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 1980 in _propagate_hardware_config
+  File "c:\dev\MEBP\gui\app.py", line 947 in _create_pages
+  File "c:\dev\MEBP\gui\app.py", line 160 in __init__
+  File "c:\dev\MEBP\main.py", line 257 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>
+
+======================================================================
+GUI THREAD STALL — 2026-08-13 13:34:17 — idle 5.6s
+======================================================================
+Thread 0x00002ad4 (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 930 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00003c1c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1194 in _jog_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Current thread 0x00003a8c (most recent call first):
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 157 in _dump
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 130 in _check_once
+  File "c:\dev\MEBP\SupportClasses\GuiWatchdog.py", line 114 in _watch
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00004480 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\site-packages\serial\serialwin32.py", line 321 in write
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 919 in _txn_full
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 902 in _txn
+  File "c:\dev\MEBP\SupportClasses\ZPStage.py", line 1277 in get_current_position
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1401 in _poll_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x00000b10 (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 363 in wait
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\queue.py", line 213 in get
+  File "c:\dev\MEBP\SupportClasses\Processor.py", line 119 in _process_loop
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 992 in run
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1041 in _bootstrap_inner
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1012 in _bootstrap
+
+Thread 0x000007dc (most recent call first):
+  File "C:\Users\mcghe\AppData\Local\Programs\Python\Python313\Lib\threading.py", line 1092 in join
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 1358 in stop
+  File "c:\dev\MEBP\SupportClasses\StageController.py", line 6068 in shutdown
+  File "c:\dev\MEBP\gui\app.py", line 3230 in closeEvent
+  File "c:\dev\MEBP\main.py", line 273 in run_gui
+  File "c:\dev\MEBP\main.py", line 400 in main
+  File "c:\dev\MEBP\main.py", line 407 in <module>

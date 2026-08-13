@@ -41,6 +41,10 @@ config/hardware/devices/
 config/hardware/calibration_status.json
 config/hardware/camera_calibrations.json
 config/hardware/fluorescence_mosaics.json
+# v7.18 incubator config — which zone has a heater is wiring on THIS rig
+# (on ME3B V1 only the bed output HB has one; Zone B/HE0 is disabled here).
+config/hardware/incubator.json
+config/hardware/incubator_calibration.json
 config/hardware/last_calibration.json
 config/hardware/microscope.json
 # LabLink node config — per-machine AND it holds a bearer site token. The
@@ -70,6 +74,10 @@ logs/*.log.[0-9][0-9]
 
 # Print execution logs (keep the schema README, ignore the runs)
 logs/prints/*.jsonl
+
+# Incubator telemetry runs + the simulator's scratch EEPROM (v7.18)
+logs/incubator/*.jsonl
+logs/incubator/sim_incubator_state.json
 
 # Deliberately KEPT: logs/hwtest, logs/challenge and logs/timing hold
 # hardware-run records that the update plans cite as evidence.

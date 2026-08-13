@@ -296,6 +296,7 @@ class MicroscopeSetupPanel(QWidget):
         root.addWidget(self._build_filter_group())
         root.addWidget(self._build_objective_group())
         root.addWidget(self._build_focus_group())
+        root.addWidget(self._build_illumination_group())
         if show_save:
             root.addLayout(self._build_save_row())
         root.addStretch(1)
@@ -407,6 +408,15 @@ class MicroscopeSetupPanel(QWidget):
         form.addRow("Nosepiece device", self._mm_objective_edit)
         self._mm_focus_edit = QLineEdit()
         form.addRow("Focus device", self._mm_focus_edit)
+        # v7.17 accessories. A configuration is free not to load these; an
+        # unloaded device simply reports "not fitted" and its row disappears
+        # from the jog card.
+        self._mm_epi_shutter_edit = QLineEdit()
+        form.addRow("Epi shutter device", self._mm_epi_shutter_edit)
+        self._mm_dia_lamp_edit = QLineEdit()
+        form.addRow("Dia lamp device", self._mm_dia_lamp_edit)
+        self._mm_light_path_edit = QLineEdit()
+        form.addRow("Light path device", self._mm_light_path_edit)
         note = QLabel(
             "⚠ Micro-Manager's Nikon adapter WRAPS Nikon's own driver and SDK; "
             "it does not replace them.")
@@ -554,6 +564,51 @@ class MicroscopeSetupPanel(QWidget):
         self._focus_min_spin.setEnabled(on)
         self._focus_max_spin.setEnabled(on)
 
+    # ── Illumination & light path (v7.17) ─────────────────────────
+
+    def _build_illumination_group(self) -> QGroupBox:
+        box = QGroupBox("Illumination & light path")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(s(6))
+
+        self._illum_live_lbl = QLabel("—")
+        self._illum_live_lbl.setWordWrap(True)
+        self._illum_live_lbl.setStyleSheet(
+            f"color: {COLORS['text']}; font-family: Consolas, Menlo, monospace;")
+        lay.addWidget(self._illum_live_lbl)
+
+        self._interlock_chk = QCheckBox(
+            "Close the excitation shutter while the filter cassette rotates")
+        self._interlock_chk.setToolTip(
+            "Rotating the cassette with the shutter open sweeps the excitation "
+            "beam across every cube that passes, flashing the sample with "
+            "out-of-band light.\n\nVerify the shutter direction below FIRST: if "
+            "the reading is inverted, this would open the shutter for the "
+            "rotation instead of closing it.")
+        lay.addWidget(self._interlock_chk)
+
+        self._shutter_invert_chk = QCheckBox("Shutter reads inverted")
+        self._shutter_invert_chk.setToolTip(
+            "Tick this if the panel says 'open' when the shutter is actually "
+            "closed. The open/closed codes are derived from what the SDK "
+            "declares, which is not verified on every body.")
+        lay.addWidget(self._shutter_invert_chk)
+
+        lay.addWidget(self._hint(
+            "Toggle the shutter from the jog panel's Microscope card and LOOK "
+            "AT THE BODY, not the screen. Only enable the interlock once the "
+            "reading matches. Run Diagnostics… to see what this body reports "
+            "for each device — including whether a shutter is fitted at all. "
+            "Lamp level and shutter state are live illumination and are "
+            "deliberately not saved — reloading them on connect would switch a "
+            "lamp on unexpectedly.\n\n"
+            "Measured on this Ti-E: the dia lamp must be switched to software "
+            "(Remote) control before the SDK will accept anything, its on/off "
+            "then works, but its LEVEL is accepted and then reverts to the "
+            "front-panel knob within a second — so brightness is still set on "
+            "the body."))
+        return box
+
     def _build_save_row(self):
         row = QHBoxLayout()
         row.addStretch(1)
@@ -592,6 +647,12 @@ class MicroscopeSetupPanel(QWidget):
         self._mm_objective_edit.setText(
             str(st.get("mm_objective_device", "TINosePiece")))
         self._mm_focus_edit.setText(str(st.get("mm_focus_device", "TIZDrive")))
+        self._mm_epi_shutter_edit.setText(
+            str(st.get("mm_epi_shutter_device", "TIEpiShutter")))
+        self._mm_dia_lamp_edit.setText(
+            str(st.get("mm_dia_lamp_device", "TIDiaLamp")))
+        self._mm_light_path_edit.setText(
+            str(st.get("mm_light_path_device", "TILightPath")))
 
         self._filter_slots_spin.setValue(st.filter_slots())
         self._objective_slots_spin.setValue(st.objective_slots())
@@ -611,6 +672,8 @@ class MicroscopeSetupPanel(QWidget):
         self._focus_min_spin.setValue(lo if lo is not None else 0.0)
         self._focus_max_spin.setValue(hi if hi is not None else 10000.0)
         self._sync_limit_enabled(has)
+        self._interlock_chk.setChecked(st.filter_shutter_interlock())
+        self._shutter_invert_chk.setChecked(st.epi_shutter_invert())
         self._refresh_live()
 
     def commit(self) -> bool:
@@ -637,6 +700,18 @@ class MicroscopeSetupPanel(QWidget):
                save=False)
         st.set("mm_focus_device",
                self._mm_focus_edit.text().strip() or "TIZDrive", save=False)
+        st.set("mm_epi_shutter_device",
+               self._mm_epi_shutter_edit.text().strip() or "TIEpiShutter",
+               save=False)
+        st.set("mm_dia_lamp_device",
+               self._mm_dia_lamp_edit.text().strip() or "TIDiaLamp", save=False)
+        st.set("mm_light_path_device",
+               self._mm_light_path_edit.text().strip() or "TILightPath",
+               save=False)
+        st.set("filter_shutter_interlock",
+               bool(self._interlock_chk.isChecked()), save=False)
+        st.set("epi_shutter_invert",
+               bool(self._shutter_invert_chk.isChecked()), save=False)
         st.set("filter_slots", int(self._filter_slots_spin.value()), save=False)
         st.set("objective_slots", int(self._objective_slots_spin.value()),
                save=False)
@@ -766,6 +841,48 @@ class MicroscopeSetupPanel(QWidget):
                 text += (f"   (travel {state.focus_min_um:,.0f} – "
                          f"{state.focus_max_um:,.0f} µm)")
             self._focus_live_lbl.setText(text)
+
+        self._illum_live_lbl.setText(self._illumination_summary(state))
+
+    @staticmethod
+    def _illumination_summary(state) -> str:
+        """One line naming what is fitted and what state it is in.
+
+        Absent, unknown and known are three DIFFERENT readings and are shown as
+        such: "not fitted" is the body telling us there is no such device, while
+        "unknown" means it is there and did not answer.
+        """
+        def _state(present, value, on_word, off_word):
+            if not present:
+                return "not fitted"
+            return "unknown" if value is None else (on_word if value else off_word)
+
+        bits = [
+            "excitation shutter: "
+            + _state(state.epi_shutter_present, state.epi_shutter_open,
+                     "open", "closed")]
+        lamp = _state(state.dia_lamp_present, state.dia_lamp_on, "on", "off")
+        if state.dia_lamp_present and state.dia_lamp_intensity is not None:
+            lamp += f" at {state.dia_lamp_intensity:g}"
+            if state.dia_lamp_min is not None and state.dia_lamp_max is not None:
+                lamp += (f" of {state.dia_lamp_min:g}–"
+                         f"{state.dia_lamp_max:g}")
+        # Naming the mode matters: MainMode is WHY the lamp controls are dead,
+        # and a readout that only said "off" would look like a broken feature.
+        if state.dia_lamp_present and state.dia_lamp_remote is not None:
+            lamp += (" · software control"
+                     if state.dia_lamp_remote else " · FRONT-PANEL control")
+        bits.append(f"dia lamp: {lamp}")
+        if state.light_path_count:
+            names = state.native_light_path_names or ()
+            pos = state.light_path_position
+            name = (names[pos - 1]
+                    if pos and len(names) >= pos else "")
+            bits.append(f"light path: {pos or '?'} of {state.light_path_count}"
+                        + (f" ({name})" if name else ""))
+        else:
+            bits.append("light path: not fitted")
+        return "   ·   ".join(bits)
 
     # ── Diagnostics ───────────────────────────────────────────────
 

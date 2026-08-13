@@ -1014,7 +1014,6 @@ def build_locations_widget(controller, hw_config, well_positions, *,
         ("plate_bottom_z", "Plate bottom Z"),
         ("plate_top_z", "Plate top Z"),
         ("fast_move_z", "Fast-move Z"),
-        ("max_z", "Max Z"),
         ("replace_z", "Replace Z"),
     ]
     for key, label in label_map:

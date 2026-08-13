@@ -514,6 +514,13 @@ class HardwareControlPanel(QWidget):
         btns.addWidget(self.btn_disconnect_scope)
         grid.addLayout(btns, row, 2)
 
+        # v7.18 NOTE — deliberately NO Incubator row: the heaters are wired
+        # to the ZP board itself, so the ZP Connect above IS the incubator
+        # connect (operator: "it does not need a separate connect button").
+        # The Incubator page opens its session over the live ZP link
+        # automatically. When the planned ESP32 sensor board arrives it gets
+        # its own dedicated-serial transport — revisit a row here then.
+
         card.add_layout(grid)
         return card
 

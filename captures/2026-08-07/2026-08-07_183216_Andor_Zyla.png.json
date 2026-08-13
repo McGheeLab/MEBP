@@ -1,0 +1,20 @@
+{
+  "bit_depth": "12 Bit",
+  "camera_identity": "andor:VSC-07863",
+  "camera_name": "Andor Zyla",
+  "camera_slot": 3,
+  "captured_h": 1025,
+  "captured_w": 1025,
+  "clip_level": 4095,
+  "exposure_us": 1008.0,
+  "gain_mode": "12-bit (low noise)",
+  "kind": "still",
+  "readout_rate": "270 MHz",
+  "software": "MEBP",
+  "source_mode": "display",
+  "timestamp_iso": "2026-08-07T18:32:16-07:00",
+  "um_per_px": 1.320118,
+  "view_flip_x": true,
+  "view_flip_y": false,
+  "view_rotation_deg": 0.0999
+}

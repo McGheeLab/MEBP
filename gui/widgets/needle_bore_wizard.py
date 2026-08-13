@@ -847,8 +847,12 @@ class NeedleBoreWizard(QWidget):
         self._s2_apply_bottom = QPushButton("Apply plate bottom")
         self._s2_apply_bottom.setObjectName("successBtn")
         self._s2_apply_bottom.setToolTip(
-            "Set the Plate Bottom Z reference to plate-top − offset (tagged "
-            "'estimated' — the optical touch-off on step 4 refines it).")
+            "Set the Plate Bottom Z reference to plate-top − offset, tagged "
+            "'estimated'.\n\nThis is a PLANNING guess: it gives step 3 a survey "
+            "height and the touch-off a starting point, but it deliberately "
+            "does NOT arm the plate-bottom clamp — an estimate that reads high "
+            "would block the very touch-off that measures the real bottom, and "
+            "one that reads low would be false protection. Step 4 measures it.")
         self._s2_apply_bottom.clicked.connect(self._on_apply_bottom)
         apply_row.addWidget(self._s2_apply_bottom)
         self._s2_bottom_preview = QLabel("—")
@@ -864,15 +868,30 @@ class NeedleBoreWizard(QWidget):
             "it. Every cross-position XY move retracts here first.")
         self._s2_set_safe.clicked.connect(self._on_set_safe)
         safe_row.addWidget(self._s2_set_safe)
-        safe_row.addStretch()
+        self._s2_safe_lbl = QLabel("—")
+        safe_row.addWidget(self._s2_safe_lbl, 1)
         lay.addLayout(safe_row)
+
+        # Row 5 — needle-swap clearance. Direct setter here too: every
+        # reference this wizard is responsible for is settable on this page,
+        # rather than sending the operator to the Advanced group for one of them.
+        repl_row = QHBoxLayout()
+        self._s2_set_replace = QPushButton("Set replace Z = current Z")
+        self._s2_set_replace.setToolTip(
+            "Needle-swap clearance — retract to the height you use when "
+            "changing the needle, then capture it.")
+        self._s2_set_replace.clicked.connect(self._on_set_replace)
+        repl_row.addWidget(self._s2_set_replace)
+        self._s2_replace_lbl = QLabel("—")
+        repl_row.addWidget(self._s2_replace_lbl, 1)
+        lay.addLayout(repl_row)
 
         row = QHBoxLayout()
         self._s2_autofill = QPushButton("Auto-fill all from plate type")
         self._s2_autofill.setToolTip(
-            "Derive ALL the plate Z references (top / bottom / safe / max) "
-            "from the needle-cam fiducial and this plate type's stored "
-            "offsets. Asks before overwriting a value you taught by hand.")
+            "Derive the plate Z references (top / bottom / safe) from the "
+            "needle-cam fiducial and this plate type's stored offsets. Asks "
+            "before overwriting a value you taught by hand.")
         self._s2_autofill.clicked.connect(self._on_autofill_z)
         row.addWidget(self._s2_autofill)
         row.addStretch()
@@ -1551,8 +1570,7 @@ class NeedleBoreWizard(QWidget):
         host = self._host
         taught = [n for n, a in (("Plate Top Z", "_top_z"),
                                  ("Plate Bottom Z", "_plate_bottom_z"),
-                                 ("Fast Move Z", "_safe_z"),
-                                 ("Max Z", "_max_z"))
+                                 ("Fast Move Z", "_safe_z"))
                   if getattr(host, a, None) is not None]
         if taught:
             resp = QMessageBox.question(
@@ -1615,17 +1633,33 @@ class NeedleBoreWizard(QWidget):
         self.refresh()
 
     def _on_set_safe(self) -> None:
+        self._capture_reference("_zoff_set_safe_z", "_safe_z",
+                               "fast-move (safe) Z")
+
+    def _on_set_replace(self) -> None:
+        self._capture_reference("_zoff_set_replace_z", "_replace_z",
+                               "replace Z")
+
+    def _capture_reference(self, host_setter: str, host_attr: str,
+                           label: str) -> None:
+        """Capture the current Z into one host reference, or refuse inline.
+
+        Shared by the fast-move and replace setters: both are "read the live Z,
+        store it, confirm it landed". Verifying the host ATTRIBUTE afterwards
+        (not just that the call returned) is what catches a disconnected Z
+        board — the host setters return None either way.
+        """
         host = self._host
-        fn = getattr(host, "_zoff_set_safe_z", None)
+        fn = getattr(host, host_setter, None)
         if not callable(fn):
-            self._refuse("This build cannot capture the fast-move Z.")
+            self._refuse(f"This build cannot capture the {label}.")
             return
         try:
             fn()
         except Exception as e:
-            self._refuse(f"Could not capture the fast-move Z: {e}")
+            self._refuse(f"Could not capture the {label}: {e}")
             return
-        if getattr(host, "_safe_z", None) is None:
+        if getattr(host, host_attr, None) is None:
             self._refuse("Could not read the needle Z — is the Z board "
                          "connected?")
             return
@@ -2948,8 +2982,9 @@ class NeedleBoreWizard(QWidget):
             return ("Centre the needle tip on both side-camera crosshairs, "
                     "then save the needle origin.")
         if step == STEP_Z_REFS:
-            return ("Jog the tip to the plate TOP and capture it — the plate "
-                    "bottom is derived from the typed offset below it.")
+            return ("Capture each reference height with its own button — the "
+                    "plate bottom is ESTIMATED from the top, and measured for "
+                    "real by the touch-off on step 4.")
         if step == STEP_BORES:
             return ("Put the needle anywhere every bore is visible in the "
                     "microscope, press 'Start measuring here', then click each "
@@ -2985,21 +3020,37 @@ class NeedleBoreWizard(QWidget):
         return ""
 
     def _floor_advisory(self) -> str:
-        """Advisory (never a refusal) when the plate-bottom clamp has no datum.
+        """Advisory (never a refusal) when the plate-bottom clamp is not armed.
 
-        Step 3 is now reachable without a taught plate bottom, which is correct —
+        Step 3 is reachable without a measured plate bottom, which is correct —
         clicking two dots in one frame does not need one. But recording each
         bore's focus Z means jogging the needle DOWN by hand, and
-        ``_arm_floor(True)`` is a no-op without the datum
-        (``StageController._apply_print_floor_raw`` returns early on
-        ``_plate_bottom_z_zref is None``), so the clamp the operator may assume
-        is protecting them is not armed. Say so rather than either blocking the
-        measurement or staying silent about an inactive guard.
+        ``_arm_floor(True)`` is a no-op unless the datum was MEASURED
+        (``StageController.print_floor_datum_zref``), so the clamp the operator
+        may assume is protecting them is not armed. Say so rather than either
+        blocking the measurement or staying silent about an inactive guard.
+
+        ⚠ Two distinct cases, and reporting them the same way would be
+        misleading: NO bottom at all, versus a step-2 ESTIMATE — which looks
+        taught (the reference shows a number, the readouts fill in) but
+        deliberately does not clamp, so it is the case an operator is most
+        likely to over-trust.
         """
-        if getattr(self._host, "_plate_bottom_z", None) is not None:
+        if getattr(self._host, "_plate_bottom_z", None) is None:
+            return (" ⚠ No plate bottom yet, so the plate-bottom clamp is "
+                    "inactive — jog Z by hand with care.")
+        ctrl = self._ctrl()
+        try:
+            armed = ctrl.print_floor_datum_zref() is not None
+        except Exception:
+            # Older controller without the rule: it clamps on any datum, which
+            # is the pre-v7.17 behaviour — not something to warn about.
             return ""
-        return (" ⚠ Plate Bottom Z is not taught, so the plate-bottom clamp is "
-                "inactive — jog Z by hand with care, or teach it on step 2.")
+        if armed:
+            return ""
+        return (" ⚠ The plate bottom is only an ESTIMATE, so the plate-bottom "
+                "clamp is inactive — the touch-off on step 4 measures the real "
+                "one. Jog Z by hand with care.")
 
     def _render_step3_buttons(self) -> None:
         """Enable/disable step 3's two buttons with the first reason as tooltip.
@@ -3159,11 +3210,21 @@ class NeedleBoreWizard(QWidget):
             else:
                 lbl.setText(f"plate top = {top:.3f} mm")
                 lbl.setStyleSheet(f"color: {COLORS['green']};")
+        for attr, lbl_attr, name in (("_safe_z", "_s2_safe_lbl", "fast-move Z"),
+                                     ("_replace_z", "_s2_replace_lbl",
+                                      "replace Z")):
+            lb = getattr(self, lbl_attr, None)
+            if lb is None:
+                continue
+            v = getattr(host, attr, None)
+            lb.setText("not captured" if v is None else f"{name} = {v:.3f} mm")
+            lb.setStyleSheet(
+                f"color: {COLORS['yellow'] if v is None else COLORS['green']};")
         prev = getattr(self, "_s2_bottom_preview", None)
         if prev is not None:
             z = self._computed_bottom_zref()
             prev.setText("→ capture the plate top first" if z is None
-                         else f"→ plate bottom ≈ {z:.3f} mm")
+                         else f"→ plate bottom ≈ {z:.3f} mm (estimate)")
             prev.setStyleSheet(
                 f"color: {COLORS['subtext0'] if z is None else COLORS['text']};"
                 f" font-size: 9pt;")
@@ -3176,7 +3237,8 @@ class NeedleBoreWizard(QWidget):
         bits = []
         for label, attr in (("Plate top", "_top_z"),
                             ("Plate bottom", "_plate_bottom_z"),
-                            ("Fast-move", "_safe_z")):
+                            ("Fast-move", "_safe_z"),
+                            ("Replace", "_replace_z")):
             v = getattr(host, attr, None)
             bits.append(f"{label}: " + ("—" if v is None else f"{v:.3f} mm"))
         src = ""

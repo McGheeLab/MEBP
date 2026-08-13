@@ -570,6 +570,172 @@ class MicroscopeSection(QWidget):
             pass
 
 
+# ── Incubator readout (v7.18) ──────────────────────────────────────
+
+class IncubatorSection(QWidget):
+    """Read-only incubator readout: per-zone temperature → target · duty.
+
+    Deliberately a READOUT, not a control surface — setpoints keep ONE writer
+    (the Workflows → Incubator page). And deliberately PEEK-only on the
+    service singleton: this card never constructs or connects a session
+    (session policy lives with the page, which follows the ZP board by
+    itself); with no live session it says where to start one instead of
+    quietly showing nothing.
+    """
+
+    _POLL_S = 1.0   # the controller samples at 1 Hz — rendering faster is noise
+
+    def __init__(self, ctx: SectionContext, options: dict):
+        super().__init__()
+        self._ctx = ctx
+        self._last_render = 0.0
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(s(4))
+
+        self._rows: dict[str, tuple[QWidget, QLabel, QLabel, QLabel]] = {}
+        try:
+            from SupportClasses.incubator.zones import ALL_ZONES
+            zone_specs = list(ALL_ZONES)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("IncubatorSection: zones unavailable: %s", exc)
+            zone_specs = []
+
+        for spec in zone_specs:
+            row = QWidget()
+            rlay = QHBoxLayout(row)
+            rlay.setContentsMargins(0, 0, 0, 0)
+            rlay.setSpacing(s(6))
+            name = QLabel(spec.title)
+            name.setStyleSheet(
+                f"color: {COLORS['subtext0']}; font-size: {sf(9)}pt;"
+                f"font-weight: 600;")
+            name.setToolTip(
+                f"{spec.blurb}\nHeater output {spec.heater_connector} · "
+                f"thermistor {spec.sensor_connector}")
+            rlay.addWidget(name, stretch=1)
+            value = QLabel("—")
+            value.setStyleSheet(
+                f"color: {COLORS['text']}; font-size: {sf(9)}pt;"
+                f"font-family: Consolas, Menlo, monospace;")
+            rlay.addWidget(value)
+            state = QLabel("")
+            state.setMinimumWidth(s(60))
+            state.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rlay.addWidget(state)
+            lay.addWidget(row)
+            self._rows[spec.zone_id] = (row, name, value, state)
+
+        self._hint = QLabel("No incubator session.")
+        self._hint.setWordWrap(True)
+        self._hint.setStyleSheet(
+            f"color: {COLORS['subtext0']}; font-size: {sf(8.5)}pt;")
+        lay.addWidget(self._hint)
+        self._render(None)
+
+    # ── rendering ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _peek():
+        """The live incubator controller, WITHOUT creating one.
+
+        get_incubator()/connect are never called here — a readout that could
+        start sessions would be a second home for session policy (and the
+        Connect-card tests pin the same rule for the same reason).
+        """
+        try:
+            from SupportClasses.incubator.service import peek_incubator
+            return peek_incubator()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _zone_enabled(zone_id: str) -> bool:
+        try:
+            from SupportClasses.incubator.config_store import get_store
+            return bool(get_store().zone(zone_id).get("enabled", True))
+        except Exception:
+            return True
+
+    def _set_state(self, lbl: QLabel, text: str, color_key: str) -> None:
+        lbl.setText(text)
+        lbl.setStyleSheet(
+            f"color: {COLORS.get(color_key, COLORS['text'])};"
+            f"font-size: {sf(8.5)}pt; font-weight: 600;")
+
+    def _render(self, ctrl) -> None:
+        live = ctrl is not None and getattr(ctrl, "connected", False)
+        for zid, (row, _name, value, state) in self._rows.items():
+            show = live and self._zone_enabled(zid)
+            row.setVisible(show)
+            if not show:
+                continue
+            try:
+                rt = ctrl.zone_runtime(zid)
+                ch = ctrl.hub.marlin_channel(rt.spec.temp_key)
+            except Exception:
+                value.setText("—")
+                self._set_state(state, "", "subtext0")
+                continue
+            temp = getattr(ch, "value_c", None) if ch is not None else None
+            duty = getattr(ch, "power_pct", None) if ch is not None else None
+            stale = bool(getattr(ch, "stale", True)) if ch is not None else True
+            target = float(getattr(rt, "requested_c", 0.0) or 0.0)
+            refused = str(getattr(rt, "refused", "") or "")
+
+            bits = []
+            if temp is not None:
+                bits.append(f"{temp:.1f}")
+                if target > 0:
+                    bits.append(f"→ {target:g}")
+                bits.append("°C")
+                if duty is not None and target > 0:
+                    bits.append(f"· {duty:.0f}%")
+            value.setText(" ".join(bits) if bits else "—")
+
+            if refused:
+                self._set_state(state, "REFUSED", "red")
+                state.setToolTip(f"Board refused {refused} — see the "
+                                 f"Incubator page.")
+                continue
+            state.setToolTip("")
+            if not getattr(rt, "sensor_ok", True):
+                self._set_state(state, "SENSOR", "red")
+            elif temp is None or stale:
+                self._set_state(state, "stale", "yellow")
+            elif target <= 0:
+                self._set_state(state, "off", "overlay0")
+            elif abs(temp - target) <= 0.75:
+                self._set_state(state, "at target", "green")
+            elif temp < target:
+                self._set_state(state, "heating", "peach")
+            else:
+                self._set_state(state, "cooling", "peach")
+
+        if not live:
+            self._hint.setText(
+                "No incubator session — open Workflows → Incubator "
+                "(it follows the ZP board).")
+            self._hint.setVisible(True)
+        else:
+            transport = str(getattr(ctrl, "transport", "") or "")
+            word = {"shared": "on the ZP board", "serial": "own board",
+                    "simulated": "SIMULATED"}.get(transport, transport)
+            self._hint.setText(word)
+            self._hint.setVisible(bool(word))
+
+    def on_status_update(self) -> None:
+        import time as _time
+        now = _time.monotonic()
+        if (now - self._last_render) < self._POLL_S:
+            return
+        self._last_render = now
+        try:
+            self._render(self._peek())
+        except Exception as exc:  # a readout must never take the tick down
+            logger.debug("IncubatorSection render failed: %s", exc)
+
+
 # ── Register the built-in catalog ──────────────────────────────────
 
 register_section("camera", SectionSpec("Live camera", "📷", CameraSection))
@@ -583,3 +749,5 @@ register_section("illumination", SectionSpec(
     "Illumination LED", "💡", IlluminationSection))
 register_section("microscope", SectionSpec(
     "Microscope (cubes / focus / objectives)", "🔬", MicroscopeSection))
+register_section("incubator", SectionSpec(
+    "Incubator (zone temps)", "🌡️", IncubatorSection))

@@ -718,6 +718,26 @@ class HardwareSetupPage(ModePage):
         micro_scroll.setWidget(micro_holder)
         self._sub_scrolls["microscope"] = micro_scroll
 
+        # v7.18: dedicated Incubator sub-page — transport, zone naming and
+        # the setpoint ceiling for the two-zone heater stage. Hosts the SAME
+        # IncubatorSetupPanel pattern as the Microscope tab; settings only —
+        # connecting lives on the Incubator page / Connect Hardware card.
+        from gui.pages.hardware.incubator_panel import IncubatorSetupPanel
+        self._incubator_panel = IncubatorSetupPanel()
+        incu_holder = QWidget()
+        incu_holder.setStyleSheet(f"background-color: {_bg};")
+        incu_lay = QVBoxLayout(incu_holder)
+        incu_lay.setSpacing(s(18))
+        incu_lay.setContentsMargins(s(20), s(20), s(20), s(20))
+        incu_lay.addWidget(self._incubator_panel)
+        incu_scroll = QScrollArea()
+        incu_scroll.setWidgetResizable(True)
+        incu_scroll.setFrameShape(QFrame.NoFrame)
+        incu_scroll.setStyleSheet(
+            f"QScrollArea {{ background-color: {_bg}; border: none; }}")
+        incu_scroll.setWidget(incu_holder)
+        self._sub_scrolls["incubator"] = incu_scroll
+
         # v7.4.2: dedicated Xbox controller sub-page.
         from gui.pages.hardware.xbox_panel import XboxHardwarePanel
         self._xbox_panel = XboxHardwarePanel(self)
@@ -1962,6 +1982,8 @@ class HardwareSetupPage(ModePage):
         self.add_sub_page("droplet",   "Pump",            self._sub_scrolls["pumps_inks"])
         self.add_sub_page("camera",    "Cameras",         self._sub_scrolls["cameras"])
         self.add_sub_page("microscope","Microscope",      self._sub_scrolls["microscope"])
+        # v7.18: incubator heater settings (transport / zones / ceiling).
+        self.add_sub_page("incubator", "Incubator",       self._sub_scrolls["incubator"])
         self.add_sub_page("gamepad",   "Xbox Controller", self._sub_scrolls["xbox"])
 
         # v7.4.8: sync the rosette designer to the plate layout when the

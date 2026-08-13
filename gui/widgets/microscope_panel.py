@@ -10,6 +10,12 @@ A compact card for the Nikon Ti Eclipse's three motorized devices:
   2. **Focus (Z)** — raise / lower the focal plane by a settable step, or drive
      to an absolute position.
   3. **Objectives** — switch the nosepiece and see which objective is in.
+  4. **Illumination + light path** (v7.17) — the epi (excitation) shutter, the
+     transmitted-light lamp (on/off + level) and the eyepiece ↔ camera-port
+     selector. All three are accessories, so each row **hides entirely** when
+     the body does not report that device: a control that is visible but
+     permanently dead reads as broken software rather than as hardware this
+     microscope was never fitted with.
 
 Deliberately standalone: nothing here is wired into prints, workflows or
 calibrations yet — that integration is a later, separate step. This is the
@@ -165,6 +171,16 @@ class MicroscopePanel(QWidget):
         self._focus_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._focus_lbl.setMinimumWidth(s(1))
         grid.addWidget(self._focus_lbl, 2, 1)
+
+        # v7.17 — light path (eyepiece ↔ camera port).
+        self._path_caption = self._caption("Path")
+        grid.addWidget(self._path_caption, 3, 0)
+        self._light_combo = self._fluid_combo(
+            "Which port the light is sent to. Selecting the eyepiece takes the "
+            "light off the camera, so every captured frame goes black — that "
+            "reads downstream as an exposure fault, not as a setting.")
+        self._light_combo.currentIndexChanged.connect(self._on_light_path_selected)
+        grid.addWidget(self._light_combo, 3, 1)
         root.addLayout(grid)
 
         # Row 4: focus jog — down / step / up.
@@ -208,6 +224,56 @@ class MicroscopePanel(QWidget):
         goto.addWidget(self._btn_goto)
         root.addLayout(goto)
 
+        # Row 6: illumination — epi (excitation) shutter + transmitted lamp.
+        # Both rows HIDE entirely when the body has no such device: a control that
+        # is present but permanently dead reads as broken software rather than as
+        # an accessory this microscope was not fitted with.
+        illum = QHBoxLayout()
+        illum.setContentsMargins(0, 0, 0, 0)
+        illum.setSpacing(s(4))
+        self._shutter_btn = QPushButton("Excitation")
+        self._shutter_btn.setCheckable(True)
+        self._shutter_btn.setToolTip(
+            "Epi (excitation) shutter. Closed keeps excitation off the sample "
+            "between acquisitions.")
+        self._shutter_btn.clicked.connect(self._on_shutter_clicked)
+        illum.addWidget(self._shutter_btn, stretch=3)
+        root.addLayout(illum)
+        self._illum_row = illum
+
+        lamp = QHBoxLayout()
+        lamp.setContentsMargins(0, 0, 0, 0)
+        lamp.setSpacing(s(4))
+        self._lamp_btn = QPushButton("Dia lamp")
+        self._lamp_btn.setCheckable(True)
+        self._lamp_btn.setToolTip("Transmitted-light (brightfield) lamp on/off.")
+        self._lamp_btn.clicked.connect(self._on_lamp_clicked)
+        lamp.addWidget(self._lamp_btn, stretch=2)
+        self._lamp_spin = QDoubleSpinBox()
+        self._lamp_spin.setDecimals(0)
+        self._lamp_spin.setRange(0.0, 100.0)
+        self._lamp_spin.setToolTip(
+            "Lamp level, in the units the microscope itself declares — not a "
+            "percentage, which would be a made-up number.")
+        self._lamp_spin.setMinimumWidth(s(30))
+        self._lamp_spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._lamp_spin.editingFinished.connect(self._on_lamp_level)
+        lamp.addWidget(self._lamp_spin, stretch=2)
+        # Software-vs-front-panel control. A separate, explicit button because
+        # switching to Remote takes the lamp away from the knob on the
+        # microscope — the operator's call, not a side effect of a slider.
+        self._lamp_remote_btn = QPushButton("Man")
+        self._lamp_remote_btn.setCheckable(True)
+        self._lamp_remote_btn.setToolTip(
+            "Software (Remote) vs the microscope's own front-panel (Main) "
+            "control of the dia lamp.\n\nThe SDK refuses every software change "
+            "while the body's panel owns the lamp, so this must be on before "
+            "the controls beside it do anything.")
+        self._lamp_remote_btn.clicked.connect(self._on_lamp_remote_clicked)
+        lamp.addWidget(self._lamp_remote_btn, stretch=1)
+        root.addLayout(lamp)
+        self._lamp_row = lamp
+
     def _caption(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setStyleSheet(f"color: {COLORS['subtext0']}; font-weight: 600;")
@@ -245,8 +311,27 @@ class MicroscopePanel(QWidget):
                 labels=self._store.objective_labels(),
                 native=state.native_objective_names,
                 current=state.objective_position)
+            self._fill_light_combo(state)
         finally:
             self._suppress = False
+
+    def _fill_light_combo(self, state) -> None:
+        """Light-path positions. No store labels — see the plan's D11.
+
+        The SDK exposes no per-position name table, so whatever the driver
+        reports is used and the fallback is the position number. ``(empty)`` would
+        be wrong here: every position on a light-path drive exists.
+        """
+        combo = self._light_combo
+        names = state.native_light_path_names or ()
+        combo.clear()
+        for pos in range(1, max(0, int(state.light_path_count)) + 1):
+            name = names[pos - 1] if len(names) >= pos else ""
+            combo.addItem(f"{pos} · {name}" if name else f"port {pos}", pos)
+        if state.light_path_position is not None:
+            idx = combo.findData(int(state.light_path_position))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
 
     def _fill_combo(self, combo: QComboBox, *, count: int, labels: dict,
                     native, current) -> None:
@@ -322,6 +407,39 @@ class MicroscopePanel(QWidget):
         self._scope.set_objective(int(pos))
         self._render(force=True)
 
+    def _on_light_path_selected(self, _index: int) -> None:
+        if self._suppress or not self._connected():
+            return
+        pos = self._light_combo.currentData()
+        if pos is None or pos == self._scope.state().light_path_position:
+            return
+        self._scope.set_light_path(int(pos))
+        self._render(force=True)
+
+    def _on_shutter_clicked(self) -> None:
+        if self._suppress or not self._connected():
+            return
+        self._scope.set_epi_shutter(bool(self._shutter_btn.isChecked()))
+        self._render(force=True)
+
+    def _on_lamp_clicked(self) -> None:
+        if self._suppress or not self._connected():
+            return
+        self._scope.set_dia_lamp_on(bool(self._lamp_btn.isChecked()))
+        self._render(force=True)
+
+    def _on_lamp_remote_clicked(self) -> None:
+        if self._suppress or not self._connected():
+            return
+        self._scope.set_dia_lamp_remote(bool(self._lamp_remote_btn.isChecked()))
+        self._render(force=True)
+
+    def _on_lamp_level(self) -> None:
+        if self._suppress or not self._connected():
+            return
+        self._scope.set_dia_lamp_intensity(float(self._lamp_spin.value()))
+        self._render(force=True)
+
     def _jog_focus(self, direction: int) -> None:
         if not self._connected():
             return
@@ -352,7 +470,17 @@ class MicroscopePanel(QWidget):
 
     def _any_popup_open(self) -> bool:
         return (self._popup_open(self._filter_combo)
-                or self._popup_open(self._objective_combo))
+                or self._popup_open(self._objective_combo)
+                or self._popup_open(self._light_combo))
+
+    @staticmethod
+    def _set_row_visible(layout, visible: bool) -> None:
+        """Show/hide every widget in a row layout."""
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setVisible(bool(visible))
 
     def _tick(self) -> None:
         # Don't poll the body while the operator has a drop-down open: the
@@ -373,7 +501,12 @@ class MicroscopePanel(QWidget):
         key = (state.connected, state.busy, state.backend,
                state.filter_position, state.objective_position,
                state.focus_um, state.error,
-               state.filter_count, state.objective_count)
+               state.filter_count, state.objective_count,
+               state.epi_shutter_present, state.epi_shutter_open,
+               state.dia_lamp_present, state.dia_lamp_on,
+               state.dia_lamp_remote,
+               state.dia_lamp_intensity, state.dia_lamp_min, state.dia_lamp_max,
+               state.light_path_position, state.light_path_count)
         if not force and key == self._rendered_key:
             return
         self._rendered_key = key
@@ -445,3 +578,84 @@ class MicroscopePanel(QWidget):
             self._focus_lbl.setText("—")
         else:
             self._focus_lbl.setText(f"{state.focus_um:,.2f} µm")
+
+        self._render_illumination(state, connected)
+
+    def _render_illumination(self, state, connected: bool) -> None:
+        """Shutter / lamp / light-path rows (v7.17).
+
+        Each row is hidden outright when the body does not have that device —
+        a permanently-dead control reads as broken software, not as an accessory
+        that was never fitted.
+        """
+        # -- epi shutter --
+        self._set_row_visible(self._illum_row, bool(state.epi_shutter_present))
+        if state.epi_shutter_present:
+            is_open = state.epi_shutter_open
+            self._suppress = True
+            try:
+                self._shutter_btn.setChecked(bool(is_open))
+            finally:
+                self._suppress = False
+            # "unknown" is shown as unknown. Rendering it as "closed" would tell
+            # the operator the sample is dark when we do not actually know.
+            word = "—" if is_open is None else ("open" if is_open else "closed")
+            self._shutter_btn.setText(f"Excitation {word}")
+            self._shutter_btn.setEnabled(connected and not state.busy)
+
+        # -- dia lamp --
+        self._set_row_visible(self._lamp_row, bool(state.dia_lamp_present))
+        if state.dia_lamp_present:
+            on = state.dia_lamp_on
+            self._suppress = True
+            try:
+                self._lamp_btn.setChecked(bool(on))
+                lo, hi = state.dia_lamp_min, state.dia_lamp_max
+                if lo is not None and hi is not None and hi > lo:
+                    self._lamp_spin.setRange(float(lo), float(hi))
+                # Don't overwrite a level the operator is part-way through
+                # typing; the ~1 s poll would otherwise fight the keyboard.
+                if (state.dia_lamp_intensity is not None
+                        and not self._lamp_spin.hasFocus()):
+                    self._lamp_spin.setValue(float(state.dia_lamp_intensity))
+            finally:
+                self._suppress = False
+            self._lamp_btn.setText(
+                "Dia lamp —" if on is None else
+                ("Dia lamp on" if on else "Dia lamp off"))
+            live = connected and not state.busy
+            # In MainMode the SDK refuses every write, so an enabled control
+            # would be a button that reliably produces an error. `None` means the
+            # driver cannot tell, and is NOT treated as a refusal.
+            remote = state.dia_lamp_remote
+            writable = live and remote is not False
+            self._lamp_remote_btn.setEnabled(live and remote is not None)
+            self._lamp_remote_btn.setText("Remote" if remote else "Man")
+            self._lamp_btn.setEnabled(writable)
+            self._lamp_spin.setEnabled(writable and state.dia_lamp_min is not None)
+            hint = ("" if remote is not False else
+                    "  —  the microscope's front panel owns the lamp; "
+                    "press Remote to take software control")
+            self._lamp_btn.setToolTip(
+                "Transmitted-light (brightfield) lamp on/off." + hint)
+
+        # -- light path --
+        has_path = bool(state.light_path_count)
+        self._path_caption.setVisible(has_path)
+        self._light_combo.setVisible(has_path)
+        if has_path and not self._popup_open(self._light_combo):
+            self._light_combo.setEnabled(connected and not state.busy)
+            if state.light_path_count != self._light_combo.count():
+                self._suppress = True
+                try:
+                    self._fill_light_combo(state)
+                finally:
+                    self._suppress = False
+            if state.light_path_position is not None:
+                idx = self._light_combo.findData(int(state.light_path_position))
+                if idx >= 0:
+                    self._suppress = True
+                    try:
+                        self._light_combo.setCurrentIndex(idx)
+                    finally:
+                        self._suppress = False

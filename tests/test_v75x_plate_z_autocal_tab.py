@@ -103,10 +103,12 @@ class TestTabOrder(_Base):
 class TestWidgetPlacement(_Base):
     def test_reference_height_widgets_exist(self):
         page = self._make_page()
-        for attr in ("_zoff_lbl_replace_z", "_zoff_lbl_max_z",
+        for attr in ("_zoff_lbl_replace_z",
                      "_zoff_lbl_safe_z", "_zoff_lbl_top_z",
                      "_zoff_lbl_plate_bottom_z", "_zoff_btn_estimate"):
             self.assertTrue(hasattr(page, attr), attr)
+        # v7.17: Max Z retired (no consumer anywhere) — its label is gone.
+        self.assertFalse(hasattr(page, "_zoff_lbl_max_z"))
 
     def test_autocal_widgets_and_live_feed_exist(self):
         page = self._make_page()

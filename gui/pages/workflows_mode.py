@@ -42,6 +42,7 @@ from gui.pages.workflows.common_print_settings_workflow import (
     CommonPrintSettingsWorkflowPage,
 )
 from gui.pages.workflows.lablink_workflow import LabLinkWorkflowPage
+from gui.pages.workflows.incubator_workflow import IncubatorWorkflowPage
 
 if TYPE_CHECKING:
     from SupportClasses.StageController import StageController
@@ -151,6 +152,12 @@ class WorkflowsModePage(QWidget):
                     settings=settings,
                     camera_manager=camera_manager,
                 )
+            elif tile.workflow_id == "incubator":
+                page = IncubatorWorkflowPage(
+                    controller=controller,
+                    settings=settings,
+                    camera_manager=camera_manager,
+                )
             else:
                 page = StubWorkflowPage(tile.title)
             page.back_requested.connect(self._show_picker)
@@ -202,6 +209,12 @@ class WorkflowsModePage(QWidget):
         """The QuickPrintWorkflowPage instance (or None), so app.py can refresh
         its saved-prints combo when the Print Library changes files on disk."""
         idx = self._workflow_index.get("quick_print")
+        return self._stack.widget(idx) if idx is not None else None
+
+    @property
+    def incubator_page(self):
+        """The IncubatorWorkflowPage instance (or None if the tile is absent)."""
+        idx = self._workflow_index.get("incubator")
         return self._stack.widget(idx) if idx is not None else None
 
     def _show_picker(self):

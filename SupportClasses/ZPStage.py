@@ -136,6 +136,7 @@ class ZPStageManager:
         steps_per_mm: int | dict[str, int] = DEFAULT_STEPS_PER_MM,
         axis_map: dict[str, str] | None = None,
         preferred_port: str | None = None,
+        exclude_ports: list[str] | None = None,
     ):
         # v7.2.6: lock before init
         self._serial_lock = threading.RLock()  # v7.2.6: ZP serial lock
@@ -146,6 +147,14 @@ class ZPStageManager:
         # v7.4.2 hotfix: cached preferred port from last successful
         # connect — tried first to skip the rediscovery scan.
         self.preferred_port = preferred_port
+        # v7.18: ports this scan must never OPEN (opening asserts DTR and
+        # auto-resets an Arduino/Marlin board). A dedicated incubator board
+        # is a Marlin board too — probing it mid-hold would reboot Marlin
+        # and silently drop its heater setpoints. Same mechanism
+        # XYStageManager grew in v7.5.x for the ZP port.
+        self._exclude_ports = {
+            str(p).upper() for p in (exclude_ports or []) if p
+        }
         # Set after a successful connect so the caller can persist it.
         self.connected_port: str | None = None
         # v7.4.2: per-axis steps_per_mm + configurable axis map
@@ -357,6 +366,13 @@ class ZPStageManager:
             device_lc = (device or "").lower()
             if any(s in device_lc for s in self._SKIP_DEVICE_PATTERNS):
                 logger.debug(f"Skipping non-candidate port {device}")
+                continue
+            # v7.18: never open a port reserved for another device — the
+            # open itself DTR-resets whatever board is behind it.
+            if self._exclude_ports and (device or "").upper() in self._exclude_ports:
+                logger.debug(
+                    f"Skipping excluded port {device} "
+                    f"(reserved for another device)")
                 continue
 
             ser = self._try_open_marlin(device)
@@ -883,6 +899,20 @@ class ZPStageManager:
         Returns ``(ok, collected_text)`` — ``collected_text`` holds the non-ok
         response lines (e.g. an M114 position line) when ``collect=True``.
         """
+        ok, text, _stats = self._txn_full(line, ok_timeout=ok_timeout,
+                                          collect=collect)
+        return (ok, text)
+
+    def _txn_full(self, line: str, *, ok_timeout: float, collect: bool,
+                  include_terminal_line: bool = False,
+                  allow_identity_lines: bool = False
+                  ) -> tuple[bool, str, dict]:
+        """:meth:`_txn` with the outcome stats retained for the caller.
+
+        v7.18: split out so :meth:`transact` (the incubator's shared-board
+        channel) can distinguish timeout/error/reset without re-implementing
+        the locked write→read round trip.
+        """
         _t0 = time.monotonic()
         with self._serial_lock:
             try:
@@ -893,22 +923,137 @@ class ZPStageManager:
                 _zp_tracer().txn(line, outcome="write_error",
                                  latency_ms=(time.monotonic() - _t0) * 1000.0,
                                  note=str(e)[:60])
-                return (False, "")
+                return (False, "", {"outcome": "write_error", "rx": 0,
+                                    "busy": 0})
             _zp_tracer().tx(line)
-            ok, text, stats = self._read_until_ok(ok_timeout, collect)
+            ok, text, stats = self._read_until_ok(
+                ok_timeout, collect,
+                include_terminal_line=include_terminal_line,
+                allow_identity_lines=allow_identity_lines)
         _zp_tracer().txn(line, outcome=stats.get("outcome", "?"),
                          latency_ms=(time.monotonic() - _t0) * 1000.0,
                          rx_count=stats.get("rx", 0),
                          busy_count=stats.get("busy", 0))
-        return (ok, text)
+        return (ok, text, stats)
+
+    def transact(self, command: str, *, ok_timeout: float = 6.0,
+                 collect: bool = True, include_terminal_line: bool = False,
+                 allow_identity_lines: bool = False
+                 ) -> tuple[bool, str, str]:
+        """Public single-command transaction for SAME-BOARD auxiliary traffic.
+
+        v7.18: the incubator heaters live on this board (bed = Zone A water
+        block, hotend 0 = Zone B), so heater G-code must share this serial
+        channel. This is the ONE sanctioned entry point: the whole round trip
+        runs under ``_serial_lock``, so heater and motion traffic can never
+        interleave mid-transaction (``SupportClasses/incubator/
+        zp_shared_link.py`` is the consumer).
+
+        Returns ``(ok, text, outcome)`` with ``outcome`` ∈ ok / timeout /
+        hard_timeout / error / reset / read_error / write_error /
+        not_connected / simulated. ``include_terminal_line=True`` keeps the
+        terminating line in ``text`` — REQUIRED for M105, whose temperature
+        data rides ON the ``ok`` line (``ok T:.. B:..``) and would otherwise
+        be discarded.
+
+        A SIMULATED ZP refuses (the motion simulator models no heaters — the
+        incubator has its own thermal simulator for that). Callers must keep
+        ``ok_timeout`` short: this holds the motion lock for the duration.
+
+        ``allow_identity_lines`` MUST be passed for a mid-session M115: its
+        legitimate reply contains ``FIRMWARE_NAME`` / ``Marlin``, which the
+        default reset classifier would misread as a boot banner — failing the
+        transaction AND poisoning ``_board_reset_detected`` (the flag the
+        position-restore flow trusts). With the flag set, only a literal
+        ``start`` line still counts as a reset.
+        """
+        if self.simulate:
+            return (False, "", "simulated")
+        if self.serial is None:
+            return (False, "", "not_connected")
+        ok, text, stats = self._txn_full(
+            command, ok_timeout=ok_timeout, collect=collect,
+            include_terminal_line=include_terminal_line,
+            allow_identity_lines=allow_identity_lines)
+        return (ok, text, stats.get("outcome", "?"))
+
+    def priority_write(self, command: str, lock_timeout_s: float = 0.25) -> bool:
+        """v7.18: bounded-lock OUT-OF-BAND write for EMERGENCY_PARSER commands.
+
+        The generalized twin of :meth:`quickstop` (which is deliberately left
+        untouched — it is hardware-verified abort code): try the serial lock
+        briefly, and on contention RAW-WRITE with a leading newline. Safe for
+        the same reasons documented on ``quickstop``: the lock holder wrote
+        its command microseconds after acquiring and has been in its READ
+        loop since, the newline terminates any hypothetical partial line, and
+        the OS queues each ``write()`` whole. Intended ONLY for commands
+        Marlin's EMERGENCY_PARSER plucks straight from the input buffer
+        (M112 / M108 / M410 / M876) — anything else belongs in
+        :meth:`transact`. No ``ok`` is awaited; a stray ``ok`` may terminate
+        one later transaction early, which every caller of those commands
+        already tolerates (see :meth:`resync_position`).
+        """
+        cmd = (command or "").strip()
+        if not cmd:
+            return False
+        if self.simulate or self.serial is None:
+            return False
+        got_lock = False
+        try:
+            got_lock = self._serial_lock.acquire(timeout=max(0.0, lock_timeout_s))
+        except TypeError:                       # fake locks without timeout=
+            try:
+                got_lock = self._serial_lock.acquire(False)
+            except Exception:
+                got_lock = False
+        try:
+            payload = (cmd + "\n").encode("utf-8")
+            if not got_lock:
+                payload = b"\n" + payload
+            try:
+                self.serial.write(payload)
+                self.serial.flush()
+                _zp_tracer().tx(cmd + ("" if got_lock else " (raw/no-lock)"))
+                logger.warning(
+                    f"ZP priority write {cmd!r} sent "
+                    f"{'under lock' if got_lock else 'RAW — lock contended'}; "
+                    f"EMERGENCY_PARSER={self.emergency_parser}")
+                return True
+            except Exception as e:
+                logger.error(f"ZP priority write failed: {e}")
+                return False
+        finally:
+            if got_lock:
+                try:
+                    self._serial_lock.release()
+                except Exception:
+                    pass
 
     def _read_until_ok(self, ok_timeout: float,
-                       collect: bool) -> tuple[bool, str, dict]:
+                       collect: bool,
+                       include_terminal_line: bool = False,
+                       allow_identity_lines: bool = False
+                       ) -> tuple[bool, str, dict]:
         """Read serial lines until Marlin acknowledges with ``ok``.
 
         MUST be called holding ``_serial_lock``. Returns
         ``(ok, text, stats)`` where ``stats`` = ``{outcome, rx, busy}`` for the
         serial tracer (outcome ∈ ok/timeout/error/reset/read_error).
+
+        ``include_terminal_line`` (v7.18, default False = byte-identical for
+        every existing caller) also appends the TERMINATING line — the ``ok``,
+        ``error…`` or reset banner — to the collected text. M105 is why it
+        exists: Marlin puts the temperature data ON the ok line
+        (``ok T:.. B:..``), so a caller that needs it must opt in.
+
+        ``allow_identity_lines`` (v7.18, default False = byte-identical)
+        narrows reset detection to a literal ``start`` line. The default
+        markers include ``firmware_name``/``marlin`` because motion commands
+        never legitimately produce them — but a mid-session M115 (the
+        incubator's shared-board firmware probe) DOES, and misreading its
+        reply as a boot banner would fail the probe and falsely set
+        ``_board_reset_detected``. A genuine reset still announces itself
+        with ``start`` first, so real resets remain caught.
 
         Line classification:
           * ``ok`` / ``ok ...``        → success.
@@ -958,10 +1103,14 @@ class ZPStageManager:
             _zp_tracer().rx(line)
             low = line.lower()
             if low == "ok" or low.startswith("ok "):
+                if include_terminal_line and collect:
+                    parts.append(line)
                 return (True, "\n".join(parts),
                         {"outcome": "ok", "rx": rx_count, "busy": busy_count})
             if low.startswith("error"):
                 logger.error(f"ZP Marlin reported an error: {line}")
+                if include_terminal_line and collect:
+                    parts.append(line)
                 return (False, "\n".join(parts),
                         {"outcome": "error", "rx": rx_count,
                          "busy": busy_count})
@@ -973,13 +1122,19 @@ class ZPStageManager:
                 busy_count += 1
                 deadline = time.monotonic() + ok_timeout
                 continue
-            if any(m in low for m in self._RESET_MARKERS):
+            reset_hit = (
+                low.startswith("start") if allow_identity_lines
+                else any(m in low for m in self._RESET_MARKERS)
+            )
+            if reset_hit:
                 logger.error(
                     f"ZP board RESET detected mid-session: {line!r} — "
                     f"position counter is lost until re-declared")
                 self._board_reset_detected = True
                 self.reset_count = getattr(self, "reset_count", 0) + 1
                 _zp_tracer().event("board_reset", line=repr(line))
+                if include_terminal_line and collect:
+                    parts.append(line)
                 return (False, "\n".join(parts),
                         {"outcome": "reset", "rx": rx_count,
                          "busy": busy_count})

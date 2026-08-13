@@ -1533,7 +1533,7 @@ class CalibrationPage(QWidget):
 
                   # v7.4.4: new Z reference heights for the Needle
                   # Offset Calibration tab.
-                  '_replace_z','_max_z','_plate_bottom_z',
+                  '_replace_z','_plate_bottom_z',
 
                   # v7.9.1: the plate-bottom anchor (bed-level plane origin).
                   '_plate_bottom_anchor_xy_um','_plate_bottom_z_source']:
@@ -1681,7 +1681,6 @@ class CalibrationPage(QWidget):
         self._safe_z = None
         self._top_z = None
         self._replace_z = None
-        self._max_z = None
         self._plate_bottom_z = None
         # v7.9.1: WHERE the plate bottom was taught (absolute stage µm) and by
         # which method. The bed-level survey anchors its plane on this point.
@@ -1713,7 +1712,6 @@ class CalibrationPage(QWidget):
                 ("_zoff_lbl_safe_z", "Fast Move Z"),
                 ("_zoff_lbl_top_z", "Plate Top Z"),
                 ("_zoff_lbl_replace_z", "Replace Z"),
-                ("_zoff_lbl_max_z", "Max Z"),
                 ("_zoff_lbl_plate_bottom_z", "Plate Bottom Z")):
             lbl = getattr(self, lbl_attr, None)
             if lbl is not None:
@@ -1812,21 +1810,19 @@ class CalibrationPage(QWidget):
         Keys (all values are mm, zero-referenced; missing = ``None``):
 
         * ``replace_z``       — needle-swap clearance (highest)
-        * ``max_z``           — soft-limit ceiling
         * ``fast_move_z``     — fast XY travel height (legacy ``safe_z``)
         * ``plate_top_z``     — plate's top surface (legacy ``top_z``)
         * ``plate_bottom_z``  — well floor (lowest)
         """
         return {
             "replace_z":      getattr(self, "_replace_z", None),
-            "max_z":          getattr(self, "_max_z", None),
             "fast_move_z":    getattr(self, "_safe_z", None),
             "plate_top_z":    getattr(self, "_top_z", None),
             "plate_bottom_z": getattr(self, "_plate_bottom_z", None),
         }
 
     #: Default: every reference gets a quick-move badge (the pre-v7.9.1 look).
-    _ALL_Z_REF_KEYS = ("replace_z", "max_z", "fast_move_z",
+    _ALL_Z_REF_KEYS = ("replace_z", "fast_move_z",
                        "plate_top_z", "plate_bottom_z")
 
     def get_z_reference_visibility(self) -> dict:
@@ -2673,7 +2669,7 @@ class CalibrationPage(QWidget):
                 getattr(wiz, "current_step", ""))
 
         # ── Advanced Z references — the full reference-heights panel
-        # (Replace/Max Z, the XZ side view, needle-cam estimates, the learn
+        # (Replace Z, the XZ side view, needle-cam estimates, the learn
         # loop), collapsed by default. Step 2 carries the primary flow now;
         # this is the escape hatch. Its content keeps its own scroll area.
         self._needle_loc_adv_btn = QToolButton()
@@ -4712,10 +4708,6 @@ class CalibrationPage(QWidget):
              "for replacing the needle.",
              self._zoff_set_replace_z, "_zoff_lbl_replace_z", "Replace Z",
              "replace_z"),
-            ("Set Max Z",
-             "Soft-limit ceiling — the highest Z the stage may "
-             "travel to during normal motion.",
-             self._zoff_set_max_z, "_zoff_lbl_max_z", "Max Z", "max_z"),
             ("Set Fast Move Z",
              "Travel height for fast XY moves between wells "
              "(retract before XY, return below afterward).",
@@ -5610,9 +5602,11 @@ class CalibrationPage(QWidget):
     #
     # The existing wizard uses ``_safe_z`` (Fast Move Z) and ``_top_z``
     # (Plate Top Z) — those internals stay so the rest of the pipeline
-    # (safe-travel logic, soft limits, etc.) keeps working. The three
-    # new heights (Replace Z, Max Z, Plate Bottom Z) get fresh
-    # attributes plus a shared capture helper.
+    # (safe-travel logic, soft limits, etc.) keeps working. The two
+    # remaining new heights (Replace Z, Plate Bottom Z) get fresh
+    # attributes plus a shared capture helper. (v7.17 retired Max Z: it
+    # had no consumer anywhere — display only — and was one more stale
+    # reference to re-teach after a Z re-datum.)
 
     def _zoff_capture_current_z(self) -> float | None:
         """Read the current stage Z (mm, zero-referenced) or None.
@@ -5642,7 +5636,6 @@ class CalibrationPage(QWidget):
         ("_safe_z", ("lbl_safe_z", "_zoff_lbl_safe_z"), "Fast Move Z"),
         ("_top_z", ("lbl_top_z", "_zoff_lbl_top_z"), "Plate Top Z"),
         ("_replace_z", ("_zoff_lbl_replace_z",), "Replace Z"),
-        ("_max_z", ("_zoff_lbl_max_z",), "Max Z"),
         ("_plate_bottom_z", ("_zoff_lbl_plate_bottom_z",), "Plate Bottom Z"),
     ]
 
@@ -5711,18 +5704,13 @@ class CalibrationPage(QWidget):
                 "tip records its camera Z), then try again.")
             return
         # Pre-fill the references (zero-ref storage) + push to controller.
-        # v7.5.x: Max Z is now inherited too (kept as a print reference only —
-        # NOT written to safety_limits.z_max; see _zoff_set_max_z).
         self._top_z = refs["plate_top_z"]
         self._plate_bottom_z = refs["plate_bottom_z"]
         self._safe_z = refs["safe_z"]
-        if refs.get("plate_max_z") is not None:
-            self._max_z = refs["plate_max_z"]
         for lbl_attr, prefix, val in (
             ("_zoff_lbl_top_z", "Plate Top Z", self._top_z),
             ("_zoff_lbl_plate_bottom_z", "Plate Bottom Z", self._plate_bottom_z),
             ("_zoff_lbl_safe_z", "Fast Move Z", self._safe_z),
-            ("_zoff_lbl_max_z", "Max Z", getattr(self, "_max_z", None)),
         ):
             lbl = getattr(self, lbl_attr, None)
             if lbl is not None and val is not None:
@@ -5767,8 +5755,9 @@ class CalibrationPage(QWidget):
         makes its Z guesses appear without an extra click. The taught-wins gate
         (fill only when the reference is currently ``None``) means restored /
         manually-taught values are never clobbered; ``force=True`` overrides
-        (re-derive from the new type's offsets). Max Z stays a print reference
-        only (never touches ``safety_limits.z_max``).
+        (re-derive from the new type's offsets). No reference here ever
+        touches ``safety_limits.z_min/z_max`` — that envelope is owned by
+        Hardware Setup → Device.
         """
         ctrl = getattr(self, "controller", None)
         if ctrl is None or not hasattr(ctrl, "estimate_plate_z_refs"):
@@ -5784,7 +5773,6 @@ class CalibrationPage(QWidget):
             ("_plate_bottom_z", "plate_bottom_z",
              "_zoff_lbl_plate_bottom_z", "Plate Bottom Z"),
             ("_safe_z", "safe_z", "_zoff_lbl_safe_z", "Fast Move Z"),
-            ("_max_z", "plate_max_z", "_zoff_lbl_max_z", "Max Z"),
         )
         changed = False
         for attr, ref_key, lbl_attr, prefix in targets:
@@ -5839,7 +5827,6 @@ class CalibrationPage(QWidget):
             ("top", getattr(self, "_top_z", None)),
             ("bottom", getattr(self, "_plate_bottom_z", None)),
             ("safe", getattr(self, "_safe_z", None)),
-            ("max", getattr(self, "_max_z", None)),
         )
         new_off = {key: float(cam) - float(ctrl.zref_to_user_z(zref))
                    for key, zref in ref_map if zref is not None}
@@ -5847,7 +5834,7 @@ class CalibrationPage(QWidget):
             QMessageBox.information(
                 self, "Save Z offsets",
                 "No Z references are set yet — teach Plate Top / Bottom / "
-                "Fast-Move / Max above first.")
+                "Fast-Move above first.")
             return
         try:
             if kind == "document":
@@ -5934,37 +5921,21 @@ class CalibrationPage(QWidget):
         logger.info(f"Replace Z set: {z:.2f} mm (zero-ref)")
         self._emit_calibration_data_changed()
 
-    def _zoff_set_max_z(self) -> None:
-        """Max Z setter — captures the upper Z reference height for print
-        planning.
-
-        v7.5.x: this no longer writes into the safety envelope. The Z
-        soft limits are owned by Hardware Setup → Device
-        (``safety_limits.z_min/z_max``). The old behaviour pushed the
-        calibrated Max Z into ``z_max``, which clobbered the user's
-        device-setup range and — on machines where the needle descends as
-        Z *increases* (so Max Z is numerically *below* Plate Bottom Z) —
-        inverted the envelope, collapsing ``clamp_z`` to a single point so
-        every jog was clamped. The value is still kept as a print/Z
-        reference via ``self._max_z``."""
-        z = self._zoff_capture_current_z()
-        if z is None:
-            return
-        self._max_z = z
-        self._zoff_lbl_max_z.setText(f"Max Z: {self._zoff_user_z(z):.2f} mm")
-        self._zoff_lbl_max_z.setStyleSheet(f"color: {COLORS['green']};")
-        logger.info(f"Max Z set: {z:.2f} mm (zero-ref)")
-        self._emit_calibration_data_changed()
-
     def _zoff_set_plate_bottom_z(self) -> None:
         """Plate Bottom Z setter — captures the lower Z reference height
         (well floor) for print planning.
 
         v7.5.x: this no longer writes into the safety envelope; the Z soft
-        limits are owned by Hardware Setup → Device (see
-        ``_zoff_set_max_z`` for the inverted-envelope bug this caused). The
-        value is still kept as a print/Z reference via
-        ``self._plate_bottom_z``."""
+        limits are owned by Hardware Setup → Device. Writing a calibrated
+        height into ``safety_limits.z_max`` once inverted the envelope on
+        machines where the needle descends as raw Z increases, collapsing
+        ``clamp_z`` to a single point so every jog was clamped. The value is
+        kept as a print/Z reference via ``self._plate_bottom_z``.
+
+        v7.17: this is the CONTACT touch-off, and it is one of only two
+        writers that may arm the print-floor clamp (the other is the optical
+        measurement). A step-2 ESTIMATE must not — see
+        :meth:`_zoff_apply_plate_bottom_z`."""
         z = self._zoff_capture_current_z()
         if z is None:
             return
@@ -6044,6 +6015,15 @@ class CalibrationPage(QWidget):
         estimated" warnings can fire; ``set_plate_bottom_z`` only overwrites
         ``source`` when non-None, so app.py's untagged re-push on
         ``calibration_data_changed`` cannot clobber the tag afterwards.
+
+        ⚠ v7.17 — WITH ``source="estimated"`` THIS DOES NOT ARM THE PRINT-FLOOR
+        CLAMP. The value is a planning reference (survey heights, readouts, a
+        starting guess for the optical search); the clamp is armed only by a
+        MEASURED bottom, from the touch-off. That the tag survives app.py's
+        untagged re-push is what makes the rule hold, and
+        ``StageController.print_floor_datum_zref`` is where it lives — one
+        place, so a second caller cannot re-arm a guess by accident. See that
+        method for why an estimate is unsafe in BOTH directions.
         """
         z = float(zref_mm)
         self._plate_bottom_z = z
@@ -15164,7 +15144,6 @@ class CalibrationPage(QWidget):
             "corner_well": getattr(self, '_corner_well', "H12"),
             # v7.4.4 additions — Needle Offset Calibration heights.
             "replace_z": getattr(self, '_replace_z', None),
-            "max_z": getattr(self, '_max_z', None),
             "plate_bottom_z": getattr(self, '_plate_bottom_z', None),
             # v7.9.1: WHERE the plate bottom was taught, and by which method.
             # The bed-level survey measures tilt only, so this scalar is its one
@@ -15454,7 +15433,6 @@ class CalibrationPage(QWidget):
         # v7.4.4: new Z reference heights.
         for key, attr, lbl_attr, prefix in [
             ("replace_z", "_replace_z", "_zoff_lbl_replace_z", "Replace Z"),
-            ("max_z", "_max_z", "_zoff_lbl_max_z", "Max Z"),
             ("plate_bottom_z", "_plate_bottom_z",
              "_zoff_lbl_plate_bottom_z", "Plate Bottom Z"),
         ]:
@@ -15487,14 +15465,13 @@ class CalibrationPage(QWidget):
 
         # v7.5.x: the Z soft-limit envelope is owned by Hardware Setup →
         # Device (settings ``safety_limits.z_min/z_max``, loaded onto the
-        # live controller in main.py), NOT by the calibrated Max Z / Plate
-        # Bottom Z. The old v7.4.4 restore pushed those into the envelope on
-        # every startup, which clobbered the user's device-setup range and —
-        # on machines where the needle descends as Z *increases* (Max Z
-        # numerically below Plate Bottom Z) — inverted the envelope so
-        # clamp_z() collapsed to a single point and every jog was clamped to
-        # it. The captured heights remain available as print/Z references via
-        # self._max_z / self._plate_bottom_z.
+        # live controller in main.py), NOT by the calibrated Plate Bottom Z.
+        # The old v7.4.4 restore pushed the calibrated heights into the
+        # envelope on every startup, which clobbered the user's device-setup
+        # range and — on machines where the needle descends as Z *increases*
+        # — inverted the envelope so clamp_z() collapsed to a single point
+        # and every jog was clamped to it. The captured heights remain
+        # available as print/Z references via self._plate_bottom_z.
 
         self._taught_a1_z = cal.get("taught_a1_z")
         self._taught_corner_z = cal.get("taught_corner_z")

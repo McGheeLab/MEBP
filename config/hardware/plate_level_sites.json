@@ -16,12 +16,12 @@
       "ref_focus_um": 1000.0
     },
     "plate-24|x": {
-      "n_runs": 12,
+      "n_runs": 13,
       "offset_mean_um": 0.0,
       "offset_sigma_um": 0.0,
       "sx_mm_per_mm": -2.2774319436142186e-18,
       "sy_mm_per_mm": 0.019900000000000008,
-      "date": "2026-08-10T17:14:41",
+      "date": "2026-08-12T17:08:00",
       "ref_xy_um": [
         0.0,
         0.0

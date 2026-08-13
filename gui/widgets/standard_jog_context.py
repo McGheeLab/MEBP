@@ -73,7 +73,7 @@ class StandardJogContextPanel(QWidget):
         # Needle Offset Calibration tab. Populated via
         # ``set_z_references()``. Missing entries render as "unset".
         self._z_refs: dict[str, float | None] = {
-            "replace_z": None, "max_z": None,
+            "replace_z": None,
             "fast_move_z": None, "plate_top_z": None,
             "plate_bottom_z": None,
         }
@@ -153,7 +153,7 @@ class StandardJogContextPanel(QWidget):
 
     def set_z_references(self, refs: dict) -> None:
         """v7.4.4: Receive the full set of captured Z reference heights
-        (``replace_z`` / ``max_z`` / ``fast_move_z`` / ``plate_top_z``
+        (``replace_z`` / ``fast_move_z`` / ``plate_top_z``
         / ``plate_bottom_z``). Each value is mm zero-referenced or
         None when unset."""
         for key in self._z_refs:
@@ -390,7 +390,6 @@ class StandardJogContextPanel(QWidget):
         self._lbl_info_calibration = self._info_row(card, "Calibration", "—")
         # v7.4.4: five Z reference heights, top → bottom.
         self._lbl_info_replace_z = self._info_row(card, "Replace Z", "—")
-        self._lbl_info_max_z = self._info_row(card, "Max Z", "—")
         self._lbl_info_safe_z = self._info_row(card, "Fast Move Z", "—")
         self._lbl_info_plate_top_z = self._info_row(card, "Plate Top Z", "—")
         self._lbl_info_plate_bottom_z = self._info_row(
@@ -522,7 +521,6 @@ class StandardJogContextPanel(QWidget):
         # v7.4.4: render all five Z reference heights.
         for key, lbl in (
             ("replace_z",      self._lbl_info_replace_z),
-            ("max_z",          self._lbl_info_max_z),
             ("fast_move_z",    self._lbl_info_safe_z),
             ("plate_top_z",    self._lbl_info_plate_top_z),
             ("plate_bottom_z", self._lbl_info_plate_bottom_z),
