@@ -1777,6 +1777,9 @@ class StageController:
             # reset the ZP board regardless of connect order.
             xy_exclude = [p for p in (
                 self.zp_connected_port, self._preferred_zp_port) if p]
+            # v7.18: the incubator's dedicated board (when one exists) is a
+            # Marlin board too — keep the XY scan off its port as well.
+            xy_exclude += self._incubator_reserved_ports()
             try:
                 self.xy_stage = XYStageManager(
                     simulate=sim_xy,
@@ -1829,10 +1832,14 @@ class StageController:
             # v7.2.8: ZP connection error handling
             # v7.4.2 hotfix: pass preferred_port so the rediscovery scan
             # can short-circuit to the last-known-good port.
+            # v7.18: keep the ZP scan off a dedicated incubator board's port
+            # — opening it would DTR-reset that board and silently drop its
+            # heater setpoints mid-hold.
             try:
                 self.zp_stage = ZPStageManager(
                     simulate=sim_zp,
                     preferred_port=self._preferred_zp_port,
+                    exclude_ports=self._incubator_reserved_ports(),
                 )
             except (ConnectionError, ImportError, OSError) as e:
                 logger.error(f"ZP stage connection failed: {e}")
@@ -1972,6 +1979,48 @@ class StageController:
         if self.zp_stage and not self.simulate_zp:
             return getattr(self.zp_stage, "connected_port", None)
         return None
+
+    def _incubator_reserved_ports(self) -> list[str]:
+        """v7.18: ports a DEDICATED incubator board owns, for scan exclusion.
+
+        Two sources, both lazy and guarded so a missing/broken incubator
+        module can never block a stage connect:
+          * the live incubator connection, when it holds its own serial port
+            (``transport == "serial"`` — the shared-ZP transport owns no
+            port, and the simulator has none);
+          * the saved dedicated-port hint in the incubator config store,
+            honoured ONLY while the configured transport is "serial" — a
+            stale hint left behind after switching back to the shared
+            transport must not blind the ZP scan to a real port.
+
+        A port equal to the ZP's own last-known-good is never excluded: if
+        the operator mistypes the ZP port into the incubator config, the ZP
+        board must still win its own port (the incubator connect then fails
+        with its own actionable message, which is the recoverable direction).
+        """
+        out: list[str] = []
+        try:
+            from SupportClasses.incubator.service import peek_incubator
+            inc = peek_incubator()
+            if (inc is not None and getattr(inc, "connected", False)
+                    and getattr(inc, "transport", "") == "serial"):
+                p = getattr(inc, "active_port", "")
+                if p:
+                    out.append(p)
+        except Exception as e:
+            logger.debug(f"incubator live-port lookup skipped: {e}")
+        try:
+            from SupportClasses.incubator.config_store import get_store
+            store = get_store()
+            if store.get("transport", "shared") == "serial":
+                p = store.get("dedicated_port", "")
+                if p:
+                    out.append(p)
+        except Exception as e:
+            logger.debug(f"incubator config-port lookup skipped: {e}")
+        preferred = (self._preferred_zp_port or "").upper()
+        return [p for p in dict.fromkeys(out)
+                if p and p.upper() != preferred]
 
     def set_min_travel_z(self, z_mm: float | None) -> None:
         """v7.4.8: set the plate-wide travel-Z clearance floor (zero-ref mm).
@@ -2663,6 +2712,42 @@ class StageController:
         """Provenance of the plate-bottom scalar: taught / estimated / restored."""
         return getattr(self, "_plate_bottom_z_source", None)
 
+    #: Provenance tags whose plate-bottom scalar must NOT clamp motion.
+    NON_CLAMPING_PLATE_BOTTOM_SOURCES = ("estimated",)
+
+    def print_floor_datum_zref(self) -> float | None:
+        """The plate-bottom scalar **only when it may serve as a floor**.
+
+        v7.17. An ESTIMATED plate bottom is a planning number (plate top minus a
+        datasheet offset), not a measurement, and it must never clamp motion —
+        for two independent reasons, in opposite directions:
+
+        * Estimated too HIGH (the real glass is lower than the datasheet
+          implies): the clamp stops the needle above the glass, which BLOCKS the
+          very touch-off that would measure the true bottom. The operator cannot
+          calibrate their way out, because the guess is what is stopping them.
+        * Estimated too LOW: the clamp passes a Z that punches through the
+          glass, i.e. *false* protection — worse than none, because the caller
+          believes it is guarded (the same reasoning that made
+          ``set_print_floor_active`` refcounted).
+
+        So the floor is armed only by a MEASURED bottom: the contact touch-off
+        or the optical measurement. ``get_plate_bottom_z`` still returns the
+        estimate — print heights, survey clearances and the readouts all want a
+        best guess; only the clamp insists on a measurement.
+
+        An absent/legacy ``source`` (None) is deliberately treated as clampable:
+        only an explicit "estimated" tag disarms, so every pre-v7.17 path keeps
+        its floor rather than silently losing it.
+        """
+        z = getattr(self, "_plate_bottom_z_zref", None)
+        if z is None:
+            return None
+        src = getattr(self, "_plate_bottom_z_source", None)
+        if src is not None and str(src) in self.NON_CLAMPING_PLATE_BOTTOM_SOURCES:
+            return None
+        return z
+
     def plate_bottom_zero_z_mm(self) -> float | None:
         """The needle-zero epoch the plate-bottom scalar was taught against.
 
@@ -3148,16 +3233,21 @@ class StageController:
 
     def _apply_print_floor_raw(self, raw_z: float) -> float:
         """Clamp a *raw* Marlin Z so the needle never goes deeper than the
-        plate bottom. No-op unless the floor is armed and calibrated.
+        plate bottom. No-op unless the floor is armed AND the datum was
+        measured (:meth:`print_floor_datum_zref` — an estimate never clamps).
 
         Polarity-general: ``up*(raw - plate_bottom_raw) < 0`` means "deeper than
         the floor" for either Z direction, and we cap at the floor. ``up`` is
         the reference-vector direction (:meth:`print_z_dir`), falling back to
         ``ZDIR`` when the plate top isn't taught.
         """
-        if not self._print_floor_active or self._plate_bottom_z_zref is None:
+        if not self._print_floor_active:
             return raw_z
-        pb_raw = self._plate_bottom_z_zref + self.zero_position.get("Z", 0.0)
+        # v7.17: an ESTIMATED bottom is not a floor — see print_floor_datum_zref.
+        datum = self.print_floor_datum_zref()
+        if datum is None:
+            return raw_z
+        pb_raw = datum + self.zero_position.get("Z", 0.0)
         if self.print_z_dir() * (raw_z - pb_raw) < 0:
             logger.warning(
                 f"Print floor: Z {raw_z:.3f} would punch through the plate "

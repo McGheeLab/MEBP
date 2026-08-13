@@ -173,7 +173,7 @@ class CellTargetingWorkflowPage(QWidget):
         self._well_positions: dict[str, tuple[float, float]] | None = None
         self._safe_z: float | None = None
         self._z_references: dict[str, float | None] = {
-            "replace_z": None, "max_z": None,
+            "replace_z": None,
             "fast_move_z": None, "plate_top_z": None,
             "plate_bottom_z": None,
         }

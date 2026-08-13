@@ -297,6 +297,12 @@ class MicroscopeConfigStore:
             "mm_filter_device": "TIFilterBlock1",
             "mm_objective_device": "TINosePiece",
             "mm_focus_device": "TIZDrive",
+            # v7.17 — illumination + light path. Same adapter, same hub; these
+            # three are accessories, so a configuration that does not load them
+            # is normal and every backend degrades to "not fitted".
+            "mm_epi_shutter_device": "TIEpiShutter",
+            "mm_dia_lamp_device": "TIDiaLamp",
+            "mm_light_path_device": "TILightPath",
             # Slot assignments (operator-owned names).
             "filter_slots": _DEFAULT_FILTER_SLOTS,
             "objective_slots": _DEFAULT_OBJECTIVE_SLOTS,
@@ -360,6 +366,21 @@ class MicroscopeConfigStore:
             # Off by default: silently moving focus on a turret change is a
             # surprise until the operator has seen the measurement.
             "parfocal_auto_apply": False,
+            # v7.17 — close the epi (excitation) shutter for the duration of a
+            # filter-cassette rotation, then restore whatever it was.
+            #
+            # OFF by default, for a reason that is about correctness rather than
+            # timidity: the shutter's open/closed ENCODING is not yet verified on
+            # hardware (see MicroscopeControl.NikonTiSdkBackend._shutter_codes).
+            # If it is inverted on this body, an interlock would OPEN the shutter
+            # for the rotation — exactly the exposure it exists to prevent. Verify
+            # the direction on the body, then enable. Same shape as
+            # parfocal_auto_apply above.
+            "filter_shutter_interlock": False,
+            # Operator override for that encoding, so a body which disagrees with
+            # the SDK's declared range is a checkbox and not a code change — the
+            # treatment focus_up_is_positive and plate_flip_180 already get.
+            "epi_shutter_invert": False,
         }
 
     def _load(self) -> None:
@@ -469,6 +490,12 @@ class MicroscopeConfigStore:
                     "objective_device": d.get("mm_objective_device")
                     or "TINosePiece",
                     "focus_device": d.get("mm_focus_device") or "TIZDrive",
+                    "epi_shutter_device": d.get("mm_epi_shutter_device")
+                    or "TIEpiShutter",
+                    "dia_lamp_device": d.get("mm_dia_lamp_device")
+                    or "TIDiaLamp",
+                    "light_path_device": d.get("mm_light_path_device")
+                    or "TILightPath",
                 }
             return {
                 "filter_slots": int(d.get("filter_slots")
@@ -909,6 +936,27 @@ class MicroscopeConfigStore:
             self._data["focus_min_um"] = None if lo is None else float(lo)
             self._data["focus_max_um"] = None if hi is None else float(hi)
             self._write()
+
+    # ── Illumination policy (v7.17) ────────────────────────────────
+
+    def filter_shutter_interlock(self) -> bool:
+        """Close the epi shutter while the filter cassette rotates?
+
+        See the field's note in :meth:`_blank` for why this defaults off.
+        """
+        with self._lock:
+            return bool(self._data.get("filter_shutter_interlock", False))
+
+    def set_filter_shutter_interlock(self, value: bool) -> None:
+        self.set("filter_shutter_interlock", bool(value))
+
+    def epi_shutter_invert(self) -> bool:
+        """Does this body's shutter report/accept open and closed the other way?"""
+        with self._lock:
+            return bool(self._data.get("epi_shutter_invert", False))
+
+    def set_epi_shutter_invert(self, value: bool) -> None:
+        self.set("epi_shutter_invert", bool(value))
 
     # ── Parfocality (per camera identity) ───────────────────────────
 

@@ -39,14 +39,23 @@ from gui.pages.calibration import CalibrationPage
 
 def _fake_page(sl: SafetyLimits) -> SimpleNamespace:
     """Minimal stand-in exposing exactly what the setters touch — no
-    QApplication / real CalibrationPage instantiation required."""
+    QApplication / real CalibrationPage instantiation required.
+
+    v7.17: ``_zoff_read_stage_xy_um`` / ``_zoff_push_plate_bottom_to_controller``
+    / ``_plate_bottom_z_source`` were added to the production setter by v7.9.1's
+    plate-bottom-anchor work and never added here, so this fake had been raising
+    AttributeError rather than testing anything. Also drops ``_max_z``, retired
+    in v7.17.
+    """
     return SimpleNamespace(
         controller=SimpleNamespace(safety_limits=sl),
-        _max_z=None,
         _plate_bottom_z=None,
-        _zoff_lbl_max_z=MagicMock(),
+        _plate_bottom_anchor_xy_um=None,
+        _plate_bottom_z_source=None,
         _zoff_lbl_plate_bottom_z=MagicMock(),
         _emit_calibration_data_changed=lambda: None,
+        _zoff_read_stage_xy_um=lambda: (1000.0, 2000.0),
+        _zoff_push_plate_bottom_to_controller=lambda z, src: None,
         # v7.5.x: the label now renders the value in the unified user frame;
         # the controller stub has no converter, so identity is fine here.
         _zoff_user_z=lambda z: z,
@@ -54,18 +63,10 @@ def _fake_page(sl: SafetyLimits) -> SimpleNamespace:
 
 
 class TestCalZEnvelopeNoClobber(unittest.TestCase):
-    def test_set_max_z_does_not_touch_safety_limits(self):
-        sl = SafetyLimits(z_min=0.0, z_max=60.0, enabled=True)
-        page = _fake_page(sl)
-        page._zoff_capture_current_z = lambda: 16.4
-
-        CalibrationPage._zoff_set_max_z(page)
-
-        # Captured as a reference height …
-        self.assertEqual(page._max_z, 16.4)
-        # … but the envelope is untouched.
-        self.assertEqual(sl.z_min, 0.0)
-        self.assertEqual(sl.z_max, 60.0)
+    """v7.17 — Max Z is retired (it had no consumer), so the two tests that
+    drove ``_zoff_set_max_z`` are gone. The invariant they guarded is unchanged
+    and still covered: no Z-reference capture on this page may write the
+    device-setup envelope."""
 
     def test_set_plate_bottom_z_does_not_touch_safety_limits(self):
         sl = SafetyLimits(z_min=0.0, z_max=60.0, enabled=True)
@@ -78,15 +79,13 @@ class TestCalZEnvelopeNoClobber(unittest.TestCase):
         self.assertEqual(sl.z_min, 0.0)
         self.assertEqual(sl.z_max, 60.0)
 
-    def test_inverting_capture_order_no_longer_collapses_envelope(self):
-        """The exact field values from the bug report (max_z=16.4 <
-        plate_bottom_z=48.4) must leave the device-setup envelope valid and
+    def test_a_low_reference_no_longer_collapses_the_envelope(self):
+        """The bug-report value (plate_bottom_z=48.4 captured on a machine whose
+        envelope is 10..60) must leave the device-setup envelope valid and
         non-inverted, so clamp_z stays a pass-through inside the range."""
         sl = SafetyLimits(z_min=10.0, z_max=60.0, enabled=True)
         page = _fake_page(sl)
 
-        page._zoff_capture_current_z = lambda: 16.4
-        CalibrationPage._zoff_set_max_z(page)
         page._zoff_capture_current_z = lambda: 48.4
         CalibrationPage._zoff_set_plate_bottom_z(page)
 
@@ -97,6 +96,21 @@ class TestCalZEnvelopeNoClobber(unittest.TestCase):
         # collapsed every one of these to 48.4).
         for z in (12.0, 48.28, 48.509, 55.0):
             self.assertEqual(sl.clamp_z(z), z)
+
+    def test_the_contact_touch_off_records_taught_provenance(self):
+        """v7.17: the clamp is armed only by a MEASURED bottom, so the contact
+        touch-off must tag itself 'taught' — see
+        StageController.print_floor_datum_zref."""
+        page = _fake_page(SafetyLimits(z_min=0.0, z_max=60.0, enabled=True))
+        page._zoff_capture_current_z = lambda: 48.4
+        pushed = []
+        page._zoff_push_plate_bottom_to_controller = \
+            lambda z, src: pushed.append((z, src))
+
+        CalibrationPage._zoff_set_plate_bottom_z(page)
+
+        self.assertEqual(pushed, [(48.4, "taught")])
+        self.assertEqual(page._plate_bottom_z_source, "taught")
 
     def test_calibration_module_no_longer_pushes_into_envelope(self):
         """Guard the _load_calibration path (too heavyweight to instantiate

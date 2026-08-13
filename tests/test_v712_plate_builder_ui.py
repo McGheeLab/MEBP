@@ -583,7 +583,8 @@ class TestHardwareSetupWiring(unittest.TestCase):
     def test_tabs_are_plate_and_layout(self):
         self.assertEqual("Plate", self.page._sub_titles[2])
         self.assertEqual("Layout", self.page._sub_titles[3])
-        self.assertEqual(10, len(self.page._sub_titles))
+        # v7.18: +1 for the Incubator tab.
+        self.assertEqual(11, len(self.page._sub_titles))
 
     def test_retired_surfaces_are_gone(self):
         for attr in ("_plate_designer", "_rosette_designer",

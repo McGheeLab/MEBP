@@ -102,6 +102,15 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         enabled=False,
     ),
     WorkflowTile(
+        workflow_id="incubator",
+        icon="🌡️",
+        title="Incubator",
+        description="Hold the two-zone incubator stage at temperature — "
+                    "setpoints, watchdog-safe ramps, PID, sensor calibration "
+                    "and a live trend.",
+        enabled=True,
+    ),
+    WorkflowTile(
         workflow_id="stress_test",
         icon="🔁",
         title="ZP Stress Test",

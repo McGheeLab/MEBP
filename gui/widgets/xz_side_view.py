@@ -86,7 +86,6 @@ class XZSideView(QWidget):
     _Z_REF_META: list[tuple[str, str, str]] = [
         # (key, label, color key from gui.styles.COLORS)
         ("replace_z",      "Replace",     "peach"),
-        ("max_z",          "Max",         "red"),
         ("fast_move_z",    "Safe",        "green"),
         ("plate_top_z",    "Plate ↑",     "blue"),
         ("plate_bottom_z", "Plate ↓",     "mauve"),
@@ -126,7 +125,7 @@ class XZSideView(QWidget):
         # calibration page's get_z_references()). Each non-None entry
         # renders as a dashed horizontal line + clickable badge.
         self._z_refs: dict[str, float | None] = {
-            "replace_z": None, "max_z": None,
+            "replace_z": None,
             "fast_move_z": None, "plate_top_z": None,
             "plate_bottom_z": None,
         }
@@ -245,7 +244,7 @@ class XZSideView(QWidget):
         """Receive captured Z heights from the Calibration page.
 
         Keys (all mm, zero-referenced; missing = ``None``):
-            ``replace_z`` · ``max_z`` · ``fast_move_z`` ·
+            ``replace_z`` · ``fast_move_z`` ·
             ``plate_top_z`` · ``plate_bottom_z``
 
         Each non-None entry draws a thin dashed line on the side view

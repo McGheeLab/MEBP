@@ -3139,6 +3139,44 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean shutdown — stop timers, save settings, stop recording."""
+        # v7.18: ask about the incubator heaters BEFORE anything is torn down
+        # (the prompt needs a live event loop, and the answer decides what
+        # shutdown_incubator() commands). Only when a zone is actually
+        # heating — a cold, idle session closes silently. NOTE closing the
+        # app never stops the heaters by itself: the firmware owns the
+        # control loop and holds its last setpoint (see
+        # SupportClasses/incubator/README heritage) — which is exactly why
+        # the question is worth asking rather than silently choosing.
+        incubator_heaters_off = True
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            from SupportClasses.incubator.service import peek_incubator
+            from SupportClasses.incubator.config_store import get_store as \
+                _incu_store
+            _inc = peek_incubator()
+            if _inc is not None and _inc.connected:
+                from SupportClasses.incubator.zones import ALL_ZONES as _IZ
+                _heating = any(
+                    _inc.zone_runtime(z.zone_id).requested_c > 0 for z in _IZ)
+                if _heating:
+                    _default_off = bool(
+                        _incu_store().get("heaters_off_on_app_exit", True))
+                    _ans = QMessageBox.question(
+                        self, "Incubator is heating",
+                        "The incubator is holding a temperature. Closing the "
+                        "app does NOT stop the board — Marlin keeps its own "
+                        "control loop running and will hold the current "
+                        "setpoint.\n\n"
+                        "Turn both heaters OFF before closing?\n\n"
+                        "Yes = turn heaters off\n"
+                        "No  = leave them running for a long soak",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes if _default_off else QMessageBox.No,
+                    )
+                    incubator_heaters_off = (_ans == QMessageBox.Yes)
+        except Exception as e:
+            logger.debug(f"incubator close prompt skipped: {e}")
+
         self._closing = True  # stops the self-rescheduling _tick loop
         _at = getattr(self, "_motion_anim_timer", None)
         if _at is not None:
@@ -3175,6 +3213,17 @@ class MainWindow(QMainWindow):
             shutdown_microscope()
         except Exception as e:
             logger.debug(f"microscope shutdown failed: {e}")
+
+        # v7.18: close the incubator session, honouring the prompt answer.
+        # ORDERING: before controller.shutdown() — in shared-transport mode
+        # the heater-off commands ride the ZP link, which disconnect_stages()
+        # is about to close. peek-only, so an untouched incubator costs
+        # nothing here.
+        try:
+            from SupportClasses.incubator.service import shutdown_incubator
+            shutdown_incubator(heaters_off=incubator_heaters_off)
+        except Exception as e:
+            logger.debug(f"incubator shutdown failed: {e}")
 
         # v7.17: stop the LabLink upload worker and STATE what was not sent —
         # the operator chose in-session-only retry, which is honest only if

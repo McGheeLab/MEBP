@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "features": {
+    "nest-plastic-24": {
+      "image": "reanchor_features/nest-plastic-24.png",
+      "stage_um": [
+        94018.55523662198,
+        37488.26504044382
+      ],
+      "um_per_px": 1.876065,
+      "camobj": "tucam:0|4x",
+      "date": "2026-08-12"
+    }
+  }
+}

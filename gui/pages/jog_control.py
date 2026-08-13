@@ -244,7 +244,7 @@ class JogControlPage(QWidget):
         # set_z_references is called). Pushed into the XZ view after
         # it's constructed below.
         self._z_references: dict[str, float | None] = {
-            "replace_z": None, "max_z": None,
+            "replace_z": None,
             "fast_move_z": None, "plate_top_z": None,
             "plate_bottom_z": None,
         }

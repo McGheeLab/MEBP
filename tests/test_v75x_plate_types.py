@@ -483,12 +483,12 @@ class TestAutoFillNoClobber(_CalBase):
         page._top_z = 99.0           # already taught
         page._plate_bottom_z = None  # un-taught
         page._safe_z = None
-        page._max_z = None
         page._apply_plate_type_z_estimates(force=False)
         self.assertEqual(page._top_z, 99.0)          # taught wins
         self.assertEqual(page._plate_bottom_z, 2.0)  # filled from guess
         self.assertEqual(page._safe_z, 3.0)
-        self.assertEqual(page._max_z, 4.0)
+        # v7.17: Max Z is retired, so plate_max_z is no longer applied.
+        self.assertFalse(hasattr(page, "_max_z"))
 
     def test_force_overrides(self):
         page, ctrl = self._make_page()
@@ -528,7 +528,6 @@ class TestLearnLoop(_CalBase, _TempStoreMixin):
         page._top_z = 23.0
         page._plate_bottom_z = 10.0
         page._safe_z = 45.0
-        page._max_z = 49.0
         with patch("gui.pages.calibration.QMessageBox"):
             page._zoff_save_offsets_to_plate_type()
         pt = self.store.get("corning-24")
@@ -536,7 +535,12 @@ class TestLearnLoop(_CalBase, _TempStoreMixin):
         self.assertAlmostEqual(pt.z_offsets["top"], 27.0)
         self.assertAlmostEqual(pt.z_offsets["bottom"], 40.0)
         self.assertAlmostEqual(pt.z_offsets["safe"], 5.0)
-        self.assertAlmostEqual(pt.z_offsets["max"], 1.0)
+        # v7.17: Max Z retired — the learn loop no longer WRITES a max offset.
+        # A legacy one already on disk is left alone (the save merges rather
+        # than replaces, so retiring a reference must not destroy stored data);
+        # it stays at the built-in's 0.0 instead of being updated to
+        # fiducial(50) − 49 = 1.0.
+        self.assertAlmostEqual(pt.z_offsets.get("max", 0.0), 0.0)
         self.assertFalse(pt.builtin)                       # user override
         self.assertTrue((self._user_dir / "corning-24.json").exists())
         # built-in file left pristine (all zeros)

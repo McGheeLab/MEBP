@@ -1104,7 +1104,7 @@ class PrintSetupPage(QWidget):
                 # downstream consumers (safety, trajectory clamping,
                 # GCode comments) can pick them up via hasattr-guarded
                 # reads.
-                for key in ("replace_z", "max_z", "plate_bottom_z"):
+                for key in ("replace_z", "plate_bottom_z"):
                     val = cal.get(key)
                     if val is not None:
                         setattr(s, key, float(val))
