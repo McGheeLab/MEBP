@@ -699,7 +699,11 @@ class ScaleFovCalibrationDialog(QDialog):
             settings=verify_settings, center_um=(cx, cy), frame_size=(fw, fh),
             um_per_px_camera=float(self.result_um_per_px),
             cam_key=self._cam_key, objective=self._objective, parent=self)
-        dlg.exec()
+        # Released explicitly: this dialog owns a mosaic builder AND a live feed,
+        # so a leaked copy keeps doing per-frame GUI work for the rest of the
+        # session. See gui.widgets.components.exec_dialog.
+        from gui.widgets.components import exec_dialog
+        exec_dialog(dlg)
 
         # Re-sync the µm/px ONLY when the verify step actually CORRECTED it.
         #

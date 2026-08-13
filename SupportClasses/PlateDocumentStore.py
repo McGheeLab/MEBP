@@ -33,14 +33,19 @@ from typing import Optional
 from SupportClasses.PlateDocument import (
     FutureSchemaError, LegacySchemaError, PlateDocument, new_doc_id,
 )
+from SupportClasses.MachineConfig import resolve_shared_path
 
 logger = logging.getLogger(__name__)
 
-_ROOT = Path(__file__).resolve().parent.parent / "config" / "hardware"
+# Shared/portable catalogs — user-authored plate/rosette designs are meant to
+# sync across every rig, unlike the per-machine stores that live under
+# config/hardware/<machine-id>/.
+_PLATES_ROOT = resolve_shared_path("plates")
+_ROSETTES_ROOT = resolve_shared_path("rosettes")
 
-DEFAULT_PLATES_DIR = _ROOT / "plates" / "v2"
-DEFAULT_ROSETTES_USER_DIR = _ROOT / "rosettes" / "user"
-DEFAULT_ROSETTES_BUILTIN_DIR = _ROOT / "rosettes" / "builtin"
+DEFAULT_PLATES_DIR = _PLATES_ROOT / "v2"
+DEFAULT_ROSETTES_USER_DIR = _ROSETTES_ROOT / "user"
+DEFAULT_ROSETTES_BUILTIN_DIR = _ROSETTES_ROOT / "builtin"
 
 
 @dataclass(frozen=True)

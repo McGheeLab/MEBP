@@ -291,12 +291,13 @@ class Settings:
         if self.get("device_profile.active"):
             return  # Already configured
         try:
-            # Lazy import to avoid GUI dependency in headless contexts
-            from pathlib import Path
-            standard_path = (
-                Path(__file__).resolve().parent.parent
-                / "config" / "hardware" / "devices" / "Standard.json"
-            )
+            # Lazy import to avoid GUI dependency in headless contexts.
+            # v7.17.x: device profiles live in the machine-INDEPENDENT
+            # config/hardware/devices/ (a profile NAMES the machine folder, so
+            # it cannot live inside it). Resolved here rather than hardcoded,
+            # or this would look at a path nothing writes to any more.
+            from SupportClasses.MachineConfig import devices_dir
+            standard_path = devices_dir() / "Standard.json"
             if not standard_path.exists():
                 logger.debug(
                     "Standard device profile not found; skipping default")

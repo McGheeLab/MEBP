@@ -381,8 +381,12 @@ class TestRealMosaics(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        path = os.path.join(REPO, "config", "hardware", "plate_mosaics.json")
-        if not os.path.exists(path):
+        # v7.17.x: mosaics are PER-MACHINE (config/hardware/<machine-id>/) —
+        # reading the old flat path made these silently skip forever.
+        from SupportClasses.MachineConfig import resolve_machine_path
+        cls.cfg_dir = resolve_machine_path("plate_mosaics.json").parent
+        path = cls.cfg_dir / "plate_mosaics.json"
+        if not path.exists():
             raise unittest.SkipTest("no plate_mosaics.json")
         with open(path, encoding="utf-8") as f:
             cls.store = (json.load(f) or {}).get("mosaics") or {}
@@ -391,7 +395,14 @@ class TestRealMosaics(unittest.TestCase):
         m = self.store.get(key)
         if not m:
             self.skipTest(f"mosaic {key!r} not present")
-        img_path = os.path.join(REPO, "config", "hardware", m.get("image", ""))
+        # v7.13 made a plate key hold {active, scans:{id: …}} instead of a bare
+        # leaf. Reading the old flat shape found no "image" and skipped every
+        # one of these tuning-evidence tests; resolve the ACTIVE scan the way
+        # MosaicStore.get_meta does. Single-well keys are still bare leaves.
+        scans = m.get("scans")
+        if isinstance(scans, dict) and scans:
+            m = scans.get(m.get("active")) or next(iter(scans.values()))
+        img_path = os.path.join(str(self.cfg_dir), m.get("image", ""))
         if not os.path.exists(img_path):
             self.skipTest(f"mosaic image for {key!r} not on disk")
         img = cv2.imread(img_path)

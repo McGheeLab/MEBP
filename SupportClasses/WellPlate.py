@@ -61,14 +61,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from SupportClasses.MachineConfig import resolve_shared_path
+
 logger = logging.getLogger(__name__)
 
 
-# v7.4.5: User-saved custom plate designs live here as JSON.
+# v7.4.5: User-saved custom plate designs live here as JSON. Shared/portable
+# (like the v2 plates PlateDocumentStore manages under the same "plates"
+# root) — meant to sync across every rig, unlike a per-machine store.
 # Standards are still computed in-code from `PLATE_DEFINITIONS`.
-USER_PLATES_DIR = (
-    Path(__file__).resolve().parent.parent / "config" / "hardware" / "plates" / "user"
-)
+USER_PLATES_DIR = resolve_shared_path("plates") / "user"
 
 
 # ═══════════════════════════════════════════════════════════════════

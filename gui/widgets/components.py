@@ -28,6 +28,44 @@ from gui.styles import COLORS, build_page_header_style
 from gui.scaling import s, sf, sp, scaled_font_size
 
 
+# ── Modal dialogs ──────────────────────────────────────────────────
+
+def exec_dialog(dlg):
+    """``exec()`` a modal dialog and GUARANTEE its widget tree is released.
+
+    ⚠ **A parented QDialog SURVIVES ``exec()``.** Qt gives ownership to the
+    parent, so ``dlg = SomeDialog(parent=self); dlg.exec()`` leaves the whole
+    dialog — every spin box, every live ``CameraFeedView``, every signal
+    connection — alive as a child of the page for the rest of the session. Open
+    it ten times and ten copies are resident.
+
+    That is not merely memory. A leaked camera dialog's feed view is still
+    connected to ``frame_captured``, so it keeps converting and scaling a pixmap
+    on the GUI thread for every frame, forever. Measured on this rig
+    (2026-08-13, ``logs/app.log``): one hour of ordinary camera-calibration work
+    took the widget count from **8201 to 9072** and stretched the 300 ms status
+    tick from ~63 s per 200 ticks to **203 s** — i.e. the event loop running at
+    a third of its rate. Both operator complaints ("laggy over time", and a
+    mosaic that could no longer collect frames fast enough) trace back here.
+
+    Deletion is DEFERRED (``deleteLater``), never immediate, because callers
+    legitimately read results off the dialog after it closes
+    (``dlg.result_um_per_px``, ``dlg.values()``). ``deleteLater`` runs on the
+    next event-loop pass, which cannot happen until the calling handler
+    returns — so those reads stay valid.
+
+    Only for a dialog CONSTRUCTED for this one call. A cached/reused modeless
+    dialog must not be passed here.
+    """
+    try:
+        return dlg.exec()
+    finally:
+        try:
+            dlg.deleteLater()
+        except Exception:
+            pass
+
+
 # ── Card ───────────────────────────────────────────────────────────
 
 class Card(QFrame):

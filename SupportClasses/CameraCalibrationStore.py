@@ -61,9 +61,11 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/camera_calibrations.json")
+_DEFAULT_PATH = resolve_machine_path("camera_calibrations.json")
 
 # Current on-disk schema version. A FRESH store is born here; only files that
 # load with an older version run the migration chain in ``_migrate``.

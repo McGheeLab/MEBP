@@ -30,6 +30,8 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -39,7 +41,9 @@ except ImportError:   # pragma: no cover - cv2 always present in this project
     cv2 = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/reanchor_features.json")
+_DEFAULT_PATH = resolve_machine_path("reanchor_features.json")
+# Migrated at import time (see MosaicStore.py's _DEFAULT_IMG_DIR comment).
+_DEFAULT_IMG_DIR = resolve_machine_path("reanchor_features")
 
 
 def _safe_key(plate_key) -> str:
@@ -51,7 +55,8 @@ class ReanchorFeatureStore:
 
     def __init__(self, path: Path = _DEFAULT_PATH):
         self._path = Path(path)
-        self._img_dir = self._path.parent / "reanchor_features"
+        self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
+                          else self._path.parent / "reanchor_features")
         self._data: dict = {"version": "1.0", "features": {}}
         self._load()
 

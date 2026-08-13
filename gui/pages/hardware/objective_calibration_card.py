@@ -37,6 +37,7 @@ from PySide6.QtGui import QColor
 
 from gui.scaling import s, scaled_font_size
 from gui.styles import COLORS
+from gui.widgets.components import exec_dialog
 from gui.dialogs.pixel_calibration_dialog import PixelCalibrationDialog
 from SupportClasses.HardwareConfig import CameraRole
 from SupportClasses.ObjectiveCalibration import get_store as _get_store
@@ -556,7 +557,7 @@ class ObjectiveCalibrationCard(QGroupBox):
 
     def _on_add_clicked(self) -> None:
         dlg = _AddObjectiveDialog(parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg) != QDialog.DialogCode.Accepted:
             return
         name, nominal = dlg.values()
         if not name:
@@ -651,7 +652,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             # objective's magnification and the camera's native scale.
             cam_key=cam_key, objective=objective,
         )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg) != QDialog.DialogCode.Accepted:
             return
         um_per_px = dlg.result_um_per_px
         if um_per_px is None or um_per_px <= 0:
@@ -802,7 +803,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             tile_count_getter=self._estimate_plate_tiles,
             test_mosaic_runner=lambda cal: dlg.build_test_mosaic(cal),
             parent=self)
-        if confirm.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(confirm) != QDialog.DialogCode.Accepted:
             return None
         return confirm.result_calibration()
 
@@ -926,7 +927,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             # v7.5.x: the real scan settings, so the test/verify mosaic builds the
             # way the actual scan will (it used to be handed an empty dict).
             scan_settings=self._scan_settings(), parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg) != QDialog.DialogCode.Accepted:
             return
         um_per_px = dlg.result_um_per_px
         if um_per_px is None or um_per_px <= 0:
@@ -1090,7 +1091,7 @@ class ObjectiveCalibrationCard(QGroupBox):
             objective=(self._selected_objective_name()
                        or self._current_objective_name()),
         )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(dlg) != QDialog.DialogCode.Accepted:
             return
         rotation_deg = dlg.result_rotation_deg
         if rotation_deg is None:

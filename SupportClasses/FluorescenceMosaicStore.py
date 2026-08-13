@@ -68,6 +68,8 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -79,13 +81,24 @@ except ImportError:   # pragma: no cover - cv2/numpy always present in this proj
     np = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/fluorescence_mosaics.json")
+_DEFAULT_PATH = resolve_machine_path("fluorescence_mosaics.json")
+# Migrated at import time (see MosaicStore.py's _DEFAULT_IMG_DIR comment) —
+# NOT lazily inside __init__, so a plain `import` is enough to relocate it.
+_DEFAULT_IMG_DIR = resolve_machine_path("fluor_mosaics")
 
-# The standard filter cubes surfaced in the workflow UI, with their default
-# display pseudo-colours (RGB 0-255). The operator can override any colour per
-# capture; this is just the seed. DAPI/FITC/mCherry/Cy5 are excitation channels
-# 1-4; "Bright Field" is the microscope's non-excitation channel 5 (channel 6 is
-# also brightfield but is not surfaced as a separate option).
+# The app's IMAGING-CHANNEL vocabulary: the channels surfaced in the workflow UI,
+# with their default display pseudo-colours (RGB 0-255). The operator can override
+# any colour per capture; this is just the seed.
+#
+# ⚠ These are channel names, NOT the labels on the cubes in any particular
+# cassette, and v7.18 keeps them deliberately independent of the hardware. They
+# key stored captures (the PNG filename is
+# ``{plate}_{well}_{channel}.png``) and the built-in target-type rules
+# (``config/hardware/target_types/builtin/*.json`` author clauses against
+# ``"imaging_channel": "mCherry"``), so renaming one to match a physical cube
+# label would orphan data and invalidate those rules. The channel → cube slot
+# mapping is a separate, per-machine fact — see ``CHANNEL_ORDINALS`` below and
+# ``MicroscopeConfigStore.optic_aliases("filter")``.
 CHANNELS: tuple[str, ...] = ("DAPI", "FITC", "mCherry", "Cy5", "Bright Field")
 
 DEFAULT_CHANNEL_COLORS: dict[str, tuple[int, int, int]] = {
@@ -96,12 +109,37 @@ DEFAULT_CHANNEL_COLORS: dict[str, tuple[int, int, int]] = {
     "Bright Field": (255, 255, 255),  # grayscale / white (non-fluorescent)
 }
 
-# Microscope hardware channel number (1-based) for each filter cube, shown in
-# the pre-scan "set the filter" prompt so the operator knows which turret
-# position to select. Channels 5 & 6 are both brightfield; only 5 is surfaced.
-CHANNEL_NUMBERS: dict[str, int] = {
+# ⚠ v7.18 — THIS IS AN ORDINAL, **NOT** A TURRET SLOT NUMBER. Do not use it to
+# drive the filter cassette.
+#
+# It was introduced as "the microscope hardware channel number … so the operator
+# knows which turret position to select", and that claim was never true of any
+# particular rig: nothing reconciled it against the operator's actual slot
+# assignments (``MicroscopeConfigStore.filter_labels()``) or the body's own
+# reported names. On THIS machine the cassette holds DAPI(1) FITC(2) **TxRed**(3)
+# Cy5(4) with slots 5 and 6 empty — so "mCherry → 3" names a cube that is not
+# mCherry, and "Bright Field → 5" names an EMPTY slot. Driving either would put
+# the wrong thing (or nothing) in the light path and store the result as a
+# legitimate channel, which no downstream consumer can detect.
+#
+# What it legitimately IS: a stable, per-channel-name ordinal giving a
+# deterministic ACQUISITION ORDER. ``LabLinkJob`` relies on exactly that — the
+# sidecar's ``channels`` array is order-load-bearing while ``ND3Reader.image_ids``
+# returns alphabetical ids, so without an ordinal a DAPI/FITC/Cy5 well would be
+# declared Cy5, DAPI, FITC and a recipe indexing by position would analyse the
+# wrong channel. It is also fine as a display hint.
+#
+# To find the slot a channel actually lives in, use
+# ``OpticsRegistry.find_slot(resolve_filters(...), channel, aliases=...)``, which
+# refuses rather than guessing. See ``channel_slot_hint`` below.
+CHANNEL_ORDINALS: dict[str, int] = {
     "DAPI": 1, "FITC": 2, "mCherry": 3, "Cy5": 4, "Bright Field": 5,
 }
+
+#: Deprecated alias. Same object, so existing readers are unaffected; the name
+#: is what was misleading. New code should use ``CHANNEL_ORDINALS`` (for order)
+#: or ``OpticsRegistry.find_slot`` (for a real slot).
+CHANNEL_NUMBERS = CHANNEL_ORDINALS
 
 
 def default_color(channel: str) -> tuple[int, int, int]:
@@ -109,12 +147,45 @@ def default_color(channel: str) -> tuple[int, int, int]:
     return DEFAULT_CHANNEL_COLORS.get(channel, (220, 220, 220))
 
 
-def channel_number(channel: str):
-    """Microscope hardware channel number (1-based) for a channel name.
+def channel_ordinal(channel: str):
+    """Stable acquisition-order ordinal for a channel name, or ``None``.
 
-    Returns ``None`` for an unknown channel (the prompt then omits the number).
+    ⚠ **Not a turret slot.** See :data:`CHANNEL_ORDINALS`. Use
+    :func:`channel_slot` when you need the cube's actual position.
     """
-    return CHANNEL_NUMBERS.get(channel)
+    return CHANNEL_ORDINALS.get(channel)
+
+
+def channel_number(channel: str):
+    """Deprecated: use :func:`channel_ordinal` (order) or :func:`channel_slot`.
+
+    Retained because ND3 sidecars already on disk carry the value under the name
+    ``channel_number`` and ``LabLinkJob`` reads it for acquisition ordering.
+    """
+    return channel_ordinal(channel)
+
+
+def channel_slot(channel: str, *, scope_state, config_store):
+    """Which cassette POSITION holds this channel's cube? ``SlotMatch``.
+
+    v7.18. The real resolution, and the only thing a caller may drive the filter
+    turret from: it joins the live turret against the operator's slot labels and
+    aliases via ``OpticsRegistry``, and **refuses** — with a sentence naming what
+    IS configured — rather than guessing. ``result.ok`` is False for a channel
+    whose name matches no cube ("mCherry" against a cassette holding "TxRed",
+    until the operator declares that alias) and for a slot the body reports empty
+    ("Bright Field", which the legacy ordinal table pointed at slot 5).
+    """
+    from SupportClasses.OpticsRegistry import FILTER, find_slot, resolve_filters
+    slots = resolve_filters(scope_state=scope_state, config_store=config_store)
+    aliases = {}
+    try:
+        aliases = config_store.optic_aliases("filter")
+    except Exception:
+        aliases = {}
+    # kind is explicit: with no cassette the slot list is empty, and a refusal
+    # that cannot tell which turret was asked about names the wrong one.
+    return find_slot(slots, channel, aliases=aliases, kind=FILTER)
 
 
 def _safe_token(value) -> str:
@@ -134,8 +205,15 @@ class FluorescenceMosaicStore:
         # An env override lets tests isolate the store so automated runs never
         # read or write the repo's config/hardware (mirrors the other stores).
         env = os.environ.get("MEBP_FLUOR_MOSAIC_PATH")
-        self._path = Path(env) if env else Path(path)
-        self._img_dir = self._path.parent / "fluor_mosaics"
+        if env:
+            self._path = Path(env)
+            self._img_dir = self._path.parent / "fluor_mosaics"
+        else:
+            self._path = Path(path)
+            # A test-supplied path keeps its own sibling dir untouched; the
+            # default path uses the already-migrated _DEFAULT_IMG_DIR.
+            self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
+                              else self._path.parent / "fluor_mosaics")
         self._data: dict = {"version": "1.0", "wells": {}}
         self._load()
 

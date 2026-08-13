@@ -33,8 +33,9 @@ from gui.pages.hardware import microscope_setup_panel as setup_panel_mod
 
 from SupportClasses.MicroscopeConfigStore import MicroscopeConfigStore
 from SupportClasses.MicroscopeControl import (
-    MicroManagerBackend, MicroscopeController, MicroscopeError,
-    NikonTiSdkBackend, SimulatedMicroscopeBackend, build_backend,
+    MicroManagerBackend, MicroscopeBackend, MicroscopeController,
+    MicroscopeError, NikonTiSdkBackend, SimulatedMicroscopeBackend,
+    build_backend,
 )
 
 _app = QApplication.instance() or QApplication([])
@@ -167,6 +168,20 @@ class TestSimulatedBackend(unittest.TestCase):
         with self.assertRaises(MicroscopeError):
             build_backend("nope")
 
+    def test_optic_write_support_is_unsupported(self):
+        """Neither the base contract nor the simulator claims a writable
+        optics database — that would be a lie no hardware has confirmed."""
+        self.assertEqual(MicroscopeBackend().probe_optic_write_support(), {})
+        self.assertEqual(
+            SimulatedMicroscopeBackend().probe_optic_write_support(), {})
+
+    def test_set_optic_name_is_refused_by_default(self):
+        """A backend that cannot tell the body its optics must say so, not
+        silently accept a rename that goes nowhere."""
+        for backend in (MicroscopeBackend(), SimulatedMicroscopeBackend()):
+            with self.assertRaises(MicroscopeError):
+                backend.set_optic_name("filter", 4, "CY5")
+
 
 # ── 3. Nikon Ti SDK plumbing (no hardware) ─────────────────────────
 
@@ -235,6 +250,117 @@ class _FakeOptic:
     @property
     def WorkingDistance(self):
         return self._field(self._wd)
+
+
+class _ReadOnlyOptic:
+    """An optic whose Name/Code are get-only ``property`` objects.
+
+    This is how comtypes represents a COM property the typelib declares with a
+    ``propget`` and no ``propput`` — i.e. what the Ti SDK is expected to look
+    like if (as the "No database code is associated with this optical element"
+    error implies) these values are resolved from a hardware-sensed code.
+    """
+
+    def __init__(self, code, name):
+        self._code, self._name = code, name
+
+    @property
+    def Code(self):
+        return self._code
+
+    @property
+    def Name(self):
+        return self._name
+
+
+class _WritableNameOptic:
+    """Name declares a setter (propget + propput); Code stays get-only."""
+
+    def __init__(self, code, name):
+        self._code, self._name = code, name
+
+    @property
+    def Code(self):
+        return self._code
+
+    @property
+    def Name(self):
+        return self._name
+
+    @Name.setter
+    def Name(self, value):
+        self._name = value
+
+
+class _IgnoringNameOptic(_WritableNameOptic):
+    """Accepts a Name write and silently keeps the old value.
+
+    The SDK's documented failure mode, in a different place: it accepted filter
+    slot 999, clamped it to 6 and reported success.
+    """
+
+    @_WritableNameOptic.Name.setter
+    def Name(self, value):
+        pass
+
+
+class _RecordingOptic:
+    """Records every attribute write instead of performing it.
+
+    Lets a test assert exactly WHICH fields a code path wrote — including
+    "none at all" — in a way a broad ``except`` around a reintroduced write
+    cannot hide. ``Name`` declares a setter so writability checks pass and the
+    write is actually attempted; ``Code`` is get-only, as the real body's is
+    believed to be.
+    """
+
+    def __init__(self, code, name, writes):
+        object.__setattr__(self, "_code", code)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_writes", writes)
+
+    @property
+    def Code(self):
+        return self._code
+
+    @property
+    def Name(self):
+        return self._name
+
+    @Name.setter
+    def Name(self, value):        # declared, but never reached (see below)
+        object.__setattr__(self, "_name", value)
+
+    def __setattr__(self, key, value):
+        # Intercepts EVERY assignment, property setters included, so the write
+        # is recorded and deliberately not performed — the read-back then shows
+        # the old value, which is also how a silently-ignored SDK write looks.
+        self._writes.append((key, value))
+
+
+class _LockedOptic(_RecordingOptic):
+    """The real Ti-E: declares a Name setter but reports ``CanModify == 0``."""
+
+    @property
+    def CanModify(self):
+        return 0
+
+
+class _RefusingOptic(_WritableNameOptic):
+    """Declares a Name setter, then refuses the write with a real ``COMError``.
+
+    This is the REAL Ti-E, hardware-verified 2026-08-12: the typelib advertises
+    ``propput`` on Name and Code, and the SDK rejects every write at runtime
+    with *"Database entry cannot be modified."*
+    """
+
+    @_WritableNameOptic.Name.setter
+    def Name(self, value):
+        from SupportClasses.MicroscopeControl import COMError
+        raise COMError(
+            -2147352567, "Exception occurred.",
+            ("Database entry cannot be modified.",
+             "Nikon.TiScope.FilterBlock.1", None, 0, None))
 
 
 class _FakeCollection:
@@ -399,6 +525,160 @@ class TestNikonTiPlumbing(unittest.TestCase):
         b._scope = object()
         b._devices = {"filter": _TiDevice(position=1, mounted=True)}
         self.assertEqual(b.mounted_filters(), ())   # no FilterBlocks attribute
+
+    # ── Optics write-support check (READ-ONLY) ──────────────────────
+
+    def _optic_backend(self, logical, items):
+        b = NikonTiSdkBackend()
+        b._scope = object()
+        dev = _TiDevice(position=1, mounted=True)
+        setattr(dev, "FilterBlocks" if logical == "filter" else "Objectives",
+                _FakeCollection(items))
+        b._devices = {logical: dev}
+        return b
+
+    def test_write_support_reads_the_declared_setters(self):
+        """comtypes exposes a COM property as a Python ``property`` — get-only
+        when the typelib declares no propput. ``_ReadOnlyOptic`` models a body
+        that declares neither field settable."""
+        b = self._optic_backend("objective", [_ReadOnlyOptic(106, "MRH20040")])
+        self.assertEqual(b.probe_optic_write_support(),
+                         {"objective": {"Name": False, "Code": False}})
+
+    def test_write_support_detects_a_settable_name(self):
+        b = self._optic_backend("filter", [_WritableNameOptic(4, "DAPI")])
+        self.assertEqual(b.probe_optic_write_support()["filter"]["Name"], True)
+
+    def test_write_support_is_undeterminable_without_type_information(self):
+        """A late-bound wrapper exposes no descriptor at all. That must report
+        None (unknown), never a guess in either direction."""
+        b = self._optic_backend("objective",
+                                [_FakeOptic(code=106, name="MRH20040")])
+        self.assertIsNone(b.probe_optic_write_support()["objective"]["Code"])
+
+    def test_write_support_check_writes_nothing_at_all(self):
+        """⚠ THE LOAD-BEARING TEST. An earlier cut settled writability by
+        writing each field's own current value back to itself, on the theory
+        that a same-value write is a no-op. ``tucam_backend._capa_set`` records
+        a hardware-verified case where exactly that was DESTRUCTIVE. Here the
+        analogous field (``Code``) resolves the working distance that bounds a
+        focus sweep, so this check must never write.
+
+        Asserts against a RECORDED list rather than a raising fake, so a
+        reintroduced write cannot hide inside a broad ``except``."""
+        writes: list = []
+        b = self._optic_backend("objective",
+                                [_RecordingOptic(106, "MRH20040", writes)])
+        b.probe_optic_write_support()
+        self.assertEqual(writes, [])
+
+    def test_write_support_empty_when_nothing_enumerable(self):
+        b = NikonTiSdkBackend()
+        b._scope = object()
+        b._devices = {}
+        self.assertEqual(b.probe_optic_write_support(), {})
+
+    # ── set_optic_name: the ONE genuine write ───────────────────────
+
+    def test_set_optic_name_writes_and_verifies(self):
+        optic = _WritableNameOptic(4, "-----")
+        b = self._optic_backend("filter", [_WritableNameOptic(1, "DAPI"),
+                                           _WritableNameOptic(2, "FITC"),
+                                           _WritableNameOptic(3, "TxRed"),
+                                           optic])
+        self.assertEqual(b.set_optic_name("filter", 4, "CY5"), "CY5")
+        self.assertEqual(optic.Name, "CY5")
+
+    def test_set_optic_name_never_touches_code(self):
+        """Code resolves an objective's NA/working distance, which bound a
+        focus sweep — a rename must not be able to disturb it."""
+        writes: list = []
+        b = self._optic_backend("filter", [_RecordingOptic(4, "DAPI", writes)])
+        try:
+            b.set_optic_name("filter", 1, "CY5")
+        except MicroscopeError:
+            pass
+        self.assertEqual([k for k, _v in writes], ["Name"])
+
+    def test_set_optic_name_refuses_a_declared_readonly_field(self):
+        b = self._optic_backend("filter", [_ReadOnlyOptic(4, "DAPI")])
+        with self.assertRaises(MicroscopeError) as ctx:
+            b.set_optic_name("filter", 1, "CY5")
+        self.assertIn("read-only", str(ctx.exception))
+
+    def test_set_optic_name_raises_when_the_write_does_not_take(self):
+        """⚠ This SDK has already been caught accepting an out-of-range turret
+        index, clamping it and reporting SUCCESS. A silently-ignored rename is
+        the same failure mode, so the value is read back and disagreement is an
+        error — never a reported success."""
+        b = self._optic_backend("filter", [_IgnoringNameOptic(4, "DAPI")])
+        with self.assertRaises(MicroscopeError) as ctx:
+            b.set_optic_name("filter", 1, "CY5")
+        self.assertIn("did not take", str(ctx.exception))
+
+    def test_set_optic_name_honours_the_bodys_own_canmodify_flag(self):
+        """``CanModify`` is Nikon's own advertised gate — *"Determines if
+        properties such as 'Name' can be modified for this optical element"* —
+        and it reads 0 on every slot of the real Ti-E. Asking it turns a COM
+        error into a plain explanation, and it must be asked BEFORE any write
+        (assert on the recorded writes, not just the message)."""
+        writes: list = []
+        b = self._optic_backend("filter", [_LockedOptic(0, "-----", writes)])
+        with self.assertRaises(MicroscopeError) as ctx:
+            b.set_optic_name("filter", 1, "CY5")
+        self.assertIn("CanModify=0", str(ctx.exception))
+        self.assertEqual(writes, [])          # refused without touching it
+
+    def test_set_optic_name_still_proceeds_when_canmodify_is_true(self):
+        """The gate must not become a blanket refusal — a body that permits it
+        (or does not expose the flag) still goes through."""
+        optic = _WritableNameOptic(4, "-----")
+        optic.CanModify = 1
+        b = self._optic_backend("filter", [optic])
+        self.assertEqual(b.set_optic_name("filter", 1, "CY5"), "CY5")
+
+    def test_set_optic_name_surfaces_the_ti_e_runtime_refusal(self):
+        """⚠ THE HARDWARE FINDING, pinned (real Ti-E, SDK 4.4.1.714,
+        2026-08-12). The body DECLARES Name and Code settable and then refuses
+        at runtime — so a declared setter is a FALSE POSITIVE and only a real
+        attempt settles it. The operator must see Nikon's own words, not a
+        traceback and not a success."""
+        b = self._optic_backend("filter", [_RefusingOptic(0, "-----")])
+        with self.assertRaises(MicroscopeError) as ctx:
+            b.set_optic_name("filter", 1, "CY5")
+        msg = str(ctx.exception)
+        self.assertIn("Database entry cannot be modified.", msg)
+        self.assertIn("Nikon.TiScope.FilterBlock.1", msg)
+        self.assertNotIn("Traceback", msg)
+        # ...and the optimistic typelib claim is exactly what makes this trap.
+        self.assertEqual(b.probe_optic_write_support()["filter"]["Name"], True)
+
+    def test_filter_catalogue_indices_match_this_rig(self):
+        """The names come from Nikon's own 0-based FilterBlockNames.txt, which
+        this rig's live readings pin: codes 4/15/23 -> DAPI/FITC/TxRed, and Cy5
+        is 25. Guards the "empty slot" rule those readings also confirmed."""
+        coll = _FakeCollection([
+            _FakeOptic(code=4, name="DAPI"),
+            _FakeOptic(code=15, name="FITC"),
+            _FakeOptic(code=23, name="TxRed"),
+            _FakeOptic(code=0, name="-----"),   # slot 4 as the body reports it
+        ])
+        b = NikonTiSdkBackend()
+        b._scope = object()
+        b._devices = {"filter": _TiDevice(position=1, mounted=True)}
+        b._devices["filter"].FilterBlocks = coll
+        optics = b.mounted_filters()
+        self.assertEqual([o.label for o in optics],
+                         ["DAPI", "FITC", "TxRed", ""])
+        self.assertEqual([o.present for o in optics],
+                         [True, True, True, False])
+
+    def test_set_optic_name_rejects_a_bad_slot_and_group(self):
+        b = self._optic_backend("filter", [_WritableNameOptic(4, "DAPI")])
+        with self.assertRaises(MicroscopeError):
+            b.set_optic_name("filter", 7, "CY5")      # only 1 slot enumerable
+        with self.assertRaises(MicroscopeError):
+            b.set_optic_name("turntable", 1, "CY5")   # unknown group
 
     def test_magnification_table_covers_the_known_codes(self):
         table = NikonTiSdkBackend._MAGNIFICATIONS
@@ -608,6 +888,67 @@ class TestMicroscopeController(_StoreCase):
         self.assertFalse(st.connected)
         self.assertIsNone(st.filter_position)
         self.assertIsNone(st.focus_um)
+
+    def test_probe_optic_write_support_updates_state(self):
+        """Wiring only — the simulated backend truthfully reports {} (see
+        TestSimulatedBackend); this proves the op reaches the backend and the
+        result lands on the cached state, not that hardware supports it."""
+        ctrl = self._connected()
+        self.assertEqual(ctrl.state().optic_write_support, {})
+        op = ctrl.probe_optic_write_support()
+        self.assertIsNone(op.error)
+        self.assertEqual(ctrl.state().optic_write_support, {})
+        ctrl.disconnect()
+        self.assertEqual(ctrl.state().optic_write_support, {})
+
+    def test_probe_optic_write_support_fails_cleanly_when_disconnected(self):
+        ctrl = MicroscopeController(store=self.store, threaded=False)
+        op = ctrl.probe_optic_write_support()
+        self.assertIsNotNone(op.error)
+
+    def test_set_optic_name_reports_the_refusal(self):
+        """The simulated body cannot be told its optics; the op must carry the
+        error, and ``result`` must stay None rather than implying success."""
+        ctrl = self._connected()
+        op = ctrl.set_optic_name("filter", 4, "CY5")
+        self.assertIsNotNone(op.error)
+        self.assertIsNone(op.result)
+
+    def test_set_optic_name_carries_the_verified_value_inline(self):
+        """⚠ REGRESSION: the op's fn closes over the op itself to report a
+        result. Built naively (``op = self._submit(...)`` with ``_do``
+        referencing ``op``), the INLINE threaded=False path — the one the whole
+        suite uses — runs ``_do`` before ``op`` is bound and dies with a
+        NameError swallowed into op.error."""
+        ctrl = MicroscopeController(store=self.store, threaded=False)
+        ctrl.connect()
+
+        class _Body(SimulatedMicroscopeBackend):
+            def set_optic_name(self, logical, position, name):
+                return name.upper()
+
+        ctrl._backend = _Body()
+        ctrl._backend.connect()
+        op = ctrl.set_optic_name("filter", 4, "cy5")
+        self.assertIsNone(op.error)
+        self.assertEqual(op.result, "CY5")
+
+    def test_set_optic_name_carries_the_verified_value_threaded(self):
+        ctrl = MicroscopeController(store=self.store, threaded=True)
+        self.addCleanup(ctrl.shutdown)
+        ctrl.connect()
+        ctrl.wait_idle(timeout=10.0)
+
+        class _Body(SimulatedMicroscopeBackend):
+            def set_optic_name(self, logical, position, name):
+                return name.upper()
+
+        ctrl._backend = _Body()
+        ctrl._backend.connect()
+        op = ctrl.set_optic_name("filter", 4, "cy5")
+        self.assertTrue(ctrl.wait_idle(timeout=10.0))
+        self.assertIsNone(op.error)
+        self.assertEqual(op.result, "CY5")
 
     def test_reconnect_replaces_previous_backend(self):
         ctrl = self._connected()
@@ -950,6 +1291,66 @@ class TestMicroscopeSetupPanel(_StoreCase):
         self.assertTrue(panel2._filter_table._rows[1]["go"].isEnabled())
         panel2._go_filter(3)
         self.assertEqual(ctrl2.state().filter_position, 3)
+
+    # ── Optics write-support probe ──────────────────────────────────
+
+    def test_probe_write_support_needs_a_connection(self):
+        panel, _ = self._panel(connect=False)
+        with mock.patch.object(setup_panel_mod.QMessageBox,
+                               "information") as info:
+            panel._probe_write_support()
+        info.assert_called_once()
+
+    def test_probe_write_support_runs_when_connected(self):
+        panel, ctrl = self._panel(connect=True)
+        # The result dialog is modal — patch exec() so this can't block under
+        # offscreen Qt (the same trap already recorded for QMessageBox above).
+        with mock.patch.object(setup_panel_mod.QDialog, "exec"):
+            panel._probe_write_support()
+        # The simulated backend has no notion of a writable optics database —
+        # this only proves the probe reaches it and the result lands on state.
+        self.assertEqual(ctrl.state().optic_write_support, {})
+
+    def test_format_write_support_with_no_result(self):
+        text = setup_panel_mod.MicroscopeSetupPanel._format_write_support({})
+        self.assertIn("no notion", text)
+
+    def test_format_write_support_read_only(self):
+        text = setup_panel_mod.MicroscopeSetupPanel._format_write_support(
+            {"objective": {"Name": False, "Code": False}})
+        self.assertIn("cannot be set from software", text)
+        self.assertIn("read-only", text)
+        self.assertNotIn("WRITABLE", text)
+        self.assertIn("nothing was written", text.lower())
+
+    def test_format_write_support_writable_carries_the_false_positive_warning(self):
+        """A declared setter is hardware-verified to be a FALSE POSITIVE on the
+        Ti-E. This report must not promise that a rename will reach the body."""
+        text = setup_panel_mod.MicroscopeSetupPanel._format_write_support(
+            {"objective": {"Name": True, "Code": False}})
+        self.assertIn("WRITABLE", text)
+        self.assertIn("FALSE POSITIVE", text)
+        self.assertIn("Database entry cannot be modified.", text)
+        self.assertNotIn("MAY be pushable", text)
+
+    def test_format_write_support_undeterminable(self):
+        text = setup_panel_mod.MicroscopeSetupPanel._format_write_support(
+            {"objective": {"Name": None, "Code": None}})
+        self.assertIn("Undeterminable", text)
+        self.assertNotIn("cannot be set from software", text)
+
+    def test_probe_surfaces_a_refusal_instead_of_a_stale_result(self):
+        """A lease-blocked / dropped op must not render as "this driver has no
+        such notion" — that would read as a hardware answer."""
+        panel, ctrl = self._panel(connect=True)
+        with mock.patch.object(ctrl, "probe_optic_write_support") as probe:
+            probe.return_value = mock.Mock(error="microscope is reserved by x")
+            with mock.patch.object(setup_panel_mod.QMessageBox,
+                                   "warning") as warn:
+                with mock.patch.object(setup_panel_mod.QDialog, "exec") as ex:
+                    panel._probe_write_support()
+        warn.assert_called_once()
+        ex.assert_not_called()
 
 
 class TestMicroscopeSettingsDialogWrapper(_StoreCase):

@@ -24,14 +24,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import devices_dir
+
 logger = logging.getLogger(__name__)
 
-# Standard location for device profile JSONs. Ships with two presets
-# (Standard.json, Conservative.json); users add more via the Stage UI.
-DEVICES_DIR = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "config" / "hardware" / "devices"
-)
+# ⚠ MACHINE-INDEPENDENT on purpose. A device profile NAMES the machine — its
+# name is what gives this rig config/hardware/<name>/ — so profiles cannot
+# live inside that folder without a chicken-and-egg. They are tracked in git:
+# each rig's file has a distinct name so they cannot conflict on pull, and it
+# backs up every rig's safety envelope / steps-per-mm / axis map.
+DEVICES_DIR = devices_dir()
 
 
 @dataclass

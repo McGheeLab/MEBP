@@ -34,7 +34,9 @@ from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPixmap
 
 from SupportClasses.StageController import StageController, plate_relative_to_zref
 from SupportClasses.WellPlate import WellPlate, PLATE_DEFINITIONS
-from SupportClasses.CaptureTiming import resolve_grab_timing
+from SupportClasses.CaptureTiming import (
+    fresh_frame_timeout_s, resolve_grab_timing,
+)
 from SupportClasses.FrameAveraging import average_if_agreeing
 from gui.styles import COLORS, SECTION_TITLE_STYLE, CONTEXT_SECTION_LABEL_STYLE
 from gui.unit_helpers import stage_to_um, format_um, DEFAULT_XY_POSITION_SCALE
@@ -646,6 +648,11 @@ class _MosaicScanWorker(QThread):
         self._min_dist_px = float(min_dist_px)
         self._fresh_frames = int(fresh_frames)
         self._fresh_timeout_s = float(fresh_timeout_s)
+        # v7.18: the camera's MEASURED seconds-per-frame, from the preflight.
+        # Used to size the per-tile timeout when the backend cannot report its
+        # own exposure/frame rate (see _grab_post_move_frame).
+        self._measured_period_s = None
+        self._last_wait_timeout_s = None
         # Extra settle (ms) after each move before counting fresh frames — gives
         # the camera time to finish exposing a sharp, post-move frame.
         self._settle_ms = max(0, int(settle_ms))
@@ -722,8 +729,21 @@ class _MosaicScanWorker(QThread):
             except Exception:
                 return None
 
-        n_frames, timeout_s, _period = resolve_grab_timing(
+        n_frames, timeout_s, period = resolve_grab_timing(
             cam, self._fresh_frames, self._fresh_timeout_s)
+        # v7.18: when the backend cannot report an exposure/frame rate,
+        # resolve_grab_timing degrades to the flat configured timeout — which is
+        # WRONG for a slow camera and is what aborted this rig's scans. The
+        # preflight measures the real delivery rate, so use it.
+        #
+        # Measured 2026-08-13: a Tucsen at a 300 ms exposure delivers ~2.4 fps,
+        # so three fresh frames need ~1.3 s of integration alone; the flat 2.5 s
+        # left no margin and every tile was dropped ("camera stopped delivering
+        # frames (8 tiles in a row) — scan aborted"), which is the error that
+        # blocked objective calibration.
+        if period is None and self._measured_period_s:
+            timeout_s = fresh_frame_timeout_s(
+                n_frames, self._measured_period_s, self._fresh_timeout_s)
         fresh = False
         t_end = time.time() + timeout_s
         while time.time() < t_end and not self._stop:
@@ -745,6 +765,7 @@ class _MosaicScanWorker(QThread):
                 "move (needed %d) — dropping this tile rather than stitching "
                 "a frame exposed before/during the move", timeout_s, n_frames)
             return None
+        self._last_wait_timeout_s = timeout_s
         try:
             first = cam.get_current_frame()
         except Exception:
@@ -805,6 +826,105 @@ class _MosaicScanWorker(QThread):
             logger.debug("Mosaic worker: averaged %d of %d requested frames",
                          n_used, self._avg_frames)
         return frame
+
+    # ── v7.18: measure the camera's real delivery rate before scanning ──
+    #
+    # Two operator-visible failures came out of NOT doing this:
+    #
+    #  * a scan that ran ~25 s and then died with "camera stopped delivering
+    #    frames (8 tiles in a row)". Every tile had been dropped from the first
+    #    one, so the 8 wasted moves told the operator nothing they could act on;
+    #  * the flat 2.5 s frame timeout, used whenever the backend cannot report
+    #    its exposure, being shorter than the time three frames physically take.
+    #
+    # `frame_count_value()` is advanced by the widget's DISPLAY timer (that is
+    # deliberate — the counter and the frame buffer must move together), so a
+    # stopped/hidden feed freezes it while the camera itself streams happily.
+    # Measuring distinguishes those cases up front and prices the timeout.
+
+    #: How long the preflight will wait for the first frames before giving up.
+    _PREFLIGHT_WAIT_S = 6.0
+    #: Frames to observe when timing the camera. Two intervals from three frames.
+    _PREFLIGHT_FRAMES = 3
+
+    def _measure_frame_period(self):
+        """``(period_s, frames_seen)`` observed via the display-gated counter.
+
+        ``period_s`` is None when fewer than two frames arrived (nothing to time
+        an interval from). Never raises.
+        """
+        cam = self._cam
+        try:
+            start_count = cam.frame_count_value()
+        except Exception:
+            return None, None
+        if start_count is None:
+            return None, None
+        t0 = time.time()
+        stamps = []
+        last = start_count
+        deadline = t0 + self._PREFLIGHT_WAIT_S
+        while time.time() < deadline and not self._stop:
+            try:
+                now = cam.frame_count_value()
+            except Exception:
+                break
+            if now > last:
+                stamps.append(time.time())
+                last = now
+                if len(stamps) >= self._PREFLIGHT_FRAMES:
+                    break
+            time.sleep(0.01)
+        seen = last - start_count
+        if len(stamps) < 2:
+            return None, seen
+        return (stamps[-1] - stamps[0]) / (len(stamps) - 1), seen
+
+    def _preflight_camera(self) -> "str | None":
+        """``None`` when the camera is delivering frames, else why it is not.
+
+        Refuses BEFORE any stage motion. The message distinguishes the two
+        causes, because they need different actions from the operator: a frozen
+        display feed is a software/UI state, while a genuinely silent camera is
+        the camera.
+        """
+        period, seen = self._measure_frame_period()
+        if period is not None:
+            self._measured_period_s = period
+            logger.info(
+                "Mosaic preflight: camera delivering ~%.2f fps (%.0f ms/frame)",
+                (1.0 / period) if period > 0 else 0.0, period * 1000.0)
+            return None
+        if self._stop:
+            return None
+
+        # Nothing (or only one frame) arrived. Is the BACKEND streaming?
+        backend_moved = None
+        try:
+            getter = getattr(self._cam, "frames_acquired", None)
+            if callable(getter):
+                a = getter()
+                time.sleep(1.0)
+                b = getter()
+                if a is not None and b is not None:
+                    backend_moved = b > a
+        except Exception:
+            backend_moved = None
+
+        if backend_moved:
+            return ("the camera is streaming but its live view is not updating, "
+                    "so the scan cannot tell a post-move frame from a stale one. "
+                    "Make sure the camera's preview is visible and started on "
+                    "this page (Hardware Setup → Cameras), then scan again.")
+        if seen:
+            return ("the camera delivered only one frame in "
+                    f"{self._PREFLIGHT_WAIT_S:.0f} s — far too slow to scan. "
+                    "Lower the exposure, or raise 'Fresh frame timeout' in the "
+                    "mosaic settings.")
+        return ("the camera is not delivering frames — it is stopped, or its "
+                "exposure is longer than "
+                f"{self._PREFLIGHT_WAIT_S:.0f} s. Start the camera preview and "
+                "check the exposure, then scan again.")
 
     # Abort the scan if this many consecutive tiles yield no fresh frame
     # (camera stopped / crashed) rather than silently building a partial mosaic.
@@ -900,6 +1020,18 @@ class _MosaicScanWorker(QThread):
         # watchdogs. Paired with _resume_poller() in finally.
         self._suspend_poller()
         try:
+            # v7.18: prove the camera is delivering frames BEFORE moving the
+            # stage. Without this a dead/frozen feed cost 8 moves and ~25 s and
+            # then reported "camera stopped delivering frames", which names a
+            # symptom rather than the cause. Refusing here costs a couple of
+            # seconds and says what to fix.
+            why = self._preflight_camera()
+            if why is not None:
+                self.failed.emit(f"cannot start the scan — {why}")
+                return
+            if self._stop:
+                return
+
             total = len(self._positions)
             consecutive_none = 0
             last_x, last_y = None, None
@@ -1010,9 +1142,24 @@ class _MosaicScanWorker(QThread):
                         f"Mosaic worker: no fresh frame at tile {idx} "
                         f"({consecutive_none} consecutive)")
                     if consecutive_none >= self._MAX_CONSEC_NONE:
+                        # Name the timeout that was actually applied and the
+                        # measured rate — "stopped delivering frames" alone sent
+                        # the operator looking at the camera when the real fix
+                        # was the timeout or the exposure.
+                        rate = ""
+                        if self._measured_period_s:
+                            rate = (f" The camera measured "
+                                    f"{1.0 / self._measured_period_s:.1f} fps at "
+                                    f"scan start")
+                            if self._last_wait_timeout_s:
+                                rate += (f" and the wait was "
+                                         f"{self._last_wait_timeout_s:.1f} s")
+                            rate += "."
                         self.failed.emit(
-                            f"camera stopped delivering frames "
-                            f"({consecutive_none} tiles in a row) — scan aborted")
+                            f"no post-move frame for {consecutive_none} tiles in "
+                            f"a row — scan aborted.{rate} Lower the exposure, or "
+                            f"raise 'Fresh frame timeout' / lower 'Fresh frames' "
+                            f"in the mosaic settings.")
                         return
                     self.progress.emit(idx + 1, total)
                     continue

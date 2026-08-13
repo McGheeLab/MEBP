@@ -2,10 +2,21 @@
 mosaic of a single well.
 
 v7.5.x: Captures a high-resolution stitched mosaic of ONE well, once per
-fluorescence channel (DAPI / FITC / mCherry / Cy5 …). There is no filter-wheel
-hardware, so the operator switches the physical filter/illumination between
-channels: the workflow rasters a full single-well mosaic for the current channel,
-then prompts the operator to switch the filter and repeat for the next channel.
+fluorescence channel (DAPI / FITC / mCherry / Cy5 …). The workflow rasters a full
+single-well mosaic for the current channel, then moves to the next channel.
+
+⚠ v7.18 — WHICH FILTER CUBE IS IN THE LIGHT PATH IS NOW A KNOWN, DRIVABLE FACT.
+This docstring used to assert "there is no filter-wheel hardware, so the operator
+switches the physical filter/illumination between channels". That is no longer
+true: the Nikon Ti's ``FilterBlockCassette1`` is motorized and hardware-verified
+switching all six slots with read-back, and ``MicroscopeController.set_filter``
+has been public the whole time. The per-channel prompt is therefore a fallback,
+not the mechanism — the cube is resolved through
+``OpticsRegistry.find_slot``/``OpticsService.ensure_filter`` and switched
+automatically, and the operator is only asked when that REFUSES (no body
+connected, an unnamed/empty slot, or a channel name that does not resolve to a
+cube — this rig's cassette holds a cube labelled "TxRed" while the channel
+vocabulary says "mCherry", which the software must never equate on its own).
 
 Because every channel of a well reuses the SAME raster grid + camera scale, their
 composites register pixel-for-pixel; the workflow blends them into a false-colour
@@ -2885,14 +2896,17 @@ class FluorescenceMosaicWorkflowPage(QWidget):
 
         # The body's own optics for the CURRENT turret position (read-only —
         # this never writes current_objective_name).
+        # v7.18: one shared walk (OpticsRegistry.optic_at) instead of a fourth
+        # hand-rolled copy, and `label` NOT `name` — `MountedOptic` has no `name`
+        # field, so `getattr(optic, "name", "")` was ALWAYS empty and this label
+        # silently fell back to `_scan_objective` on every run, never carrying
+        # the body's own answer. The sibling lines below read the right fields,
+        # which is why nothing looked wrong.
+        from SupportClasses.OpticsRegistry import OBJECTIVE, optic_at
         pos = getattr(st, "objective_position", None)
-        optic = None
-        for o in (getattr(st, "mounted_objectives", ()) or ()):
-            if int(getattr(o, "position", 0) or 0) == int(pos or 0):
-                optic = o
-                break
+        optic = optic_at(st, pos, OBJECTIVE)
         optics = ObjectiveOptics(
-            label=str(getattr(optic, "name", "") or self._scan_objective),
+            label=str(getattr(optic, "label", "") or self._scan_objective),
             position=int(pos or 0),
             magnification=getattr(optic, "magnification", None),
             numerical_aperture=getattr(optic, "numerical_aperture", None),

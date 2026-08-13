@@ -43,6 +43,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -52,7 +54,7 @@ except ImportError:                                   # pragma: no cover
     cv2 = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/plate_level_sites.json")
+_DEFAULT_PATH = resolve_machine_path("plate_level_sites.json")
 
 #: Defocus levels banked either side of best focus, as multiples of the focus
 #: curve's own FWHM. Beyond ~2 FWHM the feature is a smear that matches anything.

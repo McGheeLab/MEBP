@@ -42,6 +42,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -51,7 +53,7 @@ except ImportError:   # pragma: no cover - cv2 present in this project
     cv2 = None
     _CV2 = False
 
-_DEFAULT_DIR = Path("config/hardware/well_training")
+_DEFAULT_DIR = resolve_machine_path("well_training")
 
 
 def _safe(token) -> str:

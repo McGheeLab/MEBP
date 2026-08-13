@@ -7,17 +7,6 @@ module is the GUI-free backend for driving those three devices manually. It is
 deliberately standalone — no print/workflow/calibration code calls into it yet
 (integration into the workflows and calibrations is a later, separate step).
 
-v7.17 adds three more devices the body exposes and nothing was driving — the
-**epi (excitation) shutter**, the **transmitted-light (dia) lamp** and the
-**light-path drive** (eyepiece ↔ camera port) — plus the one piece of *behaviour*
-in this module: an optional **shutter↔cassette interlock** that closes the
-excitation shutter for the duration of a filter-cube rotation and then restores
-it. Rotating the cassette with the shutter open sweeps the excitation beam across
-every cube that passes, flashing the sample with out-of-band excitation. See
-:meth:`MicroscopeController._with_shutter_closed`. All three are **accessories**:
-a body without one is normal, so every getter degrades to "not fitted" rather
-than raising.
-
 Two layers:
 
 * :class:`MicroscopeBackend` — the driver contract (connect, read/set turret
@@ -121,33 +110,6 @@ class MicroscopeState:
     focus_um: Optional[float] = None
     focus_min_um: Optional[float] = None
     focus_max_um: Optional[float] = None
-    # ── v7.17: illumination + light path ────────────────────────────
-    # Each ``*_present`` says the body actually has that accessory; the value
-    # beside it is ``None`` for "fitted but not readable right now", which is a
-    # different thing and must not render as a state.
-    #
-    # These are POLLED, unlike the mounted optics, because the Ti-E has physical
-    # buttons and a lamp knob ON THE BODY — the operator can change any of them
-    # without the software, and polling is the only way the panel tells the truth.
-    epi_shutter_present: bool = False
-    #: True = open (excitation reaching the sample). Already corrected for the
-    #: operator's ``epi_shutter_invert`` override.
-    epi_shutter_open: Optional[bool] = None
-    dia_lamp_present: bool = False
-    dia_lamp_on: Optional[bool] = None
-    #: Is the lamp under software (Remote) control? ``False`` = the body's own
-    #: front-panel knob owns it and the SDK refuses every write. ``None`` = the
-    #: driver cannot tell, so don't gate anything on it.
-    dia_lamp_remote: Optional[bool] = None
-    #: Lamp level in the DEVICE'S OWN units, with the range the device declares.
-    #: Deliberately not rescaled to a percentage — see set_dia_lamp_intensity.
-    dia_lamp_intensity: Optional[float] = None
-    dia_lamp_min: Optional[float] = None
-    dia_lamp_max: Optional[float] = None
-    #: Eyepiece / camera-port selector, 1-based like the turrets.
-    light_path_position: Optional[int] = None
-    light_path_count: int = 0
-    native_light_path_names: tuple = ()
     #: Names the hardware itself reports, when it reports any (Micro-Manager
     #: state labels, SDK objective info). Empty when unavailable — the operator
     #: assignments in MicroscopeConfigStore are the fallback and the override.
@@ -158,6 +120,9 @@ class MicroscopeState:
     #: physically swaps them, so this is not on the ~1 s poll.
     mounted_filters: tuple = ()
     mounted_objectives: tuple = ()
+    #: Result of the last probe_optic_write_support() call — see there for the
+    #: shape. {} until probed, or when the driver has no notion of this.
+    optic_write_support: dict = field(default_factory=dict)
     #: Last error text, cleared by the next successful operation.
     error: Optional[str] = None
     last_op: Optional[str] = None
@@ -173,10 +138,6 @@ class MicroscopeState:
     @property
     def has_focus(self) -> bool:
         return self.focus_um is not None
-
-    @property
-    def has_light_path(self) -> bool:
-        return self.light_path_count > 0
 
 
 # ── Backend contract ───────────────────────────────────────────────
@@ -237,6 +198,51 @@ class MicroscopeBackend:
         """``MountedOptic`` per nosepiece position, or ``()`` if unsupported."""
         return ()
 
+    # -- can the body's OWN optics database be told what is mounted? --
+    def probe_optic_write_support(self) -> dict:
+        """**READ-ONLY** inspection: does this body's optics interface declare
+        its name/identity fields as settable, so a rename in the app could make
+        the body's own display follow?
+
+        Commands NOTHING and writes NOTHING — it inspects the driver's own type
+        information. ``{}`` means "nothing to report" (driver has no such
+        notion, or no optics are enumerable). Otherwise
+        ``{"filter": {<field>: True | False | None}, "objective": {...}}``,
+        where the verdict is per FIELD (writability is a property of the
+        interface, not of one slot) and ``None`` means undeterminable.
+
+        ⚠ Deliberately does **not** settle the question by writing a field's
+        own current value back to itself. That looks safe and is not: writing a
+        device property the value it already holds is hardware-verified in this
+        codebase to be destructive on at least one instrument SDK — see
+        ``tucam_backend._capa_set`` (a redundant ``auto_exposure`` write reset
+        the exposure to the sensor minimum and blacked out the preview). On a
+        nosepiece the equivalent field (``Code``) is what resolves NA and
+        working distance, which bound a focus sweep — so a corrupted one is a
+        collision hazard, not a cosmetic bug.
+
+        ⚠⚠ **A ``True`` here is NOT an answer.** Hardware-verified on the real
+        Ti-E: it declares ``Name`` and ``Code`` settable and then refuses every
+        write at runtime (*"Database entry cannot be modified."*). Treat this as
+        "the typelib does not rule it out"; only :meth:`set_optic_name` settles
+        it. See that method for the full finding.
+        """
+        return {}
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> str:
+        """Write one optic's name into the body's own database and VERIFY it.
+
+        ``logical`` is ``"filter"`` or ``"objective"``; ``position`` is 1-based.
+        Returns the name the body reports **after** the write, so a driver that
+        accepts a write and silently keeps the old value is caught (the Ti SDK
+        has form here — it silently clamped an out-of-range turret index and
+        reported success; see ``NikonTiSdkBackend._set_turret``).
+
+        Raises :class:`MicroscopeError` when unsupported or refused.
+        """
+        raise MicroscopeError(
+            "this microscope cannot be told what optics are fitted")
+
     # -- focus --
     def get_focus_um(self) -> Optional[float]:
         return None
@@ -254,82 +260,6 @@ class MicroscopeBackend:
     def focus_limits_um(self) -> Optional[tuple]:
         """Hardware travel limits ``(min, max)`` in µm, or ``None`` if unknown."""
         return None
-
-    # -- epi (excitation) shutter --
-    #
-    # v7.17. All three device groups below are ACCESSORIES: a body without one is
-    # entirely normal, so the default is "not fitted" and the ``has_*`` probe is
-    # what callers gate on. Raising from a setter that was never advertised keeps
-    # a mis-wired UI loud instead of silently doing nothing.
-
-    def has_epi_shutter(self) -> bool:
-        return False
-
-    def epi_shutter_open(self) -> Optional[bool]:
-        """``True`` = open. ``None`` = fitted but unreadable, or not fitted."""
-        return None
-
-    def set_epi_shutter(self, open_: bool) -> None:
-        raise MicroscopeError("this microscope has no motorized epi shutter")
-
-    # -- transmitted-light (diascopic) lamp --
-
-    def has_dia_lamp(self) -> bool:
-        return False
-
-    def dia_lamp_on(self) -> Optional[bool]:
-        return None
-
-    def set_dia_lamp_on(self, on: bool) -> None:
-        raise MicroscopeError("this microscope has no controllable dia lamp")
-
-    def dia_lamp_intensity(self) -> Optional[float]:
-        """Lamp level in the device's own units, or ``None``."""
-        return None
-
-    def set_dia_lamp_intensity(self, value: float) -> None:
-        raise MicroscopeError("this microscope's dia lamp is not dimmable")
-
-    def dia_lamp_intensity_range(self) -> Optional[tuple]:
-        """``(min, max)`` the device declares for its level, else ``None``."""
-        return None
-
-    def dia_lamp_remote(self) -> Optional[bool]:
-        """Is the lamp under SOFTWARE control? ``None`` = the driver can't tell.
-
-        ⚠ Hardware-measured on a Ti-E: the dia lamp has two modes and the SDK
-        **refuses every write in the wrong one** — ``IsControlled = 0
-        ('MainMode')`` means the body's own front-panel knob owns the lamp, and
-        level/switch writes come back ``0xE01004BB`` / ``0xE01004BE``. ``1
-        ('RemoteMode')`` accepts them.
-        """
-        return None
-
-    def set_dia_lamp_remote(self, on: bool) -> None:
-        """Take/release software control of the lamp.
-
-        Deliberately a separate, explicit operation rather than something the
-        setters do for you: switching to RemoteMode takes the lamp away from the
-        knob on the microscope, which changes what the person standing at the
-        body can do. That is theirs to choose, not a side effect of moving a
-        slider.
-        """
-        raise MicroscopeError(
-            "this microscope's dia lamp has no software/manual mode switch")
-
-    # -- light path (eyepiece / camera port selector) --
-
-    def light_path_count(self) -> int:
-        return 0
-
-    def get_light_path(self) -> Optional[int]:
-        return None
-
-    def set_light_path(self, position: int) -> None:
-        raise MicroscopeError("this microscope has no motorized light path")
-
-    def light_path_names(self) -> tuple:
-        return ()
 
     # -- diagnostics --
     def diagnostics(self) -> str:
@@ -349,14 +279,9 @@ class SimulatedMicroscopeBackend(MicroscopeBackend):
     name = "simulated"
     display_name = "Simulated microscope"
 
-    #: Plausible stand-in names for a Ti light-path selector.
-    _LIGHT_PATHS = ("Eyepiece", "Left port", "Right port", "Bottom port")
-
     def __init__(self, filter_slots: int = 6, objective_slots: int = 6,
                  focus_um: float = 5000.0,
-                 focus_range_um: tuple = (0.0, 10000.0), *,
-                 epi_shutter: bool = True, dia_lamp: bool = True,
-                 light_path_slots: int = 4, dia_lamp_remote: bool = True):
+                 focus_range_um: tuple = (0.0, 10000.0)):
         self._filter_slots = max(1, int(filter_slots))
         self._objective_slots = max(1, int(objective_slots))
         self._filter_pos = 1
@@ -364,24 +289,6 @@ class SimulatedMicroscopeBackend(MicroscopeBackend):
         self._focus_um = float(focus_um)
         self._focus_range = (float(focus_range_um[0]), float(focus_range_um[1]))
         self._connected = False
-        # v7.17 accessories. Each can be switched off at construction so the
-        # "body without this device" path is testable, which is the case a
-        # simulator that always has everything would hide.
-        self._has_epi = bool(epi_shutter)
-        self._has_lamp = bool(dia_lamp)
-        self._light_path_slots = max(0, int(light_path_slots))
-        # Closed / off at rest: that is the state an excitation shutter and a
-        # lamp should be found in, and it means a freshly-connected simulator is
-        # not modelling light on the sample.
-        self._epi_open = False
-        self._lamp_on = False
-        self._lamp_level = 50.0
-        self._lamp_range = (0.0, 100.0)
-        self._light_path = 1
-        # Modelled because the real body has it and REFUSES every lamp write in
-        # MainMode: a simulator that always accepts them would leave that whole
-        # branch untested (and it is the one the operator hits first).
-        self._lamp_remote = bool(dia_lamp_remote)
 
     def connect(self) -> None:
         self._connected = True
@@ -439,95 +346,6 @@ class SimulatedMicroscopeBackend(MicroscopeBackend):
     def focus_limits_um(self) -> Optional[tuple]:
         return self._focus_range
 
-    # v7.17 accessories
-
-    def has_epi_shutter(self) -> bool:
-        return self._has_epi
-
-    def epi_shutter_open(self) -> Optional[bool]:
-        if not (self._connected and self._has_epi):
-            return None
-        return self._epi_open
-
-    def set_epi_shutter(self, open_: bool) -> None:
-        self._require()
-        if not self._has_epi:
-            raise MicroscopeError("this microscope has no motorized epi shutter")
-        self._epi_open = bool(open_)
-
-    def has_dia_lamp(self) -> bool:
-        return self._has_lamp
-
-    def dia_lamp_on(self) -> Optional[bool]:
-        if not (self._connected and self._has_lamp):
-            return None
-        return self._lamp_on
-
-    def set_dia_lamp_on(self, on: bool) -> None:
-        self._require()
-        if not self._has_lamp:
-            raise MicroscopeError("this microscope has no controllable dia lamp")
-        self._require_lamp_remote()
-        self._lamp_on = bool(on)
-
-    def dia_lamp_remote(self) -> Optional[bool]:
-        if not (self._connected and self._has_lamp):
-            return None
-        return self._lamp_remote
-
-    def set_dia_lamp_remote(self, on: bool) -> None:
-        self._require()
-        if not self._has_lamp:
-            raise MicroscopeError("this microscope has no controllable dia lamp")
-        self._lamp_remote = bool(on)
-
-    def _require_lamp_remote(self) -> None:
-        if not self._lamp_remote:
-            raise MicroscopeError(
-                "the dia lamp is in MainMode — the microscope's own front-panel "
-                "control owns it and the SDK refuses software changes. Switch it "
-                "to software (Remote) control first.")
-
-    def dia_lamp_intensity(self) -> Optional[float]:
-        if not (self._connected and self._has_lamp):
-            return None
-        return self._lamp_level
-
-    def set_dia_lamp_intensity(self, value: float) -> None:
-        self._require()
-        if not self._has_lamp:
-            raise MicroscopeError("this microscope's dia lamp is not dimmable")
-        self._require_lamp_remote()
-        lo, hi = self._lamp_range
-        self._lamp_level = max(lo, min(hi, float(value)))
-
-    def dia_lamp_intensity_range(self) -> Optional[tuple]:
-        return self._lamp_range if self._has_lamp else None
-
-    def light_path_count(self) -> int:
-        return self._light_path_slots
-
-    def get_light_path(self) -> Optional[int]:
-        if not (self._connected and self._light_path_slots):
-            return None
-        return self._light_path
-
-    def set_light_path(self, position: int) -> None:
-        self._require()
-        if not self._light_path_slots:
-            raise MicroscopeError("this microscope has no motorized light path")
-        pos = int(position)
-        if not 1 <= pos <= self._light_path_slots:
-            raise MicroscopeError(
-                f"light path {pos} out of range 1-{self._light_path_slots}")
-        self._light_path = pos
-
-    def light_path_names(self) -> tuple:
-        return tuple(
-            self._LIGHT_PATHS[p - 1] if p <= len(self._LIGHT_PATHS)
-            else f"port {p}"
-            for p in range(1, self._light_path_slots + 1))
-
     def mounted_filters(self) -> tuple:
         """Plausible stand-in optics so the setup page is exercisable."""
         names = ("DAPI", "FITC", "TxRed", "Cy5")
@@ -573,17 +391,7 @@ class SimulatedMicroscopeBackend(MicroscopeBackend):
                 f"  objective slots  : {self._objective_slots} "
                 f"(at {self._objective_pos})\n"
                 f"  focus            : {self._focus_um:.2f} µm "
-                f"in {self._focus_range[0]:.0f}..{self._focus_range[1]:.0f}\n"
-                f"  epi shutter      : "
-                + (("open" if self._epi_open else "closed") if self._has_epi
-                   else "not fitted") + "\n"
-                f"  dia lamp         : "
-                + (f"{'on' if self._lamp_on else 'off'} at {self._lamp_level:g} "
-                   f"in {self._lamp_range[0]:g}..{self._lamp_range[1]:g}"
-                   if self._has_lamp else "not fitted") + "\n"
-                f"  light path       : "
-                + (f"{self._light_path} of {self._light_path_slots}"
-                   if self._light_path_slots else "not fitted"))
+                f"in {self._focus_range[0]:.0f}..{self._focus_range[1]:.0f}")
 
 
 # ── Nikon Ti SDK (COM) backend ─────────────────────────────────────
@@ -616,20 +424,7 @@ _TI_DEVICE_ALIASES = {
                "FilterBlock", "FilterCassette"),
     "objective": ("Nosepiece", "NosePiece", "Objective"),
     "focus": ("ZDrive", "ZDrive1", "Focus", "FocusDrive"),
-    # v7.17 accessories. ``EpiShutter``, ``DiaLamp`` and ``LightPathDrive`` are
-    # all in the confirmed 61-class list published by NikonTi.dll v4.4.1.714 and
-    # were seen on this body's own diagnostics dump, so the first alias in each
-    # group is the SDK's own name. What is NOT yet verified is the *semantics* of
-    # their values — see _shutter_codes and set_dia_lamp_intensity.
-    "epi_shutter": ("EpiShutter", "EpiShutter1", "FluoShutter", "Shutter"),
-    "dia_lamp": ("DiaLamp", "DiaLamp1", "TransmittedLamp", "Lamp"),
-    "light_path": ("LightPathDrive", "LightPathDrive1", "LightPath"),
 }
-
-#: Devices whose absence means the connection is not usable. The rest are
-#: accessories: a body without an epi shutter is perfectly normal, so failing to
-#: find one is logged quietly and never warns on every connect.
-_TI_CORE_DEVICES = frozenset({"filter", "objective", "focus"})
 
 
 try:  # the exception comtypes raises for a failed COM call
@@ -700,11 +495,6 @@ class NikonTiSdkBackend(MicroscopeBackend):
         #: Resolved lazily from the SDK's declared focus unit; see
         #: focus_units_per_um(). Cleared on connect/disconnect.
         self._focus_factor: Optional[float] = None
-        #: ``(closed_raw, open_raw)`` for the epi shutter, resolved lazily from
-        #: the SDK's own declared range + DisplayString. See _shutter_codes().
-        self._shutter_codes_cache: Optional[tuple] = None
-        #: Which property carries the dia lamp's on/off, once found.
-        self._lamp_switch_attr: Optional[str] = None
 
     # -- lifecycle --
 
@@ -740,42 +530,12 @@ class NikonTiSdkBackend(MicroscopeBackend):
                 + "\n  ".join(errors))
         self._scope = scope
         self._focus_factor = None      # re-resolve against this connection
-        self._shutter_codes_cache = None
-        self._lamp_switch_attr = None
         self._devices = self._discover_devices(scope)
-        self._prime_devices()
-        # Judge the connection on the CORE devices only: an accessory-only match
-        # (say an epi shutter but no turrets at all) is a broken link, not a
-        # usable body, and must still be reported as one.
-        if not (set(self._devices) & _TI_CORE_DEVICES):
+        if not self._devices:
             raise MicroscopeError(
                 f"connected to {self._resolved_prog_id} but found none of the "
                 "expected devices (nosepiece / filter cassette / Z drive). Use "
                 "the Diagnostics report to see what this body exposes.")
-
-    def _prime_devices(self) -> None:
-        """Touch each device once so its first real read is not stale.
-
-        ⚠ **Hardware-measured on the Ti-E (2026-08-12).** Reading a device's
-        ``Position`` as the *first* COM access after connect returns a default —
-        the light-path drive sitting at 3 answered **1**, and kept answering 1 for
-        as long as nothing else on the device was touched (6 reads over 0.9 s).
-        One access to any other property (``IsMounted``) makes the very next
-        ``Position`` read return the true 3. So it is the access that primes it,
-        not elapsed time.
-
-        Every position getter already happens to call ``_require_mounted`` first
-        and is therefore primed **by accident of ordering** — as is
-        ``dia_lamp_intensity`` in ``_read_all``, because ``has_dia_lamp`` runs
-        ahead of it. Relying on that is a latent trap: reorder those two lines and
-        the first state published after connect silently carries a wrong value.
-        Priming once, explicitly, removes the accident. Six cheap reads, no sleep.
-        """
-        for logical, device in self._devices.items():
-            try:
-                self._is_mounted(device)
-            except Exception as exc:
-                logger.debug(f"Nikon Ti: priming {logical} failed: {exc}")
 
     def _discover_devices(self, scope) -> dict:
         found = {}
@@ -786,21 +546,15 @@ class NikonTiSdkBackend(MicroscopeBackend):
                 found[logical] = device
                 logger.info(
                     f"Nikon Ti: {logical} device resolved to '{attr}'")
-            elif logical in _TI_CORE_DEVICES:
+            else:
                 logger.warning(
                     f"Nikon Ti: no {logical} device found (tried {names})")
-            else:
-                logger.info(
-                    f"Nikon Ti: no {logical} accessory on this body "
-                    f"(tried {names})")
         return found
 
     def disconnect(self) -> None:
         self._devices = {}
         self._scope = None
         self._focus_factor = None
-        self._shutter_codes_cache = None
-        self._lamp_switch_attr = None
         try:
             import comtypes
             comtypes.CoUninitialize()
@@ -1266,6 +1020,205 @@ class NikonTiSdkBackend(MicroscopeBackend):
     def objective_names(self) -> tuple:
         return tuple(o.label for o in self.mounted_objectives())
 
+    # -- can the body's own optics database be written to? --
+    #
+    # ``mounted_objectives()`` above already tells most of the story: an empty
+    # position has ``Code == 0`` and every OTHER field (Name, Magnification,
+    # NA, WD) then raises "No database code is associated with this optical
+    # element." That is the signature of a value being RESOLVED by looking
+    # ``Code`` up in a catalogue — and the SDK redistributable ships exactly
+    # such catalogues (``ObjectiveNames.txt`` — 199 rows, ``FilterBlockNames.txt``
+    # — 34 rows). The most plausible reading is that ``Code`` is SENSED from a
+    # *coded* Nikon optic's physical ring/chip, not typed by an operator — in
+    # which case the body's own display already tracks a coded optic
+    # automatically, with nothing for software to push, and an UNCODED optic
+    # has no ``Code`` to attach a name to either way.
+    #
+    # ⚠ The probe is READ-ONLY BY DESIGN and must stay that way. Settling this
+    # by writing each field's own current value back to itself reads as
+    # perfectly safe and is NOT: ``tucam_backend._capa_set`` records a
+    # hardware-verified case where writing a device property the value it
+    # ALREADY held reset the exposure to the sensor minimum. Here the analogous
+    # field is ``Code``, which resolves the NA and working distance that bound a
+    # focus sweep — so a corrupted one is a collision hazard, not a cosmetic
+    # bug. Writability is therefore inferred from the COM wrapper's own type
+    # information, and an actual write happens ONLY through the explicit,
+    # single-target, read-back-verified ``set_optic_name`` below.
+
+    #: The two identity fields a physical display could plausibly show. ``Code``
+    #: is REPORTED ON but never written by ``set_optic_name`` (see above).
+    _OPTIC_IDENTITY_FIELDS = ("Name", "Code")
+
+    #: logical device -> the collection attribute holding its optics.
+    _OPTIC_COLLECTIONS = {"filter": "FilterBlocks", "objective": "Objectives"}
+
+    @staticmethod
+    def _declared_writability(item, field_name: str):
+        """``True``/``False`` from the COM wrapper's own type info, else ``None``.
+
+        comtypes builds early-bound wrappers from the registered typelib and
+        exposes each COM property as a Python ``property`` — get-only when the
+        typelib declares no ``propput``. So the presence of a setter is
+        readable without touching the instrument. (Early binding is confirmed
+        for this body: ``diagnostics()`` gets real attribute names out of
+        ``dir(device)``, which a late-bound dynamic dispatch would not provide.)
+
+        ``None`` = undeterminable, which must be reported as such rather than
+        guessed either way.
+        """
+        descriptor = getattr(type(item), field_name, None)
+        if isinstance(descriptor, property):
+            return descriptor.fset is not None
+        # comtypes' underlying accessors, if the property itself is absent.
+        if hasattr(type(item), f"_set_{field_name}"):
+            return True
+        if hasattr(type(item), f"_get_{field_name}"):
+            return False
+        return None
+
+    def probe_optic_write_support(self) -> dict:
+        out: dict[str, dict] = {}
+        for logical, attr in self._OPTIC_COLLECTIONS.items():
+            item = self._safe(lambda l=logical, a=attr: self._first_optic(l, a))
+            if item is None:
+                continue
+            # Writability belongs to the INTERFACE, so one representative item
+            # answers for every slot — reporting it per slot would be 12 lines
+            # of identical noise implying per-slot variation that cannot exist.
+            out[logical] = {name: self._declared_writability(item, name)
+                            for name in self._OPTIC_IDENTITY_FIELDS}
+        return out
+
+    def _first_optic(self, logical: str, attr: str):
+        """The first enumerable optic item on a collection, or ``None``."""
+        coll = self._collection(logical, attr)
+        count = int(self._safe(lambda: coll.Count, 0) or 0)
+        for pos in range(1, count + 1):
+            item = self._safe(lambda p=pos: coll.Item(p))
+            if item is not None:
+                return item
+        return None
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> str:
+        """Write ONE optic's ``Name`` into the body's database, then verify it.
+
+        ⚠⚠ **HARDWARE-VERIFIED 2026-08-12 (real Ti-E, SDK 4.4.1.714): THIS
+        BODY REFUSES. The Ti's optics database is READ-ONLY through this SDK.**
+        Asked to set filter slot 4's ``Name``, the SDK answered, in its own
+        words::
+
+            Database entry cannot be modified. [Nikon.TiScope.FilterBlock.1]
+
+        **And the typelib claimed otherwise** — ``_declared_writability``
+        reported ``Name`` AND ``Code`` as settable for BOTH the cassette and the
+        nosepiece (``propput`` present) on the very same body that then refused
+        at runtime. So a declared setter is a **FALSE POSITIVE** here, and only
+        an actual attempt settles it. That is exactly why the read-only probe
+        must never be presented as an answer on its own.
+
+        **Every other write path was tested too, and all are refused.** The
+        typelib's ``IFilterBlock`` advertises writable ``ExcitationFilterCode``
+        / ``DichroicMirrorCode`` / ``BarrierFilterCode`` / ``Composition``
+        ("Gets or sets the codes for the optical elements in the filter block"),
+        which looked like a way to declare a cube by its optical make-up
+        (``Cy5`` = catalogue code 25 = excitation 20 / dichroic 11 / barrier 19
+        per ``FilterCodes.txt``). Attempted on the EMPTY slot 4, all three
+        refused with the **same** *"Database entry cannot be modified."*, and
+        ``CanModify`` reads **0 on all six slots**, filled and empty alike.
+        ``Nikon.TiScope.Database`` does expose ``FilterBlocks.Add``/``Remove``
+        over a 309-entry catalogue, but that is the CATALOGUE — the live slot's
+        ``Code`` is documented read-only and reports 0, so a new catalogue entry
+        could not be bound to a slot anyway. The chain breaks at the sensing
+        step, not the catalogue step.
+
+        ⚠ **Micro-Manager / pymmcore cannot change this.** MM's ``NikonTI``
+        adapter *wraps* this same ``NikonTi.dll`` ("This adapter uses the driver
+        and API supplied by Nikon") and would take the identical refusal from
+        the identical code path — the message itself lives in Nikon's
+        ``MipDeviceMsg.dll``, beneath any wrapper. What MM offers is
+        ``defineStateLabel``: **host-side** labels for turret positions, stored
+        in MM's own configuration. That is the same kind of thing
+        :class:`MicroscopeConfigStore` already provides, and it does not reach
+        the body's display either.
+
+        What the display actually follows: a ``Code`` the body SENSES from the
+        fitted optic, resolved through Nikon's own catalogues in
+        ``C:\\Program Files\\Nikon\\Shared\\Data\\Ti`` (``FilterBlockNames.txt``,
+        ``ObjectiveNames.txt``). Verified against this rig: codes 4 / 15 / 23 →
+        ``DAPI`` / ``FITC`` / ``TxRed``, matching those files' 0-based rows
+        exactly (``Cy5`` is code 25). A slot reporting ``Code == 0`` is one the
+        body sees nothing coded in — so there is no entry to name, and naming it
+        is an app-side concern (``MicroscopeConfigStore``).
+
+        Kept anyway, because it is what PRODUCED that answer and it is the only
+        way another body / SDK generation can be settled in one call. Writes
+        ``Name`` only — never ``Code`` (see the note above: ``Code`` resolves the
+        NA/working distance a focus sweep is bounded by).
+
+        Verification is not optional: this SDK has already been caught
+        accepting an out-of-range turret index, clamping it and reporting
+        success (``_set_turret``). So the value is read back and returned, and
+        a write that did not take is raised as an error rather than reported as
+        a success.
+        """
+        attr = self._OPTIC_COLLECTIONS.get(str(logical))
+        if attr is None:
+            raise MicroscopeError(
+                f"unknown optic group {logical!r} (expected "
+                f"{' or '.join(map(repr, self._OPTIC_COLLECTIONS))})")
+        coll = self._collection(logical, attr)
+        count = int(self._safe(lambda: coll.Count, 0) or 0)
+        pos = int(position)
+        if not 1 <= pos <= max(count, 0):
+            raise MicroscopeError(
+                f"{logical} slot {pos} is outside this body's 1-{count}")
+        item = self._safe(lambda: coll.Item(pos))
+        if item is None:
+            raise MicroscopeError(
+                f"the body did not return {logical} slot {pos}")
+
+        # Nikon's OWN advertised gate, and the authority here: _IElementBase
+        # exposes ``CanModify`` — "Determines if properties such as 'Name' can
+        # be modified for this optical element (read-only)". Measured 0 on every
+        # slot of this Ti-E, filled and empty alike, which is exactly why the
+        # write is refused. Reading it first turns a COM error into a plain
+        # explanation, and asks the SDK instead of guessing from the typelib
+        # (which advertises setters it does not honour — see the docstring).
+        can_modify = self._safe(lambda: item.CanModify)
+        if can_modify is not None and not bool(can_modify):
+            raise MicroscopeError(
+                f"the body reports this {logical} entry as not modifiable "
+                f"(CanModify=0), so its name is fixed. It is resolved from the "
+                f"optic's own hardware code through Nikon's catalogue, not set "
+                f"by software — name it in the app instead")
+
+        declared = self._declared_writability(item, "Name")
+        if declared is False:
+            raise MicroscopeError(
+                f"this body declares {logical} Name as read-only — it is "
+                "resolved from the optic's own hardware code, not set by "
+                "software, so there is nothing to write")
+        before = self._safe(lambda: item.Name)
+        try:
+            item.Name = str(name)
+        except COMError as exc:
+            raise MicroscopeError(_com_message(exc)) from exc
+        except Exception as exc:
+            raise MicroscopeError(
+                f"the SDK refused to set {logical} slot {pos} Name: {exc}"
+            ) from exc
+
+        after = self._safe(lambda: item.Name)
+        after_txt = "" if after is None else str(after).strip()
+        if after_txt != str(name).strip():
+            raise MicroscopeError(
+                f"the SDK accepted the write but {logical} slot {pos} still "
+                f"reports {after_txt!r} (was {before!r}, asked for "
+                f"{str(name)!r}) — the name did not take")
+        logger.info(f"Nikon Ti: {logical} slot {pos} Name {before!r} -> "
+                    f"{after_txt!r}")
+        return after_txt
+
     def focus_limits_um(self) -> Optional[tuple]:
         """Travel limits the SDK declares for the Z drive, converted to µm.
 
@@ -1284,454 +1237,6 @@ class NikonTiSdkBackend(MicroscopeBackend):
         factor = self.focus_units_per_um() or 1.0
         lo_um, hi_um = float(lo) / factor, float(hi) / factor
         return (min(lo_um, hi_um), max(lo_um, hi_um))
-
-    # ── v7.17 accessories: epi shutter / dia lamp / light path ──────
-    #
-    # These use their own small read/write helpers rather than the turret ones
-    # because the value-carrying property is NOT always ``Position`` on this
-    # family of devices (a lamp's level and a shutter's state are both commonly
-    # ``Value``). The turret/focus paths above are hardware-verified and are left
-    # byte-identical.
-
-    #: Property names probed, in order, for a device's value-carrying parameter.
-    _VALUE_PROPS = ("Position", "Value")
-
-    #: Property names probed for the dia lamp's separate on/off switch.
-    #: ``IsOn`` is the one this SDK actually has (hardware-confirmed).
-    _LAMP_SWITCH_PROPS = ("IsOn", "SwitchValue", "Switch", "LampSwitch", "OnOff")
-
-    #: The SDK's "I don't know" sentinel on a boolean status parameter. Measured
-    #: on a Ti-E: an unfitted shutter answers ``IsOpened`` with
-    #: ``RawValue=-1, DisplayString='Status Unknown'``. It must read as UNKNOWN,
-    #: never as a state — "closed" would tell the operator the sample is dark.
-    _STATUS_UNKNOWN = -1
-
-    def _accessory_present(self, logical: str) -> bool:
-        """Is this accessory PHYSICALLY FITTED (not merely known to the SDK)?
-
-        ⚠ **Hardware-measured, and it is not the same question as "did the
-        attribute resolve".** The Ti SDK publishes a COM object for every device
-        it knows about whether or not the body has one: on this Ti-E,
-        ``EpiShutter`` and ``DiaShutter`` both resolve and then report
-        ``IsMounted = 0 ('Device not available')`` with
-        ``IsOpened = -1 ('Status Unknown')``, while ``DiaLamp`` and
-        ``LightPathDrive`` report ``IsMounted = 1 ('Device mounted')``.
-
-        Resolving the attribute alone therefore claims hardware that is not
-        there — and for the shutter that is not cosmetic: the interlock would
-        believe it had a shutter to close and silently protect nothing.
-
-        ``IsMounted`` absent (``None``) counts as present, so a device that
-        simply does not report its mount state is still usable.
-        """
-        device = self._devices.get(logical)
-        if device is None:
-            return False
-        return self._is_mounted(device) is not False
-
-    @classmethod
-    def _status_bool(cls, param):
-        """A named boolean status parameter as ``True``/``False``/``None``.
-
-        ``None`` for the SDK's ``-1 / 'Status Unknown'`` sentinel and for
-        anything non-numeric.
-        """
-        raw = cls._param_attr(param, "RawValue")
-        if isinstance(raw, bool):
-            return raw
-        if not isinstance(raw, (int, float)):
-            return None
-        value = int(raw)
-        return None if value < 0 else bool(value)
-
-    def _value_param(self, logical: str):
-        """The parameter that carries this device's value, or ``None``."""
-        device = self._devices.get(logical)
-        if device is None:
-            return None
-        for prop in self._VALUE_PROPS:
-            param = self._param_attr(device, prop)
-            if param is not None:
-                return param
-        return None
-
-    def _write_value(self, logical: str, raw) -> None:
-        """Write a raw value to whichever property this device exposes."""
-        device = self._devices.get(logical)
-        if device is None:
-            raise MicroscopeError(f"this body has no {logical} device")
-        for prop in self._VALUE_PROPS:
-            param = self._param_attr(device, prop)
-            if param is None:
-                continue
-            try:
-                if hasattr(param, "RawValue"):
-                    param.RawValue = raw
-                else:
-                    setattr(device, prop, raw)
-            except COMError as exc:
-                raise MicroscopeError(_com_message(exc)) from exc
-            return
-        raise MicroscopeError(
-            f"the {logical} device exposes no writable value property "
-            f"(tried {', '.join(self._VALUE_PROPS)})")
-
-    def _read_value_raw(self, logical: str):
-        """The raw number behind this device's value, or ``None``."""
-        param = self._value_param(logical)
-        if param is None:
-            return None
-        if isinstance(param, (int, float)) and not isinstance(param, bool):
-            return float(param)
-        raw = self._param_attr(param, "RawValue")
-        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
-            return None
-        return float(raw)
-
-    def _value_range(self, logical: str):
-        """``(lower, upper)`` the SDK declares for this device, else ``None``."""
-        param = self._value_param(logical)
-        lo = self._param_attr(param, "RangeLowerLimit")
-        hi = self._param_attr(param, "RangeHigherLimit")
-
-        def _num(v):
-            return isinstance(v, (int, float)) and not isinstance(v, bool)
-
-        if _num(lo) and _num(hi) and hi > lo:
-            return float(lo), float(hi)
-        return None
-
-    # -- epi shutter --
-
-    #: Ti convention when the SDK declares no range at all: 1 = closed, 2 = open.
-    _SHUTTER_FALLBACK_CODES = (1, 2)
-
-    def has_epi_shutter(self) -> bool:
-        return self._accessory_present("epi_shutter")
-
-    def epi_shutter_interlock_enabled(self):
-        """The **body's own** interlock flag, if it has one. Read-only.
-
-        ``IEpiShutter`` publishes ``IsInterlockEnabled`` — so the SDK has its own
-        notion of an interlock, separate from ours. Surfaced (in Diagnostics) but
-        never written: what it interlocks against is undocumented here, and this
-        rig's shutter is unfitted so it reads ``-1 'Status Unknown'``. Worth
-        settling with Nikon before anything relies on it.
-        """
-        if "epi_shutter" not in self._devices:
-            return None
-        return self._status_bool(
-            self._param_attr(self._devices["epi_shutter"], "IsInterlockEnabled"))
-
-    def _shutter_codes(self) -> tuple:
-        """``(closed_raw, open_raw)`` for this body's epi shutter.
-
-        ⚠ **The mapping is DERIVED, not assumed — and is not yet confirmed on
-        hardware.** Three stages, most trustworthy first:
-
-        1. **The SDK's declared range.** A shutter declares two states; the Ti
-           convention is that the lower code is closed and the higher is open.
-        2. **Refined by the live ``DisplayString``.** A shutter reports its state
-           in words ("Open" / "Closed"), so the raw value currently in force
-           tells us which code that word belongs to, and the other endpoint
-           follows by elimination. When the SDK populates the string this is a
-           *measurement* rather than a convention, and it overrides stage 1.
-        3. **Fallback** to ``1 = closed, 2 = open`` when no range is declared,
-           logged as the guess it is.
-
-        The operator's ``epi_shutter_invert`` setting is applied one layer up, in
-        :class:`MicroscopeController`, so a body that disagrees with all three is
-        a checkbox rather than a code change.
-        """
-        if self._shutter_codes_cache is not None:
-            return self._shutter_codes_cache
-        rng = self._value_range("epi_shutter")
-        if rng is None:
-            codes = self._SHUTTER_FALLBACK_CODES
-            logger.warning(
-                "Nikon Ti: the epi shutter declares no range; assuming "
-                f"{codes[0]}=closed / {codes[1]}=open. Verify on the body and "
-                "use 'Shutter reads inverted' if it is the other way round.")
-        else:
-            codes = (int(round(rng[0])), int(round(rng[1])))
-            text = str(self._param_attr(
-                self._value_param("epi_shutter"), "DisplayString", "") or "")
-            raw = self._read_value_raw("epi_shutter")
-            said = self._state_from_text(text)
-            if said is not None and raw is not None:
-                here = int(round(raw))
-                other = codes[0] if here == codes[1] else codes[1]
-                # `said` describes the code currently in force; the remaining
-                # endpoint is necessarily the opposite state.
-                codes = (other, here) if said else (here, other)
-                logger.info(
-                    f"Nikon Ti: epi shutter reports {text!r} at raw {here} → "
-                    f"{codes[0]}=closed / {codes[1]}=open")
-            else:
-                logger.info(
-                    f"Nikon Ti: epi shutter range {codes} → "
-                    f"{codes[0]}=closed / {codes[1]}=open (from the declared "
-                    "range; the body reported no state text to confirm it)")
-        self._shutter_codes_cache = codes
-        return codes
-
-    @staticmethod
-    def _state_from_text(text: str):
-        """``True``/``False`` if this state text names open/closed, else ``None``."""
-        low = str(text or "").strip().lower()
-        if not low:
-            return None
-        # Check 'closed' first: "closed" contains no "open", but being explicit
-        # keeps a future "not open" style string from reading as open.
-        if "clos" in low or "shut" in low:
-            return False
-        if "open" in low:
-            return True
-        return None
-
-    def epi_shutter_open(self) -> Optional[bool]:
-        """``True`` = open, from ``IsOpened`` where the SDK provides it.
-
-        ⚠ **``Value`` is NOT the shutter state on this SDK.** Measured on a
-        Ti-E: ``IEpiShutter`` carries a *named boolean* ``IsOpened`` alongside a
-        generic ``Value`` that sits at 1 in a declared 1–2 range regardless. So
-        the named property is read first and the derived
-        :meth:`_shutter_codes` mapping is only a fallback for an SDK generation
-        that has no ``IsOpened`` — which is what turns the riskiest guess in this
-        module into no guess at all wherever ``IsOpened`` exists.
-        """
-        if not self.has_epi_shutter():
-            return None
-        named = self._param_attr(self._devices["epi_shutter"], "IsOpened")
-        if named is not None:
-            return self._status_bool(named)
-        raw = self._read_value_raw("epi_shutter")
-        if raw is None:
-            return None
-        closed, opened = self._shutter_codes()
-        # Compare against both codes rather than truthiness: neither endpoint is
-        # guaranteed to be 0/1, and a value matching neither is unknown.
-        here = int(round(raw))
-        if here == opened:
-            return True
-        if here == closed:
-            return False
-        return None
-
-    def set_epi_shutter(self, open_: bool) -> None:
-        """Open/close via the SDK's own ``Open()`` / ``Close()`` where present.
-
-        Hardware-confirmed to exist on ``IEpiShutter``. Preferred over writing a
-        derived code to ``Value`` for the same reason as the read above: an
-        explicitly named action cannot be got backwards, whereas an encoding can.
-        """
-        if not self.has_epi_shutter():
-            raise MicroscopeError(
-                "this body has no epi shutter fitted (the SDK exposes the "
-                "device but reports it 'not available') — check the Diagnostics "
-                "report")
-        action = self._param_attr(
-            self._devices["epi_shutter"], "Open" if open_ else "Close")
-        if callable(action):
-            try:
-                action()
-            except COMError as exc:
-                raise MicroscopeError(_com_message(exc)) from exc
-            return
-        closed, opened = self._shutter_codes()
-        self._write_value("epi_shutter", opened if open_ else closed)
-
-    # -- dia lamp --
-
-    def has_dia_lamp(self) -> bool:
-        return self._accessory_present("dia_lamp")
-
-    #: ``IsControlled``: 0 = MainMode (front panel owns the lamp), 1 = RemoteMode
-    #: (software may write). Hardware-measured; see ``dia_lamp_remote``.
-    def dia_lamp_remote(self) -> Optional[bool]:
-        if not self.has_dia_lamp():
-            return None
-        return self._status_bool(
-            self._param_attr(self._devices["dia_lamp"], "IsControlled"))
-
-    def set_dia_lamp_remote(self, on: bool) -> None:
-        if not self.has_dia_lamp():
-            raise MicroscopeError("this body has no dia lamp fitted")
-        param = self._param_attr(self._devices["dia_lamp"], "IsControlled")
-        if param is None or not hasattr(param, "RawValue"):
-            raise MicroscopeError(
-                "this body's dia lamp exposes no software/manual mode switch")
-        try:
-            param.RawValue = 1 if on else 0
-        except COMError as exc:
-            raise MicroscopeError(_com_message(exc)) from exc
-
-    def _require_lamp_writable(self) -> None:
-        """Refuse a lamp write in MainMode, with the reason and the remedy.
-
-        Checked BEFORE writing rather than translating the HRESULT afterwards:
-        the SDK's own answer is a bare ``0xE01004BB``, which tells the operator
-        nothing about the knob on the front of their microscope.
-        """
-        if self.dia_lamp_remote() is False:
-            raise MicroscopeError(
-                "the dia lamp is in MainMode — the microscope's own front-panel "
-                "control owns it and the SDK refuses software changes. Switch it "
-                "to software (Remote) control first.")
-
-    def _lamp_switch(self):
-        """``(attr_name, param)`` for the lamp's on/off, or ``(None, None)``."""
-        device = self._devices.get("dia_lamp")
-        if device is None:
-            return None, None
-        names = ([self._lamp_switch_attr] if self._lamp_switch_attr
-                 else list(self._LAMP_SWITCH_PROPS))
-        attr, param = _first_attr(device, names)
-        if attr is not None:
-            self._lamp_switch_attr = attr
-        return attr, param
-
-    def dia_lamp_on(self) -> Optional[bool]:
-        if not self.has_dia_lamp():
-            return None
-        attr, param = self._lamp_switch()
-        if attr is None:
-            return None
-        if isinstance(param, bool):
-            return param
-        if isinstance(param, (int, float)):
-            return bool(param)
-        return self._status_bool(param)
-
-    def set_dia_lamp_on(self, on: bool) -> None:
-        """Switch the lamp via the SDK's ``On()`` / ``Off()`` where present.
-
-        Hardware-confirmed on ``IDiaLamp``; writing ``IsOn.RawValue`` is the
-        fallback for a generation without them.
-        """
-        if not self.has_dia_lamp():
-            raise MicroscopeError("this body has no dia lamp fitted")
-        self._require_lamp_writable()
-        device = self._devices["dia_lamp"]
-        action = self._param_attr(device, "On" if on else "Off")
-        if callable(action):
-            try:
-                action()
-            except COMError as exc:
-                raise MicroscopeError(_com_message(exc)) from exc
-            return
-        attr, param = self._lamp_switch()
-        if attr is None:
-            raise MicroscopeError(
-                "this body's dia lamp exposes no on/off switch "
-                f"(tried On/Off and {', '.join(self._LAMP_SWITCH_PROPS)}) — set "
-                "its level instead, or check the Diagnostics report")
-        try:
-            if hasattr(param, "RawValue"):
-                param.RawValue = 1 if on else 0
-            else:
-                setattr(device, attr, 1 if on else 0)
-        except COMError as exc:
-            raise MicroscopeError(_com_message(exc)) from exc
-
-    def dia_lamp_intensity(self) -> Optional[float]:
-        if not self.has_dia_lamp():
-            return None
-        return self._read_value_raw("dia_lamp")
-
-    def dia_lamp_intensity_range(self) -> Optional[tuple]:
-        if not self.has_dia_lamp():
-            return None
-        return self._value_range("dia_lamp")
-
-    def set_dia_lamp_intensity(self, value: float) -> None:
-        """Set the lamp level, CLAMPED to the range the device declares.
-
-        Clamped, not refused, on the same principle as ``set_focus_um``: this is
-        a continuous level where asking for "full" and landing at the declared
-        maximum is ordinary operation, not a mistake. (A *discrete* selector —
-        a turret, the light path — refuses instead; see ``_set_turret``.)
-
-        The value is in the DEVICE'S OWN units, whatever the SDK declares. It is
-        deliberately not rescaled to a percentage: the declared range may be
-        volts or an arbitrary index, and a "percentage" of an unknown quantity is
-        a fabricated number that reads as a measured one.
-
-        ⚠ **MEASURED LIMITATION on this Ti-E (2026-08-12) — the level does not
-        stick.** In RemoteMode the write IS accepted (no error) and ``Value``
-        reads back the number written, but it **reverts to the front-panel knob's
-        setting within about a second**, and ``MeasuredVoltage`` never moves at
-        all — so the lamp's brightness does not appear to change. Identical via
-        this method and via a direct parameter write, and ``Increase()`` does
-        nothing either. The lamp's **on/off does work** in RemoteMode.
-
-        Left writing rather than refusing, because the write is correct and
-        harmless and may well hold on another body or configuration; the panel
-        polls about once a second, so a level that does not stick is visibly
-        rejected on screen rather than silently accepted. What governs it is a
-        question for Nikon, not something to guess at here.
-        """
-        if not self.has_dia_lamp():
-            raise MicroscopeError("this body has no dia lamp fitted")
-        self._require_lamp_writable()
-        raw = float(value)
-        rng = self._value_range("dia_lamp")
-        if rng is not None:
-            clamped = max(rng[0], min(rng[1], raw))
-            if clamped != raw:
-                logger.info(
-                    f"Nikon Ti: dia lamp level {raw:g} clamped to the declared "
-                    f"range {rng[0]:g}-{rng[1]:g}")
-            raw = clamped
-        self._write_value("dia_lamp", int(round(raw)))
-
-    # -- light path --
-
-    def light_path_count(self) -> int:
-        if not self._accessory_present("light_path"):
-            return 0
-        try:
-            return self._read_range(self._device("light_path"), 0)
-        except MicroscopeError:
-            return 0
-
-    def get_light_path(self) -> Optional[int]:
-        if not self._accessory_present("light_path"):
-            return None
-        try:
-            return self._read_position(
-                self._device("light_path"), self._SANE_POSITION_MAX)
-        except MicroscopeError:
-            return None
-
-    def set_light_path(self, position: int) -> None:
-        """Select a light path, REFUSING an out-of-range index.
-
-        Routed through the same ``_set_turret`` as the cassette and nosepiece
-        precisely because it is the same kind of device: hardware-verified in
-        v7.5.x, this SDK **silently clamps an out-of-range discrete index and
-        reports success**, so a stale index would quietly send the light
-        somewhere else while the app called the move fine.
-        """
-        if not self._accessory_present("light_path"):
-            raise MicroscopeError("this body has no light path drive fitted")
-        self._set_turret("light_path", position, "light path")
-
-    def light_path_names(self) -> tuple:
-        """``()`` — the SDK exposes no light-path name collection.
-
-        Unlike ``FilterBlocks``/``Objectives`` there is no per-position table to
-        read, and the only text available (``DisplayString``) describes the
-        position currently in force. Naming the others would mean moving the
-        drive to read them, so the UI shows position numbers and the current
-        name is surfaced in Diagnostics instead of inventing labels.
-        """
-        return ()
-
-    def light_path_name_now(self) -> str:
-        """The SDK's own words for the light path currently selected, if any."""
-        return str(self._param_attr(
-            self._value_param("light_path"), "DisplayString", "") or "").strip()
 
     # -- diagnostics --
 
@@ -1797,68 +1302,8 @@ class NikonTiSdkBackend(MicroscopeBackend):
                 lines.append(f"    focus scale -> "
                              f"{self.focus_units_per_um()} device units per µm "
                              f"(configured fallback {self._z_units_per_um})")
-            # The DERIVED semantics of the v7.17 accessories — the part that is
-            # not yet hardware-verified, so it is exactly what a bench session
-            # needs to see. Read these before enabling the shutter interlock.
-            elif logical == "epi_shutter":
-                # FITTED is the first question: this SDK publishes the COM
-                # object either way, and an unfitted shutter is one the
-                # interlock must not believe in.
-                lines.append(f"    FITTED -> {self.has_epi_shutter()}"
-                             + ("" if self.has_epi_shutter()
-                                else "   <-- no shutter on this body; the "
-                                     "cassette interlock degrades to a plain "
-                                     "move"))
-                lines.append(f"    IsOpened -> "
-                             f"{self._describe_bool(self.epi_shutter_open())}"
-                             f"   (named property, preferred over Value)")
-                lines.append(
-                    f"    Open()/Close() -> "
-                    f"{callable(self._param_attr(device, 'Open'))}"
-                    f"   (used in preference to a derived code)")
-                lines.append(
-                    f"    body's own IsInterlockEnabled -> "
-                    f"{self._describe_bool(self.epi_shutter_interlock_enabled())}"
-                    f"   (read-only; the SDK has its own interlock notion)")
-                if self._param_attr(device, "IsOpened") is None:
-                    closed, opened = self._shutter_codes()
-                    lines.append(f"    fallback codes -> {closed}=closed, "
-                                 f"{opened}=open  (no IsOpened on this SDK)")
-            elif logical == "dia_lamp":
-                attr, _param = self._lamp_switch()
-                lines.append(f"    FITTED -> {self.has_dia_lamp()}")
-                lines.append(f"    on/off -> "
-                             f"{self._describe_bool(self.dia_lamp_on())}"
-                             f"   via {'On()/Off()' if callable(self._param_attr(device, 'On')) else attr or 'NOTHING'}")
-                lines.append(f"    level -> {self.dia_lamp_intensity()} in "
-                             f"{self.dia_lamp_intensity_range()}"
-                             f"   step {self._param_attr(self._param_attr(device, 'Resolution'), 'RawValue')}"
-                             f" {self._param_attr(device, 'Unit') or '?'}")
-                remote = self.dia_lamp_remote()
-                lines.append(
-                    f"    IsControlled -> "
-                    + ("unknown" if remote is None
-                       else ("RemoteMode (software may write)" if remote
-                             else "MainMode  <-- the SDK REFUSES every software "
-                                  "write until this is Remote")))
-                lines.append(f"    MeasuredVoltage -> "
-                             f"{self._param_attr(self._param_attr(device, 'MeasuredVoltage'), 'RawValue')}"
-                             f"   (read-only; measured on this rig NOT to track "
-                             f"the level, so do not read it as feedback)")
-            elif logical == "light_path":
-                lines.append(f"    FITTED -> "
-                             f"{self._accessory_present('light_path')}")
-                lines.append(f"    positions -> {self.light_path_count()}, "
-                             f"now {self.get_light_path()}"
-                             f" ({self.light_path_name_now() or 'unnamed'})")
-        for logical in sorted(set(_TI_DEVICE_ALIASES) - set(self._devices)):
-            lines.append(f"  [{logical}] not present on this body")
         lines.append(f"  z_units_per_um: {self._z_units_per_um}")
         return "\n".join(lines)
-
-    @staticmethod
-    def _describe_bool(value) -> str:
-        return "unknown" if value is None else str(value)
 
 
 # ── Micro-Manager backend ──────────────────────────────────────────
@@ -1887,25 +1332,15 @@ class MicroManagerBackend(MicroscopeBackend):
     name = "micromanager"
     display_name = "Micro-Manager (NikonTI)"
 
-    #: Property names probed for the dia lamp's level. MM adapters differ on
-    #: what they call it, and asking is cheaper than assuming.
-    _LAMP_LEVEL_PROPS = ("Intensity", "Voltage", "Level", "Brightness")
-
     def __init__(self, config_path: str = "", mm_dir: Optional[str] = None,
                  filter_device: str = "TIFilterBlock1",
                  objective_device: str = "TINosePiece",
-                 focus_device: str = "TIZDrive",
-                 epi_shutter_device: str = "TIEpiShutter",
-                 dia_lamp_device: str = "TIDiaLamp",
-                 light_path_device: str = "TILightPath"):
+                 focus_device: str = "TIZDrive"):
         self._config_path = config_path
         self._mm_dir = mm_dir
         self._filter_device = filter_device
         self._objective_device = objective_device
         self._focus_device = focus_device
-        self._epi_shutter_device = epi_shutter_device
-        self._dia_lamp_device = dia_lamp_device
-        self._light_path_device = light_path_device
         self._core = None
         self._loaded: set = set()
 
@@ -2027,122 +1462,6 @@ class MicroManagerBackend(MicroscopeBackend):
         except Exception as exc:
             raise MicroscopeError(f"{self._focus_device}: {exc}") from exc
 
-    # ── v7.17 accessories ───────────────────────────────────────────
-    #
-    # A configuration is free not to load these — they are accessories — so
-    # presence is "is this device in the loaded set", and every read degrades to
-    # None rather than raising. Mirrors _require()'s treatment of an
-    # un-enumerable device list: if we could not read the list at all, don't
-    # second-guess it, try the call and let it fail with the adapter's own words.
-
-    def _has(self, device: str) -> bool:
-        if self._core is None or not device:
-            return False
-        return (device in self._loaded) if self._loaded else True
-
-    def has_epi_shutter(self) -> bool:
-        return self._has(self._epi_shutter_device)
-
-    def epi_shutter_open(self) -> Optional[bool]:
-        if not self._has(self._epi_shutter_device):
-            return None
-        try:
-            return bool(self._core.getShutterOpen(self._epi_shutter_device))
-        except Exception:
-            return None
-
-    def set_epi_shutter(self, open_: bool) -> None:
-        core = self._require(self._epi_shutter_device)
-        try:
-            core.setShutterOpen(self._epi_shutter_device, bool(open_))
-            core.waitForDevice(self._epi_shutter_device)
-        except Exception as exc:
-            raise MicroscopeError(
-                f"{self._epi_shutter_device}: {exc}") from exc
-
-    def has_dia_lamp(self) -> bool:
-        return self._has(self._dia_lamp_device)
-
-    def dia_lamp_on(self) -> Optional[bool]:
-        if not self._has(self._dia_lamp_device):
-            return None
-        try:
-            return bool(self._core.getShutterOpen(self._dia_lamp_device))
-        except Exception:
-            return None
-
-    def set_dia_lamp_on(self, on: bool) -> None:
-        core = self._require(self._dia_lamp_device)
-        try:
-            core.setShutterOpen(self._dia_lamp_device, bool(on))
-        except Exception as exc:
-            raise MicroscopeError(f"{self._dia_lamp_device}: {exc}") from exc
-
-    def _lamp_level_prop(self) -> Optional[str]:
-        if self._core is None:
-            return None
-        for prop in self._LAMP_LEVEL_PROPS:
-            try:
-                if self._core.hasProperty(self._dia_lamp_device, prop):
-                    return prop
-            except Exception:
-                continue
-        return None
-
-    def dia_lamp_intensity(self) -> Optional[float]:
-        prop = self._lamp_level_prop()
-        if prop is None:
-            return None
-        try:
-            return float(self._core.getProperty(self._dia_lamp_device, prop))
-        except Exception:
-            return None
-
-    def dia_lamp_intensity_range(self) -> Optional[tuple]:
-        prop = self._lamp_level_prop()
-        if prop is None:
-            return None
-        try:
-            lo = float(self._core.getPropertyLowerLimit(
-                self._dia_lamp_device, prop))
-            hi = float(self._core.getPropertyUpperLimit(
-                self._dia_lamp_device, prop))
-        except Exception:
-            return None
-        return (lo, hi) if hi > lo else None
-
-    def set_dia_lamp_intensity(self, value: float) -> None:
-        core = self._require(self._dia_lamp_device)
-        prop = self._lamp_level_prop()
-        if prop is None:
-            raise MicroscopeError(
-                f"{self._dia_lamp_device} exposes no level property "
-                f"(tried {', '.join(self._LAMP_LEVEL_PROPS)})")
-        raw = float(value)
-        rng = self.dia_lamp_intensity_range()
-        if rng is not None:
-            raw = max(rng[0], min(rng[1], raw))
-        try:
-            core.setProperty(self._dia_lamp_device, prop, raw)
-        except Exception as exc:
-            raise MicroscopeError(f"{self._dia_lamp_device}: {exc}") from exc
-
-    def light_path_count(self) -> int:
-        return (self._state_count(self._light_path_device)
-                if self._has(self._light_path_device) else 0)
-
-    def get_light_path(self) -> Optional[int]:
-        if not self._has(self._light_path_device):
-            return None
-        return self._get_state(self._light_path_device)
-
-    def set_light_path(self, position: int) -> None:
-        self._set_state(self._light_path_device, position)
-
-    def light_path_names(self) -> tuple:
-        return (self._labels(self._light_path_device)
-                if self._has(self._light_path_device) else ())
-
     def diagnostics(self) -> str:
         lines = [self.display_name, f"  config: {self._config_path}"]
         if self._core is None:
@@ -2151,23 +1470,13 @@ class MicroManagerBackend(MicroscopeBackend):
         lines.append(f"  loaded devices: {', '.join(sorted(self._loaded))}")
         for label, device in (("filter", self._filter_device),
                               ("objective", self._objective_device),
-                              ("focus", self._focus_device),
-                              ("light path", self._light_path_device)):
+                              ("focus", self._focus_device)):
             lines.append(f"  [{label}] {device}")
             if label == "focus":
                 lines.append(f"    position: {self.get_focus_um()} µm")
             else:
                 lines.append(f"    states: {self._state_count(device)} "
                              f"labels: {', '.join(self._labels(device))}")
-        lines.append(f"  [epi shutter] {self._epi_shutter_device}")
-        lines.append(f"    present: {self.has_epi_shutter()}  "
-                     f"open: {self.epi_shutter_open()}")
-        lines.append(f"  [dia lamp] {self._dia_lamp_device}")
-        lines.append(f"    present: {self.has_dia_lamp()}  "
-                     f"on: {self.dia_lamp_on()}  "
-                     f"level property: {self._lamp_level_prop()}  "
-                     f"level: {self.dia_lamp_intensity()} "
-                     f"in {self.dia_lamp_intensity_range()}")
         return "\n".join(lines)
 
 
@@ -2192,6 +1501,9 @@ class _Op:
     fn: Callable[[], None]
     done: threading.Event = field(default_factory=threading.Event)
     error: Optional[str] = None
+    #: Set by ops that produce a value (e.g. the name a body reports back after
+    #: a write). Only meaningful once ``done`` is set and ``error`` is None.
+    result: Optional[object] = None
 
 
 class MicroscopeController:
@@ -2369,7 +1681,14 @@ class MicroscopeController:
             op.done.set()
 
     def _submit(self, name: str, fn: Callable[[], None]) -> _Op:
-        op = _Op(name=name, fn=fn)
+        return self._submit_op(_Op(name=name, fn=fn))
+
+    def _submit_op(self, op: _Op) -> _Op:
+        """Queue an already-built op — for ops whose ``fn`` needs to close over
+        the op itself (to report a result back to the caller). Inline
+        (``threaded=False``) execution happens here, so the op MUST be fully
+        constructed before this is called."""
+        name = op.name
         blocked = self._lease_blocks(name)
         if blocked is not None:
             # Fail fast rather than queue. Queueing here is what produces the
@@ -2433,16 +1752,8 @@ class MicroscopeController:
             self._emit(backend="none", connected=False, busy=False,
                        filter_position=None, objective_position=None,
                        focus_um=None, mounted_filters=(),
-                       mounted_objectives=(), error=None,
-                       last_op="disconnect",
-                       # Accessories too, or a reconnect to a different body
-                       # inherits the previous one's shutter/lamp readout.
-                       epi_shutter_present=False, epi_shutter_open=None,
-                       dia_lamp_present=False, dia_lamp_on=None,
-                       dia_lamp_remote=None,
-                       dia_lamp_intensity=None, dia_lamp_min=None,
-                       dia_lamp_max=None, light_path_position=None,
-                       light_path_count=0, native_light_path_names=())
+                       mounted_objectives=(), optic_write_support={},
+                       error=None, last_op="disconnect")
 
         return self._submit("disconnect", _do)
 
@@ -2469,171 +1780,44 @@ class MicroscopeController:
         return self._submit(
             "refresh_mounted", lambda: self._read_all(include_mounted=True))
 
-    def set_filter(self, position: int) -> _Op:
-        """Rotate the cassette — with the epi shutter interlock, if enabled.
+    def probe_optic_write_support(self) -> _Op:
+        """READ-ONLY: see MicroscopeBackend.probe_optic_write_support.
 
-        The interlock lives HERE, in the one chokepoint every cassette move
-        reaches (the jog card's combo, the Hardware Setup slot table's ``Go``
-        button, and anything added later), rather than in a separate
-        ``set_filter_interlocked``. A second entry point is how the ``Go`` button
-        would have ended up unprotected.
-
-        Close → move → restore is one submitted op on purpose: this controller is
-        a process-wide singleton whose jog card polls it about once a second, so
-        three separate ops would let a ``refresh`` land between the close and the
-        move.
+        Read the result from ``state().optic_write_support`` once this op's
+        ``.done`` (or ``wait_idle()``) confirms it has landed.
         """
         def _do():
-            backend = self._require()
-            self._with_shutter_closed(
-                backend, lambda: backend.set_filter(int(position)))
+            result = self._require().probe_optic_write_support()
+            self._emit(optic_write_support=dict(result), error=None,
+                       last_op="probe_optic_write_support")
+
+        return self._submit("probe_optic_write_support", _do)
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> _Op:
+        """Write one optic's name into the BODY's own database.
+
+        The only operation in this module that mutates the body's optics
+        configuration. On success ``op.result`` holds the name the body reports
+        back afterwards; a write that did not take is an error, not a success.
+        """
+        op = _Op(name="set_optic_name", fn=lambda: None)
+
+        def _do():
+            op.result = self._require().set_optic_name(
+                str(logical), int(position), str(name))
+            self._emit(error=None, last_op="set_optic_name")
+            self._read_all(include_mounted=True)
+
+        op.fn = _do
+        return self._submit_op(op)
+
+    def set_filter(self, position: int) -> _Op:
+        def _do():
+            self._require().set_filter(int(position))
             self._emit(error=None, last_op="set_filter")
             self._read_all()
 
         return self._submit("set_filter", _do)
-
-    # ── The epi-shutter interlock ─────────────────────────────────
-
-    def _with_shutter_closed(self, backend, fn) -> None:
-        """Run ``fn`` with the epi shutter closed, then put it BACK as it was.
-
-        Rotating the cassette with the excitation shutter open sweeps the
-        excitation beam across every cube that passes through the light path:
-        the sample is flashed with out-of-band excitation and any camera
-        integrating at that moment gets a bright artefact frame.
-
-        Three properties this has to have, each of which is a way to get it
-        wrong:
-
-        * **Restore the PREVIOUS state, never "open".** A shutter the operator
-          had deliberately closed must stay closed — reopening it would
-          illuminate a sample they had gone dark on.
-        * **Restore in a ``finally``.** A cassette move that fails mid-rotation
-          must still reopen the shutter, or the next acquisition is black with
-          nothing on screen explaining why.
-        * **Do nothing at all when the prior state is unknown.** If the shutter
-          cannot be read we cannot restore it, and closing it on the way in would
-          leave the body in a state we invented rather than one we found.
-        """
-        if not self._interlock_enabled() or not backend.has_epi_shutter():
-            fn()
-            return
-        invert = self._shutter_invert()
-        was_open = self._apply_invert(backend.epi_shutter_open(), invert)
-        if was_open is None:
-            logger.warning(
-                "microscope: epi-shutter interlock skipped — the shutter's state "
-                "could not be read, and a state we cannot read is one we cannot "
-                "restore")
-            fn()
-            return
-        if not was_open:
-            fn()          # already closed: nothing to protect, nothing to restore
-            return
-
-        self._set_shutter(backend, False, invert)
-        moved = False
-        try:
-            fn()
-            moved = True
-        finally:
-            try:
-                self._set_shutter(backend, True, invert)
-            except Exception as exc:
-                if moved:
-                    # The cube changed but the light is still off. That is worth
-                    # an error of its own: every following image would be black.
-                    raise MicroscopeError(
-                        "the filter cube changed, but reopening the epi shutter "
-                        f"failed — the light path is still closed: {exc}") from exc
-                logger.error(
-                    "microscope: the epi shutter did not reopen after a failed "
-                    f"filter move: {exc}")
-
-    def _interlock_enabled(self) -> bool:
-        return bool(self._store.filter_shutter_interlock())
-
-    def _shutter_invert(self) -> bool:
-        return bool(self._store.epi_shutter_invert())
-
-    @staticmethod
-    def _apply_invert(value, invert):
-        """Apply the operator's inversion override. ``None`` stays ``None``.
-
-        Pure and total on purpose: it is called from inside ``_read_all``, whose
-        per-device reads are exception-swallowed, so anything that could raise
-        here would turn a policy flag into a silently missing readout.
-        """
-        return None if value is None else (bool(value) != bool(invert))
-
-    def _set_shutter(self, backend, open_: bool, invert: bool) -> None:
-        """Drive the shutter in OPERATOR terms, applying the inversion override."""
-        backend.set_epi_shutter(bool(open_) != bool(invert))
-
-    def set_epi_shutter(self, open_: bool) -> _Op:
-        """Open/close the epi (excitation) shutter. ``open_`` is in operator terms."""
-        want = bool(open_)
-
-        def _do():
-            backend = self._require()
-            self._set_shutter(backend, want, self._shutter_invert())
-            self._emit(error=None, last_op="set_epi_shutter")
-            self._read_all()
-
-        return self._submit("set_epi_shutter", _do)
-
-    def set_dia_lamp_on(self, on: bool) -> _Op:
-        want = bool(on)
-
-        def _do():
-            self._require().set_dia_lamp_on(want)
-            self._emit(error=None, last_op="set_dia_lamp_on")
-            self._read_all()
-
-        return self._submit("set_dia_lamp_on", _do)
-
-    def set_dia_lamp_remote(self, on: bool) -> _Op:
-        """Take (or release) software control of the dia lamp.
-
-        Explicit, because RemoteMode takes the lamp away from the knob on the
-        microscope — a change to what the person standing at the body can do, so
-        it is not something a slider should cause as a side effect.
-        """
-        want = bool(on)
-
-        def _do():
-            self._require().set_dia_lamp_remote(want)
-            self._emit(error=None, last_op="set_dia_lamp_remote")
-            self._read_all()
-
-        return self._submit("set_dia_lamp_remote", _do)
-
-    def set_dia_lamp_intensity(self, value: float) -> _Op:
-        """Set the lamp level, in the device's own declared units."""
-        level = float(value)
-
-        def _do():
-            self._require().set_dia_lamp_intensity(level)
-            self._emit(error=None, last_op="set_dia_lamp_intensity")
-            self._read_all()
-
-        return self._submit("set_dia_lamp_intensity", _do)
-
-    def set_light_path(self, position: int) -> _Op:
-        """Select the eyepiece / camera port.
-
-        ⚠ Selecting a port the camera is not on makes every acquired frame
-        black — which downstream reads as an exposure or focus fault, not as a
-        light-path setting. There is deliberately no new guard for that: a scan
-        or calibration holding this controller's exclusivity lease already makes
-        this op fail fast with *"microscope is reserved by …"*.
-        """
-        def _do():
-            self._require().set_light_path(int(position))
-            self._emit(error=None, last_op="set_light_path")
-            self._read_all()
-
-        return self._submit("set_light_path", _do)
 
     def set_objective(self, position: int) -> _Op:
         def _do():
@@ -2713,9 +1897,7 @@ class MicroscopeController:
         backend = self._backend
         if backend is None or not backend.is_connected:
             self._emit(connected=False, filter_position=None,
-                       objective_position=None, focus_um=None,
-                       epi_shutter_open=None, dia_lamp_on=None,
-                       dia_lamp_intensity=None, light_path_position=None)
+                       objective_position=None, focus_um=None)
             return
 
         def _safe(fn, default=None):
@@ -2732,12 +1914,6 @@ class MicroscopeController:
                     _safe(backend.mounted_objectives, ()) or ()))
 
         limits = _safe(backend.focus_limits_um)
-        # v7.17 accessories. Polled like the turrets, not cached like the mounted
-        # optics: the Ti-E has physical buttons and a lamp knob on the body, so
-        # the operator can change any of these without the software and a cached
-        # value would quietly disagree with the microscope in front of them.
-        lamp_range = _safe(backend.dia_lamp_intensity_range)
-        invert = _safe(self._shutter_invert, False)
         self._emit(
             connected=True,
             filter_position=_safe(backend.get_filter),
@@ -2750,19 +1926,6 @@ class MicroscopeController:
             native_filter_names=tuple(_safe(backend.filter_names, ()) or ()),
             native_objective_names=tuple(
                 _safe(backend.objective_names, ()) or ()),
-            epi_shutter_present=bool(_safe(backend.has_epi_shutter, False)),
-            epi_shutter_open=self._apply_invert(
-                _safe(backend.epi_shutter_open), invert),
-            dia_lamp_present=bool(_safe(backend.has_dia_lamp, False)),
-            dia_lamp_on=_safe(backend.dia_lamp_on),
-            dia_lamp_remote=_safe(backend.dia_lamp_remote),
-            dia_lamp_intensity=_safe(backend.dia_lamp_intensity),
-            dia_lamp_min=(lamp_range[0] if lamp_range else None),
-            dia_lamp_max=(lamp_range[1] if lamp_range else None),
-            light_path_position=_safe(backend.get_light_path),
-            light_path_count=_safe(backend.light_path_count, 0) or 0,
-            native_light_path_names=tuple(
-                _safe(backend.light_path_names, ()) or ()),
         )
 
 

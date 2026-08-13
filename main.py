@@ -159,6 +159,36 @@ def run_headless(controller: StageController, settings: Settings):
         controller.shutdown()
 
 
+def _ensure_machine_id(app) -> None:
+    """Report which rig this is, before anything resolves a config path.
+
+    Per-machine config (calibration, camera cal, mosaics, …) lives under
+    ``config/hardware/<machine-id>/`` (see ``SupportClasses/MachineConfig.py``)
+    so it can never collide with another rig's data when this repo is shared
+    across several machines. The identity IS the active device profile's name,
+    chosen on Hardware Setup → Device; a machine with no profile yet gets the
+    onboarding wizard, which lands the operator on exactly that card.
+
+    So there is nothing to prompt for here — this only logs, early, which
+    bucket the session is using. It stays a named function because
+    ``run_gui`` must not import ``gui.app`` before it (that import resolves
+    five per-machine stores), and an AST test pins that ordering.
+    """
+    try:
+        from SupportClasses import MachineConfig
+        if MachineConfig.machine_id_is_configured():
+            logging.getLogger(__name__).info(
+                "Machine: %s  (config/hardware/%s/)",
+                MachineConfig.machine_id(), MachineConfig.machine_id())
+        else:
+            logging.getLogger(__name__).warning(
+                "No device profile selected yet — per-machine config is read "
+                "in place and nothing is moved. Name this machine on "
+                "Hardware Setup → Device.")
+    except Exception as exc:   # never block startup over this
+        logging.getLogger(__name__).warning(f"Machine id check skipped: {exc}")
+
+
 def _apply_dark_palette(app) -> None:
     """Pin a Catppuccin-Mocha dark palette on the QApplication.
 
@@ -207,8 +237,6 @@ def run_gui(controller: StageController, settings: Settings):
     """Run the full GUI application."""
     try:
         from PySide6.QtWidgets import QApplication
-        from gui.app import MainWindow
-        from gui.widgets.console_log import QtLogHandler
     except ImportError as e:
         print(f"GUI dependencies not available: {e}")
         print("Install PySide6: pip install PySide6")
@@ -238,6 +266,27 @@ def run_gui(controller: StageController, settings: Settings):
     # default to the theme's dark surfaces regardless of the OS theme; the QSS
     # still overrides per-widget wherever it sets an explicit background.
     _apply_dark_palette(app)
+
+    # v7.17.x: ask which physical rig this is (once) before anything else
+    # touches per-machine config — see _ensure_machine_id's docstring.
+    _ensure_machine_id(app)
+
+    # ⚠ ORDER IS LOAD-BEARING — do NOT hoist these back up to the PySide6
+    # import above. Importing ``gui.app`` transitively imports several
+    # per-machine stores (objectives, needle-bore, fluorescence mosaics,
+    # print timing …), and each resolves its config path AT IMPORT TIME. Done
+    # before _ensure_machine_id, that resolution happens with no machine id
+    # known, so a fresh rig would read/write the wrong bucket for the whole
+    # session. MachineConfig also refuses to migrate while unconfigured, so
+    # this ordering and that guard are belt-and-braces for the same hazard.
+    try:
+        from gui.app import MainWindow
+        from gui.widgets.console_log import QtLogHandler
+    except ImportError as e:
+        print(f"GUI dependencies not available: {e}")
+        print("Install PySide6: pip install PySide6")
+        print("Or run in headless mode: python main.py --headless")
+        sys.exit(1)
 
     # v7.16: arm the GUI-thread stall watchdog. faulthandler (above) catches a
     # hard crash but is blind to a HANG — the process is alive, the event loop
@@ -298,6 +347,19 @@ def main():
     parser.add_argument("--settings", default="settings.json",
                         help="Path to settings file (default: settings.json)")
     args = parser.parse_args()
+
+    # v7.17.x: the machine identity (= active device profile name, which names
+    # this rig's config/hardware/<name>/ folder) is read straight from the
+    # settings FILE by SupportClasses.MachineConfig, so a non-default
+    # --settings must be pointed at BEFORE anything resolves a config path.
+    # Otherwise one rig's settings would run against another rig's config.
+    if args.settings != "settings.json":
+        try:
+            from SupportClasses.MachineConfig import set_settings_path
+            set_settings_path(args.settings)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                f"Could not point MachineConfig at {args.settings}: {exc}")
 
     settings = Settings(args.settings)
     settings.load()

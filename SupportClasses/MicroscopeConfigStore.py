@@ -36,6 +36,9 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+from SupportClasses.OpticsRegistry import normalize_optic_name
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_FILENAME = "microscope.json"
@@ -61,7 +64,7 @@ def _default_path() -> Path:
     d = os.environ.get("MEBP_MICROSCOPE_CONFIG_DIR")
     if d:
         return Path(d) / _DEFAULT_FILENAME
-    return Path("config/hardware") / _DEFAULT_FILENAME
+    return resolve_machine_path(_DEFAULT_FILENAME)
 
 
 #: Plausibility band for a filter wavelength (nm). Deliberately generous —
@@ -95,11 +98,55 @@ def clean_wavelength(value):
 _clean_wavelength = clean_wavelength
 
 
-def _clean_optics(raw) -> dict:
-    """``{cube name: {emission_nm, excitation_nm}}``, dropping anything unusable.
+#: A bandpass FWHM in nm. 0/absent means "width not recorded" — a center with
+#: no width is still useful (it is what the LabLink sidecar consumes), so an
+#: unknown width must not invent one.
+_MAX_BANDWIDTH_NM = 600.0
 
-    Entries with neither wavelength are removed entirely, so "present but
+#: Where a wavelength came from, weakest first. Mirrors
+#: ``FilterCubeStore.PROVENANCES`` — the catalogue is the writer, this is the
+#: store, and neither may silently promote a value it merely read.
+_PROVENANCES = ("nominal", "datasheet", "measured")
+
+
+#: Narrowest plausible bandpass FWHM. Exists to catch the SAME unit slip the
+#: wavelength band guards against: a 40 nm band typed in µm is 0.04, which is
+#: otherwise a perfectly well-formed positive number. Real narrowband filters
+#: bottom out around 1-2 nm, so 1 nm is generous.
+_MIN_BANDWIDTH_NM = 1.0
+
+
+def clean_bandwidth(value):
+    """A plausible bandpass width in nm, or None. Never raises."""
+    try:
+        nm = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (_MIN_BANDWIDTH_NM <= nm <= _MAX_BANDWIDTH_NM):
+        return None
+    return nm
+
+
+def _clean_optics(raw) -> dict:
+    """``{cube name: {emission_nm, excitation_nm, …}}``, dropping the unusable.
+
+    Entries with no usable wavelength are removed entirely, so "present but
     empty" can never be mistaken for "measured".
+
+    v7.18 additions are all OPTIONAL and purely additive — the band CENTERS keep
+    their original ``emission_nm`` / ``excitation_nm`` keys and meaning, because
+    those are what every existing consumer reads (``OpticsRegistry.resolve_slots``
+    and the ``lablink.imagejob/1`` sidecar, which carries one number per
+    channel). A pre-v7.18 entry therefore round-trips byte-identically:
+
+    * ``*_width_nm`` — bandpass FWHM, so the real RANGE is recoverable;
+    * ``dichroic_nm`` — the beamsplitter EDGE (not a band);
+    * ``provenance``  — nominal / datasheet / measured, so an auto-filled
+      catalogue value can never be mistaken for a verified one;
+    * ``cube_id``     — which ``FilterCubeStore`` entry filled this in.
+
+    ⚠ A width or dichroic is dropped when there is no matching center: a width
+    alone describes no band, and keeping it would imply knowledge we lack.
     """
     out: dict = {}
     if not isinstance(raw, dict):
@@ -113,8 +160,104 @@ def _clean_optics(raw) -> dict:
             nm = _clean_wavelength(entry.get(field))
             if nm is not None:
                 clean[field] = nm
+                width = clean_bandwidth(entry.get(f"{field[:-3]}_width_nm"))
+                if width is not None:
+                    clean[f"{field[:-3]}_width_nm"] = width
+        if not clean:
+            # No usable band at all — a cube_id/provenance on its own says
+            # nothing measurable, so the whole entry goes.
+            continue
+        dichroic = _clean_wavelength(entry.get("dichroic_nm"))
+        if dichroic is not None:
+            clean["dichroic_nm"] = dichroic
+        # ⚠ ABSENT is a third state, distinct from "nominal": it means the
+        # provenance was never recorded (every pre-v7.18 entry, hand-typed by an
+        # operator from their own knowledge). Stamping those "nominal" would
+        # both break the byte-identical round-trip promised above and understate
+        # a value the operator may well have taken off a datasheet. Only a
+        # provenance actually present is kept, and an unrecognised one degrades
+        # to the weakest claim rather than being promoted.
+        raw_prov = entry.get("provenance")
+        if raw_prov not in (None, ""):
+            prov = str(raw_prov).strip().lower()
+            clean["provenance"] = (prov if prov in _PROVENANCES
+                                   else _PROVENANCES[0])
+        cube_id = str(entry.get("cube_id") or "").strip()
+        if cube_id:
+            clean["cube_id"] = cube_id
+        out[key] = clean
+    return out
+
+
+def _clean_objective_specs(raw) -> dict:
+    """``{objective name: {optics}}``, dropping anything unusable.
+
+    v7.18. An entry with neither NA nor working distance is removed entirely, so
+    "present but empty" can never be mistaken for "known" — the two figures are
+    what size the focus sweep and bound a nosepiece rotation, and an entry that
+    carries only a provenance says nothing measurable.
+    """
+    from SupportClasses.ObjectiveCatalogue import (
+        MAX_COVERSLIP_MM, MAX_FIELD_NUMBER_MM, clean_immersion,
+        clean_magnification, clean_na, clean_optional_mm, clean_provenance,
+        clean_wd_mm)
+
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        key = str(name).strip()
+        if not key or not isinstance(entry, dict):
+            continue
+        clean: dict = {}
+        na = clean_na(entry.get("numerical_aperture"))
+        if na is not None:
+            clean["numerical_aperture"] = na
+        wd = clean_wd_mm(entry.get("working_distance_mm"))
+        if wd is not None:
+            clean["working_distance_mm"] = wd
+        if not clean:
+            continue
+        mag = clean_magnification(entry.get("magnification"))
+        if mag is not None:
+            clean["magnification"] = mag
+        for field, ceiling in (("coverslip_mm", MAX_COVERSLIP_MM),
+                               ("field_number_mm", MAX_FIELD_NUMBER_MM)):
+            v = clean_optional_mm(entry.get(field), ceiling)
+            if v is not None:
+                clean[field] = v
+        clean["immersion"] = clean_immersion(entry.get("immersion"))
+        clean["provenance"] = clean_provenance(entry.get("provenance"))
+        for field in ("objective_id", "product_code"):
+            v = str(entry.get(field) or "").strip()
+            if v:
+                clean[field] = v
+        out[key] = clean
+    return out
+
+
+def _clean_aliases(raw) -> dict:
+    """``{kind: {alias: slot name}}``, dropping anything unusable.
+
+    v7.18. Only the two real turrets are kept, and an alias is dropped unless
+    both sides are non-empty strings — a half-written alias would otherwise read
+    as configured while resolving to nothing.
+    """
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    for kind, table in raw.items():
+        k = str(kind).strip().lower()
+        if k not in ("filter", "objective") or not isinstance(table, dict):
+            continue
+        clean = {}
+        for alias, target in table.items():
+            a = str(alias).strip()
+            t = str(target).strip()
+            if a and t:
+                clean[a] = t
         if clean:
-            out[key] = clean
+            out[k] = clean
     return out
 
 
@@ -165,6 +308,18 @@ class MicroscopeConfigStore:
             "objective_slots": _DEFAULT_OBJECTIVE_SLOTS,
             "filter_cubes": {},         # {"1": "DAPI", ...} — 1-based string keys
             "objectives": {},           # {"1": "4x Plan Fluor", ...}
+            # v7.18 — operator-declared equivalences, {requested name: slot name},
+            # per turret. The app's imaging-channel vocabulary and the label on
+            # the cube physically in the cassette need not match: this rig holds a
+            # cube labelled "TxRed" while the channel vocabulary (and the built-in
+            # target-type rules) say "mCherry". Case and spacing are handled by
+            # normalization and need NO alias; this is only for genuinely
+            # different names, which the software must never equate on its own —
+            # a TxRed image filed as an mCherry channel is a result nothing
+            # downstream can detect. Per-machine because "the red cube in slot 3
+            # is the one we use for mCherry" is a fact about THIS cassette.
+            #   {"filter": {"mCherry": "TxRed"}, "objective": {}}
+            "optic_aliases": {},
             # v7.17 — per-cube emission/excitation, for the LabLink image-job
             # sidecar. Keyed by the cube's NAME, not its turret position: the
             # wavelengths are a property of the cube and travel with it if it
@@ -178,6 +333,19 @@ class MicroscopeConfigStore:
             # NA + emission moved a segmented object count 2855 -> 2660 with
             # no warning from any layer).
             "filter_optics": {},
+            # v7.18 — per-objective optics, keyed by the objective's NAME for the
+            # same reason filter_optics is keyed by the cube's: they belong to the
+            # lens and travel with it between nosepiece positions.
+            #   {"4X": {"numerical_aperture": 0.13, "working_distance_mm": 17.1,
+            #           "immersion": "air", "provenance": "datasheet", ...}}
+            # ⚠ These OVERRIDE what the body reports, because the body only knows
+            # the product code programmed into it — which can be blank, or a
+            # different variant of the same nominal name. NA sizes every focus
+            # step and working distance IS the collision bound, so an operator who
+            # has read the engraving knows better than the nosepiece EEPROM. When
+            # the two disagree, OpticsRegistry keeps the SHORTER working distance
+            # (the fail-safe direction) and reports the disagreement.
+            "objective_specs": {},
             # Focus preferences.
             "focus_step_um": _DEFAULT_FOCUS_STEP_UM,
             "focus_up_is_positive": True,
@@ -249,6 +417,13 @@ class MicroscopeConfigStore:
         # rather than coerced: a wavelength that is not a positive number is
         # not recoverable into one, and absent is the honest answer.
         data["filter_optics"] = _clean_optics(data.get("filter_optics"))
+        # v7.18 — nested {kind: {alias: slot name}}; same reasoning as above, a
+        # malformed entry is dropped rather than coerced. An alias that does not
+        # name a real slot is left in place here (the slot may simply not be
+        # named yet) and refused at resolution time, where the turret is known.
+        data["optic_aliases"] = _clean_aliases(data.get("optic_aliases"))
+        data["objective_specs"] = _clean_objective_specs(
+            data.get("objective_specs"))
         self._data = data
 
     def _write(self) -> None:
@@ -396,6 +571,213 @@ class MicroscopeConfigStore:
             if save:
                 self._write()
 
+    # ── Optic name aliases (v7.18) ─────────────────────────────────
+
+    def optic_aliases(self, kind: str) -> dict:
+        """``{requested name: slot name}`` for one turret ('filter'/'objective').
+
+        Consumed by ``OpticsRegistry.find_slot``'s alias tier. Case and spacing
+        are already handled by normalization, so an alias is only ever needed for
+        two genuinely different names (mCherry ⇄ TxRed).
+        """
+        k = str(kind).strip().lower()
+        with self._lock:
+            table = (self._data.get("optic_aliases") or {}).get(k) or {}
+            return dict(table)
+
+    def set_optic_alias(self, kind: str, alias: str, slot_name: str, *,
+                        save: bool = True) -> None:
+        """Declare that ``alias`` means the cube/objective labelled ``slot_name``.
+
+        ⚠ **Refuses a target that is not currently a named slot on that turret.**
+        An alias pointing at nothing reads as configured and then fails at the
+        moment a run needs it — the operator would see "mCherry is aliased" and
+        still get a refusal. Failing here, while they are looking at the setting,
+        is the recoverable half.
+
+        Passing an empty ``slot_name`` clears the alias (mirrors ``_set_label``).
+        """
+        k = str(kind).strip().lower()
+        if k not in ("filter", "objective"):
+            raise ValueError(f"kind must be 'filter' or 'objective', got {kind!r}")
+        a = str(alias or "").strip()
+        if not a:
+            raise ValueError("alias must not be empty")
+        t = str(slot_name or "").strip()
+        if not t:
+            self.clear_optic_alias(k, a, save=save)
+            return
+
+        labels = (self.filter_labels() if k == "filter"
+                  else self.objective_labels())
+        names = list(labels.values())
+        norm = normalize_optic_name(t)
+        match = [n for n in names if normalize_optic_name(n) == norm]
+        if not match:
+            have = ", ".join(f"{n!r} ({p})" for p, n in sorted(labels.items()))
+            raise ValueError(
+                f"Cannot alias {a!r} to {t!r}: no {k} slot is named that. "
+                f"This turret holds {have or 'nothing named'}. Name the slot "
+                f"first on Hardware Setup → Microscope.")
+        if normalize_optic_name(a) == norm:
+            raise ValueError(
+                f"{a!r} and {t!r} are already the same name once case and "
+                f"spacing are ignored — no alias is needed.")
+
+        with self._lock:
+            table = self._data.setdefault("optic_aliases", {})
+            if not isinstance(table, dict):
+                table = self._data["optic_aliases"] = {}
+            table.setdefault(k, {})[a] = match[0]
+            if save:
+                self._write()
+        logger.info("Optic alias set: %s %r -> %r", k, a, match[0])
+
+    def clear_optic_alias(self, kind: str, alias: str, *,
+                          save: bool = True) -> None:
+        """Forget one alias. Silent when it was not set."""
+        k = str(kind).strip().lower()
+        a = str(alias or "").strip()
+        with self._lock:
+            table = (self._data.get("optic_aliases") or {}).get(k)
+            if isinstance(table, dict) and table.pop(a, None) is not None:
+                if save:
+                    self._write()
+                logger.info("Optic alias cleared: %s %r", k, a)
+
+    # ── Objective optics (v7.18) ──────────────────────────────────
+
+    def objective_specs(self) -> dict:
+        """``{objective name: {magnification, numerical_aperture, ...}}``.
+
+        Only objectives the operator has actually assigned appear. An objective
+        with no entry is UNKNOWN and falls back to whatever the body reports.
+
+        Keyed by the objective's NAME rather than its nosepiece position — same
+        reasoning as ``filter_optics``: the optics are a property of the lens and
+        travel with it if it is moved to another position.
+        """
+        with self._lock:
+            return json.loads(
+                json.dumps(self._data.get("objective_specs") or {}))
+
+    def objective_spec_for(self, objective_name: str) -> dict:
+        """One objective's optics, or ``{}`` if never recorded.
+
+        Matched case-insensitively: the nosepiece label is typed by hand (this
+        rig has "4X" against a calibration keyed "4x"), and a spelling difference
+        must not silently cost the objective its working distance — which is the
+        collision bound.
+        """
+        want = normalize_optic_name(objective_name)
+        if not want:
+            return {}
+        for name, entry in self.objective_specs().items():
+            if normalize_optic_name(name) == want:
+                return dict(entry)
+        return {}
+
+    def set_objective_spec(self, objective_name: str, *,
+                           magnification=None, numerical_aperture=None,
+                           working_distance_mm=None, immersion=None,
+                           coverslip_mm=None, field_number_mm=None,
+                           objective_id=None, product_code=None,
+                           provenance=None, save: bool = True) -> None:
+        """Record one objective's optics. Passing nothing usable clears it.
+
+        ⚠ Out-of-band values are REFUSED, not clamped, and the working-distance
+        refusal is the one that matters: ``WD_SWEEP_FRACTION`` of this number is
+        how far the focus may travel and whether a nosepiece rotation is allowed
+        at all, so a value that survived a unit slip (17100 for 17.1 mm) would
+        authorise a 17-metre excursion. Clearing it instead makes
+        ``plan_turret_change`` fall back to its tiny conservative budget and say
+        so, which is recoverable.
+        """
+        from SupportClasses.ObjectiveCatalogue import (
+            MAX_COVERSLIP_MM, MAX_FIELD_NUMBER_MM, MAX_NA, MAX_WD_MM, MIN_NA,
+            MIN_WD_MM, clean_immersion, clean_magnification, clean_na,
+            clean_optional_mm, clean_provenance, clean_wd_mm)
+
+        key = str(objective_name or "").strip()
+        if not key:
+            raise ValueError("an objective name is required")
+
+        entry: dict = {}
+        na = clean_na(numerical_aperture) if numerical_aperture not in (None, "") else None
+        if numerical_aperture not in (None, "") and na is None:
+            raise ValueError(
+                f"numerical_aperture={numerical_aperture!r} is not an NA "
+                f"(expected {MIN_NA}-{MAX_NA}). A dry 20x is about 0.75, not 75.")
+        if na is not None:
+            entry["numerical_aperture"] = na
+
+        wd = clean_wd_mm(working_distance_mm) if working_distance_mm not in (None, "") else None
+        if working_distance_mm not in (None, "") and wd is None:
+            raise ValueError(
+                f"working_distance_mm={working_distance_mm!r} is not a working "
+                f"distance in MILLIMETRES (expected {MIN_WD_MM}-{MAX_WD_MM}). "
+                f"A Plan Fluor 4x is about 17.1, not 17100.")
+        if wd is not None:
+            entry["working_distance_mm"] = wd
+
+        mag = clean_magnification(magnification) if magnification not in (None, "") else None
+        if magnification not in (None, "") and mag is None:
+            raise ValueError(f"magnification={magnification!r} is implausible")
+        if mag is not None:
+            entry["magnification"] = mag
+
+        # ⚠ The NA/WD check comes BEFORE the trimmings. An entry carrying only a
+        # coverslip thickness (or only a provenance) says nothing measurable, and
+        # `_clean_objective_specs` drops exactly that on reload — so accepting one
+        # here would look saved and silently vanish on the next launch.
+        if not entry:
+            with self._lock:
+                table = self._data.setdefault("objective_specs", {})
+                if isinstance(table, dict) and table.pop(key, None) is not None:
+                    if save:
+                        self._write()
+            return
+
+        for field, value, ceiling in (
+                ("coverslip_mm", coverslip_mm, MAX_COVERSLIP_MM),
+                ("field_number_mm", field_number_mm, MAX_FIELD_NUMBER_MM)):
+            if value in (None, ""):
+                continue
+            v = clean_optional_mm(value, ceiling)
+            if v is None:
+                raise ValueError(f"{field}={value!r} is implausible")
+            entry[field] = v
+
+        if not entry:
+            with self._lock:
+                table = self._data.setdefault("objective_specs", {})
+                if isinstance(table, dict) and table.pop(key, None) is not None:
+                    if save:
+                        self._write()
+            return
+
+        entry["immersion"] = clean_immersion(immersion)
+        entry["provenance"] = clean_provenance(provenance)
+        for field, value in (("objective_id", objective_id),
+                             ("product_code", product_code)):
+            v = str(value or "").strip()
+            if v:
+                entry[field] = v
+
+        with self._lock:
+            table = self._data.setdefault("objective_specs", {})
+            if not isinstance(table, dict):
+                table = self._data["objective_specs"] = {}
+            table[key] = entry
+            if save:
+                self._write()
+
+    def set_all_objective_specs(self, specs: dict) -> None:
+        """Replace the whole table (the setup panel's Save)."""
+        with self._lock:
+            self._data["objective_specs"] = _clean_objective_specs(specs)
+            self._write()
+
     # ── Filter-cube optics (v7.17, for the LabLink image-job sidecar) ──
 
     def filter_optics(self) -> dict:
@@ -425,19 +807,27 @@ class MicroscopeConfigStore:
 
     def set_filter_optics(self, cube_name: str, *,
                           emission_nm=None, excitation_nm=None,
+                          emission_width_nm=None, excitation_width_nm=None,
+                          dichroic_nm=None, provenance=None, cube_id=None,
                           save: bool = True) -> None:
-        """Record one cube's wavelengths. Passing None for both clears it.
+        """Record one cube's optics. Passing no usable band clears the entry.
 
         Values outside a plausible band are REFUSED rather than clamped: a
         clamped wavelength is a fabricated number that looks measured, and
         this value silently changes an analysis result.
+
+        v7.18: the ``*_width_nm`` FWHMs make the real RANGE recoverable,
+        ``dichroic_nm`` records the beamsplitter edge, and ``provenance`` says
+        whether the numbers are nominal-for-the-type or verified. All optional —
+        omitting every one of them writes exactly the pre-v7.18 entry.
         """
         key = str(cube_name or "").strip()
         if not key:
             raise ValueError("a filter cube name is required")
         entry = {}
         for field, value in (("emission_nm", emission_nm),
-                             ("excitation_nm", excitation_nm)):
+                             ("excitation_nm", excitation_nm),
+                             ("dichroic_nm", dichroic_nm)):
             if value in (None, ""):
                 continue
             nm = _clean_wavelength(value)
@@ -447,6 +837,26 @@ class MicroscopeConfigStore:
                     f"(expected {_MIN_WAVELENGTH_NM:.0f}-{_MAX_WAVELENGTH_NM:.0f}). "
                     f"A green emission is about 519, not 0.519.")
             entry[field] = nm
+        for field, value in (("emission_width_nm", emission_width_nm),
+                             ("excitation_width_nm", excitation_width_nm)):
+            if value in (None, ""):
+                continue
+            nm = clean_bandwidth(value)
+            if nm is None:
+                raise ValueError(
+                    f"{field}={value!r} is not a bandpass width in nm "
+                    f"(expected {_MIN_BANDWIDTH_NM:.0f}-{_MAX_BANDWIDTH_NM:.0f}). "
+                    f"A 40 nm-wide band is 40, not 0.04.")
+            entry[field] = nm
+        if provenance not in (None, ""):
+            entry["provenance"] = provenance
+        if cube_id not in (None, ""):
+            entry["cube_id"] = str(cube_id).strip()
+        # One cleaner owns the shape, so a direct set and a whole-table replace
+        # cannot disagree about what a valid entry looks like (this is also what
+        # drops a width with no center, and any junk provenance).
+        cleaned = _clean_optics({key: entry}) if entry else {}
+        entry = cleaned.get(key, {})
         with self._lock:
             table = self._data.setdefault("filter_optics", {})
             if entry:

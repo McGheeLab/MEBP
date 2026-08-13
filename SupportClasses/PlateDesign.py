@@ -48,16 +48,15 @@ from typing import Any, ClassVar, Optional
 from SupportClasses.WellPlate import (
     WellPlate, WellInfo, ROW_LABELS, PLATE_DEFINITIONS, USER_PLATES_DIR,
 )
+from SupportClasses.MachineConfig import resolve_shared_path
 
 logger = logging.getLogger(__name__)
 
 
 # v7.4.8: standard in-house insert designs (nested rosette PlateDesigns)
-# that can be dropped into any well.
-INSERTS_DIR = (
-    Path(__file__).resolve().parent.parent
-    / "config" / "hardware" / "inserts"
-)
+# that can be dropped into any well. Shared/portable — meant to sync across
+# every rig, unlike a per-machine store.
+INSERTS_DIR = resolve_shared_path("inserts")
 
 
 def list_standard_inserts() -> list[str]:

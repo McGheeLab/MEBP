@@ -60,9 +60,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/print_timing_calibration.json")
+_DEFAULT_PATH = resolve_machine_path("print_timing_calibration.json")
 
 
 def _speed_key(speed_mm_s: float) -> str:

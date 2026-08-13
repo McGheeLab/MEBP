@@ -548,6 +548,19 @@ def should_show_onboarding(settings) -> bool:
     Trigger condition: no needle gauge has been saved (the most reliable
     signal that Hardware Setup was never completed).
     """
+    # v7.17.x: a machine with NO device profile has no identity yet. The
+    # profile names this rig, and that name is what gives it its own
+    # config/hardware/<name>/ calibration folder (see
+    # SupportClasses/MachineConfig.py) — until one exists, this rig's
+    # calibration cannot be told apart from any other rig's. That is a first
+    # run by definition, whatever else happens to be configured.
+    try:
+        from gui.pages.hardware.device_profile import list_profiles
+        if not list_profiles():
+            return True
+    except Exception:                       # never let this block startup
+        pass
+
     needle_gauge = settings.get("workspace.needle_gauge")
     if needle_gauge:
         return False

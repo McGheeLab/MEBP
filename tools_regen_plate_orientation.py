@@ -15,10 +15,13 @@ import os
 
 from SupportClasses.WellPlate import WellPlate
 from SupportClasses.MosaicWellRemap import label_positions
+from SupportClasses.MachineConfig import resolve_machine_path
 
 SIGN = (-1.0, -1.0)  # plate_flip_180=True (ME3B V1 180° mount)
 SETTINGS = "settings.json"
-SNAPSHOT = os.path.join("config", "hardware", "last_calibration.json")
+# v7.17.x: the calibration snapshot is PER-MACHINE — resolved rather than
+# hardcoded to the (now empty) flat config/hardware/ root.
+SNAPSHOT = str(resolve_machine_path("last_calibration.json"))
 
 
 def regen_cal(cal: dict, plate) -> dict:

@@ -2126,6 +2126,19 @@ class StageHardwarePanel(QWidget):
         self.btn_check_alignment.clicked.connect(self._check_marlin_alignment)
         save_row.addWidget(self.btn_check_alignment)
 
+        self.btn_load_from_hardware = icon_button(
+            "Load values from hardware", "arrow-down",
+            tooltip=(
+                "Query Marlin (M503) and ADOPT its reported steps/mm, "
+                "max feedrate, and max acceleration into software — the "
+                "reverse of Save Calibration. Use this when the board "
+                "already has the correct values (e.g. just tuned in "
+                "firmware) and software should follow hardware instead "
+                "of overwriting it."))
+        self.btn_load_from_hardware.clicked.connect(
+            self._load_calibration_from_hardware)
+        save_row.addWidget(self.btn_load_from_hardware)
+
         btn_save_cal = icon_button(
             "Save Calibration", "save", object_name="accentBtn",
             tooltip=("Re-send steps_per_mm (M92), per-axis max acceleration "
@@ -3448,6 +3461,108 @@ class StageHardwarePanel(QWidget):
                 self.lbl_alignment_status.setStyleSheet(
                     f"color: {COLORS['green']}; ")
 
+    def _load_calibration_from_hardware(self) -> None:
+        """Query Marlin (M503) and ADOPT its reported steps_per_mm,
+        per-axis max feedrate, and per-axis max acceleration into
+        software — the mirror of :meth:`_apply_steps_cal` (which pushes
+        software → hardware via M92/M203/M201).
+
+        Use this when the board already carries the correct calibration
+        (freshly tuned in firmware, or re-flashed with known-good values)
+        and the software side has drifted and should follow the board
+        instead of overwriting it.
+
+        No G-code is re-sent — the values already live on the board;
+        this only updates ``StageController``/settings.json/the active
+        profile and the on-screen grids.
+        """
+        if self._settings is None:
+            return
+        if (self._controller is None or self._controller.zp_stage is None
+                or self._controller.simulate_zp):
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "Connect ZP (real hardware) to load values from hardware.")
+            return
+        zp = self._controller.zp_stage
+        try:
+            reported = zp.query_settings()
+        except Exception as e:
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(f"M503 query failed: {e}")
+            return
+
+        hw_steps = reported.get("steps_per_mm") or {}
+        hw_feed = reported.get("max_feedrate") or {}
+        hw_accel = reported.get("max_accel") or {}
+        if not (hw_steps or hw_feed or hw_accel):
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "M503 returned nothing usable — check the serial "
+                    "connection and try again.")
+            return
+
+        axis_map = zp.axis_map
+        new_steps = dict(zp.steps_per_mm)
+        new_feed = dict(
+            self._settings.get("device_profile.per_axis_max_feedrate") or {})
+        new_accel = dict(
+            self._settings.get("device_profile.per_axis_max_accel") or {})
+        loaded: list[str] = []
+        for logical, physical in axis_map.items():
+            if physical in hw_steps:
+                new_steps[logical] = hw_steps[physical]
+                loaded.append(f"{logical} steps/mm")
+            if physical in hw_feed:
+                new_feed[logical] = hw_feed[physical]
+                loaded.append(f"{logical} feedrate")
+            if physical in hw_accel:
+                new_accel[logical] = hw_accel[physical]
+                loaded.append(f"{logical} accel")
+
+        if not loaded:
+            if hasattr(self, 'lbl_alignment_status'):
+                self.lbl_alignment_status.setText(
+                    "M503 didn't report any axis matching this device's "
+                    "axis mapping — nothing to load.")
+            return
+
+        # Adopt locally only (persist=False) — these values already live
+        # on the board, so there is nothing to re-send it.
+        zp.set_steps_per_mm(new_steps, persist=False)
+        zp.set_per_axis_max_feedrate(new_feed, persist=False)
+        zp.set_axis_accelerations(new_accel, persist=False)
+
+        self._settings.set("device_profile.steps_per_mm", new_steps)
+        self._settings.set("device_profile.per_axis_max_feedrate", new_feed)
+        self._settings.set("device_profile.per_axis_max_accel", new_accel)
+        self._settings.save()
+        # v7.4.2: also persist to the active profile JSON so the change
+        # survives a profile switch round-trip.
+        self._persist_active_profile()
+
+        # Reflect the loaded acceleration values in the visible spinboxes.
+        if hasattr(self, 'spin_axis_accel'):
+            for ax, sp_w in self.spin_axis_accel.items():
+                if ax in new_accel:
+                    sp_w.blockSignals(True)
+                    sp_w.setValue(float(new_accel[ax]))
+                    sp_w.blockSignals(False)
+
+        self._refresh_steps_grid()
+        self._refresh_max_feedrate_grid()
+        try:
+            self._check_marlin_alignment(quiet=True)
+        except Exception:
+            pass
+
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                "Loaded from hardware: steps_per_mm, per_axis_max_feedrate, "
+                "and per_axis_max_accel adopted from Marlin's M503 report "
+                "(nothing re-sent to the board).")
+        logger.info(f"ZP calibration loaded from hardware (M503): {loaded}")
+
     def _apply_safety_and_zero(self) -> None:
         """Save safety_limits + zero positions: settings + controller.
 
@@ -3771,7 +3886,9 @@ class StageHardwarePanel(QWidget):
             QMessageBox.warning(self, "Load Device Profile",
                                 f"Failed to load {name}: {e}")
             return
+        previous = ""
         if self._settings is not None:
+            previous = (self._settings.get("device_profile.active") or "").strip()
             profile.apply_to_settings(self._settings)
             self._settings.set("device_profile.active", profile.profile_name)
             self._settings.save()
@@ -3788,6 +3905,11 @@ class StageHardwarePanel(QWidget):
             f"Loaded profile: {profile.profile_name}")
         self.settings_applied.emit()
         logger.info(f"Loaded device profile: {profile.profile_name}")
+        # Loading a DIFFERENT profile means "this is another machine", which
+        # re-points every per-machine config folder — but those paths were
+        # resolved at import time, so a restart is required for it to take.
+        if previous and previous != profile.profile_name:
+            self._notify_identity_change(profile.profile_name)
 
     def _persist_active_profile(self) -> bool:
         """v7.4.2: Snapshot current settings into the active profile JSON
@@ -3842,16 +3964,32 @@ class StageHardwarePanel(QWidget):
         logger.info(f"Saved device profile: {name}")
 
     def _save_as_new_profile(self):
-        """Prompt for a name and save a new profile."""
+        """Prompt for a name and save a new profile.
+
+        ⚠ v7.17.x: the profile name IS this machine's identity — it names
+        ``config/hardware/<name>/``, where every per-machine calibration
+        lives (see ``SupportClasses/MachineConfig.py``). So a Save-As is
+        either a RENAME of this rig, in which case the calibration must
+        follow, or a genuinely DIFFERENT machine, in which case it must not.
+        Only the operator knows which, so ask instead of guessing: guessing
+        wrong either strands a taught plate map in a folder nothing reads, or
+        silently hands one rig another rig's calibration.
+        """
+        from SupportClasses import MachineConfig as mc
         name, ok = QInputDialog.getText(
             self, "Save Device Profile As",
-            "Profile name:")
+            "Machine / profile name (this names its calibration folder):")
         if not ok or not name.strip():
             return
         name = name.strip()
+        valid, why = mc.is_valid_machine_name(name)
+        if not valid:
+            QMessageBox.warning(self, "Save Device Profile As", why)
+            return
         self._apply()  # Snapshot current widget values to Settings
         if self._settings is None:
             return
+        previous = (self._settings.get("device_profile.active") or "").strip()
         profile = DeviceProfile.from_settings(self._settings, name=name)
         try:
             path = profile.save()  # Default location in DEVICES_DIR
@@ -3859,14 +3997,64 @@ class StageHardwarePanel(QWidget):
             QMessageBox.warning(self, "Save Device Profile",
                                 f"Failed to save {name}: {e}")
             return
+        self._maybe_move_machine_folder(previous, name)
         self._settings.set("device_profile.active", name)
         self._settings.save()
+        self._notify_identity_change(name)
         self._refresh_profile_list()
         idx = self.cmb_profile.findText(name)
         if idx >= 0:
             self.cmb_profile.setCurrentIndex(idx)
         self.lbl_profile_status.setText(f"Saved new profile: {name}")
         logger.info(f"Saved new device profile {name} → {path}")
+
+    def _maybe_move_machine_folder(self, previous: str, new: str) -> None:
+        """Offer to carry this machine's calibration to a renamed profile.
+
+        Only asked when it is actually ambiguous: the old folder exists and
+        the new one does not. If the new name already has a folder, the
+        operator is switching back to a machine that already has calibration
+        — nothing to move, and merging would be a guess.
+        """
+        from SupportClasses import MachineConfig as mc
+        if not previous or previous == new:
+            return
+        src, dst = mc.HARDWARE_ROOT / previous, mc.HARDWARE_ROOT / new
+        if not src.is_dir() or dst.exists():
+            return
+        reply = QMessageBox.question(
+            self, "Is this the same machine?",
+            f"'{previous}' has a calibration folder "
+            f"(taught plate map, camera calibration, mosaics …).\n\n"
+            f"Yes — this is the SAME machine being renamed to '{new}': move "
+            f"its calibration across.\n\n"
+            f"No — '{new}' is a DIFFERENT machine: start it with fresh "
+            f"calibration and leave '{previous}' untouched.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            if mc.rename_machine_folder(previous, new):
+                logger.info(f"Machine calibration moved {previous} → {new}")
+            else:
+                QMessageBox.warning(
+                    self, "Could not move calibration",
+                    f"'{previous}' could not be moved to '{new}' — see the log. "
+                    f"Nothing was deleted; move the folder by hand if needed.")
+
+    def _notify_identity_change(self, name: str) -> None:
+        """Tell the operator a restart is needed to re-point the config folder.
+
+        Every per-machine store resolves its path once, at module-import
+        time, so switching identity mid-session leaves them reading the
+        PREVIOUS machine's folder. Saying nothing would look like the new
+        machine had inherited the old one's calibration.
+        """
+        QMessageBox.information(
+            self, "Machine identity changed",
+            f"This machine is now '{name}'.\n\n"
+            f"Its calibration lives in config/hardware/{name}/.\n\n"
+            f"Restart MEBP so every calibration store reads from there — "
+            f"until you do, they are still using the previous machine's "
+            f"folder.")
 
     def _delete_selected_profile(self):
         """Confirm + delete the selected profile."""

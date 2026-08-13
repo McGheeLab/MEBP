@@ -76,8 +76,12 @@ class TestLegacySerializationIdentity(unittest.TestCase):
         self.assertEqual(set(spec.to_dict()), LEGACY_KEYS)
 
     def test_every_on_disk_setup_needle_round_trips(self):
+        # v7.17.x: hardware setup files are SHARED config, so they live in
+        # config/hardware/ME3B_general/ — globbing the old flat root made this
+        # iterate zero files and pass vacuously.
+        from SupportClasses.MachineConfig import shared_config_dir
         checked = 0
-        for path in sorted((REPO / "config" / "hardware").glob("*.json")):
+        for path in sorted(shared_config_dir().glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:

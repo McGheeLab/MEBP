@@ -44,10 +44,14 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+from SupportClasses.OpticsRegistry import normalize_optic_name
+
 logger = logging.getLogger(__name__)
 
-# Default path relative to working directory (project root)
-_DEFAULT_PATH = Path("config/hardware/objectives.json")
+# Default path — per-machine (this camera + objective's own bench-measured
+# µm/px), resolved under config/hardware/<machine-id>/.
+_DEFAULT_PATH = resolve_machine_path("objectives.json")
 
 # v7.4.x: Objectives are user-defined — no prepopulated list. Users
 # create entries via the Objective Calibration Setup card with their
@@ -111,10 +115,23 @@ class ObjectiveCalibrationStore:
         return [o["name"] for o in self.objectives]
 
     def nominal_magnification(self, objective_name: str) -> Optional[float]:
-        """Return nominal magnification for a named objective, or None."""
-        for obj in self.objectives:
-            if obj["name"] == objective_name:
+        """Return nominal magnification for a named objective, or None.
+
+        v7.18: falls back to a case/whitespace-folded match, so a slot labelled
+        "4X" resolves against a library entry named "4x". A non-unique folded
+        match returns None — see :meth:`_resolve_key` for why ambiguity refuses.
+        """
+        objectives = self.objectives
+        for obj in objectives:
+            if obj.get("name") == objective_name:
                 return float(obj["nominal_magnification"])
+        norm = normalize_optic_name(objective_name)
+        if not norm:
+            return None
+        hits = [o for o in objectives
+                if normalize_optic_name(o.get("name")) == norm]
+        if len(hits) == 1:
+            return float(hits[0]["nominal_magnification"])
         return None
 
     # ── Objective library CRUD (v7.4.x) ────────────────────────────
@@ -122,14 +139,24 @@ class ObjectiveCalibrationStore:
     def add_objective(self, name: str, nominal_magnification: float) -> bool:
         """Add a user-defined objective. Returns True on success.
 
-        Duplicate names are rejected (case-sensitive). Persists immediately.
+        v7.18: duplicates are rejected **case-insensitively**. Adding "4X"
+        alongside an existing "4x" is what created this machine's split in the
+        first place, and two entries that fold together make every later lookup
+        ambiguous — i.e. read as uncalibrated. Refusing here is what keeps
+        :meth:`_resolve_key` unambiguous.
         """
         name = (name or "").strip()
         if not name:
             return False
         objectives = list(self._data.get("objectives", []))
+        norm = normalize_optic_name(name)
         for obj in objectives:
-            if obj.get("name") == name:
+            existing = obj.get("name")
+            if existing == name or normalize_optic_name(existing) == norm:
+                if existing != name:
+                    logger.info(
+                        "Objective %r not added: %r already exists and the two "
+                        "names differ only by case or spacing.", name, existing)
                 return False  # duplicate
         objectives.append({
             "name": name,
@@ -153,16 +180,64 @@ class ObjectiveCalibrationStore:
             return False  # not found
         self._data["objectives"] = remaining
         # Also strip any calibration entries keyed by this objective name
-        # so the store stays internally consistent.
+        # so the store stays internally consistent. v7.18: match the way
+        # get_calibration reads, or a case-variant key survives as an orphan
+        # that nothing can reach but sensor_width_um still averages in.
+        norm = normalize_optic_name(name)
         for cam, cals in self._data.get(
             "camera_objective_calibrations", {}
         ).items():
-            cals.pop(name, None)
+            if not isinstance(cals, dict):
+                continue
+            for key in [k for k in cals
+                        if k == name or normalize_optic_name(k) == norm]:
+                cals.pop(key, None)
         self.save()
         logger.info(f"Objective removed: {name}")
         return True
 
     # ── Calibration read / write ───────────────────────────────────
+
+    def _resolve_key(self, camera_name: str,
+                     objective_name: str) -> Optional[str]:
+        """The stored key for this objective on this camera, or None.
+
+        v7.18. Exact match first, then a case/whitespace-folded match. Until this
+        existed the lookup was an exact, case-sensitive ``dict.get``, and this
+        machine labels nosepiece position 1 **"4X"** while its calibration is
+        stored under **"4x"** — so ``ObjectiveLadder.resolve_ladder`` reported
+        *"no µm/px calibration for '4X'"* for an objective measured the day
+        before, and the plate-bed-leveling ladder was unusable for 4X and 10X.
+
+        ⚠ **A non-unique folded match returns None and logs both keys.** With two
+        candidates a "pick the first" rule would silently make one measurement
+        stand in for another; an ambiguous store must read as unusable (the
+        ``sensor_width_um`` refusal precedent). Only lookups are folded — the
+        stored keys are never rewritten, because the objective name also keys the
+        parfocal offsets, the fluorescence align key, mosaic alignment records
+        and ``.nd3`` sidecars already on disk.
+        """
+        cam = (self._data
+               .get("camera_objective_calibrations", {})
+               .get(camera_name))
+        if not isinstance(cam, dict) or not cam:
+            return None
+        if objective_name in cam:
+            return objective_name
+        norm = normalize_optic_name(objective_name)
+        if not norm:
+            return None
+        hits = [k for k in cam if normalize_optic_name(k) == norm]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            logger.warning(
+                "Camera %r has %d calibrations whose names differ only by case "
+                "or spacing (%s) — %r is ambiguous, so it reads as "
+                "uncalibrated. Remove or rename the duplicates.",
+                camera_name, len(hits), ", ".join(repr(h) for h in sorted(hits)),
+                objective_name)
+        return None
 
     def get_calibration(self, camera_name: str,
                         objective_name: str) -> Optional[dict]:
@@ -172,12 +247,17 @@ class ObjectiveCalibrationStore:
 
         The dict contains at minimum:
             ``measured_um_per_px``, ``resolution``, ``date``
+
+        v7.18: resolves the name case-insensitively via :meth:`_resolve_key`.
         """
+        key = self._resolve_key(camera_name, objective_name)
+        if key is None:
+            return None
         return (
             self._data
             .get("camera_objective_calibrations", {})
             .get(camera_name, {})
-            .get(objective_name)
+            .get(key)
         )
 
     def set_calibration(
@@ -203,6 +283,11 @@ class ObjectiveCalibrationStore:
         """
         cals = self._data.setdefault("camera_objective_calibrations", {})
         cam_cals = cals.setdefault(camera_name, {})
+        # v7.18: write INTO an existing case-variant key rather than beside it.
+        # Creating a sibling ("4X" next to "4x") is what makes _resolve_key
+        # ambiguous, and an ambiguous store reads as uncalibrated — so a save
+        # would appear to succeed and then be ignored by every reader.
+        key = self._resolve_key(camera_name, objective_name) or objective_name
         entry = {
             "measured_um_per_px": round(measured_um_per_px, 6),
             "resolution": list(resolution),
@@ -213,14 +298,15 @@ class ObjectiveCalibrationStore:
         else:
             # v7.5.x: a µm/px-only update must not silently drop a previously
             # measured rotation (mirrors CameraCalibrationStore.set_calibration).
-            prev = cam_cals.get(objective_name)
+            prev = cam_cals.get(key)
             if isinstance(prev, dict) and prev.get("rotation_deg") is not None:
                 entry["rotation_deg"] = prev["rotation_deg"]
-        cam_cals[objective_name] = entry
+        cam_cals[key] = entry
         self.save()
+        reused = "" if key == objective_name else f" (stored under {key!r})"
         logger.info(
-            f"Objective calibration saved: {camera_name}/{objective_name} "
-            f"= {measured_um_per_px:.4f} µm/px @ {resolution}"
+            f"Objective calibration saved: {camera_name}/{objective_name}"
+            f"{reused} = {measured_um_per_px:.4f} µm/px @ {resolution}"
         )
 
     # ── Plausibility ───────────────────────────────────────────────
@@ -411,9 +497,14 @@ class ObjectiveCalibrationStore:
 
     def clear_calibration(self, camera_name: str,
                           objective_name: str) -> None:
-        """Remove a stored calibration entry."""
+        """Remove a stored calibration entry.
+
+        v7.18: resolves the name the same way :meth:`get_calibration` does, so
+        clearing a calibration the reader can see cannot silently miss.
+        """
+        key = self._resolve_key(camera_name, objective_name) or objective_name
         try:
-            del self._data["camera_objective_calibrations"][camera_name][objective_name]
+            del self._data["camera_objective_calibrations"][camera_name][key]
             self.save()
         except KeyError:
             pass

@@ -99,6 +99,7 @@ except ImportError:
 from gui.widgets.mono_display import (
     LEVEL_MAX, _mono_to_bgr8, _auto_levels, compute_raw_frame_stats,
     RawAverageRequest)
+from SupportClasses.MachineConfig import resolve_machine_path
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -330,8 +331,7 @@ def _sdk_config_dir() -> str:
     Falls back to the DLL directory only if that cannot be created, since the SDK
     needs *some* writable path.
     """
-    root = Path(__file__).resolve().parent.parent.parent
-    d = root / "config" / "hardware" / "tucsen"
+    d = resolve_machine_path("tucsen")
     try:
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
