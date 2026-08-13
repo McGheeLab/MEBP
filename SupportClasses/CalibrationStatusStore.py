@@ -46,6 +46,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 # Calibration types tracked. "p" (pump) is a single most-recent-pump stamp — any
@@ -77,7 +79,7 @@ def _default_path() -> Path:
     d = os.environ.get("MEBP_CALIBRATION_STATUS_DIR")
     if d:
         return Path(d) / _DEFAULT_FILENAME
-    return Path("config/hardware") / _DEFAULT_FILENAME
+    return resolve_machine_path(_DEFAULT_FILENAME)
 
 
 class CalibrationStatusStore:

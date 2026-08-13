@@ -55,9 +55,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/spheroid_sink_calibration.json")
+_DEFAULT_PATH = resolve_machine_path("spheroid_sink_calibration.json")
 
 
 def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:

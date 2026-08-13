@@ -120,6 +120,9 @@ class MicroscopeState:
     #: physically swaps them, so this is not on the ~1 s poll.
     mounted_filters: tuple = ()
     mounted_objectives: tuple = ()
+    #: Result of the last probe_optic_write_support() call — see there for the
+    #: shape. {} until probed, or when the driver has no notion of this.
+    optic_write_support: dict = field(default_factory=dict)
     #: Last error text, cleared by the next successful operation.
     error: Optional[str] = None
     last_op: Optional[str] = None
@@ -194,6 +197,51 @@ class MicroscopeBackend:
     def mounted_objectives(self) -> tuple:
         """``MountedOptic`` per nosepiece position, or ``()`` if unsupported."""
         return ()
+
+    # -- can the body's OWN optics database be told what is mounted? --
+    def probe_optic_write_support(self) -> dict:
+        """**READ-ONLY** inspection: does this body's optics interface declare
+        its name/identity fields as settable, so a rename in the app could make
+        the body's own display follow?
+
+        Commands NOTHING and writes NOTHING — it inspects the driver's own type
+        information. ``{}`` means "nothing to report" (driver has no such
+        notion, or no optics are enumerable). Otherwise
+        ``{"filter": {<field>: True | False | None}, "objective": {...}}``,
+        where the verdict is per FIELD (writability is a property of the
+        interface, not of one slot) and ``None`` means undeterminable.
+
+        ⚠ Deliberately does **not** settle the question by writing a field's
+        own current value back to itself. That looks safe and is not: writing a
+        device property the value it already holds is hardware-verified in this
+        codebase to be destructive on at least one instrument SDK — see
+        ``tucam_backend._capa_set`` (a redundant ``auto_exposure`` write reset
+        the exposure to the sensor minimum and blacked out the preview). On a
+        nosepiece the equivalent field (``Code``) is what resolves NA and
+        working distance, which bound a focus sweep — so a corrupted one is a
+        collision hazard, not a cosmetic bug.
+
+        ⚠⚠ **A ``True`` here is NOT an answer.** Hardware-verified on the real
+        Ti-E: it declares ``Name`` and ``Code`` settable and then refuses every
+        write at runtime (*"Database entry cannot be modified."*). Treat this as
+        "the typelib does not rule it out"; only :meth:`set_optic_name` settles
+        it. See that method for the full finding.
+        """
+        return {}
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> str:
+        """Write one optic's name into the body's own database and VERIFY it.
+
+        ``logical`` is ``"filter"`` or ``"objective"``; ``position`` is 1-based.
+        Returns the name the body reports **after** the write, so a driver that
+        accepts a write and silently keeps the old value is caught (the Ti SDK
+        has form here — it silently clamped an out-of-range turret index and
+        reported success; see ``NikonTiSdkBackend._set_turret``).
+
+        Raises :class:`MicroscopeError` when unsupported or refused.
+        """
+        raise MicroscopeError(
+            "this microscope cannot be told what optics are fitted")
 
     # -- focus --
     def get_focus_um(self) -> Optional[float]:
@@ -972,6 +1020,205 @@ class NikonTiSdkBackend(MicroscopeBackend):
     def objective_names(self) -> tuple:
         return tuple(o.label for o in self.mounted_objectives())
 
+    # -- can the body's own optics database be written to? --
+    #
+    # ``mounted_objectives()`` above already tells most of the story: an empty
+    # position has ``Code == 0`` and every OTHER field (Name, Magnification,
+    # NA, WD) then raises "No database code is associated with this optical
+    # element." That is the signature of a value being RESOLVED by looking
+    # ``Code`` up in a catalogue — and the SDK redistributable ships exactly
+    # such catalogues (``ObjectiveNames.txt`` — 199 rows, ``FilterBlockNames.txt``
+    # — 34 rows). The most plausible reading is that ``Code`` is SENSED from a
+    # *coded* Nikon optic's physical ring/chip, not typed by an operator — in
+    # which case the body's own display already tracks a coded optic
+    # automatically, with nothing for software to push, and an UNCODED optic
+    # has no ``Code`` to attach a name to either way.
+    #
+    # ⚠ The probe is READ-ONLY BY DESIGN and must stay that way. Settling this
+    # by writing each field's own current value back to itself reads as
+    # perfectly safe and is NOT: ``tucam_backend._capa_set`` records a
+    # hardware-verified case where writing a device property the value it
+    # ALREADY held reset the exposure to the sensor minimum. Here the analogous
+    # field is ``Code``, which resolves the NA and working distance that bound a
+    # focus sweep — so a corrupted one is a collision hazard, not a cosmetic
+    # bug. Writability is therefore inferred from the COM wrapper's own type
+    # information, and an actual write happens ONLY through the explicit,
+    # single-target, read-back-verified ``set_optic_name`` below.
+
+    #: The two identity fields a physical display could plausibly show. ``Code``
+    #: is REPORTED ON but never written by ``set_optic_name`` (see above).
+    _OPTIC_IDENTITY_FIELDS = ("Name", "Code")
+
+    #: logical device -> the collection attribute holding its optics.
+    _OPTIC_COLLECTIONS = {"filter": "FilterBlocks", "objective": "Objectives"}
+
+    @staticmethod
+    def _declared_writability(item, field_name: str):
+        """``True``/``False`` from the COM wrapper's own type info, else ``None``.
+
+        comtypes builds early-bound wrappers from the registered typelib and
+        exposes each COM property as a Python ``property`` — get-only when the
+        typelib declares no ``propput``. So the presence of a setter is
+        readable without touching the instrument. (Early binding is confirmed
+        for this body: ``diagnostics()`` gets real attribute names out of
+        ``dir(device)``, which a late-bound dynamic dispatch would not provide.)
+
+        ``None`` = undeterminable, which must be reported as such rather than
+        guessed either way.
+        """
+        descriptor = getattr(type(item), field_name, None)
+        if isinstance(descriptor, property):
+            return descriptor.fset is not None
+        # comtypes' underlying accessors, if the property itself is absent.
+        if hasattr(type(item), f"_set_{field_name}"):
+            return True
+        if hasattr(type(item), f"_get_{field_name}"):
+            return False
+        return None
+
+    def probe_optic_write_support(self) -> dict:
+        out: dict[str, dict] = {}
+        for logical, attr in self._OPTIC_COLLECTIONS.items():
+            item = self._safe(lambda l=logical, a=attr: self._first_optic(l, a))
+            if item is None:
+                continue
+            # Writability belongs to the INTERFACE, so one representative item
+            # answers for every slot — reporting it per slot would be 12 lines
+            # of identical noise implying per-slot variation that cannot exist.
+            out[logical] = {name: self._declared_writability(item, name)
+                            for name in self._OPTIC_IDENTITY_FIELDS}
+        return out
+
+    def _first_optic(self, logical: str, attr: str):
+        """The first enumerable optic item on a collection, or ``None``."""
+        coll = self._collection(logical, attr)
+        count = int(self._safe(lambda: coll.Count, 0) or 0)
+        for pos in range(1, count + 1):
+            item = self._safe(lambda p=pos: coll.Item(p))
+            if item is not None:
+                return item
+        return None
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> str:
+        """Write ONE optic's ``Name`` into the body's database, then verify it.
+
+        ⚠⚠ **HARDWARE-VERIFIED 2026-08-12 (real Ti-E, SDK 4.4.1.714): THIS
+        BODY REFUSES. The Ti's optics database is READ-ONLY through this SDK.**
+        Asked to set filter slot 4's ``Name``, the SDK answered, in its own
+        words::
+
+            Database entry cannot be modified. [Nikon.TiScope.FilterBlock.1]
+
+        **And the typelib claimed otherwise** — ``_declared_writability``
+        reported ``Name`` AND ``Code`` as settable for BOTH the cassette and the
+        nosepiece (``propput`` present) on the very same body that then refused
+        at runtime. So a declared setter is a **FALSE POSITIVE** here, and only
+        an actual attempt settles it. That is exactly why the read-only probe
+        must never be presented as an answer on its own.
+
+        **Every other write path was tested too, and all are refused.** The
+        typelib's ``IFilterBlock`` advertises writable ``ExcitationFilterCode``
+        / ``DichroicMirrorCode`` / ``BarrierFilterCode`` / ``Composition``
+        ("Gets or sets the codes for the optical elements in the filter block"),
+        which looked like a way to declare a cube by its optical make-up
+        (``Cy5`` = catalogue code 25 = excitation 20 / dichroic 11 / barrier 19
+        per ``FilterCodes.txt``). Attempted on the EMPTY slot 4, all three
+        refused with the **same** *"Database entry cannot be modified."*, and
+        ``CanModify`` reads **0 on all six slots**, filled and empty alike.
+        ``Nikon.TiScope.Database`` does expose ``FilterBlocks.Add``/``Remove``
+        over a 309-entry catalogue, but that is the CATALOGUE — the live slot's
+        ``Code`` is documented read-only and reports 0, so a new catalogue entry
+        could not be bound to a slot anyway. The chain breaks at the sensing
+        step, not the catalogue step.
+
+        ⚠ **Micro-Manager / pymmcore cannot change this.** MM's ``NikonTI``
+        adapter *wraps* this same ``NikonTi.dll`` ("This adapter uses the driver
+        and API supplied by Nikon") and would take the identical refusal from
+        the identical code path — the message itself lives in Nikon's
+        ``MipDeviceMsg.dll``, beneath any wrapper. What MM offers is
+        ``defineStateLabel``: **host-side** labels for turret positions, stored
+        in MM's own configuration. That is the same kind of thing
+        :class:`MicroscopeConfigStore` already provides, and it does not reach
+        the body's display either.
+
+        What the display actually follows: a ``Code`` the body SENSES from the
+        fitted optic, resolved through Nikon's own catalogues in
+        ``C:\\Program Files\\Nikon\\Shared\\Data\\Ti`` (``FilterBlockNames.txt``,
+        ``ObjectiveNames.txt``). Verified against this rig: codes 4 / 15 / 23 →
+        ``DAPI`` / ``FITC`` / ``TxRed``, matching those files' 0-based rows
+        exactly (``Cy5`` is code 25). A slot reporting ``Code == 0`` is one the
+        body sees nothing coded in — so there is no entry to name, and naming it
+        is an app-side concern (``MicroscopeConfigStore``).
+
+        Kept anyway, because it is what PRODUCED that answer and it is the only
+        way another body / SDK generation can be settled in one call. Writes
+        ``Name`` only — never ``Code`` (see the note above: ``Code`` resolves the
+        NA/working distance a focus sweep is bounded by).
+
+        Verification is not optional: this SDK has already been caught
+        accepting an out-of-range turret index, clamping it and reporting
+        success (``_set_turret``). So the value is read back and returned, and
+        a write that did not take is raised as an error rather than reported as
+        a success.
+        """
+        attr = self._OPTIC_COLLECTIONS.get(str(logical))
+        if attr is None:
+            raise MicroscopeError(
+                f"unknown optic group {logical!r} (expected "
+                f"{' or '.join(map(repr, self._OPTIC_COLLECTIONS))})")
+        coll = self._collection(logical, attr)
+        count = int(self._safe(lambda: coll.Count, 0) or 0)
+        pos = int(position)
+        if not 1 <= pos <= max(count, 0):
+            raise MicroscopeError(
+                f"{logical} slot {pos} is outside this body's 1-{count}")
+        item = self._safe(lambda: coll.Item(pos))
+        if item is None:
+            raise MicroscopeError(
+                f"the body did not return {logical} slot {pos}")
+
+        # Nikon's OWN advertised gate, and the authority here: _IElementBase
+        # exposes ``CanModify`` — "Determines if properties such as 'Name' can
+        # be modified for this optical element (read-only)". Measured 0 on every
+        # slot of this Ti-E, filled and empty alike, which is exactly why the
+        # write is refused. Reading it first turns a COM error into a plain
+        # explanation, and asks the SDK instead of guessing from the typelib
+        # (which advertises setters it does not honour — see the docstring).
+        can_modify = self._safe(lambda: item.CanModify)
+        if can_modify is not None and not bool(can_modify):
+            raise MicroscopeError(
+                f"the body reports this {logical} entry as not modifiable "
+                f"(CanModify=0), so its name is fixed. It is resolved from the "
+                f"optic's own hardware code through Nikon's catalogue, not set "
+                f"by software — name it in the app instead")
+
+        declared = self._declared_writability(item, "Name")
+        if declared is False:
+            raise MicroscopeError(
+                f"this body declares {logical} Name as read-only — it is "
+                "resolved from the optic's own hardware code, not set by "
+                "software, so there is nothing to write")
+        before = self._safe(lambda: item.Name)
+        try:
+            item.Name = str(name)
+        except COMError as exc:
+            raise MicroscopeError(_com_message(exc)) from exc
+        except Exception as exc:
+            raise MicroscopeError(
+                f"the SDK refused to set {logical} slot {pos} Name: {exc}"
+            ) from exc
+
+        after = self._safe(lambda: item.Name)
+        after_txt = "" if after is None else str(after).strip()
+        if after_txt != str(name).strip():
+            raise MicroscopeError(
+                f"the SDK accepted the write but {logical} slot {pos} still "
+                f"reports {after_txt!r} (was {before!r}, asked for "
+                f"{str(name)!r}) — the name did not take")
+        logger.info(f"Nikon Ti: {logical} slot {pos} Name {before!r} -> "
+                    f"{after_txt!r}")
+        return after_txt
+
     def focus_limits_um(self) -> Optional[tuple]:
         """Travel limits the SDK declares for the Z drive, converted to µm.
 
@@ -1254,6 +1501,9 @@ class _Op:
     fn: Callable[[], None]
     done: threading.Event = field(default_factory=threading.Event)
     error: Optional[str] = None
+    #: Set by ops that produce a value (e.g. the name a body reports back after
+    #: a write). Only meaningful once ``done`` is set and ``error`` is None.
+    result: Optional[object] = None
 
 
 class MicroscopeController:
@@ -1431,7 +1681,14 @@ class MicroscopeController:
             op.done.set()
 
     def _submit(self, name: str, fn: Callable[[], None]) -> _Op:
-        op = _Op(name=name, fn=fn)
+        return self._submit_op(_Op(name=name, fn=fn))
+
+    def _submit_op(self, op: _Op) -> _Op:
+        """Queue an already-built op — for ops whose ``fn`` needs to close over
+        the op itself (to report a result back to the caller). Inline
+        (``threaded=False``) execution happens here, so the op MUST be fully
+        constructed before this is called."""
+        name = op.name
         blocked = self._lease_blocks(name)
         if blocked is not None:
             # Fail fast rather than queue. Queueing here is what produces the
@@ -1495,8 +1752,8 @@ class MicroscopeController:
             self._emit(backend="none", connected=False, busy=False,
                        filter_position=None, objective_position=None,
                        focus_um=None, mounted_filters=(),
-                       mounted_objectives=(), error=None,
-                       last_op="disconnect")
+                       mounted_objectives=(), optic_write_support={},
+                       error=None, last_op="disconnect")
 
         return self._submit("disconnect", _do)
 
@@ -1522,6 +1779,37 @@ class MicroscopeController:
         """
         return self._submit(
             "refresh_mounted", lambda: self._read_all(include_mounted=True))
+
+    def probe_optic_write_support(self) -> _Op:
+        """READ-ONLY: see MicroscopeBackend.probe_optic_write_support.
+
+        Read the result from ``state().optic_write_support`` once this op's
+        ``.done`` (or ``wait_idle()``) confirms it has landed.
+        """
+        def _do():
+            result = self._require().probe_optic_write_support()
+            self._emit(optic_write_support=dict(result), error=None,
+                       last_op="probe_optic_write_support")
+
+        return self._submit("probe_optic_write_support", _do)
+
+    def set_optic_name(self, logical: str, position: int, name: str) -> _Op:
+        """Write one optic's name into the BODY's own database.
+
+        The only operation in this module that mutates the body's optics
+        configuration. On success ``op.result`` holds the name the body reports
+        back afterwards; a write that did not take is an error, not a success.
+        """
+        op = _Op(name="set_optic_name", fn=lambda: None)
+
+        def _do():
+            op.result = self._require().set_optic_name(
+                str(logical), int(position), str(name))
+            self._emit(error=None, last_op="set_optic_name")
+            self._read_all(include_mounted=True)
+
+        op.fn = _do
+        return self._submit_op(op)
 
     def set_filter(self, position: int) -> _Op:
         def _do():

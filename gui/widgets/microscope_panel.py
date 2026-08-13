@@ -354,6 +354,13 @@ class MicroscopePanel(QWidget):
         return (self._popup_open(self._filter_combo)
                 or self._popup_open(self._objective_combo))
 
+    def _lease_owner(self) -> str:
+        """Who has the body reserved, or "" — v7.18."""
+        try:
+            return str(self._scope.lease_owner() or "")
+        except Exception:
+            return ""
+
     def _tick(self) -> None:
         # Don't poll the body while the operator has a drop-down open: the
         # refresh sets busy=True, which used to disable the combo mid-selection
@@ -362,7 +369,14 @@ class MicroscopePanel(QWidget):
             return
         state = self._scope.state()
         now = time.monotonic()
-        if (state.connected and not state.busy
+        # v7.18: do not poll under someone ELSE's lease. `_submit` fails a
+        # lease-blocked op fast WITHOUT publishing an error, so a refusal is
+        # invisible — the card would render correctly-but-sparsely off whatever
+        # the lease holder's own ops happen to read back, then quietly go stale
+        # the moment the run stops moving turrets. Not polling and SAYING who has
+        # it is the honest version.
+        leased = bool(self._lease_owner())
+        if (state.connected and not state.busy and not leased
                 and now - self._last_refresh >= _REFRESH_INTERVAL_S):
             self._last_refresh = now
             self._scope.refresh()
@@ -370,10 +384,11 @@ class MicroscopePanel(QWidget):
 
     def _render(self, *, force: bool = False) -> None:
         state = self._scope.state()
+        leased_by = self._lease_owner()
         key = (state.connected, state.busy, state.backend,
                state.filter_position, state.objective_position,
                state.focus_um, state.error,
-               state.filter_count, state.objective_count)
+               state.filter_count, state.objective_count, leased_by)
         if not force and key == self._rendered_key:
             return
         self._rendered_key = key
@@ -383,7 +398,11 @@ class MicroscopePanel(QWidget):
         if connected:
             dot, colour = "●", COLORS["green"]
             text = state.backend.replace("_", " ")
-            if state.busy:
+            if leased_by:
+                # Say WHO, so "why are the combos dead?" answers itself.
+                dot, colour = "◐", COLORS["yellow"]
+                text = f"reserved by {leased_by.replace('_', ' ')}"
+            elif state.busy:
                 text += " · moving…"
         else:
             dot, colour = "○", COLORS["subtext0"]
@@ -400,12 +419,24 @@ class MicroscopePanel(QWidget):
         has_filter = connected and state.filter_count > 0
         has_objective = connected and state.objective_count > 0
         has_focus = connected and state.focus_um is not None
+        # v7.18: a leased body belongs to a running workflow. Leaving these live
+        # lets the operator fight it — and an op submitted just BEFORE the lease
+        # was taken is not blocked at all, so it lands at an arbitrary point
+        # inside the run. Disabled + a tooltip naming the owner.
+        tip = (f"The microscope is reserved by {leased_by.replace('_', ' ')} "
+               f"until it finishes." if leased_by else "")
         # Never disable or re-index a combo whose list is open — doing so
         # closes the drop-down out from under the operator's click.
         if not self._popup_open(self._filter_combo):
-            self._filter_combo.setEnabled(has_filter and not state.busy)
+            self._filter_combo.setEnabled(
+                has_filter and not state.busy and not leased_by)
+            if tip:
+                self._filter_combo.setToolTip(tip)
         if not self._popup_open(self._objective_combo):
-            self._objective_combo.setEnabled(has_objective and not state.busy)
+            self._objective_combo.setEnabled(
+                has_objective and not state.busy and not leased_by)
+            if tip:
+                self._objective_combo.setToolTip(tip)
         # Focus jog stays live DURING a move. Repeated small steps are the most
         # common microscope interaction, and queued deltas are additive and each
         # bounded by the step size — so dropping the operator's click (which is

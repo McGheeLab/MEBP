@@ -76,7 +76,10 @@ class TestLegacyByteIdentity(unittest.TestCase):
     def test_every_real_on_disk_setup_round_trips_identically(self):
         """The operator's actual saved setups. Key ORDER matters too — this is
         what a diff of the settings file would show."""
-        paths = sorted(glob.glob(os.path.join(_REPO, "config", "hardware",
+        # v7.17.x: setup files are SHARED config (config/hardware/ME3B_general/)
+        # — the old flat root now holds none, which made this vacuous.
+        from SupportClasses.MachineConfig import shared_config_dir
+        paths = sorted(glob.glob(os.path.join(str(shared_config_dir()),
                                               "*.json")))
         checked = 0
         for p in paths:

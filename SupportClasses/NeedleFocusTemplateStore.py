@@ -55,6 +55,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -64,8 +66,10 @@ except ImportError:   # pragma: no cover - cv2 always present in this project
     cv2 = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/needle_focus_templates.json")
+_DEFAULT_PATH = resolve_machine_path("needle_focus_templates.json")
 _IMG_SUBDIR = "needle_focus_templates"
+# Migrated at import time (see MosaicStore.py's _DEFAULT_IMG_DIR comment).
+_DEFAULT_IMG_DIR = resolve_machine_path(_IMG_SUBDIR)
 
 # Keep a bounded history per key: enough to cover a many-well calibration while
 # never letting the store grow without limit across repeated re-calibrations.
@@ -93,7 +97,8 @@ class NeedleFocusTemplateStore:
             path = (Path(env) / "needle_focus_templates.json" if env
                     else _DEFAULT_PATH)
         self._path = Path(path)
-        self._img_dir = self._path.parent / _IMG_SUBDIR
+        self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
+                          else self._path.parent / _IMG_SUBDIR)
         self._data: dict = {"version": "1.0", "templates": {}}
         self._load()
 

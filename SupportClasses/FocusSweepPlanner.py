@@ -120,6 +120,216 @@ class SweepPlan:
         return " · ".join(bits)
 
 
+@dataclass(frozen=True, kw_only=True)
+class TurretChangePlan:
+    """How to make a nosepiece rotation safe. See :func:`plan_turret_change`."""
+    #: Where to send the focus BEFORE rotating. None = already safe, do not move.
+    retreat_focus_um: float | None = None
+    #: Where the focus should end up AFTER rotating. None = leave it alone.
+    post_focus_um: float | None = None
+
+    from_label: str = ""
+    to_label: str = ""
+    #: Front-lens-to-specimen gap the TARGET objective would have, µm.
+    clearance_before_um: float | None = None
+    clearance_after_um: float | None = None
+    wd_known: bool = True
+    parfocal_applied_um: float | None = None
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def moves_focus(self) -> bool:
+        return self.retreat_focus_um is not None
+
+    def describe(self) -> str:
+        bits = [f"{self.from_label or '?'} → {self.to_label or '?'}"]
+        if self.retreat_focus_um is not None:
+            bits.append(f"retreat focus to {self.retreat_focus_um:.0f} µm first")
+        else:
+            bits.append("focus already clear")
+        if self.clearance_after_um is not None:
+            bits.append(f"clearance {self.clearance_after_um:.0f} µm")
+        if not self.wd_known:
+            bits.append("⚠ working distance UNKNOWN — conservative bound in force")
+        if self.reasons:
+            bits.append("; ".join(self.reasons))
+        return " · ".join(bits)
+
+
+def plan_turret_change(*, to_optics, current_focus_um: float,
+                       glass_focus_um: float | None,
+                       from_optics=None,
+                       focus_up_is_positive: bool = True,
+                       parfocal_delta_um: float | None = None,
+                       focus_limits_um: tuple | None = None,
+                       soft_limits_um: tuple | None = None,
+                       ) -> tuple[TurretChangePlan | None, str]:
+    """Make a nosepiece rotation safe. ``(plan, refusal)``.
+
+    ⚠ **A ROTATION IS A COLLISION EVENT, AND IT CANNOT BE ABORTED.** The focus
+    drive raises the objective TOWARD the specimen and working distance varies
+    enormously — this rig's 4x reports 16.4 mm, a 20x about 1 mm. Rotating does
+    not move Z, so a focus height that is comfortable under the 4x can be *inside*
+    the 20x's front lens the instant the turret turns, with no move in flight to
+    stop. So the focus retreats FIRST, exactly as CLAUDE.md's rule 1 retracts Z
+    before any cross-position XY move.
+
+    THE MODEL, and why it needs the glass datum
+    -------------------------------------------
+    A specimen is in focus when it sits one working distance from the front lens,
+    so at the focus position where the glass is sharp (``glass_focus_um``) EVERY
+    parfocal objective has its own full WD of clearance. Moving the focus toward
+    the specimen by δ eats δ of that gap::
+
+        clearance(X) = WD_X − u·(focus − glass_focus)      u = ±1 from the
+                                                          focus_up_is_positive
+                                                          convention
+
+    Without ``glass_focus_um`` there is no way to turn a focus reading into a gap,
+    so this REFUSES rather than assuming — the one input it cannot invent.
+
+    The bound reuses ``WD_SWEEP_FRACTION``, so "how close a rotation may happen"
+    and "how far a sweep may travel" are one policy rather than two numbers that
+    can drift apart.
+
+    Never moves toward the specimen: if the computed target is closer to the glass
+    than the current position, there is nothing to retreat from and
+    ``retreat_focus_um`` is None (the raise-only semantics of
+    ``StageController.ensure_retracted_to``, which never descends).
+    """
+    from SupportClasses.ObjectiveOptics import (
+        NO_WD_FALLBACK_HALF_RANGE_UM, WD_SWEEP_FRACTION)
+
+    to_label = str(getattr(to_optics, "label", "") or "the target objective")
+    from_label = str(getattr(from_optics, "label", "") or "") if from_optics else ""
+
+    if glass_focus_um is None:
+        return (None,
+                f"Cannot rotate to {to_label} safely: the focus height at which "
+                f"the plate glass is sharp is not known, so the objective's "
+                f"clearance cannot be computed. Focus on the plate bottom and "
+                f"record it (Calibration → Plate Bed Level), or change the "
+                f"objective by hand.")
+
+    try:
+        f_now = float(current_focus_um)
+        f_glass = float(glass_focus_um)
+    except (TypeError, ValueError):
+        return (None, f"Cannot rotate to {to_label} safely: the focus position "
+                      f"could not be read as a number.")
+
+    u = 1.0 if focus_up_is_positive else -1.0
+    reasons: list[str] = []
+
+    wd_mm = getattr(to_optics, "working_distance_mm", None)
+    try:
+        wd_um = float(wd_mm) * 1000.0 if wd_mm else 0.0
+    except (TypeError, ValueError):
+        wd_um = 0.0
+    wd_known = wd_um > 0
+    if not wd_known:
+        # An unknown WD is not a licence to rotate at any height. Same fallback
+        # the sweep planner uses, and the caller MUST surface it: a conservative
+        # bound that is never explained reads downstream as an optics fault.
+        budget = NO_WD_FALLBACK_HALF_RANGE_UM
+        reasons.append(
+            f"{to_label} reports no working distance, so the rotation is only "
+            f"allowed within ±{budget:.0f} µm of the focused plane. Read the "
+            f"objectives from the microscope on Hardware Setup → Microscope to "
+            f"lift that restriction.")
+    else:
+        budget = WD_SWEEP_FRACTION * wd_um
+
+    def _clearance(f: float) -> float | None:
+        return (wd_um - u * (f - f_glass)) if wd_known else None
+
+    # How far toward the specimen we are, in the target objective's terms.
+    toward_now = u * (f_now - f_glass)
+    safe_here = toward_now <= budget
+
+    lo, hi = _merge_limits(focus_limits_um, soft_limits_um)
+
+    post = None
+    if parfocal_delta_um is not None:
+        try:
+            post = f_now + float(parfocal_delta_um)
+        except (TypeError, ValueError):
+            post = None
+
+    if safe_here:
+        return (TurretChangePlan(
+            retreat_focus_um=None, post_focus_um=post,
+            from_label=from_label, to_label=to_label,
+            clearance_before_um=_clearance(f_now),
+            clearance_after_um=_clearance(f_now),
+            wd_known=wd_known, parfocal_applied_um=parfocal_delta_um,
+            reasons=tuple(reasons)), "")
+
+    # Retreat to the focused plane: at f_glass the target objective has its FULL
+    # working distance of clearance, which is by definition where it is meant to
+    # sit, and it is the least surprising place to leave the operator.
+    target = f_glass
+    if lo is not None and target < lo:
+        target = lo
+    if hi is not None and target > hi:
+        target = hi
+    if u * (target - f_glass) > budget + 1e-6:
+        return (None,
+                f"Cannot rotate to {to_label} safely: the focus soft limits "
+                f"({lo}..{hi} µm) do not allow retreating far enough from the "
+                f"glass — the closest legal position still leaves "
+                f"{_clearance(target):.0f} µm of clearance against a "
+                f"{wd_um / 1000.0:g} mm working distance. Widen the limits on "
+                f"Hardware Setup → Microscope, or change the objective by hand.")
+
+    # Raise-only belt-and-braces: a "retreat" must never move toward the
+    # specimen.
+    #
+    # ⚠ THIS CANNOT FIRE TODAY, and that is recorded rather than left to look
+    # load-bearing. Reaching here requires `not safe_here` — f_now is already
+    # closer to the specimen than the budget allows — and `target` is
+    # clamp(f_glass), which is therefore always further from the specimen than
+    # f_now. Measured: over 400 000 randomised (polarity, WD, glass, focus,
+    # limits) combinations, 121 265 reached this point and the condition held
+    # 0 times. It is kept because it is free and the target computation above may
+    # change; the property test in test_v718_turret_focus_safety is what actually
+    # protects the invariant, so do NOT expect a mutation here to be caught.
+    if u * (target - f_now) >= 0:
+        reasons.append(
+            f"the focus is already further from the plate than {to_label} needs")
+        return (TurretChangePlan(
+            retreat_focus_um=None, post_focus_um=post,
+            from_label=from_label, to_label=to_label,
+            clearance_before_um=_clearance(f_now),
+            clearance_after_um=_clearance(f_now),
+            wd_known=wd_known, parfocal_applied_um=parfocal_delta_um,
+            reasons=tuple(reasons)), "")
+
+    moved = abs(target - f_now)
+    if wd_known:
+        reasons.append(
+            f"focus retreats {moved:.0f} µm to clear {to_label}'s "
+            f"{wd_um / 1000.0:g} mm working distance "
+            f"(it had {_clearance(f_now):.0f} µm)")
+    else:
+        reasons.append(f"focus retreats {moved:.0f} µm to the focused plane")
+
+    post_after = None
+    if parfocal_delta_um is not None:
+        try:
+            post_after = target + float(parfocal_delta_um)
+        except (TypeError, ValueError):
+            post_after = None
+
+    return (TurretChangePlan(
+        retreat_focus_um=target, post_focus_um=post_after,
+        from_label=from_label, to_label=to_label,
+        clearance_before_um=_clearance(f_now),
+        clearance_after_um=_clearance(target),
+        wd_known=wd_known, parfocal_applied_um=parfocal_delta_um,
+        reasons=tuple(reasons)), "")
+
+
 def choose_ladder(range_ratio: float, k_lo: int = K_MIN,
                   k_hi: int = K_MAX) -> tuple[int, int]:
     """``(K, m)`` — samples per side and rung count — minimising total frames.

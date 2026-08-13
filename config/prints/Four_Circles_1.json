@@ -2,9 +2,9 @@
   "schema_version": "7.5.0",
   "metadata": {
     "name": "Four_Circles_1",
-    "description": "Four_Circles_1: 4 shape(s), 1 layer(s), 56.4 mm path \u00b7 print height 0.20 mm above plate bottom",
-    "created": "2026-07-21T18:31:22.114293+00:00",
-    "modified": "2026-07-21T18:31:22.114293+00:00",
+    "description": "Four_Circles_1: 1 shape(s), 1 layer(s), 15.7 mm path \u00b7 print height 0.20 mm above plate bottom",
+    "created": "2026-08-13T20:40:08.090765+00:00",
+    "modified": "2026-08-13T20:40:08.090765+00:00",
     "author": "Print Builder"
   },
   "objects": {
@@ -14,7 +14,7 @@
         "source_file": "config\\prints\\Four_Circles_1.csv",
         "csv_path": "config\\prints\\Four_Circles_1.csv",
         "source": "SketchTrajectory",
-        "num_waypoints": 130,
+        "num_waypoints": 34,
         "z_above_plate_bottom_mm": 0.2,
         "z_datum": "plate_bottom",
         "layer_height_mm": 0.2,
@@ -24,68 +24,9 @@
           "shapes": [
             {
               "kind": "circle",
-              "cx": -2.80888548090725,
-              "cy": 2.772415921300561,
-              "radius": 2.25,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.5,
-              "ink_id": 2,
-              "color": "#ff0000",
-              "z_offset_mm": 0.0,
-              "no_print": false
-            },
-            {
-              "kind": "circle",
-              "cx": 2.81034426329152,
-              "cy": -2.932152592377862,
-              "radius": 2.25,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.5,
-              "ink_id": 2,
-              "color": "#ff0000",
-              "z_offset_mm": 0.0,
-              "no_print": false,
-              "start_point": [
-                1.8341058502770142,
-                -0.9049726395974189
-              ]
-            },
-            {
-              "kind": "circle",
-              "cx": 2.6754068927467682,
-              "cy": 2.789191918719639,
-              "radius": 2.25,
-              "rx": 5.0,
-              "ry": 3.0,
-              "width": 10.0,
-              "height": 10.0,
-              "points": [],
-              "filled": false,
-              "line_width_mm": 0.5,
-              "ink_id": 1,
-              "color": "#89b4fa",
-              "z_offset_mm": 0.0,
-              "no_print": false,
-              "start_point": [
-                2.1747347913450605,
-                0.5956041163105357
-              ]
-            },
-            {
-              "kind": "circle",
-              "cx": -2.7870037451432363,
-              "cy": -2.8395199109768705,
-              "radius": 2.25,
+              "cx": -2.520590082904147,
+              "cy": -2.661910802817478,
+              "radius": 2.5,
               "rx": 5.0,
               "ry": 3.0,
               "width": 10.0,
@@ -108,11 +49,6 @@
               "id": 1,
               "name": "TL & BR",
               "color": "#89b4fa"
-            },
-            {
-              "id": 2,
-              "name": "TR & BL",
-              "color": "#ff0000"
             }
           ],
           "_next_ink_id": 3,

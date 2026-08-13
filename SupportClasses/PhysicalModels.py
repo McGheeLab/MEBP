@@ -28,6 +28,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from SupportClasses.MachineConfig import resolve_shared_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,10 +37,11 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Default config paths (relative to application root)
-DEFAULT_NEEDLES_JSON = "config/hardware/needles.json"
-DEFAULT_SYRINGES_JSON = "config/hardware/syringes.json"
-DEFAULT_CAMERAS_JSON = "config/hardware/cameras.json"
+# Default config paths — shared/portable catalogs meant to sync across every
+# rig, resolved under config/hardware/ME3B_general/.
+DEFAULT_NEEDLES_JSON = resolve_shared_path("needles.json")
+DEFAULT_SYRINGES_JSON = resolve_shared_path("syringes.json")
+DEFAULT_CAMERAS_JSON = resolve_shared_path("cameras.json")
 
 # --- Needle types (v7.6) ---------------------------------------------------
 # A HYPODERMIC needle is one straight bore: geometry comes from the ASTM gauge

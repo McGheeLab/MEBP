@@ -75,11 +75,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_shared_path
+
 logger = logging.getLogger(__name__)
 
-_HW_DIR = Path(__file__).resolve().parent.parent / "config" / "hardware"
-_DEFAULT_BUILTIN_DIR = _HW_DIR / "target_types" / "builtin"
-_DEFAULT_USER_DIR = _HW_DIR / "target_types" / "user"
+# Shared/portable catalog — meant to sync across every rig, unlike the
+# per-machine stores that live under config/hardware/<machine-id>/.
+_TARGET_TYPES_DIR = resolve_shared_path("target_types")
+_DEFAULT_BUILTIN_DIR = _TARGET_TYPES_DIR / "builtin"
+_DEFAULT_USER_DIR = _TARGET_TYPES_DIR / "user"
 
 # ── the authoring vocabulary ───────────────────────────────────────
 

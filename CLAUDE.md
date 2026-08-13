@@ -159,6 +159,33 @@ MEBP is a Python/PySide6 desktop application for controlling laboratory bioprint
 
 ---
 
+## Per-Machine Config (multi-rig setups)
+
+This repo is shared, via git, across several physical rigs (`ME3B_01`, `ME3B_02`, ...). `config/hardware/` is split structurally so per-machine calibration can never collide between rigs:
+
+- `config/hardware/<machine-id>/` — **per-machine** state: camera/objective calibration, taught plate positions, mosaics, needle-bore/focus calibration, calibration status, LabLink node config, Tucsen per-camera SDK files, etc. Gitignored (`config/hardware/*/` except the two folders below), so it never syncs.
+- `config/hardware/ME3B_general/` — **shared/portable** catalogs meant to travel between rigs: needle/plate/well/target-type libraries, plate/rosette designs, and the swappable `*Setup*.json` hardware configs. Tracked.
+- `config/hardware/devices/` — **device profiles**. Tracked. See below.
+
+**The machine identity IS the active device profile's name.** The profile already names the rig, is chosen by the operator on Hardware Setup → Device (the mandatory Page 0), and is recorded in the per-machine, gitignored `settings.json` under `device_profile.active` — so naming a rig `ME3B_01` gives it `config/hardware/ME3B_01/`, and there is exactly one home for "which machine is this". Resolution order: `MEBP_MACHINE_ID` env var (test/CI) → `device_profile.active` → the literal `"unassigned"` fallback (a real, functioning bucket so a fresh checkout never hard-crashes; `MachineConfig.machine_id_is_configured()` detects it).
+
+⚠ **Device profiles live in the machine-INDEPENDENT `config/hardware/devices/`** — a profile *names* the per-machine folder, so it cannot live inside one. They are **tracked in git** deliberately: each rig's file has a distinct name so they can never conflict on pull, and it backs up every rig's safety envelope / steps-per-mm / axis map for a rebuild. Loading one is always an explicit operator action, so no rig adopts another's settings. A machine with **no** device profile has no identity yet, which triggers the onboarding wizard and lands the operator on the Device sub-page. `python tools_set_machine_id.py <ID>` sets/shows the identity headlessly.
+
+⚠ **Renaming a profile (Save As) asks whether to carry the calibration folder** — a rename is "same rig, new label" (calibration must follow) while a new name is "different rig" (it must not); only the operator knows which. Switching identity mid-session needs a **restart**, because every store resolves its path once at import time; the panel says so.
+
+**Every store must resolve its path through `SupportClasses/MachineConfig.py`'s `resolve_machine_path(relative)` / `resolve_shared_path(relative)`** — never hardcode `config/hardware/<file>`. Both auto-migrate a file/folder still sitting at the legacy flat `config/hardware/<relative>` location the first time it's asked for, so existing installs self-heal with no manual step beyond setting the machine id once. `python tools_migrate_machine_config.py` runs that migration for every known store in one deterministic pass (recommended after upgrading, so `git status` shows the old tracked per-machine paths as deletions in one commit instead of trickling in).
+
+This is why any **new** per-machine store never needs a `.gitignore` edit: as long as it goes through `resolve_machine_path`, it lives under a folder that's already ignored structurally.
+
+### ⚠ Four invariants that must not be relaxed (each is mutation-pinned)
+
+1. **Nothing is MOVED while the machine id is unconfigured.** These paths resolve at *module-import* time, and a store can be imported before a device profile has been chosen — importing `gui.app` alone pulls in five of them. Migrating then would file real calibration under `unassigned/`, and once the operator names the rig the app would look in `<their-id>/` and find an empty folder: the calibration is still on disk but invisible. While unconfigured, `resolve_machine_path` therefore **reads the legacy location in place** and moves nothing; the real migration happens on the next run. (This failure has occurred once on the bench.)
+2. **`main.py` imports `gui.app` only AFTER `_ensure_machine_id`.** Ordering is load-bearing and pinned by an AST test (`tests/test_v717_machine_config.py`) — do not tidy those imports back to the top of `run_gui`.
+3. **The leftover sweep never files a per-machine store as shared.** "Shared" means committed to git and pushed to every other rig, so `sweep_remaining_flat_files` is denied by name via `PER_MACHINE_FILENAMES` rather than trusting that every store module imported successfully. **Add new per-machine filenames to that set.**
+4. **Reserved machine names are refused.** A rig named `ME3B_general` or `devices` would write its private calibration into a shared, tracked folder and publish it to every other rig. `MachineConfig` refuses those names (and path traversal like `..`); it never many-to-one *sanitizes* a name, which would silently merge two rigs' calibration into one folder.
+
+---
+
 ## Update Plans
 
 For each update task in a version, a plan document **must** exist in:

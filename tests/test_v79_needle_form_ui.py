@@ -65,8 +65,12 @@ from SupportClasses.PhysicalModels import (          # noqa: E402
 )
 from SupportClasses.HardwareConfig import HardwareConfig  # noqa: E402
 
-CONFIG_HARDWARE_DIR = (
-    Path(__file__).resolve().parent.parent / "config" / "hardware")
+# v7.17.x: hardware setup files are SHARED config and now live in
+# config/hardware/ME3B_general/ (see SupportClasses/MachineConfig.py). This is
+# the same directory the Hardware Setup page saves to and lists from.
+from SupportClasses.MachineConfig import shared_config_dir  # noqa: E402
+
+CONFIG_HARDWARE_DIR = shared_config_dir()
 
 # The exact legacy key set — same list the v7.6 byte-identity tests assert.
 LEGACY_KEYS = {

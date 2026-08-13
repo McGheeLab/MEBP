@@ -275,7 +275,21 @@ class MainWindow(QMainWindow):
                 # onboarding actually dropped the operator on Rosette while the
                 # comment claimed Pump.
                 if hasattr(hw_page, 'sub_page_index'):
-                    idx = hw_page.sub_page_index("Pump")
+                    # v7.17.x: a rig with NO device profile has no identity
+                    # yet — naming it on Device is what gives it its own
+                    # config/hardware/<name>/ calibration folder, so that has
+                    # to come before any material config. Otherwise land on
+                    # Pump as before.
+                    landing = "Pump"
+                    try:
+                        from gui.pages.hardware.device_profile import list_profiles
+                        if not list_profiles():
+                            landing = "Device"
+                    except Exception:
+                        pass
+                    idx = hw_page.sub_page_index(landing)
+                    if idx < 0:
+                        idx = hw_page.sub_page_index("Pump")
                     if idx >= 0:
                         hw_page.switch_to(idx)
             logger.info("Onboarding config applied")

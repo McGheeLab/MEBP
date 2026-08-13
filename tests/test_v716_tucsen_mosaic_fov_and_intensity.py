@@ -474,9 +474,18 @@ class TestVerifyDoesNotOverwriteTheMeasurement(unittest.TestCase):
             "actually corrected it")
 
     def test_a_before_snapshot_is_taken_ahead_of_the_dialog(self):
+        import re
+
         src = self._src()
+        # Match the dialog's execution WITHOUT pinning how it is invoked. This
+        # asserted `src.index("dlg.exec()")` and broke in v7.18 when the call
+        # became `exec_dialog(dlg)` (dialogs are now disposed to stop a widget
+        # leak) — a cosmetic change to a line this test does not care about.
+        # The invariant is the ORDER, so match either spelling.
+        run = re.search(r"(dlg\.exec\(\)|exec_dialog\(dlg\))", src)
+        self.assertIsNotNone(run, "could not find where the verify dialog runs")
         self.assertLess(
-            src.index("before = _mgr_eff()"), src.index("dlg.exec()"),
+            src.index("before = _mgr_eff()"), run.start(),
             "the snapshot must be taken BEFORE the verify dialog runs")
 
 

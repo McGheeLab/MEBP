@@ -72,6 +72,8 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -81,7 +83,12 @@ except ImportError:   # pragma: no cover - cv2 always present in this project
     cv2 = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/plate_mosaics.json")
+_DEFAULT_PATH = resolve_machine_path("plate_mosaics.json")
+# Migrated at import time (not lazily in __init__) so a plain `import
+# MosaicStore` — as done by tools_migrate_machine_config.py — is enough to
+# relocate the paired image dir; it doesn't require a store instance to
+# actually be constructed first.
+_DEFAULT_IMG_DIR = resolve_machine_path("mosaics")
 
 #: v7.13 — plate keys hold a container of named scans.
 SCHEMA_VERSION = "2.0"
@@ -128,7 +135,10 @@ class MosaicStore:
 
     def __init__(self, path: Path = _DEFAULT_PATH):
         self._path = Path(path)
-        self._img_dir = self._path.parent / "mosaics"
+        # A test-supplied path keeps its own sibling dir untouched; the
+        # default path uses the already-migrated _DEFAULT_IMG_DIR.
+        self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
+                          else self._path.parent / "mosaics")
         self._data: dict = {"version": "1.0", "mosaics": {}}
         self._load()
 

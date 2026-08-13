@@ -2,26 +2,26 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "__last__",
-  "saved": "2026-07-29T17:10:25",
+  "saved": "2026-08-13T13:52:16",
   "values": {
     "pump": {
       "text": "P1",
       "data": null
     },
-    "extrusion_mod": 8.0,
+    "extrusion_mod": 1.5,
     "top_speed": 1.0,
     "resolution": 30.0,
-    "printz": 0.35,
+    "printz": 0.5,
     "motion_mode": {
-      "text": "Velocity (closed-loop)",
+      "text": "Velocity (closed-loop) \u2014 recommended",
       "data": "velocity"
     },
     "ink": {
-      "text": "Inert GFP",
-      "data": "Inert GFP"
+      "text": "RhoB_LLS",
+      "data": "RhoB_LLS"
     },
     "ink_z": 5.0,
-    "ink_padding": 1.0,
+    "ink_padding": 0.5,
     "ink_prime": true,
     "ink_prime_uL": 2.0,
     "orbit_granular": true,
@@ -29,11 +29,11 @@
     "orbit_dia": 1.0,
     "orbit_speed": 2.0,
     "prep": true,
-    "service_z": 1.5,
+    "service_z": 0.5,
     "service_z__ovr": false,
     "buffer_needles": 0.2,
     "buffer_needles__ovr": true,
-    "wash_cycles": 10,
+    "wash_cycles": 3,
     "wash_cycles__ovr": false,
     "line_retract": 0.8,
     "line_z_speed": 80.0,
@@ -42,7 +42,7 @@
     "postclean_margin": 0.5,
     "travel_speed": 6.0,
     "preflow": 5.0,
-    "g_settle": 5.0,
+    "g_settle": 1.0,
     "__extra__": {
       "ink_map_last": {}
     }

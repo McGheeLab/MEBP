@@ -878,7 +878,11 @@ class CameraFeedView(QWidget):
             cls = (VideoRecordingSettingsDialog if kind == "video"
                    else ImageCaptureSettingsDialog)
             dlg = cls(get_settings(), self._manager, self._cam_idx, parent=self)
-            dlg.exec()
+            # Freshly built per open, so it must be released — otherwise every
+            # visit leaves a copy parented to this live feed forever. See
+            # gui.widgets.components.exec_dialog.
+            from gui.widgets.components import exec_dialog
+            exec_dialog(dlg)
         except Exception as exc:
             logger.warning(f"capture settings unavailable: {exc}")
 

@@ -36,9 +36,11 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/mosaic_alignment.json")
+_DEFAULT_PATH = resolve_machine_path("mosaic_alignment.json")
 
 
 class MosaicAlignmentStore:

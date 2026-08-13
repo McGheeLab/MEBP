@@ -53,6 +53,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -62,8 +64,10 @@ except ImportError:   # pragma: no cover - cv2 always present in this project
     cv2 = None
     _CV2 = False
 
-_DEFAULT_PATH = Path("config/hardware/spheroid_training.json")
+_DEFAULT_PATH = resolve_machine_path("spheroid_training.json")
 _IMG_SUBDIR = "spheroid_training"
+# Migrated at import time (see MosaicStore.py's _DEFAULT_IMG_DIR comment).
+_DEFAULT_IMG_DIR = resolve_machine_path(_IMG_SUBDIR)
 
 # A backstop, not a policy: the corpus is meant to grow, but a stuck loop must
 # not fill the disk. Oldest samples are trimmed (and their PNGs unlinked).
@@ -237,7 +241,8 @@ class SpheroidTrainingStore:
             path = (Path(env) / "spheroid_training.json" if env
                     else _DEFAULT_PATH)
         self._path = Path(path)
-        self._img_dir = self._path.parent / _IMG_SUBDIR
+        self._img_dir = (_DEFAULT_IMG_DIR if self._path == _DEFAULT_PATH
+                          else self._path.parent / _IMG_SUBDIR)
         self._max_samples = max(1, int(max_samples))
         self._data: dict = {"version": "1.0", "samples": []}
         self._load()

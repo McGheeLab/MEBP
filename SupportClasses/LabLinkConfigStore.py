@@ -40,6 +40,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_FILENAME = "lablink.json"
@@ -68,7 +70,7 @@ def _default_path() -> Path:
     d = os.environ.get(ENV_CONFIG_DIR)
     if d:
         return Path(d) / _DEFAULT_FILENAME
-    return Path(__file__).resolve().parent.parent / "config" / "hardware" / _DEFAULT_FILENAME
+    return resolve_machine_path(_DEFAULT_FILENAME)
 
 
 def _blank_source() -> dict:

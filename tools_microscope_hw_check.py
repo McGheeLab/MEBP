@@ -23,6 +23,13 @@ restored. **Lower the stage / remove the sample before using ``--focus``.**
 On a real backend this uses your saved configuration (driver, ProgID,
 ``z_units_per_um``, Micro-Manager config, slot names) and does **not** modify
 your slot assignments. On ``simulated`` it uses a throwaway store.
+
+Also runs the **optics write-support check** (always; READ-ONLY, writes
+nothing): it answers whether the body's own optics database — the thing that
+drives its physical LCD readout — declares its name fields as settable at all,
+or whether that display is purely hardware-sensed (a coded objective/cube).
+See ``MicroscopeBackend.probe_optic_write_support`` for why it must NOT settle
+that by writing a value back to itself.
 """
 
 from __future__ import annotations
@@ -125,6 +132,44 @@ def main() -> int:
         print("\nDIAGNOSTICS")
         for line in ctrl.diagnostics().splitlines():
             print(f"  {line}")
+
+        # ── Optics write-support check — READ-ONLY (inspects the driver's own
+        #    type information; writes nothing — see
+        #    MicroscopeBackend.probe_optic_write_support for why it must not
+        #    settle this by writing a value back to itself). Answers whether an
+        #    operator-typed cube/objective name could ever be pushed to the
+        #    body's own display, or whether that display is driven entirely by
+        #    a hardware-sensed Code (a coded optic's ring/chip). ────────────
+        print("\nOPTICS WRITE-SUPPORT CHECK (read-only)")
+        op = ctrl.probe_optic_write_support()
+        ctrl.wait_idle(timeout=15.0)
+        if op.error:
+            r.note(f"check failed: {op.error}")
+        else:
+            support = ctrl.state().optic_write_support
+            if not support:
+                r.note("no result — no optics enumerable, or this driver has "
+                       "no notion of an optics database")
+            else:
+                verdicts = []
+                for logical, fields in support.items():
+                    for name, verdict in sorted(fields.items()):
+                        verdicts.append(verdict)
+                        r.note(f"{logical}.{name}: "
+                               + {True: "WRITABLE (declares a setter)",
+                                  False: "read-only (no setter)"}.get(
+                                      verdict, "undeterminable"))
+                if True in verdicts:
+                    r.note("=> a rename MAY be pushable — confirm one real "
+                           "rename changes the body's display AND survives a "
+                           "reconnect before relying on it")
+                elif False in verdicts:
+                    r.note("=> this body's optics names cannot be set from "
+                           "software; the display is driven by a "
+                           "hardware-sensed Code")
+                else:
+                    r.note("=> undeterminable from type info; ask before "
+                           "attempting a real write")
 
         # ── Filter cubes ───────────────────────────────────────────
         print("\nFILTER CUBES — track and switch")

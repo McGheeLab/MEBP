@@ -78,6 +78,7 @@ from SupportClasses.NeedleTypeStore import (
 from SupportClasses.WellPlate import PLATE_DEFINITIONS, WellPlate
 from SupportClasses.CameraRotationTracker import (  # v7.10
     nearest_nominal, nearest_square_rotation, wrap_deg)
+from SupportClasses.MachineConfig import shared_config_dir
 from gui.styles import COLORS, SECTION_TITLE_STYLE
 from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
@@ -86,8 +87,11 @@ from gui.widgets.components import StatusBadge  # v7.4.x rev3 polish
 
 logger = logging.getLogger(__name__)
 
-# v7.2.4: Default directory for hardware config files
-CONFIG_HARDWARE_DIR = Path(__file__).resolve().parent.parent.parent / "config" / "hardware"
+# v7.2.4: Default directory for hardware config files. These are the
+# swappable *Setup*.json hardware configs (needle/pump/ink/plate choices) —
+# explicitly meant to travel between rigs (see .gitignore's header comment),
+# so this resolves to the shared/portable folder, not a per-machine one.
+CONFIG_HARDWARE_DIR = shared_config_dir()
 
 # v7.3.0: Nikon Ti2-U objective magnifications available on the microscope
 NIKON_TI2U_OBJECTIVES = [1.0, 2.0, 4.0, 10.0, 20.0]

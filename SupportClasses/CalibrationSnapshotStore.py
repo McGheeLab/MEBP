@@ -49,9 +49,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/last_calibration.json")
+_DEFAULT_PATH = resolve_machine_path("last_calibration.json")
 
 # Fingerprint dimensions → human label, in the order they're reported.
 _FINGERPRINT_LABELS = {

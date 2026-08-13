@@ -49,9 +49,11 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/plate_focus_datum.json")
+_DEFAULT_PATH = resolve_machine_path("plate_focus_datum.json")
 
 #: Measured |scale| must land this close to 1.000 mm/mm or the calibration is
 #: refused as a bug rather than stored as a constant.

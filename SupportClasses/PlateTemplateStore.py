@@ -42,9 +42,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from SupportClasses.MachineConfig import resolve_machine_path
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path("config/hardware/plate_templates.json")
+_DEFAULT_PATH = resolve_machine_path("plate_templates.json")
 
 
 def make_key(plate_key, camera_identity, objective) -> str:

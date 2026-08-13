@@ -259,6 +259,14 @@ class PlateLevelSurveyWorker(QThread):
         and the resulting plane looks entirely well-formed. So the error is
         checked on every call, and a stale drop ABORTS rather than retries: a
         retry re-queues behind exactly the same backlog.
+
+        v7.18: ``OpticsService.wait_for_op`` is the same decision for callers
+        outside this wizard, and NEW code should use it. This copy is kept because
+        its wording is more specific — the stale case names the two surfaces that
+        actually contend for the body — and delegating would mean re-deriving the
+        case here just to restore that text.
+        ``test_v718_optics_service.TestTheWizardAndTheServiceCannotDrift`` pins
+        that the two never disagree about whether an op succeeded.
         """
         if op is None:
             raise _Abort(f"the microscope refused {what}")
@@ -366,8 +374,34 @@ class PlateLevelSurveyWorker(QThread):
             self.finished_ok.emit(self._state)
 
     def _restore(self, entry_obj, entry_focus) -> str:
-        """Put the body back. Never raises; reports what it could not do."""
+        """Put the body back. Never raises; reports what it could not do.
+
+        ⚠ v7.18 — ORDER MATTERS AND IT WAS BACKWARDS. This restored the objective
+        FIRST and the focus after. The focus drive raises the objective toward the
+        plate and working distance varies enormously (this rig's 4x reports
+        16.4 mm, a 20x about 1 mm), so if the entry objective was the 20x and the
+        run happened to end at a focus height that is legal under a 4x, restoring
+        rotated the 20x in AT THAT HEIGHT — into the plate. Rotation does not move
+        Z, so there is no move to abort: the crash is at the instant of rotation.
+
+        Focus goes to the entry height BEFORE the turret turns. That height was
+        legal for the entry objective (it is where the entry objective was), so it
+        is the one position guaranteed safe for the optic being rotated back in.
+
+        Still exactly ONE focus command, deliberately: re-issuing it after the
+        rotation would add nothing (rotation does not move Z, and ``set_focus_um``
+        clamps against the same soft limits either way) while doubling the moves a
+        caller has to reason about after an abort. The post-rotation step is a
+        read-back CHECK, not a move.
+        """
         problems = []
+        try:
+            if entry_focus is not None:
+                op = self._scope.set_focus_um(float(entry_focus))
+                if getattr(op, "done", None):
+                    op.done.wait(OP_TIMEOUT_S)
+        except Exception:
+            problems.append("the focus drive did not return to its start value")
         try:
             if entry_obj:
                 op = self._scope.set_objective(int(entry_obj))
@@ -375,18 +409,17 @@ class PlateLevelSurveyWorker(QThread):
                     op.done.wait(OP_TIMEOUT_S)
         except Exception:
             problems.append("the objective did not return to its start position")
+        # VERIFY, no move: set_focus_um clamps to the soft limits BEFORE queueing,
+        # so a restore can arrive silently short and the operator must be told.
         try:
             if entry_focus is not None:
-                op = self._scope.set_focus_um(float(entry_focus))
-                if getattr(op, "done", None):
-                    op.done.wait(OP_TIMEOUT_S)
                 back = self._focus_now_um()
                 if back is not None and abs(back - float(entry_focus)) > 5.0:
                     problems.append(
                         f"the focus drive is at {back:.0f} µm and did not return "
                         f"to {float(entry_focus):.0f} µm")
         except Exception:
-            problems.append("the focus drive did not return to its start value")
+            problems.append("the focus drive position could not be confirmed")
         return ("  ⚠ " + "; ".join(problems) +
                 " — check the body before moving the objective.") \
             if problems else ""

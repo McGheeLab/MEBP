@@ -168,8 +168,10 @@ class TestTheRepairedRecordIsSelfConsistent(unittest.TestCase):
 class TestTheOperatorsStoreIsRepaired(unittest.TestCase):
     """Runs against the real file when present — skipped elsewhere."""
 
-    PATH = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "config", "hardware", "plate_mosaics.json")
+    # v7.17.x: mosaics are PER-MACHINE (config/hardware/<machine-id>/) — the
+    # old flat path made this skip forever instead of checking the real store.
+    from SupportClasses.MachineConfig import resolve_machine_path
+    PATH = str(resolve_machine_path("plate_mosaics.json"))
 
     def setUp(self):
         if not os.path.exists(self.PATH):
@@ -182,10 +184,17 @@ class TestTheOperatorsStoreIsRepaired(unittest.TestCase):
               .get("scans", {}).get("s1"))
         if sc is None:
             self.skipTest("this machine has no nest-plastic-24 scan")
+        # The load-bearing half: the v7.9.1 corruption put X max at 212923 µm
+        # on a 116340 µm machine, so these bound the extent to the envelope.
         ext = sc["extent_um"]
         self.assertLess(ext[0], 0.0)          # world-min corner at/below (0,0)
         self.assertLess(ext[2], 130000.0)     # and not off the far side
-        pf = sc["plate_frame"]
+        pf = sc.get("plate_frame")
+        if pf is None:
+            # v7.13 legacy/re-scanned entry: no plate frame, so it cannot
+            # follow a re-teach and the UI flags it "⚠ re-scan to track the
+            # plate". Documented and supported — not a failure of this guard.
+            self.skipTest("this scan carries no plate_frame (pre-v7.13 / re-scanned)")
         back = plate_mm_to_stage_um(
             pf["extent_mm"], pf["anchor_um"], pf["axis_sign"])
         for a, b in zip(ext, back):

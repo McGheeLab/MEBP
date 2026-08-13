@@ -23,6 +23,7 @@ from SupportClasses.TargetTypeStore import (
     METRIC_INTENSITY, METRIC_PERCENTILE, RULE_EVALUATION_IMPLEMENTED,
     STATE_ANY, STATE_NEGATIVE, STATE_POSITIVE, SignatureClause, SignatureRule,
     TargetType, TargetTypeStore, get_store, safe_id, stamp_target_type,
+    _DEFAULT_BUILTIN_DIR,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -555,7 +556,12 @@ class TestEnvOverride(_IsolatedStore):
                 os.environ["MEBP_TARGET_TYPE_DIR"] = prev
 
 
-BUILTIN_DIR = REPO / "config" / "hardware" / "target_types" / "builtin"
+
+# v7.17.x: read the store's own resolved builtin dir (config/hardware/<machine
+# id>/target_types/builtin or .../ME3B_general/target_types/builtin — see
+# SupportClasses/MachineConfig.py) rather than a hardcoded legacy flat path,
+# which the per-machine/shared config split moved out from under.
+BUILTIN_DIR = _DEFAULT_BUILTIN_DIR
 
 
 class TestBundledBuiltins(unittest.TestCase):

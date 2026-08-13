@@ -3886,7 +3886,9 @@ class StageHardwarePanel(QWidget):
             QMessageBox.warning(self, "Load Device Profile",
                                 f"Failed to load {name}: {e}")
             return
+        previous = ""
         if self._settings is not None:
+            previous = (self._settings.get("device_profile.active") or "").strip()
             profile.apply_to_settings(self._settings)
             self._settings.set("device_profile.active", profile.profile_name)
             self._settings.save()
@@ -3903,6 +3905,11 @@ class StageHardwarePanel(QWidget):
             f"Loaded profile: {profile.profile_name}")
         self.settings_applied.emit()
         logger.info(f"Loaded device profile: {profile.profile_name}")
+        # Loading a DIFFERENT profile means "this is another machine", which
+        # re-points every per-machine config folder — but those paths were
+        # resolved at import time, so a restart is required for it to take.
+        if previous and previous != profile.profile_name:
+            self._notify_identity_change(profile.profile_name)
 
     def _persist_active_profile(self) -> bool:
         """v7.4.2: Snapshot current settings into the active profile JSON
@@ -3957,16 +3964,32 @@ class StageHardwarePanel(QWidget):
         logger.info(f"Saved device profile: {name}")
 
     def _save_as_new_profile(self):
-        """Prompt for a name and save a new profile."""
+        """Prompt for a name and save a new profile.
+
+        ⚠ v7.17.x: the profile name IS this machine's identity — it names
+        ``config/hardware/<name>/``, where every per-machine calibration
+        lives (see ``SupportClasses/MachineConfig.py``). So a Save-As is
+        either a RENAME of this rig, in which case the calibration must
+        follow, or a genuinely DIFFERENT machine, in which case it must not.
+        Only the operator knows which, so ask instead of guessing: guessing
+        wrong either strands a taught plate map in a folder nothing reads, or
+        silently hands one rig another rig's calibration.
+        """
+        from SupportClasses import MachineConfig as mc
         name, ok = QInputDialog.getText(
             self, "Save Device Profile As",
-            "Profile name:")
+            "Machine / profile name (this names its calibration folder):")
         if not ok or not name.strip():
             return
         name = name.strip()
+        valid, why = mc.is_valid_machine_name(name)
+        if not valid:
+            QMessageBox.warning(self, "Save Device Profile As", why)
+            return
         self._apply()  # Snapshot current widget values to Settings
         if self._settings is None:
             return
+        previous = (self._settings.get("device_profile.active") or "").strip()
         profile = DeviceProfile.from_settings(self._settings, name=name)
         try:
             path = profile.save()  # Default location in DEVICES_DIR
@@ -3974,14 +3997,64 @@ class StageHardwarePanel(QWidget):
             QMessageBox.warning(self, "Save Device Profile",
                                 f"Failed to save {name}: {e}")
             return
+        self._maybe_move_machine_folder(previous, name)
         self._settings.set("device_profile.active", name)
         self._settings.save()
+        self._notify_identity_change(name)
         self._refresh_profile_list()
         idx = self.cmb_profile.findText(name)
         if idx >= 0:
             self.cmb_profile.setCurrentIndex(idx)
         self.lbl_profile_status.setText(f"Saved new profile: {name}")
         logger.info(f"Saved new device profile {name} → {path}")
+
+    def _maybe_move_machine_folder(self, previous: str, new: str) -> None:
+        """Offer to carry this machine's calibration to a renamed profile.
+
+        Only asked when it is actually ambiguous: the old folder exists and
+        the new one does not. If the new name already has a folder, the
+        operator is switching back to a machine that already has calibration
+        — nothing to move, and merging would be a guess.
+        """
+        from SupportClasses import MachineConfig as mc
+        if not previous or previous == new:
+            return
+        src, dst = mc.HARDWARE_ROOT / previous, mc.HARDWARE_ROOT / new
+        if not src.is_dir() or dst.exists():
+            return
+        reply = QMessageBox.question(
+            self, "Is this the same machine?",
+            f"'{previous}' has a calibration folder "
+            f"(taught plate map, camera calibration, mosaics …).\n\n"
+            f"Yes — this is the SAME machine being renamed to '{new}': move "
+            f"its calibration across.\n\n"
+            f"No — '{new}' is a DIFFERENT machine: start it with fresh "
+            f"calibration and leave '{previous}' untouched.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            if mc.rename_machine_folder(previous, new):
+                logger.info(f"Machine calibration moved {previous} → {new}")
+            else:
+                QMessageBox.warning(
+                    self, "Could not move calibration",
+                    f"'{previous}' could not be moved to '{new}' — see the log. "
+                    f"Nothing was deleted; move the folder by hand if needed.")
+
+    def _notify_identity_change(self, name: str) -> None:
+        """Tell the operator a restart is needed to re-point the config folder.
+
+        Every per-machine store resolves its path once, at module-import
+        time, so switching identity mid-session leaves them reading the
+        PREVIOUS machine's folder. Saying nothing would look like the new
+        machine had inherited the old one's calibration.
+        """
+        QMessageBox.information(
+            self, "Machine identity changed",
+            f"This machine is now '{name}'.\n\n"
+            f"Its calibration lives in config/hardware/{name}/.\n\n"
+            f"Restart MEBP so every calibration store reads from there — "
+            f"until you do, they are still using the previous machine's "
+            f"folder.")
 
     def _delete_selected_profile(self):
         """Confirm + delete the selected profile."""
