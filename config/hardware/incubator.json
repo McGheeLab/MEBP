@@ -1,0 +1,23 @@
+{
+  "transport": "shared",
+  "dedicated_port": "",
+  "dedicated_baud": 38400,
+  "sim_time_scale": 300,
+  "max_setpoint_c": 50.0,
+  "ramp_step_c": 3.0,
+  "fine_period_s": 60,
+  "log_on_connect": true,
+  "heaters_off_on_app_exit": true,
+  "zones": {
+    "bed": {
+      "label": "",
+      "enabled": true,
+      "preset_c": 37.0
+    },
+    "hotend": {
+      "label": "",
+      "enabled": false,
+      "preset_c": 37.0
+    }
+  }
+}
