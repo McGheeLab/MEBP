@@ -6,11 +6,11 @@
   "safety_limits": {
     "xy_min_x": 0.0,
     "xy_min_y": 0.0,
-    "xy_max_x": 116596.0,
-    "xy_max_y": 74505.0,
-    "z_min": -7.100000000000001,
-    "z_max": 52.9,
-    "p1_min": -30.0,
+    "xy_max_x": 116604.0,
+    "xy_max_y": 74509.0,
+    "z_min": -17.06,
+    "z_max": 32.94,
+    "p1_min": -34.0,
     "p1_max": 0.0,
     "p2_min": 0.0,
     "p2_max": 30.0,
@@ -22,7 +22,7 @@
     "enabled": true,
     "max_pump_feedrate_p2": 100.0,
     "max_pump_feedrate_p3": 100.0,
-    "max_pump_feedrate_p1": 100.0
+    "max_pump_feedrate_p1": 35.0
   },
   "zp_stage": {
     "last_port": "COM4",
@@ -73,17 +73,22 @@
   "xy_max_speed_um_s": null,
   "z_up_sign": -1.0,
   "plate_flip_180": null,
-  "needle_cam_z": null,
+  "needle_cam_z": 35.849999999999994,
   "plate_z_offsets": {},
-  "needle_loc_xy_um": null,
+  "needle_loc_xy_um": [
+    10547.0,
+    38377.0
+  ],
   "pump_setup": {
     "P1": {
       "raw_dispensed": 0.0,
-      "raw_aspirated": -30.0,
+      "raw_aspirated": -34.0,
       "aspirate_sign": -1.0,
-      "capacity_uL": 100.0
+      "capacity_uL": 113.33333333333334
     }
   },
-  "pump_compliance_uL": {},
-  "backlash_comp_enabled": null
+  "pump_compliance_uL": {
+    "P1": 0.4
+  },
+  "backlash_comp_enabled": true
 }

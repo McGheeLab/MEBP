@@ -1692,6 +1692,50 @@ class MosaicBuilder:
             f"max per-tile correction {max_corr:.1f}px")
         return self.composite, len(edges), max_corr
 
+    def apply_registration_from(self, reference) -> bool:
+        """Adopt ``reference``'s solved tile positions and global shift.
+
+        v7.19 — the reason tile-major multi-channel acquisition is worth its
+        cost. Registering each channel INDEPENDENTLY would give every channel
+        its own solved positions and its own global shift, so the channels
+        would not overlay each other any better than they do when captured
+        minutes apart. Solving once on a reference channel and replaying it
+        here is what puts them in register.
+
+        Safe because the channels share everything the solve depends on: one
+        raster grid, one field of view and one mosaic scale, all frozen once
+        per run — so tile ``i`` covers the same ground in every channel and the
+        ``(tw, th)`` boxes are identical. Refuses (returns False, changing
+        nothing) if the tile counts disagree, which is the only way that
+        assumption could be violated.
+
+        Deliberately public: the workflow must not reach into
+        ``_reblend_at_positions``.
+        """
+        opt = getattr(reference, "_optimized_positions", None)
+        if opt is None:
+            # The reference's own solve was a no-op (too few confident
+            # overlaps). Nothing to share — both keep the trusted open-loop
+            # stage placement, which is the correct degradation.
+            self._global_shift_um = getattr(reference, "_global_shift_um",
+                                            self._global_shift_um)
+            return False
+        mine = getattr(self, "_reorient_tiles", None)
+        if not mine or len(mine) != len(opt):
+            logger.warning(
+                "Mosaic registration not shared: %d tiles here vs %d solved — "
+                "this channel keeps its own stage placement.",
+                len(mine or []), len(opt))
+            return False
+        self._reblend_at_positions(opt)
+        self._optimized_positions = opt
+        # The global shift is applied to the EXTENT, not the pixels, so it must
+        # travel with the positions or the channels would be offset in world
+        # coordinates even though their pixels line up.
+        self._global_shift_um = getattr(reference, "_global_shift_um",
+                                        self._global_shift_um)
+        return True
+
     def _reblend_at_positions(self, positions) -> np.ndarray | None:
         """Re-blend every retained canvas-res tile at the given (N, 2) top-left
         pixel positions. Shares the zero-then-accumulate pattern with

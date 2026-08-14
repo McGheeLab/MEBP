@@ -160,7 +160,14 @@ class Card(QFrame):
                 self._toggle_btn.clicked.connect(self._on_toggle)
                 header.addWidget(self._toggle_btn)
 
+            #: v7.21: kept so controls can be added to the header AFTER
+            #: construction (SectionStack's ▲▼, the settings popout's promote
+            #: checkbox). Without it a caller's only option is the body, where a
+            #: control reads as content rather than as a control on the card.
+            self._header_layout = header
             outer.addLayout(header)
+        else:
+            self._header_layout = None
 
         self._body = QWidget(self)
         self._body_layout = QVBoxLayout(self._body)
@@ -180,6 +187,38 @@ class Card(QFrame):
     def title(self) -> str:
         """The card's heading, or "" when it was built without one."""
         return self._title_label.text() if self._title_label is not None else ""
+
+    def set_title(self, text: str) -> None:
+        """Re-label the card. No-op on a card built without a title, since there
+        is no header row to put one in."""
+        if self._title_label is not None:
+            self._title_label.setText(str(text))
+
+    def has_header(self) -> bool:
+        """True when this card was built with a title, and therefore has a header
+        row that can carry controls. A card without one is not broken — callers
+        that need an affordance must supply their own strip."""
+        return getattr(self, "_header_layout", None) is not None
+
+    def add_header_widget(self, w: QWidget, *, before_toggle: bool = True):
+        """v7.21: put a control in the card's header row, right-aligned.
+
+        Returns ``w``, or ``None`` when the card has no header (see
+        :meth:`has_header`) — in which case ``w`` is left untouched and
+        unparented rather than being silently dropped into the body, where it
+        would read as content.
+
+        ``before_toggle`` keeps the collapse chevron the RIGHTMOST control, so
+        its position does not shift as callers add or remove their own buttons.
+        """
+        header = getattr(self, "_header_layout", None)
+        if header is None:
+            return None
+        if before_toggle and self._toggle_btn is not None:
+            header.insertWidget(header.count() - 1, w)
+        else:
+            header.addWidget(w)
+        return w
 
     def set_collapsed(self, collapsed: bool):
         if not self._collapsible:

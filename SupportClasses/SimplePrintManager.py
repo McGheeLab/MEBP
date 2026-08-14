@@ -184,8 +184,19 @@ class SimplePrintManager:
             hop_z = p.get("hop_z", None)
             self._safe_retract(float(hop_z) if hop_z is not None
                                else settings.travel_z_height)
-            self._confirmed_xy(p.get("x", 0.0), p.get("y", 0.0),
-                               getattr(settings, "travel_speed_mm_s", 10.0))
+            # v7.20 CRITICAL SAFETY: the NEXT command in a well-plate plan is
+            # MOVE_Z — the descent. Continuing with XY unconfirmed lowers the
+            # needle at an unverified position and breaks it against the plate.
+            # Raise so _execute_loop's finally retracts to safe Z; the needle is
+            # still retracted here, so this stops in the safe state.
+            if not self._confirmed_xy(
+                    p.get("x", 0.0), p.get("y", 0.0),
+                    getattr(settings, "travel_speed_mm_s", 10.0)):
+                raise RuntimeError(
+                    f"XY move to ({float(p.get('x', 0.0)):.3f}, "
+                    f"{float(p.get('y', 0.0)):.3f}) mm not confirmed — aborting "
+                    "before the Z descent rather than lowering the needle at an "
+                    "unverified position")
             return
 
         if t == CommandType.MOVE_Z:
@@ -250,14 +261,24 @@ class SimplePrintManager:
                                            timeout_s=self._Z_TIMEOUT_S)
         return True
 
-    def _confirmed_xy(self, x_mm: float, y_mm: float, speed_mm_s: float):
-        """Move XY (zero-ref mm) and block until arrival."""
+    def _confirmed_xy(self, x_mm: float, y_mm: float,
+                      speed_mm_s: float) -> bool:
+        """Move XY (zero-ref mm) and block until arrival. Returns confirmation.
+
+        v7.20: this method is *named* ``_confirmed_xy`` and this class's whole
+        premise is "every move blocks until verified" — but the arrival result
+        was DISCARDED, so MOVE_XY handed off to MOVE_Z's descent with the stage
+        position unverified. Returning the verdict is what makes the name true.
+        A controller without the waiter returns True (nothing to confirm
+        against), matching the pre-existing ``hasattr`` guard.
+        """
         ctrl = self.controller
         self._set_xy_speed(speed_mm_s)
         ctrl.move_xy_absolute(x_mm, y_mm, from_zero_ref=True)
         if hasattr(ctrl, "wait_for_xy_arrival"):
-            ctrl.wait_for_xy_arrival(x_mm, y_mm, tolerance_mm=0.5,
-                                     timeout_s=self._XY_TIMEOUT_S)
+            return bool(ctrl.wait_for_xy_arrival(
+                x_mm, y_mm, tolerance_mm=0.5, timeout_s=self._XY_TIMEOUT_S))
+        return True
 
     def _set_xy_speed(self, speed_mm_s: float):
         ctrl = self.controller

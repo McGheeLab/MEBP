@@ -84,6 +84,9 @@ from gui.scaling import s, sf, sp, scaled_font_size
 from gui.pages.mode_page import ModePage  # v7.4.0-b
 from gui.widgets.icons import icon, icon_button
 from gui.widgets.components import StatusBadge  # v7.4.x rev3 polish
+# v7.19: the ordered applier lives beside the persisted key list so the restore
+# path and the fluorescence workflow's preset cannot apply them differently.
+from gui.widgets.hw_controls_snapshot import apply_hw_controls
 
 logger = logging.getLogger(__name__)
 
@@ -4586,80 +4589,27 @@ class HardwareSetupPage(ModePage):
             logger.debug(f"log_hw_settings failed: {exc}")
 
     def _apply_hw_controls(self, cam_idx: int, hw: dict):
-        """Push a persisted hardware-control set onto a running camera."""
+        """Push a persisted hardware-control set onto a running camera.
+
+        v7.19: the ordering rules moved to ``hw_controls_snapshot`` beside the
+        persisted key list, because the fluorescence workflow now applies and
+        restores the same keys and a second hand-written applier would drift
+        from this one exactly as the two key lists once did. Only the
+        microscope-resolution decision stays here — it needs the page's config.
+        """
         mgr = getattr(self, "_camera_manager", None)
         if mgr is None or not isinstance(hw, dict):
             return
-        auto = hw.get("auto_exposure")
-        # Only drive auto-exposure when we have a CLEAN boolean. OpenCV/DShow
-        # cameras often report a raw CAP_PROP value (e.g. -1.0) or nothing for
-        # auto-exposure; coercing that via bool() would wrongly force auto ON,
-        # so ignore non-bool values rather than guess.
-        if isinstance(auto, bool):
-            mgr.set_hw_auto_exposure(cam_idx, auto)
-        res = hw.get("resolution")
-        if res:
-            # v7.5.x: the MICROSCOPE resolution has ONE source of truth
-            # (active_resolution), applied on start — don't let a per-identity
-            # hw_controls resolution compete for it (non-microscope cameras keep
-            # their per-identity resolution).
-            try:
-                is_mic = (cam_idx
-                          == self._config.camera_for_role(CameraRole.MICROSCOPE))
-            except Exception:
-                is_mic = False
-            if not is_mic:
-                try:
-                    mgr.set_capture_resolution(cam_idx, int(res[0]), int(res[1]))
-                except Exception as exc:
-                    logger.debug(f"restore resolution failed: {exc}")
-        # v7.13 — Andor sensor-quality features, BEFORE the exposure restore
-        # (v7.13.x: the achievable exposure range depends on the readout rate
-        # and gain mode, so the saved exposure must be applied against the
-        # constraint set it was saved UNDER, not the open-time defaults) and
-        # BEFORE the display-scaling block (the manual black/white levels are
-        # raw counts whose meaning depends on the bit depth the gain mode
-        # selects, so the stored levels must be the LAST thing applied).
-        # Within this block: gain mode first (it constrains bit depth and the
-        # legal readout rates), then readout rate, then the booleans.
-        if hasattr(mgr, "set_hw_andor_feature"):
-            if isinstance(hw.get("andor_gain_mode"), str):
-                mgr.set_hw_andor_feature(cam_idx, "andor_gain_mode",
-                                         hw["andor_gain_mode"])
-            if isinstance(hw.get("andor_readout_rate"), str):
-                mgr.set_hw_andor_feature(cam_idx, "andor_readout_rate",
-                                         hw["andor_readout_rate"])
-            for key in ("andor_sensor_cooling", "andor_noise_filter",
-                        "andor_blemish_correction"):
-                if isinstance(hw.get(key), bool):
-                    mgr.set_hw_andor_feature(cam_idx, key, hw[key])
-        # Restore manual exposure/gain UNLESS auto-exposure is explicitly on.
-        # (When auto is unknown/None — e.g. an OpenCV cam — we still restore the
-        # saved exposure so "reload exactly" holds; there's no auto state to
-        # clobber. Previously `if not auto:` skipped restore only when auto was
-        # truthy, which was correct, but `auto is not True` is clearer + robust
-        # to the non-bool values now filtered above.)
-        if auto is not True:
-            if hw.get("exposure_us") is not None:
-                mgr.set_hw_exposure_us(cam_idx, hw["exposure_us"])
-            if hw.get("exposure_gain_pct") is not None:
-                mgr.set_hw_exposure_gain(cam_idx, hw["exposure_gain_pct"])
-        if hw.get("gamma") is not None:
-            mgr.set_hw_gamma(cam_idx, hw["gamma"])
-        if hw.get("brightness") is not None:
-            mgr.set_hw_brightness(cam_idx, hw["brightness"])
-        if hw.get("contrast") is not None:
-            mgr.set_hw_contrast(cam_idx, hw["contrast"])
-        # Andor (Zyla) display scaling. Auto flag FIRST — turning auto off
-        # seeds the levels from the last auto frame, so the stored manual
-        # levels must be applied after it to win.
-        ascale = hw.get("andor_auto_scale")
-        if isinstance(ascale, bool) and hasattr(mgr, "set_hw_andor_auto_scale"):
-            mgr.set_hw_andor_auto_scale(cam_idx, ascale)
-        if hw.get("andor_scale_lo") is not None and hasattr(mgr, "set_hw_andor_scale_lo"):
-            mgr.set_hw_andor_scale_lo(cam_idx, hw["andor_scale_lo"])
-        if hw.get("andor_scale_hi") is not None and hasattr(mgr, "set_hw_andor_scale_hi"):
-            mgr.set_hw_andor_scale_hi(cam_idx, hw["andor_scale_hi"])
+        # v7.5.x: the MICROSCOPE resolution has ONE source of truth
+        # (active_resolution), applied on start — don't let a per-identity
+        # hw_controls resolution compete for it (non-microscope cameras keep
+        # their per-identity resolution).
+        try:
+            is_mic = (cam_idx
+                      == self._config.camera_for_role(CameraRole.MICROSCOPE))
+        except Exception:
+            is_mic = False
+        apply_hw_controls(mgr, cam_idx, hw, skip_resolution=is_mic)
 
     def _on_calibrate_slot_rotation(self, cam_idx: int):
         """v7.5.x: measure THIS slot's camera rotation relative to the stage.

@@ -46,6 +46,10 @@ class WellPlateNavigator(QWidget):
     """
 
     well_clicked = Signal(str)
+    #: v7.19: the multi-selection changed. Payload is in PLATE order, so a
+    #: readout or a tooltip built from it is stable across repaints. Only ever
+    #: emitted while :meth:`set_multi_select_enabled` is on.
+    selection_changed = Signal(list)
 
     # Colours (Catppuccin Mocha palette)
     _CLR_BG = QColor("#11111b")
@@ -62,10 +66,25 @@ class WellPlateNavigator(QWidget):
     _CLR_TEXT = QColor("#cdd6f4")
     _CLR_LABEL = QColor("#6c7086")
 
+    # v7.19 print-queue overlay. Teal / mauve / red collide with none of the four
+    # state hues above (green calibrated · yellow approximate · blue current ·
+    # orange hover) and stay distinguishable at the radius floor below.
+    _CLR_QUEUE_PATH = QColor("#94e2d5")        # a queued toolpath
+    _CLR_QUEUE_FILL = QColor("#94e2d51f")      # ~12 % teal wash on a queued well
+    _CLR_QUEUE_BORDER = QColor("#94e2d5")
+    _CLR_QUEUE_BAD = QColor("#f38ba8")         # queued but NOT runnable
+    _CLR_SELECTED = QColor("#cba6f7")          # in the multi-selection
+
     # v7.12: floor so a small well on a mixed-diameter plate (a 5.5 mm rosette
     # bore beside a 28 mm insert) stays visible and clickable in this widget,
     # which is often only ~200 px wide.
     _MIN_WELL_RADIUS_PX = 4.0
+
+    # v7.19: below this radius a toolpath glyph becomes a filled centre dot. A
+    # few-pixel scribble carries no shape (on a 384 plate the well is at the
+    # floor above) and costs thousands of lineTo calls per well; a dot still says
+    # "something is queued here", which is the only readable fact left.
+    _GLYPH_MIN_R_PX = 6.0
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -83,6 +102,19 @@ class WellPlateNavigator(QWidget):
         # show the planned single-well raster coverage. 0,0 = off.
         self._raster_cols = 0
         self._raster_rows = 0
+        # v7.19: per-well toolpath glyphs, {well: (paths, colour|None, ok)}.
+        # Empty = this widget paints EXACTLY what it painted before v7.19, which
+        # is what keeps the Jog page and the Fluorescence Mosaic page unchanged.
+        self._well_paths: dict[str, tuple] = {}
+        # v7.19: opt-in multi-selection, OFF by default (see
+        # set_multi_select_enabled for why that default is load-bearing).
+        self._multi_enabled = False
+        self._selected_wells: set[str] = set()
+        self._sel_anchor: str | None = None      # Shift-range anchor
+        self._brush_active = False
+        self._brush_additive = False
+        self._brush_base: set[str] = set()
+        self._brush_touched: set[str] = set()
 
         self.setMinimumSize(s(160), s(100))
         self.setMouseTracking(True)
@@ -104,6 +136,12 @@ class WellPlateNavigator(QWidget):
             else self._resolve_footprint(plate)
         self._hover_well = None
         self._current_well = None
+        # v7.19: a new plate renames or removes every well, so anything keyed by
+        # well name is stale. The owning page re-pushes what still applies (see
+        # QuickPrintWorkflowPage.set_calibration_data).
+        self._well_paths = {}
+        self._selected_wells = set()
+        self._sel_anchor = None
         self.update()
 
     @staticmethod
@@ -166,6 +204,158 @@ class WellPlateNavigator(QWidget):
             self._raster_cols = cols
             self._raster_rows = rows
             self.update()
+
+    # ── v7.19: per-well toolpath glyphs ────────────────────────────
+
+    def set_well_paths(self, overlays) -> None:
+        """Draw a small toolpath glyph inside named wells.
+
+        *overlays* maps well name → ``(paths, colour_hex_or_None, ok)``:
+
+          ``paths``   ``[[(x_mm, y_mm), …], …]`` in **WELL-RELATIVE mm** — one
+                      polyline per contiguous print run, i.e. exactly the shape
+                      ``QuickPrintWorkflowPage._path_segments_for_selection``
+                      already returns, so no caller converts anything.
+          ``colour``  hex string, or None for the default teal.
+          ``ok``      False renders it as queued-but-NOT-runnable (dashed red).
+
+        A 2-tuple ``(paths, colour)`` and a bare list of polylines are both
+        accepted, so a caller holding nothing but geometry needs no tuple.
+
+        ``None`` / ``{}`` clears it, and this widget then paints EXACTLY what it
+        painted before this method existed — the Fluorescence Mosaic page never
+        calls it and must stay pixel-identical.
+
+        Unlike :meth:`set_raster_grid` this is keyed on the CALLER'S well names,
+        never on ``_current_well``: a raster preview is a single-well thing, a
+        print queue is a plate-wide one.
+        """
+        norm = self._normalise_overlays(overlays)
+        # Change gate, as set_current_well / set_raster_grid already model: the
+        # owning page pushes this on every debounced widget edit, and a repaint
+        # per keystroke on a 384-well plate is a real cost.
+        if norm != self._well_paths:
+            self._well_paths = norm
+            self.update()
+
+    @staticmethod
+    def _normalise_overlays(overlays) -> dict:
+        """Coerce whatever a caller passed into ``{well: (paths, colour, ok)}``.
+
+        Total on purpose: this feeds ``paintEvent``, which must never raise, so a
+        malformed entry is dropped rather than allowed to reach the painter.
+        """
+        if not overlays or not isinstance(overlays, dict):
+            return {}
+        out: dict[str, tuple] = {}
+        for name, value in overlays.items():
+            if not isinstance(name, str) or not name:
+                continue
+            colour, ok = None, True
+            if isinstance(value, tuple):
+                if len(value) >= 3:
+                    paths, colour, ok = value[0], value[1], bool(value[2])
+                elif len(value) == 2:
+                    paths, colour = value[0], value[1]
+                elif len(value) == 1:
+                    paths = value[0]
+                else:
+                    continue
+            else:
+                paths = value
+            clean: list[list[tuple[float, float]]] = []
+            if isinstance(paths, (list, tuple)):
+                for poly in paths:
+                    if not isinstance(poly, (list, tuple)):
+                        continue
+                    pts = []
+                    for pt in poly:
+                        try:
+                            px, py = pt[0], pt[1]
+                            pts.append((float(px), float(py)))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    if len(pts) >= 2:
+                        clean.append(pts)
+            if clean or not ok:
+                out[name] = (clean, colour if isinstance(colour, str) else None,
+                             ok)
+        return out
+
+    # ── v7.19: multi-selection ─────────────────────────────────────
+
+    def set_multi_select_enabled(self, on: bool) -> None:
+        """Turn drag/Ctrl/Shift multi-selection on for this instance.
+
+        **Default OFF, deliberately.** The flag is not a preference — it states
+        that the owning page has somewhere to put a SET of wells. The Jog page's
+        contract is "click a well → fast-travel", and you cannot travel to six
+        wells; the Fluorescence Mosaic page scans exactly one well. Turning this
+        on for them would change what a click means on a page that has no use for
+        the answer, and would make a Ctrl+click silently NOT travel.
+        """
+        on = bool(on)
+        if on == self._multi_enabled:
+            return
+        self._multi_enabled = on
+        if not on:
+            self._selected_wells = set()
+            self._sel_anchor = None
+            self._brush_active = False
+        self.update()
+
+    def multi_select_enabled(self) -> bool:
+        return self._multi_enabled
+
+    def selected_wells(self) -> list[str]:
+        """The multi-selection, in PLATE order (not click order)."""
+        return self._ordered(self._selected_wells)
+
+    def set_selected_wells(self, names) -> None:
+        """Replace the multi-selection. Emits only when it actually changed."""
+        self._set_selection({n for n in (names or []) if isinstance(n, str)})
+
+    def clear_selection(self) -> None:
+        self.set_selected_wells([])
+
+    def _ordered(self, names) -> list[str]:
+        """*names* in plate order; unknown wells sort last, alphabetically."""
+        names = set(names or [])
+        if not names:
+            return []
+        layout = self._well_layout()
+        if layout is None:
+            return sorted(names)
+        order = [w[0] for w in layout["wells"] if w[0] in names]
+        rest = sorted(n for n in names if n not in set(order))
+        return order + rest
+
+    def _set_selection(self, names: set) -> None:
+        if names == self._selected_wells:
+            return          # a re-crossed well must not re-emit mid-drag
+        self._selected_wells = set(names)
+        self.update()
+        self.selection_changed.emit(self._ordered(self._selected_wells))
+
+    def _range_wells(self, a: str, b: str) -> set:
+        """The rectangular row/col span between two wells.
+
+        Only meaningful on a REAL grid: on a parametric plate ``row``/``col`` are
+        a pseudo-grid where a whole ring of wells shares one cell, so a "range"
+        there would select wells that are not in that row at all. Degrades to
+        just *b*, which is what a plain click would have given.
+        """
+        if not self._draw_headers() or self._plate is None:
+            return {b}
+        try:
+            info = {w.name: w for w in self._plate.get_all_wells()}
+            wa, wb = info[a], info[b]
+        except Exception:
+            return {b}
+        r0, r1 = sorted((wa.row, wb.row))
+        c0, c1 = sorted((wa.col, wb.col))
+        return {w.name for w in info.values()
+                if r0 <= w.row <= r1 and c0 <= w.col <= c1}
 
     def update_current_from_position(self, x_um: float, y_um: float):
         """Determine nearest well to stage position and highlight it."""
@@ -310,9 +500,96 @@ class WellPlateNavigator(QWidget):
                 fill = self._CLR_UNCAL
                 border = self._CLR_UNCAL_BORDER
 
-            p.setPen(QPen(border, 1.0))
+            # v7.19: "queued" is a FIFTH fact that co-occurs with the four above
+            # — a well can be calibrated AND queued AND selected AND the one
+            # being edited, and the operator needs all of that at once. So it
+            # gets its own channels: a faint wash over the calibration fill
+            # (painted first, underneath) plus a slightly heavier border. It
+            # never REPLACES the calibration colour, which would hide it.
+            entry = self._well_paths.get(name)
+            border_w = 1.0
+            if entry is not None:
+                p.setPen(QPen(border, 1.0))
+                p.setBrush(QBrush(fill))
+                p.drawEllipse(QPointF(cx, cy), r, r)
+                fill = self._CLR_QUEUE_FILL
+                if name not in (self._hover_well, self._current_well):
+                    border = (self._CLR_QUEUE_BORDER if entry[2]
+                              else self._CLR_QUEUE_BAD)
+                border_w = 1.2 if entry[2] else 1.6
+            if name == self._current_well:
+                # The ACTIVE well is the thickest ring on screen: it is the one
+                # the editor widgets are bound to.
+                border_w = 2.2
+
+            p.setPen(QPen(border, border_w))
             p.setBrush(QBrush(fill))
             p.drawEllipse(QPointF(cx, cy), r, r)
+
+        # v7.19: queued-print toolpath glyphs. CLIPPED to each well circle, so a
+        # print larger than its well cannot bleed onto a neighbour — the clip is
+        # what makes "does it fit?" legible at a glance, and an oversized print
+        # is a real design problem the operator should SEE rather than have the
+        # renderer quietly scale away.
+        if self._well_paths:
+            by_name = {w[0]: w for w in layout["wells"]}
+            for name, (paths, colour, ok) in self._well_paths.items():
+                hit = by_name.get(name)
+                if hit is None:
+                    continue
+                cx, cy = transform.to_px(hit[1], hit[2])
+                r = self._well_radius(layout, hit[3])
+                p.save()
+                pen = QPen(self._CLR_QUEUE_BAD if not ok
+                           else QColor(colour or self._CLR_QUEUE_PATH))
+                pen.setWidthF(max(0.8, s(1.1)))
+                pen.setCosmetic(True)      # 1 device px at any mm→px scale
+                if not ok:
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                p.setPen(pen)
+                p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+
+                if r < self._GLYPH_MIN_R_PX or not paths:
+                    dot = max(1.2, r * 0.35)
+                    p.setBrush(QBrush(pen.color()))
+                    p.drawEllipse(QPointF(cx, cy), dot, dot)
+                    p.restore()
+                    continue
+
+                clip = QPainterPath()
+                clip.addEllipse(QPointF(cx, cy), r, r)
+                p.setClipPath(clip)
+                spilled = False
+                for poly in paths:
+                    path = QPainterPath()
+                    for i, (mx, my) in enumerate(poly):
+                        # WELL-RELATIVE mm → px. **NO Y FLIP.** This widget is a
+                        # plate-local schematic: PlateTransform.to_px puts A1
+                        # top-left with +Y painting DOWN, and these polylines are
+                        # in the same plate-local frame the executor consumes.
+                        # (PrintThumbnail flips Y because it is a standalone
+                        # "Y up" chart with no plate around it. This is not that.)
+                        px_ = cx + float(mx) * transform.scale
+                        py_ = cy + float(my) * transform.scale
+                        if math.hypot(px_ - cx, py_ - cy) > r:
+                            spilled = True
+                        if i == 0:
+                            path.moveTo(px_, py_)
+                        else:
+                            path.lineTo(px_, py_)
+                    p.drawPath(path)
+                p.setClipping(False)
+                if spilled:
+                    # The clip truncated something. Say so, rather than showing a
+                    # print that appears to fit when it does not. ⚠ This is a
+                    # RENDERING fact only: `_well_radius` is floored at
+                    # _MIN_WELL_RADIUS_PX, so a floored r can EXCEED the true
+                    # well radius and a genuinely-spilling print would read as
+                    # fitting. The authoritative fit check is in mm, on the page.
+                    p.setPen(QPen(self._CLR_QUEUE_BAD, max(1.0, s(1.4))))
+                    p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    p.drawEllipse(QPointF(cx, cy), r, r)
+                p.restore()
 
         # v7.5.x: raster-grid preview inside the current well (Fluorescence
         # Mosaic). Drawn last so it sits on top of the well fill, clipped to the
@@ -349,6 +626,23 @@ class WellPlateNavigator(QWidget):
                 p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
                 p.drawEllipse(QPointF(cx, cy), r, r)
                 p.restore()
+
+        # v7.19: the multi-selection, painted LAST as an OUTSET ring. Selection is
+        # orthogonal to calibrated / queued / active, so it must not join the
+        # fill-precedence chain (that would hide one of the others). Outsetting
+        # is what keeps it readable at the _MIN_WELL_RADIUS_PX floor: at r = 4 the
+        # ring lands at 5.5 and never paints over the glyph inside.
+        if self._multi_enabled and self._selected_wells:
+            by_name = {w[0]: w for w in layout["wells"]}
+            p.setPen(QPen(self._CLR_SELECTED, max(1.4, s(1.8))))
+            p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            for name in self._selected_wells:
+                hit = by_name.get(name)
+                if hit is None:
+                    continue
+                cx, cy = transform.to_px(hit[1], hit[2])
+                r = self._well_radius(layout, hit[3]) + max(1.0, s(1.5))
+                p.drawEllipse(QPointF(cx, cy), r, r)
 
         p.end()
 
@@ -395,6 +689,18 @@ class WellPlateNavigator(QWidget):
         if well != self._hover_well:
             self._hover_well = well
             self.update()
+        # v7.19: brush-drag — the pointer paints wells into the selection. The
+        # button test is required because setMouseTracking(True) means this fires
+        # with no button held. A tooltip storm mid-drag is unusable, so it is
+        # suppressed for the duration.
+        if self._brush_active:
+            if well and well not in self._brush_touched:
+                self._brush_touched.add(well)
+                if self._sel_anchor is None:
+                    self._sel_anchor = well
+                self._set_selection(self._brush_base | self._brush_touched)
+            QToolTip.hideText()
+            return
         # Tooltip
         if well and self._well_positions and well in self._well_positions:
             x, y = self._well_positions[well]
@@ -408,13 +714,57 @@ class WellPlateNavigator(QWidget):
             QToolTip.hideText()
 
     def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            well = self._hit_test(event.pos())
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        well = self._hit_test(event.pos())
+        if not self._multi_enabled:
+            # Byte-for-byte the pre-v7.19 body — the Jog page and the
+            # Fluorescence Mosaic page must be unchanged.
             if well:
                 self.well_clicked.emit(well)
                 logger.debug(f"Well plate navigator: clicked {well}")
+            return
+
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        self._brush_active = True
+        self._brush_additive = ctrl or shift
+        self._brush_base = set(self._selected_wells) if self._brush_additive \
+            else set()
+        self._brush_touched = set()
+        if well is None:
+            # A stroke that started on empty space may still cross wells; the
+            # release decides whether it was really "click nothing to clear".
+            self._set_selection(self._brush_base)
+            return
+        if shift and self._sel_anchor:
+            self._brush_touched = self._range_wells(self._sel_anchor, well)
+        else:
+            self._brush_touched = {well}
+            self._sel_anchor = well
+        self._set_selection(self._brush_base | self._brush_touched)
+        # A PLAIN press is still a click, so every existing consumer is unchanged
+        # and the page can make this well the one being edited. Ctrl/Shift do NOT
+        # emit: adding to a selection must not move what the operator is editing.
+        if not self._brush_additive:
+            self.well_clicked.emit(well)
+            logger.debug(f"Well plate navigator: clicked {well}")
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() != Qt.MouseButton.LeftButton or not self._brush_active:
+            return
+        self._brush_active = False
+        if not self._brush_touched and not self._brush_additive:
+            self._set_selection(set())     # a plain click on empty space clears
+        self._brush_base = set()
+        self._brush_touched = set()
 
     def leaveEvent(self, event):
+        # v7.19: deliberately does NOT cancel a brush-drag. The mouse is grabbed
+        # for the duration of a drag, so moves keep arriving after the pointer
+        # leaves the widget; cancelling here would drop wells the operator is
+        # still selecting whenever they overshoot an edge.
         if self._hover_well is not None:
             self._hover_well = None
             self.update()

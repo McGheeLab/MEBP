@@ -973,6 +973,16 @@ class CameraManager(QObject):
         cam = self._widget(cam_idx)
         return bool(cam and cam.set_hw_auto_exposure(enabled))
 
+    def set_hw_auto_levels(self, cam_idx: int, enabled: bool) -> bool:
+        """v7.19 — the camera's HARDWARE auto black/white levels (Tucsen only).
+
+        Not the same channel as ``set_hw_andor_auto_scale``: that one is the
+        software mono16→8-bit DISPLAY mapping, this one moves the sensor's own
+        levels and changes captured pixel values.
+        """
+        cam = self._widget(cam_idx)
+        return bool(cam and cam.set_hw_auto_levels(enabled))
+
     def set_hw_exposure_us(self, cam_idx: int, microseconds) -> bool:
         cam = self._widget(cam_idx)
         return bool(cam and cam.set_hw_exposure_us(microseconds))

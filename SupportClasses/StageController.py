@@ -5511,6 +5511,25 @@ class StageController:
         if p is not None:
             p.resume()
 
+    def is_position_poller_suspended(self) -> bool:
+        """v7.19: True while some sequence has the position poller suspended.
+
+        Read as a cheap PROXY for "another workflow is currently driving the
+        stage" — every long programmatic sequence in this app (a print's
+        PRINT_PATH, a mosaic scan, ``safe_travel_to``) suspends the poller for
+        its duration, so the flag being set means one of them is in flight.
+        Quick Print's held print queue uses it to refuse a Resume that would put
+        a second driver on the serial channel: ``_stage_busy()`` is a per-PAGE
+        guard, so a workflow cannot otherwise see what another page is doing.
+
+        ⚠ A proxy, NOT a lease. It catches a running scan or print; it does not
+        catch a manual jog, and it cannot say WHICH workflow is driving. A
+        process-wide stage lease is the real fix. Guarded (returns False when
+        there is no poller) so a mock/headless controller reads as idle.
+        """
+        p = getattr(self, "_pos_poller", None)
+        return bool(getattr(p, "_suspended", False)) if p is not None else False
+
     def suspend_zp_watchdog(self) -> None:
         """v7.5.x: pause the ZP port-health watchdog for the duration of a dense
         write burst (PRINT_PATH). The watchdog reads ``serial.in_waiting``
@@ -5687,9 +5706,26 @@ class StageController:
                 if not self.wait_for_xy_arrival(target_x_mm, target_y_mm,
                                                 tolerance_mm=0.5,
                                                 timeout_s=xy_timeout_s):
-                    logger.warning("safe_travel_to: XY arrival timed out — "
-                                   "proceeding with Z descent anyway")
-                    ok = False
+                    # v7.20 CRITICAL SAFETY — this used to log
+                    # "proceeding with Z descent anyway" and then LOWER THE
+                    # NEEDLE at an unverified position. That is a broken needle
+                    # against the plate or a well wall, and it is the documented
+                    # bench failure this guard exists to prevent.
+                    #
+                    # Note the asymmetry it removes: step 1 already ABORTS when
+                    # the Z RETRACT cannot be confirmed. An unconfirmed XY
+                    # arrival is no less dangerous — it is the difference
+                    # between descending into a well and descending into its
+                    # rim — so it now fails closed the same way. The needle is
+                    # left RETRACTED at the safe height, which is the recoverable
+                    # outcome; the caller sees False.
+                    logger.error(
+                        "safe_travel_to: XY arrival NOT confirmed "
+                        "(target=%.3f, %.3f mm) — ABORTING before the Z "
+                        "descent; leaving the needle retracted at the safe "
+                        "height rather than lowering it at an unverified "
+                        "position", target_x_mm, target_y_mm)
+                    return False
 
             # Step 3: Lower Z to target and WAIT. v7.5.x: the descent's FINAL
             # _descend_slow_dist_mm runs slowly (gentle, controlled re-entry

@@ -2310,10 +2310,21 @@ class MainWindow(QMainWindow):
         host.set_native_available(native is not None)
         # Label the native pill for the current page ("Jog" for jog-capable
         # pages; the page's own controls elsewhere).
+        #
+        # v7.19: ask the page first. The map below is keyed on the page CLASS,
+        # and every workflow shares one class (WorkflowsModePage), so a workflow
+        # whose panel is not a jog panel — Fluorescence Mosaic's signal
+        # controls — could not be labelled correctly from here.
         cls = type(page).__name__ if page is not None else ""
+        label = None
+        if page is not None and hasattr(page, "context_label"):
+            try:
+                label = page.context_label()
+            except Exception as e:
+                logger.debug("context_label failed for page %s: %s", cls, e)
         host.set_native_label(
-            {"HardwareSetupPage": "Controls",
-             "SettingsPage": "Safety"}.get(cls, "Jog"))
+            label or {"HardwareSetupPage": "Controls",
+                      "SettingsPage": "Safety"}.get(cls, "Jog"))
         self._context_title.setText(self._context_title_for(page, idx))
 
         # Scope = "everywhere the left box already appears": a page qualifies iff

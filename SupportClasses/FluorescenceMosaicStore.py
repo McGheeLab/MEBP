@@ -1,12 +1,21 @@
 """
 FluorescenceMosaicStore.py — Per-(plate, well) multi-channel fluorescence mosaics.
 
-v7.5.x: The new **Fluorescence Mosaic** workflow rasters a single well at high
-resolution once per fluorescence channel (DAPI / FITC / mCherry / Cy5 / …). The
-operator switches the physical filter/illumination between channels (there is no
-filter-wheel hardware), so each channel is captured as its own full single-well
-mosaic. Every channel of a well shares the SAME raster grid + camera scale, so
-their composites register pixel-for-pixel and can be overlaid in any pseudo-colour.
+v7.5.x: The **Fluorescence Mosaic** workflow rasters a single well at high
+resolution for each selected fluorescence channel (DAPI / FITC / mCherry / Cy5 /
+…). Every channel of a well shares the SAME raster grid + camera scale, so their
+composites register pixel-for-pixel and can be overlaid in any pseudo-colour.
+
+⚠ This docstring used to add "the operator switches the physical filter between
+channels (there is no filter-wheel hardware)". **That is wrong and has been since
+v7.5.x** — the Nikon Ti's cassette is motorized and hardware-verified switching
+all six slots with read-back. Since v7.19 the workflow drives it (see
+``channel_slot`` below) and only prompts when the cube cannot be resolved or the
+body cannot be reached.
+
+⚠ The channel names here are OUR vocabulary, not the cassette's labels. Use
+``channel_slot`` — never ``channel_ordinal`` / the deprecated
+``channel_number`` — to turn a channel into a turret position.
 
 The captured mosaics are a property of the *physical plate on the stage* (their
 absolute stage-µm extent matters) — so, like ``MosaicStore`` / objectives.json,
@@ -263,6 +272,9 @@ class FluorescenceMosaicStore:
         shift_um: tuple[float, float] = (0.0, 0.0),
         display_levels: tuple[float, float] | None = None,
         avg_frames: int = 1,
+        gain_pct: float | None = None,
+        cube_slot: int | None = None,
+        cube_label: str = "",
     ) -> bool:
         """Persist one channel's stitched single-well mosaic.
 
@@ -340,6 +352,25 @@ class FluorescenceMosaicStore:
                 pass
         if int(avg_frames) > 1:
             ch_entry["avg_frames"] = int(avg_frames)
+        # v7.19 — the rest of the capture recipe, and WHICH CUBE was really in
+        # the light path. The cube fields are read back from the body, so they
+        # are ABSENT when it could not be read rather than echoing what was
+        # asked for: a channel labelled with a cube that was not fitted is a
+        # wrong fact nothing downstream can detect. All conditional, so a
+        # capture that knows none of them round-trips byte-identically to a
+        # pre-v7.19 one.
+        if gain_pct is not None:
+            try:
+                ch_entry["gain_pct"] = float(gain_pct)
+            except (TypeError, ValueError):
+                pass
+        if cube_slot:
+            try:
+                ch_entry["cube_slot"] = int(cube_slot)
+            except (TypeError, ValueError):
+                pass
+        if cube_label:
+            ch_entry["cube_label"] = str(cube_label)
         entry.setdefault("channels", {})[str(channel)] = ch_entry
         self._save_meta()
         logger.info(

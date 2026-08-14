@@ -78,6 +78,15 @@ WORKFLOWS: tuple[WorkflowTile, ...] = (
         enabled=True,
     ),
     WorkflowTile(
+        workflow_id="print_calibrator",
+        icon="🎚️",
+        title="Print Calibrator",
+        description="Measure print settings on the machine instead of guessing "
+                    "them — print a line, click where the ink starts, and get "
+                    "the prime time.",
+        enabled=True,
+    ),
+    WorkflowTile(
         workflow_id="full_print",
         icon="🖨️",
         title="Full Print",

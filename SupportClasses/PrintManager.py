@@ -83,6 +83,32 @@ from SupportClasses.PrintExecutionLogger import PrintExecutionLogger
 logger = logging.getLogger(__name__)
 
 
+# v7.20 SAFETY: how far (mm) the stage may sit from the last CONFIRMED XY target
+# before MOVE_Z refuses to lower the needle. This is the descent's independent
+# backstop, not its primary gate — MOVE_XY's own 50 µm settle owns precision, so
+# this is deliberately loose (matching safe_travel_to's 0.5 mm arrival
+# tolerance) and catches only gross mis-positioning: a stalled stage, a soft-limit
+# clamp, or a plan that skipped the confirmed travel entirely.
+_MOVE_Z_XY_PRECONDITION_TOL_MM = 0.5
+
+
+class MoveNotConfirmedError(RuntimeError):
+    """A commanded axis move could not be confirmed to have completed.
+
+    v7.20 CRITICAL SAFETY. On a critical path (print execution, service travel,
+    well entry) the next axis must not start moving until the previous move is
+    confirmed at its target. Raising — rather than returning a status a caller
+    may ignore — is the point: the bench failure that motivated this was a
+    confirmation that WAS computed and then discarded, and an audit found the
+    same discard at a dozen more call sites.
+
+    Raised by the :class:`DirectCommandExecutor` primitives. It propagates to
+    ``PrintManager._execute_loop``, which sets state ERROR and whose ``finally``
+    retracts the needle to the safe Z — so an unconfirmed move ends with the
+    needle UP, which is the recoverable outcome.
+    """
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Data Structures
 # ═══════════════════════════════════════════════════════════════════
@@ -1274,7 +1300,12 @@ class DirectCommandExecutor:
             lg.log("xy_arrival", ok=bool(ok),
                    duration_s=round(time.monotonic() - t0, 3),
                    timeout_s=timeout_s)
-        return ok
+        if not ok:
+            raise MoveNotConfirmedError(
+                f"XY move to ({x_mm:.3f}, {y_mm:.3f}) mm was not confirmed "
+                f"within {timeout_s:.1f}s — refusing to start the next axis "
+                "move (the needle would descend at an unverified position)")
+        return True
 
     def move_z(self, z_mm: float, feedrate_mm_min: float | None = None,
                timeout_s: float = 10.0) -> bool:
@@ -1291,7 +1322,11 @@ class DirectCommandExecutor:
             lg.log("z_move", context="blocking", z_mm=round(z_mm, 4),
                    feedrate_mm_min=feedrate_mm_min, ok=bool(ok),
                    duration_s=round(time.monotonic() - t0, 3))
-        return ok
+        if not ok:
+            raise MoveNotConfirmedError(
+                f"Z move to {z_mm:.3f} mm was not confirmed within "
+                f"{timeout_s:.1f}s — refusing to start the next axis move")
+        return True
 
     def raise_z(self, z_mm: float, feedrate_mm_min: float | None = None,
                 timeout_s: float = 15.0) -> bool:
@@ -1308,11 +1343,21 @@ class DirectCommandExecutor:
             return True
         if hasattr(ctrl, "ensure_retracted_to"):
             try:
-                return bool(ctrl.ensure_retracted_to(
+                ok = bool(ctrl.ensure_retracted_to(
                     float(z_mm), timeout_s=timeout_s,
                     feedrate_mm_min=feedrate_mm_min))
             except TypeError:
-                return bool(ctrl.ensure_retracted_to(float(z_mm)))
+                ok = bool(ctrl.ensure_retracted_to(float(z_mm)))
+            if not ok:
+                # v7.20: an unconfirmed RETRACT is the most dangerous of the
+                # three — every caller follows it with an XY travel, and moving
+                # XY with the needle possibly still down DRAGS it across the
+                # plate. This used to return False into callers that ignored it.
+                raise MoveNotConfirmedError(
+                    f"Retract to {float(z_mm):.3f} mm was not confirmed — "
+                    "refusing to start the XY travel that follows (it would "
+                    "drag an unretracted needle across the plate)")
+            return True
         return self.move_z(z_mm, feedrate_mm_min=feedrate_mm_min,
                            timeout_s=timeout_s)
 
@@ -1376,8 +1421,7 @@ class DirectCommandExecutor:
 
         # Phase 1: raise to safe Z — gentle slow first mm (lift out of any
         # previous print without peeling the bead), then fast.
-        if not self.raise_z(safe_z, feedrate_mm_min=z_fast):
-            return False
+        self.raise_z(safe_z, feedrate_mm_min=z_fast)
         self.dwell(1.0)  # settle after Z up
 
         # v7.2.9: Set XY speed to service speed before travel.
@@ -1391,20 +1435,19 @@ class DirectCommandExecutor:
                 xy.set_speed_mm_s(service_speed)
 
         # Phase 2: fast XY travel (blocking)
-        if not self.move_xy(wx, wy, timeout_s=20.0):
-            logger.warning(f"XY travel to ({wx:.1f}, {wy:.1f}) timed out")
+        # v7.20: every primitive below RAISES MoveNotConfirmedError rather than
+        # returning an ignorable status, so each phase is a hard barrier: Phase 3
+        # cannot lower the needle unless this travel is confirmed, and this
+        # travel cannot start unless Phase 1's retract is confirmed.
+        self.move_xy(wx, wy, timeout_s=20.0)
         self.dwell(1.0)  # settle after XY travel
 
-        # Phase 3: lower into well
+        # Phase 3: lower into well. Each descent leg is confirmed before the
+        # next is commanded, so the slow entry below top_z can never start while
+        # the fast approach above it is still running.
         if top_z > 0:
-            approach_z = top_z + 0.5
-            if not self.move_z(approach_z, feedrate_mm_min=z_fast):
-                return False
-            if not self.move_z(print_z, feedrate_mm_min=z_entry):
-                return False
-        else:
-            if not self.move_z(print_z, feedrate_mm_min=z_entry):
-                return False
+            self.move_z(top_z + 0.5, feedrate_mm_min=z_fast)
+        self.move_z(print_z, feedrate_mm_min=z_entry)
 
         # Dwell after arrival
         dwell_s = getattr(settings, 'dwell_after_move', 0)
@@ -1818,6 +1861,13 @@ class HybridPlanExecutor:
                                 _xy.set_speed_mm_s(_svc_spd)
                         wx, wy = self._well_xy_mm(target_wells[0])
                         direct.move_xy(wx, wy, timeout_s=20.0)
+                    except MoveNotConfirmedError:
+                        # v7.20: must NOT be swallowed. This handler exists for
+                        # lookup/config faults (a missing well, a bad name); an
+                        # unconfirmed MOVE is a machine fault, and continuing the
+                        # plan would drive the next step's descent at an unknown
+                        # position. Let it reach _execute_loop, which retracts.
+                        raise
                     except Exception as e:
                         logger.warning(f"TRAVEL_XY failed: {e}")
 
@@ -1966,8 +2016,13 @@ class HybridPlanExecutor:
                     _xy = self.controller.xy_stage
                     if _xy and hasattr(_xy, 'set_speed_mm_s'):
                         _xy.set_speed_mm_s(_svc_spd)
-                if not direct.move_xy(first_x, first_y, timeout_s=20.0):
-                    logger.warning(f"XY travel to first point timed out")
+                # v7.20 CRITICAL SAFETY: an unconfirmed travel RAISES out of
+                # move_xy, so step 3 below (Z down to print height) is
+                # unreachable unless the stage is verified at the print
+                # position. This used to warn and fall straight through,
+                # driving the needle into the plate at wherever the stage
+                # actually was.
+                direct.move_xy(first_x, first_y, timeout_s=20.0)
                 direct.dwell(1.0)
 
                 # 3. Z down to print height (fast above top_z, slow entry)
@@ -2015,6 +2070,12 @@ class HybridPlanExecutor:
                 direct.dwell(1.0)
                 direct.move_z(safe_z, feedrate_mm_min=z_fast)
 
+        except MoveNotConfirmedError:
+            # v7.20: must NOT be swallowed. A stage that cannot confirm a move
+            # is a machine fault, not a per-well hiccup — carrying on to the
+            # next well is how the needle gets broken on THAT one. Propagate to
+            # _execute_loop (state ERROR, finally retracts to safe Z).
+            raise
         except Exception as e:
             logger.error(f"Print step execution failed: {e}", exc_info=True)
 
@@ -2333,6 +2394,12 @@ class PrintManager:
         self._pause_event.set()  # Not paused initially
         self._abort_flag = threading.Event()
 
+        # v7.20 SAFETY: the last XY position (zero-ref mm) whose arrival was
+        # CONFIRMED by MOVE_XY / HOME_XY. MOVE_Z re-checks the stage against it
+        # before descending, so a descent can never run at an XY the plan never
+        # confirmed. None = "no confirmed target" (nothing to cross-check).
+        self._last_xy_target: Optional[tuple[float, float]] = None
+
         # Current step tracking
         self._current_step = 0
 
@@ -2395,6 +2462,10 @@ class PrintManager:
         self._pause_event.set()
         self._current_step = 0
         self._active_pump = "P1"
+        # v7.20: a reused PrintManager must not inherit the PREVIOUS job's
+        # confirmed-XY record — the stage has since been jogged/homed, so a
+        # stale value could only mislead this job's first descent check.
+        self._last_xy_target = None
         self._start_time = time.time()
 
         # v7.5.x: arm the plate-bottom floor for the duration of the run so
@@ -2834,6 +2905,57 @@ class PrintManager:
             logger.warning("Retract-for-travel (%s): needle not confirmed at "
                            "travel Z — XY move may be unsafe", context)
 
+    def _assert_xy_at_confirmed_target(self, context: str,
+                                       z_mm: float | None = None) -> None:
+        """v7.20 CRITICAL SAFETY: refuse a Z DESCENT unless XY is where the plan
+        confirmed it. Raises ``RuntimeError`` when the stage has moved away.
+
+        This is the descent's own, independent gate. ``MOVE_XY`` already refuses
+        to hand off without a confirmed arrival, so on a well-formed plan this is
+        a no-op — but *this* is the instant the needle goes down, and a gate at
+        the point of danger cannot be bypassed by anything upstream (a
+        hand-built command list, a future plan builder, a re-ordered step). The
+        original failure — needle driven into the plate because the descent ran
+        while the stage was still travelling — had exactly one enforcement point
+        and it was discarded, so a second one is warranted here.
+
+        No-ops (deliberately) when there is nothing to check against:
+        ``_last_xy_target`` is None (no confirmed travel yet — e.g. a plan that
+        opens with a descent at the current position), XY is not connected, or
+        the position cannot be read. It never *invents* a reason to abort; a
+        failed read is handled by the arrival waits, which fail closed.
+        """
+        confirmed = getattr(self, "_last_xy_target", None)
+        if confirmed is None:
+            return
+        ctrl = self.controller
+        if not getattr(ctrl, "is_xy_connected", False):
+            return
+        try:
+            now = ctrl.get_xy_position_mm(cached=False)
+        except Exception:
+            return
+        if now is None or now[0] is None or now[1] is None:
+            return
+        drift = math.hypot(float(now[0]) - confirmed[0],
+                           float(now[1]) - confirmed[1])
+        if drift <= _MOVE_Z_XY_PRECONDITION_TOL_MM:
+            return
+        if self.exec_logger:
+            try:
+                self.exec_logger.log(
+                    "z_move", context=f"{context}_abort_xy_moved",
+                    z_mm=(round(float(z_mm), 4) if z_mm is not None else None),
+                    drift_mm=round(drift, 4),
+                    confirmed_x_mm=round(confirmed[0], 4),
+                    confirmed_y_mm=round(confirmed[1], 4))
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Refusing to lower the needle: XY is {drift:.3f} mm from the "
+            f"confirmed print position ({confirmed[0]:.3f}, {confirmed[1]:.3f}) "
+            "mm. The stage is not where the plan expects it to be.")
+
     def _retract_to_safe_z(self, context: str = "print_end",
                            travel_z: float | None = None) -> None:
         """v7.5.x CRITICAL SAFETY: unconditionally retract the needle to the
@@ -2906,6 +3028,50 @@ class PrintManager:
             return bool(ctrl.wait_for_z_arrival(float(z_mm),
                                                 timeout_s=timeout_s))
 
+    def _confirm_z_or_raise(self, ctrl, z_mm: float, context: str,
+                            timeout_s: float = 15.0) -> None:
+        """v7.20: confirm a discrete Z move (M400 + position poll) or RAISE.
+
+        Several discrete handlers used to command Z and then ``time.sleep(0.3)``
+        — a fixed guess with no relationship to how long the move takes, and no
+        verification at all. The next command then ran regardless, which on a
+        DESCENT means extruding (or moving XY) at an unknown height.
+
+        Best-effort where verification is impossible (ZP not connected, older
+        controller, mock): those degrade to the legacy fixed settle rather than
+        inventing a failure. Where it IS possible, an unconfirmed move stops the
+        print with the needle retracted by ``_execute_loop``'s ``finally``.
+        """
+        if not (getattr(ctrl, "is_zp_connected", False)
+                and hasattr(ctrl, "wait_for_z_arrival")):
+            time.sleep(0.3)
+            return
+        # Size the wait to the move (the gentle slow-final-mm re-entry can take
+        # ~10 s on its own); floor/cap mirror the MOVE_Z handler.
+        to = timeout_s
+        if hasattr(ctrl, "estimate_gentle_z_time_s"):
+            try:
+                to = min(120.0, max(timeout_s, float(
+                    ctrl.estimate_gentle_z_time_s(float(z_mm), None)) + 5.0))
+            except Exception:
+                to = timeout_s
+        zp = getattr(ctrl, "zp_stage", None)
+        ok = True
+        if zp is not None and hasattr(zp, "flush_moves"):
+            ok = self._flush_moves(zp, to)
+        if not ok or not self._wait_z(ctrl, float(z_mm), to):
+            if self.exec_logger:
+                try:
+                    self.exec_logger.log("z_move",
+                                         context=f"{context}_unconfirmed",
+                                         z_mm=round(float(z_mm), 4))
+                except Exception:
+                    pass
+            raise MoveNotConfirmedError(
+                f"Z move to {float(z_mm):.3f} mm ({context}) was not confirmed "
+                "— refusing to run the next command against an unverified "
+                "needle height")
+
     def _pump_uL(self, ctrl, pump, volume_uL, rate_uL_s=None, **kw):
         """Abort-aware ``move_pump_uL`` — used for the DISCRETE actuations
         (prime / retract / suck-back). The streamed print path's tiny
@@ -2971,8 +3137,41 @@ class PrintManager:
                     context=("hop" if hop_z is not None else "travel"),
                     speed_mm_s=_tspd,
                     **self.exec_logger.xy_cmd_fields(ctrl, x, y))
+            _xy_to = self._xy_settle_timeout_s(x, y)
             ctrl.move_xy_absolute(x, y, from_zero_ref=True)
-            self._wait_for_xy_settle(x, y, timeout=10.0)
+            # v7.20 CRITICAL SAFETY: the arrival confirm is now a GATE, not a
+            # log line. The command that follows MOVE_XY in every well-plate plan
+            # is MOVE_Z — the descent to print height — so continuing with XY
+            # unconfirmed drives the needle DOWN at whatever position the stage
+            # actually reached. That breaks the needle against the plate/well
+            # wall, which is precisely what happened on the bench.
+            #
+            # The timeout is distance-scaled (see _xy_settle_timeout_s) so a
+            # legitimately slow long traverse is not mistaken for a failure;
+            # only a stage that genuinely did not arrive trips this.
+            self._last_xy_target = None
+            if not self._wait_for_xy_settle(x, y, timeout=_xy_to):
+                if self._abort_flag.is_set():
+                    return  # aborting — _execute_loop's finally retracts
+                if self.exec_logger:
+                    self.exec_logger.log(
+                        "xy_cmd", context="move_xy_abort_unconfirmed",
+                        target_x_mm=round(float(x), 4),
+                        target_y_mm=round(float(y), 4),
+                        timeout_s=round(_xy_to, 2))
+                # Raise so _execute_loop aborts cleanly (state→ERROR, history +
+                # recorder closed) and its finally retracts to safe Z — the same
+                # contract MOVE_Z uses for an unconfirmed descent. The needle is
+                # still retracted at this point (MOVE_XY retracts first), so
+                # stopping here leaves it in the safe state.
+                raise RuntimeError(
+                    f"XY move to ({float(x):.3f}, {float(y):.3f}) mm not "
+                    f"confirmed within {_xy_to:.1f}s — aborting before the Z "
+                    "descent rather than lowering the needle at an unverified "
+                    "position")
+            # Remember what we CONFIRMED, so the following descent can re-check
+            # that the stage is still there (see MOVE_Z).
+            self._last_xy_target = (float(x), float(y))
 
             # Session 4: Log move
             pos_logger = getattr(ctrl, 'position_logger', None)
@@ -2982,6 +3181,22 @@ class PrintManager:
 
         elif cmd.type == CommandType.MOVE_Z:
             z = p.get("z", 0)
+            # v7.20 CRITICAL SAFETY — SECOND, INDEPENDENT GATE ON THE DESCENT.
+            #
+            # MOVE_XY already refuses to hand off unless it confirmed arrival, so
+            # in a well-formed plan this is a no-op. It exists because THIS is
+            # the moment the needle goes down: a plan that reaches a descent
+            # without a preceding confirmed MOVE_XY (hand-built commands, a
+            # future plan builder, a re-ordered step) would otherwise inherit
+            # the exact failure mode this change fixes, silently. Verifying at
+            # the point of danger costs one position read and cannot be bypassed
+            # by anything upstream.
+            #
+            # The tolerance is deliberately LOOSE (0.5 mm): the tight 50 µm check
+            # is MOVE_XY's job, and a backstop that second-guesses it would only
+            # produce false aborts. This catches gross mis-positioning — a stage
+            # that stalled, hit a soft limit, or never moved — not settle jitter.
+            self._assert_xy_at_confirmed_target("move_z", z_mm=z)
             if self.exec_logger:
                 self.exec_logger.log("z_move", context="move_z",
                                      z_mm=round(float(z), 4))
@@ -3074,8 +3289,25 @@ class PrintManager:
         elif cmd.type == CommandType.MOVE_Z_REL:
             dist = p.get("distance", 0)
             feedrate = p.get("feedrate", settings.z_feedrate)
+            # v7.20: confirm the relative move before the next command. The
+            # target is computed from the CURRENT height (read fresh — the
+            # poller's cache may lag), because a relative move has no absolute
+            # target of its own to confirm against. If the height cannot be
+            # read we degrade to the legacy fixed settle rather than guessing.
+            _cur = None
+            try:
+                if getattr(ctrl, "is_zp_connected", False):
+                    _zp = ctrl.get_zp_position(cached=False)
+                    _z = ctrl.zp_logical_value(_zp, "Z")
+                    if _z is not None:
+                        _cur = _z - ctrl.zero_position.get("Z", 0)
+            except Exception:
+                _cur = None
             ctrl.move_z_relative(dist, feedrate)
-            time.sleep(0.3)
+            if _cur is None:
+                time.sleep(0.3)
+            else:
+                self._confirm_z_or_raise(ctrl, _cur + float(dist), "move_z_rel")
 
         elif cmd.type == CommandType.DISPENSE:
             pump = p.get("pump", self._active_pump)
@@ -3123,6 +3355,16 @@ class PrintManager:
                 time.sleep(min(wait, 5.0))
 
         elif cmd.type == CommandType.PRINT_PATH:
+            # v7.20 SAFETY BOOKKEEPING: the path itself drives XY all over the
+            # well, so the "last CONFIRMED XY" record is stale the moment this
+            # starts. Clear it, or the next descent's precondition check would
+            # compare the stage against a position the print deliberately left —
+            # a FALSE abort. Clearing (rather than updating) is the honest
+            # answer: after an open-loop path we do not have a confirmed
+            # position, and the check correctly no-ops until the next MOVE_XY
+            # establishes one. Every real plan puts a confirmed MOVE_XY before
+            # its next MOVE_Z, so this loses no protection.
+            self._last_xy_target = None
             # v7.5.x ZP-disconnect fix: a PRINT_PATH issues a dense per-segment
             # ZP write stream (one pump G0 per segment, ~1 write/100 ms). With
             # the background poller ACTIVE its M114 reads contend with that
@@ -3172,14 +3414,29 @@ class PrintManager:
             # a bare G0 Z — the ~12-min-crawl ZP-hang bug) on an older
             # controller without ensure_retracted_to.
             if hasattr(ctrl, "ensure_retracted_to"):
-                ctrl.ensure_retracted_to(float(settings.travel_z_height))
+                # v7.20: act on the confirmation. TRAVEL_UP is the lift that
+                # every following cross-position move depends on; an
+                # unconfirmed one means the next XY could drag the needle.
+                if not ctrl.ensure_retracted_to(float(settings.travel_z_height)):
+                    raise MoveNotConfirmedError(
+                        f"Retract to the travel Z "
+                        f"{float(settings.travel_z_height):.3f} mm was not "
+                        "confirmed — refusing to continue the plan (the next "
+                        "XY move would drag an unretracted needle)")
             else:
                 ctrl.move_z_absolute(
                     settings.travel_z_height, from_zero_ref=True,
                     feedrate_mm_min=getattr(ctrl, "_zp_retract_feedrate", None))
-                time.sleep(0.5)
+                # v7.20: was a blind sleep(0.5) — confirm it instead.
+                self._confirm_z_or_raise(ctrl, settings.travel_z_height,
+                                         "travel_up")
 
         elif cmd.type == CommandType.TRAVEL_DOWN:
+            # v7.20 SAFETY: TRAVEL_DOWN is the other descent-to-print-height
+            # command, so it gets the same XY precondition as MOVE_Z. Same gate,
+            # one implementation — a descent must never be reachable without it.
+            self._assert_xy_at_confirmed_target(
+                "travel_down", z_mm=settings.print_z_height)
             if self.exec_logger:
                 self.exec_logger.log(
                     "z_move", context="travel_down",
@@ -3188,7 +3445,10 @@ class PrintManager:
             ctrl.move_z_absolute(
                 settings.print_z_height, from_zero_ref=True,
                 feedrate_mm_min=getattr(ctrl, "_zp_insert_feedrate", None))
-            time.sleep(0.3)
+            # v7.20: was a blind sleep(0.3) after a DESCENT — the next command
+            # (prime / print) would run at an unverified height. Confirm it.
+            self._confirm_z_or_raise(ctrl, settings.print_z_height,
+                                     "travel_down")
 
         elif cmd.type == CommandType.HOME_XY:
             # v7.5.x CRITICAL SAFETY: HOME_XY returns to the zero reference — a
@@ -3214,7 +3474,22 @@ class PrintManager:
                     "xy_cmd", context="home", speed_mm_s=_hspd,
                     **self.exec_logger.xy_cmd_fields(ctrl, 0.0, 0.0))
             ctrl.move_xy_absolute(0, 0, from_zero_ref=True)
-            self._wait_for_xy_settle(0, 0, timeout=15.0)
+            # v7.20: HOME_XY is the end-of-plan return; the needle is retracted
+            # and NOTHING descends after it, so an unconfirmed home is logged
+            # rather than raised (failing a finished print at its last step
+            # would be worse than useless). What matters for safety is that the
+            # confirmed-target record tracks reality: clear it on failure so a
+            # later descent cannot cross-check against a position we never
+            # reached.
+            if self._wait_for_xy_settle(0, 0,
+                                        timeout=self._xy_settle_timeout_s(
+                                            0, 0, floor_s=15.0)):
+                self._last_xy_target = (0.0, 0.0)
+            else:
+                self._last_xy_target = None
+                logger.warning(
+                    "HOME_XY: return to the zero reference was not confirmed "
+                    "(needle is retracted; nothing descends after this step)")
 
         elif cmd.type == CommandType.SET_PUMP_RATE:
             pass
@@ -4793,11 +5068,26 @@ class PrintManager:
 
         v7.2.7: mm-based settle — shorter timeout, better logging.
         target_x/y are in mm (zero-ref). tolerance in µm.
+
+        v7.20 SAFETY — RETURNS ``True`` only when arrival was CONFIRMED.
+
+        ⚠ This method used to return ``None`` on EVERY path, so no caller could
+        distinguish "the stage is there" from "we gave up waiting". Its own
+        timeout branch already carried the note *"a settle TIMEOUT silently
+        continues execution — this is a prime suspect for desync bugs"*, but
+        only logging was added: the ``MOVE_XY`` handler discarded the result and
+        the very next plan command (``MOVE_Z``) drove the needle DOWN at
+        whatever XY the stage happened to be at. That is a broken needle, and it
+        is exactly the failure this return value now makes impossible to ignore.
+
+        A missing XY stage returns ``True`` (nothing to confirm against),
+        matching the pre-existing no-stage behaviour. An ABORT returns ``False``:
+        the caller must not treat an interrupted wait as an arrival.
         """
         ctrl = self.controller
         if not hasattr(ctrl, 'xy_stage') or not ctrl.xy_stage:
             time.sleep(0.1)
-            return
+            return True
 
         # Convert target mm → µm for comparison with stage position
         target_x_um = target_x * 1000.0 + ctrl.zero_position.get("x", 0)
@@ -4813,7 +5103,7 @@ class PrintManager:
                            target_x_mm=round(target_x, 4),
                            target_y_mm=round(target_y, 4),
                            duration_s=round(time.monotonic() - t0, 3))
-                return
+                return False
             pos = ctrl.get_xy_position(cached=False)
             if pos[0] is not None:
                 dx = abs(pos[0] - target_x_um)
@@ -4826,7 +5116,7 @@ class PrintManager:
                                target_y_mm=round(target_y, 4),
                                duration_s=round(time.monotonic() - t0, 3),
                                final_err_um=round(last_err_um, 1))
-                    return
+                    return True
             time.sleep(0.05)
 
         logger.debug(f"v7.2.7: Settle timeout after {timeout}s "
@@ -4841,6 +5131,42 @@ class PrintManager:
                    timeout_s=timeout,
                    final_err_um=(round(last_err_um, 1)
                                  if last_err_um is not None else None))
+        return False
+
+    def _xy_settle_timeout_s(self, target_x, target_y,
+                             floor_s: float = 10.0,
+                             cap_s: float = 45.0) -> float:
+        """Seconds to allow for an XY travel to ``target_x/y`` (zero-ref mm).
+
+        v7.20: a FIXED timeout is the wrong shape for this. The ME3B V1 Prior is
+        measured at roughly 2.5× slower than commanded on short accel-dominated
+        segments, so a full-plate traverse can legitimately outlast a flat 10 s —
+        and now that an unconfirmed arrival ABORTS the print (rather than
+        descending anyway), a too-short timeout would turn healthy long moves
+        into spurious aborts. Scale it to the distance actually being travelled:
+        ``2 × dist / speed + floor``, clamped. Generous by construction — this
+        bound exists to stop waiting on a stage that will never arrive, not to
+        police how fast it gets there.
+
+        Any failure to read the geometry degrades to ``floor_s``.
+        """
+        ctrl = self.controller
+        try:
+            pos = ctrl.get_xy_position_mm(cached=True)
+            if pos is None or pos[0] is None or pos[1] is None:
+                return floor_s
+            dist_mm = math.hypot(float(target_x) - float(pos[0]),
+                                 float(target_y) - float(pos[1]))
+            speed = 0.0
+            lim = getattr(ctrl, "safety_limits", None)
+            if lim is not None:
+                # safety_limits.max_xy_speed is µm/s.
+                speed = float(getattr(lim, "max_xy_speed", 0) or 0) / 1000.0
+            if speed <= 0:
+                speed = 10.0  # mm/s — conservative fallback
+            return max(floor_s, min(cap_s, 2.0 * dist_mm / speed + floor_s))
+        except Exception:
+            return floor_s
 
 
 class PrintQueue:

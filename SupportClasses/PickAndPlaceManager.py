@@ -2791,7 +2791,7 @@ class PickPlaceExecutor:
         same_well = bool(target.well_name) and target.well_name == self._current_well
         if not same_well:
             # Inter-well: full safe Z
-            self._safe_travel(
+            ok = self._safe_travel(
                 target_x_um=x_um,
                 target_y_um=y_um,
                 safe_z_mm=self.safe_z_mm,
@@ -2799,6 +2799,26 @@ class PickPlaceExecutor:
                 z_timeout_s=self.z_timeout_s,
                 xy_timeout_s=self.xy_timeout_s,
             )
+            # v7.20 CRITICAL SAFETY: ACT on the verdict. `safe_travel_to`
+            # returns False when the retract was not confirmed, when the XY
+            # arrival was not confirmed, or on abort — and this result used to
+            # be DISCARDED, so the caller went straight on to descend, aspirate
+            # or dispense at a position the stage may never have reached.
+            #
+            # Note the asymmetry this removes: `_intra_well_move` below already
+            # raises on an unconfirmed move, and it is the SHORTER, less
+            # dangerous one. The inter-well travel — needle crossing the whole
+            # plate — must not use a weaker policy than its intra-well sibling.
+            #
+            # Only an explicit False is a failure: a stub/older controller that
+            # returns None cannot report a verdict, and "absent" degrades to
+            # permitted exactly as `_wait_xy_arrival_um` already documents.
+            if ok is False:
+                raise AbortException(
+                    f"Travel to ({x_um:.0f}, {y_um:.0f}) µm was not confirmed "
+                    "— stopping with the needle retracted rather than "
+                    "descending or dispensing at an unverified position. "
+                    "Check the XY and Z/pump boards.")
         else:
             # Intra-well: small retract
             self._intra_well_move(x_um, y_um, target_z_mm=z)

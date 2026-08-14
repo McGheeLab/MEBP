@@ -2,13 +2,13 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "__last__",
-  "saved": "2026-08-13T17:22:40",
+  "saved": "2026-08-14T16:16:08",
   "values": {
     "pump": {
       "text": "P1",
       "data": null
     },
-    "extrusion_mod": 1.5,
+    "extrusion_mod": 1.0,
     "top_speed": 1.0,
     "resolution": 30.0,
     "printz": 0.5,
@@ -21,7 +21,7 @@
       "data": "RhoB, LLS"
     },
     "ink_z": 5.5,
-    "ink_padding": 1.0,
+    "ink_padding": 0.5,
     "ink_prime": true,
     "ink_prime_uL": 0.4,
     "orbit_granular": true,
@@ -40,14 +40,46 @@
     "line_xy_speed": 80.0,
     "postclean": true,
     "postclean_margin": 0.5,
-    "travel_speed": 10.0,
-    "preflow": 0.1,
-    "g_settle": 0.1,
+    "travel_speed": 8.0,
+    "preflow": 0.5,
+    "preflow__ovr": true,
+    "g_settle": 0.5,
     "__extra__": {
       "ink_map_last": {
         "Bottom Left": "RhoB, LLS",
-        "Top Right": "GFP, LLS"
-      }
+        "Top Right": "GFP, LLS",
+        "Bottom": "GFP, LLS",
+        "Top": "RhoB, LLS",
+        "3 Boxes": "RhoB, LLS",
+        "1 Box": "GFP, LLS"
+      },
+      "print_queue": {
+        "schema": 1,
+        "prints": [
+          {
+            "well": "D2",
+            "object_data": "file:Four_Circles_1",
+            "object_label": "\ud83d\udcc4 Four_Circles_1  (1)",
+            "size_mm": 1.0,
+            "pump": "P1",
+            "ink_name": "RhoB, LLS",
+            "ink_dip_z_mm": 5.5,
+            "ink_padding_uL": 0.5,
+            "top_speed_mm_s": 1.0,
+            "resolution_um": 30.0,
+            "print_z_mm": 0.5,
+            "extrusion_mod": 1.0,
+            "motion_mode": "velocity",
+            "ink_map_by_name": {
+              "3 Boxes": "RhoB, LLS",
+              "1 Box": "GFP, LLS"
+            },
+            "enabled": true
+          }
+        ]
+      },
+      "queue_group_by_ink": true,
+      "queue_clean_between": false
     }
   }
 }

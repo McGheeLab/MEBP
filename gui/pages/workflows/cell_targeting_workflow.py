@@ -81,6 +81,8 @@ from PySide6.QtWidgets import (
 from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card, FormRow
+from gui.widgets.section_stack import (
+    PromotedSectionsPanel, wire_section_promotion)
 from gui.widgets.live_target_picker import LiveTargetPicker, PROV_MOSAIC
 from gui.widgets.safe_travel_worker import SafeTravelWorker
 from gui.widgets.standard_jog_context import StandardJogContextPanel
@@ -276,6 +278,15 @@ class CellTargetingWorkflowPage(QWidget):
 
         self._refresh_volume_label()
         self._refresh_readiness()
+        # v7.21: a section moved out of ⚙ Settings lands in the drawer, which is
+        # hidden (zero footprint) until something is in it. AFTER the run row on
+        # purpose, so Start / Abort never move.
+        self._promoted_panel = PromotedSectionsPanel()
+        outer.addWidget(self._promoted_panel)
+        self._layout_store = wire_section_promotion(
+            self, self._settings_dialog, self._promoted_panel.stack,
+            settings=self._settings, workflow_id="cell_targeting")
+
         self._settings_dialog.load_last()
         self._refresh_reagent_status()
         self._refresh_prep_status()

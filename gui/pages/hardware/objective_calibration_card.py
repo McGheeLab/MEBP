@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QGroupBox, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
@@ -43,6 +43,21 @@ from SupportClasses.HardwareConfig import CameraRole
 from SupportClasses.ObjectiveCalibration import get_store as _get_store
 
 logger = logging.getLogger(__name__)
+
+#: How often to re-read which objective the BODY has in the light path.
+#:
+#: 🐞 v7.19.1, operator: *"the physical objective changed, but didnt update the
+#: in path"*. The "← in path" marker was resolved exactly twice — at
+#: ``apply_config`` and inside ``_on_objective_changed`` — and this card is not
+#: the only thing that moves the nosepiece (the jog microscope card, the
+#: Microscope setup panel, the fluorescence panel and the operator's own hand
+#: all do). So the marker went stale the moment the turret was driven from
+#: anywhere else, and a stale "in path" marker does not merely fail to update:
+#: it makes a POSITIVE claim about the hardware that is false.
+#:
+#: 1 s matches ``microscope_panel`` and the controller's own ~1 Hz sampling —
+#: faster is repaint noise against a cached snapshot.
+_LIGHT_PATH_MS = 1000
 
 
 class _AddObjectiveDialog(QDialog):
@@ -125,11 +140,81 @@ class ObjectiveCalibrationCard(QGroupBox):
         self._settings_getter = settings_getter or (lambda: None)
         self._store = _get_store()
         self._loading = False
+        # v7.19.1 — the last light-path position we RENDERED. Purely a change
+        # detector for the poll; every reader still asks the body directly, so a
+        # stale cache can never become the displayed answer.
+        self._live_pos: Optional[int] = None
+        self._path_timer = QTimer(self)
+        self._path_timer.setInterval(_LIGHT_PATH_MS)
+        self._path_timer.timeout.connect(self._poll_light_path)
 
         self.setStyleSheet(self._group_style())
         self._build_ui()
         self._wire_signals()
         self._refresh_visible_state()
+
+    # ── Light-path tracking ───────────────────────────────────────
+
+    def showEvent(self, event):  # noqa: N802 (Qt)
+        super().showEvent(event)
+        self._poll_light_path(force=True)
+        self._path_timer.start()
+
+    def hideEvent(self, event):  # noqa: N802 (Qt)
+        self._path_timer.stop()
+        super().hideEvent(event)
+
+    def _poll_light_path(self, *, force: bool = False) -> None:
+        """Re-decorate when the body's nosepiece position has changed.
+
+        Deliberately does NOT touch ``current_objective_name`` or push µm/px.
+        Following a turret that someone else moved is a DISPLAY act; adopting it
+        as the declared objective would be a poll-driven write of the value the
+        whole µm/px chain is keyed by, which the v7.18 optics design names as
+        "the mutation most likely to be proposed in good faith".
+        """
+        # ⚠ Reading state() alone is NOT enough, and this is the half that is
+        # easy to miss: MicroscopeController does not poll itself, and on this
+        # page nothing else re-reads the body (microscope_panel is the only
+        # other refresh caller and it is not mounted here). Without this the
+        # marker would follow an app-driven change — because set_objective
+        # re-reads afterwards — and silently miss a turret turned BY HAND, which
+        # is the case a bench test is least likely to try.
+        try:
+            from gui.widgets.optics_ensure import request_state_refresh
+            request_state_refresh()
+        except Exception:
+            pass
+        pos = self.live_objective_position()
+        if pos == self._live_pos and not force:
+            return
+        self._live_pos = pos
+        self._redecorate_light_path()
+
+    def _redecorate_light_path(self) -> None:
+        """Repaint the marker. Never steals a drop-down the operator has open."""
+        # A background poll that clears a combo closes its popup under the
+        # cursor — the v7.5.x Nikon Ti defect ("every time it reads it cancels
+        # the dropdown box I have opened"). A CLOSED combo still tracks.
+        try:
+            popup_open = self._cmb_objective.view().isVisible()
+        except Exception:
+            popup_open = False
+        if not popup_open:
+            self._reload_objective_combo(
+                preferred=self._current_objective_name() or None)
+        self._refresh_table()
+        self._refresh_objective_note()
+
+    def _light_path_name(self) -> str:
+        """Name of the objective the BODY reports in the path, else ``""``."""
+        pos = self.live_objective_position()
+        if pos is None:
+            return ""
+        for p, name in self._objective_rows():
+            if p == pos:
+                return str(name)
+        return ""
 
     # ── Style ─────────────────────────────────────────────────────
 
@@ -364,13 +449,23 @@ class ObjectiveCalibrationCard(QGroupBox):
             self._loading = False
 
     def write_to_config(self, config) -> None:
-        """Push card state into a HardwareConfig snapshot."""
+        """Push card state into a HardwareConfig snapshot.
+
+        🐞 v7.19: this wrote ``currentText()`` — the DECORATED display string
+        ``"4x (4×)"`` — while every other write path uses ``currentData()``, the
+        raw name. Harmless while this card's objective list was unrelated to
+        anything else; the moment names are shared with the nosepiece it is a
+        real mismatch in ``ObjectiveLadder.ladder_gate`` and in every
+        ``ObjectiveCalibration.get_calibration`` lookup, because
+        ``"4x (4×)"`` matches no calibration key.
+        """
         config.camera_config.current_objective_name = (
-            self._cmb_objective.currentText() or None
+            self._current_objective_name() or None
         )
 
     def selected_objective_name(self) -> str:
-        return self._cmb_objective.currentText()
+        """The raw objective name — the key calibrations are filed under."""
+        return self._current_objective_name()
 
     # ── Visibility / refresh ──────────────────────────────────────
 
@@ -389,12 +484,82 @@ class ObjectiveCalibrationCard(QGroupBox):
         if has_microscope:
             self._refresh_objective_note()
 
+    def nosepiece_objectives(self) -> list[tuple[int, str]]:
+        """``[(turret position, name), …]`` from Hardware Setup → Microscope.
+
+        v7.19, operator: *"in the microscope camera objective calibration the
+        objectives in the table should be auto populated based on the objectives
+        defined in the microscope page. it should also know what the current
+        objective is."*
+
+        Two records of "which objective" have existed side by side since v7.11
+        and were never joined: ``MicroscopeConfigStore.objectives`` maps turret
+        position → operator name, while ``ObjectiveCalibration`` maps camera →
+        name → µm/px. They already agree BY STRING — ``ObjectiveLadder``
+        resolves one into the other, and ``ObjectiveCalibration._resolve_key``
+        folds case, so the panel's ``4X`` finds the ``4x`` calibration.
+
+        ⚠ That case-folded LOOKUP is the whole reason no migration is needed
+        here. Renaming a calibration key to match a slot label would orphan the
+        measurement it names — the v7.16 class of change.
+
+        Returns ``[]`` when no nosepiece is configured, which is the signal to
+        fall back to the card's own user-managed list.
+        """
+        try:
+            from SupportClasses.MicroscopeConfigStore import get_store as _cfg
+            from SupportClasses.OpticsRegistry import OBJECTIVE, resolve_slots
+            state = self._scope_state()
+            slots = resolve_slots(scope_state=state, config_store=_cfg(),
+                                  kind=OBJECTIVE)
+        except Exception as exc:
+            logger.debug("nosepiece objectives unavailable: %s", exc)
+            return []
+        return [(int(sl.position), str(sl.name))
+                for sl in sorted(slots, key=lambda x: x.position)
+                if getattr(sl, "name", "")]
+
+    def _scope_state(self):
+        """The microscope's cached state, or None. Never raises, never blocks."""
+        try:
+            from SupportClasses.MicroscopeControl import get_microscope
+            return get_microscope().state()
+        except Exception:
+            return None
+
+    def live_objective_position(self) -> Optional[int]:
+        """The turret position the BODY reports, or None if it cannot be read."""
+        state = self._scope_state()
+        if not getattr(state, "connected", False):
+            return None
+        pos = getattr(state, "objective_position", None)
+        return int(pos) if pos else None
+
+    def _objective_rows(self) -> list[tuple[Optional[int], str]]:
+        """The rows to show: nosepiece slots if configured, else the own list.
+
+        A rig with no motorised body keeps exactly the pre-v7.19 behaviour —
+        its own user-managed list, added to by hand.
+        """
+        rows = [(pos, name) for pos, name in self.nosepiece_objectives()]
+        if rows:
+            return rows
+        return [(None, name) for name in self._store.objective_names()]
+
     def _reload_objective_combo(self, preferred: Optional[str] = None) -> None:
         self._cmb_objective.blockSignals(True)
         self._cmb_objective.clear()
-        for name in self._store.objective_names():
+        live = self.live_objective_position()
+        for pos, name in self._objective_rows():
             nominal = self._store.nominal_magnification(name) or 0.0
-            self._cmb_objective.addItem(f"{name} ({nominal:g}×)", name)
+            label = f"{name} ({nominal:g}×)" if nominal else str(name)
+            if pos is not None:
+                label = f"{pos}. {label}"
+                if pos == live:
+                    label += "  ← in path"
+            # userData stays the RAW name: it is the calibration key, and the
+            # decorated text is display only (see write_to_config's bug note).
+            self._cmb_objective.addItem(label, name)
         if preferred:
             idx = self._cmb_objective.findData(preferred)
             if idx >= 0:
@@ -457,6 +622,26 @@ class ObjectiveCalibrationCard(QGroupBox):
         if not cam_key or not name:
             self._lbl_obj_note.setText("")
             return
+
+        # v7.19.1 — the DECLARED objective is what µm/px is keyed by, and this
+        # card is where it is declared. When the body has a different objective
+        # in the path the two disagree, and that disagreement is the whole scale
+        # error: every mosaic tile would be measured with one objective's µm/px
+        # while another one formed the image. Say it, in front of the
+        # calibration sentence, rather than leaving a green "Calibrated" tick
+        # over a number that is not being used to look at anything.
+        in_path = self._light_path_name()
+        if in_path and in_path.strip().lower() != name.strip().lower():
+            self._lbl_obj_note.setText(
+                f"⚠ {in_path} is in the light path — µm/px is being taken "
+                f"from {name}. Pick {in_path}, or rotate the turret."
+            )
+            self._lbl_obj_note.setStyleSheet(
+                f"color: {COLORS['yellow']}; "
+                f"font-size: {scaled_font_size(9)}pt;"
+            )
+            return
+
         cal = self._store.get_calibration(cam_key, name)
         if cal is None:
             self._lbl_obj_note.setText(
@@ -480,8 +665,11 @@ class ObjectiveCalibrationCard(QGroupBox):
     def _refresh_table(self) -> None:
         config = self._config_getter()
         cam_key = self._camera_key()
-        names = self._store.objective_names()
-        self._table.setRowCount(len(names))
+        # v7.19 — the nosepiece's own slots when one is configured, in turret
+        # order, so this table lists what the body can actually be driven to.
+        rows = self._objective_rows()
+        names = [name for _pos, name in rows]
+        self._table.setRowCount(len(rows))
         active_res = (
             tuple(config.camera_config.active_resolution)
             if config is not None
@@ -489,13 +677,29 @@ class ObjectiveCalibrationCard(QGroupBox):
         )
         cals = self._store.all_calibrations_for_camera(cam_key) if cam_key else {}
         current = self._current_objective_name()
+        live_pos = self.live_objective_position()
         highlight = QColor(COLORS.get("surface1", "#45475a"))
+        in_path = QColor(COLORS.get("green", "#a6e3a1"))
 
-        for row, name in enumerate(names):
+        for row, (pos, name) in enumerate(rows):
             nominal = self._store.nominal_magnification(name)
+            # `cals` is keyed by whatever the calibration was filed under, which
+            # may differ from the slot label only by case ("4x" vs "4X"). The
+            # store's own case-folding resolver is the authority — a plain dict
+            # lookup here would report a calibrated objective as uncalibrated.
             cal = cals.get(name)
+            if cal is None and cam_key:
+                cal = self._store.get_calibration(cam_key, name)
+            label = f"{pos}. {name}" if pos is not None else str(name)
+            name_item = QTableWidgetItem(label)
+            if pos is not None and pos == live_pos:
+                name_item.setText(f"{label}  ← in path")
+                name_item.setForeground(in_path)
+                name_item.setToolTip(
+                    "This objective is in the light path right now, read from "
+                    "the microscope.")
             items = [
-                QTableWidgetItem(name),
+                name_item,
                 QTableWidgetItem(f"{nominal:g}×" if nominal is not None else "—"),
             ]
             if cal is None:
@@ -525,10 +729,15 @@ class ObjectiveCalibrationCard(QGroupBox):
                 if name == current:
                     item.setBackground(highlight)
                 self._table.setItem(row, col, item)
+            # The RAW name — what every calibration is keyed by. The cell TEXT
+            # is decorated (position prefix, "in path" marker) and must never
+            # be used as a lookup key.
+            name_item.setData(Qt.ItemDataRole.UserRole, name)
 
         # Restore selection on the current objective if any.
         for row in range(self._table.rowCount()):
-            if self._table.item(row, 0).text() == current:
+            item = self._table.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == current:
                 self._table.selectRow(row)
                 break
         self._refresh_button_state()
@@ -1286,11 +1495,22 @@ class ObjectiveCalibrationCard(QGroupBox):
         return {obj: cal for obj, cal in old.items() if obj not in new}
 
     def _selected_objective_name(self) -> str:
+        """The RAW objective name of the selected row.
+
+        ⚠ v7.19 reads ``UserRole``, not the cell text. The name column now
+        carries a decorated label (``"2. 10X  ← in path"``) and this value is
+        the key every calibration read and write is filed under — returning the
+        decoration would silently look up a calibration that does not exist and
+        then create one under the decorated name.
+        """
         row = self._table.currentRow()
         if row < 0:
             return ""
         item = self._table.item(row, 0)
-        return item.text() if item is not None else ""
+        if item is None:
+            return ""
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        return str(raw) if raw else item.text()
 
     def _mosaic_align_key(self, cam_idx: int, objective: str) -> str:
         """The MosaicAlignmentStore key the mosaic build uses for this camera +

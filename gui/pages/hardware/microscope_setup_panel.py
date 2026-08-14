@@ -1495,6 +1495,18 @@ class MicroscopeSetupPanel(QWidget):
             self._scope.set_objective(position)
 
     def _refresh_live(self) -> None:
+        # v7.19.1 — this ticks every 500 ms but ``state()`` is a CACHE, and
+        # MicroscopeController does not poll itself. On this page nothing else
+        # re-reads the body (``microscope_panel``, the only other refresh
+        # caller, is not mounted on Hardware Setup), so "cube slot N ·
+        # objective position N" and the green border on the current slot could
+        # sit on a turret the operator had since turned by hand. Throttled and
+        # lease-aware in one shared place.
+        try:
+            from gui.widgets.optics_ensure import request_state_refresh
+            request_state_refresh()
+        except Exception:
+            pass
         state = self._scope.state()
         connected = bool(state.connected)
         if connected:

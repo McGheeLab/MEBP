@@ -54,6 +54,8 @@ from PySide6.QtWidgets import (
 from gui.styles import COLORS
 from gui.scaling import s, sf
 from gui.widgets.components import Card
+from gui.widgets.section_stack import (
+    PromotedSectionsPanel, wire_section_promotion)
 from gui.widgets.standard_jog_context import StandardJogContextPanel
 from gui.dialogs.workflow_settings_dialog import (
     WorkflowSettingsDialog, build_locations_widget,
@@ -153,6 +155,14 @@ class StressTestWorkflowPage(QWidget):
         outer.addLayout(self._build_header())
         outer.addWidget(self._build_monitor(), stretch=1)
         outer.addWidget(self._build_run_row())
+        # v7.21: a section moved out of ⚙ Settings lands in the drawer, which is
+        # hidden (zero footprint) until something is in it. AFTER the run row on
+        # purpose, so Start / Abort never move.
+        self._promoted_panel = PromotedSectionsPanel()
+        outer.addWidget(self._promoted_panel)
+        self._layout_store = wire_section_promotion(
+            self, self._settings_dialog, self._promoted_panel.stack,
+            settings=self._settings, workflow_id="stress_test")
         self._update_button_state()
         self._settings_dialog.load_last()
         self._update_settings_summary()
