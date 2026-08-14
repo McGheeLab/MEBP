@@ -5,6 +5,10 @@ A small reusable widget: an on/off toggle + a brightness slider that drives the
 microscope illumination LED wired to the ZP board's FAN0 output (dimmed via
 Marlin ``M106`` — see StageController.set_led_brightness / ZPStage.set_led_brightness).
 
+**The slider's 100 % is not the LED's 100 %.** The emitter overheats when held
+above ~30 % duty, so the 0-100 % the operator sees is scaled onto ``_MAX_DUTY_PCT``
+(20 %) of the electrical maximum — full slider commands ``M106 S51``, not ``S255``.
+
 Single source of truth used in two places:
   - embedded as a ``Card("Illumination")`` in :class:`StandardJogContextPanel`
     (so it rides the "Jog" pill everywhere that panel appears), and
@@ -45,17 +49,34 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_LEVEL = 255           # Marlin PWM range for M106 S<v>
+_MAX_LEVEL = 255           # Marlin PWM full scale for M106 S<v>
+
+# ── Thermal ceiling ──────────────────────────────────────────────────
+# The LED overheats when driven above ~30 % duty for long periods, so the
+# slider's 100 % is REMAPPED onto _MAX_DUTY_PCT of the electrical maximum
+# rather than clipped at it: the operator keeps a full-range 0-100 % control
+# and simply cannot command a level that cooks the emitter. Clipping instead
+# would make every setting above the ceiling look different but behave the
+# same, which reads as a broken slider.
+#
+# This is the ONE place the ceiling is expressed — the hardware layer
+# (ZPStage.set_led_brightness) still accepts the full 0-255 Marlin range, so
+# a second copy of this rule there would be a redundant guard, not a backstop.
+_MAX_DUTY_PCT = 20.0
+_CEILING_LEVEL = max(1, round(_MAX_LEVEL * _MAX_DUTY_PCT / 100.0))  # 51 of 255
+
 _SEND_DEBOUNCE_MS = 100    # coalesce slider drags before hitting the serial bus
-_DEFAULT_ON_LEVEL = _MAX_LEVEL  # brightness used when toggled on from a dark slider
+_DEFAULT_ON_LEVEL = _CEILING_LEVEL  # brightness used when toggled on from a dark slider
 
 
 def _level_from_pct(pct: int) -> int:
-    return max(0, min(_MAX_LEVEL, round(pct / 100.0 * _MAX_LEVEL)))
+    """Slider percentage → Marlin PWM level, scaled by the thermal ceiling."""
+    return max(0, min(_CEILING_LEVEL, round(pct / 100.0 * _CEILING_LEVEL)))
 
 
 def _pct_from_level(level: int) -> int:
-    return max(0, min(100, round(level / _MAX_LEVEL * 100.0)))
+    """Marlin PWM level → slider percentage (inverse of :func:`_level_from_pct`)."""
+    return max(0, min(100, round(level / _CEILING_LEVEL * 100.0)))
 
 
 class _IlluminationState(QObject):
@@ -211,7 +232,11 @@ class IlluminationControl(QWidget):
         # Row 2: brightness slider (percentage).
         self._slider = QSlider(Qt.Horizontal)
         self._slider.setRange(0, 100)
-        self._slider.setToolTip("LED brightness.")
+        self._slider.setToolTip(
+            "LED brightness. 100 % commands "
+            f"{_MAX_DUTY_PCT:g} % of the LED's electrical maximum — the range is "
+            "scaled to a safe ceiling, because the emitter overheats when held "
+            "brighter for long periods.")
         self._slider.valueChanged.connect(self._on_slider)
         root.addWidget(self._slider)
 

@@ -2,7 +2,7 @@
   "_format": "mebp-workflow-settings",
   "workflow_id": "quick_print",
   "name": "__last__",
-  "saved": "2026-08-12T14:22:36",
+  "saved": "2026-08-13T17:22:40",
   "values": {
     "pump": {
       "text": "P1",
@@ -17,13 +17,13 @@
       "data": "velocity"
     },
     "ink": {
-      "text": "LLS rhodamine",
-      "data": "LLS rhodamine"
+      "text": "RhoB, LLS",
+      "data": "RhoB, LLS"
     },
     "ink_z": 5.5,
     "ink_padding": 1.0,
     "ink_prime": true,
-    "ink_prime_uL": 2.0,
+    "ink_prime_uL": 0.4,
     "orbit_granular": true,
     "orbit_all": false,
     "orbit_dia": 1.0,
@@ -40,11 +40,14 @@
     "line_xy_speed": 80.0,
     "postclean": true,
     "postclean_margin": 0.5,
-    "travel_speed": 6.0,
-    "preflow": 1.0,
-    "g_settle": 10.0,
+    "travel_speed": 10.0,
+    "preflow": 0.1,
+    "g_settle": 0.1,
     "__extra__": {
-      "ink_map_last": {}
+      "ink_map_last": {
+        "Bottom Left": "RhoB, LLS",
+        "Top Right": "GFP, LLS"
+      }
     }
   }
 }
