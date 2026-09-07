@@ -1,0 +1,17 @@
+baseline  B(THB) 21.04   T(THO) 21.39
+
+STAGE 1 -- control: M140 S10, below ambient, MOSFET never switches
+  reply: ['//action:notification Bed Cooling...', 'ok']
+   [ctrl] t=   0.0s  B  21.04 (+0.00)  T  21.39 (+0.00)  bed duty   0/127
+   [ctrl] t=   5.1s  B  21.48 (+0.44)  T  21.41 (+0.02)  bed duty   0/127
+   [ctrl] survived 10s (peak bed duty 0/127)
+
+STAGE 2 -- the real test: M140 S37, 10 minutes
+  reply: ['//action:notification Bed Heating...', 'ok']
+   [hold] t=   0.0s  B  21.62 (+0.58)  T  20.94 (-0.45)  bed duty 127/127
+   [hold] t=  30.2s  B  20.82 (-0.22)  T  21.62 (+0.23)  bed duty 127/127
+*** [hold] BOARD FAULT at 60.4s: ['echo:Heating Failed', 'Error:Printer halted. kill() called!']
+
+heater off: ['ff']
+
+VERDICT: fault

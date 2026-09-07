@@ -29,7 +29,9 @@ def apply_store_config(ctrl: IncubatorController) -> None:
     """Push the per-machine store's preferences onto a controller.
 
     Idempotent and safe on a live controller — everything here is a host-side
-    preference (ceiling, display labels), never a command to the board.
+    preference (ceiling, display labels, the desired PID gains), never a
+    command to the board. The gains are only *declared* here; the controller
+    pushes them on connect and after a reset.
     """
     store = get_store()
     try:
@@ -40,6 +42,14 @@ def apply_store_config(ctrl: IncubatorController) -> None:
         ctrl.set_zone_labels(store.zone_labels())
     except Exception:
         logger.debug("could not apply incubator zone labels", exc_info=True)
+    try:
+        from .config_store import ZONE_IDS
+        ctrl.set_configured_pid(
+            {zid: store.zone_pid(zid) for zid in ZONE_IDS},
+            apply_on_connect=bool(store.get("pid_apply_on_connect", True)),
+        )
+    except Exception:
+        logger.debug("could not apply incubator PID gains", exc_info=True)
 
 
 def get_incubator() -> IncubatorController:

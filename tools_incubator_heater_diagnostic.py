@@ -51,11 +51,30 @@ UnicodeEncodeError from a decorative character would kill the diagnostic at
 exactly the moment it is needed (the same trap already recorded for
 tools_install_tucsen_sdk.ps1).
 
+THE POWER STAIRCASE (``--staircase``)
+  When the symptom is not "no heat" but "the board vanishes the moment the
+  heater starts" -- app.log on 2026-08-17 shows WriteFile ERROR_BAD_COMMAND
+  0.45 s after ``M140 S37``, four attempts out of four, and never once with
+  the heater off -- the question changes. It is no longer *is it driving the
+  output* but *how much power can this rig actually carry*. ``--staircase``
+  steps the bed power up a rung at a time and reports the highest level the
+  USB link survives, in either of two ways:
+
+      --mode pid   Marlin's own duty is held down (pure-P bed PID), so the
+                   PEAK current is limited. This is the default.
+      --mode pwm   full-power bursts gated on and off: the AVERAGE is
+                   limited but every burst is full current.
+
+  pid surviving where pwm dies at the same percentage means the failure is
+  inrush/peak current -- and a duty cap in the app is then a real fix.
+
 Usage:
     python tools_incubator_heater_diagnostic.py                 # scan + check
     python tools_incubator_heater_diagnostic.py --port COM4
     python tools_incubator_heater_diagnostic.py --seconds 0     # duty only
     python tools_incubator_heater_diagnostic.py --report-only   # no heating
+    python tools_incubator_heater_diagnostic.py --staircase     # power sweep
+    python tools_incubator_heater_diagnostic.py --staircase --mode pwm
 """
 
 from __future__ import annotations
@@ -207,6 +226,7 @@ def report_state(link: Link) -> dict:
                    or "bed" in ln.lower()]
     for ln in (interesting or m503[:20]):
         print("   " + ln)
+    bed_pid = parse_bed_pid(m503)
     if not any("M304" in ln for ln in m503):
         print("   !! NO M304 line -- PIDTEMPBED may be disabled in this build")
         print("      (the bed would run bang-bang, but it would still HEAT).")
@@ -236,7 +256,25 @@ def report_state(link: Link) -> dict:
         else:
             print("   (could not parse an M105 reply)")
         time.sleep(0.6)
-    return sample or {}
+    out = dict(sample or {})
+    out["bed_pid"] = bed_pid          # None when the build has no M304
+    return out
+
+
+# -- bed PID: the only way to command a PARTIAL bed power -----------
+#
+# The arithmetic AND the interpretation live in ONE place, shared with the
+# in-app Power-staircase tab (Incubator page). Two copies of a verdict is
+# how two surfaces come to disagree about the same measurement.
+#
+# The gains are RAM-only unless M500 is sent, and nothing here EVER sends
+# M500 -- so a power cycle restores them even if the restore cannot run.
+
+from SupportClasses.incubator.power_staircase import (   # noqa: E402
+    DELIVERED_FRAC, DUTY_FULL, StaircaseOutcome, p_gain_for_duty,
+    parse_bed_pid, plan_staircase, rung_delivered, rung_open_circuit,
+    verdict_lines,
+)
 
 
 def resistance_table(supply_v: float) -> list[str]:
@@ -452,6 +490,209 @@ def verdict(duty_seen: bool, max_duty: int, rise: float | None,
     print()
 
 
+# -- the staircase: find the power level the USB link survives ------
+
+def poll_once(link: Link) -> tuple[str, dict | None, str]:
+    """One M105, classified. Returns (kind, sample, detail).
+
+    kind is one of:
+      ok       -- answered and parsed
+      fault    -- the board reported a thermal/kill line (see ERROR_MARKERS)
+      silent   -- port still open, board did not answer (the kill() signature)
+      dropped  -- the port itself failed: the board left USB (a POWER fault)
+      garbled  -- answered, but no M105 could be parsed out of it
+    """
+    try:
+        lines = link.txn("M105", timeout=4.0)
+    except Exception as e:                      # the port went away under us
+        return "dropped", None, f"{type(e).__name__}: {e}"
+    bad = problem_lines(lines)
+    if bad:
+        return "fault", None, " | ".join(bad)
+    if not lines:
+        return "silent", None, "no reply"
+    s = parse_m105(lines)
+    if s is None:
+        return "garbled", None, lines[0][:70]
+    return "ok", s, ""
+
+
+def staircase_test(link: Link, *, ceiling_c: int, rungs: list[int],
+                   rung_seconds: float, abort_above: float,
+                   mode: str, pwm_period: float,
+                   orig_pid: tuple[float, float, float] | None,
+                   supply_v: float = 12.0) -> None:
+    """Step the bed power up a rung at a time until the link dies.
+
+    Today's app.log (2026-08-17) shows the ZP link failing with
+    WriteFile ERROR_BAD_COMMAND 0.45 s after M140 S37, four times out of
+    four, and never once while the heater was off. That is a power/USB
+    fault rather than a control-path one -- so the useful number is the
+    highest bed duty this rig can actually sustain.
+
+    Two mechanisms, because they fail differently and the difference is the
+    whole answer:
+
+      mode=pid  -- Marlin's own PWM is held down (pure-P, see p_gain_for_duty).
+                   Reduces the PEAK current the supply ever sees.
+      mode=pwm  -- host-side slow PWM: full-power bursts, gated on and off.
+                   Reduces the AVERAGE only; every burst is full current.
+
+    pid surviving where pwm dies at the same percentage means the failure is
+    inrush/peak current, and an app-side duty cap will fix it. Both dying at
+    any level points at a short or a supply that cannot start the load at all.
+    """
+    print()
+    print("=" * 68)
+    print(f"  POWER STAIRCASE  (mode={mode})")
+    print(f"  rungs {rungs} % of full bed power, {rung_seconds:g}s each")
+    print(f"  ceiling target {ceiling_c} C, abort above {abort_above:g} C")
+    print("  Ctrl-C stops and turns the heater off.")
+    print("=" * 68)
+    print()
+
+    outcome = StaircaseOutcome(mode=mode, supply_v=supply_v)
+    survived = outcome.survived               # (requested %, measured B@)
+    undelivered = outcome.undelivered         # rungs the firmware never drove
+    aborted_hot = False
+    died_at: tuple[int, int, str, str] | None = None
+
+    kind, s0, detail = poll_once(link)
+    if kind != "ok" or s0 is None:
+        print(f"   *** Cannot read the bed before starting "
+              f"({kind}: {detail}). Nothing was commanded.")
+        return
+    if s0["bed_c"] >= ceiling_c - 1.0:
+        print(f"   *** The bed is already {s0['bed_c']:.1f} C against a "
+              f"{ceiling_c} C ceiling,")
+        print(f"       so there is no error for the firmware to drive and "
+              f"every rung")
+        print(f"       would read 0% and look like a pass. Let it cool, or "
+              f"raise --target.")
+        return
+
+    print("   rung   t(s)   sensor C   target   duty(0-127)   %power")
+    print("   ----   ----   --------   ------   -----------   ------")
+
+    for pct in rungs:
+        # Re-read the bed each rung: the error shrinks as the plate warms,
+        # so the P that gave 20% at the start would give more later.
+        kind, s, detail = poll_once(link)
+        if kind != "ok" or s is None:
+            died_at = (pct, 0, kind, detail)
+            break
+        error_c = max(0.5, ceiling_c - s["bed_c"])
+
+        if mode == "pid":
+            p = p_gain_for_duty(pct, error_c)
+            link.txn(f"M304 P{p:.3f} I0 D0", timeout=4.0)
+            link.txn(f"M140 S{ceiling_c}", timeout=6.0)
+        else:
+            p = 0.0                            # unused; slow PWM below
+
+        rung_start = time.monotonic()
+        rung_t0 = s["bed_c"]          # for the open-circuit check below
+        rung_last = rung_t0
+        max_duty = 0
+        trimmed = False
+        next_edge = rung_start
+        on_phase = False
+        while True:
+            elapsed = time.monotonic() - rung_start
+
+            if mode == "pwm":
+                # Slow PWM: full-power bursts of pct% of the period.
+                now = time.monotonic()
+                if now >= next_edge:
+                    on_phase = not on_phase
+                    span = pwm_period * (pct / 100.0 if on_phase
+                                         else 1.0 - pct / 100.0)
+                    next_edge = now + max(0.05, span)
+                    try:
+                        link.txn(
+                            f"M140 S{ceiling_c if on_phase else 0}",
+                            timeout=6.0)
+                    except Exception as e:
+                        died_at = (pct, max_duty, "dropped",
+                                   f"{type(e).__name__}: {e}")
+                        break
+
+            kind, s, detail = poll_once(link)
+            if kind in ("dropped", "fault", "silent"):
+                died_at = (pct, max_duty, kind, detail)
+                break
+            if kind == "ok" and s is not None:
+                duty = s["bed_duty"] or 0
+                max_duty = max(max_duty, duty)
+                rung_last = s["bed_c"]
+                print(f"   {pct:4d}   {elapsed:4.1f}   {s['bed_c']:8.2f}   "
+                      f"{s['bed_target_c']:6.1f}   {duty:11d}   "
+                      f"{100.0 * duty / DUTY_FULL:5.0f}%")
+                if s["bed_c"] >= abort_above:
+                    print(f"\n   [ABORT] sensor reached {s['bed_c']:.1f} C "
+                          f"(limit {abort_above:.1f}).")
+                    aborted_hot = True
+                    break
+                # One proportional trim, once there is a reading to trim on.
+                if (mode == "pid" and not trimmed and elapsed > 2.0
+                        and duty > 0):
+                    goal = pct / 100.0 * DUTY_FULL
+                    if abs(duty - goal) > 0.15 * DUTY_FULL:
+                        p = max(0.01, min(500.0, p * goal / max(1, duty)))
+                        link.txn(f"M304 P{p:.3f} I0 D0", timeout=4.0)
+                    trimmed = True
+            if elapsed >= rung_seconds:
+                break
+            time.sleep(1.0)
+
+        # A temperature abort still measured this rung -- the link carried
+        # that duty right up to the moment we stopped for heat, and throwing
+        # it away would report "NOTHING WAS PROVEN" over a log showing 99%.
+        if died_at is None:
+            held = time.monotonic() - rung_start
+            rise = rung_last - rung_t0
+            if rung_open_circuit(100.0 * max_duty / DUTY_FULL, held, rise):
+                # Commanded real power for a real interval and nothing got
+                # warm: B@ is what Marlin ASKS for, not proof current flowed.
+                outcome.no_heat.append((pct, max_duty, rise))
+                print(f"   ({pct}% commanded {max_duty}/{DUTY_FULL:.0f} for "
+                      f"{held:.0f}s and the sensor moved {rise:+.2f} C -- "
+                      f"nothing is drawing)")
+            if rung_delivered(pct, max_duty):
+                survived.append((pct, max_duty))
+            else:
+                undelivered.append((pct, max_duty))
+                print(f"   ({pct}% not delivered -- peak duty only "
+                      f"{max_duty}/{DUTY_FULL}; this rung proves nothing)")
+        if died_at is not None or aborted_hot:
+            break
+
+    outcome.died_at = died_at
+    outcome.aborted_hot = aborted_hot
+    print()
+    print("=" * 68)
+    print("  STAIRCASE VERDICT")
+    print("=" * 68)
+    for line in verdict_lines(outcome):
+        print(("  " + line) if line else "")
+    print()
+
+    # Put the board's own gains back. RAM-only, so a power cycle would also
+    # do it -- but leaving a pure-P bed behind would quietly degrade the
+    # next hold, and the operator would have no reason to suspect it.
+    if mode == "pid" and orig_pid is not None:
+        try:
+            link.txn(f"M304 P{orig_pid[0]:.2f} I{orig_pid[1]:.2f} "
+                     f"D{orig_pid[2]:.2f}", timeout=5.0)
+            print(f"   Bed PID restored: P{orig_pid[0]:.2f} I{orig_pid[1]:.2f}"
+                  f" D{orig_pid[2]:.2f} (not saved to EEPROM).")
+        except Exception as e:
+            print(f"   !! COULD NOT RESTORE the bed PID ({e}).")
+            print(f"      Power-cycle the board -- the stored gains are still")
+            print(f"      P{orig_pid[0]:.2f} I{orig_pid[1]:.2f} "
+                  f"D{orig_pid[2]:.2f} in EEPROM.")
+
+
 # -- main -----------------------------------------------------------
 
 def main() -> int:
@@ -471,9 +712,31 @@ def main() -> int:
                          "should measure and draw (ME3B V1 is 12 V)")
     ap.add_argument("--report-only", action="store_true",
                     help="report state only -- never command a heater")
+    ap.add_argument("--staircase", action="store_true",
+                    help="step the bed power up a rung at a time and report "
+                         "the highest level the USB link survives (use this "
+                         "when the board drops off USB as the heater starts)")
+    ap.add_argument("--rungs", default="10,25,50,75,100",
+                    help="staircase levels, %% of full bed power "
+                         "(default 10,25,50,75,100)")
+    ap.add_argument("--rung-seconds", type=float, default=12.0,
+                    help="seconds to hold each rung (default 12)")
+    ap.add_argument("--mode", choices=("pid", "pwm"), default="pid",
+                    help="pid: hold Marlin's own duty down, limiting PEAK "
+                         "current (default). pwm: full-power bursts gated on "
+                         "and off, limiting AVERAGE only")
+    ap.add_argument("--pwm-period", type=float, default=4.0,
+                    help="slow-PWM period in seconds for --mode pwm "
+                         "(default 4)")
     ap.add_argument("--yes", action="store_true",
                     help="skip the confirmation prompt")
     args = ap.parse_args()
+
+    try:
+        rungs = plan_staircase(args.rungs)
+    except ValueError as e:
+        print(f"*** --rungs: {e}")
+        return 2
 
     print()
     print("MEBP incubator heater diagnostic")
@@ -517,6 +780,46 @@ def main() -> int:
             print(f"\n*** Refusing a {target} C target -- this rig holds "
                   f"37 C; anything above 45 is a mistake here.")
             return 2
+
+        if args.staircase:
+            orig_pid = state.get("bed_pid")
+            if args.mode == "pid" and orig_pid is None:
+                print()
+                print("*** --mode pid needs the board's current bed PID so it")
+                print("    can put it back afterwards, and M503 reported no")
+                print("    M304 line. Refusing rather than leaving gains this")
+                print("    tool cannot restore.")
+                print("    Use --mode pwm instead (it never touches the PID).")
+                return 2
+            if not args.yes:
+                print()
+                print(f"About to run a POWER STAIRCASE on the bed heater:")
+                print(f"  rungs   {rungs} % of full power, "
+                      f"{args.rung_seconds:g}s each")
+                print(f"  mode    {args.mode} "
+                      f"({'peak-limited' if args.mode == 'pid' else 'average-limited, full-current bursts'})")
+                print(f"  ceiling {target} C, abort above "
+                      f"{args.abort_above:.0f} C")
+                if args.mode == "pid":
+                    print(f"  bed PID {orig_pid} -> pure-P for the run, "
+                          f"restored after (never saved to EEPROM)")
+                print()
+                print("It stops at the first rung that kills the link, and the")
+                print("heater is switched off on every exit path incl. Ctrl-C.")
+                try:
+                    if input("Type y to continue: ").strip().lower() not in (
+                            "y", "yes"):
+                        print("Cancelled -- no heater was commanded.")
+                        return 0
+                except (EOFError, KeyboardInterrupt):
+                    print("\nCancelled.")
+                    return 0
+            staircase_test(link, ceiling_c=target, rungs=rungs,
+                           rung_seconds=max(2.0, args.rung_seconds),
+                           abort_above=args.abort_above, mode=args.mode,
+                           pwm_period=max(0.5, args.pwm_period),
+                           orig_pid=orig_pid, supply_v=args.supply_volts)
+            return 0
 
         if not args.yes:
             print()

@@ -3,7 +3,16 @@ config_store.py — per-machine incubator configuration.
 
 Owns everything the operator configures about the incubator on Hardware Setup
 → Incubator: which transport reaches the board, the dedicated-port hint, zone
-naming/enable, the setpoint ceiling and ramp/dither preferences.
+naming/enable, the setpoint ceiling, ramp/dither preferences, and the per-zone
+PID gains.
+
+The PID gains live here — not only in the board's EEPROM — because a Marlin
+reset reverts the running gains to whatever EEPROM holds, and this board resets
+routinely (opening its serial port pulses DTR, so every ZP auto-reconnect
+reboots it). That is the same mechanism that made it forget its *setpoint*
+(see ``controller._service_setpoint_keeper``). Holding the gains host-side lets
+the app re-assert them the same way, so a tuned loop survives a reset **without
+writing EEPROM at all**.
 
 Kept deliberately separate from ``HardwareConfig`` because — like the camera
 calibrations and the microscope config — this is a property of *this physical
@@ -46,6 +55,14 @@ HARD_MAX_SETPOINT_C = 50.0
 #: ``incubator.ramp.MAX_SAFE_STEP_C``); the store clamps rather than trusts.
 MAX_RAMP_STEP_C = 4.0
 
+#: Plausibility bounds for stored PID gains. A gain outside these is refused
+#: outright rather than clamped: a clamped gain is a *different controller*
+#: than the one that was tuned, silently, on a live heater — absent is
+#: recoverable (the board keeps its own gains), wrong is not.
+PID_MAX_KP = 1000.0
+PID_MAX_KI = 100.0
+PID_MAX_KD = 10000.0
+
 #: The two zone ids (``incubator.zones.ALL_ZONES``). Kept as data here so the
 #: store stays importable without the rest of the package.
 ZONE_IDS = ("bed", "hotend")
@@ -76,6 +93,39 @@ def clamp_ramp_step(value) -> float:
     return max(0.5, min(MAX_RAMP_STEP_C, v))
 
 
+def parse_pid(value) -> Optional[dict]:
+    """
+    A usable ``{"kp","ki","kd"}`` from arbitrary stored/typed input, or None.
+
+    Returns None — never a partially-repaired dict — when anything is missing,
+    non-finite or out of :data:`PID_MAX_KP` / ``KI`` / ``KD`` range, so a
+    malformed config leaves the board's own gains alone instead of pushing a
+    controller nobody chose.
+    """
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for key, hi in (("kp", PID_MAX_KP), ("ki", PID_MAX_KI), ("kd", PID_MAX_KD)):
+        if key not in value:
+            return None
+        try:
+            v = float(value[key])
+        except (TypeError, ValueError):
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        if v < 0.0 or v > hi:
+            return None
+        out[key] = v
+    if out["kp"] <= 0.0:
+        return None      # a zero proportional gain is not a controller
+    return out
+
+
+def _blank_zone() -> dict:
+    return {"label": "", "enabled": True, "preset_c": 37.0, "pid": None}
+
+
 class IncubatorConfigStore:
     """Load/save the per-machine incubator configuration."""
 
@@ -99,10 +149,11 @@ class IncubatorConfigStore:
             "fine_period_s": 60,
             "log_on_connect": False,
             "heaters_off_on_app_exit": True,
-            "zones": {
-                zid: {"label": "", "enabled": True, "preset_c": 37.0}
-                for zid in ZONE_IDS
-            },
+            #: Push the stored per-zone gains onto the board on every connect,
+            #: and again whenever a board reset is detected. Costs one M304
+            #: per zone and needs no EEPROM write.
+            "pid_apply_on_connect": True,
+            "zones": {zid: _blank_zone() for zid in ZONE_IDS},
         }
 
     def _load(self) -> None:
@@ -139,6 +190,8 @@ class IncubatorConfigStore:
                                             z["preset_c"])
                                     except Exception:
                                         pass
+                                if "pid" in z:
+                                    entry["pid"] = parse_pid(z["pid"])
                 else:
                     data[key] = raw[key]
             # Validation belongs to the store, not the UI (one owner).
@@ -162,6 +215,8 @@ class IncubatorConfigStore:
             except (TypeError, ValueError):
                 data["dedicated_baud"] = 38400
             data["dedicated_port"] = str(data.get("dedicated_port") or "").strip()
+            data["pid_apply_on_connect"] = bool(
+                data.get("pid_apply_on_connect", True))
             self._data = data
 
     def _write(self) -> None:
@@ -216,25 +271,32 @@ class IncubatorConfigStore:
             z = (self._data.get("zones") or {}).get(zone_id)
             if isinstance(z, dict):
                 return dict(z)
-            return {"label": "", "enabled": True, "preset_c": 37.0}
+            return _blank_zone()
 
     def set_zone(self, zone_id: str, *, label=None, enabled=None,
-                 preset_c=None, save: bool = True) -> None:
+                 preset_c=None, pid=..., save: bool = True) -> None:
         with self._lock:
             zones = self._data.setdefault("zones", {})
-            entry = zones.setdefault(
-                zone_id, {"label": "", "enabled": True, "preset_c": 37.0})
+            entry = zones.setdefault(zone_id, _blank_zone())
             if label is not None:
                 entry["label"] = str(label)
             if enabled is not None:
                 entry["enabled"] = bool(enabled)
             if preset_c is not None:
                 entry["preset_c"] = clamp_ceiling(preset_c)
+            # `pid` uses an ellipsis sentinel, not None: None is the meaningful
+            # value "forget the stored gains and leave the board alone".
+            if pid is not ...:
+                entry["pid"] = parse_pid(pid) if pid is not None else None
             if save:
                 try:
                     self._write()
                 except Exception as e:
                     logger.warning("incubator config save failed: %s", e)
+
+    def zone_pid(self, zone_id: str) -> Optional[dict]:
+        """Validated ``{"kp","ki","kd"}`` for a zone, or None if none stored."""
+        return parse_pid(self.zone(zone_id).get("pid"))
 
     def zone_labels(self) -> dict[str, str]:
         """Non-empty operator labels keyed by zone id."""

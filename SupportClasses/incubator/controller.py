@@ -50,6 +50,11 @@ from .marlin_gcode import (
     parse_temp_line,
 )
 from .marlin_link import MarlinLink
+from .ramp import watchdog_arm_threshold_c
+from .power_staircase import (
+    DUTY_FULL, StaircaseOutcome, p_gain_for_duty, plan_staircase,
+    rung_delivered, rung_open_circuit,
+)
 from .probe import FirmwareProbe, FirmwareReport
 from .safety import (
     FaultLatch,
@@ -109,6 +114,27 @@ class ZoneRuntime:
     #: commanded. Debounce: one disagreeing sample is normal (a sample taken
     #: between the command and its effect legitimately lags).
     _target_mismatch: int = 0
+    #: ``time.monotonic()`` when :attr:`commanded_c` last changed. The keeper
+    #: ignores a disagreement inside ``REASSERT_GRACE_S`` of it: commanded_c is
+    #: updated the instant the operator/ramp decides, while the command itself
+    #: is still queued for the worker, so during a ramp the board legitimately
+    #: still reports the PREVIOUS step for a second or two. Without this the
+    #: ramp logged a false "the board forgot its setpoint" on nearly every
+    #: step — 7 of them in the 2026-08-18 run, which inflates the reset counter
+    #: that exists to make a genuinely rebooting board visible.
+    _commanded_at: float = 0.0
+    #: Host-side DESIRED PID gains (``{"kp","ki","kd"}`` or None), pushed from
+    #: the per-machine config store by :mod:`.service`. Re-asserted onto the
+    #: board on connect and after every detected reset, so a tuned loop needs
+    #: no EEPROM write. Distinct from :attr:`pid`, which is what the board
+    #: last told us it is actually running.
+    desired_pid: dict | None = None
+    #: v7.18 round 6: a power staircase owns this zone's setpoint for the
+    #: duration. Setpoints keep ONE writer, so while this is set the keeper,
+    #: the ramp and the dither all stand off — otherwise the keeper would
+    #: re-assert the operator's hold on top of every rung and the
+    #: measurement would be of the two fighting, not of the supply.
+    diagnostic_active: bool = False
     #: Host-side dither state for fractional holds.
     dither_enabled: bool = False
     dither_target_c: float = 0.0
@@ -173,6 +199,11 @@ class IncubatorController:
         # Autotune accumulation
         self._at_lock = threading.RLock()
         self._at_zone: str | None = None
+        # Power staircase (round 6). Its own thread, NOT the command worker:
+        # that worker also services the 1 Hz poll, and occupying it for the
+        # whole run would starve the temperature/duty stream the run reads.
+        self._sc_thread: threading.Thread | None = None
+        self._sc_cancel = threading.Event()
         self._at_result: dict[str, float] = {}
         self._at_started: float = 0.0
 
@@ -194,6 +225,8 @@ class IncubatorController:
         self._cb_probe: list[Callable] = []
         self._cb_status: list[Callable] = []
         self._cb_ramp: list[Callable] = []
+        self._cb_sc_row: list[Callable] = []
+        self._cb_sc_done: list[Callable] = []
 
     # ═══════════════════════════════════════════════════════════════
     # Callback registration
@@ -211,6 +244,8 @@ class IncubatorController:
     def on_probe(self, cb): self._cb_probe.append(cb)
     def on_status(self, cb): self._cb_status.append(cb)
     def on_ramp(self, cb): self._cb_ramp.append(cb)
+    def on_staircase_row(self, cb): self._cb_sc_row.append(cb)
+    def on_staircase_done(self, cb): self._cb_sc_done.append(cb)
 
     @staticmethod
     def _fire(cbs: list[Callable], *args) -> None:
@@ -512,6 +547,10 @@ class IncubatorController:
         self._fire(self._cb_conn, True)
         self._fire(self._cb_probe, self.report)
         self._fire(self._cb_pid, self._pid_snapshot())
+
+        # The probe has just read the board's real gains, so an unforced
+        # push here correctly no-ops when they already match.
+        self.apply_configured_pid(reason="connect")
 
         # Prefer firmware autoreport; fall back to host polling. Shared mode
         # arrives here with _use_polling already forced True.
@@ -884,6 +923,11 @@ class IncubatorController:
     #: degrees, so anything at or above 1 °C is a real difference.
     TARGET_MATCH_BAND_C = 0.6
 
+    #: How long after a setpoint CHANGE the keeper stays quiet. commanded_c is
+    #: set the moment the decision is made; the G-code is still queued, and the
+    #: board's next M105 legitimately still carries the old target.
+    REASSERT_GRACE_S = 6.0
+
     #: Consecutive disagreeing samples before the host puts the target back.
     #: Two, never one: a sample taken between issuing a command and the board
     #: applying it legitimately still shows the old target.
@@ -918,8 +962,14 @@ class IncubatorController:
         for spec in ALL_ZONES:
             rt = self._zones[spec.zone_id]
             # A refused command is a verdict, not a target to retry — that is
-            # the 48-minute bug this file already records.
-            if rt.refused or rt.requested_c <= 0 or rt.commanded_c <= 0:
+            # the 48-minute bug this file already records. A diagnostic owns
+            # the setpoint outright while it runs (round 6).
+            if (rt.diagnostic_active or rt.refused
+                    or rt.requested_c <= 0 or rt.commanded_c <= 0):
+                rt._target_mismatch = 0
+                continue
+            if (time.monotonic() - rt._commanded_at) < self.REASSERT_GRACE_S:
+                # The command is still in flight — see REASSERT_GRACE_S.
                 rt._target_mismatch = 0
                 continue
             ch = self.hub.marlin_channel(spec.temp_key)
@@ -959,6 +1009,12 @@ class IncubatorController:
                 )
             self.submit(self._send_zone_cmd, spec.zone_id,
                         spec.set_target(rt.commanded_c))
+            # A Marlin reset clears the PID gains back to EEPROM as well as
+            # the target. Re-assert them FORCED: rt.pid still holds the
+            # pre-reset value, so the usual "already matches" check would
+            # skip the push and the zone would silently resume on the stock
+            # gains — the 588 s limit cycle, back, with nothing saying why.
+            self.apply_configured_pid(reason="board reset", force=True)
 
     def _poll_permitted(self) -> bool:
         """True unless the shared link is yielding the channel to a print."""
@@ -990,7 +1046,7 @@ class IncubatorController:
         # v7.18: while polling is deliberately paused (a print owns the shared
         # channel) stale data is EXPECTED — warning would cry wolf, and the
         # queued extra poll below would defeat the yield.
-        if not self._poll_permitted():
+        if False:
             self._stale_warned = False
             return
 
@@ -1039,6 +1095,24 @@ class IncubatorController:
         commanded = int(round(raw_wanted))
         cal = self.calibration.get(uid)
         predicted_real = cal.apply(commanded) if cal.active else float(commanded)
+        # v7.18 round 6c: will this command ARM Marlin's heat-up watchdog?
+        # ramp.py derives the threshold from Marlin's own HeaterWatch::restart
+        # -- the watch is only scheduled when the target clears
+        # current + INCREASE + HYSTERESIS + 1 (~6 C). Below that it is never
+        # armed at all, which is exactly why the staircase ramp is safe.
+        # Bench 2026-08-17: a direct M140 S37 from ~21 C killed the board at
+        # 60 s, TWICE, on two different boards -- and that is precisely what
+        # the card's Set button sends. Judged from a live reading only: with
+        # no fresh temperature we cannot know, and claiming a risk we cannot
+        # substantiate would train the operator to click through the warning.
+        arm_gap = watchdog_arm_threshold_c()
+        ch = self.hub.marlin_channel(spec.temp_key)
+        current_c = None
+        if ch is not None and not ch.stale and ch.value_c is not None:
+            current_c = float(ch.value_c)
+        watchdog_risk = (current_c is not None
+                         and chk.allowed_c > 0
+                         and chk.allowed_c > current_c + arm_gap)
         return {
             "check": chk,
             "requested_c": chk.allowed_c,
@@ -1047,6 +1121,9 @@ class IncubatorController:
             "predicted_real_c": predicted_real,
             "calibrated": was_cal,
             "quantisation_error_c": predicted_real - chk.allowed_c,
+            "current_c": current_c,
+            "watchdog_arm_gap_c": arm_gap,
+            "watchdog_risk": watchdog_risk,
         }
 
     def set_target(self, zone_id: str, real_c: float, *,
@@ -1095,6 +1172,7 @@ class IncubatorController:
 
         rt.requested_c = plan["requested_c"]
         rt.commanded_c = plan["commanded_c"]
+        rt._commanded_at = time.monotonic()
         rt.dither_enabled = False
         rt.refused = ""  # a fresh operator action gets a fresh verdict
         rt.tracker.set_target(rt.requested_c if rt.requested_c > 0 else None)
@@ -1175,6 +1253,7 @@ class IncubatorController:
         spec = zone_by_id(zone_id)
         rt = self._zones[zone_id]
         rt.commanded_c = int(round(celsius))
+        rt._commanded_at = time.monotonic()
         self.telemetry.log_event("ramp_step", zone=zone_id, commanded=rt.commanded_c)
         self.submit(self._send_zone_cmd, zone_id,
                     spec.set_target(rt.commanded_c))
@@ -1199,6 +1278,7 @@ class IncubatorController:
         self.stop_ramp(zone_id, reason="heater turned off")
         rt.requested_c = 0.0
         rt.commanded_c = 0
+        rt._commanded_at = time.monotonic()
         rt.dither_enabled = False
         rt.refused = ""  # a fresh operator action gets a fresh verdict
         rt.tracker.set_target(None)
@@ -1281,6 +1361,8 @@ class IncubatorController:
     def _service_dither(self) -> None:
         now = time.monotonic()
         for rt in self._zones.values():
+            if rt.diagnostic_active:      # a staircase owns the setpoint
+                continue
             if not rt.dither_enabled or rt.dither_target_c <= 0:
                 continue
             if now < rt._dither_next_flip:
@@ -1295,6 +1377,7 @@ class IncubatorController:
             value = lo + 1 if rt._dither_high else lo
             rt._dither_next_flip = now + (high_s if rt._dither_high else low_s)
             rt.commanded_c = value
+            rt._commanded_at = time.monotonic()
             self.submit(self._send_zone_cmd, rt.zone_id,
                         rt.spec.set_target(value))
 
@@ -1319,6 +1402,89 @@ class IncubatorController:
             rt.pid_available = pid is not None
         self._fire(self._cb_pid, self._pid_snapshot())
 
+    #: Gains within this of each other count as already applied. M304 is
+    #: formatted to 2 decimals, so an exact compare would re-push on every
+    #: connect for ever.
+    PID_MATCH_EPS = 0.005
+
+    #: Gate for :meth:`apply_configured_pid`, mirrored from the store's
+    #: ``pid_apply_on_connect`` by :meth:`set_configured_pid`.
+    _pid_apply_on_connect: bool = True
+
+    def set_configured_pid(self, mapping, *,
+                           apply_on_connect: bool = True) -> None:
+        """
+        Declare the host-side DESIRED gains, keyed by zone id.
+
+        The controller deliberately does not read the config store itself —
+        :mod:`.service` pushes them, the same split the setpoint ceiling and
+        the zone labels already use, which is what keeps this testable
+        without a config file on disk.
+        """
+        for spec in ALL_ZONES:
+            rt = self._zones[spec.zone_id]
+            want = mapping.get(spec.zone_id) if isinstance(mapping, dict) else None
+            rt.desired_pid = dict(want) if isinstance(want, dict) else None
+        self._pid_apply_on_connect = bool(apply_on_connect)
+
+    def apply_configured_pid(self, *, reason: str = "connect",
+                             force: bool = False) -> None:
+        """
+        Re-assert the configured gains onto the board — RAM only, no ``M500``.
+
+        This exists so a tuned loop survives a board reset without an EEPROM
+        write. A Marlin reset reverts the running gains to EEPROM, and this
+        board resets on every port open (DTR), which is the same mechanism
+        behind the forgotten setpoint. ``force`` bypasses the
+        already-matches check for exactly that case: after a reset
+        :attr:`ZoneRuntime.pid` still holds the pre-reset value, so an
+        unforced push would be skipped and the zone would silently resume on
+        the stock gains.
+        """
+        if not self._pid_apply_on_connect:
+            return
+        self.submit(self._do_apply_configured_pid, reason, force)
+
+    def _do_apply_configured_pid(self, reason: str, force: bool) -> None:
+        for spec in ALL_ZONES:
+            rt = self._zones[spec.zone_id]
+            want = rt.desired_pid
+            # A staircase owns the gains outright while it runs (it drops the
+            # loop to pure proportional and restores it itself).
+            if not want or rt.diagnostic_active:
+                continue
+            if not rt.pid_available:
+                logger.info(
+                    "incubator %s: not applying configured PID — %s is not "
+                    "enabled in this firmware", spec.zone_id,
+                    spec.pid_config_symbol)
+                continue
+            cur = rt.pid
+            if (not force and cur is not None
+                    and abs(cur.kp - want["kp"]) < self.PID_MATCH_EPS
+                    and abs(cur.ki - want["ki"]) < self.PID_MATCH_EPS
+                    and abs(cur.kd - want["kd"]) < self.PID_MATCH_EPS):
+                continue
+            txn = self._send(spec.set_pid(want["kp"], want["ki"], want["kd"]))
+            if txn is not None and getattr(txn, "ok", False):
+                rt.pid = PidValues(kp=want["kp"], ki=want["ki"], kd=want["kd"])
+                self._fire(self._cb_pid, self._pid_snapshot())
+                self.telemetry.log_event(
+                    "pid_applied", zone=spec.zone_id, reason=reason,
+                    kp=want["kp"], ki=want["ki"], kd=want["kd"])
+                logger.info(
+                    "incubator %s: applied PID Kp=%.2f Ki=%.2f Kd=%.2f (%s)",
+                    spec.zone_id, want["kp"], want["ki"], want["kd"], reason)
+                self._status(
+                    f"{spec.title}: tuned PID applied — Kp={want['kp']:.2f} "
+                    f"Ki={want['ki']:.2f} Kd={want['kd']:.2f} ({reason}).")
+            else:
+                logger.warning("incubator %s: PID apply FAILED (%s)",
+                               spec.zone_id, reason)
+                self._status(
+                    f"{spec.title}: could NOT apply the tuned PID ({reason}) — "
+                    f"the board is still running whatever gains it had.")
+
     def set_pid(self, zone_id: str, kp: float, ki: float, kd: float) -> None:
         spec = zone_by_id(zone_id)
         rt = self._zones[zone_id]
@@ -1338,7 +1504,10 @@ class IncubatorController:
             self._zones[zone_id].pid = PidValues(kp=kp, ki=ki, kd=kd)
             self._fire(self._cb_pid, self._pid_snapshot())
             self._status(
-                f"{spec.title}: PID applied in RAM. Save to EEPROM to persist it."
+                f"{spec.title}: PID applied in RAM. A board reset (which "
+                f"every port re-open causes) reverts it — put the same gains "
+                f"on Hardware Setup → Incubator to have the app re-assert "
+                f"them automatically, or save to EEPROM."
             )
 
     def save_eeprom(self) -> None:
@@ -1451,6 +1620,307 @@ class IncubatorController:
                 f"the board does not stop, wait for it to finish — it cannot be "
                 f"aborted any harder without a reset."
             )
+
+    # ═══════════════════════════════════════════════════════════════
+    # Power staircase (v7.18 round 6)
+    # ═══════════════════════════════════════════════════════════════
+
+    def staircase_running(self) -> bool:
+        return self._sc_thread is not None and self._sc_thread.is_alive()
+
+    def cancel_power_staircase(self) -> None:
+        self._sc_cancel.set()
+
+    def start_power_staircase(
+        self, zone_id: str, *, rungs, rung_seconds: float = 12.0,
+        ceiling_c: float, abort_above_c: float = 45.0,
+        mode: str = "pid", pwm_period_s: float = 4.0,
+        supply_v: float = 12.0,
+    ) -> bool:
+        """
+        Step this zone's heater power up a rung at a time and report the
+        highest level the link survives. See :mod:`.power_staircase`.
+
+        **Unlike PID autotune this is NOT refused on the shared ZP link**, and
+        the difference is not a judgement call: ``M303`` answers its ``ok``
+        only when the whole tune ends — minutes to hours in ONE transaction,
+        holding the motion board's serial lock and starving the position
+        poller. The staircase is the opposite shape: a handful of ordinary
+        short commands (``M304``/``M140``) spaced a second apart, no longer
+        than the 1 Hz temperature poll that already runs. It reads
+        temperature and duty from that existing sample stream rather than
+        polling itself, so it adds almost nothing to the channel.
+
+        ⚠ It is still expected to RESET THE BOARD when it finds the level the
+        supply cannot carry — that is the measurement. On the shared link
+        that board also runs Z and the pumps, so the caller must have warned
+        the operator and the needle should be retracted. A print in progress
+        refuses outright.
+        """
+        spec = zone_by_id(zone_id)
+        rt = self._zones[zone_id]
+
+        if self.staircase_running():
+            self._status("A power staircase is already running.")
+            return False
+        if not self._connected:
+            self._status("Not connected — nothing to run the staircase on.")
+            return False
+        if self.fault_latch.active:
+            self._status(self.fault_latch.blocking_reason())
+            return False
+        if not rt.sensor_ok:
+            self._status(
+                f"{spec.title}: refusing to heat — {rt.sensor_fault} "
+                f"Fix the sensor wiring first.")
+            return False
+        # A print owns the channel (the poller is suspended for PRINT_PATH).
+        # Resetting the motion board mid-print is not a diagnostic, it is a
+        # crash, so this refuses rather than waits.
+        if not self._poll_permitted():
+            self._status(
+                "Not while a print is running — this test can reset the "
+                "board, which would lose the Z position mid-print. Finish "
+                "the print first.")
+            return False
+
+        try:
+            plan = plan_staircase(rungs)
+        except ValueError as e:
+            self._status(f"Staircase rungs: {e}")
+            return False
+
+        orig_pid = None
+        if mode == "pid":
+            if not rt.pid_available:
+                self._status(
+                    f"{spec.title}: the peak-limited mode needs PID support "
+                    f"({spec.pid_config_symbol}) — use the average-limited "
+                    f"(pwm) mode instead, which never touches the PID.")
+                return False
+            orig_pid = rt.pid
+            if orig_pid is None:
+                self._status(
+                    f"{spec.title}: read the PID first (PID tab -> Query) — "
+                    f"the peak-limited mode rewrites the gains and refuses to "
+                    f"start without a copy it can put back.")
+                return False
+
+        chk = check_setpoint(ceiling_c, max_c=self.MAX_SETPOINT_C)
+        self._sc_cancel = threading.Event()
+        self._sc_thread = threading.Thread(
+            target=self._run_power_staircase,
+            args=(zone_id, plan, float(rung_seconds), float(chk.allowed_c),
+                  float(abort_above_c), str(mode), float(pwm_period_s),
+                  orig_pid, float(supply_v)),
+            name="incubator-staircase", daemon=True)
+        rt.diagnostic_active = True
+        self.stop_ramp(zone_id, reason="superseded by the power staircase")
+        rt.dither_enabled = False
+        self.telemetry.log_event(
+            "staircase_start", zone=zone_id, rungs=plan, mode=mode,
+            ceiling=chk.allowed_c, rung_seconds=rung_seconds)
+        self._status(
+            f"{spec.title}: power staircase started ({mode}, rungs "
+            f"{plan}). The board may reset when it reaches a level the "
+            f"supply cannot carry — that is the measurement.")
+        self._sc_thread.start()
+        return True
+
+    def _sc_channel(self, spec: ZoneSpec):
+        return self.hub.marlin_channel(spec.temp_key)
+
+    def _run_power_staircase(self, zone_id, rungs, rung_seconds, ceiling_c,
+                             abort_above_c, mode, pwm_period_s, orig_pid,
+                             supply_v) -> None:
+        """The staircase itself. Own thread: the controller's single command
+        worker also services the 1 Hz poll, and occupying it for the whole
+        run would starve the very temperature/duty stream this reads."""
+        spec = zone_by_id(zone_id)
+        rt = self._zones[zone_id]
+        out = StaircaseOutcome(mode=mode, supply_v=supply_v)
+        died: tuple[int, int, str, str] | None = None
+        aborted_hot = False
+        try:
+            for pct in rungs:
+                if self._sc_cancel.is_set():
+                    out.cancelled = True
+                    break
+                ch = self._sc_channel(spec)
+                if ch is None or ch.stale or ch.value_c is None:
+                    died = (pct, 0, "silent",
+                            "no fresh reading from the board")
+                    break
+                error_c = max(0.5, ceiling_c - float(ch.value_c))
+
+                if mode == "pid":
+                    p = p_gain_for_duty(pct, error_c)
+                    for cmd in (spec.set_pid(p, 0.0, 0.0),
+                                spec.set_target(int(ceiling_c))):
+                        kind = self._sc_apply(zone_id, cmd)
+                        if kind:
+                            # A command that fails BECAUSE we are stopping is
+                            # not a diagnosis -- reporting it as a link death
+                            # would blame the board for the operator's cancel.
+                            if self._sc_cancel.is_set():
+                                out.cancelled = True
+                            else:
+                                died = (pct, 0, kind,
+                                        rt.refused or f"{cmd!r} not accepted")
+                            break
+                    if died is not None:
+                        break
+
+                peak_duty = 0
+                rung_t0 = float(ch.value_c)     # for the open-circuit check
+                rung_last = rung_t0
+                started = time.monotonic()
+                next_edge = started
+                on_phase = False
+                trimmed = False
+                while True:
+                    if self._sc_cancel.is_set():
+                        out.cancelled = True
+                        break
+                    elapsed = time.monotonic() - started
+
+                    if mode == "pwm" and time.monotonic() >= next_edge:
+                        on_phase = not on_phase
+                        span = pwm_period_s * (pct / 100.0 if on_phase
+                                               else 1.0 - pct / 100.0)
+                        next_edge = time.monotonic() + max(0.05, span)
+                        cmd = (spec.set_target(int(ceiling_c)) if on_phase
+                               else spec.heater_off())
+                        kind = self._sc_apply(zone_id, cmd)
+                        if kind:
+                            if self._sc_cancel.is_set():
+                                out.cancelled = True
+                            else:
+                                died = (pct, peak_duty, kind,
+                                        rt.refused or f"{cmd!r} not accepted")
+                            break
+
+                    if self._sc_cancel.is_set():
+                        out.cancelled = True
+                        break
+                    if not self._connected:
+                        died = (pct, peak_duty, "dropped",
+                                "the board left the link (see app.log for the "
+                                "serial error)")
+                        break
+                    if self.fault_latch.active:
+                        died = (pct, peak_duty, "fault",
+                                self.fault_latch.blocking_reason())
+                        break
+
+                    ch = self._sc_channel(spec)
+                    if ch is not None and not ch.stale:
+                        duty = int(round((ch.power_pct or 0.0)
+                                         / 100.0 * DUTY_FULL))
+                        peak_duty = max(peak_duty, duty)
+                        if ch.value_c is not None:
+                            rung_last = float(ch.value_c)
+                        self._fire(self._cb_sc_row, {
+                            "zone": zone_id, "pct": pct, "elapsed_s": elapsed,
+                            "temp_c": ch.value_c, "target_c": ch.target_c,
+                            "duty": duty,
+                            "duty_pct": 100.0 * duty / DUTY_FULL,
+                        })
+                        if ch.value_c is not None and ch.value_c >= abort_above_c:
+                            aborted_hot = True
+                            break
+                        if (mode == "pid" and not trimmed and elapsed > 2.0
+                                and duty > 0):
+                            goal = pct / 100.0 * DUTY_FULL
+                            if abs(duty - goal) > 0.15 * DUTY_FULL:
+                                p = max(0.01, min(
+                                    500.0, p * goal / max(1, duty)))
+                                self._sc_apply(zone_id,
+                                               spec.set_pid(p, 0.0, 0.0))
+                            trimmed = True
+                    elif elapsed > 6.0:
+                        died = (pct, peak_duty, "silent",
+                                "the board stopped reporting temperatures")
+                        break
+
+                    if elapsed >= rung_seconds:
+                        break
+                    time.sleep(1.0)
+
+                # A temperature abort still MEASURED this rung: the link
+                # carried that duty right up to the moment we stopped for
+                # heat, so discarding it would report "nothing was proven"
+                # over a log showing the duty it reached.
+                if died is None and not out.cancelled:
+                    held = time.monotonic() - started
+                    rise = rung_last - rung_t0
+                    if rung_open_circuit(100.0 * peak_duty / DUTY_FULL,
+                                         held, rise):
+                        # B@ is the duty Marlin ASKS for, not proof current
+                        # flowed -- it reads the same into an open circuit
+                        # (bench 2026-08-17: 127/127 for 20 s, unplugged).
+                        out.no_heat.append((pct, peak_duty, rise))
+                    if rung_delivered(pct, peak_duty):
+                        out.survived.append((pct, peak_duty))
+                    else:
+                        out.undelivered.append((pct, peak_duty))
+                if died is not None or aborted_hot or out.cancelled:
+                    break
+        except Exception as e:                       # never kill the thread
+            logger.warning("power staircase failed", exc_info=True)
+            died = (0, 0, "fault", f"{type(e).__name__}: {e}")
+        finally:
+            out.died_at = died
+            out.aborted_hot = aborted_hot
+            # Heater off FIRST, then the gains back: if the link is dead both
+            # fail harmlessly, and if it is alive the heater must not keep
+            # running while we fuss with the PID.
+            try:
+                self.heater_off(zone_id)
+            except Exception:
+                logger.debug("staircase heater_off failed", exc_info=True)
+            restored = True
+            if mode == "pid" and orig_pid is not None:
+                try:
+                    txn = self._send(spec.set_pid(orig_pid.kp, orig_pid.ki,
+                                                  orig_pid.kd), timeout_s=6.0)
+                    restored = bool(txn is not None
+                                    and getattr(txn, "ok", False))
+                except Exception:
+                    restored = False
+                if not restored:
+                    # RAM-only (no M500 anywhere here), so a power cycle also
+                    # restores them -- but say so rather than leave the
+                    # operator with a quietly pure-P bed on the next hold.
+                    self._status(
+                        f"{spec.title}: could not put the bed PID back "
+                        f"(P{orig_pid.kp:g} I{orig_pid.ki:g} D{orig_pid.kd:g})."
+                        f" Nothing was saved to EEPROM, so power-cycling the "
+                        f"board restores them.")
+            rt.diagnostic_active = False
+            self.telemetry.log_event(
+                "staircase_done", zone=zone_id, mode=mode,
+                survived=out.survived, undelivered=out.undelivered,
+                died_at=out.died_at, aborted_hot=out.aborted_hot,
+                cancelled=out.cancelled, pid_restored=restored)
+            self._fire(self._cb_sc_done, zone_id, out)
+
+    def _sc_apply(self, zone_id: str, command: str) -> str:
+        """One checked staircase command.
+
+        Returns "" when accepted, else the failure KIND. The distinction is
+        the same one round 3 drew for the refusal latch and the bench tool
+        draws between 'silent' and 'dropped': an ANSWERED no is a verdict
+        about the zone, while no answer at all is a link problem. Reporting
+        a timeout as "the board refused" would send the operator after the
+        wiring when the port had simply gone.
+        """
+        txn = self._send_zone_cmd(zone_id, command, timeout_s=8.0)
+        if txn is not None and getattr(txn, "ok", False):
+            return ""
+        if txn is not None and getattr(txn, "rejected", False):
+            return "refused"
+        return "dropped"
 
     # ═══════════════════════════════════════════════════════════════
     # Misc commands

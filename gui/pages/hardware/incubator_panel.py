@@ -35,7 +35,8 @@ from gui.scaling import s, sf
 from gui.styles import COLORS
 
 from SupportClasses.incubator.config_store import (
-    HARD_MAX_SETPOINT_C, MAX_RAMP_STEP_C, get_store,
+    HARD_MAX_SETPOINT_C, MAX_RAMP_STEP_C,
+    PID_MAX_KD, PID_MAX_KI, PID_MAX_KP, get_store,
 )
 from SupportClasses.incubator.zones import ALL_ZONES
 
@@ -173,6 +174,15 @@ class IncubatorSetupPanel(QWidget):
         g.addWidget(QLabel("Enabled"), 0, 1)
         g.addWidget(QLabel("Display name"), 0, 2)
         g.addWidget(QLabel("Preset °C"), 0, 3)
+        for col, txt in ((4, "Kp"), (5, "Ki"), (6, "Kd")):
+            h = QLabel(txt)
+            h.setToolTip(
+                "PID gains the app re-asserts onto the board on every connect "
+                "and after every detected board reset (M304, RAM only — no "
+                "EEPROM write needed). Leave Kp at 0 to not manage this "
+                "zone's gains at all, in which case the board keeps whatever "
+                "it already has.")
+            g.addWidget(h, 0, col)
 
         self._zone_rows: dict[str, dict] = {}
         for i, spec in enumerate(ALL_ZONES, start=1):
@@ -196,15 +206,50 @@ class IncubatorSetupPanel(QWidget):
             preset.setValue(37.0)
             preset.setSuffix(" °C")
             g.addWidget(preset, i, 3)
+
+            def _spin(hi, dec, step):
+                sp = QDoubleSpinBox()
+                sp.setRange(0.0, hi)
+                sp.setDecimals(dec)
+                sp.setSingleStep(step)
+                sp.setValue(0.0)
+                sp.setMinimumWidth(s(78))
+                return sp
+
+            # 2 decimals because that is exactly what M304 is formatted to
+            # (ZoneSpec.set_pid) — a third would be silently discarded.
+            kp = _spin(PID_MAX_KP, 2, 1.0)
+            ki = _spin(PID_MAX_KI, 2, 0.01)
+            kd = _spin(PID_MAX_KD, 2, 1.0)
+            kp.setToolTip("Proportional gain. 0 = do not manage this zone's "
+                          "PID; the board keeps its own gains.")
+            ki.setToolTip("Integral gain. Kp/Ki is the integral time — it must "
+                          "be comparable to the block's thermal time constant, "
+                          "not to a bare heater's.")
+            kd.setToolTip("Derivative gain. 0 is right for a lag-dominant "
+                          "water block; D mostly amplifies sensor noise into "
+                          "duty chatter here.")
+            g.addWidget(kp, i, 4)
+            g.addWidget(ki, i, 5)
+            g.addWidget(kd, i, 6)
             self._zone_rows[spec.zone_id] = {
                 "enabled": enabled, "label": label, "preset": preset,
+                "kp": kp, "ki": ki, "kd": kd,
             }
 
         g.addWidget(self._hint(
             "Display names show on the zone cards, the trend legend and the "
             "sensor table. The zone→heater wiring itself is fixed in "
             "firmware (Zone A = bed HB/THB, Zone B = hotend HE0/THO)."
-        ), len(ALL_ZONES) + 1, 0, 1, 4)
+        ), len(ALL_ZONES) + 1, 0, 1, 7)
+        g.addWidget(self._hint(
+            "The stock bed gains are tuned for a thin printer bed: their "
+            "integral time is seconds, while a water block's time constant is "
+            "tens of minutes. That mismatch makes the duty rail 0↔100 % and "
+            "the temperature swing in a slow limit cycle. Gains set here are "
+            "re-asserted after a board reset, so they survive a ZP reconnect "
+            "without an EEPROM write."
+        ), len(ALL_ZONES) + 2, 0, 1, 7)
         return box
 
     def _build_behaviour_group(self) -> QGroupBox:
@@ -272,6 +317,18 @@ class IncubatorSetupPanel(QWidget):
             "running for a long soak is legitimate, and closing the app "
             "never stops them by itself.")
         g.addWidget(self._off_on_exit, 4, 0, 1, 3)
+
+        self._pid_on_connect = QCheckBox(
+            "Re-assert the PID gains above on connect and after a board reset")
+        self._pid_on_connect.setToolTip(
+            "A Marlin reset reverts the running PID gains to whatever EEPROM "
+            "holds, and this board resets whenever its serial port is opened "
+            "(DTR) — which is every ZP reconnect. That is the same mechanism "
+            "that makes it forget its setpoint. With this ticked the app "
+            "pushes the configured gains again (M304) on connect and whenever "
+            "it catches a reset, so a tuned loop survives without ever "
+            "writing EEPROM. Untick to leave the board's own gains alone.")
+        g.addWidget(self._pid_on_connect, 5, 0, 1, 3)
         return box
 
     def _build_save_row(self) -> QHBoxLayout:
@@ -346,6 +403,8 @@ class IncubatorSetupPanel(QWidget):
         self._log_on_connect.setChecked(bool(st.get("log_on_connect", False)))
         self._off_on_exit.setChecked(
             bool(st.get("heaters_off_on_app_exit", True)))
+        self._pid_on_connect.setChecked(
+            bool(st.get("pid_apply_on_connect", True)))
         for zid, row in self._zone_rows.items():
             z = st.zone(zid)
             row["enabled"].setChecked(bool(z.get("enabled", True)))
@@ -354,6 +413,12 @@ class IncubatorSetupPanel(QWidget):
                 row["preset"].setValue(float(z.get("preset_c", 37.0)))
             except Exception:
                 pass
+            pid = st.zone_pid(zid) or {}
+            for key in ("kp", "ki", "kd"):
+                try:
+                    row[key].setValue(float(pid.get(key, 0.0)))
+                except Exception:
+                    row[key].setValue(0.0)
         self._refresh_rows()
 
     def commit(self) -> bool:
@@ -371,12 +436,21 @@ class IncubatorSetupPanel(QWidget):
                save=False)
         st.set("heaters_off_on_app_exit",
                bool(self._off_on_exit.isChecked()), save=False)
+        st.set("pid_apply_on_connect",
+               bool(self._pid_on_connect.isChecked()), save=False)
         for zid, row in self._zone_rows.items():
             st.set_zone(
                 zid,
                 label=row["label"].text().strip(),
                 enabled=row["enabled"].isChecked(),
                 preset_c=float(row["preset"].value()),
+                # Kp of 0 means "do not manage this zone" — store None so the
+                # board keeps its own gains rather than being handed a
+                # controller with no proportional term.
+                pid=({"kp": float(row["kp"].value()),
+                      "ki": float(row["ki"].value()),
+                      "kd": float(row["kd"].value())}
+                     if float(row["kp"].value()) > 0.0 else None),
                 save=False,
             )
         ok = st.save()
@@ -388,6 +462,10 @@ class IncubatorSetupPanel(QWidget):
             if ctrl is not None:
                 from SupportClasses.incubator.service import apply_store_config
                 apply_store_config(ctrl)
+                # apply_store_config only DECLARES the gains; push them for
+                # real so Save takes effect without waiting for a reconnect
+                # (the same reason the ceiling is pushed live).
+                ctrl.apply_configured_pid(reason="settings saved")
         except Exception:
             logger.debug("live incubator config push failed", exc_info=True)
         return ok

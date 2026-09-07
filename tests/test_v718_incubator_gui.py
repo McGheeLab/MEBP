@@ -213,8 +213,12 @@ class TestIncubatorWorkflowPage(unittest.TestCase):
         card._sp.setValue(37.0)
         # The first Set is a >10 °C jump from 0 → confirm dialog; a real
         # modal blocks forever offscreen, so answer Yes programmatically.
+        # v7.18 round 6c: a jump this size also arms Marlin's heat-up
+        # watchdog, so the card now offers the Ramp first. This test is
+        # about the DIRECT set, so take "Set anyway".
         with patch.object(QMessageBox, "question",
-                          return_value=QMessageBox.Yes):
+                          return_value=QMessageBox.Yes),                 patch.object(type(card), "_ask_watchdog",
+                             return_value="set"):
             card._on_set()
         self.assertEqual(
             37.0, self.page.ctrl.zone_runtime("bed").requested_c)
@@ -621,6 +625,97 @@ class TestIncubatorJogPanelSection(unittest.TestCase):
             w.deleteLater()
         finally:
             service.peek_incubator = orig
+
+
+class TestTrendPlotIsResizable(unittest.TestCase):
+    """The trend plot's width and height are operator-adjustable.
+
+    It used to be pinned: the zone-card column was a FIXED width and the
+    sensor table a FIXED height, so the plot absorbed every spare pixel of
+    the upper area and rendered as a very wide, very short strip with no
+    handle anywhere to change it (operator: "too wide … needs to be
+    resizable"). These assert the DRAG, not just the widget types — a
+    splitter whose panes are already at their minimums is still unmovable.
+    """
+
+    def setUp(self):
+        _isolate_env()
+        _fresh_singletons()
+        self.app = _app()
+        from gui.pages.workflows.incubator_workflow import (
+            IncubatorWorkflowPage,
+        )
+        self.page = IncubatorWorkflowPage(controller=None, settings=None)
+        # Tall enough that the vertical divider has slack to give away.
+        self.page.resize(1600, 1300)
+        self.page.show()
+        self.app.processEvents()
+
+    def tearDown(self):
+        self.page.deleteLater()
+        self.app.processEvents()
+        _fresh_singletons()
+
+    def _splitters(self):
+        """(horizontal cards|right, vertical trend|sensors) around the plot."""
+        from PySide6.QtWidgets import QSplitter
+        vert = self.page._plot.parent()
+        while vert is not None and not isinstance(vert, QSplitter):
+            vert = vert.parent()
+        self.assertIsNotNone(vert, "plot is not inside a splitter")
+        horiz = vert.parent()
+        while horiz is not None and not isinstance(horiz, QSplitter):
+            horiz = horiz.parent()
+        self.assertIsNotNone(horiz, "trend column is not inside a splitter")
+        return horiz, vert
+
+    def test_dragging_the_side_divider_narrows_the_plot(self):
+        horiz, _ = self._splitters()
+        self.assertEqual(2, horiz.count())
+        before = self.page._plot.width()
+        cards_w, right_w = horiz.sizes()
+        horiz.setSizes([cards_w + 300, right_w - 300])
+        self.app.processEvents()
+        self.assertLess(self.page._plot.width(), before,
+                        "the side divider did not narrow the plot")
+
+    def test_dragging_the_lower_divider_shortens_the_plot(self):
+        _, vert = self._splitters()
+        self.assertEqual(2, vert.count())
+        before_plot = self.page._plot.height()
+        before_table = self.page._table.height()
+        trend_h, sensors_h = vert.sizes()
+        vert.setSizes([trend_h - 200, sensors_h + 200])
+        self.app.processEvents()
+        self.assertLess(self.page._plot.height(), before_plot)
+        self.assertGreater(self.page._table.height(), before_table,
+                           "the sensor table still cannot grow")
+
+    def test_neither_pane_can_be_collapsed_away(self):
+        """A pane dragged to zero is a control surface the operator loses."""
+        horiz, vert = self._splitters()
+        self.assertFalse(horiz.childrenCollapsible())
+        self.assertFalse(vert.childrenCollapsible())
+
+    def test_the_plot_keeps_a_readable_floor(self):
+        """Squeezed hard, the plot stops rather than degenerating."""
+        horiz, _ = self._splitters()
+        horiz.setSizes([10_000, 1])
+        self.app.processEvents()
+        self.assertGreaterEqual(self.page._plot.width(),
+                                self.page._plot.minimumWidth())
+        self.assertGreater(self.page._plot.minimumWidth(), 0)
+
+    def test_nothing_in_the_upper_area_is_pinned_to_a_fixed_size(self):
+        """The two fixed sizes that made the plot unresizable are gone."""
+        horiz, _ = self._splitters()
+        cards_pane = horiz.widget(0)
+        self.assertGreater(cards_pane.maximumWidth(),
+                           cards_pane.minimumWidth(),
+                           "zone-card column is fixed-width again")
+        self.assertGreater(self.page._table.maximumHeight(),
+                           self.page._table.minimumHeight(),
+                           "sensor table is fixed-height again")
 
 
 if __name__ == "__main__":

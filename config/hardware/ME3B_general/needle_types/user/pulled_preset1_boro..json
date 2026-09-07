@@ -1,0 +1,16 @@
+{
+  "id": "pulled_preset1_boro.",
+  "display_name": "Pulled_Preset1_Boro.",
+  "manufacturer": "",
+  "model": "",
+  "barrel_id_um": 500.0,
+  "barrel_od_um": 1000.0,
+  "barrel_length_mm": 75.0,
+  "tip_id_um": 150.0,
+  "tip_length_mm": 5.0,
+  "tip_od_um": 500.0,
+  "tip_profile": "cone",
+  "puller_program": "",
+  "notes": "",
+  "builtin": false
+}
